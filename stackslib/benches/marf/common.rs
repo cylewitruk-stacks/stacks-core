@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use blockstack_lib::chainstate::stacks::index::MARFValue;
+use criterion::Criterion;
 use stacks_common::types::chainstate::StacksBlockId;
 
 /// Build a deterministic [`StacksBlockId`] from a numeric seed.
@@ -32,4 +35,12 @@ pub fn make_batch(
     }
 
     (keys, values)
+}
+
+pub fn configured_criterion() -> Criterion {
+    Criterion::default()
+        .warm_up_time(Duration::from_secs(8))
+        .measurement_time(Duration::from_secs(30))
+        .sample_size(120)
+        .noise_threshold(0.03)
 }

@@ -9,6 +9,8 @@ use blockstack_lib::chainstate::stacks::index::{bits, TrieLeaf};
 use criterion::{criterion_group, BenchmarkId, Criterion};
 use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 
+use super::common::configured_criterion;
+
 #[inline]
 fn sample_path() -> [u8; TRIEHASH_ENCODED_SIZE] {
     std::array::from_fn(|i| i as u8)
@@ -205,10 +207,12 @@ pub fn bench_write_nodetype_bytes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_path_from_bytes,
-    bench_ptrs_from_bytes,
-    bench_read_nodetype_at_head,
-    bench_write_nodetype_bytes
-);
+criterion_group! {
+    name = benches;
+    config = configured_criterion();
+    targets =
+        bench_path_from_bytes,
+        bench_ptrs_from_bytes,
+        bench_read_nodetype_at_head,
+        bench_write_nodetype_bytes
+}

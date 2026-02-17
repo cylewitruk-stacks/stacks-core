@@ -4,11 +4,11 @@ use std::hint::black_box;
 use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use blockstack_lib::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue, TrieMerkleProof};
-use criterion::{criterion_group, Criterion};
+use criterion::{criterion_group, BatchSize, Criterion};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use tempfile::TempDir;
 
-use super::common::{block_id, make_batch};
+use super::common::{block_id, configured_criterion, make_batch};
 
 const CHAIN_LEN: u32 = 192;
 const DEPTHS: [u32; 3] = [1, 8, 64];
@@ -212,45 +212,49 @@ fn bench_insert_batch_commit(c: &mut Criterion) {
     let mut group = c.benchmark_group("marf_api/insert_batch_commit");
 
     for strategy in CACHE_STRATEGIES {
-        let mut fixture = make_fixture(strategy);
         let (keys, value_template) = make_write_batch("write", INSERT_BATCH_SIZE);
-        let mut next_block_seed = 10_000_000u32;
+        let next_block_seed = 10_000_000u32;
 
         group.bench_function(format!("{strategy}/batch_{INSERT_BATCH_SIZE}"), move |b| {
-            b.iter(|| {
-                let parent = fixture.tip.clone();
-                let next = block_id(next_block_seed);
-                next_block_seed = next_block_seed.wrapping_add(1);
+            b.iter_batched(
+                || make_fixture(strategy),
+                |mut fixture| {
+                    let parent = fixture.tip.clone();
+                    let next = block_id(next_block_seed);
 
-                let mut values = value_template.clone();
-                values[0] = MARFValue::from(next_block_seed);
+                    let mut values = value_template.clone();
+                    values[0] = MARFValue::from(next_block_seed.wrapping_add(1));
 
-                let mut tx = fixture
-                    .marf
-                    .begin_tx()
-                    .expect("failed to start marf_api insert tx");
-                tx.begin(&parent, &next)
-                    .expect("failed to begin marf_api insert extension");
-                tx.insert_batch(&keys, values)
-                    .expect("failed to insert marf_api write batch");
-                let root_hash = tx.seal().expect("failed to seal marf_api write batch");
-                black_box(root_hash);
-                tx.commit().expect("failed to commit marf_api write batch");
+                    let mut tx = fixture
+                        .marf
+                        .begin_tx()
+                        .expect("failed to start marf_api insert tx");
+                    tx.begin(&parent, &next)
+                        .expect("failed to begin marf_api insert extension");
+                    tx.insert_batch(&keys, values)
+                        .expect("failed to insert marf_api write batch");
+                    let root_hash = tx.seal().expect("failed to seal marf_api write batch");
+                    black_box(root_hash);
+                    tx.commit().expect("failed to commit marf_api write batch");
 
-                fixture.tip = next;
-                fixture.tip_height = fixture.tip_height.wrapping_add(1);
-                black_box((&fixture.tip, fixture.tip_height));
-            });
+                    fixture.tip = next;
+                    fixture.tip_height = fixture.tip_height.wrapping_add(1);
+                    black_box((&fixture.tip, fixture.tip_height));
+                },
+                BatchSize::PerIteration,
+            );
         });
     }
 
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_get,
-    bench_get_with_proof,
-    bench_proof_verify,
-    bench_insert_batch_commit
-);
+criterion_group! {
+    name = benches;
+    config = configured_criterion();
+    targets =
+        bench_get,
+        bench_get_with_proof,
+        bench_proof_verify,
+        bench_insert_batch_commit
+}

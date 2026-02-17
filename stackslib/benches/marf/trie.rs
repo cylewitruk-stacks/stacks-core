@@ -10,7 +10,7 @@ use blockstack_lib::chainstate::stacks::index::{Error, MARFValue, MarfTrieId, Tr
 use criterion::{criterion_group, Criterion};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 
-use super::common::block_id;
+use super::common::{block_id, configured_criterion};
 
 fn path_from_seed(seed: u8) -> TrieHash {
     let bytes: [u8; 32] = std::array::from_fn(|i| seed.wrapping_mul(17).wrapping_add(i as u8));
@@ -289,11 +289,13 @@ fn bench_cursor_walk_add_value(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_read_root,
-    bench_walk_from,
-    bench_get_children_hashes,
-    bench_add_value_update_root_hash,
-    bench_cursor_walk_add_value
-);
+criterion_group! {
+    name = benches;
+    config = configured_criterion();
+    targets =
+        bench_read_root,
+        bench_walk_from,
+        bench_get_children_hashes,
+        bench_add_value_update_root_hash,
+        bench_cursor_walk_add_value
+}

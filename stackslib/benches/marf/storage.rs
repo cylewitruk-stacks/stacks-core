@@ -10,7 +10,7 @@ use criterion::{criterion_group, Criterion};
 use stacks_common::types::chainstate::StacksBlockId;
 use tempfile::TempDir;
 
-use super::common::{block_id, make_batch};
+use super::common::{block_id, configured_criterion, make_batch};
 
 fn build_committed_chain(
     db_path: &str,
@@ -371,11 +371,13 @@ fn bench_flush(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_open_block,
-    bench_read_nodetype,
-    bench_read_node_hash_bytes,
-    bench_write_children_hashes,
-    bench_flush
-);
+criterion_group! {
+    name = benches;
+    config = configured_criterion();
+    targets =
+        bench_open_block,
+        bench_read_nodetype,
+        bench_read_node_hash_bytes,
+        bench_write_children_hashes,
+        bench_flush
+}
