@@ -412,7 +412,7 @@ impl TrieBenchmark {
 
 #[cfg(not(test))]
 impl TrieBenchmark {
-    pub fn new() -> TrieBenchmark {
+    pub const fn new() -> TrieBenchmark {
         TrieBenchmark {
             total_read_nodetype_time_ns: 0,
             total_read_node_hash_time_ns: 0,
@@ -441,13 +441,13 @@ impl TrieBenchmark {
             total_marf_walk_backptr_time_ns: 0,
             total_marf_walk_find_backptr_node_time_ns: 0,
 
-            read_nodetype_start_time: SystemTime::now(),
-            read_node_hash_start_time: SystemTime::now(),
-            open_block_start_time: SystemTime::now(),
-            get_block_hash_caching_start_time: SystemTime::now(),
-            marf_walk_from_start_time: SystemTime::now(),
-            marf_walk_backptr_start_time: SystemTime::now(),
-            marf_walk_find_backptr_node_start_time: SystemTime::now(),
+            read_nodetype_start_time: SystemTime::UNIX_EPOCH,
+            read_node_hash_start_time: SystemTime::UNIX_EPOCH,
+            open_block_start_time: SystemTime::UNIX_EPOCH,
+            get_block_hash_caching_start_time: SystemTime::UNIX_EPOCH,
+            marf_walk_from_start_time: SystemTime::UNIX_EPOCH,
+            marf_walk_backptr_start_time: SystemTime::UNIX_EPOCH,
+            marf_walk_find_backptr_node_start_time: SystemTime::UNIX_EPOCH,
 
             time_errors: 0,
         }
@@ -466,25 +466,25 @@ impl TrieBenchmark {
     pub fn read_node_hash_finish(&mut self, _cache_hit: bool) {}
 
     pub fn write_children_hashes_start(&mut self) -> SystemTime {
-        SystemTime::now()
+        SystemTime::UNIX_EPOCH
     }
 
     pub fn write_children_hashes_finish(&mut self, _start_time: SystemTime, _in_ram: bool) {}
 
     pub fn write_children_hashes_empty_start(&mut self) -> SystemTime {
-        SystemTime::now()
+        SystemTime::UNIX_EPOCH
     }
 
     pub fn write_children_hashes_empty_finish(&mut self, _start_time: SystemTime) {}
 
     pub fn write_children_hashes_same_block_start(&mut self) -> SystemTime {
-        SystemTime::now()
+        SystemTime::UNIX_EPOCH
     }
 
     pub fn write_children_hashes_same_block_finish(&mut self, _start_time: SystemTime) {}
 
     pub fn write_children_hashes_ancestor_block_start(&mut self) -> SystemTime {
-        SystemTime::now()
+        SystemTime::UNIX_EPOCH
     }
 
     pub fn write_children_hashes_ancestor_block_finish(&mut self, _start_time: SystemTime) {}

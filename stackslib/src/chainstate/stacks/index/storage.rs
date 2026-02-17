@@ -265,9 +265,22 @@ impl<T: MarfTrieId> UncommittedState<T> {
         node: &TrieNodeType,
         hash: TrieHash,
     ) -> Result<(), Error> {
+        self.write_nodetype_owned(node_array_ptr, node.clone(), hash)
+    }
+
+    /// Write a node and its hash to a particular slot in the TrieRAM, taking ownership of the
+    /// node to avoid an extra clone.
+    /// Panics if the UncommittedState is sealed already.
+    #[inline]
+    pub fn write_nodetype_owned(
+        &mut self,
+        node_array_ptr: u32,
+        node: TrieNodeType,
+        hash: TrieHash,
+    ) -> Result<(), Error> {
         match self {
             UncommittedState::RW(ref mut trie_ram) => {
-                trie_ram.write_nodetype(node_array_ptr, node, hash)
+                trie_ram.write_nodetype_owned(node_array_ptr, node, hash)
             }
             UncommittedState::Sealed(..) => {
                 panic!("FATAL: tried to write to a sealed TrieRAM");
@@ -694,110 +707,113 @@ impl<T: MarfTrieId> TrieRAM<T> {
     ) -> Result<TrieHash, Error> {
         let start_time = storage_tx.bench.write_children_hashes_start();
         let mut start_node_time = Some(storage_tx.bench.write_children_hashes_same_block_start());
-        let (node, node_hash) = self.get_nodetype(node_ptr as u32)?.to_owned();
-        if node.is_leaf() {
-            // base case: we already have the hash of the leaf, so return it.
-            Ok(node_hash)
-        } else {
-            // inductive case: calculate children hashes, hash them, and return that hash.
-            let mut hasher = TrieHasher::new();
-            let empty_node_hash = TrieHash::EMPTY;
+        let node_array_ptr = node_ptr as u32;
 
-            node.write_consensus_bytes(storage_tx, &mut hasher)
-                .expect("IO Failure pushing to hasher.");
-
-            // count get_nodetype load time for write_children_hashes_same_block benchmark, but
-            // only if that code path will be exercised.
-            for ptr in node.ptrs().iter() {
-                if !is_backptr(ptr.id()) && !ptr.is_empty() {
-                    if let Some(start_node_time) = start_node_time.take() {
-                        // count the time taken to load the root node in this case,
-                        // but only do so once.
-                        storage_tx
-                            .bench
-                            .write_children_hashes_same_block_finish(start_node_time);
-                        break;
-                    }
-                }
-            }
-
-            // calculate the hashes of this node's children, and store them if they're in the
-            // same trie.
-            for ptr in node.ptrs().iter() {
-                if ptr.is_empty() {
-                    // hash of empty string
-                    let start_time = storage_tx.bench.write_children_hashes_empty_start();
-
-                    hasher.write_all(empty_node_hash.as_bytes())?;
-
-                    storage_tx
-                        .bench
-                        .write_children_hashes_empty_finish(start_time);
-                } else if !is_backptr(ptr.id()) {
-                    // hash is the hash of this node's children
-                    let node_hash = self.calculate_node_hashes(storage_tx, ptr.ptr() as u64)?;
-
-                    // count the time taken to store the hash towards the
-                    // write_children_hashes_same_benchmark
-                    let start_time = storage_tx.bench.write_children_hashes_same_block_start();
-                    trace!(
-                        "calculate_node_hashes({:?}): at chr {} ptr {}: {:?} {:?}",
-                        &self.block_header,
-                        ptr.chr(),
-                        ptr.ptr(),
-                        &node_hash,
-                        node
-                    );
-                    hasher.write_all(node_hash.as_bytes())?;
-
-                    if TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode
-                        && ptr.id() != TrieNodeID::Leaf as u8
-                    {
-                        // need to store this hash too, since we deferred calculation
-                        self.write_node_hash(ptr.ptr(), node_hash)?;
-                    }
-
-                    storage_tx
-                        .bench
-                        .write_children_hashes_same_block_finish(start_time);
+        // Borrow the node to seed the hasher and collect immutable metadata, but avoid cloning
+        // the full node on the recursive seal path.
+        let mut hasher = TrieHasher::new();
+        let empty_node_hash = TrieHash::EMPTY;
+        let (is_leaf, node_hash, num_ptrs) =
+            self.with_nodetype(node_array_ptr, |(node, node_hash)| {
+                if node.is_leaf() {
+                    (true, *node_hash, 0usize)
                 } else {
-                    // hash is that of the block that contains this node
-                    let start_time = storage_tx
-                        .bench
-                        .write_children_hashes_ancestor_block_start();
-
-                    let block_hash = storage_tx.get_block_hash_caching(ptr.back_block())?;
-                    trace!(
-                        "calculate_node_hashes({:?}): at chr {} bkptr {}: {:?} {:?}",
-                        &self.block_header,
-                        ptr.chr(),
-                        ptr.ptr(),
-                        &block_hash,
-                        node
-                    );
-                    hasher.write_all(block_hash.as_bytes())?;
-
-                    storage_tx
-                        .bench
-                        .write_children_hashes_ancestor_block_finish(start_time);
+                    node.write_consensus_bytes(storage_tx, &mut hasher)
+                        .expect("IO Failure pushing to hasher.");
+                    (false, *node_hash, node.ptrs().len())
                 }
-            }
+            })?;
 
-            // only measure full trie
-            if node_ptr == 0 {
+        if is_leaf {
+            // base case: we already have the hash of the leaf, so return it.
+            return Ok(node_hash);
+        }
+
+        // inductive case: calculate children hashes, hash them, and return that hash.
+        for ptr_index in 0..num_ptrs {
+            let ptr = self.with_nodetype(node_array_ptr, |(node, _)| node.ptrs()[ptr_index])?;
+
+            if ptr.is_empty() {
+                // hash of empty string
+                let start_time = storage_tx.bench.write_children_hashes_empty_start();
+
+                hasher.write_all(empty_node_hash.as_bytes())?;
+
                 storage_tx
                     .bench
-                    .write_children_hashes_finish(start_time, true);
+                    .write_children_hashes_empty_finish(start_time);
+            } else if !is_backptr(ptr.id()) {
+                if let Some(start_node_time) = start_node_time.take() {
+                    // count the time taken to load the root node in this case,
+                    // but only do so once.
+                    storage_tx
+                        .bench
+                        .write_children_hashes_same_block_finish(start_node_time);
+                }
+
+                // hash is the hash of this node's children
+                let node_hash = self.calculate_node_hashes(storage_tx, ptr.ptr() as u64)?;
+
+                // count the time taken to store the hash towards the
+                // write_children_hashes_same_benchmark
+                let start_time = storage_tx.bench.write_children_hashes_same_block_start();
+                trace!(
+                    "calculate_node_hashes({:?}): node {} at chr {} ptr {}: {:?}",
+                    &self.block_header,
+                    node_array_ptr,
+                    ptr.chr(),
+                    ptr.ptr(),
+                    &node_hash
+                );
+                hasher.write_all(node_hash.as_bytes())?;
+
+                if TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode
+                    && ptr.id() != TrieNodeID::Leaf as u8
+                {
+                    // need to store this hash too, since we deferred calculation
+                    self.write_node_hash(ptr.ptr(), node_hash)?;
+                }
+
+                storage_tx
+                    .bench
+                    .write_children_hashes_same_block_finish(start_time);
+            } else {
+                // hash is that of the block that contains this node
+                let start_time = storage_tx
+                    .bench
+                    .write_children_hashes_ancestor_block_start();
+
+                let block_hash = storage_tx.get_block_hash_caching(ptr.back_block())?;
+                trace!(
+                    "calculate_node_hashes({:?}): node {} at chr {} bkptr {}: {:?}",
+                    &self.block_header,
+                    node_array_ptr,
+                    ptr.chr(),
+                    ptr.ptr(),
+                    &block_hash
+                );
+                hasher.write_all(block_hash.as_bytes())?;
+
+                storage_tx
+                    .bench
+                    .write_children_hashes_ancestor_block_finish(start_time);
             }
-
-            let node_hash = {
-                let mut buf = [0u8; 32];
-                buf.copy_from_slice(hasher.finalize().as_slice());
-                TrieHash(buf)
-            };
-
-            Ok(node_hash)
         }
+
+        // only measure full trie
+        if node_ptr == 0 {
+            storage_tx
+                .bench
+                .write_children_hashes_finish(start_time, true);
+        }
+
+        let node_hash = {
+            let mut buf = [0u8; 32];
+            buf.copy_from_slice(hasher.finalize().as_slice());
+            TrieHash(buf)
+        };
+
+        Ok(node_hash)
     }
 
     /// Walk through the buffered TrieNodes and dump them to f.
@@ -1003,6 +1019,16 @@ impl<T: MarfTrieId> TrieRAM<T> {
         })
     }
 
+    /// Access a node and hash by reference through a closure without cloning.
+    #[inline]
+    pub fn with_nodetype<R, F>(&self, ptr: u32, f: F) -> Result<R, Error>
+    where
+        F: FnOnce(&(TrieNodeType, TrieHash)) -> R,
+    {
+        let node = self.get_nodetype(ptr)?;
+        Ok(f(node))
+    }
+
     /// Get an owned instance of a node and its hash from the TrieRAM.  ptr.ptr() is an array
     /// index.
     pub fn read_nodetype(&mut self, ptr: &TriePtr) -> Result<(TrieNodeType, TrieHash), Error> {
@@ -1042,6 +1068,17 @@ impl<T: MarfTrieId> TrieRAM<T> {
         node: &TrieNodeType,
         hash: TrieHash,
     ) -> Result<(), Error> {
+        self.write_nodetype_owned(node_array_ptr, node.clone(), hash)
+    }
+
+    /// Store a node and its hash to the TrieRAM at the given slot, taking ownership of the node
+    /// to avoid an extra clone.
+    pub fn write_nodetype_owned(
+        &mut self,
+        node_array_ptr: u32,
+        node: TrieNodeType,
+        hash: TrieHash,
+    ) -> Result<(), Error> {
         if self.readonly {
             trace!("Read-only!");
             return Err(Error::ReadOnlyError);
@@ -1052,11 +1089,11 @@ impl<T: MarfTrieId> TrieRAM<T> {
             &self.block_header,
             node_array_ptr,
             &hash,
-            node
+            &node
         );
 
         self.write_count += 1;
-        match node {
+        match &node {
             TrieNodeType::Leaf(_) => {
                 self.write_leaf_count += 1;
             }
@@ -1065,12 +1102,13 @@ impl<T: MarfTrieId> TrieRAM<T> {
             }
         }
 
+        let node_byte_len = get_node_byte_len(&node);
         if let Some(existing_node) = self.data.get_mut(node_array_ptr as usize) {
-            *existing_node = (node.clone(), hash);
+            *existing_node = (node, hash);
             Ok(())
         } else if node_array_ptr == (self.data.len() as u32) {
-            self.data.push((node.clone(), hash));
-            self.total_bytes += get_node_byte_len(node);
+            self.data.push((node, hash));
+            self.total_bytes += node_byte_len;
             Ok(())
         } else {
             error!("Failed to write node bytes: off the end of the buffer");
@@ -2755,6 +2793,18 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         node: &TrieNodeType,
         hash: TrieHash,
     ) -> Result<(), Error> {
+        self.write_nodetype_owned(disk_ptr, node.clone(), hash)
+    }
+
+    /// Store a node and its hash to the uncommitted state, taking ownership of the node to avoid
+    /// an extra clone.
+    /// If the uncommitted state is not instantiated, then this panics.
+    pub fn write_nodetype_owned(
+        &mut self,
+        disk_ptr: u32,
+        node: TrieNodeType,
+        hash: TrieHash,
+    ) -> Result<(), Error> {
         if self.data.readonly {
             return Err(Error::ReadOnlyError);
         }
@@ -2764,11 +2814,11 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
             &self.data.cur_block,
             disk_ptr,
             &hash,
-            node
+            &node
         );
 
         self.data.write_count += 1;
-        match node {
+        match &node {
             TrieNodeType::Leaf(_) => {
                 self.data.write_leaf_count += 1;
             }
@@ -2781,7 +2831,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         if let Some((ref uncommitted_bhh, ref mut uncommitted_trie)) = self.data.uncommitted_writes
         {
             if &self.data.cur_block == uncommitted_bhh {
-                return uncommitted_trie.write_nodetype(disk_ptr, node, hash);
+                return uncommitted_trie.write_nodetype_owned(disk_ptr, node, hash);
             }
         }
 
@@ -2800,7 +2850,7 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         }
 
         let node_type = node.as_trie_node_type();
-        self.write_nodetype(ptr, &node_type, hash)
+        self.write_nodetype_owned(ptr, node_type, hash)
     }
 
     /// Get the last slot into which a node will be inserted in the uncommitted state.
