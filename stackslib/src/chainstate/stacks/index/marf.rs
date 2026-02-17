@@ -1255,7 +1255,6 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         current_block_hash: &T,
     ) -> Result<Option<u32>, Error> {
-        let hash_key = format!("{}::{}", BLOCK_HASH_TO_HEIGHT_MAPPING_KEY, block_hash);
         #[cfg(test)]
         {
             // used in testing in order to short-circuit block-height lookups
@@ -1268,6 +1267,7 @@ impl<T: MarfTrieId> MARF<T> {
         let marf_value = if block_hash == current_block_hash {
             MARF::get_by_key(storage, current_block_hash, OWN_BLOCK_HEIGHT_KEY)?
         } else {
+            let hash_key = format!("{}::{}", BLOCK_HASH_TO_HEIGHT_MAPPING_KEY, block_hash);
             MARF::get_by_key(storage, current_block_hash, &hash_key)?
         };
 
