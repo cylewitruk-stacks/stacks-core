@@ -32,6 +32,31 @@ use crate::chainstate::stacks::index::{Error, MarfTrieId, TrieHasher, TrieLeaf};
 /// storage implementation.
 pub struct Trie {}
 
+/// A validated insertion location: the cursor position and the node at `cursor.ptr()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertionPoint<T: MarfTrieId> {
+    cursor: TrieCursor<T>,
+    node: TrieNodeType,
+}
+
+impl<T: MarfTrieId> InsertionPoint<T> {
+    pub fn new(cursor: TrieCursor<T>, node: TrieNodeType) -> Result<Self, Error> {
+        let ptr_node_id = clear_backptr(cursor.ptr().id());
+        if ptr_node_id != node.id() {
+            return Err(Error::CorruptionError(format!(
+                "Insertion point mismatch: cursor ptr id {} != node id {}",
+                ptr_node_id,
+                node.id()
+            )));
+        }
+        Ok(Self { cursor, node })
+    }
+
+    pub fn cursor(&self) -> &TrieCursor<T> {
+        &self.cursor
+    }
+}
+
 /// Fetch children hashes and compute the node's hash
 fn get_nodetype_hash<T: MarfTrieId>(
     storage: &mut TrieStorageConnection<T>,
@@ -696,38 +721,39 @@ impl Trie {
     /// Returns a ptr to be inserted into the last node visited by the cursor.
     pub fn add_value<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
-        cursor: &mut TrieCursor<T>,
+        insertion_point: &mut InsertionPoint<T>,
         value: &mut TrieLeaf,
     ) -> Result<TriePtr, Error> {
-        let mut node = match cursor.node() {
-            Some(n) => n,
-            None => panic!("Cursor is uninitialized"),
-        };
+        let InsertionPoint { cursor, node } = insertion_point;
+
+        if !cursor.visited_node {
+            panic!("Cursor is uninitialized");
+        }
 
         if cursor.eop() {
             match node {
                 TrieNodeType::Leaf(_) => Trie::replace_leaf(storage, cursor, value),
-                _ => Trie::insert_leaf(storage, cursor, value, &mut node),
+                _ => Trie::insert_leaf(storage, cursor, value, node),
             }
         } else {
             // didn't reach the end of the path, so we're on an intermediate node
             // or we're somewhere in the path of a leaf.
             // Either tack the leaf on (possibly promoting the node), or splice the leaf in.
-            if cursor.eonp(&node) {
+            if cursor.eonp(node) {
                 trace!(
                     "eop = {}, eonp = {}, c = {:?}, node = {:?}",
                     cursor.eop(),
-                    cursor.eonp(&node),
+                    cursor.eonp(node),
                     cursor,
-                    &node
+                    node
                 );
-                Trie::insert_leaf(storage, cursor, value, &mut node)
+                Trie::insert_leaf(storage, cursor, value, node)
             } else {
                 match node {
                     TrieNodeType::Leaf(ref mut data) => {
                         Trie::promote_leaf_to_node4(storage, cursor, data, value)
                     }
-                    _ => Trie::splice_leaf(storage, cursor, value, &mut node),
+                    _ => Trie::splice_leaf(storage, cursor, value, node),
                 }
             }
         }

@@ -28,7 +28,7 @@ use crate::chainstate::stacks::index::node::{
 use crate::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode, TrieStorageConnection, TrieStorageTransaction,
 };
-use crate::chainstate::stacks::index::trie::Trie;
+use crate::chainstate::stacks::index::trie::{InsertionPoint, Trie};
 use crate::chainstate::stacks::index::{Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
 use crate::util_lib::db::Error as db_error;
 
@@ -834,7 +834,7 @@ impl<T: MarfTrieId> MARF<T> {
         storage: &mut TrieStorageTransaction<T>,
         block_hash: &T,
         path: &TrieHash,
-    ) -> Result<TrieCursor<T>, Error> {
+    ) -> Result<InsertionPoint<T>, Error> {
         let block_id = storage.get_block_identifier(block_hash);
         MARF::extend_trie(storage, block_hash)?;
 
@@ -872,7 +872,7 @@ impl<T: MarfTrieId> MARF<T> {
                                 &node_ptr
                             );
                             storage.open_block_maybe_id(block_hash, block_id)?;
-                            return Ok(cursor);
+                            return InsertionPoint::new(cursor, node);
                         }
                     }
                 }
@@ -885,7 +885,7 @@ impl<T: MarfTrieId> MARF<T> {
                                     // some nodes over.
                                     trace!("Path diverged -- we're done.");
                                     storage.open_block_maybe_id(block_hash, block_id)?;
-                                    return Ok(cursor);
+                                    return InsertionPoint::new(cursor, node);
                                 }
                                 CursorError::ChrNotFound => {
                                     // end-of-node-path but no such child -- not even a backptr.
@@ -894,7 +894,7 @@ impl<T: MarfTrieId> MARF<T> {
                                         storage.get_cur_block_ref()
                                     );
                                     storage.open_block_maybe_id(block_hash, block_id)?;
-                                    return Ok(cursor);
+                                    return InsertionPoint::new(cursor, node);
                                 }
                                 CursorError::BackptrEncountered(ptr) => {
                                     // at intermediate node whose child is not present in this trie.
@@ -1097,11 +1097,16 @@ impl<T: MarfTrieId> MARF<T> {
         update_skiplist: bool,
     ) -> Result<(), Error> {
         let mut value = leaf_value.clone();
-        let mut cursor = MARF::walk_cow(storage, block_hash, path)?;
+        let mut insertion_point = MARF::walk_cow(storage, block_hash, path)?;
 
-        if cursor.block_hashes.len() + 1 != cursor.node_ptrs.len() {
-            trace!("c.block_hashes = {:?}", &cursor.block_hashes);
-            trace!("c.node_ptrs = {:?}", cursor.node_ptrs);
+        if insertion_point.cursor().block_hashes.len() + 1
+            != insertion_point.cursor().node_ptrs.len()
+        {
+            trace!(
+                "c.block_hashes = {:?}",
+                &insertion_point.cursor().block_hashes
+            );
+            trace!("c.node_ptrs = {:?}", insertion_point.cursor().node_ptrs);
             panic!();
         }
 
@@ -1110,12 +1115,12 @@ impl<T: MarfTrieId> MARF<T> {
             leaf_value.data, &leaf_value.path
         );
 
-        Trie::add_value(storage, &mut cursor, &mut value)?;
+        Trie::add_value(storage, &mut insertion_point, &mut value)?;
 
         if update_skiplist {
-            Trie::update_root_hash(storage, &cursor)?;
+            Trie::update_root_hash(storage, insertion_point.cursor())?;
         } else {
-            Trie::update_root_node_hash(storage, &cursor)?;
+            Trie::update_root_node_hash(storage, insertion_point.cursor())?;
         }
         Ok(())
     }

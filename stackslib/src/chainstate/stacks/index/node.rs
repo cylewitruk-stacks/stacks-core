@@ -321,13 +321,24 @@ impl TriePtr {
 /// nodes to visit when updating the root node hash.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrieCursor<T: MarfTrieId> {
-    pub path: TrieHash,                  // the path to walk
-    pub index: usize,                    // index into the path
-    pub node_path_index: usize,          // index into the currently-visited node's compressed path
-    pub nodes: Vec<TrieNodeType>,        // list of nodes this cursor visits
-    pub node_ptrs: Vec<TriePtr>,         // list of ptr branches this cursor has taken
-    pub block_hashes: Vec<T>, // list of Tries we've visited.  block_hashes[i] corresponds to node_ptrs[i]
-    pub last_error: Option<CursorError>, // last error encountered while walking (used to make sure the client calls the right "recovery" method)
+    /// The path to walk
+    pub path: TrieHash,
+    /// Index into the path               
+    pub index: usize,
+    /// Index into the currently-visited node's compressed path
+    pub node_path_index: usize,
+    /// Has [`Self::walk()`] been called at least once?
+    pub visited_node: bool,
+    /// List of ptr branches this cursor has taken
+    pub node_ptrs: Vec<TriePtr>,
+    /// List of Tries we've visited.  `block_hashes[i]` corresponds to `node_ptrs[i]`
+    pub block_hashes: Vec<T>,
+    /// Last error encountered while walking (used to make sure the client calls the right "recovery" method)
+    pub last_error: Option<CursorError>,
+
+    /// List of nodes this cursor visits. Used in test assertions.
+    #[cfg(test)]
+    pub nodes: Vec<TrieNodeType>,
 }
 
 impl<T: MarfTrieId> TrieCursor<T> {
@@ -336,14 +347,44 @@ impl<T: MarfTrieId> TrieCursor<T> {
             path: *path,
             index: 0,
             node_path_index: 0,
-            nodes: vec![],
+            visited_node: false,
             node_ptrs: vec![root_ptr],
             block_hashes: vec![],
             last_error: None,
+
+            #[cfg(test)]
+            nodes: vec![],
         }
     }
 
-    /// what point in the path are we at now?
+    #[inline(always)]
+    fn record_walked_node(&mut self, node: &TrieNodeType) {
+        #[cfg(test)]
+        self.nodes.push((*node).clone());
+        #[cfg(not(test))]
+        let _ = node;
+    }
+
+    #[inline(always)]
+    fn retarget_walked_node(&mut self, node: &TrieNodeType) {
+        #[cfg(test)]
+        {
+            self.nodes.pop();
+            self.nodes.push(node.clone());
+        }
+        #[cfg(not(test))]
+        let _ = node;
+    }
+
+    #[inline(always)]
+    fn record_backptr_walked_node(&mut self, node: &TrieNodeType) {
+        #[cfg(test)]
+        self.nodes.push(node.clone());
+        #[cfg(not(test))]
+        let _ = node;
+    }
+
+    /// What point in the path are we at now?
     /// Will be None only if we haven't taken a step yet.
     pub fn chr(&self) -> Option<u8> {
         if self.index > 0 {
@@ -353,12 +394,12 @@ impl<T: MarfTrieId> TrieCursor<T> {
         }
     }
 
-    /// what offset in the path are we at?
+    /// What offset in the path are we at?
     pub fn tell(&self) -> usize {
         self.index
     }
 
-    /// what is the offset in the node's compressed path?
+    /// What is the offset in the node's compressed path?
     pub fn ntell(&self) -> usize {
         self.node_path_index
     }
@@ -368,15 +409,16 @@ impl<T: MarfTrieId> TrieCursor<T> {
         self.index == self.path.len()
     }
 
-    /// last ptr visited
+    /// Last ptr visited
     pub fn ptr(&self) -> TriePtr {
         // should always be true by construction
         assert!(!self.node_ptrs.is_empty());
         *self.node_ptrs.last().unwrap()
     }
 
-    /// last node visited.
+    /// Last node visited.
     /// Will only be None if we haven't taken a step yet.
+    #[cfg(test)]
     pub fn node(&self) -> Option<TrieNodeType> {
         self.nodes.last().cloned()
     }
@@ -414,8 +456,9 @@ impl<T: MarfTrieId> TrieCursor<T> {
         trace!("cursor: walk: node = {:?} block = {:?}", node, block_hash);
 
         // walk this node
-        self.nodes.push((*node).clone());
+        self.visited_node = true;
         self.node_path_index = 0;
+        self.record_walked_node(node);
 
         if self.index >= self.path.len() {
             trace!("cursor: out of path");
@@ -504,11 +547,10 @@ impl<T: MarfTrieId> TrieCursor<T> {
             panic!();
         }
 
-        self.nodes.pop();
         self.node_ptrs.pop();
         self.block_hashes.pop();
 
-        self.nodes.push(node.clone());
+        self.retarget_walked_node(node);
         self.node_ptrs.push(*ptr);
         self.block_hashes.push(hash.clone());
 
@@ -546,7 +588,7 @@ impl<T: MarfTrieId> TrieCursor<T> {
         self.node_ptrs.push(backptr);
         self.block_hashes.push(block_hash);
 
-        self.nodes.push(next_node.clone());
+        self.record_backptr_walked_node(next_node);
     }
 
     /// Record that we landed on a non-backptr from a backptr.

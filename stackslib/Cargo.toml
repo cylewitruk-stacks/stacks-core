@@ -51,6 +51,10 @@ winapi = { version = "0.3", features = ["consoleapi", "handleapi", "synchapi", "
 [target.'cfg(windows)'.dev-dependencies]
 winapi = { version = "0.3", features = ["fileapi", "processenv", "winnt"] }
 
+# Included for benchmark entrypoints
+[target.'cfg(not(any(target_os = "macos", target_os="windows", target_arch = "arm")))'.dev-dependencies]
+tikv-jemallocator = { workspace = true }
+
 [dependencies.serde_json]
 version = "1.0"
 features = ["arbitrary_precision", "unbounded_depth"]

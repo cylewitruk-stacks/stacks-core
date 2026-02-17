@@ -5,33 +5,12 @@ use blockstack_lib::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode,
 };
 use blockstack_lib::chainstate::stacks::index::trie::Trie;
-use blockstack_lib::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue};
+use blockstack_lib::chainstate::stacks::index::ClarityMarfTrieId;
 use criterion::{criterion_group, Criterion};
 use stacks_common::types::chainstate::StacksBlockId;
 use tempfile::TempDir;
 
-fn block_id(seed: u32) -> StacksBlockId {
-    let mut bytes = [0u8; 32];
-    bytes[..4].copy_from_slice(&seed.to_be_bytes());
-    StacksBlockId::from(bytes)
-}
-
-fn make_batch(
-    key_prefix: &str,
-    seed_start: u32,
-    count: u32,
-    value_start: u32,
-) -> (Vec<String>, Vec<MARFValue>) {
-    let mut keys = Vec::with_capacity(count as usize);
-    let mut values = Vec::with_capacity(count as usize);
-
-    for i in 0..count {
-        keys.push(format!("{key_prefix}:{:08x}", seed_start + i));
-        values.push(MARFValue::from(value_start + i + 1));
-    }
-
-    (keys, values)
-}
+use super::common::{block_id, make_batch};
 
 fn build_committed_chain(
     db_path: &str,

@@ -5,14 +5,12 @@ use blockstack_lib::chainstate::stacks::index::node::{CursorError, TrieCursor};
 use blockstack_lib::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode, TrieStorageConnection,
 };
-use blockstack_lib::chainstate::stacks::index::trie::Trie;
+use blockstack_lib::chainstate::stacks::index::trie::{InsertionPoint, Trie};
 use blockstack_lib::chainstate::stacks::index::{Error, MARFValue, MarfTrieId, TrieLeaf};
 use criterion::{criterion_group, Criterion};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 
-fn block_id(byte: u8) -> StacksBlockId {
-    StacksBlockId::from([byte; 32])
-}
+use super::common::block_id;
 
 fn path_from_seed(seed: u8) -> TrieHash {
     let bytes: [u8; 32] = std::array::from_fn(|i| seed.wrapping_mul(17).wrapping_add(i as u8));
@@ -20,14 +18,15 @@ fn path_from_seed(seed: u8) -> TrieHash {
 }
 
 fn missing_path() -> TrieHash {
-    let bytes: [u8; 32] = std::array::from_fn(|i| 255u8.wrapping_sub(i as u8));
+    // Ensure the first byte is not present in the seeded fixture keys.
+    let bytes: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_add(1));
     TrieHash::from_bytes(&bytes).expect("failed to build missing trie path")
 }
 
 fn walk_to_insertion_point<T: MarfTrieId>(
     storage: &mut TrieStorageConnection<T>,
     path: &TrieHash,
-) -> Result<TrieCursor<T>, Error> {
+) -> Result<InsertionPoint<T>, Error> {
     let mut cursor = TrieCursor::new(path, storage.root_trieptr());
     let mut node = Trie::read_root_nohash(storage)?;
 
@@ -36,9 +35,9 @@ fn walk_to_insertion_point<T: MarfTrieId>(
             Ok(Some((_next_ptr, next_node))) => {
                 node = next_node;
             }
-            Ok(None) => return Ok(cursor),
+            Ok(None) => return InsertionPoint::new(cursor, node),
             Err(Error::CursorError(CursorError::PathDiverged | CursorError::ChrNotFound)) => {
-                return Ok(cursor);
+                return InsertionPoint::new(cursor, node);
             }
             Err(e) => return Err(e),
         }
@@ -47,18 +46,6 @@ fn walk_to_insertion_point<T: MarfTrieId>(
     Err(Error::CorruptionError(
         "Exceeded maximum trie walk depth while finding insertion point".to_string(),
     ))
-}
-
-fn trie_insert<T: MarfTrieId>(
-    storage: &mut TrieStorageConnection<T>,
-    path: &TrieHash,
-    value: MARFValue,
-) -> Result<(), Error> {
-    let mut cursor = walk_to_insertion_point(storage, path)?;
-    let mut leaf = TrieLeaf::from_value(&[], value);
-    Trie::add_value(storage, &mut cursor, &mut leaf)?;
-    Trie::update_root_hash(storage, &cursor)?;
-    Ok(())
 }
 
 struct TrieFixture {
@@ -76,7 +63,7 @@ fn make_fixture() -> TrieFixture {
     )
     .expect("failed to create trie store");
 
-    let tip = block_id(1);
+    let tip = block_id(1u32);
     let walk_path = path_from_seed(96);
     let existing_path = path_from_seed(42);
     let missing_path = missing_path();
@@ -88,7 +75,9 @@ fn make_fixture() -> TrieFixture {
     tx.open_block(&tip).expect("failed to open fixture tip");
 
     for i in 0..192u32 {
-        trie_insert(&mut tx, &path_from_seed(i as u8), MARFValue::from(i + 1))
+        let path = path_from_seed(i as u8);
+        let leaf = TrieLeaf::from_value(&[], MARFValue::from(i + 1));
+        MARF::insert_leaf(&mut tx, &tip, &path, &leaf)
             .expect("failed to pre-populate trie fixture");
     }
 
@@ -215,11 +204,13 @@ fn bench_add_value_update_root_hash(c: &mut Criterion) {
             tx.open_block(&fixture.tip)
                 .expect("failed to open fixture tip");
 
-            let mut cursor =
+            let mut insertion_point =
                 walk_to_insertion_point(&mut tx, &fixture.existing_path).expect("walk failed");
             let mut leaf = TrieLeaf::from_value(&[], MARFValue::from(next_value));
-            let out = Trie::add_value(&mut tx, &mut cursor, &mut leaf).expect("add_value failed");
-            Trie::update_root_hash(&mut tx, &cursor).expect("update_root_hash failed");
+            let out = Trie::add_value(&mut tx, &mut insertion_point, &mut leaf)
+                .expect("add_value failed");
+            Trie::update_root_hash(&mut tx, insertion_point.cursor())
+                .expect("update_root_hash failed");
 
             black_box(out);
             tx.rollback();
@@ -235,11 +226,61 @@ fn bench_add_value_update_root_hash(c: &mut Criterion) {
             tx.open_block(&fixture.tip)
                 .expect("failed to open fixture tip");
 
-            let mut cursor =
+            let mut insertion_point =
                 walk_to_insertion_point(&mut tx, &fixture.missing_path).expect("walk failed");
             let mut leaf = TrieLeaf::from_value(&[], MARFValue::from(0xA5A5_A5A5));
-            let out = Trie::add_value(&mut tx, &mut cursor, &mut leaf).expect("add_value failed");
-            Trie::update_root_hash(&mut tx, &cursor).expect("update_root_hash failed");
+            let out = Trie::add_value(&mut tx, &mut insertion_point, &mut leaf)
+                .expect("add_value failed");
+            Trie::update_root_hash(&mut tx, insertion_point.cursor())
+                .expect("update_root_hash failed");
+
+            black_box(out);
+            tx.rollback();
+        });
+    });
+    group.finish();
+}
+
+fn bench_cursor_walk_add_value(c: &mut Criterion) {
+    let mut fixture = make_fixture();
+    let mut next_value = 50_000u32;
+
+    let mut group = c.benchmark_group("marf_trie/cursor_walk_add_value");
+    group.bench_function("replace_leaf", |b| {
+        b.iter(|| {
+            next_value = next_value.wrapping_add(1);
+            let mut tx = fixture
+                .store
+                .transaction()
+                .expect("failed to start tx for replace bench");
+            tx.open_block(&fixture.tip)
+                .expect("failed to open fixture tip");
+
+            let mut insertion_point =
+                walk_to_insertion_point(&mut tx, &fixture.existing_path).expect("walk failed");
+            let mut leaf = TrieLeaf::from_value(&[], MARFValue::from(next_value));
+            let out = Trie::add_value(&mut tx, &mut insertion_point, &mut leaf)
+                .expect("add_value failed");
+
+            black_box(out);
+            tx.rollback();
+        });
+    });
+
+    group.bench_function("insert_missing_leaf", |b| {
+        b.iter(|| {
+            let mut tx = fixture
+                .store
+                .transaction()
+                .expect("failed to start tx for insert bench");
+            tx.open_block(&fixture.tip)
+                .expect("failed to open fixture tip");
+
+            let mut insertion_point =
+                walk_to_insertion_point(&mut tx, &fixture.missing_path).expect("walk failed");
+            let mut leaf = TrieLeaf::from_value(&[], MARFValue::from(0x5A5A_5A5A));
+            let out = Trie::add_value(&mut tx, &mut insertion_point, &mut leaf)
+                .expect("add_value failed");
 
             black_box(out);
             tx.rollback();
@@ -253,5 +294,6 @@ criterion_group!(
     bench_read_root,
     bench_walk_from,
     bench_get_children_hashes,
-    bench_add_value_update_root_hash
+    bench_add_value_update_root_hash,
+    bench_cursor_walk_add_value
 );

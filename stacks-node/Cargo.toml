@@ -38,7 +38,7 @@ libsigner_v3_3_0_0_1 = { package = "libsigner", git = "https://github.com/stacks
 stacks_v3_3_0_0_1 = { package = "stackslib", git = "https://github.com/stacks-network/stacks-core.git", rev="b3efa588571e168d2d154790e1c57d9e3e64adc5", optional = true, features = ["testing", "default"]}
 stacks_common_v3_3_0_0_1 = { package = "stacks-common", git = "https://github.com/stacks-network/stacks-core.git", rev="b3efa588571e168d2d154790e1c57d9e3e64adc5", optional = true, features = ["testing", "default"]}
 [target.'cfg(not(any(target_os = "macos", target_os="windows", target_arch = "arm")))'.dependencies]
-tikv-jemallocator = {workspace = true}
+tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 warp = "0.3.5"

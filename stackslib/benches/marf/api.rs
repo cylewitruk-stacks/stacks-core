@@ -8,6 +8,8 @@ use criterion::{criterion_group, Criterion};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use tempfile::TempDir;
 
+use super::common::{block_id, make_batch};
+
 const CHAIN_LEN: u32 = 192;
 const DEPTHS: [u32; 3] = [1, 8, 64];
 const KEYS_PER_BLOCK: u32 = 4;
@@ -21,12 +23,6 @@ struct MarfApiFixture {
     tip_height: u32,
 }
 
-fn block_id(seed: u32) -> StacksBlockId {
-    let mut bytes = [0u8; 32];
-    bytes[..4].copy_from_slice(&seed.to_be_bytes());
-    StacksBlockId::from(bytes)
-}
-
 fn depth_key(height: u32) -> String {
     format!("depth:{height:08x}")
 }
@@ -37,15 +33,7 @@ fn key_for_depth_from_tip(tip_height: u32, depth: u32) -> String {
 }
 
 fn make_write_batch(prefix: &str, count: u32) -> (Vec<String>, Vec<MARFValue>) {
-    let mut keys = Vec::with_capacity(count as usize);
-    let mut values = Vec::with_capacity(count as usize);
-
-    for i in 0..count {
-        keys.push(format!("{prefix}:{i:08x}"));
-        values.push(MARFValue::from(i + 1));
-    }
-
-    (keys, values)
+    make_batch(prefix, 0, count, 0)
 }
 
 fn make_fixture(cache_strategy: &str) -> MarfApiFixture {
