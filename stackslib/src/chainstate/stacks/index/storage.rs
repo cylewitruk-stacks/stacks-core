@@ -565,8 +565,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
         (lr, lw)
     }
 
-    /// write the trie data to f, using node_data_order to
-    ///   iterate over node_data
+    /// Write the trie data to f, using node_data_order to iterate over
+    /// node_data
     pub fn write_trie_indirect<F: Write + Seek>(
         f: &mut F,
         node_data_order: &[u32],
@@ -576,12 +576,14 @@ impl<T: MarfTrieId> TrieRAM<T> {
     ) -> Result<(), Error> {
         assert_eq!(node_data_order.len(), offsets.len());
 
-        // write parent block ptr
+        // Write parent block ptr
         f.seek(SeekFrom::Start(0))?;
         f.write_all(parent_hash.as_bytes())
             .map_err(Error::IOError)?;
-        // write zero-identifier (TODO: this is a convenience hack for now, we should remove the
-        //    identifier from the trie data blob)
+
+        // Backwards-compatibility shim: trie blob header reserves 4 bytes after parent hash.
+        // Block identifier now lives in SQLite (`marf_data`), so this field is always zero.
+        // Keep this slot to preserve on-disk layout (`root_ptr_disk()` assumes +4).
         f.seek(SeekFrom::Start(BLOCK_HEADER_HASH_ENCODED_SIZE as u64))?;
         f.write_all(&0u32.to_le_bytes()).map_err(Error::IOError)?;
 
@@ -819,7 +821,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     /// Walk through the buffered TrieNodes and dump them to f.
     /// This consumes this TrieRAM instance.
     fn dump_consume<F: Write + Seek>(mut self, f: &mut F) -> Result<u64, Error> {
-        // step 1: write out each node in breadth-first order to get their ptr offsets
+        // Step 1: Write out each node in breadth-first order to get their ptr offsets
         let num_nodes = self.data.len();
         let mut frontier: VecDeque<u32> = VecDeque::with_capacity(num_nodes);
 
@@ -829,17 +831,17 @@ impl<T: MarfTrieId> TrieRAM<T> {
         let start = TriePtr::new(TrieNodeID::Node256 as u8, 0, 0).ptr();
         frontier.push_back(start);
 
-        // first 32 bytes is reserved for the parent block hash
-        //    next 4 bytes is the local block identifier
+        // First 32 bytes is reserved for the parent block hash
+        // Next 4 bytes is the local block identifier
         let mut ptr = BLOCK_HEADER_HASH_ENCODED_SIZE as u64 + 4;
 
         while let Some(pointer) = frontier.pop_front() {
             let (node, _node_hash) = self.get_nodetype(pointer)?;
-            // calculate size
+            // Calculate size
             let num_written = get_node_byte_len(node);
             ptr += num_written as u64;
 
-            // queue each child
+            // Queue each child
             if !node.is_leaf() {
                 for ptr in node.ptrs().iter() {
                     if !ptr.is_empty() && !is_backptr(ptr.id) {
@@ -854,35 +856,45 @@ impl<T: MarfTrieId> TrieRAM<T> {
 
         assert_eq!(offsets.len(), node_data.len());
 
-        // step 2: update ptrs in all nodes
-        let mut i = 0;
-        for node_data_ptr in node_data.iter() {
-            let next_node = &mut self
-                .data
-                .get_mut(*node_data_ptr as usize)
-                .ok_or_else(|| Error::CorruptionError("Miscalculated dump_consume pointer".into()))?
-                .0;
+        // Step 2: Update ptrs and write each node in breadth-first order
+        let mut child_offset_ix = 0;
+
+        // Write parent block ptr
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(self.parent.as_bytes())
+            .map_err(Error::IOError)?;
+
+        // Backwards-compatibility shim: trie blob header reserves 4 bytes after parent hash.
+        // Block identifier now lives in SQLite (`marf_data`), so this field is always zero.
+        // Keep this slot to preserve on-disk layout (`root_ptr_disk()` assumes +4).
+        f.seek(SeekFrom::Start(BLOCK_HEADER_HASH_ENCODED_SIZE as u64))?;
+        f.write_all(&0u32.to_le_bytes()).map_err(Error::IOError)?;
+
+        for (ix, node_data_ptr) in node_data.iter().enumerate() {
+            let (next_node, node_hash) =
+                self.data.get_mut(*node_data_ptr as usize).ok_or_else(|| {
+                    Error::CorruptionError("Miscalculated dump_consume pointer".into())
+                })?;
+
             if !next_node.is_leaf() {
                 let ptrs = next_node.ptrs_mut();
                 for ptr in ptrs.iter_mut() {
                     if !ptr.is_empty() && !is_backptr(ptr.id) {
-                        ptr.ptr = *offsets.get(i).ok_or_else(|| {
+                        ptr.ptr = *offsets.get(child_offset_ix).ok_or_else(|| {
                             Error::CorruptionError("Miscalculated dump_consume offsets".into())
                         })?;
-                        i += 1;
+                        child_offset_ix += 1;
                     }
                 }
             }
-        }
 
-        // step 3: write out each node (now that they have the write ptrs)
-        TrieRAM::write_trie_indirect(
-            f,
-            &node_data,
-            self.data.as_slice(),
-            offsets.as_slice(),
-            &self.parent,
-        )?;
+            write_nodetype_bytes(f, next_node, *node_hash)?;
+
+            let next_offset = *offsets
+                .get(ix)
+                .ok_or_else(|| Error::CorruptionError("node_data.len() != offsets.len()".into()))?;
+            f.seek(SeekFrom::Start(next_offset.into()))?;
+        }
 
         Ok(ptr)
     }
