@@ -133,7 +133,7 @@ impl Trie {
         cursor: &mut TrieCursor<T>,
         read_hash: bool,
     ) -> Result<Option<(TriePtr, TrieNodeType, TrieHash)>, Error> {
-        match cursor.walk(node, &storage.get_cur_block()) {
+        match cursor.walk(node, storage.get_cur_block_ref()) {
             Ok(ptr_opt) => {
                 match ptr_opt {
                     None => {
@@ -223,7 +223,7 @@ impl Trie {
             storage.bench_mut().marf_find_backptr_node_finish();
 
             let (node, node_hash) = storage.read_nodetype(&backptr)?;
-            cursor.repair_backptr_step_backptr(&node, &backptr, storage.get_cur_block());
+            cursor.repair_backptr_step_backptr(&node, &backptr, back_block_hash);
             Ok((node, node_hash, backptr))
         }
     }
@@ -360,13 +360,12 @@ impl Trie {
             .ok_or_else(|| Error::CorruptionError("Current leaf path too short".into()))?
             .to_vec();
 
-        // update current leaf (path changed) and save it
+        // update current leaf path
         let cur_leaf_disk_ptr = cur_leaf_ptr.ptr();
         let cur_leaf_new_ptr =
             TriePtr::new(TrieNodeID::Leaf as u8, cur_leaf_chr, cur_leaf_disk_ptr);
 
         assert!(cur_leaf_path.len() <= cur_leaf_data.path.len());
-        let _sav_cur_leaf_data = cur_leaf_data.clone();
         cur_leaf_data.path = cur_leaf_path;
         let cur_leaf_hash = get_leaf_hash(cur_leaf_data);
 
@@ -413,15 +412,10 @@ impl Trie {
         // update cursor to point to this node4 as the last-node-visited, and set the newly-created
         // ptr as the last ptr traversed (so the cursor still points to this leaf, but accurately
         // reflects the path taken to it).
-        cursor.repair_retarget(&node4, &ret, &storage.get_cur_block());
+        cursor.repair_retarget(&node4, &ret, storage.get_cur_block_ref());
 
         trace!(
-            "Promoted {:?} to {:?}, {:?}, {:?}, new ptr = {:?}",
-            _sav_cur_leaf_data,
-            cur_leaf_data,
-            &node4,
-            new_leaf_data,
-            &ret
+            "Promoted leaf to {cur_leaf_data:?}, {node4:?}, {new_leaf_data:?}, new ptr = {ret:?}"
         );
         Ok(ret)
     }
@@ -557,7 +551,7 @@ impl Trie {
 
         // update the cursor so its path of nodes and ptrs accurately reflects that we would have
         // visited this leaf on its path.
-        cursor.repair_retarget(&new_node, &ret, &storage.get_cur_block());
+        cursor.repair_retarget(&new_node, &ret, storage.get_cur_block_ref());
         Ok(ret)
     }
 
@@ -682,7 +676,7 @@ impl Trie {
             cur_node_cur_ptr.chr(),
             cur_node_cur_ptr.ptr(),
         );
-        cursor.repair_retarget(&new_node, &ret, &storage.get_cur_block());
+        cursor.repair_retarget(&new_node, &ret, storage.get_cur_block_ref());
 
         trace!("splice_leaf: node-X' at {ret:?}");
         Ok(ret)
@@ -869,13 +863,14 @@ impl Trie {
         cursor: &TrieCursor<T>,
         update_skiplist: bool,
     ) -> Result<(), Error> {
-        assert!(!cursor.node_ptrs.is_empty());
+        let Some((child_ptr, ancestor_ptrs)) = cursor.node_ptrs.split_last() else {
+            unreachable!("cursor node pointer list cannot be empty");
+        };
 
-        let mut ptrs = cursor.node_ptrs.clone();
-        trace!("update_root_hash: ptrs = {:?}", &ptrs);
-        let mut child_ptr = ptrs.pop().unwrap();
+        trace!("update_root_hash: ptrs = {:?}", &cursor.node_ptrs);
+        let mut child_ptr = *child_ptr;
 
-        if ptrs.is_empty() {
+        if ancestor_ptrs.is_empty() {
             // root node was already updated by trie operations, but it will have the wrong hash.
             // we need to "fix" the root node so it mixes in its ancestor hashes.
             trace!("Fix up root node so it mixes in its ancestor hashes");
@@ -919,7 +914,8 @@ impl Trie {
 
             storage.write_nodetype(child_ptr.ptr(), &node, h)?;
         } else {
-            while let Some(ptr) = ptrs.pop() {
+            for ptr in ancestor_ptrs.iter().rev() {
+                let ptr = *ptr;
                 if is_backptr(ptr.id()) {
                     // this node was not altered, but instead queued to the cursor as part of walking a
                     // backptr skiplist.  Do nothing.

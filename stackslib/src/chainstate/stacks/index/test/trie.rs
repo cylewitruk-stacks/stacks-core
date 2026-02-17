@@ -25,7 +25,7 @@ fn walk_to_insertion_point(
     cursor: &mut TrieCursor<BlockHeaderHash>,
 ) -> (TriePtr, TrieNodeType, TrieHash) {
     let (mut node, root_hash) = Trie::read_root(f).unwrap();
-    let mut node_hash = TrieHash::from_empty_data();
+    let mut node_hash = TrieHash::EMPTY;
     let mut node_ptr = f.root_trieptr();
 
     for _ in 0..cursor.path.len() {

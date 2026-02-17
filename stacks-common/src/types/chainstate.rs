@@ -43,25 +43,21 @@ impl_byte_array_serde!(TrieHash);
 pub const TRIEHASH_ENCODED_SIZE: usize = 32;
 
 impl TrieHash {
+    /// SHA2-512/256 hash of empty string.
+    pub const EMPTY: TrieHash = TrieHash([
+        0xc6, 0x72, 0xb8, 0xd1, 0xef, 0x56, 0xed, 0x28, 0xab, 0x87, 0xc3, 0x62, 0x2c, 0x51, 0x14,
+        0x06, 0x9b, 0xdd, 0x3a, 0xd7, 0xb8, 0xf9, 0x73, 0x74, 0x98, 0xd0, 0xc0, 0x1e, 0xce, 0xf0,
+        0x96, 0x7a,
+    ]);
+
     pub fn from_key(k: &str) -> Self {
         Self::from_data(k.as_bytes())
-    }
-
-    /// TrieHash of zero bytes
-    pub fn from_empty_data() -> TrieHash {
-        // sha2-512/256 hash of empty string.
-        // this is used so frequently it helps performance if we just have a constant for it.
-        TrieHash([
-            0xc6, 0x72, 0xb8, 0xd1, 0xef, 0x56, 0xed, 0x28, 0xab, 0x87, 0xc3, 0x62, 0x2c, 0x51,
-            0x14, 0x06, 0x9b, 0xdd, 0x3a, 0xd7, 0xb8, 0xf9, 0x73, 0x74, 0x98, 0xd0, 0xc0, 0x1e,
-            0xce, 0xf0, 0x96, 0x7a,
-        ])
     }
 
     /// TrieHash from bytes
     pub fn from_data(data: &[u8]) -> TrieHash {
         if data.is_empty() {
-            return TrieHash::from_empty_data();
+            return Self::EMPTY;
         }
 
         let mut hasher = Sha512_256::new();
@@ -72,7 +68,7 @@ impl TrieHash {
 
     pub fn from_data_array<B: AsRef<[u8]>>(data: &[B]) -> TrieHash {
         if data.is_empty() {
-            return TrieHash::from_empty_data();
+            return Self::EMPTY;
         }
 
         let mut hasher = Sha512_256::new();

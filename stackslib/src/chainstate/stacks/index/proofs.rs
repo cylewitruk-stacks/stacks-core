@@ -605,8 +605,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                         "Could not find block at height of {}",
                         current_height
                     ))
-                })?
-                .clone();
+                })?;
 
             let mut trimmed_ancestor_hashes = Vec::with_capacity(ancestor_hashes.len() - 1);
             for (i, ancestor_hash) in ancestor_hashes.iter().enumerate() {
@@ -860,7 +859,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
         trace!(
             "make_segment_proof: Trie segment from {:?} starting at {starting_chr:?}: {ptrs:?}",
-            &storage.get_cur_block()
+            storage.get_cur_block_ref()
         );
         for ptr in ptrs.iter().rev() {
             let proof_node = TrieMerkleProof::ptr_to_segment_proof_node(storage, ptr, prev_chr)?;
@@ -1326,7 +1325,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         trace!(
             "Walk path {:?} from {:?} to the first backptr",
             path,
-            &storage.get_cur_block()
+            storage.get_cur_block_ref()
         );
 
         let mut node_ptr = storage.root_trieptr();
@@ -1412,7 +1411,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
             trace!(
                 "Walk {:?} path {:?} to leaf or backptr",
-                &storage.get_cur_block(),
+                storage.get_cur_block_ref(),
                 path
             );
             let (cursor, reached_node, backptr) =
@@ -1421,7 +1420,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             // make a proof to this node
             trace!(
                 "Make segment proof at {:?} from {:?}",
-                &storage.get_cur_block(),
+                storage.get_cur_block_ref(),
                 &cursor.node_ptrs
             );
             let segment_proof = TrieMerkleProof::make_segment_proof(
@@ -1434,7 +1433,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             // make a shunt proof to this segment proof's root
             trace!(
                 "Make shunt proof {:?} back to the block containing {:?} (cursor ptrs = {:?})",
-                &storage.get_cur_block(),
+                storage.get_cur_block_ref(),
                 &backptr,
                 &cursor.node_ptrs
             );
@@ -1487,7 +1486,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             trace!(
                 "Walk back for {:?} from {:?}",
                 &backptr,
-                &storage.get_cur_block()
+                storage.get_cur_block_ref()
             );
             block_header = storage
                 .get_block_from_local_id(backptr.back_block())?

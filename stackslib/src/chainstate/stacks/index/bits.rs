@@ -30,6 +30,7 @@ use crate::chainstate::stacks::index::{BlockMap, Error, MarfTrieId, TrieLeaf};
 
 /// Get the size of a Trie path (note that a Trie path is 32 bytes long, and can definitely _not_
 /// be over 255 bytes).
+#[inline]
 pub fn get_path_byte_len(p: &[u8]) -> usize {
     assert!(p.len() < 255);
     let path_len_byte_len = 1;
@@ -61,8 +62,23 @@ pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, Error> {
         )));
     }
 
-    let mut retbuf = vec![0; lenbuf[0] as usize];
-    r.read_exact(&mut retbuf).map_err(|e| {
+    let path_len = lenbuf[0] as usize;
+    if path_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Reserve exactly once and fill spare capacity directly to avoid zero-initializing bytes
+    // that will immediately be overwritten by `read_exact`.
+    let mut retbuf = Vec::with_capacity(path_len);
+    // SAFETY: `retbuf` was allocated with capacity `path_len`, so the first `path_len` bytes of
+    // spare capacity are valid writable memory for `read_exact`.
+    let read_buf = unsafe {
+        std::slice::from_raw_parts_mut(
+            retbuf.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+            path_len,
+        )
+    };
+    r.read_exact(read_buf).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
             Error::CorruptionError(format!("Failed to read {} bytes of path", lenbuf[0]))
         } else {
@@ -70,17 +86,21 @@ pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, Error> {
             Error::IOError(e)
         }
     })?;
+    // SAFETY: `read_exact` above initialized exactly `path_len` bytes.
+    unsafe { retbuf.set_len(path_len) };
 
     Ok(retbuf)
 }
 
 /// Helper to verify that a Trie node's ID byte is valid.
+#[inline]
 pub fn check_node_id(nid: u8) -> bool {
     let node_id = clear_backptr(nid);
     TrieNodeID::from_u8(node_id).is_some()
 }
 
 /// Helper to return the number of children in a Trie, given its ID.
+#[inline]
 pub fn node_id_to_ptr_count(node_id: u8) -> usize {
     match TrieNodeID::from_u8(clear_backptr(node_id))
         .unwrap_or_else(|| panic!("Unknown node ID {}", node_id))
@@ -95,9 +115,70 @@ pub fn node_id_to_ptr_count(node_id: u8) -> usize {
 }
 
 /// Helper to determine how many bytes a Trie node's child pointers will take to encode.
+#[inline]
 pub fn get_ptrs_byte_len(ptrs: &[TriePtr]) -> usize {
     let node_id_len = 1;
     node_id_len + TRIEPTR_SIZE * ptrs.len()
+}
+
+/// Helper to map an error from trying to read a Trie node's child pointers into an appropriate
+/// Error variant.
+#[inline]
+fn map_ptrs_read_error(e: std::io::Error, num_ptrs: usize) -> Error {
+    if e.kind() == ErrorKind::UnexpectedEof {
+        Error::CorruptionError(format!(
+            "Failed to read 1 + {} bytes of ptrs",
+            num_ptrs * TRIEPTR_SIZE
+        ))
+    } else {
+        eprintln!("failed: {:?}", &e);
+        Error::IOError(e)
+    }
+}
+
+/// Helper to decode a Trie node's child pointers from a byte slice, and write them to the given
+/// ptrs_buf slice.
+#[inline]
+fn decode_ptrs_bytes(
+    expected_node_id: u8,
+    bytes: &[u8],
+    ptrs_buf: &mut [TriePtr],
+) -> Result<u8, Error> {
+    // caller guarantees this invariant when allocating `bytes`
+    debug_assert!(!bytes.is_empty());
+
+    let nid = bytes[0];
+    if clear_backptr(nid) != expected_node_id {
+        trace!("Bad idbuf: {:x} != {:x}", nid, expected_node_id);
+        return Err(Error::CorruptionError(
+            "Failed to read expected node ID".to_string(),
+        ));
+    }
+
+    let ptr_bytes = &bytes[1..];
+    // iterate over the read-in bytes in chunks of TRIEPTR_SIZE and store them to `ptrs_buf`
+    for (next_ptr_bytes, ptr_slot) in ptr_bytes
+        .chunks_exact(TRIEPTR_SIZE)
+        .zip(ptrs_buf.iter_mut())
+    {
+        *ptr_slot = TriePtr {
+            id: next_ptr_bytes[0],
+            chr: next_ptr_bytes[1],
+            ptr: u32::from_be_bytes([
+                next_ptr_bytes[2],
+                next_ptr_bytes[3],
+                next_ptr_bytes[4],
+                next_ptr_bytes[5],
+            ]),
+            back_block: u32::from_be_bytes([
+                next_ptr_bytes[6],
+                next_ptr_bytes[7],
+                next_ptr_bytes[8],
+                next_ptr_bytes[9],
+            ]),
+        };
+    }
+    Ok(nid)
 }
 
 /// Read a Trie node's children from a Readable object, and write them to the given ptrs_buf slice.
@@ -115,43 +196,52 @@ pub fn ptrs_from_bytes<R: Read>(
         )));
     }
 
+    // Keep original behavior for invalid enum variants (`Empty` panics through
+    // `node_id_to_ptr_count`), while optimizing the read/decode path below.
     let num_ptrs = node_id_to_ptr_count(node_id);
-    let mut bytes = vec![0u8; 1 + num_ptrs * TRIEPTR_SIZE];
-    r.read_exact(&mut bytes).map_err(|e| {
-        if e.kind() == ErrorKind::UnexpectedEof {
-            Error::CorruptionError(format!(
-                "Failed to read 1 + {} bytes of ptrs",
-                num_ptrs * TRIEPTR_SIZE
-            ))
-        } else {
-            eprintln!("failed: {:?}", &e);
-            Error::IOError(e)
+    let expected_node_id = clear_backptr(node_id);
+
+    // Fast path for small node variants: avoid heap allocation and keep zero-init size tight for
+    // each concrete node kind.
+    const LEAF_PTR_BUF_LEN: usize = 1 + TRIEPTR_SIZE;
+    const NODE4_PTR_BUF_LEN: usize = 1 + 4 * TRIEPTR_SIZE;
+    const NODE16_PTR_BUF_LEN: usize = 1 + 16 * TRIEPTR_SIZE;
+    const NODE48_PTR_BUF_LEN: usize = 1 + 48 * TRIEPTR_SIZE;
+
+    match num_ptrs {
+        1 => {
+            let mut stack_bytes = [0u8; LEAF_PTR_BUF_LEN];
+            r.read_exact(&mut stack_bytes)
+                .map_err(|e| map_ptrs_read_error(e, num_ptrs))?;
+            decode_ptrs_bytes(expected_node_id, &stack_bytes, ptrs_buf)
         }
-    })?;
-
-    // verify the id is correct
-    let nid = bytes
-        .first()
-        .ok_or_else(|| Error::CorruptionError("Failed to read 1 byte from bytes array".into()))?;
-    if clear_backptr(*nid) != clear_backptr(node_id) {
-        trace!("Bad idbuf: {:x} != {:x}", nid, node_id);
-        return Err(Error::CorruptionError(
-            "Failed to read expected node ID".to_string(),
-        ));
+        4 => {
+            let mut stack_bytes = [0u8; NODE4_PTR_BUF_LEN];
+            r.read_exact(&mut stack_bytes)
+                .map_err(|e| map_ptrs_read_error(e, num_ptrs))?;
+            decode_ptrs_bytes(expected_node_id, &stack_bytes, ptrs_buf)
+        }
+        16 => {
+            let mut stack_bytes = [0u8; NODE16_PTR_BUF_LEN];
+            r.read_exact(&mut stack_bytes)
+                .map_err(|e| map_ptrs_read_error(e, num_ptrs))?;
+            decode_ptrs_bytes(expected_node_id, &stack_bytes, ptrs_buf)
+        }
+        48 => {
+            let mut stack_bytes = [0u8; NODE48_PTR_BUF_LEN];
+            r.read_exact(&mut stack_bytes)
+                .map_err(|e| map_ptrs_read_error(e, num_ptrs))?;
+            decode_ptrs_bytes(expected_node_id, &stack_bytes, ptrs_buf)
+        }
+        256 => {
+            let total_len = 1 + num_ptrs * TRIEPTR_SIZE;
+            let mut heap_bytes = vec![0u8; total_len];
+            r.read_exact(&mut heap_bytes)
+                .map_err(|e| map_ptrs_read_error(e, num_ptrs))?;
+            decode_ptrs_bytes(expected_node_id, &heap_bytes, ptrs_buf)
+        }
+        _ => unreachable!("invalid pointer count for trie node id"),
     }
-
-    let ptr_bytes = bytes
-        .get(1..)
-        .ok_or_else(|| Error::CorruptionError("Failed to read >1 bytes from bytes array".into()))?;
-    // iterate over the read-in bytes in chunks of TRIEPTR_SIZE and store them
-    //   to `ptrs_buf`
-    let reading_ptrs = ptr_bytes
-        .chunks_exact(TRIEPTR_SIZE)
-        .zip(ptrs_buf.iter_mut());
-    for (next_ptr_bytes, ptr_slot) in reading_ptrs {
-        *ptr_slot = TriePtr::from_bytes(next_ptr_bytes);
-    }
-    Ok(*nid)
 }
 
 /// Calculate the hash of a TrieNode, given its childrens' hashes.
@@ -261,7 +351,8 @@ pub fn read_root_hash<T: MarfTrieId>(s: &mut TrieStorageConnection<T>) -> Result
     Ok(s.read_node_hash_bytes(&ptr)?)
 }
 
-/// count the number of allocated children in a list of a node's children pointers.
+/// Count the number of allocated children in a list of a node's children pointers.
+#[inline]
 pub fn count_children(children: &[TriePtr]) -> usize {
     let mut cnt = 0;
     for child in children.iter() {
@@ -371,33 +462,31 @@ fn inner_read_nodetype_at_head<F: Read + Seek>(
     Ok((node, h))
 }
 
-/// calculate how many bytes a node will be when serialized, including its hash.
+/// Calculate how many bytes a node will be when serialized, including its hash.
+#[inline]
 pub fn get_node_byte_len(node: &TrieNodeType) -> usize {
     let hash_len = TRIEHASH_ENCODED_SIZE;
     let node_byte_len = node.byte_len();
     hash_len + node_byte_len
 }
 
-/// write all the bytes for a node, including its hash, to the given Writeable object.
+/// Write all the bytes for a node, including its hash, to the given Writeable object.
 /// Returns the number of bytes written.
 pub fn write_nodetype_bytes<F: Write + Seek>(
     f: &mut F,
     node: &TrieNodeType,
     hash: TrieHash,
 ) -> Result<u64, Error> {
-    let start = f.stream_position().map_err(Error::IOError)?;
+    let bytes_written = (TRIEHASH_ENCODED_SIZE + node.byte_len()) as u64;
     f.write_all(hash.as_bytes())?;
     node.write_bytes(f)?;
-    let end = f.stream_position().map_err(Error::IOError)?;
     trace!(
-        "write_nodetype: {:?} {:?} at {}-{}",
+        "write_nodetype: {:?} {:?} ({} bytes)",
         node,
         &hash,
-        start,
-        end
+        bytes_written
     );
-
-    Ok(end - start)
+    Ok(bytes_written)
 }
 
 pub fn write_path_to_bytes<W: Write>(path: &[u8], w: &mut W) -> Result<(), Error> {

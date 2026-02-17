@@ -189,6 +189,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Get the inner trie cache state, as an immutable reference
+    #[inline]
     fn state_ref(&self) -> &TrieCacheState<T> {
         match self {
             TrieCache::Noop(ref state) => state,
@@ -198,6 +199,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Get the inner trie cache state, as a mutable reference
+    #[inline]
     fn state_mut(&mut self) -> &mut TrieCacheState<T> {
         match self {
             TrieCache::Noop(ref mut state) => state,
@@ -207,6 +209,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Load a node from the cache, given its block ID and trie pointer within the block.
+    #[inline]
     pub fn load_node(&mut self, block_id: u32, trieptr: &TriePtr) -> Option<TrieNodeType> {
         if let TrieCache::Noop(_) = self {
             None
@@ -217,6 +220,7 @@ impl<T: MarfTrieId> TrieCache<T> {
 
     /// Load both a node and its hash, given its block ID and trie pointer within the block.
     /// Returns None if either the hash or the node are missing -- both must be cached.
+    #[inline]
     pub fn load_node_and_hash(
         &mut self,
         block_id: u32,
@@ -230,6 +234,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Load a node's hash, given its node's block ID and trie pointer within the block.
+    #[inline]
     pub fn load_node_hash(&mut self, block_id: u32, trieptr: &TriePtr) -> Option<TrieHash> {
         if let TrieCache::Noop(_) = self {
             None
@@ -239,6 +244,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Store a node and its hash to the cache.  `trieptr` must NOT be a backpointer
+    #[inline]
     pub fn store_node_and_hash(
         &mut self,
         block_id: u32,
@@ -260,7 +266,18 @@ impl<T: MarfTrieId> TrieCache<T> {
         }
     }
 
+    /// Determine whether or not this cache strategy stores the given node type.
+    #[inline]
+    pub fn stores_node(&self, node: &TrieNodeType) -> bool {
+        match self {
+            TrieCache::Noop(_) => false,
+            TrieCache::Everything(_) => true,
+            TrieCache::Node256(_) => matches!(node, TrieNodeType::Node256(_)),
+        }
+    }
+
     /// Store a node to the cache.  `trieptr` must NOT be a backpointer
+    #[inline]
     pub fn store_node(&mut self, block_id: u32, trieptr: TriePtr, node: TrieNodeType) {
         assert!(!is_backptr(trieptr.id()));
         match self {
@@ -275,6 +292,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Store a node's hash to the cache.  `trieptr` must NOT be a backpointer
+    #[inline]
     pub fn store_node_hash(&mut self, block_id: u32, trieptr: TriePtr, hash: TrieHash) {
         assert!(!is_backptr(trieptr.id()));
         match self {
@@ -299,6 +317,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Load a block's hash, given its block ID.
+    #[inline]
     pub fn load_block_hash(&mut self, block_id: u32) -> Option<T> {
         self.state_mut().load_block_hash(block_id)
     }
@@ -306,6 +325,7 @@ impl<T: MarfTrieId> TrieCache<T> {
     /// Get cached entry for a block hash, given its ID, or, if not
     ///  found, use `lookup` to get the corresponding block hash and
     ///  store it in the cache
+    #[inline]
     pub fn get_block_hash_caching<E, F: FnOnce(u32) -> Result<T, E>>(
         &mut self,
         id: u32,
@@ -315,16 +335,19 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 
     /// Store a block's ID and hash to teh cache.
+    #[inline]
     pub fn store_block_hash(&mut self, block_id: u32, block_hash: T) {
         self.state_mut().store_block_hash(block_id, block_hash)
     }
 
     /// Get an immutable reference to the block hash, given its ID
+    #[inline]
     pub fn ref_block_hash(&self, block_id: u32) -> Option<&T> {
         self.state_ref().ref_block_hash(block_id)
     }
 
     /// Get the block ID, given the block hash
+    #[inline]
     pub fn load_block_id(&self, block_hash: &T) -> Option<u32> {
         self.state_ref().load_block_id(block_hash)
     }

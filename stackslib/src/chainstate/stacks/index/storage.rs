@@ -245,17 +245,20 @@ impl<T: MarfTrieId> UncommittedState<T> {
     }
 
     /// Read a node's hash
+    #[inline]
     pub fn read_node_hash(&self, ptr: &TriePtr) -> Result<TrieHash, Error> {
         self.trie_ram_ref().read_node_hash(ptr)
     }
 
     /// Read a node's hash and the node itself
+    #[inline]
     pub fn read_nodetype(&mut self, ptr: &TriePtr) -> Result<(TrieNodeType, TrieHash), Error> {
         self.trie_ram_mut().read_nodetype(ptr)
     }
 
     /// Write a node and its hash to a particular slot in the TrieRAM.
     /// Panics of the UncommittedState is sealed already.
+    #[inline]
     pub fn write_nodetype(
         &mut self,
         node_array_ptr: u32,
@@ -274,6 +277,7 @@ impl<T: MarfTrieId> UncommittedState<T> {
 
     /// Write a node hash to a particular slot in the TrieRAM.
     /// Panics of the UncommittedState is sealed already.
+    #[inline]
     pub fn write_node_hash(&mut self, node_array_ptr: u32, hash: TrieHash) -> Result<(), Error> {
         match self {
             UncommittedState::RW(ref mut trie_ram) => {
@@ -286,6 +290,7 @@ impl<T: MarfTrieId> UncommittedState<T> {
     }
 
     /// Get the last pointer (i.e. last slot) of the TrieRAM
+    #[inline]
     pub fn last_ptr(&mut self) -> Result<u32, Error> {
         self.trie_ram_mut().last_ptr()
     }
@@ -799,10 +804,11 @@ impl<T: MarfTrieId> TrieRAM<T> {
     /// This consumes this TrieRAM instance.
     fn dump_consume<F: Write + Seek>(mut self, f: &mut F) -> Result<u64, Error> {
         // step 1: write out each node in breadth-first order to get their ptr offsets
-        let mut frontier: VecDeque<u32> = VecDeque::new();
+        let num_nodes = self.data.len();
+        let mut frontier: VecDeque<u32> = VecDeque::with_capacity(num_nodes);
 
-        let mut node_data = vec![];
-        let mut offsets = vec![];
+        let mut node_data = Vec::with_capacity(num_nodes);
+        let mut offsets = Vec::with_capacity(num_nodes);
 
         let start = TriePtr::new(TrieNodeID::Node256 as u8, 0, 0).ptr();
         frontier.push_back(start);
@@ -947,6 +953,16 @@ impl<T: MarfTrieId> TrieRAM<T> {
         //  NOT bytes. this led to enormous over-allocations
     }
 
+    /// Estimate serialized byte size for this TrieRAM, including the trie blob header.
+    #[inline]
+    fn serialized_len_hint(&self) -> usize {
+        let mut total_len = BLOCK_HEADER_HASH_ENCODED_SIZE + 4;
+        for (node, _) in self.data.iter() {
+            total_len += get_node_byte_len(node);
+        }
+        total_len
+    }
+
     /// Clear the TrieRAM contents
     pub fn format(&mut self) -> Result<(), Error> {
         if self.readonly {
@@ -959,6 +975,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     }
 
     /// Read a node's hash from the TrieRAM.  ptr.ptr() is an array index.
+    #[inline]
     pub fn read_node_hash(&self, ptr: &TriePtr) -> Result<TrieHash, Error> {
         let (_, node_trie_hash) = self.data.get(ptr.ptr() as usize).ok_or_else(|| {
             error!(
@@ -973,6 +990,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     }
 
     /// Get an immutable reference to a node and its hash from the TrieRAM.  ptr.ptr() is an array index.
+    #[inline]
     pub fn get_nodetype(&self, ptr: u32) -> Result<&(TrieNodeType, TrieHash), Error> {
         self.data.get(ptr as usize).ok_or_else(|| {
             error!(
@@ -1085,6 +1103,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     }
 
     /// Get the next ptr value for a node to store.
+    #[inline]
     pub fn last_ptr(&mut self) -> Result<u32, Error> {
         Ok(self.data.len() as u32)
     }
@@ -1733,7 +1752,8 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
         }
         if let Some((bhh, trie_ram)) = self.data.uncommitted_writes.take() {
             trace!("Buffering block flush started.");
-            let mut buffer = Cursor::new(Vec::new());
+            let buffer_capacity = trie_ram.trie_ram_ref().serialized_len_hint();
+            let mut buffer = Cursor::new(Vec::with_capacity(buffer_capacity));
             trie_ram.dump(self, &mut buffer, &bhh)?;
 
             // consume the cursor, get the buffer
@@ -2153,10 +2173,11 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
         trace!("Extended from {} to {}", &self.data.cur_block, bhh);
 
         // update internal structures
+        let bhh = bhh.clone();
         self.data.set_block(bhh.clone(), None);
         self.clear_cached_ancestor_hashes_bytes();
 
-        self.data.uncommitted_writes = Some((bhh.clone(), trie_buf));
+        self.data.uncommitted_writes = Some((bhh, trie_buf));
     }
 
     /// Is the given block in the marf_data DB table, and is it part of the block history (i.e. it's not mined and
@@ -2329,16 +2350,31 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     }
 
     /// Get the currently-open block hash
+    #[inline]
     pub fn get_cur_block(&self) -> T {
         self.data.cur_block.clone()
     }
 
+    /// Borrow the currently-open block hash
+    #[inline]
+    pub fn get_cur_block_ref(&self) -> &T {
+        &self.data.cur_block
+    }
+
     /// Get the currently-open block hash and block ID (row ID)
+    #[inline]
     pub fn get_cur_block_and_id(&self) -> (T, Option<u32>) {
         (self.data.cur_block.clone(), self.data.cur_block_id)
     }
 
+    /// Borrow the currently-open block hash and return its block ID (row ID)
+    #[inline]
+    pub fn get_cur_block_and_id_ref(&self) -> (&T, Option<u32>) {
+        (&self.data.cur_block, self.data.cur_block_id)
+    }
+
     /// Get the block hash of a given block ID (i.e. row ID)
+    #[inline]
     pub fn get_block_from_local_id(&mut self, local_id: u32) -> Result<&T, Error> {
         let res = self.get_block_hash_caching(local_id);
         res
@@ -2356,11 +2392,13 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     }
 
     /// Get a TriePtr to the currently-open block's trie's root node.
+    #[inline]
     pub fn root_trieptr(&self) -> TriePtr {
         TriePtr::new(TrieNodeID::Node256 as u8, 0, self.root_ptr())
     }
 
     /// Get the TriePtr::ptr() value for a trie's root node if the node is stored to disk.
+    #[inline]
     pub fn root_ptr_disk() -> u32 {
         // first 32 bytes are the block parent hash
         //   next 4 are the identifier
@@ -2491,15 +2529,17 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                 // hash is in the same block as this node
                 let start_time = bench.write_children_hashes_same_block_start();
 
-                let mut buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE);
-                hash_reader.read_node_hash_bytes(ptr, &mut buf)?;
+                let mut buf = [0u8; TRIEHASH_ENCODED_SIZE];
+                let mut buf_writer: &mut [u8] = &mut buf;
+                hash_reader.read_node_hash_bytes(ptr, &mut buf_writer)?;
+                debug_assert!(buf_writer.is_empty());
                 trace!(
                     "inner_write_children_hashes for node {:?}: {:?} same block {}",
                     &node,
                     &ptr,
                     &to_hex(&buf)
                 );
-                w.write_all(&buf[..])?;
+                w.write_all(&buf)?;
 
                 bench.write_children_hashes_same_block_finish(start_time);
             } else {
@@ -2676,8 +2716,14 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                     } else {
                         let (node_inst, node_hash) =
                             self.inner_read_persisted_nodetype(id, &clear_ptr, read_hash)?;
-                        self.cache
-                            .store_node_and_hash(id, clear_ptr, node_inst.clone(), node_hash);
+                        if self.cache.stores_node(&node_inst) {
+                            self.cache.store_node_and_hash(
+                                id,
+                                clear_ptr,
+                                node_inst.clone(),
+                                node_hash,
+                            );
+                        }
                         (node_inst, node_hash)
                     }
                 } else if let Some(node_inst) = self.cache.load_node(id, &clear_ptr) {
@@ -2685,7 +2731,9 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
                 } else {
                     let (node_inst, _) =
                         self.inner_read_persisted_nodetype(id, &clear_ptr, read_hash)?;
-                    self.cache.store_node(id, clear_ptr, node_inst.clone());
+                    if self.cache.stores_node(&node_inst) {
+                        self.cache.store_node(id, clear_ptr, node_inst.clone());
+                    }
                     (node_inst, TrieHash([0u8; TRIEHASH_ENCODED_SIZE]))
                 };
 

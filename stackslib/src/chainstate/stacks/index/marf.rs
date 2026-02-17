@@ -729,7 +729,7 @@ impl<T: MarfTrieId> MARF<T> {
     ) -> Result<(TrieNodeType, TrieHash, TriePtr, T), Error> {
         trace!(
             "Copy to {:?} child {:x} of {:?}",
-            storage.get_cur_block(),
+            storage.get_cur_block_ref(),
             chr,
             node
         );
@@ -868,7 +868,7 @@ impl<T: MarfTrieId> MARF<T> {
 
                             trace!(
                                 "Out of path in {:?} -- we're done. Node at {:?}",
-                                storage.get_cur_block(),
+                                storage.get_cur_block_ref(),
                                 &node_ptr
                             );
                             storage.open_block_maybe_id(block_hash, block_id)?;
@@ -889,7 +889,10 @@ impl<T: MarfTrieId> MARF<T> {
                                 }
                                 CursorError::ChrNotFound => {
                                     // end-of-node-path but no such child -- not even a backptr.
-                                    trace!("ChrNotFound encountered at {:?} -- we're done (node not found)", storage.get_cur_block());
+                                    trace!(
+                                        "ChrNotFound encountered at {:?} -- we're done (node not found)",
+                                        storage.get_cur_block_ref()
+                                    );
                                     storage.open_block_maybe_id(block_hash, block_id)?;
                                     return Ok(cursor);
                                 }
