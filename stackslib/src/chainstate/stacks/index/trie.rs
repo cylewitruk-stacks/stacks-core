@@ -964,12 +964,15 @@ impl Trie {
                 }
 
                 let content_hash = get_nodetype_hash(storage, &node)?;
+                let root_ptr = storage.root_trieptr();
+                let is_root_node = node.is_node256() && ptr == root_ptr;
 
-                // flush the current node to storage --
-                //  necessary because computing ancestor hashes requires that the trie's pointers
-                //  all be intact, since it does ancestor lookups!
-                // however, since we're going to update the hash in the next write anyways, just write an empty buff
-                storage.write_nodetype(ptr.ptr(), &node, TrieHash([0; 32]))?;
+                if is_root_node {
+                    // Flush the root node's pointers before calculating the skiplist hash.
+                    // Root hash derivation may perform ancestor lookups that expect the current
+                    // trie structure to be materialized.
+                    storage.write_nodetype(ptr.ptr(), &node, TrieHash::EMPTY)?;
+                }
 
                 let h = if !node.is_node256() {
                     trace!(
@@ -981,7 +984,6 @@ impl Trie {
                     );
                     content_hash
                 } else {
-                    let root_ptr = storage.root_trieptr();
                     let node_hash = if ptr == root_ptr {
                         let h = if update_skiplist {
                             Trie::get_trie_root_hash(storage, &content_hash)?
@@ -1015,7 +1017,12 @@ impl Trie {
                     node_hash
                 };
 
-                storage.write_nodetype(ptr.ptr(), &node, h)?;
+                if is_root_node {
+                    // Root was already flushed with updated pointers above.
+                    storage.write_node_hash(ptr.ptr(), h)?;
+                } else {
+                    storage.write_nodetype(ptr.ptr(), &node, h)?;
+                }
 
                 child_ptr = ptr;
                 child_ptr.id = clear_backptr(child_ptr.id);
