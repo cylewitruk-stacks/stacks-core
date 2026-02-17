@@ -711,7 +711,7 @@ impl<T: MarfTrieId> MARF<T> {
             TrieNodeType::Leaf(leaf) => get_leaf_hash(leaf),
             _ => {
                 MARF::<T>::node_copy_update_ptrs(node.ptrs_mut(), child_block_id);
-                TrieHash::from_data(&[])
+                TrieHash::EMPTY
             }
         };
 

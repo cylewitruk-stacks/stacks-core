@@ -1199,7 +1199,7 @@ fn marf_split_leaf_path() {
 #[test]
 #[ignore]
 fn marf_insert_random_65536_2048() {
-    let mut seed = TrieHash::from_data(&[]).as_bytes().to_vec();
+    let mut seed = TrieHash::EMPTY.as_bytes().to_vec();
     marf_insert(
         |i| {
             let mut path = [0; 32];
@@ -1278,7 +1278,7 @@ fn marf_insert_random_10485760_4096_file_storage() {
 
     let mut block_header = BlockHeaderHash::sentinel();
 
-    let mut seed = TrieHash::from_data(&[]).as_bytes().to_vec();
+    let mut seed = TrieHash::EMPTY.as_bytes().to_vec();
     let mut start_time = get_epoch_time_ms();
     let mut end_time = 0;
     let mut block_start_time = start_time;
@@ -1353,7 +1353,7 @@ fn marf_insert_random_10485760_4096_file_storage() {
     }
 
     i = 1;
-    seed = TrieHash::from_data(&[]).as_bytes().to_vec();
+    seed = TrieHash::EMPTY.as_bytes().to_vec();
 
     while i <= num_iterations {
         let mut keys = vec![];
@@ -1411,7 +1411,7 @@ fn marf_insert_random_4096_128_merkle_proof() {
 
         let mut block_header = BlockHeaderHash::sentinel();
 
-        let mut seed = TrieHash::from_data(&[]).as_bytes().to_vec();
+        let mut seed = TrieHash::EMPTY.as_bytes().to_vec();
         let mut prev_block_header = block_header.clone();
 
         let mut i = 1;
@@ -1474,7 +1474,7 @@ fn marf_insert_random_4096_128_merkle_proof() {
         }
 
         i = 1;
-        seed = TrieHash::from_data(&[]).as_bytes().to_vec();
+        seed = TrieHash::EMPTY.as_bytes().to_vec();
 
         let mut block_table_cache = None;
         while i <= 4096 {
@@ -1560,7 +1560,7 @@ fn marf_read_random_1048576_4096_file_storage() {
         .unwrap();
         f.open_block(&block_header).unwrap();
 
-        let mut seed = TrieHash::from_data(&[]).as_bytes().to_vec();
+        let mut seed = TrieHash::EMPTY.as_bytes().to_vec();
         let mut start_time = 0;
 
         start_time = get_epoch_time_ms();
