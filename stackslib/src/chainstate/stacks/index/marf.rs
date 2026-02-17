@@ -1344,10 +1344,14 @@ impl<T: MarfTrieId> MARF<T> {
     ) -> Result<(), Error> {
         assert_eq!(keys.len(), values.len());
 
-        let (Some(last_key), Some(last_value)) = (keys.last(), values.last()) else {
+        let Some((last_key, batch_keys)) = keys.split_last() else {
             // if empty, nothing to do
             return Ok(());
         };
+        let mut values_iter = values.into_iter();
+        let last_value = values_iter
+            .next_back()
+            .expect("BUG: values is non-empty if keys is non-empty");
 
         let (cur_block_hash, cur_block_id) = conn.get_cur_block_and_id();
 
@@ -1355,11 +1359,12 @@ impl<T: MarfTrieId> MARF<T> {
         let mut progress = 0;
         let eta_enabled = keys.len() > 10_000;
         let mut result =
-            keys.iter()
+            batch_keys
+                .iter()
                 .enumerate()
-                .zip(values.iter())
+                .zip(values_iter)
                 .try_for_each(|((index, key), value)| {
-                    let marf_leaf = TrieLeaf::from_value(&[], value.clone());
+                    let marf_leaf = TrieLeaf::from_value(&[], value);
                     let path = TrieHash::from_key(key);
 
                     if eta_enabled {
@@ -1377,7 +1382,7 @@ impl<T: MarfTrieId> MARF<T> {
 
         if result.is_ok() {
             // last insert updates the root with the skiplist hash
-            let marf_leaf = TrieLeaf::from_value(&[], last_value.clone());
+            let marf_leaf = TrieLeaf::from_value(&[], last_value);
             let path = TrieHash::from_key(last_key);
             result = MARF::insert_leaf(conn, block_hash, &path, &marf_leaf);
         }

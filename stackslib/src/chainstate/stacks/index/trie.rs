@@ -15,6 +15,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 /// This module defines the methods for reading and inserting into a Trie
+use std::io::{self, Write};
+
 use sha2::Digest;
 use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use stacks_common::util::macros::is_trace;
@@ -31,6 +33,82 @@ use crate::chainstate::stacks::index::{Error, MarfTrieId, TrieHasher, TrieLeaf};
 /// We don't actually instantiate a Trie, but we still need to pass a type parameter for the
 /// storage implementation.
 pub struct Trie {}
+
+/// Collect a stream of hash bytes from `write_children_hashes()` directly into `TrieHash` values.
+struct TrieHashCollector {
+    hashes: Vec<TrieHash>,
+    pending: [u8; TRIEHASH_ENCODED_SIZE],
+    pending_len: usize,
+    expected_hashes: usize,
+}
+
+impl TrieHashCollector {
+    fn with_capacity(expected_hashes: usize) -> Self {
+        Self {
+            hashes: Vec::with_capacity(expected_hashes),
+            pending: [0u8; TRIEHASH_ENCODED_SIZE],
+            pending_len: 0,
+            expected_hashes,
+        }
+    }
+
+    fn finish(self) -> Result<Vec<TrieHash>, Error> {
+        if self.pending_len != 0 {
+            return Err(Error::CorruptionError(format!(
+                "Failed to decode child hashes: {} dangling bytes",
+                self.pending_len
+            )));
+        }
+        if self.hashes.len() != self.expected_hashes {
+            return Err(Error::CorruptionError(format!(
+                "Failed to decode child hashes: expected {}, got {}",
+                self.expected_hashes,
+                self.hashes.len()
+            )));
+        }
+        Ok(self.hashes)
+    }
+}
+
+impl Write for TrieHashCollector {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut remaining = buf;
+
+        if self.pending_len > 0 {
+            let fill = (TRIEHASH_ENCODED_SIZE - self.pending_len).min(remaining.len());
+            self.pending[self.pending_len..self.pending_len + fill]
+                .copy_from_slice(&remaining[..fill]);
+            self.pending_len += fill;
+            remaining = &remaining[fill..];
+
+            if self.pending_len == TRIEHASH_ENCODED_SIZE {
+                self.hashes.push(TrieHash(self.pending));
+                self.pending_len = 0;
+            }
+        }
+
+        if !remaining.is_empty() {
+            let mut chunks = remaining.chunks_exact(TRIEHASH_ENCODED_SIZE);
+            for chunk in &mut chunks {
+                let mut hash = [0u8; TRIEHASH_ENCODED_SIZE];
+                hash.copy_from_slice(chunk);
+                self.hashes.push(TrieHash(hash));
+            }
+
+            let rem = chunks.remainder();
+            if !rem.is_empty() {
+                self.pending[..rem.len()].copy_from_slice(rem);
+                self.pending_len = rem.len();
+            }
+        }
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A validated insertion location: the cursor position and the node at `cursor.ptr()`.
 #[derive(Debug, Clone, PartialEq)]
@@ -261,18 +339,9 @@ impl Trie {
         storage: &mut TrieStorageConnection<T>,
         node: &TrieNodeType,
     ) -> Result<Vec<TrieHash>, Error> {
-        let mut buffer = Vec::with_capacity(node.ptrs().len() * TRIEHASH_ENCODED_SIZE);
-        storage.write_children_hashes(node, &mut buffer)?;
-        assert_eq!(buffer.len() % TRIEHASH_ENCODED_SIZE, 0);
-
-        let trie_hashes: Vec<_> = buffer
-            .chunks_exact(TRIEHASH_ENCODED_SIZE)
-            .map(|x| {
-                TrieHash::from_bytes(x).expect("Failed to re-encode TrieHash from byte buffer")
-            })
-            .collect();
-
-        Ok(trie_hashes)
+        let mut collector = TrieHashCollector::with_capacity(node.ptrs().len());
+        storage.write_children_hashes(node, &mut collector)?;
+        collector.finish()
     }
 
     /// Given an existing leaf, replace it with the new leaf.
