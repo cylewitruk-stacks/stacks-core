@@ -28,8 +28,8 @@ use crate::chainstate::stacks::index::bits::{
 };
 use crate::chainstate::stacks::index::marf::MARF;
 use crate::chainstate::stacks::index::node::{
-    is_backptr, ConsensusSerializable, CursorError, TrieCursor, TrieNode, TrieNodeID, TrieNodeType,
-    TriePtr,
+    is_backptr, ConsensusSerializable, CursorError, TrieCursor, TrieNode, TrieNodeID, TrieNodePath,
+    TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::trie::Trie;
@@ -86,7 +86,7 @@ impl<T: MarfTrieId> ProofTrieNode<T> {
         block_map: &mut M,
     ) -> Result<ProofTrieNode<T>, Error> {
         let id = other.id();
-        let path = other.path().clone();
+        let path = TrieNodePath::from_slice(other.path());
         let ptrs: Result<Vec<_>, Error> = other
             .ptrs()
             .iter()
@@ -959,23 +959,23 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             match proof_node {
                 TrieMerkleProofType::Leaf((ref _chr, ref node)) => {
                     // path_parts.push(vec![*chr]);
-                    path_parts.push(node.path.clone());
+                    path_parts.push(node.path.to_vec());
                 }
                 TrieMerkleProofType::Node4((ref chr, ref node, _)) => {
                     path_parts.push(vec![*chr]);
-                    path_parts.push(node.path.clone());
+                    path_parts.push(node.path.to_vec());
                 }
                 TrieMerkleProofType::Node16((ref chr, ref node, _)) => {
                     path_parts.push(vec![*chr]);
-                    path_parts.push(node.path.clone());
+                    path_parts.push(node.path.to_vec());
                 }
                 TrieMerkleProofType::Node48((ref chr, ref node, _)) => {
                     path_parts.push(vec![*chr]);
-                    path_parts.push(node.path.clone());
+                    path_parts.push(node.path.to_vec());
                 }
                 TrieMerkleProofType::Node256((ref chr, ref node, _)) => {
                     path_parts.push(vec![*chr]);
-                    path_parts.push(node.path.clone());
+                    path_parts.push(node.path.to_vec());
                 }
                 _ => {
                     trace!("Not a valid segment proof: got a non-node proof node");

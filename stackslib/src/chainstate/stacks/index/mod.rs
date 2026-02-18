@@ -40,6 +40,8 @@ pub mod trie_sql;
 #[cfg(test)]
 pub mod test;
 
+use self::node::TrieNodePath;
+
 #[derive(Debug)]
 pub struct TrieMerkleProof<T: MarfTrieId>(pub Vec<TrieMerkleProofType<T>>);
 
@@ -68,7 +70,7 @@ pub enum TrieMerkleProofType<T> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProofTrieNode<T> {
     pub id: u8,
-    pub path: Vec<u8>,
+    pub path: TrieNodePath,
     pub ptrs: Vec<ProofTriePtr<T>>,
 }
 
@@ -82,8 +84,8 @@ pub struct ProofTriePtr<T> {
 /// Leaf of a Trie.
 #[derive(Clone)]
 pub struct TrieLeaf {
-    pub path: Vec<u8>,   // path to be lazily expanded
-    pub data: MARFValue, // the actual data
+    pub path: TrieNodePath, // path to be lazily expanded
+    pub data: MARFValue,    // the actual data
 }
 
 pub trait MarfTrieId:

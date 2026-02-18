@@ -25,7 +25,7 @@ use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::marf::MARF;
 use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, set_backptr, TrieCursor, TrieNode, TrieNode16, TrieNode256,
-    TrieNode4, TrieNode48, TrieNodeID, TrieNodeType, TriePtr,
+    TrieNode4, TrieNode48, TrieNodeID, TrieNodePath, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::storage::{TrieHashCalculationMode, TrieStorageConnection};
 use crate::chainstate::stacks::index::{Error, MarfTrieId, TrieHasher, TrieLeaf};
@@ -359,7 +359,7 @@ impl Trie {
             )));
         }
 
-        value.path.clone_from(cur_leaf.path_bytes());
+        value.path = TrieNodePath::from_slice(cur_leaf.path_bytes());
 
         let leaf_hash = get_leaf_hash(value);
 
@@ -383,12 +383,10 @@ impl Trie {
         let ptr = storage.last_ptr()?;
         let chr = cursor.chr().unwrap();
 
-        value.path = cursor
-            .path
-            .as_bytes()
-            .get(cursor.index..)
-            .ok_or_else(|| Error::CorruptionError("Cursor path shorter than cursor index".into()))?
-            .to_vec();
+        value.path =
+            TrieNodePath::from_slice(cursor.path.as_bytes().get(cursor.index..).ok_or_else(
+                || Error::CorruptionError("Cursor path shorter than cursor index".into()),
+            )?);
 
         let leaf_hash = get_leaf_hash(value);
         let leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, chr, ptr);
@@ -451,8 +449,7 @@ impl Trie {
         let cur_leaf_path = cur_leaf_data
             .path
             .get(cur_leaf_path_start..)
-            .ok_or_else(|| Error::CorruptionError("Current leaf path too short".into()))?
-            .to_vec();
+            .ok_or_else(|| Error::CorruptionError("Current leaf path too short".into()))?;
 
         // update current leaf path
         let cur_leaf_disk_ptr = cur_leaf_ptr.ptr();
@@ -460,7 +457,7 @@ impl Trie {
             TriePtr::new(TrieNodeID::Leaf as u8, cur_leaf_chr, cur_leaf_disk_ptr);
 
         assert!(cur_leaf_path.len() <= cur_leaf_data.path.len());
-        cur_leaf_data.path = cur_leaf_path;
+        cur_leaf_data.path = TrieNodePath::from_slice(cur_leaf_path);
         let cur_leaf_hash = get_leaf_hash(cur_leaf_data);
 
         // NOTE: this is safe since the current leaf's byte representation has gotten shorter
@@ -469,8 +466,9 @@ impl Trie {
         // append the new leaf and the end of the file.
         let new_leaf_disk_ptr = storage.last_ptr()?;
         let new_leaf_chr = cursor.path[cursor.tell()]; // NOTE: this is safe because !cursor.eop()
-        new_leaf_data.path =
-            cursor.path[std::cmp::min(cursor.tell() + 1, cursor.path.len())..].to_vec();
+        new_leaf_data.path = TrieNodePath::from_slice(
+            &cursor.path[std::cmp::min(cursor.tell() + 1, cursor.path.len())..],
+        );
         let new_leaf_hash = get_leaf_hash(new_leaf_data);
 
         // put new leaf at the end of this Trie
@@ -701,7 +699,7 @@ impl Trie {
             .get(0..cursor.ntell())
             .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?
             .to_vec();
-        let leaf_path = cursor.path[cursor.tell() + 1..].to_vec();
+        let leaf_path = &cursor.path[cursor.tell() + 1..];
         let new_cur_node_path = node_path
             .get(cursor.ntell() + 1..)
             .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?
@@ -711,7 +709,7 @@ impl Trie {
             .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?;
 
         // store leaf
-        leaf.path = leaf_path;
+        leaf.path = TrieNodePath::from_slice(leaf_path);
         let leaf_chr = cursor.path[cursor.tell()];
         let leaf_disk_ptr = storage.last_ptr()?;
         let leaf_hash = get_leaf_hash(leaf);
@@ -727,7 +725,7 @@ impl Trie {
             new_cur_node_disk_ptr,
         );
 
-        node.set_path(new_cur_node_path);
+        node.set_path(&new_cur_node_path);
 
         let new_cur_node_hash = get_nodetype_hash(storage, node)?;
 

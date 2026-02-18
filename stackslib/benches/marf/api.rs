@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 use std::collections::HashMap;
 use std::hint::black_box;
 
@@ -12,6 +27,8 @@ use super::common::{block_id, configured_criterion, make_batch};
 
 const CHAIN_LEN: u32 = 192;
 const DEPTHS: [u32; 3] = [1, 8, 64];
+const BACKPTR_CHAIN_LEN: u32 = 512;
+const BACKPTR_DEPTHS: [u32; 4] = [32, 128, 256, 511];
 const KEYS_PER_BLOCK: u32 = 4;
 const CACHE_STRATEGIES: [&str; 2] = ["noop", "everything"];
 const INSERT_BATCH_SIZE: u32 = 64;
@@ -36,7 +53,7 @@ fn make_write_batch(prefix: &str, count: u32) -> (Vec<String>, Vec<MARFValue>) {
     make_batch(prefix, 0, count, 0)
 }
 
-fn make_fixture(cache_strategy: &str) -> MarfApiFixture {
+fn make_fixture(cache_strategy: &str, chain_len: u32) -> MarfApiFixture {
     let tmpdir = tempfile::tempdir().expect("failed to create temp dir for marf_api fixture");
     let db_path = tmpdir.path().join("marf-api.sqlite");
     let db_path_str = db_path
@@ -51,7 +68,7 @@ fn make_fixture(cache_strategy: &str) -> MarfApiFixture {
     let mut parent = StacksBlockId::sentinel();
     let mut tip = parent.clone();
 
-    for height in 1..=CHAIN_LEN {
+    for height in 1..=chain_len {
         let next = block_id(height);
 
         let mut tx = marf
@@ -86,7 +103,7 @@ fn make_fixture(cache_strategy: &str) -> MarfApiFixture {
         _tmpdir: tmpdir,
         marf,
         tip,
-        tip_height: CHAIN_LEN,
+        tip_height: chain_len,
     }
 }
 
@@ -119,7 +136,7 @@ fn bench_get(c: &mut Criterion) {
 
     for strategy in CACHE_STRATEGIES {
         for depth in DEPTHS {
-            let mut fixture = make_fixture(strategy);
+            let mut fixture = make_fixture(strategy, CHAIN_LEN);
             let key = key_for_depth_from_tip(fixture.tip_height, depth);
 
             group.bench_function(format!("{strategy}/existing_tip/depth_{depth}"), move |b| {
@@ -134,7 +151,7 @@ fn bench_get(c: &mut Criterion) {
         }
 
         {
-            let mut fixture = make_fixture(strategy);
+            let mut fixture = make_fixture(strategy, CHAIN_LEN);
             let key = "missing:00000000".to_string();
             group.bench_function(format!("{strategy}/missing_tip"), move |b| {
                 b.iter(|| {
@@ -151,12 +168,35 @@ fn bench_get(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_get_backptr_heavy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("marf_api/get_backptr_heavy");
+
+    for strategy in CACHE_STRATEGIES {
+        for depth in BACKPTR_DEPTHS {
+            let mut fixture = make_fixture(strategy, BACKPTR_CHAIN_LEN);
+            let key = key_for_depth_from_tip(fixture.tip_height, depth);
+
+            group.bench_function(format!("{strategy}/depth_{depth}"), move |b| {
+                b.iter(|| {
+                    let out = fixture
+                        .marf
+                        .get(&fixture.tip, &key)
+                        .expect("marf_api/get_backptr_heavy query failed");
+                    black_box(out);
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_get_with_proof(c: &mut Criterion) {
     let mut group = c.benchmark_group("marf_api/get_with_proof");
 
     for strategy in CACHE_STRATEGIES {
         for depth in DEPTHS {
-            let mut fixture = make_fixture(strategy);
+            let mut fixture = make_fixture(strategy, CHAIN_LEN);
             let key = key_for_depth_from_tip(fixture.tip_height, depth);
 
             group.bench_function(format!("{strategy}/existing_tip/depth_{depth}"), move |b| {
@@ -179,7 +219,7 @@ fn bench_proof_verify(c: &mut Criterion) {
 
     for strategy in CACHE_STRATEGIES {
         for depth in DEPTHS {
-            let mut fixture = make_fixture(strategy);
+            let mut fixture = make_fixture(strategy, CHAIN_LEN);
             let key = key_for_depth_from_tip(fixture.tip_height, depth);
             let path = TrieHash::from_key(&key);
             let root_hash = fixture
@@ -217,7 +257,7 @@ fn bench_insert_batch_commit(c: &mut Criterion) {
 
         group.bench_function(format!("{strategy}/batch_{INSERT_BATCH_SIZE}"), move |b| {
             b.iter_batched(
-                || make_fixture(strategy),
+                || make_fixture(strategy, CHAIN_LEN),
                 |mut fixture| {
                     let parent = fixture.tip.clone();
                     let next = block_id(next_block_seed);
@@ -254,6 +294,7 @@ criterion_group! {
     config = configured_criterion();
     targets =
         bench_get,
+        bench_get_backptr_heavy,
         bench_get_with_proof,
         bench_proof_verify,
         bench_insert_batch_commit

@@ -23,7 +23,7 @@ use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::node::{
     clear_backptr, ConsensusSerializable, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
-    TrieNodeID, TrieNodeType, TriePtr, TRIEPTR_SIZE,
+    TrieNodeID, TrieNodePath, TrieNodeType, TriePtr, TRIEPTR_SIZE,
 };
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{BlockMap, Error, MarfTrieId, TrieLeaf};
@@ -40,6 +40,12 @@ pub fn get_path_byte_len(p: &[u8]) -> usize {
 /// Decode a trie path from a Readable object.
 /// Returns Error::CorruptionError if the path doesn't decode.
 pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, Error> {
+    Ok(path_from_bytes_inline(r)?.to_vec())
+}
+
+/// Decode a trie path from a Readable object into fixed-size inline storage.
+/// Returns Error::CorruptionError if the path doesn't decode.
+pub fn path_from_bytes_inline<R: Read>(r: &mut R) -> Result<TrieNodePath, Error> {
     let mut lenbuf = [0u8; 1];
     r.read_exact(&mut lenbuf).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -64,21 +70,11 @@ pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, Error> {
 
     let path_len = lenbuf[0] as usize;
     if path_len == 0 {
-        return Ok(Vec::new());
+        return Ok(TrieNodePath::default());
     }
 
-    // Reserve exactly once and fill spare capacity directly to avoid zero-initializing bytes
-    // that will immediately be overwritten by `read_exact`.
-    let mut retbuf = Vec::with_capacity(path_len);
-    // SAFETY: `retbuf` was allocated with capacity `path_len`, so the first `path_len` bytes of
-    // spare capacity are valid writable memory for `read_exact`.
-    let read_buf = unsafe {
-        std::slice::from_raw_parts_mut(
-            retbuf.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
-            path_len,
-        )
-    };
-    r.read_exact(read_buf).map_err(|e| {
+    let mut path_bytes = [0u8; TRIEHASH_ENCODED_SIZE];
+    r.read_exact(&mut path_bytes[..path_len]).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
             Error::CorruptionError(format!("Failed to read {} bytes of path", lenbuf[0]))
         } else {
@@ -86,10 +82,8 @@ pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, Error> {
             Error::IOError(e)
         }
     })?;
-    // SAFETY: `read_exact` above initialized exactly `path_len` bytes.
-    unsafe { retbuf.set_len(path_len) };
 
-    Ok(retbuf)
+    Ok(TrieNodePath::from_array_len(path_bytes, path_len))
 }
 
 /// Helper to verify that a Trie node's ID byte is valid.
@@ -207,6 +201,7 @@ pub fn ptrs_from_bytes<R: Read>(
     const NODE4_PTR_BUF_LEN: usize = 1 + 4 * TRIEPTR_SIZE;
     const NODE16_PTR_BUF_LEN: usize = 1 + 16 * TRIEPTR_SIZE;
     const NODE48_PTR_BUF_LEN: usize = 1 + 48 * TRIEPTR_SIZE;
+    const NODE256_PTR_BUF_LEN: usize = 1 + 256 * TRIEPTR_SIZE;
 
     match num_ptrs {
         1 => {
@@ -234,11 +229,10 @@ pub fn ptrs_from_bytes<R: Read>(
             decode_ptrs_bytes(expected_node_id, &stack_bytes, ptrs_buf)
         }
         256 => {
-            let total_len = 1 + num_ptrs * TRIEPTR_SIZE;
-            let mut heap_bytes = vec![0u8; total_len];
-            r.read_exact(&mut heap_bytes)
+            let mut stack_bytes = [0u8; NODE256_PTR_BUF_LEN];
+            r.read_exact(&mut stack_bytes)
                 .map_err(|e| map_ptrs_read_error(e, num_ptrs))?;
-            decode_ptrs_bytes(expected_node_id, &heap_bytes, ptrs_buf)
+            decode_ptrs_bytes(expected_node_id, &stack_bytes, ptrs_buf)
         }
         _ => unreachable!("invalid pointer count for trie node id"),
     }
