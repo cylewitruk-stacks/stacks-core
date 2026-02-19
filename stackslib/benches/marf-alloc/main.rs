@@ -98,7 +98,9 @@ fn print_usage() {
     println!("Subcommands:");
     println!("  node-alloc    Node micro-allocation profile");
     println!("  read          Read-heavy MARF::get profile");
+    println!("  read-proof    Read-heavy MARF::get_with_proof profile");
     println!("  read-backptr  Focused deep backpointer-walk MARF::get profile");
+    println!("  read-backptr-proof  Focused deep backpointer-walk MARF::get_with_proof profile");
     println!("  write         Write workflow profile");
     println!();
     println!("Environment variables:");
@@ -130,7 +132,9 @@ fn main() {
     let summary = match cmd {
         "node-alloc" => node_alloc::run(sub_args, output_mode),
         "read" => read::run(sub_args, output_mode),
+        "read-proof" => read::run_proof(sub_args, output_mode),
         "read-backptr" => read_backptr::run(sub_args, output_mode),
+        "read-backptr-proof" => read_backptr::run_proof(sub_args, output_mode),
         "write" => write::run(sub_args, output_mode),
         "-h" | "--help" | "help" => {
             print_usage();

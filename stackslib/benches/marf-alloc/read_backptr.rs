@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Focused MARF::get benchmark tuned for deep backpointer walking.
+//! Focused MARF::get and MARF::get_with_proof benchmark tuned for deep
+//! backpointer walking.
 //!
 //! In `MARF_ALLOC_OUTPUT=raw`, this emits line-oriented `config` and `result`
 //! records per round/case. Unified summary rows are emitted by `main.rs`.
@@ -40,6 +41,23 @@ const DEFAULT_READ_ITERS: usize = 200_000;
 const DEFAULT_READ_ROUNDS: usize = 2;
 const DEFAULT_DEPTHS: [u32; 4] = [256, 768, 1536, 2047];
 const DEFAULT_CACHE_STRATEGIES: [&str; 2] = ["noop", "node256"];
+const READ_VARIANTS_GET: [ReadVariant; 1] = [ReadVariant::Get];
+const READ_VARIANTS_PROOF: [ReadVariant; 1] = [ReadVariant::GetWithProof];
+
+#[derive(Clone, Copy)]
+enum ReadVariant {
+    Get,
+    GetWithProof,
+}
+
+impl ReadVariant {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::GetWithProof => "get-with-proof",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct CaseAggregate {
@@ -149,16 +167,33 @@ fn make_fixture(cache_strategy: &str, chain_len: u32) -> MarfReadFixture {
     }
 }
 
-fn measure_get_case(fixture: &mut MarfReadFixture, key: &str, iters: usize) -> CaseMeasurement {
+fn measure_case(
+    fixture: &mut MarfReadFixture,
+    key: &str,
+    iters: usize,
+    variant: ReadVariant,
+) -> CaseMeasurement {
     reset_stats();
     let start = Instant::now();
     for _ in 0..iters {
-        black_box(
-            fixture
-                .marf
-                .get(&fixture.tip, key)
-                .expect("MARF::get failed in read-backptr benchmark"),
-        );
+        match variant {
+            ReadVariant::Get => {
+                black_box(
+                    fixture
+                        .marf
+                        .get(&fixture.tip, key)
+                        .expect("MARF::get failed in read-backptr benchmark"),
+                );
+            }
+            ReadVariant::GetWithProof => {
+                black_box(
+                    fixture
+                        .marf
+                        .get_with_proof(&fixture.tip, key)
+                        .expect("MARF::get_with_proof failed in read-backptr benchmark"),
+                );
+            }
+        }
     }
     CaseMeasurement {
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -166,7 +201,12 @@ fn measure_get_case(fixture: &mut MarfReadFixture, key: &str, iters: usize) -> C
     }
 }
 
-pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
+fn run_with_variants(
+    args: &[String],
+    output_mode: OutputMode,
+    benchmark_name: &'static str,
+    variants: &[ReadVariant],
+) -> Option<Summary> {
     if has_help_flag(args) {
         print_usage(args);
         return None;
@@ -193,7 +233,7 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
         );
     }
 
-    let mut results: HashMap<(String, u32), CaseAggregate> = HashMap::new();
+    let mut results: HashMap<(String, u32, &'static str), CaseAggregate> = HashMap::new();
 
     for round in 1..=rounds {
         for strategy in &cache_strategies {
@@ -201,46 +241,71 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
 
             for &depth in &depths {
                 let key = key_for_depth_from_tip(fixture.tip_height, depth);
-                let measurement = measure_get_case(&mut fixture, &key, iters);
-                let elapsed_ms = measurement.elapsed_ms;
-                let us_per_op = (elapsed_ms * 1000.0) / (iters as f64);
-                let alloc_calls_per_op = (measurement.snapshot.alloc_calls as f64) / (iters as f64);
-                let alloc_bytes_per_op = (measurement.snapshot.alloc_bytes as f64) / (iters as f64);
+                for &variant in variants {
+                    let measurement = measure_case(&mut fixture, &key, iters, variant);
+                    let elapsed_ms = measurement.elapsed_ms;
+                    let us_per_op = (elapsed_ms * 1000.0) / (iters as f64);
+                    let alloc_calls_per_op =
+                        (measurement.snapshot.alloc_calls as f64) / (iters as f64);
+                    let alloc_bytes_per_op =
+                        (measurement.snapshot.alloc_bytes as f64) / (iters as f64);
 
-                if output_mode.is_raw() {
-                    println!(
-                        "result\tround={round}\tstrategy={strategy}\tdepth={depth}\telapsed_ms={elapsed_ms:.3}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\tus_per_op={us_per_op:.6}\talloc_calls_per_op={alloc_calls_per_op:.6}\talloc_bytes_per_op={alloc_bytes_per_op:.6}",
-                        measurement.snapshot.alloc_calls,
-                        measurement.snapshot.alloc_bytes,
-                        measurement.snapshot.realloc_calls,
-                        measurement.snapshot.dealloc_calls,
-                        measurement.snapshot.dealloc_bytes,
-                    );
+                    if output_mode.is_raw() {
+                        println!(
+                            "result\tround={round}\tstrategy={strategy}\tdepth={depth}\tvariant={}\telapsed_ms={elapsed_ms:.3}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\tus_per_op={us_per_op:.6}\talloc_calls_per_op={alloc_calls_per_op:.6}\talloc_bytes_per_op={alloc_bytes_per_op:.6}",
+                            variant.name(),
+                            measurement.snapshot.alloc_calls,
+                            measurement.snapshot.alloc_bytes,
+                            measurement.snapshot.realloc_calls,
+                            measurement.snapshot.dealloc_calls,
+                            measurement.snapshot.dealloc_bytes,
+                        );
+                    }
+
+                    let agg = results
+                        .entry((strategy.to_string(), depth, variant.name()))
+                        .or_default();
+                    agg.total_ms += elapsed_ms;
+                    agg.alloc_calls += measurement.snapshot.alloc_calls;
+                    agg.alloc_bytes += measurement.snapshot.alloc_bytes;
                 }
-
-                let agg = results.entry((strategy.to_string(), depth)).or_default();
-                agg.total_ms += elapsed_ms;
-                agg.alloc_calls += measurement.snapshot.alloc_calls;
-                agg.alloc_bytes += measurement.snapshot.alloc_bytes;
             }
         }
     }
 
-    let mut summary = Summary::new("read-backptr", cache_strategies.len() * depths.len());
+    let mut summary = Summary::new(
+        benchmark_name,
+        cache_strategies.len() * depths.len() * variants.len(),
+    );
     for strategy in &cache_strategies {
         for &depth in &depths {
-            let key = (strategy.to_string(), depth);
-            let case = results
-                .get(&key)
-                .expect("missing case samples while summarizing read-backptr benchmark");
-            summary.push_line(
-                format!("{strategy}/depth={depth}"),
-                case.total_ms,
-                case.alloc_calls,
-                case.alloc_bytes,
-            );
+            for &variant in variants {
+                let key = (strategy.to_string(), depth, variant.name());
+                let case = results
+                    .get(&key)
+                    .expect("missing case samples while summarizing read-backptr benchmark");
+                summary.push_line(
+                    format!("{strategy}/depth={depth}/variant={}", variant.name()),
+                    case.total_ms,
+                    case.alloc_calls,
+                    case.alloc_bytes,
+                );
+            }
         }
     }
 
     Some(summary)
+}
+
+pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
+    run_with_variants(args, output_mode, "read-backptr", &READ_VARIANTS_GET)
+}
+
+pub fn run_proof(args: &[String], output_mode: OutputMode) -> Option<Summary> {
+    run_with_variants(
+        args,
+        output_mode,
+        "read-backptr-proof",
+        &READ_VARIANTS_PROOF,
+    )
 }

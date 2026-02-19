@@ -1394,19 +1394,17 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
     /// Make a merkle proof of inclusion from a path.
     /// If the path doesn't resolve, return an error (NotFoundError)
-    pub fn from_path(
+    fn from_path_with_value(
         storage: &mut TrieStorageConnection<T>,
         path: &TrieHash,
-        expected_value: &MARFValue,
         root_block_header: &T,
-    ) -> Result<TrieMerkleProof<T>, Error> {
+    ) -> Result<(MARFValue, TrieMerkleProof<T>), Error> {
         // accumulate proofs in reverse order -- each proof will be from an earlier and earlier
         // trie, so we'll reverse them in the end so the proof starts with the latest trie.
         let mut segment_proofs = vec![];
         let mut shunt_proofs = vec![];
         let mut block_header = root_block_header.clone();
-
-        loop {
+        let found_value = loop {
             storage.open_block(&block_header)?;
 
             trace!(
@@ -1450,35 +1448,12 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
             if cursor.ptr().id() == TrieNodeID::Leaf as u8 {
                 match reached_node {
-                    TrieNodeType::Leaf(ref data) => {
-                        if data.data != *expected_value {
-                            trace!(
-                                "Did not find leaf {:?} at {:?} (but got {:?})",
-                                expected_value,
-                                path,
-                                data
-                            );
-
-                            // if we're testing, then permit the prover to return an invalid proof
-                            // if the test requests it
-                            #[cfg(test)]
-                            {
-                                use std::env;
-                                if env::var("BLOCKSTACK_TEST_PROOF_ALLOW_INVALID")
-                                    == Ok("1".to_string())
-                                {
-                                    break;
-                                }
-                            }
-                            return Err(Error::NotFoundError);
-                        }
-                    }
+                    TrieNodeType::Leaf(ref data) => break data.data.clone(),
                     _ => {
                         trace!("Did not find leaf at {:?}", path);
                         return Err(Error::NotFoundError);
                     }
                 }
-                break;
             }
 
             storage.open_block(&block_header)?;
@@ -1491,7 +1466,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             block_header = storage
                 .get_block_from_local_id(backptr.back_block())?
                 .clone();
-        }
+        };
 
         assert_eq!(shunt_proofs.len(), segment_proofs.len());
 
@@ -1508,7 +1483,49 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             proof.append(shunt);
         }
 
-        Ok(TrieMerkleProof(proof))
+        Ok((found_value, TrieMerkleProof(proof)))
+    }
+
+    /// Make a merkle proof of inclusion from a path.
+    /// If the path doesn't resolve, return an error (NotFoundError)
+    pub fn from_path(
+        storage: &mut TrieStorageConnection<T>,
+        path: &TrieHash,
+        expected_value: &MARFValue,
+        root_block_header: &T,
+    ) -> Result<TrieMerkleProof<T>, Error> {
+        let (found_value, proof) =
+            TrieMerkleProof::from_path_with_value(storage, path, root_block_header)?;
+
+        if found_value != *expected_value {
+            trace!(
+                "Did not find leaf {:?} at {:?} (but got {:?})",
+                expected_value,
+                path,
+                found_value
+            );
+
+            // if we're testing, then permit the prover to return an invalid proof
+            // if the test requests it
+            #[cfg(test)]
+            {
+                use std::env;
+                if env::var("BLOCKSTACK_TEST_PROOF_ALLOW_INVALID") == Ok("1".to_string()) {
+                    return Ok(proof);
+                }
+            }
+            return Err(Error::NotFoundError);
+        }
+
+        Ok(proof)
+    }
+
+    pub(crate) fn from_path_lookup(
+        storage: &mut TrieStorageConnection<T>,
+        path: &TrieHash,
+        root_block_header: &T,
+    ) -> Result<(MARFValue, TrieMerkleProof<T>), Error> {
+        TrieMerkleProof::from_path_with_value(storage, path, root_block_header)
     }
 
     /// Make a merkle proof of inclusion from a key/value pair.

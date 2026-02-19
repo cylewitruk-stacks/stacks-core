@@ -19,7 +19,9 @@ enum OutputFormat {
 enum BenchKind {
     NodeAlloc,
     Read,
+    ReadProof,
     ReadBackptr,
+    ReadBackptrProof,
     Write,
 }
 
@@ -28,7 +30,9 @@ impl BenchKind {
         match self {
             Self::NodeAlloc => "node-alloc",
             Self::Read => "read",
+            Self::ReadProof => "read-proof",
             Self::ReadBackptr => "read-backptr",
+            Self::ReadBackptrProof => "read-backptr-proof",
             Self::Write => "write",
         }
     }

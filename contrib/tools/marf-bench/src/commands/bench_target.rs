@@ -11,8 +11,12 @@ pub(crate) enum BenchTarget {
     NodeAlloc(NodeAllocArgs),
     #[command(about = "Run read bench")]
     Read(ReadArgs),
+    #[command(name = "read-proof", about = "Run read-proof bench")]
+    ReadProof(ReadArgs),
     #[command(name = "read-backptr", about = "Run read-backptr bench")]
     ReadBackptr(ReadBackptrArgs),
+    #[command(name = "read-backptr-proof", about = "Run read-backptr-proof bench")]
+    ReadBackptrProof(ReadBackptrArgs),
     #[command(about = "Run write bench")]
     Write(WriteArgs),
 }
@@ -52,6 +56,29 @@ impl BenchTarget {
                     },
                 ),
                 BenchRunRequest::new(
+                    BenchKind::ReadProof,
+                    BenchEnvOverrides {
+                        iters: args.iters,
+                        rounds: args.rounds,
+                        chain_len: args.chain_len,
+                        keys_per_block: args.keys_per_block,
+                        depths: args.depths.clone(),
+                        cache_strategies: args.cache_strategies.clone(),
+                        ..Default::default()
+                    },
+                ),
+                BenchRunRequest::new(
+                    BenchKind::ReadBackptrProof,
+                    BenchEnvOverrides {
+                        iters: args.iters,
+                        rounds: args.rounds,
+                        chain_len: args.chain_len,
+                        depths: args.depths.clone(),
+                        cache_strategies: args.cache_strategies.clone(),
+                        ..Default::default()
+                    },
+                ),
+                BenchRunRequest::new(
                     BenchKind::Write,
                     BenchEnvOverrides {
                         rounds: args.rounds,
@@ -79,8 +106,31 @@ impl BenchTarget {
                     ..Default::default()
                 },
             )],
+            Self::ReadProof(args) => vec![BenchRunRequest::new(
+                BenchKind::ReadProof,
+                BenchEnvOverrides {
+                    iters: args.iters,
+                    rounds: args.rounds,
+                    chain_len: args.chain_len,
+                    keys_per_block: args.keys_per_block,
+                    depths: args.depths,
+                    cache_strategies: args.cache_strategies,
+                    ..Default::default()
+                },
+            )],
             Self::ReadBackptr(args) => vec![BenchRunRequest::new(
                 BenchKind::ReadBackptr,
+                BenchEnvOverrides {
+                    iters: args.iters,
+                    rounds: args.rounds,
+                    chain_len: args.chain_len,
+                    depths: args.depths,
+                    cache_strategies: args.cache_strategies,
+                    ..Default::default()
+                },
+            )],
+            Self::ReadBackptrProof(args) => vec![BenchRunRequest::new(
+                BenchKind::ReadBackptrProof,
                 BenchEnvOverrides {
                     iters: args.iters,
                     rounds: args.rounds,
@@ -113,7 +163,10 @@ pub(crate) struct AllArgs {
     )]
     rounds: Option<usize>,
 
-    #[arg(long, help = "Set CHAIN_LEN for read/read-backptr fixture length")]
+    #[arg(
+        long,
+        help = "Set CHAIN_LEN for read/read-proof/read-backptr/read-backptr-proof fixture length"
+    )]
     chain_len: Option<u32>,
 
     #[arg(long, help = "Set KEYS_PER_BLOCK for read fixture density")]

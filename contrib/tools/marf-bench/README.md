@@ -12,6 +12,8 @@ This document explains the git operations it performs, what they change (or do n
   - `cargo marf-bench bench --base staged read`
 - Compare two named revisions (branch/tag/commit):
   - `cargo marf-bench bench --base master --target v3.0.0.0.0 read-backptr`
+- Run proofed read benchmark separately:
+  - `cargo marf-bench bench --base staged read-proof`
 - Run everything with machine-readable output:
   - `cargo marf-bench bench --base staged --output-format tsv all`
 - Override benchmark loop controls from CLI:
@@ -22,8 +24,8 @@ This document explains the git operations it performs, what they change (or do n
 
 ## Command shape
 
-- `run`: `cargo marf-bench run [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-backptr|write> [bench-specific options]`
-- `bench`: `cargo marf-bench bench [--base <rev>] [--target <rev>] [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-backptr|write> [bench-specific options]`
+- `run`: `cargo marf-bench run [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-proof|read-backptr|read-backptr-proof|write> [bench-specific options]`
+- `bench`: `cargo marf-bench bench [--base <rev>] [--target <rev>] [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-proof|read-backptr|read-backptr-proof|write> [bench-specific options]`
 
 Notes:
 
@@ -43,6 +45,17 @@ Bench-specific options are accepted on the bench target subcommands and are forw
 - `--key-search-max-tries <N>` sets `KEY_SEARCH_MAX_TRIES`
 
 These flags are useful for automation since callers can avoid command-specific env var conditionals.
+
+## Raw output notes
+
+When `--output-format raw` (or `MARF_ALLOC_OUTPUT=raw`) is used, `read`, `read-proof`,
+`read-backptr`, and `read-backptr-proof`
+bench `result` lines now include:
+
+- `variant=get`
+- `variant=get-with-proof`
+
+This allows direct side-by-side comparison of plain reads and proofed reads within the same depth/strategy case.
 
 ## High-level lifecycle
 
