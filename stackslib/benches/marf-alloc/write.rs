@@ -21,11 +21,8 @@
 //! - `seal()`, and
 //! - flush/commit to disk (`commit_flush`).
 //!
-//! Output format is line-oriented and parse-friendly:
-//! - `config\t...`: effective benchmark configuration.
-//! - `keys\t...`: metadata about the generated key set used to force promotions.
-//! - `result\t...`: per-round/per-step timing and allocation totals + per-item rates.
-//! - `summary\t...`: aggregate per strategy/step over all rounds.
+//! In `MARF_ALLOC_OUTPUT=raw`, this emits line-oriented `config`, `keys`, and
+//! `result` records. Unified summary rows are emitted by `main.rs`.
 //!
 //! Environment variables:
 //! - `WRITE_ROUNDS` (default `2`): number of independent workflow repetitions.
@@ -45,17 +42,19 @@ use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use tempfile::TempDir;
 
 use crate::allocator::{reset_stats, snapshot, Snapshot};
+use crate::utils::{block_id, has_help_flag, parse_usize_env};
+use crate::{OutputMode, Summary};
 
 const DEFAULT_WRITE_ROUNDS: usize = 2;
 const DEFAULT_KEY_SEARCH_MAX_TRIES: usize = 200_000;
 const REQUIRED_BRANCHES: usize = 49;
 const WRITE_CACHE_STRATEGIES: [&str; 2] = ["noop", "node256"];
 
-#[derive(Clone, Copy)]
-struct StepSample {
-    us_per_item: f64,
-    alloc_calls_per_item: f64,
-    alloc_bytes_per_item: f64,
+#[derive(Clone, Copy, Default)]
+struct StepAggregate {
+    total_ms: f64,
+    alloc_calls: u64,
+    alloc_bytes: u64,
 }
 
 struct StepMeasurement {
@@ -133,32 +132,21 @@ struct PromotionKeys {
     search_tries: usize,
 }
 
-fn parse_usize_env(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
 #[rustfmt::skip]
 fn print_usage(args: &[String]) {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if has_help_flag(args) {
         println!("write: step-wise MARF write workflow profiler");
         println!();
         println!("Environment variables:");
-        println!("  WRITE_ROUNDS          (default {DEFAULT_WRITE_ROUNDS}) independent rounds per strategy"
-        );
-        println!(
-            "  KEY_SEARCH_MAX_TRIES  (default {DEFAULT_KEY_SEARCH_MAX_TRIES}) max key candidates when searching for promotion-driving keys"
-        );
+        println!("  WRITE_ROUNDS          independent rounds per strategy [default {DEFAULT_WRITE_ROUNDS}]");
+        println!("  KEY_SEARCH_MAX_TRIES  max key candidates when searching for promotion-driving keys [default {DEFAULT_KEY_SEARCH_MAX_TRIES}]");
+        println!("  MARF_ALLOC_OUTPUT     output mode ('summary' | 'raw') [default: summary]");
         println!();
         println!("Output lines:");
         println!("  config   Effective configuration");
         println!("  keys     Metadata about generated key set used to drive node promotions");
-        println!(
-            "  result   Per-round/per-step elapsed time and allocation totals + per-item rates"
-        );
-        println!("  summary  Aggregated per strategy/step over all rounds");
+        println!("  result   Per-round/per-step elapsed time and allocation totals + per-item rates");
+        println!("  summary  Unified summary lines emitted by marf-alloc main");
         return;
     }
 }
@@ -175,16 +163,6 @@ where
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         snapshot: snapshot(),
     })
-}
-
-fn average(values: &[f64]) -> f64 {
-    values.iter().sum::<f64>() / (values.len() as f64)
-}
-
-fn block_id(seed: u32) -> StacksBlockId {
-    let mut bytes = [0u8; 32];
-    bytes[..4].copy_from_slice(&seed.to_be_bytes());
-    StacksBlockId::from(bytes)
 }
 
 fn make_values(start: u32, count: usize) -> Vec<MARFValue> {
@@ -260,18 +238,20 @@ fn find_promotion_keys(seed_prefix: &str, max_tries: usize) -> PromotionKeys {
     );
 }
 
-fn run_workflow() -> Result<(), IndexError> {
+fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
     let rounds = parse_usize_env("WRITE_ROUNDS", DEFAULT_WRITE_ROUNDS);
     let max_tries = parse_usize_env("KEY_SEARCH_MAX_TRIES", DEFAULT_KEY_SEARCH_MAX_TRIES);
 
     assert!(rounds > 0, "WRITE_ROUNDS must be > 0");
     assert!(max_tries > 0, "KEY_SEARCH_MAX_TRIES must be > 0");
 
-    println!(
-        "config\twrite_rounds={rounds}\tkey_search_max_tries={max_tries}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
-    );
+    if output_mode.is_raw() {
+        println!(
+            "config\twrite_rounds={rounds}\tkey_search_max_tries={max_tries}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
+        );
+    }
 
-    let mut results: HashMap<(String, String), Vec<StepSample>> = HashMap::new();
+    let mut results: HashMap<(String, String), StepAggregate> = HashMap::new();
 
     for round in 1..=rounds {
         for (strategy_idx, strategy) in WRITE_CACHE_STRATEGIES.into_iter().enumerate() {
@@ -287,12 +267,14 @@ fn run_workflow() -> Result<(), IndexError> {
 
             let promotion_keys =
                 find_promotion_keys(&format!("write-profile:{strategy}:{round}"), max_tries);
-            println!(
-                "keys\tround={round}\tstrategy={strategy}\tshared_first_byte={}\tsearch_tries={}\tkey_count={}",
-                promotion_keys.shared_first_byte,
-                promotion_keys.search_tries,
-                promotion_keys.keys.len()
-            );
+            if output_mode.is_raw() {
+                println!(
+                    "keys\tround={round}\tstrategy={strategy}\tshared_first_byte={}\tsearch_tries={}\tkey_count={}",
+                    promotion_keys.shared_first_byte,
+                    promotion_keys.search_tries,
+                    promotion_keys.keys.len()
+                );
+            }
 
             let mut tx = marf.begin_tx()?;
 
@@ -304,6 +286,7 @@ fn run_workflow() -> Result<(), IndexError> {
                 "begin_block",
                 1,
                 begin_measurement,
+                output_mode,
             );
 
             let mut value_cursor = 10_000u32;
@@ -320,11 +303,20 @@ fn run_workflow() -> Result<(), IndexError> {
                     step.name,
                     keys.len(),
                     measurement,
+                    output_mode,
                 );
             }
 
             let seal_measurement = measure_step(|| tx.seal())?;
-            emit_result_and_store(&mut results, round, strategy, "seal", 1, seal_measurement);
+            emit_result_and_store(
+                &mut results,
+                round,
+                strategy,
+                "seal",
+                1,
+                seal_measurement,
+                output_mode,
+            );
 
             let commit_measurement = measure_step(|| tx.commit())?;
             emit_result_and_store(
@@ -334,75 +326,67 @@ fn run_workflow() -> Result<(), IndexError> {
                 "commit_flush",
                 1,
                 commit_measurement,
+                output_mode,
             );
         }
     }
 
-    println!(
-        "summary\tstrategy\tstep\tavg_us_per_item\tmin_us_per_item\tmax_us_per_item\tavg_alloc_calls_per_item\tavg_alloc_bytes_per_item"
-    );
+    let mut summary = Summary::new("write", WRITE_CACHE_STRATEGIES.len() * STEP_ORDER.len());
     for strategy in WRITE_CACHE_STRATEGIES {
         for step in STEP_ORDER {
             let key = (strategy.to_string(), step.to_string());
-            let samples = results
+            let agg = results
                 .get(&key)
                 .expect("missing step samples while summarizing write profile");
-
-            let us: Vec<f64> = samples.iter().map(|s| s.us_per_item).collect();
-            let alloc_calls: Vec<f64> = samples.iter().map(|s| s.alloc_calls_per_item).collect();
-            let alloc_bytes: Vec<f64> = samples.iter().map(|s| s.alloc_bytes_per_item).collect();
-
-            let avg_us = average(&us);
-            let min_us = us.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max_us = us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let avg_alloc_calls = average(&alloc_calls);
-            let avg_alloc_bytes = average(&alloc_bytes);
-
-            println!(
-                "summary\t{strategy}\t{step}\t{avg_us:.6}\t{min_us:.6}\t{max_us:.6}\t{avg_alloc_calls:.6}\t{avg_alloc_bytes:.6}"
+            summary.push_line(
+                format!("{strategy}/{step}"),
+                agg.total_ms,
+                agg.alloc_calls,
+                agg.alloc_bytes,
             );
         }
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 fn emit_result_and_store(
-    results: &mut HashMap<(String, String), Vec<StepSample>>,
+    results: &mut HashMap<(String, String), StepAggregate>,
     round: usize,
     strategy: &str,
     step: &str,
     items: usize,
     measurement: StepMeasurement,
+    output_mode: OutputMode,
 ) {
     let elapsed_ms = measurement.elapsed_ms;
     let us_per_item = (elapsed_ms * 1000.0) / (items as f64);
     let alloc_calls_per_item = (measurement.snapshot.alloc_calls as f64) / (items as f64);
     let alloc_bytes_per_item = (measurement.snapshot.alloc_bytes as f64) / (items as f64);
 
-    println!(
-        "result\tround={round}\tstrategy={strategy}\tstep={step}\titems={items}\telapsed_ms={elapsed_ms:.3}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\tus_per_item={us_per_item:.6}\talloc_calls_per_item={alloc_calls_per_item:.6}\talloc_bytes_per_item={alloc_bytes_per_item:.6}",
-        measurement.snapshot.alloc_calls,
-        measurement.snapshot.alloc_bytes,
-        measurement.snapshot.realloc_calls,
-        measurement.snapshot.dealloc_calls,
-        measurement.snapshot.dealloc_bytes,
-    );
+    if output_mode.is_raw() {
+        println!(
+            "result\tround={round}\tstrategy={strategy}\tstep={step}\titems={items}\telapsed_ms={elapsed_ms:.3}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\tus_per_item={us_per_item:.6}\talloc_calls_per_item={alloc_calls_per_item:.6}\talloc_bytes_per_item={alloc_bytes_per_item:.6}",
+            measurement.snapshot.alloc_calls,
+            measurement.snapshot.alloc_bytes,
+            measurement.snapshot.realloc_calls,
+            measurement.snapshot.dealloc_calls,
+            measurement.snapshot.dealloc_bytes,
+        );
+    }
 
-    results
+    let agg = results
         .entry((strategy.to_string(), step.to_string()))
-        .or_default()
-        .push(StepSample {
-            us_per_item,
-            alloc_calls_per_item,
-            alloc_bytes_per_item,
-        });
+        .or_default();
+    agg.total_ms += elapsed_ms;
+    agg.alloc_calls += measurement.snapshot.alloc_calls;
+    agg.alloc_bytes += measurement.snapshot.alloc_bytes;
 }
 
-pub fn run(args: &[String]) {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
+    if has_help_flag(args) {
         print_usage(args);
-        return;
+        return None;
     }
-    run_workflow().expect("marf_write_profile failed");
+    Some(run_workflow(output_mode).expect("marf_write_profile failed"))
 }

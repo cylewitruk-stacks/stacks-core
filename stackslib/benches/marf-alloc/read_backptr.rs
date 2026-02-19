@@ -13,11 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Read-heavy MARF timing benchmark focused on `MARF::get` backpointer walks.
+//! Focused MARF::get benchmark tuned for deep backpointer walking.
 //!
 //! In `MARF_ALLOC_OUTPUT=raw`, this emits line-oriented `config` and `result`
 //! records per round/case. Unified summary rows are emitted by `main.rs`.
-//! Run `read --help` for user-facing configuration details.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -36,11 +35,10 @@ use crate::utils::{
 };
 use crate::{OutputMode, Summary};
 
-const DEFAULT_CHAIN_LEN: u32 = 512;
+const DEFAULT_CHAIN_LEN: u32 = 2048;
 const DEFAULT_READ_ITERS: usize = 200_000;
 const DEFAULT_READ_ROUNDS: usize = 2;
-const DEFAULT_KEYS_PER_BLOCK: u32 = 4;
-const DEFAULT_DEPTHS: [u32; 4] = [32, 128, 256, 511];
+const DEFAULT_DEPTHS: [u32; 4] = [256, 768, 1536, 2047];
 const DEFAULT_CACHE_STRATEGIES: [&str; 2] = ["noop", "node256"];
 
 #[derive(Clone, Copy, Default)]
@@ -72,31 +70,23 @@ fn print_usage(args: &[String]) {
             .join(",");
         let default_cache_strategies = DEFAULT_CACHE_STRATEGIES.join(",");
 
-        println!("read: MARF::get backpointer read benchmark");
+        println!("read-backptr: focused MARF::get backpointer-walk benchmark");
         println!();
         println!("Environment variables:");
-        println!("  CHAIN_LEN   blocks in fixture; must be > max depth [default: {DEFAULT_CHAIN_LEN}]");
-        println!("              Higher values increase fixture construction time and temporary DB size");
-        println!("  READ_ITERS  reads per measured case [default: {DEFAULT_READ_ITERS}]");
-        println!("              Higher values reduce measurement noise but increase runtime linearly");
-        println!("              Affects elapsed_ms/alloc totals directly; per-op metrics remain normalized");
-        println!("  READ_ROUNDS (default 2) independent repetitions per case");
-        println!("              Higher values improve stability estimates (summary min/max)");
-        println!("  KEYS_PER_BLOCK number of keys inserted per fixture block [default: {DEFAULT_KEYS_PER_BLOCK}]");
-        println!("              Must be >= 1; higher values make each fixture block denser");
-        println!("  DEPTHS      comma-separated depths [default: {default_depths}]");
-        println!("              Example: DEPTHS=16,64,255");
-        println!("  CACHE_STRATEGIES comma-separated MARF cache strategies [default: {default_cache_strategies}]");
-        println!("              Example: CACHE_STRATEGIES=noop,node256,everything");
-        println!("  MARF_ALLOC_OUTPUT output mode [default: summary]");
-        println!("              'summary': unified summary lines only");
-        println!("              'raw': config/result lines + unified summary lines");
+        println!("  BACKPTR_CHAIN_LEN   blocks in fixture; must be > max depth [default: {DEFAULT_CHAIN_LEN}]");
+        println!("  BACKPTR_READ_ITERS  reads per measured case [default: {DEFAULT_READ_ITERS}]");
+        println!("  BACKPTR_READ_ROUNDS independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
+        println!("  BACKPTR_DEPTHS      comma-separated depths [default: {default_depths}]");
+        println!("                      Example: BACKPTR_DEPTHS=128,512,1024");
+        println!("  BACKPTR_CACHE_STRATEGIES comma-separated cache strategies [default: {default_cache_strategies}]");
+        println!("  MARF_ALLOC_OUTPUT   output mode [default: summary]");
+        println!("                      'summary': unified summary lines only");
+        println!("                      'raw': config/result lines + unified summary lines");
         println!();
         println!("Output lines:");
         println!("  config  Effective benchmark settings");
         println!("  result  Per-round measurement: strategy/depth/time + alloc totals + per-op metrics");
         println!("  summary Unified summary lines emitted by marf-alloc main");
-        return;
     }
 }
 
@@ -109,18 +99,19 @@ fn key_for_depth_from_tip(tip_height: u32, depth: u32) -> String {
     depth_key(tip_height - depth)
 }
 
-fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> MarfReadFixture {
+fn make_fixture(cache_strategy: &str, chain_len: u32) -> MarfReadFixture {
     let db_dir = tempfile::Builder::new()
-        .prefix(&format!("marf-read-profile-{cache_strategy}-"))
+        .prefix(&format!("marf-read-backptr-{cache_strategy}-"))
         .tempdir()
-        .expect("failed to create MARF read benchmark dir");
-    let db_path = db_dir.path().join("marf-read.sqlite");
+        .expect("failed to create MARF read-backptr benchmark dir");
+    let db_path = db_dir.path().join("marf-read-backptr.sqlite");
     let db_path_str = db_path
         .to_str()
-        .expect("failed to convert MARF read benchmark path to UTF-8");
+        .expect("failed to convert MARF read-backptr benchmark path to UTF-8")
+        .to_string();
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, cache_strategy, true);
-    let mut marf =
-        MARF::from_path(db_path_str, open_opts).expect("failed to open MARF for read profile");
+    let mut writer_marf = MARF::from_path(&db_path_str, open_opts.clone())
+        .expect("failed to open MARF for read-backptr fixture build");
 
     let mut parent = StacksBlockId::sentinel();
     let mut tip = parent.clone();
@@ -128,33 +119,27 @@ fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> Ma
     for height in 1..=chain_len {
         let next = block_id(height);
 
-        let mut tx = marf
+        let mut tx = writer_marf
             .begin_tx()
-            .expect("failed to begin tx while building read profile fixture");
+            .expect("failed to begin tx while building read-backptr fixture");
         tx.begin(&parent, &next)
-            .expect("failed to begin block extension while building read profile fixture");
+            .expect("failed to begin block extension while building read-backptr fixture");
 
-        let mut keys = Vec::with_capacity(keys_per_block as usize);
-        let mut values = Vec::with_capacity(keys_per_block as usize);
-
-        keys.push(depth_key(height));
-        values.push(MARFValue::from(height));
-
-        for noise_ix in 0..(keys_per_block - 1) {
-            keys.push(format!("noise:{height:08x}:{noise_ix:02x}"));
-            values.push(MARFValue::from(
-                height.wrapping_mul(97).wrapping_add(noise_ix + 1),
-            ));
-        }
+        let keys = vec![depth_key(height)];
+        let values = vec![MARFValue::from(height)];
 
         tx.insert_batch(&keys, values)
             .expect("failed to insert fixture keys");
         tx.commit()
-            .expect("failed to commit block while building read profile fixture");
+            .expect("failed to commit block while building read-backptr fixture");
 
         parent = next.clone();
         tip = next;
     }
+
+    drop(writer_marf);
+    let marf = MARF::from_path(&db_path_str, open_opts)
+        .expect("failed to reopen persisted MARF for read-backptr benchmark");
 
     MarfReadFixture {
         marf,
@@ -172,7 +157,7 @@ fn measure_get_case(fixture: &mut MarfReadFixture, key: &str, iters: usize) -> C
             fixture
                 .marf
                 .get(&fixture.tip, key)
-                .expect("MARF::get failed in read profile"),
+                .expect("MARF::get failed in read-backptr benchmark"),
         );
     }
     CaseMeasurement {
@@ -187,26 +172,25 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
         return None;
     }
 
-    let chain_len = parse_u32_env("CHAIN_LEN", DEFAULT_CHAIN_LEN);
-    let iters = parse_usize_env("READ_ITERS", DEFAULT_READ_ITERS);
-    let rounds = parse_usize_env("READ_ROUNDS", DEFAULT_READ_ROUNDS);
-    let keys_per_block = parse_u32_env("KEYS_PER_BLOCK", DEFAULT_KEYS_PER_BLOCK);
-    let depths = parse_csv_u32_env("DEPTHS", &DEFAULT_DEPTHS);
-    let cache_strategies = parse_csv_string_env("CACHE_STRATEGIES", &DEFAULT_CACHE_STRATEGIES);
+    let chain_len = parse_u32_env("BACKPTR_CHAIN_LEN", DEFAULT_CHAIN_LEN);
+    let iters = parse_usize_env("BACKPTR_READ_ITERS", DEFAULT_READ_ITERS);
+    let rounds = parse_usize_env("BACKPTR_READ_ROUNDS", DEFAULT_READ_ROUNDS);
+    let depths = parse_csv_u32_env("BACKPTR_DEPTHS", &DEFAULT_DEPTHS);
+    let cache_strategies =
+        parse_csv_string_env("BACKPTR_CACHE_STRATEGIES", &DEFAULT_CACHE_STRATEGIES);
 
-    assert!(iters > 0, "READ_ITERS must be > 0");
-    assert!(rounds > 0, "READ_ROUNDS must be > 0");
-    assert!(keys_per_block > 0, "KEYS_PER_BLOCK must be >= 1");
+    assert!(iters > 0, "BACKPTR_READ_ITERS must be > 0");
+    assert!(rounds > 0, "BACKPTR_READ_ROUNDS must be > 0");
 
     let max_depth = *depths.iter().max().expect("depth list must not be empty");
     assert!(
         chain_len > max_depth,
-        "CHAIN_LEN ({chain_len}) must be greater than max depth ({max_depth})"
+        "BACKPTR_CHAIN_LEN ({chain_len}) must be greater than max depth ({max_depth})"
     );
 
     if output_mode.is_raw() {
         println!(
-            "config\tchain_len={chain_len}\tread_iters={iters}\tread_rounds={rounds}\tkeys_per_block={keys_per_block}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
+            "config\tchain_len={chain_len}\tread_iters={iters}\tread_rounds={rounds}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
         );
     }
 
@@ -214,7 +198,7 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
 
     for round in 1..=rounds {
         for strategy in &cache_strategies {
-            let mut fixture = make_fixture(strategy, chain_len, keys_per_block);
+            let mut fixture = make_fixture(strategy, chain_len);
 
             for &depth in &depths {
                 let key = key_for_depth_from_tip(fixture.tip_height, depth);
@@ -243,13 +227,13 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
         }
     }
 
-    let mut summary = Summary::new("read", cache_strategies.len() * depths.len());
+    let mut summary = Summary::new("read-backptr", cache_strategies.len() * depths.len());
     for strategy in &cache_strategies {
         for &depth in &depths {
             let key = (strategy.to_string(), depth);
             let case = results
                 .get(&key)
-                .expect("missing case samples while summarizing read profile");
+                .expect("missing case samples while summarizing read-backptr benchmark");
             summary.push_line(
                 format!("{strategy}/depth={depth}"),
                 case.total_ms,

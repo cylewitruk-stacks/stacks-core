@@ -15,8 +15,9 @@
 
 //! Allocation-focused micro-benchmark for trie node construction/clone/decode.
 //!
-//! Output format is one line per case:
-//! `{case}\talloc_calls=...\talloc_bytes=...\trealloc_calls=...\tdealloc_calls=...\tdealloc_bytes=...\telapsed_ms=...`
+//! In `MARF_ALLOC_OUTPUT=raw`, this emits detailed per-case lines.
+//! In all modes, the unified `summary\tbenchmark\tname\t...` output is emitted
+//! by `main.rs`.
 //!
 //! Environment variables:
 //! - `ITERS` (default `200000`): iterations per case.
@@ -35,34 +36,38 @@ use blockstack_lib::chainstate::stacks::index::{bits, TrieLeaf};
 use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 
 use crate::allocator::{reset_stats, snapshot};
+use crate::utils::{has_help_flag, parse_usize_env};
+use crate::{OutputMode, Summary};
 
 const DEFAULT_ITERS: usize = 200_000;
 
-fn parse_usize_env(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default)
+#[derive(Clone, Copy)]
+struct CaseStats {
+    alloc_calls: u64,
+    alloc_bytes: u64,
+    elapsed_ms: f64,
 }
 
 #[rustfmt::skip]
 fn print_usage(args: &[String]) {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if has_help_flag(args) {
         println!("node-alloc: allocation profiling micro-benchmark for trie nodes");
         println!();
         println!("Environment variables:");
         println!("  ITERS iterations per measured case [default: {DEFAULT_ITERS}]");
         println!("        Higher values reduce timer noise but increase runtime linearly");
         println!("        Allocation counters are total counts/bytes across all iterations");
+        println!("  MARF_ALLOC_OUTPUT output mode [default: summary]");
+        println!("        'summary': unified summary lines only");
+        println!("        'raw': detailed per-case lines + unified summary lines");
         println!();
         println!("Output:");
-        println!("  One tab-separated line per case with alloc/realloc/dealloc totals");
-        println!("  and elapsed_ms for the whole case.");
+        println!("  summary\\tbenchmark\\tname\\ttotal_ms\\talloc_count\\talloc_bytes");
         return;
     }
 }
 
-fn run_case<F>(name: &str, mut f: F)
+fn run_case<F>(name: &str, mode: OutputMode, mut f: F) -> CaseStats
 where
     F: FnMut(),
 {
@@ -71,15 +76,30 @@ where
     f();
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     let stats = snapshot();
-    println!(
-        "{name}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\telapsed_ms={:.2}",
-        stats.alloc_calls,
-        stats.alloc_bytes,
-        stats.realloc_calls,
-        stats.dealloc_calls,
-        stats.dealloc_bytes,
-        elapsed_ms
-    );
+    if mode.is_raw() {
+        println!(
+            "{name}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\telapsed_ms={:.2}",
+            stats.alloc_calls,
+            stats.alloc_bytes,
+            stats.realloc_calls,
+            stats.dealloc_calls,
+            stats.dealloc_bytes,
+            elapsed_ms
+        );
+    }
+    CaseStats {
+        alloc_calls: stats.alloc_calls,
+        alloc_bytes: stats.alloc_bytes,
+        elapsed_ms,
+    }
+}
+
+fn record_case<F>(summary: &mut Summary, name: &str, mode: OutputMode, f: F)
+where
+    F: FnMut(),
+{
+    let stats = run_case(name, mode, f);
+    summary.push_line(name, stats.elapsed_ms, stats.alloc_calls, stats.alloc_bytes);
 }
 
 fn sample_path() -> [u8; TRIEHASH_ENCODED_SIZE] {
@@ -117,10 +137,10 @@ fn serialize_nodetype(node: &TrieNodeType) -> Vec<u8> {
     cursor.into_inner()
 }
 
-pub fn run(args: &[String]) {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
+    if has_help_flag(args) {
         print_usage(args);
-        return;
+        return None;
     }
 
     let iters = parse_usize_env("ITERS", DEFAULT_ITERS);
@@ -138,51 +158,55 @@ pub fn run(args: &[String]) {
     let encoded_node256 = serialize_nodetype(&TrieNodeType::Node256(Box::new(node256.clone())));
     let encoded_leaf = serialize_nodetype(&TrieNodeType::Leaf(leaf.clone()));
 
-    println!("iters={iters}");
+    if output_mode.is_raw() {
+        println!("iters={iters}");
+    }
 
-    run_case("new_node4", || {
+    let mut summary = Summary::new("node-alloc", 10);
+
+    record_case(&mut summary, "new_node4", output_mode, || {
         for _ in 0..iters {
             black_box(TrieNode4::new(&path));
         }
     });
 
-    run_case("new_node16", || {
+    record_case(&mut summary, "new_node16", output_mode, || {
         for _ in 0..iters {
             black_box(TrieNode16::new(&path));
         }
     });
 
-    run_case("clone_node4", || {
+    record_case(&mut summary, "clone_node4", output_mode, || {
         for _ in 0..iters {
             black_box(node4.clone());
         }
     });
 
-    run_case("clone_node16", || {
+    record_case(&mut summary, "clone_node16", output_mode, || {
         for _ in 0..iters {
             black_box(node16.clone());
         }
     });
 
-    run_case("clone_node256", || {
+    record_case(&mut summary, "clone_node256", output_mode, || {
         for _ in 0..iters {
             black_box(node256.clone());
         }
     });
 
-    run_case("new_leaf", || {
+    record_case(&mut summary, "new_leaf", output_mode, || {
         for _ in 0..iters {
             black_box(TrieLeaf::new(&path, &leaf_data));
         }
     });
 
-    run_case("clone_leaf", || {
+    record_case(&mut summary, "clone_leaf", output_mode, || {
         for _ in 0..iters {
             black_box(leaf.clone());
         }
     });
 
-    run_case("decode_node4_nohash", || {
+    record_case(&mut summary, "decode_node4_nohash", output_mode, || {
         for _ in 0..iters {
             let mut cursor = Cursor::new(encoded_node4.as_slice());
             black_box(
@@ -192,7 +216,7 @@ pub fn run(args: &[String]) {
         }
     });
 
-    run_case("decode_leaf_nohash", || {
+    record_case(&mut summary, "decode_leaf_nohash", output_mode, || {
         for _ in 0..iters {
             let mut cursor = Cursor::new(encoded_leaf.as_slice());
             black_box(
@@ -202,7 +226,7 @@ pub fn run(args: &[String]) {
         }
     });
 
-    run_case("decode_node256_nohash", || {
+    record_case(&mut summary, "decode_node256_nohash", output_mode, || {
         for _ in 0..iters {
             let mut cursor = Cursor::new(encoded_node256.as_slice());
             black_box(
@@ -211,4 +235,6 @@ pub fn run(args: &[String]) {
             );
         }
     });
+
+    Some(summary)
 }

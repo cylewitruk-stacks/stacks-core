@@ -1,0 +1,77 @@
+// Copyright (C) 2026 Stacks Open Internet Foundation
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use std::str::FromStr;
+
+use stacks_common::types::chainstate::StacksBlockId;
+
+pub fn has_help_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "-h" || arg == "--help")
+}
+
+pub fn parse_usize_env(name: &str, default: usize) -> usize {
+    parse_env_or_default(name, default)
+}
+
+pub fn parse_u32_env(name: &str, default: u32) -> u32 {
+    parse_env_or_default(name, default)
+}
+
+pub fn parse_csv_u32_env(name: &str, default: &[u32]) -> Vec<u32> {
+    parse_csv_env(name, default, "integer")
+}
+
+pub fn parse_csv_string_env(name: &str, default: &[&str]) -> Vec<String> {
+    let defaults: Vec<String> = default.iter().map(|s| (*s).to_string()).collect();
+    parse_csv_env(name, &defaults, "string")
+}
+
+pub fn block_id(seed: u32) -> StacksBlockId {
+    let mut bytes = [0u8; 32];
+    bytes[..4].copy_from_slice(&seed.to_be_bytes());
+    StacksBlockId::from(bytes)
+}
+
+fn parse_env_or_default<T>(name: &str, default: T) -> T
+where
+    T: FromStr,
+{
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<T>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_csv_env<T>(name: &str, default: &[T], value_kind: &str) -> Vec<T>
+where
+    T: FromStr + Clone,
+{
+    let Some(raw) = std::env::var(name).ok() else {
+        return default.to_vec();
+    };
+
+    let parsed: Vec<T> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<T>()
+                .unwrap_or_else(|_| panic!("invalid {name} {value_kind} entry: '{s}'"))
+        })
+        .collect();
+
+    assert!(!parsed.is_empty(), "{name} must contain at least one value");
+    parsed
+}

@@ -13,10 +13,11 @@ members = [
     "stacks-node",
     "contrib/stacks-inspect",
     "contrib/clarity-cli",
-    "contrib/stacks-cli"
+    "contrib/stacks-cli",
+    "contrib/tools/marf-bench",
 ]
 
-exclude = ["contrib/tools/config-docs-generator"]
+exclude = ["contrib/tools/config-docs-generator", "contrib/tools/marf-bench"]
 
 # Dependencies we want to keep the same between workspace members
 [workspace.dependencies]
@@ -59,6 +60,10 @@ lto = "fat"
 [profile.release-lite]
 inherits = "release"
 lto = "thin"
+
+[profile.bench]
+inherits = "release"
+debug = false
 
 # faster tests for `insta` https://docs.rs/insta/1.43.2/insta/#optional-faster-runs
 [profile.dev.package]
