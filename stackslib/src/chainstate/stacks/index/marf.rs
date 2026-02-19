@@ -54,7 +54,7 @@ struct WriteChainTip<T> {
     height: u32,
 }
 
-pub struct MarfReadScratch<T: MarfTrieId> {
+struct MarfReadScratch<T: MarfTrieId> {
     cursor: Option<TrieCursor<T>>,
 }
 
@@ -65,7 +65,7 @@ impl<T: MarfTrieId> Default for MarfReadScratch<T> {
 }
 
 impl<T: MarfTrieId> MarfReadScratch<T> {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self { cursor: None }
     }
 
@@ -73,6 +73,47 @@ impl<T: MarfTrieId> MarfReadScratch<T> {
         self.cursor
             .get_or_insert_with(|| TrieCursor::new(path, TriePtr::default()))
     }
+}
+
+fn lookup_with_proof_by_key_with_scratch<T: MarfTrieId>(
+    conn: &mut TrieStorageConnection<T>,
+    block_hash: &T,
+    key: &str,
+    scratch: &mut MarfReadScratch<T>,
+) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+    let marf_value = match MARF::get_by_key_with_scratch(conn, block_hash, key, scratch)? {
+        None => return Ok(None),
+        Some(x) => x,
+    };
+    let proof = TrieMerkleProof::from_raw_entry(conn, key, &marf_value, block_hash)?;
+    Ok(Some((marf_value, proof)))
+}
+
+fn lookup_with_proof_by_hash_with_scratch<T: MarfTrieId>(
+    conn: &mut TrieStorageConnection<T>,
+    block_hash: &T,
+    hash: &TrieHash,
+    scratch: &mut MarfReadScratch<T>,
+) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+    let marf_value = match MARF::get_by_path_with_scratch(conn, block_hash, hash, scratch)? {
+        None => return Ok(None),
+        Some(x) => x,
+    };
+    let proof = TrieMerkleProof::from_path(conn, hash, &marf_value, block_hash)?;
+    Ok(Some((marf_value, proof)))
+}
+
+fn with_ephemeral_read_scratch<T: MarfTrieId, C: MarfConnection<T> + ?Sized, R, F>(
+    marf_connection: &mut C,
+    f: F,
+) -> Result<R, Error>
+where
+    F: FnOnce(&mut TrieStorageConnection<T>, &mut MarfReadScratch<T>) -> Result<R, Error>,
+{
+    marf_connection.with_conn(|conn| {
+        let mut scratch = MarfReadScratch::new();
+        f(conn, &mut scratch)
+    })
 }
 
 /// Options for opening a MARF
@@ -162,12 +203,16 @@ pub trait MarfConnection<T: MarfTrieId> {
     /// Resolve a key from the MARF to a MARFValue with respect to the given block height.
     fn get(&mut self, block_hash: &T, key: &str) -> Result<Option<MARFValue>, Error> {
         self.get_and_check_with_hash(block_hash, key);
-        self.with_conn(|c| MARF::get_by_key(c, block_hash, key))
+        with_ephemeral_read_scratch(self, |conn, scratch| {
+            MARF::get_by_key_with_scratch(conn, block_hash, key, scratch)
+        })
     }
 
     /// Resolve a TrieHash from the MARF to a MARFValue with respect to the given block height.
     fn get_from_hash(&mut self, block_hash: &T, th: &TrieHash) -> Result<Option<MARFValue>, Error> {
-        self.with_conn(|c| MARF::get_by_hash(c, block_hash, th))
+        with_ephemeral_read_scratch(self, |conn, scratch| {
+            MARF::get_by_path_with_scratch(conn, block_hash, th, scratch)
+        })
     }
 
     fn get_with_proof(
@@ -175,13 +220,8 @@ pub trait MarfConnection<T: MarfTrieId> {
         block_hash: &T,
         key: &str,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
-        self.with_conn(|conn| {
-            let marf_value = match MARF::get_by_key(conn, block_hash, key)? {
-                None => return Ok(None),
-                Some(x) => x,
-            };
-            let proof = TrieMerkleProof::from_raw_entry(conn, key, &marf_value, block_hash)?;
-            Ok(Some((marf_value, proof)))
+        with_ephemeral_read_scratch(self, |conn, scratch| {
+            lookup_with_proof_by_key_with_scratch(conn, block_hash, key, scratch)
         })
     }
 
@@ -190,13 +230,8 @@ pub trait MarfConnection<T: MarfTrieId> {
         block_hash: &T,
         hash: &TrieHash,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
-        self.with_conn(|conn| {
-            let marf_value = match MARF::get_by_path(conn, block_hash, hash)? {
-                None => return Ok(None),
-                Some(x) => x,
-            };
-            let proof = TrieMerkleProof::from_path(conn, hash, &marf_value, block_hash)?;
-            Ok(Some((marf_value, proof)))
+        with_ephemeral_read_scratch(self, |conn, scratch| {
+            lookup_with_proof_by_hash_with_scratch(conn, block_hash, hash, scratch)
         })
     }
 
@@ -294,14 +329,35 @@ impl<T: MarfTrieId> MarfConnection<T> for MARF<T> {
 
     fn get(&mut self, block_hash: &T, key: &str) -> Result<Option<MARFValue>, Error> {
         self.get_and_check_with_hash(block_hash, key);
+        self.with_persistent_read_scratch(|conn, scratch| {
+            MARF::get_by_key_with_scratch(conn, block_hash, key, scratch)
+        })
+    }
 
-        let mut scratch = std::mem::take(&mut self.read_scratch);
-        let result = {
-            let mut conn = self.storage.connection();
-            MARF::get_by_key_with_scratch(&mut conn, block_hash, key, &mut scratch)
-        };
-        self.read_scratch = scratch;
-        result
+    fn get_from_hash(&mut self, block_hash: &T, th: &TrieHash) -> Result<Option<MARFValue>, Error> {
+        self.with_persistent_read_scratch(|conn, scratch| {
+            MARF::get_by_path_with_scratch(conn, block_hash, th, scratch)
+        })
+    }
+
+    fn get_with_proof(
+        &mut self,
+        block_hash: &T,
+        key: &str,
+    ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+        self.with_persistent_read_scratch(|conn, scratch| {
+            lookup_with_proof_by_key_with_scratch(conn, block_hash, key, scratch)
+        })
+    }
+
+    fn get_with_proof_from_hash(
+        &mut self,
+        block_hash: &T,
+        hash: &TrieHash,
+    ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+        self.with_persistent_read_scratch(|conn, scratch| {
+            lookup_with_proof_by_hash_with_scratch(conn, block_hash, hash, scratch)
+        })
     }
 }
 
@@ -1100,7 +1156,7 @@ impl<T: MarfTrieId> MARF<T> {
         MARF::get_path_with_scratch(storage, block_hash, path, &mut scratch)
     }
 
-    pub fn get_path_with_scratch(
+    fn get_path_with_scratch(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
         path: &TrieHash,
@@ -1216,28 +1272,29 @@ impl<T: MarfTrieId> MARF<T> {
         Ok(MARF::from_storage(file_storage))
     }
 
-    pub fn get_with_scratch(
-        &mut self,
-        block_hash: &T,
-        key: &str,
-        scratch: &mut MarfReadScratch<T>,
-    ) -> Result<Option<MARFValue>, Error> {
-        MARF::get_by_key_with_scratch(&mut self.storage.connection(), block_hash, key, scratch)
-    }
-
     pub fn get_by_path(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
         path: &TrieHash,
     ) -> Result<Option<MARFValue>, Error> {
+        let mut scratch = MarfReadScratch::new();
+        MARF::get_by_path_with_scratch(storage, block_hash, path, &mut scratch)
+    }
+
+    fn get_by_path_with_scratch(
+        storage: &mut TrieStorageConnection<T>,
+        block_hash: &T,
+        path: &TrieHash,
+        scratch: &mut MarfReadScratch<T>,
+    ) -> Result<Option<MARFValue>, Error> {
         let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
 
-        let result = MARF::get_path(storage, block_hash, path).or_else(|e| match e {
-            Error::NotFoundError => Ok(None),
-            _ => Err(e),
-        });
+        let result =
+            MARF::get_path_with_scratch(storage, block_hash, path, scratch).or_else(|e| match e {
+                Error::NotFoundError => Ok(None),
+                _ => Err(e),
+            });
 
-        // restore
         storage
             .open_block_maybe_id(&cur_block_hash, cur_block_id)
             .inspect_err(|e| {
@@ -1259,7 +1316,7 @@ impl<T: MarfTrieId> MARF<T> {
         MARF::get_by_key_with_scratch(storage, block_hash, key, &mut scratch)
     }
 
-    pub fn get_by_key_with_scratch(
+    fn get_by_key_with_scratch(
         storage: &mut TrieStorageConnection<T>,
         block_hash: &T,
         key: &str,
@@ -1292,22 +1349,8 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         path: &TrieHash,
     ) -> Result<Option<MARFValue>, Error> {
-        let (cur_block_hash, cur_block_id) = storage.get_cur_block_and_id();
-
-        let result = MARF::get_path(storage, block_hash, path).or_else(|e| match e {
-            Error::NotFoundError => Ok(None),
-            _ => Err(e),
-        });
-
-        // restore
-        storage
-            .open_block_maybe_id(&cur_block_hash, cur_block_id)
-            .inspect_err(|e| {
-                warn!("Failed to re-open {cur_block_hash} {cur_block_id:?}: {e:?}");
-                warn!("Result of failed hash lookup '{path}': {result:?}");
-            })?;
-
-        result.map(|option_result| option_result.map(|leaf| leaf.data))
+        let mut scratch = MarfReadScratch::new();
+        MARF::get_by_path_with_scratch(storage, block_hash, path, &mut scratch)
     }
 
     pub fn get_block_height_miner_tip(
@@ -1456,6 +1499,19 @@ impl<T: MarfTrieId> MARF<T> {
 
 // instance methods
 impl<T: MarfTrieId> MARF<T> {
+    fn with_persistent_read_scratch<R, F>(&mut self, f: F) -> Result<R, Error>
+    where
+        F: FnOnce(&mut TrieStorageConnection<T>, &mut MarfReadScratch<T>) -> Result<R, Error>,
+    {
+        let mut scratch = std::mem::take(&mut self.read_scratch);
+        let result = {
+            let mut conn = self.storage.connection();
+            f(&mut conn, &mut scratch)
+        };
+        self.read_scratch = scratch;
+        result
+    }
+
     pub fn begin_tx(&mut self) -> Result<MarfTransaction<'_, T>, Error> {
         let storage = self.storage.transaction()?;
         Ok(MarfTransaction {
@@ -1474,13 +1530,7 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         key: &str,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
-        let mut conn = self.storage.connection();
-        let marf_value = match MARF::get_by_key(&mut conn, block_hash, key)? {
-            None => return Ok(None),
-            Some(x) => x,
-        };
-        let proof = TrieMerkleProof::from_raw_entry(&mut conn, key, &marf_value, block_hash)?;
-        Ok(Some((marf_value, proof)))
+        <Self as MarfConnection<T>>::get_with_proof(self, block_hash, key)
     }
 
     pub fn get_with_proof_from_hash(
@@ -1488,13 +1538,7 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         path: &TrieHash,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
-        let mut conn = self.storage.connection();
-        let marf_value = match MARF::get_by_path(&mut conn, block_hash, path)? {
-            None => return Ok(None),
-            Some(x) => x,
-        };
-        let proof = TrieMerkleProof::from_path(&mut conn, path, &marf_value, block_hash)?;
-        Ok(Some((marf_value, proof)))
+        <Self as MarfConnection<T>>::get_with_proof_from_hash(self, block_hash, path)
     }
 
     pub fn get_bhh_at_height(&mut self, block_hash: &T, height: u32) -> Result<Option<T>, Error> {
