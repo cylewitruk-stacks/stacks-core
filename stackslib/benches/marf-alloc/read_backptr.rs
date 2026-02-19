@@ -73,12 +73,12 @@ fn print_usage(args: &[String]) {
         println!("read-backptr: focused MARF::get backpointer-walk benchmark");
         println!();
         println!("Environment variables:");
-        println!("  BACKPTR_CHAIN_LEN   blocks in fixture; must be > max depth [default: {DEFAULT_CHAIN_LEN}]");
-        println!("  BACKPTR_READ_ITERS  reads per measured case [default: {DEFAULT_READ_ITERS}]");
-        println!("  BACKPTR_READ_ROUNDS independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
-        println!("  BACKPTR_DEPTHS      comma-separated depths [default: {default_depths}]");
-        println!("                      Example: BACKPTR_DEPTHS=128,512,1024");
-        println!("  BACKPTR_CACHE_STRATEGIES comma-separated cache strategies [default: {default_cache_strategies}]");
+        println!("  CHAIN_LEN           blocks in fixture; must be > max depth [default: {DEFAULT_CHAIN_LEN}]");
+        println!("  ITERS               reads per measured case [default: {DEFAULT_READ_ITERS}]");
+        println!("  ROUNDS              independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
+        println!("  DEPTHS              comma-separated depths [default: {default_depths}]");
+        println!("                      Example: DEPTHS=128,512,1024");
+        println!("  CACHE_STRATEGIES    comma-separated cache strategies [default: {default_cache_strategies}]");
         println!("  MARF_ALLOC_OUTPUT   output mode [default: summary]");
         println!("                      'summary': unified summary lines only");
         println!("                      'raw': config/result lines + unified summary lines");
@@ -172,25 +172,24 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
         return None;
     }
 
-    let chain_len = parse_u32_env("BACKPTR_CHAIN_LEN", DEFAULT_CHAIN_LEN);
-    let iters = parse_usize_env("BACKPTR_READ_ITERS", DEFAULT_READ_ITERS);
-    let rounds = parse_usize_env("BACKPTR_READ_ROUNDS", DEFAULT_READ_ROUNDS);
-    let depths = parse_csv_u32_env("BACKPTR_DEPTHS", &DEFAULT_DEPTHS);
-    let cache_strategies =
-        parse_csv_string_env("BACKPTR_CACHE_STRATEGIES", &DEFAULT_CACHE_STRATEGIES);
+    let chain_len = parse_u32_env("CHAIN_LEN", DEFAULT_CHAIN_LEN);
+    let iters = parse_usize_env("ITERS", DEFAULT_READ_ITERS);
+    let rounds = parse_usize_env("ROUNDS", DEFAULT_READ_ROUNDS);
+    let depths = parse_csv_u32_env("DEPTHS", &DEFAULT_DEPTHS);
+    let cache_strategies = parse_csv_string_env("CACHE_STRATEGIES", &DEFAULT_CACHE_STRATEGIES);
 
-    assert!(iters > 0, "BACKPTR_READ_ITERS must be > 0");
-    assert!(rounds > 0, "BACKPTR_READ_ROUNDS must be > 0");
+    assert!(iters > 0, "ITERS must be > 0");
+    assert!(rounds > 0, "ROUNDS must be > 0");
 
     let max_depth = *depths.iter().max().expect("depth list must not be empty");
     assert!(
         chain_len > max_depth,
-        "BACKPTR_CHAIN_LEN ({chain_len}) must be greater than max depth ({max_depth})"
+        "CHAIN_LEN ({chain_len}) must be greater than max depth ({max_depth})"
     );
 
     if output_mode.is_raw() {
         println!(
-            "config\tchain_len={chain_len}\tread_iters={iters}\tread_rounds={rounds}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
+            "config\tchain_len={chain_len}\titers={iters}\trounds={rounds}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
         );
     }
 

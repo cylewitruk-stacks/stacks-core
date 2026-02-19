@@ -7,13 +7,42 @@ This document explains the git operations it performs, what they change (or do n
 ## Quick start
 
 - Compare a known commit to your current working tree:
-  - `cargo marf-bench bench --base c8a06adfc2c9c33ee858766a971eb36845e81499 --read`
+  - `cargo marf-bench bench --base c8a06adfc2c9c33ee858766a971eb36845e81499 read`
 - Compare staged snapshot to your current working tree:
-  - `cargo marf-bench bench --base staged --read`
+  - `cargo marf-bench bench --base staged read`
 - Compare two named revisions (branch/tag/commit):
-  - `cargo marf-bench bench --base master --target v3.0.0.0.0 --read-backptr`
+  - `cargo marf-bench bench --base master --target v3.0.0.0.0 read-backptr`
 - Run everything with machine-readable output:
-  - `cargo marf-bench bench --base staged --all --output-format tsv`
+  - `cargo marf-bench bench --base staged --output-format tsv all`
+- Override benchmark loop controls from CLI:
+  - `cargo marf-bench bench --base staged read-backptr --iters 400000 --rounds 4`
+- Override read-shape and write-search controls from CLI:
+  - `cargo marf-bench run read --chain-len 1024 --depths 64,256,768 --cache-strategies noop,node256 --keys-per-block 8`
+  - `cargo marf-bench run write --rounds 4 --key-search-max-tries 500000`
+
+## Command shape
+
+- `run`: `cargo marf-bench run [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-backptr|write> [bench-specific options]`
+- `bench`: `cargo marf-bench bench [--base <rev>] [--target <rev>] [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-backptr|write> [bench-specific options]`
+
+Notes:
+
+- Global `bench` options (`--base`, `--target`, `--output-format`) come before the bench subcommand.
+- Bench-specific options (`--iters`, `--rounds`, etc.) come after the bench subcommand.
+
+## Benchmark parameter flags
+
+Bench-specific options are accepted on the bench target subcommands and are forwarded to `marf-alloc` subprocess env vars:
+
+- `--iters <N>` sets `ITERS`
+- `--rounds <N>` sets `ROUNDS`
+- `--chain-len <N>` sets `CHAIN_LEN`
+- `--keys-per-block <N>` sets `KEYS_PER_BLOCK`
+- `--depths <CSV>` sets `DEPTHS`
+- `--cache-strategies <CSV>` sets `CACHE_STRATEGIES`
+- `--key-search-max-tries <N>` sets `KEY_SEARCH_MAX_TRIES`
+
+These flags are useful for automation since callers can avoid command-specific env var conditionals.
 
 ## High-level lifecycle
 
@@ -50,13 +79,13 @@ Impact:
 Examples:
 
 - Commit hash vs current working tree:
-  - `cargo marf-bench bench --base c8a06adfc2c9c33ee858766a971eb36845e81499 --read`
+  - `cargo marf-bench bench --base c8a06adfc2c9c33ee858766a971eb36845e81499 read`
 - Branch vs current working tree:
-  - `cargo marf-bench bench --base master --read-backptr`
+  - `cargo marf-bench bench --base master read-backptr`
 - Tag vs branch:
-  - `cargo marf-bench bench --base v3.0.0.0.0 --target master --write`
+  - `cargo marf-bench bench --base v3.0.0.0.0 --target master write`
 - Remote branch vs local branch:
-  - `cargo marf-bench bench --base origin/master --target feat/marf-tweaks --read`
+  - `cargo marf-bench bench --base origin/master --target feat/marf-tweaks read`
 
 ## Staged snapshot mode (`--base staged`)
 
@@ -90,11 +119,11 @@ Notes:
 Examples:
 
 - Staged snapshot vs current working tree:
-  - `cargo marf-bench bench --base staged --read`
+  - `cargo marf-bench bench --base staged read`
 - Staged snapshot vs explicit target branch:
-  - `cargo marf-bench bench --base staged --target master --read-backptr`
+  - `cargo marf-bench bench --base staged --target master read-backptr`
 - Staged snapshot with all benches in TSV output:
-  - `cargo marf-bench bench --base staged --all --output-format tsv`
+  - `cargo marf-bench bench --base staged --output-format tsv all`
 
 ## Overlay behavior
 

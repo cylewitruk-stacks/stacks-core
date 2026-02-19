@@ -48,10 +48,14 @@ fn parse_env_or_default<T>(name: &str, default: T) -> T
 where
     T: FromStr,
 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<T>().ok())
-        .unwrap_or(default)
+    parse_env(name).unwrap_or(default)
+}
+
+fn parse_env<T>(name: &str) -> Option<T>
+where
+    T: FromStr,
+{
+    std::env::var(name).ok().and_then(|s| s.parse::<T>().ok())
 }
 
 fn parse_csv_env<T>(name: &str, default: &[T], value_kind: &str) -> Vec<T>

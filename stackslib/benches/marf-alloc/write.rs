@@ -25,7 +25,7 @@
 //! `result` records. Unified summary rows are emitted by `main.rs`.
 //!
 //! Environment variables:
-//! - `WRITE_ROUNDS` (default `2`): number of independent workflow repetitions.
+//! - `ROUNDS` (default `2`): number of independent workflow repetitions.
 //! - `KEY_SEARCH_MAX_TRIES` (default `200000`): max key candidates to try when
 //!   searching for a hash bucket that yields enough distinct branches.
 
@@ -138,7 +138,7 @@ fn print_usage(args: &[String]) {
         println!("write: step-wise MARF write workflow profiler");
         println!();
         println!("Environment variables:");
-        println!("  WRITE_ROUNDS          independent rounds per strategy [default {DEFAULT_WRITE_ROUNDS}]");
+        println!("  ROUNDS                independent rounds per strategy [default {DEFAULT_WRITE_ROUNDS}]");
         println!("  KEY_SEARCH_MAX_TRIES  max key candidates when searching for promotion-driving keys [default {DEFAULT_KEY_SEARCH_MAX_TRIES}]");
         println!("  MARF_ALLOC_OUTPUT     output mode ('summary' | 'raw') [default: summary]");
         println!();
@@ -239,15 +239,15 @@ fn find_promotion_keys(seed_prefix: &str, max_tries: usize) -> PromotionKeys {
 }
 
 fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
-    let rounds = parse_usize_env("WRITE_ROUNDS", DEFAULT_WRITE_ROUNDS);
+    let rounds = parse_usize_env("ROUNDS", DEFAULT_WRITE_ROUNDS);
     let max_tries = parse_usize_env("KEY_SEARCH_MAX_TRIES", DEFAULT_KEY_SEARCH_MAX_TRIES);
 
-    assert!(rounds > 0, "WRITE_ROUNDS must be > 0");
+    assert!(rounds > 0, "ROUNDS must be > 0");
     assert!(max_tries > 0, "KEY_SEARCH_MAX_TRIES must be > 0");
 
     if output_mode.is_raw() {
         println!(
-            "config\twrite_rounds={rounds}\tkey_search_max_tries={max_tries}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
+            "config\trounds={rounds}\tkey_search_max_tries={max_tries}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
         );
     }
 

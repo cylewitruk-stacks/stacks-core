@@ -11,6 +11,29 @@ use crate::util::{
 };
 use crate::{BenchKind, OutputFormat, TempBuilder};
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BenchEnvOverrides {
+    pub(crate) iters: Option<usize>,
+    pub(crate) rounds: Option<usize>,
+    pub(crate) chain_len: Option<u32>,
+    pub(crate) keys_per_block: Option<u32>,
+    pub(crate) depths: Option<String>,
+    pub(crate) cache_strategies: Option<String>,
+    pub(crate) key_search_max_tries: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BenchRunRequest {
+    pub(crate) kind: BenchKind,
+    pub(crate) env: BenchEnvOverrides,
+}
+
+impl BenchRunRequest {
+    pub(crate) fn new(kind: BenchKind, env: BenchEnvOverrides) -> Self {
+        Self { kind, env }
+    }
+}
+
 struct ManagedWorktree {
     path: PathBuf,
     _temp_root: TempDir,
@@ -57,7 +80,7 @@ impl Runner {
     pub(crate) fn run_current_tree(
         &self,
         label: &str,
-        benches: &[BenchKind],
+        requests: &[BenchRunRequest],
         output_format: OutputFormat,
     ) -> Result<Vec<SummaryRow>> {
         let marf_bench_dir = self.repo_root.join("stackslib/benches/marf-alloc");
@@ -78,20 +101,20 @@ impl Runner {
             );
         }
 
-        self.run_benches(label, &self.repo_root, benches, output_format)
+        self.run_benches(label, &self.repo_root, requests, output_format)
     }
 
     pub(crate) fn run_revision_via_worktree(
         &mut self,
         label: &str,
         revision: &str,
-        benches: &[BenchKind],
+        requests: &[BenchRunRequest],
         output_format: OutputFormat,
     ) -> Result<Vec<SummaryRow>> {
         let wt = self.create_worktree(revision)?;
         self.overlay_benches(&wt)?;
         self.ensure_bench_target(&wt.join("stackslib/Cargo.toml"))?;
-        self.run_benches(label, &wt, benches, output_format)
+        self.run_benches(label, &wt, requests, output_format)
     }
 
     fn create_worktree(&mut self, revision: &str) -> Result<PathBuf> {
@@ -166,15 +189,15 @@ impl Runner {
         &self,
         label: &str,
         root: &Path,
-        benches: &[BenchKind],
+        requests: &[BenchRunRequest],
         output_format: OutputFormat,
     ) -> Result<Vec<SummaryRow>> {
         self.build_bench_profile(label, root)?;
         log(&format!("Running marf-alloc benches for {label}"));
 
         let mut rows = Vec::new();
-        for &bench in benches {
-            rows.extend(self.run_bench_case(label, root, bench, output_format)?);
+        for request in requests {
+            rows.extend(self.run_bench_case(label, root, request, output_format)?);
         }
 
         Ok(rows)
@@ -202,9 +225,10 @@ impl Runner {
         &self,
         label: &str,
         root: &Path,
-        bench: BenchKind,
+        request: &BenchRunRequest,
         output_format: OutputFormat,
     ) -> Result<Vec<SummaryRow>> {
+        let bench = request.kind;
         log(&format!("[{label}] Running {}", bench.as_arg()));
 
         let marf_output_mode = if output_format == OutputFormat::Raw {
@@ -223,6 +247,28 @@ impl Runner {
             .arg("--")
             .arg(bench.as_arg())
             .env("MARF_ALLOC_OUTPUT", marf_output_mode);
+
+        if let Some(iters) = request.env.iters {
+            cmd.env("ITERS", iters.to_string());
+        }
+        if let Some(rounds) = request.env.rounds {
+            cmd.env("ROUNDS", rounds.to_string());
+        }
+        if let Some(chain_len) = request.env.chain_len {
+            cmd.env("CHAIN_LEN", chain_len.to_string());
+        }
+        if let Some(keys_per_block) = request.env.keys_per_block {
+            cmd.env("KEYS_PER_BLOCK", keys_per_block.to_string());
+        }
+        if let Some(depths) = &request.env.depths {
+            cmd.env("DEPTHS", depths);
+        }
+        if let Some(cache_strategies) = &request.env.cache_strategies {
+            cmd.env("CACHE_STRATEGIES", cache_strategies);
+        }
+        if let Some(key_search_max_tries) = request.env.key_search_max_tries {
+            cmd.env("KEY_SEARCH_MAX_TRIES", key_search_max_tries.to_string());
+        }
 
         let output = cmd
             .output()

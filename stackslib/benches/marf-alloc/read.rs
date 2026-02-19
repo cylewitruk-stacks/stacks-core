@@ -77,10 +77,10 @@ fn print_usage(args: &[String]) {
         println!("Environment variables:");
         println!("  CHAIN_LEN   blocks in fixture; must be > max depth [default: {DEFAULT_CHAIN_LEN}]");
         println!("              Higher values increase fixture construction time and temporary DB size");
-        println!("  READ_ITERS  reads per measured case [default: {DEFAULT_READ_ITERS}]");
+        println!("  ITERS       reads per measured case [default: {DEFAULT_READ_ITERS}]");
         println!("              Higher values reduce measurement noise but increase runtime linearly");
         println!("              Affects elapsed_ms/alloc totals directly; per-op metrics remain normalized");
-        println!("  READ_ROUNDS (default 2) independent repetitions per case");
+        println!("  ROUNDS      independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
         println!("              Higher values improve stability estimates (summary min/max)");
         println!("  KEYS_PER_BLOCK number of keys inserted per fixture block [default: {DEFAULT_KEYS_PER_BLOCK}]");
         println!("              Must be >= 1; higher values make each fixture block denser");
@@ -188,14 +188,14 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
     }
 
     let chain_len = parse_u32_env("CHAIN_LEN", DEFAULT_CHAIN_LEN);
-    let iters = parse_usize_env("READ_ITERS", DEFAULT_READ_ITERS);
-    let rounds = parse_usize_env("READ_ROUNDS", DEFAULT_READ_ROUNDS);
+    let iters = parse_usize_env("ITERS", DEFAULT_READ_ITERS);
+    let rounds = parse_usize_env("ROUNDS", DEFAULT_READ_ROUNDS);
     let keys_per_block = parse_u32_env("KEYS_PER_BLOCK", DEFAULT_KEYS_PER_BLOCK);
     let depths = parse_csv_u32_env("DEPTHS", &DEFAULT_DEPTHS);
     let cache_strategies = parse_csv_string_env("CACHE_STRATEGIES", &DEFAULT_CACHE_STRATEGIES);
 
-    assert!(iters > 0, "READ_ITERS must be > 0");
-    assert!(rounds > 0, "READ_ROUNDS must be > 0");
+    assert!(iters > 0, "ITERS must be > 0");
+    assert!(rounds > 0, "ROUNDS must be > 0");
     assert!(keys_per_block > 0, "KEYS_PER_BLOCK must be >= 1");
 
     let max_depth = *depths.iter().max().expect("depth list must not be empty");
@@ -206,7 +206,7 @@ pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
 
     if output_mode.is_raw() {
         println!(
-            "config\tchain_len={chain_len}\tread_iters={iters}\tread_rounds={rounds}\tkeys_per_block={keys_per_block}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
+            "config\tchain_len={chain_len}\titers={iters}\trounds={rounds}\tkeys_per_block={keys_per_block}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
         );
     }
 
