@@ -63,8 +63,12 @@ pub(crate) fn run_command(args: BenchArgs) -> Result<()> {
         }
 
         let base_label = format!("base:{base_display}");
-        let base_rows =
-            runner.run_revision_via_worktree(&base_label, &base_revision, &benches, args.output_format)?;
+        let base_rows = runner.run_revision_via_worktree(
+            &base_label,
+            &base_revision,
+            &benches,
+            args.output_format,
+        )?;
 
         let (target_label, target_rows) = if let Some(target) = &args.target {
             let target_label = format!("target:{target}");

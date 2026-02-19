@@ -451,6 +451,20 @@ impl<T: MarfTrieId> TrieCursor<T> {
         }
     }
 
+    pub fn reset(&mut self, path: &TrieHash, root_ptr: TriePtr) {
+        self.path = *path;
+        self.index = 0;
+        self.node_path_index = 0;
+        self.visited_node = false;
+        self.node_ptrs.clear();
+        self.node_ptrs.push(root_ptr);
+        self.block_hashes.clear();
+        self.last_error = None;
+
+        #[cfg(test)]
+        self.nodes.clear();
+    }
+
     #[inline(always)]
     fn record_walked_node(&mut self, node: &TrieNodeType) {
         #[cfg(test)]
