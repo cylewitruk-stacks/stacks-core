@@ -23,10 +23,160 @@ use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::node::{
     clear_backptr, ConsensusSerializable, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
-    TrieNodeID, TrieNodePath, TrieNodeType, TriePtr, TRIEPTR_SIZE,
+    TrieNodeID, TrieNodePath, TrieNodeRef, TrieNodeType, TriePtr, TRIEPTR_SIZE,
 };
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{BlockMap, Error, MarfTrieId, TrieLeaf};
+
+#[derive(Default)]
+pub struct TrieNodeDecodeScratch {
+    node4: Option<TrieNode4>,
+    node16: Option<TrieNode16>,
+    node48: Option<TrieNode48>,
+    node256: Option<TrieNode256>,
+    leaf: Option<TrieLeaf>,
+    owned: Option<TrieNodeType>,
+    current_id: Option<TrieNodeID>,
+}
+
+impl TrieNodeDecodeScratch {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn get_ref(&self) -> TrieNodeRef<'_> {
+        match self
+            .current_id
+            .expect("BUG: decode scratch has no current node")
+        {
+            TrieNodeID::Node4 => {
+                let n = self.node4.as_ref().unwrap();
+                TrieNodeRef::Node4 {
+                    path: n.path.as_slice(),
+                    ptrs: &n.ptrs,
+                }
+            }
+            TrieNodeID::Node16 => {
+                let n = self.node16.as_ref().unwrap();
+                TrieNodeRef::Node16 {
+                    path: n.path.as_slice(),
+                    ptrs: &n.ptrs,
+                }
+            }
+            TrieNodeID::Node48 => {
+                let n = self.node48.as_ref().unwrap();
+                TrieNodeRef::Node48 {
+                    path: n.path.as_slice(),
+                    indexes: &n.indexes,
+                    ptrs: &n.ptrs,
+                }
+            }
+            TrieNodeID::Node256 => {
+                let n = self.node256.as_ref().unwrap();
+                TrieNodeRef::Node256 {
+                    path: n.path.as_slice(),
+                    ptrs: &n.ptrs,
+                }
+            }
+            TrieNodeID::Leaf => {
+                let n = self.leaf.as_ref().unwrap();
+                TrieNodeRef::Leaf(crate::chainstate::stacks::index::node::TrieLeafRef {
+                    path: n.path.as_slice(),
+                    data: &n.data,
+                })
+            }
+            TrieNodeID::Empty => {
+                let n = self.owned.as_ref().unwrap();
+                TrieNodeRef::from(n)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
+        self.current_id = Some(TrieNodeID::Empty);
+        self.owned = Some(node);
+        TrieNodeRef::from(self.owned.as_ref().expect("BUG: decode scratch lost node"))
+    }
+
+    #[inline]
+    pub fn store_from_ref(&mut self, node: &TrieNodeType) -> TrieNodeRef<'_> {
+        match node {
+            TrieNodeType::Node4(n) => self.store_node4(n.clone()),
+            TrieNodeType::Node16(n) => self.store_node16(n.clone()),
+            TrieNodeType::Node48(n) => self.store_node48((**n).clone()),
+            TrieNodeType::Node256(n) => self.store_node256((**n).clone()),
+            TrieNodeType::Leaf(n) => self.store_leaf(n.clone()),
+        }
+    }
+
+    #[inline]
+    fn store_node4(&mut self, node: TrieNode4) -> TrieNodeRef<'_> {
+        self.current_id = Some(TrieNodeID::Node4);
+        self.node4 = Some(node);
+        let n = self.node4.as_ref().expect("BUG: decode scratch lost node4");
+        TrieNodeRef::Node4 {
+            path: n.path.as_slice(),
+            ptrs: &n.ptrs,
+        }
+    }
+
+    #[inline]
+    fn store_node16(&mut self, node: TrieNode16) -> TrieNodeRef<'_> {
+        self.current_id = Some(TrieNodeID::Node16);
+        self.node16 = Some(node);
+        let n = self
+            .node16
+            .as_ref()
+            .expect("BUG: decode scratch lost node16");
+        TrieNodeRef::Node16 {
+            path: n.path.as_slice(),
+            ptrs: &n.ptrs,
+        }
+    }
+
+    #[inline]
+    fn store_node48(&mut self, node: TrieNode48) -> TrieNodeRef<'_> {
+        self.current_id = Some(TrieNodeID::Node48);
+        self.node48 = Some(node);
+        let n = self
+            .node48
+            .as_ref()
+            .expect("BUG: decode scratch lost node48");
+        TrieNodeRef::Node48 {
+            path: n.path.as_slice(),
+            indexes: &n.indexes,
+            ptrs: &n.ptrs,
+        }
+    }
+
+    #[inline]
+    fn store_node256(&mut self, node: TrieNode256) -> TrieNodeRef<'_> {
+        self.current_id = Some(TrieNodeID::Node256);
+        self.node256 = Some(node);
+        let n = self
+            .node256
+            .as_ref()
+            .expect("BUG: decode scratch lost node256");
+        TrieNodeRef::Node256 {
+            path: n.path.as_slice(),
+            ptrs: &n.ptrs,
+        }
+    }
+
+    #[inline]
+    fn store_leaf(&mut self, node: TrieLeaf) -> TrieNodeRef<'_> {
+        self.current_id = Some(TrieNodeID::Leaf);
+        self.leaf = Some(node);
+        let n = self.leaf.as_ref().expect("BUG: decode scratch lost leaf");
+        TrieNodeRef::Leaf(crate::chainstate::stacks::index::node::TrieLeafRef {
+            path: n.path.as_slice(),
+            data: &n.data,
+        })
+    }
+}
 
 /// Get the size of a Trie path (note that a Trie path is 32 bytes long, and can definitely _not_
 /// be over 255 bytes).
@@ -379,6 +529,30 @@ pub fn read_nodetype_nohash<F: Read + Seek>(
     read_nodetype_at_head_nohash(f, ptr.id())
 }
 
+/// Read a node and its hash into scratch, returning a borrowed node view.
+pub fn read_nodetype_ref<'a, F: Read + Seek>(
+    f: &mut F,
+    ptr: &TriePtr,
+    scratch: &'a mut TrieNodeDecodeScratch,
+) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
+    f.seek(SeekFrom::Start(ptr.ptr() as u64))
+        .map_err(Error::IOError)?;
+    trace!("read_nodetype_ref at {:?}", ptr);
+    read_nodetype_at_head_ref(f, ptr.id(), scratch)
+}
+
+/// Read a node into scratch, returning a borrowed node view.
+pub fn read_nodetype_ref_nohash<'a, F: Read + Seek>(
+    f: &mut F,
+    ptr: &TriePtr,
+    scratch: &'a mut TrieNodeDecodeScratch,
+) -> Result<TrieNodeRef<'a>, Error> {
+    f.seek(SeekFrom::Start(ptr.ptr() as u64))
+        .map_err(Error::IOError)?;
+    trace!("read_nodetype_ref_nohash at {:?}", ptr);
+    read_nodetype_at_head_ref_nohash(f, ptr.id(), scratch)
+}
+
 /// Read a node and hash at the stream's current position
 pub fn read_nodetype_at_head<F: Read + Seek>(
     f: &mut F,
@@ -398,6 +572,47 @@ pub fn read_nodetype_at_head_nohash<F: Read + Seek>(
     ptr_id: u8,
 ) -> Result<TrieNodeType, Error> {
     inner_read_nodetype_at_head(f, ptr_id, false).map(|(node, _)| node)
+}
+
+/// Read a node and hash at the stream's current position into scratch.
+pub fn read_nodetype_at_head_ref<'a, F: Read + Seek>(
+    f: &mut F,
+    ptr_id: u8,
+    scratch: &'a mut TrieNodeDecodeScratch,
+) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
+    let hash = TrieHash(read_hash_bytes(f)?);
+    let node_ref = decode_nodetype_ref_at_head(f, ptr_id, scratch)?;
+    Ok((node_ref, hash))
+}
+
+/// Read a node at the stream's current position into scratch.
+pub fn read_nodetype_at_head_ref_nohash<'a, F: Read + Seek>(
+    f: &mut F,
+    ptr_id: u8,
+    scratch: &'a mut TrieNodeDecodeScratch,
+) -> Result<TrieNodeRef<'a>, Error> {
+    f.seek(SeekFrom::Current(TRIEHASH_ENCODED_SIZE as i64))?;
+
+    decode_nodetype_ref_at_head(f, ptr_id, scratch)
+}
+
+fn decode_nodetype_ref_at_head<'a, F: Read + Seek>(
+    f: &mut F,
+    ptr_id: u8,
+    scratch: &'a mut TrieNodeDecodeScratch,
+) -> Result<TrieNodeRef<'a>, Error> {
+    match TrieNodeID::from_u8(ptr_id).ok_or_else(|| {
+        Error::CorruptionError(format!("read_node_type: Unknown trie node type {}", ptr_id))
+    })? {
+        TrieNodeID::Node4 => Ok(scratch.store_node4(TrieNode4::from_bytes(f)?)),
+        TrieNodeID::Node16 => Ok(scratch.store_node16(TrieNode16::from_bytes(f)?)),
+        TrieNodeID::Node48 => Ok(scratch.store_node48(TrieNode48::from_bytes(f)?)),
+        TrieNodeID::Node256 => Ok(scratch.store_node256(TrieNode256::from_bytes(f)?)),
+        TrieNodeID::Leaf => Ok(scratch.store_leaf(TrieLeaf::from_bytes(f)?)),
+        TrieNodeID::Empty => Err(Error::CorruptionError(
+            "read_node_type: stored empty node type".to_string(),
+        )),
+    }
 }
 
 /// Deserialize a node.

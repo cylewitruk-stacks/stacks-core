@@ -27,8 +27,9 @@ use stacks_common::types::chainstate::TrieHash;
 
 use crate::chainstate::stacks::index::bits::{
     read_hash_bytes, read_nodetype_at_head, read_nodetype_at_head_nohash,
+    read_nodetype_at_head_ref, read_nodetype_at_head_ref_nohash, TrieNodeDecodeScratch,
 };
-use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::node::{TrieNodeRef, TrieNodeType, TriePtr};
 use crate::chainstate::stacks::index::storage::NodeHashReader;
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
@@ -388,6 +389,32 @@ impl TrieFile {
         let offset = self.get_trie_offset(db, block_id)?;
         self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
         read_nodetype_at_head_nohash(self, ptr.id())
+    }
+
+    /// Obtain a borrowed TrieNodeRef and its hash for a node, given its block ID and pointer.
+    pub fn read_node_type_ref<'a>(
+        &mut self,
+        db: &Connection,
+        block_id: u32,
+        ptr: &TriePtr,
+        scratch: &'a mut TrieNodeDecodeScratch,
+    ) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
+        let offset = self.get_trie_offset(db, block_id)?;
+        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
+        read_nodetype_at_head_ref(self, ptr.id(), scratch)
+    }
+
+    /// Obtain a borrowed TrieNodeRef for a node, given its block ID and pointer.
+    pub fn read_node_type_ref_nohash<'a>(
+        &mut self,
+        db: &Connection,
+        block_id: u32,
+        ptr: &TriePtr,
+        scratch: &'a mut TrieNodeDecodeScratch,
+    ) -> Result<TrieNodeRef<'a>, Error> {
+        let offset = self.get_trie_offset(db, block_id)?;
+        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
+        read_nodetype_at_head_ref_nohash(self, ptr.id(), scratch)
     }
 
     /// Obtain a TrieHash for a node, given the node's block's hash (used only in testing)

@@ -492,6 +492,13 @@ impl<T: MarfTrieId> TrieCursor<T> {
         let _ = node;
     }
 
+    fn record_backptr_walked_node_ref(&mut self, node: &TrieNodeRef<'_>) {
+        #[cfg(test)]
+        self.nodes.push(node.to_owned_node());
+        #[cfg(not(test))]
+        let _ = node;
+    }
+
     /// What point in the path are we at now?
     /// Will be None only if we haven't taken a step yet.
     pub fn chr(&self) -> Option<u8> {
@@ -642,6 +649,91 @@ impl<T: MarfTrieId> TrieCursor<T> {
         }
     }
 
+    /// Like [`Self::walk()`], but operates on a borrowed node view.
+    ///
+    /// This is used by borrowed read paths to avoid owned node materialization.
+    pub fn walk_ref(
+        &mut self,
+        node: &TrieNodeRef<'_>,
+        block_hash: &T,
+    ) -> Result<Option<TriePtr>, CursorError> {
+        assert!(self.last_error.is_none());
+
+        trace!(
+            "cursor: walk_ref: node = {:?} block = {:?}",
+            node,
+            block_hash
+        );
+
+        self.visited_node = true;
+        self.node_path_index = 0;
+
+        if self.index >= self.path.len() {
+            trace!("cursor: out of path");
+            return Ok(None);
+        }
+
+        let node_path = node.path_bytes();
+        let path_bytes = self.path.as_bytes();
+
+        for (_i, path_set) in node_path.iter().enumerate() {
+            let Some(path_head) = path_bytes.get(self.index) else {
+                trace!("cursor: out of path");
+                return Ok(None);
+            };
+            if path_set != path_head {
+                trace!("cursor: diverged({} != {}): i = {_i}, self.index = {}, self.node_path_index = {}", to_hex(node_path), to_hex(path_bytes), self.index, self.node_path_index);
+                self.last_error = Some(CursorError::PathDiverged);
+                return Err(CursorError::PathDiverged);
+            }
+            self.index += 1;
+            self.node_path_index += 1;
+        }
+
+        if let Some(chr) = path_bytes.get(self.index) {
+            self.index += 1;
+            let mut ptr_opt = node.walk(*chr);
+
+            let do_walk = match &ptr_opt {
+                Some(ptr) => {
+                    if !is_backptr(ptr.id()) {
+                        self.node_ptrs.push(*ptr);
+                        self.block_hashes.push(block_hash.clone());
+                        true
+                    } else {
+                        self.last_error = Some(CursorError::BackptrEncountered(*ptr));
+                        false
+                    }
+                }
+                None => {
+                    self.last_error = Some(CursorError::ChrNotFound);
+                    false
+                }
+            };
+
+            if !do_walk {
+                ptr_opt = None;
+            }
+
+            if ptr_opt.is_none() {
+                assert!(self.last_error.is_some());
+
+                trace!(
+                    "cursor: not found: chr = 0x{:02x}, self.index = {}, self.path = {:?}",
+                    chr,
+                    self.index - 1,
+                    &path_bytes
+                );
+                return Err(self.last_error.clone().unwrap());
+            } else {
+                return Ok(ptr_opt);
+            }
+        }
+
+        trace!("cursor: now out of path");
+        Ok(None)
+    }
+
     /// Replace the last-visited node and ptr within this trie.  Used when doing a copy-on-write or
     /// promoting a node, so the cursor state accurately reflects the nodes and tries visited.
     #[inline]
@@ -697,6 +789,35 @@ impl<T: MarfTrieId> TrieCursor<T> {
         self.block_hashes.push(block_hash);
 
         self.record_backptr_walked_node(next_node);
+    }
+
+    pub fn repair_backptr_step_backptr_ref(
+        &mut self,
+        next_node: &TrieNodeRef<'_>,
+        ptr: &TriePtr,
+        block_hash: T,
+    ) {
+        // this can only be called if we walked to a backptr.
+        // If it's anything else, we're in trouble.
+        if Some(CursorError::ChrNotFound) == self.last_error
+            || Some(CursorError::PathDiverged) == self.last_error
+        {
+            eprintln!("{:?}", &self.last_error);
+            panic!();
+        }
+
+        trace!(
+            "Cursor: repair_backptr_step_backptr ptr={:?} block_hash={:?} next_node={:?}",
+            ptr,
+            &block_hash,
+            next_node
+        );
+
+        let backptr = TriePtr::new(set_backptr(ptr.id()), ptr.chr(), ptr.ptr()); // set_backptr() informs update_root_hash() to skip this node
+        self.node_ptrs.push(backptr);
+        self.block_hashes.push(block_hash);
+
+        self.record_backptr_walked_node_ref(next_node);
     }
 
     /// Record that we landed on a non-backptr from a backptr.
@@ -840,7 +961,7 @@ impl TrieNode16 {
 #[derive(Clone)]
 pub struct TrieNode48 {
     pub path: TrieNodePath,
-    indexes: [i8; 256], // indexes[i], if non-negative, is an index into ptrs.
+    pub(crate) indexes: [i8; 256], // indexes[i], if non-negative, is an index into ptrs.
     pub ptrs: [TriePtr; 48],
 }
 
@@ -1374,6 +1495,173 @@ pub enum TrieNodeType {
     Node48(Box<TrieNode48>),
     Node256(Box<TrieNode256>),
     Leaf(TrieLeaf),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TrieLeafRef<'a> {
+    pub path: &'a [u8],
+    pub data: &'a MARFValue,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum TrieNodeRef<'a> {
+    Node4 {
+        path: &'a [u8],
+        ptrs: &'a [TriePtr; 4],
+    },
+    Node16 {
+        path: &'a [u8],
+        ptrs: &'a [TriePtr; 16],
+    },
+    Node48 {
+        path: &'a [u8],
+        indexes: &'a [i8; 256],
+        ptrs: &'a [TriePtr; 48],
+    },
+    Node256 {
+        path: &'a [u8],
+        ptrs: &'a [TriePtr; 256],
+    },
+    Leaf(TrieLeafRef<'a>),
+}
+
+impl<'a> TrieNodeRef<'a> {
+    pub fn is_leaf(&self) -> bool {
+        matches!(self, Self::Leaf(_))
+    }
+
+    pub fn id(&self) -> u8 {
+        match self {
+            Self::Node4 { .. } => TrieNodeID::Node4 as u8,
+            Self::Node16 { .. } => TrieNodeID::Node16 as u8,
+            Self::Node48 { .. } => TrieNodeID::Node48 as u8,
+            Self::Node256 { .. } => TrieNodeID::Node256 as u8,
+            Self::Leaf(_) => TrieNodeID::Leaf as u8,
+        }
+    }
+
+    pub fn ptrs(&self) -> &[TriePtr] {
+        match self {
+            Self::Node4 { ptrs, .. } => &ptrs[..],
+            Self::Node16 { ptrs, .. } => &ptrs[..],
+            Self::Node48 { ptrs, .. } => &ptrs[..],
+            Self::Node256 { ptrs, .. } => &ptrs[..],
+            Self::Leaf(_) => &[],
+        }
+    }
+
+    pub fn path_bytes(&self) -> &[u8] {
+        match self {
+            Self::Node4 { path, .. } => path,
+            Self::Node16 { path, .. } => path,
+            Self::Node48 { path, .. } => path,
+            Self::Node256 { path, .. } => path,
+            Self::Leaf(leaf) => leaf.path,
+        }
+    }
+
+    pub fn walk(&self, chr: u8) -> Option<TriePtr> {
+        match self {
+            Self::Node4 { ptrs, .. } => {
+                for ptr in ptrs.iter() {
+                    if !ptr.is_empty() && ptr.chr() == chr {
+                        return Some(*ptr);
+                    }
+                }
+                None
+            }
+            Self::Node16 { ptrs, .. } => {
+                for ptr in ptrs.iter() {
+                    if !ptr.is_empty() && ptr.chr() == chr {
+                        return Some(*ptr);
+                    }
+                }
+                None
+            }
+            Self::Node48 { indexes, ptrs, .. } => {
+                let ptr_index = indexes[chr as usize];
+                if ptr_index >= 0 {
+                    Some(ptrs[ptr_index as usize])
+                } else {
+                    None
+                }
+            }
+            Self::Node256 { ptrs, .. } => {
+                let ptr = ptrs[chr as usize];
+                if !ptr.is_empty() {
+                    Some(ptr)
+                } else {
+                    None
+                }
+            }
+            Self::Leaf(_) => None,
+        }
+    }
+
+    pub fn as_leaf(&self) -> Option<TrieLeafRef<'a>> {
+        match self {
+            Self::Leaf(leaf) => Some(*leaf),
+            _ => None,
+        }
+    }
+
+    pub fn to_owned_node(&self) -> TrieNodeType {
+        match self {
+            Self::Node4 { path, ptrs } => TrieNodeType::Node4(TrieNode4 {
+                path: TrieNodePath::from_slice(path),
+                ptrs: **ptrs,
+            }),
+            Self::Node16 { path, ptrs } => TrieNodeType::Node16(TrieNode16 {
+                path: TrieNodePath::from_slice(path),
+                ptrs: **ptrs,
+            }),
+            Self::Node48 {
+                path,
+                indexes,
+                ptrs,
+            } => TrieNodeType::Node48(Box::new(TrieNode48 {
+                path: TrieNodePath::from_slice(path),
+                indexes: **indexes,
+                ptrs: **ptrs,
+            })),
+            Self::Node256 { path, ptrs } => TrieNodeType::Node256(Box::new(TrieNode256 {
+                path: TrieNodePath::from_slice(path),
+                ptrs: **ptrs,
+            })),
+            Self::Leaf(leaf) => TrieNodeType::Leaf(TrieLeaf {
+                path: TrieNodePath::from_slice(leaf.path),
+                data: leaf.data.clone(),
+            }),
+        }
+    }
+}
+
+impl<'a> From<&'a TrieNodeType> for TrieNodeRef<'a> {
+    fn from(node: &'a TrieNodeType) -> Self {
+        match node {
+            TrieNodeType::Node4(data) => Self::Node4 {
+                path: data.path.as_slice(),
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Node16(data) => Self::Node16 {
+                path: data.path.as_slice(),
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Node48(data) => Self::Node48 {
+                path: data.path.as_slice(),
+                indexes: &data.indexes,
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Node256(data) => Self::Node256 {
+                path: data.path.as_slice(),
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Leaf(data) => Self::Leaf(TrieLeafRef {
+                path: data.path.as_slice(),
+                data: &data.data,
+            }),
+        }
+    }
 }
 
 macro_rules! with_node {

@@ -76,11 +76,23 @@ impl<T: MarfTrieId> TrieCacheState<T> {
             .cloned()
     }
 
+    #[inline]
+    pub fn ref_node(&self, block_id: u32, trieptr: TriePtr) -> Option<&TrieNodeType> {
+        self.node_cache.get(&TrieNodeAddr(block_id, trieptr))
+    }
+
     /// Obtain a possibly-cached node hash
     pub fn load_node_hash(&self, block_id: u32, trieptr: TriePtr) -> Option<TrieHash> {
         self.hash_cache
             .get(&TrieNodeAddr(block_id, trieptr))
             .cloned()
+    }
+
+    #[inline]
+    pub fn ref_node_hash(&self, block_id: u32, trieptr: TriePtr) -> Option<TrieHash> {
+        self.hash_cache
+            .get(&TrieNodeAddr(block_id, trieptr))
+            .copied()
     }
 
     /// Cache a node and hash
@@ -218,6 +230,15 @@ impl<T: MarfTrieId> TrieCache<T> {
         }
     }
 
+    #[inline]
+    pub fn ref_node(&self, block_id: u32, trieptr: &TriePtr) -> Option<&TrieNodeType> {
+        if let TrieCache::Noop(_) = self {
+            None
+        } else {
+            self.state_ref().ref_node(block_id, *trieptr)
+        }
+    }
+
     /// Load both a node and its hash, given its block ID and trie pointer within the block.
     /// Returns None if either the hash or the node are missing -- both must be cached.
     #[inline]
@@ -240,6 +261,15 @@ impl<T: MarfTrieId> TrieCache<T> {
             None
         } else {
             self.state_mut().load_node_hash(block_id, *trieptr)
+        }
+    }
+
+    #[inline]
+    pub fn ref_node_hash(&self, block_id: u32, trieptr: &TriePtr) -> Option<TrieHash> {
+        if let TrieCache::Noop(_) = self {
+            None
+        } else {
+            self.state_ref().ref_node_hash(block_id, *trieptr)
         }
     }
 

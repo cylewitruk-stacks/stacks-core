@@ -331,6 +331,56 @@ impl Trie {
         }
     }
 
+    pub fn walk_backptr_ref<'a, T: MarfTrieId>(
+        storage: &mut TrieStorageConnection<T>,
+        ptr: &TriePtr,
+        cursor: &mut TrieCursor<T>,
+        scratch: &'a mut crate::chainstate::stacks::index::bits::TrieNodeDecodeScratch,
+    ) -> Result<
+        (
+            crate::chainstate::stacks::index::node::TrieNodeRef<'a>,
+            TrieHash,
+            TriePtr,
+        ),
+        Error,
+    > {
+        if !is_backptr(ptr.id()) {
+            // child is in this block
+            if ptr.id() == (TrieNodeID::Empty as u8) {
+                // shouldn't happen
+                return Err(Error::CorruptionError("ptr is empty".to_string()));
+            }
+            let (node, node_hash) = storage.read_nodetype_ref(ptr, scratch)?;
+            Ok((node, node_hash, *ptr))
+        } else {
+            storage.bench_mut().marf_find_backptr_node_start();
+            // ptr is a backptr -- find the block
+            let back_block_hash = storage
+                .get_block_from_local_id(ptr.back_block())
+                .inspect_err(|_e| {
+                    test_debug!("Failed to get block from local ID {}", ptr.back_block());
+                })?
+                .clone();
+
+            storage
+                .open_block_known_id(&back_block_hash, ptr.back_block())
+                .inspect_err(|_e| {
+                    test_debug!(
+                        "Failed to open block {} with id {}: {_e:?}",
+                        &back_block_hash,
+                        ptr.back_block(),
+                    );
+                })?;
+
+            let backptr = ptr.from_backptr();
+            storage.bench_mut().marf_find_backptr_node_finish();
+
+            let (node, node_hash) = storage.read_nodetype_ref(&backptr, scratch)?;
+            cursor.repair_backptr_step_backptr_ref(&node, &backptr, back_block_hash);
+            Ok((node, node_hash, backptr))
+        }
+    }
+
     /// Read a node's children's hashes as a vector of TrieHashes.
     /// This only works for intermediate nodes and leafs (the latter of which have no children).
     ///

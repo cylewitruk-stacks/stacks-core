@@ -31,6 +31,7 @@ use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::bits::{
     get_node_byte_len, read_hash_bytes, read_nodetype, read_root_hash, write_nodetype_bytes,
+    TrieNodeDecodeScratch,
 };
 use crate::chainstate::stacks::index::cache::*;
 use crate::chainstate::stacks::index::file::{TrieFile, TrieFileNodeHashReader};
@@ -38,7 +39,7 @@ use crate::chainstate::stacks::index::marf::MARFOpenOpts;
 #[cfg(test)]
 use crate::chainstate::stacks::index::node::set_backptr;
 use crate::chainstate::stacks::index::node::{
-    is_backptr, TrieNode, TrieNodeID, TrieNodeType, TriePtr,
+    is_backptr, TrieNode, TrieNodeID, TrieNodeRef, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::trie::Trie;
@@ -2675,6 +2676,155 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     pub fn read_nodetype_nohash(&mut self, ptr: &TriePtr) -> Result<TrieNodeType, Error> {
         self.read_nodetype_maybe_hash(ptr, false)
             .map(|(node, _)| node)
+    }
+
+    /// Read a persisted node and its hash into decode scratch, returning a borrowed view.
+    #[inline]
+    pub fn read_nodetype_ref<'a>(
+        &mut self,
+        ptr: &TriePtr,
+        scratch: &'a mut TrieNodeDecodeScratch,
+    ) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
+        self.read_nodetype_maybe_hash_ref(ptr, scratch, true)
+    }
+
+    /// Read a persisted node into decode scratch, returning a borrowed view.
+    #[inline]
+    pub fn read_nodetype_ref_nohash<'a>(
+        &mut self,
+        ptr: &TriePtr,
+        scratch: &'a mut TrieNodeDecodeScratch,
+    ) -> Result<TrieNodeRef<'a>, Error> {
+        self.read_nodetype_maybe_hash_ref(ptr, scratch, false)
+            .map(|(node, _)| node)
+    }
+
+    fn inner_read_persisted_nodetype_ref<'a>(
+        &mut self,
+        block_id: u32,
+        ptr: &TriePtr,
+        read_hash: bool,
+        scratch: &'a mut TrieNodeDecodeScratch,
+    ) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
+        trace!(
+            "inner_read_persisted_nodetype_ref({block_id}): {ptr:?} (unconfirmed={:?},{})",
+            &self.unconfirmed_block_id,
+            self.unconfirmed()
+        );
+
+        if self.unconfirmed_block_id == Some(block_id) {
+            trace!("Read persisted node from unconfirmed block id {block_id}");
+            if read_hash {
+                return trie_sql::read_node_type_ref(&self.db, block_id, ptr, scratch);
+            } else {
+                return trie_sql::read_node_type_ref_nohash(&self.db, block_id, ptr, scratch)
+                    .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])));
+            }
+        }
+
+        match self.blobs.as_mut() {
+            Some(blobs) => {
+                if read_hash {
+                    blobs.read_node_type_ref(&self.db, block_id, ptr, scratch)
+                } else {
+                    blobs
+                        .read_node_type_ref_nohash(&self.db, block_id, ptr, scratch)
+                        .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])))
+                }
+            }
+            None => {
+                if read_hash {
+                    trie_sql::read_node_type_ref(&self.db, block_id, ptr, scratch)
+                } else {
+                    trie_sql::read_node_type_ref_nohash(&self.db, block_id, ptr, scratch)
+                        .map(|node| (node, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])))
+                }
+            }
+        }
+    }
+
+    fn read_nodetype_maybe_hash_ref<'a>(
+        &mut self,
+        ptr: &TriePtr,
+        scratch: &'a mut TrieNodeDecodeScratch,
+        read_hash: bool,
+    ) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
+        trace!("read_nodetype_ref({:?}): {:?}", &self.data.cur_block, ptr);
+
+        self.data.read_count += 1;
+        if is_backptr(ptr.id()) {
+            self.data.read_backptr_count += 1;
+        } else if ptr.id() == TrieNodeID::Leaf as u8 {
+            self.data.read_leaf_count += 1;
+        } else {
+            self.data.read_node_count += 1;
+        }
+
+        let clear_ptr = ptr.from_backptr();
+
+        if let Some((ref uncommitted_bhh, ref mut uncommitted_trie)) = self.data.uncommitted_writes
+        {
+            if &self.data.cur_block == uncommitted_bhh {
+                let (node_ref, hash) = uncommitted_trie
+                    .trie_ram_ref()
+                    .with_nodetype(clear_ptr.ptr(), |(node, hash)| {
+                        (scratch.store_from_ref(node), *hash)
+                    })?;
+                return Ok((node_ref, hash));
+            }
+        }
+
+        match self.data.cur_block_id {
+            Some(id) => {
+                self.bench.read_nodetype_start();
+
+                if matches!(&self.cache, TrieCache::Noop(_)) {
+                    let (node_ref, hash) =
+                        self.inner_read_persisted_nodetype_ref(id, &clear_ptr, read_hash, scratch)?;
+                    self.bench.read_nodetype_finish(false);
+                    return Ok((node_ref, hash));
+                }
+
+                if read_hash {
+                    if let Some(node_hash) = self.cache.ref_node_hash(id, &clear_ptr) {
+                        if let Some(node_inst) = self.cache.ref_node(id, &clear_ptr) {
+                            let node_ref = scratch.store_from_ref(node_inst);
+                            self.bench.read_nodetype_finish(false);
+                            return Ok((node_ref, node_hash));
+                        }
+                    }
+                } else if let Some(node_inst) = self.cache.ref_node(id, &clear_ptr) {
+                    let node_ref = scratch.store_from_ref(node_inst);
+                    self.bench.read_nodetype_finish(false);
+                    return Ok((node_ref, TrieHash([0u8; TRIEHASH_ENCODED_SIZE])));
+                }
+
+                let (node_inst, node_hash) = if read_hash {
+                    let (node_inst, node_hash) =
+                        self.inner_read_persisted_nodetype(id, &clear_ptr, read_hash)?;
+                    if self.cache.stores_node(&node_inst) {
+                        self.cache
+                            .store_node_and_hash(id, clear_ptr, node_inst.clone(), node_hash);
+                    }
+                    (node_inst, node_hash)
+                } else {
+                    let (node_inst, _) =
+                        self.inner_read_persisted_nodetype(id, &clear_ptr, read_hash)?;
+                    if self.cache.stores_node(&node_inst) {
+                        self.cache.store_node(id, clear_ptr, node_inst.clone());
+                    }
+                    (node_inst, TrieHash([0u8; TRIEHASH_ENCODED_SIZE]))
+                };
+
+                let node_ref = scratch.store(node_inst);
+                self.bench.read_nodetype_finish(false);
+                Ok((node_ref, node_hash))
+            }
+            None => {
+                debug!("Not found (no file is open)");
+                Err(Error::NotFoundError)
+            }
+        }
     }
 
     /// Inner method for reading a node, and optionally its hash as well.

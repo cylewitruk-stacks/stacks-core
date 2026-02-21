@@ -28,8 +28,9 @@ use stacks_common::types::sqlite::NO_PARAMS;
 use crate::chainstate::stacks::index::bits::read_hash_bytes;
 use crate::chainstate::stacks::index::bits::{
     read_node_hash_bytes as bits_read_node_hash_bytes, read_nodetype, read_nodetype_nohash,
+    read_nodetype_ref, read_nodetype_ref_nohash, TrieNodeDecodeScratch,
 };
-use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::node::{TrieNodeRef, TrieNodeType, TriePtr};
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
@@ -489,6 +490,40 @@ pub fn read_node_type_nohash(
         true,
     )?;
     read_nodetype_nohash(&mut blob, ptr)
+}
+
+/// Read a node and its hash from a sqlite-stored trie blob into decode scratch.
+pub fn read_node_type_ref<'a>(
+    conn: &Connection,
+    block_id: u32,
+    ptr: &TriePtr,
+    scratch: &'a mut TrieNodeDecodeScratch,
+) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
+    let mut blob = conn.blob_open(
+        DatabaseName::Main,
+        "marf_data",
+        "data",
+        block_id.into(),
+        true,
+    )?;
+    read_nodetype_ref(&mut blob, ptr, scratch)
+}
+
+/// Read a node from a sqlite-stored trie blob into decode scratch, excluding its hash.
+pub fn read_node_type_ref_nohash<'a>(
+    conn: &Connection,
+    block_id: u32,
+    ptr: &TriePtr,
+    scratch: &'a mut TrieNodeDecodeScratch,
+) -> Result<TrieNodeRef<'a>, Error> {
+    let mut blob = conn.blob_open(
+        DatabaseName::Main,
+        "marf_data",
+        "data",
+        block_id.into(),
+        true,
+    )?;
+    read_nodetype_ref_nohash(&mut blob, ptr, scratch)
 }
 
 /// Get the offset and length of a trie blob in the trie blobs file.

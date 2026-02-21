@@ -1329,14 +1329,14 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         );
 
         let mut node_ptr = storage.root_trieptr();
-        let (mut node, _) = Trie::read_root(storage)?;
+        let mut node = Trie::read_root_nohash(storage)?;
         let mut cursor = TrieCursor::new(path, storage.root_trieptr());
 
         for _ in 0..(cursor.path.len() + 1) {
-            match Trie::walk_from(storage, &node, &mut cursor) {
+            match Trie::walk_from_nohash(storage, &node, &mut cursor) {
                 Ok(node_info_opt) => {
                     match node_info_opt {
-                        Some((next_node_ptr, next_node, _)) => {
+                        Some((next_node_ptr, next_node)) => {
                             // end-of-node-path.
                             // keep walking.
                             node = next_node;

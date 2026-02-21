@@ -20,7 +20,7 @@ use stacks_common::types::chainstate::TrieHash;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use super::storage::ReopenedTrieStorageConnection;
-use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
+use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash, TrieNodeDecodeScratch};
 use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, set_backptr, CursorError, TrieCursor, TrieNode256, TrieNodeID,
     TrieNodeType, TriePtr,
@@ -56,6 +56,7 @@ struct WriteChainTip<T> {
 
 struct MarfReadScratch<T: MarfTrieId> {
     cursor: Option<TrieCursor<T>>,
+    decode_scratch: TrieNodeDecodeScratch,
 }
 
 impl<T: MarfTrieId> Default for MarfReadScratch<T> {
@@ -65,8 +66,12 @@ impl<T: MarfTrieId> Default for MarfReadScratch<T> {
 }
 
 impl<T: MarfTrieId> MarfReadScratch<T> {
+    #[inline]
     fn new() -> Self {
-        Self { cursor: None }
+        Self {
+            cursor: None,
+            decode_scratch: TrieNodeDecodeScratch::new(),
+        }
     }
 
     fn cursor_mut(&mut self, path: &TrieHash) -> &mut TrieCursor<T> {
@@ -1129,6 +1134,82 @@ impl<T: MarfTrieId> MARF<T> {
         Err(Error::CorruptionError("Trie has a cycle".to_string()))
     }
 
+    fn walk_with_cursor_ref(
+        storage: &mut TrieStorageConnection<T>,
+        block_hash: &T,
+        path: &TrieHash,
+        cursor: &mut TrieCursor<T>,
+        read_scratch: &mut MarfReadScratch<T>,
+    ) -> Result<TrieLeaf, Error> {
+        storage.open_block(block_hash)?;
+        cursor.reset(path, storage.root_trieptr());
+
+        let mut node_ptr = storage.root_trieptr();
+        let mut node_already_in_scratch = false;
+
+        for _ in 0..(cursor.path.len() + 1) {
+            let node = if node_already_in_scratch {
+                node_already_in_scratch = false;
+                read_scratch.decode_scratch.get_ref()
+            } else {
+                storage.read_nodetype_ref_nohash(&node_ptr, &mut read_scratch.decode_scratch)?
+            };
+
+            storage.bench_mut().marf_walk_from_start();
+            match cursor.walk_ref(&node, storage.get_cur_block_ref()) {
+                Ok(next_ptr_opt) => match next_ptr_opt {
+                    Some(next_ptr) => {
+                        node_ptr = next_ptr;
+                        continue;
+                    }
+                    None => {
+                        if clear_backptr(cursor.ptr().id()) != TrieNodeID::Leaf as u8 {
+                            return Err(Error::CorruptionError(
+                                "Non-leaf encountered at end of path".to_string(),
+                            ));
+                        }
+
+                        let leaf = node.as_leaf().ok_or_else(|| {
+                            Error::CorruptionError("Path reached a non-leaf".to_string())
+                        })?;
+                        storage.bench_mut().marf_walk_from_finish();
+                        return Ok(TrieLeaf::from_value(leaf.path, leaf.data.clone()));
+                    }
+                },
+                Err(cursor_error) => match cursor_error {
+                    CursorError::PathDiverged => {
+                        trace!("Path diverged -- we're done.");
+                        storage.bench_mut().marf_walk_from_finish();
+                        return Err(Error::NotFoundError);
+                    }
+                    CursorError::ChrNotFound => {
+                        trace!("ChrNotFound encountered -- node does not exist");
+                        storage.bench_mut().marf_walk_from_finish();
+                        return Err(Error::NotFoundError);
+                    }
+                    CursorError::BackptrEncountered(ptr) => {
+                        storage.bench_mut().marf_walk_backptr_start();
+                        let (_, _, next_node_ptr) = Trie::walk_backptr_ref(
+                            storage,
+                            &ptr,
+                            cursor,
+                            &mut read_scratch.decode_scratch,
+                        )?;
+                        storage.bench_mut().marf_walk_backptr_finish();
+
+                        cursor.repair_backptr_finish(&next_node_ptr, storage.get_cur_block());
+                        node_ptr = next_node_ptr;
+                        node_already_in_scratch = true;
+                        continue;
+                    }
+                },
+            }
+        }
+
+        trace!("Trie has a cycle");
+        Err(Error::CorruptionError("Trie has a cycle".to_string()))
+    }
+
     pub fn format(
         storage: &mut TrieStorageTransaction<T>,
         first_block_hash: &T,
@@ -1163,10 +1244,20 @@ impl<T: MarfTrieId> MARF<T> {
     ) -> Result<Option<TrieLeaf>, Error> {
         trace!("MARF::get_path_with_scratch({block_hash:?}) {path:?}");
 
-        let cursor = scratch.cursor_mut(path);
-        let node = MARF::walk_with_cursor(storage, block_hash, path, cursor).inspect_err(|e| {
-            trace!("Failed to look up key {block_hash:?} {path:?}: {e:?}");
-        })?;
+        let mut cursor = std::mem::take(&mut scratch.cursor)
+            .unwrap_or_else(|| TrieCursor::new(path, TriePtr::default()));
+
+        let leaf_result =
+            MARF::walk_with_cursor_ref(storage, block_hash, path, &mut cursor, scratch)
+                .inspect_err(|e| {
+                    trace!("Failed to look up key {block_hash:?} {path:?}: {e:?}");
+                });
+
+        scratch.cursor = Some(cursor);
+
+        let leaf = leaf_result?;
+
+        let cursor = scratch.cursor.as_ref().expect("cursor should be restored");
 
         if cursor.block_hashes.len() + 1 != cursor.node_ptrs.len() {
             trace!("cursor.block_hashes = {:?}", &cursor.block_hashes);
@@ -1176,12 +1267,7 @@ impl<T: MarfTrieId> MARF<T> {
 
         assert!(cursor.eop());
 
-        match node {
-            TrieNodeType::Leaf(data) => Ok(Some(data)),
-            _ => Err(Error::CorruptionError(
-                "Path reached a non-leaf".to_string(),
-            )),
-        }
+        Ok(Some(leaf))
     }
 
     fn do_insert_leaf(
