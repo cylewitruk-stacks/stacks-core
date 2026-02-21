@@ -11,12 +11,6 @@ pub(crate) enum BenchTarget {
     NodeAlloc(NodeAllocArgs),
     #[command(about = "Run read bench")]
     Read(ReadArgs),
-    #[command(name = "read-proof", about = "Run read-proof bench")]
-    ReadProof(ReadArgs),
-    #[command(name = "read-backptr", about = "Run read-backptr bench")]
-    ReadBackptr(ReadBackptrArgs),
-    #[command(name = "read-backptr-proof", about = "Run read-backptr-proof bench")]
-    ReadBackptrProof(ReadBackptrArgs),
     #[command(about = "Run write bench")]
     Write(WriteArgs),
 }
@@ -38,41 +32,8 @@ impl BenchTarget {
                         iters: args.iters,
                         rounds: args.rounds,
                         chain_len: args.chain_len,
+                        read_proofs: Some(args.proofs),
                         keys_per_block: args.keys_per_block,
-                        depths: args.depths.clone(),
-                        cache_strategies: args.cache_strategies.clone(),
-                        ..Default::default()
-                    },
-                ),
-                BenchRunRequest::new(
-                    BenchKind::ReadBackptr,
-                    BenchEnvOverrides {
-                        iters: args.iters,
-                        rounds: args.rounds,
-                        chain_len: args.chain_len,
-                        depths: args.depths.clone(),
-                        cache_strategies: args.cache_strategies.clone(),
-                        ..Default::default()
-                    },
-                ),
-                BenchRunRequest::new(
-                    BenchKind::ReadProof,
-                    BenchEnvOverrides {
-                        iters: args.iters,
-                        rounds: args.rounds,
-                        chain_len: args.chain_len,
-                        keys_per_block: args.keys_per_block,
-                        depths: args.depths.clone(),
-                        cache_strategies: args.cache_strategies.clone(),
-                        ..Default::default()
-                    },
-                ),
-                BenchRunRequest::new(
-                    BenchKind::ReadBackptrProof,
-                    BenchEnvOverrides {
-                        iters: args.iters,
-                        rounds: args.rounds,
-                        chain_len: args.chain_len,
                         depths: args.depths.clone(),
                         cache_strategies: args.cache_strategies.clone(),
                         ..Default::default()
@@ -81,7 +42,11 @@ impl BenchTarget {
                 BenchRunRequest::new(
                     BenchKind::Write,
                     BenchEnvOverrides {
+                        iters: args.iters,
                         rounds: args.rounds,
+                        key_updates: args.key_updates,
+                        write_depths: args.write_depths.clone(),
+                        sqlite_wal_autocheckpoint: args.sqlite_wal_autocheckpoint,
                         key_search_max_tries: args.key_search_max_tries,
                         ..Default::default()
                     },
@@ -100,41 +65,8 @@ impl BenchTarget {
                     iters: args.iters,
                     rounds: args.rounds,
                     chain_len: args.chain_len,
+                    read_proofs: Some(args.proofs),
                     keys_per_block: args.keys_per_block,
-                    depths: args.depths,
-                    cache_strategies: args.cache_strategies,
-                    ..Default::default()
-                },
-            )],
-            Self::ReadProof(args) => vec![BenchRunRequest::new(
-                BenchKind::ReadProof,
-                BenchEnvOverrides {
-                    iters: args.iters,
-                    rounds: args.rounds,
-                    chain_len: args.chain_len,
-                    keys_per_block: args.keys_per_block,
-                    depths: args.depths,
-                    cache_strategies: args.cache_strategies,
-                    ..Default::default()
-                },
-            )],
-            Self::ReadBackptr(args) => vec![BenchRunRequest::new(
-                BenchKind::ReadBackptr,
-                BenchEnvOverrides {
-                    iters: args.iters,
-                    rounds: args.rounds,
-                    chain_len: args.chain_len,
-                    depths: args.depths,
-                    cache_strategies: args.cache_strategies,
-                    ..Default::default()
-                },
-            )],
-            Self::ReadBackptrProof(args) => vec![BenchRunRequest::new(
-                BenchKind::ReadBackptrProof,
-                BenchEnvOverrides {
-                    iters: args.iters,
-                    rounds: args.rounds,
-                    chain_len: args.chain_len,
                     depths: args.depths,
                     cache_strategies: args.cache_strategies,
                     ..Default::default()
@@ -143,7 +75,11 @@ impl BenchTarget {
             Self::Write(args) => vec![BenchRunRequest::new(
                 BenchKind::Write,
                 BenchEnvOverrides {
+                    iters: args.iters,
                     rounds: args.rounds,
+                    key_updates: args.key_updates,
+                    write_depths: args.write_depths,
+                    sqlite_wal_autocheckpoint: args.sqlite_wal_autocheckpoint,
                     key_search_max_tries: args.key_search_max_tries,
                     ..Default::default()
                 },
@@ -163,13 +99,16 @@ pub(crate) struct AllArgs {
     )]
     rounds: Option<usize>,
 
-    #[arg(
-        long,
-        help = "Set CHAIN_LEN for read/read-proof/read-backptr/read-backptr-proof fixture length"
-    )]
+    #[arg(long, help = "Set CHAIN_LEN for read fixture length")]
     chain_len: Option<u32>,
 
-    #[arg(long, help = "Set KEYS_PER_BLOCK for read fixture density")]
+    #[arg(long, help = "Enable proofed reads (MARF::get_with_proof) for read")]
+    proofs: bool,
+
+    #[arg(
+        long,
+        help = "Set KEYS_PER_BLOCK additional noise/bulk keys per block for read"
+    )]
     keys_per_block: Option<u32>,
 
     #[arg(
@@ -189,6 +128,24 @@ pub(crate) struct AllArgs {
         help = "Set KEY_SEARCH_MAX_TRIES for write promotion-key search budget"
     )]
     key_search_max_tries: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Set WRITE_DEPTHS as comma-separated values (for example: 1,64,1024)"
+    )]
+    write_depths: Option<String>,
+
+    #[arg(
+        long,
+        help = "Set KEY_UPDATES percent (0-100) for write update share of total writes"
+    )]
+    key_updates: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Set SQLITE_WAL_AUTOCHECKPOINT page threshold for write benchmark SQLite connection"
+    )]
+    sqlite_wal_autocheckpoint: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -208,7 +165,13 @@ pub(crate) struct ReadArgs {
     #[arg(long, help = "Set ROUNDS for read repeated case runs")]
     rounds: Option<usize>,
 
-    #[arg(long, help = "Set KEYS_PER_BLOCK for read fixture density")]
+    #[arg(long, help = "Enable proofed reads (MARF::get_with_proof)")]
+    proofs: bool,
+
+    #[arg(
+        long,
+        help = "Set KEYS_PER_BLOCK additional noise/bulk keys per block for read"
+    )]
     keys_per_block: Option<u32>,
 
     #[arg(
@@ -225,33 +188,30 @@ pub(crate) struct ReadArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct ReadBackptrArgs {
-    #[arg(long, help = "Set CHAIN_LEN for read-backptr fixture length")]
-    chain_len: Option<u32>,
-
-    #[arg(long, help = "Set ITERS for read-backptr per-case iteration count")]
+pub(crate) struct WriteArgs {
+    #[arg(long, help = "Set ITERS for write inserted keys per workflow round")]
     iters: Option<usize>,
 
-    #[arg(long, help = "Set ROUNDS for read-backptr repeated case runs")]
-    rounds: Option<usize>,
-
-    #[arg(
-        long,
-        help = "Set DEPTHS as comma-separated values (for example: 256,768,1536)"
-    )]
-    depths: Option<String>,
-
-    #[arg(
-        long,
-        help = "Set CACHE_STRATEGIES as comma-separated values (for example: noop,node256)"
-    )]
-    cache_strategies: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct WriteArgs {
     #[arg(long, help = "Set ROUNDS for write repeated workflow runs")]
     rounds: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Set WRITE_DEPTHS as comma-separated values (for example: 1,64,1024)"
+    )]
+    write_depths: Option<String>,
+
+    #[arg(
+        long,
+        help = "Set KEY_UPDATES percent (0-100) for write update share of total writes"
+    )]
+    key_updates: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Set SQLITE_WAL_AUTOCHECKPOINT page threshold for write benchmark SQLite connection"
+    )]
+    sqlite_wal_autocheckpoint: Option<usize>,
 
     #[arg(
         long,

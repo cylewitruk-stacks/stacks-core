@@ -15,10 +15,6 @@
 
 //! Read-heavy MARF timing benchmark focused on `MARF::get` and
 //! `MARF::get_with_proof` backpointer walks.
-//!
-//! In `MARF_ALLOC_OUTPUT=raw`, this emits line-oriented `config` and `result`
-//! records per round/case. Unified summary rows are emitted by `main.rs`.
-//! Run `read --help` for user-facing configuration details.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -37,14 +33,12 @@ use crate::utils::{
 };
 use crate::{OutputMode, Summary};
 
-const DEFAULT_CHAIN_LEN: u32 = 512;
+const DEFAULT_CHAIN_LEN: u32 = 2048;
 const DEFAULT_READ_ITERS: usize = 200_000;
 const DEFAULT_READ_ROUNDS: usize = 2;
-const DEFAULT_KEYS_PER_BLOCK: u32 = 4;
-const DEFAULT_DEPTHS: [u32; 4] = [32, 128, 256, 511];
+const DEFAULT_KEYS_PER_BLOCK: u32 = 16;
+const DEFAULT_DEPTHS: [u32; 4] = [32, 128, 768, 2047];
 const DEFAULT_CACHE_STRATEGIES: [&str; 2] = ["noop", "node256"];
-const READ_VARIANTS_GET: [ReadVariant; 1] = [ReadVariant::Get];
-const READ_VARIANTS_PROOF: [ReadVariant; 1] = [ReadVariant::GetWithProof];
 
 #[derive(Clone, Copy)]
 enum ReadVariant {
@@ -89,24 +83,37 @@ fn print_usage(args: &[String]) {
             .collect::<Vec<_>>()
             .join(",");
         let default_cache_strategies = DEFAULT_CACHE_STRATEGIES.join(",");
+        let default_keys_per_block = DEFAULT_KEYS_PER_BLOCK;
+        let default_total_fixture_keys = default_keys_per_block + 1;
 
-        println!("read: MARF::get backpointer read benchmark");
+        println!("read: MARF::get benchmark");
+        println!();
+        println!("CLI args:");
+        println!("  --proofs     use MARF::get_with_proof instead of MARF::get [default: false]");
         println!();
         println!("Environment variables:");
-        println!("  CHAIN_LEN   blocks in fixture; must be > max depth [default: {DEFAULT_CHAIN_LEN}]");
-        println!("              Higher values increase fixture construction time and temporary DB size");
-        println!("  ITERS       reads per measured case [default: {DEFAULT_READ_ITERS}]");
+        println!("  ITERS       Reads per measured case [default: {DEFAULT_READ_ITERS}]");
         println!("              Higher values reduce measurement noise but increase runtime linearly");
         println!("              Affects elapsed_ms/alloc totals directly; per-op metrics remain normalized");
-        println!("  ROUNDS      independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
+        println!("  ROUNDS      Independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
         println!("              Higher values improve stability estimates (summary min/max)");
-        println!("  KEYS_PER_BLOCK number of keys inserted per fixture block [default: {DEFAULT_KEYS_PER_BLOCK}]");
-        println!("              Must be >= 1; higher values make each fixture block denser");
-        println!("  DEPTHS      comma-separated depths [default: {default_depths}]");
+        println!("  CHAIN_LEN   Number of sequential blocks/tries created [default: {DEFAULT_CHAIN_LEN}]");
+        println!("              Must be greater than the maximum `DEPTHS` value.");
+        println!("              Higher values increase fixture construction time and temporary DB size");
+        println!("  DEPTHS      Comma-separated depths [default: {default_depths}]");
+        println!("              Must be less than CHAIN_LEN");
         println!("              Example: DEPTHS=16,64,255");
-        println!("  CACHE_STRATEGIES comma-separated MARF cache strategies [default: {default_cache_strategies}]");
+        println!("  KEYS_PER_BLOCK");
+        println!("              Additional noise/bulk keys inserted per fixture block [default: {default_keys_per_block}]");
+        println!("              Must be >= 0; fixture keys per block = 1 measured depth key + KEYS_PER_BLOCK (total default: {default_total_fixture_keys})");
+        println!("              Read measurements always target the single measured depth key");
+        println!("  READ_PROOFS");
+        println!("              Set to true/false to steer proofed reads [default: false]");
+        println!("  CACHE_STRATEGIES");
+        println!("              Comma-separated MARF cache strategies [default: {default_cache_strategies}]");
         println!("              Example: CACHE_STRATEGIES=noop,node256,everything");
-        println!("  MARF_ALLOC_OUTPUT output mode [default: summary]");
+        println!("  MARF_ALLOC_OUTPUT");
+        println!("              Output mode [default: summary]");
         println!("              'summary': unified summary lines only");
         println!("              'raw': config/result lines + unified summary lines");
         println!();
@@ -135,10 +142,11 @@ fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> Ma
     let db_path = db_dir.path().join("marf-read.sqlite");
     let db_path_str = db_path
         .to_str()
-        .expect("failed to convert MARF read benchmark path to UTF-8");
+        .expect("failed to convert MARF read benchmark path to UTF-8")
+        .to_string();
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, cache_strategy, true);
-    let mut marf =
-        MARF::from_path(db_path_str, open_opts).expect("failed to open MARF for read profile");
+    let mut marf = MARF::from_path(&db_path_str, open_opts.clone())
+        .expect("failed to open MARF for read profile");
 
     let mut parent = StacksBlockId::sentinel();
     let mut tip = parent.clone();
@@ -152,13 +160,14 @@ fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> Ma
         tx.begin(&parent, &next)
             .expect("failed to begin block extension while building read profile fixture");
 
-        let mut keys = Vec::with_capacity(keys_per_block as usize);
-        let mut values = Vec::with_capacity(keys_per_block as usize);
+        let total_fixture_keys = keys_per_block + 1;
+        let mut keys = Vec::with_capacity(total_fixture_keys as usize);
+        let mut values = Vec::with_capacity(total_fixture_keys as usize);
 
         keys.push(depth_key(height));
         values.push(MARFValue::from(height));
 
-        for noise_ix in 0..(keys_per_block - 1) {
+        for noise_ix in 0..keys_per_block {
             keys.push(format!("noise:{height:08x}:{noise_ix:02x}"));
             values.push(MARFValue::from(
                 height.wrapping_mul(97).wrapping_add(noise_ix + 1),
@@ -180,6 +189,24 @@ fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> Ma
         tip_height: chain_len,
         _db_dir: db_dir,
     }
+}
+
+fn parse_keys_per_block() -> u32 {
+    parse_u32_env("KEYS_PER_BLOCK", DEFAULT_KEYS_PER_BLOCK)
+}
+
+fn parse_proofs_setting(args: &[String]) -> bool {
+    let cli_proofs = args.iter().any(|arg| arg == "--proofs");
+    let env_proofs = std::env::var("READ_PROOFS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false);
+    cli_proofs || env_proofs
 }
 
 fn measure_case(
@@ -230,13 +257,13 @@ fn run_with_variants(
     let chain_len = parse_u32_env("CHAIN_LEN", DEFAULT_CHAIN_LEN);
     let iters = parse_usize_env("ITERS", DEFAULT_READ_ITERS);
     let rounds = parse_usize_env("ROUNDS", DEFAULT_READ_ROUNDS);
-    let keys_per_block = parse_u32_env("KEYS_PER_BLOCK", DEFAULT_KEYS_PER_BLOCK);
+    let keys_per_block = parse_keys_per_block();
+    let total_fixture_keys = keys_per_block + 1;
     let depths = parse_csv_u32_env("DEPTHS", &DEFAULT_DEPTHS);
     let cache_strategies = parse_csv_string_env("CACHE_STRATEGIES", &DEFAULT_CACHE_STRATEGIES);
 
     assert!(iters > 0, "ITERS must be > 0");
     assert!(rounds > 0, "ROUNDS must be > 0");
-    assert!(keys_per_block > 0, "KEYS_PER_BLOCK must be >= 1");
 
     let max_depth = *depths.iter().max().expect("depth list must not be empty");
     assert!(
@@ -246,7 +273,7 @@ fn run_with_variants(
 
     if output_mode.is_raw() {
         println!(
-            "config\tchain_len={chain_len}\titers={iters}\trounds={rounds}\tkeys_per_block={keys_per_block}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
+            "config\tchain_len={chain_len}\titers={iters}\trounds={rounds}\tkeys_per_block={keys_per_block}\ttotal_fixture_keys_per_block={total_fixture_keys}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
         );
     }
 
@@ -315,9 +342,9 @@ fn run_with_variants(
 }
 
 pub fn run(args: &[String], output_mode: OutputMode) -> Option<Summary> {
-    run_with_variants(args, output_mode, "read", &READ_VARIANTS_GET)
-}
-
-pub fn run_proof(args: &[String], output_mode: OutputMode) -> Option<Summary> {
-    run_with_variants(args, output_mode, "read-proof", &READ_VARIANTS_PROOF)
+    if parse_proofs_setting(args) {
+        run_with_variants(args, output_mode, "read", &[ReadVariant::GetWithProof])
+    } else {
+        run_with_variants(args, output_mode, "read", &[ReadVariant::Get])
+    }
 }

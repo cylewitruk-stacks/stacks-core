@@ -27,8 +27,36 @@ pub fn resolve_base_revision(repo_root: &Path, base: &str) -> Result<(String, St
         return Ok((commit, "staged".to_string()));
     }
 
+    if let Some((_, upstream_ref)) = base.split_once(':') {
+        if base.starts_with("merge-base:") {
+            if upstream_ref.trim().is_empty() {
+                bail!("invalid --base value: '{base}'. Expected merge-base:<upstream-ref>");
+            }
+            return resolve_merge_base_revision(repo_root, upstream_ref.trim());
+        }
+    }
+
+    if base.eq_ignore_ascii_case("merge-base") {
+        bail!("invalid --base value: '{base}'. Use --base merge-base:<upstream-ref>");
+    }
+
     verify_revision(repo_root, base)?;
     Ok((base.to_string(), base.to_string()))
+}
+
+pub fn resolve_merge_base_revision(
+    repo_root: &Path,
+    upstream_ref: &str,
+) -> Result<(String, String)> {
+    verify_revision(repo_root, upstream_ref)?;
+
+    let merge_base = git_capture_output_in(repo_root, ["merge-base", upstream_ref, "HEAD"])?;
+    let merge_base = merge_base.trim().to_string();
+    if merge_base.is_empty() {
+        bail!("failed to resolve merge-base for {upstream_ref} and HEAD");
+    }
+
+    Ok((merge_base, format!("merge-base({upstream_ref})")))
 }
 
 fn create_staged_snapshot_commit(repo_root: &Path) -> Result<String> {

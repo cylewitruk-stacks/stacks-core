@@ -33,6 +33,10 @@ pub fn parse_csv_u32_env(name: &str, default: &[u32]) -> Vec<u32> {
     parse_csv_env(name, default, "integer")
 }
 
+pub fn parse_csv_usize_env(name: &str, default: &[usize]) -> Vec<usize> {
+    parse_csv_env(name, default, "integer")
+}
+
 pub fn parse_csv_string_env(name: &str, default: &[&str]) -> Vec<String> {
     let defaults: Vec<String> = default.iter().map(|s| (*s).to_string()).collect();
     parse_csv_env(name, &defaults, "string")

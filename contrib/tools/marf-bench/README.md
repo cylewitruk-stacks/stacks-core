@@ -10,26 +10,42 @@ This document explains the git operations it performs, what they change (or do n
   - `cargo marf-bench bench --base c8a06adfc2c9c33ee858766a971eb36845e81499 read`
 - Compare staged snapshot to your current working tree:
   - `cargo marf-bench bench --base staged read`
+- Compare branch base via `--base` keyword (explicit upstream ref):
+  - `cargo marf-bench bench --base merge-base:upstream/develop read`
 - Compare two named revisions (branch/tag/commit):
-  - `cargo marf-bench bench --base master --target v3.0.0.0.0 read-backptr`
+  - `cargo marf-bench bench --base master --target v3.0.0.0.0 read --chain-len 2048 --depths 256,768,1536,2047 --keys-per-block 0`
 - Run proofed read benchmark separately:
-  - `cargo marf-bench bench --base staged read-proof`
+  - `cargo marf-bench bench --base staged read --proofs`
 - Run everything with machine-readable output:
   - `cargo marf-bench bench --base staged --output-format tsv all`
+- Run repeated comparisons and emit median/min/max repeat stats:
+  - `cargo marf-bench bench --base merge-base:upstream/develop --repeats 5 write --rounds 10 --iters 200 --write-depths 32,512,1024 --key-updates 25`
+- A/B write benchmark checkpoint behavior (bench-only hack):
+  - `cargo marf-bench bench --base merge-base:upstream/develop write --rounds 10 --iters 200 --write-depths 1024 --key-updates 25 --sqlite-wal-autocheckpoint 0`
+- Tune high-jitter detection threshold for repeat confidence summary:
+  - `cargo marf-bench bench --base merge-base:upstream/develop --repeats 5 --repeat-jitter-threshold 40 write --rounds 10 --iters 200 --write-depths 32,512,1024 --key-updates 25`
 - Override benchmark loop controls from CLI:
-  - `cargo marf-bench bench --base staged read-backptr --iters 400000 --rounds 4`
+  - `cargo marf-bench bench --base staged read --iters 400000 --rounds 4`
 - Override read-shape and write-search controls from CLI:
-  - `cargo marf-bench run read --chain-len 1024 --depths 64,256,768 --cache-strategies noop,node256 --keys-per-block 8`
-  - `cargo marf-bench run write --rounds 4 --key-search-max-tries 500000`
+  - `cargo marf-bench run read --chain-len 1024 --depths 64,256,768 --cache-strategies noop,node256 --keys-per-block 7`
+  - `cargo marf-bench run write --iters 20000 --write-depths 1024 --key-updates 25 --rounds 4 --key-search-max-tries 500000`
+- Run write across a depth distribution in one invocation:
+  - `cargo marf-bench run write --iters 20000 --write-depths 1,64,256,1024 --key-updates 25 --rounds 4 --key-search-max-tries 500000`
 
 ## Command shape
 
-- `run`: `cargo marf-bench run [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-proof|read-backptr|read-backptr-proof|write> [bench-specific options]`
-- `bench`: `cargo marf-bench bench [--base <rev>] [--target <rev>] [--output-format <summary|raw|tsv>] <all|node-alloc|read|read-proof|read-backptr|read-backptr-proof|write> [bench-specific options]`
+- `run`: `cargo marf-bench run [--output-format <summary|raw|tsv>] <all|node-alloc|read|write> [bench-specific options]`
+- `bench`: `cargo marf-bench bench [--base <rev|staged|merge-base:<upstream-ref>>] [--target <rev>] [--repeats <N>] [--repeat-jitter-threshold <PCT>] [--output-format <summary|raw|tsv>] <all|node-alloc|read|write> [bench-specific options]`
 
 Notes:
 
 - Global `bench` options (`--base`, `--target`, `--output-format`) come before the bench subcommand.
+- `--base` also accepts keywords: `staged`, `merge-base:<upstream-ref>`.
+- `merge-base` keyword requires an explicit upstream ref suffix (no default remote/ref).
+- `--target` requires `--base`.
+- `--repeats` requires `--base`; when set, marf-bench runs full base/target comparisons N times and appends repeat statistics.
+- `--repeat-jitter-threshold` sets the spread threshold (percentage points) for classifying high-jitter rows in repeat confidence output; default is `30`.
+- Repeat confidence classifies a row as high-jitter when total-ms repeat deltas straddle both signs (`min < 0 < max`) and spread exceeds threshold.
 - Bench-specific options (`--iters`, `--rounds`, etc.) come after the bench subcommand.
 
 ## Benchmark parameter flags
@@ -39,18 +55,27 @@ Bench-specific options are accepted on the bench target subcommands and are forw
 - `--iters <N>` sets `ITERS`
 - `--rounds <N>` sets `ROUNDS`
 - `--chain-len <N>` sets `CHAIN_LEN`
-- `--keys-per-block <N>` sets `KEYS_PER_BLOCK`
+- `--proofs` sets `READ_PROOFS=1` (uses `MARF::get_with_proof`)
+- `--keys-per-block <N>` sets `KEYS_PER_BLOCK` (additional noise/bulk keys per fixture block)
 - `--depths <CSV>` sets `DEPTHS`
 - `--cache-strategies <CSV>` sets `CACHE_STRATEGIES`
+- `--write-depths <CSV>` sets `WRITE_DEPTHS` (write parent-chain depth distribution)
+- `--key-updates <N>` sets `KEY_UPDATES` (write update share in percent, `0..=100`)
+- `--sqlite-wal-autocheckpoint <N>` sets `SQLITE_WAL_AUTOCHECKPOINT` (write benchmark only; page threshold for SQLite WAL auto-checkpoint, `0` disables auto-checkpoint)
 - `--key-search-max-tries <N>` sets `KEY_SEARCH_MAX_TRIES`
+
+Read fixture semantics:
+
+- Exactly one measured depth key is inserted per block.
+- `KEYS_PER_BLOCK` controls additional non-measured noise/bulk keys inserted alongside it.
+- Total fixture keys per block = `1 + KEYS_PER_BLOCK`.
 
 These flags are useful for automation since callers can avoid command-specific env var conditionals.
 
 ## Raw output notes
 
-When `--output-format raw` (or `MARF_ALLOC_OUTPUT=raw`) is used, `read`, `read-proof`,
-`read-backptr`, and `read-backptr-proof`
-bench `result` lines now include:
+When `--output-format raw` (or `MARF_ALLOC_OUTPUT=raw`) is used, `read`
+bench `result` lines include:
 
 - `variant=get`
 - `variant=get-with-proof`
@@ -94,7 +119,7 @@ Examples:
 - Commit hash vs current working tree:
   - `cargo marf-bench bench --base c8a06adfc2c9c33ee858766a971eb36845e81499 read`
 - Branch vs current working tree:
-  - `cargo marf-bench bench --base master read-backptr`
+  - `cargo marf-bench bench --base master read --chain-len 2048 --depths 256,768,1536,2047 --keys-per-block 0`
 - Tag vs branch:
   - `cargo marf-bench bench --base v3.0.0.0.0 --target master write`
 - Remote branch vs local branch:
@@ -134,7 +159,7 @@ Examples:
 - Staged snapshot vs current working tree:
   - `cargo marf-bench bench --base staged read`
 - Staged snapshot vs explicit target branch:
-  - `cargo marf-bench bench --base staged --target master read-backptr`
+  - `cargo marf-bench bench --base staged --target master read --chain-len 2048 --depths 256,768,1536,2047 --keys-per-block 0`
 - Staged snapshot with all benches in TSV output:
   - `cargo marf-bench bench --base staged --output-format tsv all`
 
@@ -161,8 +186,11 @@ Temporary worktree roots are created with the `tempfile` crate in your platform 
 (for example `/tmp` on Linux, `/var/folders/...` on macOS, `%TEMP%` on Windows).
 
 If the process exits normally, these temporary directories are removed by the runner cleanup.
-If the process crashes, the OS temp area lifecycle usually cleans up old temp files/directories
-over time, and you can also remove leftovers manually using the recovery commands below.
+On startup, marf-bench also performs a stale-worktree sweep for prior marf-bench temp worktrees.
+On `Ctrl-C` and panic paths, marf-bench proactively runs the same cleanup before exiting.
+If the process is forcibly terminated (`SIGKILL`, power loss), the OS temp area lifecycle usually
+cleans up old temp files/directories over time, and you can also remove leftovers manually using
+the recovery commands below.
 
 ## Failure/interrupt recovery
 

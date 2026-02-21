@@ -25,6 +25,14 @@
 //! `result` records. Unified summary rows are emitted by `main.rs`.
 //!
 //! Environment variables:
+//! - `ITERS` (default `49`): number of inserted keys per workflow round.
+//! - `WRITE_DEPTHS` (default `1`): comma-separated parent-chain depths;
+//!   runs all listed depths in one benchmark invocation.
+//! - `KEY_UPDATES` (default `0`): percent (0-100) of total writes that should
+//!   be updates of existing keys from prior tries (excluding the first
+//!   parent/genesis trie).
+//! - `SQLITE_WAL_AUTOCHECKPOINT` (optional): if set, applies
+//!   `PRAGMA wal_autocheckpoint = <pages>` to the MARF SQLite connection.
 //! - `ROUNDS` (default `2`): number of independent workflow repetitions.
 //! - `KEY_SEARCH_MAX_TRIES` (default `200000`): max key candidates to try when
 //!   searching for a hash bucket that yields enough distinct branches.
@@ -33,19 +41,22 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Instant;
 
-use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
+use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use blockstack_lib::chainstate::stacks::index::{
     ClarityMarfTrieId, Error as IndexError, MARFValue,
 };
+use blockstack_lib::util_lib::db::sql_pragma;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use tempfile::TempDir;
 
 use crate::allocator::{reset_stats, snapshot, Snapshot};
-use crate::utils::{block_id, has_help_flag, parse_usize_env};
+use crate::utils::{block_id, has_help_flag, parse_csv_usize_env, parse_usize_env};
 use crate::{OutputMode, Summary};
 
 const DEFAULT_WRITE_ROUNDS: usize = 2;
+const DEFAULT_WRITE_DEPTHS: [usize; 1] = [1];
+const DEFAULT_KEY_UPDATES_PERCENT: usize = 0;
 const DEFAULT_KEY_SEARCH_MAX_TRIES: usize = 200_000;
 const REQUIRED_BRANCHES: usize = 49;
 const WRITE_CACHE_STRATEGIES: [&str; 2] = ["noop", "node256"];
@@ -69,7 +80,7 @@ struct InsertStep {
     end: usize,
 }
 
-const INSERT_STEPS: [InsertStep; 8] = [
+const INSERT_STEP_TEMPLATES: [InsertStep; 8] = [
     InsertStep {
         name: "insert_first_leaf",
         start: 0,
@@ -112,24 +123,15 @@ const INSERT_STEPS: [InsertStep; 8] = [
     },
 ];
 
-const STEP_ORDER: [&str; 11] = [
-    "begin_block",
-    "insert_first_leaf",
-    "split_leaf_to_node4",
-    "fill_node4_to_capacity",
-    "promote_node4_to_node16",
-    "fill_node16_to_capacity",
-    "promote_node16_to_node48",
-    "fill_node48_to_capacity",
-    "promote_node48_to_node256",
-    "seal",
-    "commit_flush",
-];
-
 struct PromotionKeys {
     keys: Vec<String>,
     shared_first_byte: u8,
     search_tries: usize,
+}
+
+struct ParentChainInfo {
+    tip: StacksBlockId,
+    update_candidate_keys: Vec<String>,
 }
 
 #[rustfmt::skip]
@@ -138,6 +140,15 @@ fn print_usage(args: &[String]) {
         println!("write: step-wise MARF write workflow profiler");
         println!();
         println!("Environment variables:");
+        println!("  ITERS                 inserted keys per workflow round [default {REQUIRED_BRANCHES}]");
+        println!("                        Higher values increase write/rehash/seal work");
+        println!("  WRITE_DEPTHS          comma-separated parent-chain depths [default: 1]");
+        println!("                        Example: WRITE_DEPTHS=1,64,1024");
+        println!("  KEY_UPDATES           percent (0-100) of writes that are key updates [default {DEFAULT_KEY_UPDATES_PERCENT}]");
+        println!("                        Updates target existing keys from prior tries (excluding first parent/genesis trie)");
+        println!("  SQLITE_WAL_AUTOCHECKPOINT");
+        println!("                        optional SQLite WAL auto-checkpoint page threshold");
+        println!("                        Example: SQLITE_WAL_AUTOCHECKPOINT=0 (disable auto-checkpoint)");
         println!("  ROUNDS                independent rounds per strategy [default {DEFAULT_WRITE_ROUNDS}]");
         println!("  KEY_SEARCH_MAX_TRIES  max key candidates when searching for promotion-driving keys [default {DEFAULT_KEY_SEARCH_MAX_TRIES}]");
         println!("  MARF_ALLOC_OUTPUT     output mode ('summary' | 'raw') [default: summary]");
@@ -190,22 +201,53 @@ fn make_marf(cache_strategy: &str) -> (TempDir, MARF<StacksBlockId>) {
     (db_dir, marf)
 }
 
-fn initialize_parent_block(
+fn initialize_parent_chain(
     marf: &mut MARF<StacksBlockId>,
-    parent_block: &StacksBlockId,
-) -> Result<(), IndexError> {
-    let mut tx = marf.begin_tx()?;
-    tx.begin(&StacksBlockId::sentinel(), parent_block)?;
+    first_height: u32,
+    chain_len: usize,
+) -> Result<ParentChainInfo, IndexError> {
+    let mut parent = StacksBlockId::sentinel();
+    let mut update_candidate_keys = Vec::new();
 
-    // Bootstrap with one write so the measured block extends a non-empty parent trie.
-    let keys = vec!["bootstrap:parent".to_string()];
-    let values = vec![MARFValue::from(1)];
-    tx.insert_batch(&keys, values)?;
-    tx.commit()?;
-    Ok(())
+    for offset in 0..chain_len {
+        let next = block_id(first_height.wrapping_add(offset as u32));
+        let mut tx = marf.begin_tx()?;
+        tx.begin(&parent, &next)?;
+
+        let key = format!("bootstrap:parent:{offset:08x}");
+        let keys = vec![key.clone()];
+        let values = vec![MARFValue::from((offset as u32).wrapping_add(1))];
+        tx.insert_batch(&keys, values)?;
+        tx.commit()?;
+
+        if offset > 0 {
+            update_candidate_keys.push(key);
+        }
+
+        parent = next;
+    }
+
+    Ok(ParentChainInfo {
+        tip: parent,
+        update_candidate_keys,
+    })
 }
 
-fn find_promotion_keys(seed_prefix: &str, max_tries: usize) -> PromotionKeys {
+fn select_distributed_update_keys(pool: &[String], count: usize) -> Vec<String> {
+    if pool.is_empty() || count == 0 {
+        return vec![];
+    }
+
+    let count = count.min(pool.len());
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let idx = (i * pool.len()) / count;
+        out.push(pool[idx].clone());
+    }
+    out
+}
+
+fn find_promotion_keys(seed_prefix: &str, max_tries: usize, key_count: usize) -> PromotionKeys {
     let mut buckets: Vec<HashMap<u8, String>> = (0..256).map(|_| HashMap::new()).collect();
 
     for i in 0..max_tries {
@@ -218,11 +260,11 @@ fn find_promotion_keys(seed_prefix: &str, max_tries: usize) -> PromotionKeys {
         let bucket = &mut buckets[first];
         bucket.entry(second).or_insert(key);
 
-        if bucket.len() >= REQUIRED_BRANCHES {
+        if bucket.len() >= key_count {
             let mut pairs: Vec<(u8, String)> =
                 bucket.iter().map(|(&chr, k)| (chr, k.clone())).collect();
             pairs.sort_by_key(|(chr, _)| *chr);
-            pairs.truncate(REQUIRED_BRANCHES);
+            pairs.truncate(key_count);
 
             return PromotionKeys {
                 keys: pairs.into_iter().map(|(_, key)| key).collect(),
@@ -233,117 +275,226 @@ fn find_promotion_keys(seed_prefix: &str, max_tries: usize) -> PromotionKeys {
     }
 
     panic!(
-        "failed to find {} promotion-driving keys within KEY_SEARCH_MAX_TRIES={max_tries}",
-        REQUIRED_BRANCHES
+        "failed to find {key_count} promotion-driving keys within KEY_SEARCH_MAX_TRIES={max_tries}"
     );
 }
 
+fn build_insert_steps(total_keys: usize) -> Vec<InsertStep> {
+    let mut steps = Vec::new();
+    for template in INSERT_STEP_TEMPLATES {
+        if template.start >= total_keys {
+            break;
+        }
+        let end = template.end.min(total_keys);
+        steps.push(InsertStep {
+            name: template.name,
+            start: template.start,
+            end,
+        });
+    }
+    if total_keys > REQUIRED_BRANCHES {
+        steps.push(InsertStep {
+            name: "insert_bulk_keys",
+            start: REQUIRED_BRANCHES,
+            end: total_keys,
+        });
+    }
+    steps
+}
+
+fn build_step_order(insert_steps: &[InsertStep]) -> Vec<&'static str> {
+    let mut step_order = vec!["begin_block"];
+    step_order.extend(insert_steps.iter().map(|s| s.name));
+    step_order.push("seal");
+    step_order.push("commit_flush");
+    step_order
+}
+
+fn parse_write_depths() -> Vec<usize> {
+    parse_csv_usize_env("WRITE_DEPTHS", &DEFAULT_WRITE_DEPTHS)
+}
+
+fn parse_optional_wal_autocheckpoint_pages() -> Option<i64> {
+    std::env::var("SQLITE_WAL_AUTOCHECKPOINT").ok().map(|raw| {
+        raw.parse::<i64>()
+            .unwrap_or_else(|_| panic!("SQLITE_WAL_AUTOCHECKPOINT must be an integer, got '{raw}'"))
+    })
+}
+
 fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
+    let iters = parse_usize_env("ITERS", REQUIRED_BRANCHES);
+    let write_depths = parse_write_depths();
+    let key_updates_pct = parse_usize_env("KEY_UPDATES", DEFAULT_KEY_UPDATES_PERCENT);
     let rounds = parse_usize_env("ROUNDS", DEFAULT_WRITE_ROUNDS);
     let max_tries = parse_usize_env("KEY_SEARCH_MAX_TRIES", DEFAULT_KEY_SEARCH_MAX_TRIES);
+    let wal_autocheckpoint_pages = parse_optional_wal_autocheckpoint_pages();
 
+    assert!(iters > 0, "ITERS must be > 0");
+    assert!(
+        write_depths.iter().all(|depth| *depth > 0),
+        "WRITE_DEPTHS entries must be > 0"
+    );
+    assert!(
+        key_updates_pct <= 100,
+        "KEY_UPDATES must be in range 0..=100"
+    );
     assert!(rounds > 0, "ROUNDS must be > 0");
     assert!(max_tries > 0, "KEY_SEARCH_MAX_TRIES must be > 0");
-
-    if output_mode.is_raw() {
-        println!(
-            "config\trounds={rounds}\tkey_search_max_tries={max_tries}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
+    if let Some(pages) = wal_autocheckpoint_pages {
+        assert!(
+            pages >= 0,
+            "SQLITE_WAL_AUTOCHECKPOINT must be >= 0 (0 disables auto-checkpoint)"
         );
     }
 
-    let mut results: HashMap<(String, String), StepAggregate> = HashMap::new();
+    let insert_steps = build_insert_steps(iters);
+    let step_order = build_step_order(&insert_steps);
+
+    if output_mode.is_raw() {
+        println!(
+            "config\titers={iters}\twrite_depths={write_depths:?}\tkey_updates={key_updates_pct}\trounds={rounds}\tkey_search_max_tries={max_tries}\tsqlite_wal_autocheckpoint={wal_autocheckpoint_pages:?}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
+        );
+    }
+
+    let mut results: HashMap<(String, usize, String), StepAggregate> = HashMap::new();
 
     for round in 1..=rounds {
-        for (strategy_idx, strategy) in WRITE_CACHE_STRATEGIES.into_iter().enumerate() {
-            let (_db_dir, mut marf) = make_marf(strategy);
+        for &write_depth in &write_depths {
+            for (strategy_idx, strategy) in WRITE_CACHE_STRATEGIES.into_iter().enumerate() {
+                let (_db_dir, mut marf) = make_marf(strategy);
 
-            let base_seed = 1_000_000u32
-                .wrapping_add((round as u32).wrapping_mul(100))
-                .wrapping_add((strategy_idx as u32).wrapping_mul(2));
-            let parent_block = block_id(base_seed);
-            let next_block = block_id(base_seed.wrapping_add(1));
+                if let Some(pages) = wal_autocheckpoint_pages {
+                    sql_pragma(marf.sqlite_conn(), "wal_autocheckpoint", &pages)
+                        .map_err(IndexError::from)?;
+                }
 
-            initialize_parent_block(&mut marf, &parent_block)?;
+                let base_seed = 1_000_000u32
+                    .wrapping_add((round as u32).wrapping_mul(100_000))
+                    .wrapping_add((write_depth as u32).wrapping_mul(100))
+                    .wrapping_add((strategy_idx as u32).wrapping_mul(2));
+                let parent_chain = initialize_parent_chain(&mut marf, base_seed, write_depth)?;
+                let parent_block = parent_chain.tip;
+                let next_block = block_id(base_seed.wrapping_add(write_depth as u32));
 
-            let promotion_keys =
-                find_promotion_keys(&format!("write-profile:{strategy}:{round}"), max_tries);
-            if output_mode.is_raw() {
-                println!(
-                    "keys\tround={round}\tstrategy={strategy}\tshared_first_byte={}\tsearch_tries={}\tkey_count={}",
-                    promotion_keys.shared_first_byte,
-                    promotion_keys.search_tries,
-                    promotion_keys.keys.len()
+                let requested_updates = (iters.saturating_mul(key_updates_pct)) / 100;
+                let max_updates = iters.saturating_sub(REQUIRED_BRANCHES);
+                let effective_updates = requested_updates
+                    .min(max_updates)
+                    .min(parent_chain.update_candidate_keys.len());
+                let insert_key_count = iters.saturating_sub(effective_updates);
+                let promotion_key_count = insert_key_count.min(REQUIRED_BRANCHES);
+
+                let promotion_keys = find_promotion_keys(
+                    &format!("write-profile:{strategy}:{round}:chain:{write_depth}:promote"),
+                    max_tries,
+                    promotion_key_count,
                 );
-            }
 
-            let mut tx = marf.begin_tx()?;
+                let mut all_keys = promotion_keys.keys.clone();
 
-            let begin_measurement = measure_step(|| tx.begin(&parent_block, &next_block))?;
-            emit_result_and_store(
-                &mut results,
-                round,
-                strategy,
-                "begin_block",
-                1,
-                begin_measurement,
-                output_mode,
-            );
+                if insert_key_count > promotion_key_count {
+                    for extra_ix in promotion_key_count..insert_key_count {
+                        all_keys.push(format!(
+                            "write-profile:{strategy}:{round}:chain:{write_depth}:bulk:{extra_ix:08x}"
+                        ));
+                    }
+                }
 
-            let mut value_cursor = 10_000u32;
-            for step in INSERT_STEPS {
-                let keys = &promotion_keys.keys[step.start..step.end];
-                let values = make_values(value_cursor, keys.len());
-                value_cursor = value_cursor.wrapping_add(keys.len() as u32);
+                let update_keys = select_distributed_update_keys(
+                    &parent_chain.update_candidate_keys,
+                    effective_updates,
+                );
+                all_keys.extend(update_keys);
 
-                let measurement = measure_step(|| tx.insert_batch(keys, values))?;
+                if output_mode.is_raw() {
+                    println!(
+                        "keys\tround={round}\tdepth={write_depth}\tstrategy={strategy}\tshared_first_byte={}\tsearch_tries={}\tinsert_count={}\tupdate_count={}\tkey_count={}",
+                        promotion_keys.shared_first_byte,
+                        promotion_keys.search_tries,
+                        insert_key_count,
+                        effective_updates,
+                        all_keys.len()
+                    );
+                }
+
+                let mut tx = marf.begin_tx()?;
+
+                let begin_measurement = measure_step(|| tx.begin(&parent_block, &next_block))?;
                 emit_result_and_store(
                     &mut results,
                     round,
+                    write_depth,
                     strategy,
-                    step.name,
-                    keys.len(),
-                    measurement,
+                    "begin_block",
+                    1,
+                    begin_measurement,
+                    output_mode,
+                );
+
+                let mut value_cursor = 10_000u32;
+                for step in &insert_steps {
+                    let keys = &all_keys[step.start..step.end];
+                    let values = make_values(value_cursor, keys.len());
+                    value_cursor = value_cursor.wrapping_add(keys.len() as u32);
+
+                    let measurement = measure_step(|| tx.insert_batch(keys, values))?;
+                    emit_result_and_store(
+                        &mut results,
+                        round,
+                        write_depth,
+                        strategy,
+                        step.name,
+                        keys.len(),
+                        measurement,
+                        output_mode,
+                    );
+                }
+
+                let seal_measurement = measure_step(|| tx.seal())?;
+                emit_result_and_store(
+                    &mut results,
+                    round,
+                    write_depth,
+                    strategy,
+                    "seal",
+                    1,
+                    seal_measurement,
+                    output_mode,
+                );
+
+                let commit_measurement = measure_step(|| tx.commit())?;
+                emit_result_and_store(
+                    &mut results,
+                    round,
+                    write_depth,
+                    strategy,
+                    "commit_flush",
+                    1,
+                    commit_measurement,
                     output_mode,
                 );
             }
-
-            let seal_measurement = measure_step(|| tx.seal())?;
-            emit_result_and_store(
-                &mut results,
-                round,
-                strategy,
-                "seal",
-                1,
-                seal_measurement,
-                output_mode,
-            );
-
-            let commit_measurement = measure_step(|| tx.commit())?;
-            emit_result_and_store(
-                &mut results,
-                round,
-                strategy,
-                "commit_flush",
-                1,
-                commit_measurement,
-                output_mode,
-            );
         }
     }
 
-    let mut summary = Summary::new("write", WRITE_CACHE_STRATEGIES.len() * STEP_ORDER.len());
-    for strategy in WRITE_CACHE_STRATEGIES {
-        for step in STEP_ORDER {
-            let key = (strategy.to_string(), step.to_string());
-            let agg = results
-                .get(&key)
-                .expect("missing step samples while summarizing write profile");
-            summary.push_line(
-                format!("{strategy}/{step}"),
-                agg.total_ms,
-                agg.alloc_calls,
-                agg.alloc_bytes,
-            );
+    let mut summary = Summary::new(
+        "write",
+        WRITE_CACHE_STRATEGIES.len() * step_order.len() * write_depths.len(),
+    );
+    for &write_depth in &write_depths {
+        for strategy in WRITE_CACHE_STRATEGIES {
+            for step in &step_order {
+                let key = (strategy.to_string(), write_depth, step.to_string());
+                let agg = results
+                    .get(&key)
+                    .expect("missing step samples while summarizing write profile");
+                summary.push_line(
+                    format!("{strategy}/depth={write_depth}/{step}"),
+                    agg.total_ms,
+                    agg.alloc_calls,
+                    agg.alloc_bytes,
+                );
+            }
         }
     }
 
@@ -351,8 +502,9 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
 }
 
 fn emit_result_and_store(
-    results: &mut HashMap<(String, String), StepAggregate>,
+    results: &mut HashMap<(String, usize, String), StepAggregate>,
     round: usize,
+    write_depth: usize,
     strategy: &str,
     step: &str,
     items: usize,
@@ -366,7 +518,7 @@ fn emit_result_and_store(
 
     if output_mode.is_raw() {
         println!(
-            "result\tround={round}\tstrategy={strategy}\tstep={step}\titems={items}\telapsed_ms={elapsed_ms:.3}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\tus_per_item={us_per_item:.6}\talloc_calls_per_item={alloc_calls_per_item:.6}\talloc_bytes_per_item={alloc_bytes_per_item:.6}",
+            "result\tround={round}\tdepth={write_depth}\tstrategy={strategy}\tstep={step}\titems={items}\telapsed_ms={elapsed_ms:.3}\talloc_calls={}\talloc_bytes={}\trealloc_calls={}\tdealloc_calls={}\tdealloc_bytes={}\tus_per_item={us_per_item:.6}\talloc_calls_per_item={alloc_calls_per_item:.6}\talloc_bytes_per_item={alloc_bytes_per_item:.6}",
             measurement.snapshot.alloc_calls,
             measurement.snapshot.alloc_bytes,
             measurement.snapshot.realloc_calls,
@@ -376,7 +528,7 @@ fn emit_result_and_store(
     }
 
     let agg = results
-        .entry((strategy.to_string(), step.to_string()))
+        .entry((strategy.to_string(), write_depth, step.to_string()))
         .or_default();
     agg.total_ms += elapsed_ms;
     agg.alloc_calls += measurement.snapshot.alloc_calls;
