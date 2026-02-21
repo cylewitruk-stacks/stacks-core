@@ -41,20 +41,30 @@ impl BenchRunRequest {
 
 struct ManagedWorktree {
     path: PathBuf,
-    _temp_root: TempDir,
+    _temp_root: Option<TempDir>,
 }
 
 pub struct Runner {
     repo_root: PathBuf,
     source_bench_dir: PathBuf,
+    keep_worktrees: bool,
     worktrees: Vec<ManagedWorktree>,
     worktrees_by_revision: HashMap<String, PathBuf>,
     built_roots: HashSet<PathBuf>,
+    overlay_changed_roots: HashMap<PathBuf, bool>,
 }
 
 impl Runner {
-    pub(crate) fn new(repo_root: PathBuf) -> Result<Self> {
-        cleanup_stale_marf_bench_worktrees(&repo_root)?;
+    pub(crate) fn new(repo_root: PathBuf, keep_worktrees: bool) -> Result<Self> {
+        if !keep_worktrees {
+            cleanup_stale_marf_bench_worktrees(&repo_root)?;
+        } else {
+            let cache_root = keep_worktrees_root(&repo_root);
+            log(&format!(
+                "Keep-worktrees cache root: {}",
+                cache_root.display()
+            ));
+        }
 
         let source_bench_dir = repo_root.join("stackslib/benches/marf-alloc");
         if !source_bench_dir.is_dir() {
@@ -81,9 +91,11 @@ impl Runner {
         Ok(Self {
             repo_root,
             source_bench_dir,
+            keep_worktrees,
             worktrees: Vec::new(),
             worktrees_by_revision: HashMap::new(),
             built_roots: HashSet::new(),
+            overlay_changed_roots: HashMap::new(),
         })
     }
 
@@ -126,21 +138,73 @@ impl Runner {
             existing.clone()
         } else {
             let wt = self.create_worktree(revision)?;
-            self.overlay_benches(&wt)?;
-            self.ensure_bench_target(&wt.join("stackslib/Cargo.toml"))?;
             self.worktrees_by_revision
                 .insert(revision.to_string(), wt.clone());
             wt
         };
+
+        let overlay_changed = self.overlay_benches(&wt)?;
+        self.ensure_bench_target(&wt.join("stackslib/Cargo.toml"))?;
+        self.overlay_changed_roots
+            .entry(wt.clone())
+            .and_modify(|changed| *changed |= overlay_changed)
+            .or_insert(overlay_changed);
+
         self.run_benches(label, &wt, requests, output_format)
     }
 
     fn create_worktree(&mut self, revision: &str) -> Result<PathBuf> {
+        let revision_tag: String = sanitize_revision(revision).chars().take(40).collect();
+
+        if self.keep_worktrees {
+            let cache_root = keep_worktrees_root(&self.repo_root);
+            fs::create_dir_all(&cache_root)
+                .with_context(|| format!("failed to create {}", cache_root.display()))?;
+            let path = cache_root.join(format!("marf-bench-{revision_tag}"));
+
+            if path.is_dir() {
+                if self.is_registered_worktree(&path)? {
+                    log(&format!(
+                        "Reusing worktree for {revision} at {}",
+                        path.display()
+                    ));
+                    return Ok(path);
+                }
+
+                log(&format!(
+                    "Removing unregistered cached worktree dir: {}",
+                    path.display()
+                ));
+                fs::remove_dir_all(&path).with_context(|| {
+                    format!(
+                        "failed to remove stale cached worktree dir {}",
+                        path.display()
+                    )
+                })?;
+            }
+
+            log(&format!(
+                "Creating worktree for {revision} at {}",
+                path.display()
+            ));
+
+            let mut cmd = Command::new("git");
+            cmd.current_dir(&self.repo_root)
+                .arg("worktree")
+                .arg("add")
+                .arg("--detach")
+                .arg(&path)
+                .arg(revision);
+            run_checked(cmd, "failed to create git worktree")?;
+
+            return Ok(path);
+        }
+
         let temp_root = TempBuilder::new()
             .prefix(&format!("marf-bench-{}-", sanitize_revision(revision)))
             .tempdir()
             .context("failed to create temporary directory for worktree")?;
-        let revision_tag: String = sanitize_revision(revision).chars().take(12).collect();
+        let revision_tag: String = revision_tag.chars().take(12).collect();
         let path = temp_root.path().join(format!("marf-bench-{revision_tag}"));
 
         log(&format!(
@@ -159,15 +223,17 @@ impl Runner {
 
         self.worktrees.push(ManagedWorktree {
             path: path.clone(),
-            _temp_root: temp_root,
+            _temp_root: Some(temp_root),
         });
         Ok(path)
     }
 
-    fn overlay_benches(&self, root: &Path) -> Result<()> {
+    fn overlay_benches(&self, root: &Path) -> Result<bool> {
         let dest = root.join("stackslib/benches/marf-alloc");
         fs::create_dir_all(&dest)
             .with_context(|| format!("failed to create {}", dest.display()))?;
+
+        let mut changed = false;
 
         for name in [
             "allocator.rs",
@@ -179,12 +245,10 @@ impl Runner {
         ] {
             let src = self.source_bench_dir.join(name);
             let dst = dest.join(name);
-            fs::copy(&src, &dst).with_context(|| {
-                format!("failed to copy {} -> {}", src.display(), dst.display())
-            })?;
+            changed |= copy_if_different(&src, &dst)?;
         }
 
-        Ok(())
+        Ok(changed)
     }
 
     fn ensure_bench_target(&self, cargo_toml: &Path) -> Result<()> {
@@ -223,7 +287,22 @@ impl Runner {
         output_format: OutputFormat,
     ) -> Result<Vec<SummaryRow>> {
         if !self.built_roots.contains(root) {
-            self.build_bench_profile(label, root)?;
+            let overlay_changed = self
+                .overlay_changed_roots
+                .get(root)
+                .copied()
+                .unwrap_or(true);
+
+            let can_reuse_cached_build =
+                self.keep_worktrees && self.is_cached_worktree_path(root) && !overlay_changed;
+
+            if can_reuse_cached_build {
+                log(&format!(
+                    "[{label}] Reusing existing marf-alloc build artifacts (worktree unchanged)"
+                ));
+            } else {
+                self.build_bench_profile(label, root)?;
+            }
             self.built_roots.insert(root.to_path_buf());
         }
         log(&format!("Running marf-alloc benches for {label}"));
@@ -336,24 +415,56 @@ impl Runner {
         let combined = combine_output_text(&output);
         Ok(extract_summary_lines(&combined))
     }
+
+    fn is_registered_worktree(&self, path: &Path) -> Result<bool> {
+        let mut list_cmd = Command::new("git");
+        list_cmd
+            .current_dir(&self.repo_root)
+            .arg("worktree")
+            .arg("list")
+            .arg("--porcelain");
+
+        let output = list_cmd
+            .output()
+            .context("failed to list git worktrees for cache lookup")?;
+        if !output.status.success() {
+            bail!(
+                "failed to list git worktrees for cache lookup: {}",
+                combine_output_text(&output)
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let needle = path.to_string_lossy();
+        Ok(stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|p| p == needle))
+    }
+
+    fn is_cached_worktree_path(&self, path: &Path) -> bool {
+        path.starts_with(keep_worktrees_root(&self.repo_root))
+    }
 }
 
 impl Drop for Runner {
     fn drop(&mut self) {
-        for worktree in self.worktrees.drain(..) {
-            let path = worktree.path;
-            if !path.is_dir() {
-                continue;
-            }
+        if !self.keep_worktrees {
+            for worktree in self.worktrees.drain(..) {
+                let path = worktree.path;
+                if !path.is_dir() {
+                    continue;
+                }
 
-            log(&format!("Removing worktree: {}", path.display()));
-            let mut cmd = Command::new("git");
-            cmd.current_dir(&self.repo_root)
-                .arg("worktree")
-                .arg("remove")
-                .arg("--force")
-                .arg(&path);
-            let _ = cmd.output();
+                log(&format!("Removing worktree: {}", path.display()));
+                let mut cmd = Command::new("git");
+                cmd.current_dir(&self.repo_root)
+                    .arg("worktree")
+                    .arg("remove")
+                    .arg("--force")
+                    .arg(&path);
+                let _ = cmd.output();
+            }
         }
 
         let mut prune_cmd = Command::new("git");
@@ -390,7 +501,7 @@ pub(crate) fn cleanup_stale_marf_bench_worktrees(repo_root: &Path) -> Result<()>
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .map(PathBuf::from)
-        .filter(|path| is_marf_bench_worktree_path(path))
+        .filter(|path| is_marf_bench_worktree_path(path, repo_root))
         .collect();
 
     for stale in stale_paths {
@@ -420,8 +531,16 @@ pub(crate) fn cleanup_stale_marf_bench_worktrees(repo_root: &Path) -> Result<()>
     Ok(())
 }
 
-fn is_marf_bench_worktree_path(path: &Path) -> bool {
+fn is_marf_bench_worktree_path(path: &Path, repo_root: &Path) -> bool {
+    if path.starts_with(keep_worktrees_root(repo_root)) {
+        return false;
+    }
+
     let path_text = path.to_string_lossy();
+    if path_text.contains("/.marf-bench-worktrees/") {
+        return false;
+    }
+
     let name_matches = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -429,4 +548,34 @@ fn is_marf_bench_worktree_path(path: &Path) -> bool {
         .unwrap_or(false);
 
     path_text.contains("/marf-bench-") && name_matches
+}
+
+fn keep_worktrees_root(repo_root: &Path) -> PathBuf {
+    let repo_tag: String = sanitize_revision(&repo_root.to_string_lossy())
+        .chars()
+        .take(96)
+        .collect();
+    std::env::temp_dir()
+        .join("marf-bench-worktrees")
+        .join(repo_tag)
+}
+
+fn copy_if_different(src: &Path, dst: &Path) -> Result<bool> {
+    let should_copy = if dst.is_file() {
+        let src_bytes =
+            fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+        let dst_bytes =
+            fs::read(dst).with_context(|| format!("failed to read {}", dst.display()))?;
+        src_bytes != dst_bytes
+    } else {
+        true
+    };
+
+    if !should_copy {
+        return Ok(false);
+    }
+
+    fs::copy(src, dst)
+        .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))?;
+    Ok(true)
 }

@@ -42,6 +42,13 @@ pub(crate) struct BenchArgs {
     )]
     repeat_jitter_threshold: f64,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Keep and reuse comparison worktrees across invocations to avoid cold rebuilds"
+    )]
+    keep_worktrees: bool,
+
     #[command(subcommand)]
     target: BenchTarget,
 }
@@ -85,7 +92,7 @@ pub(crate) fn run_command(args: BenchArgs) -> Result<()> {
         };
 
         let mut repeated_rows = Vec::with_capacity(repeats);
-        let mut runner = Runner::new(repo_root.clone())?;
+        let mut runner = Runner::new(repo_root.clone(), args.keep_worktrees)?;
 
         for repeat_ix in 0..repeats {
             if repeats > 1 {
@@ -134,7 +141,7 @@ pub(crate) fn run_command(args: BenchArgs) -> Result<()> {
             );
         }
     } else {
-        let mut runner = Runner::new(repo_root.clone())?;
+        let mut runner = Runner::new(repo_root.clone(), false)?;
         let rows =
             runner.run_current_tree("current-working-tree", &requests, args.output_format)?;
         print_single_run(args.output_format, &rows);

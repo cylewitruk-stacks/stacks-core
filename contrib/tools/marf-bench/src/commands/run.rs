@@ -19,7 +19,7 @@ pub(crate) struct RunArgs {
 
 pub(crate) fn run_command(args: RunArgs) -> Result<()> {
     let repo_root = current_repo_root()?;
-    let mut runner = Runner::new(repo_root.clone())?;
+    let mut runner = Runner::new(repo_root.clone(), false)?;
     let requests = args.target.into_requests();
     let rows = runner.run_benches(
         "current-working-tree",

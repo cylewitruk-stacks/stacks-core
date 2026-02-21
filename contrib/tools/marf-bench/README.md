@@ -20,6 +20,8 @@ This document explains the git operations it performs, what they change (or do n
   - `cargo marf-bench bench --base staged --output-format tsv all`
 - Run repeated comparisons and emit median/min/max repeat stats:
   - `cargo marf-bench bench --base merge-base:upstream/develop --repeats 5 write --rounds 10 --iters 200 --write-depths 32,512,1024 --key-updates 25`
+- Keep and reuse comparison worktrees across invocations:
+  - `cargo marf-bench bench --base merge-base:upstream/develop --keep-worktrees write --rounds 10 --iters 200 --write-depths 1024 --key-updates 25`
 - A/B write benchmark checkpoint behavior (bench-only hack):
   - `cargo marf-bench bench --base merge-base:upstream/develop write --rounds 10 --iters 200 --write-depths 1024 --key-updates 25 --sqlite-wal-autocheckpoint 0`
 - Tune high-jitter detection threshold for repeat confidence summary:
@@ -35,7 +37,7 @@ This document explains the git operations it performs, what they change (or do n
 ## Command shape
 
 - `run`: `cargo marf-bench run [--output-format <summary|raw|tsv>] <all|node-alloc|read|write> [bench-specific options]`
-- `bench`: `cargo marf-bench bench [--base <rev|staged|merge-base:<upstream-ref>>] [--target <rev>] [--repeats <N>] [--repeat-jitter-threshold <PCT>] [--output-format <summary|raw|tsv>] <all|node-alloc|read|write> [bench-specific options]`
+- `bench`: `cargo marf-bench bench [--base <rev|staged|merge-base:<upstream-ref>>] [--target <rev>] [--repeats <N>] [--repeat-jitter-threshold <PCT>] [--keep-worktrees] [--output-format <summary|raw|tsv>] <all|node-alloc|read|write> [bench-specific options]`
 
 Notes:
 
@@ -46,6 +48,7 @@ Notes:
 - `--repeats` requires `--base`; when set, marf-bench runs full base/target comparisons N times and appends repeat statistics.
 - `--repeat-jitter-threshold` sets the spread threshold (percentage points) for classifying high-jitter rows in repeat confidence output; default is `30`.
 - Repeat confidence classifies a row as high-jitter when total-ms repeat deltas straddle both signs (`min < 0 < max`) and spread exceeds threshold.
+- `--keep-worktrees` keeps revision worktrees under the platform temp directory (for example `/tmp/marf-bench-worktrees/...` on Linux) and reuses them across invocations (faster subsequent builds when overlays are unchanged).
 - Bench-specific options (`--iters`, `--rounds`, etc.) come after the bench subcommand.
 
 ## Benchmark parameter flags
@@ -188,6 +191,7 @@ Temporary worktree roots are created with the `tempfile` crate in your platform 
 If the process exits normally, these temporary directories are removed by the runner cleanup.
 On startup, marf-bench also performs a stale-worktree sweep for prior marf-bench temp worktrees.
 On `Ctrl-C` and panic paths, marf-bench proactively runs the same cleanup before exiting.
+When `--keep-worktrees` is enabled, cached worktrees are stored under the platform temp directory and intentionally retained for reuse.
 If the process is forcibly terminated (`SIGKILL`, power loss), the OS temp area lifecycle usually
 cleans up old temp files/directories over time, and you can also remove leftovers manually using
 the recovery commands below.
