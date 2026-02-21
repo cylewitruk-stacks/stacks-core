@@ -191,15 +191,27 @@ impl Runner {
         let mut text = fs::read_to_string(cargo_toml)
             .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
 
-        if text.contains("name = \"marf-alloc\"") {
-            return Ok(());
+        let mut updated = false;
+
+        if !text.contains("name = \"marf-alloc\"") {
+            text.push_str(
+                "\n[[bench]]\nname = \"marf-alloc\"\nharness = false\npath = \"benches/marf-alloc/main.rs\"\n",
+            );
+            updated = true;
         }
 
-        text.push_str(
-            "\n[[bench]]\nname = \"marf-alloc\"\nharness = false\npath = \"benches/marf-alloc/main.rs\"\n",
-        );
-        fs::write(cargo_toml, text)
-            .with_context(|| format!("failed to update {}", cargo_toml.display()))?;
+        if !text.contains("tikv-jemallocator") {
+            text.push_str(
+                "\n# Included for profiling/benchmark entrypoints\n[target.'cfg(not(any(target_os = \"macos\", target_os=\"windows\", target_arch = \"arm\")))'.dev-dependencies]\ntikv-jemallocator = { workspace = true }\n",
+            );
+            updated = true;
+        }
+
+        if updated {
+            fs::write(cargo_toml, text)
+                .with_context(|| format!("failed to update {}", cargo_toml.display()))?;
+        }
+
         Ok(())
     }
 
