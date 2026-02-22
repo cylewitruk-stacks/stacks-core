@@ -23,6 +23,7 @@ use std::time::Instant;
 use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use blockstack_lib::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue};
+use blockstack_lib::util_lib::db::sql_pragma;
 use stacks_common::types::chainstate::StacksBlockId;
 use tempfile::TempDir;
 
@@ -33,12 +34,12 @@ use crate::utils::{
 };
 use crate::{OutputMode, Summary};
 
-const DEFAULT_CHAIN_LEN: u32 = 2048;
 const DEFAULT_READ_ITERS: usize = 200_000;
 const DEFAULT_READ_ROUNDS: usize = 2;
 const DEFAULT_KEYS_PER_BLOCK: u32 = 16;
 const DEFAULT_DEPTHS: [u32; 4] = [32, 128, 768, 2047];
 const DEFAULT_CACHE_STRATEGIES: [&str; 2] = ["noop", "node256"];
+const DEFAULT_CHAIN_LEN_DEPTH_SLACK: u32 = 16;
 
 #[derive(Clone, Copy)]
 enum ReadVariant {
@@ -74,6 +75,39 @@ struct MarfReadFixture {
     _db_dir: TempDir,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WalCheckpointMode {
+    Passive,
+    Full,
+    Restart,
+    Truncate,
+}
+
+impl WalCheckpointMode {
+    fn parse(raw: &str) -> Option<Self> {
+        if raw.eq_ignore_ascii_case("passive") {
+            Some(Self::Passive)
+        } else if raw.eq_ignore_ascii_case("full") {
+            Some(Self::Full)
+        } else if raw.eq_ignore_ascii_case("restart") {
+            Some(Self::Restart)
+        } else if raw.eq_ignore_ascii_case("truncate") {
+            Some(Self::Truncate)
+        } else {
+            None
+        }
+    }
+
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Passive => "PASSIVE",
+            Self::Full => "FULL",
+            Self::Restart => "RESTART",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
+}
+
 #[rustfmt::skip]
 fn print_usage(args: &[String]) {
     if has_help_flag(args) {
@@ -82,6 +116,11 @@ fn print_usage(args: &[String]) {
             .map(|d| d.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        let default_max_depth = *DEFAULT_DEPTHS
+            .iter()
+            .max()
+            .expect("DEFAULT_DEPTHS must not be empty");
+        let default_chain_len = default_max_depth + DEFAULT_CHAIN_LEN_DEPTH_SLACK;
         let default_cache_strategies = DEFAULT_CACHE_STRATEGIES.join(",");
         let default_keys_per_block = DEFAULT_KEYS_PER_BLOCK;
         let default_total_fixture_keys = default_keys_per_block + 1;
@@ -97,7 +136,9 @@ fn print_usage(args: &[String]) {
         println!("              Affects elapsed_ms/alloc totals directly; per-op metrics remain normalized");
         println!("  ROUNDS      Independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
         println!("              Higher values improve stability estimates (summary min/max)");
-        println!("  CHAIN_LEN   Number of sequential blocks/tries created [default: {DEFAULT_CHAIN_LEN}]");
+        println!(
+            "  CHAIN_LEN   Number of sequential blocks/tries created [default: max(DEPTHS)+{DEFAULT_CHAIN_LEN_DEPTH_SLACK}; with defaults: {default_chain_len}]"
+        );
         println!("              Must be greater than the maximum `DEPTHS` value.");
         println!("              Higher values increase fixture construction time and temporary DB size");
         println!("  DEPTHS      Comma-separated depths [default: {default_depths}]");
@@ -112,6 +153,13 @@ fn print_usage(args: &[String]) {
         println!("  CACHE_STRATEGIES");
         println!("              Comma-separated MARF cache strategies [default: {default_cache_strategies}]");
         println!("              Example: CACHE_STRATEGIES=noop,node256,everything");
+        println!("  SQLITE_WAL_AUTOCHECKPOINT");
+        println!("              Optional SQLite WAL auto-checkpoint page threshold");
+        println!("              Example: SQLITE_WAL_AUTOCHECKPOINT=0 (disable auto-checkpoint)");
+        println!("  SQLITE_WAL_CHECKPOINT_MODE");
+        println!("              WAL checkpoint mode for explicit post-setup checkpoint when auto-checkpoint is disabled");
+        println!("              Post-setup checkpoint runs only when SQLITE_WAL_AUTOCHECKPOINT=0");
+        println!("              Allowed: PASSIVE, FULL, RESTART, TRUNCATE [default: PASSIVE]");
         println!("  MARF_ALLOC_OUTPUT");
         println!("              Output mode [default: summary]");
         println!("              'summary': unified summary lines only");
@@ -134,7 +182,13 @@ fn key_for_depth_from_tip(tip_height: u32, depth: u32) -> String {
     depth_key(tip_height - depth)
 }
 
-fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> MarfReadFixture {
+fn make_fixture(
+    cache_strategy: &str,
+    chain_len: u32,
+    keys_per_block: u32,
+    wal_autocheckpoint_pages: Option<i64>,
+    wal_checkpoint_mode: Option<WalCheckpointMode>,
+) -> MarfReadFixture {
     let db_dir = tempfile::Builder::new()
         .prefix(&format!("marf-read-profile-{cache_strategy}-"))
         .tempdir()
@@ -147,6 +201,11 @@ fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> Ma
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, cache_strategy, true);
     let mut marf = MARF::from_path(&db_path_str, open_opts.clone())
         .expect("failed to open MARF for read profile");
+
+    if let Some(pages) = wal_autocheckpoint_pages {
+        sql_pragma(marf.sqlite_conn(), "wal_autocheckpoint", &pages)
+            .expect("failed to set wal_autocheckpoint for read profile fixture");
+    }
 
     let mut parent = StacksBlockId::sentinel();
     let mut tip = parent.clone();
@@ -183,6 +242,14 @@ fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> Ma
         tip = next;
     }
 
+    if wal_autocheckpoint_pages == Some(0) {
+        let checkpoint_mode = wal_checkpoint_mode.unwrap_or(WalCheckpointMode::Passive);
+        let sql = format!("PRAGMA wal_checkpoint({})", checkpoint_mode.as_sql());
+        marf.sqlite_conn()
+            .execute_batch(&sql)
+            .expect("failed to run post-setup WAL checkpoint for read profile fixture");
+    }
+
     MarfReadFixture {
         marf,
         tip,
@@ -193,6 +260,31 @@ fn make_fixture(cache_strategy: &str, chain_len: u32, keys_per_block: u32) -> Ma
 
 fn parse_keys_per_block() -> u32 {
     parse_u32_env("KEYS_PER_BLOCK", DEFAULT_KEYS_PER_BLOCK)
+}
+
+fn parse_chain_len(depths: &[u32]) -> u32 {
+    let max_depth = *depths.iter().max().expect("depth list must not be empty");
+    let default_chain_len = max_depth.saturating_add(DEFAULT_CHAIN_LEN_DEPTH_SLACK);
+    parse_u32_env("CHAIN_LEN", default_chain_len)
+}
+
+fn parse_optional_wal_autocheckpoint_pages() -> Option<i64> {
+    std::env::var("SQLITE_WAL_AUTOCHECKPOINT").ok().map(|raw| {
+        raw.parse::<i64>()
+            .unwrap_or_else(|_| panic!("SQLITE_WAL_AUTOCHECKPOINT must be an integer, got '{raw}'"))
+    })
+}
+
+fn parse_optional_wal_checkpoint_mode() -> Option<WalCheckpointMode> {
+    std::env::var("SQLITE_WAL_CHECKPOINT_MODE")
+        .ok()
+        .map(|raw| {
+            WalCheckpointMode::parse(&raw).unwrap_or_else(|| {
+                panic!(
+                    "SQLITE_WAL_CHECKPOINT_MODE must be one of PASSIVE|FULL|RESTART|TRUNCATE, got '{raw}'"
+                )
+            })
+        })
 }
 
 fn parse_proofs_setting(args: &[String]) -> bool {
@@ -254,12 +346,14 @@ fn run_with_variants(
         return None;
     }
 
-    let chain_len = parse_u32_env("CHAIN_LEN", DEFAULT_CHAIN_LEN);
     let iters = parse_usize_env("ITERS", DEFAULT_READ_ITERS);
     let rounds = parse_usize_env("ROUNDS", DEFAULT_READ_ROUNDS);
     let keys_per_block = parse_keys_per_block();
     let total_fixture_keys = keys_per_block + 1;
     let depths = parse_csv_u32_env("DEPTHS", &DEFAULT_DEPTHS);
+    let chain_len = parse_chain_len(&depths);
+    let wal_autocheckpoint_pages = parse_optional_wal_autocheckpoint_pages();
+    let wal_checkpoint_mode = parse_optional_wal_checkpoint_mode();
     let cache_strategies = parse_csv_string_env("CACHE_STRATEGIES", &DEFAULT_CACHE_STRATEGIES);
 
     assert!(iters > 0, "ITERS must be > 0");
@@ -270,10 +364,18 @@ fn run_with_variants(
         chain_len > max_depth,
         "CHAIN_LEN ({chain_len}) must be greater than max depth ({max_depth})"
     );
+    if let Some(pages) = wal_autocheckpoint_pages {
+        assert!(
+            pages >= 0,
+            "SQLITE_WAL_AUTOCHECKPOINT must be >= 0 (0 disables auto-checkpoint)"
+        );
+    }
 
     if output_mode.is_raw() {
         println!(
-            "config\tchain_len={chain_len}\titers={iters}\trounds={rounds}\tkeys_per_block={keys_per_block}\ttotal_fixture_keys_per_block={total_fixture_keys}\tdepths={depths:?}\tstrategies={cache_strategies:?}"
+            "config\tchain_len={chain_len}\titers={iters}\trounds={rounds}\tkeys_per_block={keys_per_block}\ttotal_fixture_keys_per_block={total_fixture_keys}\tdepths={depths:?}\tstrategies={cache_strategies:?}\tsqlite_wal_autocheckpoint={wal_autocheckpoint_pages:?}\tsqlite_wal_checkpoint_mode={wal_checkpoint_mode:?}\tsqlite_post_setup_checkpoint_ran={}"
+            ,
+            wal_autocheckpoint_pages == Some(0)
         );
     }
 
@@ -281,7 +383,13 @@ fn run_with_variants(
 
     for round in 1..=rounds {
         for strategy in &cache_strategies {
-            let mut fixture = make_fixture(strategy, chain_len, keys_per_block);
+            let mut fixture = make_fixture(
+                strategy,
+                chain_len,
+                keys_per_block,
+                wal_autocheckpoint_pages,
+                wal_checkpoint_mode,
+            );
 
             for &depth in &depths {
                 let key = key_for_depth_from_tip(fixture.tip_height, depth);

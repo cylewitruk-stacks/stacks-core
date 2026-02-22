@@ -33,6 +33,8 @@
 //!   parent/genesis trie).
 //! - `SQLITE_WAL_AUTOCHECKPOINT` (optional): if set, applies
 //!   `PRAGMA wal_autocheckpoint = <pages>` to the MARF SQLite connection.
+//! - `SQLITE_WAL_CHECKPOINT_MODE` (optional): WAL checkpoint mode used when
+//!   running an explicit post-setup checkpoint with auto-checkpoint disabled.
 //! - `ROUNDS` (default `2`): number of independent workflow repetitions.
 //! - `KEY_SEARCH_MAX_TRIES` (default `200000`): max key candidates to try when
 //!   searching for a hash bucket that yields enough distinct branches.
@@ -134,6 +136,39 @@ struct ParentChainInfo {
     update_candidate_keys: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WalCheckpointMode {
+    Passive,
+    Full,
+    Restart,
+    Truncate,
+}
+
+impl WalCheckpointMode {
+    fn parse(raw: &str) -> Option<Self> {
+        if raw.eq_ignore_ascii_case("passive") {
+            Some(Self::Passive)
+        } else if raw.eq_ignore_ascii_case("full") {
+            Some(Self::Full)
+        } else if raw.eq_ignore_ascii_case("restart") {
+            Some(Self::Restart)
+        } else if raw.eq_ignore_ascii_case("truncate") {
+            Some(Self::Truncate)
+        } else {
+            None
+        }
+    }
+
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Passive => "PASSIVE",
+            Self::Full => "FULL",
+            Self::Restart => "RESTART",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
+}
+
 #[rustfmt::skip]
 fn print_usage(args: &[String]) {
     if has_help_flag(args) {
@@ -149,6 +184,10 @@ fn print_usage(args: &[String]) {
         println!("  SQLITE_WAL_AUTOCHECKPOINT");
         println!("                        optional SQLite WAL auto-checkpoint page threshold");
         println!("                        Example: SQLITE_WAL_AUTOCHECKPOINT=0 (disable auto-checkpoint)");
+        println!("  SQLITE_WAL_CHECKPOINT_MODE");
+        println!("                        WAL checkpoint mode for explicit post-setup checkpoint when auto-checkpoint is disabled");
+        println!("                        Post-setup checkpoint runs only when SQLITE_WAL_AUTOCHECKPOINT=0");
+        println!("                        Allowed: PASSIVE, FULL, RESTART, TRUNCATE [default: PASSIVE]");
         println!("  ROUNDS                independent rounds per strategy [default {DEFAULT_WRITE_ROUNDS}]");
         println!("  KEY_SEARCH_MAX_TRIES  max key candidates when searching for promotion-driving keys [default {DEFAULT_KEY_SEARCH_MAX_TRIES}]");
         println!("  MARF_ALLOC_OUTPUT     output mode ('summary' | 'raw') [default: summary]");
@@ -321,6 +360,28 @@ fn parse_optional_wal_autocheckpoint_pages() -> Option<i64> {
     })
 }
 
+fn parse_optional_wal_checkpoint_mode() -> Option<WalCheckpointMode> {
+    std::env::var("SQLITE_WAL_CHECKPOINT_MODE")
+        .ok()
+        .map(|raw| {
+            WalCheckpointMode::parse(&raw).unwrap_or_else(|| {
+                panic!(
+                    "SQLITE_WAL_CHECKPOINT_MODE must be one of PASSIVE|FULL|RESTART|TRUNCATE, got '{raw}'"
+                )
+            })
+        })
+}
+
+fn run_wal_checkpoint(
+    marf: &MARF<StacksBlockId>,
+    mode: WalCheckpointMode,
+) -> Result<(), IndexError> {
+    let sql = format!("PRAGMA wal_checkpoint({})", mode.as_sql());
+    marf.sqlite_conn()
+        .execute_batch(&sql)
+        .map_err(IndexError::from)
+}
+
 fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
     let iters = parse_usize_env("ITERS", REQUIRED_BRANCHES);
     let write_depths = parse_write_depths();
@@ -328,6 +389,7 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
     let rounds = parse_usize_env("ROUNDS", DEFAULT_WRITE_ROUNDS);
     let max_tries = parse_usize_env("KEY_SEARCH_MAX_TRIES", DEFAULT_KEY_SEARCH_MAX_TRIES);
     let wal_autocheckpoint_pages = parse_optional_wal_autocheckpoint_pages();
+    let wal_checkpoint_mode = parse_optional_wal_checkpoint_mode();
 
     assert!(iters > 0, "ITERS must be > 0");
     assert!(
@@ -352,7 +414,9 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
 
     if output_mode.is_raw() {
         println!(
-            "config\titers={iters}\twrite_depths={write_depths:?}\tkey_updates={key_updates_pct}\trounds={rounds}\tkey_search_max_tries={max_tries}\tsqlite_wal_autocheckpoint={wal_autocheckpoint_pages:?}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
+            "config\titers={iters}\twrite_depths={write_depths:?}\tkey_updates={key_updates_pct}\trounds={rounds}\tkey_search_max_tries={max_tries}\tsqlite_wal_autocheckpoint={wal_autocheckpoint_pages:?}\tsqlite_wal_checkpoint_mode={wal_checkpoint_mode:?}\tsqlite_post_setup_checkpoint_ran={}\trequired_branches={REQUIRED_BRANCHES}\tstrategies={WRITE_CACHE_STRATEGIES:?}"
+            ,
+            wal_autocheckpoint_pages == Some(0)
         );
     }
 
@@ -373,6 +437,10 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
                     .wrapping_add((write_depth as u32).wrapping_mul(100))
                     .wrapping_add((strategy_idx as u32).wrapping_mul(2));
                 let parent_chain = initialize_parent_chain(&mut marf, base_seed, write_depth)?;
+                if wal_autocheckpoint_pages == Some(0) {
+                    let checkpoint_mode = wal_checkpoint_mode.unwrap_or(WalCheckpointMode::Passive);
+                    run_wal_checkpoint(&marf, checkpoint_mode)?;
+                }
                 let parent_block = parent_chain.tip;
                 let next_block = block_id(base_seed.wrapping_add(write_depth as u32));
 

@@ -20,6 +20,7 @@ pub(crate) struct BenchEnvOverrides {
     pub(crate) write_depths: Option<String>,
     pub(crate) key_updates: Option<usize>,
     pub(crate) sqlite_wal_autocheckpoint: Option<usize>,
+    pub(crate) sqlite_wal_checkpoint_mode: Option<String>,
     pub(crate) read_proofs: Option<bool>,
     pub(crate) keys_per_block: Option<u32>,
     pub(crate) depths: Option<String>,
@@ -380,6 +381,9 @@ impl Runner {
                 "SQLITE_WAL_AUTOCHECKPOINT",
                 sqlite_wal_autocheckpoint.to_string(),
             );
+        }
+        if let Some(sqlite_wal_checkpoint_mode) = &request.env.sqlite_wal_checkpoint_mode {
+            cmd.env("SQLITE_WAL_CHECKPOINT_MODE", sqlite_wal_checkpoint_mode);
         }
         if let Some(read_proofs) = request.env.read_proofs {
             cmd.env("READ_PROOFS", if read_proofs { "1" } else { "0" });

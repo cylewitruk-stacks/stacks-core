@@ -36,6 +36,8 @@ impl BenchTarget {
                         keys_per_block: args.keys_per_block,
                         depths: args.depths.clone(),
                         cache_strategies: args.cache_strategies.clone(),
+                        sqlite_wal_autocheckpoint: args.sqlite_wal_autocheckpoint,
+                        sqlite_wal_checkpoint_mode: args.sqlite_wal_checkpoint_mode.clone(),
                         ..Default::default()
                     },
                 ),
@@ -47,6 +49,7 @@ impl BenchTarget {
                         key_updates: args.key_updates,
                         write_depths: args.write_depths.clone(),
                         sqlite_wal_autocheckpoint: args.sqlite_wal_autocheckpoint,
+                        sqlite_wal_checkpoint_mode: args.sqlite_wal_checkpoint_mode.clone(),
                         key_search_max_tries: args.key_search_max_tries,
                         ..Default::default()
                     },
@@ -69,6 +72,8 @@ impl BenchTarget {
                     keys_per_block: args.keys_per_block,
                     depths: args.depths,
                     cache_strategies: args.cache_strategies,
+                    sqlite_wal_autocheckpoint: args.sqlite_wal_autocheckpoint,
+                    sqlite_wal_checkpoint_mode: args.sqlite_wal_checkpoint_mode,
                     ..Default::default()
                 },
             )],
@@ -80,6 +85,7 @@ impl BenchTarget {
                     key_updates: args.key_updates,
                     write_depths: args.write_depths,
                     sqlite_wal_autocheckpoint: args.sqlite_wal_autocheckpoint,
+                    sqlite_wal_checkpoint_mode: args.sqlite_wal_checkpoint_mode,
                     key_search_max_tries: args.key_search_max_tries,
                     ..Default::default()
                 },
@@ -143,9 +149,15 @@ pub(crate) struct AllArgs {
 
     #[arg(
         long,
-        help = "Set SQLITE_WAL_AUTOCHECKPOINT page threshold for write benchmark SQLite connection"
+        help = "Set SQLITE_WAL_AUTOCHECKPOINT page threshold for read/write benchmark SQLite connection"
     )]
     sqlite_wal_autocheckpoint: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Set SQLITE_WAL_CHECKPOINT_MODE for post-setup checkpoint when SQLITE_WAL_AUTOCHECKPOINT=0 (PASSIVE|FULL|RESTART|TRUNCATE)"
+    )]
+    sqlite_wal_checkpoint_mode: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +197,18 @@ pub(crate) struct ReadArgs {
         help = "Set CACHE_STRATEGIES as comma-separated values (for example: noop,node256)"
     )]
     cache_strategies: Option<String>,
+
+    #[arg(
+        long,
+        help = "Set SQLITE_WAL_AUTOCHECKPOINT page threshold for read benchmark SQLite connection"
+    )]
+    sqlite_wal_autocheckpoint: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Set SQLITE_WAL_CHECKPOINT_MODE for post-setup checkpoint when SQLITE_WAL_AUTOCHECKPOINT=0 (PASSIVE|FULL|RESTART|TRUNCATE)"
+    )]
+    sqlite_wal_checkpoint_mode: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +236,12 @@ pub(crate) struct WriteArgs {
         help = "Set SQLITE_WAL_AUTOCHECKPOINT page threshold for write benchmark SQLite connection"
     )]
     sqlite_wal_autocheckpoint: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Set SQLITE_WAL_CHECKPOINT_MODE for post-setup checkpoint when SQLITE_WAL_AUTOCHECKPOINT=0 (PASSIVE|FULL|RESTART|TRUNCATE)"
+    )]
+    sqlite_wal_checkpoint_mode: Option<String>,
 
     #[arg(
         long,

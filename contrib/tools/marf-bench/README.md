@@ -24,6 +24,10 @@ This document explains the git operations it performs, what they change (or do n
   - `cargo marf-bench bench --base merge-base:upstream/develop --keep-worktrees write --rounds 10 --iters 200 --write-depths 1024 --key-updates 25`
 - A/B write benchmark checkpoint behavior (bench-only hack):
   - `cargo marf-bench bench --base merge-base:upstream/develop write --rounds 10 --iters 200 --write-depths 1024 --key-updates 25 --sqlite-wal-autocheckpoint 0`
+- A/B write benchmark with explicit post-setup checkpoint mode (when auto-checkpoint is disabled):
+  - `cargo marf-bench bench --base merge-base:upstream/develop write --rounds 10 --iters 200 --write-depths 1024 --key-updates 25 --sqlite-wal-autocheckpoint 0 --sqlite-wal-checkpoint-mode FULL`
+- Read benchmark with matching SQLite WAL behavior controls:
+  - `cargo marf-bench bench --base merge-base:upstream/develop read --depths 128,512,1024,2048 --sqlite-wal-autocheckpoint 0 --sqlite-wal-checkpoint-mode FULL`
 - Tune high-jitter detection threshold for repeat confidence summary:
   - `cargo marf-bench bench --base merge-base:upstream/develop --repeats 5 --repeat-jitter-threshold 40 write --rounds 10 --iters 200 --write-depths 32,512,1024 --key-updates 25`
 - Override benchmark loop controls from CLI:
@@ -64,7 +68,8 @@ Bench-specific options are accepted on the bench target subcommands and are forw
 - `--cache-strategies <CSV>` sets `CACHE_STRATEGIES`
 - `--write-depths <CSV>` sets `WRITE_DEPTHS` (write parent-chain depth distribution)
 - `--key-updates <N>` sets `KEY_UPDATES` (write update share in percent, `0..=100`)
-- `--sqlite-wal-autocheckpoint <N>` sets `SQLITE_WAL_AUTOCHECKPOINT` (write benchmark only; page threshold for SQLite WAL auto-checkpoint, `0` disables auto-checkpoint)
+- `--sqlite-wal-autocheckpoint <N>` sets `SQLITE_WAL_AUTOCHECKPOINT` (read/write benchmarks; page threshold for SQLite WAL auto-checkpoint, `0` disables auto-checkpoint)
+- `--sqlite-wal-checkpoint-mode <MODE>` sets `SQLITE_WAL_CHECKPOINT_MODE` (read/write benchmarks; used for explicit post-setup checkpoint only when `SQLITE_WAL_AUTOCHECKPOINT=0`; allowed: `PASSIVE|FULL|RESTART|TRUNCATE`; default mode is `PASSIVE`)
 - `--key-search-max-tries <N>` sets `KEY_SEARCH_MAX_TRIES`
 
 Read fixture semantics:
@@ -84,6 +89,12 @@ bench `result` lines include:
 - `variant=get-with-proof`
 
 This allows direct side-by-side comparison of plain reads and proofed reads within the same depth/strategy case.
+
+In `raw` mode, read/write `config` lines also include WAL-control fields useful for parsers:
+
+- `sqlite_wal_autocheckpoint`
+- `sqlite_wal_checkpoint_mode`
+- `sqlite_post_setup_checkpoint_ran`
 
 ## High-level lifecycle
 
