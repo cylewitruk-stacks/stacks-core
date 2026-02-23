@@ -9,7 +9,7 @@ use crate::runner::Runner;
 use crate::util::log;
 
 #[derive(Debug, Args)]
-pub(crate) struct RunArgs {
+pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Summary)]
     output_format: OutputFormat,
 
@@ -17,7 +17,7 @@ pub(crate) struct RunArgs {
     target: BenchTarget,
 }
 
-pub(crate) fn run_command(args: RunArgs) -> Result<()> {
+pub fn run_command(args: RunArgs) -> Result<()> {
     let repo_root = current_repo_root()?;
     let mut runner = Runner::new(repo_root.clone(), false)?;
     let requests = args.target.into_requests();

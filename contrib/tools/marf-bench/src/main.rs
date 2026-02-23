@@ -54,6 +54,7 @@ struct Cli {
 enum Commands {
     Run(commands::run::RunArgs),
     Bench(commands::bench::BenchArgs),
+    Clean(commands::clean::CleanArgs),
 }
 
 fn main() -> Result<()> {
@@ -62,6 +63,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Run(args) => commands::run::run_command(args),
         Commands::Bench(args) => commands::bench::run_command(args),
+        Commands::Clean(args) => commands::clean::run_command(args),
     }
 }
 

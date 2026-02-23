@@ -9,7 +9,7 @@ use crate::runner::Runner;
 use crate::util::log;
 
 #[derive(Debug, Args)]
-pub(crate) struct BenchArgs {
+pub struct BenchArgs {
     #[arg(
         long,
         global = true,
@@ -53,7 +53,7 @@ pub(crate) struct BenchArgs {
     target: BenchTarget,
 }
 
-pub(crate) fn run_command(args: BenchArgs) -> Result<()> {
+pub fn run_command(args: BenchArgs) -> Result<()> {
     let requests = args.target.into_requests();
     let repo_root = current_repo_root()?;
     let repeats = args.repeats.unwrap_or(1);

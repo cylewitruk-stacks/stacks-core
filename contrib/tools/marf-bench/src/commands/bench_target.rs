@@ -4,7 +4,7 @@ use crate::BenchKind;
 use crate::runner::{BenchEnvOverrides, BenchRunRequest};
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum BenchTarget {
+pub enum BenchTarget {
     #[command(about = "Run all bench types")]
     All(AllArgs),
     #[command(name = "node-alloc", about = "Run node-alloc bench")]
@@ -16,7 +16,7 @@ pub(crate) enum BenchTarget {
 }
 
 impl BenchTarget {
-    pub(crate) fn into_requests(self) -> Vec<BenchRunRequest> {
+    pub fn into_requests(self) -> Vec<BenchRunRequest> {
         match self {
             Self::All(args) => vec![
                 BenchRunRequest::new(
@@ -95,8 +95,8 @@ impl BenchTarget {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct AllArgs {
-    #[arg(long, help = "Set ITERS for benches that use per-case iteration count")]
+pub struct AllArgs {
+    #[arg(long, help = "Set ITERS for benches that use per-case pub count")]
     iters: Option<usize>,
 
     #[arg(
@@ -161,17 +161,17 @@ pub(crate) struct AllArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct NodeAllocArgs {
-    #[arg(long, help = "Set ITERS for node-alloc case iteration count")]
+pub struct NodeAllocArgs {
+    #[arg(long, help = "Set ITERS for node-alloc case pub count")]
     iters: Option<usize>,
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct ReadArgs {
+pub struct ReadArgs {
     #[arg(long, help = "Set CHAIN_LEN for read fixture length")]
     chain_len: Option<u32>,
 
-    #[arg(long, help = "Set ITERS for read per-case iteration count")]
+    #[arg(long, help = "Set ITERS for read per-case pub count")]
     iters: Option<usize>,
 
     #[arg(long, help = "Set ROUNDS for read repeated case runs")]
@@ -212,7 +212,7 @@ pub(crate) struct ReadArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct WriteArgs {
+pub struct WriteArgs {
     #[arg(long, help = "Set ITERS for write inserted keys per workflow round")]
     iters: Option<usize>,
 

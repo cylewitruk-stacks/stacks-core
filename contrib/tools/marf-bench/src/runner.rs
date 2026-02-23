@@ -23,29 +23,29 @@ const MARF_ALLOC_BENCH_FILES: [&str; 7] = [
 ];
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BenchEnvOverrides {
-    pub(crate) iters: Option<usize>,
-    pub(crate) rounds: Option<usize>,
-    pub(crate) chain_len: Option<u32>,
-    pub(crate) write_depths: Option<String>,
-    pub(crate) key_updates: Option<usize>,
-    pub(crate) sqlite_wal_autocheckpoint: Option<usize>,
-    pub(crate) sqlite_wal_checkpoint_mode: Option<String>,
-    pub(crate) read_proofs: Option<bool>,
-    pub(crate) keys_per_block: Option<u32>,
-    pub(crate) depths: Option<String>,
-    pub(crate) cache_strategies: Option<String>,
-    pub(crate) key_search_max_tries: Option<usize>,
+pub struct BenchEnvOverrides {
+    pub iters: Option<usize>,
+    pub rounds: Option<usize>,
+    pub chain_len: Option<u32>,
+    pub write_depths: Option<String>,
+    pub key_updates: Option<usize>,
+    pub sqlite_wal_autocheckpoint: Option<usize>,
+    pub sqlite_wal_checkpoint_mode: Option<String>,
+    pub read_proofs: Option<bool>,
+    pub keys_per_block: Option<u32>,
+    pub depths: Option<String>,
+    pub cache_strategies: Option<String>,
+    pub key_search_max_tries: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct BenchRunRequest {
-    pub(crate) kind: BenchKind,
-    pub(crate) env: BenchEnvOverrides,
+pub struct BenchRunRequest {
+    pub kind: BenchKind,
+    pub env: BenchEnvOverrides,
 }
 
 impl BenchRunRequest {
-    pub(crate) fn new(kind: BenchKind, env: BenchEnvOverrides) -> Self {
+    pub fn new(kind: BenchKind, env: BenchEnvOverrides) -> Self {
         Self { kind, env }
     }
 }
@@ -66,7 +66,7 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub(crate) fn new(repo_root: PathBuf, keep_worktrees: bool) -> Result<Self> {
+    pub fn new(repo_root: PathBuf, keep_worktrees: bool) -> Result<Self> {
         if !keep_worktrees {
             cleanup_stale_marf_bench_worktrees(&repo_root)?;
         } else {
@@ -103,7 +103,7 @@ impl Runner {
         })
     }
 
-    pub(crate) fn run_current_tree(
+    pub fn run_current_tree(
         &mut self,
         label: &str,
         requests: &[BenchRunRequest],
@@ -131,7 +131,7 @@ impl Runner {
         self.run_benches(label, &repo_root, requests, output_format)
     }
 
-    pub(crate) fn run_revision_via_worktree(
+    pub fn run_revision_via_worktree(
         &mut self,
         label: &str,
         revision: &str,
@@ -276,7 +276,7 @@ impl Runner {
         Ok(())
     }
 
-    pub(crate) fn run_benches(
+    pub fn run_benches(
         &mut self,
         label: &str,
         root: &Path,
@@ -478,31 +478,8 @@ impl Drop for Runner {
     }
 }
 
-pub(crate) fn cleanup_stale_marf_bench_worktrees(repo_root: &Path) -> Result<()> {
-    let mut list_cmd = Command::new("git");
-    list_cmd
-        .current_dir(repo_root)
-        .arg("worktree")
-        .arg("list")
-        .arg("--porcelain");
-
-    let output = list_cmd
-        .output()
-        .context("failed to list git worktrees for cleanup")?;
-    if !output.status.success() {
-        bail!(
-            "failed to list git worktrees for cleanup: {}",
-            combine_output_text(&output)
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stale_paths: Vec<PathBuf> = stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .filter(|path| is_marf_bench_worktree_path(path, repo_root))
-        .collect();
+pub fn cleanup_stale_marf_bench_worktrees(repo_root: &Path) -> Result<()> {
+    let stale_paths = list_stale_marf_bench_worktrees(repo_root)?;
 
     for stale in stale_paths {
         log(&format!(
@@ -529,6 +506,111 @@ pub(crate) fn cleanup_stale_marf_bench_worktrees(repo_root: &Path) -> Result<()>
     let _ = prune_cmd.output();
 
     Ok(())
+}
+
+pub fn list_stale_marf_bench_worktrees(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut list_cmd = Command::new("git");
+    list_cmd
+        .current_dir(repo_root)
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain");
+
+    let output = list_cmd
+        .output()
+        .context("failed to list git worktrees for cleanup")?;
+    if !output.status.success() {
+        bail!(
+            "failed to list git worktrees for cleanup: {}",
+            combine_output_text(&output)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stale_paths: Vec<PathBuf> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .filter(|path| is_marf_bench_worktree_path(path, repo_root))
+        .collect();
+
+    Ok(stale_paths)
+}
+
+pub fn cached_keep_worktrees_root_if_exists(repo_root: &Path) -> Option<PathBuf> {
+    let root = keep_worktrees_root(repo_root);
+    if root.exists() { Some(root) } else { None }
+}
+
+pub fn list_orphan_temp_worktree_dirs() -> Result<Vec<PathBuf>> {
+    let temp_root = std::env::temp_dir();
+    let entries = fs::read_dir(&temp_root)
+        .with_context(|| format!("failed to read temp dir {}", temp_root.display()))?;
+
+    let mut paths = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if !name.starts_with("marf-bench-") {
+            continue;
+        }
+
+        if name == "marf-bench-worktrees" {
+            continue;
+        }
+
+        paths.push(path);
+    }
+
+    Ok(paths)
+}
+
+pub fn cleanup_cached_keep_worktrees(repo_root: &Path) -> Result<bool> {
+    let Some(root) = cached_keep_worktrees_root_if_exists(repo_root) else {
+        return Ok(false);
+    };
+
+    log(&format!(
+        "Removing cached keep-worktrees root: {}",
+        root.display()
+    ));
+    fs::remove_dir_all(&root).with_context(|| {
+        format!(
+            "failed to remove cached keep-worktrees root {}",
+            root.display()
+        )
+    })?;
+    Ok(true)
+}
+
+pub fn cleanup_orphan_temp_worktree_dirs() -> Result<usize> {
+    let orphan_paths = list_orphan_temp_worktree_dirs()?;
+
+    let mut removed = 0usize;
+    for path in orphan_paths {
+        log(&format!(
+            "Removing orphan temp marf-bench dir: {}",
+            path.display()
+        ));
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
 }
 
 fn is_marf_bench_worktree_path(path: &Path, repo_root: &Path) -> bool {

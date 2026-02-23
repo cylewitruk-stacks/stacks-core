@@ -37,11 +37,16 @@ This document explains the git operations it performs, what they change (or do n
   - `cargo marf-bench run write --iters 20000 --write-depths 1024 --key-updates 25 --rounds 4 --key-search-max-tries 500000`
 - Run write across a depth distribution in one invocation:
   - `cargo marf-bench run write --iters 20000 --write-depths 1,64,256,1024 --key-updates 25 --rounds 4 --key-search-max-tries 500000`
+- Remove marf-bench temporary worktrees and cached temp data:
+  - `cargo marf-bench clean`
+- Preview what clean would remove without deleting anything:
+  - `cargo marf-bench clean --dry-run`
 
 ## Command shape
 
 - `run`: `cargo marf-bench run [--output-format <summary|raw|tsv>] <all|node-alloc|read|write> [bench-specific options]`
 - `bench`: `cargo marf-bench bench [--base <rev|staged|merge-base:<upstream-ref>>] [--target <rev>] [--repeats <N>] [--repeat-jitter-threshold <PCT>] [--keep-worktrees] [--output-format <summary|raw|tsv>] <all|node-alloc|read|write> [bench-specific options]`
+- `clean`: `cargo marf-bench clean [--dry-run]`
 
 Notes:
 
@@ -206,6 +211,15 @@ When `--keep-worktrees` is enabled, cached worktrees are stored under the platfo
 If the process is forcibly terminated (`SIGKILL`, power loss), the OS temp area lifecycle usually
 cleans up old temp files/directories over time, and you can also remove leftovers manually using
 the recovery commands below.
+
+You can also run explicit marf-bench cleanup:
+
+- `cargo marf-bench clean`
+  - Removes stale marf-bench git worktrees.
+  - Removes this repo's cached keep-worktree root.
+  - Removes orphan temp dirs matching marf-bench naming conventions.
+- `cargo marf-bench clean --dry-run`
+  - Prints the same removal plan without deleting anything.
 
 ## Failure/interrupt recovery
 
