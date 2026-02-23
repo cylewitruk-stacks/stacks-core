@@ -27,6 +27,7 @@ use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, set_backptr, TrieCursor, TrieNode, TrieNode16, TrieNode256,
     TrieNode4, TrieNode48, TrieNodeID, TrieNodePath, TrieNodeType, TriePtr,
 };
+use crate::chainstate::stacks::index::scratch::TrieNodeDecodeScratch;
 use crate::chainstate::stacks::index::storage::{TrieHashCalculationMode, TrieStorageConnection};
 use crate::chainstate::stacks::index::{Error, MarfTrieId, TrieHasher, TrieLeaf};
 
@@ -335,7 +336,7 @@ impl Trie {
         storage: &mut TrieStorageConnection<T>,
         ptr: &TriePtr,
         cursor: &mut TrieCursor<T>,
-        scratch: &'a mut crate::chainstate::stacks::index::bits::TrieNodeDecodeScratch,
+        scratch: &'a mut TrieNodeDecodeScratch,
     ) -> Result<
         (
             crate::chainstate::stacks::index::node::TrieNodeRef<'a>,

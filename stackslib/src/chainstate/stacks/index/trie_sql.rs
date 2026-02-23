@@ -28,9 +28,10 @@ use stacks_common::types::sqlite::NO_PARAMS;
 use crate::chainstate::stacks::index::bits::read_hash_bytes;
 use crate::chainstate::stacks::index::bits::{
     read_node_hash_bytes as bits_read_node_hash_bytes, read_nodetype, read_nodetype_nohash,
-    read_nodetype_ref, read_nodetype_ref_nohash, TrieNodeDecodeScratch,
+    read_nodetype_ref, read_nodetype_ref_nohash,
 };
 use crate::chainstate::stacks::index::node::{TrieNodeRef, TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::scratch::TrieNodeDecodeScratch;
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
@@ -460,12 +461,13 @@ pub fn read_node_hash_bytes_by_bhh<W: Write, T: MarfTrieId>(
     w.write_all(&hash_buff).map_err(|e| e.into())
 }
 
-/// Read a node and its hash from a sqlite-stored trie blob
-pub fn read_node_type(
-    conn: &Connection,
-    block_id: u32,
-    ptr: &TriePtr,
-) -> Result<(TrieNodeType, TrieHash), Error> {
+/// Helper to open a trie blob and execute the provided closure on it, returning the closure's
+/// result.
+#[inline]
+fn with_open_trie_blob<R, F>(conn: &Connection, block_id: u32, reader: F) -> Result<R, Error>
+where
+    F: FnOnce(&mut Blob<'_>) -> Result<R, Error>,
+{
     let mut blob = conn.blob_open(
         DatabaseName::Main,
         "marf_data",
@@ -473,7 +475,16 @@ pub fn read_node_type(
         block_id.into(),
         true,
     )?;
-    read_nodetype(&mut blob, ptr)
+    reader(&mut blob)
+}
+
+/// Read a node and its hash from a sqlite-stored trie blob
+pub fn read_node_type(
+    conn: &Connection,
+    block_id: u32,
+    ptr: &TriePtr,
+) -> Result<(TrieNodeType, TrieHash), Error> {
+    with_open_trie_blob(conn, block_id, |blob| read_nodetype(blob, ptr))
 }
 
 /// Read a node from a sqlite-stored trie blob, excluding its hash.
@@ -482,14 +493,7 @@ pub fn read_node_type_nohash(
     block_id: u32,
     ptr: &TriePtr,
 ) -> Result<TrieNodeType, Error> {
-    let mut blob = conn.blob_open(
-        DatabaseName::Main,
-        "marf_data",
-        "data",
-        block_id.into(),
-        true,
-    )?;
-    read_nodetype_nohash(&mut blob, ptr)
+    with_open_trie_blob(conn, block_id, |blob| read_nodetype_nohash(blob, ptr))
 }
 
 /// Read a node and its hash from a sqlite-stored trie blob into decode scratch.
@@ -499,14 +503,7 @@ pub fn read_node_type_ref<'a>(
     ptr: &TriePtr,
     scratch: &'a mut TrieNodeDecodeScratch,
 ) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
-    let mut blob = conn.blob_open(
-        DatabaseName::Main,
-        "marf_data",
-        "data",
-        block_id.into(),
-        true,
-    )?;
-    read_nodetype_ref(&mut blob, ptr, scratch)
+    with_open_trie_blob(conn, block_id, |blob| read_nodetype_ref(blob, ptr, scratch))
 }
 
 /// Read a node from a sqlite-stored trie blob into decode scratch, excluding its hash.
@@ -516,14 +513,9 @@ pub fn read_node_type_ref_nohash<'a>(
     ptr: &TriePtr,
     scratch: &'a mut TrieNodeDecodeScratch,
 ) -> Result<TrieNodeRef<'a>, Error> {
-    let mut blob = conn.blob_open(
-        DatabaseName::Main,
-        "marf_data",
-        "data",
-        block_id.into(),
-        true,
-    )?;
-    read_nodetype_ref_nohash(&mut blob, ptr, scratch)
+    with_open_trie_blob(conn, block_id, |blob| {
+        read_nodetype_ref_nohash(blob, ptr, scratch)
+    })
 }
 
 /// Get the offset and length of a trie blob in the trie blobs file.

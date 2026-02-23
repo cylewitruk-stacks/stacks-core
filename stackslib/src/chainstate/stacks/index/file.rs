@@ -27,9 +27,10 @@ use stacks_common::types::chainstate::TrieHash;
 
 use crate::chainstate::stacks::index::bits::{
     read_hash_bytes, read_nodetype_at_head, read_nodetype_at_head_nohash,
-    read_nodetype_at_head_ref, read_nodetype_at_head_ref_nohash, TrieNodeDecodeScratch,
+    read_nodetype_at_head_ref, read_nodetype_at_head_ref_nohash,
 };
 use crate::chainstate::stacks::index::node::{TrieNodeRef, TrieNodeType, TriePtr};
+use crate::chainstate::stacks::index::scratch::TrieNodeDecodeScratch;
 use crate::chainstate::stacks::index::storage::NodeHashReader;
 #[cfg(test)]
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
@@ -172,7 +173,10 @@ impl TrieFile {
             .map(|stat| Some(stat.len()))
             .unwrap_or(None);
 
-        info!("Preemptively vacuuming the database file to free up space after copying trie blobs to a separate file");
+        info!(
+            "Preemptively vacuuming the database file to free up space after copying trie blobs \
+            to a separate file"
+        );
         sql_vacuum(db)?;
 
         let size_after_opt = fs::metadata(db_path)
@@ -180,7 +184,7 @@ impl TrieFile {
             .unwrap_or(None);
 
         if let (Some(sz_before), Some(sz_after)) = (size_before_opt, size_after_opt) {
-            debug!("Shrank DB from {} to {} bytes", sz_before, sz_after);
+            debug!("Shrank DB from {sz_before} to {sz_after} bytes");
         }
 
         Ok(())
@@ -212,7 +216,7 @@ impl TrieFile {
         // don't materialize the error; just warn
         let res = TrieFile::inner_post_migrate_vacuum(db, db_path);
         if let Err(e) = res {
-            warn!("Failed to VACUUM the MARF DB post-migration: {:?}", &e);
+            warn!("Failed to VACUUM the MARF DB post-migration: {e:?}");
         }
 
         if set_sqlite_tmpdir {
@@ -220,7 +224,7 @@ impl TrieFile {
             env::remove_var("SQLITE_TMPDIR");
         }
         if let Some(old_tmpdir) = old_tmpdir_opt {
-            debug!("Restore TMPDIR to '{}'", &old_tmpdir);
+            debug!("Restore TMPDIR to '{old_tmpdir}'");
             env::set_var("TMPDIR", old_tmpdir);
         } else {
             debug!("Unset TMPDIR");
@@ -236,24 +240,26 @@ impl TrieFile {
         db_path: &str,
     ) -> Result<(), Error> {
         if trie_sql::detect_partial_migration(db)? {
-            panic!("PARTIAL MIGRATION DETECTED! This is an irrecoverable error. You will need to restart your node from genesis.");
+            panic!(
+                "PARTIAL MIGRATION DETECTED! This is an irrecoverable error. You will need to \
+                restart your node from genesis."
+            );
         }
 
         let max_block = trie_sql::count_blocks(db)?;
         info!(
-            "Migrate {} blocks to external blob storage at {}",
-            max_block,
+            "Migrate {max_block} blocks to external blob storage at {}",
             &self.get_path()
         );
 
         for block_id in 0..(max_block + 1) {
             match trie_sql::is_unconfirmed_block(db, block_id) {
                 Ok(true) => {
-                    test_debug!("Skip block_id {} since it's unconfirmed", block_id);
+                    test_debug!("Skip block_id {block_id} since it's unconfirmed");
                     continue;
                 }
                 Err(Error::NotFoundError) => {
-                    test_debug!("Skip block_id {} since it's not a block", block_id);
+                    test_debug!("Skip block_id {block_id} since it's not a block");
                     continue;
                 }
                 Ok(false) => {
@@ -265,10 +271,7 @@ impl TrieFile {
 
                     // append the blob, replacing the current trie blob
                     if block_id % 1000 == 0 {
-                        info!(
-                            "Migrate block {} ({} of {}) to external blob storage",
-                            &bhh, block_id, max_block
-                        );
+                        info!("Migrate block {bhh} ({block_id} of {max_block}) to external blob storage");
                     }
 
                     // append directly to file, so we can get the true offset
@@ -277,7 +280,7 @@ impl TrieFile {
                     self.write_all(&trie_blob)?;
                     self.flush()?;
 
-                    test_debug!("Stored trie blob {} to offset {}", bhh, offset);
+                    test_debug!("Stored trie blob {bhh} to offset {offset}");
                     trie_sql::update_external_trie_blob(
                         db,
                         &bhh,
@@ -287,11 +290,7 @@ impl TrieFile {
                     )?;
                 }
                 Err(e) => {
-                    test_debug!(
-                        "Failed to determine if {} is unconfirmed: {:?}",
-                        block_id,
-                        &e
-                    );
+                    test_debug!("Failed to determine if {block_id} is unconfirmed: {e:?}");
                     return Err(e);
                 }
             }
@@ -299,7 +298,7 @@ impl TrieFile {
 
         TrieFile::post_migrate_vacuum(db, db_path);
 
-        debug!("Mark MARF trie migration of '{}' as finished", db_path);
+        debug!("Mark MARF trie migration of '{db_path}' as finished");
         trie_sql::set_migrated(db).expect("FATAL: failed to mark DB as migrated");
         Ok(())
     }
@@ -366,6 +365,22 @@ impl TrieFile {
         Ok(TrieHash(hash_buff))
     }
 
+    #[inline]
+    fn with_node_reader_at_ptr<R, F>(
+        &mut self,
+        db: &Connection,
+        block_id: u32,
+        ptr: &TriePtr,
+        reader: F,
+    ) -> Result<R, Error>
+    where
+        F: FnOnce(&mut TrieFile, u8) -> Result<R, Error>,
+    {
+        let offset = self.get_trie_offset(db, block_id)?;
+        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
+        reader(self, ptr.id())
+    }
+
     /// Obtain a TrieNodeType and its associated TrieHash for a node, given its block ID and
     /// pointer
     pub fn read_node_type(
@@ -374,9 +389,9 @@ impl TrieFile {
         block_id: u32,
         ptr: &TriePtr,
     ) -> Result<(TrieNodeType, TrieHash), Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head(self, ptr.id())
+        self.with_node_reader_at_ptr(db, block_id, ptr, |f, ptr_id| {
+            read_nodetype_at_head(f, ptr_id)
+        })
     }
 
     /// Obtain a TrieNodeType, given its block ID and pointer
@@ -386,9 +401,9 @@ impl TrieFile {
         block_id: u32,
         ptr: &TriePtr,
     ) -> Result<TrieNodeType, Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head_nohash(self, ptr.id())
+        self.with_node_reader_at_ptr(db, block_id, ptr, |f, ptr_id| {
+            read_nodetype_at_head_nohash(f, ptr_id)
+        })
     }
 
     /// Obtain a borrowed TrieNodeRef and its hash for a node, given its block ID and pointer.
@@ -399,9 +414,9 @@ impl TrieFile {
         ptr: &TriePtr,
         scratch: &'a mut TrieNodeDecodeScratch,
     ) -> Result<(TrieNodeRef<'a>, TrieHash), Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head_ref(self, ptr.id(), scratch)
+        self.with_node_reader_at_ptr(db, block_id, ptr, |f, ptr_id| {
+            read_nodetype_at_head_ref(f, ptr_id, scratch)
+        })
     }
 
     /// Obtain a borrowed TrieNodeRef for a node, given its block ID and pointer.
@@ -412,9 +427,9 @@ impl TrieFile {
         ptr: &TriePtr,
         scratch: &'a mut TrieNodeDecodeScratch,
     ) -> Result<TrieNodeRef<'a>, Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head_ref_nohash(self, ptr.id(), scratch)
+        self.with_node_reader_at_ptr(db, block_id, ptr, |f, ptr_id| {
+            read_nodetype_at_head_ref_nohash(f, ptr_id, scratch)
+        })
     }
 
     /// Obtain a TrieHash for a node, given the node's block's hash (used only in testing)
@@ -450,10 +465,8 @@ impl TrieFile {
             let root_hash = TrieHash(hash_buff);
 
             trace!(
-                "Root hash for block {} at offset {} is {}",
-                &block_hash,
+                "Root hash for block {block_hash} at offset {} is {root_hash}",
                 offset + start,
-                &root_hash
             );
             Ok((root_hash, block_hash))
         })?;
@@ -464,7 +477,7 @@ impl TrieFile {
     /// Returns the offset at which it was appended.
     pub fn append_trie_blob(&mut self, db: &Connection, buf: &[u8]) -> Result<u64, Error> {
         let offset = trie_sql::get_external_blobs_length(db)?;
-        test_debug!("Write trie of {} bytes at {}", buf.len(), offset);
+        test_debug!("Write trie of {} bytes at {offset}", buf.len());
         self.seek(SeekFrom::Start(offset))?;
         self.write_all(buf)?;
         self.flush()?;

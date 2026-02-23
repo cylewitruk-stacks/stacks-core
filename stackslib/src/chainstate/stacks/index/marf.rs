@@ -20,11 +20,12 @@ use stacks_common::types::chainstate::TrieHash;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use super::storage::ReopenedTrieStorageConnection;
-use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash, TrieNodeDecodeScratch};
+use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, set_backptr, CursorError, TrieCursor, TrieNode256, TrieNodeID,
     TrieNodeType, TriePtr,
 };
+use crate::chainstate::stacks::index::scratch::MarfReadScratch;
 use crate::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode, TrieStorageConnection, TrieStorageTransaction,
 };
@@ -52,32 +53,6 @@ pub struct MarfTransaction<'a, T: MarfTrieId> {
 struct WriteChainTip<T> {
     block_hash: T,
     height: u32,
-}
-
-struct MarfReadScratch<T: MarfTrieId> {
-    cursor: Option<TrieCursor<T>>,
-    decode_scratch: TrieNodeDecodeScratch,
-}
-
-impl<T: MarfTrieId> Default for MarfReadScratch<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: MarfTrieId> MarfReadScratch<T> {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            cursor: None,
-            decode_scratch: TrieNodeDecodeScratch::new(),
-        }
-    }
-
-    fn cursor_mut(&mut self, path: &TrieHash) -> &mut TrieCursor<T> {
-        self.cursor
-            .get_or_insert_with(|| TrieCursor::new(path, TriePtr::default()))
-    }
 }
 
 fn lookup_with_proof_by_key_with_scratch<T: MarfTrieId>(
@@ -1150,9 +1125,9 @@ impl<T: MarfTrieId> MARF<T> {
         for _ in 0..(cursor.path.len() + 1) {
             let node = if node_already_in_scratch {
                 node_already_in_scratch = false;
-                read_scratch.decode_scratch.get_ref()
+                read_scratch.decode_scratch().get_ref()
             } else {
-                storage.read_nodetype_ref_nohash(&node_ptr, &mut read_scratch.decode_scratch)?
+                storage.read_nodetype_ref_nohash(&node_ptr, read_scratch.decode_scratch_mut())?
             };
 
             storage.bench_mut().marf_walk_from_start();
@@ -1193,7 +1168,7 @@ impl<T: MarfTrieId> MARF<T> {
                             storage,
                             &ptr,
                             cursor,
-                            &mut read_scratch.decode_scratch,
+                            read_scratch.decode_scratch_mut(),
                         )?;
                         storage.bench_mut().marf_walk_backptr_finish();
 
@@ -1244,7 +1219,8 @@ impl<T: MarfTrieId> MARF<T> {
     ) -> Result<Option<TrieLeaf>, Error> {
         trace!("MARF::get_path_with_scratch({block_hash:?}) {path:?}");
 
-        let mut cursor = std::mem::take(&mut scratch.cursor)
+        let mut cursor = scratch
+            .take_cursor()
             .unwrap_or_else(|| TrieCursor::new(path, TriePtr::default()));
 
         let leaf_result =
@@ -1253,11 +1229,11 @@ impl<T: MarfTrieId> MARF<T> {
                     trace!("Failed to look up key {block_hash:?} {path:?}: {e:?}");
                 });
 
-        scratch.cursor = Some(cursor);
+        scratch.set_cursor(cursor);
 
         let leaf = leaf_result?;
 
-        let cursor = scratch.cursor.as_ref().expect("cursor should be restored");
+        let cursor = scratch.cursor_ref().expect("cursor should be restored");
 
         if cursor.block_hashes.len() + 1 != cursor.node_ptrs.len() {
             trace!("cursor.block_hashes = {:?}", &cursor.block_hashes);

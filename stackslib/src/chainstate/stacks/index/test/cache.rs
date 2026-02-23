@@ -20,6 +20,7 @@ use std::{cmp, fs};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use super::*;
+use crate::chainstate::stacks::index::cache::MruCache;
 use crate::chainstate::stacks::index::*;
 
 /// Deterministic random keys to insert
@@ -155,6 +156,82 @@ fn test_marf_with_cache(
     root_hash = marf.get_root_hash_at(&last_block_header).unwrap();
     eprintln!("root hash at {:?}: {:?}", &last_block_header, &root_hash);
     root_hash
+}
+
+#[test]
+fn mru_get_promotes_and_affects_eviction() {
+    let mut cache = MruCache::<u32, &'static str, 3>::new();
+    cache.put(1, "one");
+    cache.put(2, "two");
+    cache.put(3, "three");
+
+    // Promote key 1 to MRU.
+    assert_eq!(cache.get(&1), Some(&"one"));
+
+    // Promotion is implemented via swap(0, pos), so key 3 is now in the
+    // last slot and gets evicted on the next insert.
+    cache.put(4, "four");
+    assert_eq!(cache.get(&3), None);
+    assert_eq!(cache.get(&1), Some(&"one"));
+    assert_eq!(cache.get(&2), Some(&"two"));
+    assert_eq!(cache.get(&4), Some(&"four"));
+}
+
+#[test]
+fn mru_put_existing_updates_and_promotes() {
+    let mut cache = MruCache::<u32, u32, 3>::new();
+    cache.put(1, 10);
+    cache.put(2, 20);
+    cache.put(3, 30);
+
+    // Update key 2 and promote it to MRU.
+    cache.put(2, 200);
+    assert_eq!(cache.get(&2), Some(&200));
+
+    // LRU should now be key 1.
+    cache.put(4, 40);
+    assert_eq!(cache.get(&1), None);
+    assert_eq!(cache.get(&2), Some(&200));
+    assert_eq!(cache.get(&3), Some(&30));
+    assert_eq!(cache.get(&4), Some(&40));
+}
+
+#[test]
+fn mru_clear_resets_state() {
+    let mut cache = MruCache::<u32, u32, 3>::new();
+    cache.put(1, 10);
+    cache.put(2, 20);
+    cache.put(3, 30);
+    cache.clear();
+
+    assert_eq!(cache.get(&1), None);
+    assert_eq!(cache.get(&2), None);
+    assert_eq!(cache.get(&3), None);
+
+    // Reusable after clear.
+    cache.put(9, 90);
+    assert_eq!(cache.get(&9), Some(&90));
+}
+
+#[test]
+fn mru_capacity_one() {
+    let mut cache = MruCache::<u8, u8, 1>::new();
+    cache.put(1, 10);
+    assert_eq!(cache.get(&1), Some(&10));
+
+    cache.put(2, 20);
+    assert_eq!(cache.get(&1), None);
+    assert_eq!(cache.get(&2), Some(&20));
+
+    cache.put(2, 22);
+    assert_eq!(cache.get(&2), Some(&22));
+}
+
+#[test]
+#[should_panic]
+fn mru_zero_capacity_panics_on_put() {
+    let mut cache = MruCache::<u8, u8, 0>::new();
+    cache.put(1, 1);
 }
 
 #[test]

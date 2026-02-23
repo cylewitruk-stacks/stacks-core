@@ -35,6 +35,7 @@ pub mod file;
 pub mod marf;
 pub mod node;
 pub mod proofs;
+pub mod scratch;
 pub mod storage;
 pub mod trie;
 
