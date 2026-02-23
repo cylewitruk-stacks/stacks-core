@@ -1430,9 +1430,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
     }
 
     /// Build a read-only storage connection which can be used for reads without modifying the
-    ///  calling TrieFileStorage struct (i.e., the tip pointer is only changed in the connection)
-    ///  but reusing the TrieFileStorage's existing SQLite Connection (avoiding the overhead of
-    ///   `reopen_readonly`).
+    /// calling [`TrieFileStorage`] struct (i.e., the tip pointer is only changed in the connection)
+    /// but reusing the `TrieFileStorage`'s existing SQLite Connection (avoiding the overhead of
+    /// `reopen_readonly()`).
     pub fn reopen_connection(&self) -> Result<ReopenedTrieStorageConnection<'_, T>, Error> {
         let data = TrieStorageTransientData {
             uncommitted_writes: self.data.uncommitted_writes.clone(),

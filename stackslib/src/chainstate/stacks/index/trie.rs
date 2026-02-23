@@ -401,7 +401,7 @@ impl Trie {
         cursor: &mut TrieCursor<T>,
         value: &mut TrieLeaf,
     ) -> Result<TriePtr, Error> {
-        let (cur_leaf, _) = storage.read_nodetype(&cursor.ptr())?;
+        let (cur_leaf, cur_leaf_hash) = storage.read_nodetype(&cursor.ptr())?;
         if !cur_leaf.is_leaf() {
             return Err(Error::CorruptionError(format!(
                 "Not a leaf: {:?}",
@@ -412,6 +412,15 @@ impl Trie {
         value.path = TrieNodePath::from_slice(cur_leaf.path_bytes());
 
         let leaf_hash = get_leaf_hash(value);
+
+        // Avoid redundant writes if the leaf is identical
+        if leaf_hash == cur_leaf_hash {
+            trace!(
+                "replace_leaf: skipped redundant write at {:?}",
+                &cursor.ptr()
+            );
+            return Ok(cursor.ptr());
+        }
 
         let leaf_ptr = cursor.ptr();
         storage.write_node(leaf_ptr.ptr(), value, leaf_hash)?;
@@ -449,10 +458,11 @@ impl Trie {
     /// Given a leaf and a cursor that is _not_ EOP, and a new leaf, create a node4 with the two
     /// leaves as its children and return its pointer.
     ///
-    /// f must point to the start of cur_leaf.
+    /// `f` must point to the start of cur_leaf.
     ///
-    /// before:
+    /// Before:
     ///
+    /// ```ignore
     /// leaf[path=aabbccddeeff00112233]=123456
     ///
     /// insert (aabbccddeeff99887766, 98765)
@@ -463,20 +473,20 @@ impl Trie {
     /// node4[path=aabbccddeeff]
     ///                         \
     ///                          [99]leaf[887766]=98765
-    ///
+    /// ```
     fn promote_leaf_to_node4<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
         cursor: &mut TrieCursor<T>,
         cur_leaf_data: &mut TrieLeaf,
         new_leaf_data: &mut TrieLeaf,
     ) -> Result<TriePtr, Error> {
-        // can only work if we're not at the end of the path, and the current node has a path
+        // Can only work if we're not at the end of the path, and the current node has a path
         assert!(!cursor.eop());
         assert!(!cur_leaf_data.path.is_empty());
 
-        // switch from lazy expansion to path compression --
-        // * the current and new leaves will have unique suffixes
-        // * the node4 will have their shared prefix
+        // Wwitch from lazy expansion to path compression --
+        // * The current and new leaves will have unique suffixes
+        // * The node4 will have their shared prefix
         let cur_leaf_ptr = cursor.ptr();
 
         let node4_path = cur_leaf_data
@@ -501,7 +511,7 @@ impl Trie {
             .get(cur_leaf_path_start..)
             .ok_or_else(|| Error::CorruptionError("Current leaf path too short".into()))?;
 
-        // update current leaf path
+        // Update current leaf path
         let cur_leaf_disk_ptr = cur_leaf_ptr.ptr();
         let cur_leaf_new_ptr =
             TriePtr::new(TrieNodeID::Leaf as u8, cur_leaf_chr, cur_leaf_disk_ptr);
@@ -513,7 +523,7 @@ impl Trie {
         // NOTE: this is safe since the current leaf's byte representation has gotten shorter
         storage.write_node(cur_leaf_ptr.ptr(), cur_leaf_data, cur_leaf_hash)?;
 
-        // append the new leaf and the end of the file.
+        // Append the new leaf and the end of the file.
         let new_leaf_disk_ptr = storage.last_ptr()?;
         let new_leaf_chr = cursor.path[cursor.tell()]; // NOTE: this is safe because !cursor.eop()
         new_leaf_data.path = TrieNodePath::from_slice(
@@ -521,12 +531,12 @@ impl Trie {
         );
         let new_leaf_hash = get_leaf_hash(new_leaf_data);
 
-        // put new leaf at the end of this Trie
+        // Put new leaf at the end of this Trie
         let new_leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, new_leaf_chr, new_leaf_disk_ptr);
 
         storage.write_node(new_leaf_disk_ptr, new_leaf_data, new_leaf_hash)?;
 
-        // append the Node4 that points to both of them, and put it after the new leaf
+        // Append the Node4 that points to both of them, and put it after the new leaf
         let mut node4_data = TrieNode4::new(&node4_path);
 
         assert!(node4_data.insert(&cur_leaf_new_ptr));
@@ -545,13 +555,13 @@ impl Trie {
 
         let node4 = TrieNodeType::Node4(node4_data);
 
-        // append the node4 to the end of the trie
+        // Append the node4 to the end of the trie
         let node4_disk_ptr = storage.last_ptr()?;
 
         let ret = TriePtr::new(TrieNodeID::Node4 as u8, node4_chr, node4_disk_ptr);
         storage.write_nodetype(node4_disk_ptr, &node4, node4_hash)?;
 
-        // update cursor to point to this node4 as the last-node-visited, and set the newly-created
+        // Update cursor to point to this node4 as the last-node-visited, and set the newly-created
         // ptr as the last ptr traversed (so the cursor still points to this leaf, but accurately
         // reflects the path taken to it).
         cursor.repair_retarget(&node4, &ret, storage.get_cur_block_ref());
@@ -583,9 +593,11 @@ impl Trie {
 
     /// Try to insert a leaf node into the given node, if there's space to do so and if the leaf
     /// belongs as a child of this node.
+    ///
     /// If so, then save the leaf and its hash, update the node's ptrs and hash, and return the
     /// node's ptr and the node's new hash so we can update the trie.
-    /// Return None if there's no space, or if the leaf doesn't share its full path prefix with the
+    ///
+    /// Returns None if there's no space, or if the leaf doesn't share its full path prefix with the
     /// given node.
     ///
     /// ```text
@@ -608,7 +620,7 @@ impl Trie {
         leaf: &mut TrieLeaf,
         node: &mut TrieNodeType,
     ) -> Result<Option<TriePtr>, Error> {
-        // can only do this if we're at the end of the node's path
+        // Can only do this if we're at the end of the node's path
         if !cursor.eonp(node) {
             // nope
             return Ok(None);
@@ -618,11 +630,11 @@ impl Trie {
 
         let has_space = Trie::node_has_space(cursor.chr().unwrap(), node.ptrs());
         if !has_space {
-            // nope!
+            // Nope!
             return Ok(None);
         }
 
-        // write leaf and update parent
+        // Write leaf and update parent
         let leaf_ptr = Trie::append_leaf(storage, cursor, leaf)?;
         let inserted = node.insert(&leaf_ptr);
 
@@ -645,27 +657,28 @@ impl Trie {
         Trie::try_attach_leaf(storage, cursor, leaf, node)
     }
 
-    /// Given a node and a leaf, attach the leaf.  Promote the intermediate node if necessary.
-    /// Does the same thing as try_attach_leaf, but the node might get expanaded.  In this case, the
-    /// new node will be appended and the old node will be leaked in the storage implementation
-    /// (leakage isn't a concern in practice, because the "leak" will happen inside the TrieRAM
-    /// storage implementation, which will be garbage-collected and dumped to disk once we finish
-    /// all the block's inserts and call the TrieRAM's containing TrieStorageConnection instance's
-    /// flush() method).
+    /// Given a node and a leaf, attach the leaf and, if necessary, promote the intermediate node.
+    ///
+    /// Does the same thing as [`try_attach_leaf()`](Self::try_attach_leaf), but the node might get
+    /// expanaded. In this case, the new node will be appended and the old node will be leaked in
+    /// the storage implementation (leakage isn't a concern in practice, because the "leak" will
+    /// happen inside the [`TrieRAM`](super::storage::TrieRAM) storage implementation, which will be
+    /// garbage-collected and dumped to disk once we finish all the block's inserts and call the
+    /// `TrieRAM`'s containing [`TrieStorageConnection`] instance's `flush()` method).
     fn insert_leaf<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
         cursor: &mut TrieCursor<T>,
         leaf: &mut TrieLeaf,
         node: &mut TrieNodeType,
     ) -> Result<TriePtr, Error> {
-        // can only do this if we're at the end of the node's path
+        // Can only do this if we're at the end of the node's path
         assert!(cursor.eonp(node));
 
         if let Some(ptr) = Trie::try_attach_leaf(storage, cursor, leaf, node)? {
             return Ok(ptr);
         }
 
-        // not enough space -- need to promote node
+        // Not enough space -- need to promote node
         let mut new_node = match node {
             TrieNodeType::Leaf(_) => panic!("Cannot insert into a leaf"),
             TrieNodeType::Node256(_) => panic!("Somehow could not insert into a Node256"),
@@ -685,13 +698,13 @@ impl Trie {
 
         let new_node_hash = get_nodetype_hash(storage, &new_node)?;
 
-        // append this leaf to the Trie
+        // Append this leaf to the Trie
         let new_node_disk_ptr = storage.last_ptr()?;
 
         let ret = TriePtr::new(new_node.id(), node_ptr.chr(), new_node_disk_ptr);
         storage.write_nodetype(new_node_disk_ptr, &new_node, new_node_hash)?;
 
-        // update the cursor so its path of nodes and ptrs accurately reflects that we would have
+        // Update the cursor so its path of nodes and ptrs accurately reflects that we would have
         // visited this leaf on its path.
         cursor.repair_retarget(&new_node, &ret, storage.get_cur_block_ref());
         Ok(ret)
@@ -708,8 +721,8 @@ impl Trie {
     }
 
     /// Given a node and a leaf to insert, break apart the node's compressed path into the shared
-    /// prefix and the node- and leaf-specific segments, and add a Node4 at the break with the
-    /// leaf.  Updates the given node and leaf, and returns the node4's ptr and hash.
+    /// prefix and the node- and leaf-specific segments, and add a Node4 at the break with the leaf.
+    /// Updates the given node and leaf, and returns the node4's ptr and hash.
     ///
     /// ```text
     /// before:
@@ -730,9 +743,9 @@ impl Trie {
     ///                                                         [99]nodeZ[path=887766]...
     ///
     /// ```
-    /// (if nodeX was the root, then there is no parent, and the resulting node will be a node256
-    /// instead of a node4).
     ///
+    /// _(If `nodeX` was the root, then there is no parent, and the resulting node will be a node256
+    /// instead of a `node4`)._
     fn splice_leaf<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
         cursor: &mut TrieCursor<T>,
@@ -882,14 +895,14 @@ impl Trie {
         storage: &mut TrieStorageConnection<T>,
     ) -> Result<Vec<TrieHash>, Error> {
         let cur_block_header = storage.get_cur_block();
-        // definitely enough space for the foreseeable future
-        //    ancestor depth _cannot_ exceed 32 -- 2^32 > max size of u32
-        //    (which is how we are identifying blocks).
+        // Definitely enough space for the foreseeable future
+        // * ancestor depth _cannot_ exceed 32 -- 2^32 > max size of u32 (which is how we are
+        //   identifying blocks).
         let mut hash_buf = Vec::with_capacity(33);
 
-        // here is where some mind-bending things begin to happen.
-        //   we want to find the block at a given _height_. but how to do so?
-        //   use the data stored already in the MARF.
+        // Here is where some mind-bending things begin to happen.
+        // * We want to find the block at a given _height_. but how to do so?
+        // * Use the data stored already in the MARF.
         let cur_block_height =
             MARF::get_block_height_miner_tip(storage, &cur_block_header, &cur_block_header)
                 .map_err(|e| match e {
@@ -941,6 +954,7 @@ impl Trie {
     }
 
     /// Calculate the byte vector of the ancestor root hashes of this trie.
+    ///
     /// `storage` must point to the block that contains the trie's root.
     pub fn get_trie_ancestor_hashes_bytes<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
@@ -963,7 +977,8 @@ impl Trie {
     }
 
     /// Calculate the bytes of the ancestor root hashes of this trie, plus the current trie's root.
-    /// Return the resulting sequence of hashes a a single byte buffer.
+    ///
+    /// Returns the resulting sequence of hashes a a single byte buffer.
     pub fn get_trie_root_ancestor_hashes_bytes<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
         children_root_hash: &TrieHash,
@@ -984,7 +999,7 @@ impl Trie {
     }
 
     /// Calculate the root hash of the trie (i.e. the hash for the root node) by including both the
-    /// digest of this Trie, as well as a geometric sequence of prior Trie root hashes as far back
+    /// digest of this [`Trie`], as well as a geometric sequence of prior `Trie` root hashes as far back
     /// as we can go.
     pub fn get_trie_root_hash<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
@@ -997,9 +1012,12 @@ impl Trie {
         }
     }
 
-    /// Unwind a TrieCursor to update the Merkle root of the trie.
-    /// The root hashes of each trie form a Merkle skip-list -- the hash of Trie i is calculated
-    /// from the hash of its children, plus the hash Tries i-1, i-2, i-4, i-8, ..., i-2**j, ...
+    /// Unwind a [`TrieCursor`] to update the Merkle root of the trie.
+    ///
+    /// The root hashes of each trie form a Merkle skip-list -- the hash of [`Trie`] `i` is
+    /// calculated from the hash of its children, plus the hash of `Trie`s `i-1`, `i-2`, `i-4`,
+    /// `i-8`, ..., `i-2**j`, ...
+    ///
     /// This is required for Merkle proofs to work (specifically, the shunt proofs).
     fn recalculate_root_hash<T: MarfTrieId>(
         storage: &mut TrieStorageConnection<T>,
@@ -1014,8 +1032,8 @@ impl Trie {
         let mut child_ptr = *child_ptr;
 
         if ancestor_ptrs.is_empty() {
-            // root node was already updated by trie operations, but it will have the wrong hash.
-            // we need to "fix" the root node so it mixes in its ancestor hashes.
+            // Root node was already updated by trie operations, but it will have the wrong hash.
+            // We need to "fix" the root node so it mixes in its ancestor hashes.
             trace!("Fix up root node so it mixes in its ancestor hashes");
             let (node, _cur_hash) = storage.read_nodetype(&child_ptr)?;
             if !node.is_node256() {
@@ -1040,7 +1058,7 @@ impl Trie {
                 my_hash
             };
 
-            // for debug purposes
+            // For debug purposes
             if cfg!(test) && is_trace() {
                 let node_hash = my_hash;
                 let _ = Trie::get_trie_root_ancestor_hashes_bytes(storage, &node_hash)
@@ -1060,8 +1078,8 @@ impl Trie {
             for ptr in ancestor_ptrs.iter().rev() {
                 let ptr = *ptr;
                 if is_backptr(ptr.id()) {
-                    // this node was not altered, but instead queued to the cursor as part of walking a
-                    // backptr skiplist.  Do nothing.
+                    // This node was not altered, but instead queued to the cursor as part of
+                    // walking a backptr skiplist. Do nothing.
                     continue;
                 }
 
@@ -1145,7 +1163,8 @@ impl Trie {
                 child_ptr.id = clear_backptr(child_ptr.id);
             }
         }
-        // must be at the root
+
+        // Must be at the root
         assert_eq!(child_ptr, storage.root_trieptr());
         Ok(())
     }
