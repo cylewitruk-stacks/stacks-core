@@ -127,18 +127,16 @@ fn print_usage(args: &[String]) {
 
         println!("read: MARF::get benchmark");
         println!();
-        println!("CLI args:");
-        println!("  --proofs     use MARF::get_with_proof instead of MARF::get [default: false]");
+        println!("CLI Args:");
+        println!("  --proofs     Use MARF::get_with_proof instead of MARF::get [default: false]");
         println!();
-        println!("Environment variables:");
+        println!("Environment Variables:");
         println!("  ITERS       Reads per measured case [default: {DEFAULT_READ_ITERS}]");
         println!("              Higher values reduce measurement noise but increase runtime linearly");
         println!("              Affects elapsed_ms/alloc totals directly; per-op metrics remain normalized");
         println!("  ROUNDS      Independent repetitions per case [default: {DEFAULT_READ_ROUNDS}]");
         println!("              Higher values improve stability estimates (summary min/max)");
-        println!(
-            "  CHAIN_LEN   Number of sequential blocks/tries created [default: max(DEPTHS)+{DEFAULT_CHAIN_LEN_DEPTH_SLACK}; with defaults: {default_chain_len}]"
-        );
+        println!("  CHAIN_LEN   Number of sequential blocks/tries created [default: max(DEPTHS)+{DEFAULT_CHAIN_LEN_DEPTH_SLACK}; with defaults: {default_chain_len}]");
         println!("              Must be greater than the maximum `DEPTHS` value.");
         println!("              Higher values increase fixture construction time and temporary DB size");
         println!("  DEPTHS      Comma-separated depths [default: {default_depths}]");
@@ -165,7 +163,7 @@ fn print_usage(args: &[String]) {
         println!("              'summary': unified summary lines only");
         println!("              'raw': config/result lines + unified summary lines");
         println!();
-        println!("Output lines:");
+        println!("Output Lines:");
         println!("  config  Effective benchmark settings");
         println!("  result  Per-round measurement: strategy/depth/time + alloc totals + per-op metrics");
         println!("  summary Unified summary lines emitted by marf-alloc main");

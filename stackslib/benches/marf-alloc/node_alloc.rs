@@ -14,17 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Allocation-focused micro-benchmark for trie node construction/clone/decode.
-//!
-//! In `MARF_ALLOC_OUTPUT=raw`, this emits detailed per-case lines.
-//! In all modes, the unified `summary\tbenchmark\tname\t...` output is emitted
-//! by `main.rs`.
-//!
-//! Environment variables:
-//! - `ITERS` (default `200000`): iterations per case.
-//!   Runtime scales roughly linearly with this value.
-//!   Allocation counters are totals over the full case, so normalize by
-//!   `ITERS` when comparing per-operation allocation behavior.
-//!
+
 use std::hint::black_box;
 use std::io::Cursor;
 use std::time::Instant;
@@ -51,17 +41,17 @@ struct CaseStats {
 #[rustfmt::skip]
 fn print_usage(args: &[String]) {
     if has_help_flag(args) {
-        println!("node-alloc: allocation profiling micro-benchmark for trie nodes");
+        println!("node-alloc: Allocation profiling micro-benchmark for trie nodes");
         println!();
-        println!("Environment variables:");
-        println!("  ITERS iterations per measured case [default: {DEFAULT_ITERS}]");
-        println!("        Higher values reduce timer noise but increase runtime linearly");
-        println!("        Allocation counters are total counts/bytes across all iterations");
+        println!("Environment Variables:");
+        println!("  ITERS Iterations per measured case [default: {DEFAULT_ITERS}]");
+        println!("              Higher values reduce timer noise but increase runtime linearly");
+        println!("              Allocation counters are total counts/bytes across all iterations");
         println!("  MARF_ALLOC_OUTPUT output mode [default: summary]");
-        println!("        'summary': unified summary lines only");
-        println!("        'raw': detailed per-case lines + unified summary lines");
+        println!("              'summary': unified summary lines only");
+        println!("              'raw': detailed per-case lines + unified summary lines");
         println!();
-        println!("Output:");
+        println!("Output Lines:");
         println!("  summary\\tbenchmark\\tname\\ttotal_ms\\talloc_count\\talloc_bytes");
         return;
     }

@@ -14,30 +14,6 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Write-heavy MARF profiling benchmark focused on a controlled block-write workflow.
-//!
-//! Each run measures per-step timing and allocation counters for:
-//! - beginning a new trie extension (`begin_block`),
-//! - deterministic node-growth insert phases up through `Node256` promotion,
-//! - `seal()`, and
-//! - flush/commit to disk (`commit_flush`).
-//!
-//! In `MARF_ALLOC_OUTPUT=raw`, this emits line-oriented `config`, `keys`, and
-//! `result` records. Unified summary rows are emitted by `main.rs`.
-//!
-//! Environment variables:
-//! - `ITERS` (default `49`): number of inserted keys per workflow round.
-//! - `WRITE_DEPTHS` (default `1`): comma-separated parent-chain depths;
-//!   runs all listed depths in one benchmark invocation.
-//! - `KEY_UPDATES` (default `0`): percent (0-100) of total writes that should
-//!   be updates of existing keys from prior tries (excluding the first
-//!   parent/genesis trie).
-//! - `SQLITE_WAL_AUTOCHECKPOINT` (optional): if set, applies
-//!   `PRAGMA wal_autocheckpoint = <pages>` to the MARF SQLite connection.
-//! - `SQLITE_WAL_CHECKPOINT_MODE` (optional): WAL checkpoint mode used when
-//!   running an explicit post-setup checkpoint with auto-checkpoint disabled.
-//! - `ROUNDS` (default `2`): number of independent workflow repetitions.
-//! - `KEY_SEARCH_MAX_TRIES` (default `200000`): max key candidates to try when
-//!   searching for a hash bucket that yields enough distinct branches.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -172,27 +148,27 @@ impl WalCheckpointMode {
 #[rustfmt::skip]
 fn print_usage(args: &[String]) {
     if has_help_flag(args) {
-        println!("write: step-wise MARF write workflow profiler");
+        println!("write: Step-wise MARF write workflow profiler");
         println!();
-        println!("Environment variables:");
-        println!("  ITERS                 inserted keys per workflow round [default {REQUIRED_BRANCHES}]");
+        println!("Environment Variables:");
+        println!("  ITERS                 Inserted keys per workflow round [default {REQUIRED_BRANCHES}]");
         println!("                        Higher values increase write/rehash/seal work");
-        println!("  WRITE_DEPTHS          comma-separated parent-chain depths [default: 1]");
+        println!("  WRITE_DEPTHS          Comma-separated parent-chain depths [default: 1]");
         println!("                        Example: WRITE_DEPTHS=1,64,1024");
-        println!("  KEY_UPDATES           percent (0-100) of writes that are key updates [default {DEFAULT_KEY_UPDATES_PERCENT}]");
+        println!("  KEY_UPDATES           Percent (0-100) of writes that are key updates [default {DEFAULT_KEY_UPDATES_PERCENT}]");
         println!("                        Updates target existing keys from prior tries (excluding first parent/genesis trie)");
         println!("  SQLITE_WAL_AUTOCHECKPOINT");
-        println!("                        optional SQLite WAL auto-checkpoint page threshold");
+        println!("                        Optional SQLite WAL auto-checkpoint page threshold");
         println!("                        Example: SQLITE_WAL_AUTOCHECKPOINT=0 (disable auto-checkpoint)");
         println!("  SQLITE_WAL_CHECKPOINT_MODE");
         println!("                        WAL checkpoint mode for explicit post-setup checkpoint when auto-checkpoint is disabled");
         println!("                        Post-setup checkpoint runs only when SQLITE_WAL_AUTOCHECKPOINT=0");
         println!("                        Allowed: PASSIVE, FULL, RESTART, TRUNCATE [default: PASSIVE]");
-        println!("  ROUNDS                independent rounds per strategy [default {DEFAULT_WRITE_ROUNDS}]");
-        println!("  KEY_SEARCH_MAX_TRIES  max key candidates when searching for promotion-driving keys [default {DEFAULT_KEY_SEARCH_MAX_TRIES}]");
-        println!("  MARF_ALLOC_OUTPUT     output mode ('summary' | 'raw') [default: summary]");
+        println!("  ROUNDS                Independent rounds per strategy [default {DEFAULT_WRITE_ROUNDS}]");
+        println!("  KEY_SEARCH_MAX_TRIES  Max key candidates when searching for promotion-driving keys [default {DEFAULT_KEY_SEARCH_MAX_TRIES}]");
+        println!("  MARF_ALLOC_OUTPUT     Output mode ('summary' | 'raw') [default: summary]");
         println!();
-        println!("Output lines:");
+        println!("Output Lines:");
         println!("  config   Effective configuration");
         println!("  keys     Metadata about generated key set used to drive node promotions");
         println!("  result   Per-round/per-step elapsed time and allocation totals + per-item rates");
