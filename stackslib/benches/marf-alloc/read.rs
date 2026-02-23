@@ -18,16 +18,18 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::time::Instant;
 
 use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use blockstack_lib::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue};
-use blockstack_lib::util_lib::db::sql_pragma;
 use stacks_common::types::chainstate::StacksBlockId;
 use tempfile::TempDir;
 
-use crate::allocator::{reset_stats, snapshot, Snapshot};
+use crate::common::{
+    apply_optional_wal_autocheckpoint, maybe_run_post_setup_wal_checkpoint, measure_with_allocs,
+    parse_optional_wal_autocheckpoint_pages, parse_optional_wal_checkpoint_mode, BenchMeasurement,
+    WalCheckpointMode,
+};
 use crate::utils::{
     block_id, has_help_flag, parse_csv_string_env, parse_csv_u32_env, parse_u32_env,
     parse_usize_env,
@@ -63,49 +65,11 @@ struct CaseAggregate {
     alloc_bytes: u64,
 }
 
-struct CaseMeasurement {
-    elapsed_ms: f64,
-    snapshot: Snapshot,
-}
-
 struct MarfReadFixture {
     marf: MARF<StacksBlockId>,
     tip: StacksBlockId,
     tip_height: u32,
     _db_dir: TempDir,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum WalCheckpointMode {
-    Passive,
-    Full,
-    Restart,
-    Truncate,
-}
-
-impl WalCheckpointMode {
-    fn parse(raw: &str) -> Option<Self> {
-        if raw.eq_ignore_ascii_case("passive") {
-            Some(Self::Passive)
-        } else if raw.eq_ignore_ascii_case("full") {
-            Some(Self::Full)
-        } else if raw.eq_ignore_ascii_case("restart") {
-            Some(Self::Restart)
-        } else if raw.eq_ignore_ascii_case("truncate") {
-            Some(Self::Truncate)
-        } else {
-            None
-        }
-    }
-
-    fn as_sql(self) -> &'static str {
-        match self {
-            Self::Passive => "PASSIVE",
-            Self::Full => "FULL",
-            Self::Restart => "RESTART",
-            Self::Truncate => "TRUNCATE",
-        }
-    }
 }
 
 #[rustfmt::skip]
@@ -200,10 +164,8 @@ fn make_fixture(
     let mut marf = MARF::from_path(&db_path_str, open_opts.clone())
         .expect("failed to open MARF for read profile");
 
-    if let Some(pages) = wal_autocheckpoint_pages {
-        sql_pragma(marf.sqlite_conn(), "wal_autocheckpoint", &pages)
-            .expect("failed to set wal_autocheckpoint for read profile fixture");
-    }
+    apply_optional_wal_autocheckpoint(marf.sqlite_conn(), wal_autocheckpoint_pages)
+        .expect("failed to set wal_autocheckpoint for read profile fixture");
 
     let mut parent = StacksBlockId::sentinel();
     let mut tip = parent.clone();
@@ -240,13 +202,12 @@ fn make_fixture(
         tip = next;
     }
 
-    if wal_autocheckpoint_pages == Some(0) {
-        let checkpoint_mode = wal_checkpoint_mode.unwrap_or(WalCheckpointMode::Passive);
-        let sql = format!("PRAGMA wal_checkpoint({})", checkpoint_mode.as_sql());
-        marf.sqlite_conn()
-            .execute_batch(&sql)
-            .expect("failed to run post-setup WAL checkpoint for read profile fixture");
-    }
+    maybe_run_post_setup_wal_checkpoint(
+        marf.sqlite_conn(),
+        wal_autocheckpoint_pages,
+        wal_checkpoint_mode,
+    )
+    .expect("failed to run post-setup WAL checkpoint for read profile fixture");
 
     MarfReadFixture {
         marf,
@@ -264,25 +225,6 @@ fn parse_chain_len(depths: &[u32]) -> u32 {
     let max_depth = *depths.iter().max().expect("depth list must not be empty");
     let default_chain_len = max_depth.saturating_add(DEFAULT_CHAIN_LEN_DEPTH_SLACK);
     parse_u32_env("CHAIN_LEN", default_chain_len)
-}
-
-fn parse_optional_wal_autocheckpoint_pages() -> Option<i64> {
-    std::env::var("SQLITE_WAL_AUTOCHECKPOINT").ok().map(|raw| {
-        raw.parse::<i64>()
-            .unwrap_or_else(|_| panic!("SQLITE_WAL_AUTOCHECKPOINT must be an integer, got '{raw}'"))
-    })
-}
-
-fn parse_optional_wal_checkpoint_mode() -> Option<WalCheckpointMode> {
-    std::env::var("SQLITE_WAL_CHECKPOINT_MODE")
-        .ok()
-        .map(|raw| {
-            WalCheckpointMode::parse(&raw).unwrap_or_else(|| {
-                panic!(
-                    "SQLITE_WAL_CHECKPOINT_MODE must be one of PASSIVE|FULL|RESTART|TRUNCATE, got '{raw}'"
-                )
-            })
-        })
 }
 
 fn parse_proofs_setting(args: &[String]) -> bool {
@@ -304,33 +246,29 @@ fn measure_case(
     key: &str,
     iters: usize,
     variant: ReadVariant,
-) -> CaseMeasurement {
-    reset_stats();
-    let start = Instant::now();
-    for _ in 0..iters {
-        match variant {
-            ReadVariant::Get => {
-                black_box(
-                    fixture
-                        .marf
-                        .get(&fixture.tip, key)
-                        .expect("MARF::get failed in read profile"),
-                );
-            }
-            ReadVariant::GetWithProof => {
-                black_box(
-                    fixture
-                        .marf
-                        .get_with_proof(&fixture.tip, key)
-                        .expect("MARF::get_with_proof failed in read profile"),
-                );
+) -> BenchMeasurement {
+    measure_with_allocs(|| {
+        for _ in 0..iters {
+            match variant {
+                ReadVariant::Get => {
+                    black_box(
+                        fixture
+                            .marf
+                            .get(&fixture.tip, key)
+                            .expect("MARF::get failed in read profile"),
+                    );
+                }
+                ReadVariant::GetWithProof => {
+                    black_box(
+                        fixture
+                            .marf
+                            .get_with_proof(&fixture.tip, key)
+                            .expect("MARF::get_with_proof failed in read profile"),
+                    );
+                }
             }
         }
-    }
-    CaseMeasurement {
-        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
-        snapshot: snapshot(),
-    }
+    })
 }
 
 fn run_with_variants(

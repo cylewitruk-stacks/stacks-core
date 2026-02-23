@@ -12,6 +12,16 @@ use crate::util::{
 };
 use crate::{BenchKind, OutputFormat, TempBuilder};
 
+const MARF_ALLOC_BENCH_FILES: [&str; 7] = [
+    "allocator.rs",
+    "common.rs",
+    "main.rs",
+    "node_alloc.rs",
+    "read.rs",
+    "utils.rs",
+    "write.rs",
+];
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BenchEnvOverrides {
     pub(crate) iters: Option<usize>,
@@ -75,14 +85,7 @@ impl Runner {
             );
         }
 
-        for name in [
-            "allocator.rs",
-            "main.rs",
-            "node_alloc.rs",
-            "read.rs",
-            "utils.rs",
-            "write.rs",
-        ] {
+        for name in MARF_ALLOC_BENCH_FILES {
             let path = source_bench_dir.join(name);
             if !path.is_file() {
                 bail!("missing source bench file: {}", path.display());
@@ -236,14 +239,7 @@ impl Runner {
 
         let mut changed = false;
 
-        for name in [
-            "allocator.rs",
-            "main.rs",
-            "node_alloc.rs",
-            "read.rs",
-            "utils.rs",
-            "write.rs",
-        ] {
+        for name in MARF_ALLOC_BENCH_FILES {
             let src = self.source_bench_dir.join(name);
             let dst = dest.join(name);
             changed |= copy_if_different(&src, &dst)?;

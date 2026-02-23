@@ -16,19 +16,20 @@
 //! Write-heavy MARF profiling benchmark focused on a controlled block-write workflow.
 
 use std::collections::HashMap;
-use std::hint::black_box;
-use std::time::Instant;
 
 use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use blockstack_lib::chainstate::stacks::index::{
     ClarityMarfTrieId, Error as IndexError, MARFValue,
 };
-use blockstack_lib::util_lib::db::sql_pragma;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use tempfile::TempDir;
 
-use crate::allocator::{reset_stats, snapshot, Snapshot};
+use crate::common::{
+    apply_optional_wal_autocheckpoint, maybe_run_post_setup_wal_checkpoint,
+    measure_result_with_allocs, parse_optional_wal_autocheckpoint_pages,
+    parse_optional_wal_checkpoint_mode, BenchMeasurement,
+};
 use crate::utils::{block_id, has_help_flag, parse_csv_usize_env, parse_usize_env};
 use crate::{OutputMode, Summary};
 
@@ -44,11 +45,6 @@ struct StepAggregate {
     total_ms: f64,
     alloc_calls: u64,
     alloc_bytes: u64,
-}
-
-struct StepMeasurement {
-    elapsed_ms: f64,
-    snapshot: Snapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -112,39 +108,6 @@ struct ParentChainInfo {
     update_candidate_keys: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum WalCheckpointMode {
-    Passive,
-    Full,
-    Restart,
-    Truncate,
-}
-
-impl WalCheckpointMode {
-    fn parse(raw: &str) -> Option<Self> {
-        if raw.eq_ignore_ascii_case("passive") {
-            Some(Self::Passive)
-        } else if raw.eq_ignore_ascii_case("full") {
-            Some(Self::Full)
-        } else if raw.eq_ignore_ascii_case("restart") {
-            Some(Self::Restart)
-        } else if raw.eq_ignore_ascii_case("truncate") {
-            Some(Self::Truncate)
-        } else {
-            None
-        }
-    }
-
-    fn as_sql(self) -> &'static str {
-        match self {
-            Self::Passive => "PASSIVE",
-            Self::Full => "FULL",
-            Self::Restart => "RESTART",
-            Self::Truncate => "TRUNCATE",
-        }
-    }
-}
-
 #[rustfmt::skip]
 fn print_usage(args: &[String]) {
     if has_help_flag(args) {
@@ -177,18 +140,11 @@ fn print_usage(args: &[String]) {
     }
 }
 
-fn measure_step<R, F>(f: F) -> Result<StepMeasurement, IndexError>
+fn measure_step_with_allocs<R, F>(f: F) -> Result<BenchMeasurement, IndexError>
 where
     F: FnOnce() -> Result<R, IndexError>,
 {
-    reset_stats();
-    let start = Instant::now();
-    let out = f()?;
-    black_box(out);
-    Ok(StepMeasurement {
-        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
-        snapshot: snapshot(),
-    })
+    measure_result_with_allocs(f)
 }
 
 fn make_values(start: u32, count: usize) -> Vec<MARFValue> {
@@ -329,35 +285,6 @@ fn parse_write_depths() -> Vec<usize> {
     parse_csv_usize_env("WRITE_DEPTHS", &DEFAULT_WRITE_DEPTHS)
 }
 
-fn parse_optional_wal_autocheckpoint_pages() -> Option<i64> {
-    std::env::var("SQLITE_WAL_AUTOCHECKPOINT").ok().map(|raw| {
-        raw.parse::<i64>()
-            .unwrap_or_else(|_| panic!("SQLITE_WAL_AUTOCHECKPOINT must be an integer, got '{raw}'"))
-    })
-}
-
-fn parse_optional_wal_checkpoint_mode() -> Option<WalCheckpointMode> {
-    std::env::var("SQLITE_WAL_CHECKPOINT_MODE")
-        .ok()
-        .map(|raw| {
-            WalCheckpointMode::parse(&raw).unwrap_or_else(|| {
-                panic!(
-                    "SQLITE_WAL_CHECKPOINT_MODE must be one of PASSIVE|FULL|RESTART|TRUNCATE, got '{raw}'"
-                )
-            })
-        })
-}
-
-fn run_wal_checkpoint(
-    marf: &MARF<StacksBlockId>,
-    mode: WalCheckpointMode,
-) -> Result<(), IndexError> {
-    let sql = format!("PRAGMA wal_checkpoint({})", mode.as_sql());
-    marf.sqlite_conn()
-        .execute_batch(&sql)
-        .map_err(IndexError::from)
-}
-
 fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
     let iters = parse_usize_env("ITERS", REQUIRED_BRANCHES);
     let write_depths = parse_write_depths();
@@ -403,20 +330,20 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
             for (strategy_idx, strategy) in WRITE_CACHE_STRATEGIES.into_iter().enumerate() {
                 let (_db_dir, mut marf) = make_marf(strategy);
 
-                if let Some(pages) = wal_autocheckpoint_pages {
-                    sql_pragma(marf.sqlite_conn(), "wal_autocheckpoint", &pages)
-                        .map_err(IndexError::from)?;
-                }
+                apply_optional_wal_autocheckpoint(marf.sqlite_conn(), wal_autocheckpoint_pages)
+                    .map_err(IndexError::from)?;
 
                 let base_seed = 1_000_000u32
                     .wrapping_add((round as u32).wrapping_mul(100_000))
                     .wrapping_add((write_depth as u32).wrapping_mul(100))
                     .wrapping_add((strategy_idx as u32).wrapping_mul(2));
                 let parent_chain = initialize_parent_chain(&mut marf, base_seed, write_depth)?;
-                if wal_autocheckpoint_pages == Some(0) {
-                    let checkpoint_mode = wal_checkpoint_mode.unwrap_or(WalCheckpointMode::Passive);
-                    run_wal_checkpoint(&marf, checkpoint_mode)?;
-                }
+                maybe_run_post_setup_wal_checkpoint(
+                    marf.sqlite_conn(),
+                    wal_autocheckpoint_pages,
+                    wal_checkpoint_mode,
+                )
+                .map_err(IndexError::from)?;
                 let parent_block = parent_chain.tip;
                 let next_block = block_id(base_seed.wrapping_add(write_depth as u32));
 
@@ -463,7 +390,8 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
 
                 let mut tx = marf.begin_tx()?;
 
-                let begin_measurement = measure_step(|| tx.begin(&parent_block, &next_block))?;
+                let begin_measurement =
+                    measure_step_with_allocs(|| tx.begin(&parent_block, &next_block))?;
                 emit_result_and_store(
                     &mut results,
                     round,
@@ -481,7 +409,7 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
                     let values = make_values(value_cursor, keys.len());
                     value_cursor = value_cursor.wrapping_add(keys.len() as u32);
 
-                    let measurement = measure_step(|| tx.insert_batch(keys, values))?;
+                    let measurement = measure_step_with_allocs(|| tx.insert_batch(keys, values))?;
                     emit_result_and_store(
                         &mut results,
                         round,
@@ -494,7 +422,7 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
                     );
                 }
 
-                let seal_measurement = measure_step(|| tx.seal())?;
+                let seal_measurement = measure_step_with_allocs(|| tx.seal())?;
                 emit_result_and_store(
                     &mut results,
                     round,
@@ -506,7 +434,7 @@ fn run_workflow(output_mode: OutputMode) -> Result<Summary, IndexError> {
                     output_mode,
                 );
 
-                let commit_measurement = measure_step(|| tx.commit())?;
+                let commit_measurement = measure_step_with_allocs(|| tx.commit())?;
                 emit_result_and_store(
                     &mut results,
                     round,
@@ -552,7 +480,7 @@ fn emit_result_and_store(
     strategy: &str,
     step: &str,
     items: usize,
-    measurement: StepMeasurement,
+    measurement: BenchMeasurement,
     output_mode: OutputMode,
 ) {
     let elapsed_ms = measurement.elapsed_ms;

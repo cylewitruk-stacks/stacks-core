@@ -19,19 +19,16 @@ use std::hint::black_box;
 use blockstack_lib::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
 use blockstack_lib::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use blockstack_lib::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue, TrieMerkleProof};
-use criterion::{criterion_group, BatchSize, Criterion};
+use criterion::{criterion_group, Criterion};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use tempfile::TempDir;
 
-use super::common::{block_id, configured_criterion, make_batch};
+use super::common::{block_id, configured_criterion};
 
 const CHAIN_LEN: u32 = 192;
 const DEPTHS: [u32; 3] = [1, 8, 64];
-const BACKPTR_CHAIN_LEN: u32 = 512;
-const BACKPTR_DEPTHS: [u32; 4] = [32, 128, 256, 511];
 const KEYS_PER_BLOCK: u32 = 4;
 const CACHE_STRATEGIES: [&str; 2] = ["noop", "everything"];
-const INSERT_BATCH_SIZE: u32 = 64;
 
 struct MarfApiFixture {
     _tmpdir: TempDir,
@@ -47,10 +44,6 @@ fn depth_key(height: u32) -> String {
 fn key_for_depth_from_tip(tip_height: u32, depth: u32) -> String {
     assert!(depth < tip_height);
     depth_key(tip_height - depth)
-}
-
-fn make_write_batch(prefix: &str, count: u32) -> (Vec<String>, Vec<MARFValue>) {
-    make_batch(prefix, 0, count, 0)
 }
 
 fn make_fixture(cache_strategy: &str, chain_len: u32) -> MarfApiFixture {
@@ -131,89 +124,6 @@ fn build_root_to_block_map(
     root_to_block
 }
 
-fn bench_get(c: &mut Criterion) {
-    let mut group = c.benchmark_group("marf_api/get");
-
-    for strategy in CACHE_STRATEGIES {
-        for depth in DEPTHS {
-            let mut fixture = make_fixture(strategy, CHAIN_LEN);
-            let key = key_for_depth_from_tip(fixture.tip_height, depth);
-
-            group.bench_function(format!("{strategy}/existing_tip/depth_{depth}"), move |b| {
-                b.iter(|| {
-                    let out = fixture
-                        .marf
-                        .get(&fixture.tip, &key)
-                        .expect("marf_api/get existing query failed");
-                    black_box(out);
-                });
-            });
-        }
-
-        {
-            let mut fixture = make_fixture(strategy, CHAIN_LEN);
-            let key = "missing:00000000".to_string();
-            group.bench_function(format!("{strategy}/missing_tip"), move |b| {
-                b.iter(|| {
-                    let out = fixture
-                        .marf
-                        .get(&fixture.tip, &key)
-                        .expect("marf_api/get missing query failed");
-                    black_box(out);
-                });
-            });
-        }
-    }
-
-    group.finish();
-}
-
-fn bench_get_backptr_heavy(c: &mut Criterion) {
-    let mut group = c.benchmark_group("marf_api/get_backptr_heavy");
-
-    for strategy in CACHE_STRATEGIES {
-        for depth in BACKPTR_DEPTHS {
-            let mut fixture = make_fixture(strategy, BACKPTR_CHAIN_LEN);
-            let key = key_for_depth_from_tip(fixture.tip_height, depth);
-
-            group.bench_function(format!("{strategy}/depth_{depth}"), move |b| {
-                b.iter(|| {
-                    let out = fixture
-                        .marf
-                        .get(&fixture.tip, &key)
-                        .expect("marf_api/get_backptr_heavy query failed");
-                    black_box(out);
-                });
-            });
-        }
-    }
-
-    group.finish();
-}
-
-fn bench_get_with_proof(c: &mut Criterion) {
-    let mut group = c.benchmark_group("marf_api/get_with_proof");
-
-    for strategy in CACHE_STRATEGIES {
-        for depth in DEPTHS {
-            let mut fixture = make_fixture(strategy, CHAIN_LEN);
-            let key = key_for_depth_from_tip(fixture.tip_height, depth);
-
-            group.bench_function(format!("{strategy}/existing_tip/depth_{depth}"), move |b| {
-                b.iter(|| {
-                    let out = fixture
-                        .marf
-                        .get_with_proof(&fixture.tip, &key)
-                        .expect("marf_api/get_with_proof query failed");
-                    black_box(out);
-                });
-            });
-        }
-    }
-
-    group.finish();
-}
-
 fn bench_proof_verify(c: &mut Criterion) {
     let mut group = c.benchmark_group("marf_api/proof_verify");
 
@@ -248,54 +158,8 @@ fn bench_proof_verify(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_insert_batch_commit(c: &mut Criterion) {
-    let mut group = c.benchmark_group("marf_api/insert_batch_commit");
-
-    for strategy in CACHE_STRATEGIES {
-        let (keys, value_template) = make_write_batch("write", INSERT_BATCH_SIZE);
-        let next_block_seed = 10_000_000u32;
-
-        group.bench_function(format!("{strategy}/batch_{INSERT_BATCH_SIZE}"), move |b| {
-            b.iter_batched(
-                || make_fixture(strategy, CHAIN_LEN),
-                |mut fixture| {
-                    let parent = fixture.tip.clone();
-                    let next = block_id(next_block_seed);
-
-                    let mut values = value_template.clone();
-                    values[0] = MARFValue::from(next_block_seed.wrapping_add(1));
-
-                    let mut tx = fixture
-                        .marf
-                        .begin_tx()
-                        .expect("failed to start marf_api insert tx");
-                    tx.begin(&parent, &next)
-                        .expect("failed to begin marf_api insert extension");
-                    tx.insert_batch(&keys, values)
-                        .expect("failed to insert marf_api write batch");
-                    let root_hash = tx.seal().expect("failed to seal marf_api write batch");
-                    black_box(root_hash);
-                    tx.commit().expect("failed to commit marf_api write batch");
-
-                    fixture.tip = next;
-                    fixture.tip_height = fixture.tip_height.wrapping_add(1);
-                    black_box((&fixture.tip, fixture.tip_height));
-                },
-                BatchSize::PerIteration,
-            );
-        });
-    }
-
-    group.finish();
-}
-
 criterion_group! {
     name = benches;
     config = configured_criterion();
-    targets =
-        bench_get,
-        bench_get_backptr_heavy,
-        bench_get_with_proof,
-        bench_proof_verify,
-        bench_insert_batch_commit
+    targets = bench_proof_verify
 }
