@@ -383,6 +383,69 @@ impl<T: MarfTrieId> TrieCache<T> {
     }
 }
 
+/// A small array-backed (fixed capacity) Most-Recently-Used (MRU) cache.
+///
+/// Index `0` is always the most recently accessed entry. On lookup, a hit
+/// promotes the entry to index `0` via `swap()`. On insert when full, the
+/// least-recently-used entry (last position) is evicted.
+pub struct MruCache<K, V, const N: usize> {
+    entries: [Option<(K, V)>; N],
+    len: usize,
+}
+
+impl<K: Eq, V, const N: usize> MruCache<K, V, N> {
+    pub fn new() -> Self {
+        Self {
+            entries: core::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+
+    /// Look up by key. On hit, promotes the entry to MRU position.
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        let pos = self.entries[..self.len]
+            .iter()
+            .position(|entry| &entry.as_ref().unwrap().0 == key)?;
+        if pos > 0 {
+            self.entries.swap(0, pos);
+        }
+        Some(&self.entries[0].as_ref().unwrap().1)
+    }
+
+    /// Insert a key-value pair. If the key is already present, updates the
+    /// value and promotes it. Otherwise, inserts at MRU position, evicting
+    /// the LRU entry if at capacity.
+    pub fn put(&mut self, key: K, value: V) {
+        // Update existing entry
+        if let Some(pos) = self.entries[..self.len]
+            .iter()
+            .position(|entry| entry.as_ref().unwrap().0 == key)
+        {
+            self.entries[pos] = Some((key, value));
+            if pos > 0 {
+                self.entries.swap(0, pos);
+            }
+            return;
+        }
+        // Grow if not at capacity
+        if self.len < N {
+            self.len += 1;
+        }
+        // Shift right; the entry at len-1 is overwritten (evicted) when full
+        for i in (1..self.len).rev() {
+            self.entries.swap(i, i - 1);
+        }
+        self.entries[0] = Some((key, value));
+    }
+
+    pub fn clear(&mut self) {
+        for i in 0..self.len {
+            self.entries[i] = None;
+        }
+        self.len = 0;
+    }
+}
+
 #[cfg(test)]
 pub mod test {
     use std::time::SystemTime;
