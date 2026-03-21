@@ -14,57 +14,123 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::{env, fs, io};
 
+/// Positional read: reads bytes from a file at a given offset without modifying the
+/// file cursor. Maps to `pread(2)` on Unix and `seek_read` on Windows.
+fn pread(fd: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        fd.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        fd.seek_read(buf, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        compile_error!("pread: unsupported platform");
+    }
+}
+
+/// Positional write: writes bytes to a file at a given offset without modifying the
+/// file cursor. Maps to `pwrite(2)` on Unix and `seek_write` on Windows.
+fn pwrite(fd: &fs::File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        fd.write_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        fd.seek_write(buf, offset)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        compile_error!("pwrite: unsupported platform");
+    }
+}
+
+/// Positional write_all: writes the entire buffer at the given offset.
+/// Loops until all bytes are written (handles short writes).
+fn pwrite_all(fd: &fs::File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = pwrite(fd, buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        buf = buf.get(n..).unwrap_or(&[]);
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+use memmap2::Mmap;
 #[cfg(test)]
 use rusqlite::params;
 use rusqlite::Connection;
 
-use crate::chainstate::stacks::index::bits::{
-    read_hash_bytes, read_nodetype_at_head, read_nodetype_at_head_nohash,
-};
-use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
-use crate::chainstate::stacks::index::storage::NodeHashReader;
+use crate::chainstate::stacks::index::node::{TrieNodeID, TriePtr};
 #[cfg(test)]
-use crate::chainstate::stacks::index::storage::TrieStorageConnection;
-use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
-use crate::types::chainstate::TrieHash;
+use crate::chainstate::stacks::index::storage;
+use crate::chainstate::stacks::index::storage::NodeHashReader;
+use crate::chainstate::stacks::index::{
+    bits, trie_sql, BorrowedNodeBytes, Error, MarfTrieId, NodeDecodeScratch, ReadTrieItem,
+    ReadTrieNode,
+};
+use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use crate::util_lib::db::sql_vacuum;
 
 /// Mapping between block IDs and trie offsets
 pub type TrieIdOffsets = HashMap<u32, u64>;
 
-/// Handle to a flat file containing Trie blobs
+/// Handle to a flat file containing Trie blobs, optionally mmap-accelerated for reads.
+/// When `mmap` is `Some`, hot read methods (`get_node_hash`, `read_trie_item`,
+/// `read_node_type_id`) slice directly into the mapped region instead of using
+/// positional I/O. All `Write`/`Seek`/`Read` trait impls always go through the fd.
 pub struct TrieFileDisk {
     fd: fs::File,
     path: String,
-    trie_offsets: TrieIdOffsets,
+    /// If true, mmap is desired but not yet active (file was empty at open time).
+    /// `append_trie_blob` will create the mmap after the first write.
+    mmap_enabled: bool,
+    /// Memory-mapped view of the blobs file. `None` if mmap is not enabled or the
+    /// file was empty at open time (will be populated after first write).
+    mmap: Option<Mmap>,
+    /// Cached mapping from block_id → trie file offset. Interior-mutable so that
+    /// read methods can populate the cache while taking `&self`.
+    trie_offsets: RefCell<TrieIdOffsets>,
 }
 
 /// Handle to a flat in-memory buffer containing Trie blobs (used for testing)
 pub struct TrieFileRAM {
     fd: Cursor<Vec<u8>>,
     readonly: bool,
-    trie_offsets: TrieIdOffsets,
+    trie_offsets: RefCell<TrieIdOffsets>,
 }
 
 /// This is flat-file storage for a MARF's tries.  All tries are stored as contiguous byte arrays
 /// within a larger byte array.  The variants differ in how those bytes are backed.  The `RAM`
 /// variant stores data in RAM in a byte buffer, and the `Disk` variant stores data in a flat file
-/// on disk.  This structure is used to support external trie blobs, so that the tries don't need
-/// to be stored in sqlite blobs (which incurs a sqlite paging overhead).  This is useful for when
-/// the tries are too big to fit into a single page, such as the Stacks chainstate.
+/// on disk — optionally with a memory-mapped read overlay for zero-syscall reads.
 pub enum TrieFile {
     RAM(TrieFileRAM),
     Disk(TrieFileDisk),
 }
 
 impl TrieFile {
-    /// Make a new disk-backed TrieFile
+    /// Make a new disk-backed TrieFile (no mmap).
     fn new_disk(path: &str, readonly: bool) -> Result<TrieFile, Error> {
         let fd = OpenOptions::new()
             .read(true)
@@ -74,7 +140,9 @@ impl TrieFile {
         Ok(TrieFile::Disk(TrieFileDisk {
             fd,
             path: path.to_string(),
-            trie_offsets: TrieIdOffsets::new(),
+            mmap_enabled: false,
+            mmap: None,
+            trie_offsets: RefCell::new(TrieIdOffsets::new()),
         }))
     }
 
@@ -83,8 +151,35 @@ impl TrieFile {
         TrieFile::RAM(TrieFileRAM {
             fd: Cursor::new(vec![]),
             readonly,
-            trie_offsets: TrieIdOffsets::new(),
+            trie_offsets: RefCell::new(TrieIdOffsets::new()),
         })
+    }
+
+    /// Make a new disk-backed TrieFile with mmap-accelerated reads.
+    /// If the file is empty (no committed tries yet), the mmap is deferred —
+    /// `append_trie_blob` will create it after the first write.
+    fn new_mmap(path: &str, readonly: bool) -> Result<TrieFile, Error> {
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(!readonly)
+            .create(!readonly)
+            .open(path)?;
+        let file_len = fd.metadata()?.len();
+        let mmap = if file_len > 0 {
+            // SAFETY: The .blobs file is append-only and single-writer. Existing data
+            // at existing offsets never changes. The mmap is read-only.
+            Some(unsafe { Mmap::map(&fd)? })
+        } else {
+            // Can't mmap an empty file. Will be created on first append.
+            None
+        };
+        Ok(TrieFile::Disk(TrieFileDisk {
+            fd,
+            path: path.to_string(),
+            mmap_enabled: true,
+            mmap,
+            trie_offsets: RefCell::new(TrieIdOffsets::new()),
+        }))
     }
 
     /// Does the TrieFile exist at the expected path?
@@ -117,13 +212,18 @@ impl TrieFile {
 
     /// Instantiate a TrieFile, given the associated DB path.
     /// If path is ':memory:', then it'll be an in-RAM TrieFile.
-    /// Otherwise, it'll be stored as `$db_path.blobs`.
-    pub fn from_db_path(path: &str, readonly: bool) -> Result<TrieFile, Error> {
+    /// If `use_mmap` is true, the file will be memory-mapped for reads.
+    /// Otherwise, it'll use seek+read I/O on `$db_path.blobs`.
+    pub fn from_db_path(path: &str, readonly: bool, use_mmap: bool) -> Result<TrieFile, Error> {
         if path == ":memory:" {
             Ok(TrieFile::new_ram(readonly))
         } else {
             let blob_path = format!("{}.blobs", path);
-            TrieFile::new_disk(&blob_path, readonly)
+            if use_mmap {
+                TrieFile::new_mmap(&blob_path, readonly)
+            } else {
+                TrieFile::new_disk(&blob_path, readonly)
+            }
         }
     }
 
@@ -152,16 +252,21 @@ impl TrieFile {
         Ok(trie_blob)
     }
 
-    /// Read a trie blob in its entirety from the blobs file
-    #[cfg(test)]
-    pub fn read_trie_blob(&mut self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
+    /// Read a trie blob in its entirety from the blobs file.
+    /// Takes `&self` — uses positional reads.
+    pub fn read_trie_blob_bytes(&self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
         let (offset, length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
-        self.seek(SeekFrom::Start(offset))?;
-
         let mut buf = vec![0u8; length as usize];
-        self.read_exact(&mut buf)
+        let n = self
+            .read_bytes_at(&mut buf, offset)
             .inspect_err(|e| error!("Failed to read trie blob {block_id}: {e:}"))?;
+        buf.truncate(n);
         Ok(buf)
+    }
+
+    #[cfg(test)]
+    pub fn read_trie_blob(&self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
+        self.read_trie_blob_bytes(db, block_id)
     }
 
     /// Vacuum the database and report the size before and after.
@@ -273,10 +378,26 @@ impl TrieFile {
                     }
 
                     // append directly to file, so we can get the true offset
-                    self.seek(SeekFrom::End(0))?;
-                    let offset = self.stream_position()?;
-                    self.write_all(&trie_blob)?;
-                    self.flush()?;
+                    let offset = match self {
+                        TrieFile::Disk(ref disk) => disk.fd.metadata()?.len(),
+                        TrieFile::RAM(ref ram) => ram.fd.get_ref().len() as u64,
+                    };
+                    match self {
+                        TrieFile::Disk(ref disk) => {
+                            pwrite_all(&disk.fd, &trie_blob, offset)?;
+                        }
+                        TrieFile::RAM(ref mut ram) => {
+                            let data = ram.fd.get_mut();
+                            let start = offset as usize;
+                            let end = start + trie_blob.len();
+                            if data.len() < end {
+                                data.resize(end, 0);
+                            }
+                            data.get_mut(start..end)
+                                .expect("BUG: just resized to cover range")
+                                .copy_from_slice(&trie_blob);
+                        }
+                    }
 
                     test_debug!("Stored trie blob {} to offset {}", bhh, offset);
                     trie_sql::update_external_trie_blob(
@@ -309,14 +430,14 @@ impl TrieFile {
 /// NodeHashReader for TrieFile
 pub struct TrieFileNodeHashReader<'a> {
     db: &'a Connection,
-    file: &'a mut TrieFile,
+    file: &'a TrieFile,
     block_id: u32,
 }
 
 impl<'a> TrieFileNodeHashReader<'a> {
     pub fn new(
         db: &'a Connection,
-        file: &'a mut TrieFile,
+        file: &'a TrieFile,
         block_id: u32,
     ) -> TrieFileNodeHashReader<'a> {
         TrieFileNodeHashReader { db, file, block_id }
@@ -324,92 +445,218 @@ impl<'a> TrieFileNodeHashReader<'a> {
 }
 
 impl NodeHashReader for TrieFileNodeHashReader<'_> {
-    fn read_node_hash_bytes<W: Write>(&mut self, ptr: &TriePtr, w: &mut W) -> Result<(), Error> {
-        let trie_offset = self.file.get_trie_offset(self.db, self.block_id)?;
-        self.file
-            .seek(SeekFrom::Start(trie_offset + (ptr.ptr() as u64)))?;
-        let hash_buff = read_hash_bytes(self.file)?;
-        w.write_all(&hash_buff).map_err(|e| e.into())
+    fn read_node_hash<W: Write>(&mut self, ptr: &TriePtr, w: &mut W) -> Result<(), Error> {
+        let hash = self.file.get_node_hash(self.db, self.block_id, ptr)?;
+        w.write_all(hash.as_ref()).map_err(|e| e.into())
     }
 }
 
 impl TrieFile {
     /// Determine the file offset in the TrieFile where a serialized trie starts.
     /// The offsets are stored in the given DB, and are cached indefinitely once loaded.
-    pub fn get_trie_offset(&mut self, db: &Connection, block_id: u32) -> Result<u64, Error> {
-        let offset_opt = match self {
-            TrieFile::RAM(ref ram) => ram.trie_offsets.get(&block_id),
-            TrieFile::Disk(ref disk) => disk.trie_offsets.get(&block_id),
+    /// Takes `&self` — the offset cache uses interior mutability (`RefCell`).
+    pub fn get_trie_offset(&self, db: &Connection, block_id: u32) -> Result<u64, Error> {
+        let cache = match self {
+            TrieFile::RAM(ref ram) => &ram.trie_offsets,
+            TrieFile::Disk(ref disk) => &disk.trie_offsets,
         };
-        match offset_opt {
-            Some(offset) => Ok(*offset),
-            None => {
-                let (offset, _length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
-                match self {
-                    TrieFile::RAM(ref mut ram) => ram.trie_offsets.insert(block_id, offset),
-                    TrieFile::Disk(ref mut disk) => disk.trie_offsets.insert(block_id, offset),
-                };
-                Ok(offset)
+        if let Some(offset) = cache.borrow().get(&block_id).copied() {
+            return Ok(offset);
+        }
+        let (offset, _length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
+        cache.borrow_mut().insert(block_id, offset);
+        Ok(offset)
+    }
+
+    /// Read bytes at a given file offset into `buf` without modifying any cursor state.
+    /// Uses `pread` for Disk, direct slice for RAM, mmap slice for mmap-enabled Disk.
+    /// Returns the number of bytes read.
+    fn read_bytes_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        match self {
+            TrieFile::Disk(ref disk) => {
+                if let Some(ref mmap) = disk.mmap {
+                    let start = offset as usize;
+                    let bytes = mmap.get(start..).ok_or(Error::NotFoundError)?;
+                    let len = buf.len().min(bytes.len());
+                    let dst = buf.get_mut(..len).ok_or(Error::NotFoundError)?;
+                    let src = bytes.get(..len).ok_or(Error::NotFoundError)?;
+                    dst.copy_from_slice(src);
+                    Ok(len)
+                } else {
+                    pread(&disk.fd, buf, offset).map_err(Error::IOError)
+                }
+            }
+            TrieFile::RAM(ref ram) => {
+                let data = ram.fd.get_ref();
+                let start = offset as usize;
+                let bytes = data.get(start..).ok_or(Error::NotFoundError)?;
+                let len = buf.len().min(bytes.len());
+                let dst = buf.get_mut(..len).ok_or(Error::NotFoundError)?;
+                let src = bytes.get(..len).ok_or(Error::NotFoundError)?;
+                dst.copy_from_slice(src);
+                Ok(len)
             }
         }
     }
 
-    /// Obtain a TrieHash for a node, given its block ID and pointer
-    pub fn get_node_hash_bytes(
-        &mut self,
+    /// Get a slice from the mmap region at the given offset, if mmap is active.
+    /// Returns `None` if not mmap-enabled or if offset is out of range.
+    fn mmap_slice_at(&self, offset: u64) -> Option<&[u8]> {
+        if let TrieFile::Disk(ref disk) = self {
+            disk.mmap.as_ref()?.get(offset as usize..)
+        } else {
+            None
+        }
+    }
+
+    /// Read bytes at a known file position into scratch, then decode.
+    /// For mmap: slices directly into the mapped region (zero-copy decode).
+    /// For disk: uses `pread` into scratch's node_bytes buffer.
+    /// For RAM: slices the in-memory buffer.
+    fn read_item_at_offset<'a>(
+        &self,
+        file_offset: u64,
+        ptr: &TriePtr,
+        scratch: &'a mut impl NodeDecodeScratch,
+    ) -> Result<ReadTrieItem<'a>, Error> {
+        // Fast path: mmap slice available — decode directly from it.
+        if let Some(bytes) = self.mmap_slice_at(file_offset) {
+            return bits::read_trie_item_from_slice(bytes, ptr.id(), scratch);
+        }
+        // Slow path: positional read into scratch's reusable buffer, then decode.
+        // take_node_bytes() returns the pre-allocated buffer (avoiding allocation
+        // when scratch has been used before). We don't restore it afterward because
+        // the decode result borrows scratch — but the buffer will be re-created on
+        // the next take_node_bytes() call.
+        let max_len = bits::get_node_max_byte_len(ptr.id())?;
+        let mut buf = scratch.take_node_bytes();
+        buf.resize(max_len, 0);
+        let n = self.read_bytes_at(&mut buf, file_offset)?;
+        buf.truncate(n);
+        bits::read_trie_item_from_slice(&buf, ptr.id(), scratch)
+    }
+
+    /// Read hash bytes at a known file position.
+    fn read_hash_at(&self, file_offset: u64) -> Result<TrieHash, Error> {
+        if let Some(bytes) = self.mmap_slice_at(file_offset) {
+            let (hash, _) = bits::parse_hash_from_bytes(bytes)?;
+            return Ok(hash);
+        }
+        let mut buf = [0u8; TRIEHASH_ENCODED_SIZE];
+        let n = self.read_bytes_at(&mut buf, file_offset)?;
+        if n < TRIEHASH_ENCODED_SIZE {
+            return Err(Error::CorruptionError(
+                "Failed to read hash in full via pread".to_string(),
+            ));
+        }
+        Ok(TrieHash(buf))
+    }
+
+    /// Read node type ID and hash at a known file position.
+    fn read_node_type_at(&self, file_offset: u64) -> Result<(TrieNodeID, TrieHash), Error> {
+        if let Some(bytes) = self.mmap_slice_at(file_offset) {
+            return bits::read_stored_node_type_from_slice(bytes);
+        }
+        // hash (32 bytes) + node id (1 byte)
+        let mut buf = [0u8; TRIEHASH_ENCODED_SIZE + 1];
+        let n = self.read_bytes_at(&mut buf, file_offset)?;
+        if n < TRIEHASH_ENCODED_SIZE + 1 {
+            return Err(Error::CorruptionError(
+                "Failed to read node type via pread".to_string(),
+            ));
+        }
+        bits::read_stored_node_type_from_slice(&buf)
+    }
+
+    /// Obtain a TrieHash for a node, given its block ID and pointer.
+    /// Takes `&self` — uses positional reads, no cursor state.
+    pub fn get_node_hash(
+        &self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
     ) -> Result<TrieHash, Error> {
         let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        let hash_buff = read_hash_bytes(self)?;
-        Ok(TrieHash(hash_buff))
+        self.read_hash_at(offset + ptr.ptr() as u64)
     }
 
-    /// Obtain a TrieNodeType and its associated TrieHash for a node, given its block ID and
-    /// pointer
-    pub fn read_node_type(
-        &mut self,
+    /// Obtain a trie node view and its associated TrieHash for a node, given its block ID and
+    /// pointer.
+    pub fn read_node<'a>(
+        &self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
-    ) -> Result<(TrieNodeType, TrieHash), Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head(self, ptr.id())
+        scratch: &'a mut impl NodeDecodeScratch,
+    ) -> Result<ReadTrieNode<'a>, Error> {
+        self.read_trie_item(db, block_id, ptr, scratch)?.into_node()
     }
 
-    /// Obtain a TrieNodeType, given its block ID and pointer
-    pub fn read_node_type_nohash(
-        &mut self,
+    /// Read a trie item (node or patch) at the given block and pointer.
+    /// Takes `&self` — uses positional reads, no cursor state.
+    pub fn read_trie_item<'a>(
+        &self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
-    ) -> Result<TrieNodeType, Error> {
+        scratch: &'a mut impl NodeDecodeScratch,
+    ) -> Result<ReadTrieItem<'a>, Error> {
         let offset = self.get_trie_offset(db, block_id)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        read_nodetype_at_head_nohash(self, ptr.id())
+        self.read_item_at_offset(offset + ptr.ptr() as u64, ptr, scratch)
+    }
+
+    /// Read a trie item as borrowed bytes from the mmap region (zero-copy).
+    /// Returns `None` if mmap is not active or the node is a patch.
+    /// Takes `&self` — no cursor state needed.
+    pub fn read_trie_item_borrowed<'a>(
+        &'a self,
+        db: &Connection,
+        block_id: u32,
+        ptr: &TriePtr,
+    ) -> Result<Option<ReadTrieItem<'a>>, Error> {
+        let offset = self.get_trie_offset(db, block_id)?;
+        let Some(bytes) = self.mmap_slice_at(offset + ptr.ptr() as u64) else {
+            return Ok(None);
+        };
+        let (hash, remaining) = bits::parse_hash_from_bytes(bytes)?;
+        let stored_node_id = bits::stored_node_id_from_bytes(remaining)?;
+        if stored_node_id == TrieNodeID::Patch {
+            return Ok(None);
+        }
+        let node_bytes = BorrowedNodeBytes::new(stored_node_id, remaining);
+        Ok(Some(ReadTrieItem::from_node(
+            ReadTrieNode::from_stable_bytes(node_bytes, Some(hash)),
+        )))
+    }
+
+    /// Read the node type ID and hash at the given block and pointer.
+    /// Takes `&self` — uses positional reads, no cursor state.
+    pub fn read_node_type_id(
+        &self,
+        db: &Connection,
+        block_id: u32,
+        ptr: &TriePtr,
+    ) -> Result<(TrieNodeID, TrieHash), Error> {
+        let offset = self.get_trie_offset(db, block_id)?;
+        self.read_node_type_at(offset + ptr.ptr() as u64)
     }
 
     /// Obtain a TrieHash for a node, given the node's block's hash (used only in testing)
     #[cfg(test)]
-    pub fn get_node_hash_bytes_by_bhh<T: MarfTrieId>(
-        &mut self,
+    pub fn get_node_hash_by_bhh<T: MarfTrieId>(
+        &self,
         db: &Connection,
         bhh: &T,
         ptr: &TriePtr,
     ) -> Result<TrieHash, Error> {
         let (offset, _length) = trie_sql::get_external_trie_offset_length_by_bhh(db, bhh)?;
-        self.seek(SeekFrom::Start(offset + (ptr.ptr() as u64)))?;
-        let hash_buff = read_hash_bytes(self)?;
-        Ok(TrieHash(hash_buff))
+        self.read_hash_at(offset + ptr.ptr() as u64)
     }
 
     /// Get all (root hash, trie hash) pairs for this TrieFile
     #[cfg(test)]
     pub fn read_all_block_hashes_and_roots<T: MarfTrieId>(
-        &mut self,
+        &self,
         db: &Connection,
     ) -> Result<Vec<(TrieHash, T)>, Error> {
         let mut s =
@@ -418,11 +665,9 @@ impl TrieFile {
             let block_hash: T = row.get_unwrap("block_hash");
             let offset_i64: i64 = row.get_unwrap("external_offset");
             let offset = offset_i64 as u64;
-            let start = TrieStorageConnection::<T>::root_ptr_disk() as u64;
+            let start = storage::ROOT_PTR_DISK as u64;
 
-            self.seek(SeekFrom::Start(offset + start))?;
-            let hash_buff = read_hash_bytes(self)?;
-            let root_hash = TrieHash(hash_buff);
+            let root_hash = self.read_hash_at(offset + start)?;
 
             trace!(
                 "Root hash for block {} at offset {} is {}",
@@ -440,99 +685,29 @@ impl TrieFile {
     pub fn append_trie_blob(&mut self, db: &Connection, buf: &[u8]) -> Result<u64, Error> {
         let offset = trie_sql::get_external_blobs_length(db)?;
         test_debug!("Write trie of {} bytes at {}", buf.len(), offset);
-        self.seek(SeekFrom::Start(offset))?;
-        self.write_all(buf)?;
-        self.flush()?;
 
-        if let TrieFile::Disk(ref mut data) = self {
-            data.fd.sync_data()?;
+        match self {
+            TrieFile::Disk(ref mut disk) => {
+                pwrite_all(&disk.fd, buf, offset)?;
+                disk.fd.sync_data()?;
+                if disk.mmap_enabled {
+                    // (Re)map to cover the written data.
+                    // SAFETY: append-only, single-writer, file just fsynced.
+                    disk.mmap = Some(unsafe { Mmap::map(&disk.fd)? });
+                }
+            }
+            TrieFile::RAM(ref mut ram) => {
+                let data = ram.fd.get_mut();
+                let start = offset as usize;
+                let end = start + buf.len();
+                if data.len() < end {
+                    data.resize(end, 0);
+                }
+                data.get_mut(start..end)
+                    .expect("BUG: just resized to cover range")
+                    .copy_from_slice(buf);
+            }
         }
         Ok(offset)
-    }
-}
-
-/// Boilerplate Write implementation for TrieFileDisk.  Plumbs through to the inner fd.
-impl Write for TrieFileDisk {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.fd.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.fd.flush()
-    }
-}
-
-/// Boilerplate Write implementation for TrieFileRAM.  Plumbs through to the inner fd.
-impl Write for TrieFileRAM {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.fd.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.fd.flush()
-    }
-}
-
-/// Boilerplate Write implementation for TrieFile enum.  Plumbs through to the inner struct.
-impl Write for TrieFile {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            TrieFile::RAM(ref mut ram) => ram.write(buf),
-            TrieFile::Disk(ref mut disk) => disk.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            TrieFile::RAM(ref mut ram) => ram.flush(),
-            TrieFile::Disk(ref mut disk) => disk.flush(),
-        }
-    }
-}
-
-/// Boilerplate Read implementation for TrieFileDisk.  Plumbs through to the inner fd.
-impl Read for TrieFileDisk {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.fd.read(buf)
-    }
-}
-
-/// Boilerplate Read implementation for TrieFileRAM.  Plumbs through to the inner fd.
-impl Read for TrieFileRAM {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.fd.read(buf)
-    }
-}
-
-/// Boilerplate Read implementation for TrieFile enum.  Plumbs through to the inner struct.
-impl Read for TrieFile {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            TrieFile::RAM(ref mut ram) => ram.read(buf),
-            TrieFile::Disk(ref mut disk) => disk.read(buf),
-        }
-    }
-}
-
-/// Boilerplate Seek implementation for TrieFileDisk.  Plumbs through to the inner fd
-impl Seek for TrieFileDisk {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.fd.seek(pos)
-    }
-}
-
-/// Boilerplate Seek implementation for TrieFileDisk.  Plumbs through to the inner fd
-impl Seek for TrieFileRAM {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.fd.seek(pos)
-    }
-}
-
-impl Seek for TrieFile {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match self {
-            TrieFile::RAM(ref mut ram) => ram.seek(pos),
-            TrieFile::Disk(ref mut disk) => disk.seek(pos),
-        }
     }
 }

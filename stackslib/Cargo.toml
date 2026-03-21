@@ -38,6 +38,7 @@ stacks-common = { path = "../stacks-common" }
 pox-locking = { path = "../pox-locking" }
 libstackerdb = { path = "../libstackerdb" }
 siphasher = "0.3.7"
+memmap2 = "0.9"
 rusqlite = { workspace = true }
 time = "0.3.41"
 toml = { workspace = true }

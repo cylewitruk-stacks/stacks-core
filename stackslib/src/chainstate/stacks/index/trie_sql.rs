@@ -14,23 +14,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use rusqlite::blob::Blob;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Transaction};
 
+use crate::chainstate::stacks::index::node::{TrieNodeID, TriePtr};
 #[cfg(test)]
-use crate::chainstate::stacks::index::bits::read_hash_bytes;
-use crate::chainstate::stacks::index::bits::{
-    read_node_hash_bytes as bits_read_node_hash_bytes, read_nodetype, read_nodetype_nohash,
+use crate::chainstate::stacks::index::storage;
+use crate::chainstate::stacks::index::{
+    bits, trie_sql, Error, MarfTrieId, NodeDecodeScratch, ReadTrieItem, ReadTrieNode,
 };
-use crate::chainstate::stacks::index::node::{TrieNodeType, TriePtr};
-#[cfg(test)]
-use crate::chainstate::stacks::index::storage::TrieStorageConnection;
-use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
 use crate::types::chainstate::TrieHash;
 use crate::types::sqlite::NO_PARAMS;
-use crate::util_lib::db::{query_count, query_row, tx_begin_immediate, u64_to_sql};
+use crate::util_lib::db;
 
 static SQL_MARF_DATA_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS marf_data (
@@ -79,7 +76,7 @@ INSERT OR REPLACE INTO migrated_version (version) VALUES (1);
 pub static SQL_MARF_SCHEMA_VERSION: u64 = 2;
 
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
-    let tx = tx_begin_immediate(conn)?;
+    let tx = db::tx_begin_immediate(conn)?;
 
     tx.execute_batch(SQL_MARF_DATA_TABLE)?;
     tx.execute_batch(SQL_MARF_MINED_TABLE)?;
@@ -124,7 +121,7 @@ pub fn migrate_tables_if_needed<T: MarfTrieId>(conn: &mut Connection) -> Result<
                 debug!("Migrate MARF data from schema 1 to schema 2");
 
                 // add external_* fields
-                let tx = tx_begin_immediate(conn)?;
+                let tx = db::tx_begin_immediate(conn)?;
                 tx.execute_batch(SQL_MARF_DATA_TABLE_SCHEMA_2)?;
                 tx.commit()?;
             }
@@ -249,8 +246,8 @@ fn inner_write_external_trie_blob<T: MarfTrieId>(
             block_hash,
             empty_blob,
             0,
-            u64_to_sql(offset)?,
-            u64_to_sql(length)?,
+            db::u64_to_sql(offset)?,
+            db::u64_to_sql(length)?,
             block_id,
         ];
         let mut s =
@@ -269,8 +266,8 @@ fn inner_write_external_trie_blob<T: MarfTrieId>(
             block_hash,
             empty_blob,
             0,
-            u64_to_sql(offset)?,
-            u64_to_sql(length)?,
+            db::u64_to_sql(offset)?,
+            db::u64_to_sql(length)?,
         ];
         let mut s =
             conn.prepare("INSERT INTO marf_data (block_hash, data, unconfirmed, external_offset, external_length) VALUES (?, ?, ?, ?, ?)")?;
@@ -377,7 +374,7 @@ pub fn write_trie_blob_to_unconfirmed<T: MarfTrieId>(
     Ok(block_id)
 }
 
-/// Open a trie blob. Returns a Blob<'a> readable/writeable handle to it.
+/// Open a trie blob in read-only mode. Returns a Blob<'a> readable handle to it.
 pub fn open_trie_blob(conn: &Connection, block_id: u32) -> Result<Blob<'_>, Error> {
     let blob = conn.blob_open(
         DatabaseName::Main,
@@ -389,14 +386,16 @@ pub fn open_trie_blob(conn: &Connection, block_id: u32) -> Result<Blob<'_>, Erro
     Ok(blob)
 }
 
-/// Open a trie blob. Returns a Blob<'a> readable handle to it.
+/// Open a trie blob in read-only mode. Returns a Blob<'a> readable handle to it.
+/// Passes `read_only = true` to rusqlite, which maps to `flags = 0` in the
+/// underlying sqlite3_blob_open call — safe to call on a read-only connection.
 pub fn open_trie_blob_readonly(conn: &Connection, block_id: u32) -> Result<Blob<'_>, Error> {
     let blob = conn.blob_open(
         DatabaseName::Main,
         "marf_data",
         "data",
         block_id.into(),
-        false,
+        true,
     )?;
     Ok(blob)
 }
@@ -414,8 +413,8 @@ pub fn read_all_block_hashes_and_roots<T: MarfTrieId>(
             .get_ref("data")?
             .as_blob()
             .expect("DB Corruption: MARF data is non-blob");
-        let start = TrieStorageConnection::<T>::root_ptr_disk() as usize;
-        let trie_hash = TrieHash(read_hash_bytes(&mut &data[start..])?);
+        let start = storage::ROOT_PTR_DISK as usize;
+        let trie_hash = TrieHash(bits::read_hash_bytes(&mut &data[start..])?);
         Ok((trie_hash, block_hash))
     })?;
     rows.collect()
@@ -435,7 +434,7 @@ pub fn read_node_hash_bytes<W: Write>(
         block_id.into(),
         true,
     )?;
-    let hash_buff = bits_read_node_hash_bytes(&mut blob, ptr)?;
+    let hash_buff = bits::read_node_hash_bytes(&mut blob, ptr)?;
     w.write_all(&hash_buff).map_err(|e| e.into())
 }
 
@@ -452,32 +451,26 @@ pub fn read_node_hash_bytes_by_bhh<W: Write, T: MarfTrieId>(
         |r| r.get("block_id"),
     )?;
     let mut blob = conn.blob_open(DatabaseName::Main, "marf_data", "data", row_id, true)?;
-    let hash_buff = bits_read_node_hash_bytes(&mut blob, ptr)?;
+    let hash_buff = bits::read_node_hash_bytes(&mut blob, ptr)?;
     w.write_all(&hash_buff).map_err(|e| e.into())
 }
 
-/// Read a node and its hash from a sqlite-stored trie blob
-pub fn read_node_type(
+/// Read a node and its hash from a sqlite-stored trie blob into decode scratch.
+pub fn read_node_type<'a>(
     conn: &Connection,
     block_id: u32,
     ptr: &TriePtr,
-) -> Result<(TrieNodeType, TrieHash), Error> {
-    let mut blob = conn.blob_open(
-        DatabaseName::Main,
-        "marf_data",
-        "data",
-        block_id.into(),
-        true,
-    )?;
-    read_nodetype(&mut blob, ptr)
+    scratch: &'a mut impl NodeDecodeScratch,
+) -> Result<ReadTrieNode<'a>, Error> {
+    read_trie_item(conn, block_id, ptr, scratch)?.into_node()
 }
 
-/// Read a node from a sqlite-stored trie blob, excluding its hash.
-pub fn read_node_type_nohash(
+pub fn read_trie_item<'a>(
     conn: &Connection,
     block_id: u32,
     ptr: &TriePtr,
-) -> Result<TrieNodeType, Error> {
+    scratch: &'a mut impl NodeDecodeScratch,
+) -> Result<ReadTrieItem<'a>, Error> {
     let mut blob = conn.blob_open(
         DatabaseName::Main,
         "marf_data",
@@ -485,7 +478,15 @@ pub fn read_node_type_nohash(
         block_id.into(),
         true,
     )?;
-    read_nodetype_nohash(&mut blob, ptr)
+    bits::read_trie_item(&mut blob, ptr, scratch)
+}
+
+pub fn read_trie_blob_bytes(conn: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
+    let mut blob = open_trie_blob_readonly(conn, block_id)?;
+    let mut trie_blob = Vec::new();
+    blob.read_to_end(&mut trie_blob)
+        .inspect_err(|e| error!("Failed to read sqlite trie blob {block_id}: {e:}"))?;
+    Ok(trie_blob)
 }
 
 /// Get the offset and length of a trie blob in the trie blobs file.
@@ -495,7 +496,8 @@ pub fn get_external_trie_offset_length(
 ) -> Result<(u64, u64), Error> {
     let qry = "SELECT external_offset, external_length FROM marf_data WHERE block_id = ?1";
     let args = params![block_id];
-    let (offset, length): (u64, u64) = query_row(conn, qry, args)?.ok_or(Error::NotFoundError)?;
+    let (offset, length): (u64, u64) =
+        db::query_row(conn, qry, args)?.ok_or(Error::NotFoundError)?;
     Ok((offset, length))
 }
 
@@ -506,7 +508,8 @@ pub fn get_external_trie_offset_length_by_bhh<T: MarfTrieId>(
 ) -> Result<(u64, u64), Error> {
     let qry = "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1";
     let args = params![bhh];
-    let (offset, length): (u64, u64) = query_row(conn, qry, args)?.ok_or(Error::NotFoundError)?;
+    let (offset, length): (u64, u64) =
+        db::query_row(conn, qry, args)?.ok_or(Error::NotFoundError)?;
     Ok((offset, length))
 }
 
@@ -514,7 +517,7 @@ pub fn get_external_trie_offset_length_by_bhh<T: MarfTrieId>(
 /// which the next trie will be appended.
 pub fn get_external_blobs_length(conn: &Connection) -> Result<u64, Error> {
     let qry = "SELECT (external_offset + external_length) AS blobs_length FROM marf_data ORDER BY external_offset DESC LIMIT 1";
-    let max_len: u64 = query_row(conn, qry, NO_PARAMS)?.unwrap_or(0);
+    let max_len: u64 = db::query_row(conn, qry, NO_PARAMS)?.unwrap_or(0);
     Ok(max_len)
 }
 
@@ -528,12 +531,12 @@ pub fn detect_partial_migration(conn: &Connection) -> Result<bool, Error> {
         return Ok(false);
     }
 
-    let num_migrated = query_count(
+    let num_migrated = db::query_count(
         conn,
         "SELECT COUNT(*) FROM marf_data WHERE external_offset = 0 AND external_length = 0 AND unconfirmed = 0",
         NO_PARAMS,
     )?;
-    let num_not_migrated = query_count(
+    let num_not_migrated = db::query_count(
         conn,
         "SELECT COUNT(*) FROM marf_data WHERE external_offset != 0 AND external_length != 0 AND unconfirmed = 0",
         NO_PARAMS,
@@ -545,7 +548,7 @@ pub fn detect_partial_migration(conn: &Connection) -> Result<bool, Error> {
 pub fn set_migrated(conn: &Connection) -> Result<(), Error> {
     conn.execute(
         "UPDATE migrated_version SET version = ?1",
-        &[&u64_to_sql(SQL_MARF_SCHEMA_VERSION)?],
+        &[&db::u64_to_sql(SQL_MARF_SCHEMA_VERSION)?],
     )
     .map_err(|e| e.into())
     .map(|_| ())
@@ -563,7 +566,7 @@ pub fn get_node_hash_bytes(
         block_id.into(),
         true,
     )?;
-    let hash_buff = bits_read_node_hash_bytes(&mut blob, ptr)?;
+    let hash_buff = bits::read_node_hash_bytes(&mut blob, ptr)?;
     Ok(TrieHash(hash_buff))
 }
 
@@ -578,8 +581,24 @@ pub fn get_node_hash_bytes_by_bhh<T: MarfTrieId>(
         |r| r.get("block_id"),
     )?;
     let mut blob = conn.blob_open(DatabaseName::Main, "marf_data", "data", row_id, true)?;
-    let hash_buff = bits_read_node_hash_bytes(&mut blob, ptr)?;
+    let hash_buff = bits::read_node_hash_bytes(&mut blob, ptr)?;
     Ok(TrieHash(hash_buff))
+}
+
+pub fn probe_node_type(
+    conn: &Connection,
+    block_id: u32,
+    ptr: &TriePtr,
+) -> Result<(TrieNodeID, TrieHash), Error> {
+    let mut blob = conn.blob_open(
+        DatabaseName::Main,
+        "marf_data",
+        "data",
+        block_id.into(),
+        true,
+    )?;
+    blob.seek(SeekFrom::Start(ptr.ptr() as u64))?;
+    bits::read_stored_node_type_at_head(&mut blob).map_err(Into::into)
 }
 
 pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(

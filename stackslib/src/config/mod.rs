@@ -2126,6 +2126,12 @@ pub struct NodeConfig {
     ///   - Compression affects only the on-disk MARF representation; in-memory behavior
     ///     remains unchanged.
     pub marf_compress: bool,
+    /// Use memory-mapped I/O for reading MARF trie blobs. When enabled, hot-path
+    /// reads (Clarity contract evaluation, proof generation) bypass `read()` syscalls
+    /// and slice directly into a kernel-managed page cache.
+    /// ---
+    /// @default: `true`
+    pub marf_mmap: bool,
     /// Sampling interval in seconds for the PoX synchronization watchdog thread
     /// (pre-Nakamoto). Determines how often the watchdog checked PoX state
     /// consistency in the Neon run loop.
@@ -2446,6 +2452,7 @@ impl Default for NodeConfig {
             marf_cache_strategy: None,
             marf_defer_hashing: true,
             marf_compress: true,
+            marf_mmap: true,
             pox_sync_sample_secs: 30,
             use_test_genesis_chainstate: None,
             fault_injection_block_push_fail_probability: None,
@@ -2612,6 +2619,7 @@ impl NodeConfig {
             false,
         )
         .with_compression(self.marf_compress)
+        .with_mmap(self.marf_mmap)
     }
 }
 
@@ -3860,6 +3868,7 @@ pub struct NodeConfigFile {
     pub marf_cache_strategy: Option<String>,
     pub marf_defer_hashing: Option<bool>,
     pub marf_compress: Option<bool>,
+    pub marf_mmap: Option<bool>,
     pub pox_sync_sample_secs: Option<u64>,
     pub use_test_genesis_chainstate: Option<bool>,
     /// At most, how often should the chain-liveness thread
@@ -3938,6 +3947,7 @@ impl NodeConfigFile {
             marf_compress: self
                 .marf_compress
                 .unwrap_or(default_node_config.marf_compress),
+            marf_mmap: self.marf_mmap.unwrap_or(default_node_config.marf_mmap),
             pox_sync_sample_secs: self
                 .pox_sync_sample_secs
                 .unwrap_or(default_node_config.pox_sync_sample_secs),
@@ -4953,6 +4963,7 @@ mod tests {
             "default defer hashing"
         );
         assert_eq!(true, config.node.marf_compress, "default compress");
+        assert_eq!(true, config.node.marf_mmap, "default mmap");
 
         let cfg_opts = config.node.get_marf_opts();
         assert_eq!("noop", cfg_opts.cache_strategy, "default cache opt");
@@ -4962,6 +4973,7 @@ mod tests {
             "default defer hashing opt"
         );
         assert_eq!(true, cfg_opts.compress, "default compress opt");
+        assert_eq!(true, cfg_opts.mmap, "default mmap opt");
         assert_eq!(
             false, cfg_opts.external_blobs,
             "internal default blob setting"
@@ -4978,6 +4990,7 @@ mod tests {
                 marf_cache_strategy = "everything"
                 marf_defer_hashing = false
                 marf_compress = false
+                marf_mmap = false
                 "#,
         );
 
@@ -4991,6 +5004,7 @@ mod tests {
             "configured defer hashing"
         );
         assert_eq!(false, config.node.marf_compress, "configured compress");
+        assert_eq!(false, config.node.marf_mmap, "configured mmap");
 
         let cfg_opts = config.node.get_marf_opts();
         assert_eq!(
@@ -5003,6 +5017,7 @@ mod tests {
             "configured hash opt"
         );
         assert_eq!(false, cfg_opts.compress, "configured compress opt");
+        assert_eq!(false, cfg_opts.mmap, "configured mmap opt");
         assert_eq!(
             false, cfg_opts.external_blobs,
             "internal default blob setting"

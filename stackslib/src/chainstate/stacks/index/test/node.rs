@@ -14,8 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::Cursor;
-
 use super::*;
 use crate::chainstate::stacks::index::*;
 
@@ -112,11 +110,11 @@ fn trie_node4_to_bytes() {
         0x12,
         0x13,
     ];
-    let mut node4_stream = Cursor::new(node4_bytes.clone());
+
     let buf = node4.to_bytes();
     assert_eq!(buf, node4_bytes);
     assert_eq!(node4.byte_len(), node4_bytes.len());
-    assert_eq!(TrieNode4::from_bytes(&mut node4_stream).unwrap(), node4);
+    assert_eq!(TrieNode4::from_bytes(&node4_bytes).unwrap().0, node4);
 }
 
 #[test]
@@ -500,11 +498,11 @@ fn trie_node16_to_bytes() {
         0x12,
         0x13,
     ];
-    let mut node16_stream = Cursor::new(node16_bytes.clone());
+
     let buf = node16.to_bytes();
     assert_eq!(buf, node16_bytes);
     assert_eq!(node16.byte_len(), node16_bytes.len());
-    assert_eq!(TrieNode16::from_bytes(&mut node16_stream).unwrap(), node16);
+    assert_eq!(TrieNode16::from_bytes(&node16_bytes).unwrap().0, node16);
 }
 
 #[test]
@@ -1872,12 +1870,11 @@ fn trie_node48_to_bytes() {
         0x12,
         0x13,
     ];
-    let mut node48_stream = Cursor::new(node48_bytes.clone());
 
     let buf = node48.to_bytes();
     assert_eq!(buf, node48_bytes);
     assert_eq!(node48.byte_len(), node48_bytes.len());
-    assert_eq!(TrieNode48::from_bytes(&mut node48_stream).unwrap(), node48);
+    assert_eq!(TrieNode48::from_bytes(&node48_bytes).unwrap().0, node48);
 }
 
 #[test]
@@ -3609,15 +3606,10 @@ fn trie_node256_to_bytes() {
         0x0f, 0x10, 0x11, 0x12, 0x13,
     ]);
 
-    let mut node256_stream = Cursor::new(node256_bytes.clone());
-
     let buf = node256.to_bytes();
     assert_eq!(buf, node256_bytes);
     assert_eq!(node256.byte_len(), node256_bytes.len());
-    assert_eq!(
-        TrieNode256::from_bytes(&mut node256_stream).unwrap(),
-        node256
-    );
+    assert_eq!(TrieNode256::from_bytes(&node256_bytes).unwrap().0, node256);
 }
 
 #[test]
@@ -3837,7 +3829,7 @@ fn read_write_node4() {
     let wres = trie_io.write_nodetype(0, &TrieNodeType::Node4(node4.clone()), hash);
     assert!(wres.is_ok());
 
-    let rres = trie_io.read_nodetype(&TriePtr::new(TrieNodeID::Node4 as u8, 0, 0));
+    let rres = read_nodetype(&mut trie_io, &TriePtr::new(TrieNodeID::Node4 as u8, 0, 0));
 
     assert!(rres.is_ok());
     assert_eq!(rres.unwrap(), (TrieNodeType::Node4(node4.clone()), hash));
@@ -3867,7 +3859,7 @@ fn read_write_node16() {
     let wres = trie_io.write_nodetype(0, &TrieNodeType::Node16(node16.clone()), hash);
     assert!(wres.is_ok());
 
-    let rres = trie_io.read_nodetype(&TriePtr::new(TrieNodeID::Node16 as u8, 0, 0));
+    let rres = read_nodetype(&mut trie_io, &TriePtr::new(TrieNodeID::Node16 as u8, 0, 0));
 
     assert!(rres.is_ok());
     assert_eq!(rres.unwrap(), (TrieNodeType::Node16(node16.clone()), hash));
@@ -3897,7 +3889,7 @@ fn read_write_node48() {
     let wres = trie_io.write_nodetype(0, &node48.as_trie_node_type(), hash);
     assert!(wres.is_ok());
 
-    let rres = trie_io.read_nodetype(&TriePtr::new(TrieNodeID::Node48 as u8, 0, 0));
+    let rres = read_nodetype(&mut trie_io, &TriePtr::new(TrieNodeID::Node48 as u8, 0, 0));
 
     assert!(rres.is_ok());
     assert_eq!(rres.unwrap(), (node48.as_trie_node_type(), hash));
@@ -3928,7 +3920,10 @@ fn read_write_node256() {
     assert!(wres.is_ok());
 
     let root_ptr = trie_io.root_ptr();
-    let rres = trie_io.read_nodetype(&TriePtr::new(TrieNodeID::Node256 as u8, 0, root_ptr));
+    let rres = read_nodetype(
+        &mut trie_io,
+        &TriePtr::new(TrieNodeID::Node256 as u8, 0, root_ptr),
+    );
 
     assert!(rres.is_ok());
     assert_eq!(rres.unwrap(), (node256.as_trie_node_type(), hash));
@@ -3957,7 +3952,7 @@ fn read_write_leaf() {
     let wres = trie_io.write_nodetype(0, &TrieNodeType::Leaf(leaf.clone()), hash);
     assert!(wres.is_ok());
 
-    let rres = trie_io.read_nodetype(&TriePtr::new(TrieNodeID::Leaf as u8, 0, 0));
+    let rres = read_nodetype(&mut trie_io, &TriePtr::new(TrieNodeID::Leaf as u8, 0, 0));
 
     assert!(rres.is_ok());
     assert_eq!(rres.unwrap(), (TrieNodeType::Leaf(leaf), hash));
@@ -4146,6 +4141,35 @@ fn read_write_node256_hashes() {
 }
 
 #[test]
+fn trie_cursor_walk_ref_records_deferred_history() {
+    let mut node4 = TrieNode4::new(&[]);
+    let leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, 1, 7);
+    assert!(node4.insert(&leaf_ptr));
+
+    let node = TrieNodeType::Node4(node4);
+    let mut path = [0u8; 32];
+    path[0] = 1;
+
+    let mut cursor = TrieCursor::new(&TrieHash::from_bytes(&path).unwrap(), TriePtr::default());
+    let block = BlockHeaderHash([0x11; 32]);
+
+    let next_ptr = cursor
+        .walk_ref(&TrieNodeRef::from(&node), &block)
+        .expect("walk_ref should succeed")
+        .expect("walk_ref should find the child ptr");
+
+    assert_eq!(next_ptr, leaf_ptr);
+    assert!(cursor.node().is_none());
+    assert_eq!(cursor.nodes.len(), 1);
+    assert!(matches!(
+        cursor.nodes.last(),
+        Some(TrieCursorNode::Handle(CursorNodeHandle::Persisted { .. }))
+    ));
+    assert_eq!(cursor.ptr(), leaf_ptr);
+    assert_eq!(cursor.chr(), Some(1));
+}
+
+#[test]
 fn trie_cursor_walk_full() {
     let marf_opts = MARFOpenOpts::default();
     let mut trie_io_store = TrieFileStorage::new_memory(marf_opts).unwrap();
@@ -4209,9 +4233,10 @@ fn trie_cursor_walk_full() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..31 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4233,7 +4258,7 @@ fn trie_cursor_walk_full() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4304,9 +4329,10 @@ fn trie_cursor_walk_1() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..15 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4328,7 +4354,7 @@ fn trie_cursor_walk_1() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4394,9 +4420,10 @@ fn trie_cursor_walk_2() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..10 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4418,7 +4445,7 @@ fn trie_cursor_walk_2() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4481,9 +4508,10 @@ fn trie_cursor_walk_3() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..7 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4505,7 +4533,7 @@ fn trie_cursor_walk_3() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4570,9 +4598,10 @@ fn trie_cursor_walk_4() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..6 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4594,7 +4623,7 @@ fn trie_cursor_walk_4() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4655,9 +4684,10 @@ fn trie_cursor_walk_5() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..5 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4679,7 +4709,7 @@ fn trie_cursor_walk_5() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4739,9 +4769,10 @@ fn trie_cursor_walk_6() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..4 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4763,7 +4794,7 @@ fn trie_cursor_walk_6() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4824,9 +4855,10 @@ fn trie_cursor_walk_10() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..2 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4848,7 +4880,7 @@ fn trie_cursor_walk_10() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -4916,9 +4948,10 @@ fn trie_cursor_walk_20() {
         trie_io.root_trieptr(),
     );
     let mut walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     for i in 0..1 {
-        let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+        let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
         assert!(res.is_ok());
 
         let fields_opt = res.unwrap();
@@ -4940,7 +4973,7 @@ fn trie_cursor_walk_20() {
     }
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();
@@ -5007,9 +5040,10 @@ fn trie_cursor_walk_32() {
         trie_io.root_trieptr(),
     );
     let walk_point = nodes[0].clone();
+    let mut scratch = MarfReadState::new();
 
     // walk to the leaf
-    let res = Trie::walk_from(&mut trie_io, &walk_point, &mut c);
+    let res = walk_from(&mut trie_io, &walk_point, &mut c, &mut scratch);
     assert!(res.is_ok());
 
     let fields_opt = res.unwrap();

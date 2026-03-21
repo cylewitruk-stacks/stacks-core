@@ -26,9 +26,10 @@ mod utils {
 
     use clarity::types::chainstate::{BlockHeaderHash, TrieHash};
 
-    use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
+    use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfCore as _, MARF};
     use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
-    use crate::chainstate::stacks::index::test::merkle_test_marf;
+    use crate::chainstate::stacks::index::test::marf::MarfTestExt;
+    use crate::chainstate::stacks::index::test::verify_marf_merkle_proof;
     use crate::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue, TrieLeaf};
 
     /// Runs a MARF test using string keys.
@@ -52,8 +53,8 @@ mod utils {
                 if batch_size > 0 {
                     for chunk in block_data.chunks(batch_size) {
                         let keys: Vec<_> = chunk.iter().map(|(k, _)| k.clone()).collect();
-                        let values = chunk.iter().map(|(_, v)| v.clone()).collect();
-                        marf.insert_batch(&keys, values).unwrap();
+                        let values = chunk.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>();
+                        marf.insert_batch(&keys, &values).unwrap();
                     }
                 } else {
                     for (key, value) in block_data.iter() {
@@ -123,10 +124,11 @@ mod utils {
                 TrieHashCalculationMode::All => "all",
             };
             let compress_str = if marf_opts.compress { "com" } else { "unc" };
+            let mmap_str = if marf_opts.mmap { "mmap" } else { "nommap" };
 
             let test_dir = format!(
-                "/tmp/stacks-marf-tests/{}-{}-{}-{}-{}",
-                test_name, cache_str, hash_str, compress_str, batch_size
+                "/tmp/stacks-marf-tests/{}-{}-{}-{}-{}-{}",
+                test_name, cache_str, hash_str, compress_str, mmap_str, batch_size
             );
 
             if fs::metadata(&test_dir).is_ok() {
@@ -155,30 +157,26 @@ mod utils {
 
             let proof_block_data = &data[i / 2];
             test_debug!("Prove block {}", i / 2);
-
+            let mut root_to_block = None;
+            let internals = marf.internals();
             for (key, value) in proof_block_data.iter() {
-                merkle_test_marf(
-                    &mut marf.borrow_storage_backend(),
+                root_to_block = Some(verify_marf_merkle_proof(
+                    internals,
                     &block_header,
                     path_fn(key).as_bytes(),
                     value.as_bytes(),
-                    None,
-                );
+                    root_to_block.take(),
+                ));
             }
         }
 
         let mut total_read_time = 0;
+        let internals = marf.internals();
         for (i, block_data) in data.iter().enumerate() {
             test_debug!("Read block {}", i);
             for (key, value) in block_data.iter() {
                 let start = SystemTime::now();
-                let leaf = MARF::get_path(
-                    &mut marf.borrow_storage_backend(),
-                    &last_block_header,
-                    &path_fn(key),
-                )
-                .unwrap()
-                .unwrap();
+                let leaf = internals.expect_path(&last_block_header, &path_fn(key));
 
                 total_read_time += start.elapsed().unwrap().as_nanos();
                 assert_eq!(leaf.data, TrieLeaf::from_value(&[], value.clone()).data);
@@ -205,21 +203,10 @@ mod utils {
 #[case::noop_deferred_batch_64(&opts::OPTS_NOOP_DEF_EXT, 64)]
 #[case::noop_deferred_batch_67(&opts::OPTS_NOOP_DEF_EXT, 67)]
 #[case::noop_deferred_batch_128(&opts::OPTS_NOOP_DEF_EXT, 128)]
-#[case::node256_immediate_batch_0(&opts::OPTS_N256_IMM_EXT, 0)]
-#[case::node256_immediate_batch_13(&opts::OPTS_N256_IMM_EXT, 13)]
-#[case::node256_immediate_batch_64(&opts::OPTS_N256_IMM_EXT, 64)]
-#[case::node256_immediate_batch_67(&opts::OPTS_N256_IMM_EXT, 67)]
-#[case::node256_immediate_batch_128(&opts::OPTS_N256_IMM_EXT, 128)]
-#[case::all_immediate_batch_0(&opts::OPTS_EVER_IMM_EXT, 0)]
-#[case::all_immediate_batch_13(&opts::OPTS_EVER_IMM_EXT, 13)]
-#[case::all_immediate_batch_64(&opts::OPTS_EVER_IMM_EXT, 64)]
-#[case::all_immediate_batch_67(&opts::OPTS_EVER_IMM_EXT, 67)]
-#[case::all_immediate_batch_128(&opts::OPTS_EVER_IMM_EXT, 128)]
-#[case::all_deferred_batch_0(&opts::OPTS_EVER_DEF_EXT, 0)]
-#[case::all_deferred_batch_13(&opts::OPTS_EVER_DEF_EXT, 13)]
-#[case::all_deferred_batch_64(&opts::OPTS_EVER_DEF_EXT, 64)]
-#[case::all_deferred_batch_67(&opts::OPTS_EVER_DEF_EXT, 67)]
-#[case::all_deferred_batch_128(&opts::OPTS_EVER_DEF_EXT, 128)]
+#[case::noop_immediate_mmap_batch_0(&opts::OPTS_NOOP_IMM_EXT_MMAP, 0)]
+#[case::noop_immediate_mmap_batch_128(&opts::OPTS_NOOP_IMM_EXT_MMAP, 128)]
+#[case::noop_deferred_mmap_batch_0(&opts::OPTS_NOOP_DEF_EXT_MMAP, 0)]
+#[case::noop_deferred_mmap_batch_128(&opts::OPTS_NOOP_DEF_EXT_MMAP, 128)]
 fn test_marf_cache_128_128(#[case] marf_opts: &MARFOpenOpts, #[case] batch_size: usize) {
     let test_data = make_test_insert_data(128, 128);
     let root_hash =
@@ -237,8 +224,7 @@ fn test_marf_cache_128_128(#[case] marf_opts: &MARFOpenOpts, #[case] batch_size:
 /// For all configurations, the resulting root hash must remain stable.
 #[rstest]
 #[case::noop_immediate_batch_15500(&opts::OPTS_NOOP_IMM_EXT, 15500)]
-#[case::node256_deferred_batch_15500(&opts::OPTS_N256_DEF_EXT, 15500)]
-#[case::ever_deferred_compress_batch_15500(&opts::OPTS_EVER_DEF_EXT_COMP, 15500)]
+#[case::noop_immediate_mmap_batch_15500(&opts::OPTS_NOOP_IMM_EXT_MMAP, 15500)]
 fn test_marf_cache_15500_10(#[case] marf_opts: &MARFOpenOpts, #[case] batch_size: usize) {
     let test_data = make_test_insert_data(15500, 10);
     let root_hash =
@@ -258,6 +244,8 @@ fn test_marf_cache_15500_10(#[case] marf_opts: &MARFOpenOpts, #[case] batch_size
 #[case::noop_immediate(&opts::OPTS_NOOP_IMM_EXT)]
 #[case::noop_immediate_compress(&opts::OPTS_NOOP_IMM_EXT_COMP)]
 #[case::noop_deferred_compress(&opts::OPTS_NOOP_DEF_EXT_COMP)]
+#[case::noop_immediate_mmap(&opts::OPTS_NOOP_IMM_EXT_MMAP)]
+#[case::noop_immediate_compress_mmap(&opts::OPTS_NOOP_IMM_EXT_COMP_MMAP)]
 fn test_marf_compress_1_256(#[case] marf_opts: &MARFOpenOpts) {
     let test_data = make_test_insert_data(1, 256);
     let root_hash =
@@ -277,6 +265,8 @@ fn test_marf_compress_1_256(#[case] marf_opts: &MARFOpenOpts) {
 #[case::noop_immediate(&opts::OPTS_NOOP_IMM_EXT)]
 #[case::noop_immediate_compress(&opts::OPTS_NOOP_IMM_EXT_COMP)]
 #[case::noop_deferred_compress(&opts::OPTS_NOOP_DEF_EXT_COMP)]
+#[case::noop_immediate_mmap(&opts::OPTS_NOOP_IMM_EXT_MMAP)]
+#[case::noop_immediate_compress_mmap(&opts::OPTS_NOOP_IMM_EXT_COMP_MMAP)]
 fn test_marf_compressed_2048_1(#[case] marf_opts: &MARFOpenOpts) {
     let test_data = make_test_insert_data(2048, 1);
     let root_hash =
@@ -296,6 +286,8 @@ fn test_marf_compressed_2048_1(#[case] marf_opts: &MARFOpenOpts) {
 #[case::noop_immediate_batch_8(&opts::OPTS_NOOP_IMM_EXT, 8)]
 #[case::noop_immediate_compress_batch_8(&opts::OPTS_NOOP_IMM_EXT_COMP, 8)]
 #[case::noop_immediate_compress_batch_5(&opts::OPTS_NOOP_IMM_EXT_COMP, 5)]
+#[case::noop_immediate_mmap_batch_8(&opts::OPTS_NOOP_IMM_EXT_MMAP, 8)]
+#[case::noop_immediate_compress_mmap_batch_5(&opts::OPTS_NOOP_IMM_EXT_COMP_MMAP, 5)]
 fn test_marf_compress_8_256(#[case] marf_opts: &MARFOpenOpts, #[case] batch_size: usize) {
     let test_data = make_test_insert_data(8, 256);
     let root_hash =
@@ -315,6 +307,8 @@ fn test_marf_compress_8_256(#[case] marf_opts: &MARFOpenOpts, #[case] batch_size
 #[rstest]
 #[case::noop_immediate_compress(&opts::OPTS_NOOP_IMM_EXT_COMP)]
 #[case::noop_deferred_compress(&opts::OPTS_NOOP_DEF_EXT_COMP)]
+#[case::noop_immediate_compress_mmap(&opts::OPTS_NOOP_IMM_EXT_COMP_MMAP)]
+#[case::noop_deferred_compress_mmap(&opts::OPTS_NOOP_DEF_EXT_COMP_MMAP)]
 fn test_marf_patch_expansion(#[case] marf_opts: &MARFOpenOpts) {
     let test_data: Vec<_> = (0u8..=255u8)
         .map(|i| {

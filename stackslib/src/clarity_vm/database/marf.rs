@@ -26,13 +26,13 @@ use clarity::vm::database::sqlite::{
 use clarity::vm::database::{ClarityBackingStore, SpecialCaseHandler, SqliteConnection};
 use clarity::vm::errors::{IncomparableError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::QualifiedContractIdentifier;
-use rusqlite;
-use rusqlite::Connection;
+use rusqlite::{self, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
 
 use crate::chainstate::stacks::index::marf::{
-    test_override_marf_compression, MARFOpenOpts, MarfConnection, MarfTransaction, MARF,
+    test_override_marf_compression, MARFOpenOpts, MarfConnection as _, MarfCore as _,
+    MarfTransaction, MARF,
 };
 use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
@@ -511,7 +511,7 @@ impl ReadOnlyMarfStore<'_> {
     /// Return Err(..) if we encounter a sqlite error
     pub fn trie_exists_for_block(&mut self, bhh: &StacksBlockId) -> Result<bool, DatabaseError> {
         self.marf
-            .with_conn(|conn| conn.has_block(bhh).map_err(DatabaseError::IndexError))
+            .with_storage(|conn| conn.has_block(bhh).map_err(DatabaseError::IndexError))
     }
 
     /// Get the DB path on disk.
@@ -1013,7 +1013,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             values.push(marf_value);
         }
         self.marf
-            .insert_batch(&keys, values)
+            .insert_batch(&keys, &values)
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())
     }
 

@@ -14,16 +14,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::{error, fmt};
 
-use crate::chainstate::stacks::index::bits::{
-    get_compressed_ptrs_size, get_path_byte_len, get_ptrs_byte_len, get_ptrs_byte_len_compressed,
-    get_sparse_ptrs_bitmap_size, path_from_bytes, ptrs_from_bytes, write_path_to_bytes,
-    SPARSE_PTR_BITMAP_MARKER,
-};
+use crate::chainstate::stacks::index::bits::{self, SPARSE_PTR_BITMAP_MARKER};
 use crate::chainstate::stacks::index::{
-    BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, TrieLeaf, MARF_VALUE_ENCODED_SIZE,
+    BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, ReadNodeBacking, ReadTrieNode,
+    ReadTrieNodeCursorStep, TrieLeaf,
 };
 use crate::codec::{read_next, write_next, Error as codec_error, StacksMessageCodec};
 use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE};
@@ -142,7 +139,7 @@ fn write_ptrs_to_bytes_compressed<W: Write>(
         ));
     }
 
-    let Some((ptrs_size, is_sparse)) = get_compressed_ptrs_size(id, ptrs) else {
+    let Some((ptrs_size, is_sparse)) = bits::get_compressed_ptrs_size(id, ptrs) else {
         // doesn't apply -- this node has no ptrs
         return Ok(());
     };
@@ -154,7 +151,7 @@ fn write_ptrs_to_bytes_compressed<W: Write>(
         w.write_all(&[SPARSE_PTR_BITMAP_MARKER])?;
 
         // compute the bitmap
-        let bitmap_size = get_sparse_ptrs_bitmap_size(id).ok_or_else(|| {
+        let bitmap_size = bits::get_sparse_ptrs_bitmap_size(id).ok_or_else(|| {
             Error::CorruptionError(format!("No bitmap size defined for node id {id}"))
         })?;
 
@@ -208,7 +205,7 @@ fn write_ptrs_to_bytes_compressed<W: Write>(
     Ok(())
 }
 
-fn ptrs_consensus_hash<W: Write, M: BlockMap>(
+fn ptrs_consensus_hash<W: Write, M: BlockMap + ?Sized>(
     ptrs: &[TriePtr],
     map: &mut M,
     w: &mut W,
@@ -275,10 +272,18 @@ pub trait TrieNode {
     /// child does not exist.
     fn replace(&mut self, ptr: &TriePtr) -> bool;
 
-    /// Read an encoded instance of this node from a byte stream and instantiate it.
-    fn from_bytes<R: Read + Seek>(r: &mut R) -> Result<Self, Error>
+    /// Load an encoded instance of this node from bytes into `self`.
+    fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error>;
+
+    /// Read an encoded instance of this node from bytes and instantiate a new owned value.
+    fn from_bytes(bytes: &[u8]) -> Result<(Self, usize), Error>
     where
-        Self: Sized;
+        Self: Sized,
+    {
+        let mut node = Self::empty();
+        let consumed = node.load_from_slice(bytes)?;
+        Ok((node, consumed))
+    }
 
     /// Get a reference to the children of this node.
     fn ptrs(&self) -> &[TriePtr];
@@ -309,7 +314,7 @@ pub trait TrieNode {
     fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
         write_ptrs_to_bytes(self.ptrs(), w)?;
-        write_path_to_bytes(self.path().as_slice(), w)
+        bits::write_path_to_bytes(self.path().as_slice(), w)
     }
 
     /// Encode this node instance into a byte stream and write it to w.
@@ -317,7 +322,7 @@ pub trait TrieNode {
     fn write_bytes_compressed<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         w.write_all(&[set_compressed(self.id())])?;
         write_ptrs_to_bytes_compressed(self.id(), self.ptrs(), w)?;
-        write_path_to_bytes(self.path().as_slice(), w)
+        bits::write_path_to_bytes(self.path().as_slice(), w)
     }
 
     #[cfg(test)]
@@ -330,12 +335,13 @@ pub trait TrieNode {
 
     /// Calculate how many bytes this node will take to encode.
     fn byte_len(&self) -> usize {
-        get_ptrs_byte_len(self.ptrs()) + get_path_byte_len(self.path())
+        bits::get_ptrs_byte_len(self.ptrs()) + bits::get_path_byte_len(self.path())
     }
 
     /// Calculate how many bytes this node will take to encode.
     fn byte_len_compressed(&self) -> usize {
-        get_ptrs_byte_len_compressed(self.id(), self.ptrs()) + get_path_byte_len(self.path())
+        bits::get_ptrs_byte_len_compressed(self.id(), self.ptrs())
+            + bits::get_path_byte_len(self.path())
     }
 }
 
@@ -345,7 +351,7 @@ pub trait TrieNode {
 ///  both types.
 /// The type `M` is used for any additional data structures required
 ///   (BlockHashMap for TrieNode and () for ProofTrieNode)
-pub trait ConsensusSerializable<M> {
+pub trait ConsensusSerializable<M: ?Sized> {
     /// Encode the consensus-relevant bytes of this node and write it to w.
     fn write_consensus_bytes<W: Write>(
         &self,
@@ -362,11 +368,19 @@ pub trait ConsensusSerializable<M> {
     }
 }
 
-impl<T: TrieNode, M: BlockMap> ConsensusSerializable<M> for T {
+impl<T: TrieNode, M: BlockMap + ?Sized> ConsensusSerializable<M> for T {
     fn write_consensus_bytes<W: Write>(&self, map: &mut M, w: &mut W) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
         ptrs_consensus_hash(self.ptrs(), map, w)?;
-        write_path_to_bytes(self.path().as_slice(), w)
+        bits::write_path_to_bytes(self.path().as_slice(), w)
+    }
+}
+
+impl<M: BlockMap + ?Sized> ConsensusSerializable<M> for TrieNodeRef<'_> {
+    fn write_consensus_bytes<W: Write>(&self, map: &mut M, w: &mut W) -> Result<(), Error> {
+        w.write_all(&[self.id()])?;
+        ptrs_consensus_hash(self.ptrs(), map, w)?;
+        bits::write_path_to_bytes(self.path_bytes(), w)
     }
 }
 
@@ -486,7 +500,7 @@ impl TriePtr {
     /// The parts of a child pointer that are relevant for consensus are only its ID, path
     /// character, and referred-to block hash.  The software doesn't care about the details of how/where
     /// nodes are stored.
-    pub fn write_consensus_bytes<W: Write, M: BlockMap>(
+    pub fn write_consensus_bytes<W: Write, M: BlockMap + ?Sized>(
         &self,
         block_map: &mut M,
         w: &mut W,
@@ -523,12 +537,22 @@ impl TriePtr {
         }
     }
 
-    /// Load up this TriePtr from a slice of bytes, assuming that they represent a compressed
-    /// TriePtr.  A TriePtr that is compressed will not have a stored `back_block` field if the
-    /// node ID does not have the backptr bit set.
+    /// Load a [`TriePtr`]` from a slice of bytes, assuming that they represent a compressed
+    /// `TriePtr`.
+    ///
+    /// A `TriePtr` that is compressed will not have a stored `back_block` field if the node ID does
+    /// not have the backptr bit set.
     #[inline]
     #[allow(clippy::indexing_slicing)]
-    pub fn from_bytes_compressed(bytes: &[u8]) -> TriePtr {
+    pub fn from_slice_compressed(slice: &[u8]) -> Result<(TriePtr, usize), Error> {
+        let ptr_id = *slice.first().ok_or_else(|| {
+            Error::CorruptionError("Failed to read compressed ptr ID".to_string())
+        })?;
+        let ptr_len = TriePtr::compressed_size_for_id(clear_compressed(ptr_id));
+        let bytes = slice.get(..ptr_len).ok_or_else(|| {
+            Error::CorruptionError(format!("Failed to read {ptr_len} bytes of compressed ptr"))
+        })?;
+
         assert!(bytes.len() >= TRIEPTR_SIZE_COMPRESSED);
         let id = clear_compressed(bytes[0]);
         let chr = bytes[1];
@@ -541,12 +565,14 @@ impl TriePtr {
             0
         };
 
-        TriePtr {
+        let ptr = TriePtr {
             id,
             chr,
             ptr,
             back_block,
-        }
+        };
+
+        Ok((ptr, ptr_len))
     }
 
     /// Load up a compressed TriePtr from a Read object.
@@ -597,18 +623,81 @@ impl TriePtr {
 /// codebase remember which nodes were visited, which blocks they came from, and which pointers
 /// were walked.  In particular, it's useful for figuring out where to insert a new node, and which
 /// nodes to visit when updating the root node hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParkedNodeHandle(usize);
+
+impl ParkedNodeHandle {
+    pub fn new(slot: usize) -> Self {
+        Self(slot)
+    }
+
+    pub fn slot(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CursorNodeHandle<T: MarfTrieId> {
+    Persisted { ptr: TriePtr, block_hash: T },
+    Parked(ParkedNodeHandle),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrieCursorNode<T: MarfTrieId> {
+    Handle(CursorNodeHandle<T>),
+    Materialized(TrieNodeType),
+}
+
+impl<T: MarfTrieId> TrieCursorNode<T> {
+    fn as_node(&self) -> Option<&TrieNodeType> {
+        match self {
+            TrieCursorNode::Handle(_) => None,
+            TrieCursorNode::Materialized(node) => Some(node),
+        }
+    }
+
+    fn as_handle(&self) -> Option<&CursorNodeHandle<T>> {
+        match self {
+            TrieCursorNode::Handle(handle) => Some(handle),
+            TrieCursorNode::Materialized(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrieCursor<T: MarfTrieId> {
-    pub path: TrieHash,                  // the path to walk
-    pub index: usize,                    // index into the path
-    pub node_path_index: usize,          // index into the currently-visited node's compressed path
-    pub nodes: Vec<TrieNodeType>,        // list of nodes this cursor visits
-    pub node_ptrs: Vec<TriePtr>,         // list of ptr branches this cursor has taken
-    pub block_hashes: Vec<T>, // list of Tries we've visited.  block_hashes[i] corresponds to node_ptrs[i]
-    pub last_error: Option<CursorError>, // last error encountered while walking (used to make sure the client calls the right "recovery" method)
+    /// The path to walk.
+    pub path: TrieHash,
+    /// Index into the path.
+    pub index: usize,
+    /// Index into the currently-visited node's compressed path.
+    pub node_path_index: usize,
+    /// List of visited nodes, materialized only when needed.
+    pub nodes: Vec<TrieCursorNode<T>>,
+    /// List of ptr branches this cursor has taken.
+    pub node_ptrs: Vec<TriePtr>,
+    /// List of Tries we've visited.
+    ///
+    /// `block_hashes[i]` corresponds to `node_ptrs[i + 1]`.
+    pub block_hashes: Vec<T>,
+    /// Last error encountered while walking (used to make sure the client calls the right "recovery" method).
+    pub last_error: Option<CursorError>,
 }
 
 impl<T: MarfTrieId> TrieCursor<T> {
+    fn step_from_walk_result(
+        walk_result: Result<Option<TriePtr>, CursorError>,
+        is_leaf: bool,
+    ) -> ReadTrieNodeCursorStep {
+        match walk_result {
+            Ok(Some(next_ptr)) => ReadTrieNodeCursorStep::Next(next_ptr),
+            Ok(None) => ReadTrieNodeCursorStep::EndOfPath { is_leaf },
+            Err(CursorError::PathDiverged) => ReadTrieNodeCursorStep::Diverged,
+            Err(CursorError::ChrNotFound) => ReadTrieNodeCursorStep::ChrNotFound,
+            Err(CursorError::BackptrEncountered(ptr)) => ReadTrieNodeCursorStep::FollowBackptr(ptr),
+        }
+    }
+
     pub fn new(path: &TrieHash, root_ptr: TriePtr) -> TrieCursor<T> {
         TrieCursor {
             path: *path,
@@ -619,6 +708,17 @@ impl<T: MarfTrieId> TrieCursor<T> {
             block_hashes: vec![],
             last_error: None,
         }
+    }
+
+    pub fn reset(&mut self, path: &TrieHash, root_ptr: TriePtr) {
+        self.path = *path;
+        self.index = 0;
+        self.node_path_index = 0;
+        self.nodes.clear();
+        self.node_ptrs.clear();
+        self.node_ptrs.push(root_ptr);
+        self.block_hashes.clear();
+        self.last_error = None;
     }
 
     /// what point in the path are we at now?
@@ -654,9 +754,13 @@ impl<T: MarfTrieId> TrieCursor<T> {
     }
 
     /// last node visited.
-    /// Will only be None if we haven't taken a step yet.
+    /// Returns None if we haven't taken a step yet, or if the last visited node is still deferred.
     pub fn node(&self) -> Option<TrieNodeType> {
-        self.nodes.last().cloned()
+        self.nodes.last().and_then(TrieCursorNode::as_node).cloned()
+    }
+
+    pub fn node_handle(&self) -> Option<&CursorNodeHandle<T>> {
+        self.nodes.last().and_then(TrieCursorNode::as_handle)
     }
 
     /// Are we at the [E]nd [O]f a [N]ode's [P]ath?
@@ -692,7 +796,8 @@ impl<T: MarfTrieId> TrieCursor<T> {
         trace!("cursor: walk: node = {:?} block = {:?}", node, block_hash);
 
         // walk this node
-        self.nodes.push((*node).clone());
+        self.nodes
+            .push(TrieCursorNode::Materialized((*node).clone()));
         self.node_path_index = 0;
 
         if self.index >= self.path.len() {
@@ -769,6 +874,247 @@ impl<T: MarfTrieId> TrieCursor<T> {
         }
     }
 
+    fn walk_borrowed(
+        &mut self,
+        node: &TrieNodeRef<'_>,
+        block_hash: &T,
+        cursor_node: TrieCursorNode<T>,
+    ) -> Result<Option<TriePtr>, CursorError> {
+        assert!(self.last_error.is_none());
+
+        trace!(
+            "cursor: walk_ref: node = {:?} block = {:?}",
+            node,
+            block_hash
+        );
+
+        self.nodes.push(cursor_node);
+        self.node_path_index = 0;
+
+        if self.index >= self.path.len() {
+            trace!("cursor: out of path");
+            return Ok(None);
+        }
+
+        let node_path = node.path_bytes();
+        let path_bytes = self.path.as_bytes();
+
+        for (_i, path_set) in node_path.iter().enumerate() {
+            let Some(path_head) = path_bytes.get(self.index) else {
+                trace!("cursor: out of path");
+                return Ok(None);
+            };
+            if path_set != path_head {
+                trace!("cursor: diverged({} != {}): i = {_i}, self.index = {}, self.node_path_index = {}", to_hex(node_path), to_hex(path_bytes), self.index, self.node_path_index);
+                self.last_error = Some(CursorError::PathDiverged);
+                return Err(CursorError::PathDiverged);
+            }
+            self.index += 1;
+            self.node_path_index += 1;
+        }
+
+        if let Some(chr) = path_bytes.get(self.index) {
+            self.index += 1;
+            let mut ptr_opt = node.walk(*chr);
+
+            let do_walk = match &ptr_opt {
+                Some(ptr) => {
+                    if !is_backptr(ptr.id()) {
+                        self.node_ptrs.push(*ptr);
+                        self.block_hashes.push(block_hash.clone());
+                        true
+                    } else {
+                        self.last_error = Some(CursorError::BackptrEncountered(*ptr));
+                        false
+                    }
+                }
+                None => {
+                    self.last_error = Some(CursorError::ChrNotFound);
+                    false
+                }
+            };
+
+            if !do_walk {
+                ptr_opt = None;
+            }
+
+            if ptr_opt.is_none() {
+                assert!(self.last_error.is_some());
+
+                trace!(
+                    "cursor: not found: chr = 0x{:02x}, self.index = {}, self.path = {:?}",
+                    chr,
+                    self.index - 1,
+                    &path_bytes
+                );
+                return Err(self.last_error.clone().unwrap());
+            } else {
+                return Ok(ptr_opt);
+            }
+        }
+
+        trace!("cursor: now out of path");
+        Ok(None)
+    }
+
+    pub fn walk_ref(
+        &mut self,
+        node: &TrieNodeRef<'_>,
+        block_hash: &T,
+    ) -> Result<Option<TriePtr>, CursorError> {
+        self.walk_borrowed(
+            node,
+            block_hash,
+            TrieCursorNode::Handle(CursorNodeHandle::Persisted {
+                ptr: self.ptr(),
+                block_hash: block_hash.clone(),
+            }),
+        )
+    }
+
+    pub fn walk_parked(
+        &mut self,
+        node: &TrieNodeRef<'_>,
+        parked_handle: ParkedNodeHandle,
+        block_hash: &T,
+    ) -> Result<Option<TriePtr>, CursorError> {
+        self.walk_borrowed(
+            node,
+            block_hash,
+            TrieCursorNode::Handle(CursorNodeHandle::Parked(parked_handle)),
+        )
+    }
+
+    pub fn walk_read(
+        &mut self,
+        node: &ReadTrieNode<'_>,
+        block_hash: &T,
+    ) -> Result<Option<TriePtr>, Error> {
+        match &node.backing {
+            ReadNodeBacking::VolatileDecoded(node_ref)
+            | ReadNodeBacking::PersistedDecoded(node_ref) => self
+                .walk_ref(node_ref, block_hash)
+                .map_err(Error::CursorError),
+            ReadNodeBacking::PersistedBytes(_) => self
+                .walk_borrowed_read(
+                    node,
+                    block_hash,
+                    TrieCursorNode::Handle(CursorNodeHandle::Persisted {
+                        ptr: self.ptr(),
+                        block_hash: block_hash.clone(),
+                    }),
+                )
+                .map_err(Error::CursorError),
+            ReadNodeBacking::Owned(node_type) => {
+                self.walk(node_type, block_hash).map_err(Error::CursorError)
+            }
+        }
+    }
+
+    fn walk_borrowed_read(
+        &mut self,
+        node: &ReadTrieNode<'_>,
+        block_hash: &T,
+        cursor_node: TrieCursorNode<T>,
+    ) -> Result<Option<TriePtr>, CursorError> {
+        assert!(self.last_error.is_none());
+
+        self.nodes.push(cursor_node);
+        self.node_path_index = 0;
+
+        if self.index >= self.path.len() {
+            trace!("cursor: out of path");
+            return Ok(None);
+        }
+
+        let node_path = node.path_bytes().map_err(|_| CursorError::ChrNotFound)?;
+        let path_bytes = self.path.as_bytes();
+
+        for (_i, path_set) in node_path.iter().enumerate() {
+            let Some(path_head) = path_bytes.get(self.index) else {
+                trace!("cursor: out of path");
+                return Ok(None);
+            };
+            if path_set != path_head {
+                trace!("cursor: diverged({} != {}): i = {_i}, self.index = {}, self.node_path_index = {}", to_hex(node_path), to_hex(path_bytes), self.index, self.node_path_index);
+                self.last_error = Some(CursorError::PathDiverged);
+                return Err(CursorError::PathDiverged);
+            }
+            self.index += 1;
+            self.node_path_index += 1;
+        }
+
+        if let Some(chr) = path_bytes.get(self.index) {
+            self.index += 1;
+            let mut ptr_opt = node.walk(*chr).map_err(|_| CursorError::ChrNotFound)?;
+
+            let do_walk = match &ptr_opt {
+                Some(ptr) => {
+                    if !is_backptr(ptr.id()) {
+                        self.node_ptrs.push(*ptr);
+                        self.block_hashes.push(block_hash.clone());
+                        true
+                    } else {
+                        self.last_error = Some(CursorError::BackptrEncountered(*ptr));
+                        false
+                    }
+                }
+                None => {
+                    self.last_error = Some(CursorError::ChrNotFound);
+                    false
+                }
+            };
+
+            if !do_walk {
+                ptr_opt = None;
+            }
+
+            if ptr_opt.is_none() {
+                assert!(self.last_error.is_some());
+                trace!(
+                    "cursor: not found: chr = 0x{:02x}, self.index = {}, self.path = {:?}",
+                    chr,
+                    self.index - 1,
+                    &path_bytes
+                );
+                Err(self.last_error.clone().expect("BUG: missing cursor error"))
+            } else {
+                Ok(ptr_opt)
+            }
+        } else {
+            trace!("cursor: now out of path");
+            Ok(None)
+        }
+    }
+
+    pub fn walk_ref_step(
+        &mut self,
+        node: &TrieNodeRef<'_>,
+        block_hash: &T,
+    ) -> ReadTrieNodeCursorStep {
+        Self::step_from_walk_result(self.walk_ref(node, block_hash), node.is_leaf())
+    }
+
+    pub fn walk_parked_step(
+        &mut self,
+        node: &TrieNodeRef<'_>,
+        parked_handle: ParkedNodeHandle,
+        block_hash: &T,
+    ) -> ReadTrieNodeCursorStep {
+        Self::step_from_walk_result(
+            self.walk_parked(node, parked_handle, block_hash),
+            node.is_leaf(),
+        )
+    }
+
+    pub fn promote_last_node_to_parked(&mut self, parked_handle: ParkedNodeHandle) {
+        if let Some(last_node) = self.nodes.last_mut() {
+            *last_node = TrieCursorNode::Handle(CursorNodeHandle::Parked(parked_handle));
+        } else {
+            panic!("Cursor has no last node to park");
+        }
+    }
+
     /// Replace the last-visited node and ptr within this trie.  Used when doing a copy-on-write or
     /// promoting a node, so the cursor state accurately reflects the nodes and tries visited.
     #[inline]
@@ -786,7 +1132,7 @@ impl<T: MarfTrieId> TrieCursor<T> {
         self.node_ptrs.pop();
         self.block_hashes.pop();
 
-        self.nodes.push(node.clone());
+        self.nodes.push(TrieCursorNode::Materialized(node.clone()));
         self.node_ptrs.push(*ptr);
         self.block_hashes.push(hash.clone());
 
@@ -824,7 +1170,33 @@ impl<T: MarfTrieId> TrieCursor<T> {
         self.node_ptrs.push(backptr);
         self.block_hashes.push(block_hash);
 
-        self.nodes.push(next_node.clone());
+        self.nodes
+            .push(TrieCursorNode::Materialized(next_node.clone()));
+    }
+
+    #[inline]
+    pub fn repair_backptr_step_backptr_deferred(&mut self, ptr: &TriePtr, block_hash: T) {
+        if Some(CursorError::ChrNotFound) == self.last_error
+            || Some(CursorError::PathDiverged) == self.last_error
+        {
+            eprintln!("{:?}", &self.last_error);
+            panic!();
+        }
+
+        trace!(
+            "Cursor: repair_backptr_step_backptr_deferred ptr={:?} block_hash={:?}",
+            ptr,
+            &block_hash
+        );
+
+        let backptr = TriePtr::new(set_backptr(ptr.id()), ptr.chr(), ptr.ptr());
+        self.node_ptrs.push(backptr);
+        self.block_hashes.push(block_hash.clone());
+        self.nodes
+            .push(TrieCursorNode::Handle(CursorNodeHandle::Persisted {
+                ptr: *ptr,
+                block_hash,
+            }));
     }
 
     /// Record that we landed on a non-backptr from a backptr.
@@ -1016,6 +1388,46 @@ impl TrieNode48 {
             cowptr: None,
             patches: vec![],
         }
+    }
+
+    pub fn indexes(&self) -> &[i8; 256] {
+        &self.indexes
+    }
+
+    fn validate_indexes(
+        ptrs_slice: &[TriePtr; 48],
+        indexes_slice: &[i8; 256],
+    ) -> Result<(), Error> {
+        // SAFETY: ptr.chr() is a u8, so it is always in bounds for the 256-entry index array.
+        #[allow(clippy::indexing_slicing)]
+        let all_ptrs_valid = ptrs_slice.iter().all(|ptr| {
+            ptr.is_empty()
+                || indexes_slice[ptr.chr() as usize] >= 0 && indexes_slice[ptr.chr() as usize] < 48
+        });
+
+        if !all_ptrs_valid {
+            return Err(Error::CorruptionError(
+                "Node48: corrupt index array: invalid index value".to_string(),
+            ));
+        }
+
+        let all_indexes_valid = indexes_slice.iter().all(|index| {
+            let Ok(index) = usize::try_from(*index) else {
+                return true;
+            };
+            let Some(ptr) = ptrs_slice.get(index) else {
+                return false;
+            };
+            !ptr.is_empty()
+        });
+
+        if !all_indexes_valid {
+            return Err(Error::CorruptionError(
+                "Node48: corrupt index array: index points to empty node".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Promote a node16 to a node48
@@ -1230,7 +1642,7 @@ impl StacksMessageCodec for TrieNodePatch {
 }
 
 /// Turn each non-empty, non-backptr in `ptrs` into a backptr pointing at `child_block_id`
-pub(crate) fn node_copy_update_ptrs(ptrs: &mut [TriePtr], child_block_id: u32) {
+pub fn node_copy_update_ptrs(ptrs: &mut [TriePtr], child_block_id: u32) {
     for pointer in ptrs.iter_mut() {
         // if the node is empty, do nothing, if it's a back pointer,
         if pointer.id() == TrieNodeID::Empty as u8 || is_backptr(pointer.id()) {
@@ -1423,6 +1835,36 @@ impl TrieNodePatch {
         Some(patch)
     }
 
+    /// Create a patch from a borrowed node reference to another node. If they're not the same
+    /// nodetype, then this function returns None.
+    pub fn try_from_noderef(
+        old_node_ptr: TriePtr,
+        old_node: TrieNodeRef<'_>,
+        new_node: &TrieNodeType,
+    ) -> Option<Self> {
+        if clear_ctrl_bits(old_node.id()) != clear_ctrl_bits(new_node.id()) {
+            trace!("Cannot produce TrieNodePatch: old node and new node are not the same type!");
+            return None;
+        }
+
+        if old_node.is_leaf() {
+            trace!("Cannot produce TrieNodePatch: old node and new node are type leaf!");
+            return None;
+        }
+
+        let patch = Self {
+            ptr: old_node_ptr,
+            ptr_diff: Self::make_ptr_diff(&old_node_ptr, old_node.ptrs(), new_node.ptrs()),
+        };
+
+        if patch.ptr_diff.is_empty() {
+            trace!("Cannot produce TrieNodePatch: patch has no diffs!");
+            return None;
+        }
+
+        Some(patch)
+    }
+
     /// Create a patch from one patch to a node
     pub fn try_from_patch(
         old_patch_ptr: TriePtr,
@@ -1448,23 +1890,58 @@ impl TrieNodePatch {
 
     /// Apply this patch to a node4, given the node, block ID where the patch was found, and block
     /// ID where the node was written.
+    pub fn apply_node4_in_place(
+        &self,
+        old_node: &mut TrieNode4,
+        patch_block_id: u32,
+        cur_block_id: u32,
+    ) -> bool {
+        trace!("Apply patch {self:?} read from block ID {patch_block_id} to {old_node:?}");
+        node_copy_update_ptrs(&mut old_node.ptrs, self.ptr.back_block);
+        for ptr in self.ptr_diff.iter() {
+            if !old_node.insert(ptr) {
+                return false;
+            }
+        }
+        node_copy_update_ptrs(&mut old_node.ptrs, patch_block_id);
+        node_normalize_ptrs(&mut old_node.ptrs, cur_block_id);
+        trace!("Patched up to {old_node:?}");
+        true
+    }
+
+    /// Apply this patch to a node4, given the node, block ID where the patch was found, and block
+    /// ID where the node was written.
     pub fn apply_node4(
         &self,
         mut old_node: TrieNode4,
         patch_block_id: u32,
         cur_block_id: u32,
     ) -> Option<TrieNode4> {
+        if !self.apply_node4_in_place(&mut old_node, patch_block_id, cur_block_id) {
+            return None;
+        }
+        Some(old_node)
+    }
+
+    /// Apply this patch to a node16, given the node, block ID where the patch was found, and block
+    /// ID where the node was written.
+    pub fn apply_node16_in_place(
+        &self,
+        old_node: &mut TrieNode16,
+        patch_block_id: u32,
+        cur_block_id: u32,
+    ) -> bool {
         trace!("Apply patch {self:?} read from block ID {patch_block_id} to {old_node:?}");
         node_copy_update_ptrs(&mut old_node.ptrs, self.ptr.back_block);
         for ptr in self.ptr_diff.iter() {
             if !old_node.insert(ptr) {
-                return None;
+                return false;
             }
         }
         node_copy_update_ptrs(&mut old_node.ptrs, patch_block_id);
         node_normalize_ptrs(&mut old_node.ptrs, cur_block_id);
         trace!("Patched up to {old_node:?}");
-        Some(old_node)
+        true
     }
 
     /// Apply this patch to a node16, given the node, block ID where the patch was found, and block
@@ -1475,17 +1952,31 @@ impl TrieNodePatch {
         patch_block_id: u32,
         cur_block_id: u32,
     ) -> Option<TrieNode16> {
+        if !self.apply_node16_in_place(&mut old_node, patch_block_id, cur_block_id) {
+            return None;
+        }
+        Some(old_node)
+    }
+
+    /// Apply this patch to a node48, given the node, block ID where the patch was found, and block
+    /// ID where the node was written.
+    pub fn apply_node48_in_place(
+        &self,
+        old_node: &mut TrieNode48,
+        patch_block_id: u32,
+        cur_block_id: u32,
+    ) -> bool {
         trace!("Apply patch {self:?} read from block ID {patch_block_id} to {old_node:?}");
         node_copy_update_ptrs(&mut old_node.ptrs, self.ptr.back_block);
         for ptr in self.ptr_diff.iter() {
             if !old_node.insert(ptr) {
-                return None;
+                return false;
             }
         }
         node_copy_update_ptrs(&mut old_node.ptrs, patch_block_id);
         node_normalize_ptrs(&mut old_node.ptrs, cur_block_id);
         trace!("Patched up to {old_node:?}");
-        Some(old_node)
+        true
     }
 
     /// Apply this patch to a node48, given the node, block ID where the patch was found, and block
@@ -1496,17 +1987,31 @@ impl TrieNodePatch {
         patch_block_id: u32,
         cur_block_id: u32,
     ) -> Option<TrieNode48> {
+        if !self.apply_node48_in_place(&mut old_node, patch_block_id, cur_block_id) {
+            return None;
+        }
+        Some(old_node)
+    }
+
+    /// Apply this patch to a node256, given the node, block ID where the patch was found, and block
+    /// ID where the node was written.
+    pub fn apply_node256_in_place(
+        &self,
+        old_node: &mut TrieNode256,
+        patch_block_id: u32,
+        cur_block_id: u32,
+    ) -> bool {
         trace!("Apply patch {self:?} read from block ID {patch_block_id} to {old_node:?}");
         node_copy_update_ptrs(&mut old_node.ptrs, self.ptr.back_block);
         for ptr in self.ptr_diff.iter() {
             if !old_node.insert(ptr) {
-                return None;
+                return false;
             }
         }
         node_copy_update_ptrs(&mut old_node.ptrs, patch_block_id);
         node_normalize_ptrs(&mut old_node.ptrs, cur_block_id);
         trace!("Patched up to {old_node:?}");
-        Some(old_node)
+        true
     }
 
     /// Apply this patch to a node256, given the node, block ID where the patch was found, and block
@@ -1517,16 +2022,9 @@ impl TrieNodePatch {
         patch_block_id: u32,
         cur_block_id: u32,
     ) -> Option<TrieNode256> {
-        trace!("Apply patch {self:?} read from block ID {patch_block_id} to {old_node:?}");
-        node_copy_update_ptrs(&mut old_node.ptrs, self.ptr.back_block);
-        for ptr in self.ptr_diff.iter() {
-            if !old_node.insert(ptr) {
-                return None;
-            }
+        if !self.apply_node256_in_place(&mut old_node, patch_block_id, cur_block_id) {
+            return None;
         }
-        node_copy_update_ptrs(&mut old_node.ptrs, patch_block_id);
-        node_normalize_ptrs(&mut old_node.ptrs, cur_block_id);
-        trace!("Patched up to {old_node:?}");
         Some(old_node)
     }
 
@@ -1546,6 +2044,54 @@ impl TrieNodePatch {
         sz
     }
 
+    /// Load a TrieNodePatch from a byte slice.
+    /// Returns the number of bytes consumed on success.
+    pub fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let id = *bytes
+            .first()
+            .ok_or_else(|| Error::CorruptionError("Failed to read patch node ID".to_string()))?;
+        if id != TrieNodeID::Patch as u8 {
+            return Err(Error::CorruptionError(
+                "Did not read a TrieNodeID::Patch".to_string(),
+            ));
+        }
+
+        let mut offset = 1;
+        let (ptr, ptr_consumed) =
+            TriePtr::from_slice_compressed(bytes.get(offset..).ok_or_else(|| {
+                Error::CorruptionError("Patch ptr starts past encoded node bytes".to_string())
+            })?)?;
+        self.ptr = ptr;
+        offset = offset
+            .checked_add(ptr_consumed)
+            .ok_or(Error::OverflowError)?;
+
+        let num_ptrs_norm = *bytes
+            .get(offset)
+            .ok_or_else(|| Error::CorruptionError("Failed to read patch diff length".to_string()))?
+            as usize;
+        offset = offset.checked_add(1).ok_or(Error::OverflowError)?;
+        let num_ptrs = num_ptrs_norm.checked_add(1).ok_or(Error::OverflowError)?;
+
+        self.ptr_diff.clear();
+        if self.ptr_diff.capacity() < num_ptrs {
+            self.ptr_diff.reserve(num_ptrs - self.ptr_diff.capacity());
+        }
+        for _ in 0..num_ptrs {
+            let (ptr, ptr_consumed) =
+                TriePtr::from_slice_compressed(bytes.get(offset..).ok_or_else(|| {
+                    Error::CorruptionError(
+                        "Patch diff ptr starts past encoded node bytes".to_string(),
+                    )
+                })?)?;
+            self.ptr_diff.push(ptr);
+            offset = offset
+                .checked_add(ptr_consumed)
+                .ok_or(Error::OverflowError)?;
+        }
+        Ok(offset)
+    }
+
     /// Load a TrieNodePatch from a Read object
     /// Returns Ok(Self) on success
     /// Returns Err(codec_error::*) on failure to decode the bytes
@@ -1553,6 +2099,15 @@ impl TrieNodePatch {
     pub fn from_bytes<R: Read>(f: &mut R) -> Result<Self, Error> {
         Self::consensus_deserialize(f)
             .map_err(|e| Error::CorruptionError(format!("Codec error: {e:?}")))
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<(Self, usize), Error> {
+        let mut patch = Self {
+            ptr: TriePtr::default(),
+            ptr_diff: Vec::new(),
+        };
+        let consumed = patch.load_from_slice(bytes)?;
+        Ok((patch, consumed))
     }
 }
 
@@ -1579,17 +2134,16 @@ impl TrieNode for TrieNode4 {
         None
     }
 
-    fn from_bytes<R: Read + Seek>(r: &mut R) -> Result<TrieNode4, Error> {
-        let mut ptrs_slice = [TriePtr::default(); 4];
-        ptrs_from_bytes(TrieNodeID::Node4 as u8, r, &mut ptrs_slice)?;
-        let path = path_from_bytes(r)?;
-
-        Ok(TrieNode4 {
-            path,
-            ptrs: ptrs_slice,
-            cowptr: None,
-            patches: vec![],
-        })
+    fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let (_, ptrs_consumed) =
+            bits::ptrs_from_slice_into(TrieNodeID::Node4 as u8, bytes, &mut self.ptrs)?;
+        let remaining = bytes.get(ptrs_consumed..).ok_or_else(|| {
+            Error::CorruptionError("Node4: path starts past encoded node bytes".to_string())
+        })?;
+        let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
+        self.cowptr = None;
+        self.patches.clear();
+        Ok(ptrs_consumed + path_consumed)
     }
 
     fn insert(&mut self, ptr: &TriePtr) -> bool {
@@ -1676,18 +2230,16 @@ impl TrieNode for TrieNode16 {
         None
     }
 
-    fn from_bytes<R: Read + Seek>(r: &mut R) -> Result<TrieNode16, Error> {
-        let mut ptrs_slice = [TriePtr::default(); 16];
-        ptrs_from_bytes(TrieNodeID::Node16 as u8, r, &mut ptrs_slice)?;
-
-        let path = path_from_bytes(r)?;
-
-        Ok(TrieNode16 {
-            path,
-            ptrs: ptrs_slice,
-            cowptr: None,
-            patches: vec![],
-        })
+    fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let (_, ptrs_consumed) =
+            bits::ptrs_from_slice_into(TrieNodeID::Node16 as u8, bytes, &mut self.ptrs)?;
+        let remaining = bytes.get(ptrs_consumed..).ok_or_else(|| {
+            Error::CorruptionError("Node16: path starts past encoded node bytes".to_string())
+        })?;
+        let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
+        self.cowptr = None;
+        self.patches.clear();
+        Ok(ptrs_consumed + path_consumed)
     }
 
     fn insert(&mut self, ptr: &TriePtr) -> bool {
@@ -1786,7 +2338,7 @@ impl TrieNode for TrieNode48 {
             w.write_all(&[*i as u8])?;
         }
 
-        write_path_to_bytes(self.path().as_slice(), w)
+        bits::write_path_to_bytes(self.path().as_slice(), w)
     }
 
     fn write_bytes_compressed<W: Write>(&self, w: &mut W) -> Result<(), Error> {
@@ -1797,68 +2349,45 @@ impl TrieNode for TrieNode48 {
             w.write_all(&[*i as u8])?;
         }
 
-        write_path_to_bytes(self.path().as_slice(), w)
+        bits::write_path_to_bytes(self.path().as_slice(), w)
     }
 
     fn byte_len(&self) -> usize {
-        get_ptrs_byte_len(&self.ptrs) + 256 + get_path_byte_len(&self.path)
+        bits::get_ptrs_byte_len(&self.ptrs) + 256 + bits::get_path_byte_len(&self.path)
     }
 
     fn byte_len_compressed(&self) -> usize {
-        get_ptrs_byte_len_compressed(self.id(), &self.ptrs) + 256 + get_path_byte_len(&self.path)
+        bits::get_ptrs_byte_len_compressed(self.id(), &self.ptrs)
+            + 256
+            + bits::get_path_byte_len(&self.path)
     }
 
-    #[allow(clippy::indexing_slicing)]
-    fn from_bytes<R: Read + Seek>(r: &mut R) -> Result<TrieNode48, Error> {
-        let mut ptrs_slice = [TriePtr::default(); 48];
-        ptrs_from_bytes(TrieNodeID::Node48 as u8, r, &mut ptrs_slice)?;
+    fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let (_, ptrs_consumed) =
+            bits::ptrs_from_slice_into(TrieNodeID::Node48 as u8, bytes, &mut self.ptrs)?;
 
-        let mut indexes = [0u8; 256];
-        r.read_exact(&mut indexes).inspect_err(|e| {
-            error!("I/O error reading TrieNode48 indexes: {e:?}");
+        let indexes_bytes = bytes
+            .get(ptrs_consumed..ptrs_consumed + 256)
+            .ok_or_else(|| {
+                Error::CorruptionError("I/O error reading TrieNode48 indexes".to_string())
+            })?;
+        let mut indexes = [0i8; 256];
+        for (dst, src) in indexes.iter_mut().zip(indexes_bytes.iter()) {
+            *dst = *src as i8;
+        }
+
+        let path_offset = ptrs_consumed + 256;
+        let remaining = bytes.get(path_offset..).ok_or_else(|| {
+            Error::CorruptionError("Node48: path starts past encoded node bytes".to_string())
         })?;
+        let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
 
-        let path = path_from_bytes(r)?;
+        Self::validate_indexes(&self.ptrs, &indexes)?;
 
-        let indexes_slice: [i8; 256] = indexes.map(|i| i as i8);
-
-        let all_ptrs_valid = ptrs_slice.iter().all(|ptr| {
-            ptr.is_empty()
-                || indexes_slice[ptr.chr() as usize] >= 0 && indexes_slice[ptr.chr() as usize] < 48
-        });
-        if !all_ptrs_valid {
-            return Err(Error::CorruptionError(
-                "Node48: corrupt index array: invalid index value".to_string(),
-            ));
-        }
-
-        let all_indexes_valid = indexes_slice.iter().all(|index| {
-            let Ok(index) = usize::try_from(*index) else {
-                // if the index is < 0, then no corresponding ptr is
-                // stored in the slice and so the index is valid
-                return true;
-            };
-            let Some(ptr) = ptrs_slice.get(index) else {
-                // if the index is out of bounds, it is invalid
-                return false;
-            };
-            // if the index references a pointer, it must reference a
-            // non-empty one
-            !ptr.is_empty()
-        });
-        if !all_indexes_valid {
-            return Err(Error::CorruptionError(
-                "Node48: corrupt index array: index points to empty node".to_string(),
-            ));
-        }
-
-        Ok(TrieNode48 {
-            path,
-            indexes: indexes_slice,
-            ptrs: ptrs_slice,
-            cowptr: None,
-            patches: vec![],
-        })
+        self.indexes = indexes;
+        self.cowptr = None;
+        self.patches.clear();
+        Ok(path_offset + path_consumed)
     }
 
     #[allow(clippy::indexing_slicing)]
@@ -1940,7 +2469,6 @@ impl TrieNode for TrieNode256 {
         }
     }
 
-    #[allow(clippy::indexing_slicing)]
     fn walk(&self, chr: u8) -> Option<TriePtr> {
         let ptr = self.ptrs.get(chr as usize)?;
         if ptr.is_empty() {
@@ -1949,18 +2477,16 @@ impl TrieNode for TrieNode256 {
         Some(*ptr)
     }
 
-    fn from_bytes<R: Read + Seek>(r: &mut R) -> Result<TrieNode256, Error> {
-        let mut ptrs_slice = [TriePtr::default(); 256];
-        ptrs_from_bytes(TrieNodeID::Node256 as u8, r, &mut ptrs_slice)?;
-
-        let path = path_from_bytes(r)?;
-
-        Ok(TrieNode256 {
-            path,
-            ptrs: ptrs_slice,
-            cowptr: None,
-            patches: vec![],
-        })
+    fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let (_, ptrs_consumed) =
+            bits::ptrs_from_slice_into(TrieNodeID::Node256 as u8, bytes, &mut self.ptrs)?;
+        let remaining = bytes.get(ptrs_consumed..).ok_or_else(|| {
+            Error::CorruptionError("Node256: path starts past encoded node bytes".to_string())
+        })?;
+        let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
+        self.cowptr = None;
+        self.patches.clear();
+        Ok(ptrs_consumed + path_consumed)
     }
 
     #[allow(clippy::indexing_slicing)]
@@ -2036,54 +2562,50 @@ impl TrieNode for TrieLeaf {
 
     fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
-        write_path_to_bytes(&self.path, w)?;
+        bits::write_path_to_bytes(&self.path, w)?;
         w.write_all(&self.data.0[..])?;
         Ok(())
     }
 
     fn write_bytes_compressed<W: Write>(&self, w: &mut W) -> Result<(), Error> {
         w.write_all(&[self.id()])?;
-        write_path_to_bytes(&self.path, w)?;
+        bits::write_path_to_bytes(&self.path, w)?;
         w.write_all(&self.data.0[..])?;
         Ok(())
     }
 
     fn byte_len(&self) -> usize {
-        1 + get_path_byte_len(&self.path) + self.data.len()
+        1 + bits::get_path_byte_len(&self.path) + self.data.len()
     }
 
     fn byte_len_compressed(&self) -> usize {
-        1 + get_path_byte_len(&self.path) + self.data.len()
+        1 + bits::get_path_byte_len(&self.path) + self.data.len()
     }
 
-    fn from_bytes<R: Read + Seek>(r: &mut R) -> Result<TrieLeaf, Error> {
-        let mut idbuf = [0u8; 1];
-        r.read_exact(&mut idbuf).inspect_err(|e| {
-            error!("I/O error reading TrieLeaf ID: {e:?}");
-        })?;
+    fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let id = *bytes
+            .first()
+            .ok_or_else(|| Error::CorruptionError("Leaf: missing node ID byte".to_string()))?;
 
-        if clear_ctrl_bits(idbuf[0]) != TrieNodeID::Leaf as u8 {
-            return Err(Error::CorruptionError(format!(
-                "Leaf: bad ID 0x{:02x}",
-                idbuf[0]
-            )));
+        if clear_ctrl_bits(id) != TrieNodeID::Leaf as u8 {
+            return Err(Error::CorruptionError(format!("Leaf: bad ID 0x{:02x}", id)));
         }
 
-        let path = path_from_bytes(r)?;
-        let mut leaf_data = [0u8; MARF_VALUE_ENCODED_SIZE as usize];
-
-        r.read_exact(&mut leaf_data).inspect_err(|e| {
-            error!(
-                "I/O error reading TrieLeaf data: {e:?}. Got idbuf = {:02x}, path = {}",
-                &idbuf[0],
-                &to_hex(&path)
-            );
+        let remaining = bytes.get(1..).ok_or_else(|| {
+            Error::CorruptionError("Leaf: missing encoded path bytes".to_string())
         })?;
+        let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
 
-        Ok(TrieLeaf {
-            path,
-            data: MARFValue(leaf_data),
-        })
+        let data_start = 1 + path_consumed;
+        let data_end = data_start
+            .checked_add(self.data.0.len())
+            .ok_or(Error::OverflowError)?;
+        let data_bytes = bytes.get(data_start..data_end).ok_or_else(|| {
+            Error::CorruptionError("Leaf: not enough bytes for MARF value".to_string())
+        })?;
+        self.data.0.copy_from_slice(data_bytes);
+
+        Ok(data_end)
     }
 
     fn insert(&mut self, _ptr: &TriePtr) -> bool {
@@ -2131,6 +2653,191 @@ pub enum TrieNodeType {
     Node48(Box<TrieNode48>),
     Node256(Box<TrieNode256>),
     Leaf(TrieLeaf),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TrieLeafRef<'a> {
+    pub path: &'a [u8],
+    pub data: &'a MARFValue,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum TrieNodeRef<'a> {
+    Node4 {
+        path: &'a [u8],
+        ptrs: &'a [TriePtr; 4],
+    },
+    Node16 {
+        path: &'a [u8],
+        ptrs: &'a [TriePtr; 16],
+    },
+    Node48 {
+        path: &'a [u8],
+        indexes: &'a [i8; 256],
+        ptrs: &'a [TriePtr; 48],
+    },
+    Node256 {
+        path: &'a [u8],
+        ptrs: &'a [TriePtr; 256],
+    },
+    Leaf(TrieLeafRef<'a>),
+}
+
+impl<'a> TrieNodeRef<'a> {
+    pub fn is_leaf(&self) -> bool {
+        matches!(self, Self::Leaf(_))
+    }
+
+    pub fn is_node256(&self) -> bool {
+        matches!(self, Self::Node256 { .. })
+    }
+
+    pub fn id(&self) -> u8 {
+        match self {
+            Self::Node4 { .. } => TrieNodeID::Node4 as u8,
+            Self::Node16 { .. } => TrieNodeID::Node16 as u8,
+            Self::Node48 { .. } => TrieNodeID::Node48 as u8,
+            Self::Node256 { .. } => TrieNodeID::Node256 as u8,
+            Self::Leaf(_) => TrieNodeID::Leaf as u8,
+        }
+    }
+
+    pub fn ptrs(&self) -> &[TriePtr] {
+        match self {
+            Self::Node4 { ptrs, .. } => &ptrs[..],
+            Self::Node16 { ptrs, .. } => &ptrs[..],
+            Self::Node48 { ptrs, .. } => &ptrs[..],
+            Self::Node256 { ptrs, .. } => &ptrs[..],
+            Self::Leaf(_) => &[],
+        }
+    }
+
+    pub fn path_bytes(&self) -> &[u8] {
+        match self {
+            Self::Node4 { path, .. } => path,
+            Self::Node16 { path, .. } => path,
+            Self::Node48 { path, .. } => path,
+            Self::Node256 { path, .. } => path,
+            Self::Leaf(leaf) => leaf.path,
+        }
+    }
+
+    pub fn walk(&self, chr: u8) -> Option<TriePtr> {
+        match self {
+            Self::Node4 { ptrs, .. } => {
+                for ptr in ptrs.iter() {
+                    if !ptr.is_empty() && ptr.chr() == chr {
+                        return Some(*ptr);
+                    }
+                }
+                None
+            }
+            Self::Node16 { ptrs, .. } => {
+                for ptr in ptrs.iter() {
+                    if !ptr.is_empty() && ptr.chr() == chr {
+                        return Some(*ptr);
+                    }
+                }
+                None
+            }
+            Self::Node48 { indexes, ptrs, .. } => {
+                // SAFETY: chr is a u8, so it always indexes the 256-entry index table.
+                #[allow(clippy::indexing_slicing)]
+                let ptr_index = indexes[chr as usize];
+                if ptr_index >= 0 {
+                    // SAFETY: Node48 invariants guarantee non-negative index entries are in 0..48.
+                    #[allow(clippy::indexing_slicing)]
+                    Some(ptrs[ptr_index as usize])
+                } else {
+                    None
+                }
+            }
+            Self::Node256 { ptrs, .. } => {
+                // SAFETY: chr is a u8, so it always indexes the 256-entry pointer array.
+                #[allow(clippy::indexing_slicing)]
+                let ptr = ptrs[chr as usize];
+                if !ptr.is_empty() {
+                    Some(ptr)
+                } else {
+                    None
+                }
+            }
+            Self::Leaf(_) => None,
+        }
+    }
+
+    pub fn as_leaf(&self) -> Option<TrieLeafRef<'a>> {
+        match self {
+            Self::Leaf(leaf) => Some(*leaf),
+            _ => None,
+        }
+    }
+
+    pub fn to_owned_node(&self) -> TrieNodeType {
+        match self {
+            Self::Node4 { path, ptrs } => TrieNodeType::Node4(TrieNode4 {
+                path: path.to_vec(),
+                ptrs: **ptrs,
+                cowptr: None,
+                patches: vec![],
+            }),
+            Self::Node16 { path, ptrs } => TrieNodeType::Node16(TrieNode16 {
+                path: path.to_vec(),
+                ptrs: **ptrs,
+                cowptr: None,
+                patches: vec![],
+            }),
+            Self::Node48 {
+                path,
+                indexes,
+                ptrs,
+            } => TrieNodeType::Node48(Box::new(TrieNode48 {
+                path: path.to_vec(),
+                indexes: **indexes,
+                ptrs: **ptrs,
+                cowptr: None,
+                patches: vec![],
+            })),
+            Self::Node256 { path, ptrs } => TrieNodeType::Node256(Box::new(TrieNode256 {
+                path: path.to_vec(),
+                ptrs: **ptrs,
+                cowptr: None,
+                patches: vec![],
+            })),
+            Self::Leaf(leaf) => TrieNodeType::Leaf(TrieLeaf {
+                path: leaf.path.to_vec(),
+                data: leaf.data.clone(),
+            }),
+        }
+    }
+}
+
+impl<'a> From<&'a TrieNodeType> for TrieNodeRef<'a> {
+    fn from(node: &'a TrieNodeType) -> Self {
+        match node {
+            TrieNodeType::Node4(data) => Self::Node4 {
+                path: data.path.as_slice(),
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Node16(data) => Self::Node16 {
+                path: data.path.as_slice(),
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Node48(data) => Self::Node48 {
+                path: data.path.as_slice(),
+                indexes: data.indexes(),
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Node256(data) => Self::Node256 {
+                path: data.path.as_slice(),
+                ptrs: &data.ptrs,
+            },
+            TrieNodeType::Leaf(data) => Self::Leaf(TrieLeafRef {
+                path: data.path.as_slice(),
+                data: &data.data,
+            }),
+        }
+    }
 }
 
 macro_rules! with_node {

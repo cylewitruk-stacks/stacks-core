@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::hash::Hash;
+use std::sync::{Arc, OnceLock};
 use std::{error, fmt, io};
 
 use sha2::{Digest, Sha512_256 as TrieHasher};
@@ -24,6 +25,7 @@ use stacks_common::types::chainstate::{
     BurnchainHeaderHash, SortitionId, StacksBlockId, TrieHash, TRIEHASH_ENCODED_SIZE,
 };
 
+use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::util_lib::db::Error as db_error;
 
 pub mod bits;
@@ -33,6 +35,7 @@ pub mod marf;
 pub mod node;
 pub mod profile;
 pub mod proofs;
+pub mod scratch;
 pub mod storage;
 pub mod trie;
 pub mod trie_sql;
@@ -40,7 +43,9 @@ pub mod trie_sql;
 #[cfg(test)]
 pub mod test;
 
-use crate::chainstate::stacks::index::node::TrieNodePatch;
+use crate::chainstate::stacks::index::node::{
+    ParkedNodeHandle, TrieLeafRef, TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeType, TriePtr,
+};
 
 #[derive(Debug)]
 pub struct TrieMerkleProof<T: MarfTrieId>(pub Vec<TrieMerkleProofType<T>>);
@@ -162,6 +167,17 @@ impl_byte_array_newtype!(MARFValue, u8, 40);
 impl_byte_array_message_codec!(MARFValue, 40);
 pub const MARF_VALUE_ENCODED_SIZE: u32 = 40;
 
+impl From<String> for MARFValue {
+    #[inline]
+    fn from(s: String) -> Self {
+        let mut hasher = TrieHasher::new();
+        hasher.update(s.as_bytes());
+        let tmp = hasher.finalize().into();
+
+        MARFValue::from_value_hash_bytes(&tmp)
+    }
+}
+
 impl From<u32> for MARFValue {
     fn from(value: u32) -> MARFValue {
         let h = value.to_le_bytes();
@@ -220,6 +236,7 @@ impl MARFValue {
     }
 
     /// Construct from a String that encodes a value inserted into the underlying data store
+    #[inline]
     pub fn from_value(s: &str) -> MARFValue {
         let mut hasher = TrieHasher::new();
         hasher.update(s.as_bytes());
@@ -265,6 +282,492 @@ pub enum Error {
     OverflowError,
     Patch(Option<TrieHash>, TrieNodePatch),
     NodeTooDeep,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BorrowedNodeBytes<'a> {
+    node_type: TrieNodeID,
+    bytes: &'a [u8],
+}
+
+impl<'a> BorrowedNodeBytes<'a> {
+    pub fn new(node_type: TrieNodeID, bytes: &'a [u8]) -> Self {
+        Self { node_type, bytes }
+    }
+
+    pub fn node_type(&self) -> TrieNodeID {
+        self.node_type
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OwnedNodeBytes {
+    node_type: TrieNodeID,
+    bytes: Vec<u8>,
+}
+
+impl OwnedNodeBytes {
+    pub fn new(node_type: TrieNodeID, bytes: Vec<u8>) -> Self {
+        Self { node_type, bytes }
+    }
+
+    pub fn node_type(&self) -> TrieNodeID {
+        self.node_type
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum BytesBacking<'a> {
+    Borrowed(BorrowedNodeBytes<'a>),
+    Owned(OwnedNodeBytes),
+}
+
+impl<'a> BytesBacking<'a> {
+    pub fn node_type(&self) -> TrieNodeID {
+        match self {
+            BytesBacking::Borrowed(node) => node.node_type(),
+            BytesBacking::Owned(node) => node.node_type(),
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            BytesBacking::Borrowed(node) => node.bytes(),
+            BytesBacking::Owned(node) => node.bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ReadTrieItemKind<'a> {
+    Node(ReadTrieNode<'a>),
+    Patch(&'a TrieNodePatch),
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadTrieItem<'a> {
+    pub hash: Option<TrieHash>,
+    pub patch_depth: usize,
+    pub kind: ReadTrieItemKind<'a>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReadNodeBacking<'a> {
+    VolatileDecoded(TrieNodeRef<'a>),
+    PersistedDecoded(TrieNodeRef<'a>),
+    PersistedBytes(BytesBacking<'a>),
+    Owned(TrieNodeType),
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadTrieNode<'a> {
+    pub hash: Option<TrieHash>,
+    pub patch_depth: usize,
+    pub backing: ReadNodeBacking<'a>,
+    decoded_bytes: Arc<OnceLock<TrieNodeType>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadTrieNodeCursorStep {
+    Next(TriePtr),
+    EndOfPath { is_leaf: bool },
+    Diverged,
+    ChrNotFound,
+    FollowBackptr(TriePtr),
+}
+
+pub trait TrieNodeArena {
+    fn park<'a>(&'a mut self, node: TrieNodeType) -> TrieNodeRef<'a>;
+}
+
+/// Transitional marker trait — combines parking and patching capabilities.
+/// Not the target architecture: will be eliminated once all call sites declare
+/// their own specific bounds.
+pub trait TrieNodeReadState: NodeParking + NodePatching {}
+
+/// Blanket impl: any type implementing both capability traits satisfies this.
+impl<T: NodeParking + NodePatching> TrieNodeReadState for T {}
+
+/// Base capability trait: reusable byte-buffer and typed-slot decode workspace.
+///
+/// Implemented by types that can deserialize trie nodes from byte slices
+/// into pre-allocated internal storage, avoiding per-read allocation.
+pub trait NodeDecodeScratch {
+    /// Take ownership of the internal byte buffer (leaves an empty vec behind).
+    fn take_node_bytes(&mut self) -> Vec<u8>;
+    /// Return a previously-taken byte buffer for reuse.
+    fn restore_node_bytes(&mut self, bytes: Vec<u8>);
+
+    /// Decode a node of the given type from a byte slice into internal storage.
+    /// Returns the number of bytes consumed.
+    fn decode_node_from_slice(&mut self, id: TrieNodeID, bytes: &[u8]) -> Result<usize, Error>;
+    /// Decode a patch node from a byte slice into internal storage.
+    fn decode_patch_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error>;
+
+    /// Get a borrowed reference to the currently-decoded node.
+    fn get_ref(&self) -> TrieNodeRef<'_>;
+    /// Get the decoded patch node.
+    fn patch(&self) -> &TrieNodePatch;
+    /// Store an owned node as the current node and return a reference.
+    fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_>;
+    /// Clear the current decoded node slot.
+    fn clear_current_node(&mut self);
+    /// Check whether a node is currently decoded.
+    fn has_current_node(&self) -> bool;
+}
+
+/// Parking capability trait: keep decoded nodes alive across multiple storage reads.
+///
+/// When walking a trie, we often need to read a node, then read another node
+/// (which overwrites the decode scratch), while keeping the first node
+/// accessible. Parking moves a node into stable storage with a handle
+/// for later retrieval.
+///
+/// Note: `NodeParking` is intentionally independent of `TrieNodeArena`.
+/// `TrieNodeArena::park()` stores into the "current node" slot (ephemeral),
+/// while `NodeParking` methods use a separate parked-node vec (persistent
+/// across reads). These are distinct operations and should not be conflated.
+pub trait NodeParking: NodeDecodeScratch {
+    /// Move the currently-decoded node into parked storage.
+    fn park_current_node(&mut self) -> Result<ParkedNodeHandle, Error>;
+    /// Park an already-owned node.
+    fn park_owned_node(&mut self, node: TrieNodeType) -> ParkedNodeHandle;
+    /// Retrieve a reference to a previously-parked node.
+    fn get_parked_ref(&self, handle: ParkedNodeHandle) -> TrieNodeRef<'_>;
+    /// Clear all parked nodes (e.g., between top-level operations).
+    fn clear_parked_nodes(&mut self);
+}
+
+/// Patching capability trait: apply compressed patch nodes in-place to decoded nodes.
+///
+/// MARF compression stores "patch" nodes that record ptr diffs relative to
+/// a base node. The patching trait allows the storage layer to resolve a chain
+/// of patches by decoding the base node and applying patches in-place.
+pub trait NodePatching: NodeDecodeScratch {
+    /// Apply a sequence of patches to the currently-decoded node.
+    fn apply_patches_in_place(
+        &mut self,
+        patches: &[(u32, TriePtr, TrieNodePatch)],
+        cur_block_id: u32,
+    ) -> Result<(), Error>;
+}
+
+pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
+    fn read_node_with_state<'a, S: TrieNodeReadState>(
+        &'a mut self,
+        ptr: &TriePtr,
+        state: &'a mut S,
+    ) -> Result<ReadTrieNode<'a>, Error>;
+
+    fn open_block(&mut self, bhh: &T) -> Result<(), Error>;
+    fn open_block_maybe_id(&mut self, bhh: &T, id: Option<u32>) -> Result<(), Error> {
+        match id {
+            Some(id) => self.open_block_known_id(bhh, id),
+            None => self.open_block(bhh),
+        }
+    }
+    fn open_block_known_id(&mut self, bhh: &T, id: u32) -> Result<(), Error>;
+    fn get_cur_block(&self) -> T {
+        self.get_cur_block_and_id().0
+    }
+    fn get_cur_block_and_id(&self) -> (T, Option<u32>);
+    fn get_block_from_local_id(&mut self, local_id: u32) -> Result<T, Error> {
+        Ok(self.get_block_hash_caching(local_id)?.clone())
+    }
+    fn root_trieptr(&self) -> TriePtr;
+    fn read_node_hash(&mut self, ptr: &TriePtr) -> Result<TrieHash, Error>;
+    fn read_node_type_id(&mut self, ptr: &TriePtr) -> Result<(TrieNodeID, TrieHash), Error>;
+    fn set_cached_ancestor_hashes_bytes(&mut self, bhh: &T, bytes: Vec<TrieHash>);
+    fn check_cached_ancestor_hashes_bytes(&mut self, bhh: &T) -> Option<Vec<TrieHash>>;
+    #[cfg(test)]
+    fn test_genesis_block(&self) -> Option<T>;
+    fn write_children_hashes_by_ptrs<W: io::Write + ?Sized>(
+        &mut self,
+        ptrs: &[TriePtr],
+        w: &mut W,
+    ) -> Result<(), Error>;
+    fn bench_mut(&mut self) -> &mut crate::chainstate::stacks::index::profile::TrieBenchmark;
+}
+
+pub struct TrieReadSession<
+    'a,
+    T: MarfTrieId,
+    S: TrieNodeReadState,
+    R: TrieReadStorage<T> + ?Sized = TrieStorageConnection<'a, T>,
+> {
+    storage: &'a mut R,
+    state: &'a mut S,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>
+    TrieReadSession<'a, T, S, R>
+{
+    pub fn new(storage: &'a mut R, state: &'a mut S) -> Self {
+        Self {
+            storage,
+            state,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn storage(&mut self) -> &mut R {
+        self.storage
+    }
+
+    pub fn read_node<'b>(&'b mut self, ptr: &TriePtr) -> Result<ReadTrieNode<'b>, Error> {
+        self.storage.read_node_with_state(ptr, self.state)
+    }
+}
+
+impl<'a> ReadTrieItem<'a> {
+    pub fn from_node(node: ReadTrieNode<'a>) -> Self {
+        Self {
+            hash: node.hash,
+            patch_depth: node.patch_depth,
+            kind: ReadTrieItemKind::Node(node),
+        }
+    }
+
+    pub fn from_patch(patch: &'a TrieNodePatch, hash: Option<TrieHash>) -> Self {
+        Self {
+            hash,
+            patch_depth: 0,
+            kind: ReadTrieItemKind::Patch(patch),
+        }
+    }
+
+    pub fn is_patch(&self) -> bool {
+        matches!(&self.kind, ReadTrieItemKind::Patch(_))
+    }
+
+    pub fn as_patch(&self) -> Option<&TrieNodePatch> {
+        match &self.kind {
+            ReadTrieItemKind::Node(_) => None,
+            ReadTrieItemKind::Patch(patch) => Some(*patch),
+        }
+    }
+
+    pub fn into_node(self) -> Result<ReadTrieNode<'a>, Error> {
+        match self.kind {
+            ReadTrieItemKind::Node(node) => Ok(node),
+            ReadTrieItemKind::Patch(patch) => Err(Error::Patch(self.hash, patch.clone())),
+        }
+    }
+}
+
+impl<'a> ReadTrieNode<'a> {
+    fn new(hash: Option<TrieHash>, patch_depth: usize, backing: ReadNodeBacking<'a>) -> Self {
+        Self {
+            hash,
+            patch_depth,
+            backing,
+            decoded_bytes: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn patch_depth_from_owned(node: &TrieNodeType) -> usize {
+        if node.is_leaf() {
+            0
+        } else {
+            node.get_patches().len()
+        }
+    }
+
+    pub fn from_borrowed(node: TrieNodeRef<'a>, hash: Option<TrieHash>) -> Self {
+        Self::new(hash, 0, ReadNodeBacking::PersistedDecoded(node))
+    }
+
+    pub fn from_state_borrowed(node: TrieNodeRef<'a>, hash: Option<TrieHash>) -> Self {
+        Self::new(hash, 0, ReadNodeBacking::VolatileDecoded(node))
+    }
+
+    pub fn from_stable_bytes(node: BorrowedNodeBytes<'a>, hash: Option<TrieHash>) -> Self {
+        Self::new(
+            hash,
+            0,
+            ReadNodeBacking::PersistedBytes(BytesBacking::Borrowed(node)),
+        )
+    }
+
+    pub fn from_owned_bytes(node: OwnedNodeBytes, hash: Option<TrieHash>) -> Self {
+        Self::new(
+            hash,
+            0,
+            ReadNodeBacking::PersistedBytes(BytesBacking::Owned(node)),
+        )
+    }
+
+    pub fn from_owned(node: TrieNodeType, hash: Option<TrieHash>) -> Self {
+        let patch_depth = Self::patch_depth_from_owned(&node);
+        Self::new(hash, patch_depth, ReadNodeBacking::Owned(node))
+    }
+
+    pub fn node_type(&self) -> Option<TrieNodeID> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => TrieNodeID::from_u8(node.id()),
+            ReadNodeBacking::PersistedDecoded(node) => TrieNodeID::from_u8(node.id()),
+            ReadNodeBacking::PersistedBytes(node) => Some(node.node_type()),
+            ReadNodeBacking::Owned(node) => TrieNodeID::from_u8(node.id()),
+        }
+    }
+
+    pub fn node_type_u8(&self) -> u8 {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => node.id(),
+            ReadNodeBacking::PersistedDecoded(node) => node.id(),
+            ReadNodeBacking::PersistedBytes(node) => node.node_type() as u8,
+            ReadNodeBacking::Owned(node) => node.id(),
+        }
+    }
+
+    pub fn is_node256(&self) -> bool {
+        matches!(self.node_type(), Some(TrieNodeID::Node256))
+    }
+
+    /// Decode a `BytesBacking` node into an owned `TrieNodeType`.
+    /// Borrowed bytes (mmap) may be a prefix slice — uses prefix decode.
+    /// Owned bytes use exact-length decode with validation.
+    fn decode_bytes_to_node(&self, node: &BytesBacking<'_>) -> Result<TrieNodeType, Error> {
+        match node {
+            BytesBacking::Owned(_) => {
+                bits::decode_stable_node_bytes(node.bytes(), node.node_type())
+            }
+            BytesBacking::Borrowed(_) => {
+                let (decoded, _consumed) =
+                    bits::decode_nodetype_from_slice_at_head(node.bytes(), node.node_type() as u8)?;
+                Ok(decoded)
+            }
+        }
+    }
+
+    fn decoded_from_bytes(&self, node: &BytesBacking<'_>) -> Result<&TrieNodeType, Error> {
+        if let Some(decoded) = self.decoded_bytes.get() {
+            return Ok(decoded);
+        }
+
+        let decoded = self.decode_bytes_to_node(node)?;
+        let _ = self.decoded_bytes.set(decoded);
+        self.decoded_bytes.get().ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "Failed to cache decoded stable byte-backed {:?} node",
+                node.node_type()
+            ))
+        })
+    }
+
+    pub fn with_patch_depth(mut self, patch_depth: usize) -> Self {
+        self.patch_depth = patch_depth;
+        self
+    }
+
+    pub fn is_leaf(&self) -> Result<bool, Error> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok(node.is_leaf()),
+            ReadNodeBacking::PersistedDecoded(node) => Ok(node.is_leaf()),
+            ReadNodeBacking::PersistedBytes(node) => Ok(node.node_type() == TrieNodeID::Leaf),
+            ReadNodeBacking::Owned(node) => Ok(node.is_leaf()),
+        }
+    }
+
+    pub fn path_bytes(&self) -> Result<&[u8], Error> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok(node.path_bytes()),
+            ReadNodeBacking::PersistedDecoded(node) => Ok(node.path_bytes()),
+            ReadNodeBacking::PersistedBytes(node) => {
+                Ok(self.decoded_from_bytes(node)?.path_bytes())
+            }
+            ReadNodeBacking::Owned(node) => Ok(node.path_bytes().as_slice()),
+        }
+    }
+
+    pub fn ptrs(&self) -> Result<&[TriePtr], Error> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok(node.ptrs()),
+            ReadNodeBacking::PersistedDecoded(node) => Ok(node.ptrs()),
+            ReadNodeBacking::PersistedBytes(node) => Ok(self.decoded_from_bytes(node)?.ptrs()),
+            ReadNodeBacking::Owned(node) => Ok(node.ptrs()),
+        }
+    }
+
+    pub fn walk(&self, chr: u8) -> Result<Option<TriePtr>, Error> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok(node.walk(chr)),
+            ReadNodeBacking::PersistedDecoded(node) => Ok(node.walk(chr)),
+            ReadNodeBacking::PersistedBytes(node) => Ok(self.decoded_from_bytes(node)?.walk(chr)),
+            ReadNodeBacking::Owned(node) => Ok(node.walk(chr)),
+        }
+    }
+
+    pub fn as_leaf(&self) -> Result<Option<TrieLeafRef<'_>>, Error> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok(node.as_leaf()),
+            ReadNodeBacking::PersistedDecoded(node) => Ok(node.as_leaf()),
+            ReadNodeBacking::PersistedBytes(node) => Ok(match self.decoded_from_bytes(node)? {
+                TrieNodeType::Leaf(leaf) => Some(TrieLeafRef {
+                    path: leaf.path.as_slice(),
+                    data: &leaf.data,
+                }),
+                _ => None,
+            }),
+            ReadNodeBacking::Owned(node) => Ok(TrieNodeRef::from(node).as_leaf()),
+        }
+    }
+
+    pub fn as_node_ref(&self) -> Result<(TrieNodeRef<'_>, Option<TrieHash>), Error> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok((*node, self.hash)),
+            ReadNodeBacking::PersistedDecoded(node) => Ok((*node, self.hash)),
+            ReadNodeBacking::PersistedBytes(node) => {
+                Ok((TrieNodeRef::from(self.decoded_from_bytes(node)?), self.hash))
+            }
+            ReadNodeBacking::Owned(node) => Ok((TrieNodeRef::from(node), self.hash)),
+        }
+    }
+
+    pub fn park_in<A: TrieNodeArena>(
+        self,
+        arena: &'a mut A,
+    ) -> Result<(TrieNodeRef<'a>, Option<TrieHash>), Error> {
+        match self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok((node, self.hash)),
+            ReadNodeBacking::PersistedDecoded(node) => {
+                Ok((arena.park(node.to_owned_node()), self.hash))
+            }
+            ReadNodeBacking::PersistedBytes(ref node) => {
+                Ok((arena.park(self.decode_bytes_to_node(node)?), self.hash))
+            }
+            ReadNodeBacking::Owned(node) => Ok((arena.park(node), self.hash)),
+        }
+    }
+
+    pub fn into_owned_node(self) -> Result<(TrieNodeType, Option<TrieHash>), Error> {
+        match self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => Ok((node.to_owned_node(), self.hash)),
+            ReadNodeBacking::PersistedDecoded(node) => Ok((node.to_owned_node(), self.hash)),
+            ReadNodeBacking::PersistedBytes(ref node) => {
+                Ok((self.decode_bytes_to_node(node)?, self.hash))
+            }
+            ReadNodeBacking::Owned(node) => Ok((node, self.hash)),
+        }
+    }
+
+    pub fn into_hash(self) -> Result<Option<TrieHash>, Error> {
+        match self.backing {
+            ReadNodeBacking::VolatileDecoded(_)
+            | ReadNodeBacking::PersistedDecoded(_)
+            | ReadNodeBacking::PersistedBytes(_)
+            | ReadNodeBacking::Owned(_) => Ok(self.hash),
+        }
+    }
 }
 
 impl From<io::Error> for Error {

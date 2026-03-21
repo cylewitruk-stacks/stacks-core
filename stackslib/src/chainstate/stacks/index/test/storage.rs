@@ -18,7 +18,90 @@ use std::collections::VecDeque;
 use std::fs;
 
 use super::*;
+use crate::chainstate::stacks::index::node::ParkedNodeHandle;
+use crate::chainstate::stacks::index::scratch::MarfReadState;
+use crate::chainstate::stacks::index::test::marf::MarfTestExt;
 use crate::chainstate::stacks::index::*;
+
+struct CountingReadState {
+    scratch: MarfReadState,
+    decode_calls: usize,
+}
+
+impl CountingReadState {
+    fn new() -> Self {
+        Self {
+            scratch: MarfReadState::new(),
+            decode_calls: 0,
+        }
+    }
+}
+
+impl TrieNodeArena for CountingReadState {
+    fn park<'a>(&'a mut self, node: TrieNodeType) -> TrieNodeRef<'a> {
+        self.scratch.store(node)
+    }
+}
+
+// CountingReadState satisfies TrieNodeReadState automatically via the blanket
+// impl over NodeParking + NodePatching. The delegation below counts decode calls
+// for testing purposes.
+
+impl NodeDecodeScratch for CountingReadState {
+    fn take_node_bytes(&mut self) -> Vec<u8> {
+        self.decode_calls += 1;
+        self.scratch.take_node_bytes()
+    }
+    fn restore_node_bytes(&mut self, bytes: Vec<u8>) {
+        self.scratch.restore_node_bytes(bytes)
+    }
+    fn decode_node_from_slice(&mut self, id: TrieNodeID, bytes: &[u8]) -> Result<usize, Error> {
+        self.scratch.decode_node_from_slice(id, bytes)
+    }
+    fn decode_patch_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.scratch.decode_patch_from_slice(bytes)
+    }
+    fn get_ref(&self) -> TrieNodeRef<'_> {
+        self.scratch.get_ref()
+    }
+    fn patch(&self) -> &TrieNodePatch {
+        self.scratch.patch()
+    }
+    fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
+        self.scratch.store(node)
+    }
+    fn clear_current_node(&mut self) {
+        self.scratch.clear_current_node()
+    }
+    fn has_current_node(&self) -> bool {
+        self.scratch.has_current_node()
+    }
+}
+
+impl NodeParking for CountingReadState {
+    fn park_current_node(&mut self) -> Result<ParkedNodeHandle, Error> {
+        self.scratch.park_current_node()
+    }
+    fn park_owned_node(&mut self, node: TrieNodeType) -> ParkedNodeHandle {
+        self.scratch.park_owned_node(node)
+    }
+    fn get_parked_ref(&self, handle: ParkedNodeHandle) -> TrieNodeRef<'_> {
+        self.scratch.get_parked_ref(handle)
+    }
+    fn clear_parked_nodes(&mut self) {
+        self.scratch.clear_parked_nodes()
+    }
+}
+
+impl NodePatching for CountingReadState {
+    fn apply_patches_in_place(
+        &mut self,
+        patches: &[(u32, TriePtr, TrieNodePatch)],
+        cur_block_id: u32,
+    ) -> Result<(), Error> {
+        self.scratch.apply_patches_in_place(patches, cur_block_id)
+    }
+}
 
 fn ptrs_cmp(p1: &[TriePtr], p2: &[TriePtr]) -> bool {
     if p1.len() != p2.len() {
@@ -126,6 +209,29 @@ fn trie_cmp<T: MarfTrieId>(
     return true;
 }
 
+#[test]
+fn trie_ram_read_node_returns_borrowed_view() {
+    let block = StacksBlockId([0x11; 32]);
+    let parent = StacksBlockId::sentinel();
+    let mut trie = TrieRAM::new(&block, 1, &parent);
+
+    let node = TrieNodeType::Leaf(TrieLeaf::from_value(&[0xaa, 0xbb], MARFValue::from(7u32)));
+    let hash = TrieHash::from_data(&[0x55; 8]);
+    trie.write_nodetype(0, &node, hash).unwrap();
+
+    let read = trie
+        .read_node(&TriePtr::new(TrieNodeID::Leaf as u8, 0, 0))
+        .unwrap();
+
+    assert_eq!(read.hash, Some(hash));
+    match read.backing {
+        ReadNodeBacking::PersistedDecoded(node_ref) => {
+            assert_eq!(node_ref.to_owned_node(), node);
+        }
+        other => panic!("expected borrowed TrieRAM read, got {other:?}"),
+    }
+}
+
 fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
     let test_name = format!(
         "/tmp/load_store_trie_{}_{}_{}",
@@ -205,12 +311,9 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
 
             let path = TrieHash::from_bytes(&path_bytes).unwrap();
 
-            // NOTE: may have been overwritten; just check for presence
-            assert!(
-                MARF::get_path(&mut marf.borrow_storage_backend(), &unconfirmed_tip, &path)
-                    .unwrap()
-                    .is_some()
-            );
+            // NOTE: may have been overwritten; just check for presence. This test helper will panic
+            // if the path is not found, which is what we want to test here.
+            marf.internals().expect_path(&unconfirmed_tip, &path);
         }
 
         // insert new keys
@@ -230,11 +333,7 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
 
             new_inserted.push((path, value.clone()));
 
-            if let Ok(Some(_)) = MARF::get_path(
-                &mut confirmed_marf.borrow_storage_backend(),
-                &confirmed_tip,
-                &path,
-            ) {
+            if let Ok(Some(_)) = marf.internals().get_path(&confirmed_tip, &path) {
             } else {
                 all_new_paths.push(path);
             }
@@ -244,9 +343,7 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
 
         // verify that all new keys are there, off the unconfirmed tip
         for (path, expected_value) in new_inserted.iter() {
-            let value = MARF::get_path(&mut marf.borrow_storage_backend(), &unconfirmed_tip, path)
-                .unwrap()
-                .unwrap();
+            let value = marf.internals().expect_path(&unconfirmed_tip, path);
             assert_eq!(expected_value.data, value.data);
         }
 
@@ -271,18 +368,17 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
     // test rollback
     for path in all_new_paths.iter() {
         eprintln!("path present? {path:?}");
-        assert!(
-            MARF::get_path(&mut marf.borrow_storage_backend(), &unconfirmed_tip, path)
-                .unwrap()
-                .is_some()
-        );
+        // This will panic if the path is not found, which is what we want to test here.
+        marf.internals().expect_path(&unconfirmed_tip, path);
     }
 
     marf.drop_unconfirmed();
 
     for path in all_new_paths.iter() {
         eprintln!("path absent?  {path:?}");
-        assert!(MARF::get_path(&mut marf.borrow_storage_backend(), &confirmed_tip, path).is_err());
+        marf.internals()
+            .get_path(&confirmed_tip, path)
+            .expect_err("path should not be found after dropping unconfirmed trie");
     }
 }
 

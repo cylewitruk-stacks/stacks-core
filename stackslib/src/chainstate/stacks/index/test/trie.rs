@@ -17,19 +17,47 @@
 #![allow(unused_variables)]
 #![allow(unused_assignments)]
 
+use std::ops::Deref;
+
+use rusqlite::Connection;
+
+use super::marf::MarfTestExt;
 use super::*;
+use crate::chainstate::stacks::index::marf::MarfReadCtx;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, *};
 
-fn walk_to_insertion_point(
-    f: &mut TrieStorageConnection<BlockHeaderHash>,
+fn expect_path_ephemeral<Db: Deref<Target = Connection>>(
+    storage: &mut TrieStorageConnection<BlockHeaderHash, Db>,
+    block_header: &BlockHeaderHash,
+    path: &[u8],
+) -> TrieLeaf {
+    MarfReadCtx::with_ephemeral(storage, |ctx| {
+        ctx.expect_path(block_header, &TrieHash::from_bytes(path).unwrap())
+    })
+}
+
+fn get_block_height_ephemeral<Db: Deref<Target = Connection>>(
+    storage: &mut TrieStorageConnection<BlockHeaderHash, Db>,
+    block_hash: &BlockHeaderHash,
+    current_block_hash: &BlockHeaderHash,
+) -> Option<u32> {
+    MarfReadCtx::with_ephemeral(storage, |ctx| {
+        ctx.get_block_height(block_hash, current_block_hash)
+    })
+    .unwrap()
+}
+
+fn walk_to_insertion_point<Db: Deref<Target = Connection>>(
+    f: &mut TrieStorageConnection<BlockHeaderHash, Db>,
     cursor: &mut TrieCursor<BlockHeaderHash>,
+    scratch: &mut MarfReadState,
 ) -> (TriePtr, TrieNodeType, TrieHash) {
-    let (mut node, root_hash) = Trie::read_root(f).unwrap();
+    let (mut node, root_hash) = read_root(f).unwrap();
     let mut node_hash = TrieHash::EMPTY;
     let mut node_ptr = f.root_trieptr();
 
     for _ in 0..cursor.path.len() {
-        match Trie::walk_from(f, &node, cursor) {
+        match walk_from(f, &node, cursor, scratch) {
             Ok(node_data_opt) => match node_data_opt {
                 Some((next_nodeptr, next_node, next_node_hash)) => {
                     node = next_node;
@@ -72,6 +100,7 @@ fn trie_cursor_try_attach_leaf() {
         {
             let mut f_store = TrieFileStorage::new_memory(marf_opts.clone()).unwrap();
             let mut f = f_store.transaction().unwrap();
+            let mut scratch = MarfReadState::new();
 
             let block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
             MARF::format(&mut f, &block_header).unwrap();
@@ -129,7 +158,8 @@ fn trie_cursor_try_attach_leaf() {
 
                 let mut c =
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 // end of path -- cursor points to the insertion point.
                 // all nodes have space,
@@ -148,21 +178,11 @@ fn trie_cursor_try_attach_leaf() {
                 let ptr = ptr_opt.unwrap();
                 ptrs.push(ptr);
 
-                let update_res = Trie::update_root_hash(&mut f, &c);
+                let update_res = update_root_hash(&mut f, &c);
                 assert!(update_res.is_ok());
 
                 // we must be able to query it now
-                let leaf_opt_res = MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap(),
-                );
-                assert!(leaf_opt_res.is_ok());
-
-                let leaf_opt = leaf_opt_res.unwrap();
-                assert!(leaf_opt.is_some());
-
-                let leaf = leaf_opt.unwrap();
+                let leaf = expect_path_ephemeral(&mut f, &block_header, &path);
                 assert_eq!(leaf, TrieLeaf::new(&path[i + 1..], &[i as u8; 40]));
 
                 // without a MARF commit, merkle tests will fail in deferred mode
@@ -179,17 +199,7 @@ fn trie_cursor_try_attach_leaf() {
                 ];
                 path[i] = 32;
 
-                let leaf_opt_res = MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap(),
-                );
-                assert!(leaf_opt_res.is_ok());
-
-                let leaf_opt = leaf_opt_res.unwrap();
-                assert!(leaf_opt.is_some());
-
-                let leaf = leaf_opt.unwrap();
+                let leaf = expect_path_ephemeral(&mut f, &block_header, &path);
                 assert_eq!(leaf, TrieLeaf::new(&path[i + 1..], &[i as u8; 40]));
 
                 // without a MARF commit, merkle tests will fail in deferred mode
@@ -201,7 +211,7 @@ fn trie_cursor_try_attach_leaf() {
             // each ptr must be a node with two children
             for i in 0..32 {
                 let ptr = &ptrs[i];
-                let (node, hash) = f.read_nodetype(ptr).unwrap();
+                let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
                 match node {
                     TrieNodeType::Node4(ref data) => assert_eq!(count_children(&data.ptrs), 2),
                     TrieNodeType::Node16(ref data) => assert_eq!(count_children(&data.ptrs), 2),
@@ -223,6 +233,7 @@ fn trie_cursor_promote_leaf_to_node4() {
     for marf_opts in MARFOpenOpts::all().into_iter() {
         let mut f_store = TrieFileStorage::new_memory(marf_opts).unwrap();
         let mut f = f_store.transaction().unwrap();
+        let mut scratch = MarfReadState::new();
 
         let block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
         MARF::format(&mut f, &block_header).unwrap();
@@ -231,7 +242,7 @@ fn trie_cursor_promote_leaf_to_node4() {
         //   mess up these tests expected trie structures.
         f.test_genesis_block.replace(block_header.clone());
 
-        let (node, root_hash) = Trie::read_root(&mut f).unwrap();
+        let (node, root_hash) = read_root(&mut f).unwrap();
 
         // add a single leaf
         let mut c = TrieCursor::new(
@@ -243,7 +254,7 @@ fn trie_cursor_promote_leaf_to_node4() {
             f.root_trieptr(),
         );
 
-        let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+        let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
         f.open_block(&block_header).unwrap();
         Trie::test_try_attach_leaf(
@@ -254,20 +265,17 @@ fn trie_cursor_promote_leaf_to_node4() {
         )
         .unwrap()
         .unwrap();
-        Trie::update_root_hash(&mut f, &c).unwrap();
+        update_root_hash(&mut f, &c).unwrap();
 
         assert_eq!(
-            MARF::get_path(
+            expect_path_ephemeral(
                 &mut f,
                 &block_header,
-                &TrieHash::from_bytes(&[
+                &[
                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-                    22, 23, 24, 25, 26, 27, 28, 29, 30, 31
-                ])
-                .unwrap()
-            )
-            .unwrap()
-            .unwrap(),
+                    22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                ],
+            ),
             TrieLeaf::new(
                 &[
                     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
@@ -303,7 +311,7 @@ fn trie_cursor_promote_leaf_to_node4() {
             let mut c =
                 TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-            let (nodeptr, node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+            let (nodeptr, node, node_hash) = walk_to_insertion_point(&mut f, &mut c, &mut scratch);
             // end of path -- cursor points to the insertion point
             let mut leaf_data = match node {
                 TrieNodeType::Leaf(ref data) => data.clone(),
@@ -320,20 +328,10 @@ fn trie_cursor_promote_leaf_to_node4() {
             .unwrap();
             ptrs.push(ptr);
 
-            Trie::update_root_hash(&mut f, &c).unwrap();
+            update_root_hash(&mut f, &c).unwrap();
 
             // make sure we can query it again
-            let leaf_opt_res = MARF::get_path(
-                &mut f,
-                &block_header,
-                &TrieHash::from_bytes(&path[..]).unwrap(),
-            );
-            assert!(leaf_opt_res.is_ok());
-
-            let leaf_opt = leaf_opt_res.unwrap();
-            assert!(leaf_opt.is_some());
-
-            let leaf = leaf_opt.unwrap();
+            let leaf = expect_path_ephemeral(&mut f, &block_header, &path);
             assert_eq!(leaf, TrieLeaf::new(&path[i + 1..], &[(i + 128) as u8; 40]));
 
             // without a MARF commit, merkle tests will fail in deferred mode
@@ -350,17 +348,7 @@ fn trie_cursor_promote_leaf_to_node4() {
             ];
             path[i] = 32;
 
-            let leaf_opt_res = MARF::get_path(
-                &mut f,
-                &block_header,
-                &TrieHash::from_bytes(&path[..]).unwrap(),
-            );
-            assert!(leaf_opt_res.is_ok());
-
-            let leaf_opt = leaf_opt_res.unwrap();
-            assert!(leaf_opt.is_some());
-
-            let leaf = leaf_opt.unwrap();
+            let leaf = expect_path_ephemeral(&mut f, &block_header, &path);
             assert_eq!(leaf, TrieLeaf::new(&path[i + 1..], &[(i + 128) as u8; 40]));
 
             // without a MARF commit, merkle tests will fail in deferred mode
@@ -371,7 +359,7 @@ fn trie_cursor_promote_leaf_to_node4() {
 
         // each ptr must be a node with two children
         for ptr in ptrs.iter().take(31) {
-            let (node, hash) = f.read_nodetype(ptr).unwrap();
+            let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
             match node {
                 TrieNodeType::Node4(ref data) => assert_eq!(count_children(&data.ptrs), 2),
                 TrieNodeType::Node256(ref data) => assert_eq!(count_children(&data.ptrs), 2),
@@ -388,6 +376,7 @@ fn trie_cursor_promote_node4_to_node16() {
     for marf_opts in MARFOpenOpts::all().into_iter() {
         let mut f_store = TrieFileStorage::new_memory(marf_opts).unwrap();
         let mut f = f_store.transaction().unwrap();
+        let mut scratch = MarfReadState::new();
 
         let block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
         MARF::format(&mut f, &block_header).unwrap();
@@ -432,7 +421,7 @@ fn trie_cursor_promote_node4_to_node16() {
         let (nodes, node_ptrs, hashes) =
             make_node4_path(&mut f, &path_segments, [31u8; 40].to_vec());
 
-        let (node, root_hash) = Trie::read_root(&mut f).unwrap();
+        let (node, root_hash) = read_root(&mut f).unwrap();
 
         // fill each node4
         for k in 0..31 {
@@ -445,7 +434,8 @@ fn trie_cursor_promote_node4_to_node16() {
 
                 let mut c =
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 f.open_block(&block_header).unwrap();
                 Trie::test_try_attach_leaf(
@@ -456,17 +446,11 @@ fn trie_cursor_promote_node4_to_node16() {
                 )
                 .unwrap()
                 .unwrap();
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[k + 1..], &[128 + j; 40])
                 );
 
@@ -494,7 +478,8 @@ fn trie_cursor_promote_node4_to_node16() {
             let mut c =
                 TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-            let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+            let (nodeptr, mut node, node_hash) =
+                walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
             f.open_block(&block_header).unwrap();
             let new_ptr = Trie::test_insert_leaf(
@@ -506,17 +491,11 @@ fn trie_cursor_promote_node4_to_node16() {
             .unwrap();
             ptrs.push(new_ptr);
 
-            Trie::update_root_hash(&mut f, &c).unwrap();
+            update_root_hash(&mut f, &c).unwrap();
 
             // should have inserted
             assert_eq!(
-                MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap()
-                )
-                .unwrap()
-                .unwrap(),
+                expect_path_ephemeral(&mut f, &block_header, &path),
                 TrieLeaf::new(&path[k + 1..], &[192 + k as u8; 40])
             );
 
@@ -528,7 +507,7 @@ fn trie_cursor_promote_node4_to_node16() {
 
         // each ptr we got should point to a node16 with 5 children
         for ptr in ptrs.iter() {
-            let (node, hash) = f.read_nodetype(ptr).unwrap();
+            let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
             if let TrieNodeType::Node16(data) = &node {
                 assert_eq!(count_children(&data.ptrs), 5);
             } else {
@@ -545,6 +524,7 @@ fn trie_cursor_promote_node16_to_node48() {
     for marf_opts in MARFOpenOpts::all().into_iter() {
         let mut f_store = TrieFileStorage::new_memory(marf_opts).unwrap();
         let mut f = f_store.transaction().unwrap();
+        let mut scratch = MarfReadState::new();
 
         let block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
         MARF::format(&mut f, &block_header).unwrap();
@@ -589,7 +569,7 @@ fn trie_cursor_promote_node16_to_node48() {
         let (nodes, node_ptrs, hashes) =
             make_node4_path(&mut f, &path_segments, [31u8; 40].to_vec());
 
-        let (node, root_hash) = Trie::read_root(&mut f).unwrap();
+        let (node, root_hash) = read_root(&mut f).unwrap();
 
         // fill each node4
         for k in 0..31 {
@@ -603,7 +583,8 @@ fn trie_cursor_promote_node16_to_node48() {
                 let mut c =
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 f.open_block(&block_header).unwrap();
                 Trie::test_try_attach_leaf(
@@ -615,17 +596,11 @@ fn trie_cursor_promote_node16_to_node48() {
                 .unwrap()
                 .unwrap();
 
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[k + 1..], &[128 + j; 40])
                 );
 
@@ -653,7 +628,8 @@ fn trie_cursor_promote_node16_to_node48() {
             let mut c =
                 TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-            let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+            let (nodeptr, mut node, node_hash) =
+                walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
             f.open_block(&block_header).unwrap();
             let new_ptr = Trie::test_insert_leaf(
@@ -665,17 +641,11 @@ fn trie_cursor_promote_node16_to_node48() {
             .unwrap();
             ptrs.push(new_ptr);
 
-            Trie::update_root_hash(&mut f, &c).unwrap();
+            update_root_hash(&mut f, &c).unwrap();
 
             // should have inserted
             assert_eq!(
-                MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap()
-                )
-                .unwrap()
-                .unwrap(),
+                expect_path_ephemeral(&mut f, &block_header, &path),
                 TrieLeaf::new(&path[k + 1..], &[192 + k as u8; 40])
             );
 
@@ -687,7 +657,7 @@ fn trie_cursor_promote_node16_to_node48() {
 
         // each ptr we got should point to a node16 with 5 children
         for ptr in ptrs.iter() {
-            let (node, hash) = f.read_nodetype(ptr).unwrap();
+            let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
             if let TrieNodeType::Node16(ref data) = node {
                 assert_eq!(count_children(&data.ptrs), 5);
             } else {
@@ -707,7 +677,8 @@ fn trie_cursor_promote_node16_to_node48() {
                 let mut c =
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 f.open_block(&block_header).unwrap();
                 Trie::test_try_attach_leaf(
@@ -719,17 +690,11 @@ fn trie_cursor_promote_node16_to_node48() {
                 .unwrap()
                 .unwrap();
 
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[k + 1..], &[128 + j; 40])
                 );
 
@@ -757,7 +722,8 @@ fn trie_cursor_promote_node16_to_node48() {
             let mut c =
                 TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-            let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+            let (nodeptr, mut node, node_hash) =
+                walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
             f.open_block(&block_header).unwrap();
 
@@ -770,17 +736,11 @@ fn trie_cursor_promote_node16_to_node48() {
             .unwrap();
             ptrs.push(new_ptr);
 
-            Trie::update_root_hash(&mut f, &c).unwrap();
+            update_root_hash(&mut f, &c).unwrap();
 
             // should have inserted
             assert_eq!(
-                MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap()
-                )
-                .unwrap()
-                .unwrap(),
+                expect_path_ephemeral(&mut f, &block_header, &path),
                 TrieLeaf::new(&path[k + 1..], &[192 + k as u8; 40])
             );
 
@@ -792,7 +752,7 @@ fn trie_cursor_promote_node16_to_node48() {
 
         // each ptr we got should point to a node48 with 17 children
         for ptr in ptrs.iter() {
-            let (node, hash) = f.read_nodetype(ptr).unwrap();
+            let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
             if let TrieNodeType::Node48(ref data) = node {
                 assert_eq!(count_children(&data.ptrs), 17);
             } else {
@@ -809,6 +769,7 @@ fn trie_cursor_promote_node48_to_node256() {
     for marf_opts in MARFOpenOpts::all().into_iter() {
         let mut f_store = TrieFileStorage::new_memory(marf_opts).unwrap();
         let mut f = f_store.transaction().unwrap();
+        let mut scratch = MarfReadState::new();
 
         let block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
         MARF::format(&mut f, &block_header).unwrap();
@@ -853,7 +814,7 @@ fn trie_cursor_promote_node48_to_node256() {
         let (nodes, node_ptrs, hashes) =
             make_node4_path(&mut f, &path_segments, [31u8; 40].to_vec());
 
-        let (node, root_hash) = Trie::read_root(&mut f).unwrap();
+        let (node, root_hash) = read_root(&mut f).unwrap();
 
         // fill each node4
         for k in 0..31 {
@@ -867,7 +828,8 @@ fn trie_cursor_promote_node48_to_node256() {
                 let mut c =
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 f.open_block(&block_header).unwrap();
                 Trie::test_try_attach_leaf(
@@ -879,17 +841,11 @@ fn trie_cursor_promote_node48_to_node256() {
                 .unwrap()
                 .unwrap();
 
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[k + 1..], &[128 + j; 40])
                 );
 
@@ -917,7 +873,8 @@ fn trie_cursor_promote_node48_to_node256() {
             let mut c =
                 TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-            let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+            let (nodeptr, mut node, node_hash) =
+                walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
             f.open_block(&block_header).unwrap();
             let new_ptr = Trie::test_insert_leaf(
@@ -929,17 +886,11 @@ fn trie_cursor_promote_node48_to_node256() {
             .unwrap();
             ptrs.push(new_ptr);
 
-            Trie::update_root_hash(&mut f, &c).unwrap();
+            update_root_hash(&mut f, &c).unwrap();
 
             // should have inserted
             assert_eq!(
-                MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap()
-                )
-                .unwrap()
-                .unwrap(),
+                expect_path_ephemeral(&mut f, &block_header, &path),
                 TrieLeaf::new(&path[k + 1..], &[192 + k as u8; 40])
             );
 
@@ -951,7 +902,7 @@ fn trie_cursor_promote_node48_to_node256() {
 
         // each ptr we got should point to a node16 with 5 children
         for ptr in ptrs.iter() {
-            let (node, hash) = f.read_nodetype(ptr).unwrap();
+            let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
             if let TrieNodeType::Node16(ref data) = node {
                 assert_eq!(count_children(&data.ptrs), 5);
             } else {
@@ -971,7 +922,8 @@ fn trie_cursor_promote_node48_to_node256() {
                 let mut c =
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 f.open_block(&block_header).unwrap();
                 Trie::test_try_attach_leaf(
@@ -982,17 +934,11 @@ fn trie_cursor_promote_node48_to_node256() {
                 )
                 .unwrap()
                 .unwrap();
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[k + 1..], &[128 + j; 40])
                 );
 
@@ -1020,7 +966,8 @@ fn trie_cursor_promote_node48_to_node256() {
             let mut c =
                 TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-            let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+            let (nodeptr, mut node, node_hash) =
+                walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
             f.open_block(&block_header).unwrap();
             let new_ptr = Trie::test_insert_leaf(
@@ -1032,17 +979,11 @@ fn trie_cursor_promote_node48_to_node256() {
             .unwrap();
             ptrs.push(new_ptr);
 
-            Trie::update_root_hash(&mut f, &c).unwrap();
+            update_root_hash(&mut f, &c).unwrap();
 
             // should have inserted
             assert_eq!(
-                MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap()
-                )
-                .unwrap()
-                .unwrap(),
+                expect_path_ephemeral(&mut f, &block_header, &path),
                 TrieLeaf::new(&path[k + 1..], &[192 + k as u8; 40])
             );
 
@@ -1054,7 +995,7 @@ fn trie_cursor_promote_node48_to_node256() {
 
         // each ptr we got should point to a node48 with 17 children
         for ptr in ptrs.iter() {
-            let (node, hash) = f.read_nodetype(ptr).unwrap();
+            let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
             if let TrieNodeType::Node48(ref data) = node {
                 assert_eq!(count_children(&data.ptrs), 17);
             } else {
@@ -1074,7 +1015,8 @@ fn trie_cursor_promote_node48_to_node256() {
                 let mut c =
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 f.open_block(&block_header).unwrap();
                 Trie::test_try_attach_leaf(
@@ -1086,17 +1028,11 @@ fn trie_cursor_promote_node48_to_node256() {
                 .unwrap()
                 .unwrap();
 
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[k + 1..], &[128 + j; 40])
                 );
 
@@ -1124,7 +1060,8 @@ fn trie_cursor_promote_node48_to_node256() {
             let mut c =
                 TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
-            let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+            let (nodeptr, mut node, node_hash) =
+                walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
             f.open_block(&block_header).unwrap();
             let new_ptr = Trie::test_insert_leaf(
@@ -1136,17 +1073,11 @@ fn trie_cursor_promote_node48_to_node256() {
             .unwrap();
             ptrs.push(new_ptr);
 
-            Trie::update_root_hash(&mut f, &c).unwrap();
+            update_root_hash(&mut f, &c).unwrap();
 
             // should have inserted
             assert_eq!(
-                MARF::get_path(
-                    &mut f,
-                    &block_header,
-                    &TrieHash::from_bytes(&path[..]).unwrap()
-                )
-                .unwrap()
-                .unwrap(),
+                expect_path_ephemeral(&mut f, &block_header, &path),
                 TrieLeaf::new(&path[k + 1..], &[192 + k as u8; 40])
             );
 
@@ -1158,7 +1089,7 @@ fn trie_cursor_promote_node48_to_node256() {
 
         // each ptr we got should point to a node256 with 49 children
         for ptr in ptrs.iter() {
-            let (node, hash) = f.read_nodetype(ptr).unwrap();
+            let (node, hash) = read_nodetype(&mut f, ptr).unwrap();
             if let TrieNodeType::Node256(ref data) = node {
                 assert_eq!(count_children(&data.ptrs), 49);
             } else {
@@ -1183,6 +1114,7 @@ fn trie_cursor_splice_leaf_4() {
         {
             let mut f_store = TrieFileStorage::new_memory(marf_opts.clone()).unwrap();
             let mut f = f_store.transaction().unwrap();
+            let mut scratch = MarfReadState::new();
 
             let block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
             MARF::format(&mut f, &block_header).unwrap();
@@ -1216,7 +1148,8 @@ fn trie_cursor_splice_leaf_4() {
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
                 test_debug!("Start splice-insert at {:?}", &c);
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 test_debug!("Splice leaf pattern={} at {:?}", 192 + k, &c);
                 f.open_block(&block_header).unwrap();
@@ -1232,17 +1165,11 @@ fn trie_cursor_splice_leaf_4() {
                 )
                 .unwrap();
 
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[5 * k + 3..], &[192 + k as u8; 40])
                 );
 
@@ -1270,6 +1197,7 @@ fn trie_cursor_splice_leaf_2() {
         {
             let mut f_store = TrieFileStorage::new_memory(marf_opts.clone()).unwrap();
             let mut f = f_store.transaction().unwrap();
+            let mut scratch = MarfReadState::new();
 
             let block_header = BlockHeaderHash::from_bytes(&[0u8; 32]).unwrap();
             MARF::format(&mut f, &block_header).unwrap();
@@ -1307,7 +1235,8 @@ fn trie_cursor_splice_leaf_2() {
                     TrieCursor::new(&TrieHash::from_bytes(&path[..]).unwrap(), f.root_trieptr());
 
                 test_debug!("Start splice-insert at {:?}", &c);
-                let (nodeptr, mut node, node_hash) = walk_to_insertion_point(&mut f, &mut c);
+                let (nodeptr, mut node, node_hash) =
+                    walk_to_insertion_point(&mut f, &mut c, &mut scratch);
 
                 test_debug!("Splice leaf pattern={} at {:?}", 192 + k, &c);
                 f.open_block(&block_header).unwrap();
@@ -1319,17 +1248,11 @@ fn trie_cursor_splice_leaf_2() {
                 )
                 .unwrap();
 
-                Trie::update_root_hash(&mut f, &c).unwrap();
+                update_root_hash(&mut f, &c).unwrap();
 
                 // should have inserted
                 assert_eq!(
-                    MARF::get_path(
-                        &mut f,
-                        &block_header,
-                        &TrieHash::from_bytes(&path[..]).unwrap()
-                    )
-                    .unwrap()
-                    .unwrap(),
+                    expect_path_ephemeral(&mut f, &block_header, &path),
                     TrieLeaf::new(&path[3 * k + 2..], &[192 + k as u8; 40])
                 );
 
@@ -1356,13 +1279,14 @@ where
         let mut marf = MARF::from_storage(f);
         marf.begin(&BlockHeaderHash::sentinel(), &block_header)
             .unwrap();
-        MARF::get_block_height(
-            &mut marf.borrow_storage_backend(),
-            &block_header,
-            &block_header,
-        )
-        .unwrap()
-        .unwrap();
+        assert_eq!(
+            get_block_height_ephemeral(
+                &mut marf.borrow_storage_backend(),
+                &block_header,
+                &block_header,
+            ),
+            Some(0)
+        );
 
         for i in 0..count {
             eprintln!("{}", i);
@@ -1473,9 +1397,7 @@ where
             let path = path_gen(i);
             let triepath = TrieHash::from_bytes(&path).unwrap();
             let value =
-                MARF::get_path(&mut marf.borrow_storage_backend(), &block_header, &triepath)
-                    .unwrap()
-                    .unwrap();
+                expect_path_ephemeral(&mut marf.borrow_storage_backend(), &block_header, &path);
             assert_eq!(
                 value.data.to_vec(),
                 [

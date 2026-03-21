@@ -3744,6 +3744,7 @@ dependencies = [
  "insta",
  "lazy_static",
  "libstackerdb 0.0.1",
+ "memmap2",
  "mio 0.6.23",
  "mutants",
  "nix",

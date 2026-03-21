@@ -23,8 +23,7 @@ use clarity::vm::database::sqlite::{
 use clarity::vm::database::{ClarityBackingStore, SpecialCaseHandler, SqliteConnection};
 use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::QualifiedContractIdentifier;
-use rusqlite;
-use rusqlite::Connection;
+use rusqlite::{self, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
 use stacks_common::types::sqlite::NO_PARAMS;
@@ -704,7 +703,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             values.push(marf_value);
         }
         self.ephemeral_marf
-            .insert_batch(&keys, values)
+            .insert_batch(&keys, &values)
             .unwrap_or_else(|e| {
                 panic!(
                     "FATAL: failed to insert ephemeral MARF key/value pairs: {:?}",

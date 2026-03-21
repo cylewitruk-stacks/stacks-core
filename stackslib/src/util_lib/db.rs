@@ -944,7 +944,7 @@ impl<'a, C: Clone, T: MarfTrieId> IndexDBTx<'a, C, T> {
             marf_values.push(marf_value);
         }
 
-        self.index_mut().insert_batch(keys, marf_values)?;
+        self.index_mut().insert_batch(keys, &marf_values)?;
         let root_hash = self.index_mut().seal()?;
         Ok(root_hash)
     }

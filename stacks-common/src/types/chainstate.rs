@@ -85,6 +85,18 @@ impl TrieHash {
     }
 }
 
+impl From<&str> for TrieHash {
+    fn from(s: &str) -> TrieHash {
+        TrieHash::from_key(s)
+    }
+}
+
+impl From<String> for TrieHash {
+    fn from(s: String) -> TrieHash {
+        TrieHash::from_key(&s)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct BurnchainHeaderHash(pub [u8; 32]);
 impl_array_newtype!(BurnchainHeaderHash, u8, 32);
