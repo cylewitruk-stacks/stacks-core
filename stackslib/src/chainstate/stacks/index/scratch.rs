@@ -31,44 +31,50 @@ pub struct MarfReadState {
     leaf: Option<TrieLeaf>,
     patch: Option<TrieNodePatch>,
     node_bytes: Vec<u8>,
+    /// Reusable buffer for patch chain accumulation. Taken by `take_patch_chain_buf` and restored
+    /// by `restore_patch_chain_buf` to avoid per-read allocation in the patch-chasing loop.
+    patch_chain_buf: Vec<(u32, TriePtr, TrieNodePatch)>,
     owned: Option<TrieNodeType>,
     parked: Vec<TrieNodeType>,
     current_id: Option<TrieNodeID>,
 }
 
 impl MarfReadState {
-    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
-    #[inline]
     pub fn take_node_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.node_bytes)
     }
 
-    #[inline]
+    pub fn take_patch_chain_buf(&mut self) -> Vec<(u32, TriePtr, TrieNodePatch)> {
+        let mut buf = std::mem::take(&mut self.patch_chain_buf);
+        buf.clear();
+        buf
+    }
+
+    pub fn restore_patch_chain_buf(&mut self, buf: Vec<(u32, TriePtr, TrieNodePatch)>) {
+        self.patch_chain_buf = buf;
+    }
+
     pub fn restore_node_bytes(&mut self, node_bytes: Vec<u8>) {
         self.node_bytes = node_bytes;
     }
 
-    #[inline]
     pub fn clear_current_node(&mut self) {
         self.current_id = None;
         self.owned = None;
     }
 
-    #[inline]
     pub fn has_current_node(&self) -> bool {
         self.current_id.is_some()
     }
 
-    #[inline]
     pub fn clear_parked_nodes(&mut self) {
         self.parked.clear();
     }
 
-    #[inline]
     pub fn get_parked_ref(&self, parked_handle: ParkedNodeHandle) -> TrieNodeRef<'_> {
         let node = self
             .parked
@@ -77,7 +83,6 @@ impl MarfReadState {
         TrieNodeRef::from(node)
     }
 
-    #[inline]
     pub fn park_owned_node(&mut self, node: TrieNodeType) -> ParkedNodeHandle {
         self.parked.push(node);
         ParkedNodeHandle::new(self.parked.len() - 1)
@@ -126,7 +131,6 @@ impl MarfReadState {
         Ok(self.park_owned_node(node))
     }
 
-    #[inline]
     pub fn get_ref(&self) -> TrieNodeRef<'_> {
         match self
             .current_id
@@ -178,7 +182,6 @@ impl MarfReadState {
         }
     }
 
-    #[inline]
     pub fn to_owned_node(&self) -> TrieNodeType {
         match self
             .current_id
@@ -225,14 +228,12 @@ impl MarfReadState {
         }
     }
 
-    #[inline]
     pub fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
         self.current_id = Some(TrieNodeID::Empty);
         self.owned = Some(node);
         TrieNodeRef::from(self.owned.as_ref().expect("BUG: decode scratch lost node"))
     }
 
-    #[inline]
     pub fn store_from_ref(&mut self, node: &TrieNodeType) -> TrieNodeRef<'_> {
         match node {
             TrieNodeType::Node4(n) => self.store_node4(n.clone()),
@@ -243,7 +244,6 @@ impl MarfReadState {
         }
     }
 
-    #[inline]
     pub fn store_node4(&mut self, node: TrieNode4) -> TrieNodeRef<'_> {
         self.current_id = Some(TrieNodeID::Node4);
         self.node4 = Some(node);
@@ -254,7 +254,6 @@ impl MarfReadState {
         }
     }
 
-    #[inline]
     pub fn store_node16(&mut self, node: TrieNode16) -> TrieNodeRef<'_> {
         self.current_id = Some(TrieNodeID::Node16);
         self.node16 = Some(node);
@@ -268,7 +267,6 @@ impl MarfReadState {
         }
     }
 
-    #[inline]
     pub fn store_node48(&mut self, node: TrieNode48) -> TrieNodeRef<'_> {
         self.current_id = Some(TrieNodeID::Node48);
         self.node48 = Some(node);
@@ -283,7 +281,6 @@ impl MarfReadState {
         }
     }
 
-    #[inline]
     pub fn store_node256(&mut self, node: TrieNode256) -> TrieNodeRef<'_> {
         self.current_id = Some(TrieNodeID::Node256);
         self.node256 = Some(node);
@@ -297,7 +294,6 @@ impl MarfReadState {
         }
     }
 
-    #[inline]
     pub fn store_leaf(&mut self, node: TrieLeaf) -> TrieNodeRef<'_> {
         self.current_id = Some(TrieNodeID::Leaf);
         self.leaf = Some(node);
@@ -308,10 +304,15 @@ impl MarfReadState {
         })
     }
 
-    #[inline]
     pub fn patch(&self) -> &TrieNodePatch {
         self.patch
             .as_ref()
+            .expect("BUG: decode scratch lost patch node")
+    }
+
+    pub fn take_patch(&mut self) -> TrieNodePatch {
+        self.patch
+            .take()
             .expect("BUG: decode scratch lost patch node")
     }
 
@@ -458,80 +459,78 @@ impl MarfReadState {
 // These implement the NodeDecodeScratch / NodeParking / NodePatching traits.
 
 impl NodeDecodeScratch for MarfReadState {
-    #[inline]
     fn take_node_bytes(&mut self) -> Vec<u8> {
         MarfReadState::take_node_bytes(self)
     }
 
-    #[inline]
     fn restore_node_bytes(&mut self, bytes: Vec<u8>) {
         MarfReadState::restore_node_bytes(self, bytes)
     }
 
-    #[inline]
     fn decode_node_from_slice(&mut self, id: TrieNodeID, bytes: &[u8]) -> Result<usize, Error> {
         MarfReadState::decode_node_from_slice(self, id, bytes)
     }
 
-    #[inline]
     fn decode_patch_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
         MarfReadState::decode_patch_from_slice(self, bytes)
     }
 
-    #[inline]
     fn get_ref(&self) -> TrieNodeRef<'_> {
         MarfReadState::get_ref(self)
     }
 
-    #[inline]
     fn patch(&self) -> &TrieNodePatch {
         MarfReadState::patch(self)
+    }
+
+    fn take_patch(&mut self) -> TrieNodePatch {
+        MarfReadState::take_patch(self)
+    }
+
+    fn take_patch_chain_buf(&mut self) -> Vec<(u32, TriePtr, TrieNodePatch)> {
+        MarfReadState::take_patch_chain_buf(self)
+    }
+
+    fn restore_patch_chain_buf(&mut self, buf: Vec<(u32, TriePtr, TrieNodePatch)>) {
+        MarfReadState::restore_patch_chain_buf(self, buf)
     }
 
     /// Note: delegates to the inherent `MarfReadState::store()` method.
     /// When called through `&mut impl NodeDecodeScratch`, Rust dispatches to this trait method.
     /// When called as `self.store()` inside MarfReadState methods, Rust dispatches to the
     /// inherent method. Both have identical behavior.
-    #[inline]
     fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
         MarfReadState::store(self, node)
     }
 
-    #[inline]
     fn clear_current_node(&mut self) {
         MarfReadState::clear_current_node(self)
     }
 
-    #[inline]
     fn has_current_node(&self) -> bool {
         MarfReadState::has_current_node(self)
     }
 }
 
 impl NodeParking for MarfReadState {
-    #[inline]
     fn park_current_node(&mut self) -> Result<ParkedNodeHandle, Error> {
         MarfReadState::park_current_node(self)
     }
 
-    #[inline]
     fn park_owned_node(&mut self, node: TrieNodeType) -> ParkedNodeHandle {
         MarfReadState::park_owned_node(self, node)
     }
 
-    #[inline]
     fn get_parked_ref(&self, handle: ParkedNodeHandle) -> TrieNodeRef<'_> {
         MarfReadState::get_parked_ref(self, handle)
     }
 
-    #[inline]
     fn clear_parked_nodes(&mut self) {
         MarfReadState::clear_parked_nodes(self)
     }
 }
 
 impl NodePatching for MarfReadState {
-    #[inline]
     fn apply_patches_in_place(
         &mut self,
         patches: &[(u32, TriePtr, TrieNodePatch)],
@@ -542,7 +541,6 @@ impl NodePatching for MarfReadState {
 }
 
 impl TrieNodeArena for MarfReadState {
-    #[inline]
     fn park<'a>(&'a mut self, node: TrieNodeType) -> TrieNodeRef<'a> {
         self.store(node)
     }

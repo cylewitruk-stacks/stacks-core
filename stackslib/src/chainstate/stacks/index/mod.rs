@@ -416,6 +416,13 @@ pub trait NodeDecodeScratch {
     fn get_ref(&self) -> TrieNodeRef<'_>;
     /// Get the decoded patch node.
     fn patch(&self) -> &TrieNodePatch;
+    /// Take ownership of the decoded patch node, leaving the slot empty.
+    /// Avoids cloning when the patch will be moved into a collection.
+    fn take_patch(&mut self) -> TrieNodePatch;
+    /// Take the reusable patch chain buffer (cleared, ready for use).
+    fn take_patch_chain_buf(&mut self) -> Vec<(u32, TriePtr, TrieNodePatch)>;
+    /// Return the patch chain buffer for reuse in subsequent calls.
+    fn restore_patch_chain_buf(&mut self, buf: Vec<(u32, TriePtr, TrieNodePatch)>);
     /// Store an owned node as the current node and return a reference.
     fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_>;
     /// Clear the current decoded node slot.

@@ -67,6 +67,15 @@ impl NodeDecodeScratch for CountingReadState {
     fn patch(&self) -> &TrieNodePatch {
         self.scratch.patch()
     }
+    fn take_patch(&mut self) -> TrieNodePatch {
+        self.scratch.take_patch()
+    }
+    fn take_patch_chain_buf(&mut self) -> Vec<(u32, TriePtr, TrieNodePatch)> {
+        self.scratch.take_patch_chain_buf()
+    }
+    fn restore_patch_chain_buf(&mut self, buf: Vec<(u32, TriePtr, TrieNodePatch)>) {
+        self.scratch.restore_patch_chain_buf(buf)
+    }
     fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
         self.scratch.store(node)
     }

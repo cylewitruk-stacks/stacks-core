@@ -446,7 +446,7 @@ impl<'a> TrieFileNodeHashReader<'a> {
 
 impl NodeHashReader for TrieFileNodeHashReader<'_> {
     fn read_node_hash<W: Write>(&mut self, ptr: &TriePtr, w: &mut W) -> Result<(), Error> {
-        let hash = self.file.get_node_hash(self.db, self.block_id, ptr)?;
+        let hash = self.file.get_node_hash(self.db, self.block_id, ptr, None)?;
         w.write_all(hash.as_ref()).map_err(|e| e.into())
     }
 }
@@ -586,40 +586,47 @@ impl TrieFile {
         bits::read_stored_node_type_from_slice(&buf)
     }
 
-    /// Obtain a TrieHash for a node, given its block ID and pointer.
-    /// Takes `&self` — uses positional reads, no cursor state.
+    /// Obtain a [`TrieHash`] for a node, given its block ID and pointer.
+    ///
+    /// If `trie_offset` is `Some`, uses the pre-resolved offset (bypassing the offset
+    /// cache). Otherwise resolves the offset from the cache or SQL.
     pub fn get_node_hash(
         &self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
+        trie_offset: Option<u64>,
     ) -> Result<TrieHash, Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
+        let offset = trie_offset.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
         self.read_hash_at(offset + ptr.ptr() as u64)
     }
 
-    /// Obtain a trie node view and its associated TrieHash for a node, given its block ID and
-    /// pointer.
-    pub fn read_node<'a>(
-        &self,
-        db: &Connection,
-        block_id: u32,
-        ptr: &TriePtr,
-        scratch: &'a mut impl NodeDecodeScratch,
-    ) -> Result<ReadTrieNode<'a>, Error> {
-        self.read_trie_item(db, block_id, ptr, scratch)?.into_node()
-    }
+    // TODO: Unused -- do we need this?
+    // /// Obtain a trie node view and its associated TrieHash for a node, given its block ID and
+    // /// pointer.
+    // pub fn read_node<'a>(
+    //     &self,
+    //     db: &Connection,
+    //     block_id: u32,
+    //     ptr: &TriePtr,
+    //     scratch: &'a mut impl NodeDecodeScratch,
+    // ) -> Result<ReadTrieNode<'a>, Error> {
+    //     self.read_trie_item(db, block_id, ptr, None, scratch)?.into_node()
+    // }
 
     /// Read a trie item (node or patch) at the given block and pointer.
-    /// Takes `&self` — uses positional reads, no cursor state.
+    ///
+    /// If `trie_offset` is `Some`, uses the pre-resolved offset (bypassing the offset
+    /// cache). Otherwise resolves the offset from the cache or SQL.
     pub fn read_trie_item<'a>(
         &self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
+        trie_offset: Option<u64>,
         scratch: &'a mut impl NodeDecodeScratch,
     ) -> Result<ReadTrieItem<'a>, Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
+        let offset = trie_offset.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
         self.read_item_at_offset(offset + ptr.ptr() as u64, ptr, scratch)
     }
 
@@ -659,6 +666,40 @@ impl TrieFile {
         self.read_node_type_at(offset + ptr.ptr() as u64)
     }
 
+    /// Append a serialized trie to the TrieFile.
+    /// Returns the offset at which it was appended.
+    pub fn append_trie_blob(&mut self, db: &Connection, buf: &[u8]) -> Result<u64, Error> {
+        let offset = trie_sql::get_external_blobs_length(db)?;
+        test_debug!("Write trie of {} bytes at {}", buf.len(), offset);
+
+        match self {
+            TrieFile::Disk(ref mut disk) => {
+                pwrite_all(&disk.fd, buf, offset)?;
+                disk.fd.sync_data()?;
+                if disk.mmap_enabled {
+                    // (Re)map to cover the written data.
+                    // SAFETY: append-only, single-writer, file just fsynced.
+                    disk.mmap = Some(unsafe { Mmap::map(&disk.fd)? });
+                }
+            }
+            TrieFile::RAM(ref mut ram) => {
+                let data = ram.fd.get_mut();
+                let start = offset as usize;
+                let end = start + buf.len();
+                if data.len() < end {
+                    data.resize(end, 0);
+                }
+                data.get_mut(start..end)
+                    .expect("BUG: just resized to cover range")
+                    .copy_from_slice(buf);
+            }
+        }
+        Ok(offset)
+    }
+}
+
+#[cfg(test)]
+impl TrieFile {
     /// Obtain a TrieHash for a node, given the node's block's hash (used only in testing)
     #[cfg(test)]
     pub fn get_node_hash_by_bhh<T: MarfTrieId>(
@@ -696,36 +737,5 @@ impl TrieFile {
             Ok((root_hash, block_hash))
         })?;
         rows.collect()
-    }
-
-    /// Append a serialized trie to the TrieFile.
-    /// Returns the offset at which it was appended.
-    pub fn append_trie_blob(&mut self, db: &Connection, buf: &[u8]) -> Result<u64, Error> {
-        let offset = trie_sql::get_external_blobs_length(db)?;
-        test_debug!("Write trie of {} bytes at {}", buf.len(), offset);
-
-        match self {
-            TrieFile::Disk(ref mut disk) => {
-                pwrite_all(&disk.fd, buf, offset)?;
-                disk.fd.sync_data()?;
-                if disk.mmap_enabled {
-                    // (Re)map to cover the written data.
-                    // SAFETY: append-only, single-writer, file just fsynced.
-                    disk.mmap = Some(unsafe { Mmap::map(&disk.fd)? });
-                }
-            }
-            TrieFile::RAM(ref mut ram) => {
-                let data = ram.fd.get_mut();
-                let start = offset as usize;
-                let end = start + buf.len();
-                if data.len() < end {
-                    data.resize(end, 0);
-                }
-                data.get_mut(start..end)
-                    .expect("BUG: just resized to cover range")
-                    .copy_from_slice(buf);
-            }
-        }
-        Ok(offset)
     }
 }
