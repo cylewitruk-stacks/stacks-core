@@ -524,16 +524,34 @@ impl TrieFile {
             return bits::read_trie_item_from_slice(bytes, ptr.id(), scratch);
         }
         // Slow path: positional read into scratch's reusable buffer, then decode.
-        // take_node_bytes() returns the pre-allocated buffer (avoiding allocation
-        // when scratch has been used before). We don't restore it afterward because
-        // the decode result borrows scratch — but the buffer will be re-created on
-        // the next take_node_bytes() call.
+        // Pattern: take buffer → pread → decode (extracts hash + node ID from bytes,
+        // copies decoded node into scratch slots) → restore buffer for reuse.
         let max_len = bits::get_node_max_byte_len(ptr.id())?;
         let mut buf = scratch.take_node_bytes();
         buf.resize(max_len, 0);
         let n = self.read_bytes_at(&mut buf, file_offset)?;
         buf.truncate(n);
-        bits::read_trie_item_from_slice(&buf, ptr.id(), scratch)
+        let (hash, remaining) = bits::parse_hash_from_bytes(&buf)?;
+        let stored_node_id = bits::stored_node_id_from_bytes(remaining)?;
+        let _consumed = if stored_node_id == TrieNodeID::Patch {
+            scratch.decode_patch_from_slice(remaining)?
+        } else {
+            scratch.decode_node_from_slice(
+                TrieNodeID::from_u8(ptr.id()).ok_or_else(|| {
+                    Error::CorruptionError(format!("Invalid node ID {}", ptr.id()))
+                })?,
+                remaining,
+            )?
+        };
+        scratch.restore_node_bytes(buf);
+        if stored_node_id == TrieNodeID::Patch {
+            Ok(ReadTrieItem::from_patch(scratch.patch(), Some(hash)))
+        } else {
+            Ok(ReadTrieItem::from_node(ReadTrieNode::from_state_borrowed(
+                scratch.get_ref(),
+                Some(hash),
+            )))
+        }
     }
 
     /// Read hash bytes at a known file position.
