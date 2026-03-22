@@ -15,8 +15,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::chainstate::stacks::index::node::{
-    set_backptr, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID,
-    TrieNodePatch, TrieNodeRef, TrieNodeType, TriePtr,
+    TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodePatch,
+    TrieNodeRef, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::{MARFValue, OwnedNodeBytes, ReadTrieNode, TrieLeaf};
@@ -86,14 +86,8 @@ fn trie_node_decode_scratch_to_owned_preserves_patch_metadata() {
 
     let mut node4 = TrieNode4::new(&[0x01, 0x02]);
     assert!(node4.insert(&TriePtr::new(TrieNodeID::Leaf as u8, 0x11, 7)));
-    node4.patches.push((
-        5,
-        TriePtr::new(TrieNodeID::Node4 as u8, 0x22, 9),
-        TrieNodePatch {
-            ptr: TriePtr::new(set_backptr(TrieNodeID::Node4 as u8), 0x22, 9),
-            ptr_diff: vec![TriePtr::new(TrieNodeID::Leaf as u8, 0x11, 7)],
-        },
-    ));
+    node4.patch_depth = 1;
+    node4.last_patch_source = Some((5, TriePtr::new(TrieNodeID::Node4 as u8, 0x22, 9)));
 
     let node = TrieNodeType::Node4(node4);
     scratch.store_from_ref(&node);

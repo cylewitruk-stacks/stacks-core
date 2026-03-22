@@ -1279,8 +1279,11 @@ pub struct TrieNode4 {
     pub ptrs: [TriePtr; 4],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,
-    /// List of patches applied to this node.  Fields are (node block ID, pointer to node, patch itself)
-    pub patches: Vec<(u32, TriePtr, TrieNodePatch)>,
+    /// Number of patches applied to reconstruct this node from the base on-disk node.
+    pub patch_depth: usize,
+    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
+    /// the next amendment patch's COW backpointer.
+    pub last_patch_source: Option<(u32, TriePtr)>,
 }
 
 impl fmt::Debug for TrieNode4 {
@@ -1300,7 +1303,8 @@ impl TrieNode4 {
             path: path.to_owned(),
             ptrs: [TriePtr::default(); 4],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 }
@@ -1312,8 +1316,11 @@ pub struct TrieNode16 {
     pub ptrs: [TriePtr; 16],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,
-    /// List of patches applied to this node.  Fields are (node block ID, pointer to node, patch itself)
-    pub patches: Vec<(u32, TriePtr, TrieNodePatch)>,
+    /// Number of patches applied to reconstruct this node from the base on-disk node.
+    pub patch_depth: usize,
+    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
+    /// the next amendment patch's COW backpointer.
+    pub last_patch_source: Option<(u32, TriePtr)>,
 }
 
 impl fmt::Debug for TrieNode16 {
@@ -1333,7 +1340,8 @@ impl TrieNode16 {
             path: path.to_owned(),
             ptrs: [TriePtr::default(); 16],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -1345,7 +1353,8 @@ impl TrieNode16 {
             path: node4.path.clone(),
             ptrs,
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 }
@@ -1358,8 +1367,11 @@ pub struct TrieNode48 {
     pub ptrs: [TriePtr; 48],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,
-    /// List of patches applied to this node.  Fields are (node block ID, pointer to node, patch itself)
-    pub patches: Vec<(u32, TriePtr, TrieNodePatch)>,
+    /// Number of patches applied to reconstruct this node from the base on-disk node.
+    pub patch_depth: usize,
+    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
+    /// the next amendment patch's COW backpointer.
+    pub last_patch_source: Option<(u32, TriePtr)>,
 }
 
 impl fmt::Debug for TrieNode48 {
@@ -1386,7 +1398,8 @@ impl TrieNode48 {
             indexes: [-1; 256],
             ptrs: [TriePtr::default(); 48],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -1446,7 +1459,8 @@ impl TrieNode48 {
             indexes,
             ptrs,
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 }
@@ -1458,8 +1472,11 @@ pub struct TrieNode256 {
     pub ptrs: [TriePtr; 256],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,
-    /// List of patches applied to this node.  Fields are (node block ID, pointer to node, patch itself)
-    pub patches: Vec<(u32, TriePtr, TrieNodePatch)>,
+    /// Number of patches applied to reconstruct this node from the base on-disk node.
+    pub patch_depth: usize,
+    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
+    /// the next amendment patch's COW backpointer.
+    pub last_patch_source: Option<(u32, TriePtr)>,
 }
 
 impl fmt::Debug for TrieNode256 {
@@ -1485,7 +1502,8 @@ impl TrieNode256 {
             path: path.to_owned(),
             ptrs: [TriePtr::default(); 256],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -1502,7 +1520,8 @@ impl TrieNode256 {
             path: node4.path.clone(),
             ptrs,
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -1520,7 +1539,8 @@ impl TrieNode256 {
             path: node48.path.clone(),
             ptrs,
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 }
@@ -2121,7 +2141,8 @@ impl TrieNode for TrieNode4 {
             path: vec![],
             ptrs: [TriePtr::default(); 4],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -2142,7 +2163,8 @@ impl TrieNode for TrieNode4 {
         })?;
         let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
         self.cowptr = None;
-        self.patches.clear();
+        self.patch_depth = 0;
+        self.last_patch_source = None;
         Ok(ptrs_consumed + path_consumed)
     }
 
@@ -2202,7 +2224,10 @@ impl TrieNode for TrieNode4 {
             };
             node = next_node;
         }
-        node.patches.extend_from_slice(patches);
+        node.patch_depth += patches.len();
+        if let Some((block_id, ptr, _)) = patches.last() {
+            node.last_patch_source = Some((*block_id, *ptr));
+        }
         Some(node)
     }
 }
@@ -2217,7 +2242,8 @@ impl TrieNode for TrieNode16 {
             path: vec![],
             ptrs: [TriePtr::default(); 16],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -2238,7 +2264,8 @@ impl TrieNode for TrieNode16 {
         })?;
         let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
         self.cowptr = None;
-        self.patches.clear();
+        self.patch_depth = 0;
+        self.last_patch_source = None;
         Ok(ptrs_consumed + path_consumed)
     }
 
@@ -2298,7 +2325,10 @@ impl TrieNode for TrieNode16 {
             };
             node = next_node;
         }
-        node.patches.extend_from_slice(patches);
+        node.patch_depth += patches.len();
+        if let Some((block_id, ptr, _)) = patches.last() {
+            node.last_patch_source = Some((*block_id, *ptr));
+        }
         Some(node)
     }
 }
@@ -2314,7 +2344,8 @@ impl TrieNode for TrieNode48 {
             indexes: [-1; 256],
             ptrs: [TriePtr::default(); 48],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -2386,7 +2417,8 @@ impl TrieNode for TrieNode48 {
 
         self.indexes = indexes;
         self.cowptr = None;
-        self.patches.clear();
+        self.patch_depth = 0;
+        self.last_patch_source = None;
         Ok(path_offset + path_consumed)
     }
 
@@ -2450,7 +2482,10 @@ impl TrieNode for TrieNode48 {
             };
             node = next_node;
         }
-        node.patches.extend_from_slice(patches);
+        node.patch_depth += patches.len();
+        if let Some((block_id, ptr, _)) = patches.last() {
+            node.last_patch_source = Some((*block_id, *ptr));
+        }
         Some(node)
     }
 }
@@ -2465,7 +2500,8 @@ impl TrieNode for TrieNode256 {
             path: vec![],
             ptrs: [TriePtr::default(); 256],
             cowptr: None,
-            patches: vec![],
+            patch_depth: 0,
+            last_patch_source: None,
         }
     }
 
@@ -2485,7 +2521,8 @@ impl TrieNode for TrieNode256 {
         })?;
         let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
         self.cowptr = None;
-        self.patches.clear();
+        self.patch_depth = 0;
+        self.last_patch_source = None;
         Ok(ptrs_consumed + path_consumed)
     }
 
@@ -2542,7 +2579,10 @@ impl TrieNode for TrieNode256 {
             };
             node = next_node;
         }
-        node.patches.extend_from_slice(patches);
+        node.patch_depth += patches.len();
+        if let Some((block_id, ptr, _)) = patches.last() {
+            node.last_patch_source = Some((*block_id, *ptr));
+        }
         Some(node)
     }
 }
@@ -2779,13 +2819,15 @@ impl<'a> TrieNodeRef<'a> {
                 path: path.to_vec(),
                 ptrs: **ptrs,
                 cowptr: None,
-                patches: vec![],
+                patch_depth: 0,
+                last_patch_source: None,
             }),
             Self::Node16 { path, ptrs } => TrieNodeType::Node16(TrieNode16 {
                 path: path.to_vec(),
                 ptrs: **ptrs,
                 cowptr: None,
-                patches: vec![],
+                patch_depth: 0,
+                last_patch_source: None,
             }),
             Self::Node48 {
                 path,
@@ -2796,13 +2838,15 @@ impl<'a> TrieNodeRef<'a> {
                 indexes: **indexes,
                 ptrs: **ptrs,
                 cowptr: None,
-                patches: vec![],
+                patch_depth: 0,
+                last_patch_source: None,
             })),
             Self::Node256 { path, ptrs } => TrieNodeType::Node256(Box::new(TrieNode256 {
                 path: path.to_vec(),
                 ptrs: **ptrs,
                 cowptr: None,
-                patches: vec![],
+                patch_depth: 0,
+                last_patch_source: None,
             })),
             Self::Leaf(leaf) => TrieNodeType::Leaf(TrieLeaf {
                 path: leaf.path.to_vec(),
@@ -2987,13 +3031,23 @@ impl TrieNodeType {
         }
     }
 
-    pub fn get_patches(&self) -> &[(u32, TriePtr, TrieNodePatch)] {
+    pub fn patch_depth(&self) -> usize {
         match self {
-            TrieNodeType::Node4(ref data) => &data.patches,
-            TrieNodeType::Node16(ref data) => &data.patches,
-            TrieNodeType::Node48(ref data) => &data.patches,
-            TrieNodeType::Node256(ref data) => &data.patches,
-            TrieNodeType::Leaf(_) => panic!("Leaf has no patches"),
+            TrieNodeType::Node4(ref data) => data.patch_depth,
+            TrieNodeType::Node16(ref data) => data.patch_depth,
+            TrieNodeType::Node48(ref data) => data.patch_depth,
+            TrieNodeType::Node256(ref data) => data.patch_depth,
+            TrieNodeType::Leaf(_) => 0,
+        }
+    }
+
+    pub fn last_patch_source(&self) -> Option<(u32, TriePtr)> {
+        match self {
+            TrieNodeType::Node4(ref data) => data.last_patch_source,
+            TrieNodeType::Node16(ref data) => data.last_patch_source,
+            TrieNodeType::Node48(ref data) => data.last_patch_source,
+            TrieNodeType::Node256(ref data) => data.last_patch_source,
+            TrieNodeType::Leaf(_) => None,
         }
     }
 }

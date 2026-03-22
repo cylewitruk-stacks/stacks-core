@@ -321,6 +321,9 @@ impl MarfReadState {
         patches: &[(u32, TriePtr, TrieNodePatch)],
         cur_block_id: u32,
     ) -> Result<(), Error> {
+        let added_depth = patches.len();
+        let new_source = patches.last().map(|(block_id, ptr, _)| (*block_id, *ptr));
+
         match self
             .current_id
             .expect("BUG: decode scratch has no current node")
@@ -334,7 +337,8 @@ impl MarfReadState {
                         ));
                     }
                 }
-                node.patches.extend_from_slice(patches);
+                node.patch_depth += added_depth;
+                node.last_patch_source = new_source.or(node.last_patch_source);
             }
             TrieNodeID::Node16 => {
                 let node = self
@@ -348,7 +352,8 @@ impl MarfReadState {
                         ));
                     }
                 }
-                node.patches.extend_from_slice(patches);
+                node.patch_depth += added_depth;
+                node.last_patch_source = new_source.or(node.last_patch_source);
             }
             TrieNodeID::Node48 => {
                 let node = self
@@ -362,7 +367,8 @@ impl MarfReadState {
                         ));
                     }
                 }
-                node.patches.extend_from_slice(patches);
+                node.patch_depth += added_depth;
+                node.last_patch_source = new_source.or(node.last_patch_source);
             }
             TrieNodeID::Node256 => {
                 let node = self
@@ -376,7 +382,8 @@ impl MarfReadState {
                         ));
                     }
                 }
-                node.patches.extend_from_slice(patches);
+                node.patch_depth += added_depth;
+                node.last_patch_source = new_source.or(node.last_patch_source);
             }
             TrieNodeID::Leaf | TrieNodeID::Empty | TrieNodeID::Patch => {
                 return Err(Error::CorruptionError(

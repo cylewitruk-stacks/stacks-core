@@ -582,11 +582,7 @@ impl<'a> ReadTrieNode<'a> {
     }
 
     fn patch_depth_from_owned(node: &TrieNodeType) -> usize {
-        if node.is_leaf() {
-            0
-        } else {
-            node.get_patches().len()
-        }
+        node.patch_depth()
     }
 
     pub fn from_borrowed(node: TrieNodeRef<'a>, hash: Option<TrieHash>) -> Self {

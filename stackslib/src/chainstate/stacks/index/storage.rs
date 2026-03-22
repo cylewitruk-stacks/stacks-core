@@ -1096,12 +1096,12 @@ impl<T: MarfTrieId> TrieRAM<T> {
             // Only applies to non-leaf nodes, and only if doing so results in a stack of patches
             // that's less than MAX_PATCH_DEPTH. Also, only patch a node if the path is the same.
             let mut patch_node_opt = if !node.is_leaf()
-                && node.get_patches().len() < MAX_PATCH_DEPTH as usize
+                && node.patch_depth() < MAX_PATCH_DEPTH as usize
             {
-                if let Some((last_patch_block_id, last_patch_ptr, _)) = node.get_patches().last() {
+                if let Some((last_patch_block_id, last_patch_ptr)) = node.last_patch_source() {
                     // this node is a patch to a node in a previous trie.  Try to amend a patch
                     // atop it.
-                    let block_hash = storage_tx.get_block_hash_caching(*last_patch_block_id)?;
+                    let block_hash = storage_tx.get_block_hash_caching(last_patch_block_id)?;
 
                     // construct a COW pointer to this patch node
                     let mut patch_ptr = TriePtr::new(
@@ -1109,7 +1109,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                         last_patch_ptr.chr(),
                         last_patch_ptr.ptr(),
                     );
-                    patch_ptr.back_block = *last_patch_block_id;
+                    patch_ptr.back_block = last_patch_block_id;
 
                     let base_ptr = TrieCowPtr::new(block_hash.clone(), patch_ptr);
                     let patch_node_opt =
