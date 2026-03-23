@@ -1131,7 +1131,14 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
 
     /// Insert a batch of key/value pairs.  More efficient than inserting them individually, since
     /// the trie root hash will only be calculated once (which is an O(log B) operation).
-    pub fn insert_batch(&mut self, keys: &[String], values: &[MARFValue]) -> Result<(), Error> {
+    pub fn insert_batch(
+        &mut self,
+        keys: impl AsRef<[String]>,
+        values: impl AsRef<[MARFValue]>,
+    ) -> Result<(), Error> {
+        let keys = keys.as_ref();
+        let values = values.as_ref();
+
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
         }
@@ -1856,7 +1863,14 @@ impl<T: MarfTrieId> MARF<T> {
 
     /// Insert a batch of key/value pairs.  More efficient than inserting them individually, since
     /// the trie root hash will only be calculated once (which is an O(log B) operation).
-    pub fn insert_batch(&mut self, keys: &[String], values: &[MARFValue]) -> Result<(), Error> {
+    pub fn insert_batch(
+        &mut self,
+        keys: impl AsRef<[String]>,
+        values: impl AsRef<[MARFValue]>,
+    ) -> Result<(), Error> {
+        let keys = keys.as_ref();
+        let values = values.as_ref();
+
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
         }
