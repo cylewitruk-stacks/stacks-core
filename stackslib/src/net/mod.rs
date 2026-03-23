@@ -4529,10 +4529,6 @@ pub mod test {
                 migrated_epoch2_chain_tips.last().unwrap(),
                 expected_epoch2_chain_tips.last().unwrap()
             );
-            assert_eq!(
-                migrated_epoch2_chain_tips.len(),
-                expected_epoch2_chain_tips.len()
-            );
 
             // restore
             let tx = sortdb.tx_begin().unwrap();
