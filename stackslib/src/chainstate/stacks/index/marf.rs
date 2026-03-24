@@ -435,13 +435,6 @@ impl MARFOpenOpts {
 ///  MARF structs and MarfTransactions
 ///
 pub trait MarfConnection<T: MarfTrieId>: MarfInternals<T> + Sized {
-    // fn with_conn<F, R>(&mut self, exec: F) -> R
-    // where
-    //     F: FnOnce(&mut TrieStorageConnection<T>) -> R,
-    // {
-    //     self.with_storage(exec)
-    // }
-
     fn sqlite_conn(&self) -> &Connection;
 
     /// Get and check a value against get_from_hash

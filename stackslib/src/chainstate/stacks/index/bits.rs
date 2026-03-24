@@ -223,7 +223,7 @@ pub fn get_node_body_max_byte_len(node_id: u8) -> Result<usize, Error> {
     Ok(max_len)
 }
 
-pub(crate) fn get_node_max_byte_len(node_id: u8) -> Result<usize, Error> {
+pub fn get_node_max_byte_len(node_id: u8) -> Result<usize, Error> {
     TRIEHASH_ENCODED_SIZE
         .checked_add(get_node_body_max_byte_len(node_id)?)
         .ok_or(Error::OverflowError)
@@ -378,7 +378,7 @@ fn read_node_bytes_into<R: Read + Seek>(
     read_max_bytes_into(r, bytes, max_len, "trie node")
 }
 
-pub(crate) fn parse_hash_from_bytes(bytes: &[u8]) -> Result<(TrieHash, &[u8]), Error> {
+pub fn parse_hash_from_bytes(bytes: &[u8]) -> Result<(TrieHash, &[u8]), Error> {
     let hash_bytes = bytes.get(..TRIEHASH_ENCODED_SIZE).ok_or_else(|| {
         Error::CorruptionError("Failed to read hash in full from node bytes".to_string())
     })?;
@@ -960,51 +960,6 @@ pub fn read_trie_item_at_head_ref<'a, F: Read + Seek>(
     }
 }
 
-/// Deserialize a TrieNodeType and optionally its hash from the given Read+Seek object.
-/// The given `ptr_id` identifies the expected node type.
-///
-/// Node wire format for non-patch ("normal") nodes:
-///
-/// 0               32 33               33+X         33+X+Y
-/// |---------------|--|------------------|-----------|
-///   node hash      id  ptrs & ptr data      path
-///
-/// Node wire format for patch nodes:
-///
-/// 0               32 33               33+X
-/// |---------------|--|------------------|
-///   base node hash id  compressed ptrs
-///
-/// Returns Ok(node, hash) if the node is found
-/// Returns Err(Patch(..)) if a `TrieNodePatch` is found instead of the targeted node
-/// Returns Err(CorruptionError(..)) if the given `ptr_id` is not recognized, or the data read does
-/// not decode to a valid node or patch.
-/// Returns Err(IOError(..)) on disk I/O error
-#[cfg(test)]
-pub fn read_node_at_head<F: Read + Seek>(
-    f: &mut F,
-    ptr_id: u8,
-) -> Result<(TrieNodeType, TrieHash), Error> {
-    let mut node_bytes = Vec::new();
-    let start_disk_ptr = read_node_bytes_into(f, &mut node_bytes, ptr_id)?;
-    parse_node_from_bytes(f, start_disk_ptr, node_bytes.as_slice(), |bytes| {
-        let (hash, remaining) = parse_hash_from_bytes(bytes)?;
-        let (node, consumed) =
-            decode_nodetype_from_slice_at_head(remaining, ptr_id).map_err(|e| {
-                if let Error::Patch(_, patch) = e {
-                    Error::Patch(Some(hash), patch)
-                } else {
-                    e
-                }
-            })?;
-        let total_consumed = TRIEHASH_ENCODED_SIZE
-            .checked_add(consumed)
-            .ok_or(Error::OverflowError)?;
-
-        Ok(((node, hash), total_consumed))
-    })
-}
-
 /// Calculate how many bytes a node will be when serialized, including its hash.
 /// This assumes that none of the trie nodes will be compressed
 pub fn get_node_byte_len(node: &TrieNodeType) -> usize {
@@ -1091,6 +1046,50 @@ mod tests {
     use crate::chainstate::stacks::index::scratch::MarfReadState;
     use crate::chainstate::stacks::index::ReadTrieItemKind;
     use crate::codec::StacksMessageCodec;
+
+    /// Deserialize a TrieNodeType and optionally its hash from the given Read+Seek object.
+    /// The given `ptr_id` identifies the expected node type.
+    ///
+    /// Node wire format for non-patch ("normal") nodes:
+    ///
+    /// 0               32 33               33+X         33+X+Y
+    /// |---------------|--|------------------|-----------|
+    ///   node hash      id  ptrs & ptr data      path
+    ///
+    /// Node wire format for patch nodes:
+    ///
+    /// 0               32 33               33+X
+    /// |---------------|--|------------------|
+    ///   base node hash id  compressed ptrs
+    ///
+    /// Returns Ok(node, hash) if the node is found
+    /// Returns Err(Patch(..)) if a `TrieNodePatch` is found instead of the targeted node
+    /// Returns Err(CorruptionError(..)) if the given `ptr_id` is not recognized, or the data read does
+    /// not decode to a valid node or patch.
+    /// Returns Err(IOError(..)) on disk I/O error
+    pub fn read_node_at_head<F: Read + Seek>(
+        f: &mut F,
+        ptr_id: u8,
+    ) -> Result<(TrieNodeType, TrieHash), Error> {
+        let mut node_bytes = Vec::new();
+        let start_disk_ptr = read_node_bytes_into(f, &mut node_bytes, ptr_id)?;
+        parse_node_from_bytes(f, start_disk_ptr, node_bytes.as_slice(), |bytes| {
+            let (hash, remaining) = parse_hash_from_bytes(bytes)?;
+            let (node, consumed) =
+                decode_nodetype_from_slice_at_head(remaining, ptr_id).map_err(|e| {
+                    if let Error::Patch(_, patch) = e {
+                        Error::Patch(Some(hash), patch)
+                    } else {
+                        e
+                    }
+                })?;
+            let total_consumed = TRIEHASH_ENCODED_SIZE
+                .checked_add(consumed)
+                .ok_or(Error::OverflowError)?;
+
+            Ok(((node, hash), total_consumed))
+        })
+    }
 
     #[test]
     fn ptrs_from_slice_into_decodes_node4_dense_compressed() {

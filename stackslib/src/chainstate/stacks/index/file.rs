@@ -77,13 +77,9 @@ fn pwrite_all(fd: &fs::File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
 }
 
 use memmap2::Mmap;
-#[cfg(test)]
-use rusqlite::params;
 use rusqlite::Connection;
 
 use crate::chainstate::stacks::index::node::{TrieNodeID, TriePtr};
-#[cfg(test)]
-use crate::chainstate::stacks::index::storage;
 use crate::chainstate::stacks::index::storage::NodeHashReader;
 use crate::chainstate::stacks::index::{
     bits, trie_sql, BorrowedNodeBytes, Error, MarfTrieId, NodeDecodeScratch, ReadTrieItem,
@@ -262,11 +258,6 @@ impl TrieFile {
             .inspect_err(|e| error!("Failed to read trie blob {block_id}: {e:}"))?;
         buf.truncate(n);
         Ok(buf)
-    }
-
-    #[cfg(test)]
-    pub fn read_trie_blob(&self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
-        self.read_trie_blob_bytes(db, block_id)
     }
 
     /// Vacuum the database and report the size before and after.
@@ -699,43 +690,52 @@ impl TrieFile {
 }
 
 #[cfg(test)]
-impl TrieFile {
-    /// Obtain a TrieHash for a node, given the node's block's hash (used only in testing)
-    #[cfg(test)]
-    pub fn get_node_hash_by_bhh<T: MarfTrieId>(
-        &self,
-        db: &Connection,
-        bhh: &T,
-        ptr: &TriePtr,
-    ) -> Result<TrieHash, Error> {
-        let (offset, _length) = trie_sql::get_external_trie_offset_length_by_bhh(db, bhh)?;
-        self.read_hash_at(offset + ptr.ptr() as u64)
-    }
+mod testing {
+    use super::*;
+    use crate::chainstate::stacks::index::storage;
+    use crate::types::chainstate::TrieHash;
+    use rusqlite::params;
 
-    /// Get all (root hash, trie hash) pairs for this TrieFile
-    #[cfg(test)]
-    pub fn read_all_block_hashes_and_roots<T: MarfTrieId>(
-        &self,
-        db: &Connection,
-    ) -> Result<Vec<(TrieHash, T)>, Error> {
-        let mut s =
-            db.prepare("SELECT block_hash, external_offset FROM marf_data WHERE unconfirmed = 0 ORDER BY block_hash")?;
-        let rows = s.query_and_then(params![], |row| {
-            let block_hash: T = row.get_unwrap("block_hash");
-            let offset_i64: i64 = row.get_unwrap("external_offset");
-            let offset = offset_i64 as u64;
-            let start = storage::ROOT_PTR_DISK as u64;
+    impl TrieFile {
+        pub fn read_trie_blob(&self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
+            self.read_trie_blob_bytes(db, block_id)
+        }
 
-            let root_hash = self.read_hash_at(offset + start)?;
+        /// Obtain a TrieHash for a node, given the node's block's hash (used only in testing)
+        pub fn get_node_hash_by_bhh<T: MarfTrieId>(
+            &self,
+            db: &Connection,
+            bhh: &T,
+            ptr: &TriePtr,
+        ) -> Result<TrieHash, Error> {
+            let (offset, _length) = trie_sql::get_external_trie_offset_length_by_bhh(db, bhh)?;
+            self.read_hash_at(offset + ptr.ptr() as u64)
+        }
 
-            trace!(
-                "Root hash for block {} at offset {} is {}",
-                &block_hash,
-                offset + start,
-                &root_hash
-            );
-            Ok((root_hash, block_hash))
-        })?;
-        rows.collect()
+        /// Get all (root hash, trie hash) pairs for this TrieFile
+        pub fn read_all_block_hashes_and_roots<T: MarfTrieId>(
+            &self,
+            db: &Connection,
+        ) -> Result<Vec<(TrieHash, T)>, Error> {
+            let mut s =
+                db.prepare("SELECT block_hash, external_offset FROM marf_data WHERE unconfirmed = 0 ORDER BY block_hash")?;
+            let rows = s.query_and_then(params![], |row| {
+                let block_hash: T = row.get_unwrap("block_hash");
+                let offset_i64: i64 = row.get_unwrap("external_offset");
+                let offset = offset_i64 as u64;
+                let start = storage::ROOT_PTR_DISK as u64;
+
+                let root_hash = self.read_hash_at(offset + start)?;
+
+                trace!(
+                    "Root hash for block {} at offset {} is {}",
+                    &block_hash,
+                    offset + start,
+                    &root_hash
+                );
+                Ok((root_hash, block_hash))
+            })?;
+            rows.collect()
+        }
     }
 }
