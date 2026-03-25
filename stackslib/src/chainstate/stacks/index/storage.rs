@@ -37,7 +37,7 @@ use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
     bits, trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodeDecodeScratch,
-    NodePatching, ReadTrieItem, ReadTrieItemKind, ReadTrieNode, TrieHasher, TrieLeaf,
+    NodePatching, NodePath, ReadTrieItem, ReadTrieItemKind, ReadTrieNode, TrieHasher, TrieLeaf,
     TrieNodeReadState, TrieReadStorage, MAX_PATCH_DEPTH,
 };
 use crate::codec::StacksMessageCodec;
@@ -1454,7 +1454,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
     fn slot_placeholder() -> (TrieNodeType, TrieHash) {
         (
             TrieNodeType::Leaf(TrieLeaf {
-                path: vec![],
+                path: NodePath::default(),
                 data: MARFValue([0u8; 40]),
             }),
             TrieHash([0u8; TRIEHASH_ENCODED_SIZE]),

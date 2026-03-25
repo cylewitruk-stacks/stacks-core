@@ -1014,12 +1014,12 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
 
     /// Given a segment proof, extract the path prefix it encodes
     fn get_segment_proof_path_prefix(segment_proof: &[TrieMerkleProofType<T>]) -> Option<Vec<u8>> {
-        let mut path_parts = vec![];
+        let mut path_parts: Vec<Vec<u8>> = vec![];
         for proof_node in segment_proof {
             match proof_node {
                 TrieMerkleProofType::Leaf((ref _chr, ref node)) => {
                     // path_parts.push(vec![*chr]);
-                    path_parts.push(node.path.clone());
+                    path_parts.push(node.path.to_vec());
                 }
                 TrieMerkleProofType::Node4((ref chr, ref node, _)) => {
                     path_parts.push(vec![*chr]);

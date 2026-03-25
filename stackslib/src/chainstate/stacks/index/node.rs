@@ -19,8 +19,8 @@ use std::{error, fmt};
 
 use crate::chainstate::stacks::index::bits::{self, SPARSE_PTR_BITMAP_MARKER};
 use crate::chainstate::stacks::index::{
-    BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, ReadNodeBacking, ReadTrieNode,
-    ReadTrieNodeCursorStep, TrieLeaf,
+    BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodePath, ReadNodeBacking,
+    ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf,
 };
 use crate::codec::{read_next, write_next, Error as codec_error, StacksMessageCodec};
 use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE};
@@ -293,8 +293,8 @@ pub trait TrieNode {
     /// Get a reference to the children of this node.
     fn ptrs(&self) -> &[TriePtr];
 
-    /// Get a reference to the children of this node.
-    fn path(&self) -> &Vec<u8>;
+    /// Get a reference to the node's compressed path.
+    fn path(&self) -> &NodePath;
 
     /// Construct a TrieNodeType from a TrieNode
     fn as_trie_node_type(&self) -> TrieNodeType;
@@ -1230,14 +1230,14 @@ impl TrieLeaf {
         let mut bytes = [0u8; 40];
         bytes.copy_from_slice(data);
         TrieLeaf {
-            path: path.to_owned(),
+            path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             data: MARFValue(bytes),
         }
     }
 
     pub fn from_value(path: &[u8], value: MARFValue) -> TrieLeaf {
         TrieLeaf {
-            path: path.to_owned(),
+            path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             data: value,
         }
     }
@@ -1256,12 +1256,26 @@ impl fmt::Debug for TrieLeaf {
 
 impl StacksMessageCodec for TrieLeaf {
     fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), codec_error> {
-        self.path.consensus_serialize(fd)?;
+        // Wire format: 4-byte big-endian length prefix + path bytes (standard Stacks Vec<u8> codec)
+        let path_slice = self.path.as_slice();
+        (path_slice.len() as u32).consensus_serialize(fd)?;
+        fd.write_all(path_slice)
+            .map_err(|e| codec_error::SerializeError(format!("Failed to write path: {e:?}")))?;
         self.data.consensus_serialize(fd)
     }
 
     fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<TrieLeaf, codec_error> {
-        let path = read_next(fd)?;
+        // Read the 4-byte big-endian length prefix directly, then into NodePath — no temporary Vec.
+        let path_len: u32 = read_next(fd)?;
+        if path_len > 32 {
+            return Err(codec_error::DeserializeError(format!(
+                "TrieLeaf path length {} exceeds maximum of 32",
+                path_len
+            )));
+        }
+        let mut path = NodePath::default();
+        path.read_from(path_len as u8, fd)
+            .map_err(|e| codec_error::DeserializeError(format!("Failed to read path: {e:?}")))?;
         let data = read_next(fd)?;
 
         Ok(TrieLeaf { path, data })
@@ -1271,7 +1285,7 @@ impl StacksMessageCodec for TrieLeaf {
 /// Trie node with four children
 #[derive(Clone, PartialEq)]
 pub struct TrieNode4 {
-    pub path: Vec<u8>,
+    pub path: NodePath,
     pub ptrs: [TriePtr; 4],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,
@@ -1296,7 +1310,7 @@ impl fmt::Debug for TrieNode4 {
 impl TrieNode4 {
     pub fn new(path: &[u8]) -> TrieNode4 {
         TrieNode4 {
-            path: path.to_owned(),
+            path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             ptrs: [TriePtr::default(); 4],
             cowptr: None,
             patch_depth: 0,
@@ -1308,7 +1322,7 @@ impl TrieNode4 {
 /// Trie node with 16 children
 #[derive(Clone, PartialEq)]
 pub struct TrieNode16 {
-    pub path: Vec<u8>,
+    pub path: NodePath,
     pub ptrs: [TriePtr; 16],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,
@@ -1333,7 +1347,7 @@ impl fmt::Debug for TrieNode16 {
 impl TrieNode16 {
     pub fn new(path: &[u8]) -> TrieNode16 {
         TrieNode16 {
-            path: path.to_owned(),
+            path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             ptrs: [TriePtr::default(); 16],
             cowptr: None,
             patch_depth: 0,
@@ -1346,7 +1360,7 @@ impl TrieNode16 {
         let mut ptrs = [TriePtr::default(); 16];
         ptrs[..4].copy_from_slice(&node4.ptrs[..4]);
         TrieNode16 {
-            path: node4.path.clone(),
+            path: node4.path,
             ptrs,
             cowptr: None,
             patch_depth: 0,
@@ -1358,7 +1372,7 @@ impl TrieNode16 {
 /// Trie node with 48 children
 #[derive(Clone)]
 pub struct TrieNode48 {
-    pub path: Vec<u8>,
+    pub path: NodePath,
     indexes: [i8; 256], // indexes[i], if non-negative, is an index into ptrs.
     pub ptrs: [TriePtr; 48],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
@@ -1390,7 +1404,7 @@ impl PartialEq for TrieNode48 {
 impl TrieNode48 {
     pub fn new(path: &[u8]) -> TrieNode48 {
         TrieNode48 {
-            path: path.to_owned(),
+            path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             indexes: [-1; 256],
             ptrs: [TriePtr::default(); 48],
             cowptr: None,
@@ -1451,7 +1465,7 @@ impl TrieNode48 {
             indexes[ptrs[i].chr() as usize] = i as i8;
         }
         TrieNode48 {
-            path: node16.path.clone(),
+            path: node16.path,
             indexes,
             ptrs,
             cowptr: None,
@@ -1464,7 +1478,7 @@ impl TrieNode48 {
 /// Trie node with 256 children
 #[derive(Clone)]
 pub struct TrieNode256 {
-    pub path: Vec<u8>,
+    pub path: NodePath,
     pub ptrs: [TriePtr; 256],
     /// If this node was created by copy-on-write, then this points to the node it was copied from.
     pub cowptr: Option<TrieCowPtr>,
@@ -1495,7 +1509,7 @@ impl PartialEq for TrieNode256 {
 impl TrieNode256 {
     pub fn new(path: &[u8]) -> TrieNode256 {
         TrieNode256 {
-            path: path.to_owned(),
+            path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             ptrs: [TriePtr::default(); 256],
             cowptr: None,
             patch_depth: 0,
@@ -1513,7 +1527,7 @@ impl TrieNode256 {
             ptrs[c as usize] = *node4_ptr;
         }
         TrieNode256 {
-            path: node4.path.clone(),
+            path: node4.path,
             ptrs,
             cowptr: None,
             patch_depth: 0,
@@ -1532,7 +1546,7 @@ impl TrieNode256 {
             ptrs[c as usize] = *node48_ptr;
         }
         TrieNode256 {
-            path: node48.path.clone(),
+            path: node48.path,
             ptrs,
             cowptr: None,
             patch_depth: 0,
@@ -2078,7 +2092,7 @@ impl TrieNode for TrieNode4 {
 
     fn empty() -> TrieNode4 {
         TrieNode4 {
-            path: vec![],
+            path: NodePath::default(),
             ptrs: [TriePtr::default(); 4],
             cowptr: None,
             patch_depth: 0,
@@ -2136,7 +2150,7 @@ impl TrieNode for TrieNode4 {
         &self.ptrs
     }
 
-    fn path(&self) -> &Vec<u8> {
+    fn path(&self) -> &NodePath {
         &self.path
     }
 
@@ -2160,7 +2174,7 @@ impl TrieNode for TrieNode16 {
 
     fn empty() -> TrieNode16 {
         TrieNode16 {
-            path: vec![],
+            path: NodePath::default(),
             ptrs: [TriePtr::default(); 16],
             cowptr: None,
             patch_depth: 0,
@@ -2218,7 +2232,7 @@ impl TrieNode for TrieNode16 {
         &self.ptrs
     }
 
-    fn path(&self) -> &Vec<u8> {
+    fn path(&self) -> &NodePath {
         &self.path
     }
 
@@ -2242,7 +2256,7 @@ impl TrieNode for TrieNode48 {
 
     fn empty() -> TrieNode48 {
         TrieNode48 {
-            path: vec![],
+            path: NodePath::default(),
             indexes: [-1; 256],
             ptrs: [TriePtr::default(); 48],
             cowptr: None,
@@ -2356,7 +2370,7 @@ impl TrieNode for TrieNode48 {
         &self.ptrs
     }
 
-    fn path(&self) -> &Vec<u8> {
+    fn path(&self) -> &NodePath {
         &self.path
     }
 
@@ -2380,7 +2394,7 @@ impl TrieNode for TrieNode256 {
 
     fn empty() -> TrieNode256 {
         TrieNode256 {
-            path: vec![],
+            path: NodePath::default(),
             ptrs: [TriePtr::default(); 256],
             cowptr: None,
             patch_depth: 0,
@@ -2434,7 +2448,7 @@ impl TrieNode for TrieNode256 {
         &self.ptrs
     }
 
-    fn path(&self) -> &Vec<u8> {
+    fn path(&self) -> &NodePath {
         &self.path
     }
 
@@ -2524,7 +2538,7 @@ impl TrieNode for TrieLeaf {
         &[]
     }
 
-    fn path(&self) -> &Vec<u8> {
+    fn path(&self) -> &NodePath {
         &self.path
     }
 
@@ -2682,14 +2696,14 @@ impl<'a> TrieNodeRef<'a> {
     pub fn to_owned_node(&self) -> TrieNodeType {
         match self {
             Self::Node4 { path, ptrs } => TrieNodeType::Node4(TrieNode4 {
-                path: path.to_vec(),
+                path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 ptrs: **ptrs,
                 cowptr: None,
                 patch_depth: 0,
                 last_patch_source: None,
             }),
             Self::Node16 { path, ptrs } => TrieNodeType::Node16(TrieNode16 {
-                path: path.to_vec(),
+                path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 ptrs: **ptrs,
                 cowptr: None,
                 patch_depth: 0,
@@ -2700,7 +2714,7 @@ impl<'a> TrieNodeRef<'a> {
                 indexes,
                 ptrs,
             } => TrieNodeType::Node48(Box::new(TrieNode48 {
-                path: path.to_vec(),
+                path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 indexes: **indexes,
                 ptrs: **ptrs,
                 cowptr: None,
@@ -2708,14 +2722,14 @@ impl<'a> TrieNodeRef<'a> {
                 last_patch_source: None,
             })),
             Self::Node256 { path, ptrs } => TrieNodeType::Node256(Box::new(TrieNode256 {
-                path: path.to_vec(),
+                path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 ptrs: **ptrs,
                 cowptr: None,
                 patch_depth: 0,
                 last_patch_source: None,
             })),
             Self::Leaf(leaf) => TrieNodeType::Leaf(TrieLeaf {
-                path: leaf.path.to_vec(),
+                path: NodePath::from_slice(leaf.path).expect("node path exceeds 32 bytes"),
                 data: leaf.data.clone(),
             }),
         }
@@ -2867,11 +2881,11 @@ impl TrieNodeType {
         }
     }
 
-    pub fn path_bytes(&self) -> &Vec<u8> {
-        with_node!(self, ref data, &data.path)
+    pub fn path_bytes(&self) -> &[u8] {
+        with_node!(self, ref data, data.path.as_slice())
     }
 
-    pub fn set_path(&mut self, new_path: Vec<u8>) {
+    pub fn set_path(&mut self, new_path: NodePath) {
         with_node!(self, ref mut data, data.path = new_path)
     }
 

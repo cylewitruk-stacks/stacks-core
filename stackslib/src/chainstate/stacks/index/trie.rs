@@ -28,7 +28,7 @@ use crate::chainstate::stacks::index::node::{
 use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::storage::{TrieHashCalculationMode, TrieStorageConnection};
 use crate::chainstate::stacks::index::{
-    bits, Error, MarfTrieId, ReadNodeBacking, ReadTrieNode, TrieHasher, TrieLeaf,
+    bits, Error, MarfTrieId, NodePath, ReadNodeBacking, ReadTrieNode, TrieHasher, TrieLeaf,
     TrieNodeReadState, TrieReadSession, TrieReadStorage,
 };
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
@@ -293,8 +293,8 @@ impl Trie {
         cur_leaf_path: &[u8],
         value: &mut TrieLeaf,
     ) -> Result<TriePtr, Error> {
-        value.path.clear();
-        value.path.extend_from_slice(cur_leaf_path);
+        value.path = NodePath::from_slice(cur_leaf_path)
+            .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
 
         let leaf_hash = bits::get_leaf_hash(value);
 
@@ -318,12 +318,11 @@ impl Trie {
         let ptr = storage.last_ptr()?;
         let chr = cursor.chr().unwrap();
 
-        value.path = cursor
-            .path
-            .as_bytes()
-            .get(cursor.index..)
-            .ok_or_else(|| Error::CorruptionError("Cursor path shorter than cursor index".into()))?
-            .to_vec();
+        value.path =
+            NodePath::from_slice(cursor.path.as_bytes().get(cursor.index..).ok_or_else(|| {
+                Error::CorruptionError("Cursor path shorter than cursor index".into())
+            })?)
+            .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
 
         let leaf_hash = bits::get_leaf_hash(value);
         let leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, chr, ptr);
@@ -366,11 +365,13 @@ impl Trie {
         // * the node4 will have their shared prefix
         let cur_leaf_ptr = cursor.ptr();
 
-        let node4_path = cur_leaf_data
-            .path
-            .get(..cursor.ntell())
-            .ok_or_else(|| Error::CorruptionError("Node4 leaf path too short".into()))?
-            .to_vec();
+        let node4_path = NodePath::from_slice(
+            cur_leaf_data
+                .path
+                .get(..cursor.ntell())
+                .ok_or_else(|| Error::CorruptionError("Node4 leaf path too short".into()))?,
+        )
+        .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
         let node4_chr = cur_leaf_ptr.chr();
 
         let cur_leaf_chr = *cur_leaf_data
@@ -383,11 +384,13 @@ impl Trie {
             cursor.ntell() + 1
         };
 
-        let cur_leaf_path = cur_leaf_data
-            .path
-            .get(cur_leaf_path_start..)
-            .ok_or_else(|| Error::CorruptionError("Current leaf path too short".into()))?
-            .to_vec();
+        let cur_leaf_path = NodePath::from_slice(
+            cur_leaf_data
+                .path
+                .get(cur_leaf_path_start..)
+                .ok_or_else(|| Error::CorruptionError("Current leaf path too short".into()))?,
+        )
+        .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
 
         // update current leaf (path changed) and save it
         let cur_leaf_disk_ptr = cur_leaf_ptr.ptr();
@@ -405,8 +408,10 @@ impl Trie {
         // append the new leaf and the end of the file.
         let new_leaf_disk_ptr = storage.last_ptr()?;
         let new_leaf_chr = cursor.path[cursor.tell()]; // NOTE: this is safe because !cursor.eop()
-        new_leaf_data.path =
-            cursor.path[std::cmp::min(cursor.tell() + 1, cursor.path.len())..].to_vec();
+        new_leaf_data.path = NodePath::from_slice(
+            &cursor.path[std::cmp::min(cursor.tell() + 1, cursor.path.len())..],
+        )
+        .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
         let new_leaf_hash = bits::get_leaf_hash(new_leaf_data);
 
         // put new leaf at the end of this Trie
@@ -638,15 +643,20 @@ impl Trie {
         assert!(!node.is_leaf());
 
         let node_path = node.path_bytes();
-        let shared_path_prefix = node_path
-            .get(0..cursor.ntell())
-            .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?
-            .to_vec();
-        let leaf_path = cursor.path[cursor.tell() + 1..].to_vec();
-        let new_cur_node_path = node_path
-            .get(cursor.ntell() + 1..)
-            .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?
-            .to_vec();
+        let shared_path_prefix = NodePath::from_slice(
+            node_path
+                .get(0..cursor.ntell())
+                .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?,
+        )
+        .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
+        let leaf_path = NodePath::from_slice(&cursor.path[cursor.tell() + 1..])
+            .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
+        let new_cur_node_path = NodePath::from_slice(
+            node_path
+                .get(cursor.ntell() + 1..)
+                .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?,
+        )
+        .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
         let new_cur_node_chr = *node_path
             .get(cursor.ntell()) // chr for node-X post-update
             .ok_or_else(|| Error::CorruptionError("Node path too short".into()))?;
@@ -822,7 +832,7 @@ impl Trie {
         decode_scratch: &mut S,
     ) -> Result<TriePtr, Error> {
         enum MutationTarget {
-            ReplaceLeaf(Vec<u8>),
+            ReplaceLeaf(NodePath),
             MutateNode(TrieNodeType),
         }
 
@@ -834,7 +844,9 @@ impl Trie {
 
             if cursor.eop() {
                 if let Some(cur_leaf) = current_node_read.as_leaf()? {
-                    MutationTarget::ReplaceLeaf(cur_leaf.path.to_vec())
+                    MutationTarget::ReplaceLeaf(NodePath::from_slice(cur_leaf.path).ok_or_else(
+                        || Error::CorruptionError("Node path exceeds 32 bytes".into()),
+                    )?)
                 } else {
                     MutationTarget::MutateNode(current_node_read.into_owned_node()?.0)
                 }

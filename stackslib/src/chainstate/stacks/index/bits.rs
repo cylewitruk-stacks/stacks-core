@@ -25,7 +25,7 @@ use crate::chainstate::stacks::index::node::{
     TrieNodeType, TriePtr, TRIEPTR_SIZE,
 };
 use crate::chainstate::stacks::index::{
-    BlockMap, Error, MarfTrieId, NodeDecodeScratch, ReadTrieItem, ReadTrieNode, TrieLeaf,
+    BlockMap, Error, MarfTrieId, NodeDecodeScratch, NodePath, ReadTrieItem, ReadTrieNode, TrieLeaf,
     TrieReadStorage,
 };
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
@@ -49,7 +49,7 @@ pub const fn get_path_byte_len(p: &[u8]) -> usize {
 /// Returns Ok(()) on success and writes the decoded path into `dst`
 /// Returns Err(CorruptionError) if the path doesn't decode, or if the length prefix is invalid
 /// Returns Err(IOError) on disk I/O failure
-pub fn path_from_bytes_into<R: Read>(r: &mut R, dst: &mut Vec<u8>) -> Result<(), Error> {
+pub fn path_from_bytes_into<R: Read>(r: &mut R, dst: &mut NodePath) -> Result<(), Error> {
     let mut lenbuf = [0u8; 1];
     r.read_exact(&mut lenbuf).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -72,9 +72,7 @@ pub fn path_from_bytes_into<R: Read>(r: &mut R, dst: &mut Vec<u8>) -> Result<(),
         )));
     }
 
-    dst.clear();
-    dst.resize(lenbuf[0] as usize, 0);
-    r.read_exact(dst.as_mut_slice()).map_err(|e| {
+    dst.read_from(lenbuf[0], r).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
             Error::CorruptionError(format!("Failed to read {} bytes of path", lenbuf[0]))
         } else {
@@ -86,7 +84,7 @@ pub fn path_from_bytes_into<R: Read>(r: &mut R, dst: &mut Vec<u8>) -> Result<(),
     Ok(())
 }
 
-pub fn path_from_bytes_slice_into(bytes: &[u8], dst: &mut Vec<u8>) -> Result<usize, Error> {
+pub fn path_from_bytes_slice_into(bytes: &[u8], dst: &mut NodePath) -> Result<usize, Error> {
     let path_len = *bytes
         .first()
         .ok_or_else(|| Error::CorruptionError("Failed to read len buf".to_string()))?
@@ -108,8 +106,9 @@ pub fn path_from_bytes_slice_into(bytes: &[u8], dst: &mut Vec<u8>) -> Result<usi
         Error::CorruptionError(format!("Failed to read {} bytes of path", path_len))
     })?;
 
-    dst.clear();
-    dst.extend_from_slice(path_bytes);
+    dst.set_from_slice(path_bytes).ok_or_else(|| {
+        Error::CorruptionError(format!("Node path length {} exceeds 32", path_len))
+    })?;
     Ok(1 + path_len)
 }
 
@@ -119,8 +118,8 @@ pub fn path_from_bytes_slice_into(bytes: &[u8], dst: &mut Vec<u8>) -> Result<usi
 /// Returns Ok(path-bytes) on success
 /// Returns Err(CorruptionError) if the path doesn't decode, or if the length prefix is invalid
 /// Returns Err(IOError) on disk I/O failure
-pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, Error> {
-    let mut path = Vec::new();
+pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<NodePath, Error> {
+    let mut path = NodePath::default();
     path_from_bytes_into(r, &mut path)?;
     Ok(path)
 }
@@ -1140,6 +1139,64 @@ mod tests {
         assert_eq!(
             clear_ctrl_bits(set_backptr(TrieNodeID::Patch as u8)),
             TrieNodeID::Patch as u8
+        );
+    }
+
+    /// Regression: NodePath equality must compare only the active prefix, not stale tail bytes.
+    /// A shorter path decoded into a scratch slot after a longer one must compare equal to a
+    /// freshly-constructed NodePath with the same active bytes.
+    #[test]
+    fn nodepath_equality_ignores_stale_tail_bytes() {
+        use crate::chainstate::stacks::index::NodePath;
+
+        // Simulate scratch reuse: first decode a long path, then a short one into the same slot.
+        let mut path = NodePath::from_slice(&[0xaa; 20]).unwrap();
+        assert_eq!(path.len(), 20);
+
+        // Overwrite with a shorter path (as set_from_slice does in decode).
+        path.set_from_slice(&[0xbb; 5]).unwrap();
+
+        // A freshly-constructed path with the same active content must be equal.
+        let fresh = NodePath::from_slice(&[0xbb; 5]).unwrap();
+        assert_eq!(path, fresh);
+        assert_eq!(path.as_slice(), fresh.as_slice());
+
+        // Same test via read_from (the Read-based decode path).
+        let mut path2 = NodePath::from_slice(&[0xcc; 32]).unwrap();
+        let short_data = [0xdd; 3];
+        path2
+            .read_from(3, &mut std::io::Cursor::new(&short_data))
+            .unwrap();
+        let fresh2 = NodePath::from_slice(&[0xdd; 3]).unwrap();
+        assert_eq!(path2, fresh2);
+
+        // from_slice rejects oversized input
+        assert!(NodePath::from_slice(&[0xff; 33]).is_none());
+
+        // set_from_slice rejects oversized input
+        let mut p = NodePath::default();
+        assert!(p.set_from_slice(&[0xff; 33]).is_none());
+    }
+
+    /// Regression: TrieLeaf::consensus_deserialize must return an error (not panic) when the
+    /// wire path exceeds 32 bytes.
+    #[test]
+    fn trieleaf_deserialize_rejects_oversized_path() {
+        use crate::chainstate::stacks::index::TrieLeaf;
+
+        // Build a valid-looking wire payload with a 33-byte path.
+        let mut wire = Vec::new();
+        // 4-byte big-endian length prefix = 33
+        wire.extend_from_slice(&33u32.to_be_bytes());
+        // 33 bytes of path data
+        wire.extend_from_slice(&[0xaa; 33]);
+        // 40 bytes of MARFValue (would follow in a valid leaf)
+        wire.extend_from_slice(&[0x00; 40]);
+
+        let result = TrieLeaf::consensus_deserialize(&mut std::io::Cursor::new(&wire));
+        assert!(
+            result.is_err(),
+            "Expected DeserializeError for oversized path, got Ok"
         );
     }
 }

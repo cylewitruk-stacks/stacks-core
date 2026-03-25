@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::hash::Hash;
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 use std::{error, fmt, io};
 
@@ -87,10 +88,120 @@ pub struct ProofTriePtr<T> {
     pub back_block: T,
 }
 
+/// A compressed trie path segment, stored inline as a fixed-size array.
+///
+/// Replaces `Vec<u8>` on all trie node types. Maximum length is 32 bytes
+/// (the size of a `TrieHash`), enforced at construction time.
+///
+/// `NodePath` is `Copy`, so cloning nodes no longer heap-allocates for the path field.
+#[derive(Clone, Copy, Default)]
+pub struct NodePath {
+    data: [u8; 32],
+    len: u8,
+}
+
+impl PartialEq for NodePath {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for NodePath {}
+
+impl NodePath {
+    /// Create a `NodePath` from a byte slice. Returns `None` if `s.len() > 32`.
+    #[inline]
+    pub fn from_slice(s: &[u8]) -> Option<Self> {
+        let len = s.len();
+        if len > 32 {
+            return None;
+        }
+        let mut data = [0u8; 32];
+        data.get_mut(..len)?.copy_from_slice(s);
+        Some(Self {
+            data,
+            len: len as u8,
+        })
+    }
+
+    /// The path bytes as a slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        // `len` is always <= 32: only set by validated paths (try_from_slice, try_set_from_slice,
+        // read_from after bits::path_from_bytes_* validates TRIEHASH_ENCODED_SIZE).
+        self.data
+            .get(..self.len as usize)
+            .expect("BUG: NodePath len invariant violated")
+    }
+
+    /// The length of the path in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Returns `true` if the path is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Set the path from a reader.
+    ///
+    /// `len` must be <= 32 (callers validate via [`TRIEHASH_ENCODED_SIZE`] before calling).
+    #[inline]
+    pub fn read_from<R: io::Read>(&mut self, len: u8, r: &mut R) -> Result<(), io::Error> {
+        self.len = len;
+        r.read_exact(
+            self.data
+                .get_mut(..len as usize)
+                .expect("BUG: NodePath::read_from called with len > 32"),
+        )
+    }
+
+    /// Set the path from a byte slice. Returns `None` if `s.len() > 32`.
+    #[inline]
+    pub fn set_from_slice(&mut self, s: &[u8]) -> Option<()> {
+        let len = s.len();
+        if len > 32 {
+            return None;
+        }
+        self.data.get_mut(..len)?.copy_from_slice(s);
+        self.len = len as u8;
+        Some(())
+    }
+}
+
+impl Deref for NodePath {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for NodePath {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl fmt::Debug for NodePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "NodePath({})",
+            crate::util::hash::to_hex(self.as_slice())
+        )
+    }
+}
+
 /// Leaf of a Trie.
 #[derive(Clone)]
 pub struct TrieLeaf {
-    pub path: Vec<u8>,   // path to be lazily expanded
+    pub path: NodePath,
     pub data: MARFValue, // the actual data
 }
 
@@ -847,7 +958,7 @@ impl<'a> ReadTrieNode<'a> {
             ReadNodeBacking::PersistedBytes(node) => {
                 Ok(self.decoded_from_bytes(node)?.path_bytes())
             }
-            ReadNodeBacking::Owned(node) => Ok(node.path_bytes().as_slice()),
+            ReadNodeBacking::Owned(node) => Ok(node.path_bytes()),
         }
     }
 
