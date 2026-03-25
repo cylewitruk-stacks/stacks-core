@@ -114,14 +114,18 @@ fn write_ptrs_to_bytes<W: Write>(ptrs: &[TriePtr], w: &mut W) -> Result<(), Erro
 }
 
 /// Write the list of TriePtrs to the given Write object.
+///
 /// The given `id` is a node ID with some control bits set -- in particular, the compressed bit.
+///
 /// If the compressed bit is set, then the TriePtr list will be compressed as best as possible
 /// before written.  See `bits::ptrs_to_bytes()` for details.
 ///
-/// Returns Ok(()) on success
-/// Returns Err(CorruptionError(..)) if the id does not correspond to a valid node ID or is a patch
+/// Returns:
+///
+/// * Ok(()) on success
+/// * Err(CorruptionError(..)) if the id does not correspond to a valid node ID or is a patch
 /// node ID
-/// Returns Err(IOError(..)) on disk I/O error
+/// * Err(IOError(..)) on disk I/O error
 fn write_ptrs_to_bytes_compressed<W: Write>(
     id: u8,
     ptrs: &[TriePtr],
@@ -132,6 +136,7 @@ fn write_ptrs_to_bytes_compressed<W: Write>(
             "Tried to store invalid trie node ID".to_string(),
         ));
     };
+
     if node_id == TrieNodeID::Patch {
         // NB the only proper way to store a patch node is to have it dumped as part of a TrieRAM
         return Err(Error::CorruptionError(
@@ -299,15 +304,6 @@ pub trait TrieNode {
 
     /// Set the ptr to the node we were copied from (on COW)
     fn set_cow_ptr(&mut self, cowptr: TrieCowPtr);
-
-    /// Apply a list of TrieNodePatches to produce this node
-    fn apply_patches(
-        self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
-        cur_block_id: u32,
-    ) -> Option<Self>
-    where
-        Self: Sized;
 
     /// Encode this node instance into a byte stream and write it to w.
     /// The TriePtrs willl NOT be compressed
@@ -1929,20 +1925,6 @@ impl TrieNodePatch {
         true
     }
 
-    /// Apply this patch to a node4, given the node, block ID where the patch was found, and block
-    /// ID where the node was written.
-    pub fn apply_node4(
-        &self,
-        mut old_node: TrieNode4,
-        patch_block_id: u32,
-        cur_block_id: u32,
-    ) -> Option<TrieNode4> {
-        if !self.apply_node4_in_place(&mut old_node, patch_block_id, cur_block_id) {
-            return None;
-        }
-        Some(old_node)
-    }
-
     /// Apply this patch to a node16, given the node, block ID where the patch was found, and block
     /// ID where the node was written.
     pub fn apply_node16_in_place(
@@ -1962,20 +1944,6 @@ impl TrieNodePatch {
         node_normalize_ptrs(&mut old_node.ptrs, cur_block_id);
         trace!("Patched up to {old_node:?}");
         true
-    }
-
-    /// Apply this patch to a node16, given the node, block ID where the patch was found, and block
-    /// ID where the node was written.
-    pub fn apply_node16(
-        &self,
-        mut old_node: TrieNode16,
-        patch_block_id: u32,
-        cur_block_id: u32,
-    ) -> Option<TrieNode16> {
-        if !self.apply_node16_in_place(&mut old_node, patch_block_id, cur_block_id) {
-            return None;
-        }
-        Some(old_node)
     }
 
     /// Apply this patch to a node48, given the node, block ID where the patch was found, and block
@@ -1999,20 +1967,6 @@ impl TrieNodePatch {
         true
     }
 
-    /// Apply this patch to a node48, given the node, block ID where the patch was found, and block
-    /// ID where the node was written.
-    pub fn apply_node48(
-        &self,
-        mut old_node: TrieNode48,
-        patch_block_id: u32,
-        cur_block_id: u32,
-    ) -> Option<TrieNode48> {
-        if !self.apply_node48_in_place(&mut old_node, patch_block_id, cur_block_id) {
-            return None;
-        }
-        Some(old_node)
-    }
-
     /// Apply this patch to a node256, given the node, block ID where the patch was found, and block
     /// ID where the node was written.
     pub fn apply_node256_in_place(
@@ -2032,20 +1986,6 @@ impl TrieNodePatch {
         node_normalize_ptrs(&mut old_node.ptrs, cur_block_id);
         trace!("Patched up to {old_node:?}");
         true
-    }
-
-    /// Apply this patch to a node256, given the node, block ID where the patch was found, and block
-    /// ID where the node was written.
-    pub fn apply_node256(
-        &self,
-        mut old_node: TrieNode256,
-        patch_block_id: u32,
-        cur_block_id: u32,
-    ) -> Option<TrieNode256> {
-        if !self.apply_node256_in_place(&mut old_node, patch_block_id, cur_block_id) {
-            return None;
-        }
-        Some(old_node)
     }
 
     /// Compute the size of the TriePatchNode. Its pointers are always compressed.
@@ -2211,25 +2151,6 @@ impl TrieNode for TrieNode4 {
     fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
         self.cowptr.replace(cowptr);
     }
-
-    fn apply_patches(
-        self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
-        cur_block_id: u32,
-    ) -> Option<Self> {
-        let mut node = self;
-        for (patch_block_id, _, patch) in patches.iter() {
-            let Some(next_node) = patch.apply_node4(node, *patch_block_id, cur_block_id) else {
-                return None;
-            };
-            node = next_node;
-        }
-        node.patch_depth += patches.len();
-        if let Some((block_id, ptr, _)) = patches.last() {
-            node.last_patch_source = Some((*block_id, *ptr));
-        }
-        Some(node)
-    }
 }
 
 impl TrieNode for TrieNode16 {
@@ -2311,25 +2232,6 @@ impl TrieNode for TrieNode16 {
 
     fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
         self.cowptr.replace(cowptr);
-    }
-
-    fn apply_patches(
-        self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
-        cur_block_id: u32,
-    ) -> Option<Self> {
-        let mut node = self;
-        for (patch_block_id, _, patch) in patches.iter() {
-            let Some(next_node) = patch.apply_node16(node, *patch_block_id, cur_block_id) else {
-                return None;
-            };
-            node = next_node;
-        }
-        node.patch_depth += patches.len();
-        if let Some((block_id, ptr, _)) = patches.last() {
-            node.last_patch_source = Some((*block_id, *ptr));
-        }
-        Some(node)
     }
 }
 
@@ -2469,25 +2371,6 @@ impl TrieNode for TrieNode48 {
     fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
         self.cowptr.replace(cowptr);
     }
-
-    fn apply_patches(
-        self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
-        cur_block_id: u32,
-    ) -> Option<Self> {
-        let mut node = self;
-        for (patch_block_id, _, patch) in patches.iter() {
-            let Some(next_node) = patch.apply_node48(node, *patch_block_id, cur_block_id) else {
-                return None;
-            };
-            node = next_node;
-        }
-        node.patch_depth += patches.len();
-        if let Some((block_id, ptr, _)) = patches.last() {
-            node.last_patch_source = Some((*block_id, *ptr));
-        }
-        Some(node)
-    }
 }
 
 impl TrieNode for TrieNode256 {
@@ -2565,25 +2448,6 @@ impl TrieNode for TrieNode256 {
 
     fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
         self.cowptr.replace(cowptr);
-    }
-
-    fn apply_patches(
-        self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
-        cur_block_id: u32,
-    ) -> Option<Self> {
-        let mut node = self;
-        for (patch_block_id, _, patch) in patches.iter() {
-            let Some(next_node) = patch.apply_node256(node, *patch_block_id, cur_block_id) else {
-                return None;
-            };
-            node = next_node;
-        }
-        node.patch_depth += patches.len();
-        if let Some((block_id, ptr, _)) = patches.last() {
-            node.last_patch_source = Some((*block_id, *ptr));
-        }
-        Some(node)
     }
 }
 
@@ -2676,14 +2540,6 @@ impl TrieNode for TrieLeaf {
     fn set_cow_ptr(&mut self, _cowptr: TrieCowPtr) {
         // no-op
     }
-
-    fn apply_patches(
-        self,
-        _patches: &[(u32, TriePtr, TrieNodePatch)],
-        _cur_block_id: u32,
-    ) -> Option<Self> {
-        Some(self)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2721,6 +2577,16 @@ pub enum TrieNodeRef<'a> {
         ptrs: &'a [TriePtr; 256],
     },
     Leaf(TrieLeafRef<'a>),
+}
+
+/// Transient metadata from an owned `TrieNodeType` that `TrieNodeRef` does not carry
+/// (because it is a lightweight structural view). Captured alongside a `TrieNodeRef` so
+/// that `to_owned_node()` can round-trip without losing COW/patch state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrieNodeTransientMeta {
+    pub cowptr: Option<TrieCowPtr>,
+    pub patch_depth: usize,
+    pub last_patch_source: Option<(u32, TriePtr)>,
 }
 
 impl<'a> TrieNodeRef<'a> {
@@ -2853,6 +2719,26 @@ impl<'a> TrieNodeRef<'a> {
                 data: leaf.data.clone(),
             }),
         }
+    }
+}
+
+impl TrieNodeTransientMeta {
+    /// Extract transient metadata from an owned `TrieNodeType`.
+    pub fn from_node(node: &TrieNodeType) -> Self {
+        Self {
+            cowptr: node.get_cow_ptr().copied(),
+            patch_depth: node.patch_depth(),
+            last_patch_source: node.last_patch_source(),
+        }
+    }
+
+    /// Apply this metadata to an owned `TrieNodeType`.
+    pub fn apply_to(self, node: &mut TrieNodeType) {
+        if let Some(cowptr) = self.cowptr {
+            node.set_cow_ptr(cowptr);
+        }
+        node.set_patch_depth(self.patch_depth);
+        node.set_last_patch_source(self.last_patch_source);
     }
 }
 
@@ -2997,40 +2883,6 @@ impl TrieNodeType {
         with_node!(self, ref mut data, data.set_cow_ptr(cowptr))
     }
 
-    pub fn apply_patches(
-        self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
-        cur_block_id: u32,
-    ) -> Option<Self> {
-        match self {
-            TrieNodeType::Node4(data) => {
-                let Some(new_data) = data.apply_patches(patches, cur_block_id) else {
-                    return None;
-                };
-                Some(TrieNodeType::Node4(new_data))
-            }
-            TrieNodeType::Node16(data) => {
-                let Some(new_data) = data.apply_patches(patches, cur_block_id) else {
-                    return None;
-                };
-                Some(TrieNodeType::Node16(new_data))
-            }
-            TrieNodeType::Node48(data) => {
-                let Some(new_data) = data.apply_patches(patches, cur_block_id) else {
-                    return None;
-                };
-                Some(TrieNodeType::Node48(Box::new(new_data)))
-            }
-            TrieNodeType::Node256(data) => {
-                let Some(new_data) = data.apply_patches(patches, cur_block_id) else {
-                    return None;
-                };
-                Some(TrieNodeType::Node256(Box::new(new_data)))
-            }
-            TrieNodeType::Leaf(data) => Some(TrieNodeType::Leaf(data)),
-        }
-    }
-
     pub fn patch_depth(&self) -> usize {
         match self {
             TrieNodeType::Node4(ref data) => data.patch_depth,
@@ -3048,6 +2900,26 @@ impl TrieNodeType {
             TrieNodeType::Node48(ref data) => data.last_patch_source,
             TrieNodeType::Node256(ref data) => data.last_patch_source,
             TrieNodeType::Leaf(_) => None,
+        }
+    }
+
+    pub fn set_patch_depth(&mut self, depth: usize) {
+        match self {
+            TrieNodeType::Node4(ref mut data) => data.patch_depth = depth,
+            TrieNodeType::Node16(ref mut data) => data.patch_depth = depth,
+            TrieNodeType::Node48(ref mut data) => data.patch_depth = depth,
+            TrieNodeType::Node256(ref mut data) => data.patch_depth = depth,
+            TrieNodeType::Leaf(_) => {}
+        }
+    }
+
+    pub fn set_last_patch_source(&mut self, source: Option<(u32, TriePtr)>) {
+        match self {
+            TrieNodeType::Node4(ref mut data) => data.last_patch_source = source,
+            TrieNodeType::Node16(ref mut data) => data.last_patch_source = source,
+            TrieNodeType::Node48(ref mut data) => data.last_patch_source = source,
+            TrieNodeType::Node256(ref mut data) => data.last_patch_source = source,
+            TrieNodeType::Leaf(_) => {}
         }
     }
 }

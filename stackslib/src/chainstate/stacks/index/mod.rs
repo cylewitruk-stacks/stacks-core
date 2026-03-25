@@ -44,7 +44,8 @@ pub mod trie_sql;
 pub mod test;
 
 use crate::chainstate::stacks::index::node::{
-    ParkedNodeHandle, TrieLeafRef, TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeType, TriePtr,
+    ParkedNodeHandle, TrieLeafRef, TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeTransientMeta,
+    TrieNodeType, TriePtr,
 };
 
 #[derive(Debug)]
@@ -285,7 +286,7 @@ pub enum Error {
 }
 
 /// A borrowed slice of serialized trie node bytes (e.g. from an mmap'd blob).
-/// 
+///
 /// Carries the node type so the decoder knows how to interpret the bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct BorrowedNodeBytes<'a> {
@@ -311,7 +312,7 @@ impl<'a> BorrowedNodeBytes<'a> {
 }
 
 /// An owned copy of serialized trie node bytes (e.g. from a seek+read I/O path).
-/// 
+///
 /// Same role as [`BorrowedNodeBytes`] but owns its allocation.
 #[derive(Debug, Clone)]
 pub struct OwnedNodeBytes {
@@ -337,7 +338,7 @@ impl OwnedNodeBytes {
 }
 
 /// Serialized node bytes — either borrowed from an mmap region or owned from a read buffer.
-/// 
+///
 /// Provides uniform access to the node type and raw bytes regardless of ownership.
 #[derive(Debug, Clone)]
 pub enum BytesBacking<'a> {
@@ -385,7 +386,7 @@ pub struct ReadTrieItem<'a> {
 }
 
 /// How a read node's data is backed in memory.
-/// 
+///
 /// This enum is the core of the lazy-decode / zero-copy strategy: nodes from different sources
 /// carry different backing, and decoding is deferred until the caller actually needs structured
 /// access (e.g. `walk()`, `ptrs()`).
@@ -393,7 +394,7 @@ pub struct ReadTrieItem<'a> {
 pub enum ReadNodeBacking<'a> {
     /// Decoded node borrowed from scratch/parking state (not persisted — e.g. the uncommitted
     /// TrieRAM).
-    /// 
+    ///
     /// "Volatile" because the reference is invalidated when the scratch slot is reused.
     VolatileDecoded(TrieNodeRef<'a>),
     /// Decoded node borrowed from persisted storage (e.g. already-decoded cache or SQLite inline
@@ -424,10 +425,14 @@ pub struct ReadTrieNode<'a> {
     /// Lazily-decoded node for the `PersistedBytes` case. Shared via `Arc` so that `ReadTrieNode`
     /// remains `Clone` without re-decoding.
     decoded_bytes: Arc<OnceLock<TrieNodeType>>,
+    /// Transient metadata (cowptr, patch state) from the source `TrieNodeType` that
+    /// `TrieNodeRef` cannot carry. Applied by `into_owned_node()` to round-trip
+    /// without loss.
+    transient_meta: Option<TrieNodeTransientMeta>,
 }
 
-/// Result of a single step during a trie cursor walk. 
-/// 
+/// Result of a single step during a trie cursor walk.
+///
 /// Tells the walker what to do next after visiting a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadTrieNodeCursorStep {
@@ -452,7 +457,7 @@ pub trait TrieNodeArena {
 }
 
 /// Transitional marker trait; combines parking and patching capabilities.
-/// 
+///
 /// TODO: Not the target architecture: will be eliminated once all call sites declare their own
 /// specific bounds.
 pub trait TrieNodeReadState: NodeParking + NodePatching {}
@@ -535,12 +540,13 @@ pub trait NodePatching: NodeDecodeScratch {
 ///
 /// Provides block-level positioning (which trie to read from) and node-level I/O (reading node
 /// data, hashes, and children). The MARF walk uses this trait to traverse tries across blocks:
-/// [`open_block`](Self::open_block) repositions storage to a specific block's trie, then
+/// [`open_block()`](Self::open_block) repositions storage to a specific block's trie, then
 /// [`read_node_with_state`](Self::read_node_with_state) reads individual nodes within that trie.
 ///
-/// Backpointer resolution works by calling `open_block` / `open_block_known_id` to jump to an
-/// ancestor block, reading the target node there, then continuing the walk. The storage tracks
-/// which block is currently open via [`get_cur_block_and_id`](Self::get_cur_block_and_id).
+/// Backpointer resolution works by calling [`open_block()`](Self::open_block) /
+/// [`open_block_known_id()`](Self::open_block_known_id) to jump to an ancestor block, reading the
+/// target node there, then continuing the walk. The storage tracks which block is currently open
+/// via [`get_cur_block_and_id()`](Self::get_cur_block_and_id).
 pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     /// Read a node from the currently-open block's trie at the given pointer. The `state` parameter
     /// provides scratch space for node decoding and patch resolution (see [`TrieNodeReadState`]).
@@ -564,8 +570,8 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     }
 
     /// Reposition storage to the trie for `bhh` using a known block ID, avoiding the
-    /// block-hash-to-ID lookup. 
-    /// 
+    /// block-hash-to-ID lookup.
+    ///
     /// Used during backpointer resolution where the `back_block` ID is already available from the
     /// [`TriePtr`].
     fn open_block_known_id(&mut self, bhh: &T, id: u32) -> Result<(), Error>;
@@ -575,8 +581,8 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
         self.get_cur_block_and_id().0
     }
 
-    /// Return the block hash and numeric ID of the currently-open trie. 
-    /// 
+    /// Return the block hash and numeric ID of the currently-open trie.
+    ///
     /// The ID is `None` if the block was opened without a known ID.
     fn get_cur_block_and_id(&self) -> (T, Option<u32>);
 
@@ -586,8 +592,8 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
         Ok(self.get_block_hash_caching(local_id)?.clone())
     }
 
-    /// Return a [`TriePtr`] pointing to the root node of the currently-open block's trie. 
-    /// 
+    /// Return a [`TriePtr`] pointing to the root node of the currently-open block's trie.
+    ///
     /// This is the starting point for all trie walks.
     fn root_trieptr(&self) -> TriePtr;
 
@@ -604,7 +610,7 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     fn check_cached_ancestor_hashes_bytes(&mut self, bhh: &T) -> Option<Vec<TrieHash>>;
 
     /// Write the hashes of the children pointed to by `ptrs` into `w`.
-    /// 
+    ///
     /// Used during Merkle proof construction and root hash computation.
     fn write_children_hashes_by_ptrs<W: io::Write + ?Sized>(
         &mut self,
@@ -621,8 +627,10 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
 }
 
 /// Bundles a [`TrieReadStorage`] reference with a [`TrieNodeReadState`] for convenient node
-/// reading. Callers use `read_node()` instead of manually passing state to every
-/// `read_node_with_state()` call.
+/// reading.
+///
+/// Callers use [`read_node()`](Self::read_node) instead of manually passing state to every
+/// [`read_node_with_state()`](TrieReadStorage::read_node_with_state) call.
 pub struct TrieReadSession<
     'a,
     T: MarfTrieId,
@@ -645,7 +653,8 @@ impl<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>
         }
     }
 
-    /// Access the underlying storage (e.g. for `open_block` calls).
+    /// Access the underlying storage (e.g. for [`open_block()`](TrieReadStorage::open_block)
+    /// calls).
     pub fn storage(&mut self) -> &mut R {
         self.storage
     }
@@ -706,7 +715,14 @@ impl<'a> ReadTrieNode<'a> {
             patch_depth,
             backing,
             decoded_bytes: Arc::new(OnceLock::new()),
+            transient_meta: None,
         }
+    }
+
+    /// Attach transient metadata (cowptr, patch state) captured from the source TrieNodeType.
+    pub fn with_transient_meta(mut self, meta: TrieNodeTransientMeta) -> Self {
+        self.transient_meta = Some(meta);
+        self
     }
 
     fn patch_depth_from_owned(node: &TrieNodeType) -> usize {
@@ -773,8 +789,8 @@ impl<'a> ReadTrieNode<'a> {
         matches!(self.node_type(), Some(TrieNodeID::Node256))
     }
 
-    /// Decode a `BytesBacking` node into an owned `TrieNodeType`. 
-    /// 
+    /// Decode a [`BytesBacking`] node into an owned [`TrieNodeType`].
+    ///
     /// Borrowed bytes (mmap) may be a prefix slice — uses prefix decode. Owned bytes use
     /// exact-length decode with validation.
     fn decode_bytes_to_node(&self, node: &BytesBacking<'_>) -> Result<TrieNodeType, Error> {
@@ -901,16 +917,23 @@ impl<'a> ReadTrieNode<'a> {
         }
     }
 
-    /// Consume this read node and return an owned `TrieNodeType` + hash.
+    /// Consume this read node and return an owned [`TrieNodeType`] + hash.
+    ///
+    /// If transient metadata (cowptr, patch state) was captured when the `ReadTrieNode` was
+    /// constructed, it is applied to the owned node so that round-tripping through [`TrieNodeRef`]
+    /// doesn't lose COW/patch state.
     pub fn into_owned_node(self) -> Result<(TrieNodeType, Option<TrieHash>), Error> {
-        match self.backing {
-            ReadNodeBacking::VolatileDecoded(node) => Ok((node.to_owned_node(), self.hash)),
-            ReadNodeBacking::PersistedDecoded(node) => Ok((node.to_owned_node(), self.hash)),
-            ReadNodeBacking::PersistedBytes(ref node) => {
-                Ok((self.decode_bytes_to_node(node)?, self.hash))
-            }
-            ReadNodeBacking::Owned(node) => Ok((node, self.hash)),
+        let meta = self.transient_meta;
+        let mut node = match self.backing {
+            ReadNodeBacking::VolatileDecoded(node) => node.to_owned_node(),
+            ReadNodeBacking::PersistedDecoded(node) => node.to_owned_node(),
+            ReadNodeBacking::PersistedBytes(ref node) => self.decode_bytes_to_node(node)?,
+            ReadNodeBacking::Owned(node) => node,
+        };
+        if let Some(meta) = meta {
+            meta.apply_to(&mut node);
         }
+        Ok((node, self.hash))
     }
 
     /// Consume this read node and return only the hash, discarding node data.

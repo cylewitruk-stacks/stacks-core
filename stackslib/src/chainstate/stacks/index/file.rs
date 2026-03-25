@@ -691,10 +691,11 @@ impl TrieFile {
 
 #[cfg(test)]
 mod testing {
+    use rusqlite::params;
+
     use super::*;
     use crate::chainstate::stacks::index::storage;
     use crate::types::chainstate::TrieHash;
-    use rusqlite::params;
 
     impl TrieFile {
         pub fn read_trie_blob(&self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {

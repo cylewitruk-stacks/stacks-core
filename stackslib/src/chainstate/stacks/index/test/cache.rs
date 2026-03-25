@@ -185,6 +185,15 @@ mod utils {
 
         marf.get_root_hash_at(&last_block_header).unwrap()
     }
+
+    /// Returns the short hash-mode string used in test directory names.
+    pub fn hash_mode_str(opts: &MARFOpenOpts) -> &'static str {
+        match opts.hash_calculation_mode {
+            TrieHashCalculationMode::Immediate => "imm",
+            TrieHashCalculationMode::Deferred => "def",
+            TrieHashCalculationMode::All => "all",
+        }
+    }
 }
 
 /// Tests MARF cache behavior (no compression) using 128 inserts across 128 blocks,

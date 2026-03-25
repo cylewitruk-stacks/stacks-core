@@ -73,6 +73,7 @@ fn read_detached_hashed_node<
         hash,
         patch_depth,
         backing,
+        transient_meta,
         ..
     } = read;
     let hash =
@@ -92,10 +93,13 @@ fn read_detached_hashed_node<
         DetachAction::ParkOwned(node) => read_state.park_owned_node(node),
     };
 
-    Ok(
+    let mut result =
         ReadTrieNode::from_state_borrowed(read_state.get_parked_ref(parked_handle), Some(hash))
-            .with_patch_depth(patch_depth),
-    )
+            .with_patch_depth(patch_depth);
+    if let Some(meta) = transient_meta {
+        result = result.with_transient_meta(meta);
+    }
+    Ok(result)
 }
 
 /// Fetch children hashes and compute the node's hash
@@ -723,6 +727,22 @@ impl Trie {
         Trie::splice_leaf(storage, cursor, leaf, node)
     }
 
+    /// Read the node at the cursor's current position, resolving deferred (parked or
+    /// persisted) handles into a borrowable `ReadTrieNode`.
+    ///
+    /// # Transient metadata
+    ///
+    /// For **parked** cursor nodes the returned `ReadTrieNode` has **no `transient_meta`**.
+    /// Calling `into_owned_node()` on it will therefore produce a `TrieNodeType` with
+    /// zeroed `cowptr` / `patch_depth` / `last_patch_source`.
+    ///
+    /// This is safe because current callers (`add_value`, `splice_leaf`, etc.)
+    /// only use the resulting owned node for **new-slot** TrieRAM mutations — never
+    /// to overwrite the original COW-backed slot whose metadata matters for
+    /// `dump_compressed_consume`.
+    ///
+    /// **Do not** use the returned node for in-place overwrite or flush logic without
+    /// first ensuring transient metadata is preserved.
     fn read_deferred_cursor_node<
         'a,
         T: MarfTrieId,
@@ -758,6 +778,7 @@ impl Trie {
             hash,
             patch_depth,
             backing,
+            transient_meta,
             ..
         } = read;
 
@@ -783,10 +804,13 @@ impl Trie {
         };
 
         storage.open_block_maybe_id(&cur_block, cur_block_id)?;
-        Ok(
+        let mut result =
             ReadTrieNode::from_state_borrowed(decode_scratch.get_parked_ref(parked_handle), hash)
-                .with_patch_depth(patch_depth),
-        )
+                .with_patch_depth(patch_depth);
+        if let Some(meta) = transient_meta {
+            result = result.with_transient_meta(meta);
+        }
+        Ok(result)
     }
 
     /// Add a new value to the Trie at the location pointed at by the cursor.
@@ -1026,19 +1050,9 @@ impl Trie {
         let mut child_ptr = ptrs.pop().unwrap();
 
         if ptrs.is_empty() {
-            // root node was already updated by trie operations, but it will have the wrong hash.
-            // we need to "fix" the root node so it mixes in its ancestor hashes.
+            // Root node was already updated by trie operations, but it will have the wrong hash.
+            // We need to "fix" the root node so it mixes in its ancestor hashes.
             trace!("Fix up root node so it mixes in its ancestor hashes");
-            let node_read = read_detached_hashed_node(storage, &child_ptr, decode_scratch)?;
-            let _cur_hash = node_read.hash.ok_or_else(|| {
-                Error::CorruptionError("Missing node hash in trie read".to_string())
-            })?;
-
-            if !node_read.is_node256() {
-                return Err(Error::CorruptionError(
-                    "Only ptr was not a node256".to_string(),
-                ));
-            }
 
             if child_ptr != storage.root_trieptr() {
                 return Err(Error::CorruptionError(
@@ -1046,8 +1060,20 @@ impl Trie {
                 ));
             }
 
-            let (node, _) = node_read.into_owned_node()?;
+            // O(1) swap from TrieRAM — avoids the heap allocation of into_owned_node().
+            let (node, _cur_hash) = storage.take_ram_node(child_ptr.ptr())?;
+
+            if !node.is_node256() {
+                storage.restore_ram_node(child_ptr.ptr(), node, _cur_hash)?;
+                return Err(Error::CorruptionError(
+                    "Only ptr was not a node256".to_string(),
+                ));
+            }
+
             let my_hash = get_nodetype_hash(storage, &node)?;
+
+            // Restore before ancestor hash lookup (which traverses the trie).
+            storage.restore_ram_node(child_ptr.ptr(), node, my_hash)?;
 
             let h = if update_skiplist {
                 trace!("Update root skiplist");
@@ -1057,7 +1083,6 @@ impl Trie {
                 my_hash
             };
 
-            // for debug purposes
             if cfg!(test) && is_trace() {
                 let node_hash = my_hash;
                 let node_debug = format!("root@{child_ptr:?}");
@@ -1070,68 +1095,62 @@ impl Trie {
 
             debug!("Next root hash is {h} (update_skiplist={update_skiplist})");
 
-            storage.write_nodetype(child_ptr.ptr(), &node, h)?;
+            // Update the final hash if it differs from my_hash (skiplist case).
+            if h != my_hash {
+                let (node, _) = storage.take_ram_node(child_ptr.ptr())?;
+                storage.restore_ram_node(child_ptr.ptr(), node, h)?;
+            }
         } else {
             while let Some(ptr) = ptrs.pop() {
                 if is_backptr(ptr.id()) {
-                    // this node was not altered, but instead queued to the cursor as part of walking a
-                    // backptr skiplist.  Do nothing.
                     continue;
                 }
 
-                let (mut node, _cur_hash) = read_owned_hashed_node(storage, &ptr, decode_scratch)?;
+                // O(1) swap from TrieRAM — avoids the heap allocation of into_owned_node().
+                let (mut node, _cur_hash) = storage.take_ram_node(ptr.ptr())?;
                 assert!(!node.is_leaf());
 
-                // this child_ptr _must_ be in the node.
                 let updated = node.replace(&child_ptr);
                 if !updated {
                     trace!("FAILED TO UPDATE {node:?} WITH {child_ptr:?}: {cursor:?}");
                     assert!(updated);
                 }
 
+                let is_root_node256 = node.is_node256() && ptr == storage.root_trieptr();
                 let content_hash = get_nodetype_hash(storage, &node)?;
 
-                // flush the current node to storage --
-                //  necessary because computing ancestor hashes requires that the trie's pointers
-                //  all be intact, since it does ancestor lookups!
-                // however, since we're going to update the hash in the next write anyways, just write an empty buff
-                storage.write_nodetype(ptr.ptr(), &node, TrieHash([0; 32]))?;
-
-                let h = if !node.is_node256() {
-                    trace!("update_root_hash: Updated {node:?} with {child_ptr:?} from {_cur_hash:?} to {content_hash:?}");
-                    content_hash
+                if !is_root_node256 {
+                    trace!("update_root_hash: Updated node with {child_ptr:?} from {_cur_hash:?} to {content_hash:?}");
+                    storage.restore_ram_node(ptr.ptr(), node, content_hash)?;
                 } else {
-                    let root_ptr = storage.root_trieptr();
-                    let node_hash = if ptr == root_ptr {
-                        let h = if update_skiplist {
-                            Trie::get_trie_root_hash(
-                                storage,
-                                &content_hash,
-                                ancestor_cursor,
-                                decode_scratch,
-                            )?
-                        } else {
-                            content_hash
-                        };
+                    // Root Node256: restore with temp hash so ancestor traversal works,
+                    // then compute final hash and fix up.
+                    storage.restore_ram_node(ptr.ptr(), node, TrieHash([0; 32]))?;
 
-                        if cfg!(test) && is_trace() {
-                            let _ = Trie::get_trie_root_ancestor_hashes_bytes(storage, &content_hash)
-                                        .map(|_hs| {
-                                            storage.clear_cached_ancestor_hashes_bytes();
-                                            trace!("update_root_hash: Updated {node:?} with {child_ptr:?} from {_cur_hash:?} to {content_hash:?} + {:?} = {h:?}", &_hs.get(1..));
-                                        });
-                        }
-
-                        debug!("Next root hash is {h} (update_skiplist={update_skiplist})");
-                        h
+                    let h = if update_skiplist {
+                        Trie::get_trie_root_hash(
+                            storage,
+                            &content_hash,
+                            ancestor_cursor,
+                            decode_scratch,
+                        )?
                     } else {
-                        trace!("update_root_hash: Updated {node:?} with {child_ptr:?} from {_cur_hash:?} to {content_hash:?}");
                         content_hash
                     };
-                    node_hash
-                };
 
-                storage.write_nodetype(ptr.ptr(), &node, h)?;
+                    if cfg!(test) && is_trace() {
+                        let _ = Trie::get_trie_root_ancestor_hashes_bytes(storage, &content_hash)
+                                    .map(|_hs| {
+                                        storage.clear_cached_ancestor_hashes_bytes();
+                                        trace!("update_root_hash: Updated node with {child_ptr:?} from {_cur_hash:?} to {content_hash:?} + {:?} = {h:?}", &_hs.get(1..));
+                                    });
+                    }
+
+                    debug!("Next root hash is {h} (update_skiplist={update_skiplist})");
+
+                    let (node, _) = storage.take_ram_node(ptr.ptr())?;
+                    storage.restore_ram_node(ptr.ptr(), node, h)?;
+                }
 
                 child_ptr = ptr;
                 child_ptr.id = clear_backptr(child_ptr.id);

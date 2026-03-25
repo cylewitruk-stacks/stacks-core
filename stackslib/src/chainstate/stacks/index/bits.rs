@@ -149,8 +149,10 @@ pub fn get_ptrs_byte_len(ptrs: &[TriePtr]) -> usize {
 }
 
 /// Helper to determine a sparse TriePtr list's bitmap size, given the node ID's numeric value.
-/// Returns Some(size) if the node identified node type has ptrs
-/// Returns None if `id` is a `Leaf`, `Patch`, or `Empty` node, or is unrecognized.
+///
+/// Returns:
+/// * `Some(size)` if the node identified node type has ptrs
+/// * `None` if `id` is a `Leaf`, `Patch`, or `Empty` node, or is unrecognized.
 pub fn get_sparse_ptrs_bitmap_size(id: u8) -> Option<usize> {
     match TrieNodeID::from_u8(clear_ctrl_bits(id))? {
         TrieNodeID::Leaf => None,
@@ -166,8 +168,9 @@ pub fn get_sparse_ptrs_bitmap_size(id: u8) -> Option<usize> {
 /// Helper to determine what the compressed size of a ptrs list will be, depending on whether or
 /// not it's sparse or dense.
 ///
-/// Returns Some((size, is-sparse?)) on success
-/// Returns None if the node doesn't have ptrs
+/// Returns:
+/// * `Some((size, is-sparse?))` on success
+/// * `None` if the node doesn't have ptrs
 pub fn get_compressed_ptrs_size(id: u8, ptrs: &[TriePtr]) -> Option<(usize, bool)> {
     let bitmap_size = get_sparse_ptrs_bitmap_size(id)?;
 
@@ -191,7 +194,8 @@ pub fn get_compressed_ptrs_size(id: u8, ptrs: &[TriePtr]) -> Option<(usize, bool
 }
 
 /// Helper to determine how many bytes a Trie node's child pointers will take to encode.
-/// Size is id + ptrs encoding
+///
+/// Size is `id` + `ptrs` encoded size.
 pub fn get_ptrs_byte_len_compressed(id: u8, ptrs: &[TriePtr]) -> usize {
     1 + get_compressed_ptrs_size(id, ptrs)
         .map(|(sz, _)| sz)
@@ -227,17 +231,6 @@ pub fn get_node_max_byte_len(node_id: u8) -> Result<usize, Error> {
     TRIEHASH_ENCODED_SIZE
         .checked_add(get_node_body_max_byte_len(node_id)?)
         .ok_or(Error::OverflowError)
-}
-
-fn read_exact_or_error<R: Read>(r: &mut R, dst: &mut [u8], context: &str) -> Result<(), Error> {
-    r.read_exact(dst).map_err(|e| {
-        if e.kind() == ErrorKind::UnexpectedEof {
-            Error::CorruptionError(context.to_string())
-        } else {
-            error!("failed to read {context}: {e:?}");
-            Error::IOError(e)
-        }
-    })
 }
 
 fn read_max_bytes_into<R: Read + Seek>(
@@ -550,6 +543,50 @@ fn decode_dense_compressed_ptrs_from_bytes(
     Ok(cursor)
 }
 
+/// Read a trie node's children pointers from a byte slice, and write them to the given `ptrs_buf`
+/// slice. The `node_id` will indicate whether or not the pointers list is compressed (via its
+/// compressed bit).
+///
+/// An uncompressed list of `TriePtr`s is simply a sequence of uncompressed `TriePtr`s.  They are
+/// read verbatim into the `ptrs_buf` slice.
+///
+/// A compressed list of `TriePtr`s has either a sparse form or a dense form, and is comprised of
+/// compressed `TriePtr`s (which have variable length).  In the sparse form, the byte encoding is
+/// as follows:
+///
+/// ```text
+/// 0   1         1+B                                     1+B+N
+/// |---|-----------|---------------------------------------|
+///  0xff   bitmap    list of compressed `TriePtr`s
+/// ```
+///
+/// Where
+/// * 0xff ([`SPARSE_PTR_BITMAP_MARKER`]) is a marker bit that cannot be the first byte of a
+///   `TriePtr`, and indicates that a bitmap follows
+/// * `bitmap` is a bit field in which the ith bit is set if the ith `TriePtr` is not empty.  All
+///   other `TriePtr`s in `ptrs_buf` will be considered empty, and initialized as such.
+///
+/// The remaining bytes 1+B through 1+B+N contain the list of compressed `TriePtr`s -- one for each
+/// set bit in `bitmap`.
+///
+/// If the dense form is used, then the byte encoding is as follows:
+///
+/// ```text
+/// 0                                     N
+/// |-------------------------------------|
+///   list of compressed `TriePtr`s
+/// ```
+///
+/// The dense form includes empty `TriePtr`s.  The dense form is used if the size of using the
+/// sparse form (with the bitmap) exceeds the size of using the dense form.  The dense form is used
+/// for tries that are full or nearly full.
+///
+/// Returns Ok((node-id, bytes-consumed)) on success, where the compressed bit in `node-id` is NOT
+/// set.  However, the backptr bit MAY be set (it is preserved).
+///
+/// Returns Err(CorruptionError(..)) if the node ID is invalid, the read node ID is missing, the
+/// read node ID does not match the given node ID, or the byte encoding is invalid given the
+/// expected pointers encoding.
 pub fn ptrs_from_slice_into(
     node_id: u8,
     bytes: &[u8],
@@ -599,113 +636,6 @@ pub fn ptrs_from_slice_into(
         .ok_or_else(|| Error::CorruptionError("Failed to read >1 bytes from bytes array".into()))?;
     let consumed = decode_uncompressed_ptrs_from_bytes(ptr_bytes, ptrs_buf)?;
     Ok((clear_compressed(nid), 1 + consumed))
-}
-
-/// Read a trie node's children pointers from a Read object, and write them to the given `ptrs_buf` slice.
-/// The `node_id` will indicate whether or not the pointers list is compressed (via its compressed
-/// bit).
-///
-/// An uncompressed list of `TriePtr`s is simply a sequence of uncompressed `TriePtr`s.  They are
-/// read verbatim into the `ptrs_buf` slice.
-///
-/// A compressed list of `TriePtr`s has either a sparse form or a dense form, and is comprised of
-/// compressed `TriePtr`s (which have variable length).  In the sparse form, the byte encoding is
-/// as follows:
-///
-/// 0   1         1+B                                     1+B+N
-/// |---|-----------|---------------------------------------|
-///  0xff   bitmap    list of compressed `TriePtr`s
-///
-/// Where
-/// * 0xff ([`SPARSE_PTR_BITMAP_MARKER`]) is a marker bit that cannot be the first byte of a `TriePtr`, and indicates that a
-/// bitmap follows
-/// * `bitmap` is a bit field in which the ith bit is set if the ith `TriePtr` is not empty.  All
-/// other `TriePtr`s in `ptrs_buf` will be considered empty, and initialized as such.
-///
-/// The remaining bytes 1+B through 1+B+N contain the list of compressed `TriePtr`s -- one for each
-/// set bit in `bitmap`.
-///
-/// If the dense form is used, then the byte encoding is as follows:
-///
-/// 0                                     N
-/// |-------------------------------------|
-///   list of compressed `TriePtr`s
-///
-/// The dense form includes empty `TriePtr`s.  The dense form is used if the size of using the
-/// sparse form (with the bitmap) exceeds the size of using the dense form.  The dense form is used
-/// for tries that are full or nearly full.
-///
-/// This code path is not guaranteed to read a node's `TriePtr` list; it may instead read a
-/// `TriePatchNode`, which contains the _delta_ between two successive copies of the same node
-/// across a copy-on-write operation.  If a `TriePatchNode` is found, then it is returned as an
-/// Err(..) result, so the caller can apply it atop its targeted trie node.
-///
-/// Returns Ok(node-id) on success, where the compressed bit in `node-id` is NOT set.  However, the
-/// backptr bit MAY be set (it is preserved).
-///
-/// Returns Err(Patch(..)) if the code encountered a TrieNodePatch instead of the expected trie
-/// node.  In this case, the patch will be decoded and returned, so that it can be applied by the
-/// caller on top of a base node.
-///
-/// Returns Err(CorruptionError(..)) if the node ID is invalid, the read node ID is missing, the
-/// read node ID does not match the given node ID, or the byte encoding is invalid given the
-/// expected pointers encoding.
-///
-/// Returns Err(IOError(..)) on read failure.
-///
-/// Returns Err(OverflowError) on integer or potential buffer overflow, which should never happen.
-pub fn ptrs_from_bytes_into<R: Read + Seek>(
-    node_id: u8,
-    r: &mut R,
-    ptrs_buf: &mut [TriePtr],
-    bytes: &mut Vec<u8>,
-) -> Result<u8, Error> {
-    let cleared_node_id = clear_ctrl_bits(node_id);
-    if TrieNodeID::from_u8(cleared_node_id).is_none() {
-        error!("Bad node ID {:x}", node_id);
-        return Err(Error::CorruptionError(format!(
-            "Bad node ID: {:x}",
-            node_id
-        )));
-    };
-
-    trace!(
-        "Read ptrs for node {} at offset {}",
-        node_id,
-        r.stream_position()
-            .inspect_err(|e| error!("Failed to ftell the read handle: {e:?}"))?
-    );
-
-    let num_ptrs = node_id_to_ptr_count(node_id);
-    let ptrs_start_disk_ptr =
-        read_max_bytes_into(r, bytes, 1 + num_ptrs * TRIEPTR_SIZE, "trie ptrs")?;
-
-    trace!("Read bytes ({}) {}", bytes.len(), &to_hex(bytes));
-
-    let (nid, consumed) = ptrs_from_slice_into(node_id, bytes.as_slice(), ptrs_buf)?;
-    r.seek(SeekFrom::Start(
-        ptrs_start_disk_ptr
-            .checked_add(u64::try_from(consumed).expect("infallible"))
-            .expect("FATAL: read far too many bytes"),
-    ))
-    .inspect_err(|e| error!("Failed to seek to the end of the ptr bytes: {e:?}"))?;
-
-    Ok(nid)
-}
-
-/// Read a trie node's children pointers from a Read object, and write them to the given `ptrs_buf` slice.
-/// The `node_id` will indicate whether or not the pointers list is compressed (via its compressed
-/// bit).
-///
-/// Returns Ok(node-id) on success, where the compressed bit in `node-id` is NOT set.  However, the
-/// backptr bit MAY be set (it is preserved).
-pub fn ptrs_from_bytes<R: Read + Seek>(
-    node_id: u8,
-    r: &mut R,
-    ptrs_buf: &mut [TriePtr],
-) -> Result<u8, Error> {
-    let mut bytes = Vec::new();
-    ptrs_from_bytes_into(node_id, r, ptrs_buf, &mut bytes)
 }
 
 /// Calculate the hash of a TrieNode, given its childrens' hashes.
@@ -783,29 +713,6 @@ pub fn read_hash_bytes<F: Read>(f: &mut F) -> Result<[u8; TRIEHASH_ENCODED_SIZE]
     })?;
 
     Ok(hashbytes)
-}
-
-/// Low-level method for reading a block ID from a Read+Seek object.  The block ID is
-/// little-endian.
-///
-/// Returns Ok(block-id) on success
-/// Returns Err(CorruptionError(..)) if we run out of bytes to read (EOF)
-/// Returns Err(IOError(..)) if we encounter a disk I/O error
-pub fn read_block_identifier<F: Read + Seek>(f: &mut F) -> Result<u32, Error> {
-    let mut bytes = [0u8; 4];
-    f.read_exact(&mut bytes).map_err(|e| {
-        if e.kind() == ErrorKind::UnexpectedEof {
-            Error::CorruptionError(format!(
-                "Failed to read hash in full from {}",
-                f.stream_position().unwrap()
-            ))
-        } else {
-            eprintln!("failed: {:?}", &e);
-            Error::IOError(e)
-        }
-    })?;
-
-    Ok(u32::from_le_bytes(bytes))
 }
 
 /// Low-level method for reading a node's hash bytes into a buffer from a Read-able and Seek-able struct.
@@ -1041,55 +948,11 @@ mod tests {
 
     use super::*;
     use crate::chainstate::stacks::index::node::{
-        set_compressed, TrieNode, TrieNode4, TrieNodeRef,
+        set_compressed, TrieLeafRef, TrieNode, TrieNode4, TrieNodeRef,
     };
     use crate::chainstate::stacks::index::scratch::MarfReadState;
     use crate::chainstate::stacks::index::ReadTrieItemKind;
     use crate::codec::StacksMessageCodec;
-
-    /// Deserialize a TrieNodeType and optionally its hash from the given Read+Seek object.
-    /// The given `ptr_id` identifies the expected node type.
-    ///
-    /// Node wire format for non-patch ("normal") nodes:
-    ///
-    /// 0               32 33               33+X         33+X+Y
-    /// |---------------|--|------------------|-----------|
-    ///   node hash      id  ptrs & ptr data      path
-    ///
-    /// Node wire format for patch nodes:
-    ///
-    /// 0               32 33               33+X
-    /// |---------------|--|------------------|
-    ///   base node hash id  compressed ptrs
-    ///
-    /// Returns Ok(node, hash) if the node is found
-    /// Returns Err(Patch(..)) if a `TrieNodePatch` is found instead of the targeted node
-    /// Returns Err(CorruptionError(..)) if the given `ptr_id` is not recognized, or the data read does
-    /// not decode to a valid node or patch.
-    /// Returns Err(IOError(..)) on disk I/O error
-    pub fn read_node_at_head<F: Read + Seek>(
-        f: &mut F,
-        ptr_id: u8,
-    ) -> Result<(TrieNodeType, TrieHash), Error> {
-        let mut node_bytes = Vec::new();
-        let start_disk_ptr = read_node_bytes_into(f, &mut node_bytes, ptr_id)?;
-        parse_node_from_bytes(f, start_disk_ptr, node_bytes.as_slice(), |bytes| {
-            let (hash, remaining) = parse_hash_from_bytes(bytes)?;
-            let (node, consumed) =
-                decode_nodetype_from_slice_at_head(remaining, ptr_id).map_err(|e| {
-                    if let Error::Patch(_, patch) = e {
-                        Error::Patch(Some(hash), patch)
-                    } else {
-                        e
-                    }
-                })?;
-            let total_consumed = TRIEHASH_ENCODED_SIZE
-                .checked_add(consumed)
-                .ok_or(Error::OverflowError)?;
-
-            Ok(((node, hash), total_consumed))
-        })
-    }
 
     #[test]
     fn ptrs_from_slice_into_decodes_node4_dense_compressed() {
@@ -1235,26 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn read_nodetype_at_head_decodes_node4_from_bulk_buffer() {
-        let hash = TrieHash([0x33; TRIEHASH_ENCODED_SIZE]);
-        let mut node = TrieNode4::new(&[0xde, 0xad, 0xbe, 0xef]);
-        node.insert(&TriePtr::new(TrieNodeID::Leaf as u8, 0x66, 0x1357));
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(hash.as_bytes());
-        node.write_bytes_compressed(&mut bytes).unwrap();
-        let expected_len = bytes.len();
-
-        let mut cursor = Cursor::new(bytes);
-        let (decoded, got_hash) = read_node_at_head(&mut cursor, TrieNodeID::Node4 as u8).unwrap();
-
-        assert_eq!(got_hash, hash);
-        assert_eq!(decoded, TrieNodeType::Node4(node));
-        assert_eq!(cursor.position() as usize, expected_len);
-    }
-
-    #[test]
-    fn read_nodetype_at_head_decodes_leaf_from_bulk_buffer() {
+    fn read_trie_item_at_head_ref_decodes_leaf_from_bulk_buffer() {
         let hash = TrieHash([0x35; TRIEHASH_ENCODED_SIZE]);
         let leaf = TrieLeaf::new(&[0xca, 0xfe, 0xba, 0xbe], &[0x77; 40]);
 
@@ -1264,39 +1108,20 @@ mod tests {
         let expected_len = bytes.len();
 
         let mut cursor = Cursor::new(bytes);
-        let (decoded, got_hash) = read_node_at_head(&mut cursor, TrieNodeID::Leaf as u8).unwrap();
+        let mut scratch = MarfReadState::new();
+        let read =
+            read_trie_item_at_head_ref(&mut cursor, TrieNodeID::Leaf as u8, &mut scratch).unwrap();
+        let read = read.into_node().unwrap();
+        let (node_ref, got_hash) = read.as_node_ref().unwrap();
+        let got_hash = got_hash.expect("missing hash");
 
         assert_eq!(got_hash, hash);
-        assert_eq!(decoded, TrieNodeType::Leaf(leaf));
-        assert_eq!(cursor.position() as usize, expected_len);
-    }
-
-    #[test]
-    fn read_nodetype_at_head_decodes_patch_from_bulk_buffer() {
-        let hash = TrieHash([0x44; TRIEHASH_ENCODED_SIZE]);
-        let patch = TrieNodePatch {
-            ptr: TriePtr::new_backptr(TrieNodeID::Node16 as u8, 0x12, 0x3456, 0x789a),
-            ptr_diff: vec![
-                TriePtr::new_backptr(TrieNodeID::Leaf as u8, 0x34, 0xabcd, 0xef01),
-                TriePtr::new(TrieNodeID::Node4 as u8, 0x56, 0x2345),
-            ],
-        };
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(hash.as_bytes());
-        patch.consensus_serialize(&mut bytes).unwrap();
-        let expected_len = bytes.len();
-
-        let mut cursor = Cursor::new(bytes);
-        let err = read_node_at_head(&mut cursor, TrieNodeID::Patch as u8)
-            .expect_err("patch node should surface as Error::Patch");
-
-        match err {
-            Error::Patch(Some(got_hash), got_patch) => {
-                assert_eq!(got_hash, hash);
-                assert_eq!(got_patch, patch);
+        match node_ref {
+            TrieNodeRef::Leaf(TrieLeafRef { path, data }) => {
+                assert_eq!(path, leaf.path.as_slice());
+                assert_eq!(data, &leaf.data);
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => panic!("unexpected node ref: {other:?}"),
         }
         assert_eq!(cursor.position() as usize, expected_len);
     }

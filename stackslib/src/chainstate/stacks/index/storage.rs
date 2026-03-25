@@ -30,15 +30,15 @@ use crate::chainstate::stacks::index::file::{TrieFile, TrieFileNodeHashReader};
 use crate::chainstate::stacks::index::marf::MARFOpenOpts;
 use crate::chainstate::stacks::index::node::{
     is_backptr, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch, TrieNodeRef,
-    TrieNodeType, TriePtr,
+    TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
-    bits, trie_sql, BlockMap, ClarityMarfTrieId, Error, MarfTrieId, NodeDecodeScratch,
-    NodePatching, ReadTrieItem, ReadTrieItemKind, ReadTrieNode, TrieHasher, TrieNodeReadState,
-    TrieReadStorage, MAX_PATCH_DEPTH,
+    bits, trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodeDecodeScratch,
+    NodePatching, ReadTrieItem, ReadTrieItemKind, ReadTrieNode, TrieHasher, TrieLeaf,
+    TrieNodeReadState, TrieReadStorage, MAX_PATCH_DEPTH,
 };
 use crate::codec::StacksMessageCodec;
 use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE};
@@ -249,6 +249,33 @@ impl<T: MarfTrieId> UncommittedState<T> {
             }
             UncommittedState::Sealed(..) => {
                 panic!("FATAL: tried to write to a sealed TrieRAM");
+            }
+        }
+    }
+
+    /// Take a node+hash out of the TrieRAM, leaving a placeholder.
+    /// Panics if the UncommittedState is sealed.
+    pub fn take_node(&mut self, ptr: u32) -> Result<(TrieNodeType, TrieHash), Error> {
+        match self {
+            UncommittedState::RW(ref mut trie_ram) => trie_ram.take_node(ptr),
+            UncommittedState::Sealed(..) => {
+                panic!("FATAL: tried to take from a sealed TrieRAM");
+            }
+        }
+    }
+
+    /// Restore a node+hash into a TrieRAM slot.
+    /// Panics if the UncommittedState is sealed.
+    pub fn restore_node(
+        &mut self,
+        ptr: u32,
+        node: TrieNodeType,
+        hash: TrieHash,
+    ) -> Result<(), Error> {
+        match self {
+            UncommittedState::RW(ref mut trie_ram) => trie_ram.restore_node(ptr, node, hash),
+            UncommittedState::Sealed(..) => {
+                panic!("FATAL: tried to restore to a sealed TrieRAM");
             }
         }
     }
@@ -1386,6 +1413,54 @@ impl<T: MarfTrieId> TrieRAM<T> {
         })
     }
 
+    /// Take a node+hash out of the TrieRAM at the given slot, leaving a cheap placeholder.
+    ///
+    /// The caller MUST call [`restore_node`] to put a node back before the TrieRAM is
+    /// read at this slot again. This is used by the hash-recalculation path to avoid
+    /// cloning nodes while still allowing `&mut self` access to storage for hash
+    /// computation.
+    pub fn take_node(&mut self, ptr: u32) -> Result<(TrieNodeType, TrieHash), Error> {
+        let data_len = self.data.len();
+        let slot = self.data.get_mut(ptr as usize).ok_or_else(|| {
+            error!(
+                "TrieRAM take_node({:?}): {} >= {}",
+                &self.block_header, ptr, data_len
+            );
+            Error::NotFoundError
+        })?;
+        Ok(std::mem::replace(slot, Self::slot_placeholder()))
+    }
+
+    /// Restore a node+hash into a TrieRAM slot previously emptied by [`take_node`].
+    pub fn restore_node(
+        &mut self,
+        ptr: u32,
+        node: TrieNodeType,
+        hash: TrieHash,
+    ) -> Result<(), Error> {
+        let data_len = self.data.len();
+        let slot = self.data.get_mut(ptr as usize).ok_or_else(|| {
+            error!(
+                "TrieRAM restore_node({:?}): {} >= {}",
+                &self.block_header, ptr, data_len
+            );
+            Error::NotFoundError
+        })?;
+        *slot = (node, hash);
+        Ok(())
+    }
+
+    /// Cheap placeholder value for a temporarily-empty TrieRAM slot.
+    fn slot_placeholder() -> (TrieNodeType, TrieHash) {
+        (
+            TrieNodeType::Leaf(TrieLeaf {
+                path: vec![],
+                data: MARFValue([0u8; 40]),
+            }),
+            TrieHash([0u8; TRIEHASH_ENCODED_SIZE]),
+        )
+    }
+
     /// Get an owned instance of a node and its hash from the TrieRAM.  ptr.ptr() is an array
     /// index.
     /// Note that this will never return a patch node, since we only ever store patch nodes to
@@ -1434,10 +1509,10 @@ impl<T: MarfTrieId> TrieRAM<T> {
         }
 
         if let Some((node, hash)) = self.data.get(ptr.ptr() as usize) {
-            Ok(ReadTrieNode::from_borrowed(
-                TrieNodeRef::from(node),
-                Some(*hash),
-            ))
+            Ok(
+                ReadTrieNode::from_borrowed(TrieNodeRef::from(node), Some(*hash))
+                    .with_transient_meta(TrieNodeTransientMeta::from_node(node)),
+            )
         } else {
             error!(
                 "TrieRAM read_node({:?}): Failed to read node {:?}: {} >= {}",
@@ -3203,6 +3278,40 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
         }
 
         panic!("Tried to write to another Trie besides the currently-buffered one.  This should never happen -- only flush() can write to disk!");
+    }
+
+    /// Take a node+hash out of the uncommitted TrieRAM via O(1) swap, leaving a placeholder.
+    ///
+    /// This is a performance optimization for the hash-recalculation hot path: it avoids
+    /// the heap allocation that `into_owned_node()` → `to_owned_node()` would require.
+    ///
+    /// The caller MUST call [`restore_ram_node`] before this slot is read again. Any error
+    /// between take and restore is unrecoverable (hash computation failure = block abandoned),
+    /// so the placeholder cannot be observed by other readers.
+    pub fn take_ram_node(&mut self, ptr: u32) -> Result<(TrieNodeType, TrieHash), Error> {
+        if let Some((ref uncommitted_bhh, ref mut uncommitted_trie)) = self.data.uncommitted_writes
+        {
+            if &self.data.cur_block == uncommitted_bhh {
+                return uncommitted_trie.take_node(ptr);
+            }
+        }
+        panic!("take_ram_node: no uncommitted trie is open");
+    }
+
+    /// Restore a node+hash into the uncommitted TrieRAM at the given slot.
+    pub fn restore_ram_node(
+        &mut self,
+        ptr: u32,
+        node: TrieNodeType,
+        hash: TrieHash,
+    ) -> Result<(), Error> {
+        if let Some((ref uncommitted_bhh, ref mut uncommitted_trie)) = self.data.uncommitted_writes
+        {
+            if &self.data.cur_block == uncommitted_bhh {
+                return uncommitted_trie.restore_node(ptr, node, hash);
+            }
+        }
+        panic!("restore_ram_node: no uncommitted trie is open");
     }
 
     /// Store a node and its hash to uncommitted state.
