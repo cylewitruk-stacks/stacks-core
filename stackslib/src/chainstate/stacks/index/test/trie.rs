@@ -21,6 +21,17 @@ use super::*;
 use crate::chainstate::stacks::index::marf::MarfReadCtx;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, *};
 
+/// Count the number of allocated children in a list of a node's children pointers.
+pub fn count_children(children: &[TriePtr]) -> usize {
+    let mut cnt = 0;
+    for child in children.iter() {
+        if child.id() != TrieNodeID::Empty as u8 {
+            cnt += 1;
+        }
+    }
+    cnt
+}
+
 fn expect_path_ephemeral<Db: Deref<Target = Connection>>(
     storage: &mut TrieStorageConnection<BlockHeaderHash, Db>,
     block_header: &BlockHeaderHash,

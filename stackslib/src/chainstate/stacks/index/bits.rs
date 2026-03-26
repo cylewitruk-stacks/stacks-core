@@ -37,7 +37,7 @@ pub const SPARSE_PTR_BITMAP_MARKER: u8 = 0xff;
 
 /// Get the size of a Trie path (note that a Trie path is 32 bytes long, and can definitely _not_
 /// be over 255 bytes).
-pub const fn get_path_byte_len(p: &[u8]) -> usize {
+pub fn get_path_byte_len(p: &[u8]) -> usize {
     assert!(p.len() < 255);
     let path_len_byte_len = 1;
     path_len_byte_len + p.len()
@@ -49,41 +49,6 @@ pub const fn get_path_byte_len(p: &[u8]) -> usize {
 /// Returns Ok(()) on success and writes the decoded path into `dst`
 /// Returns Err(CorruptionError) if the path doesn't decode, or if the length prefix is invalid
 /// Returns Err(IOError) on disk I/O failure
-pub fn path_from_bytes_into<R: Read>(r: &mut R, dst: &mut NodePath) -> Result<(), Error> {
-    let mut lenbuf = [0u8; 1];
-    r.read_exact(&mut lenbuf).map_err(|e| {
-        if e.kind() == ErrorKind::UnexpectedEof {
-            Error::CorruptionError("Failed to read len buf".to_string())
-        } else {
-            error!("failed: {e:?}");
-            Error::IOError(e)
-        }
-    })?;
-
-    if lenbuf[0] as usize > TRIEHASH_ENCODED_SIZE {
-        trace!(
-            "Path length is {} (expected <= {})",
-            lenbuf[0],
-            TRIEHASH_ENCODED_SIZE
-        );
-        return Err(Error::CorruptionError(format!(
-            "Node path is longer than {} bytes (got {})",
-            TRIEHASH_ENCODED_SIZE, lenbuf[0]
-        )));
-    }
-
-    dst.read_from(lenbuf[0], r).map_err(|e| {
-        if e.kind() == ErrorKind::UnexpectedEof {
-            Error::CorruptionError(format!("Failed to read {} bytes of path", lenbuf[0]))
-        } else {
-            error!("failed: {e:?}");
-            Error::IOError(e)
-        }
-    })?;
-
-    Ok(())
-}
-
 pub fn path_from_bytes_slice_into(bytes: &[u8], dst: &mut NodePath) -> Result<usize, Error> {
     let path_len = *bytes
         .first()
@@ -110,35 +75,6 @@ pub fn path_from_bytes_slice_into(bytes: &[u8], dst: &mut NodePath) -> Result<us
         Error::CorruptionError(format!("Node path length {} exceeds 32", path_len))
     })?;
     Ok(1 + path_len)
-}
-
-/// Decode a trie path from a Readable object.
-/// This is up to 32 bytes, and must be prefixed by a 1-byte length.
-///
-/// Returns Ok(path-bytes) on success
-/// Returns Err(CorruptionError) if the path doesn't decode, or if the length prefix is invalid
-/// Returns Err(IOError) on disk I/O failure
-pub fn path_from_bytes<R: Read>(r: &mut R) -> Result<NodePath, Error> {
-    let mut path = NodePath::default();
-    path_from_bytes_into(r, &mut path)?;
-    Ok(path)
-}
-
-/// Helper to return the number of children in a Trie, given its numeric ID
-/// Panics if `node_id` is not a valid trie node ID value
-fn node_id_to_ptr_count(node_id: u8) -> usize {
-    match TrieNodeID::from_u8(clear_ctrl_bits(node_id))
-        .unwrap_or_else(|| panic!("Unknown node ID {}", node_id))
-    {
-        TrieNodeID::Leaf => 1,
-        TrieNodeID::Node4 => 4,
-        TrieNodeID::Node16 => 16,
-        TrieNodeID::Node48 => 48,
-        TrieNodeID::Node256 => 256,
-        TrieNodeID::Empty | TrieNodeID::Patch => {
-            panic!("node_id_to_ptr_count: tried getting empty node pointer count")
-        }
-    }
 }
 
 /// Helper to determine the maximum number of bytes a Trie node's child pointers will take to encode.
@@ -230,49 +166,6 @@ pub fn get_node_max_byte_len(node_id: u8) -> Result<usize, Error> {
     TRIEHASH_ENCODED_SIZE
         .checked_add(get_node_body_max_byte_len(node_id)?)
         .ok_or(Error::OverflowError)
-}
-
-fn read_max_bytes_into<R: Read + Seek>(
-    r: &mut R,
-    bytes: &mut Vec<u8>,
-    max_len: usize,
-    context: &str,
-) -> Result<u64, Error> {
-    let start_disk_ptr = r
-        .stream_position()
-        .inspect_err(|e| error!("Failed to ftell the read handle: {e:?}"))?;
-
-    bytes.clear();
-    bytes.resize(max_len, 0);
-
-    let mut offset = 0;
-    loop {
-        let nr = match r.read(
-            bytes
-                .get_mut(offset..)
-                .ok_or_else(|| Error::OverflowError)?,
-        ) {
-            Ok(nr) => nr,
-            Err(e) => match e.kind() {
-                ErrorKind::UnexpectedEof => 0,
-                ErrorKind::Interrupted => continue,
-                _ => {
-                    error!("Failed to read {context}: {e:?}");
-                    return Err(Error::IOError(e));
-                }
-            },
-        };
-        if nr == 0 {
-            break;
-        }
-        offset = offset.checked_add(nr).ok_or_else(|| Error::OverflowError)?;
-        if offset >= max_len {
-            break;
-        }
-    }
-
-    bytes.truncate(offset);
-    Ok(start_disk_ptr)
 }
 
 fn decode_nodetype_ref_from_slice_at_head(
@@ -367,7 +260,42 @@ fn read_node_bytes_into<R: Read + Seek>(
     node_id: u8,
 ) -> Result<u64, Error> {
     let max_len = get_node_max_byte_len(node_id)?;
-    read_max_bytes_into(r, bytes, max_len, "trie node")
+
+    let start_disk_ptr = r
+        .stream_position()
+        .inspect_err(|e| error!("Failed to ftell the read handle: {e:?}"))?;
+
+    bytes.clear();
+    bytes.resize(max_len, 0);
+
+    let mut offset = 0;
+    loop {
+        let nr = match r.read(
+            bytes
+                .get_mut(offset..)
+                .ok_or_else(|| Error::OverflowError)?,
+        ) {
+            Ok(nr) => nr,
+            Err(e) => match e.kind() {
+                ErrorKind::UnexpectedEof => 0,
+                ErrorKind::Interrupted => continue,
+                _ => {
+                    error!("Failed to read trie node: {e:?}");
+                    return Err(Error::IOError(e));
+                }
+            },
+        };
+        if nr == 0 {
+            break;
+        }
+        offset = offset.checked_add(nr).ok_or_else(|| Error::OverflowError)?;
+        if offset >= max_len {
+            break;
+        }
+    }
+
+    bytes.truncate(offset);
+    Ok(start_disk_ptr)
 }
 
 pub fn parse_hash_from_bytes(bytes: &[u8]) -> Result<(TrieHash, &[u8]), Error> {
@@ -741,17 +669,6 @@ pub fn read_root_hash<T: MarfTrieId, R: TrieReadStorage<T> + ?Sized>(
     Ok(s.read_node_hash(&ptr)?)
 }
 
-/// Count the number of allocated children in a list of a node's children pointers.
-pub fn count_children(children: &[TriePtr]) -> usize {
-    let mut cnt = 0;
-    for child in children.iter() {
-        if child.id() != TrieNodeID::Empty as u8 {
-            cnt += 1;
-        }
-    }
-    cnt
-}
-
 /// Read a trie item from a byte slice (no Read+Seek needed).
 /// Used by the mmap path where bytes are already in memory.
 pub fn read_trie_item_from_slice<'a>(
@@ -841,9 +758,11 @@ pub fn read_trie_item_at_head_ref<'a, F: Read + Seek>(
 ) -> Result<ReadTrieItem<'a>, Error> {
     let mut node_bytes = scratch.take_node_bytes();
     let start_disk_ptr = read_node_bytes_into(f, &mut node_bytes, ptr_id)?;
+
     let result = parse_node_from_bytes(f, start_disk_ptr, node_bytes.as_slice(), |bytes| {
         let (hash, remaining) = parse_hash_from_bytes(bytes)?;
         let stored_node_id = stored_node_id_from_bytes(remaining)?;
+
         let consumed = if stored_node_id == TrieNodeID::Patch {
             scratch.decode_patch_from_slice(remaining)?
         } else {
@@ -854,8 +773,11 @@ pub fn read_trie_item_at_head_ref<'a, F: Read + Seek>(
             .ok_or(Error::OverflowError)?;
         Ok(((hash, stored_node_id), total_consumed))
     });
+
     scratch.restore_node_bytes(node_bytes);
+
     let (hash, stored_node_id) = result?;
+
     if stored_node_id == TrieNodeID::Patch {
         Ok(ReadTrieItem::from_patch(scratch.patch(), Some(hash)))
     } else {
