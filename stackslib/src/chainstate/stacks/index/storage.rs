@@ -1018,14 +1018,19 @@ impl<T: MarfTrieId> TrieRAM<T> {
         node: &TrieNodeType,
         decode_scratch: &mut impl TrieNodeReadState,
     ) -> Result<Option<TrieNodePatch>, Error> {
-        let cur_block = storage_tx.get_cur_block();
+        // Save block state. We use `set_block` to restore instead of `open_block` because the
+        // current block may be the uncommitted trie (which has been `.take()`'d from storage during
+        // `dump_compressed_consume`), making it unreachable via `open_block`.
+        let (cur_block, cur_block_id) = storage_tx.get_cur_block_and_id();
         storage_tx.open_block(&base_ptr.block_id())?;
         match storage_tx.read_node_with_state(base_ptr.ptr(), decode_scratch) {
             Ok(read) => {
                 if read.patch_depth >= MAX_PATCH_DEPTH as usize {
+                    storage_tx.data.set_block(cur_block, cur_block_id);
                     return Ok(None);
                 }
                 if read.path_bytes()? != node.path_bytes() {
+                    storage_tx.data.set_block(cur_block, cur_block_id);
                     return Ok(None);
                 }
 
@@ -1036,14 +1041,12 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     &old_node,
                     node
                 );
-                return Ok(TrieNodePatch::try_from_noderef(
-                    *base_ptr.ptr(),
-                    old_node,
-                    &node,
-                ));
+                let result = TrieNodePatch::try_from_noderef(*base_ptr.ptr(), old_node, &node);
+                storage_tx.data.set_block(cur_block, cur_block_id);
+                return Ok(result);
             }
             Err(Error::Patch(_, _old_patch)) => {
-                storage_tx.open_block(&cur_block)?;
+                storage_tx.data.set_block(cur_block, cur_block_id);
 
                 // building atop an existing patch.
                 // Make sure that the base node's path isn't different from this node
@@ -1073,13 +1076,12 @@ impl<T: MarfTrieId> TrieRAM<T> {
                         ));
                     }
                     Err(e) => {
-                        storage_tx.open_block(&cur_block)?;
                         return Err(e);
                     }
                 }
             }
             Err(e) => {
-                storage_tx.open_block(&cur_block)?;
+                storage_tx.data.set_block(cur_block, cur_block_id);
                 return Err(e);
             }
         }

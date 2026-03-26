@@ -698,3 +698,94 @@ fn test_marf_compression_reduces_blob_size(
          compressed={compressed_size}, uncompressed={uncompressed_size}"
     );
 }
+
+/// Regression test: `make_node_patch` must restore `cur_block` after opening the ancestor block.
+///
+/// Without the fix, `make_node_patch` left `cur_block` pointing to an ancestor trie on its success
+/// path. During `dump_compressed_consume` (where `uncommitted_writes` has been `.take()`'d), the
+/// stale `cur_block` caused subsequent operations to read from the wrong trie or panic. 
+/// 
+/// This test runs the compressed flush with overlapping COW'd keys and verifies that all values are
+/// readable afterward — which requires `cur_block` to be properly restored during flush.
+#[test]
+fn make_node_patch_restores_cur_block_during_compressed_flush() {
+    let test_dir = "/tmp/stacks-marf-tests/make_node_patch_cur_block_restore";
+    if fs::metadata(test_dir).is_ok() {
+        fs::remove_dir_all(test_dir).unwrap();
+    }
+    fs::create_dir_all(test_dir).unwrap();
+    let test_file = format!("{test_dir}/marf.sqlite");
+
+    let opts =
+        MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_compression(true);
+    let f = TrieFileStorage::open(&test_file, opts).unwrap();
+    let mut marf = MARF::from_storage(f);
+
+    let num_blocks = 5;
+    let num_keys = 20;
+
+    // Pre-generate stable keys (same keys used across blocks → COW nodes).
+    let keys: Vec<String> = {
+        let mut data = vec![0u8; 32];
+        (0..num_keys)
+            .map(|_| {
+                let path_bytes = Sha512Trunc256Sum::from_data(&data).as_bytes().to_vec();
+                data.copy_from_slice(&path_bytes[0..32]);
+                to_hex(&path_bytes)
+            })
+            .collect()
+    };
+
+    let mut last_block = BlockHeaderHash::sentinel();
+    let mut block_headers = vec![];
+
+    for blk in 0..num_blocks {
+        let mut block_hash_bytes = [0u8; 32];
+        block_hash_bytes[0..8].copy_from_slice(&(blk as u64).to_be_bytes());
+        let block_header = BlockHeaderHash(block_hash_bytes);
+
+        marf.begin(&last_block, &block_header).unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            let mut value = [0u8; 40];
+            value[0..8].copy_from_slice(&(blk as u64).to_be_bytes());
+            value[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+            let leaf = TrieLeaf::from_value(&[], MARFValue(value));
+            marf.insert_raw(TrieHash::from_key(key), leaf).unwrap();
+        }
+        // commit() triggers the compressed flush, which exercises make_node_patch.
+        // Before the fix, this could leave cur_block pointing to an ancestor.
+        marf.commit().unwrap();
+        block_headers.push(block_header.clone());
+        last_block = block_header;
+    }
+
+    // Verify that all values from the latest block are readable.
+    // If make_node_patch corrupted cur_block during flush, subsequent reads would fail
+    // with NotFoundError or return wrong data.
+    for (i, key) in keys.iter().enumerate() {
+        let value = marf
+            .get_by_key(&last_block, key)
+            .unwrap_or_else(|e| panic!("Failed to read key {i} from block {}: {e:?}", last_block));
+        let value = value.unwrap_or_else(|| panic!("Key {i} not found in block {}", last_block));
+
+        let expected_blk = (num_blocks - 1) as u64;
+        let got_blk = u64::from_be_bytes(value.0[0..8].try_into().unwrap());
+        assert_eq!(got_blk, expected_blk, "Key {i}: wrong block in value");
+    }
+
+    // Also verify reads from earlier blocks to exercise cross-block backpointer resolution.
+    for (blk, bhh) in block_headers.iter().enumerate() {
+        for (i, key) in keys.iter().enumerate() {
+            let value = marf
+                .get_by_key(bhh, key)
+                .unwrap_or_else(|e| panic!("Failed to read key {i} from block {blk}: {e:?}"));
+            let value = value.unwrap_or_else(|| panic!("Key {i} not found in block {blk}"));
+
+            let got_blk = u64::from_be_bytes(value.0[0..8].try_into().unwrap());
+            assert_eq!(
+                got_blk, blk as u64,
+                "Key {i} at block {blk}: wrong block in value"
+            );
+        }
+    }
+}
