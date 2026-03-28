@@ -88,7 +88,9 @@ fn test_ephemeral_marf_store() {
             let value = format!("value-{}", blk * 10 + k);
             keys_and_values.push((key, value));
         }
-        let mut marf = marfed_kv.begin(blocks.last().as_ref().unwrap(), &target_block_id);
+        let mut marf = marfed_kv
+            .begin(blocks.last().as_ref().unwrap(), &target_block_id)
+            .unwrap();
         marf.put_all_data(keys_and_values.clone()).unwrap();
         marf.commit_to_processed_block(&final_block_id).unwrap();
 
@@ -791,7 +793,7 @@ fn prop_ephemeral_tip_height_matches_current() {
         let mut tip = StacksBlockId::sentinel();
         for blk in 0..n {
             let final_block_id = StacksBlockId([(blk as u8) + 1; 32]);
-            let mut marf = marfed_kv.begin(&tip, &target_block_id);
+            let mut marf = marfed_kv.begin(&tip, &target_block_id).unwrap();
             let keys_and_values = vec![(
                 format!("key-{}", blk),
                 format!("value-{}", blk)

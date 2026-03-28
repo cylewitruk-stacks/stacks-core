@@ -1193,6 +1193,7 @@ mod test {
             vec![],
             vec![],
             vec![],
+            StacksEpochId::Epoch20,
         )
         .unwrap();
         tx.commit().unwrap();

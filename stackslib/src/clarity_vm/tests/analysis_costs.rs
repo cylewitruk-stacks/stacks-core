@@ -70,12 +70,14 @@ fn setup_tracked_cost_test(
         .commit_block();
 
     {
-        let mut conn = clarity_instance.begin_block(
-            &StacksBlockId([0; 32]),
-            &StacksBlockId([1; 32]),
-            &TEST_HEADER_DB,
-            &burn_state_db,
-        );
+        let mut conn = clarity_instance
+            .begin_block(
+                &StacksBlockId([0; 32]),
+                &StacksBlockId([1; 32]),
+                &TEST_HEADER_DB,
+                &burn_state_db,
+            )
+            .unwrap();
 
         if epoch > StacksEpochId::Epoch20 {
             conn.initialize_epoch_2_05().unwrap();
@@ -88,12 +90,14 @@ fn setup_tracked_cost_test(
     }
 
     {
-        let mut conn = clarity_instance.begin_block(
-            &StacksBlockId([1; 32]),
-            &StacksBlockId([2; 32]),
-            &TEST_HEADER_DB,
-            &burn_state_db,
-        );
+        let mut conn = clarity_instance
+            .begin_block(
+                &StacksBlockId([1; 32]),
+                &StacksBlockId([2; 32]),
+                &TEST_HEADER_DB,
+                &burn_state_db,
+            )
+            .unwrap();
 
         assert_eq!(
             conn.with_clarity_db_readonly(|db| db.get_clarity_epoch_version().unwrap()),
@@ -122,12 +126,14 @@ fn setup_tracked_cost_test(
     }
 
     {
-        let mut conn = clarity_instance.begin_block(
-            &StacksBlockId([2; 32]),
-            &StacksBlockId([3; 32]),
-            &TEST_HEADER_DB,
-            &burn_state_db,
-        );
+        let mut conn = clarity_instance
+            .begin_block(
+                &StacksBlockId([2; 32]),
+                &StacksBlockId([3; 32]),
+                &TEST_HEADER_DB,
+                &burn_state_db,
+            )
+            .unwrap();
 
         conn.as_transaction(|conn| {
             let (ct_ast, ct_analysis) = conn
@@ -190,12 +196,14 @@ fn test_tracked_costs(
     let burn_state_db = UnitTestBurnStateDB { epoch_id: epoch };
 
     {
-        let mut conn = clarity_instance.begin_block(
-            &StacksBlockId([3; 32]),
-            &StacksBlockId([4 + prog_id as u8; 32]),
-            &TEST_HEADER_DB,
-            &burn_state_db,
-        );
+        let mut conn = clarity_instance
+            .begin_block(
+                &StacksBlockId([3; 32]),
+                &StacksBlockId([4 + prog_id as u8; 32]),
+                &TEST_HEADER_DB,
+                &burn_state_db,
+            )
+            .unwrap();
 
         conn.as_transaction(|conn| {
             let (ct_ast, ct_analysis) = conn
@@ -304,12 +312,14 @@ fn undefined_top_variable_error(#[case] use_mainnet: bool, #[case] epoch: Stacks
     let burn_state_db = UnitTestBurnStateDB { epoch_id: epoch };
 
     {
-        let mut conn = clarity_instance.begin_block(
-            &StacksBlockId([3; 32]),
-            &StacksBlockId([4; 32]),
-            &TEST_HEADER_DB,
-            &burn_state_db,
-        );
+        let mut conn = clarity_instance
+            .begin_block(
+                &StacksBlockId([3; 32]),
+                &StacksBlockId([4; 32]),
+                &TEST_HEADER_DB,
+                &burn_state_db,
+            )
+            .unwrap();
 
         conn.as_transaction(|conn| {
             let analysis_result = conn.analyze_smart_contract(

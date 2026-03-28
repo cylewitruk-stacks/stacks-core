@@ -110,7 +110,8 @@ pub fn make_block(
         &parent.1,
         &block_consensus,
         &block_hash,
-    );
+    )
+    .unwrap();
 
     let new_tip_info = StacksHeaderInfo {
         anchored_header: anchored_header.into(),
@@ -145,6 +146,7 @@ pub fn make_block(
         &new_index_hash,
         &new_tip_info,
         &ExecutionCost::ZERO,
+        StacksEpochId::Epoch20,
     )
     .unwrap();
 

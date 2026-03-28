@@ -17,6 +17,7 @@
 use clarity::vm::costs::ExecutionCost;
 use rusqlite::{OptionalExtension, Row};
 use stacks_common::types::chainstate::{StacksBlockId, StacksWorkScore};
+use stacks_common::types::StacksEpochId;
 
 use crate::chainstate::burn::ConsensusHash;
 use crate::chainstate::stacks::db::*;
@@ -105,6 +106,7 @@ impl StacksChainState {
         parent_id: &StacksBlockId,
         tip_info: &StacksHeaderInfo,
         anchored_block_cost: &ExecutionCost,
+        evaluated_epoch: StacksEpochId,
     ) -> Result<(), Error> {
         let StacksBlockHeaderTypes::Epoch2(header) = &tip_info.anchored_header else {
             return Err(Error::InvalidChildOfNakomotoBlock);
@@ -131,6 +133,8 @@ impl StacksChainState {
 
         assert!(block_height < (i64::MAX as u64));
 
+        let epoch_int = evaluated_epoch as u32;
+
         let args = params![
             header.version,
             total_burn_str,
@@ -152,7 +156,8 @@ impl StacksChainState {
             index_root,
             anchored_block_cost,
             block_size_str,
-            parent_id
+            parent_id,
+            epoch_int
         ];
 
         tx.execute("INSERT INTO block_headers \
@@ -176,8 +181,9 @@ impl StacksChainState {
                     index_root,
                     cost,
                     block_size,
-                    parent_block_id) \
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)", args)
+                    parent_block_id,
+                    evaluated_epoch) \
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)", args)
             .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
 
         Ok(())

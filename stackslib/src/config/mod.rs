@@ -2191,6 +2191,13 @@ pub struct NodeConfig {
     /// ---
     /// @default: `false`
     pub txindex: bool,
+    /// Maximum number of blocks that startup epoch-mismatch recovery is allowed
+    /// to rewind. If the rewind depth exceeds this limit, the node will refuse
+    /// to start and advise re-syncing from a snapshot. Set to `0` to disable
+    /// the limit (unlimited rewind).
+    /// ---
+    /// @default: `256`
+    pub max_epoch_rewind_depth: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2453,6 +2460,7 @@ impl Default for NodeConfig {
             chain_liveness_poll_time_secs: 300,
             stacker_dbs: vec![],
             txindex: false,
+            max_epoch_rewind_depth: 256,
         }
     }
 }
@@ -3871,6 +3879,9 @@ pub struct NodeConfigFile {
     pub fault_injection_block_push_fail_probability: Option<u8>,
     /// enable transactions indexing, note this will require additional storage (in the order of gigabytes)
     pub txindex: Option<bool>,
+    /// Maximum number of blocks that startup epoch-mismatch recovery can rewind.
+    /// Set to 0 for unlimited. Default: 256.
+    pub max_epoch_rewind_depth: Option<u64>,
 }
 
 impl NodeConfigFile {
@@ -3964,6 +3975,9 @@ impl NodeConfigFile {
             },
 
             txindex: self.txindex.unwrap_or(default_node_config.txindex),
+            max_epoch_rewind_depth: self
+                .max_epoch_rewind_depth
+                .unwrap_or(default_node_config.max_epoch_rewind_depth),
         };
         Ok(node_config)
     }

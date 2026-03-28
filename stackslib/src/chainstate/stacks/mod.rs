@@ -126,6 +126,10 @@ pub enum Error {
     TxWouldNotFitError,
     /// This error indicates an internal state or condition that should never actually happen
     Expects(String),
+    /// The parent block's MARF trie data is missing — likely due to an interrupted commit
+    /// or storage-level data loss. Contains the StacksBlockId of the missing parent.
+    /// Recovery: rewind chainstate to the last block with valid MARF data and replay.
+    MARFParentNotFound(StacksBlockId),
 }
 
 impl From<marf_error> for Error {
@@ -231,6 +235,10 @@ impl fmt::Display for Error {
             Error::TenureTooBigError => write!(f, "Too much data in tenure"),
             Error::TxWouldNotFitError => write!(f, "Transaction would not fit in this block"),
             Error::Expects(ref msg) => write!(f, "Unexpected state: {msg}"),
+            Error::MARFParentNotFound(ref block_id) => write!(
+                f,
+                "Parent block {block_id} not found in MARF (interrupted commit or storage-level data loss)",
+            ),
         }
     }
 }
@@ -280,6 +288,7 @@ impl error::Error for Error {
             Error::TenureTooBigError => None,
             Error::TxWouldNotFitError => None,
             Error::Expects(ref _msg) => None,
+            Error::MARFParentNotFound(_) => None,
         }
     }
 }
@@ -329,6 +338,7 @@ impl Error {
             Error::TenureTooBigError => "TenureTooBigError",
             Error::TxWouldNotFitError => "TxWouldNotFitError",
             Error::Expects(_) => "Expects",
+            Error::MARFParentNotFound(_) => "MARFParentNotFound",
         }
     }
 

@@ -290,7 +290,12 @@ impl RunLoop {
             .collect();
         atlas_config.genesis_attachments = Some(genesis_attachments);
 
-        let chain_state_db = self.boot_chainstate(burnchain_config);
+        let mut chain_state_db = self.boot_chainstate(burnchain_config);
+        run_loop::validate_chainstate_at_startup(
+            &mut chain_state_db,
+            burnchain_config,
+            self.config.node.max_epoch_rewind_depth,
+        );
 
         // NOTE: re-instantiate AtlasConfig so we don't have to keep the genesis attachments around
         let moved_atlas_config = self.config.atlas.clone();

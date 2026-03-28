@@ -34,7 +34,9 @@ use crate::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode, TrieStorageConnection, TrieStorageTransaction,
 };
 use crate::chainstate::stacks::index::trie::Trie;
-use crate::chainstate::stacks::index::{Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
+use crate::chainstate::stacks::index::{
+    trie_sql, Error, MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof,
+};
 use crate::util_lib::db::Error as db_error;
 
 pub const BLOCK_HASH_TO_HEIGHT_MAPPING_KEY: &str = "__MARF_BLOCK_HASH_TO_HEIGHT";
@@ -1209,6 +1211,32 @@ impl<T: MarfTrieId> MARF<T> {
             storage,
             open_chain_tip: None,
         }
+    }
+
+    /// Reset MARF runtime state after a chainstate recovery rewind.
+    /// Delegates to [`TrieFileStorage::post_recovery_reset`] and also
+    /// clears `open_chain_tip` in case it references a rewound block.
+    pub fn post_recovery_reset(&mut self, rewound_blocks: &[T]) {
+        self.storage.post_recovery_reset(rewound_blocks);
+        self.open_chain_tip = None;
+    }
+
+    /// Delete a confirmed block's trie data from this MARF so that `begin()`
+    /// can recreate it on replay. Used during chainstate recovery to clean the
+    /// clarity MARF when blocks are rewound.
+    ///
+    /// Idempotent: no-op if the block doesn't exist in this MARF.
+    /// Does NOT clean up orphaned external blob storage (harmless).
+    ///
+    /// Callers should follow up with [`post_recovery_reset`] to clear
+    /// transient MARF state (cursor, ancestor cache, uncommitted writes).
+    pub fn drop_block(&mut self, bhh: &T) -> Result<(), Error> {
+        if self.storage.readonly() {
+            return Err(Error::ReadOnlyError);
+        }
+        trie_sql::drop_confirmed_trie(self.storage.sqlite_conn(), bhh)?;
+        trie_sql::drop_lock(self.storage.sqlite_conn(), bhh)?;
+        Ok(())
     }
 
     /// Instantiate the MARF using a TrieFileStorage instance, from the given path on disk.

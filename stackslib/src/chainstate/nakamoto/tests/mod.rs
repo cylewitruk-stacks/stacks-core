@@ -1004,6 +1004,7 @@ pub fn test_load_store_update_nakamoto_blocks() {
             &epoch2_parent_block_id,
             &epoch2_header_info,
             &epoch2_execution_cost,
+            StacksEpochId::Epoch20,
         )
         .unwrap();
 
@@ -1059,6 +1060,7 @@ pub fn test_load_store_update_nakamoto_blocks() {
             true,
             1,
             300,
+            StacksEpochId::Epoch30,
         )
         .unwrap();
         staging_tx
@@ -1088,6 +1090,7 @@ pub fn test_load_store_update_nakamoto_blocks() {
             false,
             2,
             400,
+            StacksEpochId::Epoch30,
         )
         .unwrap();
 

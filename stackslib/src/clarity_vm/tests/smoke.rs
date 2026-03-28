@@ -31,10 +31,12 @@ where
     let mut marf_kv = MarfedKV::temporary();
     let epoch = epoch.unwrap_or(StacksEpochId::latest());
     {
-        let mut store = marf_kv.begin(
-            &StacksBlockId::sentinel(),
-            &StacksBlockId::new(&FIRST_BURNCHAIN_CONSENSUS_HASH, &FIRST_STACKS_BLOCK_HASH),
-        );
+        let mut store = marf_kv
+            .begin(
+                &StacksBlockId::sentinel(),
+                &StacksBlockId::new(&FIRST_BURNCHAIN_CONSENSUS_HASH, &FIRST_STACKS_BLOCK_HASH),
+            )
+            .unwrap();
 
         store
             .as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB)
@@ -43,10 +45,12 @@ where
     }
 
     {
-        let mut store = marf_kv.begin(
-            &StacksBlockId::new(&FIRST_BURNCHAIN_CONSENSUS_HASH, &FIRST_STACKS_BLOCK_HASH),
-            &StacksBlockId([1; 32]),
-        );
+        let mut store = marf_kv
+            .begin(
+                &StacksBlockId::new(&FIRST_BURNCHAIN_CONSENSUS_HASH, &FIRST_STACKS_BLOCK_HASH),
+                &StacksBlockId([1; 32]),
+            )
+            .unwrap();
 
         let mut owned_env = OwnedEnvironment::new(
             store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB),

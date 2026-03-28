@@ -48,6 +48,7 @@ use crate::chainstate::stacks::boot::{
 use crate::chainstate::stacks::db::{StacksAccount, StacksChainState};
 use crate::chainstate::stacks::events::{StacksTransactionEvent, StacksTransactionReceipt};
 use crate::chainstate::stacks::index::marf::MARF;
+use crate::chainstate::stacks::index::Error as MARFError;
 use crate::chainstate::stacks::{
     Error as ChainstateError, StacksMicroblockHeader, StacksTransaction, TransactionPayload,
     TransactionSmartContract, TransactionVersion,
@@ -418,8 +419,14 @@ impl ClarityInstance {
         next: &StacksBlockId,
         header_db: &'b dyn HeadersDB,
         burn_state_db: &'b dyn BurnStateDB,
-    ) -> ClarityBlockConnection<'a, 'b> {
-        let mut datastore = self.datastore.begin(current, next);
+    ) -> Result<ClarityBlockConnection<'a, 'b>, ChainstateError> {
+        let mut datastore = self.datastore.begin(current, next).map_err(|e| {
+            warn!("Failed to begin MARF block {current} -> {next}: {e:?}");
+            match e {
+                MARFError::NotFoundError => ChainstateError::MARFParentNotFound(current.clone()),
+                other => ChainstateError::MARFError(other),
+            }
+        })?;
 
         let epoch = Self::get_epoch_of(current, header_db, burn_state_db);
         let cost_track = {
@@ -436,7 +443,7 @@ impl ClarityInstance {
             )
         };
 
-        ClarityBlockConnection {
+        Ok(ClarityBlockConnection {
             datastore: Box::new(datastore),
             header_db,
             burn_state_db,
@@ -444,7 +451,7 @@ impl ClarityInstance {
             mainnet: self.mainnet,
             chain_id: self.chain_id,
             epoch: epoch.epoch_id,
-        }
+        })
     }
 
     pub fn begin_genesis_block<'a, 'b>(
@@ -454,7 +461,10 @@ impl ClarityInstance {
         header_db: &'b dyn HeadersDB,
         burn_state_db: &'b dyn BurnStateDB,
     ) -> ClarityBlockConnection<'a, 'b> {
-        let datastore = self.datastore.begin(current, next);
+        let datastore = self
+            .datastore
+            .begin(current, next)
+            .expect("FATAL: failed to begin genesis MARF block");
 
         let epoch = GENESIS_EPOCH;
 
@@ -480,7 +490,10 @@ impl ClarityInstance {
         header_db: &'b dyn HeadersDB,
         burn_state_db: &'b dyn BurnStateDB,
     ) -> ClarityBlockConnection<'a, 'b> {
-        let writable = self.datastore.begin(current, next);
+        let writable = self
+            .datastore
+            .begin(current, next)
+            .expect("FATAL: failed to begin test genesis MARF block");
 
         let epoch = GENESIS_EPOCH;
 
@@ -576,7 +589,10 @@ impl ClarityInstance {
         header_db: &'b dyn HeadersDB,
         burn_state_db: &'b dyn BurnStateDB,
     ) -> ClarityBlockConnection<'a, 'b> {
-        let writable = self.datastore.begin(current, next);
+        let writable = self
+            .datastore
+            .begin(current, next)
+            .expect("FATAL: failed to begin test genesis 2.1 MARF block");
 
         let epoch = StacksEpochId::Epoch21;
 
@@ -2386,12 +2402,14 @@ mod tests {
             .commit_block();
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([0; 32]),
-                &StacksBlockId([1; 32]),
-                &TEST_HEADER_DB,
-                &TEST_BURN_STATE_DB,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([0; 32]),
+                    &StacksBlockId([1; 32]),
+                    &TEST_HEADER_DB,
+                    &TEST_BURN_STATE_DB,
+                )
+                .unwrap();
 
             let contract = "(define-public (foo (x int) (y uint)) (ok (+ x y)))";
 
@@ -2437,12 +2455,14 @@ mod tests {
             .commit_block();
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([0; 32]),
-                &StacksBlockId([1; 32]),
-                &TEST_HEADER_DB,
-                &TEST_BURN_STATE_DB,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([0; 32]),
+                    &StacksBlockId([1; 32]),
+                    &TEST_HEADER_DB,
+                    &TEST_BURN_STATE_DB,
+                )
+                .unwrap();
 
             // S1G2081040G2081040G2081040G208105NK8PE5 is the transient address
             let contract = "
@@ -2498,12 +2518,14 @@ mod tests {
             .commit_block();
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([0; 32]),
-                &StacksBlockId([1; 32]),
-                &TEST_HEADER_DB,
-                &TEST_BURN_STATE_DB,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([0; 32]),
+                    &StacksBlockId([1; 32]),
+                    &TEST_HEADER_DB,
+                    &TEST_BURN_STATE_DB,
+                )
+                .unwrap();
 
             {
                 let mut tx = conn.start_transaction_processing();
@@ -2610,12 +2632,14 @@ mod tests {
             .commit_block();
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([0; 32]),
-                &StacksBlockId([1; 32]),
-                &TEST_HEADER_DB,
-                &TEST_BURN_STATE_DB,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([0; 32]),
+                    &StacksBlockId([1; 32]),
+                    &TEST_HEADER_DB,
+                    &TEST_BURN_STATE_DB,
+                )
+                .unwrap();
 
             let contract = "(define-public (foo (x int)) (ok (+ x x)))";
 
@@ -2707,7 +2731,9 @@ mod tests {
 
         let mut marf = clarity_instance.destroy();
 
-        let mut conn = marf.begin(&StacksBlockId::sentinel(), &StacksBlockId([0; 32]));
+        let mut conn = marf
+            .begin(&StacksBlockId::sentinel(), &StacksBlockId([0; 32]))
+            .unwrap();
         // should not be in the marf.
         assert_eq!(
             conn.get_contract_hash(&contract_identifier).unwrap_err(),
@@ -2890,12 +2916,14 @@ mod tests {
             .commit_block();
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([0; 32]),
-                &StacksBlockId([1; 32]),
-                &TEST_HEADER_DB,
-                &TEST_BURN_STATE_DB,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([0; 32]),
+                    &StacksBlockId([1; 32]),
+                    &TEST_HEADER_DB,
+                    &TEST_BURN_STATE_DB,
+                )
+                .unwrap();
 
             let contract = "
             (define-data-var bar int 0)
@@ -3114,12 +3142,14 @@ mod tests {
             .commit_block();
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([0; 32]),
-                &StacksBlockId([1; 32]),
-                &TEST_HEADER_DB,
-                &TEST_BURN_STATE_DB,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([0; 32]),
+                    &StacksBlockId([1; 32]),
+                    &TEST_HEADER_DB,
+                    &TEST_BURN_STATE_DB,
+                )
+                .unwrap();
 
             conn.as_transaction(|clarity_tx| {
                 let receipt =
@@ -3259,12 +3289,14 @@ mod tests {
             .commit_block();
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([0; 32]),
-                &StacksBlockId([1; 32]),
-                &TEST_HEADER_DB,
-                &TEST_BURN_STATE_DB,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([0; 32]),
+                    &StacksBlockId([1; 32]),
+                    &TEST_HEADER_DB,
+                    &TEST_BURN_STATE_DB,
+                )
+                .unwrap();
 
             let contract = "
             (define-public (do-expand)
@@ -3301,12 +3333,14 @@ mod tests {
         }
 
         {
-            let mut conn = clarity_instance.begin_block(
-                &StacksBlockId([1; 32]),
-                &StacksBlockId([2; 32]),
-                &TEST_HEADER_DB,
-                &burn_state_db,
-            );
+            let mut conn = clarity_instance
+                .begin_block(
+                    &StacksBlockId([1; 32]),
+                    &StacksBlockId([2; 32]),
+                    &TEST_HEADER_DB,
+                    &burn_state_db,
+                )
+                .unwrap();
             assert!(match conn
                 .as_transaction(|tx| tx.run_contract_call(
                     &sender,

@@ -146,6 +146,18 @@ impl<T: MarfTrieId> TrieCacheState<T> {
     pub fn load_block_id(&self, block_hash: &T) -> Option<u32> {
         self.block_id_cache.get(block_hash).copied()
     }
+
+    /// Remove a block's cache entries (both ID→hash and hash→ID mappings).
+    /// Also removes any cached nodes/hashes for this block's blob.
+    /// Used after recovery to ensure stale cache entries don't cause
+    /// `open_block()` to succeed for blocks whose `marf_data` rows were deleted.
+    pub fn invalidate_block(&mut self, block_hash: &T) {
+        if let Some(id) = self.block_id_cache.remove(block_hash) {
+            self.block_hash_cache.remove(&id);
+            self.node_cache.retain(|addr, _| addr.0 != id);
+            self.hash_cache.retain(|addr, _| addr.0 != id);
+        }
+    }
 }
 
 /// Trie node cache strategies
@@ -326,5 +338,11 @@ impl<T: MarfTrieId> TrieCache<T> {
     /// Get the block ID, given the block hash
     pub fn load_block_id(&self, block_hash: &T) -> Option<u32> {
         self.state_ref().load_block_id(block_hash)
+    }
+
+    /// Remove a block's cache entries.
+    /// Delegates to [`TrieCacheState::invalidate_block`].
+    pub fn invalidate_block(&mut self, block_hash: &T) {
+        self.state_mut().invalidate_block(block_hash);
     }
 }

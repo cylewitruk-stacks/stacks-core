@@ -80,13 +80,15 @@ fn helper_execute_epoch(
 
     let mut marf_kv = clarity_instance.destroy();
 
-    let mut store = marf_kv.begin(
-        &StacksBlockHeader::make_index_block_hash(
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-        ),
-        &StacksBlockId([1; 32]),
-    );
+    let mut store = marf_kv
+        .begin(
+            &StacksBlockHeader::make_index_block_hash(
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+            ),
+            &StacksBlockId([1; 32]),
+        )
+        .unwrap();
 
     let mut owned_env = OwnedEnvironment::new_max_limit(
         store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB),

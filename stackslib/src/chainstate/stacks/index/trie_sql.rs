@@ -667,6 +667,19 @@ pub fn drop_unconfirmed_trie<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Resul
     Ok(())
 }
 
+/// Delete a confirmed block's trie data from the MARF database.
+/// Used during chainstate recovery to clean the clarity MARF so that
+/// `MARF::begin()` can recreate the block on replay.
+///
+/// Idempotent: no-op if the block doesn't exist.
+pub fn drop_confirmed_trie<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<(), Error> {
+    conn.execute(
+        "DELETE FROM marf_data WHERE block_hash = ? AND unconfirmed = 0",
+        &[bhh],
+    )?;
+    Ok(())
+}
+
 pub fn clear_lock_data(conn: &Connection) -> Result<(), Error> {
     conn.execute("DELETE FROM block_extension_locks", NO_PARAMS)?;
     Ok(())

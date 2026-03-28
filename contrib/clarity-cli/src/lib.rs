@@ -377,7 +377,9 @@ where
     // need to load the last block
     let (from, to) = headers_db.advance_cli_chain_tip();
     let (headers_return, result) = {
-        let marf_tx = marf_kv.begin(&from, &to);
+        let marf_tx = marf_kv
+            .begin(&from, &to)
+            .expect("FATAL: failed to begin MARF block");
         let (headers_return, marf_return, result) = f(headers_db, marf_tx);
         marf_return
             .commit_to_processed_block(&to)
@@ -399,7 +401,9 @@ where
     let from = get_cli_chain_tip(&cli_db_conn);
     let to = StacksBlockId([2u8; 32]); // 0x0202020202 ... (pattern not used anywhere else)
 
-    let marf_tx = marf_kv.begin(&from, &to);
+    let marf_tx = marf_kv
+        .begin(&from, &to)
+        .expect("FATAL: failed to begin MARF block");
     let (marf_return, result) = f(marf_tx);
     marf_return.drop_current_trie();
     result
@@ -414,7 +418,9 @@ where
         .unwrap_or_else(|_| panic!("FATAL: failed to parse inputted blockhash: {blockhash}"));
     let to = StacksBlockId([2u8; 32]); // 0x0202020202 ... (pattern not used anywhere else)
 
-    let marf_tx = marf_kv.begin(&from, &to);
+    let marf_tx = marf_kv
+        .begin(&from, &to)
+        .expect("FATAL: failed to begin MARF block");
     let (marf_return, result) = f(marf_tx);
     marf_return.drop_current_trie();
     result

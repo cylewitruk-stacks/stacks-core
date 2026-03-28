@@ -807,6 +807,44 @@ impl<
                     increment_stx_blocks_processed_counter();
                     continue;
                 }
+                Err(ChainstateError::MARFParentNotFound(missing_parent_id)) => {
+                    // Parent block's MARF trie data is missing (interrupted commit or
+                    // storage-level data loss). Recovery: walk backward to find the last good
+                    // MARF block and rewind descendants.
+                    warn!(
+                        "Chainstate recovery (Nakamoto coordinator): parent block {missing_parent_id} missing. \
+                         Running chainstate recovery.",
+                    );
+                    match self
+                        .chain_state_db
+                        .handle_chainstate_recovery(self.sortition_db.conn(), &missing_parent_id)
+                    {
+                        Ok(()) => {
+                            // Recovery succeeded — rewound blocks will be replayed.
+                        }
+                        Err(ChainstateError::NoSuchBlockError) => {
+                            // Recovery couldn't fix the problem. Parent is permanently
+                            // missing — orphan all staging children so they aren't
+                            // retried indefinitely.
+                            warn!(
+                                "Chainstate recovery: parent block {missing_parent_id} not \
+                                 recoverable. Orphaning dependent staging blocks.",
+                            );
+                            NakamotoChainState::infallible_set_block_orphaned(
+                                &mut self.chain_state_db,
+                                &missing_parent_id,
+                            );
+                        }
+                        Err(e) => {
+                            error!("Chainstate recovery failed: {e:?}");
+                            return Err(e.into());
+                        }
+                    }
+
+                    self.notifier.notify_stacks_block_processed();
+                    increment_stx_blocks_processed_counter();
+                    continue;
+                }
                 Err(e) => {
                     // something else happened
                     return Err(e.into());

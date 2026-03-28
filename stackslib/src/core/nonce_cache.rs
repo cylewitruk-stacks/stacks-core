@@ -258,12 +258,14 @@ mod tests {
                 &TEST_BURN_STATE_DB,
             )
             .commit_block();
-        let mut clarity_conn = clarity_instance.begin_block(
-            &StacksBlockId([0 as u8; 32]),
-            &StacksBlockId([1 as u8; 32]),
-            &TEST_HEADER_DB,
-            &TEST_BURN_STATE_DB,
-        );
+        let mut clarity_conn = clarity_instance
+            .begin_block(
+                &StacksBlockId([0 as u8; 32]),
+                &StacksBlockId([1 as u8; 32]),
+                &TEST_HEADER_DB,
+                &TEST_BURN_STATE_DB,
+            )
+            .unwrap();
 
         clarity_conn.as_transaction(|clarity_tx| {
             assert_eq!(cache.get(&addr1, clarity_tx, conn), 1);

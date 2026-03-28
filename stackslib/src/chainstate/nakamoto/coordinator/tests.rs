@@ -24,6 +24,7 @@ use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use clarity::vm::ClarityVersion;
 use rand::prelude::SliceRandom;
 use rand::{thread_rng, Rng};
+use rusqlite::OptionalExtension;
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
 use stacks_common::bitvec::BitVec;
 use stacks_common::consts::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
@@ -4306,4 +4307,273 @@ fn test_stacks_on_burnchain_ops() {
 
     peer.check_nakamoto_migration();
     peer.check_malleablized_blocks(all_blocks, 2);
+}
+
+/// Test 3 from the recovery test plan: exercise `handle_chainstate_recovery` on a Nakamoto
+/// chainstate. Verifies that:
+/// 1. The recovery correctly identifies missing MARF data for a Nakamoto block
+/// 2. The Nakamoto-specific staging table (`nakamoto_staging_blocks`) is properly reset
+/// 3. The Nakamoto-specific header table (`nakamoto_block_headers`) is cleaned
+///
+/// Note: This calls `handle_chainstate_recovery` directly rather than going through the full
+/// coordinator loop, because the Nakamoto coordinator's pre-processing stages (reward set
+/// lookups, tenure validation) make it difficult to simulate a partial crash that reaches
+/// `chainstate_block_begin` without additional side effects. A full coordinator-loop test
+/// would require a more sophisticated crash simulation.
+#[test]
+fn test_nakamoto_chainstate_recovery_rewind_and_cleanup() {
+    let (mut test_signers, test_stackers) = TestStacker::common_signing_set();
+    let mut peer = boot_nakamoto(
+        function_name!(),
+        vec![],
+        &mut test_signers,
+        &test_stackers,
+        None,
+    );
+
+    // Mine a tenure to create Nakamoto blocks
+    let (burn_ops, mut tenure_change, miner_key) =
+        peer.begin_nakamoto_tenure(TenureChangeCause::BlockFound);
+    let (_, _, consensus_hash) = peer.next_burnchain_block(burn_ops);
+    let vrf_proof = peer.make_nakamoto_vrf_proof(miner_key);
+
+    tenure_change.tenure_consensus_hash = consensus_hash.clone();
+    tenure_change.burn_view_consensus_hash = consensus_hash.clone();
+    let tenure_change_tx = peer.chain.miner.make_nakamoto_tenure_change(tenure_change);
+    let coinbase_tx = peer.chain.miner.make_nakamoto_coinbase(None, vrf_proof);
+
+    let blocks_and_sizes = peer.make_nakamoto_tenure(
+        tenure_change_tx,
+        coinbase_tx,
+        &mut test_signers,
+        |_miner, _chainstate, _sort_dbconn, _blocks| vec![],
+    );
+    let blocks: Vec<_> = blocks_and_sizes
+        .into_iter()
+        .map(|(block, _, _)| block)
+        .collect();
+
+    // Get the canonical Nakamoto tip
+    let tip_block_id = {
+        let chainstate = &mut peer.chain.stacks_node.as_mut().unwrap().chainstate;
+        let sort_db = peer.chain.sortdb.as_mut().unwrap();
+        let tip = NakamotoChainState::get_canonical_block_header(chainstate.db(), sort_db)
+            .unwrap()
+            .unwrap();
+        tip.index_block_hash()
+    };
+
+    // Get MARF DB paths for external deletion
+    let (clarity_marf_path, state_index_path) = {
+        let chainstate = &peer.chain.stacks_node.as_ref().unwrap().chainstate;
+        let clarity_path = chainstate.clarity_state_index_path.clone();
+        let index_path =
+            StacksChainState::header_index_root_path(chainstate.root_path.clone().into())
+                .to_str()
+                .unwrap()
+                .to_string();
+        (clarity_path, index_path)
+    };
+
+    // Delete the tip's clarity MARF data via external connection.
+    //
+    // Note: we only delete from the clarity MARF, not the state_index MARF. In a real
+    // crash both would be affected, but the Nakamoto coordinator reads from the state_index
+    // MARF (tenure lookups, coinbase heights) BEFORE calling chainstate_block_begin.
+    // Deleting from state_index breaks those pre-processing reads, making full coordinator
+    // replay through this test harness infeasible. The epoch 2.x replay test
+    // (test_chainstate_recovery_replay_after_restart) proves end-to-end replay works.
+    {
+        let ext_conn = rusqlite::Connection::open(&clarity_marf_path).unwrap();
+        let _ = ext_conn.execute(
+            "DELETE FROM marf_data WHERE block_hash = ?1",
+            rusqlite::params![&tip_block_id],
+        );
+        let _ = ext_conn.execute(
+            "DELETE FROM block_extension_locks WHERE block_hash = ?1",
+            rusqlite::params![&tip_block_id],
+        );
+        ext_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
+
+    // Run recovery directly via handle_chainstate_recovery
+    let sortdb_conn = peer.chain.sortdb.as_ref().unwrap().conn();
+    let chainstate = &mut peer.chain.stacks_node.as_mut().unwrap().chainstate;
+    chainstate
+        .handle_chainstate_recovery(sortdb_conn, &tip_block_id)
+        .expect("Chainstate recovery should succeed for Nakamoto chainstate");
+
+    // Verify: the tip block's nakamoto_staging_blocks entry should be reset to processed=0
+    let processed: i32 = chainstate
+        .nakamoto_staging_blocks_conn
+        .query_row(
+            "SELECT processed FROM nakamoto_staging_blocks WHERE index_block_hash = ?1",
+            rusqlite::params![&tip_block_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        processed, 0,
+        "Nakamoto tip should be rewound to processed=0 after recovery"
+    );
+
+    // Verify: the tip's nakamoto_block_headers entry should be deleted
+    let header_exists: bool = chainstate
+        .db()
+        .query_row(
+            "SELECT 1 FROM nakamoto_block_headers WHERE index_block_hash = ?1",
+            rusqlite::params![&tip_block_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false);
+    assert!(
+        !header_exists,
+        "Nakamoto tip's header should be deleted after recovery"
+    );
+
+    // Note: Full replay through the Nakamoto coordinator is not tested here because
+    // the coordinator's pre-processing stages (tenure lookups, coinbase heights) read
+    // from the state_index MARF, which would also be corrupted in a real crash. The
+    // epoch 2.x test (test_chainstate_recovery_replay_after_restart) proves end-to-end replay
+    // works. This test validates that Nakamoto-specific tables are correctly cleaned.
+}
+
+/// Test recovery at the epoch 2.x → Nakamoto activation boundary.
+///
+/// `boot_nakamoto` mines 11 epoch 2.x blocks to transition through epochs. This test
+/// corrupts the last epoch 2.x block (which has the Nakamoto epoch transition applied),
+/// runs recovery, and verifies the block can be replayed with the epoch transition
+/// re-applied correctly.
+#[test]
+fn test_chainstate_recovery_at_nakamoto_activation_boundary() {
+    let (mut test_signers, test_stackers) = TestStacker::common_signing_set();
+    let mut peer = boot_nakamoto(
+        function_name!(),
+        vec![],
+        &mut test_signers,
+        &test_stackers,
+        None,
+    );
+
+    // The peer has just finished transitioning to Nakamoto. Get the last epoch 2.x block
+    // (the canonical tip before any Nakamoto blocks are mined). This block has
+    // applied_epoch_transition = true for the Nakamoto epoch.
+    let (tip_block_id, original_root, had_epoch_transition) = {
+        let chainstate = &mut peer.chain.stacks_node.as_mut().unwrap().chainstate;
+        let sort_db = peer.chain.sortdb.as_ref().unwrap();
+        let tip = NakamotoChainState::get_canonical_block_header(chainstate.db(), sort_db)
+            .unwrap()
+            .unwrap();
+        let tip_id = tip.index_block_hash();
+        let root = chainstate.with_clarity_marf(|marf| marf.get_root_hash_at(&tip_id).unwrap());
+        let has_transition: bool = chainstate
+            .db()
+            .query_row(
+                "SELECT 1 FROM epoch_transitions WHERE block_id = ?1",
+                rusqlite::params![&tip_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or(false);
+        (tip_id, root, has_transition)
+    };
+
+    // Get DB paths
+    let (clarity_marf_path, state_index_path) = {
+        let chainstate = &peer.chain.stacks_node.as_ref().unwrap().chainstate;
+        let clarity_path = chainstate.clarity_state_index_path.clone();
+        let index_path =
+            StacksChainState::header_index_root_path(chainstate.root_path.clone().into())
+                .to_str()
+                .unwrap()
+                .to_string();
+        (clarity_path, index_path)
+    };
+
+    // Delete MARF data for the boundary block from the clarity MARF only.
+    // The state_index MARF is left intact — recovery must clean it during rewind
+    // so that advance_tip() can recreate the block on replay.
+    {
+        let ext_conn = rusqlite::Connection::open(&clarity_marf_path).unwrap();
+        let deleted = ext_conn
+            .execute(
+                "DELETE FROM marf_data WHERE block_hash = ?1",
+                rusqlite::params![&tip_block_id],
+            )
+            .unwrap();
+        assert!(
+            deleted > 0,
+            "Expected to delete clarity marf_data for boundary block"
+        );
+        let _ = ext_conn.execute(
+            "DELETE FROM block_extension_locks WHERE block_hash = ?1",
+            rusqlite::params![&tip_block_id],
+        );
+        ext_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
+
+    // Run recovery
+    let sortdb_conn = peer.chain.sortdb.as_ref().unwrap().conn();
+    let chainstate = &mut peer.chain.stacks_node.as_mut().unwrap().chainstate;
+    chainstate
+        .handle_chainstate_recovery(sortdb_conn, &tip_block_id)
+        .expect("Chainstate recovery at activation boundary should succeed");
+
+    // Verify the block was rewound
+    let processed: i32 = chainstate
+        .db()
+        .query_row(
+            "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+            rusqlite::params![&tip_block_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        processed, 0,
+        "Boundary block should be rewound to processed=0"
+    );
+
+    // Replay: the epoch 2.x block processor should pick up and replay the boundary block
+    let mut sortdb = peer.chain.sortdb.take().unwrap();
+    let tip_info_list = chainstate.process_blocks_at_tip(&mut sortdb, 1).unwrap();
+
+    assert_eq!(tip_info_list.len(), 1);
+    assert!(
+        tip_info_list[0].0.is_some(),
+        "Boundary block should replay successfully after recovery"
+    );
+
+    // Verify MARF root matches original
+    let replayed_root =
+        chainstate.with_clarity_marf(|marf| marf.get_root_hash_at(&tip_block_id).unwrap());
+    assert_eq!(
+        original_root, replayed_root,
+        "MARF root should match after boundary block replay"
+    );
+
+    // Verify epoch_transitions: the block's epoch_transition state after replay must match
+    // its state before corruption.
+    let has_epoch_transition_after: bool = chainstate
+        .db()
+        .query_row(
+            "SELECT 1 FROM epoch_transitions WHERE block_id = ?1",
+            rusqlite::params![&tip_block_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false);
+    assert_eq!(
+        had_epoch_transition, has_epoch_transition_after,
+        "epoch_transitions state should match after replay (had={had_epoch_transition}, has={has_epoch_transition_after})",
+    );
+
+    peer.chain.sortdb = Some(sortdb);
 }

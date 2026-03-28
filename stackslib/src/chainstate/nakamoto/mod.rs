@@ -310,6 +310,15 @@ pub static NAKAMOTO_CHAINSTATE_SCHEMA_8: &[&str] = &[
     "#,
 ];
 
+pub static CHAINSTATE_SCHEMA_6: &[&str] = &[
+    r#"UPDATE db_config SET version = "14";"#,
+    // Add `evaluated_epoch` to both header tables so Tier 2 recovery can detect
+    // blocks processed under stale epoch rules. NULL means the block was committed
+    // by an older binary that did not persist this field (grandfathered).
+    r#"ALTER TABLE block_headers ADD COLUMN evaluated_epoch INTEGER;"#,
+    r#"ALTER TABLE nakamoto_block_headers ADD COLUMN evaluated_epoch INTEGER;"#,
+];
+
 #[cfg(test)]
 mod fault_injection {
     static PROCESS_BLOCK_STALL: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
@@ -1773,7 +1782,7 @@ impl NakamotoChainState {
 
     /// Infallibly set a block as orphaned.
     /// Does not return until it succeeds.
-    fn infallible_set_block_orphaned(
+    pub(crate) fn infallible_set_block_orphaned(
         stacks_chain_state: &mut StacksChainState,
         block_id: &StacksBlockId,
     ) {
@@ -2097,6 +2106,17 @@ impl NakamotoChainState {
                 &e;
                 "stacks_block_id" => %next_ready_block.header.block_id()
             );
+
+            if let ChainstateError::MARFParentNotFound(ref missing_parent_id) = e {
+                // The parent block's MARF trie data is missing. Do NOT orphan the current
+                // block — it's valid, the parent's MARF data is the problem. The recovery
+                // will be performed by the coordinator.
+                warn!(
+                    "Chainstate recovery: parent block {missing_parent_id} missing for Nakamoto block {block_id}. \
+                     Not orphaning the child — recovery will be performed by the coordinator.",
+                );
+                return Err(e);
+            }
 
             // as a separate transaction, mark this block as processed and orphaned.
             // This is done separately so that the staging blocks DB, which receives writes
@@ -3268,6 +3288,7 @@ impl NakamotoChainState {
         tenure_changed: bool,
         height_in_tenure: u32,
         tenure_tx_fees: u128,
+        evaluated_epoch: StacksEpochId,
     ) -> Result<(), ChainstateError> {
         assert_eq!(tip_info.stacks_block_height, header.chain_length,);
         assert!(tip_info.burn_header_timestamp < u64::try_from(i64::MAX).unwrap());
@@ -3299,6 +3320,8 @@ impl NakamotoChainState {
                 block_hash
             ))
         })?;
+
+        let epoch_int = evaluated_epoch as u32;
 
         let args = params![
             u64_to_sql(*stacks_block_height)?,
@@ -3336,7 +3359,8 @@ impl NakamotoChainState {
                     "Nakamoto block StacksHeaderInfo did not set burnchain view".into(),
                 ))
             })?,
-            total_tenure_size
+            total_tenure_size,
+            epoch_int
         ];
 
         chainstate_tx.execute(
@@ -3370,8 +3394,9 @@ impl NakamotoChainState {
                     signer_bitvec,
                     height_in_tenure,
                     burn_view,
-                    total_tenure_size)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                    total_tenure_size,
+                    evaluated_epoch)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             args
         )?;
 
@@ -3403,6 +3428,7 @@ impl NakamotoChainState {
         coinbase_height: u64,
         block_fees: u128,
         burn_view: &ConsensusHash,
+        evaluated_epoch: StacksEpochId,
     ) -> Result<StacksHeaderInfo, ChainstateError> {
         let new_tip = &new_block.header;
         if new_tip.parent_block_id
@@ -3601,6 +3627,7 @@ impl NakamotoChainState {
             new_tenure,
             height_in_tenure,
             tenure_fees,
+            evaluated_epoch,
         )?;
         if let Some(block_reward) = block_reward {
             StacksChainState::insert_miner_payment_schedule(headers_tx.deref_mut(), block_reward)?;
@@ -4224,7 +4251,7 @@ impl NakamotoChainState {
                 &parent_header_hash,
                 &MINER_BLOCK_CONSENSUS_HASH,
                 &MINER_BLOCK_HEADER_HASH,
-            )
+            )?
         };
 
         // now that we have access to the ClarityVM, we can account for reward deductions from
@@ -5001,6 +5028,7 @@ impl NakamotoChainState {
             coinbase_height,
             block_fees,
             burnchain_view,
+            evaluated_epoch,
         )
         .expect("FATAL: failed to advance chain tip");
 

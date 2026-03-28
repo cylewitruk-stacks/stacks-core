@@ -1818,15 +1818,17 @@ pub mod test {
         });
         genesis.commit_block();
 
-        let mut next_block = clarity_instance.begin_block(
-            &StacksBlockHeader::make_index_block_hash(
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-            ),
-            &StacksBlockId([3; 32]),
-            &TEST_HEADER_DB,
-            &TEST_BURN_STATE_DB,
-        );
+        let mut next_block = clarity_instance
+            .begin_block(
+                &StacksBlockHeader::make_index_block_hash(
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                ),
+                &StacksBlockId([3; 32]),
+                &TEST_HEADER_DB,
+                &TEST_BURN_STATE_DB,
+            )
+            .unwrap();
 
         let mut tx_conn = next_block.start_transaction_processing();
         let sk = Secp256k1PrivateKey::random();
@@ -1899,15 +1901,17 @@ pub mod test {
             _ => panic!("Unsupported epoch in test helper: {epoch_id}"),
         };
 
-        let next_block = clarity_instance.begin_block(
-            &StacksBlockHeader::make_index_block_hash(
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-            ),
-            &StacksBlockId([3; 32]),
-            &TEST_HEADER_DB,
-            burn_db,
-        );
+        let next_block = clarity_instance
+            .begin_block(
+                &StacksBlockHeader::make_index_block_hash(
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                ),
+                &StacksBlockId([3; 32]),
+                &TEST_HEADER_DB,
+                burn_db,
+            )
+            .unwrap();
 
         let mut clarity_tx = ClarityTx {
             block: next_block,
@@ -2060,13 +2064,15 @@ pub mod test {
         let signed_tx = signer.get_tx().unwrap();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             // give the spending account some stx
             let _account = StacksChainState::get_account(&mut conn, &addr.to_account_principal());
@@ -2276,13 +2282,15 @@ pub mod test {
         ];
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             conn.connection().as_transaction(|tx| {
                 StacksChainState::account_credit(tx, &addr.to_account_principal(), 123)
@@ -2375,13 +2383,15 @@ pub mod test {
         let signed_tx = signer.get_tx().unwrap();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let account = StacksChainState::get_account(&mut conn, &addr.to_account_principal());
             let account_sponsor =
@@ -2456,13 +2466,15 @@ pub mod test {
         let signed_tx = signer.get_tx().unwrap();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let contract_id = QualifiedContractIdentifier::new(
                 StandardPrincipalData::from(addr.clone()),
@@ -2514,13 +2526,15 @@ pub mod test {
         let addr = auth.origin().address_testnet();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let contracts = [
                 contract_correct,
@@ -2617,13 +2631,15 @@ pub mod test {
         let addr = auth.origin().address_testnet();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let mut next_nonce = 0;
             for i in 0..contracts.len() {
@@ -2703,13 +2719,15 @@ pub mod test {
         let addr = auth.origin().address_testnet();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let contracts = [
                 contract_correct,
@@ -2813,13 +2831,15 @@ pub mod test {
         let signed_tx = signer.get_tx().unwrap();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let contract_id = QualifiedContractIdentifier::new(
                 StandardPrincipalData::from(addr.clone()),
@@ -2917,13 +2937,15 @@ pub mod test {
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
             // process both
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let account = StacksChainState::get_account(&mut conn, &addr.to_account_principal());
             assert_eq!(account.nonce, 0);
@@ -3042,13 +3064,15 @@ pub mod test {
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
             // process both
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let account = StacksChainState::get_account(&mut conn, &addr.to_account_principal());
             assert_eq!(account.nonce, 0);
@@ -3138,13 +3162,15 @@ pub mod test {
         let signed_tx = signer.get_tx().unwrap();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             let contract_id = QualifiedContractIdentifier::new(
                 StandardPrincipalData::from(addr.clone()),
@@ -3249,13 +3275,15 @@ pub mod test {
         let signed_tx = signer.get_tx().unwrap();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
             let (_fee, _) =
                 StacksChainState::process_transaction(&mut conn, &signed_tx, false, None).unwrap();
 
@@ -3349,13 +3377,15 @@ pub mod test {
         ];
 
         for (dbi, burn_db) in PRE_21_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
             let (_fee, _) =
                 StacksChainState::process_transaction(&mut conn, &signed_tx, false, None).unwrap();
 
@@ -3409,13 +3439,15 @@ pub mod test {
 
         // in 2.1, all of these are mineable -- the fee will be collected, and the nonce(s) will
         // advance, but no state changes go through
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([3u8; 20]),
-            &BlockHeaderHash([3u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([3u8; 20]),
+                &BlockHeaderHash([3u8; 32]),
+            )
+            .unwrap();
         let (_fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_tx, false, None).unwrap();
 
@@ -3538,13 +3570,15 @@ pub mod test {
         let signed_tx_2 = signer_2.get_tx().unwrap();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             // process both
             let account_publisher =
@@ -5101,13 +5135,15 @@ pub mod test {
 
         let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             // publish contract
             let _ =
@@ -8519,13 +8555,15 @@ pub mod test {
         // in epoch 2.05 and earlier, this fails because we debit the fee _after_ we run the tx,
         // which leads to an InvalidFee error
         for (dbi, burn_db) in PRE_21_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
             let (fee, _) =
                 StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
                     .unwrap();
@@ -8545,13 +8583,15 @@ pub mod test {
 
         // in epoch 2.1, this passes, since we debit the fee _before_ we run the tx, and then the
         // call to stx-transfer? fails.
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([3u8; 20]),
-            &BlockHeaderHash([3u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([3u8; 20]),
+                &BlockHeaderHash([3u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
@@ -8660,13 +8700,15 @@ pub mod test {
             .address_testnet();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             StacksChainState::insert_microblock_pubkey_hash(&mut conn, 1, &block_pubkh).unwrap();
 
@@ -8781,13 +8823,15 @@ pub mod test {
             .address_testnet();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             StacksChainState::insert_microblock_pubkey_hash(&mut conn, 1, &block_pubkh).unwrap();
 
@@ -8874,13 +8918,15 @@ pub mod test {
             .address_testnet();
 
         for (dbi, burn_db) in ALL_BURN_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             StacksChainState::insert_microblock_pubkey_hash(&mut conn, 1, &block_pubkh).unwrap();
 
@@ -9189,13 +9235,15 @@ pub mod test {
 
         let burndb = MockedBurnDB {};
 
-        let mut conn = chainstate.block_begin(
-            &burndb,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([2u8; 20]),
-            &BlockHeaderHash([2u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &burndb,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([2u8; 20]),
+                &BlockHeaderHash([2u8; 32]),
+            )
+            .unwrap();
 
         assert_eq!(conn.get_epoch(), StacksEpochId::Epoch2_05);
         assert_eq!(
@@ -9398,13 +9446,15 @@ pub mod test {
 
         let burndb = MockedBurnDB {};
 
-        let mut conn = chainstate.block_begin(
-            &burndb,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([2u8; 20]),
-            &BlockHeaderHash([2u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &burndb,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([2u8; 20]),
+                &BlockHeaderHash([2u8; 32]),
+            )
+            .unwrap();
 
         assert_eq!(conn.get_epoch(), StacksEpochId::Epoch21);
         assert_eq!(
@@ -9499,13 +9549,15 @@ pub mod test {
         let signed_contract_call_tx = signer.get_tx().unwrap();
 
         // In 2.0, this will succeed since we debit the fee *after* we run the contract
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_20,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([1u8; 20]),
-            &BlockHeaderHash([1u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_20,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([1u8; 20]),
+                &BlockHeaderHash([1u8; 32]),
+            )
+            .unwrap();
         let (fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
                 .unwrap();
@@ -9519,13 +9571,15 @@ pub mod test {
         conn.commit_block();
 
         // In 2.05, this will succeed since we debit the fee *after* we run the contract
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_2_05,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([2u8; 20]),
-            &BlockHeaderHash([2u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_2_05,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([2u8; 20]),
+                &BlockHeaderHash([2u8; 32]),
+            )
+            .unwrap();
         let (fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
                 .unwrap();
@@ -9539,13 +9593,15 @@ pub mod test {
         conn.commit_block();
 
         // post-2.1, this will fail since we debit the fee *before* we run the contract
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([3u8; 20]),
-            &BlockHeaderHash([3u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([3u8; 20]),
+                &BlockHeaderHash([3u8; 32]),
+            )
+            .unwrap();
         let (fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
                 .unwrap();
@@ -9642,13 +9698,15 @@ pub mod test {
         let signed_contract_call_tx = signer.get_tx().unwrap();
 
         // In 2.0, this will succeed since we debit the fee *after* we run the contract
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_20,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([1u8; 20]),
-            &BlockHeaderHash([1u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_20,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([1u8; 20]),
+                &BlockHeaderHash([1u8; 32]),
+            )
+            .unwrap();
         let (fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
                 .unwrap();
@@ -9662,13 +9720,15 @@ pub mod test {
         conn.commit_block();
 
         // In 2.05, this will succeed since we debit the fee *after* we run the contract
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_2_05,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([2u8; 20]),
-            &BlockHeaderHash([2u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_2_05,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([2u8; 20]),
+                &BlockHeaderHash([2u8; 32]),
+            )
+            .unwrap();
         let (fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
                 .unwrap();
@@ -9682,13 +9742,15 @@ pub mod test {
         conn.commit_block();
 
         // post-2.1, this will fail since we debit the fee *before* we run the contract
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([3u8; 20]),
-            &BlockHeaderHash([3u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([3u8; 20]),
+                &BlockHeaderHash([3u8; 32]),
+            )
+            .unwrap();
         let (fee, _) =
             StacksChainState::process_transaction(&mut conn, &signed_contract_tx, false, None)
                 .unwrap();
@@ -10027,13 +10089,15 @@ pub mod test {
         );
 
         // in 2.0, this invalidates the block
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_20,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([1u8; 20]),
-            &BlockHeaderHash([1u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_20,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([1u8; 20]),
+                &BlockHeaderHash([1u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -10131,13 +10195,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.05, this invalidates the block
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_2_05,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([2u8; 20]),
-            &BlockHeaderHash([2u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_2_05,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([2u8; 20]),
+                &BlockHeaderHash([2u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -10234,13 +10300,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, this is a runtime error when using clarity 1
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([3u8; 20]),
-            &BlockHeaderHash([3u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([3u8; 20]),
+                &BlockHeaderHash([3u8; 32]),
+            )
+            .unwrap();
 
         // make this mineable
         tx_runtime_checkerror_cc_contract_clar1.set_origin_nonce(4);
@@ -10323,13 +10391,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, this is successful when using clarity 2
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([4u8; 20]),
-            &BlockHeaderHash([4u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([4u8; 20]),
+                &BlockHeaderHash([4u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -10602,13 +10672,15 @@ pub mod test {
         );
 
         // in 2.0: analysis error should cause contract publish to fail
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_20,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([1u8; 20]),
-            &BlockHeaderHash([1u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_20,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([1u8; 20]),
+                &BlockHeaderHash([1u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -10680,13 +10752,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.05: analysis error should cause contract publish to fail
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_2_05,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([2u8; 20]),
-            &BlockHeaderHash([2u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_2_05,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([2u8; 20]),
+                &BlockHeaderHash([2u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -10772,13 +10846,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, using clarity 1: analysis error should cause contract publish to fail
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([3u8; 20]),
-            &BlockHeaderHash([3u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([3u8; 20]),
+                &BlockHeaderHash([3u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -10814,13 +10890,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, using clarity 2: success
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([4u8; 20]),
-            &BlockHeaderHash([4u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([4u8; 20]),
+                &BlockHeaderHash([4u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -11138,13 +11216,15 @@ pub mod test {
         );
 
         // in 2.0: calling call-foo invalidates the block
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_20,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([1u8; 20]),
-            &BlockHeaderHash([1u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_20,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([1u8; 20]),
+                &BlockHeaderHash([1u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -11244,13 +11324,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.05: calling call-foo invalidates the block
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_2_05,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([2u8; 20]),
-            &BlockHeaderHash([2u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_2_05,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([2u8; 20]),
+                &BlockHeaderHash([2u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -11353,13 +11435,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, using clarity 1 for both `transitive` and `call-foo`: calling call-foo causes an analysis error
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([3u8; 20]),
-            &BlockHeaderHash([3u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([3u8; 20]),
+                &BlockHeaderHash([3u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -11408,13 +11492,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, using clarity 1 for `transitive` and clarity 2 for `call-foo`: calling call-foo causes an analysis error
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([4u8; 20]),
-            &BlockHeaderHash([4u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([4u8; 20]),
+                &BlockHeaderHash([4u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -11463,13 +11549,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, using clarity 2 for both `transitive` and `call-foo`: publishing call-foo triggers an analysis error
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([5u8; 20]),
-            &BlockHeaderHash([5u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([5u8; 20]),
+                &BlockHeaderHash([5u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -11513,13 +11601,15 @@ pub mod test {
         conn.commit_block();
 
         // in 2.1, using clarity 2 for `transitive` and clarity 1 for `call-foo`: publishing call-foo triggers an analysis error
-        let mut conn = chainstate.block_begin(
-            &TestBurnStateDB_21,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &ConsensusHash([6u8; 20]),
-            &BlockHeaderHash([6u8; 32]),
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TestBurnStateDB_21,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &ConsensusHash([6u8; 20]),
+                &BlockHeaderHash([6u8; 32]),
+            )
+            .unwrap();
 
         let (fee, _) = validate_transactions_static_epoch_and_process_transaction(
             &mut conn,
@@ -12021,13 +12111,15 @@ pub mod test {
         ];
 
         for (dbi, burn_db) in PRE_33_DBS.iter().enumerate() {
-            let mut conn = chainstate.block_begin(
-                *burn_db,
-                &FIRST_BURNCHAIN_CONSENSUS_HASH,
-                &FIRST_STACKS_BLOCK_HASH,
-                &ConsensusHash([(dbi + 1) as u8; 20]),
-                &BlockHeaderHash([(dbi + 1) as u8; 32]),
-            );
+            let mut conn = chainstate
+                .block_begin(
+                    *burn_db,
+                    &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                    &FIRST_STACKS_BLOCK_HASH,
+                    &ConsensusHash([(dbi + 1) as u8; 20]),
+                    &BlockHeaderHash([(dbi + 1) as u8; 32]),
+                )
+                .unwrap();
 
             for cause in sip034_causes.iter() {
                 let mut tx_extend_sip034 = StacksTransaction::new(

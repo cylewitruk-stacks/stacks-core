@@ -822,7 +822,7 @@ impl<'a> StacksMicroblockBuilder<'a> {
             &anchor_block,
             &MINER_BLOCK_CONSENSUS_HASH,
             &MINER_BLOCK_HEADER_HASH,
-        );
+        )?;
 
         debug!(
             "Begin microblock mining from {} from unconfirmed state with cost {:?}",

@@ -49,9 +49,9 @@ use crate::chainstate::burn::operations::{
 use crate::chainstate::burn::{ConsensusHash, ConsensusHashExtensions};
 use crate::chainstate::nakamoto::{
     HeaderTypeNames, NakamotoBlockHeader, NakamotoChainState, NakamotoStagingBlocksConn,
-    NAKAMOTO_CHAINSTATE_SCHEMA_1, NAKAMOTO_CHAINSTATE_SCHEMA_2, NAKAMOTO_CHAINSTATE_SCHEMA_3,
-    NAKAMOTO_CHAINSTATE_SCHEMA_4, NAKAMOTO_CHAINSTATE_SCHEMA_5, NAKAMOTO_CHAINSTATE_SCHEMA_6,
-    NAKAMOTO_CHAINSTATE_SCHEMA_7, NAKAMOTO_CHAINSTATE_SCHEMA_8,
+    CHAINSTATE_SCHEMA_6, NAKAMOTO_CHAINSTATE_SCHEMA_1, NAKAMOTO_CHAINSTATE_SCHEMA_2,
+    NAKAMOTO_CHAINSTATE_SCHEMA_3, NAKAMOTO_CHAINSTATE_SCHEMA_4, NAKAMOTO_CHAINSTATE_SCHEMA_5,
+    NAKAMOTO_CHAINSTATE_SCHEMA_6, NAKAMOTO_CHAINSTATE_SCHEMA_7, NAKAMOTO_CHAINSTATE_SCHEMA_8,
 };
 use crate::chainstate::stacks::address::StacksAddressExtensions;
 use crate::chainstate::stacks::boot::*;
@@ -86,6 +86,7 @@ pub mod accounts;
 pub mod blocks;
 pub mod contracts;
 pub mod headers;
+pub mod recovery;
 pub mod transactions;
 pub mod unconfirmed;
 
@@ -669,8 +670,8 @@ impl<'a> DerefMut for ChainstateTx<'a> {
     }
 }
 
-pub const CHAINSTATE_VERSION: &str = "13";
-pub const CHAINSTATE_VERSION_NUMBER: u32 = 13;
+pub const CHAINSTATE_VERSION: &str = "14";
+pub const CHAINSTATE_VERSION_NUMBER: u32 = 14;
 
 const CHAINSTATE_INITIAL_SCHEMA: &[&str] = &[
     "PRAGMA foreign_keys = ON;",
@@ -1177,6 +1178,14 @@ impl StacksChainState {
                         "Migrating chainstate schema from version 12 to 13: add total_tenure_size field"
                     );
                     for cmd in NAKAMOTO_CHAINSTATE_SCHEMA_8.iter() {
+                        tx.execute_batch(cmd)?;
+                    }
+                }
+                "13" => {
+                    info!(
+                        "Migrating chainstate schema from version 13 to 14: add evaluated_epoch to header tables"
+                    );
+                    for cmd in CHAINSTATE_SCHEMA_6.iter() {
                         tx.execute_batch(cmd)?;
                     }
                 }
@@ -1790,6 +1799,7 @@ impl StacksChainState {
                 &parent_hash,
                 &first_tip_info,
                 &ExecutionCost::ZERO,
+                StacksEpochId::Epoch20,
             )?;
             tx.commit()?;
         }
@@ -2097,7 +2107,7 @@ impl StacksChainState {
         parent_block: &BlockHeaderHash,
         new_consensus_hash: &ConsensusHash,
         new_block: &BlockHeaderHash,
-    ) -> ClarityTx<'a, 'b> {
+    ) -> Result<ClarityTx<'a, 'b>, Error> {
         let conf = chainstate_tx.config.clone();
         StacksChainState::inner_clarity_tx_begin(
             conf,
@@ -2144,7 +2154,7 @@ impl StacksChainState {
         parent_block: &BlockHeaderHash,
         new_consensus_hash: &ConsensusHash,
         new_block: &BlockHeaderHash,
-    ) -> ClarityTx<'a, 'a> {
+    ) -> Result<ClarityTx<'a, 'a>, Error> {
         let conf = self.config();
         StacksChainState::inner_clarity_tx_begin(
             conf,
@@ -2409,7 +2419,7 @@ impl StacksChainState {
         parent_block: &BlockHeaderHash,
         new_consensus_hash: &ConsensusHash,
         new_block: &BlockHeaderHash,
-    ) -> ClarityTx<'a, 'b> {
+    ) -> Result<ClarityTx<'a, 'b>, Error> {
         // mix consensus hash and stacks block header hash together, since the stacks block hash
         // it not guaranteed to be globally unique (but the pair is)
         let parent_index_block =
@@ -2441,13 +2451,13 @@ impl StacksChainState {
             &new_index_block,
             headers_db,
             burn_dbconn,
-        );
+        )?;
 
         test_debug!("Got clarity TX!");
-        ClarityTx {
+        Ok(ClarityTx {
             block: inner_clarity_tx,
             config: conf,
-        }
+        })
     }
 
     /// Create an ephemeral Clarity VM database transaction.
@@ -2778,6 +2788,7 @@ impl StacksChainState {
         burn_transfer_stx_ops: Vec<TransferStxOp>,
         burn_delegate_stx_ops: Vec<DelegateStxOp>,
         burn_vote_for_aggregate_key_ops: Vec<VoteForAggregateKeyOp>,
+        evaluated_epoch: StacksEpochId,
     ) -> Result<StacksHeaderInfo, Error> {
         if new_tip.parent_block != FIRST_STACKS_BLOCK_HASH {
             // not the first-ever block, so linkage must occur
@@ -2834,6 +2845,7 @@ impl StacksChainState {
             &parent_hash,
             &new_tip_info,
             anchor_block_cost,
+            evaluated_epoch,
         )?;
         StacksChainState::insert_miner_payment_schedule(headers_tx.deref_mut(), block_reward)?;
         StacksChainState::store_burnchain_txids(
@@ -2963,13 +2975,15 @@ pub mod test {
         let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
 
         // verify that the boot code is there
-        let mut conn = chainstate.block_begin(
-            &TEST_BURN_STATE_DB,
-            &FIRST_BURNCHAIN_CONSENSUS_HASH,
-            &FIRST_STACKS_BLOCK_HASH,
-            &MINER_BLOCK_CONSENSUS_HASH,
-            &MINER_BLOCK_HEADER_HASH,
-        );
+        let mut conn = chainstate
+            .block_begin(
+                &TEST_BURN_STATE_DB,
+                &FIRST_BURNCHAIN_CONSENSUS_HASH,
+                &FIRST_STACKS_BLOCK_HASH,
+                &MINER_BLOCK_CONSENSUS_HASH,
+                &MINER_BLOCK_HEADER_HASH,
+            )
+            .unwrap();
 
         for (boot_contract_name, _) in STACKS_BOOT_CODE_TESTNET.iter() {
             let boot_contract_id = QualifiedContractIdentifier::new(

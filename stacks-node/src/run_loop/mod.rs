@@ -5,7 +5,8 @@ pub mod neon;
 
 use clarity::vm::costs::ExecutionCost;
 use clarity::vm::database::BurnStateDB;
-use stacks::burnchains::{PoxConstants, Txid};
+use stacks::burnchains::{Burnchain, PoxConstants, Txid};
+use stacks::chainstate::burn::db::sortdb::SortitionDB;
 use stacks::chainstate::stacks::db::StacksChainState;
 use stacks::chainstate::stacks::events::StacksTransactionReceipt;
 use stacks::chainstate::stacks::{
@@ -168,6 +169,47 @@ pub struct RegisteredKey {
     /// `memo` field that was used to register key
     /// Could be `Hash160(miner_pubkey)`, or empty
     pub memo: Vec<u8>,
+}
+
+/// Run chainstate consistency validation at startup.
+///
+/// Opens a read-only SortitionDB to get the canonical tip, walks backward using
+/// Tier 1 (MARF existence) and Tier 2 (epoch consistency) checks, and
+/// auto-rewinds if inconsistency is found. Panics on unrecoverable
+/// inconsistency (parent not in any headers table, or rewind depth exceeded).
+///
+/// `max_epoch_rewind_depth` is a safety valve: if the rewind count exceeds this
+/// limit, the node refuses to start. Set to `0` to disable (unlimited rewind).
+///
+/// Called from both the neon and nakamoto `spawn_chains_coordinator` methods,
+/// after `boot_chainstate()` returns but before the coordinator thread starts.
+pub fn validate_chainstate_at_startup(
+    chainstate: &mut StacksChainState,
+    burnchain_config: &Burnchain,
+    max_epoch_rewind_depth: u64,
+) {
+    let sortdb = SortitionDB::open(
+        &burnchain_config.get_db_path(),
+        false,
+        burnchain_config.pox_constants.clone(),
+        None,
+    )
+    .expect("FATAL: failed to open SortitionDB for startup validation");
+
+    match chainstate.check_and_recover_chainstate(sortdb.conn(), max_epoch_rewind_depth) {
+        Ok(0) => {}
+        Ok(n) => {
+            warn!("Startup: rewound {n} inconsistent blocks. Coordinator will replay them.");
+        }
+        Err(e) => {
+            panic!(
+                "FATAL: startup chainstate validation found unrecoverable \
+                 inconsistency: {e:?}. The chainstate cannot be repaired \
+                 automatically. Consider re-syncing from a snapshot or \
+                 increasing max_epoch_rewind_depth."
+            );
+        }
+    }
 }
 
 pub fn announce_boot_receipts(

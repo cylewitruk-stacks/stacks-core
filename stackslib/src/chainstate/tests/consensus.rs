@@ -842,7 +842,8 @@ impl ConsensusChain<'_> {
             &chain_tip.anchored_header.block_hash(),
             &MINER_BLOCK_CONSENSUS_HASH,
             &MINER_BLOCK_HEADER_HASH,
-        );
+        )
+        .unwrap();
         let result = Self::inner_compute_naka_block_marf_root_hash(
             &mut clarity_tx,
             block_time,

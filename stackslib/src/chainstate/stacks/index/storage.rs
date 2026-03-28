@@ -1816,6 +1816,25 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         }))
     }
 
+    /// Reset MARF runtime state after a chainstate recovery rewind.
+    ///
+    /// Chainstate recovery deletes `marf_data` rows via raw SQL, but the in-memory MARF caches and
+    /// transient state are not automatically updated. Without this reset, `open_block()` can
+    /// succeed for a deleted block via a stale `block_id_cache` hit, causing `extend_trie()`
+    /// to skip `extend_to_block()` entirely. That leaves `uncommitted_writes` as `None`, and
+    /// the next `write_nodetype()` panics.
+    ///
+    /// This method invalidates block identity caches for each rewound block and resets the
+    /// transient cursor/ancestor state to a safe baseline.
+    pub fn post_recovery_reset(&mut self, rewound_blocks: &[T]) {
+        for block_hash in rewound_blocks {
+            self.cache.invalidate_block(block_hash);
+        }
+        self.data.set_block(T::sentinel(), None);
+        self.data.trie_ancestor_hash_bytes_cache = None;
+        self.data.uncommitted_writes = None;
+    }
+
     pub fn sqlite_conn(&self) -> &Connection {
         &self.db
     }

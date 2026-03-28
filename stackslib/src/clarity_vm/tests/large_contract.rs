@@ -98,7 +98,9 @@ fn new_block<'a, 'b>(
     header_db: &'b dyn HeadersDB,
     burn_state_db: &'b dyn BurnStateDB,
 ) -> ClarityBlockConnection<'a, 'b> {
-    let mut block = clarity.begin_block(current, next, header_db, burn_state_db);
+    let mut block = clarity
+        .begin_block(current, next, header_db, burn_state_db)
+        .unwrap();
     block.as_free_transaction(|tx_conn| {
         tx_conn
             .with_clarity_db(|db| {

@@ -67,7 +67,7 @@ use crate::net::{BlocksInvData, Error as net_error};
 use crate::util_lib::boot::boot_code_id;
 use crate::util_lib::db::{
     query_count, query_int, query_one_row_column, query_row, query_row_columns, query_row_panic,
-    query_rows, u64_to_sql, DBConn, Error as db_error, FromColumn, FromRow,
+    query_rows, u64_to_sql, DBConn, DBTx, Error as db_error, FromColumn, FromRow,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5071,7 +5071,7 @@ impl StacksChainState {
             parent_header_hash,
             &MINER_BLOCK_CONSENSUS_HASH,
             &MINER_BLOCK_HEADER_HASH,
-        );
+        )?;
 
         clarity_tx.reset_cost(parent_block_cost.clone());
 
@@ -5782,6 +5782,7 @@ impl StacksChainState {
             burn_transfer_stx_ops,
             burn_delegate_stx_ops,
             burn_vote_for_aggregate_key_ops,
+            evaluated_epoch,
         )
         .expect("FATAL: failed to advance chain tip");
 
@@ -6199,6 +6200,13 @@ impl StacksChainState {
             false,
         ) {
             Ok(next_chain_tip_info) => next_chain_tip_info,
+            Err(Error::MARFParentNotFound(missing_parent_id)) => {
+                // The parent block's MARF trie data is missing — likely an interrupted commit
+                // or storage-level data loss. Do NOT mark the child as invalid yet — recovery
+                // may be able to fix it. Drop chainstate_tx (don't commit partial state).
+                drop(chainstate_tx);
+                return Err(Error::MARFParentNotFound(missing_parent_id));
+            }
             Err(e) => {
                 // something's wrong with this epoch -- either a microblock was invalid, or the
                 // anchored block was invalid.  Either way, the anchored block will _never be_
@@ -6430,8 +6438,53 @@ impl StacksChainState {
                     ret.push((None, None));
                     continue;
                 }
+                Err(Error::MARFParentNotFound(missing_parent_id)) => {
+                    // Parent block's MARF data is missing (interrupted commit or data loss).
+                    // Run recovery: walk backward to find last good MARF block, rewind
+                    // descendants so they can be reprocessed.
+                    warn!(
+                        "Chainstate recovery: parent block {missing_parent_id} missing. Running chainstate recovery.",
+                    );
+                    match self.handle_chainstate_recovery(sort_tx.sqlite(), &missing_parent_id) {
+                        Ok(()) => {
+                            // Recovery succeeded — rewound blocks will be replayed on next pass.
+                            ret.push((None, None));
+                            break;
+                        }
+                        Err(Error::NoSuchBlockError) => {
+                            // Recovery couldn't fix the problem (parent not in block_headers or
+                            // sortition/chainstate diverged too far). Mark any staging blocks
+                            // that depend on this parent as orphaned to prevent infinite retry.
+                            warn!(
+                                "Chainstate recovery: parent block {missing_parent_id} not recoverable. \
+                                 Orphaning dependent staging blocks.",
+                            );
+                            if let Ok(tx) = self.db_tx_begin() {
+                                // Orphan staging blocks whose parent matches the missing block,
+                                // plus the missing block itself if it's in staging.
+                                let _ = tx.execute(
+                                    "UPDATE staging_blocks SET processed = 1, orphaned = 1, \
+                                     attachable = 0 \
+                                     WHERE index_block_hash = ?1 \
+                                        OR (parent_anchored_block_hash, parent_consensus_hash) IN \
+                                           (SELECT anchored_block_hash, consensus_hash \
+                                            FROM staging_blocks \
+                                            WHERE index_block_hash = ?1)",
+                                    params![&missing_parent_id],
+                                );
+                                let _ = tx.commit();
+                            }
+                            ret.push((None, None));
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Chainstate recovery failed: {e:?}");
+                            return Err(e);
+                        }
+                    }
+                }
                 Err(e) => {
-                    error!("Unrecoverable error when processing blocks: {:?}", &e);
+                    error!("Unrecoverable error when processing blocks: {e:?}");
                     return Err(e);
                 }
             }

@@ -48,6 +48,7 @@ fn dependency_edge_counting_runtime(
             &TEST_HEADER_DB,
             &TEST_BURN_STATE_DB,
         )
+        .unwrap()
         .commit_block();
 
     build_ast(

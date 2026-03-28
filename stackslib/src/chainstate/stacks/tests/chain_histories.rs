@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use clarity::vm::types::*;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use rusqlite::OptionalExtension;
 use stacks_common::address::*;
 use stacks_common::types::chainstate::SortitionId;
 
@@ -33,6 +34,7 @@ use crate::burnchains::tests::*;
 use crate::chainstate::burn::db::sortdb::*;
 use crate::chainstate::stacks::db::test::*;
 use crate::chainstate::stacks::db::*;
+use crate::chainstate::stacks::index::marf::MarfConnection as _;
 use crate::chainstate::stacks::miner::*;
 use crate::chainstate::stacks::tests::*;
 use crate::chainstate::stacks::C32_ADDRESS_VERSION_TESTNET_SINGLESIG;
@@ -3576,3 +3578,585 @@ fn mine_anchored_invalid_token_transfer_blocks_single() {
 // TODO: confirm that if A is accepted but B is rejected, then C must also be rejected even if
 // it's on a different burnchain fork.
 // TODO: confirm that we can process B and C separately, even though they're the same block
+
+/// Helper: mine N simple blocks using the standard test harness and return the trace.
+fn mine_simple_chain(test_name: &str, num_blocks: usize) -> TestMinerTrace {
+    mine_stacks_blocks_1_fork_1_miner_1_burnchain(
+        &test_name.to_string(),
+        num_blocks,
+        mine_empty_anchored_block,
+        |_block, _microblocks| true,
+    )
+}
+
+/// Helper: extract block IDs from a TestMinerTrace (single miner, miner_id=1).
+fn extract_block_ids(
+    trace: &TestMinerTrace,
+) -> Vec<(ConsensusHash, BlockHeaderHash, StacksBlockId)> {
+    let miner_id = trace.miners[0].id;
+    trace
+        .points
+        .iter()
+        .filter_map(|p| {
+            let sn = p.get_block_snapshot(miner_id)?;
+            let blk = p.get_stacks_block(miner_id)?;
+            let index_hash =
+                StacksBlockHeader::make_index_block_hash(&sn.consensus_hash, &blk.block_hash());
+            Some((sn.consensus_hash, blk.block_hash(), index_hash))
+        })
+        .collect()
+}
+
+/// Assert that all chainstate tables written by `advance_tip()` have been cleaned for a
+/// given block. Checks: block_headers, payments, burnchain_txids, epoch_transitions,
+/// matured_rewards (as child).
+fn assert_block_fully_cleaned(chainstate: &StacksChainState, block_id: &StacksBlockId) {
+    let conn = chainstate.db();
+
+    let tables_and_columns = [
+        ("block_headers", "index_block_hash"),
+        ("payments", "index_block_hash"),
+        ("burnchain_txids", "index_block_hash"),
+        ("epoch_transitions", "block_id"),
+    ];
+
+    for (table, col) in &tables_and_columns {
+        let sql = format!("SELECT 1 FROM {table} WHERE {col} = ?1");
+        let exists: bool = conn
+            .query_row(&sql, rusqlite::params![block_id], |_| Ok(true))
+            .optional()
+            .unwrap()
+            .unwrap_or(false);
+        assert!(
+            !exists,
+            "Block {block_id} should have been deleted from {table} (column {col})",
+        );
+    }
+
+    // matured_rewards uses child_index_block_hash
+    let matured_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM matured_rewards WHERE child_index_block_hash = ?1",
+            rusqlite::params![block_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false);
+    assert!(
+        !matured_exists,
+        "Block {block_id} should have been deleted from matured_rewards",
+    );
+}
+
+/// Regression: when MARF trie data for a single canonical block is missing (e.g. due to an
+/// interrupted commit or storage-level data loss), `handle_chainstate_recovery` should walk back
+/// to the last good block and rewind the broken descendant so it can be reprocessed.
+#[test]
+fn test_chainstate_recovery_single_block_loss() {
+    let trace = mine_simple_chain("chainstate_recovery_single", 5);
+    let block_ids = extract_block_ids(&trace);
+    let test_name = trace.get_test_names()[0].clone();
+    let mut chainstate = open_chainstate(false, 0x80000000, &test_name);
+
+    // Delete MARF data for block 4 (the last block)
+    let target = &block_ids[4].2;
+    chainstate.with_clarity_marf(|marf| {
+        let deleted = marf
+            .sqlite_conn()
+            .execute(
+                "DELETE FROM marf_data WHERE block_hash = ?1",
+                rusqlite::params![target],
+            )
+            .unwrap();
+        assert!(deleted > 0, "Expected to delete marf_data for block 4");
+    });
+
+    // Run recovery
+    chainstate
+        .handle_chainstate_recovery(trace.burn_node.sortdb.conn(), &target)
+        .expect("Chainstate recovery should succeed");
+
+    // Verify: block 4 should be reset to processed=0 in staging_blocks
+    let processed: i32 = chainstate
+        .db()
+        .query_row(
+            "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+            rusqlite::params![target],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        processed, 0,
+        "Block 4 should be reset to processed=0 after recovery"
+    );
+
+    // Verify: all chainstate tables cleaned for block 4
+    assert_block_fully_cleaned(&chainstate, target);
+
+    // Verify: block 3 should still be processed (it has intact MARF data)
+    let block3_processed: i32 = chainstate
+        .db()
+        .query_row(
+            "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+            rusqlite::params![&block_ids[3].2],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        block3_processed, 1,
+        "Block 3 should still be processed (MARF data intact)"
+    );
+}
+
+/// Regression: when multiple consecutive canonical blocks lose their MARF data, recovery
+/// should rewind all of them back to the last good block.
+#[test]
+fn test_chainstate_recovery_multi_block_loss() {
+    let trace = mine_simple_chain("chainstate_recovery_multi", 5);
+    let block_ids = extract_block_ids(&trace);
+    let test_name = trace.get_test_names()[0].clone();
+    let mut chainstate = open_chainstate(false, 0x80000000, &test_name);
+
+    // Delete MARF data for blocks 3 and 4 (last two blocks)
+    for idx in [3, 4] {
+        let target = &block_ids[idx].2;
+        chainstate.with_clarity_marf(|marf| {
+            marf.sqlite_conn()
+                .execute(
+                    "DELETE FROM marf_data WHERE block_hash = ?1",
+                    rusqlite::params![target],
+                )
+                .unwrap();
+        });
+    }
+
+    // Run recovery (triggered by block 4 being missing, but recovery walks from canonical tip)
+    let trigger_block = block_ids[4].2.clone();
+    chainstate
+        .handle_chainstate_recovery(trace.burn_node.sortdb.conn(), &trigger_block)
+        .expect("Chainstate recovery should succeed");
+
+    // Both blocks 3 and 4 should be reset to processed=0, with full table cleanup
+    for idx in [3, 4] {
+        let target = &block_ids[idx].2;
+        let processed: i32 = chainstate
+            .db()
+            .query_row(
+                "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+                rusqlite::params![target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            processed, 0,
+            "Block {idx} should be reset to processed=0 after recovery"
+        );
+        assert_block_fully_cleaned(&chainstate, target);
+    }
+
+    // Block 2 should still be processed (it has intact MARF data)
+    let block2_processed: i32 = chainstate
+        .db()
+        .query_row(
+            "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+            rusqlite::params![&block_ids[2].2],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        block2_processed, 1,
+        "Block 2 should still be processed (MARF data intact)"
+    );
+}
+
+/// Verify that recovery correctly identifies the last good MARF block when the canonical tip
+/// itself has intact MARF data (no rewind needed).
+#[test]
+fn test_chainstate_recovery_noop_when_tip_intact() {
+    let trace = mine_simple_chain("chainstate_recovery_noop", 5);
+    let block_ids = extract_block_ids(&trace);
+    let test_name = trace.get_test_names()[0].clone();
+    let mut chainstate = open_chainstate(false, 0x80000000, &test_name);
+
+    // Don't delete anything — run recovery with an existing block that has intact MARF data.
+    // Recovery should walk from canonical tip, find everything intact, and do nothing.
+    let intact_parent = block_ids[2].2.clone();
+    chainstate
+        .handle_chainstate_recovery(trace.burn_node.sortdb.conn(), &intact_parent)
+        .expect("Chainstate recovery should succeed (noop case)");
+
+    // All 5 blocks should still be processed
+    for (idx, (_ch, _bh, ref index_hash)) in block_ids.iter().enumerate() {
+        let processed: i32 = chainstate
+            .db()
+            .query_row(
+                "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+                rusqlite::params![index_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            processed, 1,
+            "Block {idx} should still be processed (no rewind needed)"
+        );
+    }
+}
+
+/// Test 2 from the recovery test plan: after recovery rewinds a block, the coordinator should
+/// be able to replay it. Uses external-connection-plus-restart to simulate a real crash.
+#[test]
+fn test_chainstate_recovery_replay_after_restart() {
+    let test_label = "chainstate_recovery_restart";
+    let trace = mine_simple_chain(test_label, 5);
+    let block_ids = extract_block_ids(&trace);
+    let test_name = trace.get_test_names()[0].clone();
+
+    let target = block_ids[4].2.clone();
+
+    // Phase 1: Record original MARF root hash and DB paths, then drop chainstate
+    let (original_root, clarity_marf_path, state_index_path) = {
+        let mut cs = open_chainstate(false, 0x80000000, &test_name);
+        let root = cs.with_clarity_marf(|marf| marf.get_root_hash_at(&target).unwrap());
+        let clarity_path = cs.clarity_state_index_path.clone();
+        // state_index (header index) MARF uses the same root as clarity but at vm/index.sqlite
+        let root_path = cs.root_path.clone();
+        let index_path = StacksChainState::header_index_root_path(root_path.into())
+            .to_str()
+            .unwrap()
+            .to_string();
+        // cs is dropped here — closes all DB connections
+        (root, clarity_path, index_path)
+    };
+
+    // Phase 2: Simulate crash — delete ONLY from the clarity MARF. The state_index MARF
+    // is left intact. This matches the real-world failure mode where the clarity MARF
+    // loses data but the state_index survives. Recovery must clean the state_index's
+    // marf_data row for the block so advance_tip() can recreate it on replay.
+    {
+        let ext_conn = rusqlite::Connection::open(&clarity_marf_path).unwrap();
+        let deleted = ext_conn
+            .execute(
+                "DELETE FROM marf_data WHERE block_hash = ?1",
+                rusqlite::params![&target],
+            )
+            .unwrap();
+        assert!(deleted > 0, "Expected to delete clarity marf_data");
+        let _ = ext_conn.execute(
+            "DELETE FROM block_extension_locks WHERE block_hash = ?1",
+            rusqlite::params![&target],
+        );
+        ext_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
+
+    // Phase 3: Reopen chainstate (simulates process restart — fresh caches)
+    let mut chainstate = open_chainstate(false, 0x80000000, &test_name);
+
+    // Verify the block is truly missing from the reopened MARF
+    let has_block = chainstate.with_clarity_marf(|marf| {
+        marf.sqlite_conn()
+            .query_row(
+                "SELECT 1 FROM marf_data WHERE block_hash = ?1 AND unconfirmed = 0",
+                rusqlite::params![&target],
+                |_| Ok(true),
+            )
+            .optional()
+            .unwrap()
+            .unwrap_or(false)
+    });
+    assert!(
+        !has_block,
+        "Block should be missing from marf_data after external delete"
+    );
+
+    // Phase 4: Run recovery
+    // We need the sortition DB — reopen it from the burn_node (which is still alive in trace)
+    chainstate
+        .handle_chainstate_recovery(trace.burn_node.sortdb.conn(), &target)
+        .expect("Chainstate recovery should succeed");
+
+    // Verify block was rewound
+    let processed: i32 = chainstate
+        .db()
+        .query_row(
+            "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+            rusqlite::params![&target],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(processed, 0, "Block 4 should be rewound to processed=0");
+
+    // Phase 5: Replay — process_blocks_at_tip should pick up the rewound block
+    let mut sortdb_owned = trace.burn_node.sortdb;
+    let tip_info_list = chainstate
+        .process_blocks_at_tip(&mut sortdb_owned, 1)
+        .unwrap();
+
+    assert_eq!(tip_info_list.len(), 1);
+    assert!(
+        tip_info_list[0].0.is_some(),
+        "Block 4 should replay successfully after recovery"
+    );
+
+    // Phase 6: Verify MARF root matches original
+    let replayed_root =
+        chainstate.with_clarity_marf(|marf| marf.get_root_hash_at(&target).unwrap());
+    assert_eq!(
+        original_root, replayed_root,
+        "MARF root hash should match after replay"
+    );
+}
+
+/// Test 1 from the recovery test plan: when two miners compete and one wins each sortition,
+/// deleting MARF data for the canonical tip should trigger recovery that rewinds only the
+/// canonical branch. The non-canonical (losing) miner's blocks in staging should be untouched.
+///
+/// This verifies that `handle_chainstate_recovery` walks from the canonical tip (via sortition DB),
+/// not from the arbitrary `missing_parent_id`, regardless of which block triggers the error.
+#[test]
+fn test_chainstate_recovery_canonical_branch_only() {
+    // Mine 6 rounds with 2 miners on 1 burnchain. Both miners submit blocks each round,
+    // but only one wins the sortition. The fork happens at round 3.
+    let trace = mine_stacks_blocks_2_forks_2_miners_1_burnchain(
+        &"chainstate_recovery_canonical".to_string(),
+        6,
+        mine_empty_anchored_block,
+        mine_empty_anchored_block,
+    );
+
+    let test_names = trace.get_test_names();
+    let test_name = &test_names[0];
+    let mut chainstate = open_chainstate(false, 0x80000000, test_name);
+
+    let miner_1_id = trace.miners[0].id;
+    let miner_2_id = trace.miners[1].id;
+
+    // Find the canonical tip: the last round's winning block
+    let last_point = trace.points.last().unwrap();
+    let last_snapshot_1 = last_point.get_block_snapshot(miner_1_id);
+    let last_snapshot_2 = last_point.get_block_snapshot(miner_2_id);
+    let last_block_1 = last_point.get_stacks_block(miner_1_id);
+    let last_block_2 = last_point.get_stacks_block(miner_2_id);
+
+    // Determine which miner's block is canonical in the last round
+    let (canonical_snapshot, canonical_block, non_canonical_block) = {
+        let sn = last_snapshot_1
+            .as_ref()
+            .or(last_snapshot_2.as_ref())
+            .unwrap();
+        let b1 = last_block_1.as_ref();
+        let b2 = last_block_2.as_ref();
+        if b1.is_some() && sn.winning_stacks_block_hash == b1.unwrap().block_hash() {
+            (sn.clone(), b1.unwrap().clone(), b2.cloned())
+        } else {
+            (sn.clone(), b2.unwrap().clone(), b1.cloned())
+        }
+    };
+
+    let canonical_tip_id = StacksBlockHeader::make_index_block_hash(
+        &canonical_snapshot.consensus_hash,
+        &canonical_block.block_hash(),
+    );
+
+    // Build a non-canonical block ID to use as the trigger. In a real scenario, the
+    // coordinator might be processing a non-canonical block when it encounters a missing
+    // parent — but recovery should still walk from the canonical tip, not from this ID.
+    let non_canonical_trigger_id = match non_canonical_block {
+        Some(ref nc_block) => StacksBlockHeader::make_index_block_hash(
+            &canonical_snapshot.consensus_hash,
+            &nc_block.block_hash(),
+        ),
+        None => {
+            // If there's no non-canonical block in the last round (both miners mine the
+            // same block), use a fabricated non-canonical ID.
+            StacksBlockId([0xfe; 32])
+        }
+    };
+
+    // Collect all staging_blocks state before recovery
+    let pre_recovery_processed: std::collections::HashMap<String, i32> = {
+        let mut stmt = chainstate
+            .db()
+            .prepare("SELECT index_block_hash, processed FROM staging_blocks")
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+
+    // Delete MARF data for the canonical tip
+    chainstate.with_clarity_marf(|marf| {
+        let deleted = marf
+            .sqlite_conn()
+            .execute(
+                "DELETE FROM marf_data WHERE block_hash = ?1",
+                rusqlite::params![&canonical_tip_id],
+            )
+            .unwrap();
+        assert!(
+            deleted > 0,
+            "Expected to delete marf_data for canonical tip {canonical_tip_id}",
+        );
+    });
+
+    // Run recovery with the NON-CANONICAL block as the trigger.
+    // Recovery should still walk from the canonical tip (via sortition DB),
+    // not from this trigger ID.
+    chainstate
+        .handle_chainstate_recovery(trace.burn_node.sortdb.conn(), &non_canonical_trigger_id)
+        .expect("Chainstate recovery should succeed");
+
+    // Verify: canonical tip block was rewound
+    let tip_processed: i32 = chainstate
+        .db()
+        .query_row(
+            "SELECT processed FROM staging_blocks WHERE index_block_hash = ?1",
+            rusqlite::params![&canonical_tip_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tip_processed, 0,
+        "Canonical tip should be rewound to processed=0"
+    );
+    assert_block_fully_cleaned(&chainstate, &canonical_tip_id);
+
+    // Verify: no OTHER blocks were touched — only the canonical tip (and possibly its
+    // canonical ancestors if they were also missing) should have been rewound.
+    let canonical_tip_hex = format!("{canonical_tip_id}");
+    let post_recovery: std::collections::HashMap<String, i32> = {
+        let mut stmt = chainstate
+            .db()
+            .prepare("SELECT index_block_hash, processed FROM staging_blocks")
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+
+    for (block_hash, new_processed) in &post_recovery {
+        if *block_hash == canonical_tip_hex {
+            continue; // already verified above
+        }
+        let old_processed = pre_recovery_processed.get(block_hash).unwrap_or(&0);
+        assert_eq!(
+            old_processed, new_processed,
+            "Non-target block {block_hash} should not have changed processed state \
+             (was {old_processed}, now {new_processed})",
+        );
+    }
+}
+
+/// Helper: simulate a crash that loses MARF data for the given blocks, then recover and
+/// replay. Uses external connections + WAL checkpoint to delete from both the clarity MARF
+/// and state_index MARF, then reopens a fresh chainstate.
+///
+/// Returns the reopened chainstate and sortdb so the caller can do additional assertions.
+fn simulate_crash_recover_and_replay(
+    test_name: &str,
+    sortdb: SortitionDB,
+    blocks_to_delete: &[StacksBlockId],
+    trigger_id: StacksBlockId,
+    expected_replay_count: usize,
+) -> (StacksChainState, SortitionDB) {
+    // Get DB paths from a temporary chainstate open
+    let (clarity_marf_path, state_index_path) = {
+        let cs = open_chainstate(false, 0x80000000, test_name);
+        let clarity_path = cs.clarity_state_index_path.clone();
+        let index_path = StacksChainState::header_index_root_path(cs.root_path.clone().into())
+            .to_str()
+            .unwrap()
+            .to_string();
+        (clarity_path, index_path)
+    };
+
+    // External delete from clarity MARF only (matches real failure mode — state_index
+    // survives, recovery must clean it during rewind).
+    {
+        let ext_conn = rusqlite::Connection::open(&clarity_marf_path).unwrap();
+        for block_id in blocks_to_delete {
+            let _ = ext_conn.execute(
+                "DELETE FROM marf_data WHERE block_hash = ?1",
+                rusqlite::params![block_id],
+            );
+            let _ = ext_conn.execute(
+                "DELETE FROM block_extension_locks WHERE block_hash = ?1",
+                rusqlite::params![block_id],
+            );
+        }
+        ext_conn
+            .execute_batch("PRAGMA wal_checkpoint(RESTART)")
+            .unwrap();
+    }
+
+    // Reopen chainstate (fresh caches)
+    let mut chainstate = open_chainstate(false, 0x80000000, test_name);
+    let mut sortdb = sortdb;
+
+    // Run recovery
+    chainstate
+        .handle_chainstate_recovery(sortdb.conn(), &trigger_id)
+        .expect("Chainstate recovery should succeed");
+
+    // Replay
+    let tip_info_list = chainstate
+        .process_blocks_at_tip(&mut sortdb, expected_replay_count)
+        .unwrap();
+
+    let replayed = tip_info_list.iter().filter(|(r, _)| r.is_some()).count();
+    assert_eq!(
+        replayed, expected_replay_count,
+        "Expected {expected_replay_count} blocks to replay, got {replayed}"
+    );
+
+    (chainstate, sortdb)
+}
+
+/// Multi-block loss with full replay: delete MARF data for the last 2 blocks, recover, and
+/// verify both replay successfully with correct MARF roots.
+#[test]
+fn test_chainstate_recovery_multi_block_replay() {
+    let trace = mine_simple_chain("chainstate_recovery_multi_replay", 5);
+    let block_ids = extract_block_ids(&trace);
+    let test_name = trace.get_test_names()[0].clone();
+
+    // Record original MARF roots before corruption
+    let original_roots: Vec<_> = {
+        let mut cs = open_chainstate(false, 0x80000000, &test_name);
+        block_ids
+            .iter()
+            .map(|(_, _, id)| cs.with_clarity_marf(|marf| marf.get_root_hash_at(id).unwrap()))
+            .collect()
+    };
+
+    let blocks_to_delete: Vec<_> = block_ids[3..5]
+        .iter()
+        .map(|(_, _, id)| id.clone())
+        .collect();
+    let trigger = block_ids[4].2.clone();
+
+    let (mut chainstate, _sortdb) = simulate_crash_recover_and_replay(
+        &test_name,
+        trace.burn_node.sortdb,
+        &blocks_to_delete,
+        trigger,
+        2, // expect 2 blocks to replay
+    );
+
+    // Verify MARF roots match for ALL blocks (including the replayed ones)
+    for (i, (_, _, ref id)) in block_ids.iter().enumerate() {
+        let replayed_root = chainstate.with_clarity_marf(|marf| marf.get_root_hash_at(id).unwrap());
+        assert_eq!(
+            original_roots[i], replayed_root,
+            "Block {i} MARF root should match after replay"
+        );
+    }
+}

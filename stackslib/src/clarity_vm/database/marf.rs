@@ -232,29 +232,19 @@ impl MarfedKV {
         &'a mut self,
         current: &StacksBlockId,
         next: &StacksBlockId,
-    ) -> PersistentWritableMarfStore<'a> {
-        let mut tx = self.marf.begin_tx().unwrap_or_else(|e| {
-            panic!(
-                "ERROR: Failed to begin new MARF block {} - {}): {:?}",
-                current, next, &e
-            )
-        });
-        tx.begin(current, next).unwrap_or_else(|e| {
-            panic!(
-                "ERROR: Failed to begin new MARF block {} - {}: {:?})",
-                current, next, &e
-            )
-        });
+    ) -> Result<PersistentWritableMarfStore<'a>, Error> {
+        let mut tx = self.marf.begin_tx()?;
+        tx.begin(current, next)?;
 
         let chain_tip = tx
             .get_open_chain_tip()
             .expect("ERROR: Failed to get open MARF")
             .clone();
 
-        PersistentWritableMarfStore {
+        Ok(PersistentWritableMarfStore {
             chain_tip,
             marf: tx,
-        }
+        })
     }
 
     pub fn begin_unconfirmed<'a>(

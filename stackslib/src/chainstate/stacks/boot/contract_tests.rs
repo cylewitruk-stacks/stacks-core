@@ -121,10 +121,12 @@ impl ClarityTestSim {
     pub fn new() -> ClarityTestSim {
         let mut marf = MarfedKV::temporary();
         {
-            let mut store = marf.begin(
-                &StacksBlockId::sentinel(),
-                &StacksBlockId(test_sim_height_to_hash(0, 0)),
-            );
+            let mut store = marf
+                .begin(
+                    &StacksBlockId::sentinel(),
+                    &StacksBlockId(test_sim_height_to_hash(0, 0)),
+                )
+                .unwrap();
 
             let mut db = store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
             db.initialize();
@@ -164,10 +166,14 @@ impl ClarityTestSim {
         TestSimBurnStateDB,
         StacksEpochId,
     ) {
-        let mut store: Box<dyn WritableMarfStore> = Box::new(self.marf.begin(
-            &StacksBlockId(test_sim_height_to_hash(self.block_height, self.fork)),
-            &StacksBlockId(test_sim_height_to_hash(self.block_height + 1, self.fork)),
-        ));
+        let mut store: Box<dyn WritableMarfStore> = Box::new(
+            self.marf
+                .begin(
+                    &StacksBlockId(test_sim_height_to_hash(self.block_height, self.fork)),
+                    &StacksBlockId(test_sim_height_to_hash(self.block_height + 1, self.fork)),
+                )
+                .unwrap(),
+        );
 
         self.block_height += 1;
         if new_tenure {
@@ -279,10 +285,14 @@ impl ClarityTestSim {
     where
         F: FnOnce(&mut OwnedEnvironment) -> R,
     {
-        let mut store: Box<dyn WritableMarfStore> = Box::new(self.marf.begin(
-            &StacksBlockId(test_sim_height_to_hash(parent_height, self.fork)),
-            &StacksBlockId(test_sim_height_to_hash(parent_height + 1, self.fork + 1)),
-        ));
+        let mut store: Box<dyn WritableMarfStore> = Box::new(
+            self.marf
+                .begin(
+                    &StacksBlockId(test_sim_height_to_hash(parent_height, self.fork)),
+                    &StacksBlockId(test_sim_height_to_hash(parent_height + 1, self.fork + 1)),
+                )
+                .unwrap(),
+        );
 
         let r = {
             let headers_db = TestSimHeadersDB {
