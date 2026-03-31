@@ -703,8 +703,8 @@ fn test_marf_compression_reduces_blob_size(
 ///
 /// Without the fix, `make_node_patch` left `cur_block` pointing to an ancestor trie on its success
 /// path. During `dump_compressed_consume` (where `uncommitted_writes` has been `.take()`'d), the
-/// stale `cur_block` caused subsequent operations to read from the wrong trie or panic. 
-/// 
+/// stale `cur_block` caused subsequent operations to read from the wrong trie or panic.
+///
 /// This test runs the compressed flush with overlapping COW'd keys and verifies that all values are
 /// readable afterward — which requires `cur_block` to be properly restored during flush.
 #[test]

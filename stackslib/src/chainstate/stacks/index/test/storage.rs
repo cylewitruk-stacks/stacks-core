@@ -322,7 +322,7 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
 
             // NOTE: may have been overwritten; just check for presence. This test helper will panic
             // if the path is not found, which is what we want to test here.
-            marf.internals().expect_path(&unconfirmed_tip, &path);
+            marf.expect_path(&unconfirmed_tip, &path);
         }
 
         // insert new keys
@@ -342,7 +342,7 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
 
             new_inserted.push((path, value.clone()));
 
-            if let Ok(Some(_)) = marf.internals().get_path(&confirmed_tip, &path) {
+            if let Ok(Some(_)) = marf.get_path(&confirmed_tip, &path) {
             } else {
                 all_new_paths.push(path);
             }
@@ -352,7 +352,7 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
 
         // verify that all new keys are there, off the unconfirmed tip
         for (path, expected_value) in new_inserted.iter() {
-            let value = marf.internals().expect_path(&unconfirmed_tip, path);
+            let value = marf.expect_path(&unconfirmed_tip, path);
             assert_eq!(expected_value.data, value.data);
         }
 
@@ -378,15 +378,14 @@ fn load_store_trie_m_n_same(m: u64, n: u64, same: bool) {
     for path in all_new_paths.iter() {
         eprintln!("path present? {path:?}");
         // This will panic if the path is not found, which is what we want to test here.
-        marf.internals().expect_path(&unconfirmed_tip, path);
+        marf.expect_path(&unconfirmed_tip, path);
     }
 
     marf.drop_unconfirmed();
 
     for path in all_new_paths.iter() {
         eprintln!("path absent?  {path:?}");
-        marf.internals()
-            .get_path(&confirmed_tip, path)
+        marf.get_path(&confirmed_tip, path)
             .expect_err("path should not be found after dropping unconfirmed trie");
     }
 }

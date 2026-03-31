@@ -100,13 +100,11 @@ where
                     })
                     .expect("Failed to read root in proof verification")
             });
-            //let (_, root_hash) = read_root(s).unwrap();
 
             let proof = ctx
                 .prove_path(block_hash, key, value)
                 .expect("Error proving path");
 
-            //let proof = TrieMerkleProof::from_entry_ephemeral(s, key, value, header).unwrap();
 
             test_debug!("---------");
             test_debug!("MARF merkle verify: {proof:?}");
@@ -155,7 +153,7 @@ fn marf_insert_different_leaf_same_block_100() {
         debug!("---------");
 
         let value = TrieLeaf::new(&[], &[99; 40]);
-        let leaf = marf.internals().expect_path(&block_header, &path);
+        let leaf = marf.expect_path(&block_header, &path);
         assert_eq!(leaf.data.to_vec(), [99; 40].to_vec());
         assert_eq!(marf.borrow_storage_backend().get_cur_block(), block_header);
 
@@ -231,21 +229,10 @@ fn marf_insert_different_leaf_different_path_different_block_100() {
             let path = TrieHash::from_bytes(&path_bytes).unwrap();
 
             let value = TrieLeaf::new(&[], &[i; 40]);
-            let leaf = marf
-                .internals()
-                .get_path(&block_header, &path)
-                .unwrap()
-                .unwrap();
+            let leaf = marf.get_path(&block_header, &path).unwrap().unwrap();
 
             assert_eq!(leaf.data.to_vec(), [i; 40].to_vec());
             assert_eq!(marf.borrow_storage_backend().get_cur_block(), block_header);
-
-            // let leaf = MARF::get_path(&mut marf.borrow_storage_backend(), &block_header, &path)
-            //     .unwrap()
-            //     .unwrap();
-
-            // assert_eq!(leaf.data.to_vec(), [i; 40].to_vec());
-            // assert_eq!(marf.borrow_storage_backend().get_cur_block(), block_header);
 
             merkle_test_marf(
                 &mut marf.borrow_storage_backend(),
@@ -315,7 +302,7 @@ fn marf_insert_same_leaf_different_block_100() {
         for i in 0..100 {
             let next_block_header = BlockHeaderHash::from_bytes(&[i + 1; 32]).unwrap();
             let value = TrieLeaf::new(&[], &[i; 40]);
-            let leaf = marf.internals().expect_path(&next_block_header, &path);
+            let leaf = marf.expect_path(&next_block_header, &path);
 
             assert_eq!(leaf.data.to_vec(), [i; 40].to_vec());
             assert_eq!(
@@ -390,7 +377,7 @@ fn marf_insert_leaf_sequence_2() {
             let path = TrieHash::from_bytes(&path_bytes).unwrap();
 
             let value = TrieLeaf::new(&[], &[i; 40]);
-            let leaf = marf.internals().expect_path(&last_block_header, &path);
+            let leaf = marf.expect_path(&last_block_header, &path);
 
             assert_eq!(leaf.data.to_vec(), [i; 40].to_vec());
             assert_eq!(
@@ -463,7 +450,7 @@ fn marf_insert_leaf_sequence_100() {
 
             let value = TrieLeaf::new(&[], &[i; 40]);
             test_debug!("Finding value inserted at {}", &next_block_header);
-            let leaf = marf.internals().expect_path(&last_block_header, &path);
+            let leaf = marf.expect_path(&last_block_header, &path);
 
             assert_eq!(leaf.data.to_vec(), [i; 40].to_vec());
 
@@ -669,7 +656,7 @@ where
             debug!("----------------");
             debug!("get");
             debug!("----------------");
-            let read_value = marf.internals().expect_path(
+            let read_value = marf.expect_path(
                 &next_block_header,
                 &TrieHash::from_bytes(&next_path[..]).unwrap(),
             );
@@ -686,7 +673,7 @@ where
                 debug!("----------------");
 
                 let prev_path = path_gen(j, path);
-                let read_value = marf.internals().expect_path(
+                let read_value = marf.expect_path(
                     &next_block_header,
                     &TrieHash::from_bytes(&prev_path[..]).unwrap(),
                 );
@@ -756,7 +743,7 @@ where
 
             let triepath = TrieHash::from_bytes(&next_path[..]).unwrap();
             let value = MARFValue([i as u8; 40]);
-            let leaf = marf.internals().expect_path(&last_block_header, &triepath);
+            let leaf = marf.expect_path(&last_block_header, &triepath);
             assert_eq!(leaf.data, value);
 
             debug!("---------------------------------------");
@@ -1027,9 +1014,8 @@ where
             }
 
             marf.insert_raw(triepath, value.clone()).unwrap();
-            let read_value = marf
-                .internals()
-                .expect_path(&block_header, &TrieHash::from_bytes(&path[..]).unwrap());
+            let read_value =
+                marf.expect_path(&block_header, &TrieHash::from_bytes(&path[..]).unwrap());
             assert_eq!(read_value.data.to_vec(), value.data.to_vec());
             assert_eq!(marf.borrow_storage_backend().get_cur_block(), block_header);
 
@@ -1084,9 +1070,8 @@ where
                 ],
             );
 
-            let read_value = marf
-                .internals()
-                .expect_path(&block_header, &TrieHash::from_bytes(&path[..]).unwrap());
+            let read_value =
+                marf.expect_path(&block_header, &TrieHash::from_bytes(&path[..]).unwrap());
             assert_eq!(read_value.data.to_vec(), value.data.to_vec());
 
             // can make a merkle proof to each one
@@ -1256,7 +1241,7 @@ fn marf_split_leaf_path() {
     );
     debug!("----------------");
 
-    let read_value = marf.internals().expect_path(&block_header_2, &triepath);
+    let read_value = marf.expect_path(&block_header_2, &triepath);
     assert_eq!(read_value.data.to_vec(), value.data.to_vec());
 
     debug!("----------------");
@@ -1266,7 +1251,7 @@ fn marf_split_leaf_path() {
     );
     debug!("----------------");
 
-    let read_value_2 = marf.internals().expect_path(&block_header_2, &triepath_2);
+    let read_value_2 = marf.expect_path(&block_header_2, &triepath_2);
     assert_eq!(read_value_2.data.to_vec(), value_2.data.to_vec());
 }
 
@@ -1400,7 +1385,7 @@ fn marf_insert_random_4096_128_merkle_proof() {
             let mut block_table_cache = None;
             for j in 0..128 {
                 debug!("Prove {:?} == {:?}", &keys[j], &values[j]);
-                let result = marf.internals().verify_marf_entry_proof(
+                let result = marf.verify_marf_entry_proof(
                     &key_hashes[j],
                     &values[j],
                     &block_header,
@@ -1449,7 +1434,7 @@ fn marf_insert_random_4096_128_merkle_proof() {
                 assert_eq!(read_value, values[j]);
 
                 debug!("Get {:?}, should be {:?}", &keys[j], &values[j]);
-                let result = marf.internals().verify_marf_entry_proof(
+                let result = marf.verify_marf_entry_proof(
                     &key_hashes[j],
                     &values[j],
                     &block_header,
@@ -1673,7 +1658,7 @@ fn marf_insert_get_128_fork_256() {
             let expected_marf_value = MARFValue::from_value(&expected_value);
             assert_eq!(received_marf_value, expected_marf_value);
 
-            let result = m.internals().verify_marf_entry_proof(
+            let result = m.verify_marf_entry_proof(
                 &TrieHash::from_key(&key),
                 &expected_marf_value,
                 &expected_chain_tips[k],
@@ -1740,9 +1725,7 @@ fn marf_insert_flush_to_different_block() {
         marf.insert_raw(triepath, value.clone()).unwrap();
 
         // all I/O happens off the target block
-        let read_value = marf
-            .internals()
-            .expect_path(&target_block, &TrieHash::from_bytes(&path[..]).unwrap());
+        let read_value = marf.expect_path(&target_block, &TrieHash::from_bytes(&path[..]).unwrap());
 
         assert_eq!(read_value.data.to_vec(), value.data.to_vec());
         assert_eq!(marf.borrow_storage_backend().get_cur_block(), target_block);
@@ -1807,8 +1790,7 @@ fn marf_insert_flush_to_different_block() {
     for (i, block) in blocks.iter().enumerate() {
         debug!("Verify block height and hash at {i} {block} from {block_header}");
         assert_eq!(
-            marf.internals()
-                .get_block_height_miner_tip(block, &block_header)
+            marf.get_block_height_miner_tip(block, &block_header)
                 .unwrap(),
             Some(i as u32)
         );
@@ -1846,9 +1828,8 @@ fn marf_insert_flush_to_different_block() {
 
         // all I/O happens off the final block header
         debug!("{i}: Get {triepath} off of {read_from_block}");
-        let read_value = marf
-            .internals()
-            .expect_path(&read_from_block, &TrieHash::from_bytes(&path[..]).unwrap());
+        let read_value =
+            marf.expect_path(&read_from_block, &TrieHash::from_bytes(&path[..]).unwrap());
 
         assert_eq!(read_value.data.to_vec(), value.data.to_vec());
 
@@ -1953,17 +1934,14 @@ fn test_marf_begin_from_sentinel_twice() {
     marf.insert_raw(triepath_2, value_2).unwrap();
     marf.commit_to(&block_header_2).unwrap();
 
-    let read_value_1 = marf.internals().expect_path(&block_header_1, &triepath_1);
+    let read_value_1 = marf.expect_path(&block_header_1, &triepath_1);
     test_debug!("read_value_1 from {block_header_1:?} is {read_value_1:?}");
 
-    let read_value_2 = marf.internals().expect_path(&block_header_2, &triepath_2);
+    let read_value_2 = marf.expect_path(&block_header_2, &triepath_2);
     test_debug!("read_value_2 from {block_header_2:?} is {read_value_2:?}");
 
     // should fail
-    let read_value_1 = marf
-        .internals()
-        .get_path(&block_header_2, &triepath_1)
-        .unwrap_err();
+    let read_value_1 = marf.get_path(&block_header_2, &triepath_1).unwrap_err();
     assert!(matches!(read_value_1, Error::NotFoundError));
 }
 
@@ -2009,7 +1987,7 @@ fn test_marf_unconfirmed() {
     marf.commit().unwrap();
 
     // read succeeds
-    let read_value_1 = marf.internals().expect_path(&unconfirmed_tip, &triepath_1);
+    let read_value_1 = marf.expect_path(&unconfirmed_tip, &triepath_1);
     test_debug!("read_value_1 from {unconfirmed_tip:?} is {read_value_1:?}");
 
     marf.begin_unconfirmed(&block_header).unwrap();
@@ -2017,31 +1995,22 @@ fn test_marf_unconfirmed() {
     marf.drop_current();
 
     // read still succeeds -- only current trie is dropped
-    let read_value_1 = marf.internals().expect_path(&unconfirmed_tip, &triepath_1);
+    let read_value_1 = marf.expect_path(&unconfirmed_tip, &triepath_1);
     test_debug!("read_value_1 from {unconfirmed_tip:?} is {read_value_1:?}");
 
     // value 2 is dropped
-    let e = marf
-        .internals()
-        .get_path(&unconfirmed_tip, &triepath_2)
-        .unwrap_err();
+    let e = marf.get_path(&unconfirmed_tip, &triepath_2).unwrap_err();
     assert!(matches!(e, Error::NotFoundError));
 
     marf.begin_unconfirmed(&block_header).unwrap();
     marf.drop_unconfirmed();
 
     // value 1 is dropped
-    let e = marf
-        .internals()
-        .get_path(&unconfirmed_tip, &triepath_1)
-        .unwrap_err();
+    let e = marf.get_path(&unconfirmed_tip, &triepath_1).unwrap_err();
     assert!(matches!(e, Error::NotFoundError), "whoops: {e:?}");
 
     // value 2 is dropped
-    let e = marf
-        .internals()
-        .get_path(&unconfirmed_tip, &triepath_2)
-        .unwrap_err();
+    let e = marf.get_path(&unconfirmed_tip, &triepath_2).unwrap_err();
     assert!(matches!(e, Error::NotFoundError));
 }
 

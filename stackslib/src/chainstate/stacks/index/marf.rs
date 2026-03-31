@@ -72,8 +72,8 @@ pub fn fault_injection_marf_compression(enabled: bool) {
 #[cfg(any(test, feature = "testing"))]
 /// Apply test-specific overrides to the MARF compression configuration.
 ///
-/// This function mutates the provided [`MARFOpenOpts`],
-/// according to the following precedence order:
+/// This function mutates the provided [`MARFOpenOpts`], according to the
+/// following precedence order:
 ///
 /// 1. Runtime test override via [`TEST_MARF_COMPRESSION_FLAG`]
 /// 2. Global test default via [`TEST_MARF_COMPRESSION_DEFAULT`]
@@ -133,14 +133,6 @@ pub trait MarfCore<T: MarfTrieId> {
         F: for<'ctx> FnOnce(
             &mut MarfReadCtx<'ctx, T, Self::ReadState, Self::ReadStorage<'a>>,
         ) -> Ret;
-
-    #[inline]
-    fn internals(&mut self) -> &mut Self
-    where
-        Self: Sized,
-    {
-        self
-    }
 }
 
 fn with_read_storage_read_ctx<'ctx, T, S, R, F, Ret>(

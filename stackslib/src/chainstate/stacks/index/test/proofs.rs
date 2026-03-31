@@ -62,8 +62,7 @@ fn verifier_catches_stale_proof() {
     let old_v_value = MARFValue::from_value(&old_v);
     let new_v_value = MARFValue::from_value(&new_v);
 
-    m.internals()
-        .verify_marf_entry_proof(&k1_path, &new_v_value, &block_2, None);
+    m.verify_marf_entry_proof(&k1_path, &new_v_value, &block_2, None);
 
     let root_to_block = m
         .borrow_storage_backend()
@@ -72,7 +71,6 @@ fn verifier_catches_stale_proof() {
 
     // Create a proof from the current block to the old value. This should succeed.
     let proof_2 = m
-        .internals()
         .prove_raw_entry(&block_2, &k1, &MARFValue::from_value(&old_v))
         .expect("should be able to create proof for old value from block 2");
 
@@ -81,7 +79,6 @@ fn verifier_catches_stale_proof() {
 
     // Create a proof from the previous block to the old value. This should succeed.
     let proof_1 = m
-        .internals()
         .prove_raw_entry(&block_1, &k1, &old_v_value)
         .expect("should be able to create proof for old value from block 1");
 
@@ -153,12 +150,9 @@ fn ncc_verifier_catches_stale_proof() {
     let old_v_value = MARFValue::from_value(&old_v);
     let another_v_value = MARFValue::from_value(&another_v);
 
-    m.internals()
-        .verify_marf_entry_proof(&k1_path, &old_v_value, &block_2, None);
-    m.internals()
-        .verify_marf_entry_proof(&k1_path, &another_v_value, &block_5, None);
-    m.internals()
-        .verify_marf_entry_proof(&k1_path, &old_v_value, &block_2, None);
+    m.verify_marf_entry_proof(&k1_path, &old_v_value, &block_2, None);
+    m.verify_marf_entry_proof(&k1_path, &another_v_value, &block_5, None);
+    m.verify_marf_entry_proof(&k1_path, &old_v_value, &block_2, None);
 
     let root_to_block = {
         m.borrow_storage_backend()
@@ -168,7 +162,6 @@ fn ncc_verifier_catches_stale_proof() {
 
     // prove for latest k/v pair succeeds
     let proof_5 = m
-        .internals()
         .prove_raw_entry(&block_5, &k1, &another_v_value)
         .expect("should be able to create proof for another_v from block 5");
     // let proof_5 =
@@ -189,7 +182,6 @@ fn ncc_verifier_catches_stale_proof() {
     // prepare a proof for the wrong root hash i.e. block2 instead of block5.
     // Should fail
     let proof_5 = m
-        .internals()
         .prove_raw_entry(&block_2, &k1, &old_v_value)
         .expect("should be able to create proof for old_v from block 2");
     // let proof_5 =

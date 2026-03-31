@@ -148,7 +148,7 @@ fn test_migrate_existing_trie_blobs() {
             let path = TrieHash::from_key(key);
             let marf_leaf = TrieLeaf::from_value(&[], value.clone());
 
-            let leaf = marf.internals().expect_path(&last_block_header, &path);
+            let leaf = marf.expect_path(&last_block_header, &path);
 
             assert_eq!(leaf.data.to_vec(), marf_leaf.data.to_vec());
         }

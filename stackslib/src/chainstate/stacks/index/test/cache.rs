@@ -26,7 +26,7 @@ mod utils {
 
     use clarity::types::chainstate::{BlockHeaderHash, TrieHash};
 
-    use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfCore as _, MARF};
+    use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
     use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
     use crate::chainstate::stacks::index::test::marf::MarfTestExt;
     use crate::chainstate::stacks::index::test::verify_marf_merkle_proof;
@@ -158,10 +158,9 @@ mod utils {
             let proof_block_data = &data[i / 2];
             test_debug!("Prove block {}", i / 2);
             let mut root_to_block = None;
-            let internals = marf.internals();
             for (key, value) in proof_block_data.iter() {
                 root_to_block = Some(verify_marf_merkle_proof(
-                    internals,
+                    &mut marf,
                     &block_header,
                     path_fn(key).as_bytes(),
                     value.as_bytes(),
@@ -171,12 +170,11 @@ mod utils {
         }
 
         let mut total_read_time = 0;
-        let internals = marf.internals();
         for (i, block_data) in data.iter().enumerate() {
             test_debug!("Read block {}", i);
             for (key, value) in block_data.iter() {
                 let start = SystemTime::now();
-                let leaf = internals.expect_path(&last_block_header, &path_fn(key));
+                let leaf = marf.expect_path(&last_block_header, &path_fn(key));
 
                 total_read_time += start.elapsed().unwrap().as_nanos();
                 assert_eq!(leaf.data, TrieLeaf::from_value(&[], value.clone()).data);
