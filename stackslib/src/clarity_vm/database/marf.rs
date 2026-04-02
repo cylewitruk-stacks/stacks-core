@@ -577,27 +577,24 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
                 let first_tip =
                     StacksBlockId::new(&FIRST_BURNCHAIN_CONSENSUS_HASH, &FIRST_STACKS_BLOCK_HASH);
                 if self.chain_tip == first_tip || self.chain_tip == StacksBlockId([0u8; 32]) {
-                    // the current block height should always work, except if it's the first block
-                    // height (in which case, the current chain tip should match the first-ever
-                    // index block hash).
                     return 0;
                 }
 
-                // should never happen
                 let msg = format!(
-                    "Failed to obtain current block height of {} (got None)",
-                    &self.chain_tip
+                    "Failed to obtain current block height of {tip} (got None)",
+                    tip = &self.chain_tip
                 );
-                error!("{}", &msg);
-                panic!("{}", &msg);
+                error!("{msg}");
+                self.marf.dump_diagnostics();
+                panic!("{msg}");
             }
             Err(e) => {
                 let msg = format!(
-                    "Unexpected MARF failure: Failed to get current block height of {}: {:?}",
-                    &self.chain_tip, &e
+                    "Unexpected MARF failure: Failed to get current block height of {tip}: {e:?}",
+                    tip = &self.chain_tip,
                 );
-                error!("{}", &msg);
-                panic!("{}", &msg);
+                error!("{msg}");
+                panic!("{msg}");
             }
         }
     }

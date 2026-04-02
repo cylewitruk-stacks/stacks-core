@@ -36,8 +36,8 @@ use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
-    bits, trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodeDecodeScratch,
-    NodePatching, NodePath, ReadTrieItem, ReadTrieItemKind, ReadTrieNode, TrieHasher, TrieLeaf,
+    bits, trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodePatching,
+    NodePath, ReadTrieItem, ReadTrieItemKind, ReadTrieNode, TrieHasher, TrieLeaf,
     TrieNodeReadState, TrieReadStorage, MAX_PATCH_DEPTH,
 };
 use crate::codec::StacksMessageCodec;
@@ -2553,6 +2553,11 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         self.data.unconfirmed
     }
 
+    /// Returns true if there are uncommitted writes in the storage.
+    pub fn has_uncommitted_writes(&self) -> bool {
+        self.data.uncommitted_writes.is_some()
+    }
+
     /// Returns a new TrieFileStorage in read-only mode.
     ///
     /// Returns Err if the underlying SQLite database connection cannot be created.
@@ -3184,39 +3189,6 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             self.data.uncommitted_writes.as_ref(),
             Some((uncommitted_bhh, _)) if &self.data.cur_block == uncommitted_bhh
         )
-    }
-
-    fn inner_read_persisted_trie_item<'b>(
-        &mut self,
-        block_id: u32,
-        ptr: &TriePtr,
-        scratch: &'b mut impl NodeDecodeScratch,
-    ) -> Result<ReadTrieItem<'b>, Error> {
-        trace!(
-            "inner_read_persisted_node({block_id}): {ptr:?} (unconfirmed={:?},{})",
-            &self.data.unconfirmed_block_id,
-            self.unconfirmed()
-        );
-
-        if self.data.unconfirmed_block_id == Some(block_id) {
-            trace!("Read persisted node from unconfirmed block id {block_id}");
-            return trie_sql::read_trie_item(&self.db, block_id, ptr, scratch);
-        }
-
-        match self.blobs.as_mut() {
-            Some(blobs) => blobs.read_trie_item(&self.db, block_id, ptr, None, scratch),
-            None => trie_sql::read_trie_item(&self.db, block_id, ptr, scratch),
-        }
-    }
-
-    fn inner_read_persisted_node<'b>(
-        &mut self,
-        block_id: u32,
-        ptr: &TriePtr,
-        scratch: &'b mut impl NodeDecodeScratch,
-    ) -> Result<ReadTrieNode<'b>, Error> {
-        self.inner_read_persisted_trie_item(block_id, ptr, scratch)?
-            .into_node()
     }
 
     fn inner_read_patched_persisted_node<'b>(

@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+#![warn(dead_code)]
+
 use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};

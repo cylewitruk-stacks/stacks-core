@@ -2,6 +2,7 @@ mod blocks;
 mod manifest;
 mod node;
 mod trie;
+mod walk;
 
 use std::path::PathBuf;
 
@@ -10,6 +11,7 @@ pub use manifest::ManifestArgs;
 pub use node::NodeArgs;
 use rusqlite::{Connection, OpenFlags};
 pub use trie::TrieArgs;
+pub use walk::WalkArgs;
 
 #[derive(Parser)]
 #[command(name = "marf-inspect", about = "Inspect MARF trie databases")]
@@ -36,9 +38,14 @@ pub enum Command {
     /// Show a compressed serialization manifest for a block's trie.
     /// Lists each node in BFS order with: type, Normal/Patch, patch base, diff count, size.
     Manifest(ManifestArgs),
+
+    /// Walk the MARF trie for a given block and key, using the full MARF read API.
+    /// This exercises the exact same code path as `get_block_height_of`.
+    Walk(WalkArgs),
 }
 
 pub struct CliCtx {
+    db_path: PathBuf,
     db: Connection,
     blobs_path: Option<PathBuf>,
 }
@@ -61,6 +68,7 @@ impl CliCtx {
         let has_external_blobs = blobs_path.exists();
 
         Self {
+            db_path: db_path.clone(),
             db,
             blobs_path: if has_external_blobs {
                 Some(blobs_path)
@@ -68,6 +76,10 @@ impl CliCtx {
                 None
             },
         }
+    }
+
+    pub fn db_path(&self) -> &PathBuf {
+        &self.db_path
     }
 
     pub fn db(&self) -> &Connection {
@@ -86,6 +98,7 @@ impl Cli {
             Command::Trie(args) => trie::exec(ctx, args),
             Command::Node(args) => node::exec(ctx, args),
             Command::Manifest(args) => manifest::exec(ctx, args),
+            Command::Walk(args) => walk::exec(ctx, args),
         }
     }
 }

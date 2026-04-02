@@ -112,7 +112,6 @@ pub struct TrieFileDisk {
 /// Handle to a flat in-memory buffer containing Trie blobs (used for testing)
 pub struct TrieFileRAM {
     fd: Cursor<Vec<u8>>,
-    readonly: bool,
     trie_offsets: RefCell<TrieIdOffsets>,
 }
 
@@ -143,10 +142,9 @@ impl TrieFile {
     }
 
     /// Make a new RAM-backed TrieFile
-    fn new_ram(readonly: bool) -> TrieFile {
+    fn new_ram() -> TrieFile {
         TrieFile::RAM(TrieFileRAM {
             fd: Cursor::new(vec![]),
-            readonly,
             trie_offsets: RefCell::new(TrieIdOffsets::new()),
         })
     }
@@ -212,7 +210,7 @@ impl TrieFile {
     /// Otherwise, it'll use seek+read I/O on `$db_path.blobs`.
     pub fn from_db_path(path: &str, readonly: bool, use_mmap: bool) -> Result<TrieFile, Error> {
         if path == ":memory:" {
-            Ok(TrieFile::new_ram(readonly))
+            Ok(TrieFile::new_ram())
         } else {
             let blob_path = format!("{}.blobs", path);
             if use_mmap {
@@ -460,22 +458,37 @@ impl TrieFile {
     }
 
     /// Read bytes at a given file offset into `buf` without modifying any cursor state.
-    /// Uses `pread` for Disk, direct slice for RAM, mmap slice for mmap-enabled Disk.
-    /// Returns the number of bytes read.
+    /// Uses mmap when available and the offset is in range; otherwise falls back to `pread`.
+    ///
+    /// The mmap may be stale when another connection (e.g., the chains coordinator) has
+    /// appended data that this connection's mmap doesn't cover yet. In that case we
+    /// gracefully fall back to `pread`, which always sees the latest file contents.
     fn read_bytes_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
         match self {
             TrieFile::Disk(ref disk) => {
                 if let Some(ref mmap) = disk.mmap {
                     let start = offset as usize;
-                    let bytes = mmap.get(start..).ok_or(Error::NotFoundError)?;
-                    let len = buf.len().min(bytes.len());
-                    let dst = buf.get_mut(..len).ok_or(Error::NotFoundError)?;
-                    let src = bytes.get(..len).ok_or(Error::NotFoundError)?;
-                    dst.copy_from_slice(src);
-                    Ok(len)
-                } else {
-                    pread(&disk.fd, buf, offset).map_err(Error::IOError)
+                    if let Some(bytes) = mmap.get(start..) {
+                        let len = buf.len().min(bytes.len());
+                        let dst = buf.get_mut(..len).ok_or(Error::NotFoundError)?;
+                        let src = bytes.get(..len).ok_or(Error::NotFoundError)?;
+                        dst.copy_from_slice(src);
+                        return Ok(len);
+                    }
+
+                    // Mmap doesn't cover this offset; fall through to pread.
+                    //
+                    // TODO: This is a not the ideal long-term solution for handling concurrent
+                    // reads. Today, several threads get their own StacksChainState instances with
+                    // their own mmap handles, so they won't see each other's appends until they
+                    // reopen their StacksChainState and remap (which the read-only consumers
+                    // typically never do). Ideally we'd only have a single StacksChainState
+                    // instance per-MARF, shared by all threads, so that the mmap is always mapping
+                    // the latest file contents, but also so that we're not wasting system resources
+                    // on multiple mmap handles for the same file, multiple block/offset caches,
+                    // etc.
                 }
+                pread(&disk.fd, buf, offset).map_err(Error::IOError)
             }
             TrieFile::RAM(ref ram) => {
                 let data = ram.fd.get_ref();
@@ -646,7 +659,6 @@ impl TrieFile {
     }
 
     /// Read the node type ID and hash at the given block and pointer.
-    /// Takes `&self` — uses positional reads, no cursor state.
     pub fn read_node_type_id(
         &self,
         db: &Connection,

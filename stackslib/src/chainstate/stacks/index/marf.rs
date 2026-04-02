@@ -1974,6 +1974,29 @@ impl<T: MarfTrieId> MARF<T> {
         Ok(())
     }
 
+    /// Dump diagnostic information about the MARF's current transient state.
+    /// Used to debug the `get_current_block_height` panic.
+    pub fn dump_diagnostics(&mut self) {
+        let (cur_block, cur_block_id) = {
+            let conn = self.storage.connection();
+            conn.get_cur_block_and_id()
+        };
+        error!(
+            "MARF diagnostics: cur_block={cur_block}, cur_block_id={cur_block_id:?}, \
+             readonly={read_only}, unconfirmed={unconfirmed}, \
+             has_uncommitted_writes={has_uncommitted_writes}, \
+             open_chain_tip={open_tip}",
+            read_only = self.storage.readonly(),
+            unconfirmed = self.storage.unconfirmed(),
+            has_uncommitted_writes = self.storage.has_uncommitted_writes(),
+            open_tip = self
+                .open_chain_tip
+                .as_ref()
+                .map(|t| format!("Some({})", t.block_hash))
+                .unwrap_or_else(|| "None".to_string()),
+        );
+    }
+
     // Comes from the marf.
     pub fn get_block_height_of(
         &mut self,
@@ -2074,6 +2097,7 @@ impl<T: MarfTrieId> MARF<T> {
 
 // --- Leaf traversal -----------------------------------------------------------
 
+#[allow(unused)] // To be used in MARF squash
 impl<T: MarfTrieId> MARF<T> {
     /// Walk all leaves in the trie at `block_hash`, yielding full paths and values.
     ///

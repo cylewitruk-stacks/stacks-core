@@ -18,6 +18,7 @@ use std::time::SystemTime;
 
 /// Fine-grained profiling data for Trie storage ops.
 /// The implementation is only active when compiled for tests; nothing happens in production.
+#[allow(unused)] // Used specifically in benchmark tests
 #[derive(Debug, Clone)]
 pub struct TrieBenchmark {
     /// Total number of nanoseconds spent reading a node from storage

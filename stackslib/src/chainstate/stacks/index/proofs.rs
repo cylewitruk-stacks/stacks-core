@@ -25,10 +25,9 @@ use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::marf::MarfReadCtx;
 use crate::chainstate::stacks::index::node::{
-    clear_backptr, is_backptr, ConsensusSerializable, CursorError, TrieCursor, TrieNode,
-    TrieNodeID, TrieNodeRef, TrieNodeType, TriePtr,
+    clear_backptr, is_backptr, ConsensusSerializable, CursorError, TrieCursor, TrieNodeID,
+    TrieNodeRef, TriePtr,
 };
-use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
     bits, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, ProofTrieNode, ProofTriePtr,
@@ -94,20 +93,6 @@ impl<T: MarfTrieId> ProofTrieNode<T> {
 
     fn ptrs(&self) -> &[ProofTriePtr<T>] {
         &self.ptrs
-    }
-
-    fn try_from_trie_node<N: TrieNode, M: BlockMap + ?Sized>(
-        other: &N,
-        block_map: &mut M,
-    ) -> Result<ProofTrieNode<T>, Error> {
-        Self::try_from_parts(other.id(), other.path().as_slice(), other.ptrs(), block_map)
-    }
-
-    fn try_from_trie_node_ref<M: BlockMap + ?Sized>(
-        other: TrieNodeRef<'_>,
-        block_map: &mut M,
-    ) -> Result<ProofTrieNode<T>, Error> {
-        Self::try_from_parts(other.id(), other.path_bytes(), other.ptrs(), block_map)
     }
 }
 
@@ -399,14 +384,6 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         }
 
         Ok(hashes)
-    }
-
-    fn make_proof_hashes(
-        node: &TrieNodeType,
-        all_hashes: &[TrieHash],
-        chr: u8,
-    ) -> Result<Vec<TrieHash>, Error> {
-        Self::make_proof_hashes_for_ptrs(node.ptrs(), all_hashes, chr)
     }
 
     /// Given a TriePtr to the _currently-visited_ node and the chr of the _previous_ node, calculate a
@@ -885,16 +862,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     }
 
     /// Given a list of non-backptr ptrs and a root block header hash, calculate a Merkle proof.
-    fn make_segment_proof<R: TrieReadStorage<T>>(
-        storage: &mut R,
-        ptrs: &[TriePtr],
-        starting_chr: u8,
-    ) -> Result<Vec<TrieMerkleProofType<T>>, Error> {
-        let scratch = &mut MarfReadState::new();
-        TrieMerkleProof::make_segment_proof_with_scratch(storage, ptrs, starting_chr, scratch)
-    }
-
-    fn make_segment_proof_with_scratch<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
+    fn make_segment_proof<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
         storage: &mut R,
         ptrs: &[TriePtr],
         starting_chr: u8,
@@ -1490,7 +1458,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                             &storage.get_cur_block(),
                             &cursor.node_ptrs
                         );
-                        TrieMerkleProof::make_segment_proof_with_scratch(
+                        TrieMerkleProof::make_segment_proof(
                             storage,
                             &cursor.node_ptrs,
                             cursor.chr().unwrap(),

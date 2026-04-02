@@ -29,7 +29,7 @@ use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::storage::{TrieHashCalculationMode, TrieStorageConnection};
 use crate::chainstate::stacks::index::{
     bits, Error, MarfTrieId, NodePath, ReadNodeBacking, ReadTrieNode, TrieHasher, TrieLeaf,
-    TrieNodeReadState, TrieReadSession, TrieReadStorage,
+    TrieNodeReadState, TrieReadStorage,
 };
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use crate::util::macros::is_trace;
@@ -37,70 +37,6 @@ use crate::util::macros::is_trace;
 /// We don't actually instantiate a Trie, but we still need to pass a type parameter for the
 /// storage implementation.
 pub struct Trie {}
-
-fn read_owned_hashed_node<T: MarfTrieId, Db: Deref<Target = Connection>>(
-    storage: &mut TrieStorageConnection<T, Db>,
-    ptr: &TriePtr,
-    decode_scratch: &mut impl TrieNodeReadState,
-) -> Result<(TrieNodeType, TrieHash), Error> {
-    let mut read_session = TrieReadSession::new(storage, decode_scratch);
-    read_session
-        .read_node(ptr)?
-        .into_owned_node()
-        .and_then(|(node, hash)| {
-            hash.map(|hash| (node, hash))
-                .ok_or_else(|| Error::CorruptionError("Missing node hash in trie read".to_string()))
-        })
-}
-
-fn read_detached_hashed_node<
-    'a,
-    T: MarfTrieId,
-    S: TrieNodeReadState,
-    Db: Deref<Target = Connection>,
->(
-    storage: &mut TrieStorageConnection<T, Db>,
-    ptr: &TriePtr,
-    read_state: &'a mut S,
-) -> Result<ReadTrieNode<'a>, Error> {
-    enum DetachAction {
-        ParkCurrent,
-        ParkOwned(TrieNodeType),
-    }
-
-    let read = storage.read_node_with_state(ptr, read_state)?;
-    let ReadTrieNode {
-        hash,
-        patch_depth,
-        backing,
-        transient_meta,
-        ..
-    } = read;
-    let hash =
-        hash.ok_or_else(|| Error::CorruptionError("Missing node hash in trie read".to_string()))?;
-
-    let action = match backing {
-        ReadNodeBacking::VolatileDecoded(_) => DetachAction::ParkCurrent,
-        ReadNodeBacking::PersistedDecoded(node) => DetachAction::ParkOwned(node.to_owned_node()),
-        ReadNodeBacking::PersistedBytes(node) => DetachAction::ParkOwned(
-            bits::decode_stable_node_bytes(node.bytes(), node.node_type())?,
-        ),
-        ReadNodeBacking::Owned(node) => DetachAction::ParkOwned(node),
-    };
-
-    let parked_handle = match action {
-        DetachAction::ParkCurrent => read_state.park_current_node()?,
-        DetachAction::ParkOwned(node) => read_state.park_owned_node(node),
-    };
-
-    let mut result =
-        ReadTrieNode::from_state_borrowed(read_state.get_parked_ref(parked_handle), Some(hash))
-            .with_patch_depth(patch_depth);
-    if let Some(meta) = transient_meta {
-        result = result.with_transient_meta(meta);
-    }
-    Ok(result)
-}
 
 /// Fetch children hashes and compute the node's hash
 fn get_nodetype_hash<T: MarfTrieId, Db: Deref<Target = Connection>>(
@@ -193,41 +129,6 @@ impl Trie {
         }
 
         storage.read_node_with_state(&root_ptr, decode_scratch)
-    }
-
-    /// Walk from the given node to the next node on the path, advancing the cursor.
-    ///
-    /// * Returns the [`TriePtr`] which was followed, the _next_ node to walk, and the hash of the
-    ///   _current_ node.
-    /// * Returns `None` if we either didn't find the node, we're out of path, we're at a leaf, or
-    ///   if a backpointer is encountered.
-    ///
-    /// **NOTE:** This only works if we're walking a trie, not a MARF.
-    #[cfg(test)]
-    pub fn walk_from<T: MarfTrieId, Db: Deref<Target = Connection>>(
-        storage: &mut TrieStorageConnection<T, Db>,
-        node: &TrieNodeType,
-        cursor: &mut TrieCursor<T>,
-        decode_scratch: &mut impl TrieNodeReadState,
-    ) -> Result<Option<(TriePtr, TrieNodeType, TrieHash)>, Error> {
-        match cursor.walk(node, &storage.get_cur_block()) {
-            Ok(ptr_opt) => {
-                match ptr_opt {
-                    None => {
-                        // end of path
-                        Ok(None)
-                    }
-                    Some(ptr) => {
-                        // end of node path
-                        trace!("Walked to {:?}", &ptr);
-                        let (node, hash) = read_owned_hashed_node(storage, &ptr, decode_scratch)?;
-
-                        Ok(Some((ptr, node, hash)))
-                    }
-                }
-            }
-            Err(e) => Err(Error::CursorError(e)),
-        }
     }
 
     /// Follow a back-pointer back to a trie node in a previous trie.
@@ -727,16 +628,6 @@ impl Trie {
         Ok(ret)
     }
 
-    #[cfg(test)]
-    pub fn test_splice_leaf<T: MarfTrieId, Db: Deref<Target = Connection>>(
-        storage: &mut TrieStorageConnection<T, Db>,
-        cursor: &mut TrieCursor<T>,
-        leaf: &mut TrieLeaf,
-        node: &mut TrieNodeType,
-    ) -> Result<TriePtr, Error> {
-        Trie::splice_leaf(storage, cursor, leaf, node)
-    }
-
     /// Read the node at the cursor's current position, resolving deferred (parked or
     /// persisted) handles into a borrowable `ReadTrieNode`.
     ///
@@ -1199,5 +1090,21 @@ impl Trie {
     ) -> Result<(), Error> {
         let mut ancestor_cursor = None;
         Trie::recalculate_root_hash(storage, cursor, false, &mut ancestor_cursor, decode_scratch)
+    }
+}
+
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+
+    impl Trie {
+        pub fn test_splice_leaf<T: MarfTrieId, Db: Deref<Target = Connection>>(
+            storage: &mut TrieStorageConnection<T, Db>,
+            cursor: &mut TrieCursor<T>,
+            leaf: &mut TrieLeaf,
+            node: &mut TrieNodeType,
+        ) -> Result<TriePtr, Error> {
+            Trie::splice_leaf(storage, cursor, leaf, node)
+        }
     }
 }

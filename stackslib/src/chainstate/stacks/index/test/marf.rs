@@ -105,7 +105,6 @@ where
                 .prove_path(block_hash, key, value)
                 .expect("Error proving path");
 
-
             test_debug!("---------");
             test_debug!("MARF merkle verify: {proof:?}");
             test_debug!("MARF merkle verify target root hash: {root_hash:?}");
@@ -2798,4 +2797,272 @@ fn test_mmap_stale_reader() {
     let result = stale_reader.get(&block_2, "stale-key-2");
     // We don't assert success or failure — just that it doesn't panic.
     drop(result);
+}
+
+/// Regression test for the stale-mmap crash: a second MARF instance (simulating the
+/// relayer thread) opens the same blob file with mmap enabled BEFORE the writer
+/// (simulating the chains coordinator) commits new blocks. The reader's mmap is stale
+/// and doesn't cover the new data.
+///
+/// Before the fix in `TrieFile::read_bytes_at`, this would panic with
+/// `get_block_height_of` returning `Ok(None)` because `read_bytes_at` returned
+/// `NotFoundError` instead of falling back to `pread` when the mmap was out of range.
+#[test]
+fn test_mmap_stale_reader_block_height() {
+    let test_dir = "/tmp/stacks-index-test-mmap-stale-height";
+    if fs::metadata(test_dir).is_ok() {
+        fs::remove_dir_all(test_dir).unwrap();
+    }
+    fs::create_dir_all(test_dir).unwrap();
+    let test_file = format!("{test_dir}/marf.sqlite");
+
+    let marf_opts = MARFOpenOpts {
+        external_blobs: true,
+        mmap: true,
+        compress: true,
+        ..MARFOpenOpts::default()
+    };
+
+    let sentinel = BlockHeaderHash::sentinel();
+
+    // --- Phase 1: writer commits initial blocks ---
+    let f = TrieFileStorage::open(&test_file, marf_opts.clone()).unwrap();
+    let mut writer = MARF::from_storage(f);
+
+    let block_1 = BlockHeaderHash::from_bytes(&[1u8; 32]).unwrap();
+    writer.begin(&sentinel, &block_1).unwrap();
+    writer
+        .insert("key-1", MARFValue::from_value("val-1"))
+        .unwrap();
+    writer.commit().unwrap();
+
+    // --- Phase 2: open a SECOND instance (simulating the relayer thread) ---
+    // Its mmap covers only the data written so far (block_1).
+    let f2 = TrieFileStorage::open(&test_file, marf_opts.clone()).unwrap();
+    let mut reader = MARF::from_storage(f2);
+
+    // Sanity: reader can see block_1
+    let v = reader
+        .get(&block_1, "key-1")
+        .expect("reader should see block_1");
+    assert_eq!(v, Some(MARFValue::from_value("val-1")));
+
+    // --- Phase 3: writer commits MORE blocks (reader's mmap is now stale) ---
+    let block_2 = BlockHeaderHash::from_bytes(&[2u8; 32]).unwrap();
+    writer.begin(&block_1, &block_2).unwrap();
+    writer
+        .insert("key-2", MARFValue::from_value("val-2"))
+        .unwrap();
+    writer.commit().unwrap();
+
+    let block_3 = BlockHeaderHash::from_bytes(&[3u8; 32]).unwrap();
+    writer.begin(&block_2, &block_3).unwrap();
+    writer
+        .insert("key-3", MARFValue::from_value("val-3"))
+        .unwrap();
+    writer.commit().unwrap();
+
+    // --- Phase 4: reader tries to read blocks written AFTER its mmap was created ---
+    // This is the exact scenario that crashed the relayer: the reader's mmap doesn't
+    // cover block_3's blob, and `read_bytes_at` must fall back to pread.
+
+    // The crash call: get_block_height_of on a block the reader hasn't seen.
+    let height = reader
+        .get_block_height_of(&block_3, &block_3)
+        .expect("reader get_block_height_of should not error");
+    assert_eq!(
+        height,
+        Some(2),
+        "reader should see block_3 at height 2 via pread fallback"
+    );
+
+    // Also verify key reads work.
+    let v = reader
+        .get(&block_3, "key-3")
+        .expect("reader should be able to read key-3 via pread fallback");
+    assert_eq!(v, Some(MARFValue::from_value("val-3")));
+
+    // And block_2 (also beyond the original mmap).
+    let v = reader
+        .get(&block_3, "key-2")
+        .expect("reader should be able to read key-2 via pread fallback");
+    assert_eq!(v, Some(MARFValue::from_value("val-2")));
+
+    drop(writer);
+    drop(reader);
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+/// Simulate genesis sync resume: commit blocks, close, reopen, write more, verify all
+/// block heights are readable including those from the previous session.
+#[test]
+fn test_block_height_readback_resume_from_disk() {
+    let test_dir = "/tmp/stacks-index-test-height-resume";
+    if fs::metadata(test_dir).is_ok() {
+        fs::remove_dir_all(test_dir).unwrap();
+    }
+    fs::create_dir_all(test_dir).unwrap();
+    let test_file = format!("{test_dir}/marf.sqlite");
+
+    let marf_opts = MARFOpenOpts {
+        external_blobs: true,
+        mmap: true,
+        compress: true,
+        ..MARFOpenOpts::default()
+    };
+
+    let sentinel = BlockHeaderHash::sentinel();
+
+    // --- Session 1: write initial blocks ---
+    let initial_blocks: Vec<BlockHeaderHash> = (1..=20)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i >> 8) as u8;
+            bytes[1] = (i & 0xff) as u8;
+            BlockHeaderHash::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    {
+        let f = TrieFileStorage::open(&test_file, marf_opts.clone()).unwrap();
+        let mut marf = MARF::from_storage(f);
+
+        let mut prev = sentinel.clone();
+        for (i, block) in initial_blocks.iter().enumerate() {
+            marf.begin(&prev, block).unwrap();
+            for k in 0..20 {
+                let key = format!("s1-block-{i}-key-{k}");
+                let val = MARFValue::from_value(&format!("s1-block-{i}-val-{k}"));
+                marf.insert(&key, val).unwrap();
+            }
+            marf.commit().unwrap();
+            prev = block.clone();
+        }
+    }
+
+    // --- Session 2: reopen and write more blocks ---
+    let resume_blocks: Vec<BlockHeaderHash> = (21..=40)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i >> 8) as u8;
+            bytes[1] = (i & 0xff) as u8;
+            BlockHeaderHash::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    {
+        let f = TrieFileStorage::open(&test_file, marf_opts.clone()).unwrap();
+        let mut marf = MARF::from_storage(f);
+
+        let mut prev = initial_blocks.last().unwrap().clone();
+        for (i, block) in resume_blocks.iter().enumerate() {
+            marf.begin(&prev, block).unwrap();
+            for k in 0..20 {
+                let key = format!("s1-block-{}-key-{k}", i % 20);
+                let val = MARFValue::from_value(&format!("s2-block-{i}-val-{k}"));
+                marf.insert(&key, val).unwrap();
+            }
+            marf.commit().unwrap();
+            prev = block.clone();
+        }
+
+        let tip = resume_blocks.last().unwrap().clone();
+        let all_blocks: Vec<&BlockHeaderHash> =
+            initial_blocks.iter().chain(resume_blocks.iter()).collect();
+
+        for (i, block) in all_blocks.iter().enumerate() {
+            let height = MarfConnection::get_block_height(&mut marf, block, &tip)
+                .unwrap_or_else(|e| panic!("Writer: block {i} height failed: {e}"));
+            assert_eq!(height, Some(i as u32), "Writer: block {i} height mismatch");
+        }
+
+        let mut ro_marf = marf.reopen_readonly().unwrap();
+        let height = ro_marf
+            .get_block_height_of(&tip, &tip)
+            .unwrap_or_else(|e| panic!("Readonly: tip get_block_height_of failed: {e}"));
+        assert!(
+            height.is_some(),
+            "Readonly: get_block_height_of for tip returned None"
+        );
+    }
+
+    let _ = fs::remove_dir_all(test_dir);
+}
+
+/// Three close/reopen sessions with overlapping keys to create cross-session patch chains.
+#[test]
+fn test_block_height_readback_multi_resume() {
+    let test_dir = "/tmp/stacks-index-test-height-multi-resume";
+    if fs::metadata(test_dir).is_ok() {
+        fs::remove_dir_all(test_dir).unwrap();
+    }
+    fs::create_dir_all(test_dir).unwrap();
+    let test_file = format!("{test_dir}/marf.sqlite");
+
+    let marf_opts = MARFOpenOpts {
+        external_blobs: true,
+        mmap: true,
+        compress: true,
+        ..MARFOpenOpts::default()
+    };
+
+    let sentinel = BlockHeaderHash::sentinel();
+    let mut all_blocks: Vec<BlockHeaderHash> = vec![];
+    let blocks_per_session = 15;
+
+    for session in 0..3 {
+        let f = TrieFileStorage::open(&test_file, marf_opts.clone()).unwrap();
+        let mut marf = MARF::from_storage(f);
+
+        let prev = if all_blocks.is_empty() {
+            sentinel.clone()
+        } else {
+            all_blocks.last().unwrap().clone()
+        };
+
+        let session_blocks: Vec<BlockHeaderHash> = (0..blocks_per_session)
+            .map(|i| {
+                let global_i = session * blocks_per_session + i;
+                let mut bytes = [0u8; 32];
+                bytes[0] = ((global_i + 1) >> 8) as u8;
+                bytes[1] = ((global_i + 1) & 0xff) as u8;
+                BlockHeaderHash::from_bytes(&bytes).unwrap()
+            })
+            .collect();
+
+        let mut prev_block = prev;
+        for (i, block) in session_blocks.iter().enumerate() {
+            marf.begin(&prev_block, block).unwrap();
+            for k in 0..20 {
+                let key = format!("shared-key-{k}");
+                let val = MARFValue::from_value(&format!("session-{session}-block-{i}-val-{k}"));
+                marf.insert(&key, val).unwrap();
+            }
+            marf.commit().unwrap();
+            prev_block = block.clone();
+        }
+
+        let tip = session_blocks.last().unwrap().clone();
+        all_blocks.extend(session_blocks);
+
+        for (i, block) in all_blocks.iter().enumerate() {
+            let height = MarfConnection::get_block_height(&mut marf, block, &tip)
+                .unwrap_or_else(|e| panic!("Session {session}: block {i} height failed: {e}"));
+            assert_eq!(
+                height,
+                Some(i as u32),
+                "Session {session}: block {i} height mismatch"
+            );
+        }
+
+        let height = marf
+            .get_block_height_of(&tip, &tip)
+            .unwrap_or_else(|e| panic!("Session {session}: get_block_height_of tip failed: {e}"));
+        assert!(
+            height.is_some(),
+            "Session {session}: get_block_height_of returned None"
+        );
+    }
+
+    let _ = fs::remove_dir_all(test_dir);
 }
