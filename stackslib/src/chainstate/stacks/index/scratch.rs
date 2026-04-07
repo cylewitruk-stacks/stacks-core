@@ -331,7 +331,7 @@ impl MarfReadState {
             TrieNodeID::Node4 => {
                 let node = self.node4.as_mut().expect("BUG: decode scratch lost node4");
                 for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_node4_in_place(node, *patch_block_id, cur_block_id) {
+                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
                         return Err(Error::CorruptionError(
                             "Failed to apply patches to node".to_string(),
                         ));
@@ -346,7 +346,7 @@ impl MarfReadState {
                     .as_mut()
                     .expect("BUG: decode scratch lost node16");
                 for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_node16_in_place(node, *patch_block_id, cur_block_id) {
+                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
                         return Err(Error::CorruptionError(
                             "Failed to apply patches to node".to_string(),
                         ));
@@ -361,7 +361,7 @@ impl MarfReadState {
                     .as_mut()
                     .expect("BUG: decode scratch lost node48");
                 for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_node48_in_place(node, *patch_block_id, cur_block_id) {
+                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
                         return Err(Error::CorruptionError(
                             "Failed to apply patches to node".to_string(),
                         ));
@@ -376,7 +376,7 @@ impl MarfReadState {
                     .as_mut()
                     .expect("BUG: decode scratch lost node256");
                 for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_node256_in_place(node, *patch_block_id, cur_block_id) {
+                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
                         return Err(Error::CorruptionError(
                             "Failed to apply patches to node".to_string(),
                         ));

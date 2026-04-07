@@ -434,16 +434,6 @@ impl Trie {
         Ok(Some(cursor.ptr()))
     }
 
-    #[cfg(test)]
-    pub fn test_try_attach_leaf<T: MarfTrieId, Db: Deref<Target = Connection>>(
-        storage: &mut TrieStorageConnection<T, Db>,
-        cursor: &mut TrieCursor<T>,
-        leaf: &mut TrieLeaf,
-        node: &mut TrieNodeType,
-    ) -> Result<Option<TriePtr>, Error> {
-        Trie::try_attach_leaf(storage, cursor, leaf, node)
-    }
-
     /// Given a node and a leaf, attach the leaf.  Promote the intermediate node if necessary.
     /// Does the same thing as try_attach_leaf, but the node might get expanaded.  In this case, the
     /// new node will be appended and the old node will be leaked in the storage implementation
@@ -1098,6 +1088,15 @@ pub mod testing {
     use super::*;
 
     impl Trie {
+        pub fn test_try_attach_leaf<T: MarfTrieId, Db: Deref<Target = Connection>>(
+            storage: &mut TrieStorageConnection<T, Db>,
+            cursor: &mut TrieCursor<T>,
+            leaf: &mut TrieLeaf,
+            node: &mut TrieNodeType,
+        ) -> Result<Option<TriePtr>, Error> {
+            Trie::try_attach_leaf(storage, cursor, leaf, node)
+        }
+
         pub fn test_splice_leaf<T: MarfTrieId, Db: Deref<Target = Connection>>(
             storage: &mut TrieStorageConnection<T, Db>,
             cursor: &mut TrieCursor<T>,

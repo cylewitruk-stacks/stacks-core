@@ -168,29 +168,31 @@ pub fn get_node_max_byte_len(node_id: u8) -> Result<usize, Error> {
         .ok_or(Error::OverflowError)
 }
 
+/// Decode a non-patch node from a byte slice into scratch storage.
+///
+/// Callers must ensure `ptr_id` is a valid, non-Patch node type and that `bytes` does not begin
+/// with a Patch marker. both conditions are checked by callers before dispatch.
 fn decode_nodetype_ref_from_slice_at_head(
     bytes: &[u8],
     ptr_id: u8,
     scratch: &mut impl NodeDecodeScratch,
 ) -> Result<usize, Error> {
+    debug_assert_ne!(
+        TrieNodeID::from_u8(clear_ctrl_bits(ptr_id)),
+        Some(TrieNodeID::Patch),
+        "callers must handle Patch before dispatch"
+    );
+    debug_assert_ne!(
+        stored_node_id_from_bytes(bytes).ok(),
+        Some(TrieNodeID::Patch),
+        "callers must check stored node ID for Patch before dispatch"
+    );
+
     let node_id = TrieNodeID::from_u8(ptr_id).ok_or_else(|| {
         Error::CorruptionError(format!(
-            "inner_read_nodetype_at_head: Unknown trie node type {}",
-            ptr_id
+            "inner_read_nodetype_at_head: Unknown trie node type {ptr_id}"
         ))
     })?;
-
-    let stored_node_id = TrieNodeID::from_u8(clear_ctrl_bits(*bytes.first().ok_or_else(|| {
-        Error::CorruptionError("Failed to read 1st byte from bytes array".to_string())
-    })?))
-    .ok_or_else(|| {
-        Error::CorruptionError("Failed to read expected node ID -- not a valid ID".to_string())
-    })?;
-
-    if stored_node_id == TrieNodeID::Patch {
-        scratch.decode_patch_from_slice(bytes)?;
-        return Err(Error::Patch(None, scratch.patch().clone()));
-    }
 
     scratch.decode_node_from_slice(node_id, bytes)
 }
@@ -669,6 +671,38 @@ pub fn read_root_hash<T: MarfTrieId, R: TrieReadStorage<T> + ?Sized>(
     Ok(s.read_node_hash(&ptr)?)
 }
 
+/// Decode the node body from `remaining` into `scratch`, dispatching to patch or node decode.
+/// Returns `(stored_node_id, bytes_consumed)`.
+fn decode_trie_item_into_scratch(
+    remaining: &[u8],
+    ptr_id: u8,
+    scratch: &mut impl NodeDecodeScratch,
+) -> Result<(TrieNodeID, usize), Error> {
+    let stored_node_id = stored_node_id_from_bytes(remaining)?;
+    let consumed = if stored_node_id == TrieNodeID::Patch {
+        scratch.decode_patch_from_slice(remaining)?
+    } else {
+        decode_nodetype_ref_from_slice_at_head(remaining, ptr_id, scratch)?
+    };
+    Ok((stored_node_id, consumed))
+}
+
+/// Build a [`ReadTrieItem`] from scratch state that was populated by [`decode_trie_item_into_scratch`].
+fn build_read_trie_item<'a>(
+    stored_node_id: TrieNodeID,
+    hash: TrieHash,
+    scratch: &'a impl NodeDecodeScratch,
+) -> ReadTrieItem<'a> {
+    if stored_node_id == TrieNodeID::Patch {
+        ReadTrieItem::from_patch(scratch.patch(), Some(hash))
+    } else {
+        ReadTrieItem::from_node(ReadTrieNode::from_state_borrowed(
+            scratch.get_ref(),
+            Some(hash),
+        ))
+    }
+}
+
 /// Read a trie item from a byte slice (no Read+Seek needed).
 /// Used by the mmap path where bytes are already in memory.
 pub fn read_trie_item_from_slice<'a>(
@@ -677,21 +711,8 @@ pub fn read_trie_item_from_slice<'a>(
     scratch: &'a mut impl NodeDecodeScratch,
 ) -> Result<ReadTrieItem<'a>, Error> {
     let (hash, remaining) = parse_hash_from_bytes(bytes)?;
-    let stored_node_id = stored_node_id_from_bytes(remaining)?;
-    let consumed = if stored_node_id == TrieNodeID::Patch {
-        scratch.decode_patch_from_slice(remaining)?
-    } else {
-        decode_nodetype_ref_from_slice_at_head(remaining, ptr_id, scratch)?
-    };
-    let _ = consumed;
-    if stored_node_id == TrieNodeID::Patch {
-        Ok(ReadTrieItem::from_patch(scratch.patch(), Some(hash)))
-    } else {
-        Ok(ReadTrieItem::from_node(ReadTrieNode::from_state_borrowed(
-            scratch.get_ref(),
-            Some(hash),
-        )))
-    }
+    let (stored_node_id, _) = decode_trie_item_into_scratch(remaining, ptr_id, scratch)?;
+    Ok(build_read_trie_item(stored_node_id, hash, scratch))
 }
 
 /// Read a stored node type and hash from a byte slice (no Read+Seek needed).
@@ -761,13 +782,7 @@ pub fn read_trie_item_at_head_ref<'a, F: Read + Seek>(
 
     let result = parse_node_from_bytes(f, start_disk_ptr, node_bytes.as_slice(), |bytes| {
         let (hash, remaining) = parse_hash_from_bytes(bytes)?;
-        let stored_node_id = stored_node_id_from_bytes(remaining)?;
-
-        let consumed = if stored_node_id == TrieNodeID::Patch {
-            scratch.decode_patch_from_slice(remaining)?
-        } else {
-            decode_nodetype_ref_from_slice_at_head(remaining, ptr_id, scratch)?
-        };
+        let (stored_node_id, consumed) = decode_trie_item_into_scratch(remaining, ptr_id, scratch)?;
         let total_consumed = TRIEHASH_ENCODED_SIZE
             .checked_add(consumed)
             .ok_or(Error::OverflowError)?;
@@ -777,15 +792,7 @@ pub fn read_trie_item_at_head_ref<'a, F: Read + Seek>(
     scratch.restore_node_bytes(node_bytes);
 
     let (hash, stored_node_id) = result?;
-
-    if stored_node_id == TrieNodeID::Patch {
-        Ok(ReadTrieItem::from_patch(scratch.patch(), Some(hash)))
-    } else {
-        Ok(ReadTrieItem::from_node(ReadTrieNode::from_state_borrowed(
-            scratch.get_ref(),
-            Some(hash),
-        )))
-    }
+    Ok(build_read_trie_item(stored_node_id, hash, scratch))
 }
 
 /// Calculate how many bytes a node will be when serialized, including its hash.
@@ -806,52 +813,37 @@ pub fn get_node_byte_len_compressed(node: &TrieNodeType) -> usize {
 }
 
 /// Write all the bytes for a node, including its hash, to the given Writeable object.
-/// The list of child pointers will NOT be compressed.
-/// Returns Ok(nw) on success, where `nw` is the number of bytes written.
-/// Returns Err(IOError(..)) on disk I/O error
+///
+/// If `compressed` is true, child pointers will be compressed as best as possible.
+///
+/// ## Returns
+/// * `Ok(nw)` on success, where `nw` is the number of bytes written.
+/// * `Err(IOError(..))` on disk I/O error
 pub fn write_node_bytes<F: Write + Seek>(
     f: &mut F,
     node: &TrieNodeType,
     hash: TrieHash,
+    compressed: bool,
 ) -> Result<u64, Error> {
     let start = f.stream_position().map_err(Error::IOError)?;
     f.write_all(hash.as_bytes())?;
-    node.write_bytes(f)?;
+    if compressed {
+        node.write_bytes_compressed(f)?;
+    } else {
+        node.write_bytes(f)?;
+    }
     let end = f.stream_position().map_err(Error::IOError)?;
     trace!("write_nodetype_bytes: {node:?} {hash:?} at {start}-{end}");
-    Ok(end - start)
-}
-
-/// Write all of the bytes for a node, including its hash, to the given Writable object.
-/// The list of child pointers will be compressed as best as possible.
-/// Returns Ok(nw) on success, where `nw` is the number of bytes written.
-/// Returns Err(IOError(..)) on disk I/O error
-pub fn write_node_bytes_compressed<F: Write + Seek>(
-    f: &mut F,
-    node: &TrieNodeType,
-    hash: TrieHash,
-) -> Result<u64, Error> {
-    let start = f.stream_position().map_err(Error::IOError)?;
-    f.write_all(hash.as_bytes())?;
-    node.write_bytes_compressed(f)?;
-    let end = f.stream_position().map_err(Error::IOError)?;
-    trace!(
-        "write_nodetype_bytes_compressed: {:?} {:?} at {}-{}",
-        node,
-        &hash,
-        start,
-        end
-    );
-
     Ok(end - start)
 }
 
 /// Write out the path to the given writable object.
 /// This includes the length prefix and path bytes
 ///
-/// Returns Ok(()) on success
-/// Returns Err(CorruptionError(..)) if `path.len()` is greater than 32.
-/// Returns Err(IOError(..)) on disk I/O error
+/// ## Returns
+/// * `Ok(())` on success
+/// * `Err(CorruptionError(..))` if `path.len()` is greater than 32.
+/// * `Err(IOError(..))` on disk I/O error
 pub fn write_path_to_bytes<W: Write>(path: &[u8], w: &mut W) -> Result<(), Error> {
     if path.len() > 32 {
         return Err(Error::CorruptionError(

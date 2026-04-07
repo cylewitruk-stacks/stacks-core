@@ -1130,9 +1130,9 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         Ok(())
     }
 
-    /// Begin extending the MARF to an unconfirmed trie.  The resulting trie will have a block hash
-    /// equal to MARF::make_unconfirmed_block_hash(chain_tip) to avoid collision
-    /// and block hash reuse.
+    /// Begin extending the MARF to an unconfirmed trie. The resulting trie will have a block hash
+    /// equal to `MARF::make_unconfirmed_chain_tip(chain_tip)` to avoid collision and block hash
+    /// reuse.
     pub fn begin_unconfirmed(&mut self, chain_tip: &T) -> Result<T, Error> {
         if self.storage.readonly() {
             return Err(Error::ReadOnlyError);
@@ -1432,17 +1432,7 @@ impl<T: MarfTrieId> MARF<T> {
         for _ in 0..(cursor.path.len() + 1) {
             let cur_block = storage.get_cur_block();
             let action = if let Some(node) = owned_node.as_ref() {
-                match cursor.walk(node, &cur_block) {
-                    Ok(Some(next_ptr)) => ReadTrieNodeCursorStep::Next(next_ptr),
-                    Ok(None) => ReadTrieNodeCursorStep::EndOfPath {
-                        is_leaf: node.is_leaf(),
-                    },
-                    Err(CursorError::PathDiverged) => ReadTrieNodeCursorStep::Diverged,
-                    Err(CursorError::ChrNotFound) => ReadTrieNodeCursorStep::ChrNotFound,
-                    Err(CursorError::BackptrEncountered(ptr)) => {
-                        ReadTrieNodeCursorStep::FollowBackptr(ptr)
-                    }
-                }
+                cursor.walk_step(node, &cur_block)
             } else {
                 decode_scratch.clear_current_node();
                 let read = storage.read_node_with_state(&node_ptr, decode_scratch)?;

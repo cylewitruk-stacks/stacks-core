@@ -112,14 +112,16 @@ fn trie_cmp<T: MarfTrieId>(
         // search children
         for ptr in n1_data.ptrs() {
             if ptr.id != TrieNodeID::Empty as u8 && !is_backptr(ptr.id) {
-                let (child_data, child_hash) = t1.read_nodetype(ptr).unwrap();
-                frontier_1.push_back((child_data, child_hash))
+                let (child_data, child_hash) =
+                    t1.read_node(ptr).unwrap().into_owned_node().unwrap();
+                frontier_1.push_back((child_data, child_hash.unwrap()))
             }
         }
         for ptr in n2_data.ptrs() {
             if ptr.id != TrieNodeID::Empty as u8 && !is_backptr(ptr.id) {
-                let (child_data, child_hash) = t2.read_nodetype(ptr).unwrap();
-                frontier_2.push_back((child_data, child_hash))
+                let (child_data, child_hash) =
+                    t2.read_node(ptr).unwrap().into_owned_node().unwrap();
+                frontier_2.push_back((child_data, child_hash.unwrap()))
             }
         }
     }

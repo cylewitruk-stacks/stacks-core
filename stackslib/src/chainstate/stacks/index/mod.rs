@@ -571,7 +571,7 @@ pub trait TrieNodeArena {
 
 /// Transitional marker trait; combines parking and patching capabilities.
 ///
-/// TODO: Not the target architecture: will be eliminated once all call sites declare their own
+/// TODO: Not the target architecture: will be removed once all call sites declare their own
 /// specific bounds.
 pub trait TrieNodeReadState: NodeParking + NodePatching {}
 

@@ -125,7 +125,7 @@ fn trie_node_decode_scratch_apply_patches_in_place_matches_owned_path() {
     // Build expected result by applying patches in-place to a clone
     let mut expected_node4 = node4.clone();
     for (patch_block_id, _, patch) in patches.iter() {
-        assert!(patch.apply_node4_in_place(&mut expected_node4, *patch_block_id, 6));
+        assert!(patch.apply_to(&mut expected_node4, *patch_block_id, 6));
     }
     expected_node4.patch_depth += patches.len();
     expected_node4.last_patch_source = patches.last().map(|(block_id, ptr, _)| (*block_id, *ptr));
