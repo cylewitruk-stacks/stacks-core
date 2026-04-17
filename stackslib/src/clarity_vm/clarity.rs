@@ -267,7 +267,7 @@ impl<'a, 'b> ClarityTransactionConnection<'a, 'b> {
 }
 
 pub struct ClarityReadOnlyConnection<'a> {
-    datastore: ReadOnlyMarfStore<'a>,
+    datastore: ReadOnlyMarfStore,
     header_db: &'a dyn HeadersDB,
     burn_state_db: &'a dyn BurnStateDB,
     epoch: StacksEpochId,
@@ -744,7 +744,7 @@ impl ClarityInstance {
     /// Open a read-only connection at `at_block`. This will be evaluated in the Stacks epoch that
     ///  was active *during* the evaluation of `at_block`
     pub fn read_only_connection<'a>(
-        &'a mut self,
+        &self,
         at_block: &StacksBlockId,
         header_db: &'a dyn HeadersDB,
         burn_state_db: &'a dyn BurnStateDB,
@@ -756,7 +756,7 @@ impl ClarityInstance {
     /// Open a read-only connection at `at_block`. This will be evaluated in the Stacks epoch that
     ///  was active *during* the evaluation of `at_block`
     pub fn read_only_connection_checked<'a>(
-        &'a mut self,
+        &self,
         at_block: &StacksBlockId,
         header_db: &'a dyn HeadersDB,
         burn_state_db: &'a dyn BurnStateDB,
@@ -778,7 +778,7 @@ impl ClarityInstance {
         })
     }
 
-    pub fn trie_exists_for_block(&mut self, bhh: &StacksBlockId) -> Result<bool, DatabaseError> {
+    pub fn trie_exists_for_block(&self, bhh: &StacksBlockId) -> Result<bool, DatabaseError> {
         let mut datastore = self.datastore.begin_read_only(None);
         datastore.trie_exists_for_block(bhh)
     }
@@ -786,7 +786,7 @@ impl ClarityInstance {
     /// Evaluate program read-only at `at_block`. This will be evaluated in the Stacks epoch that
     ///  was active *during* the evaluation of `at_block`
     pub fn eval_read_only(
-        &mut self,
+        &self,
         at_block: &StacksBlockId,
         header_db: &dyn HeadersDB,
         burn_state_db: &dyn BurnStateDB,
@@ -2659,7 +2659,7 @@ mod tests {
             conn.commit_block();
         }
 
-        let mut marf = clarity_instance.destroy();
+        let marf = clarity_instance.destroy();
         let mut conn = marf.begin_read_only(Some(&StacksBlockId([1; 32])));
         assert!(conn.get_contract_hash(&contract_identifier).is_ok());
     }

@@ -24,6 +24,7 @@ use rusqlite::{Connection, Transaction};
 use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
+use super::squash::SquashMode;
 use super::storage::ReopenedTrieStorageConnection;
 use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, node_copy_update_ptrs, set_backptr, CursorError, TrieCowPtr,
@@ -99,7 +100,7 @@ pub fn test_override_marf_compression(_marf_opts: &mut MARFOpenOpts) {}
 
 /// Merklized Adaptive-Radix Forest -- a collection of Merklized Adaptive-Radix Tries.
 pub struct MARF<T: MarfTrieId> {
-    storage: TrieFileStorage<T>,
+    pub(crate) storage: TrieFileStorage<T>,
     open_chain_tip: Option<WriteChainTip<T>>,
     read_cursor: Option<TrieCursor<T>>,
     read_state: MarfReadState,
@@ -382,6 +383,12 @@ pub struct MARFOpenOpts {
     pub compress: bool,
     /// use memory-mapped I/O for reading trie blobs
     pub mmap: bool,
+    /// Squash mode preference. `TipOnly` stores only tip-era values;
+    /// `FullHistory` preserves per-key value-transition history for
+    /// historical reads. The effective mode may be upgraded to
+    /// `FullHistory` for pre-epoch-3.4 squash ranges regardless of
+    /// this setting.
+    pub squash_mode: SquashMode,
 }
 
 impl MARFOpenOpts {
@@ -393,6 +400,7 @@ impl MARFOpenOpts {
             force_db_migrate: false,
             compress: false,
             mmap: false,
+            squash_mode: SquashMode::TipOnly,
         }
     }
 
@@ -408,6 +416,7 @@ impl MARFOpenOpts {
             force_db_migrate: false,
             compress: false,
             mmap: false,
+            squash_mode: SquashMode::TipOnly,
         }
     }
 
@@ -418,6 +427,11 @@ impl MARFOpenOpts {
 
     pub fn with_mmap(mut self, mmap: bool) -> Self {
         self.mmap = mmap;
+        self
+    }
+
+    pub fn with_squash_mode(mut self, mode: SquashMode) -> Self {
+        self.squash_mode = mode;
         self
     }
 }
@@ -647,6 +661,45 @@ impl<T: MarfTrieId> MarfConnection<T> for ReopenedTrieStorageConnection<'_, T> {
 impl<T: MarfTrieId> MarfConnection<T> for MARF<T> {
     fn sqlite_conn(&self) -> &Connection {
         self.storage.sqlite_conn()
+    }
+
+    fn get_with_proof(
+        &mut self,
+        block_hash: &T,
+        key: &str,
+    ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+        // Check if the target block is within a squash range
+        if self.is_in_squash_range(block_hash) {
+            return Err(Error::NotSupportedError(
+                "Merkle proofs not supported for blocks within squash range".into(),
+            ));
+        }
+        // Delegate to default implementation
+        let marf_value = match <Self as MarfInternals<T>>::get_by_key(self, block_hash, key)? {
+            None => return Ok(None),
+            Some(x) => x,
+        };
+        let proof =
+            <Self as MarfInternals<T>>::prove_raw_entry(self, block_hash, key, &marf_value)?;
+        Ok(Some((marf_value, proof)))
+    }
+
+    fn get_with_proof_from_hash(
+        &mut self,
+        block_hash: &T,
+        hash: &TrieHash,
+    ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+        if self.is_in_squash_range(block_hash) {
+            return Err(Error::NotSupportedError(
+                "Merkle proofs not supported for blocks within squash range".into(),
+            ));
+        }
+        let marf_value = match <Self as MarfInternals<T>>::get_by_path(self, block_hash, hash)? {
+            None => return Ok(None),
+            Some(x) => x,
+        };
+        let proof = <Self as MarfInternals<T>>::prove_path(self, block_hash, hash, &marf_value)?;
+        Ok(Some((marf_value, proof)))
     }
 }
 
@@ -1262,16 +1315,23 @@ impl<T: MarfTrieId> MARF<T> {
         Ok((read, node_ptr, child_backptr.back_block))
     }
 
-    fn node_copy_update(node: &mut TrieNodeType, child_block_id: u32) -> TrieHash {
+    fn node_copy_update(node: &mut TrieNodeType, child_block_id: u32) -> Result<TrieHash, Error> {
         let hash = match node {
             TrieNodeType::Leaf(leaf) => bits::get_leaf_hash(leaf),
+            TrieNodeType::LeafSquashed(ref sq) => {
+                // Hash as a plain leaf using the tip value
+                bits::get_leaf_hash(&TrieLeaf {
+                    path: sq.path,
+                    data: sq.tip_value()?.clone(),
+                })
+            }
             _ => {
                 node_copy_update_ptrs(node.ptrs_mut(), child_block_id);
                 TrieHash::EMPTY
             }
         };
 
-        hash
+        Ok(hash)
     }
 
     /// Given a node, and the chr of one of its children, go find the last instance of that child in
@@ -1296,6 +1356,15 @@ impl<T: MarfTrieId> MARF<T> {
             MARF::walk_backptr(storage, child_backptr, cursor, decode_scratch)?;
         let (mut child_node, _) = child_read.into_owned_node()?;
 
+        // Flatten LeafSquashed → Leaf for per-block COW. Squash history
+        // must not be carried forward into per-block blobs.
+        if let TrieNodeType::LeafSquashed(ref sq) = child_node {
+            child_node = TrieNodeType::Leaf(TrieLeaf {
+                path: sq.path,
+                data: sq.tip_value()?.clone(),
+            });
+        }
+
         let child_block_hash = storage.get_cur_block();
         let child_block_identifier = storage.get_cur_block_identifier()?;
 
@@ -1303,7 +1372,7 @@ impl<T: MarfTrieId> MARF<T> {
 
         // update child_node with new ptrs and hashes
         storage.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
-        let child_hash = MARF::<T>::node_copy_update(&mut child_node, child_block_identifier);
+        let child_hash = MARF::<T>::node_copy_update(&mut child_node, child_block_identifier)?;
 
         // store it in this trie
         storage.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
@@ -1350,7 +1419,7 @@ impl<T: MarfTrieId> MARF<T> {
             prev_root_backptr.back_block = prev_block_identifier;
             prev_root.set_cow_ptr(TrieCowPtr::new(prev_block_hash.clone(), prev_root_backptr));
         }
-        let new_root_hash = Self::node_copy_update(&mut prev_root, prev_block_identifier);
+        let new_root_hash = Self::node_copy_update(&mut prev_root, prev_block_identifier)?;
 
         storage.open_block_maybe_id(&cur_block_hash, cur_block_id)?;
 
@@ -1467,7 +1536,11 @@ impl<T: MarfTrieId> MARF<T> {
                     continue;
                 }
                 ReadTrieNodeCursorStep::EndOfPath { is_leaf } => {
-                    if !is_leaf || clear_backptr(node_ptr.id()) != TrieNodeID::Leaf as u8 {
+                    let ptr_base = clear_backptr(node_ptr.id());
+                    if !is_leaf
+                        || (ptr_base != TrieNodeID::Leaf as u8
+                            && ptr_base != TrieNodeID::LeafSquashed as u8)
+                    {
                         trace!("Out-of-path but encountered a non-leaf at {:?}", &node_ptr);
                         error!("Out-of-path but encountered a non-leaf");
                         return Err(Error::CorruptionError(
@@ -1541,22 +1614,61 @@ impl<T: MarfTrieId> MARF<T> {
                 }
 
                 let cur_block = storage.get_cur_block();
+                // Read squash_opened_height BEFORE creating the TrieReadSession.
+                // The height is set at open_block time and does not change until
+                // the next open_block call, so reading once per iteration is safe.
+                // After a FollowBackptr re-opens a different block, the next
+                // iteration picks up the updated value.
+                let opened_height = storage.squash_opened_height();
                 storage.bench_mut().marf_walk_from_start();
                 let mut read_session = TrieReadSession::new(storage, decode_scratch);
                 let read = read_session.read_node(&node_ptr)?;
                 let action = match cursor.walk_read(&read, &cur_block) {
                     Ok(Some(next_ptr)) => WalkAction::Next(next_ptr),
                     Ok(None) => {
-                        if clear_backptr(cursor.ptr().id()) != TrieNodeID::Leaf as u8 {
+                        // Ptr-hint sanity check (unchanged)
+                        let ptr_base = clear_backptr(cursor.ptr().id());
+                        if ptr_base != TrieNodeID::Leaf as u8
+                            && ptr_base != TrieNodeID::LeafSquashed as u8
+                        {
                             return Err(Error::CorruptionError(
                                 "Non-leaf encountered at end of path".to_string(),
                             ));
                         }
 
-                        let leaf = read.as_leaf()?.ok_or_else(|| {
-                            Error::CorruptionError("Path reached a non-leaf".to_string())
-                        })?;
-                        WalkAction::FoundLeaf(TrieLeaf::from_value(leaf.path, leaf.data.clone()))
+                        // Branch on the decoded node type (ground truth from the
+                        // blob), not the ptr hint which can be stale.
+                        let leaf = match read.node_type() {
+                            Some(TrieNodeID::LeafSquashed) => {
+                                if let Some(height) = opened_height {
+                                    let sq = read.as_leaf_squashed_ref()?.ok_or_else(|| {
+                                        Error::CorruptionError(
+                                            "LeafSquashed node_type but \
+                                                 as_leaf_squashed_ref failed"
+                                                .into(),
+                                        )
+                                    })?;
+                                    let value =
+                                        sq.value_at_height(height).ok_or(Error::NotFoundError)?;
+                                    TrieLeaf::from_value(sq.path, value.clone())
+                                } else {
+                                    // No height context (tip read) — return tip value
+                                    let lr = read.as_leaf()?.ok_or_else(|| {
+                                        Error::CorruptionError(
+                                            "Path reached a non-leaf".to_string(),
+                                        )
+                                    })?;
+                                    TrieLeaf::from_value(lr.path, lr.data.clone())
+                                }
+                            }
+                            _ => {
+                                let lr = read.as_leaf()?.ok_or_else(|| {
+                                    Error::CorruptionError("Path reached a non-leaf".to_string())
+                                })?;
+                                TrieLeaf::from_value(lr.path, lr.data.clone())
+                            }
+                        };
+                        WalkAction::FoundLeaf(leaf)
                     }
                     Err(Error::CursorError(CursorError::PathDiverged))
                     | Err(Error::CursorError(CursorError::ChrNotFound)) => WalkAction::NotFound,
@@ -1772,6 +1884,16 @@ impl<T: MarfTrieId> MARF<T> {
 
 // instance methods
 impl<T: MarfTrieId> MARF<T> {
+    /// Check if a block hash falls within any loaded squash level's range.
+    pub fn is_in_squash_range(&self, block_hash: &T) -> bool {
+        let bhh_key: [u8; 32] = block_hash
+            .as_bytes()
+            .get(..32)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0u8; 32]);
+        self.storage.data.squash_block_index.contains_key(&bhh_key)
+    }
+
     pub fn begin_tx(&mut self) -> Result<MarfTransaction<'_, T>, Error> {
         let storage = self.storage.transaction()?;
         Ok(MarfTransaction {
@@ -1792,6 +1914,11 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         key: &str,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+        if self.is_in_squash_range(block_hash) {
+            return Err(Error::NotSupportedError(
+                "Merkle proofs not supported for blocks within squash range".into(),
+            ));
+        }
         let marf_value = match <Self as MarfInternals<T>>::get_by_key(self, block_hash, key)? {
             None => return Ok(None),
             Some(x) => x,
@@ -1806,6 +1933,11 @@ impl<T: MarfTrieId> MARF<T> {
         block_hash: &T,
         path: &TrieHash,
     ) -> Result<Option<(MARFValue, TrieMerkleProof<T>)>, Error> {
+        if self.is_in_squash_range(block_hash) {
+            return Err(Error::NotSupportedError(
+                "Merkle proofs not supported for blocks within squash range".into(),
+            ));
+        }
         let marf_value = match <Self as MarfInternals<T>>::get_by_path(self, block_hash, path)? {
             None => return Ok(None),
             Some(x) => x,
@@ -2010,7 +2142,7 @@ impl<T: MarfTrieId> MARF<T> {
         self.open_chain_tip.as_ref().map(|x| x.height)
     }
 
-    /// Access internal storage
+    /// Access internal storage as a [`TrieStorageConnection`].
     #[cfg(test)]
     pub fn borrow_storage_backend(&mut self) -> TrieStorageConnection<'_, T> {
         self.storage.connection()
@@ -2019,6 +2151,13 @@ impl<T: MarfTrieId> MARF<T> {
     #[cfg(test)]
     pub fn borrow_storage_transaction(&mut self) -> TrieStorageTransaction<'_, T> {
         self.storage.transaction().unwrap()
+    }
+
+    /// Borrow the underlying [`TrieFileStorage`] mutably.
+    ///
+    /// Used by the squash pipeline to read from and write to the raw storage.
+    pub(crate) fn storage_backend_mut(&mut self) -> &mut TrieFileStorage<T> {
+        &mut self.storage
     }
 
     /// Make a raw transaction to the underlying storage
@@ -2082,6 +2221,12 @@ impl<T: MarfTrieId> MARF<T> {
     /// Get the underlying storage DB path
     pub fn get_db_path(&self) -> &str {
         &self.storage.db_path
+    }
+
+    /// Reload squash level metadata and remap the blob file after an
+    /// external squash modified the underlying storage.
+    pub fn refresh_after_squash(&mut self) -> Result<(), Error> {
+        self.storage.refresh_after_squash()
     }
 }
 

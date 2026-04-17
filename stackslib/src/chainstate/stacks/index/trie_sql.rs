@@ -69,11 +69,29 @@ ALTER TABLE marf_data ADD COLUMN external_offset INTEGER DEFAULT 0 NOT NULL;
 ALTER TABLE marf_data ADD COLUMN external_length INTEGER DEFAULT 0 NOT NULL;
 CREATE INDEX IF NOT EXISTS index_external_offset ON marf_data(external_offset);
 
-INSERT OR REPLACE INTO schema_version (version) VALUES (2);
-INSERT OR REPLACE INTO migrated_version (version) VALUES (1);
+DELETE FROM schema_version;
+INSERT INTO schema_version (version) VALUES (2);
+DELETE FROM migrated_version;
+INSERT INTO migrated_version (version) VALUES (1);
 ";
 
-pub static SQL_MARF_SCHEMA_VERSION: u64 = 2;
+pub static SQL_MARF_SCHEMA_VERSION: u64 = 3;
+
+static SQL_MARF_DATA_TABLE_SCHEMA_3: &str = "
+CREATE TABLE IF NOT EXISTS marf_squash_levels (
+    level_id INTEGER PRIMARY KEY,
+    min_height INTEGER NOT NULL,
+    max_height INTEGER NOT NULL,
+    blob_offset INTEGER NOT NULL,
+    blob_length INTEGER NOT NULL,
+    reads_redirected INTEGER NOT NULL DEFAULT 0
+);
+
+DELETE FROM schema_version;
+INSERT INTO schema_version (version) VALUES (3);
+DELETE FROM migrated_version;
+INSERT INTO migrated_version (version) VALUES (3);
+";
 
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
     let tx = db::tx_begin_immediate(conn)?;
@@ -87,7 +105,7 @@ pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
 
 fn get_schema_version(conn: &Connection) -> u64 {
     // if the table doesn't exist, then the version is 1.
-    let sql = "SELECT version FROM schema_version";
+    let sql = "SELECT COALESCE(MAX(version), 1) AS version FROM schema_version";
     match conn.query_row(sql, NO_PARAMS, |row| row.get::<_, i64>("version")) {
         Ok(x) => x as u64,
         Err(e) => {
@@ -100,7 +118,7 @@ fn get_schema_version(conn: &Connection) -> u64 {
 /// Get the last schema version before the last attempted migration
 fn get_migrated_version(conn: &Connection) -> u64 {
     // if the table doesn't exist, then the version is 1.
-    let sql = "SELECT version FROM migrated_version";
+    let sql = "SELECT COALESCE(MAX(version), 1) AS version FROM migrated_version";
     match conn.query_row(sql, NO_PARAMS, |row| row.get::<_, i64>("version")) {
         Ok(x) => x as u64,
         Err(e) => {
@@ -123,6 +141,14 @@ pub fn migrate_tables_if_needed<T: MarfTrieId>(conn: &mut Connection) -> Result<
                 // add external_* fields
                 let tx = db::tx_begin_immediate(conn)?;
                 tx.execute_batch(SQL_MARF_DATA_TABLE_SCHEMA_2)?;
+                tx.commit()?;
+            }
+            2 => {
+                debug!("Migrate MARF data from schema 2 to schema 3");
+
+                // add marf_squash_levels table
+                let tx = db::tx_begin_immediate(conn)?;
+                tx.execute_batch(SQL_MARF_DATA_TABLE_SCHEMA_3)?;
                 tx.commit()?;
             }
             x if x == SQL_MARF_SCHEMA_VERSION => {
@@ -515,10 +541,27 @@ pub fn get_external_trie_offset_length_by_bhh<T: MarfTrieId>(
 
 /// Determine the offset in the blobs file at which the last trie ends.  This is also the offset at
 /// which the next trie will be appended.
+///
+/// Uses two index-friendly `ORDER BY … DESC LIMIT 1` queries instead of a
+/// `UNION ALL` + `MAX()` which would force full table scans on every append.
 pub fn get_external_blobs_length(conn: &Connection) -> Result<u64, Error> {
-    let qry = "SELECT (external_offset + external_length) AS blobs_length FROM marf_data ORDER BY external_offset DESC LIMIT 1";
-    let max_len: u64 = db::query_row(conn, qry, NO_PARAMS)?.unwrap_or(0);
-    Ok(max_len)
+    let marf_end: u64 = db::query_row(
+        conn,
+        "SELECT (external_offset + external_length) AS end_offset \
+         FROM marf_data ORDER BY external_offset DESC LIMIT 1",
+        NO_PARAMS,
+    )?
+    .unwrap_or(0);
+
+    let squash_end: u64 = db::query_row(
+        conn,
+        "SELECT (blob_offset + blob_length) AS end_offset \
+         FROM marf_squash_levels ORDER BY blob_offset DESC LIMIT 1",
+        NO_PARAMS,
+    )?
+    .unwrap_or(0);
+
+    Ok(marf_end.max(squash_end))
 }
 
 /// Do we have a partially-migrated database?
@@ -696,4 +739,205 @@ pub fn clear_tables(tx: &Transaction) -> Result<(), Error> {
     tx.execute("DELETE FROM marf_data", NO_PARAMS)?;
     tx.execute("DELETE FROM mined_blocks", NO_PARAMS)?;
     Ok(())
+}
+
+// --- Squash level registry ---
+
+use crate::chainstate::stacks::index::squash::SquashLevelRow;
+
+static SQL_SQUASH_LEVELS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS marf_squash_levels (
+    level_id INTEGER PRIMARY KEY,
+    min_height INTEGER NOT NULL,
+    max_height INTEGER NOT NULL,
+    blob_offset INTEGER NOT NULL,
+    blob_length INTEGER NOT NULL,
+    reads_redirected INTEGER NOT NULL DEFAULT 0
+);
+";
+
+pub fn create_squash_levels_table(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(SQL_SQUASH_LEVELS_TABLE)?;
+    Ok(())
+}
+
+pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(), Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO marf_squash_levels \
+         (level_id, min_height, max_height, blob_offset, blob_length, reads_redirected) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            row.level_id,
+            row.min_height,
+            row.max_height,
+            row.blob_offset as i64,
+            row.blob_length as i64,
+            row.reads_redirected as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Update an existing `marf_data` row by block hash to point to a new external
+/// blob location. Used by the incremental squash pipeline to redirect per-block
+/// blob entries to the squash blob. The inline `data` column is cleared.
+pub fn update_external_trie_blob_by_hash<T: MarfTrieId>(
+    conn: &Connection,
+    block_hash: &T,
+    offset: u64,
+    length: u64,
+) -> Result<(), Error> {
+    let empty_blob: &[u8] = &[];
+    conn.execute(
+        "UPDATE marf_data SET external_offset = ?1, external_length = ?2, data = ?3 \
+         WHERE block_hash = ?4",
+        params![offset as i64, length as i64, empty_blob, block_hash],
+    )?;
+    Ok(())
+}
+
+pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Error> {
+    // Table may not exist yet (pre-squash databases).
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='marf_squash_levels'",
+            NO_PARAMS,
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT level_id, min_height, max_height, blob_offset, blob_length, \
+         COALESCE(reads_redirected, 0) AS reads_redirected \
+         FROM marf_squash_levels ORDER BY min_height ASC",
+    )?;
+    let rows = stmt
+        .query_map(NO_PARAMS, |row| {
+            Ok(SquashLevelRow {
+                level_id: row.get::<_, u32>("level_id")?,
+                min_height: row.get::<_, u32>("min_height")?,
+                max_height: row.get::<_, u32>("max_height")?,
+                blob_offset: row.get::<_, i64>("blob_offset")? as u64,
+                blob_length: row.get::<_, i64>("blob_length")? as u64,
+                reads_redirected: row.get::<_, i64>("reads_redirected")? != 0,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Validate that no live references point into the byte range `[from_offset, +∞)` in the
+/// blob file, except for blocks whose `block_hash` is in `superseded_hashes`.
+///
+/// Returns `Ok(())` if the truncation zone is safe to overwrite/truncate.
+/// Returns `Err(CorruptionError)` if any live reference would be destroyed.
+///
+/// Checks both `marf_data` and `marf_squash_levels`.
+pub fn validate_truncation_zone<T: MarfTrieId>(
+    conn: &Connection,
+    from_offset: u64,
+    superseded_hashes: &[T],
+) -> Result<(), Error> {
+    // Check each marf_data row that overlaps the truncation zone.
+    // A blob overlaps if its extent (offset + length) exceeds from_offset.
+    let mut stmt = conn.prepare(
+        "SELECT block_hash, external_offset, external_length FROM marf_data \
+         WHERE (external_offset + external_length) > ?1 AND external_length > 0",
+    )?;
+    let dangling: Vec<(String, u64)> = stmt
+        .query_map(params![from_offset as i64], |row| {
+            Ok((
+                row.get::<_, String>("block_hash")?,
+                row.get::<_, i64>("external_offset")? as u64,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !dangling.is_empty() {
+        // Build a lookup set from the superseded hashes' ToSql representation.
+        let superseded_strs: std::collections::HashSet<String> =
+            superseded_hashes.iter().map(|h| format!("{}", h)).collect();
+
+        for (block_hash, offset) in &dangling {
+            if !superseded_strs.contains(block_hash) {
+                return Err(Error::CorruptionError(format!(
+                    "Live marf_data row for block {block_hash} references offset {offset} \
+                     (>= truncation boundary {from_offset}) but is not being superseded"
+                )));
+            }
+        }
+    }
+
+    // Check marf_squash_levels: any level whose blob extent overlaps the
+    // truncation zone? A level overlaps if blob_offset + blob_length > from_offset.
+    let levels = read_squash_levels(conn)?;
+    for level in &levels {
+        if level.blob_offset + level.blob_length > from_offset {
+            return Err(Error::CorruptionError(format!(
+                "Live marf_squash_levels row (level_id={}, blob_offset={}, blob_length={}) \
+                 overlaps truncation zone starting at {from_offset}",
+                level.level_id, level.blob_offset, level.blob_length
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Prune external blob references for non-canonical `marf_data` rows whose blob
+/// data falls within the reclaim truncation zone.
+///
+/// After blob export, committed fork blocks have `external_offset/external_length`
+/// pointing into the `.blobs` file and `data = x''` (empty).  These rows are
+/// unreachable from the canonical chain tip (`get_block_at_height` only walks
+/// the canonical ancestry), but `validate_truncation_zone` correctly rejects
+/// them because they are not in the canonical `superseded_hashes` set.
+///
+/// This function zeroes their external refs so that reclaim truncation can
+/// proceed.  **This is an intentional pruning of non-canonical fork state**:
+/// those trie blobs become permanently unreadable after this call.
+///
+/// Returns the number of orphaned rows pruned.
+pub fn prune_orphaned_external_refs<T: MarfTrieId>(
+    conn: &Connection,
+    from_offset: u64,
+    canonical_hashes: &[T],
+) -> Result<u64, Error> {
+    // Same predicate as validate_truncation_zone: find rows in the zone.
+    let mut stmt = conn.prepare(
+        "SELECT block_hash, external_offset FROM marf_data \
+         WHERE (external_offset + external_length) > ?1 AND external_length > 0",
+    )?;
+    let candidates: Vec<(String, u64)> = stmt
+        .query_map(params![from_offset as i64], |row| {
+            Ok((
+                row.get::<_, String>("block_hash")?,
+                row.get::<_, i64>("external_offset")? as u64,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let canonical_strs: std::collections::HashSet<String> =
+        canonical_hashes.iter().map(|h| format!("{}", h)).collect();
+
+    let mut count = 0u64;
+    for (block_hash, offset) in &candidates {
+        if !canonical_strs.contains(block_hash) {
+            warn!(
+                "Pruning non-canonical external trie ref: block {block_hash} \
+                 at offset {offset} (truncation boundary {from_offset})"
+            );
+            conn.execute(
+                "UPDATE marf_data SET external_offset = 0, external_length = 0 \
+                 WHERE block_hash = ?1",
+                params![block_hash],
+            )?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }

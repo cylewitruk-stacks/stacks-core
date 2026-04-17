@@ -54,7 +54,7 @@ pub struct EphemeralMarfStore<'a> {
     /// Transaction on a RAM-backed MARF which will be discarded once this struct is dropped
     ephemeral_marf: MarfTransaction<'a, StacksBlockId>,
     /// Handle to on-disk MARF
-    read_only_marf: ReadOnlyMarfStore<'a>,
+    read_only_marf: ReadOnlyMarfStore,
 }
 
 impl ClarityMarfStore for EphemeralMarfStore<'_> {}
@@ -204,7 +204,7 @@ impl<'a> EphemeralMarfStore<'a> {
     /// Returns Err(..) on sqlite error
     pub fn attach_read_only_marf(
         ephemeral_marf: &MARF<StacksBlockId>,
-        read_only_marf: &ReadOnlyMarfStore<'a>,
+        read_only_marf: &ReadOnlyMarfStore,
     ) -> Result<(), Error> {
         let conn = ephemeral_marf.sqlite_conn();
         conn.execute(
@@ -221,7 +221,7 @@ impl<'a> EphemeralMarfStore<'a> {
     /// Returns Ok(Self) on success
     /// Returns Err(..) if the ephemeral MARF tx was not opened.
     pub fn new(
-        mut read_only_marf: ReadOnlyMarfStore<'a>,
+        mut read_only_marf: ReadOnlyMarfStore,
         ephemeral_marf_tx: MarfTransaction<'a, StacksBlockId>,
     ) -> Result<Self, Error> {
         let base_tip_height = read_only_marf.get_current_block_height();

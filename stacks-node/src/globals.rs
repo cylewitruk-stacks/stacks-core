@@ -8,7 +8,7 @@ use stacks::chainstate::burn::operations::LeaderKeyRegisterOp;
 use stacks::chainstate::burn::BlockSnapshot;
 use stacks::chainstate::coordinator::comm::CoordinatorChannels;
 use stacks::chainstate::stacks::db::unconfirmed::UnconfirmedTxMap;
-use stacks::chainstate::stacks::db::StacksChainState;
+use stacks::chainstate::stacks::db::{SharedChainstate, StacksChainState};
 use stacks::chainstate::stacks::miner::MinerStatus;
 use stacks::config::{BurnchainConfig, MinerConfig};
 use stacks::net::NetworkResult;
@@ -77,6 +77,10 @@ pub struct Globals<T> {
     /// Initiative flag.
     /// Raised when the main loop should wake up and do something.
     initiative: Arc<Mutex<Option<String>>>,
+    /// Shared chainstate handle.
+    /// All threads access the single `StacksChainState` instance through this
+    /// mutex-protected wrapper. Set during boot after `open_and_exec()`.
+    shared_chainstate: Option<SharedChainstate>,
 }
 
 // Need to manually implement Clone, because [derive(Clone)] requires
@@ -101,6 +105,7 @@ impl<T> Clone for Globals<T> {
             estimated_winning_probs: self.estimated_winning_probs.clone(),
             previous_best_tips: self.previous_best_tips.clone(),
             initiative: self.initiative.clone(),
+            shared_chainstate: self.shared_chainstate.clone(),
         }
     }
 }
@@ -134,7 +139,22 @@ impl<T> Globals<T> {
             estimated_winning_probs: Arc::new(Mutex::new(HashMap::new())),
             previous_best_tips: Arc::new(Mutex::new(BTreeMap::new())),
             initiative: Arc::new(Mutex::new(None)),
+            shared_chainstate: None,
         }
+    }
+
+    /// Set the shared chainstate handle. Called once during boot after
+    /// `StacksChainState::open_and_exec()` completes.
+    pub fn set_shared_chainstate(&mut self, chainstate: SharedChainstate) {
+        self.shared_chainstate = Some(chainstate);
+    }
+
+    /// Get the shared chainstate handle.
+    /// Panics if called before `set_shared_chainstate()`.
+    pub fn get_shared_chainstate(&self) -> &SharedChainstate {
+        self.shared_chainstate
+            .as_ref()
+            .expect("BUG: shared_chainstate not initialized — set_shared_chainstate() was not called during boot")
     }
 
     /// Does the inventory sync watcher think we still need to

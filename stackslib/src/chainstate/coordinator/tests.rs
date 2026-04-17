@@ -1264,7 +1264,8 @@ fn missed_block_commits_2_05() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     // 1 block of every $MINING_COMMITMENT_WINDOW is missed
     let missed_blocks = vrf_keys.len() / (MINING_COMMITMENT_WINDOW as usize);
     let expected_height = vrf_keys.len() - missed_blocks;
@@ -1613,7 +1614,8 @@ fn missed_block_commits_2_1() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     // 1 block of every $MINING_COMMITMENT_WINDOW is missed
     let missed_blocks = vrf_keys.len() / (MINING_COMMITMENT_WINDOW as usize);
     let expected_height = vrf_keys.len() - missed_blocks;
@@ -1959,7 +1961,7 @@ fn late_block_commits_2_1() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
 
     // 1 block of every $MINING_COMMITMENT_WINDOW is missed
     let missed_blocks = vrf_keys.len() / (MINING_COMMITMENT_WINDOW as usize);
@@ -2137,7 +2139,8 @@ fn test_simple_setup() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -2440,7 +2443,8 @@ fn test_sortition_with_reward_set() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -2682,7 +2686,8 @@ fn test_sortition_with_burner_reward_set() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -2890,7 +2895,8 @@ fn test_pox_btc_ops() {
         if ix > 0 {
             let stacks_tip =
                 SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-            let mut chainstate = get_chainstate(path);
+            let chainstate = get_chainstate(path);
+
             let (stacker_balance, burn_height) = chainstate
                 .with_read_only_clarity_tx(
                     &sort_db.index_handle_at_tip(),
@@ -2970,7 +2976,8 @@ fn test_pox_btc_ops() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -3189,7 +3196,8 @@ fn test_stx_transfer_btc_ops() {
         if ix > 0 {
             let stacks_tip =
                 SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-            let mut chainstate = get_chainstate(path);
+            let chainstate = get_chainstate(path);
+
             let (sender_balance, burn_height) = chainstate
                 .with_read_only_clarity_tx(
                     &sort_db.index_handle_at_tip(),
@@ -3313,7 +3321,8 @@ fn test_stx_transfer_btc_ops() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -3709,7 +3718,8 @@ fn test_delegate_stx_btc_ops() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -3952,7 +3962,8 @@ fn test_initial_coinbase_reward_distributions() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -5480,7 +5491,8 @@ fn test_sortition_with_sunset() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
+
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -5828,7 +5840,7 @@ fn test_sortition_with_sunset_and_epoch_switch() {
     }
 
     let stacks_tip = SortitionDB::get_canonical_stacks_chain_tip_hash(sort_db.conn()).unwrap();
-    let mut chainstate = get_chainstate(path);
+    let chainstate = get_chainstate(path);
     assert_eq!(
         chainstate
             .with_read_only_clarity_tx(
@@ -6387,7 +6399,7 @@ fn eval_at_chain_tip(chainstate_path: &str, sort_db: &SortitionDB, eval: &str) -
         chainstate_path,
         &stacks_tip
     );
-    let mut chainstate = get_chainstate(chainstate_path);
+    let chainstate = get_chainstate(chainstate_path);
     chainstate
         .with_read_only_clarity_tx(
             &sort_db.index_handle_at_tip(),

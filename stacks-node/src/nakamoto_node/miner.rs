@@ -593,12 +593,8 @@ impl BlockMinerThread {
         reward_set: &RewardSet,
     ) -> Result<(), NakamotoNodeError> {
         Self::fault_injection_miner_stall();
-        let mut chain_state =
-            neon_node::open_chainstate_with_faults(&self.config).map_err(|e| {
-                NakamotoNodeError::SigningCoordinatorFailure(format!(
-                    "Failed to open chainstate DB. Cannot mine! {e:?}"
-                ))
-            })?;
+        let shared_chainstate = self.globals.get_shared_chainstate().clone();
+        let mut chain_state = shared_chainstate.lock();
         // Late block tenures are initiated only to issue the BlockFound
         //  tenure change tx (because they can be immediately extended to
         //  the next burn view). This checks whether or not we're in such a
@@ -952,12 +948,8 @@ impl BlockMinerThread {
             return Ok(Vec::new());
         }
 
-        let mut chain_state =
-            neon_node::open_chainstate_with_faults(&self.config).map_err(|e| {
-                NakamotoNodeError::SigningCoordinatorFailure(format!(
-                    "Failed to open chainstate DB. Cannot mine! {e:?}"
-                ))
-            })?;
+        let shared_chainstate = self.globals.get_shared_chainstate().clone();
+        let mut chain_state = shared_chainstate.lock();
         coordinator.propose_block(
             new_block,
             &self.burnchain,
@@ -990,12 +982,8 @@ impl BlockMinerThread {
             ))
         })?;
 
-        let mut chain_state =
-            neon_node::open_chainstate_with_faults(&self.config).map_err(|e| {
-                NakamotoNodeError::SigningCoordinatorFailure(format!(
-                    "Failed to open chainstate DB. Cannot mine! {e:?}"
-                ))
-            })?;
+        let shared_chainstate = self.globals.get_shared_chainstate().clone();
+        let mut chain_state = shared_chainstate.lock();
 
         let burn_election_height = self.burn_election_block.block_height;
 
@@ -1135,8 +1123,8 @@ impl BlockMinerThread {
             ));
         };
 
-        let mut chain_state = neon_node::open_chainstate_with_faults(&self.config)
-            .expect("FATAL: could not open chainstate DB");
+        let shared_chainstate = self.globals.get_shared_chainstate().clone();
+        let mut chain_state = shared_chainstate.lock();
         let sort_db = SortitionDB::open(
             &self.config.get_burn_db_file_path(),
             true,
@@ -1443,8 +1431,8 @@ impl BlockMinerThread {
     /// Check that the provided block is not mined too quickly after the parent block.
     /// This is to ensure that the signers do not reject the block due to the block being mined within the same second as the parent block.
     fn validate_timestamp(&self, x: &NakamotoBlock) -> Result<bool, NakamotoNodeError> {
-        let chain_state = neon_node::open_chainstate_with_faults(&self.config)
-            .expect("FATAL: could not open chainstate DB");
+        let shared_chainstate = self.globals.get_shared_chainstate().clone();
+        let chain_state = shared_chainstate.lock();
         let stacks_parent_header =
             NakamotoChainState::get_block_header(chain_state.db(), &x.header.parent_block_id)
                 .map_err(|e| {
@@ -1488,8 +1476,8 @@ impl BlockMinerThread {
         )
         .expect("FATAL: could not open sortition DB");
 
-        let mut chain_state = neon_node::open_chainstate_with_faults(&self.config)
-            .expect("FATAL: could not open chainstate DB");
+        let shared_chainstate = self.globals.get_shared_chainstate().clone();
+        let mut chain_state = shared_chainstate.lock();
 
         self.check_burn_tip_changed(&burn_db)?;
         if Self::fault_injection_block_mining_skip() {

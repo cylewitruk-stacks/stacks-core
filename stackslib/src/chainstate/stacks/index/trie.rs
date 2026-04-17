@@ -456,7 +456,9 @@ impl Trie {
 
         // not enough space -- need to promote node
         let mut new_node = match node {
-            TrieNodeType::Leaf(_) => panic!("Cannot insert into a leaf"),
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => {
+                panic!("Cannot insert into a leaf")
+            }
             TrieNodeType::Node256(_) => panic!("Somehow could not insert into a Node256"),
             TrieNodeType::Node4(ref data) => TrieNodeType::Node16(TrieNode16::from_node4(data)),
             TrieNodeType::Node16(ref data) => {
@@ -770,6 +772,14 @@ impl Trie {
                 match node {
                     TrieNodeType::Leaf(ref mut data) => {
                         Trie::promote_leaf_to_node4(storage, cursor, data, value)
+                    }
+                    TrieNodeType::LeafSquashed(ref sq) => {
+                        // Convert to plain leaf using tip value, then promote
+                        let mut plain_leaf = TrieLeaf {
+                            path: sq.path,
+                            data: sq.tip_value()?.clone(),
+                        };
+                        Trie::promote_leaf_to_node4(storage, cursor, &mut plain_leaf, value)
                     }
                     _ => Trie::splice_leaf(storage, cursor, value, &mut node),
                 }

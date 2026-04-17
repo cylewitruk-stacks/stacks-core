@@ -631,15 +631,14 @@ impl StacksChainState {
     }
 
     pub fn eval_boot_code_read_only(
-        &mut self,
+        &self,
         sortdb: &SortitionDB,
         stacks_block_id: &StacksBlockId,
         boot_contract_name: &str,
         code: &str,
     ) -> Result<Value, Error> {
         let iconn = sortdb.index_handle_at_block(self, stacks_block_id)?;
-        let ro_index = self.state_index.reopen_readonly()?;
-        let headers_db = HeadersDBConn(StacksDBConn::new(&ro_index, ()));
+        let headers_db = HeadersDBConn(StacksDBConn::new(&self.state_index, ()));
         self.clarity_state
             .eval_read_only(
                 stacks_block_id,

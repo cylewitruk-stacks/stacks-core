@@ -239,6 +239,10 @@ pub const HELIUM_BLOCK_LIMIT_20: ExecutionCost = ExecutionCost {
 pub const FAULT_DISABLE_MICROBLOCKS_COST_CHECK: &str = "MICROBLOCKS_DISABLE_COST_CHECK";
 pub const FAULT_DISABLE_MICROBLOCKS_BYTES_CHECK: &str = "MICROBLOCKS_DISABLE_BYTES_CHECK";
 
+/// How often (in Stacks blocks) to trigger automatic MARF squash.
+/// Set to 0 to disable. Dev-only / experimental.
+pub const MARF_SQUASH_CADENCE_BLOCKS: u64 = 1000;
+
 pub fn check_fault_injection(fault_name: &str) -> bool {
     use std::env;
 

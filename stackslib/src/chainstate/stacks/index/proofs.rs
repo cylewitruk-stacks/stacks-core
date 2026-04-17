@@ -414,14 +414,15 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         let storage = read_session.storage();
         let all_hashes = Trie::get_children_hashes_by_ptrs(storage, &node_ptrs)?;
 
-        let hashes = if node_id == TrieNodeID::Leaf as u8 {
-            vec![]
-        } else {
-            Self::make_proof_hashes_for_ptrs(&node_ptrs, &all_hashes, prev_chr)?
-        };
+        let hashes =
+            if node_id == TrieNodeID::Leaf as u8 || node_id == TrieNodeID::LeafSquashed as u8 {
+                vec![]
+            } else {
+                Self::make_proof_hashes_for_ptrs(&node_ptrs, &all_hashes, prev_chr)?
+            };
 
         let proof_node = match node_id {
-            x if x == TrieNodeID::Leaf as u8 => {
+            x if x == TrieNodeID::Leaf as u8 || x == TrieNodeID::LeafSquashed as u8 => {
                 let (path, data) = leaf_data.ok_or_else(|| {
                     Error::CorruptionError("Leaf proof node missing leaf payload".into())
                 })?;
@@ -1370,7 +1371,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 }
                 Ok(None) => {
                     trace!("Found leaf {:?}", &read.node_type());
-                    if clear_backptr(cursor.ptr().id()) != TrieNodeID::Leaf as u8 {
+                    let ptr_base = clear_backptr(cursor.ptr().id());
+                    if ptr_base != TrieNodeID::Leaf as u8
+                        && ptr_base != TrieNodeID::LeafSquashed as u8
+                    {
                         return Err(Error::CorruptionError(
                             "Non-leaf encountered at end of path".to_string(),
                         ));
@@ -1493,7 +1497,9 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                         .ptr()
                         .id()
                 });
-                if cursor_ptr_id == TrieNodeID::Leaf as u8 {
+                if cursor_ptr_id == TrieNodeID::Leaf as u8
+                    || cursor_ptr_id == TrieNodeID::LeafSquashed as u8
+                {
                     match reached_leaf_value {
                         Some(data) => {
                             if data != *expected_value {

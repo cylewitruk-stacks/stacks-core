@@ -27,7 +27,7 @@ use stacks::chainstate::coordinator::comm::{CoordinatorChannels, CoordinatorRece
 use stacks::chainstate::coordinator::{
     ChainsCoordinator, ChainsCoordinatorConfig, CoordinatorCommunication,
 };
-use stacks::chainstate::stacks::db::{ChainStateBootData, StacksChainState};
+use stacks::chainstate::stacks::db::{ChainStateBootData, SharedChainstate, StacksChainState};
 use stacks::chainstate::stacks::miner::{signal_mining_blocked, signal_mining_ready, MinerStatus};
 use stacks::core::StacksEpochId;
 use stacks::net::atlas::{AtlasConfig, AtlasDB, Attachment};
@@ -279,6 +279,7 @@ impl RunLoop {
         burnchain_config: &Burnchain,
         coordinator_receivers: CoordinatorReceivers,
         miner_status: Arc<Mutex<MinerStatus>>,
+        shared_chainstate: SharedChainstate,
     ) -> JoinHandle<()> {
         let use_test_genesis_data = use_test_genesis_chainstate(&self.config);
 
@@ -289,8 +290,6 @@ impl RunLoop {
             .map(|z| Attachment::new(z.zonefile_content.as_bytes().to_vec()))
             .collect();
         atlas_config.genesis_attachments = Some(genesis_attachments);
-
-        let chain_state_db = self.boot_chainstate(burnchain_config);
 
         // NOTE: re-instantiate AtlasConfig so we don't have to keep the genesis attachments around
         let moved_atlas_config = self.config.atlas.clone();
@@ -327,7 +326,7 @@ impl RunLoop {
                 };
                 ChainsCoordinator::run(
                     coord_config,
-                    chain_state_db,
+                    shared_chainstate,
                     moved_burnchain_config,
                     &coordinator_dispatcher,
                     coordinator_receivers,
@@ -447,7 +446,7 @@ impl RunLoop {
         let (relay_send, relay_recv) = sync_channel(RELAYER_MAX_BUFFER);
 
         // set up globals so other subsystems can instantiate off of the runloop state.
-        let globals = Globals::new(
+        let mut globals = Globals::new(
             coordinator_senders,
             self.get_miner_status(),
             relay_send,
@@ -457,6 +456,16 @@ impl RunLoop {
             mine_start,
             LeaderKeyRegistrationState::default(),
         );
+
+        // Boot chainstate (runs genesis/migrations) and wrap in the shared
+        // handle. This single SharedChainstate is used by the coordinator,
+        // relayer, and p2p threads — all access is serialized through the
+        // mutex so there is exactly one live mmap of the .blobs file.
+        let shared_chainstate = {
+            let chainstate = self.boot_chainstate(&burnchain_config);
+            SharedChainstate::new(chainstate)
+        };
+        globals.set_shared_chainstate(shared_chainstate.clone());
         self.set_globals(globals.clone());
 
         // have headers; boot up the chains coordinator and instantiate the chain state
@@ -464,6 +473,7 @@ impl RunLoop {
             &burnchain_config,
             coordinator_receivers,
             globals.get_miner_status(),
+            shared_chainstate,
         );
         self.start_prometheus();
 

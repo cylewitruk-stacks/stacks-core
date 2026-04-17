@@ -39,6 +39,7 @@ pub fn node_type_name(node: &TrieNodeType) -> &'static str {
         TrieNodeType::Node48(_) => "Node48",
         TrieNodeType::Node256(_) => "Node256",
         TrieNodeType::Leaf(_) => "Leaf",
+        TrieNodeType::LeafSquashed(_) => "LeafSquashed",
     }
 }
 

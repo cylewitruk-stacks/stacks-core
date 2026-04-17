@@ -25,6 +25,7 @@ ripemd = "0.1.1"
 regex = "1"
 mio = "0.6"
 lazy_static = "1.4.0"
+parking_lot.workspace = true
 url = "2.1.0"
 percent-encoding = "2.1.0"
 prometheus = { version = "0.9", optional = true }

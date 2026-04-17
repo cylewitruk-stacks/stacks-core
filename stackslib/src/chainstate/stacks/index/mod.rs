@@ -39,6 +39,7 @@ pub mod node;
 pub mod profile;
 pub mod proofs;
 pub mod scratch;
+pub mod squash;
 pub mod storage;
 pub mod trie;
 pub mod trie_sql;
@@ -47,8 +48,8 @@ pub mod trie_sql;
 pub mod test;
 
 use crate::chainstate::stacks::index::node::{
-    ParkedNodeHandle, TrieLeafRef, TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeTransientMeta,
-    TrieNodeType, TriePtr,
+    ParkedNodeHandle, TrieLeafRef, TrieLeafSquashedRef, TrieNodeID, TrieNodePatch, TrieNodeRef,
+    TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 
 #[derive(Debug)]
@@ -396,6 +397,7 @@ pub enum Error {
     OverflowError,
     Patch(Option<TrieHash>, TrieNodePatch),
     NodeTooDeep,
+    NotSupportedError(String),
 }
 
 /// A borrowed slice of serialized trie node bytes (e.g. from an mmap'd blob).
@@ -737,6 +739,15 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     /// Return the genesis block hash used in tests, if configured.
     #[cfg(test)]
     fn test_genesis_block(&self) -> Option<T>;
+
+    /// Return the opened block's height within a squash level, if any.
+    ///
+    /// Used by `walk` to resolve `TrieLeafSquashed` entries at the correct
+    /// point-in-time. Returns `None` when the currently-open block is not
+    /// inside a squash range.
+    fn squash_opened_height(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Bundles a [`TrieReadStorage`] reference with a [`TrieNodeReadState`] for convenient node
@@ -947,7 +958,10 @@ impl<'a> ReadTrieNode<'a> {
         match &self.backing {
             ReadNodeBacking::VolatileDecoded(node) => Ok(node.is_leaf()),
             ReadNodeBacking::PersistedDecoded(node) => Ok(node.is_leaf()),
-            ReadNodeBacking::PersistedBytes(node) => Ok(node.node_type() == TrieNodeID::Leaf),
+            ReadNodeBacking::PersistedBytes(node) => Ok(matches!(
+                node.node_type(),
+                TrieNodeID::Leaf | TrieNodeID::LeafSquashed
+            )),
             ReadNodeBacking::Owned(node) => Ok(node.is_leaf()),
         }
     }
@@ -994,9 +1008,38 @@ impl<'a> ReadTrieNode<'a> {
                     path: leaf.path.as_slice(),
                     data: &leaf.data,
                 }),
+                TrieNodeType::LeafSquashed(sq) => Some(TrieLeafRef {
+                    path: sq.path.as_slice(),
+                    data: sq.tip_value()?,
+                }),
                 _ => None,
             }),
             ReadNodeBacking::Owned(node) => Ok(TrieNodeRef::from(node).as_leaf()),
+        }
+    }
+
+    /// Access the borrowed squashed-leaf view if this node is a LeafSquashed.
+    /// Returns `None` if this is not a LeafSquashed node.
+    pub fn as_leaf_squashed_ref(&self) -> Result<Option<TrieLeafSquashedRef<'_>>, Error> {
+        match &self.backing {
+            ReadNodeBacking::VolatileDecoded(TrieNodeRef::LeafSquashed(sq)) => Ok(Some(*sq)),
+            ReadNodeBacking::PersistedDecoded(TrieNodeRef::LeafSquashed(sq)) => Ok(Some(*sq)),
+            ReadNodeBacking::PersistedBytes(node) => match self.decoded_from_bytes(node)? {
+                TrieNodeType::LeafSquashed(sq) => Ok(Some(TrieLeafSquashedRef {
+                    path: sq.path.as_slice(),
+                    tip_value: sq.tip_value()?,
+                    entries: &sq.entries,
+                })),
+                _ => Ok(None),
+            },
+            ReadNodeBacking::Owned(TrieNodeType::LeafSquashed(sq)) => {
+                Ok(Some(TrieLeafSquashedRef {
+                    path: sq.path.as_slice(),
+                    tip_value: sq.tip_value()?,
+                    entries: &sq.entries,
+                }))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1128,6 +1171,7 @@ impl fmt::Display for Error {
                 write!(f, "Read patch node instead of expected node: {p:?}")
             }
             Error::NodeTooDeep => write!(f, "Node is too deeply buried under patches"),
+            Error::NotSupportedError(ref s) => write!(f, "Operation not supported: {s}"),
         }
     }
 }

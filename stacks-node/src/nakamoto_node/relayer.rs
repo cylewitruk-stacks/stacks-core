@@ -37,7 +37,7 @@ use stacks::chainstate::burn::{BlockSnapshot, ConsensusHash};
 use stacks::chainstate::nakamoto::coordinator::get_nakamoto_next_recipients;
 use stacks::chainstate::nakamoto::{NakamotoBlockHeader, NakamotoChainState};
 use stacks::chainstate::stacks::address::PoxAddress;
-use stacks::chainstate::stacks::db::StacksChainState;
+use stacks::chainstate::stacks::db::{SharedChainstate, StacksChainState};
 use stacks::chainstate::stacks::miner::{
     set_mining_spend_amount, signal_mining_blocked, signal_mining_ready,
 };
@@ -67,9 +67,7 @@ use super::{
 };
 use crate::burnchains::BurnchainController;
 use crate::nakamoto_node::miner::{BlockMinerThread, MinerDirective};
-use crate::neon_node::{
-    fault_injection_skip_mining, open_chainstate_with_faults, LeaderKeyRegistrationState,
-};
+use crate::neon_node::{fault_injection_skip_mining, LeaderKeyRegistrationState};
 use crate::run_loop::nakamoto::{Globals, RunLoop};
 use crate::run_loop::RegisteredKey;
 use crate::BitcoinRegtestController;
@@ -414,8 +412,8 @@ pub struct RelayerThread {
     pub(crate) config: Config,
     /// Handle to the sortition DB
     sortdb: SortitionDB,
-    /// Handle to the chainstate DB
-    chainstate: StacksChainState,
+    /// Shared handle to the chainstate DB (mutex-protected, single instance)
+    chainstate: SharedChainstate,
     /// Handle to the mempool DB
     mempool: MemPoolDB,
     /// Handle to global state and inter-thread communication channels
@@ -495,8 +493,7 @@ impl RelayerThread {
         )
         .expect("FATAL: failed to open burnchain DB");
 
-        let chainstate =
-            open_chainstate_with_faults(&config).expect("FATAL: failed to open chainstate DB");
+        let chainstate = globals.get_shared_chainstate().clone();
 
         let mempool = config
             .connect_mempool_db()
@@ -572,20 +569,22 @@ impl RelayerThread {
             self.last_network_block_height_ts = get_epoch_time_ms();
         }
 
-        let net_receipts = self
-            .relayer
-            .process_network_result(
-                &self.local_peer,
-                &mut net_result,
-                &self.burnchain,
-                &mut self.sortdb,
-                &mut self.chainstate,
-                &mut self.mempool,
-                self.globals.sync_comms.get_ibd(),
-                Some(&self.globals.coord_comms),
-                Some(&self.event_dispatcher),
-            )
-            .expect("BUG: failure processing network results");
+        let net_receipts = {
+            let mut chainstate = self.chainstate.lock();
+            self.relayer
+                .process_network_result(
+                    &self.local_peer,
+                    &mut net_result,
+                    &self.burnchain,
+                    &mut self.sortdb,
+                    &mut *chainstate,
+                    &mut self.mempool,
+                    self.globals.sync_comms.get_ibd(),
+                    Some(&self.globals.coord_comms),
+                    Some(&self.event_dispatcher),
+                )
+                .expect("BUG: failure processing network results")
+        };
 
         if net_receipts.num_new_blocks > 0 {
             // if we received any new block data that could invalidate our view of the chain tip,
@@ -659,7 +658,7 @@ impl RelayerThread {
                 StacksBlockId::new(&canonical_stacks_tip_ch, &canonical_stacks_tip_bh);
 
             let commits_to_tip_tenure = Self::sortition_commits_to_stacks_tip_tenure(
-                &mut self.chainstate,
+                &mut *self.chainstate.lock(),
                 &canonical_stacks_tip,
                 &canonical_stacks_snapshot,
                 &sn,
@@ -715,7 +714,7 @@ impl RelayerThread {
             // we won the current ongoing tenure, but not the most recent sortition. Should we attempt to extend immediately or wait for the incoming miner?
             if let Ok(has_higher) = Self::has_higher_sortition_commits_to_stacks_tip_tenure(
                 &self.sortdb,
-                &mut self.chainstate,
+                &mut *self.chainstate.lock(),
                 &sn,
                 &canonical_stacks_snapshot,
             ) {
@@ -808,7 +807,7 @@ impl RelayerThread {
         let canonical_stacks_tip =
             StacksBlockId::new(&canonical_stacks_tip_ch, &canonical_stacks_tip_bh);
         let commits_to_tip_tenure = Self::sortition_commits_to_stacks_tip_tenure(
-            &mut self.chainstate,
+            &mut *self.chainstate.lock(),
             &canonical_stacks_tip,
             &canonical_stacks_snapshot,
             &last_winning_snapshot,
@@ -1077,9 +1076,11 @@ impl RelayerThread {
 
         let stacks_tip = StacksBlockId::new(tip_block_ch, tip_block_bh);
 
+        let mut chainstate = self.chainstate.lock();
+
         // sanity check -- this block must exist and have been processed locally
         let highest_tenure_start_block_header = NakamotoChainState::get_tenure_start_block_header(
-            &mut self.chainstate.index_conn(),
+            &mut chainstate.index_conn(),
             &stacks_tip,
             tip_block_ch,
         )
@@ -1099,7 +1100,7 @@ impl RelayerThread {
         // load the VRF proof generated in this tenure, so we can use it to seed the VRF in the
         // upcoming tenure.  This may be an epoch2x VRF proof.
         let tip_vrf_proof = NakamotoChainState::get_block_vrf_proof(
-            &mut self.chainstate.index_conn(),
+            &mut chainstate.index_conn(),
             &stacks_tip,
             tip_block_ch,
         )
@@ -1116,7 +1117,7 @@ impl RelayerThread {
         let recipients = get_nakamoto_next_recipients(
             &sort_tip,
             &mut self.sortdb,
-            &mut self.chainstate,
+            &mut *chainstate,
             &stacks_tip,
             &self.burnchain,
         )
@@ -1161,7 +1162,7 @@ impl RelayerThread {
                 &tip_block_bh, &tip_block_ch, &tip_block_id
             );
             let Ok(Some(parent_version)) =
-                NakamotoChainState::get_nakamoto_block_version(self.chainstate.db(), &tip_block_id)
+                NakamotoChainState::get_nakamoto_block_version(chainstate.db(), &tip_block_id)
             else {
                 error!(
                     "Relayer: Failed to lookup block version of {}",
@@ -1748,8 +1749,9 @@ impl RelayerThread {
         });
         let mut last_committed = self.make_block_commit(&tip_block_ch, &tip_block_bh)?;
 
+        let chainstate = self.chainstate.lock();
         let Some(tip_height) = NakamotoChainState::get_block_header(
-            self.chainstate.db(),
+            chainstate.db(),
             &StacksBlockId::new(&tip_block_ch, &tip_block_bh),
         )
         .map_err(|e| {

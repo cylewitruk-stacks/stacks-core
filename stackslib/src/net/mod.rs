@@ -4679,7 +4679,8 @@ pub mod test {
                 .sortdb
                 .take()
                 .expect("FATAL: sortdb not restored");
-            let mut node = self
+
+            let node = self
                 .chain
                 .stacks_node
                 .take()

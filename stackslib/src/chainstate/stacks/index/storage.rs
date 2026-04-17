@@ -34,6 +34,7 @@ use crate::chainstate::stacks::index::node::{
 };
 use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::scratch::MarfReadState;
+use crate::chainstate::stacks::index::squash::SquashTrailer;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
     bits, trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodePatching,
@@ -1644,7 +1645,7 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     pub uncommitted_writes: Option<(T, UncommittedState<T>)>,
 
     /// Currently-open block (may be `uncommitted_writes.unwrap().0`)
-    cur_block: T,
+    pub(crate) cur_block: T,
     /// Tracks the `row_id` for `cur_block`.
     ///
     /// If `cur_block == uncommitted_writes`, this value should always be `None`.
@@ -1687,7 +1688,25 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     ///
     /// Populated when a committed block is opened, so that hot-path reads for the current block can
     /// bypass the `RefCell<HashMap>` offset cache in `TrieFile`.
-    cur_block_trie_offset: Option<u64>,
+    pub(crate) cur_block_trie_offset: Option<u64>,
+
+    /// Loaded squash level trailers (sorted by min_height). Populated on MARF open
+    /// from `marf_squash_levels` SQL table. Empty for non-squashed MARFs.
+    pub squash_levels: Vec<std::sync::Arc<SquashTrailer>>,
+
+    /// O(1) block-hash → (level_index, height, blob_offset, reads_redirected)
+    /// index built from all trailers. Avoids O(levels × log N) lookup cost
+    /// on each `open_block` call.
+    pub squash_block_index: std::collections::HashMap<[u8; 32], (usize, u32, u64, bool)>,
+
+    /// When a block within a squash range is opened, records the height for
+    /// point-in-time value lookups via `TrieLeafSquashed::value_at_height()`.
+    pub squash_opened_height: Option<u32>,
+
+    /// Index into `squash_levels` for the currently-opened block's squash level.
+    /// Set alongside `squash_opened_height` in the `open_block_impl` fast path;
+    /// used by `read_node_hash` for O(1) trailer lookup instead of scanning.
+    pub squash_opened_level_idx: Option<usize>,
 }
 
 // disk-backed Trie.
@@ -1697,8 +1716,8 @@ pub struct TrieFileStorage<T: MarfTrieId> {
     pub db_path: String,
 
     db: Connection,
-    blobs: Option<TrieFile>,
-    data: TrieStorageTransientData<T>,
+    pub(crate) blobs: Option<TrieFile>,
+    pub(crate) data: TrieStorageTransientData<T>,
     cache: BlockCache<T>,
     bench: TrieBenchmark,
     hash_calculation_mode: TrieHashCalculationMode,
@@ -1741,6 +1760,10 @@ impl<T: MarfTrieId> Default for TrieStorageTransientData<T> {
             unconfirmed: false,
             unconfirmed_block_id: None,
             cur_block_trie_offset: None,
+            squash_levels: Vec::new(),
+            squash_block_index: std::collections::HashMap::new(),
+            squash_opened_height: None,
+            squash_opened_level_idx: None,
         }
     }
 }
@@ -1766,6 +1789,8 @@ impl<T: MarfTrieId> TrieStorageTransientData<T> {
         self.cur_block_id = id;
         self.cur_block = bhh;
         self.cur_block_trie_offset = None;
+        self.squash_opened_height = None;
+        self.squash_opened_level_idx = None;
     }
 
     fn clear_block_id(&mut self) {
@@ -1923,6 +1948,40 @@ fn open_block_impl<T: MarfTrieId>(
         }
     }
 
+    // Squash-aware fast path: if this block is in a squash level, record the opened height and
+    // level index so that root-hash lookups can consult the squash trailer via O(1) index.
+    //
+    // When `reads_redirected` is true, marf_data has been redirected to the squash blob
+    // (originals truncated), so we seed `cur_block_trie_offset` for fast offset resolution.
+    // When false (append-only squash), marf_data still points to the original per-block blobs.
+    let bhh_key: [u8; 32] = bhh
+        .as_bytes()
+        .get(..32)
+        .and_then(|s| s.try_into().ok())
+        .unwrap_or([0u8; 32]);
+    if let Some(&(level_idx, height, squash_blob_offset, reads_redirected)) =
+        data.squash_block_index.get(&bhh_key)
+    {
+        let block_id =
+            get_block_id_caching_impl(data.unconfirmed, cache, db, bhh).map_err(|e| {
+                test_debug!("Failed to open squash-range block {:?}: {:?}", bhh, e);
+                e
+            })?;
+        data.set_block(bhh.clone(), Some(block_id));
+        data.squash_opened_height = Some(height);
+        data.squash_opened_level_idx = Some(level_idx);
+
+        // * For reclaimed levels, marf_data rows point to the squash blob — seed the trie-offset
+        // hint so reads skip the offset cache/SQL lookup.
+        // * For append-only squash, leave it None so reads go through the original per-block blobs.
+        if reads_redirected {
+            data.cur_block_trie_offset = Some(squash_blob_offset);
+        }
+
+        bench.open_block_finish(false);
+        return Ok(());
+    }
+
     let block_id = get_block_id_caching_impl(data.unconfirmed, cache, db, bhh).map_err(|e| {
         test_debug!("Failed to open {:?}: {:?}", bhh, e);
         e
@@ -1937,6 +1996,9 @@ fn open_block_impl<T: MarfTrieId>(
 /// `TrieStorageConnection` and `ReopenedTrieStorageConnection`.
 ///
 /// Panics if `bhh` matches the currently-being-built uncommitted block (programming error).
+///
+/// Restores squash context (opened height, level index, trie offset) when the block
+/// lives in a squash level, mirroring the squash-aware path in `open_block_impl`.
 fn open_block_known_id_impl<T: MarfTrieId>(
     data: &mut TrieStorageTransientData<T>,
     bhh: &T,
@@ -1953,6 +2015,24 @@ fn open_block_known_id_impl<T: MarfTrieId>(
     }
 
     data.set_block(bhh.clone(), Some(id));
+
+    // Restore squash context so that root-hash lookups and trie reads use the
+    // squash blob/trailer instead of the (possibly reclaimed) per-block blobs.
+    let bhh_key: [u8; 32] = bhh
+        .as_bytes()
+        .get(..32)
+        .and_then(|s| s.try_into().ok())
+        .unwrap_or([0u8; 32]);
+    if let Some(&(level_idx, height, squash_blob_offset, reads_redirected)) =
+        data.squash_block_index.get(&bhh_key)
+    {
+        data.squash_opened_height = Some(height);
+        data.squash_opened_level_idx = Some(level_idx);
+        if reads_redirected {
+            data.cur_block_trie_offset = Some(squash_blob_offset);
+        }
+    }
+
     Ok(())
 }
 
@@ -2092,8 +2172,12 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
                 if let Some(ReadTrieItem {
                     kind: ReadTrieItemKind::Node(node),
                     ..
-                }) = blobs.read_trie_item_borrowed(&self.db, id, &clear_ptr)?
-                {
+                }) = blobs.read_trie_item_borrowed(
+                    &self.db,
+                    id,
+                    &clear_ptr,
+                    self.data.cur_block_trie_offset,
+                )? {
                     return Ok(node);
                 }
             }
@@ -2163,6 +2247,24 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return uncommitted_trie.read_node_hash(ptr);
         }
 
+        // Squash fast-path: when reading the root node hash of a block inside a squash
+        // level, return the per-height root hash stored in the squash trailer instead of
+        // reading from the blob. The squash blob contains a single merged trie whose root
+        // node hash is the *tip's* hash, not the per-block hash, so the normal read path
+        // would return the wrong value for ancestor blocks.
+        if ptr.ptr() == ROOT_PTR_DISK {
+            if let (Some(h), Some(level_idx)) = (
+                self.data.squash_opened_height,
+                self.data.squash_opened_level_idx,
+            ) {
+                if let Some(level) = self.data.squash_levels.get(level_idx) {
+                    if let Some(root_hash) = level.root_hash_at(h) {
+                        return Ok(*root_hash);
+                    }
+                }
+            }
+        }
+
         match self.data.cur_block_id {
             Some(block_id) => {
                 self.bench.read_node_hash_start();
@@ -2219,6 +2321,10 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
     #[cfg(test)]
     fn test_genesis_block(&self) -> Option<T> {
         self.test_genesis_block.clone()
+    }
+
+    fn squash_opened_height(&self) -> Option<u32> {
+        self.data.squash_opened_height
     }
 
     fn write_children_hashes_by_ptrs<W: Write + ?Sized>(
@@ -2370,6 +2476,101 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         self.db
     }
 
+    /// Write a chunk of blob data at the given file offset without syncing.
+    ///
+    /// Part of the streaming blob write API. Call [`finish_blob_write`] after
+    /// all chunks are written.
+    pub(crate) fn pwrite_blob_chunk(&mut self, data: &[u8], offset: u64) -> Result<(), Error> {
+        let blobs = self.blobs.as_mut().ok_or_else(|| {
+            Error::NotSupportedError("Cannot pwrite blob chunk: external_blobs not enabled".into())
+        })?;
+        blobs.pwrite_blob_chunk(data, offset)
+    }
+
+    /// Finalize a streaming blob write: sync, optionally truncate, remap.
+    ///
+    /// See [`TrieFile::finish_blob_write`] for details.
+    pub(crate) fn finish_blob_write(&mut self, truncate_to: Option<u64>) -> Result<(), Error> {
+        let blobs = self.blobs.as_mut().ok_or_else(|| {
+            Error::NotSupportedError("Cannot finish blob write: external_blobs not enabled".into())
+        })?;
+        blobs.finish_blob_write(truncate_to)
+    }
+
+    /// Return the current length of the external blobs file (next append offset).
+    pub(crate) fn get_blob_append_offset(&self) -> Result<u64, Error> {
+        trie_sql::get_external_blobs_length(&self.db)
+    }
+
+    /// Reload squash level metadata and remap the blob file after an external
+    /// squash operation has modified both the SQLite DB and the `.blobs` file
+    /// through a separate handle.
+    pub fn refresh_after_squash(&mut self) -> Result<(), Error> {
+        // 1. Remap the blob file mmap to cover new data.
+        if let Some(ref mut blobs) = self.blobs {
+            blobs.remap_and_invalidate()?;
+        }
+
+        // 2. Reload squash level metadata from SQLite.
+        let squash_level_rows = trie_sql::read_squash_levels(&self.db)?;
+        if !squash_level_rows.is_empty() {
+            let mut levels = Vec::with_capacity(squash_level_rows.len());
+            let mut block_index = std::collections::HashMap::new();
+
+            for row in &squash_level_rows {
+                // Stub level (no blob) — register with empty trailer.
+                if row.blob_length == 0 {
+                    levels.push(std::sync::Arc::new(SquashTrailer::empty()));
+                    continue;
+                }
+                if let Some(ref blobs) = self.blobs {
+                    let footer_offset = row.blob_offset + row.blob_length
+                        - crate::chainstate::stacks::index::squash::SQUASH_FOOTER_SIZE as u64;
+                    let footer_bytes = blobs.read_blob_range(footer_offset, 12)?;
+                    let trailer_rel_offset =
+                        SquashTrailer::read_footer(&footer_bytes).ok_or_else(|| {
+                            Error::CorruptionError(
+                                "Squash level blob has no valid trailer footer".into(),
+                            )
+                        })?;
+
+                    let trailer_abs_offset = row.blob_offset + trailer_rel_offset;
+                    let trailer_length = row.blob_offset + row.blob_length - trailer_abs_offset;
+                    let trailer_bytes =
+                        blobs.read_blob_range(trailer_abs_offset, trailer_length)?;
+                    let trailer = SquashTrailer::read_from(&trailer_bytes)?;
+
+                    let level_idx = levels.len();
+                    for &(bhh, height) in &trailer.sorted_block_entries {
+                        block_index.insert(
+                            bhh,
+                            (level_idx, height, row.blob_offset, row.reads_redirected),
+                        );
+                    }
+
+                    levels.push(std::sync::Arc::new(trailer));
+                }
+            }
+
+            self.data.squash_levels = levels;
+            self.data.squash_block_index = block_index;
+        } else {
+            self.data.squash_levels.clear();
+            self.data.squash_block_index.clear();
+        }
+
+        // 3. Clear the block cache (stale after squash).
+        self.cache = BlockCache::new("noop");
+
+        // 4. Invalidate the currently-open block context so the next
+        //    open_block() re-resolves through fresh squash metadata
+        //    instead of short-circuiting on the cached cur_block.
+        self.data.set_block(T::sentinel(), None);
+        self.data.trie_ancestor_hash_bytes_cache = None;
+
+        Ok(())
+    }
+
     fn open_opts(
         db_path: &str,
         readonly: bool,
@@ -2424,7 +2625,10 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         };
 
         let prev_schema_version = trie_sql::migrate_tables_if_needed::<T>(&mut db)?;
-        if prev_schema_version != trie_sql::SQL_MARF_SCHEMA_VERSION || marf_opts.force_db_migrate {
+        // Blob export is only needed when upgrading from schema 1 (inline sqlite blobs)
+        // to schema 2+ (external .blobs file).  Later schema bumps (e.g. 2→3 for squash
+        // metadata) don't touch the blob layout and must not trigger a full re-export.
+        if prev_schema_version < 2 || marf_opts.force_db_migrate {
             if let Some(blobs) = blobs.as_mut() {
                 if TrieFile::exists(&db_path)? {
                     // migrate blobs out of the old DB
@@ -2444,6 +2648,56 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
         let cache = BlockCache::new(&marf_opts.cache_strategy);
 
+        let mut data = TrieStorageTransientData::new(T::sentinel(), None, readonly, unconfirmed);
+
+        // Load squash level metadata (if any squash levels exist).
+        let squash_level_rows = trie_sql::read_squash_levels(&db)?;
+        if !squash_level_rows.is_empty() {
+            let mut levels = Vec::with_capacity(squash_level_rows.len());
+            let mut block_index = std::collections::HashMap::new();
+
+            for row in &squash_level_rows {
+                // Stub level (no blob) — register with empty trailer.
+                if row.blob_length == 0 {
+                    levels.push(std::sync::Arc::new(SquashTrailer::empty()));
+                    continue;
+                }
+                if let Some(ref blobs) = blobs {
+                    // Read only the 12-byte footer to find the trailer offset.
+                    let footer_offset = row.blob_offset + row.blob_length
+                        - crate::chainstate::stacks::index::squash::SQUASH_FOOTER_SIZE as u64;
+                    let footer_bytes = blobs.read_blob_range(footer_offset, 12)?;
+                    let trailer_rel_offset =
+                        SquashTrailer::read_footer(&footer_bytes).ok_or_else(|| {
+                            Error::CorruptionError(
+                                "Squash level blob has no valid trailer footer".into(),
+                            )
+                        })?;
+
+                    // Read only the trailer region (from trailer_offset to end of blob).
+                    let trailer_abs_offset = row.blob_offset + trailer_rel_offset;
+                    let trailer_length = row.blob_offset + row.blob_length - trailer_abs_offset;
+                    let trailer_bytes =
+                        blobs.read_blob_range(trailer_abs_offset, trailer_length)?;
+                    let trailer = SquashTrailer::read_from(&trailer_bytes)?;
+
+                    // Build the block-hash → (level_idx, height) index.
+                    let level_idx = levels.len();
+                    for &(bhh, height) in &trailer.sorted_block_entries {
+                        block_index.insert(
+                            bhh,
+                            (level_idx, height, row.blob_offset, row.reads_redirected),
+                        );
+                    }
+
+                    levels.push(std::sync::Arc::new(trailer));
+                }
+            }
+
+            data.squash_levels = levels;
+            data.squash_block_index = block_index;
+        }
+
         let ret = TrieFileStorage {
             db_path,
             db,
@@ -2454,7 +2708,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             compress: marf_opts.compress,
             mmap: marf_opts.mmap,
 
-            data: TrieStorageTransientData::new(T::sentinel(), None, readonly, unconfirmed),
+            data,
 
             // used in testing in order to short-circuit block-height lookups
             //   when the trie struct is tested outside of marf.rs usage

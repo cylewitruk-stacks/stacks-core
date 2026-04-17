@@ -45,6 +45,7 @@ pub mod node;
 pub mod node_patch;
 pub mod proofs;
 pub mod scratch;
+pub mod squash;
 pub mod storage;
 pub mod trie;
 
@@ -201,6 +202,10 @@ where
         let (next, next_hash, depth) = frontier.pop().unwrap();
         let (ptrs, path_len) = match next {
             TrieNodeType::Leaf(ref leaf_data) => {
+                test_debug!("{}{} {:?}", &space(depth), next_hash, leaf_data);
+                (vec![], leaf_data.path.len())
+            }
+            TrieNodeType::LeafSquashed(ref leaf_data) => {
                 test_debug!("{}{} {:?}", &space(depth), next_hash, leaf_data);
                 (vec![], leaf_data.path.len())
             }
@@ -372,7 +377,9 @@ pub fn make_node_path<Db: Deref<Target = Connection>>(
             TrieNodeType::Node4(ref mut data) => {
                 assert!(data.insert(&TriePtr::new(node_id, chr, node_ptr)))
             }
-            TrieNodeType::Leaf(_) => panic!("can't insert into leaf"),
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => {
+                panic!("can't insert into leaf")
+            }
         };
 
         s.write_nodetype(
@@ -417,7 +424,9 @@ pub fn make_node_path<Db: Deref<Target = Connection>>(
         TrieNodeType::Node4(ref mut data) => {
             assert!(data.insert(&TriePtr::new(TrieNodeID::Leaf as u8, child_chr, child_ptr)))
         }
-        TrieNodeType::Leaf(_) => panic!("can't insert into leaf"),
+        TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => {
+            panic!("can't insert into leaf")
+        }
     };
 
     s.write_nodetype(

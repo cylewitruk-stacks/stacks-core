@@ -248,6 +248,15 @@ impl TrieFile {
 
     /// Read a trie blob in its entirety from the blobs file.
     /// Takes `&self` — uses positional reads.
+    /// Read a raw byte range from the blob file at the given offset and length.
+    /// Used for reading squash level blobs (which include trie nodes + trailer).
+    pub fn read_blob_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
+        let mut buf = vec![0u8; length as usize];
+        let n = self.read_bytes_at(&mut buf, offset)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
     pub fn read_trie_blob_bytes(&self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
         let (offset, length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
         let mut buf = vec![0u8; length as usize];
@@ -528,24 +537,52 @@ impl TrieFile {
             return bits::read_trie_item_from_slice(bytes, ptr.id(), scratch);
         }
         // Slow path: positional read into scratch's reusable buffer, then decode.
-        // Pattern: take buffer → pread → decode (extracts hash + node ID from bytes,
-        // copies decoded node into scratch slots) → restore buffer for reuse.
-        let max_len = bits::get_node_max_byte_len(ptr.id())?;
+        //
+        // We size the read buffer from the ptr hint first (correct in the vast
+        // majority of cases). After reading, we check the actual stored node ID.
+        // If it requires a larger buffer (e.g. ptr says Leaf but on-disk is
+        // LeafSquashed in a FullHistory squash blob), we re-read with the
+        // correct size. This avoids a double-read in the common case while
+        // remaining correct when the ptr hint is stale.
+        let hinted_max = bits::get_node_max_byte_len(ptr.id())?;
         let mut buf = scratch.take_node_bytes();
-        buf.resize(max_len, 0);
+        buf.resize(hinted_max, 0);
         let n = self.read_bytes_at(&mut buf, file_offset)?;
         buf.truncate(n);
+
         let (hash, remaining) = bits::parse_hash_from_bytes(&buf)?;
         let stored_node_id = bits::stored_node_id_from_bytes(remaining)?;
+
+        // If the stored type needs a larger buffer than what we allocated,
+        // re-read with the correct size. This only triggers when the ptr
+        // hint and stored type diverge (e.g. Leaf → LeafSquashed).
+        let stored_max = bits::get_node_max_byte_len(stored_node_id as u8)?;
+        if stored_max > hinted_max {
+            buf.resize(stored_max, 0);
+            let n = self.read_bytes_at(&mut buf, file_offset)?;
+            buf.truncate(n);
+            // Re-parse after the larger read.
+            let (rehash, remaining) = bits::parse_hash_from_bytes(&buf)?;
+            let _consumed = if stored_node_id == TrieNodeID::Patch {
+                scratch.decode_patch_from_slice(remaining)?
+            } else {
+                scratch.decode_node_from_slice(stored_node_id, remaining)?
+            };
+            scratch.restore_node_bytes(buf);
+            return if stored_node_id == TrieNodeID::Patch {
+                Ok(ReadTrieItem::from_patch(scratch.patch(), Some(rehash)))
+            } else {
+                Ok(ReadTrieItem::from_node(ReadTrieNode::from_state_borrowed(
+                    scratch.get_ref(),
+                    Some(rehash),
+                )))
+            };
+        }
+
         let _consumed = if stored_node_id == TrieNodeID::Patch {
             scratch.decode_patch_from_slice(remaining)?
         } else {
-            scratch.decode_node_from_slice(
-                TrieNodeID::from_u8(ptr.id()).ok_or_else(|| {
-                    Error::CorruptionError(format!("Invalid node ID {}", ptr.id()))
-                })?,
-                remaining,
-            )?
+            scratch.decode_node_from_slice(stored_node_id, remaining)?
         };
         scratch.restore_node_bytes(buf);
         if stored_node_id == TrieNodeID::Patch {
@@ -642,8 +679,9 @@ impl TrieFile {
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
+        trie_offset_hint: Option<u64>,
     ) -> Result<Option<ReadTrieItem<'a>>, Error> {
-        let offset = self.get_trie_offset(db, block_id)?;
+        let offset = trie_offset_hint.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
         let Some(bytes) = self.mmap_slice_at(offset + ptr.ptr() as u64) else {
             return Ok(None);
         };
@@ -698,6 +736,133 @@ impl TrieFile {
             }
         }
         Ok(offset)
+    }
+
+    /// Write a blob at a specific offset in the blob file, then truncate the file
+    /// to exactly `offset + buf.len()` and remap the mmap.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller MUST hold exclusive access (the `SharedChainstate` mutex) and MUST
+    /// have validated that no live `marf_data` or `marf_squash_levels` row references
+    /// any byte at or beyond `offset` that is not being superseded by this write.
+    ///
+    /// This is an **experimental** reclamation primitive. Until crash recovery is
+    /// implemented (pending-file + recovery gate), a crash between the pwrite and
+    /// the subsequent metadata commit leaves the blob file in a state that requires
+    /// manual intervention.
+    pub fn write_blob_at_and_truncate(&mut self, buf: &[u8], offset: u64) -> Result<(), Error> {
+        let new_len = offset + buf.len() as u64;
+
+        match self {
+            TrieFile::Disk(ref mut disk) => {
+                pwrite_all(&disk.fd, buf, offset)?;
+                disk.fd.set_len(new_len)?;
+                disk.fd.sync_data()?;
+                if disk.mmap_enabled {
+                    // Remap to cover exactly the new file extent.
+                    // SAFETY: exclusive access, file just fsynced, no concurrent readers.
+                    disk.mmap = Some(unsafe { Mmap::map(&disk.fd)? });
+                }
+            }
+            TrieFile::RAM(ref mut ram) => {
+                let data = ram.fd.get_mut();
+                let start = offset as usize;
+                let end = start + buf.len();
+                if data.len() < end {
+                    data.resize(end, 0);
+                }
+                data.get_mut(start..end)
+                    .expect("BUG: just resized to cover range")
+                    .copy_from_slice(buf);
+                data.truncate(end);
+            }
+        }
+
+        // Invalidate the trie offset cache — offsets for blocks that were in the
+        // truncated region are now stale.
+        match self {
+            TrieFile::Disk(ref disk) => disk.trie_offsets.borrow_mut().clear(),
+            TrieFile::RAM(ref ram) => ram.trie_offsets.borrow_mut().clear(),
+        }
+
+        Ok(())
+    }
+
+    /// Write a chunk of blob data at the given file offset without syncing or
+    /// remapping.
+    ///
+    /// Used by the streaming squash blob writer to avoid building the entire blob
+    /// in memory. Call [`finish_blob_write`] after all chunks are written.
+    pub fn pwrite_blob_chunk(&mut self, data: &[u8], offset: u64) -> Result<(), Error> {
+        match self {
+            TrieFile::Disk(ref disk) => {
+                pwrite_all(&disk.fd, data, offset)?;
+            }
+            TrieFile::RAM(ref mut ram) => {
+                let buf = ram.fd.get_mut();
+                let start = offset as usize;
+                let end = start + data.len();
+                if buf.len() < end {
+                    buf.resize(end, 0);
+                }
+                buf.get_mut(start..end)
+                    .expect("BUG: just resized to cover range")
+                    .copy_from_slice(data);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize a streaming blob write: optionally truncate the file, sync to disk,
+    /// remap the mmap, and clear the trie offset cache.
+    ///
+    /// If `truncate_to` is `Some(len)`, the file is truncated to exactly `len` bytes
+    /// (used by reclaim mode). If `None`, the file is left at its current size
+    /// (used by append mode).
+    pub fn finish_blob_write(&mut self, truncate_to: Option<u64>) -> Result<(), Error> {
+        match self {
+            TrieFile::Disk(ref mut disk) => {
+                if let Some(len) = truncate_to {
+                    disk.fd.set_len(len)?;
+                }
+                disk.fd.sync_data()?;
+                if disk.mmap_enabled {
+                    disk.mmap = Some(unsafe { Mmap::map(&disk.fd)? });
+                }
+                disk.trie_offsets.borrow_mut().clear();
+            }
+            TrieFile::RAM(ref mut ram) => {
+                if let Some(len) = truncate_to {
+                    ram.fd.get_mut().truncate(len as usize);
+                }
+                ram.trie_offsets.borrow_mut().clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Remap the mmap (if any) to cover the current file extent and clear
+    /// the trie offset cache. Call after an external writer (e.g. squash)
+    /// has modified the blob file through a separate handle.
+    pub fn remap_and_invalidate(&mut self) -> Result<(), Error> {
+        match self {
+            TrieFile::Disk(ref mut disk) => {
+                if disk.mmap_enabled {
+                    let file_len = disk.fd.metadata()?.len();
+                    if file_len > 0 {
+                        disk.mmap = Some(unsafe { Mmap::map(&disk.fd)? });
+                    } else {
+                        disk.mmap = None;
+                    }
+                }
+                disk.trie_offsets.borrow_mut().clear();
+            }
+            TrieFile::RAM(ref ram) => {
+                ram.trie_offsets.borrow_mut().clear();
+            }
+        }
+        Ok(())
     }
 }
 

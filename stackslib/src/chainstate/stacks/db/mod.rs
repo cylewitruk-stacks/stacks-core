@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::prelude::*;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{fs, io};
 
 use clarity::vm::analysis::analysis_db::AnalysisDatabase;
@@ -32,6 +33,7 @@ use clarity::vm::events::*;
 use clarity::vm::representations::ContractName;
 use clarity::vm::types::TupleData;
 use clarity::vm::{SymbolicExpression, Value};
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::de::Error as de_Error;
 use serde::Deserialize;
@@ -62,6 +64,7 @@ use crate::chainstate::stacks::events::*;
 use crate::chainstate::stacks::index::marf::{
     test_override_marf_compression, MARFOpenOpts, MarfConnection, MARF,
 };
+use crate::chainstate::stacks::index::squash::SquashMode;
 use crate::chainstate::stacks::index::ClarityMarfTrieId;
 use crate::chainstate::stacks::{
     Error, StacksBlockHeader, StacksMicroblockHeader, C32_ADDRESS_VERSION_MAINNET_MULTISIG,
@@ -115,6 +118,40 @@ pub struct StacksChainState {
     pub unconfirmed_state: Option<UnconfirmedState>,
     pub fault_injection: StacksChainStateFaults,
     marf_opts: Option<MARFOpenOpts>,
+}
+
+/// Thread-safe shared handle to a single `StacksChainState` instance.
+///
+/// Wraps a `parking_lot::Mutex<StacksChainState>` behind an `Arc` so it
+/// can be cheaply cloned across threads.
+///
+/// Uses `Mutex` rather than `RwLock` because `StacksChainState` contains
+/// `RefCell` fields (via `TrieFile`'s offset cache) which are `!Sync`.
+/// `Mutex<T>` requires only `T: Send`, while `RwLock<T>` requires
+/// `T: Send + Sync`. Upgrading to `RwLock` requires replacing the
+/// `RefCell`-based caches with `Cell` or atomics — a targeted follow-up.
+///
+/// The Clarity read-only API surface (`with_read_only_clarity_tx`,
+/// `eval_read_only`, etc.) already takes `&self` on `StacksChainState`,
+/// so the API shape is ready for concurrent reads once the `Sync` bound
+/// is satisfied.
+#[derive(Clone)]
+pub struct SharedChainstate {
+    inner: Arc<Mutex<StacksChainState>>,
+}
+
+impl SharedChainstate {
+    /// Create a new shared handle wrapping the given chainstate.
+    pub fn new(chainstate: StacksChainState) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(chainstate)),
+        }
+    }
+
+    /// Acquire the mutex and return the guard directly.
+    pub fn lock(&self) -> MutexGuard<'_, StacksChainState> {
+        self.inner.lock()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2007,7 +2044,7 @@ impl StacksChainState {
     // NOTE: used for testing in the stacks testnet code.
     // DO NOT CALL FROM PRODUCTION
     pub fn clarity_eval_read_only(
-        &mut self,
+        &self,
         burn_dbconn: &dyn BurnStateDB,
         parent_id_bhh: &StacksBlockId,
         contract: &QualifiedContractIdentifier,
@@ -2025,7 +2062,7 @@ impl StacksChainState {
 
     /// Checked eval-read-only
     pub fn eval_read_only(
-        &mut self,
+        &self,
         burn_dbconn: &dyn BurnStateDB,
         parent_id_bhh: &StacksBlockId,
         contract: &QualifiedContractIdentifier,
@@ -2044,7 +2081,7 @@ impl StacksChainState {
     ///  Any mutations that occur will be rolled-back before returning, regardless of
     ///  an okay or error result.
     pub fn eval_fn_read_only(
-        &mut self,
+        &self,
         burn_dbconn: &dyn BurnStateDB,
         parent_id_bhh: &StacksBlockId,
         contract: &QualifiedContractIdentifier,
@@ -2244,11 +2281,269 @@ impl StacksChainState {
         self.clarity_state.with_marf(f)
     }
 
+    /// Check whether automatic MARF squash should run at this block height and, if so, squash both
+    /// the headers MARF and the Clarity MARF.
+    ///
+    /// **Dev-only / experimental** — crash recovery is not yet implemented.
+    ///
+    /// The squash cadence is controlled by `MARF_SQUASH_CADENCE_BLOCKS`. Set it to 0 to disable
+    /// automatic squashing.
+    ///
+    /// `sortdb_conn` is a connection to the sortition database, used to
+    /// resolve the epoch 3.4 burn-height boundary for mode selection.
+    pub fn maybe_squash(&mut self, block_height: u64, sortdb_conn: &Connection) {
+        use crate::chainstate::stacks::index::squash::{
+            create_stub_level, squash_level_incremental, SquashMode, STUB_THRESHOLD,
+        };
+
+        let cadence = MARF_SQUASH_CADENCE_BLOCKS;
+        if cadence == 0 {
+            return;
+        }
+        if block_height < cadence as u64 || block_height % cadence as u64 != 0 {
+            if block_height % 10_000 == 0 {
+                info!(
+                    "maybe_squash: skipping height {block_height} (cadence={cadence}, \
+                     remainder={})",
+                    block_height % cadence as u64
+                );
+            }
+            return;
+        }
+
+        info!("maybe_squash: TRIGGERED at height {block_height} (cadence={cadence})");
+
+        let tip_height = block_height as u32;
+
+        // Determine squash range for the headers MARF.
+        let headers_path = self.state_index.get_db_path().to_string();
+        let headers_min = Self::squash_min_height_for(&self.state_index);
+
+        // Determine squash range for the Clarity MARF.
+        let clarity_result: (String, u32) = self.clarity_state.with_marf(|clarity_marf| {
+            let path = clarity_marf.get_db_path().to_string();
+            let min = Self::squash_min_height_for_marf(clarity_marf);
+            (path, min)
+        });
+        let (clarity_path, clarity_min) = clarity_result;
+
+        // --- Mode selection ---
+        // Headers MARF: always TipOnly (no at-block reads target the headers MARF).
+        let headers_mode = SquashMode::TipOnly;
+
+        // Clarity MARF: determine effective mode from configured preference
+        // and epoch 3.4 boundary.
+        let configured = self
+            .marf_opts
+            .as_ref()
+            .map(|o| o.squash_mode)
+            .unwrap_or(SquashMode::TipOnly);
+        let clarity_mode =
+            Self::effective_squash_mode(configured, clarity_min, self.db(), sortdb_conn);
+
+        // --- Late-enablement guard for headers MARF ---
+        // If no prior levels exist and the range is too large (pre-existing
+        // chainstate), create a stub level instead of attempting a squash
+        // that would exceed the u32 pointer space.
+        let headers_block_count = (tip_height as u64) - (headers_min as u64) + 1;
+        if headers_min == 0 && headers_block_count > STUB_THRESHOLD {
+            info!(
+                "Late-enablement: headers MARF range ({headers_block_count} blocks) exceeds \
+                 STUB_THRESHOLD ({STUB_THRESHOLD}). Creating stub level."
+            );
+            match create_stub_level::<StacksBlockId>(&headers_path, 0, tip_height) {
+                Ok(()) => {
+                    info!("Stub level created for headers MARF (0..={tip_height})");
+                    if let Err(e) = self.state_index.refresh_after_squash() {
+                        warn!("Failed to refresh headers MARF after stub creation: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create stub level for headers MARF: {e}");
+                }
+            }
+        } else {
+            // Squash headers MARF.
+            info!(
+                "Auto-squash: headers MARF heights {headers_min}..={tip_height} \
+                 (path: {headers_path})"
+            );
+            match squash_level_incremental::<StacksBlockId>(
+                &headers_path,
+                headers_mode,
+                headers_min,
+                tip_height,
+                true, // reclaim=true; for L0 this is append-only since no prior levels exist
+            ) {
+                Ok(stats) => {
+                    info!(
+                        "Auto-squash headers MARF complete: {} nodes, {} leaves",
+                        stats.nodes_collected, stats.leaves_collected
+                    );
+                    if let Err(e) = self.state_index.refresh_after_squash() {
+                        warn!("Failed to refresh headers MARF after squash: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!("Auto-squash headers MARF failed: {e}");
+                }
+            }
+        }
+
+        // --- Late-enablement guard for clarity MARF ---
+        let clarity_block_count = (tip_height as u64) - (clarity_min as u64) + 1;
+        if clarity_min == 0 && clarity_block_count > STUB_THRESHOLD {
+            info!(
+                "Late-enablement: clarity MARF range ({clarity_block_count} blocks) exceeds \
+                 STUB_THRESHOLD ({STUB_THRESHOLD}). Creating stub level."
+            );
+            match create_stub_level::<StacksBlockId>(&clarity_path, 0, tip_height) {
+                Ok(()) => {
+                    info!("Stub level created for clarity MARF (0..={tip_height})");
+                    self.clarity_state.with_marf(|clarity_marf| {
+                        if let Err(e) = clarity_marf.refresh_after_squash() {
+                            warn!("Failed to refresh clarity MARF after stub creation: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to create stub level for clarity MARF: {e}");
+                }
+            }
+        } else {
+            // Squash Clarity MARF.
+            info!(
+                "Auto-squash: clarity MARF heights {clarity_min}..={tip_height} \
+                 (path: {clarity_path})"
+            );
+            match squash_level_incremental::<StacksBlockId>(
+                &clarity_path,
+                clarity_mode,
+                clarity_min,
+                tip_height,
+                true,
+            ) {
+                Ok(stats) => {
+                    info!(
+                        "Auto-squash clarity MARF complete: {} nodes, {} leaves",
+                        stats.nodes_collected, stats.leaves_collected
+                    );
+                    self.clarity_state.with_marf(|clarity_marf| {
+                        if let Err(e) = clarity_marf.refresh_after_squash() {
+                            warn!("Failed to refresh clarity MARF after squash: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("Auto-squash clarity MARF failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Determine the min_height for the next squash level by reading existing
+    /// squash levels from the given MARF.
+    fn squash_min_height_for(state_index: &MARF<StacksBlockId>) -> u32 {
+        Self::squash_min_height_for_marf(state_index)
+    }
+
+    fn squash_min_height_for_marf(marf: &MARF<StacksBlockId>) -> u32 {
+        use crate::chainstate::stacks::index::trie_sql;
+        match trie_sql::read_squash_levels(marf.sqlite_conn()) {
+            Ok(levels) => {
+                if let Some(last) = levels.last() {
+                    last.max_height + 1
+                } else {
+                    0
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// Determine the effective squash mode for a level whose range starts
+    /// at `min_height` (a Stacks block height).
+    ///
+    /// Rules:
+    /// - If the user configured `FullHistory`, always use `FullHistory`.
+    /// - If the user configured `TipOnly`, force `FullHistory` when the
+    ///   range contains pre-epoch-3.4 blocks (required for consensus-correct
+    ///   replay of `at-block`). Once the entire range is post-3.4, honour
+    ///   the `TipOnly` preference.
+    pub(crate) fn effective_squash_mode(
+        configured: SquashMode,
+        min_height: u32,
+        headers_conn: &Connection,
+        sortdb_conn: &Connection,
+    ) -> SquashMode {
+        if configured == SquashMode::FullHistory {
+            return SquashMode::FullHistory;
+        }
+
+        // TipOnly configured — check whether the range is entirely post-epoch-3.4.
+        let epoch34_burn_height = match Self::resolve_epoch34_burn_height(sortdb_conn) {
+            Some(h) => h,
+            None => {
+                // Epoch 3.4 not defined (e.g. early chain or custom test config).
+                // Conservatively use FullHistory.
+                return SquashMode::FullHistory;
+            }
+        };
+
+        // Look up the burn height of the Stacks block at `min_height`.
+        let min_burn_height = match Self::burn_height_for_stacks_height(headers_conn, min_height) {
+            Some(bh) => bh,
+            None => {
+                // If we can't resolve the burn height (e.g. genesis block,
+                // block not yet in headers table), conservatively use
+                // FullHistory.
+                return SquashMode::FullHistory;
+            }
+        };
+
+        if min_burn_height >= epoch34_burn_height {
+            SquashMode::TipOnly
+        } else {
+            SquashMode::FullHistory
+        }
+    }
+
+    /// Resolve the burn height at which epoch 3.4 starts from the sortition
+    /// database's `epochs` table.  Returns `None` if epoch 3.4 is not defined.
+    pub(crate) fn resolve_epoch34_burn_height(sortdb_conn: &Connection) -> Option<u64> {
+        use stacks_common::types::StacksEpochId;
+        SortitionDB::get_stacks_epoch_by_epoch_id(sortdb_conn, &StacksEpochId::Epoch34)
+            .ok()
+            .flatten()
+            .map(|epoch| epoch.start_height)
+    }
+
+    /// Look up the burn-chain height for a given Stacks block height
+    /// from the `block_headers` table.  Returns `None` if no header is
+    /// found at that height.
+    ///
+    /// Uses `MIN(burn_header_height)` because `block_height` is not unique
+    /// — multiple forks can share the same Stacks height.  Picking the
+    /// minimum is the safe conservative choice for epoch-boundary
+    /// comparison: if *any* fork at this height was mined before epoch 3.4,
+    /// we want `FullHistory`.
+    pub(crate) fn burn_height_for_stacks_height(
+        headers_conn: &Connection,
+        stacks_height: u32,
+    ) -> Option<u64> {
+        let sql = "SELECT MIN(burn_header_height) FROM block_headers WHERE block_height = ?1";
+        rusqlite::Connection::query_row(headers_conn, sql, params![stacks_height as u64], |row| {
+            row.get(0)
+        })
+        .ok()
+        .flatten()
+    }
+
     /// Run to_do on the state of the Clarity VM at the given chain tip.
     /// Returns Some(x: R) if the given parent_tip exists.
     /// Returns None if not
     pub fn with_read_only_clarity_tx<F, R>(
-        &mut self,
+        &self,
         burn_dbconn: &dyn BurnStateDB,
         parent_tip: &StacksBlockId,
         to_do: F,
@@ -2283,21 +2578,17 @@ impl StacksChainState {
 
     /// Run to_do on the unconfirmed Clarity VM state
     pub fn with_read_only_unconfirmed_clarity_tx<F, R>(
-        &mut self,
+        &self,
         burn_dbconn: &dyn BurnStateDB,
         to_do: F,
     ) -> Result<Option<R>, Error>
     where
         F: FnOnce(&mut ClarityReadOnlyConnection) -> R,
     {
-        if let Some(unconfirmed) = self.unconfirmed_state.as_ref() {
-            if !unconfirmed.is_readable() {
+        let res = if let Some(ref unconfirmed_state) = self.unconfirmed_state {
+            if !unconfirmed_state.is_readable() {
                 return Ok(None);
             }
-        }
-
-        let mut unconfirmed_state_opt = self.unconfirmed_state.take();
-        let res = if let Some(ref mut unconfirmed_state) = unconfirmed_state_opt {
             let mut conn = unconfirmed_state
                 .clarity_inst
                 .read_only_connection_checked(
@@ -2310,7 +2601,6 @@ impl StacksChainState {
         } else {
             None
         };
-        self.unconfirmed_state = unconfirmed_state_opt;
         Ok(res)
     }
 
@@ -2318,7 +2608,7 @@ impl StacksChainState {
     /// otherwise run to_do on the confirmed state of the Clarity VM. If the tip doesn't exist,
     /// then return None.
     pub fn maybe_read_only_clarity_tx<F, R>(
-        &mut self,
+        &self,
         burn_dbconn: &dyn BurnStateDB,
         parent_tip: &StacksBlockId,
         to_do: F,
@@ -3333,5 +3623,280 @@ pub mod test {
         assert_eq!(block_size, "1000", "Block size should be preserved");
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 5: mode selection tests
+    // -------------------------------------------------------------------
+
+    /// Create an in-memory SQLite connection with the sortition DB `epochs`
+    /// table and optionally insert an epoch 3.4 row.
+    fn mock_sortdb_conn(epoch34_start: Option<u64>) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE epochs (
+                start_block_height INTEGER NOT NULL,
+                end_block_height INTEGER NOT NULL,
+                epoch_id INTEGER NOT NULL,
+                block_limit TEXT NOT NULL,
+                network_epoch INTEGER NOT NULL,
+                PRIMARY KEY(start_block_height, epoch_id)
+            );",
+        )
+        .unwrap();
+        if let Some(start) = epoch34_start {
+            let block_limit =
+                r#"{"write_length":0,"write_count":0,"read_length":0,"read_count":0,"runtime":0}"#;
+            // epoch_id for Epoch34 = 0x03004 = 12292
+            conn.execute(
+                "INSERT INTO epochs (epoch_id, start_block_height, end_block_height, block_limit, network_epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![12292u32, start as i64, i64::MAX, block_limit, 0u8],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Create an in-memory SQLite connection with a `block_headers` table
+    /// and insert rows mapping Stacks block heights to burn heights.
+    fn mock_headers_conn(rows: &[(u32, u64)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE block_headers (
+                block_height INTEGER NOT NULL,
+                burn_header_height INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for &(stacks_h, burn_h) in rows {
+            conn.execute(
+                "INSERT INTO block_headers (block_height, burn_header_height) VALUES (?1, ?2)",
+                params![stacks_h as i64, burn_h as i64],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn test_effective_squash_mode_full_history_configured_always_full_history() {
+        // FullHistory configured → always FullHistory regardless of epoch.
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[(100, 500_000)]);
+
+        let mode = StacksChainState::effective_squash_mode(
+            SquashMode::FullHistory,
+            100,
+            &headers,
+            &sortdb,
+        );
+        assert_eq!(mode, SquashMode::FullHistory);
+    }
+
+    #[test]
+    fn test_effective_squash_mode_tiponly_pre_epoch34_forced_full_history() {
+        // TipOnly configured, range starts before epoch 3.4 → forced FullHistory.
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[(100, 800_000)]);
+
+        let mode =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 100, &headers, &sortdb);
+        assert_eq!(mode, SquashMode::FullHistory);
+    }
+
+    #[test]
+    fn test_effective_squash_mode_tiponly_post_epoch34_honoured() {
+        // TipOnly configured, range starts at or after epoch 3.4 → TipOnly.
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[(100, 900_000)]);
+
+        let mode =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 100, &headers, &sortdb);
+        assert_eq!(mode, SquashMode::TipOnly);
+
+        // Also test strictly above.
+        let headers2 = mock_headers_conn(&[(200, 950_000)]);
+        let mode2 =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 200, &headers2, &sortdb);
+        assert_eq!(mode2, SquashMode::TipOnly);
+    }
+
+    #[test]
+    fn test_effective_squash_mode_tiponly_straddling_uses_full_history() {
+        // TipOnly configured, range starts just before 3.4 boundary → FullHistory.
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[(100, 899_999)]);
+
+        let mode =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 100, &headers, &sortdb);
+        assert_eq!(mode, SquashMode::FullHistory);
+    }
+
+    #[test]
+    fn test_effective_squash_mode_no_epoch34_defined() {
+        // Epoch 3.4 not defined → conservatively use FullHistory.
+        let sortdb = mock_sortdb_conn(None);
+        let headers = mock_headers_conn(&[(100, 500_000)]);
+
+        let mode =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 100, &headers, &sortdb);
+        assert_eq!(mode, SquashMode::FullHistory);
+    }
+
+    #[test]
+    fn test_effective_squash_mode_missing_header_row() {
+        // Header row not found for min_height → conservatively use FullHistory.
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[]); // no rows
+
+        let mode =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 100, &headers, &sortdb);
+        assert_eq!(mode, SquashMode::FullHistory);
+    }
+
+    #[test]
+    fn test_effective_squash_mode_fork_ambiguity_uses_conservative_min() {
+        // Two forks at the same Stacks height with different burn heights.
+        // One is pre-3.4, one is post-3.4. MIN should pick the pre-3.4 one
+        // so the result is FullHistory (conservative).
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[
+            (100, 899_999), // fork A: pre-epoch-3.4
+            (100, 900_001), // fork B: post-epoch-3.4
+        ]);
+
+        let mode =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 100, &headers, &sortdb);
+        assert_eq!(
+            mode,
+            SquashMode::FullHistory,
+            "fork-ambiguous height should conservatively use FullHistory"
+        );
+    }
+
+    #[test]
+    fn test_effective_squash_mode_fork_ambiguity_both_post_epoch34() {
+        // Two forks, both post-3.4. MIN is still >= epoch34 → TipOnly.
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[
+            (100, 900_000), // fork A: exactly at epoch-3.4
+            (100, 900_005), // fork B: also post-epoch-3.4
+        ]);
+
+        let mode =
+            StacksChainState::effective_squash_mode(SquashMode::TipOnly, 100, &headers, &sortdb);
+        assert_eq!(
+            mode,
+            SquashMode::TipOnly,
+            "both forks post-3.4 should allow TipOnly"
+        );
+    }
+
+    /// Integration test: exercises the same config → mode → squash → verify
+    /// sequence that `maybe_squash()` performs, including reading back the
+    /// stored mode from the squash trailer.
+    #[test]
+    fn test_mode_selection_integration_config_to_squash_level() {
+        use stacks_common::types::chainstate::StacksBlockId;
+
+        use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
+        use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+        use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
+        use crate::chainstate::stacks::index::{trie_sql, MARFValue};
+
+        let test_dir = format!(
+            "/tmp/stacks-squash-tests/mode_selection_integration_{}",
+            std::process::id()
+        );
+        if std::fs::metadata(&test_dir).is_ok() {
+            std::fs::remove_dir_all(&test_dir).unwrap();
+        }
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        // --- Simulate config plumbing ---
+        // A node configured with marf_full_history = false (TipOnly default).
+        let configured_mode = SquashMode::TipOnly;
+
+        // --- Simulate epoch/header state: pre-epoch-3.4 range ---
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let headers = mock_headers_conn(&[(0, 800_000)]); // min_height=0 is pre-3.4
+
+        // effective_squash_mode should force FullHistory for pre-3.4 range
+        let clarity_mode =
+            StacksChainState::effective_squash_mode(configured_mode, 0, &headers, &sortdb);
+        assert_eq!(
+            clarity_mode,
+            SquashMode::FullHistory,
+            "pre-3.4 range should force FullHistory even with TipOnly config"
+        );
+
+        // --- Build a real MARF and squash with the computed mode ---
+        let marf_path = format!("{test_dir}/clarity.sqlite");
+        let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+            .with_squash_mode(configured_mode);
+        // Verify config plumbing: MARFOpenOpts carries the configured mode.
+        assert_eq!(open_opts.squash_mode, SquashMode::TipOnly);
+
+        let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+
+        let num_blocks: usize = 10;
+        let blocks: Vec<StacksBlockId> = (0..num_blocks)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+                StacksBlockId::from_bytes(&bytes).unwrap()
+            })
+            .collect();
+
+        marf.begin(&StacksBlockId::sentinel(), &blocks[0]).unwrap();
+        marf.insert("key", MARFValue::from_value("v0")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        for i in 1..num_blocks {
+            marf.begin(&blocks[i - 1], &blocks[i]).unwrap();
+            marf.insert("key", MARFValue::from_value(&format!("v{i}")))
+                .unwrap();
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+        }
+
+        let max_height = (num_blocks - 1) as u32;
+
+        // Squash using the computed mode (as maybe_squash would)
+        let stats = squash_level_incremental::<StacksBlockId>(
+            &marf_path,
+            clarity_mode, // FullHistory, forced by mode selection
+            0,
+            max_height,
+            true,
+        )
+        .expect("squash should succeed");
+        assert!(stats.nodes_collected > 0);
+
+        // --- Verify: read back squash level metadata ---
+        let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+        assert_eq!(levels.len(), 1, "should have exactly one squash level");
+        assert_eq!(levels[0].min_height, 0);
+        assert_eq!(levels[0].max_height, max_height);
+
+        // Re-open and verify historical reads work (FullHistory preserved history)
+        drop(marf);
+        let open_opts2 = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+        let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts2).unwrap();
+
+        // Historical read at block 0 should work (FullHistory preserved it)
+        let val = marf
+            .get(&blocks[0], "key")
+            .expect("get should succeed")
+            .expect("key should exist at block 0");
+        // Tip read should also work
+        let tip_val = marf
+            .get(&blocks[num_blocks - 1], "key")
+            .expect("get should succeed")
+            .expect("key should exist at tip");
+        // They should differ (key was updated every block)
+        assert_ne!(val, tip_val, "historical and tip values should differ");
     }
 }

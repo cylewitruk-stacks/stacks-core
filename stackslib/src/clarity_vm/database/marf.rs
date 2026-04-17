@@ -176,12 +176,13 @@ impl MarfedKV {
         }
     }
 
-    pub fn begin_read_only<'a>(
-        &'a mut self,
-        at_block: Option<&StacksBlockId>,
-    ) -> ReadOnlyMarfStore<'a> {
+    pub fn begin_read_only(&self, at_block: Option<&StacksBlockId>) -> ReadOnlyMarfStore {
+        let mut ro_marf = self.marf.reopen_readonly().unwrap_or_else(|e| {
+            error!("Failed to reopen MARF as read-only: {:?}", &e);
+            panic!()
+        });
         let chain_tip = if let Some(at_block) = at_block {
-            self.marf.open_block(at_block).unwrap_or_else(|e| {
+            ro_marf.open_block(at_block).unwrap_or_else(|e| {
                 error!(
                     "Failed to open read only connection at {}: {:?}",
                     at_block, &e
@@ -194,16 +195,20 @@ impl MarfedKV {
         };
         ReadOnlyMarfStore {
             chain_tip,
-            marf: &mut self.marf,
+            marf: ro_marf,
         }
     }
 
-    pub fn begin_read_only_checked<'a>(
-        &'a mut self,
+    pub fn begin_read_only_checked(
+        &self,
         at_block: Option<&StacksBlockId>,
-    ) -> Result<ReadOnlyMarfStore<'a>, VmExecutionError> {
+    ) -> Result<ReadOnlyMarfStore, VmExecutionError> {
+        let mut ro_marf = self.marf.reopen_readonly().map_err(|e| {
+            debug!("Failed to reopen MARF as read-only: {:?}", &e);
+            VmInternalError::MarfFailure(Error::NotFoundError.to_string())
+        })?;
         let chain_tip = if let Some(at_block) = at_block {
-            self.marf.open_block(at_block).map_err(|e| {
+            ro_marf.open_block(at_block).map_err(|e| {
                 debug!(
                     "Failed to open read only connection at {}: {:?}",
                     at_block, &e
@@ -216,7 +221,7 @@ impl MarfedKV {
         };
         Ok(ReadOnlyMarfStore {
             chain_tip,
-            marf: &mut self.marf,
+            marf: ro_marf,
         })
     }
 
@@ -321,9 +326,19 @@ impl MarfedKV {
 
         self.ephemeral_marf = Some(ephemeral_marf);
 
+        let mut ro_marf = self.marf.reopen_readonly().map_err(|e| {
+            VmInternalError::MarfFailure(format!(
+                "Failed to reopen MARF as read-only for ephemeral tx: {e:?}"
+            ))
+        })?;
+        ro_marf.open_block(base_tip).map_err(|e| {
+            VmInternalError::MarfFailure(format!(
+                "Failed to open block {base_tip} for ephemeral tx: {e:?}"
+            ))
+        })?;
         let read_only_marf = ReadOnlyMarfStore {
             chain_tip: base_tip.clone(),
-            marf: &mut self.marf,
+            marf: ro_marf,
         };
 
         let Some(ephemeral_marf) = self.ephemeral_marf.as_mut() else {
@@ -392,14 +407,20 @@ pub struct PersistentWritableMarfStore<'a> {
 
 /// A wrapper around a MARF handle which allows only read access to the MARF's keys off of a given
 /// chain tip.
-pub struct ReadOnlyMarfStore<'a> {
+/// Read-only view of a MARF.
+///
+/// Owns a read-only `MARF` instance (created via `reopen_readonly()`).
+/// This decouples read-only Clarity connections from the parent
+/// `MarfedKV`'s mutable state, allowing `begin_read_only*` to take
+/// `&self` instead of `&mut self`.
+pub struct ReadOnlyMarfStore {
     /// The chain tip from which reads will be indexed.
     chain_tip: StacksBlockId,
-    /// Handle to the MARF being read
-    marf: &'a mut MARF<StacksBlockId>,
+    /// Owned read-only MARF handle (separate SQLite connection + mmap)
+    marf: MARF<StacksBlockId>,
 }
 
-impl ClarityMarfStore for ReadOnlyMarfStore<'_> {}
+impl ClarityMarfStore for ReadOnlyMarfStore {}
 impl ClarityMarfStore for PersistentWritableMarfStore<'_> {}
 
 impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
@@ -503,7 +524,7 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
     }
 }
 
-impl ReadOnlyMarfStore<'_> {
+impl ReadOnlyMarfStore {
     /// Determine if there is a trie in the underlying MARF with the given ID `bhh`.
     ///
     /// Return Ok(true) if so
@@ -531,7 +552,7 @@ impl ReadOnlyMarfStore<'_> {
     }
 }
 
-impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
+impl ClarityBackingStore for ReadOnlyMarfStore {
     fn get_side_store(&mut self) -> &Connection {
         self.marf.sqlite_conn()
     }

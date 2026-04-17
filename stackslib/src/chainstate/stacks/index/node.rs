@@ -62,7 +62,8 @@ define_u8_enum!(TrieNodeID {
     Node16 = 3,
     Node48 = 4,
     Node256 = 5,
-    Patch = 6
+    Patch = 6,
+    LeafSquashed = 7
 });
 
 /// A node ID encodes a back-pointer if its high bit is set
@@ -771,13 +772,7 @@ impl<T: MarfTrieId> TrieCursor<T> {
 
     /// Are we at the [E]nd [O]f a [N]ode's [P]ath?
     pub fn eonp(&self, node: &TrieNodeType) -> bool {
-        match node {
-            TrieNodeType::Leaf(ref data) => self.node_path_index == data.path.len(),
-            TrieNodeType::Node4(ref data) => self.node_path_index == data.path.len(),
-            TrieNodeType::Node16(ref data) => self.node_path_index == data.path.len(),
-            TrieNodeType::Node48(ref data) => self.node_path_index == data.path.len(),
-            TrieNodeType::Node256(ref data) => self.node_path_index == data.path.len(),
-        }
+        self.node_path_index == node.path_bytes().len()
     }
 
     /// Compare the node's compressed path against the cursor path, then look up the child pointer
@@ -2355,6 +2350,206 @@ impl TrieNode for TrieLeaf {
     }
 }
 
+/// A squashed leaf node that carries the value-transition history for a key
+/// within a squash level's block range. Used in `FullHistory` squash mode.
+///
+/// `entries[0]` is the tip (most recent value). For incremental levels,
+/// `entries[last]` may be a synthetic baseline entry carrying the value
+/// inherited from the prior level.
+#[derive(Debug, Clone)]
+pub struct TrieLeafSquashed {
+    pub path: NodePath,
+    /// Value transitions sorted descending by height.
+    pub entries: Vec<(u32, MARFValue)>,
+}
+
+impl PartialEq for TrieLeafSquashed {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.entries == other.entries
+    }
+}
+
+impl TrieLeafSquashed {
+    /// Maximum number of entries per leaf. This matches the non-mmap
+    /// read ceiling in `bits::get_node_body_max_byte_len`.
+    pub const MAX_ENTRIES: usize = 65_536;
+
+    pub fn new(path: &[u8], entries: Vec<(u32, MARFValue)>) -> Result<Self, Error> {
+        if entries.is_empty() {
+            return Err(Error::CorruptionError(
+                "TrieLeafSquashed must have at least one entry".into(),
+            ));
+        }
+        if entries.len() > Self::MAX_ENTRIES {
+            return Err(Error::CorruptionError(format!(
+                "TrieLeafSquashed: {} entries exceeds maximum {}",
+                entries.len(),
+                Self::MAX_ENTRIES
+            )));
+        }
+        Ok(Self {
+            path: NodePath::from_slice(path).ok_or_else(|| {
+                Error::CorruptionError("TrieLeafSquashed: node path exceeds 32 bytes".into())
+            })?,
+            entries,
+        })
+    }
+
+    /// The most recent value (always `entries[0]`).
+    ///
+    /// Returns `CorruptionError` if `entries` is empty, which would
+    /// indicate a construction or deserialization bug.
+    pub fn tip_value(&self) -> Result<&MARFValue, Error> {
+        Ok(&self
+            .entries
+            .first()
+            .ok_or_else(|| {
+                Error::CorruptionError("BUG: TrieLeafSquashed must have at least one entry".into())
+            })?
+            .1)
+    }
+
+    /// Point-in-time lookup. Returns the value from the most recent
+    /// transition at or before `height`, or `None` if the key did not
+    /// exist at that height.
+    pub fn value_at_height(&self, height: u32) -> Option<&MARFValue> {
+        let idx = self.entries.partition_point(|(h, _)| *h > height);
+        self.entries.get(idx).map(|(_, v)| v)
+    }
+}
+
+impl TrieNode for TrieLeafSquashed {
+    fn id(&self) -> u8 {
+        TrieNodeID::LeafSquashed as u8
+    }
+
+    fn empty() -> Self {
+        Self {
+            path: NodePath::default(),
+            entries: vec![(0, MARFValue([0u8; 40]))],
+        }
+    }
+
+    fn walk(&self, _chr: u8) -> Option<TriePtr> {
+        None
+    }
+
+    fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+        w.write_all(&[self.id()])?;
+        bits::write_path_to_bytes(&self.path, w)?;
+        let count = u32::try_from(self.entries.len()).map_err(|_| Error::OverflowError)?;
+        w.write_all(&count.to_be_bytes())?;
+        for (height, value) in &self.entries {
+            w.write_all(&height.to_be_bytes())?;
+            w.write_all(&value.0)?;
+        }
+        Ok(())
+    }
+
+    fn write_bytes_compressed<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+        self.write_bytes(w)
+    }
+
+    fn byte_len(&self) -> usize {
+        1 + bits::get_path_byte_len(&self.path) + 4 + self.entries.len() * 44
+    }
+
+    fn byte_len_compressed(&self) -> usize {
+        self.byte_len()
+    }
+
+    fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let id = *bytes
+            .first()
+            .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing node ID byte".into()))?;
+
+        if clear_ctrl_bits(id) != TrieNodeID::LeafSquashed as u8 {
+            return Err(Error::CorruptionError(format!(
+                "LeafSquashed: bad ID 0x{:02x}",
+                id
+            )));
+        }
+
+        let remaining = bytes
+            .get(1..)
+            .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing path bytes".into()))?;
+        let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
+
+        let count_start = 1 + path_consumed;
+        let count_end = count_start + 4;
+        let count_bytes = bytes
+            .get(count_start..count_end)
+            .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing entry count".into()))?;
+        let entry_count = u32::from_be_bytes(count_bytes.try_into().map_err(|_| {
+            Error::CorruptionError("LeafSquashed: entry count slice is not 4 bytes".into())
+        })?) as usize;
+
+        if entry_count == 0 {
+            return Err(Error::CorruptionError(
+                "LeafSquashed: entry count is zero".into(),
+            ));
+        }
+
+        self.entries.clear();
+        self.entries.reserve(entry_count);
+
+        let mut offset = count_end;
+        for _ in 0..entry_count {
+            let entry_end = offset + 44;
+            let entry_bytes = bytes
+                .get(offset..entry_end)
+                .ok_or_else(|| Error::CorruptionError("LeafSquashed: truncated entry".into()))?;
+            let height_bytes = entry_bytes.get(..4).ok_or_else(|| {
+                Error::CorruptionError("LeafSquashed: entry too short for height".into())
+            })?;
+            let height = u32::from_be_bytes(height_bytes.try_into().map_err(|_| {
+                Error::CorruptionError("LeafSquashed: height slice is not 4 bytes".into())
+            })?);
+            let mut value = MARFValue([0u8; 40]);
+            let value_bytes = entry_bytes.get(4..44).ok_or_else(|| {
+                Error::CorruptionError("LeafSquashed: entry too short for value".into())
+            })?;
+            value.0.copy_from_slice(value_bytes);
+            self.entries.push((height, value));
+            offset = entry_end;
+        }
+
+        Ok(offset)
+    }
+
+    fn insert(&mut self, _ptr: &TriePtr) -> bool {
+        panic!("can't insert into a leaf");
+    }
+
+    fn replace(&mut self, _ptr: &TriePtr) -> bool {
+        panic!("can't replace in a leaf");
+    }
+
+    fn ptrs(&self) -> &[TriePtr] {
+        &[]
+    }
+
+    fn ptrs_mut(&mut self) -> &mut [TriePtr] {
+        &mut []
+    }
+
+    fn reset_transient_meta(&mut self) {}
+
+    fn path(&self) -> &NodePath {
+        &self.path
+    }
+
+    fn as_trie_node_type(&self) -> TrieNodeType {
+        TrieNodeType::LeafSquashed(self.clone())
+    }
+
+    fn get_cow_ptr(&self) -> Option<&TrieCowPtr> {
+        None
+    }
+
+    fn set_cow_ptr(&mut self, _cowptr: TrieCowPtr) {}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrieNodeType {
     Node4(TrieNode4),
@@ -2362,12 +2557,32 @@ pub enum TrieNodeType {
     Node48(Box<TrieNode48>),
     Node256(Box<TrieNode256>),
     Leaf(TrieLeaf),
+    LeafSquashed(TrieLeafSquashed),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct TrieLeafRef<'a> {
     pub path: &'a [u8],
     pub data: &'a MARFValue,
+}
+
+/// Borrowed view of a `TrieLeafSquashed`. Carries a reference to the
+/// full entries list so that `to_owned_node()` can round-trip without
+/// losing history.
+#[derive(Debug, Clone, Copy)]
+pub struct TrieLeafSquashedRef<'a> {
+    pub path: &'a [u8],
+    pub tip_value: &'a MARFValue,
+    pub entries: &'a [(u32, MARFValue)],
+}
+
+impl<'a> TrieLeafSquashedRef<'a> {
+    /// Point-in-time lookup on the borrowed entries slice.
+    /// Same semantics as `TrieLeafSquashed::value_at_height`.
+    pub fn value_at_height(&self, height: u32) -> Option<&MARFValue> {
+        let idx = self.entries.partition_point(|(h, _)| *h > height);
+        self.entries.get(idx).map(|(_, v)| v)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2390,6 +2605,7 @@ pub enum TrieNodeRef<'a> {
         ptrs: &'a [TriePtr; 256],
     },
     Leaf(TrieLeafRef<'a>),
+    LeafSquashed(TrieLeafSquashedRef<'a>),
 }
 
 /// Transient metadata from an owned `TrieNodeType` that `TrieNodeRef` does not carry
@@ -2404,7 +2620,7 @@ pub struct TrieNodeTransientMeta {
 
 impl<'a> TrieNodeRef<'a> {
     pub fn is_leaf(&self) -> bool {
-        matches!(self, Self::Leaf(_))
+        matches!(self, Self::Leaf(_) | Self::LeafSquashed(_))
     }
 
     pub fn is_node256(&self) -> bool {
@@ -2418,6 +2634,7 @@ impl<'a> TrieNodeRef<'a> {
             Self::Node48 { .. } => TrieNodeID::Node48 as u8,
             Self::Node256 { .. } => TrieNodeID::Node256 as u8,
             Self::Leaf(_) => TrieNodeID::Leaf as u8,
+            Self::LeafSquashed(_) => TrieNodeID::LeafSquashed as u8,
         }
     }
 
@@ -2428,6 +2645,7 @@ impl<'a> TrieNodeRef<'a> {
             Self::Node48 { ptrs, .. } => &ptrs[..],
             Self::Node256 { ptrs, .. } => &ptrs[..],
             Self::Leaf(_) => &[],
+            Self::LeafSquashed(_) => &[],
         }
     }
 
@@ -2438,6 +2656,7 @@ impl<'a> TrieNodeRef<'a> {
             Self::Node48 { path, .. } => path,
             Self::Node256 { path, .. } => path,
             Self::Leaf(leaf) => leaf.path,
+            Self::LeafSquashed(leaf) => leaf.path,
         }
     }
 
@@ -2482,12 +2701,17 @@ impl<'a> TrieNodeRef<'a> {
                 }
             }
             Self::Leaf(_) => None,
+            Self::LeafSquashed(_) => None,
         }
     }
 
     pub fn as_leaf(&self) -> Option<TrieLeafRef<'a>> {
         match self {
             Self::Leaf(leaf) => Some(*leaf),
+            Self::LeafSquashed(sq) => Some(TrieLeafRef {
+                path: sq.path,
+                data: sq.tip_value,
+            }),
             _ => None,
         }
     }
@@ -2530,6 +2754,10 @@ impl<'a> TrieNodeRef<'a> {
             Self::Leaf(leaf) => TrieNodeType::Leaf(TrieLeaf {
                 path: NodePath::from_slice(leaf.path).expect("node path exceeds 32 bytes"),
                 data: leaf.data.clone(),
+            }),
+            Self::LeafSquashed(sq) => TrieNodeType::LeafSquashed(TrieLeafSquashed {
+                path: NodePath::from_slice(sq.path).expect("node path exceeds 32 bytes"),
+                entries: sq.entries.to_vec(),
             }),
         }
     }
@@ -2579,6 +2807,16 @@ impl<'a> From<&'a TrieNodeType> for TrieNodeRef<'a> {
                 path: data.path.as_slice(),
                 data: &data.data,
             }),
+            TrieNodeType::LeafSquashed(data) => Self::LeafSquashed(TrieLeafSquashedRef {
+                path: data.path.as_slice(),
+                // Infallible: entries validated non-empty at construction
+                // and deserialization. The From trait does not permit error
+                // propagation.
+                tip_value: data
+                    .tip_value()
+                    .expect("BUG: LeafSquashed invariant violated: entries is empty"),
+                entries: &data.entries,
+            }),
         }
     }
 }
@@ -2591,13 +2829,14 @@ macro_rules! with_node {
             TrieNodeType::Node48($pat) => $s,
             TrieNodeType::Node256($pat) => $s,
             TrieNodeType::Leaf($pat) => $s,
+            TrieNodeType::LeafSquashed($pat) => $s,
         }
     };
 }
 
 impl TrieNodeType {
     pub fn is_leaf(&self) -> bool {
-        matches!(self, TrieNodeType::Leaf(_))
+        matches!(self, TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_))
     }
 
     pub fn is_node4(&self) -> bool {
@@ -2637,6 +2876,14 @@ impl TrieNodeType {
         map: &mut M,
         w: &mut W,
     ) -> Result<(), Error> {
+        // LeafSquashed must emit consensus bytes identical to a plain Leaf
+        // (using TrieNodeID::Leaf, not LeafSquashed) to preserve Merkle
+        // root equivalence.
+        if let TrieNodeType::LeafSquashed(ref sq) = self {
+            w.write_all(&[TrieNodeID::Leaf as u8])?;
+            bits::write_path_to_bytes(sq.path.as_slice(), w)?;
+            return Ok(());
+        }
         with_node!(self, ref data, data.write_consensus_bytes(map, w))
     }
 
@@ -2666,7 +2913,7 @@ impl TrieNodeType {
             TrieNodeType::Node16(ref mut data) => &mut data.ptrs,
             TrieNodeType::Node48(ref mut data) => &mut data.ptrs,
             TrieNodeType::Node256(ref mut data) => &mut data.ptrs,
-            TrieNodeType::Leaf(_) => panic!("Leaf has no ptrs"),
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => panic!("Leaf has no ptrs"),
         }
     }
 
@@ -2676,7 +2923,7 @@ impl TrieNodeType {
             TrieNodeType::Node16(_) => 16,
             TrieNodeType::Node48(_) => 48,
             TrieNodeType::Node256(_) => 256,
-            TrieNodeType::Leaf(_) => 0,
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => 0,
         }
     }
 
@@ -2702,7 +2949,7 @@ impl TrieNodeType {
             TrieNodeType::Node16(ref data) => data.patch_depth,
             TrieNodeType::Node48(ref data) => data.patch_depth,
             TrieNodeType::Node256(ref data) => data.patch_depth,
-            TrieNodeType::Leaf(_) => 0,
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => 0,
         }
     }
 
@@ -2712,7 +2959,7 @@ impl TrieNodeType {
             TrieNodeType::Node16(ref data) => data.last_patch_source,
             TrieNodeType::Node48(ref data) => data.last_patch_source,
             TrieNodeType::Node256(ref data) => data.last_patch_source,
-            TrieNodeType::Leaf(_) => None,
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => None,
         }
     }
 
@@ -2722,7 +2969,7 @@ impl TrieNodeType {
             TrieNodeType::Node16(ref mut data) => data.patch_depth = depth,
             TrieNodeType::Node48(ref mut data) => data.patch_depth = depth,
             TrieNodeType::Node256(ref mut data) => data.patch_depth = depth,
-            TrieNodeType::Leaf(_) => {}
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => {}
         }
     }
 
@@ -2732,7 +2979,7 @@ impl TrieNodeType {
             TrieNodeType::Node16(ref mut data) => data.last_patch_source = source,
             TrieNodeType::Node48(ref mut data) => data.last_patch_source = source,
             TrieNodeType::Node256(ref mut data) => data.last_patch_source = source,
-            TrieNodeType::Leaf(_) => {}
+            TrieNodeType::Leaf(_) | TrieNodeType::LeafSquashed(_) => {}
         }
     }
 }

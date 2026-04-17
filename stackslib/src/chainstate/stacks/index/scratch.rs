@@ -15,8 +15,9 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::chainstate::stacks::index::node::{
-    ParkedNodeHandle, TrieLeafRef, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
-    TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeType, TriePtr,
+    ParkedNodeHandle, TrieLeafRef, TrieLeafSquashed, TrieLeafSquashedRef, TrieNode, TrieNode16,
+    TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeType,
+    TriePtr,
 };
 use crate::chainstate::stacks::index::{
     Error, NodeDecodeScratch, NodeParking, NodePatching, TrieLeaf, TrieNodeArena,
@@ -29,6 +30,7 @@ pub struct MarfReadState {
     node48: Option<TrieNode48>,
     node256: Option<TrieNode256>,
     leaf: Option<TrieLeaf>,
+    leaf_squashed: Option<TrieLeafSquashed>,
     patch: Option<TrieNodePatch>,
     node_bytes: Vec<u8>,
     /// Reusable buffer for patch chain accumulation. Taken by `take_patch_chain_buf` and restored
@@ -126,6 +128,11 @@ impl MarfReadState {
                     "Cannot park patch nodes in decode scratch".to_string(),
                 ));
             }
+            TrieNodeID::LeafSquashed => TrieNodeType::LeafSquashed(
+                self.leaf_squashed
+                    .take()
+                    .expect("BUG: decode scratch lost leaf_squashed before parking"),
+            ),
         };
 
         Ok(self.park_owned_node(node))
@@ -179,6 +186,20 @@ impl MarfReadState {
             TrieNodeID::Patch => {
                 unreachable!("BUG: patch nodes are never stored in decode scratch")
             }
+            TrieNodeID::LeafSquashed => {
+                let n = self.leaf_squashed.as_ref().unwrap();
+                // tip_value() is infallible here: entries were validated
+                // non-empty at construction and deserialization. The trait
+                // signature (`fn get_ref -> TrieNodeRef`) does not permit
+                // error propagation, so we expect.
+                TrieNodeRef::LeafSquashed(TrieLeafSquashedRef {
+                    path: n.path.as_slice(),
+                    tip_value: n
+                        .tip_value()
+                        .expect("BUG: LeafSquashed invariant violated: entries is empty"),
+                    entries: &n.entries,
+                })
+            }
         }
     }
 
@@ -225,6 +246,12 @@ impl MarfReadState {
             TrieNodeID::Patch => {
                 unreachable!("BUG: patch nodes are never stored in decode scratch")
             }
+            TrieNodeID::LeafSquashed => TrieNodeType::LeafSquashed(
+                self.leaf_squashed
+                    .as_ref()
+                    .expect("BUG: decode scratch lost leaf_squashed")
+                    .clone(),
+            ),
         }
     }
 
@@ -241,6 +268,7 @@ impl MarfReadState {
             TrieNodeType::Node48(n) => self.store_node48((**n).clone()),
             TrieNodeType::Node256(n) => self.store_node256((**n).clone()),
             TrieNodeType::Leaf(n) => self.store_leaf(n.clone()),
+            TrieNodeType::LeafSquashed(_) => self.store(node.clone()),
         }
     }
 
@@ -385,7 +413,7 @@ impl MarfReadState {
                 node.patch_depth += added_depth;
                 node.last_patch_source = new_source.or(node.last_patch_source);
             }
-            TrieNodeID::Leaf | TrieNodeID::Empty | TrieNodeID::Patch => {
+            TrieNodeID::Leaf | TrieNodeID::Empty | TrieNodeID::Patch | TrieNodeID::LeafSquashed => {
                 return Err(Error::CorruptionError(
                     "Cannot apply patches to non-intermediate decode scratch node".to_string(),
                 ));
@@ -435,6 +463,17 @@ impl MarfReadState {
         Ok(consumed)
     }
 
+    pub fn decode_leaf_squashed_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        let node = self.leaf_squashed.get_or_insert_with(|| TrieLeafSquashed {
+            path: Default::default(),
+            entries: Vec::new(),
+        });
+        let consumed = node.load_from_slice(bytes)?;
+        self.owned = None;
+        self.current_id = Some(TrieNodeID::LeafSquashed);
+        Ok(consumed)
+    }
+
     pub fn decode_patch_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
         let node = self.patch.get_or_insert_with(|| TrieNodePatch {
             ptr: TriePtr::default(),
@@ -454,6 +493,7 @@ impl MarfReadState {
             TrieNodeID::Node48 => self.decode_node48_from_slice(bytes),
             TrieNodeID::Node256 => self.decode_node256_from_slice(bytes),
             TrieNodeID::Leaf => self.decode_leaf_from_slice(bytes),
+            TrieNodeID::LeafSquashed => self.decode_leaf_squashed_from_slice(bytes),
             _ => Err(Error::CorruptionError(format!(
                 "Cannot decode node type {id:?} from slice"
             ))),

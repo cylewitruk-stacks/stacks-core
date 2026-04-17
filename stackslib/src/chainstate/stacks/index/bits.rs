@@ -21,8 +21,8 @@ use sha2::{Digest, Sha512_256 as TrieHasher};
 
 use crate::chainstate::stacks::index::node::{
     clear_compressed, clear_ctrl_bits, is_compressed, ptrs_fmt, set_backptr, ConsensusSerializable,
-    TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodePatch,
-    TrieNodeType, TriePtr, TRIEPTR_SIZE,
+    TrieLeafSquashed, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID,
+    TrieNodePatch, TrieNodeType, TriePtr, TRIEPTR_SIZE,
 };
 use crate::chainstate::stacks::index::{
     BlockMap, Error, MarfTrieId, NodeDecodeScratch, NodePath, ReadTrieItem, ReadTrieNode, TrieLeaf,
@@ -97,6 +97,7 @@ pub fn get_sparse_ptrs_bitmap_size(id: u8) -> Option<usize> {
         TrieNodeID::Node256 => Some(32),
         TrieNodeID::Empty => None,
         TrieNodeID::Patch => None,
+        TrieNodeID::LeafSquashed => None,
     }
 }
 
@@ -151,6 +152,9 @@ pub fn get_node_body_max_byte_len(node_id: u8) -> Result<usize, Error> {
         TrieNodeID::Node48 => get_ptrs_byte_len(&[TriePtr::default(); 48]) + 256 + path_max_len,
         TrieNodeID::Node256 => get_ptrs_byte_len(&[TriePtr::default(); 256]) + path_max_len,
         TrieNodeID::Patch => 1 + patch_ptr_max_len + 1 + 256 * patch_ptr_max_len,
+        // LeafSquashed is variable-length; use a generous upper bound.
+        // In practice, squash blobs should be read via mmap (borrowed path).
+        TrieNodeID::LeafSquashed => 1 + path_max_len + 4 + 65536 * 44,
         TrieNodeID::Empty => {
             return Err(Error::CorruptionError(format!(
                 "Unsupported node ID for node-body read: {:x}",
@@ -248,6 +252,10 @@ pub fn decode_nodetype_from_slice_at_head(
         TrieNodeID::Leaf => {
             let (node, consumed) = TrieLeaf::from_bytes(bytes)?;
             Ok((TrieNodeType::Leaf(node), consumed))
+        }
+        TrieNodeID::LeafSquashed => {
+            let (node, consumed) = TrieLeafSquashed::from_bytes(bytes)?;
+            Ok((TrieNodeType::LeafSquashed(node), consumed))
         }
         TrieNodeID::Empty => Err(Error::CorruptionError(
             "inner_read_nodetype_at_head: stored empty node type".to_string(),
@@ -615,14 +623,22 @@ pub fn get_nodetype_hash_bytes<T: MarfTrieId, M: BlockMap>(
     node: &TrieNodeType,
     child_hash_bytes: &[TrieHash],
     map: &mut M,
-) -> TrieHash {
-    match node {
+) -> Result<TrieHash, Error> {
+    Ok(match node {
         TrieNodeType::Node4(ref data) => get_node_hash(data, child_hash_bytes, map),
         TrieNodeType::Node16(ref data) => get_node_hash(data, child_hash_bytes, map),
         TrieNodeType::Node48(ref data) => get_node_hash(data.as_ref(), child_hash_bytes, map),
         TrieNodeType::Node256(ref data) => get_node_hash(data.as_ref(), child_hash_bytes, map),
         TrieNodeType::Leaf(ref data) => get_node_hash(data, child_hash_bytes, map),
-    }
+        // LeafSquashed hashes as a plain Leaf using the tip value
+        TrieNodeType::LeafSquashed(ref data) => {
+            let leaf = TrieLeaf {
+                path: data.path,
+                data: data.tip_value()?.clone(),
+            };
+            get_node_hash(&leaf, child_hash_bytes, map)
+        }
+    })
 }
 
 /// Low-level method for reading a TrieHash into a byte buffer from a Read-able and Seek-able struct.
@@ -675,14 +691,17 @@ pub fn read_root_hash<T: MarfTrieId, R: TrieReadStorage<T> + ?Sized>(
 /// Returns `(stored_node_id, bytes_consumed)`.
 fn decode_trie_item_into_scratch(
     remaining: &[u8],
-    ptr_id: u8,
+    _ptr_id: u8,
     scratch: &mut impl NodeDecodeScratch,
 ) -> Result<(TrieNodeID, usize), Error> {
     let stored_node_id = stored_node_id_from_bytes(remaining)?;
     let consumed = if stored_node_id == TrieNodeID::Patch {
         scratch.decode_patch_from_slice(remaining)?
     } else {
-        decode_nodetype_ref_from_slice_at_head(remaining, ptr_id, scratch)?
+        // Use the stored node ID from the actual bytes, not the TriePtr hint.
+        // The TriePtr may carry a stale type (e.g. Leaf when the on-disk node
+        // is actually LeafSquashed in a FullHistory squash blob).
+        decode_nodetype_ref_from_slice_at_head(remaining, stored_node_id as u8, scratch)?
     };
     Ok((stored_node_id, consumed))
 }

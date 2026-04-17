@@ -48,7 +48,7 @@ use crate::chainstate::stacks::db::accounts::MinerReward;
 #[cfg(test)]
 use crate::chainstate::stacks::db::ChainStateBootData;
 use crate::chainstate::stacks::db::{
-    MinerRewardInfo, StacksChainState, StacksEpochReceipt, StacksHeaderInfo,
+    MinerRewardInfo, SharedChainstate, StacksChainState, StacksEpochReceipt, StacksHeaderInfo,
 };
 use crate::chainstate::stacks::events::{
     StacksBlockEventData, StacksTransactionEvent, StacksTransactionReceipt, TransactionOrigin,
@@ -211,7 +211,7 @@ pub struct ChainsCoordinator<
 > {
     pub canonical_sortition_tip: Option<SortitionId>,
     pub burnchain_blocks_db: BurnchainDB,
-    pub chain_state_db: StacksChainState,
+    pub chain_state_db: SharedChainstate,
     pub sortition_db: SortitionDB,
     pub burnchain: Burnchain,
     pub atlas_db: Option<AtlasDB>,
@@ -487,7 +487,7 @@ impl<
 {
     pub fn run(
         config: ChainsCoordinatorConfig,
-        chain_state_db: StacksChainState,
+        chain_state_db: SharedChainstate,
         burnchain: Burnchain,
         dispatcher: &'a T,
         comms: CoordinatorReceivers,
@@ -682,7 +682,7 @@ impl<T: BlockEventDispatcher, U: RewardSetProvider, B: BurnchainHeaderReader>
         ChainsCoordinator {
             canonical_sortition_tip: Some(canonical_sortition_tip),
             burnchain_blocks_db,
-            chain_state_db,
+            chain_state_db: SharedChainstate::new(chain_state_db),
             sortition_db,
             burnchain,
             dispatcher,
@@ -1301,7 +1301,7 @@ impl<
                     if sortition.sortition {
                         if let Some(stacks_block_header) =
                             StacksChainState::get_stacks_block_header_info_by_index_block_hash(
-                                self.chain_state_db.db(),
+                                self.chain_state_db.lock().db(),
                                 &StacksBlockId::new(
                                     &sortition.consensus_hash,
                                     &sortition.winning_stacks_block_hash,
@@ -1335,7 +1335,7 @@ impl<
                     let (next_snapshot, _) = self
                         .sortition_db
                         .evaluate_sortition(
-                            self.chain_state_db.mainnet,
+                            self.chain_state_db.lock().mainnet,
                             &header,
                             ops,
                             &self.burnchain,
@@ -1379,7 +1379,8 @@ impl<
             if !unorphan_blocks.is_empty() {
                 revalidated_stacks_block = true;
                 let ic = self.sortition_db.index_conn();
-                let mut chainstate_db_tx = self.chain_state_db.db_tx_begin()?;
+                let mut chainstate = self.chain_state_db.lock();
+                let mut chainstate_db_tx = chainstate.db_tx_begin()?;
                 for (burn_header, invalidation_height) in unorphan_blocks {
                     // permit re-processing of any associated stacks blocks if they're
                     // orphaned
@@ -1455,12 +1456,13 @@ impl<
             .as_ref()
             .expect("FATAL: Processing anchor block, but no known sortition tip");
 
+        let mut chainstate = self.chain_state_db.lock();
         get_reward_cycle_info(
             burn_header.block_height,
             &burn_header.parent_block_hash,
             sortition_tip_id,
             &self.burnchain,
-            &mut self.chain_state_db,
+            &mut *chainstate,
             &mut self.sortition_db,
             &self.reward_set_provider,
         )
@@ -1539,19 +1541,18 @@ impl<
         blocks: Vec<BlockHeaderHash>,
     ) -> Result<(), Error> {
         for bhh in blocks.into_iter() {
-            let staging_block_chs = StacksChainState::get_staging_block_consensus_hashes(
-                self.chain_state_db.db(),
-                &bhh,
-            )?;
+            let chainstate = self.chain_state_db.lock();
+            let staging_block_chs =
+                StacksChainState::get_staging_block_consensus_hashes(chainstate.db(), &bhh)?;
+            let blocks_path = chainstate.blocks_path.clone();
+            drop(chainstate);
             let mut processed = false;
 
             debug!("Consider replaying {} from {:?}", &bhh, &staging_block_chs);
 
             for alt_ch in staging_block_chs.into_iter() {
                 let alt_id = StacksBlockHeader::make_index_block_hash(&alt_ch, &bhh);
-                if !StacksChainState::has_block_indexed(&self.chain_state_db.blocks_path, &alt_id)
-                    .unwrap_or(false)
-                {
+                if !StacksChainState::has_block_indexed(&blocks_path, &alt_id).unwrap_or(false) {
                     continue;
                 }
 
@@ -1578,9 +1579,7 @@ impl<
                 // the new consensus hash
                 let ch = ancestor_sn.consensus_hash;
 
-                if let Ok(Some(block)) =
-                    StacksChainState::load_block(&self.chain_state_db.blocks_path, &alt_ch, &bhh)
-                {
+                if let Ok(Some(block)) = StacksChainState::load_block(&blocks_path, &alt_ch, &bhh) {
                     let ic = self.sortition_db.index_conn();
                     if let Some(parent_snapshot) = ic
                         .find_parent_snapshot_for_stacks_block(&ch, &bhh)
@@ -1589,7 +1588,8 @@ impl<
                         // replay in this consensus hash history
                         debug!("Replay Stacks block from {} to {}/{}", &alt_ch, &ch, &bhh);
                         let ic = self.sortition_db.index_conn();
-                        let _ = self.chain_state_db.preprocess_anchored_block(
+                        let mut chainstate = self.chain_state_db.lock();
+                        let _ = chainstate.preprocess_anchored_block(
                             &ic,
                             &ch,
                             &block,
@@ -1618,7 +1618,7 @@ impl<
         next_snapshot: &BlockSnapshot,
     ) -> Result<(), Error> {
         let staging_block_chs = StacksChainState::get_staging_block_consensus_hashes(
-            self.chain_state_db.db(),
+            self.chain_state_db.lock().db(),
             &next_snapshot.winning_stacks_block_hash,
         )?;
 
@@ -1663,9 +1663,16 @@ impl<
         let sortdb_handle = self
             .sortition_db
             .tx_handle_begin(&canonical_sortition_tip)?;
-        let mut processed_blocks =
-            self.chain_state_db
-                .process_blocks(sortdb_handle, 1, self.dispatcher)?;
+        let mut processed_blocks = {
+            let mut chainstate = self.chain_state_db.lock();
+            let result = chainstate.process_blocks(sortdb_handle, 1, self.dispatcher)?;
+            // Auto-squash MARF if cadence is met for the just-processed block.
+            if let Some((Some(ref receipt), _)) = result.first() {
+                chainstate
+                    .maybe_squash(receipt.header.stacks_block_height, self.sortition_db.conn());
+            }
+            result
+        };
 
         while let Some(block_result) = processed_blocks.pop() {
             if block_result.0.is_none() && block_result.1.is_none() {
@@ -1770,9 +1777,16 @@ impl<
                 .sortition_db
                 .tx_handle_begin(&canonical_sortition_tip)?;
             // Right before a block is set to processed, the event dispatcher will emit a new block event
-            processed_blocks =
-                self.chain_state_db
-                    .process_blocks(sortdb_handle, 1, self.dispatcher)?;
+            processed_blocks = {
+                let mut chainstate = self.chain_state_db.lock();
+                let result = chainstate.process_blocks(sortdb_handle, 1, self.dispatcher)?;
+                // Auto-squash MARF if cadence is met for the just-processed block.
+                if let Some((Some(ref receipt), _)) = result.first() {
+                    chainstate
+                        .maybe_squash(receipt.header.stacks_block_height, self.sortition_db.conn());
+                }
+                result
+            };
         }
 
         Ok(None)

@@ -2132,6 +2132,15 @@ pub struct NodeConfig {
     /// ---
     /// @default: `true`
     pub marf_mmap: bool,
+    /// Retain per-key value-transition history in squash blobs so that
+    /// historical reads (`at-block`) return correct point-in-time values.
+    /// When `false` (default), the system still forces `FullHistory` for
+    /// squash ranges that contain pre-epoch-3.4 blocks (required for
+    /// consensus correctness). Set to `true` to unconditionally retain
+    /// history even after epoch 3.4.
+    /// ---
+    /// @default: `false`
+    pub marf_full_history: bool,
     /// Sampling interval in seconds for the PoX synchronization watchdog thread
     /// (pre-Nakamoto). Determines how often the watchdog checked PoX state
     /// consistency in the Neon run loop.
@@ -2453,6 +2462,7 @@ impl Default for NodeConfig {
             marf_defer_hashing: true,
             marf_compress: true,
             marf_mmap: true,
+            marf_full_history: false,
             pox_sync_sample_secs: 30,
             use_test_genesis_chainstate: None,
             fault_injection_block_push_fail_probability: None,
@@ -2607,10 +2617,18 @@ impl NodeConfig {
     }
 
     pub fn get_marf_opts(&self) -> MARFOpenOpts {
+        use crate::chainstate::stacks::index::squash::SquashMode;
+
         let hash_mode = if self.marf_defer_hashing {
             TrieHashCalculationMode::Deferred
         } else {
             TrieHashCalculationMode::Immediate
+        };
+
+        let squash_mode = if self.marf_full_history {
+            SquashMode::FullHistory
+        } else {
+            SquashMode::TipOnly
         };
 
         MARFOpenOpts::new(
@@ -2620,6 +2638,7 @@ impl NodeConfig {
         )
         .with_compression(self.marf_compress)
         .with_mmap(self.marf_mmap)
+        .with_squash_mode(squash_mode)
     }
 }
 
@@ -3869,6 +3888,7 @@ pub struct NodeConfigFile {
     pub marf_defer_hashing: Option<bool>,
     pub marf_compress: Option<bool>,
     pub marf_mmap: Option<bool>,
+    pub marf_full_history: Option<bool>,
     pub pox_sync_sample_secs: Option<u64>,
     pub use_test_genesis_chainstate: Option<bool>,
     /// At most, how often should the chain-liveness thread
@@ -3948,6 +3968,9 @@ impl NodeConfigFile {
                 .marf_compress
                 .unwrap_or(default_node_config.marf_compress),
             marf_mmap: self.marf_mmap.unwrap_or(default_node_config.marf_mmap),
+            marf_full_history: self
+                .marf_full_history
+                .unwrap_or(default_node_config.marf_full_history),
             pox_sync_sample_secs: self
                 .pox_sync_sample_secs
                 .unwrap_or(default_node_config.pox_sync_sample_secs),
