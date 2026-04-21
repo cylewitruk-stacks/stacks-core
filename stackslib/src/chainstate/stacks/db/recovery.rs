@@ -341,6 +341,70 @@ fn canonical_stacks_tip(sortdb_conn: &Connection) -> Result<StacksBlockId, Error
     ))
 }
 
+/// Check whether a block that is still `processed = 0` in the staging DB
+/// has committed residue in the chainstate or clarity databases.
+///
+/// Residue means at least one of:
+/// - A `nakamoto_block_headers` row (inserted by `advance_tip`)
+/// - A state-index `marf_data` row (inserted by the state-index MARF)
+/// - A clarity `marf_data` row (inserted by the clarity MARF)
+///
+/// Any of these indicate the block was partially committed before a crash.
+fn has_committed_residue(
+    chainstate_conn: &Connection,
+    clarity_conn: &Connection,
+    block_id: &StacksBlockId,
+) -> Result<bool, Error> {
+    // Check nakamoto_block_headers (may not exist on pre-Nakamoto chainstates).
+    let has_header: bool = match chainstate_conn.query_row(
+        "SELECT 1 FROM nakamoto_block_headers WHERE index_block_hash = ?1",
+        params![block_id],
+        |_| Ok(true),
+    ) {
+        Ok(_) => true,
+        Err(rusqlite::Error::QueryReturnedNoRows) => false,
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::Unknown && err.extended_code == 1 =>
+        {
+            // "no such table" — pre-Nakamoto chainstate; skip.
+            false
+        }
+        Err(e) => return Err(Error::DBError(db_error::SqliteError(e))),
+    };
+
+    if has_header {
+        return Ok(true);
+    }
+
+    // Check state-index marf_data.
+    let has_state_index: bool = chainstate_conn
+        .query_row(
+            "SELECT 1 FROM marf_data WHERE block_hash = ?1 AND unconfirmed = 0",
+            params![block_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| Error::DBError(db_error::SqliteError(e)))?
+        .unwrap_or(false);
+
+    if has_state_index {
+        return Ok(true);
+    }
+
+    // Check clarity marf_data.
+    let has_clarity: bool = clarity_conn
+        .query_row(
+            "SELECT 1 FROM marf_data WHERE block_hash = ?1 AND unconfirmed = 0",
+            params![block_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| Error::DBError(db_error::SqliteError(e)))?
+        .unwrap_or(false);
+
+    Ok(has_clarity)
+}
+
 // ---------------------------------------------------------------------------
 // Generic walker
 // ---------------------------------------------------------------------------
@@ -670,6 +734,77 @@ impl StacksChainState {
     }
 
     // -----------------------------------------------------------------------
+    // Half-committed block recovery
+    // -----------------------------------------------------------------------
+
+    /// Detect and rewind Nakamoto blocks that are stuck in a half-committed
+    /// state: the MARF and/or header row were written, but the staging DB
+    /// was never updated to `processed = 1` (crash between
+    /// `chainstate_tx.commit()` and `infallible_set_block_processed()`).
+    ///
+    /// These blocks are invisible to the backward walk (which only visits
+    /// committed headers reachable from the canonical sortition tip) but
+    /// will cause `MARF::begin()` → `ExistsError` when the coordinator
+    /// tries to re-process them.
+    ///
+    /// Returns the number of blocks cleaned up.
+    fn recover_half_committed_blocks(&mut self) -> Result<usize, Error> {
+        // Collect candidate block IDs from the staging DB: unprocessed,
+        // non-orphaned Nakamoto blocks that might have residue.
+        let candidates: Vec<StacksBlockId> = {
+            let sql = "SELECT index_block_hash FROM nakamoto_staging_blocks \
+                       WHERE processed = 0 AND orphaned = 0";
+            let mut stmt = self
+                .nakamoto_staging_blocks_conn
+                .prepare(sql)
+                .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+            let rows = stmt
+                .query_map(params![], |row| row.get(0))
+                .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(|e| Error::DBError(db_error::SqliteError(e)))?);
+            }
+            ids
+        };
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // For each candidate, check for committed residue: a header row
+        // or MARF entry that should not exist for an unprocessed block.
+        let chainstate_conn = self.state_index.sqlite_conn();
+        let half_committed: Vec<StacksBlockId> =
+            self.clarity_state
+                .with_marf(|marf| -> Result<Vec<StacksBlockId>, Error> {
+                    let clarity_conn = marf.sqlite_conn();
+                    let mut result = Vec::new();
+                    for block_id in &candidates {
+                        if has_committed_residue(chainstate_conn, clarity_conn, block_id)? {
+                            result.push(block_id.clone());
+                        }
+                    }
+                    Ok(result)
+                })?;
+
+        if half_committed.is_empty() {
+            return Ok(0);
+        }
+
+        let count = half_committed.len();
+        warn!("Startup recovery: found {count} half-committed Nakamoto block(s). Rewinding.",);
+        for block_id in &half_committed {
+            info!("Startup recovery: half-committed block {block_id}");
+        }
+
+        self.execute_rewind(&half_committed)?;
+
+        warn!("Startup recovery: successfully cleaned {count} half-committed block(s).",);
+        Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
     // Recovery helpers
     // -----------------------------------------------------------------------
 
@@ -700,7 +835,13 @@ impl StacksChainState {
 
     /// Run startup consistency validation against the canonical chain tip.
     ///
-    /// Runs two passes against the same canonical tip:
+    /// Runs three passes:
+    /// 0. **Pre-flight** (half-committed blocks): scans the staging DB for
+    ///    blocks still marked `processed = 0` that have committed residue
+    ///    (header rows, MARF entries) left behind by a crash between
+    ///    `chainstate_tx.commit()` and `infallible_set_block_processed()`.
+    ///    These blocks are passed through `execute_rewind()` so the
+    ///    coordinator can re-process them cleanly.
     /// 1. **Tier 1** (MARF existence): always auto-rewinds, no depth limit.
     /// 2. **Tier 2** (epoch consistency): always runs (even after Tier 1
     ///    rewinds) to catch stale-epoch blocks behind the Tier 1 rewind
@@ -708,7 +849,7 @@ impl StacksChainState {
     ///    Tier 2 rewind count exceeds this limit, the function returns an
     ///    error instead of rewinding. Set to `0` to disable the limit.
     ///
-    /// Returns the total number of blocks rewound across both tiers
+    /// Returns the total number of blocks rewound across all passes
     /// (0 if consistent).
     ///
     /// This should be called after `StacksChainState::open()` returns but before
@@ -721,6 +862,9 @@ impl StacksChainState {
         let canonical_tip = canonical_stacks_tip(sortdb_conn)?;
 
         info!("Startup recovery: validating chainstate from canonical tip {canonical_tip}");
+
+        // -- Pre-flight: recover half-committed Nakamoto blocks. --
+        let preflight_count = self.recover_half_committed_blocks()?;
 
         // -- Pass 1: Tier 1 (MARF existence). Always auto-rewinds. --
         let tier1_checks: &[&dyn ConsistencyCheck] = &[&MarfExistenceCheck];
@@ -765,15 +909,17 @@ impl StacksChainState {
                 Err(Error::NoSuchBlockError)
             }
             WalkResult::Consistent { rewind_set, .. } if rewind_set.is_empty() => {
-                if tier1_count > 0 {
+                let total = preflight_count + tier1_count;
+                if total > 0 {
                     info!(
                         "Startup recovery: Tier 2 consistent. \
-                         Coordinator will replay {tier1_count} Tier 1 blocks on start.",
+                         Coordinator will replay {total} blocks on start \
+                         ({preflight_count} pre-flight + {tier1_count} Tier 1).",
                     );
                 } else {
                     info!("Startup recovery: chainstate is consistent. No rewind needed.");
                 }
-                Ok(tier1_count)
+                Ok(total)
             }
             WalkResult::Consistent { rewind_set, .. } => {
                 let tier2_count = rewind_set.len();
@@ -795,11 +941,11 @@ impl StacksChainState {
                 );
                 self.execute_rewind(&rewind_set)?;
 
-                let total = tier1_count + tier2_count;
+                let total = preflight_count + tier1_count + tier2_count;
                 warn!(
                     "Startup recovery: rewound {total} blocks total \
-                     ({tier1_count} Tier 1 + {tier2_count} Tier 2). \
-                     Coordinator will replay on start.",
+                     ({preflight_count} pre-flight + {tier1_count} Tier 1 + \
+                     {tier2_count} Tier 2). Coordinator will replay on start.",
                 );
                 Ok(total)
             }
@@ -1731,5 +1877,276 @@ mod tests {
                 "Expected error when rewind depth exceeds limit, got {result:?}",
             );
         }
+    }
+
+    // ----- has_committed_residue unit tests -----
+
+    #[test]
+    fn test_has_committed_residue_no_residue() {
+        let chainstate = make_test_chainstate_db();
+        let clarity = make_test_clarity_db();
+        let block_id = StacksBlockId([0x42; 32]);
+
+        // Block has no header, no state-index MARF, no clarity MARF → no residue.
+        assert!(!has_committed_residue(&chainstate, &clarity, &block_id).unwrap());
+    }
+
+    #[test]
+    fn test_has_committed_residue_header_only() {
+        let chainstate = make_test_chainstate_db();
+        let clarity = make_test_clarity_db();
+        let block_id = StacksBlockId([0x42; 32]);
+        let parent_id = StacksBlockId([0x41; 32]);
+
+        // Block has a nakamoto_block_headers row but nothing else.
+        insert_test_nakamoto_block(
+            &chainstate,
+            &block_id.to_string(),
+            &parent_id.to_string(),
+            100,
+            Some(StacksEpochId::Epoch30 as u32),
+        );
+
+        assert!(has_committed_residue(&chainstate, &clarity, &block_id).unwrap());
+    }
+
+    #[test]
+    fn test_has_committed_residue_state_index_marf_only() {
+        let chainstate = make_test_chainstate_db();
+        let clarity = make_test_clarity_db();
+        let block_id = StacksBlockId([0x42; 32]);
+
+        // Block has state-index marf_data but no header or clarity entry.
+        insert_test_state_index_marf(&chainstate, &block_id.to_string());
+
+        assert!(has_committed_residue(&chainstate, &clarity, &block_id).unwrap());
+    }
+
+    #[test]
+    fn test_has_committed_residue_clarity_marf_only() {
+        let chainstate = make_test_chainstate_db();
+        let clarity = make_test_clarity_db();
+        let block_id = StacksBlockId([0x42; 32]);
+
+        // Block has clarity marf_data but no header or state-index entry.
+        insert_test_clarity_marf(&clarity, &block_id.to_string());
+
+        assert!(has_committed_residue(&chainstate, &clarity, &block_id).unwrap());
+    }
+
+    #[test]
+    fn test_has_committed_residue_all_residue() {
+        let chainstate = make_test_chainstate_db();
+        let clarity = make_test_clarity_db();
+        let block_id = StacksBlockId([0x42; 32]);
+        let parent_id = StacksBlockId([0x41; 32]);
+
+        // Full residue: header + both MARFs.
+        insert_test_nakamoto_block(
+            &chainstate,
+            &block_id.to_string(),
+            &parent_id.to_string(),
+            100,
+            Some(StacksEpochId::Epoch30 as u32),
+        );
+        insert_test_state_index_marf(&chainstate, &block_id.to_string());
+        insert_test_clarity_marf(&clarity, &block_id.to_string());
+
+        assert!(has_committed_residue(&chainstate, &clarity, &block_id).unwrap());
+    }
+
+    // ----- Half-committed block recovery integration tests -----
+
+    #[test]
+    fn test_startup_recovery_half_committed_block() {
+        // Simulate a crash between chainstate_tx.commit() and
+        // infallible_set_block_processed(): the block has a header row and
+        // MARF entries but staging still says processed = 0.
+        let test_name = "test_startup_recovery_half_committed_block";
+        let mut chainstate = instantiate_chainstate(false, 0x80000000, test_name);
+        let epochs = StacksEpoch::unit_test(StacksEpochId::Epoch20, 0);
+        let sortdb = make_test_sortdb(test_name, epochs);
+
+        let fake_consensus = ConsensusHash([0xAA; 20]);
+        let fake_block_hash = BlockHeaderHash([0xBB; 32]);
+        let fake_block_id =
+            StacksBlockHeader::make_index_block_hash(&fake_consensus, &fake_block_hash);
+        let genesis_id = StacksBlockHeader::make_index_block_hash(
+            &crate::core::FIRST_BURNCHAIN_CONSENSUS_HASH,
+            &crate::core::FIRST_STACKS_BLOCK_HASH,
+        );
+
+        // Insert a nakamoto_staging_blocks entry: processed = 0, orphaned = 0.
+        chainstate
+            .nakamoto_staging_blocks_conn
+            .execute(
+                "INSERT INTO nakamoto_staging_blocks \
+                 (block_hash, consensus_hash, parent_block_id, is_tenure_start, \
+                  burn_attachable, processed, orphaned, index_block_hash, \
+                  processed_time, obtain_method, signing_weight, data, height) \
+                 VALUES (?1, ?2, ?3, 0, 1, 0, 0, ?4, 0, 'test', 0, X'00', 1)",
+                params![fake_block_hash, fake_consensus, genesis_id, fake_block_id],
+            )
+            .unwrap();
+
+        // Simulate residue: insert state-index marf_data (written by
+        // chainstate_tx.commit() before the crash).
+        chainstate
+            .state_index
+            .sqlite_conn()
+            .execute(
+                "INSERT INTO marf_data (block_hash, data, unconfirmed) VALUES (?1, X'00', 0)",
+                params![fake_block_id],
+            )
+            .unwrap();
+
+        // And clarity marf_data residue.
+        chainstate
+            .clarity_state
+            .with_marf(|marf| {
+                marf.sqlite_conn().execute(
+                    "INSERT INTO marf_data (block_hash, data, unconfirmed) VALUES (?1, X'00', 0)",
+                    params![fake_block_id],
+                )
+            })
+            .unwrap();
+
+        // Run recovery. The pre-flight should detect and rewind the
+        // half-committed block.
+        let result = chainstate.check_and_recover_chainstate(sortdb.conn(), 256);
+        assert_eq!(
+            result.unwrap(),
+            1,
+            "Expected 1 half-committed block rewound"
+        );
+
+        // Verify the residue was cleaned up:
+        // - state-index marf_data row should be gone.
+        let marf_count: u32 = chainstate
+            .state_index
+            .sqlite_conn()
+            .query_row(
+                "SELECT COUNT(*) FROM marf_data WHERE block_hash = ?1 AND unconfirmed = 0",
+                params![fake_block_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marf_count, 0,
+            "State-index marf_data should have been deleted"
+        );
+
+        // - clarity marf_data row should be gone.
+        let clarity_count: u32 = chainstate
+            .clarity_state
+            .with_marf(|marf| {
+                marf.sqlite_conn().query_row(
+                    "SELECT COUNT(*) FROM marf_data WHERE block_hash = ?1 AND unconfirmed = 0",
+                    params![fake_block_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            clarity_count, 0,
+            "Clarity marf_data should have been deleted"
+        );
+
+        // - staging entry should still have processed = 0 (ready for reprocessing).
+        let processed: u32 = chainstate
+            .nakamoto_staging_blocks_conn
+            .query_row(
+                "SELECT processed FROM nakamoto_staging_blocks WHERE index_block_hash = ?1",
+                params![fake_block_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(processed, 0, "Staging entry should still be processed = 0");
+    }
+
+    #[test]
+    fn test_startup_recovery_no_half_committed_blocks() {
+        // Verify that when there are unprocessed staging blocks with NO
+        // committed residue, the pre-flight is a no-op.
+        let test_name = "test_startup_recovery_no_half_committed_blocks";
+        let mut chainstate = instantiate_chainstate(false, 0x80000000, test_name);
+        let epochs = StacksEpoch::unit_test(StacksEpochId::Epoch20, 0);
+        let sortdb = make_test_sortdb(test_name, epochs);
+
+        let fake_consensus = ConsensusHash([0xCC; 20]);
+        let fake_block_hash = BlockHeaderHash([0xDD; 32]);
+        let fake_block_id =
+            StacksBlockHeader::make_index_block_hash(&fake_consensus, &fake_block_hash);
+        let genesis_id = StacksBlockHeader::make_index_block_hash(
+            &crate::core::FIRST_BURNCHAIN_CONSENSUS_HASH,
+            &crate::core::FIRST_STACKS_BLOCK_HASH,
+        );
+
+        // Insert a staging block with NO committed residue (normal pending block).
+        chainstate
+            .nakamoto_staging_blocks_conn
+            .execute(
+                "INSERT INTO nakamoto_staging_blocks \
+                 (block_hash, consensus_hash, parent_block_id, is_tenure_start, \
+                  burn_attachable, processed, orphaned, index_block_hash, \
+                  processed_time, obtain_method, signing_weight, data, height) \
+                 VALUES (?1, ?2, ?3, 0, 1, 0, 0, ?4, 0, 'test', 0, X'00', 1)",
+                params![fake_block_hash, fake_consensus, genesis_id, fake_block_id],
+            )
+            .unwrap();
+
+        // Recovery should find nothing to rewind.
+        let result = chainstate.check_and_recover_chainstate(sortdb.conn(), 256);
+        assert_eq!(result.unwrap(), 0, "Expected no blocks rewound");
+    }
+
+    #[test]
+    fn test_startup_recovery_orphaned_staging_ignored() {
+        // Verify that orphaned staging blocks are not scanned — only
+        // unprocessed non-orphaned blocks are candidates.
+        let test_name = "test_startup_recovery_orphaned_staging_ignored";
+        let mut chainstate = instantiate_chainstate(false, 0x80000000, test_name);
+        let epochs = StacksEpoch::unit_test(StacksEpochId::Epoch20, 0);
+        let sortdb = make_test_sortdb(test_name, epochs);
+
+        let fake_consensus = ConsensusHash([0xEE; 20]);
+        let fake_block_hash = BlockHeaderHash([0xFF; 32]);
+        let fake_block_id =
+            StacksBlockHeader::make_index_block_hash(&fake_consensus, &fake_block_hash);
+        let genesis_id = StacksBlockHeader::make_index_block_hash(
+            &crate::core::FIRST_BURNCHAIN_CONSENSUS_HASH,
+            &crate::core::FIRST_STACKS_BLOCK_HASH,
+        );
+
+        // Insert a staging block that is orphaned = 1 (should be skipped).
+        chainstate
+            .nakamoto_staging_blocks_conn
+            .execute(
+                "INSERT INTO nakamoto_staging_blocks \
+                 (block_hash, consensus_hash, parent_block_id, is_tenure_start, \
+                  burn_attachable, processed, orphaned, index_block_hash, \
+                  processed_time, obtain_method, signing_weight, data, height) \
+                 VALUES (?1, ?2, ?3, 0, 1, 0, 1, ?4, 0, 'test', 0, X'00', 1)",
+                params![fake_block_hash, fake_consensus, genesis_id, fake_block_id],
+            )
+            .unwrap();
+
+        // Insert residue that WOULD be detected if the block weren't orphaned.
+        chainstate
+            .state_index
+            .sqlite_conn()
+            .execute(
+                "INSERT INTO marf_data (block_hash, data, unconfirmed) VALUES (?1, X'00', 0)",
+                params![fake_block_id],
+            )
+            .unwrap();
+
+        // Recovery should find nothing because orphaned blocks are excluded.
+        let result = chainstate.check_and_recover_chainstate(sortdb.conn(), 256);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "Expected no blocks rewound (orphaned ignored)"
+        );
     }
 }
