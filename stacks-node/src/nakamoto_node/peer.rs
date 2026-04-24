@@ -21,7 +21,7 @@ use std::time::Duration;
 use stacks::burnchains::db::BurnchainHeaderReader;
 use stacks::burnchains::PoxConstants;
 use stacks::chainstate::burn::db::sortdb::SortitionDB;
-use stacks::chainstate::stacks::db::SharedChainstate;
+use stacks::chainstate::stacks::db::StacksChainState;
 use stacks::chainstate::stacks::miner::signal_mining_blocked;
 use stacks::core::mempool::MemPoolDB;
 use stacks::cost_estimates::metrics::{CostMetric, UnitMetric};
@@ -33,6 +33,7 @@ use stacks_common::util::hash::Sha256Sum;
 
 use crate::burnchains::make_bitcoin_indexer;
 use crate::nakamoto_node::relayer::RelayerDirective;
+use crate::neon_node::open_chainstate_with_faults_shared;
 use crate::run_loop::nakamoto::{Globals, RunLoop};
 use crate::{Config, EventDispatcher};
 
@@ -48,8 +49,10 @@ pub struct PeerThread {
     poll_timeout: u64,
     /// handle to the sortition DB
     sortdb: SortitionDB,
-    /// Shared handle to the chainstate DB (mutex-protected, single instance)
-    chainstate: SharedChainstate,
+    /// Owned per-thread handle to the chainstate DB. Confirmed-state operations are
+    /// independent across threads; the in-memory unconfirmed slot is shared via the
+    /// `SharedUnconfirmedState` from globals.
+    chainstate: StacksChainState,
     /// handle to the mempool DB
     mempool: MemPoolDB,
     /// Buffered network result relayer command.
@@ -169,7 +172,10 @@ impl PeerThread {
         )
         .expect("FATAL: could not open sortition DB");
 
-        let chainstate = globals.get_shared_chainstate().clone();
+        // Open this thread's own chainstate; share only the unconfirmed-state slot.
+        let chainstate =
+            open_chainstate_with_faults_shared(&config, globals.get_shared_unconfirmed())
+                .expect("FATAL: failed to open per-thread chainstate for p2p");
 
         let p2p_sock: SocketAddr = config
             .node
@@ -217,7 +223,7 @@ impl PeerThread {
 
         if let Err(e) = self
             .net
-            .refresh_stacker_db_configs(&self.sortdb, &mut *self.chainstate.lock())
+            .refresh_stacker_db_configs(&self.sortdb, &mut self.chainstate)
         {
             warn!("Failed to update StackerDB configs: {e}");
         }
@@ -278,7 +284,7 @@ impl PeerThread {
                 fee_estimator: fee_estimator.map(|boxed_estimator| boxed_estimator.as_ref()),
                 coord_comms: Some(&self.globals.coord_comms),
             };
-            let mut chainstate = self.chainstate.lock();
+            let chainstate = &mut self.chainstate;
             self.net.run(
                 indexer,
                 &self.sortdb,

@@ -36,8 +36,9 @@ use crate::chainstate::stacks::index::storage::{
 };
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
-    bits, Error, MARFValue, MarfTrieId, ReadNodeBacking, ReadTrieNode, ReadTrieNodeCursorStep,
-    TrieLeaf, TrieMerkleProof, TrieNodeReadState, TrieReadSession, TrieReadStorage,
+    bits, Error, MARFValue, MarfTrieId, NodeDecodeScratch, NodeParking, ReadNodeBacking,
+    ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf, TrieMerkleProof, TrieNodeReadState,
+    TrieReadSession, TrieReadStorage,
 };
 use crate::util_lib::db::Error as db_error;
 
@@ -153,6 +154,67 @@ where
 }
 
 pub trait MarfInternals<T: MarfTrieId>: MarfCore<T> {
+    /// Hard cap on the number of times a read entry point will retry after observing an
+    /// internal [`Error::RetryAfterSquash`] before returning a fatal `CorruptionError`.
+    /// Squashes are infrequent relative to reads, so exceeding a handful of retries
+    /// indicates pathological churn — at which point failing fast is preferable to a
+    /// silent livelock.
+    const MAX_READ_RETRIES: usize = 16;
+
+    /// Bounded retry wrapper for read entry points. Re-invokes `exec` up to
+    /// [`MAX_READ_RETRIES`](Self::MAX_READ_RETRIES) times, resetting per-traversal state
+    /// between attempts so each retry runs against fresh squash metadata with no
+    /// inherited cursor / parked-node state.
+    ///
+    /// See [`Error::RetryAfterSquash`] for the protocol and why every public read entry
+    /// point MUST be wrapped in this helper — otherwise the internal sentinel would leak
+    /// into user code.
+    fn with_read_retry<F, R>(&mut self, mut exec: F) -> Result<R, Error>
+    where
+        F: FnMut(&mut Self) -> Result<R, Error>,
+    {
+        for attempt in 0..Self::MAX_READ_RETRIES {
+            match exec(self) {
+                Ok(v) => return Ok(v),
+                Err(ref e) if e.is_retry_after_squash() => {
+                    self.reset_read_state_for_retry()?;
+                    if attempt >= 3 {
+                        warn!(
+                            "MARF read retry attempt {}/{} after concurrent squash",
+                            attempt + 1,
+                            Self::MAX_READ_RETRIES,
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        error!(
+            "MARF read retry exhausted after {} attempts — persistent squash churn",
+            Self::MAX_READ_RETRIES
+        );
+        Err(Error::CorruptionError(format!(
+            "squash-retry-exhausted after {} attempts",
+            Self::MAX_READ_RETRIES,
+        )))
+    }
+
+    /// Reset per-traversal state between retry attempts. Refreshes squash metadata on the
+    /// storage backend, drops any parked nodes / current-node scratch, and clears the walk
+    /// cursor so a fresh traversal starts from the re-synced root.
+    fn reset_read_state_for_retry(&mut self) -> Result<(), Error> {
+        self.with_read_ctx(|ctx| {
+            ctx.with_read_state(|storage, cursor, read_state| {
+                storage.refresh_after_concurrent_squash()?;
+                read_state.clear_parked_nodes();
+                read_state.clear_current_node();
+                *cursor = None;
+                Ok(())
+            })
+        })
+    }
+
     fn get_path(&mut self, block_hash: &T, path: &TrieHash) -> Result<Option<TrieLeaf>, Error> {
         self.with_read_ctx(|ctx| {
             ctx.get_path(block_hash, path).inspect_err(|_e| {
@@ -185,25 +247,29 @@ pub trait MarfInternals<T: MarfTrieId>: MarfCore<T> {
     }
 
     fn get_by_path(&mut self, block_hash: &T, path: &TrieHash) -> Result<Option<MARFValue>, Error> {
-        self.with_restored_block_context(|this| {
-            this.get_path(&block_hash, path)
-                .or_else(|e| match e {
-                    Error::NotFoundError => Ok(None),
-                    _ => Err(e),
-                })
-                .map(|opt| opt.map(|leaf| leaf.data))
+        self.with_read_retry(|this| {
+            this.with_restored_block_context(|this| {
+                this.get_path(block_hash, path)
+                    .or_else(|e| match e {
+                        Error::NotFoundError => Ok(None),
+                        _ => Err(e),
+                    })
+                    .map(|opt| opt.map(|leaf| leaf.data))
+            })
         })
     }
 
     fn get_by_key(&mut self, block_hash: &T, key: &str) -> Result<Option<MARFValue>, Error> {
         let path = TrieHash::from_key(key);
-        self.with_restored_block_context(|this| {
-            this.get_path(block_hash, &path)
-                .or_else(|e| match e {
-                    Error::NotFoundError => Ok(None),
-                    other => Err(other),
-                })
-                .map(|opt| opt.map(|leaf| leaf.data))
+        self.with_read_retry(|this| {
+            this.with_restored_block_context(|this| {
+                this.get_path(block_hash, &path)
+                    .or_else(|e| match e {
+                        Error::NotFoundError => Ok(None),
+                        other => Err(other),
+                    })
+                    .map(|opt| opt.map(|leaf| leaf.data))
+            })
         })
     }
 
@@ -213,7 +279,9 @@ pub trait MarfInternals<T: MarfTrieId>: MarfCore<T> {
         path: &TrieHash,
         marf_value: &MARFValue,
     ) -> Result<TrieMerkleProof<T>, Error> {
-        self.with_read_ctx(|ctx| TrieMerkleProof::from_path(ctx, path, marf_value, block_hash))
+        self.with_read_retry(|this| {
+            this.with_read_ctx(|ctx| TrieMerkleProof::from_path(ctx, path, marf_value, block_hash))
+        })
     }
 
     fn prove_raw_entry(
@@ -222,9 +290,11 @@ pub trait MarfInternals<T: MarfTrieId>: MarfCore<T> {
         key: &str,
         marf_value: &MARFValue,
     ) -> Result<TrieMerkleProof<T>, Error> {
-        self.with_read_ctx(|ctx| {
-            let path = &TrieHash::from_key(key);
-            TrieMerkleProof::from_path(ctx, path, marf_value, block_hash)
+        self.with_read_retry(|this| {
+            this.with_read_ctx(|ctx| {
+                let path = &TrieHash::from_key(key);
+                TrieMerkleProof::from_path(ctx, path, marf_value, block_hash)
+            })
         })
     }
 
@@ -233,7 +303,9 @@ pub trait MarfInternals<T: MarfTrieId>: MarfCore<T> {
         block_hash: &T,
         current_block_hash: &T,
     ) -> Result<Option<u32>, Error> {
-        self.with_read_ctx(|ctx| ctx.get_block_height_miner_tip(block_hash, current_block_hash))
+        self.with_read_retry(|this| {
+            this.with_read_ctx(|ctx| ctx.get_block_height_miner_tip(block_hash, current_block_hash))
+        })
     }
 
     fn get_block_height(
@@ -241,7 +313,9 @@ pub trait MarfInternals<T: MarfTrieId>: MarfCore<T> {
         block_hash: &T,
         current_block_hash: &T,
     ) -> Result<Option<u32>, Error> {
-        self.with_read_ctx(|ctx| ctx.get_block_height(block_hash, current_block_hash))
+        self.with_read_retry(|this| {
+            this.with_read_ctx(|ctx| ctx.get_block_height(block_hash, current_block_hash))
+        })
     }
 
     fn get_block_at_height(
@@ -249,7 +323,9 @@ pub trait MarfInternals<T: MarfTrieId>: MarfCore<T> {
         height: u32,
         current_block_hash: &T,
     ) -> Result<Option<T>, Error> {
-        self.with_read_ctx(|ctx| ctx.get_block_at_height(height, current_block_hash))
+        self.with_read_retry(|this| {
+            this.with_read_ctx(|ctx| ctx.get_block_at_height(height, current_block_hash))
+        })
     }
 }
 
@@ -445,6 +521,15 @@ pub trait MarfConnection<T: MarfTrieId>: MarfInternals<T> + Sized {
 
     /// Get and check a value against get_from_hash
     /// (test only)
+    ///
+    /// This helper runs two *unwrapped* reads inside a single fresh `with_read_ctx`,
+    /// bypassing `MarfInternals::with_read_retry`. That is deliberate for the cross-check
+    /// itself (we want to compare raw walk results), but it means any retry-wrapper
+    /// regression test that exercises injected-fault behavior via [`Self::get`] will have
+    /// counter credits consumed here before the wrapped entry point fires. New retry
+    /// regressions should call `MarfInternals::get_by_key` / `get_by_path` directly to
+    /// avoid that interaction — see `test_tier8_*` / `test_tier9_*` in
+    /// `index/test/squash.rs` for the pattern.
     #[cfg(test)]
     fn get_and_check_with_hash(&mut self, block_hash: &T, key: &str) {
         let trie_hash = TrieHash::from_key(key);
@@ -454,10 +539,15 @@ pub trait MarfConnection<T: MarfTrieId>: MarfInternals<T> + Sized {
             (leaf, leaf_with_hash)
         });
 
-        match (leaf, leaf_with_hash) {
+        match (&leaf, &leaf_with_hash) {
             (Ok(Some(x)), Ok(Some(y))) => assert_eq!(x, y),
             (Ok(None), Ok(None)) => {}
             (Err(_), Err(_)) => {}
+            // A concurrent squash on another handle may land between the two reads above,
+            // so only one side sees the internal `RetryAfterSquash` sentinel. The outer
+            // `get()` retry wrapper handles that for the real call; skip the consistency
+            // cross-check rather than panic on the race.
+            (Err(e), _) | (_, Err(e)) if e.is_retry_after_squash() => {}
             (x, y) => {
                 panic!("Inconsistency: {x:?} != {y:?}");
             }
@@ -515,14 +605,16 @@ pub trait MarfConnection<T: MarfTrieId>: MarfInternals<T> + Sized {
 
     /// Get the root trie hash at a particular block
     fn get_root_hash_at(&mut self, block_hash: &T) -> Result<TrieHash, Error> {
-        self.with_read_ctx(|ctx| {
-            let (cur_block_hash, cur_block_id) = ctx.storage().get_cur_block_and_id();
-            ctx.open_block(block_hash, None)?;
-            let root_ptr = ctx.storage().root_trieptr();
-            let root_hash = ctx.storage().read_node_hash(&root_ptr);
-            ctx.storage()
-                .open_block_maybe_id(&cur_block_hash, cur_block_id)?;
-            root_hash
+        self.with_read_retry(|this| {
+            this.with_read_ctx(|ctx| {
+                let (cur_block_hash, cur_block_id) = ctx.storage().get_cur_block_and_id();
+                ctx.open_block(block_hash, None)?;
+                let root_ptr = ctx.storage().root_trieptr();
+                let root_hash = ctx.storage().read_node_hash(&root_ptr);
+                ctx.storage()
+                    .open_block_maybe_id(&cur_block_hash, cur_block_id)?;
+                root_hash
+            })
         })
     }
 
@@ -531,42 +623,44 @@ pub trait MarfConnection<T: MarfTrieId>: MarfInternals<T> + Sized {
     ///   as the current block
     /// The MARF _must_ be open to a valid block for this check to be evaluated.
     fn check_ancestor_block_hash(&mut self, bhh: &T) -> Result<(), Error> {
-        self.with_read_ctx(|ctx| {
-            let cur_block_hash = ctx.storage().get_cur_block();
-            if cur_block_hash == *bhh {
-                // a block is in its own fork
-                return Ok(());
-            }
+        self.with_read_retry(|this| {
+            this.with_read_ctx(|ctx| {
+                let cur_block_hash = ctx.storage().get_cur_block();
+                if cur_block_hash == *bhh {
+                    // a block is in its own fork
+                    return Ok(());
+                }
 
-            let bhh_height = ctx
-                .get_block_height(bhh, &cur_block_hash)?
-                .ok_or_else(|| {
-                    Error::NonMatchingForks(bhh.clone().to_bytes(), cur_block_hash.clone().to_bytes())
-                })?;
+                let bhh_height = ctx
+                    .get_block_height(bhh, &cur_block_hash)?
+                    .ok_or_else(|| {
+                        Error::NonMatchingForks(bhh.clone().to_bytes(), cur_block_hash.clone().to_bytes())
+                    })?;
 
-            let actual_block_at_height = ctx
-                .get_block_at_height(bhh_height, &cur_block_hash)?
-                .ok_or_else(|| Error::CorruptionError(format!(
-                    "ERROR: Could not find block for height {}, but it was returned by MARF::get_block_height()", bhh_height)))?;
+                let actual_block_at_height = ctx
+                    .get_block_at_height(bhh_height, &cur_block_hash)?
+                    .ok_or_else(|| Error::CorruptionError(format!(
+                        "ERROR: Could not find block for height {}, but it was returned by MARF::get_block_height()", bhh_height)))?;
 
-            if bhh != &actual_block_at_height {
-                test_debug!("non-matching forks: {} != {}", bhh, &actual_block_at_height);
-                return Err(Error::NonMatchingForks(
-                    bhh.clone().to_bytes(),
-                    cur_block_hash.to_bytes(),
-                ));
-            }
+                if bhh != &actual_block_at_height {
+                    test_debug!("non-matching forks: {} != {}", bhh, &actual_block_at_height);
+                    return Err(Error::NonMatchingForks(
+                        bhh.clone().to_bytes(),
+                        cur_block_hash.to_bytes(),
+                    ));
+                }
 
-            // test open
-            let result = ctx.storage().open_block(bhh);
+                // test open
+                let result = ctx.storage().open_block(bhh);
 
-            // restore
-            ctx
-                .storage()
-                .open_block(&cur_block_hash)
-                .map_err(|e| Error::RestoreMarfBlockError(Box::new(e)))?;
+                // restore
+                ctx
+                    .storage()
+                    .open_block(&cur_block_hash)
+                    .map_err(|e| Error::RestoreMarfBlockError(Box::new(e)))?;
 
-            result
+                result
+            })
         })
     }
 }
@@ -579,11 +673,10 @@ impl<T: MarfTrieId> MarfConnection<T> for MarfTransaction<'_, T> {
 
 impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
     pub fn get(&mut self, block_hash: &T, key: &str) -> Result<Option<MARFValue>, Error> {
-        let mut conn = self.connection();
-        let mut read_cursor = None;
-        let mut read_state = MarfReadState::new();
-        let mut read_ctx = MarfReadCtx::new(&mut conn, &mut read_cursor, &mut read_state);
-        read_ctx.get_by_key(block_hash, key)
+        // Delegate to the `MarfInternals` default impl, which wraps reads in the
+        // bounded `with_read_retry` loop that absorbs the internal
+        // `Error::RetryAfterSquash` sentinel from concurrent squashes.
+        <Self as MarfInternals<T>>::get_by_key(self, block_hash, key)
     }
 
     pub fn get_from_hash(
@@ -591,11 +684,7 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
         block_hash: &T,
         hash: &TrieHash,
     ) -> Result<Option<MARFValue>, Error> {
-        let mut conn = self.connection();
-        let mut read_cursor = None;
-        let mut read_state = MarfReadState::new();
-        let mut read_ctx = MarfReadCtx::new(&mut conn, &mut read_cursor, &mut read_state);
-        read_ctx.get_by_path(block_hash, hash)
+        <Self as MarfInternals<T>>::get_by_path(self, block_hash, hash)
     }
 
     pub fn get_with_proof(
@@ -607,13 +696,8 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
             None => return Ok(None),
             Some(x) => x,
         };
-
-        let path = TrieHash::from_key(key);
-        let mut conn = self.connection();
-        let mut read_cursor = None;
-        let mut read_state = MarfReadState::new();
-        let mut read_ctx = MarfReadCtx::new(&mut conn, &mut read_cursor, &mut read_state);
-        let proof = TrieMerkleProof::from_path(&mut read_ctx, &path, &marf_value, block_hash)?;
+        let proof =
+            <Self as MarfInternals<T>>::prove_raw_entry(self, block_hash, key, &marf_value)?;
         Ok(Some((marf_value, proof)))
     }
 
@@ -626,29 +710,16 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
             None => return Ok(None),
             Some(x) => x,
         };
-
-        let mut conn = self.connection();
-        let mut read_cursor = None;
-        let mut read_state = MarfReadState::new();
-        let mut read_ctx = MarfReadCtx::new(&mut conn, &mut read_cursor, &mut read_state);
-        let proof = TrieMerkleProof::from_path(&mut read_ctx, hash, &marf_value, block_hash)?;
+        let proof = <Self as MarfInternals<T>>::prove_path(self, block_hash, hash, &marf_value)?;
         Ok(Some((marf_value, proof)))
     }
 
     pub fn get_block_at_height(&mut self, height: u32, tip: &T) -> Result<Option<T>, Error> {
-        let mut conn = self.connection();
-        let mut read_cursor = None;
-        let mut read_state = MarfReadState::new();
-        let mut read_ctx = MarfReadCtx::new(&mut conn, &mut read_cursor, &mut read_state);
-        read_ctx.get_block_at_height(height, tip)
+        <Self as MarfInternals<T>>::get_block_at_height(self, height, tip)
     }
 
     pub fn get_block_height(&mut self, ancestor: &T, tip: &T) -> Result<Option<u32>, Error> {
-        let mut conn = self.connection();
-        let mut read_cursor = None;
-        let mut read_state = MarfReadState::new();
-        let mut read_ctx = MarfReadCtx::new(&mut conn, &mut read_cursor, &mut read_state);
-        read_ctx.get_block_height(ancestor, tip)
+        <Self as MarfInternals<T>>::get_block_height(self, ancestor, tip)
     }
 }
 
@@ -1603,6 +1674,19 @@ impl<T: MarfTrieId> MARF<T> {
             storage.open_block(block_hash)?;
             cursor.reset(path, storage.root_trieptr());
 
+            // Capture the user's query height NOW, right after opening the target block and before
+            // any backptr traversal can change it.
+            //
+            // `squash_opened_height` on storage is overloaded: it tracks the currently-opened
+            // block's height (used by `read_node_hash` for per-block root-hash lookups). Backptr
+            // resolution calls `open_block_known_id` on the backptr target, which within a squash
+            // range overwrites this field with the target block's height. For `value_at_height` on
+            // a squashed leaf we always want the *user's* query height, not the height of whatever
+            // block a backptr happens to point at — those are generally different when the key was
+            // written sparsely and a historical read must chase backptrs to find the leaf in the
+            // merged squash trie.
+            let user_query_height = storage.squash_opened_height();
+
             let mut node_ptr = storage.root_trieptr();
 
             for _ in 0..(cursor.path.len() + 1) {
@@ -1614,12 +1698,6 @@ impl<T: MarfTrieId> MARF<T> {
                 }
 
                 let cur_block = storage.get_cur_block();
-                // Read squash_opened_height BEFORE creating the TrieReadSession.
-                // The height is set at open_block time and does not change until
-                // the next open_block call, so reading once per iteration is safe.
-                // After a FollowBackptr re-opens a different block, the next
-                // iteration picks up the updated value.
-                let opened_height = storage.squash_opened_height();
                 storage.bench_mut().marf_walk_from_start();
                 let mut read_session = TrieReadSession::new(storage, decode_scratch);
                 let read = read_session.read_node(&node_ptr)?;
@@ -1640,7 +1718,7 @@ impl<T: MarfTrieId> MARF<T> {
                         // blob), not the ptr hint which can be stale.
                         let leaf = match read.node_type() {
                             Some(TrieNodeID::LeafSquashed) => {
-                                if let Some(height) = opened_height {
+                                if let Some(height) = user_query_height {
                                     let sq = read.as_leaf_squashed_ref()?.ok_or_else(|| {
                                         Error::CorruptionError(
                                             "LeafSquashed node_type but \
@@ -1891,7 +1969,11 @@ impl<T: MarfTrieId> MARF<T> {
             .get(..32)
             .and_then(|s| s.try_into().ok())
             .unwrap_or([0u8; 32]);
-        self.storage.data.squash_block_index.contains_key(&bhh_key)
+        self.storage
+            .data
+            .squash_meta
+            .block_index
+            .contains_key(&bhh_key)
     }
 
     pub fn begin_tx(&mut self) -> Result<MarfTransaction<'_, T>, Error> {

@@ -14,14 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::{fmt, fs, io};
 
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OpenFlags, Transaction};
 use sha2::Digest;
 
@@ -29,8 +30,8 @@ use crate::chainstate::stacks::index::cache::*;
 use crate::chainstate::stacks::index::file::{TrieFile, TrieFileNodeHashReader};
 use crate::chainstate::stacks::index::marf::MARFOpenOpts;
 use crate::chainstate::stacks::index::node::{
-    is_backptr, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch, TrieNodeRef,
-    TrieNodeTransientMeta, TrieNodeType, TriePtr,
+    is_backptr, is_leaf_type, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch,
+    TrieNodeRef, TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::scratch::MarfReadState;
@@ -1058,6 +1059,8 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     base_ptr.ptr().back_block(),
                     *base_ptr.ptr(),
                     None,
+                    storage_tx.data.leaf_hashes_omitted,
+                    &storage_tx.data.squash_meta.leaf_hash_omitted_blocks,
                     scratch,
                 )?;
                 if read.patch_depth >= MAX_PATCH_DEPTH as usize {
@@ -1638,8 +1641,469 @@ pub struct TrieStorageConnection<'a, T: MarfTrieId, Db: Deref<Target = Connectio
     pub test_genesis_block: &'a mut Option<T>,
 }
 
+/// Immutable squash metadata snapshot. Cheap to clone (held behind `Arc`),
+/// replaced wholesale by writers via [`SharedSquashState`].
+pub struct SquashMeta {
+    /// Loaded squash level trailers (sorted by min_height). Empty for non-squashed MARFs.
+    pub levels: Vec<SquashTrailer>,
+    /// O(1) block-hash → (level_index, height, blob_offset, reads_redirected, block_id) index built
+    /// from all trailers.
+    pub block_index: HashMap<[u8; 32], (usize, u32, u64, bool, u32)>,
+    /// Set of block_ids whose blobs have leaf hashes omitted (reclaimed squash levels).
+    pub leaf_hash_omitted_blocks: HashSet<u32>,
+}
+
+impl SquashMeta {
+    pub fn empty() -> Self {
+        Self {
+            levels: Vec::new(),
+            block_index: HashMap::new(),
+            leaf_hash_omitted_blocks: HashSet::new(),
+        }
+    }
+}
+
+/// Process-wide storage coordination object shared by every `MARF<T>` handle opened against a
+/// given database path (via [`shared_storage_state_for`]).
+///
+/// Owns two co-located concerns that MUST be observable across independent handles of the same
+/// file:
+///
+/// 1. **Squash metadata** (`meta` / `generation`): writers publish a fresh [`SquashMeta`]
+///    atomically via [`SharedStorageState::publish_squash`]; readers detect staleness with a
+///    single `AtomicU64` load and re-snapshot via a brief `parking_lot::RwLock` read.
+/// 2. **Blob-file mutation quiesce** (`active_reads` / `truncate_pending`): the squash path's
+///    `ftruncate` + `pwrite` window invalidates every live mmap to the file — including ones
+///    held on other threads. Readers acquire a [`BlobReadGuard`] before touching mmap-backed
+///    bytes; writers set `truncate_pending` and spin-wait for `active_reads` to drain before
+///    mutating the file, then publish the new metadata and clear `truncate_pending`.
+///
+/// The two concerns are co-located because a single [`publish_squash`](Self::publish_squash)
+/// call must drain readers, mutate the file, install the new metadata, and release waiters —
+/// all under one ordering discipline.
+pub struct SharedStorageState {
+    /// Squash metadata snapshot. Replaced wholesale under the write lock during
+    /// [`publish_squash`](Self::publish_squash); readers read-lock briefly and `Arc::clone`.
+    meta: RwLock<Arc<SquashMeta>>,
+
+    /// Monotonically-increasing generation. Bumped on every publish so readers can detect
+    /// staleness with a single atomic load without acquiring the `meta` lock.
+    generation: AtomicU64,
+
+    /// Count of in-flight mmap-backed reads across all handles of this file. Each
+    /// [`BlobReadGuard`] increments on acquire and decrements on drop; the writer waits for
+    /// this to drain before `ftruncate`.
+    active_reads: AtomicU64,
+
+    /// Writer flag: when `true`, new readers must back off and retry (spin-yield) rather than
+    /// entering the mmap region. Set on entering the squash critical section and cleared
+    /// AFTER the generation bump, so any reader observing `false` is guaranteed to see the
+    /// post-publish generation on its next check.
+    truncate_pending: AtomicBool,
+}
+
+/// RAII guard returned by [`SharedStorageState::acquire_blob_read`]. Keeps `active_reads`
+/// incremented for the duration of its lifetime, blocking the writer from entering the
+/// `ftruncate` window while any borrowed mmap bytes are in use.
+///
+/// Owns an `Arc<SharedStorageState>` rather than borrowing one — that decouples the guard's
+/// lifetime from any `&MARF` borrow, so callers can hold the guard alongside `&mut` methods
+/// on the same storage without tripping the borrow checker.
+pub struct BlobReadGuard {
+    state: Arc<SharedStorageState>,
+}
+
+impl std::fmt::Debug for BlobReadGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BlobReadGuard")
+    }
+}
+
+impl Clone for BlobReadGuard {
+    /// Cloning a guard bumps `active_reads` again, so each clone keeps the writer from
+    /// entering the ftruncate window until its own `Drop` fires. This lets
+    /// `ReadTrieItem<'a>` / `ReadTrieNode<'a>` stay `Clone`-able (which the existing
+    /// `#[derive(Clone)]` relies on) without losing the quiesce protection.
+    fn clone(&self) -> Self {
+        self.state.active_reads.fetch_add(1, Ordering::Acquire);
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl Drop for BlobReadGuard {
+    fn drop(&mut self) {
+        self.state.active_reads.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl SharedStorageState {
+    /// Wrap an existing `SquashMeta` in a shareable container at generation 0.
+    pub fn new(initial: SquashMeta) -> Arc<Self> {
+        Arc::new(Self {
+            meta: RwLock::new(Arc::new(initial)),
+            generation: AtomicU64::new(0),
+            active_reads: AtomicU64::new(0),
+            truncate_pending: AtomicBool::new(false),
+        })
+    }
+
+    /// Empty shared state (no squash levels). Convenience for non-squashed MARFs.
+    pub fn empty() -> Arc<Self> {
+        Self::new(SquashMeta::empty())
+    }
+
+    /// Snapshot the current metadata. Takes a brief `parking_lot` read lock and clones the
+    /// inner `Arc` (just a reference-count bump).
+    pub fn snapshot(&self) -> Arc<SquashMeta> {
+        Arc::clone(&self.meta.read())
+    }
+
+    /// Current generation. Readers cache this per-handle and re-snapshot their local state
+    /// when it changes.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Acquire a [`BlobReadGuard`] that enforces the blob-mutation quiesce contract.
+    ///
+    /// Spins while `truncate_pending` is set. After incrementing `active_reads`, re-checks
+    /// `truncate_pending` to close the race where a writer sets the flag between our first
+    /// read and our increment.
+    ///
+    /// Callers **must** hold the returned guard for the entire lifetime of any borrowed bytes
+    /// they obtain from the mmap — otherwise the writer could `ftruncate` the file out from
+    /// under them and SIGBUS on next access.
+    ///
+    /// Prefer [`try_acquire_blob_read`](Self::try_acquire_blob_read) for per-read acquisition
+    /// inside traversals; spinning here from inside a traversal that already has parked
+    /// state (ReadTrieNode guards) deadlocks against a writer waiting for drain.
+    pub fn acquire_blob_read(self: &Arc<Self>) -> BlobReadGuard {
+        loop {
+            if let Some(guard) = self.try_acquire_blob_read() {
+                return guard;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Block the calling thread until no publisher is in its mutation window. Used by the
+    /// retry wrapper between attempts to avoid hammering a busy writer — without this wait,
+    /// a reader with its state already cleared can burn its entire retry budget spinning on
+    /// [`try_acquire_blob_read`](Self::try_acquire_blob_read) while the writer's brief
+    /// exclusive window (ftruncate + pwrite + trailer build) is still in flight.
+    ///
+    /// Safe to call only when the caller holds no [`BlobReadGuard`]s — otherwise deadlock:
+    /// the writer is waiting for `active_reads` to drain.
+    pub fn wait_for_publish_complete(&self) {
+        while self.truncate_pending.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Non-spinning variant of [`acquire_blob_read`](Self::acquire_blob_read). Returns `None`
+    /// immediately if a writer has set `truncate_pending`; otherwise increments `active_reads`
+    /// and returns a fresh guard.
+    ///
+    /// This is the primitive the read pipeline uses for per-read guard acquisition: on `None`,
+    /// the caller returns [`Error::RetryAfterSquash`] up the stack and the top-level retry
+    /// wrapper resets per-traversal state (dropping any held guards) so the writer can drain
+    /// and publish. After publish completes, the retry re-enters traversal against fresh
+    /// metadata.
+    ///
+    /// The spin variant would deadlock here: a reader with parked `ReadTrieNode`s holds guards
+    /// that keep `active_reads > 0`, so the writer waits forever while the reader spins on
+    /// `truncate_pending`.
+    pub fn try_acquire_blob_read(self: &Arc<Self>) -> Option<BlobReadGuard> {
+        #[cfg(test)]
+        if fault_inject::consume_failed_acquire() {
+            return None;
+        }
+        if self.truncate_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active_reads.fetch_add(1, Ordering::Acquire);
+        if self.truncate_pending.load(Ordering::Acquire) {
+            self.active_reads.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(BlobReadGuard {
+            state: Arc::clone(self),
+        })
+    }
+
+    /// Check whether this handle's `seen_squash_generation` watermark is still current
+    /// relative to the shared state. Returns `true` when fresh (safe to proceed), `false`
+    /// when a concurrent publish has bumped the generation (caller MUST return
+    /// [`Error::RetryAfterSquash`] so the outer wrapper can re-sync and restart).
+    ///
+    /// Co-located with [`try_acquire_blob_read`](Self::try_acquire_blob_read) so both
+    /// freshness checks share a single fault-injection surface in tests.
+    pub fn squash_state_fresh(&self, seen_generation: u64) -> bool {
+        #[cfg(test)]
+        if fault_inject::consume_failed_gen_check() {
+            return false;
+        }
+        self.generation() == seen_generation
+    }
+
+    /// Publish a new [`SquashMeta`] under the blob-mutation quiesce protocol. The `rebuild` closure
+    /// runs inside the exclusive window — after all in-flight readers have drained — and is
+    /// responsible for the actual file mutation (pwrite new blob bytes, ftruncate, re-mmap, clear
+    /// local offset caches, etc.) plus producing the new [`SquashMeta`] that becomes the shared
+    /// snapshot on success.
+    ///
+    /// Strict ordering (do not reorder):
+    ///
+    /// 1. `truncate_pending = true` — new readers back off.
+    /// 2. spin-wait for `active_reads == 0` — drain in-flight readers.
+    /// 3. call `rebuild` — exclusive file + metadata mutation.
+    /// 4. install the new `Arc<SquashMeta>` under the write lock.
+    /// 5. `generation += 1` — readers observing this re-sync per-handle state.
+    /// 6. `truncate_pending = false` — release waiters.
+    ///
+    /// The generation bump MUST precede clearing `truncate_pending`: otherwise a reader that just
+    /// unblocked could load the old generation, think it's fresh, and read the file through a stale
+    /// per-handle mmap.
+    pub fn publish_squash<F>(&self, rebuild: F) -> Result<(), Error>
+    where
+        F: FnOnce() -> Result<SquashMeta, Error>,
+    {
+        // 1. Claim the mutation window.
+        self.truncate_pending.store(true, Ordering::Release);
+
+        // 2. Drain in-flight readers. Bounded: readers hold guards only for the duration of
+        //    a single traversal / borrowed-read lifetime.
+        while self.active_reads.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
+
+        // 3. Exclusive window — run the writer's mutation.
+        let rebuild_result = rebuild();
+
+        match rebuild_result {
+            Ok(new_meta) => {
+                // 4. Install the new metadata snapshot.
+                *self.meta.write() = Arc::new(new_meta);
+
+                // 5. Bump generation BEFORE clearing truncate_pending so any reader that
+                //    observes `!truncate_pending` will see the new generation on its next
+                //    check (and thereby re-sync its local per-handle state).
+                self.generation.fetch_add(1, Ordering::Release);
+
+                // 6. Release waiters.
+                self.truncate_pending.store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // Release waiters without publishing. The metadata and file are left in
+                // whatever state `rebuild` saw before failing; callers using transactional
+                // rebuilds can retry safely.
+                self.truncate_pending.store(false, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Transition alias. All new code should use [`SharedStorageState`]; this keeps existing
+/// call sites compiling while the rename rolls through the tree.
+pub type SharedSquashState = SharedStorageState;
+
+/// Test-only fault injection hooks for the blob-mutation quiesce protocol.
+///
+/// The two counters inject synthetic instances of the two `RetryAfterSquash`-emitting
+/// conditions without requiring an actual concurrent squash: each counter, when positive,
+/// is decremented on the next matching check and forces a retry signal. This lets unit
+/// tests exercise the retry wrapper's reset + re-entry logic deterministically.
+///
+/// Counters are **thread-local** so they do not leak across parallel tests — `cargo test`
+/// runs each `#[test]` on its own thread. For multi-threaded tests that need to inject
+/// failures on another thread, set the counters on that thread before entering the read
+/// path. The hooks are `#[cfg(test)]` and compile out entirely in production builds.
+#[cfg(test)]
+pub mod fault_inject {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT_ACQUIRES: Cell<usize> = const { Cell::new(0) };
+        static FAIL_NEXT_GEN_CHECKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Force the next `n` calls to [`SharedStorageState::try_acquire_blob_read`] on the
+    /// current thread to return `None` as if a writer had set `truncate_pending`. Each
+    /// real acquire consumes one "credit"; once the counter hits zero, acquires behave
+    /// normally again.
+    pub fn fail_next_acquires(n: usize) {
+        FAIL_NEXT_ACQUIRES.with(|c| c.set(n));
+    }
+
+    /// Force the next `n` calls to [`SharedStorageState::squash_state_fresh`] on the
+    /// current thread to return `false` as if a publisher had bumped the generation.
+    /// Each real check consumes one "credit"; once the counter hits zero, checks behave
+    /// normally again.
+    pub fn fail_next_gen_checks(n: usize) {
+        FAIL_NEXT_GEN_CHECKS.with(|c| c.set(n));
+    }
+
+    /// Clear both counters on the current thread. Tests should call this at start and
+    /// end as a defense against earlier panics leaking injected failures into later
+    /// assertions on the same thread.
+    pub fn reset() {
+        FAIL_NEXT_ACQUIRES.with(|c| c.set(0));
+        FAIL_NEXT_GEN_CHECKS.with(|c| c.set(0));
+    }
+
+    pub(super) fn consume_failed_acquire() -> bool {
+        consume(&FAIL_NEXT_ACQUIRES)
+    }
+
+    pub(super) fn consume_failed_gen_check() -> bool {
+        consume(&FAIL_NEXT_GEN_CHECKS)
+    }
+
+    fn consume(counter: &'static std::thread::LocalKey<Cell<usize>>) -> bool {
+        counter.with(|c| {
+            let cur = c.get();
+            if cur == 0 {
+                false
+            } else {
+                c.set(cur - 1);
+                true
+            }
+        })
+    }
+}
+
+/// Process-wide registry mapping canonicalized MARF database paths to their
+/// live [`SharedSquashState`]. Entries are held as `Weak` so state is freed
+/// when the last `MARF` handle for a given path is dropped.
+///
+/// Two independent `MARF::from_path` opens against the same file return the
+/// same `Arc<SharedSquashState>`, which is the mechanism that lets the
+/// Stacks 2.x P2P thread and runloop threads — each holding their own
+/// chainstate — observe each other's `refresh_after_squash` publishes.
+fn shared_squash_registry() -> &'static Mutex<HashMap<PathBuf, std::sync::Weak<SharedSquashState>>>
+{
+    static REGISTRY: std::sync::OnceLock<
+        Mutex<HashMap<PathBuf, std::sync::Weak<SharedSquashState>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Normalize a MARF db path for use as a registry key. Canonicalizing
+/// resolves relative paths and symlinks so two `open_opts` calls spelled
+/// differently but targeting the same file share one `SharedSquashState`.
+/// Falls back to the input path if canonicalize fails (e.g. path doesn't
+/// exist yet during creation).
+fn registry_key(db_path: &str) -> PathBuf {
+    fs::canonicalize(db_path).unwrap_or_else(|_| PathBuf::from(db_path))
+}
+
+/// Obtain the [`SharedSquashState`] associated with `db_path`, constructing
+/// one from `build_initial` if no live entry is present.
+///
+/// `:memory:` paths are NOT shared — every SQLite `:memory:` connection is
+/// an independent database, so each MARF gets its own freshly-built state.
+fn shared_squash_state_for<F>(
+    db_path: &str,
+    build_initial: F,
+) -> Result<Arc<SharedSquashState>, Error>
+where
+    F: FnOnce() -> Result<SquashMeta, Error>,
+{
+    if db_path == ":memory:" {
+        return Ok(SharedSquashState::new(build_initial()?));
+    }
+
+    let key = registry_key(db_path);
+    let mut registry = shared_squash_registry().lock();
+
+    if let Some(weak) = registry.get(&key) {
+        if let Some(existing) = weak.upgrade() {
+            return Ok(existing);
+        }
+        // Weak is dead (last Arc dropped). Fall through to rebuild below.
+    }
+
+    let arc = SharedSquashState::new(build_initial()?);
+    registry.insert(key, Arc::downgrade(&arc));
+    Ok(arc)
+}
+
+/// Build a [`SquashMeta`] by reading `marf_squash_levels` from SQLite and parsing each level's
+/// trailer from the blob file.
+///
+/// Returns an empty `SquashMeta` if no squash levels have been recorded or if all present levels
+/// are stubs (blob_length == 0) with no trailers.
+pub(crate) fn build_squash_meta_from_sql(
+    db: &Connection,
+    blobs: Option<&TrieFile>,
+) -> Result<SquashMeta, Error> {
+    let squash_level_rows = trie_sql::read_squash_levels(db)?;
+    if squash_level_rows.is_empty() {
+        return Ok(SquashMeta::empty());
+    }
+
+    let mut levels = Vec::with_capacity(squash_level_rows.len());
+    let mut block_index = HashMap::new();
+    let mut leaf_hash_omitted = HashSet::new();
+
+    for row in &squash_level_rows {
+        if row.blob_length == 0 {
+            levels.push(SquashTrailer::empty());
+            continue;
+        }
+        let Some(blobs_ref) = blobs else {
+            // External-blobs disabled but a level is present: defensive fallback — register an
+            // empty stub so reads fall through to the legacy SQL path.
+            levels.push(SquashTrailer::empty());
+            continue;
+        };
+
+        let footer_offset = row.blob_offset + row.blob_length
+            - crate::chainstate::stacks::index::squash::SQUASH_FOOTER_SIZE as u64;
+        let footer_bytes = blobs_ref.read_blob_range(footer_offset, 12)?;
+        let trailer_rel_offset = SquashTrailer::read_footer(&footer_bytes).ok_or_else(|| {
+            Error::CorruptionError("Squash level blob has no valid trailer footer".into())
+        })?;
+
+        let trailer_abs_offset = row.blob_offset + trailer_rel_offset;
+        let trailer_length = row.blob_offset + row.blob_length - trailer_abs_offset;
+        let trailer_bytes = blobs_ref.read_blob_range(trailer_abs_offset, trailer_length)?;
+        let trailer = SquashTrailer::read_from(&trailer_bytes)?;
+
+        let level_idx = levels.len();
+        for &(bhh, height, block_id) in &trailer.sorted_block_entries {
+            block_index.insert(
+                bhh,
+                (
+                    level_idx,
+                    height,
+                    row.blob_offset,
+                    row.reads_redirected,
+                    block_id,
+                ),
+            );
+            if row.reads_redirected {
+                leaf_hash_omitted.insert(block_id);
+            }
+        }
+        levels.push(trailer);
+    }
+
+    Ok(SquashMeta {
+        levels,
+        block_index,
+        leaf_hash_omitted_blocks: leaf_hash_omitted,
+    })
+}
+
 /// TrieStorageTransientData holds all the data that _isn't_ committed to the underlying SQL
-/// storage. Used internally to simplify the TrieStorageConnection/TrieFileStorage interactions
+/// storage.
+///
+/// Used internally to simplify the TrieStorageConnection/TrieFileStorage interactions
 pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// This is all the nodes written but not yet committed to disk.
     pub uncommitted_writes: Option<(T, UncommittedState<T>)>,
@@ -1690,14 +2154,24 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// bypass the `RefCell<HashMap>` offset cache in `TrieFile`.
     pub(crate) cur_block_trie_offset: Option<u64>,
 
-    /// Loaded squash level trailers (sorted by min_height). Populated on MARF open
-    /// from `marf_squash_levels` SQL table. Empty for non-squashed MARFs.
-    pub squash_levels: Vec<std::sync::Arc<SquashTrailer>>,
+    /// Local snapshot of squash metadata, refreshed on-demand from
+    /// `shared_squash` whenever `seen_squash_generation` falls behind
+    /// `shared_squash.generation()`. Kept as an owned `Arc` so all existing
+    /// access patterns (`data.squash_meta.block_index.get(...)`) work
+    /// without taking a lock on every read.
+    pub squash_meta: Arc<SquashMeta>,
 
-    /// O(1) block-hash → (level_index, height, blob_offset, reads_redirected)
-    /// index built from all trailers. Avoids O(levels × log N) lookup cost
-    /// on each `open_block` call.
-    pub squash_block_index: std::collections::HashMap<[u8; 32], (usize, u32, u64, bool)>,
+    /// Shared source of truth for squash metadata across all handles
+    /// spawned off the same MARF. Updated by writers via `publish`;
+    /// readers observe via the generation counter.
+    pub shared_squash: Arc<SharedSquashState>,
+
+    /// Generation of the shared squash state that this handle's
+    /// `squash_meta` snapshot was last synchronized with. When this falls
+    /// behind `shared_squash.generation()`, the handle-local blob mmap,
+    /// block cache, and current-block context are stale and must be
+    /// invalidated before the next read.
+    pub seen_squash_generation: u64,
 
     /// When a block within a squash range is opened, records the height for
     /// point-in-time value lookups via `TrieLeafSquashed::value_at_height()`.
@@ -1707,6 +2181,12 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// Set alongside `squash_opened_height` in the `open_block_impl` fast path;
     /// used by `read_node_hash` for O(1) trailer lookup instead of scanning.
     pub squash_opened_level_idx: Option<usize>,
+
+    /// True when the currently-opened block reads from a squash blob where
+    /// leaf nodes are stored without a 32-byte hash prefix. This is only set when
+    /// `reads_redirected` is true for the squash level (i.e. the marf_data rows
+    /// point to the squash blob, not original per-block blobs).
+    pub leaf_hashes_omitted: bool,
 }
 
 // disk-backed Trie.
@@ -1760,10 +2240,12 @@ impl<T: MarfTrieId> Default for TrieStorageTransientData<T> {
             unconfirmed: false,
             unconfirmed_block_id: None,
             cur_block_trie_offset: None,
-            squash_levels: Vec::new(),
-            squash_block_index: std::collections::HashMap::new(),
+            squash_meta: Arc::new(SquashMeta::empty()),
+            shared_squash: SharedSquashState::empty(),
+            seen_squash_generation: 0,
             squash_opened_height: None,
             squash_opened_level_idx: None,
+            leaf_hashes_omitted: false,
         }
     }
 }
@@ -1791,6 +2273,7 @@ impl<T: MarfTrieId> TrieStorageTransientData<T> {
         self.cur_block_trie_offset = None;
         self.squash_opened_height = None;
         self.squash_opened_level_idx = None;
+        self.leaf_hashes_omitted = false;
     }
 
     fn clear_block_id(&mut self) {
@@ -1846,6 +2329,12 @@ impl<'a, T: MarfTrieId> ReopenedTrieStorageConnection<'a, T> {
     }
 
     pub fn connection(&mut self) -> TrieStorageConnection<'_, T> {
+        // Guards are now acquired per-read inside the storage layer (see
+        // `read_node_with_state` and siblings) rather than held for the connection's
+        // lifetime. Between reads, no guard is held — letting a concurrent squash
+        // writer enter its drain-and-truncate window promptly. Mid-traversal
+        // publishes surface as `Error::RetryAfterSquash`, which the top-level retry
+        // wrappers absorb.
         TrieStorageConnection {
             db: &self.db,
             db_path: self.db_path,
@@ -1878,16 +2367,65 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
             block_id,
             ptr.from_backptr(),
             self.data.cur_block_trie_offset,
+            self.data.leaf_hashes_omitted,
+            &self.data.squash_meta.leaf_hash_omitted_blocks,
             scratch,
         )
     }
 }
 
-/// Shared implementation for `TrieReadStorage::open_block`, used by both
-/// `TrieStorageConnection` and `ReopenedTrieStorageConnection`.
+/// Rebuild squash metadata, remap the blob file mmap, and reset per-connection
+/// caches after an external squash has modified the `.blobs` file and
+/// `marf_squash_levels` table via a different handle.
 ///
-/// `cache` is required because `get_block_id_caching` accesses `TrieCache<T>`, which lives
-/// on the storage struct alongside (not inside) `TrieStorageTransientData`.
+/// Factored out so that both the explicit [`TrieFileStorage::refresh_after_squash`]
+/// entry point and the automatic staleness recovery in [`open_block_impl`]
+/// can share the same logic.
+///
+/// Reader-side staleness recovery: check the shared generation counter and,
+/// if a writer has published a new [`SquashMeta`] since this handle last
+/// synced, re-snapshot the shared metadata and invalidate the handle-local
+/// blob mmap, block cache, and current-block context.
+///
+/// No SQL, no trailer parsing — those were already done by the publishing
+/// writer. This path is a single atomic load in the fast case (unchanged
+/// generation) and a short critical section in the slow case.
+fn sync_from_shared_squash_state<T: MarfTrieId>(
+    data: &mut TrieStorageTransientData<T>,
+    mut blobs: Option<&mut TrieFile>,
+    cache: &mut BlockCache<T>,
+) -> Result<(), Error> {
+    let current_gen = data.shared_squash.generation();
+    if current_gen == data.seen_squash_generation {
+        return Ok(());
+    }
+
+    // Snapshot the fresh metadata first; subsequent mutations are local-only.
+    data.squash_meta = data.shared_squash.snapshot();
+
+    // The blob file has been truncated/extended by the publishing writer, so any mmap region and
+    // cached offsets we hold are stale.
+    if let Some(b) = blobs.as_deref_mut() {
+        b.remap_and_invalidate()?;
+    }
+
+    // The block cache may reference block_ids whose blobs moved.
+    *cache = BlockCache::new("noop");
+
+    // Force the next open_block() through a fresh resolve against the new squash metadata rather
+    // than short-circuiting on the cached cur_block.
+    data.set_block(T::sentinel(), None);
+    data.trie_ancestor_hash_bytes_cache = None;
+
+    data.seen_squash_generation = current_gen;
+    Ok(())
+}
+
+/// Shared implementation for `TrieReadStorage::open_block`, used by both `TrieStorageConnection`
+/// and `ReopenedTrieStorageConnection`.
+///
+/// `cache` is required because `get_block_id_caching` accesses `TrieCache<T>`, which lives on the
+/// storage struct alongside (not inside) `TrieStorageTransientData`.
 fn open_block_impl<T: MarfTrieId>(
     data: &mut TrieStorageTransientData<T>,
     db: &Connection,
@@ -1959,17 +2497,13 @@ fn open_block_impl<T: MarfTrieId>(
         .get(..32)
         .and_then(|s| s.try_into().ok())
         .unwrap_or([0u8; 32]);
-    if let Some(&(level_idx, height, squash_blob_offset, reads_redirected)) =
-        data.squash_block_index.get(&bhh_key)
+    if let Some(&(level_idx, height, squash_blob_offset, reads_redirected, block_id)) =
+        data.squash_meta.block_index.get(&bhh_key)
     {
-        let block_id =
-            get_block_id_caching_impl(data.unconfirmed, cache, db, bhh).map_err(|e| {
-                test_debug!("Failed to open squash-range block {:?}: {:?}", bhh, e);
-                e
-            })?;
         data.set_block(bhh.clone(), Some(block_id));
         data.squash_opened_height = Some(height);
         data.squash_opened_level_idx = Some(level_idx);
+        data.leaf_hashes_omitted = reads_redirected;
 
         // * For reclaimed levels, marf_data rows point to the squash blob — seed the trie-offset
         // hint so reads skip the offset cache/SQL lookup.
@@ -2023,11 +2557,12 @@ fn open_block_known_id_impl<T: MarfTrieId>(
         .get(..32)
         .and_then(|s| s.try_into().ok())
         .unwrap_or([0u8; 32]);
-    if let Some(&(level_idx, height, squash_blob_offset, reads_redirected)) =
-        data.squash_block_index.get(&bhh_key)
+    if let Some(&(level_idx, height, squash_blob_offset, reads_redirected, _block_id)) =
+        data.squash_meta.block_index.get(&bhh_key)
     {
         data.squash_opened_height = Some(height);
         data.squash_opened_level_idx = Some(level_idx);
+        data.leaf_hashes_omitted = reads_redirected;
         if reads_redirected {
             data.cur_block_trie_offset = Some(squash_blob_offset);
         }
@@ -2069,12 +2604,15 @@ fn read_patched_persisted_node<'b>(
     mut block_id: u32,
     mut ptr: TriePtr,
     cur_block_trie_offset: Option<u64>,
+    leaf_hashes_omitted: bool,
+    leaf_hash_omitted_blocks: &HashSet<u32>,
     scratch: &'b mut impl NodePatching,
 ) -> Result<ReadTrieNode<'b>, Error> {
     let target_block_id = block_id;
     let mut node_hash_opt = None;
     let mut patches = scratch.take_patch_chain_buf();
     let mut trie_offset_hint = cur_block_trie_offset;
+    let mut cur_leaf_hashes_omitted = leaf_hashes_omitted;
 
     for _ in 0..=MAX_PATCH_DEPTH {
         let read = if unconfirmed_block_id == Some(block_id) {
@@ -2082,9 +2620,14 @@ fn read_patched_persisted_node<'b>(
             trie_sql::read_trie_item(db, block_id, &ptr, scratch)?
         } else {
             match blobs {
-                Some(blobs) => {
-                    blobs.read_trie_item(db, block_id, &ptr, trie_offset_hint, scratch)?
-                }
+                Some(blobs) => blobs.read_trie_item(
+                    db,
+                    block_id,
+                    &ptr,
+                    trie_offset_hint,
+                    cur_leaf_hashes_omitted,
+                    scratch,
+                )?,
                 None => trie_sql::read_trie_item(db, block_id, &ptr, scratch)?,
             }
         };
@@ -2095,9 +2638,15 @@ fn read_patched_persisted_node<'b>(
 
         match kind {
             ReadTrieItemKind::Node(_) => {
-                let node_hash = node_hash_opt.or(hash).ok_or_else(|| {
-                    Error::CorruptionError("Missing node hash in trie read".to_string())
-                })?;
+                let node_hash = node_hash_opt.or(hash);
+                // Hash-free leaves legitimately have None; non-leaf nodes must
+                // always carry a hash — flag corruption if one is missing.
+                if node_hash.is_none() && !is_leaf_type(ptr.id()) {
+                    scratch.restore_patch_chain_buf(patches);
+                    return Err(Error::CorruptionError(
+                        "Missing node hash in trie read".to_string(),
+                    ));
+                }
                 if !patches.is_empty() {
                     patches.reverse();
                     scratch.apply_patches_in_place(&patches, target_block_id)?;
@@ -2106,7 +2655,7 @@ fn read_patched_persisted_node<'b>(
                 let patch_depth = patches.len();
                 scratch.restore_patch_chain_buf(patches);
                 return Ok(
-                    ReadTrieNode::from_state_borrowed(scratch.get_ref(), Some(node_hash))
+                    ReadTrieNode::from_state_borrowed(scratch.get_ref(), node_hash)
                         .with_patch_depth(patch_depth),
                 );
             }
@@ -2120,6 +2669,7 @@ fn read_patched_persisted_node<'b>(
 
                 ptr = new_ptr;
                 block_id = new_block_id;
+                cur_leaf_hashes_omitted = leaf_hash_omitted_blocks.contains(&block_id);
                 if node_hash_opt.is_none() {
                     node_hash_opt = hash;
                 }
@@ -2165,10 +2715,31 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return Err(Error::NotFoundError);
         };
 
-        // Zero-copy mmap fast path: return borrowed bytes directly from the mmap
-        // region without decoding into scratch. Only for committed, non-patch nodes.
+        // Zero-copy mmap fast path: return borrowed bytes directly from the mmap region
+        // without decoding into scratch. Only for committed, non-patch nodes.
+        //
+        // We acquire a fresh [`BlobReadGuard`] per read and hand it to the returned
+        // `ReadTrieNode`, which keeps `active_reads` incremented until the node is dropped.
+        // If `try_acquire_blob_read` returns `None`, a writer on another handle has entered
+        // its truncate window — bubble `Error::RetryAfterSquash` so the public-entry retry
+        // wrapper resets per-traversal state (releasing any guards from parked nodes) and
+        // restarts against the freshly published metadata. Also verify the generation hasn't
+        // drifted since `open_block` sync'd: if it has, the mmap layout we cached at
+        // block-open time is stale and the traversal must restart.
         if self.data.unconfirmed_block_id != Some(id) {
             if let Some(ref blobs) = self.blobs {
+                let guard = self
+                    .data
+                    .shared_squash
+                    .try_acquire_blob_read()
+                    .ok_or(Error::RetryAfterSquash)?;
+                if !self
+                    .data
+                    .shared_squash
+                    .squash_state_fresh(self.data.seen_squash_generation)
+                {
+                    return Err(Error::RetryAfterSquash);
+                }
                 if let Some(ReadTrieItem {
                     kind: ReadTrieItemKind::Node(node),
                     ..
@@ -2177,6 +2748,8 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
                     id,
                     &clear_ptr,
                     self.data.cur_block_trie_offset,
+                    self.data.leaf_hashes_omitted,
+                    guard,
                 )? {
                     return Ok(node);
                 }
@@ -2190,6 +2763,28 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             offset
         });
 
+        // Slow path (SQL / mmap-read-into-scratch). `read_patched_persisted_node` decodes into
+        // caller-owned scratch, so no borrowed bytes escape — a local guard dropped at the end
+        // of this function suffices. Skip acquisition when the blob file is absent (pure-SQL
+        // backend has no mmap to protect). Generation check guards against stale `trie_offset`
+        // / `leaf_hashes_omitted` cached on `self.data` after a mid-walk publish.
+        let _slow_path_guard = if self.blobs.is_some() {
+            let guard = self
+                .data
+                .shared_squash
+                .try_acquire_blob_read()
+                .ok_or(Error::RetryAfterSquash)?;
+            if !self
+                .data
+                .shared_squash
+                .squash_state_fresh(self.data.seen_squash_generation)
+            {
+                return Err(Error::RetryAfterSquash);
+            }
+            Some(guard)
+        } else {
+            None
+        };
         self.bench.read_nodetype_start();
         let result = read_patched_persisted_node(
             &self.db,
@@ -2198,9 +2793,22 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             id,
             clear_ptr,
             trie_offset,
+            self.data.leaf_hashes_omitted,
+            &self.data.squash_meta.leaf_hash_omitted_blocks,
             state,
         );
         self.bench.read_nodetype_finish(false);
+        if let Err(ref e) = result {
+            error!(
+                "read_node_with_state failed: block={}, block_id={id}, ptr={clear_ptr:?}, \
+                 leaf_hashes_omitted={}, squash_levels={}, squash_block_index_len={}, \
+                 trie_offset={trie_offset:?}, err={e:?}",
+                &self.data.cur_block,
+                self.data.leaf_hashes_omitted,
+                self.data.squash_meta.levels.len(),
+                self.data.squash_meta.block_index.len(),
+            );
+        }
         result
     }
 
@@ -2212,6 +2820,7 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             self.unconfirmed(),
             self.db_path
         );
+        self.sync_shared_squash_state()?;
         open_block_impl(self.data, &self.db, self.cache, self.bench, bhh)
     }
 
@@ -2226,6 +2835,9 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             &self.data.cur_block_id,
             self.db_path,
         );
+        // No auto-refresh here: `open_block_known_id` is called during backptr resolution with a
+        // pre-resolved block_id. The parent `open_block` has already run the staleness check for
+        // this walk.
         open_block_known_id_impl(self.data, bhh, id)
     }
 
@@ -2247,17 +2859,17 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return uncommitted_trie.read_node_hash(ptr);
         }
 
-        // Squash fast-path: when reading the root node hash of a block inside a squash
-        // level, return the per-height root hash stored in the squash trailer instead of
-        // reading from the blob. The squash blob contains a single merged trie whose root
-        // node hash is the *tip's* hash, not the per-block hash, so the normal read path
-        // would return the wrong value for ancestor blocks.
+        // Squash fast-path: when reading the root node hash of a block inside a squash level,
+        // return the per-height root hash stored in the squash trailer instead of reading from the
+        // blob. The squash blob contains a single merged trie whose root node hash is the *tip's*
+        // hash, not the per-block hash, so the normal read path would return the wrong value for
+        // ancestor blocks.
         if ptr.ptr() == ROOT_PTR_DISK {
             if let (Some(h), Some(level_idx)) = (
                 self.data.squash_opened_height,
                 self.data.squash_opened_level_idx,
             ) {
-                if let Some(level) = self.data.squash_levels.get(level_idx) {
+                if let Some(level) = self.data.squash_meta.levels.get(level_idx) {
                     if let Some(root_hash) = level.root_hash_at(h) {
                         return Ok(*root_hash);
                     }
@@ -2267,6 +2879,26 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
 
         match self.data.cur_block_id {
             Some(block_id) => {
+                // Per-read guard: `inner_read_persisted_node_hash` calls `blobs.get_node_hash`
+                // which touches the mmap. The returned `TrieHash` is an owned 32-byte copy, so
+                // the guard can be local. Skip when blobs aren't enabled (pure-SQL backend).
+                let _guard = if self.blobs.is_some() {
+                    let guard = self
+                        .data
+                        .shared_squash
+                        .try_acquire_blob_read()
+                        .ok_or(Error::RetryAfterSquash)?;
+                    if !self
+                        .data
+                        .shared_squash
+                        .squash_state_fresh(self.data.seen_squash_generation)
+                    {
+                        return Err(Error::RetryAfterSquash);
+                    }
+                    Some(guard)
+                } else {
+                    None
+                };
                 self.bench.read_node_hash_start();
                 let node_hash = self.inner_read_persisted_node_hash(block_id, ptr)?;
                 self.bench.read_node_hash_finish(false);
@@ -2301,12 +2933,31 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return Ok((node_id, hash));
         }
 
-        match self.data.cur_block_id {
-            Some(id) => match self.blobs.as_mut() {
-                Some(blobs) => blobs.read_node_type_id(&self.db, id, &clear_ptr),
-                None => trie_sql::probe_node_type(&self.db, id, &clear_ptr),
-            },
-            None => Err(Error::NotFoundError),
+        let Some(id) = self.data.cur_block_id else {
+            return Err(Error::NotFoundError);
+        };
+        if self.blobs.is_some() {
+            // Per-read guard for the mmap-backed path. Hash/type decode yields owned values
+            // (Copy types), so the guard is local to this call and drops at scope end.
+            let _guard = self
+                .data
+                .shared_squash
+                .try_acquire_blob_read()
+                .ok_or(Error::RetryAfterSquash)?;
+            if !self
+                .data
+                .shared_squash
+                .squash_state_fresh(self.data.seen_squash_generation)
+            {
+                return Err(Error::RetryAfterSquash);
+            }
+            let blobs = self
+                .blobs
+                .as_mut()
+                .expect("blobs.is_some() above proves this is Some");
+            blobs.read_node_type_id(&self.db, id, &clear_ptr, self.data.leaf_hashes_omitted)
+        } else {
+            trie_sql::probe_node_type(&self.db, id, &clear_ptr)
         }
     }
 
@@ -2356,13 +3007,37 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             }
         }
 
-        if let Some(blobs) = self.blobs.as_mut() {
+        if self.blobs.is_some() {
+            // Per-read guard covers the entire `inner_write_children_hashes` walk — the hash
+            // reader does multiple mmap accesses across sibling pointers, all of which must
+            // stay protected against a concurrent ftruncate until this call returns.
+            let _guard = self
+                .data
+                .shared_squash
+                .try_acquire_blob_read()
+                .ok_or(Error::RetryAfterSquash)?;
+            if !self
+                .data
+                .shared_squash
+                .squash_state_fresh(self.data.seen_squash_generation)
+            {
+                return Err(Error::RetryAfterSquash);
+            }
             let start_time = self.bench.write_children_hashes_start();
             let block_id = self.data.cur_block_id.ok_or_else(|| {
                 error!("Failed to get cur block as hash reader");
                 Error::NotFoundError
             })?;
-            let mut cursor = TrieFileNodeHashReader::new(&self.db, blobs, block_id);
+            let blobs = self
+                .blobs
+                .as_mut()
+                .expect("blobs.is_some() above proves this is Some");
+            let mut cursor = TrieFileNodeHashReader::new(
+                &self.db,
+                blobs,
+                block_id,
+                self.data.leaf_hashes_omitted,
+            );
             let res = Self::inner_write_children_hashes(&mut cursor, &mut map, ptrs, w, self.bench);
             self.bench.write_children_hashes_finish(start_time, false);
             res
@@ -2384,10 +3059,24 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
     fn bench_mut(&mut self) -> &mut TrieBenchmark {
         self.bench
     }
+
+    fn refresh_after_concurrent_squash(&mut self) -> Result<(), Error> {
+        // Wait for any in-flight publisher to exit its mutation window before syncing —
+        // otherwise `sync_shared_squash_state` sees the not-yet-bumped generation, no-ops,
+        // and the next retry attempt hits the same `truncate_pending` flag. Reader holds
+        // no guards here (the retry reset dropped everything), so the writer's drain is
+        // unblocked and this wait is bounded by the publisher's mutation window length.
+        self.data.shared_squash.wait_for_publish_complete();
+        // Pick up fresh squash metadata, remap the mmap, clear the block cache, reset
+        // `cur_block` so the next `open_block()` re-resolves against the new layout.
+        self.sync_shared_squash_state()
+    }
 }
 
 impl<T: MarfTrieId> TrieFileStorage<T> {
     pub fn connection(&mut self) -> TrieStorageConnection<'_, T> {
+        // Per-read guard model: no connection-level acquisition. See the equivalent comment
+        // on `ReopenedTrieStorageConnection::connection` for the full rationale.
         TrieStorageConnection {
             db: &self.db,
             db_path: &self.db_path,
@@ -2411,6 +3100,11 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
     pub fn reopen_connection(&self) -> Result<ReopenedTrieStorageConnection<'_, T>, Error> {
         let data = TrieStorageTransientData {
             uncommitted_writes: self.data.uncommitted_writes.clone(),
+            // Share the source-of-truth squash state with the parent — writers' `publish` will be
+            // visible to this handle via the generation counter.
+            squash_meta: Arc::clone(&self.data.squash_meta),
+            shared_squash: Arc::clone(&self.data.shared_squash),
+            seen_squash_generation: self.data.seen_squash_generation,
             ..TrieStorageTransientData::new(
                 self.data.cur_block.clone(),
                 self.data.cur_block_id,
@@ -2448,6 +3142,10 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         }
         let tx = tx_begin_immediate(&mut self.db)?;
 
+        // Writer transactions don't race with their own squash (squash is serial on the writer
+        // thread), so acquiring a guard at transaction start would be harmless but redundant.
+        // Per-read acquisition inside the storage layer covers concurrent read-path safety on
+        // other handles.
         Ok(TrieStorageConnection {
             db: tx,
             db_path: &self.db_path,
@@ -2502,69 +3200,38 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         trie_sql::get_external_blobs_length(&self.db)
     }
 
-    /// Reload squash level metadata and remap the blob file after an external
-    /// squash operation has modified both the SQLite DB and the `.blobs` file
-    /// through a separate handle.
+    /// Reload squash level metadata and remap the blob file after an external squash operation
+    /// has modified both the SQLite DB and the `.blobs` file through a separate handle.
+    ///
+    /// Runs the remap + metadata rebuild inside the shared quiesce window so that concurrent
+    /// readers on other handles cannot be holding mmap bytes when the file is mutated. See
+    /// [`SharedStorageState::publish_squash`] for the exact ordering guarantees.
     pub fn refresh_after_squash(&mut self) -> Result<(), Error> {
-        // 1. Remap the blob file mmap to cover new data.
-        if let Some(ref mut blobs) = self.blobs {
-            blobs.remap_and_invalidate()?;
-        }
+        // Split borrows so the closure captures the blobs+db directly rather than through
+        // `&mut self` — lets us still access `self.data` and friends after.
+        let TrieFileStorage { db, blobs, .. } = self;
+        let db: &Connection = db;
+        let blobs: &mut Option<TrieFile> = blobs;
 
-        // 2. Reload squash level metadata from SQLite.
-        let squash_level_rows = trie_sql::read_squash_levels(&self.db)?;
-        if !squash_level_rows.is_empty() {
-            let mut levels = Vec::with_capacity(squash_level_rows.len());
-            let mut block_index = std::collections::HashMap::new();
-
-            for row in &squash_level_rows {
-                // Stub level (no blob) — register with empty trailer.
-                if row.blob_length == 0 {
-                    levels.push(std::sync::Arc::new(SquashTrailer::empty()));
-                    continue;
-                }
-                if let Some(ref blobs) = self.blobs {
-                    let footer_offset = row.blob_offset + row.blob_length
-                        - crate::chainstate::stacks::index::squash::SQUASH_FOOTER_SIZE as u64;
-                    let footer_bytes = blobs.read_blob_range(footer_offset, 12)?;
-                    let trailer_rel_offset =
-                        SquashTrailer::read_footer(&footer_bytes).ok_or_else(|| {
-                            Error::CorruptionError(
-                                "Squash level blob has no valid trailer footer".into(),
-                            )
-                        })?;
-
-                    let trailer_abs_offset = row.blob_offset + trailer_rel_offset;
-                    let trailer_length = row.blob_offset + row.blob_length - trailer_abs_offset;
-                    let trailer_bytes =
-                        blobs.read_blob_range(trailer_abs_offset, trailer_length)?;
-                    let trailer = SquashTrailer::read_from(&trailer_bytes)?;
-
-                    let level_idx = levels.len();
-                    for &(bhh, height) in &trailer.sorted_block_entries {
-                        block_index.insert(
-                            bhh,
-                            (level_idx, height, row.blob_offset, row.reads_redirected),
-                        );
-                    }
-
-                    levels.push(std::sync::Arc::new(trailer));
-                }
+        // `publish_squash` runs our rebuild under the quiesce. Inside the closure all other
+        // readers on this db path have drained, so remap_and_invalidate + trailer reads see a
+        // stable file. The generation bump and writer-flag release happen after we return.
+        let rebuild = || -> Result<SquashMeta, Error> {
+            if let Some(b) = blobs.as_mut() {
+                b.remap_and_invalidate()?;
             }
+            build_squash_meta_from_sql(db, blobs.as_ref())
+        };
 
-            self.data.squash_levels = levels;
-            self.data.squash_block_index = block_index;
-        } else {
-            self.data.squash_levels.clear();
-            self.data.squash_block_index.clear();
-        }
+        self.data.shared_squash.publish_squash(rebuild)?;
 
-        // 3. Clear the block cache (stale after squash).
+        // Sync this handle's local snapshot + watermark to the fresh published state.
+        self.data.squash_meta = self.data.shared_squash.snapshot();
+        self.data.seen_squash_generation = self.data.shared_squash.generation();
+
+        // Clear the block cache and current-block context — stale after the squash redirected
+        // blocks to new blob offsets.
         self.cache = BlockCache::new("noop");
-
-        // 4. Invalidate the currently-open block context so the next
-        //    open_block() re-resolves through fresh squash metadata
-        //    instead of short-circuiting on the cached cur_block.
         self.data.set_block(T::sentinel(), None);
         self.data.trie_ancestor_hash_bytes_cache = None;
 
@@ -2625,9 +3292,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         };
 
         let prev_schema_version = trie_sql::migrate_tables_if_needed::<T>(&mut db)?;
-        // Blob export is only needed when upgrading from schema 1 (inline sqlite blobs)
-        // to schema 2+ (external .blobs file).  Later schema bumps (e.g. 2→3 for squash
-        // metadata) don't touch the blob layout and must not trigger a full re-export.
+        // Blob export is only needed when upgrading from schema 1 (inline sqlite blobs) to schema
+        // 2+ (external .blobs file).  Later schema bumps (e.g. 2→3 for squash metadata) don't touch
+        // the blob layout and must not trigger a full re-export.
         if prev_schema_version < 2 || marf_opts.force_db_migrate {
             if let Some(blobs) = blobs.as_mut() {
                 if TrieFile::exists(&db_path)? {
@@ -2650,53 +3317,21 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
         let mut data = TrieStorageTransientData::new(T::sentinel(), None, readonly, unconfirmed);
 
-        // Load squash level metadata (if any squash levels exist).
-        let squash_level_rows = trie_sql::read_squash_levels(&db)?;
-        if !squash_level_rows.is_empty() {
-            let mut levels = Vec::with_capacity(squash_level_rows.len());
-            let mut block_index = std::collections::HashMap::new();
-
-            for row in &squash_level_rows {
-                // Stub level (no blob) — register with empty trailer.
-                if row.blob_length == 0 {
-                    levels.push(std::sync::Arc::new(SquashTrailer::empty()));
-                    continue;
-                }
-                if let Some(ref blobs) = blobs {
-                    // Read only the 12-byte footer to find the trailer offset.
-                    let footer_offset = row.blob_offset + row.blob_length
-                        - crate::chainstate::stacks::index::squash::SQUASH_FOOTER_SIZE as u64;
-                    let footer_bytes = blobs.read_blob_range(footer_offset, 12)?;
-                    let trailer_rel_offset =
-                        SquashTrailer::read_footer(&footer_bytes).ok_or_else(|| {
-                            Error::CorruptionError(
-                                "Squash level blob has no valid trailer footer".into(),
-                            )
-                        })?;
-
-                    // Read only the trailer region (from trailer_offset to end of blob).
-                    let trailer_abs_offset = row.blob_offset + trailer_rel_offset;
-                    let trailer_length = row.blob_offset + row.blob_length - trailer_abs_offset;
-                    let trailer_bytes =
-                        blobs.read_blob_range(trailer_abs_offset, trailer_length)?;
-                    let trailer = SquashTrailer::read_from(&trailer_bytes)?;
-
-                    // Build the block-hash → (level_idx, height) index.
-                    let level_idx = levels.len();
-                    for &(bhh, height) in &trailer.sorted_block_entries {
-                        block_index.insert(
-                            bhh,
-                            (level_idx, height, row.blob_offset, row.reads_redirected),
-                        );
-                    }
-
-                    levels.push(std::sync::Arc::new(trailer));
-                }
-            }
-
-            data.squash_levels = levels;
-            data.squash_block_index = block_index;
-        }
+        // Join (or create) the process-wide `SharedSquashState` entry for this db path. Any other
+        // independent `MARF::from_path` opens against the same file (e.g. the Stacks 2.x P2P
+        // thread's chainstate and the runloop's chainstate both targeting the same headers MARF)
+        // will share the Arc with us, so a `refresh_after_squash()` publish on either handle is
+        // observable by the other via the generation counter.
+        let shared = {
+            let db_for_build = &db;
+            let blobs_for_build = blobs.as_ref();
+            shared_squash_state_for(&db_path, || {
+                build_squash_meta_from_sql(db_for_build, blobs_for_build)
+            })?
+        };
+        data.squash_meta = shared.snapshot();
+        data.shared_squash = shared;
+        data.seen_squash_generation = data.shared_squash.generation();
 
         let ret = TrieFileStorage {
             db_path,
@@ -2770,6 +3405,11 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         // TODO: borrow self.uncommitted_writes; don't copy them
         let data = TrieStorageTransientData {
             uncommitted_writes: self.data.uncommitted_writes.clone(),
+            // Share the source-of-truth squash state with the parent so
+            // future `publish` calls are observable by this handle.
+            squash_meta: Arc::clone(&self.data.squash_meta),
+            shared_squash: Arc::clone(&self.data.shared_squash),
+            seen_squash_generation: self.data.seen_squash_generation,
             ..TrieStorageTransientData::new(
                 self.data.cur_block.clone(),
                 self.data.cur_block_id,
@@ -2842,13 +3482,19 @@ impl<'a, T: MarfTrieId> TrieStorageConnection<'a, T, Transaction<'a>> {
             &self.db_path
         );
 
+        let data = TrieStorageTransientData {
+            squash_meta: Arc::clone(&self.data.squash_meta),
+            shared_squash: Arc::clone(&self.data.shared_squash),
+            seen_squash_generation: self.data.seen_squash_generation,
+            ..TrieStorageTransientData::new(T::sentinel(), None, true, self.unconfirmed())
+        };
         build_readonly_storage(
             self.db_path,
             self.blobs.is_some(),
             self.hash_calculation_mode,
             self.compress,
             self.mmap,
-            TrieStorageTransientData::new(T::sentinel(), None, true, self.unconfirmed()),
+            data,
             #[cfg(test)]
             self.test_genesis_block.clone(),
         )
@@ -3153,6 +3799,18 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
         self.data.readonly
     }
 
+    /// Detect whether a writer has published a new [`SquashMeta`] since this
+    /// handle last synced, and if so re-snapshot the shared metadata and
+    /// invalidate the handle-local blob mmap + block cache + current-block
+    /// context.
+    ///
+    /// Fast-path: a single atomic load with no lock, no SQL, no trailer
+    /// parsing. Only the slow path (generation mismatch) acquires the
+    /// RwLock read guard to snapshot the fresh metadata.
+    fn sync_shared_squash_state(&mut self) -> Result<(), Error> {
+        sync_from_shared_squash_state(self.data, self.blobs.as_deref_mut(), self.cache)
+    }
+
     pub fn unconfirmed(&self) -> bool {
         self.data.unconfirmed
     }
@@ -3380,7 +4038,9 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             return trie_sql::get_node_hash_bytes(&self.db, block_id, ptr);
         }
         let node_hash = match self.blobs.as_mut() {
-            Some(blobs) => blobs.get_node_hash(&self.db, block_id, ptr, None),
+            Some(blobs) => {
+                blobs.get_node_hash(&self.db, block_id, ptr, None, self.data.leaf_hashes_omitted)
+            }
             None => trie_sql::get_node_hash_bytes(&self.db, block_id, ptr),
         }?;
         Ok(node_hash)

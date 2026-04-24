@@ -680,7 +680,7 @@ impl<
             if !self.in_nakamoto_epoch {
                 debug!("Check to see if the system has entered the Nakamoto epoch");
                 let canonical_header_opt = NakamotoChainState::get_canonical_block_header(
-                    self.chain_state_db.lock().db(),
+                    self.chain_state_db.db(),
                     &self.sortition_db,
                 );
                 if let Ok(Some(canonical_header)) = canonical_header_opt {
@@ -783,7 +783,7 @@ impl<
 
             // process at most one block per loop pass
             let mut processed_block_receipt = match NakamotoChainState::process_next_nakamoto_block(
-                &mut *self.chain_state_db.lock(),
+                &mut self.chain_state_db,
                 &mut self.sortition_db,
                 &canonical_sortition_tip,
                 self.dispatcher,
@@ -827,7 +827,7 @@ impl<
 
             // Auto-squash MARF if cadence is met.
             {
-                let mut chainstate = self.chain_state_db.lock();
+                let chainstate = &mut self.chain_state_db;
                 chainstate.maybe_squash(
                     block_receipt.header.stacks_block_height,
                     self.sortition_db.conn(),
@@ -942,7 +942,7 @@ impl<
                         })?,
                     &canonical_sn.sortition_id,
                     &self.burnchain,
-                    &mut *self.chain_state_db.lock(),
+                    &mut self.chain_state_db,
                     &canonical_stacks_block_id,
                     &self.sortition_db,
                     &OnChainRewardSetProvider::new(),
@@ -981,7 +981,7 @@ impl<
             ChainstateError::Expects("Processing anchor block, but no known sortition tip".into())
         })?;
 
-        let mut chainstate = self.chain_state_db.lock();
+        let chainstate = &mut self.chain_state_db;
         get_nakamoto_reward_cycle_info(
             sortition_tip_id,
             reward_cycle,
@@ -1161,7 +1161,7 @@ impl<
             let (next_snapshot, _) = self
                 .sortition_db
                 .evaluate_sortition(
-                    self.chain_state_db.lock().mainnet,
+                    self.chain_state_db.mainnet,
                     &header,
                     ops,
                     &self.burnchain,
@@ -1185,7 +1185,7 @@ impl<
                 })?;
 
             // mark this burn block as processed in the nakamoto chainstate
-            let mut chainstate = self.chain_state_db.lock();
+            let chainstate = &mut self.chain_state_db;
             let tx = chainstate.staging_db_tx_begin()?;
             tx.set_burn_block_processed(&next_snapshot.consensus_hash)?;
             tx.commit().map_err(DBError::SqliteError)?;

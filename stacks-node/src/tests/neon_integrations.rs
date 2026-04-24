@@ -7623,18 +7623,24 @@ fn use_latest_tip_integration_test() {
     next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
 
     // Check that the underlying trie for the unconfirmed state does not exist.
-    assert!(chainstate.unconfirmed_state.is_some());
-    let unconfirmed_state = chainstate.unconfirmed_state.as_mut().unwrap();
-    let trie_exists = match unconfirmed_state
-        .clarity_inst
-        .trie_exists_for_block(&unconfirmed_state.unconfirmed_chain_tip)
+    // Scope the guard so the unconfirmed-state mutex is released before the HTTP
+    // calls below — those run against this same node, and the RPC handlers can
+    // themselves take the unconfirmed-state lock to serve `tip=latest`.
     {
-        Ok(res) => res,
-        Err(e) => {
-            panic!("error when determining whether or not trie exists: {:?}", e);
-        }
-    };
-    assert!(!trie_exists);
+        let mut unconfirmed_guard = chainstate.unconfirmed_state.lock();
+        assert!(unconfirmed_guard.is_some());
+        let unconfirmed_state = unconfirmed_guard.as_mut().unwrap();
+        let trie_exists = match unconfirmed_state
+            .clarity_inst
+            .trie_exists_for_block(&unconfirmed_state.unconfirmed_chain_tip)
+        {
+            Ok(res) => res,
+            Err(e) => {
+                panic!("error when determining whether or not trie exists: {:?}", e);
+            }
+        };
+        assert!(!trie_exists);
+    }
 
     // Set tip=latest, and ask for the source of the contract defined in the previous epoch.
     // The underlying MARF trie for the unconfirmed tip does not exist, so the transaction will be

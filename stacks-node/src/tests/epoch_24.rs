@@ -467,7 +467,7 @@ fn fix_to_pox_contract() {
     let tip_info = get_chain_info(&conf);
     let tip = StacksBlockId::new(&tip_info.stacks_tip_consensus_hash, &tip_info.stacks_tip);
 
-    let (mut chainstate, _) = StacksChainState::open(
+    let (chainstate, _) = StacksChainState::open(
         false,
         conf.burnchain.chain_id,
         &conf.get_chainstate_path_str(),

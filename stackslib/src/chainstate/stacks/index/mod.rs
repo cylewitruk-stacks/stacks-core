@@ -28,7 +28,7 @@ use stacks_common::types::chainstate::{
     BurnchainHeaderHash, SortitionId, StacksBlockId, TrieHash, TRIEHASH_ENCODED_SIZE,
 };
 
-use crate::chainstate::stacks::index::storage::TrieStorageConnection;
+use crate::chainstate::stacks::index::storage::{BlobReadGuard, TrieStorageConnection};
 use crate::util_lib::db::Error as db_error;
 
 pub mod bits;
@@ -398,6 +398,30 @@ pub enum Error {
     Patch(Option<TrieHash>, TrieNodePatch),
     NodeTooDeep,
     NotSupportedError(String),
+    /// Internal retry sentinel. Emitted by read-path helpers when a concurrent squash writer
+    /// on another handle has entered (or completed) its mutation window between the current
+    /// handle's last state sync and this read. The bounded retry wrappers at the public read
+    /// entry points (`MarfInternals::get_*`, `prove_*`, `get_root_hash_at`, etc.) catch this
+    /// variant, reset per-traversal state, and restart the operation against the freshly
+    /// published squash metadata.
+    ///
+    /// This variant is **internal** — it must never reach a public API caller. A leak
+    /// indicates either a missing retry wrapper or a bug in one of the read-pipeline helpers
+    /// that returns it. Use [`Error::is_retry_after_squash`] to branch on it internally.
+    #[doc(hidden)]
+    RetryAfterSquash,
+}
+
+impl Error {
+    /// Returns `true` for the internal [`Error::RetryAfterSquash`] sentinel. See the variant's
+    /// docstring for why this exists and where it must be absorbed.
+    pub(crate) fn is_retry_after_squash(&self) -> bool {
+        matches!(self, Error::RetryAfterSquash)
+    }
+
+    pub fn corruption(msg: &str) -> Self {
+        Self::CorruptionError(msg.into())
+    }
 }
 
 /// A borrowed slice of serialized trie node bytes (e.g. from an mmap'd blob).
@@ -492,7 +516,9 @@ pub enum ReadTrieItemKind<'a> {
 }
 
 /// A single item read from trie storage, wrapping either a resolved node or an unresolved patch
-/// along with its hash and compression depth.
+/// along with its hash and compression depth. The blob-read guard (for mmap-backed reads)
+/// lives inside `ReadTrieNode` so that destructuring `ReadTrieItem { kind: Node(n), .. }` keeps
+/// the guard alive with `n`.
 #[derive(Debug, Clone)]
 pub struct ReadTrieItem<'a> {
     pub hash: Option<TrieHash>,
@@ -544,6 +570,12 @@ pub struct ReadTrieNode<'a> {
     /// `TrieNodeRef` cannot carry. Applied by `into_owned_node()` to round-trip
     /// without loss.
     transient_meta: Option<TrieNodeTransientMeta>,
+    /// RAII guard keeping the blob-mutation quiesce active while the bytes are in use.
+    /// Populated only when `backing` is `PersistedBytes::Borrowed` (mmap reads); `None`
+    /// for decoded/owned/volatile backings and for patch results. Dropping this node
+    /// decrements the shared `active_reads` counter and lets a pending squash writer
+    /// proceed with its `ftruncate`.
+    _blob_guard: Option<BlobReadGuard>,
 }
 
 /// Result of a single step during a trie cursor walk.
@@ -748,6 +780,18 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     fn squash_opened_height(&self) -> Option<u32> {
         None
     }
+
+    /// Hook invoked by the top-level retry wrapper after an internal
+    /// [`Error::RetryAfterSquash`] fires. Backends that cache squash-dependent state (mmap
+    /// region, offset cache, current-block context, snapshotted [`SquashMeta`]) should refresh
+    /// from the shared storage state here so the retry attempt reads against the freshly
+    /// published layout.
+    ///
+    /// Default implementation is a no-op — suitable for pure-SQL / in-memory storage backends
+    /// that don't observe the shared squash generation.
+    fn refresh_after_concurrent_squash(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Bundles a [`TrieReadStorage`] reference with a [`TrieNodeReadState`] for convenient node
@@ -791,7 +835,8 @@ impl<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>
 }
 
 impl<'a> ReadTrieItem<'a> {
-    /// Wrap a resolved node as a read item.
+    /// Wrap a resolved node as a read item. If the node borrows mmap bytes, its
+    /// `_blob_guard` field should already hold a [`BlobReadGuard`].
     pub fn from_node(node: ReadTrieNode<'a>) -> Self {
         Self {
             hash: node.hash,
@@ -800,7 +845,8 @@ impl<'a> ReadTrieItem<'a> {
         }
     }
 
-    /// Wrap an unresolved patch as a read item.
+    /// Wrap an unresolved patch as a read item. Patches don't borrow mmap bytes, so no
+    /// blob guard is needed.
     pub fn from_patch(patch: &'a TrieNodePatch, hash: Option<TrieHash>) -> Self {
         Self {
             hash,
@@ -840,12 +886,21 @@ impl<'a> ReadTrieNode<'a> {
             backing,
             decoded_bytes: Arc::new(OnceLock::new()),
             transient_meta: None,
+            _blob_guard: None,
         }
     }
 
     /// Attach transient metadata (cowptr, patch state) captured from the source TrieNodeType.
     pub fn with_transient_meta(mut self, meta: TrieNodeTransientMeta) -> Self {
         self.transient_meta = Some(meta);
+        self
+    }
+
+    /// Attach an RAII blob-read guard that keeps the shared quiesce counter incremented
+    /// while this node's mmap-backed bytes are in scope. Required on any `ReadTrieNode`
+    /// whose `backing` is `PersistedBytes::Borrowed`; ignored for other backings.
+    pub fn with_blob_guard(mut self, guard: BlobReadGuard) -> Self {
+        self._blob_guard = Some(guard);
         self
     }
 
@@ -865,6 +920,12 @@ impl<'a> ReadTrieNode<'a> {
     }
 
     /// Construct from borrowed raw bytes (zero-copy, e.g. mmap).
+    ///
+    /// Callers providing mmap bytes MUST chain `.with_blob_guard(guard)` so the resulting
+    /// node owns an RAII guard that keeps the blob-mutation quiesce counter incremented
+    /// for the lifetime of the borrow. Omitting the guard is a correctness bug: a
+    /// concurrent squash writer could `ftruncate` the file out from under the returned
+    /// bytes and trigger SIGBUS on next access.
     pub fn from_stable_bytes(node: BorrowedNodeBytes<'a>, hash: Option<TrieHash>) -> Self {
         Self::new(
             hash,
@@ -1172,6 +1233,14 @@ impl fmt::Display for Error {
             }
             Error::NodeTooDeep => write!(f, "Node is too deeply buried under patches"),
             Error::NotSupportedError(ref s) => write!(f, "Operation not supported: {s}"),
+            Error::RetryAfterSquash => {
+                debug_assert!(
+                    false,
+                    "BUG: Error::RetryAfterSquash escaped the internal read pipeline — \
+                     a public entry point is missing its retry wrapper",
+                );
+                write!(f, "Internal retry sentinel leaked — report as a bug")
+            }
         }
     }
 }

@@ -94,7 +94,7 @@ impl RPCPeerInfoData {
         ibd: bool,
     ) -> RPCPeerInfoData {
         let server_version = version_string("stacks-node", option_env!("STACKS_NODE_VERSION"));
-        let (unconfirmed_tip, unconfirmed_seq) = match chainstate.unconfirmed_state {
+        let (unconfirmed_tip, unconfirmed_seq) = match *chainstate.unconfirmed_state.lock() {
             Some(ref unconfirmed) => {
                 if unconfirmed.num_mined_txs() > 0 {
                     (

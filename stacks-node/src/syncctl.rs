@@ -188,6 +188,10 @@ impl PoxSyncWatchdog {
 
         self.relayer_comms.set_ibd(ibbd);
         if !self.unconditionally_download {
+            info!(
+                "PoX sync watchdog: waiting for burnchain to reach height {} (reward cycle {}) before processing next PoX reward cycle",
+                max_sync_height, burnchain_rc
+            );
             self.relayer_comms
                 .interruptable_sleep(self.steady_state_burnchain_sync_interval)?;
         }

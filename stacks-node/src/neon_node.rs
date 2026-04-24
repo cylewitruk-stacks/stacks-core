@@ -176,7 +176,9 @@ use stacks::chainstate::nakamoto::NakamotoChainState;
 use stacks::chainstate::stacks::address::PoxAddress;
 use stacks::chainstate::stacks::boot::MINERS_NAME;
 use stacks::chainstate::stacks::db::blocks::StagingBlock;
-use stacks::chainstate::stacks::db::{StacksChainState, StacksHeaderInfo, MINER_REWARD_MATURITY};
+use stacks::chainstate::stacks::db::{
+    SharedUnconfirmedState, StacksChainState, StacksHeaderInfo, MINER_REWARD_MATURITY,
+};
 use stacks::chainstate::stacks::miner::{
     signal_mining_blocked, signal_mining_ready, AssembledAnchorBlock, BlockBuilderSettings,
     StacksMicroblockBuilder,
@@ -348,17 +350,31 @@ pub(crate) fn fault_injection_skip_mining(_rpc_bind: &str, _target_burn_height: 
 }
 
 /// Open the chainstate, and inject faults from the config file
+/// Open a `StacksChainState` handle with this node's fault-injection knobs applied, using a
+/// fresh (independent) `SharedUnconfirmedState` slot. Use [`open_chainstate_with_faults_shared`]
+/// instead when constructing a long-lived thread handle that should participate in a
+/// cross-thread shared unconfirmed view.
 pub(crate) fn open_chainstate_with_faults(
     config: &Config,
 ) -> Result<StacksChainState, ChainstateError> {
-    let stacks_chainstate_path = config.get_chainstate_path_str();
-    let (mut chainstate, _) = StacksChainState::open(
+    open_chainstate_with_faults_shared(config, SharedUnconfirmedState::new())
+}
+
+/// Open a per-thread `StacksChainState` handle that participates in a cross-thread shared
+/// `SharedUnconfirmedState` slot. Use this for long-lived thread chainstates (relayer, p2p,
+/// nakamoto miner) so all threads see the same in-memory unconfirmed view via the slot's
+/// inner mutex while their confirmed-state handles stay independent.
+pub(crate) fn open_chainstate_with_faults_shared(
+    config: &Config,
+    shared_unconfirmed: SharedUnconfirmedState,
+) -> Result<StacksChainState, ChainstateError> {
+    let mut chainstate = StacksChainState::open_with_shared_unconfirmed(
         config.is_mainnet(),
         config.burnchain.chain_id,
-        &stacks_chainstate_path,
+        &config.get_chainstate_path_str(),
         Some(config.node.get_marf_opts()),
+        shared_unconfirmed,
     )?;
-
     chainstate.fault_injection.hide_blocks = config.node.fault_injection_hide_blocks;
     Ok(chainstate)
 }
@@ -587,7 +603,7 @@ impl MicroblockMinerThread {
         })
         .ok()?;
 
-        let mut chainstate = open_chainstate_with_faults(&config)
+        let chainstate = open_chainstate_with_faults(&config)
             .map_err(|e| {
                 error!(
                     "Relayer: Could not open chainstate '{stacks_chainstate_path}' ({e:?}); skipping microblock tenure"
@@ -634,14 +650,21 @@ impl MicroblockMinerThread {
                 let settings =
                     config.make_block_builder_settings(0, true, globals.get_miner_status());
 
-                // port over unconfirmed state to this thread
-                chainstate.unconfirmed_state = if let Some(unconfirmed_state) =
-                    relayer_thread.chainstate_ref().unconfirmed_state.as_ref()
-                {
-                    Some(unconfirmed_state.make_readonly_owned().ok()?)
-                } else {
-                    None
+                // Port over unconfirmed state to this thread by snapshotting the relayer's
+                // slot under its own lock and installing the read-only copy in the miner's
+                // (separate) slot under the miner's lock. The microblock miner needs a
+                // frozen-at-handoff view so the relayer's later reload/refresh writes don't
+                // perturb mining mid-run, so sharing the slot via Arc would be wrong here.
+                let snapshot = {
+                    let relayer_guard = relayer_thread.chainstate_ref().unconfirmed_state.lock();
+                    match relayer_guard.as_ref() {
+                        Some(unconfirmed_state) => {
+                            Some(unconfirmed_state.make_readonly_owned().ok()?)
+                        }
+                        None => None,
+                    }
                 };
+                *chainstate.unconfirmed_state.lock() = snapshot;
 
                 Some(MicroblockMinerThread {
                     globals,
@@ -708,6 +731,7 @@ impl MicroblockMinerThread {
             &self.parent_block_hash,
             chainstate
                 .unconfirmed_state
+                .lock()
                 .as_ref()
                 .map(|us| us.num_microblocks())
                 .unwrap_or(0)
@@ -738,8 +762,24 @@ impl MicroblockMinerThread {
                 chainstate,
                 &block_snapshot.get_canonical_stacks_block_id(),
             )?;
+            // Hold the unconfirmed-slot lock for the entire microblock-miner lifetime —
+            // the builder's `clarity_tx` borrows from `unconfirmed.clarity_inst`, so the
+            // guard MUST outlive the builder. Bind to a stack variable in this scope.
+            let mut unconfirmed_guard = chainstate.unconfirmed_state.lock();
+            let unconfirmed = match unconfirmed_guard.as_mut() {
+                Some(u) => u,
+                None => {
+                    let msg = format!(
+                        "No unconfirmed state instantiated at chaintip {}/{}",
+                        &self.parent_consensus_hash, &self.parent_block_hash
+                    );
+                    error!("{msg}");
+                    return Err(ChainstateError::NoSuchBlockError);
+                }
+            };
             let mut microblock_miner = match StacksMicroblockBuilder::resume_unconfirmed(
                 chainstate,
+                unconfirmed,
                 &ic,
                 &self.cost_so_far,
                 self.settings.clone(),
@@ -3013,7 +3053,8 @@ impl RelayerThread {
         let num_unconfirmed_microblock_tx_receipts =
             net_receipts.processed_unconfirmed_state.receipts.len();
         if num_unconfirmed_microblock_tx_receipts > 0 {
-            if let Some(unconfirmed_state) = self.chainstate_ref().unconfirmed_state.as_ref() {
+            let unconfirmed_guard = self.chainstate_ref().unconfirmed_state.lock();
+            if let Some(ref unconfirmed_state) = *unconfirmed_guard {
                 self.event_dispatcher.process_new_microblocks(
                     &unconfirmed_state.confirmed_chain_tip,
                     &net_receipts.processed_unconfirmed_state,
@@ -4019,6 +4060,7 @@ impl RelayerThread {
                                         Relayer::refresh_unconfirmed(chainstate, sortdb);
                                     let num_mblocks = chainstate
                                         .unconfirmed_state
+                                        .lock()
                                         .as_ref()
                                         .map(|unconfirmed| unconfirmed.num_microblocks())
                                         .unwrap_or(0);

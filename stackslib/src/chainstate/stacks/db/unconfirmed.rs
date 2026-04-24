@@ -529,7 +529,10 @@ impl StacksChainState {
     ) -> Result<ProcessedUnconfirmedState, Error> {
         debug!("Reload unconfirmed state off of {}", &canonical_tip);
 
-        let unconfirmed_state = self.unconfirmed_state.take();
+        // Pull the current state out of the shared slot. The slot is briefly empty here; on this
+        // handle the `&mut self` borrow ensures no other code observes the gap, and across
+        // handles the slot's inner mutex serializes against concurrent observers.
+        let unconfirmed_state = self.unconfirmed_state.lock().take();
         if let Some(mut unconfirmed_state) = unconfirmed_state {
             if unconfirmed_state.is_readable() {
                 if canonical_tip == unconfirmed_state.confirmed_chain_tip {
@@ -540,11 +543,11 @@ impl StacksChainState {
                         canonical_tip, &unconfirmed_state.unconfirmed_chain_tip
                     );
 
-                    self.unconfirmed_state = Some(unconfirmed_state);
+                    *self.unconfirmed_state.lock() = Some(unconfirmed_state);
                     return res;
                 } else {
                     // got a new tip; will imminently drop
-                    self.unconfirmed_state = Some(unconfirmed_state);
+                    *self.unconfirmed_state.lock() = Some(unconfirmed_state);
                 }
             } else {
                 // will need to drop this anyway -- it's dirty, or not instantiated
@@ -553,8 +556,10 @@ impl StacksChainState {
         }
 
         // tip changed, or we don't have unconfirmed state yet, or we do and it's dirty, or it was
-        // never instantiated anyway
-        if let Some(unconfirmed_state) = self.unconfirmed_state.take() {
+        // never instantiated anyway. Bind the take() outside the if-let so the lock guard's
+        // temporary doesn't outlive the `&mut self` borrow used for `drop_unconfirmed_state`.
+        let popped = self.unconfirmed_state.lock().take();
+        if let Some(unconfirmed_state) = popped {
             self.drop_unconfirmed_state(unconfirmed_state);
         }
 
@@ -566,7 +571,7 @@ impl StacksChainState {
             canonical_tip, &new_unconfirmed_state.unconfirmed_chain_tip
         );
 
-        self.unconfirmed_state = Some(new_unconfirmed_state);
+        *self.unconfirmed_state.lock() = Some(new_unconfirmed_state);
         Ok(processed_unconfirmed_state)
     }
 
@@ -575,30 +580,34 @@ impl StacksChainState {
         &mut self,
         burn_dbconn: &dyn BurnStateDB,
     ) -> Result<ProcessedUnconfirmedState, Error> {
-        let mut unconfirmed_state = self.unconfirmed_state.take();
+        // Same take/modify/replace pattern as `reload_unconfirmed_state`: pull out so we can pass
+        // `&self` into `unconfirmed_state.refresh(...)` (which needs the chainstate for header
+        // lookups) without holding the shared-slot lock across the whole refresh.
+        let mut unconfirmed_state = self.unconfirmed_state.lock().take();
         let res = if let Some(ref mut unconfirmed_state) = unconfirmed_state {
-            if !unconfirmed_state.is_readable() {
-                warn!("Unconfirmed state is not readable; it will soon be refreshed");
-                return Ok(Default::default());
-            }
-
-            debug!(
-                "Refresh unconfirmed state off of {} ({})",
-                &unconfirmed_state.confirmed_chain_tip, &unconfirmed_state.unconfirmed_chain_tip
-            );
-            let res = unconfirmed_state.refresh(self, burn_dbconn);
-            if res.is_ok() {
+            if unconfirmed_state.is_readable() {
                 debug!(
-                    "Unconfirmed chain tip is {}",
-                    &unconfirmed_state.unconfirmed_chain_tip
+                    "Refresh unconfirmed state off of {} ({})",
+                    &unconfirmed_state.confirmed_chain_tip,
+                    &unconfirmed_state.unconfirmed_chain_tip,
                 );
+                let res = unconfirmed_state.refresh(self, burn_dbconn);
+                if res.is_ok() {
+                    debug!(
+                        "Unconfirmed chain tip is {}",
+                        &unconfirmed_state.unconfirmed_chain_tip
+                    );
+                }
+                res
+            } else {
+                warn!("Unconfirmed state is not readable; it will soon be refreshed");
+                Ok(Default::default())
             }
-            res
         } else {
             warn!("No unconfirmed state instantiated");
             Ok(Default::default())
         };
-        self.unconfirmed_state = unconfirmed_state;
+        *self.unconfirmed_state.lock() = unconfirmed_state;
         res
     }
 
@@ -609,7 +618,8 @@ impl StacksChainState {
         &mut self,
         canonical_tip: StacksBlockId,
     ) -> Result<(), Error> {
-        if let Some(ref unconfirmed) = self.unconfirmed_state {
+        // Brief lock — assertion only.
+        if let Some(ref unconfirmed) = *self.unconfirmed_state.lock() {
             assert!(
                 unconfirmed.readonly,
                 "BUG: tried to replace a read/write unconfirmed state instance"
@@ -617,12 +627,12 @@ impl StacksChainState {
         }
 
         let unconfirmed = UnconfirmedState::new_readonly(self, canonical_tip)?;
-        self.unconfirmed_state = Some(unconfirmed);
+        *self.unconfirmed_state.lock() = Some(unconfirmed);
         Ok(())
     }
 
     pub fn set_unconfirmed_dirty(&mut self, dirty: bool) {
-        if let Some(ref mut unconfirmed) = self.unconfirmed_state.as_mut() {
+        if let Some(ref mut unconfirmed) = self.unconfirmed_state.lock().as_mut() {
             unconfirmed.dirty = dirty;
         }
     }
@@ -1301,8 +1311,13 @@ mod test {
 
                 let microblock = {
                     let sort_iconn = sortdb.index_handle_at_tip();
+                    let mut unconfirmed_guard = inner_node.chainstate.unconfirmed_state.lock();
+                    let unconfirmed = unconfirmed_guard
+                        .as_mut()
+                        .expect("unconfirmed state must be instantiated before mining");
                     let mut microblock_builder = StacksMicroblockBuilder::resume_unconfirmed(
-                        &mut inner_node.chainstate,
+                        &inner_node.chainstate,
+                        unconfirmed,
                         &sort_iconn,
                         &anchor_cost,
                         BlockBuilderSettings::max_value(),

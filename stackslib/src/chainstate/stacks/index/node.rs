@@ -81,6 +81,12 @@ pub fn clear_backptr(id: u8) -> u8 {
     id & 0x7f
 }
 
+/// Returns true if the node ID (after clearing control bits) is a leaf type.
+pub fn is_leaf_type(id: u8) -> bool {
+    let cleared = id & 0x3f;
+    cleared == TrieNodeID::Leaf as u8 || cleared == TrieNodeID::LeafSquashed as u8
+}
+
 /// Is this node compressed?
 pub fn is_compressed(id: u8) -> bool {
     id & 0x40 != 0
@@ -2387,6 +2393,11 @@ impl TrieLeafSquashed {
                 Self::MAX_ENTRIES
             )));
         }
+        if !entries.is_sorted_by(|a, b| a.0 >= b.0) {
+            return Err(Error::CorruptionError(
+                "TrieLeafSquashed: entries must be sorted descending by height".into(),
+            ));
+        }
         Ok(Self {
             path: NodePath::from_slice(path).ok_or_else(|| {
                 Error::CorruptionError("TrieLeafSquashed: node path exceeds 32 bytes".into())
@@ -2435,13 +2446,34 @@ impl TrieNode for TrieLeafSquashed {
     }
 
     fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
-        w.write_all(&[self.id()])?;
-        bits::write_path_to_bytes(&self.path, w)?;
-        let count = u32::try_from(self.entries.len()).map_err(|_| Error::OverflowError)?;
-        w.write_all(&count.to_be_bytes())?;
-        for (height, value) in &self.entries {
-            w.write_all(&height.to_be_bytes())?;
-            w.write_all(&value.0)?;
+        let (first_height, base_height) = match (self.entries.first(), self.entries.last()) {
+            (Some(&(f, _)), Some(&(l, _))) => (f, l),
+            _ => return Err(Error::corruption("BUG: TrieLeafSquashed has no entries")),
+        };
+        let max_delta = first_height.saturating_sub(base_height);
+
+        if max_delta <= u16::MAX as u32 {
+            // Compressed: [ID|0x40][path][base_height(4)][count(4)][u16+value...]
+            w.write_all(&[set_compressed(self.id())])?;
+            bits::write_path_to_bytes(&self.path, w)?;
+            w.write_all(&base_height.to_be_bytes())?;
+            let count = u32::try_from(self.entries.len()).map_err(|_| Error::OverflowError)?;
+            w.write_all(&count.to_be_bytes())?;
+            for (height, value) in &self.entries {
+                let rel = (height - base_height) as u16;
+                w.write_all(&rel.to_be_bytes())?;
+                w.write_all(&value.0)?;
+            }
+        } else {
+            // Legacy: [ID][path][count(4)][u32+value...]
+            w.write_all(&[self.id()])?;
+            bits::write_path_to_bytes(&self.path, w)?;
+            let count = u32::try_from(self.entries.len()).map_err(|_| Error::OverflowError)?;
+            w.write_all(&count.to_be_bytes())?;
+            for (height, value) in &self.entries {
+                w.write_all(&height.to_be_bytes())?;
+                w.write_all(&value.0)?;
+            }
         }
         Ok(())
     }
@@ -2451,7 +2483,19 @@ impl TrieNode for TrieLeafSquashed {
     }
 
     fn byte_len(&self) -> usize {
-        1 + bits::get_path_byte_len(&self.path) + 4 + self.entries.len() * 44
+        let base_height = self.entries.last().map_or(0, |(h, _)| *h);
+        let max_delta = self
+            .entries
+            .first()
+            .map_or(0, |(h, _)| *h)
+            .saturating_sub(base_height);
+        if max_delta <= u16::MAX as u32 {
+            // Compressed: 1 + path + 4 (base_height) + 4 (count) + entries * 42
+            1 + bits::get_path_byte_len(&self.path) + 4 + 4 + self.entries.len() * 42
+        } else {
+            // Legacy: 1 + path + 4 (count) + entries * 44
+            1 + bits::get_path_byte_len(&self.path) + 4 + self.entries.len() * 44
+        }
     }
 
     fn byte_len_compressed(&self) -> usize {
@@ -2470,19 +2514,37 @@ impl TrieNode for TrieLeafSquashed {
             )));
         }
 
+        let compressed = is_compressed(id);
+
         let remaining = bytes
             .get(1..)
             .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing path bytes".into()))?;
         let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
 
-        let count_start = 1 + path_consumed;
-        let count_end = count_start + 4;
+        let mut cursor = 1 + path_consumed;
+
+        // Compressed format has a base_height field before the entry count.
+        let base_height = if compressed {
+            let end = cursor + 4;
+            let b = bytes.get(cursor..end).ok_or_else(|| {
+                Error::CorruptionError("LeafSquashed: missing base_height".into())
+            })?;
+            cursor = end;
+            u32::from_be_bytes(b.try_into().map_err(|_| {
+                Error::CorruptionError("LeafSquashed: base_height not 4 bytes".into())
+            })?)
+        } else {
+            0 // unused for legacy format
+        };
+
+        let count_end = cursor + 4;
         let count_bytes = bytes
-            .get(count_start..count_end)
+            .get(cursor..count_end)
             .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing entry count".into()))?;
         let entry_count = u32::from_be_bytes(count_bytes.try_into().map_err(|_| {
             Error::CorruptionError("LeafSquashed: entry count slice is not 4 bytes".into())
         })?) as usize;
+        cursor = count_end;
 
         if entry_count == 0 {
             return Err(Error::CorruptionError(
@@ -2493,28 +2555,42 @@ impl TrieNode for TrieLeafSquashed {
         self.entries.clear();
         self.entries.reserve(entry_count);
 
-        let mut offset = count_end;
-        for _ in 0..entry_count {
-            let entry_end = offset + 44;
-            let entry_bytes = bytes
-                .get(offset..entry_end)
-                .ok_or_else(|| Error::CorruptionError("LeafSquashed: truncated entry".into()))?;
-            let height_bytes = entry_bytes.get(..4).ok_or_else(|| {
-                Error::CorruptionError("LeafSquashed: entry too short for height".into())
-            })?;
-            let height = u32::from_be_bytes(height_bytes.try_into().map_err(|_| {
-                Error::CorruptionError("LeafSquashed: height slice is not 4 bytes".into())
-            })?);
-            let mut value = MARFValue([0u8; 40]);
-            let value_bytes = entry_bytes.get(4..44).ok_or_else(|| {
-                Error::CorruptionError("LeafSquashed: entry too short for value".into())
-            })?;
-            value.0.copy_from_slice(value_bytes);
-            self.entries.push((height, value));
-            offset = entry_end;
+        if compressed {
+            // Per-entry: [u16 relative_height][MARFValue(40)] = 42 bytes
+            for _ in 0..entry_count {
+                let entry_end = cursor + 42;
+                let entry_bytes = bytes
+                    .get(cursor..entry_end)
+                    .ok_or_else(|| Error::corruption("LeafSquashed: truncated entry"))?;
+                let (rel_bytes, value_bytes) = entry_bytes
+                    .split_first_chunk::<2>()
+                    .ok_or_else(|| Error::corruption("LeafSquashed: bad rel height"))?;
+                let rel = u16::from_be_bytes(*rel_bytes);
+                let height = base_height + u32::from(rel);
+                let mut value = MARFValue([0u8; 40]);
+                value.0.copy_from_slice(value_bytes);
+                self.entries.push((height, value));
+                cursor = entry_end;
+            }
+        } else {
+            // Legacy: per-entry [u32 height][MARFValue(40)] = 44 bytes
+            for _ in 0..entry_count {
+                let entry_end = cursor + 44;
+                let entry_bytes = bytes
+                    .get(cursor..entry_end)
+                    .ok_or_else(|| Error::corruption("LeafSquashed: truncated entry"))?;
+                let (height_bytes, value_bytes) = entry_bytes
+                    .split_first_chunk::<4>()
+                    .ok_or_else(|| Error::corruption("LeafSquashed: bad height"))?;
+                let height = u32::from_be_bytes(*height_bytes);
+                let mut value = MARFValue([0u8; 40]);
+                value.0.copy_from_slice(value_bytes);
+                self.entries.push((height, value));
+                cursor = entry_end;
+            }
         }
 
-        Ok(offset)
+        Ok(cursor)
     }
 
     fn insert(&mut self, _ptr: &TriePtr) -> bool {

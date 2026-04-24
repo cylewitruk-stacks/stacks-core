@@ -20,9 +20,9 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use sha2::{Digest, Sha512_256 as TrieHasher};
 
 use crate::chainstate::stacks::index::node::{
-    clear_compressed, clear_ctrl_bits, is_compressed, ptrs_fmt, set_backptr, ConsensusSerializable,
-    TrieLeafSquashed, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID,
-    TrieNodePatch, TrieNodeType, TriePtr, TRIEPTR_SIZE,
+    self, clear_compressed, clear_ctrl_bits, is_compressed, ptrs_fmt, set_backptr,
+    ConsensusSerializable, TrieLeafSquashed, TrieNode, TrieNode16, TrieNode256, TrieNode4,
+    TrieNode48, TrieNodeID, TrieNodePatch, TrieNodeType, TriePtr, TRIEPTR_SIZE,
 };
 use crate::chainstate::stacks::index::{
     BlockMap, Error, MarfTrieId, NodeDecodeScratch, NodePath, ReadTrieItem, ReadTrieNode, TrieLeaf,
@@ -153,7 +153,8 @@ pub fn get_node_body_max_byte_len(node_id: u8) -> Result<usize, Error> {
         TrieNodeID::Node256 => get_ptrs_byte_len(&[TriePtr::default(); 256]) + path_max_len,
         TrieNodeID::Patch => 1 + patch_ptr_max_len + 1 + 256 * patch_ptr_max_len,
         // LeafSquashed is variable-length; use a generous upper bound.
-        // In practice, squash blobs should be read via mmap (borrowed path).
+        // Legacy format (wider spans): 1 + path + 4 (count) + 65536 * 44
+        // This covers both compressed and legacy encodings.
         TrieNodeID::LeafSquashed => 1 + path_max_len + 4 + 65536 * 44,
         TrieNodeID::Empty => {
             return Err(Error::CorruptionError(format!(
@@ -202,11 +203,32 @@ fn decode_nodetype_ref_from_slice_at_head(
 }
 
 pub fn stored_node_id_from_bytes(bytes: &[u8]) -> Result<TrieNodeID, Error> {
-    TrieNodeID::from_u8(clear_ctrl_bits(*bytes.first().ok_or_else(|| {
+    let first_byte = *bytes.first().ok_or_else(|| {
         Error::CorruptionError("Failed to read 1st byte from bytes array".to_string())
-    })?))
-    .ok_or_else(|| {
-        Error::CorruptionError("Failed to read expected node ID -- not a valid ID".to_string())
+    })?;
+    TrieNodeID::from_u8(clear_ctrl_bits(first_byte)).ok_or_else(|| {
+        // Log surrounding bytes for diagnosis — helps distinguish "reading
+        // hash bytes as node body" from "wrong file offset entirely".
+        let preview_len = bytes.len().min(40);
+        let preview: Vec<String> = bytes
+            .iter()
+            .take(preview_len)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        error!(
+            "stored_node_id_from_bytes: invalid node ID byte=0x{:02x} cleared=0x{:02x}, \
+             slice_len={}, first {} bytes=[{}]",
+            first_byte,
+            clear_ctrl_bits(first_byte),
+            bytes.len(),
+            preview_len,
+            preview.join(" "),
+        );
+        Error::CorruptionError(format!(
+            "Failed to read expected node ID -- not a valid ID (byte=0x{:02x}, cleared=0x{:02x})",
+            first_byte,
+            clear_ctrl_bits(first_byte)
+        ))
     })
 }
 
@@ -734,11 +756,49 @@ pub fn read_trie_item_from_slice<'a>(
     Ok(build_read_trie_item(stored_node_id, hash, scratch))
 }
 
+/// Like [`read_trie_item_from_slice`] but for squash blobs where leaf nodes
+/// are stored without a 32-byte hash prefix. `ptr_id` is the node type hint
+/// from the parent pointer. When the ptr hints a leaf type, the bytes are
+/// decoded directly as a node body (hash = None).
+pub fn read_trie_item_from_slice_leaf_hash_free<'a>(
+    bytes: &[u8],
+    ptr_id: u8,
+    scratch: &'a mut impl NodeDecodeScratch,
+) -> Result<ReadTrieItem<'a>, Error> {
+    if node::is_leaf_type(ptr_id) {
+        // Leaf: body starts at byte 0, no hash prefix.
+        let (_stored_node_id, _) = decode_trie_item_into_scratch(bytes, ptr_id, scratch)?;
+        Ok(ReadTrieItem::from_node(ReadTrieNode::from_state_borrowed(
+            scratch.get_ref(),
+            None,
+        )))
+    } else {
+        // Non-leaf: standard [hash(32)][body] layout.
+        read_trie_item_from_slice(bytes, ptr_id, scratch)
+    }
+}
+
 /// Read a stored node type and hash from a byte slice (no Read+Seek needed).
 pub fn read_stored_node_type_from_slice(bytes: &[u8]) -> Result<(TrieNodeID, TrieHash), Error> {
     let (hash, remaining) = parse_hash_from_bytes(bytes)?;
     let stored_id = stored_node_id_from_bytes(remaining)?;
     Ok((stored_id, hash))
+}
+
+/// Like [`read_stored_node_type_from_slice`] but for squash blobs where leaf
+/// nodes lack a hash prefix. `ptr_id` is the type hint from the parent pointer.
+pub fn read_stored_node_type_from_slice_leaf_hash_free(
+    bytes: &[u8],
+    ptr_id: u8,
+) -> Result<(TrieNodeID, Option<TrieHash>), Error> {
+    if node::is_leaf_type(ptr_id) {
+        let stored_id = stored_node_id_from_bytes(bytes)?;
+        Ok((stored_id, None))
+    } else {
+        let (hash, remaining) = parse_hash_from_bytes(bytes)?;
+        let stored_id = stored_node_id_from_bytes(remaining)?;
+        Ok((stored_id, Some(hash)))
+    }
 }
 
 /// Read a trie item and its hash into scratch.

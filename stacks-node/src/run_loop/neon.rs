@@ -16,7 +16,7 @@ use stacks::chainstate::coordinator::{
     migrate_chainstate_dbs, ChainsCoordinator, ChainsCoordinatorConfig, CoordinatorCommunication,
     Error as coord_error,
 };
-use stacks::chainstate::stacks::db::{ChainStateBootData, SharedChainstate, StacksChainState};
+use stacks::chainstate::stacks::db::{ChainStateBootData, StacksChainState};
 use stacks::chainstate::stacks::miner::{signal_mining_blocked, signal_mining_ready, MinerStatus};
 use stacks::core::StacksEpochId;
 use stacks::net::atlas::{AtlasConfig, AtlasDB, Attachment};
@@ -698,7 +698,7 @@ impl RunLoop {
                 };
                 ChainsCoordinator::run(
                     coord_config,
-                    SharedChainstate::new(chain_state_db),
+                    chain_state_db,
                     moved_burnchain_config,
                     &coordinator_dispatcher,
                     coordinator_receivers,

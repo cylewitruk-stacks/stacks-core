@@ -48,7 +48,7 @@ use crate::chainstate::stacks::db::accounts::MinerReward;
 #[cfg(test)]
 use crate::chainstate::stacks::db::ChainStateBootData;
 use crate::chainstate::stacks::db::{
-    MinerRewardInfo, SharedChainstate, StacksChainState, StacksEpochReceipt, StacksHeaderInfo,
+    MinerRewardInfo, StacksChainState, StacksEpochReceipt, StacksHeaderInfo,
 };
 use crate::chainstate::stacks::events::{
     StacksBlockEventData, StacksTransactionEvent, StacksTransactionReceipt, TransactionOrigin,
@@ -211,7 +211,7 @@ pub struct ChainsCoordinator<
 > {
     pub canonical_sortition_tip: Option<SortitionId>,
     pub burnchain_blocks_db: BurnchainDB,
-    pub chain_state_db: SharedChainstate,
+    pub chain_state_db: StacksChainState,
     pub sortition_db: SortitionDB,
     pub burnchain: Burnchain,
     pub atlas_db: Option<AtlasDB>,
@@ -487,7 +487,7 @@ impl<
 {
     pub fn run(
         config: ChainsCoordinatorConfig,
-        chain_state_db: SharedChainstate,
+        chain_state_db: StacksChainState,
         burnchain: Burnchain,
         dispatcher: &'a T,
         comms: CoordinatorReceivers,
@@ -682,7 +682,7 @@ impl<T: BlockEventDispatcher, U: RewardSetProvider, B: BurnchainHeaderReader>
         ChainsCoordinator {
             canonical_sortition_tip: Some(canonical_sortition_tip),
             burnchain_blocks_db,
-            chain_state_db: SharedChainstate::new(chain_state_db),
+            chain_state_db,
             sortition_db,
             burnchain,
             dispatcher,
@@ -1301,7 +1301,7 @@ impl<
                     if sortition.sortition {
                         if let Some(stacks_block_header) =
                             StacksChainState::get_stacks_block_header_info_by_index_block_hash(
-                                self.chain_state_db.lock().db(),
+                                self.chain_state_db.db(),
                                 &StacksBlockId::new(
                                     &sortition.consensus_hash,
                                     &sortition.winning_stacks_block_hash,
@@ -1335,7 +1335,7 @@ impl<
                     let (next_snapshot, _) = self
                         .sortition_db
                         .evaluate_sortition(
-                            self.chain_state_db.lock().mainnet,
+                            self.chain_state_db.mainnet,
                             &header,
                             ops,
                             &self.burnchain,
@@ -1379,7 +1379,7 @@ impl<
             if !unorphan_blocks.is_empty() {
                 revalidated_stacks_block = true;
                 let ic = self.sortition_db.index_conn();
-                let mut chainstate = self.chain_state_db.lock();
+                let chainstate = &mut self.chain_state_db;
                 let mut chainstate_db_tx = chainstate.db_tx_begin()?;
                 for (burn_header, invalidation_height) in unorphan_blocks {
                     // permit re-processing of any associated stacks blocks if they're
@@ -1456,7 +1456,7 @@ impl<
             .as_ref()
             .expect("FATAL: Processing anchor block, but no known sortition tip");
 
-        let mut chainstate = self.chain_state_db.lock();
+        let chainstate = &mut self.chain_state_db;
         get_reward_cycle_info(
             burn_header.block_height,
             &burn_header.parent_block_hash,
@@ -1541,11 +1541,11 @@ impl<
         blocks: Vec<BlockHeaderHash>,
     ) -> Result<(), Error> {
         for bhh in blocks.into_iter() {
-            let chainstate = self.chain_state_db.lock();
-            let staging_block_chs =
-                StacksChainState::get_staging_block_consensus_hashes(chainstate.db(), &bhh)?;
-            let blocks_path = chainstate.blocks_path.clone();
-            drop(chainstate);
+            let staging_block_chs = StacksChainState::get_staging_block_consensus_hashes(
+                self.chain_state_db.db(),
+                &bhh,
+            )?;
+            let blocks_path = self.chain_state_db.blocks_path.clone();
             let mut processed = false;
 
             debug!("Consider replaying {} from {:?}", &bhh, &staging_block_chs);
@@ -1588,7 +1588,7 @@ impl<
                         // replay in this consensus hash history
                         debug!("Replay Stacks block from {} to {}/{}", &alt_ch, &ch, &bhh);
                         let ic = self.sortition_db.index_conn();
-                        let mut chainstate = self.chain_state_db.lock();
+                        let chainstate = &mut self.chain_state_db;
                         let _ = chainstate.preprocess_anchored_block(
                             &ic,
                             &ch,
@@ -1618,7 +1618,7 @@ impl<
         next_snapshot: &BlockSnapshot,
     ) -> Result<(), Error> {
         let staging_block_chs = StacksChainState::get_staging_block_consensus_hashes(
-            self.chain_state_db.lock().db(),
+            self.chain_state_db.db(),
             &next_snapshot.winning_stacks_block_hash,
         )?;
 
@@ -1664,7 +1664,7 @@ impl<
             .sortition_db
             .tx_handle_begin(&canonical_sortition_tip)?;
         let mut processed_blocks = {
-            let mut chainstate = self.chain_state_db.lock();
+            let chainstate = &mut self.chain_state_db;
             let result = chainstate.process_blocks(sortdb_handle, 1, self.dispatcher)?;
             // Auto-squash MARF if cadence is met for the just-processed block.
             if let Some((Some(ref receipt), _)) = result.first() {
@@ -1778,7 +1778,7 @@ impl<
                 .tx_handle_begin(&canonical_sortition_tip)?;
             // Right before a block is set to processed, the event dispatcher will emit a new block event
             processed_blocks = {
-                let mut chainstate = self.chain_state_db.lock();
+                let chainstate = &mut self.chain_state_db;
                 let result = chainstate.process_blocks(sortdb_handle, 1, self.dispatcher)?;
                 // Auto-squash MARF if cadence is met for the just-processed block.
                 if let Some((Some(ref receipt), _)) = result.first() {

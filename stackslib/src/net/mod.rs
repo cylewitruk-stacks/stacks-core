@@ -744,7 +744,11 @@ impl<'a> StacksNodeState<'a> {
             let tip_req = contents.tip_request();
             match tip_req {
                 TipRequest::UseLatestUnconfirmedTip => {
-                    let unconfirmed_chain_tip_opt = match &mut chainstate.unconfirmed_state {
+                    let unconfirmed_chain_tip_opt = match chainstate
+                        .unconfirmed_state
+                        .lock()
+                        .as_mut()
+                    {
                         Some(unconfirmed_state) => {
                             match unconfirmed_state.get_unconfirmed_state_if_exists() {
                                 Ok(res) => res,

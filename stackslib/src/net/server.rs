@@ -662,8 +662,6 @@ mod test {
 
     fn test_http_server<F, C>(
         test_name: &str,
-        peer_p2p: u16,
-        peer_http: u16,
         conn_opts: ConnectionOptions,
         num_clients: usize,
         client_sleep: u64,
@@ -671,13 +669,22 @@ mod test {
         check_result: C,
     ) -> usize
     where
-        F: FnMut(usize, &mut StacksChainState) -> Vec<u8>,
+        // `make_request` receives the real OS-assigned HTTP port as its second argument, since
+        // the TCP listener binds to port 0 here and the actual port isn't known until the peer
+        // is constructed. Tests that embed a port in the request payload should use this value
+        // rather than a hardcoded constant.
+        F: FnMut(usize, u16, &mut StacksChainState) -> Vec<u8>,
         C: Fn(usize, Result<Vec<u8>, net_error>) -> bool,
     {
-        let mut peer_config = TestPeerConfig::new(test_name, peer_p2p, peer_http);
+        // Bind to port 0 for both p2p and http: `TestPeer::new_with_observer` already reads the
+        // OS-assigned ports back into `config.server_port` / `config.http_port` after bind. This
+        // avoids collisions with whatever else is listening on the test author's workstation
+        // (e.g. Logitech G Hub's LogiPlugin, which claims port 51001 on macOS).
+        let mut peer_config = TestPeerConfig::new(test_name, 0, 0);
         peer_config.connection_opts = conn_opts;
 
         let mut peer = TestPeer::new(peer_config);
+        let peer_http = peer.config.http_port;
         let view = peer.get_burnchain_view().unwrap();
         let (http_sx, http_rx) = sync_channel(1);
 
@@ -709,7 +716,7 @@ mod test {
         let (mut chainstate, _) =
             StacksChainState::open(false, network_id, &chainstate_path, None).unwrap();
         for i in 0..num_clients {
-            let request = make_request(i, &mut chainstate);
+            let request = make_request(i, peer_http, &mut chainstate);
             client_requests.push(request);
         }
 
@@ -776,14 +783,12 @@ mod test {
     fn test_http_getinfo() {
         test_http_server(
             function_name!(),
-            51000,
-            51001,
             ConnectionOptions::default(),
             1,
             0,
-            |client_id, _| {
+            |client_id, peer_http, _| {
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51001),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     "/v2/info".to_string(),
                     HttpRequestContents::new(),
@@ -809,14 +814,12 @@ mod test {
     fn test_http_10_threads_getinfo() {
         test_http_server(
             function_name!(),
-            51010,
-            51011,
             ConnectionOptions::default(),
             10,
             0,
-            |client_id, _| {
+            |client_id, peer_http, _| {
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51011),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     "/v2/info".to_string(),
                     HttpRequestContents::new(),
@@ -841,12 +844,10 @@ mod test {
     fn test_http_getblock() {
         test_http_server(
             function_name!(),
-            51020,
-            51021,
             ConnectionOptions::default(),
             1,
             0,
-            |client_id, ref mut chainstate| {
+            |client_id, peer_http, ref mut chainstate| {
                 let peer_server_block = make_codec_test_block(25, StacksEpochId::Epoch25);
                 let peer_server_consensus_hash = ConsensusHash([(client_id + 1) as u8; 20]);
                 let index_block_hash = StacksBlockHeader::make_index_block_hash(
@@ -865,7 +866,7 @@ mod test {
                 );
 
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51021),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     format!("/v2/blocks/{}", &index_block_hash),
                     HttpRequestContents::new(),
@@ -909,12 +910,10 @@ mod test {
     fn test_http_10_threads_getblock() {
         test_http_server(
             function_name!(),
-            51030,
-            51031,
             ConnectionOptions::default(),
             10,
             0,
-            |client_id, ref mut chainstate| {
+            |client_id, peer_http, ref mut chainstate| {
                 let peer_server_block = make_codec_test_block(25, StacksEpochId::latest());
                 let peer_server_consensus_hash = ConsensusHash([(client_id + 1) as u8; 20]);
                 let index_block_hash = StacksBlockHeader::make_index_block_hash(
@@ -933,7 +932,7 @@ mod test {
                 );
 
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51031),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     format!("/v2/blocks/{}", &index_block_hash),
                     HttpRequestContents::new(),
@@ -984,14 +983,12 @@ mod test {
 
         test_http_server(
             function_name!(),
-            51040,
-            51041,
             conn_opts,
             10,
             0,
-            |client_id, _| {
+            |client_id, peer_http, _| {
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51041),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     "/v2/info".to_string(),
                     HttpRequestContents::new(),
@@ -1036,14 +1033,12 @@ mod test {
 
         test_http_server(
             function_name!(),
-            51050,
-            51051,
             conn_opts,
             1,
             30,
-            |client_id, _| {
+            |client_id, peer_http, _| {
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51051),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     "/v2/info".to_string(),
                     HttpRequestContents::new(),
@@ -1073,12 +1068,10 @@ mod test {
         let conn_opts = ConnectionOptions::default();
         test_http_server(
             function_name!(),
-            51060,
-            51061,
             conn_opts,
             1,
             0,
-            |client_id, ref mut chainstate| {
+            |client_id, peer_http, ref mut chainstate| {
                 // make a gigantic transaction
                 let mut big_contract_parts = vec![];
                 let mut total_len = 0;
@@ -1114,7 +1107,7 @@ mod test {
                 let signed_contract_tx = signer.get_tx().unwrap();
 
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51061),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "POST".to_string(),
                     "/v2/transactions".to_string(),
                     HttpRequestContents::new().payload_stacks(&signed_contract_tx),
@@ -1142,12 +1135,10 @@ mod test {
     fn test_http_400() {
         test_http_server(
             function_name!(),
-            51070,
-            51071,
             ConnectionOptions::default(),
             1,
             0,
-            |client_id, _| {
+            |client_id, _peer_http, _| {
                 // live example -- should fail because we don't support `Connection:
                 // upgrade`
                 let request_txt = "GET /favicon.ico HTTP/1.1\r\nConnection: upgrade\r\nHost: crashy-stacky.zone117x.com\r\nX-Real-IP: 213.127.17.55\r\nX-Forwarded-For: 213.127.17.55\r\nX-Forwarded-Proto: http\r\nX-Forwarded-Host: crashy-stacky.zone117x.com\r\nX-Forwarded-Port: 9001\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.113 Safari/537.36\r\nAccept: image/webp,image/apng,image/*,*/*;q=0.8\r\nReferer: http://crashy-stacky.zone117x.com:9001/v2/info\r\nAccept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9\r\n\r\n";
@@ -1169,12 +1160,10 @@ mod test {
     fn test_http_404() {
         test_http_server(
             function_name!(),
-            51072,
-            51073,
             ConnectionOptions::default(),
             1,
             0,
-            |client_id, _| {
+            |client_id, _peer_http, _| {
                 // live example -- should fail because /favicon.ico doesn't exist.
                 let request_txt = "GET /favicon.ico HTTP/1.1\r\nConnection: close\r\nHost: 127.0.0.1:20443\r\nuser-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36\r\nreferer: http://127.0.0.1:20443/v2/info\r\naccept: image/webp,image/apng,image/*,*/*;q=0.8\r\nsec-fetch-dest: empty\r\naccept-encoding: gzip, deflate, br\r\nsec-fetch-site: same-origin\r\naccept-language: en-US,en;q=0.9\r\ndnt: 1\r\nsec-fetch-mode: no-cors\r\n\r\n";
                 request_txt.as_bytes().to_vec()
@@ -1199,21 +1188,19 @@ mod test {
 
         let num_events = test_http_server(
             function_name!(),
-            51082,
-            51083,
             conn_opts,
             1,
             0,
-            |client_id, _| {
+            |client_id, peer_http, _| {
                 // open a socket and just sit there
                 use std::net::TcpStream;
-                let sock = TcpStream::connect("127.0.0.1:51083");
+                let sock = TcpStream::connect(format!("127.0.0.1:{peer_http}"));
 
                 sleep_ms(15_000);
 
                 // send a different request
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51083),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     "/v2/info".to_string(),
                     HttpRequestContents::new(),
@@ -1242,12 +1229,10 @@ mod test {
         let conn_opts = ConnectionOptions::default();
         test_http_server(
             function_name!(),
-            51080,
-            51081,
             conn_opts,
             1,
             600,
-            |client_id, ref mut chainstate| {
+            |client_id, peer_http, ref mut chainstate| {
                 let peer_server_block = make_codec_test_block(25, StacksEpochId::latest());
                 let peer_server_consensus_hash = ConsensusHash([(client_id + 1) as u8; 20]);
                 let index_block_hash = StacksBlockHeader::make_index_block_hash(
@@ -1266,7 +1251,7 @@ mod test {
                 );
 
                 let mut request = StacksHttpRequest::new_for_peer(
-                    PeerHost::from_host_port("127.0.0.1".to_string(), 51071),
+                    PeerHost::from_host_port("127.0.0.1".to_string(), peer_http),
                     "GET".to_string(),
                     format!("/v2/blocks/{}", index_block_hash),
                     HttpRequestContents::new(),

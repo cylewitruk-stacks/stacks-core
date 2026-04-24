@@ -115,42 +115,58 @@ pub struct StacksChainState {
     pub clarity_state_index_path: String, // path to clarity MARF
     pub clarity_state_index_root: String, // path to dir containing clarity MARF and side-store
     pub root_path: String,
-    pub unconfirmed_state: Option<UnconfirmedState>,
+    /// Cross-handle shared slot holding the in-memory unconfirmed/microblock state.
+    /// See [`SharedUnconfirmedState`] for the threading model: multiple per-thread
+    /// `StacksChainState` handles can be constructed against the same slot so they all
+    /// observe the same `Option<UnconfirmedState>` behind a single mutex.
+    pub unconfirmed_state: SharedUnconfirmedState,
     pub fault_injection: StacksChainStateFaults,
     marf_opts: Option<MARFOpenOpts>,
 }
 
-/// Thread-safe shared handle to a single `StacksChainState` instance.
+/// Cross-handle shared slot for in-memory unconfirmed/microblock state.
 ///
-/// Wraps a `parking_lot::Mutex<StacksChainState>` behind an `Arc` so it
-/// can be cheaply cloned across threads.
+/// Wraps `Arc<parking_lot::Mutex<Option<UnconfirmedState>>>` so multiple
+/// independent `StacksChainState` handles (one per thread — relayer, p2p, miner)
+/// observe the same [`UnconfirmedState`]. This preserves cross-thread coherence
+/// for the one subsystem that needs it (relayer writes, p2p reads, miner
+/// snapshots) without serializing confirmed-state operations behind any
+/// process-wide lock.
 ///
-/// Uses `Mutex` rather than `RwLock` because `StacksChainState` contains
-/// `RefCell` fields (via `TrieFile`'s offset cache) which are `!Sync`.
-/// `Mutex<T>` requires only `T: Send`, while `RwLock<T>` requires
-/// `T: Send + Sync`. Upgrading to `RwLock` requires replacing the
-/// `RefCell`-based caches with `Cell` or atomics — a targeted follow-up.
+/// `Arc::clone` shares the slot. Each lock acquisition serializes all readers
+/// and writers — `UnconfirmedState` carries a `ClarityInstance`/`MarfedKV`
+/// with `!Sync` interior mutability, so a `Mutex` is required (not `RwLock`).
 ///
-/// The Clarity read-only API surface (`with_read_only_clarity_tx`,
-/// `eval_read_only`, etc.) already takes `&self` on `StacksChainState`,
-/// so the API shape is ready for concurrent reads once the `Sync` bound
-/// is satisfied.
+/// Threads obtain the slot via `Globals::get_shared_unconfirmed()` and pass it
+/// to [`StacksChainState::open_with_shared_unconfirmed`] when opening their
+/// per-thread handle.
 #[derive(Clone)]
-pub struct SharedChainstate {
-    inner: Arc<Mutex<StacksChainState>>,
+pub struct SharedUnconfirmedState {
+    inner: Arc<Mutex<Option<UnconfirmedState>>>,
 }
 
-impl SharedChainstate {
-    /// Create a new shared handle wrapping the given chainstate.
-    pub fn new(chainstate: StacksChainState) -> Self {
+impl SharedUnconfirmedState {
+    /// Empty slot — no unconfirmed state instantiated yet. Sole construction
+    /// path; callers create an empty slot at chainstate-open time and the
+    /// relayer populates it later via [`StacksChainState::reload_unconfirmed_state`].
+    pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(chainstate)),
+            inner: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Acquire the mutex and return the guard directly.
-    pub fn lock(&self) -> MutexGuard<'_, StacksChainState> {
+    /// Acquire the inner mutex. Blocking — squash-style retry-on-conflict is not used
+    /// here because unconfirmed-state mutation paths (refresh, drop, reload) are all
+    /// called from a single thread (the relayer) in production, so the contention
+    /// surface stays small (rare writes, brief reads).
+    pub fn lock(&self) -> MutexGuard<'_, Option<UnconfirmedState>> {
         self.inner.lock()
+    }
+}
+
+impl Default for SharedUnconfirmedState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1844,8 +1860,37 @@ impl StacksChainState {
         StacksChainState::open_and_exec(mainnet, chain_id, path_str, None, marf_opts)
     }
 
+    /// Open a chainstate handle that shares its `unconfirmed_state` slot with other handles
+    /// (typically opened against the same DB on different threads). Each call returns an
+    /// independent `StacksChainState` (its own SQLite connection, MARF handle, Clarity
+    /// instance for confirmed state) but installs the supplied [`SharedUnconfirmedState`]
+    /// `Arc` into the new handle, so all handles constructed with the same `shared_unconfirmed`
+    /// observe a single in-memory unconfirmed view through one inner mutex.
+    ///
+    /// Intended for use **after** boot has already migrated the on-disk chainstate via
+    /// [`open_and_exec`] with `boot_data` set. The implementation calls `open_and_exec` with
+    /// `boot_data = None`, which skips the genesis/install-boot-code path; any pending SQL
+    /// schema migrations would still run, but on a post-boot DB those are no-ops. Use this
+    /// as a per-thread factory.
+    pub fn open_with_shared_unconfirmed(
+        mainnet: bool,
+        chain_id: u32,
+        path_str: &str,
+        marf_opts: Option<MARFOpenOpts>,
+        shared_unconfirmed: SharedUnconfirmedState,
+    ) -> Result<StacksChainState, Error> {
+        let (mut chainstate, _receipts) =
+            StacksChainState::open_and_exec(mainnet, chain_id, path_str, None, marf_opts)?;
+        chainstate.unconfirmed_state = shared_unconfirmed;
+        Ok(chainstate)
+    }
+
     /// Re-open the chainstate -- i.e. to get a new handle to it using an existing chain state's
-    /// parameters
+    /// parameters.
+    ///
+    /// Note: the returned handle has a **fresh, independent** [`SharedUnconfirmedState`]
+    /// slot — it does NOT participate in the source handle's shared unconfirmed view. Use
+    /// [`open_with_shared_unconfirmed`] when you need a sharing-aware handle.
     pub fn reopen(&self) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
         StacksChainState::open(
             self.mainnet,
@@ -1980,7 +2025,7 @@ impl StacksChainState {
             clarity_state_index_path: clarity_state_index_marf,
             clarity_state_index_root,
             root_path: path_str.to_string(),
-            unconfirmed_state: None,
+            unconfirmed_state: SharedUnconfirmedState::new(),
             fault_injection: StacksChainStateFaults::new(),
             marf_opts,
         };
@@ -2585,7 +2630,12 @@ impl StacksChainState {
     where
         F: FnOnce(&mut ClarityReadOnlyConnection) -> R,
     {
-        let res = if let Some(ref unconfirmed_state) = self.unconfirmed_state {
+        // Hold the unconfirmed-state lock across the read-only Clarity tx so a
+        // concurrent relayer refresh / drop cannot invalidate the borrowed
+        // ClarityInstance mid-call. Lock is brief — Clarity read-only conn
+        // creation + the user closure.
+        let mut guard = self.unconfirmed_state.lock();
+        let res = if let Some(ref mut unconfirmed_state) = *guard {
             if !unconfirmed_state.is_readable() {
                 return Ok(None);
             }
@@ -2616,11 +2666,16 @@ impl StacksChainState {
     where
         F: FnOnce(&mut ClarityReadOnlyConnection) -> R,
     {
-        let unconfirmed = if let Some(ref unconfirmed_state) = self.unconfirmed_state {
-            *parent_tip == unconfirmed_state.unconfirmed_chain_tip
-                && unconfirmed_state.is_readable()
-        } else {
-            false
+        // Lock briefly just to read the tip + readability flag — release before
+        // delegating so the chosen branch can re-acquire (or skip) on its own.
+        let unconfirmed = {
+            let guard = self.unconfirmed_state.lock();
+            if let Some(ref unconfirmed_state) = *guard {
+                *parent_tip == unconfirmed_state.unconfirmed_chain_tip
+                    && unconfirmed_state.is_readable()
+            } else {
+                false
+            }
         };
 
         if unconfirmed {
@@ -2665,28 +2720,41 @@ impl StacksChainState {
     }
 
     /// Open a Clarity transaction against this chainstate's unconfirmed state, if it exists.
+    ///
+    /// `unconfirmed` is borrowed externally — the caller must acquire the
+    /// [`SharedUnconfirmedState`] lock and pass `&mut UnconfirmedState` here. This is the
+    /// price of putting `unconfirmed_state` behind a `Mutex` shared across handles: the
+    /// returned `ClarityTx<'a, 'a>` borrows `&mut unconfirmed.clarity_inst`, so the caller
+    /// must hold the unconfirmed-slot lock for the entire lifetime of the returned `ClarityTx`
+    /// (the typical pattern is to bind the `MutexGuard` to a stack variable in the same scope).
+    ///
+    /// Single-statement caller pattern:
+    ///
+    /// ```ignore
+    /// let mut guard = chainstate.unconfirmed_state.lock();
+    /// let unconfirmed = guard.as_mut().ok_or(...)?;
+    /// let mut clarity_tx = chainstate.begin_unconfirmed(burn_dbconn, unconfirmed)
+    ///     .ok_or(...)?;
+    /// // ... use clarity_tx ...
+    /// // guard drops at end of scope after clarity_tx
+    /// ```
     pub fn begin_unconfirmed<'a>(
-        &'a mut self,
+        &'a self,
         burn_dbconn: &'a dyn BurnStateDB,
+        unconfirmed: &'a mut UnconfirmedState,
     ) -> Option<ClarityTx<'a, 'a>> {
         let conf = self.config();
-        if let Some(ref mut unconfirmed) = self.unconfirmed_state {
-            if !unconfirmed.is_writable() {
-                debug!("Unconfirmed state is not writable; cannot begin unconfirmed Clarity Tx");
-                return None;
-            }
-
-            Some(StacksChainState::chainstate_begin_unconfirmed(
-                conf,
-                &self.state_index,
-                &mut unconfirmed.clarity_inst,
-                burn_dbconn,
-                &unconfirmed.confirmed_chain_tip,
-            ))
-        } else {
-            debug!("Unconfirmed state is not instantiated; cannot begin unconfirmed Clarity Tx");
-            None
+        if !unconfirmed.is_writable() {
+            debug!("Unconfirmed state is not writable; cannot begin unconfirmed Clarity Tx");
+            return None;
         }
+        Some(StacksChainState::chainstate_begin_unconfirmed(
+            conf,
+            &self.state_index,
+            &mut unconfirmed.clarity_inst,
+            burn_dbconn,
+            &unconfirmed.confirmed_chain_tip,
+        ))
     }
 
     /// Create a Clarity VM database transaction

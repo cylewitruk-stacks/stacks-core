@@ -79,8 +79,8 @@ fn pwrite_all(fd: &fs::File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
 use memmap2::Mmap;
 use rusqlite::Connection;
 
-use crate::chainstate::stacks::index::node::{TrieNodeID, TriePtr};
-use crate::chainstate::stacks::index::storage::NodeHashReader;
+use crate::chainstate::stacks::index::node::{self, TrieNodeID, TriePtr};
+use crate::chainstate::stacks::index::storage::{BlobReadGuard, NodeHashReader};
 use crate::chainstate::stacks::index::{
     bits, trie_sql, BorrowedNodeBytes, Error, MarfTrieId, NodeDecodeScratch, ReadTrieItem,
     ReadTrieNode,
@@ -88,8 +88,49 @@ use crate::chainstate::stacks::index::{
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use crate::util_lib::db::sql_vacuum;
 
-/// Mapping between block IDs and trie offsets
-pub type TrieIdOffsets = HashMap<u32, u64>;
+/// Maximum number of block_id → offset entries kept in memory per-handle before
+/// wholesale eviction. Sized to cover the active working set of a long genesis
+/// sync (~hours of hot block lookups) without letting the cache grow unbounded
+/// across millions of historical blocks. Wholesale eviction on overflow is
+/// acceptable because a miss just falls back to a single SQLite row lookup.
+const TRIE_OFFSETS_CACHE_MAX: usize = 65_536;
+
+/// Bounded block_id → trie-file-offset cache. Populated lazily from
+/// `marf_data.external_offset` on first lookup of each block_id, and cleared
+/// wholesale when it grows past [`TRIE_OFFSETS_CACHE_MAX`] or when a squash
+/// publish invalidates per-handle derived state.
+///
+/// This replaces the previous unbounded `HashMap<u32, u64>` (which would grow
+/// indefinitely on long-running nodes with millions of historical block_ids).
+#[derive(Default)]
+pub struct TrieIdOffsets {
+    inner: HashMap<u32, u64>,
+}
+
+impl TrieIdOffsets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, block_id: &u32) -> Option<u64> {
+        self.inner.get(block_id).copied()
+    }
+
+    pub fn insert(&mut self, block_id: u32, offset: u64) {
+        if self.inner.len() >= TRIE_OFFSETS_CACHE_MAX {
+            // Simple bounded-memory policy: nuke the whole map when it hits
+            // the cap. A miss after eviction is just one extra SQL lookup.
+            // A more precise LRU would reduce misses but is overkill given
+            // how often the cache is invalidated by squash publishes.
+            self.inner.clear();
+        }
+        self.inner.insert(block_id, offset);
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+}
 
 /// Handle to a flat file containing Trie blobs, optionally mmap-accelerated for reads.
 /// When `mmap` is `Some`, hot read methods (`get_node_hash`, `read_trie_item`,
@@ -430,6 +471,7 @@ pub struct TrieFileNodeHashReader<'a> {
     db: &'a Connection,
     file: &'a TrieFile,
     block_id: u32,
+    leaf_hashes_omitted: bool,
 }
 
 impl<'a> TrieFileNodeHashReader<'a> {
@@ -437,28 +479,36 @@ impl<'a> TrieFileNodeHashReader<'a> {
         db: &'a Connection,
         file: &'a TrieFile,
         block_id: u32,
+        leaf_hashes_omitted: bool,
     ) -> TrieFileNodeHashReader<'a> {
-        TrieFileNodeHashReader { db, file, block_id }
+        TrieFileNodeHashReader {
+            db,
+            file,
+            block_id,
+            leaf_hashes_omitted,
+        }
     }
 }
 
 impl NodeHashReader for TrieFileNodeHashReader<'_> {
     fn read_node_hash<W: Write>(&mut self, ptr: &TriePtr, w: &mut W) -> Result<(), Error> {
-        let hash = self.file.get_node_hash(self.db, self.block_id, ptr, None)?;
+        let hash =
+            self.file
+                .get_node_hash(self.db, self.block_id, ptr, None, self.leaf_hashes_omitted)?;
         w.write_all(hash.as_ref()).map_err(|e| e.into())
     }
 }
 
 impl TrieFile {
     /// Determine the file offset in the TrieFile where a serialized trie starts.
-    /// The offsets are stored in the given DB, and are cached indefinitely once loaded.
-    /// Takes `&self` — the offset cache uses interior mutability (`RefCell`).
+    /// The offsets are stored in the given DB and cached in the bounded
+    /// [`TrieIdOffsets`] map. Takes `&self` — the cache uses interior mutability.
     pub fn get_trie_offset(&self, db: &Connection, block_id: u32) -> Result<u64, Error> {
         let cache = match self {
             TrieFile::RAM(ref ram) => &ram.trie_offsets,
             TrieFile::Disk(ref disk) => &disk.trie_offsets,
         };
-        if let Some(offset) = cache.borrow().get(&block_id).copied() {
+        if let Some(offset) = cache.borrow().get(&block_id) {
             return Ok(offset);
         }
         let (offset, _length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
@@ -530,12 +580,17 @@ impl TrieFile {
         &self,
         file_offset: u64,
         ptr: &TriePtr,
+        leaf_hashes_omitted: bool,
         scratch: &'a mut impl NodeDecodeScratch,
     ) -> Result<ReadTrieItem<'a>, Error> {
         // Fast path: mmap slice available — decode directly from it.
         if let Some(bytes) = self.mmap_slice_at(file_offset) {
+            if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
+                return bits::read_trie_item_from_slice_leaf_hash_free(bytes, ptr.id(), scratch);
+            }
             return bits::read_trie_item_from_slice(bytes, ptr.id(), scratch);
         }
+
         // Slow path: positional read into scratch's reusable buffer, then decode.
         //
         // We size the read buffer from the ptr hint first (correct in the vast
@@ -544,11 +599,33 @@ impl TrieFile {
         // LeafSquashed in a FullHistory squash blob), we re-read with the
         // correct size. This avoids a double-read in the common case while
         // remaining correct when the ptr hint is stale.
-        let hinted_max = bits::get_node_max_byte_len(ptr.id())?;
+        let is_leaf_hint = leaf_hashes_omitted && node::is_leaf_type(ptr.id());
+        let hinted_max = if is_leaf_hint {
+            bits::get_node_body_max_byte_len(ptr.id())?
+        } else {
+            bits::get_node_max_byte_len(ptr.id())?
+        };
         let mut buf = scratch.take_node_bytes();
         buf.resize(hinted_max, 0);
         let n = self.read_bytes_at(&mut buf, file_offset)?;
         buf.truncate(n);
+
+        if is_leaf_hint {
+            // Hash-free leaf: body starts at byte 0.
+            let stored_node_id = bits::stored_node_id_from_bytes(&buf)?;
+            let stored_max = bits::get_node_body_max_byte_len(stored_node_id as u8)?;
+            if stored_max > hinted_max {
+                buf.resize(stored_max, 0);
+                let n = self.read_bytes_at(&mut buf, file_offset)?;
+                buf.truncate(n);
+            }
+            let _consumed = scratch.decode_node_from_slice(stored_node_id, &buf)?;
+            scratch.restore_node_bytes(buf);
+            return Ok(ReadTrieItem::from_node(ReadTrieNode::from_state_borrowed(
+                scratch.get_ref(),
+                None,
+            )));
+        }
 
         let (hash, remaining) = bits::parse_hash_from_bytes(&buf)?;
         let stored_node_id = bits::stored_node_id_from_bytes(remaining)?;
@@ -611,6 +688,75 @@ impl TrieFile {
         Ok(TrieHash(buf))
     }
 
+    /// Read a hash-free leaf's body at `file_offset`, decode it, and compute
+    /// its hash (SHA-512/256 of the canonical `write_bytes()` representation).
+    /// For `TrieLeafSquashed`, the hash covers the tip value only (same as
+    /// `get_nodetype_hash_bytes`).
+    fn recompute_leaf_hash_at(&self, file_offset: u64, ptr_id: u8) -> Result<TrieHash, Error> {
+        // Decode the leaf node from either the mmap slice (zero-copy) or a
+        // positional read into a temporary buffer.
+        let decode_from_slice = |slice: &[u8]| -> Result<TrieNodeType, Error> {
+            let stored_id_byte = *slice.first().ok_or_else(|| {
+                Error::CorruptionError("Empty leaf body in recompute_leaf_hash_at".into())
+            })?;
+            let stored_id = node::clear_ctrl_bits(stored_id_byte);
+            let (node, _) = bits::decode_nodetype_from_slice_at_head(slice, stored_id)?;
+            Ok(node)
+        };
+
+        let node = if let Some(bytes) = self.mmap_slice_at(file_offset) {
+            // Zero-copy: decode directly from the mmap region.
+            decode_from_slice(bytes)?
+        } else {
+            // Slow path: positional read into a temporary buffer.
+            let hinted_max = bits::get_node_body_max_byte_len(ptr_id)?;
+            let mut buf = vec![0u8; hinted_max];
+            let n = self.read_bytes_at(&mut buf, file_offset)?;
+            buf.truncate(n);
+
+            // If the stored type is larger than the hinted type, re-read.
+            let stored_id = node::clear_ctrl_bits(*buf.first().ok_or_else(|| {
+                Error::CorruptionError("Empty leaf body in recompute_leaf_hash_at".into())
+            })?);
+            let stored_max = bits::get_node_body_max_byte_len(stored_id)?;
+            if stored_max > hinted_max {
+                buf.resize(stored_max, 0);
+                let n = self.read_bytes_at(&mut buf, file_offset)?;
+                buf.truncate(n);
+            }
+
+            decode_from_slice(&buf)?
+        };
+
+        // Leaf hash: SHA-512/256(write_bytes()). For LeafSquashed, uses tip
+        // value only (consistent with get_nodetype_hash_bytes).
+        use sha2::{Digest, Sha512_256 as TrieHasher};
+
+        use crate::chainstate::stacks::index::node::{TrieNode, TrieNodeType};
+        let mut hasher = TrieHasher::new();
+        match &node {
+            TrieNodeType::Leaf(leaf) => {
+                leaf.write_bytes(&mut hasher)
+                    .expect("IO failure pushing to hasher");
+            }
+            TrieNodeType::LeafSquashed(sq) => {
+                let leaf = crate::chainstate::stacks::index::TrieLeaf {
+                    path: sq.path,
+                    data: sq.tip_value()?.clone(),
+                };
+                leaf.write_bytes(&mut hasher)
+                    .expect("IO failure pushing to hasher");
+            }
+            _ => {
+                return Err(Error::CorruptionError(
+                    "recompute_leaf_hash_at: not a leaf node".into(),
+                ));
+            }
+        }
+        let res: [u8; 32] = hasher.finalize().into();
+        Ok(TrieHash(res))
+    }
+
     /// Read node type ID and hash at a known file position.
     fn read_node_type_at(&self, file_offset: u64) -> Result<(TrieNodeID, TrieHash), Error> {
         if let Some(bytes) = self.mmap_slice_at(file_offset) {
@@ -631,15 +777,24 @@ impl TrieFile {
     ///
     /// If `trie_offset` is `Some`, uses the pre-resolved offset (bypassing the offset
     /// cache). Otherwise resolves the offset from the cache or SQL.
+    ///
+    /// When `leaf_hashes_omitted` is true, leaf nodes lack a hash prefix in
+    /// the blob and the hash is recomputed from the node body.
     pub fn get_node_hash(
         &self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
         trie_offset: Option<u64>,
+        leaf_hashes_omitted: bool,
     ) -> Result<TrieHash, Error> {
         let offset = trie_offset.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
-        self.read_hash_at(offset + ptr.ptr() as u64)
+        let file_offset = offset + ptr.ptr() as u64;
+        if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
+            self.recompute_leaf_hash_at(file_offset, ptr.id())
+        } else {
+            self.read_hash_at(file_offset)
+        }
     }
 
     // TODO: Unused -- do we need this?
@@ -665,46 +820,107 @@ impl TrieFile {
         block_id: u32,
         ptr: &TriePtr,
         trie_offset: Option<u64>,
+        leaf_hashes_omitted: bool,
         scratch: &'a mut impl NodeDecodeScratch,
     ) -> Result<ReadTrieItem<'a>, Error> {
         let offset = trie_offset.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
-        self.read_item_at_offset(offset + ptr.ptr() as u64, ptr, scratch)
+        self.read_item_at_offset(offset + ptr.ptr() as u64, ptr, leaf_hashes_omitted, scratch)
     }
 
-    /// Read a trie item as borrowed bytes from the mmap region (zero-copy).
-    /// Returns `None` if mmap is not active or the node is a patch.
-    /// Takes `&self` — no cursor state needed.
+    /// Read a trie item as borrowed bytes from the mmap region (zero-copy). Returns `None`
+    /// if mmap is not active or the node is a patch.
+    ///
+    /// The returned `ReadTrieItem<'a>` carries the supplied `BlobReadGuard`, which keeps
+    /// the blob-mutation quiesce counter incremented for as long as the borrowed mmap bytes
+    /// are in use. The caller acquires the guard (via
+    /// [`SharedStorageState::acquire_blob_read`]) before calling this function and passes
+    /// ownership in; the guard is dropped when the returned `ReadTrieItem` is dropped,
+    /// releasing the writer-drain waiter.
     pub fn read_trie_item_borrowed<'a>(
         &'a self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
         trie_offset_hint: Option<u64>,
+        leaf_hashes_omitted: bool,
+        guard: BlobReadGuard,
     ) -> Result<Option<ReadTrieItem<'a>>, Error> {
         let offset = trie_offset_hint.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
         let Some(bytes) = self.mmap_slice_at(offset + ptr.ptr() as u64) else {
             return Ok(None);
         };
+        if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
+            // Hash-free leaf: body starts at byte 0, hash deferred to explicit
+            // hash paths (get_node_hash / write_children_hashes).
+            let stored_node_id = bits::stored_node_id_from_bytes(bytes).map_err(|e| {
+                error!(
+                    "read_trie_item_borrowed: hash-free leaf decode failed: \
+                     block_id={block_id}, ptr={ptr:?}, file_offset={}, err={e:?}",
+                    offset + ptr.ptr() as u64,
+                );
+                e
+            })?;
+            if stored_node_id == TrieNodeID::Patch {
+                return Ok(None);
+            }
+            let node_bytes = BorrowedNodeBytes::new(stored_node_id, bytes);
+            return Ok(Some(ReadTrieItem::from_node(
+                ReadTrieNode::from_stable_bytes(node_bytes, None).with_blob_guard(guard),
+            )));
+        }
         let (hash, remaining) = bits::parse_hash_from_bytes(bytes)?;
-        let stored_node_id = bits::stored_node_id_from_bytes(remaining)?;
+        let stored_node_id = bits::stored_node_id_from_bytes(remaining).map_err(|e| {
+            error!(
+                "read_trie_item_borrowed: node ID after hash failed: \
+                 block_id={block_id}, ptr={ptr:?}, leaf_hashes_omitted={leaf_hashes_omitted}, \
+                 file_offset={}, is_leaf_hint={}",
+                offset + ptr.ptr() as u64,
+                node::is_leaf_type(ptr.id()),
+            );
+            e
+        })?;
         if stored_node_id == TrieNodeID::Patch {
             return Ok(None);
         }
         let node_bytes = BorrowedNodeBytes::new(stored_node_id, remaining);
         Ok(Some(ReadTrieItem::from_node(
-            ReadTrieNode::from_stable_bytes(node_bytes, Some(hash)),
+            ReadTrieNode::from_stable_bytes(node_bytes, Some(hash)).with_blob_guard(guard),
         )))
     }
 
     /// Read the node type ID and hash at the given block and pointer.
+    ///
+    /// When `leaf_hashes_omitted` is true, leaf nodes are stored without a
+    /// hash prefix; the hash is recomputed from the body.
     pub fn read_node_type_id(
         &self,
         db: &Connection,
         block_id: u32,
         ptr: &TriePtr,
+        leaf_hashes_omitted: bool,
     ) -> Result<(TrieNodeID, TrieHash), Error> {
         let offset = self.get_trie_offset(db, block_id)?;
-        self.read_node_type_at(offset + ptr.ptr() as u64)
+        let file_offset = offset + ptr.ptr() as u64;
+        if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
+            // Hash-free leaf: ID at byte 0, recompute hash from body.
+            if let Some(bytes) = self.mmap_slice_at(file_offset) {
+                let stored_id = bits::stored_node_id_from_bytes(bytes)?;
+                let hash = self.recompute_leaf_hash_at(file_offset, ptr.id())?;
+                return Ok((stored_id, hash));
+            }
+            let mut id_buf = [0u8; 1];
+            let n = self.read_bytes_at(&mut id_buf, file_offset)?;
+            if n < 1 {
+                return Err(Error::CorruptionError(
+                    "Failed to read node ID for hash-free leaf".into(),
+                ));
+            }
+            let stored_id = bits::stored_node_id_from_bytes(&id_buf)?;
+            let hash = self.recompute_leaf_hash_at(file_offset, ptr.id())?;
+            Ok((stored_id, hash))
+        } else {
+            self.read_node_type_at(file_offset)
+        }
     }
 
     /// Append a serialized trie to the TrieFile.
@@ -743,8 +959,9 @@ impl TrieFile {
     ///
     /// # Safety contract
     ///
-    /// The caller MUST hold exclusive access (the `SharedChainstate` mutex) and MUST
-    /// have validated that no live `marf_data` or `marf_squash_levels` row references
+    /// The caller MUST coordinate exclusive access against any concurrent reader
+    /// — typically via the [`SharedStorageState::publish_squash`] quiesce protocol — and
+    /// MUST have validated that no live `marf_data` or `marf_squash_levels` row references
     /// any byte at or beyond `offset` that is not being superseded by this write.
     ///
     /// This is an **experimental** reclamation primitive. Until crash recovery is

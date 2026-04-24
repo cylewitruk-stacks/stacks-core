@@ -3,10 +3,11 @@
 // correct by construction; `.get()` would add noise without safety.
 #![allow(clippy::indexing_slicing)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, MARF, OWN_BLOCK_HEIGHT_KEY,
@@ -15,7 +16,9 @@ use crate::chainstate::stacks::index::node::{
     clear_backptr, is_backptr, TrieLeafSquashed, TrieNodeID, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::scratch::MarfReadState;
-use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
+use crate::chainstate::stacks::index::storage::{
+    build_squash_meta_from_sql, SquashMeta, TrieHashCalculationMode,
+};
 use crate::chainstate::stacks::index::{
     bits, trie_sql, BlockMap, Error, MARFValue, MarfTrieId, TrieReadStorage,
 };
@@ -120,8 +123,10 @@ pub struct SquashTrailer {
     pub root_hashes: Vec<TrieHash>,
     /// Block hashes indexed by `height - min_height`.
     pub block_hashes: Vec<[u8; 32]>,
-    /// (block_hash, height) pairs sorted by block_hash for binary search.
-    pub sorted_block_entries: Vec<([u8; 32], u32)>,
+    /// (block_hash, height, block_id) tuples sorted by block_hash for binary search.
+    /// The `block_id` is the `marf_data` primary key at squash time, enabling
+    /// trailer-based block_id resolution without SQL lookups at read time.
+    pub sorted_block_entries: Vec<([u8; 32], u32, u32)>,
 }
 
 impl SquashTrailer {
@@ -168,7 +173,7 @@ impl SquashTrailer {
     /// O(log N) height lookup by block hash.
     pub fn height_of_block(&self, bhh: &[u8; 32]) -> Option<u32> {
         self.sorted_block_entries
-            .binary_search_by_key(bhh, |(hash, _)| *hash)
+            .binary_search_by_key(bhh, |(hash, _, _)| *hash)
             .ok()
             .map(|idx| self.sorted_block_entries[idx].1)
     }
@@ -206,14 +211,15 @@ impl SquashTrailer {
             written += 32;
         }
 
-        // --- BlockHash→Height (sorted) ---
+        // --- BlockHash→Height+BlockId (sorted) ---
         let count = self.sorted_block_entries.len() as u32;
         w.write_all(&count.to_be_bytes())?;
         written += 4;
-        for (bhh, height) in &self.sorted_block_entries {
+        for (bhh, height, block_id) in &self.sorted_block_entries {
             w.write_all(bhh)?;
             w.write_all(&height.to_be_bytes())?;
-            written += 36;
+            w.write_all(&block_id.to_be_bytes())?;
+            written += 40;
         }
 
         // --- Footer ---
@@ -228,8 +234,8 @@ impl SquashTrailer {
     }
 
     /// Write the 12-byte footer at the current position.
-    /// `trailer_offset` is the byte offset of the trailer start relative
-    /// to the blob start.
+    ///
+    /// `trailer_offset` is the byte offset of the trailer start relative to the blob start.
     pub fn write_footer<W: Write>(w: &mut W, trailer_offset: u64) -> Result<(), Error> {
         w.write_all(&trailer_offset.to_be_bytes())?;
         w.write_all(&SQUASH_MAGIC)?;
@@ -237,6 +243,7 @@ impl SquashTrailer {
     }
 
     /// Read the 12-byte footer from the last 12 bytes of a blob.
+    ///
     /// Returns `Some(trailer_offset)` if the magic matches, `None` otherwise.
     pub fn read_footer(blob_bytes: &[u8]) -> Option<u64> {
         if blob_bytes.len() < SQUASH_FOOTER_SIZE {
@@ -250,8 +257,8 @@ impl SquashTrailer {
         Some(offset)
     }
 
-    /// Deserialize a trailer from a byte slice starting at `offset` within
-    /// the blob. The slice should start at the trailer (after all trie nodes).
+    /// Deserialize a trailer from a byte slice starting at `offset` within the blob. The slice
+    /// should start at the trailer (after all trie nodes).
     pub fn read_from(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < SQUASH_INFO_SIZE {
             return Err(Error::CorruptionError(
@@ -334,11 +341,11 @@ impl SquashTrailer {
             pos = end;
         }
 
-        // --- BlockHash→Height (sorted) ---
+        // --- BlockHash→Height+BlockId (sorted) ---
         let sorted_count = read_u32_be(bytes, &mut pos)?;
         let mut sorted_block_entries = Vec::with_capacity(sorted_count as usize);
         for _ in 0..sorted_count {
-            let end = pos + 36;
+            let end = pos + 40;
             let entry = bytes
                 .get(pos..end)
                 .ok_or_else(|| Error::CorruptionError("Truncated sorted block table".into()))?;
@@ -349,7 +356,12 @@ impl SquashTrailer {
                     "Squash trailer: bad height slice in sorted block entry".into(),
                 )
             })?);
-            sorted_block_entries.push((bhh, height));
+            let block_id = u32::from_be_bytes(entry[36..40].try_into().map_err(|_| {
+                Error::CorruptionError(
+                    "Squash trailer: bad block_id slice in sorted block entry".into(),
+                )
+            })?);
+            sorted_block_entries.push((bhh, height, block_id));
             pos = end;
         }
 
@@ -441,8 +453,8 @@ impl NodeStore {
 
     /// Append a serialized node to the temp file.
     ///
-    /// Records the byte offset, length, hash, and block_id.
-    /// Returns the index of the newly stored node.
+    /// * Records the byte offset, length, hash, and block_id.
+    /// * Returns the index of the newly stored node.
     pub fn push(
         &mut self,
         node_bytes: &[u8],
@@ -548,32 +560,28 @@ pub struct SquashStats {
 // FullHistory: history collection
 // ---------------------------------------------------------------------------
 
-/// Precomputed `TrieHash` of `OWN_BLOCK_HEIGHT_KEY`. This is a
-/// single pathological key written every block with a different value;
-/// storing its full history would produce a leaf of unbounded size.
-/// Filtered during history collection (see design doc §4.5).
+/// Precomputed `TrieHash` of `OWN_BLOCK_HEIGHT_KEY`. This is a single pathological key written
+/// every block with a different value; storing its full history would produce a leaf of unbounded
+/// size. Filtered during history collection (see design doc §4.5).
 static OWN_BLOCK_HEIGHT_KEY_HASH: std::sync::LazyLock<TrieHash> =
     std::sync::LazyLock::new(|| TrieHash::from_key(OWN_BLOCK_HEIGHT_KEY));
 
-/// Returns `true` if `key_hash` belongs to a MARF-internal key that
-/// must be excluded from FullHistory history collection. Currently
-/// filters only `OWN_BLOCK_HEIGHT_KEY`.
+/// Returns `true` if `key_hash` belongs to a MARF-internal key that must be excluded from
+/// FullHistory history collection. Currently filters only `OWN_BLOCK_HEIGHT_KEY`.
 fn is_marf_internal_key(key_hash: &TrieHash) -> bool {
     *key_hash == *OWN_BLOCK_HEIGHT_KEY_HASH
 }
 
-/// Walk the locally-written subtree of the currently-opened block,
-/// invoking `callback` for every leaf written at this block height.
+/// Walk the locally-written subtree of the currently-opened block, invoking `callback` for every
+/// leaf written at this block height.
 ///
-/// "Locally-written" means we descend only into non-backpointer
-/// children — backpointer children belong to earlier blocks and are
-/// skipped. This visits exactly the connected subtree of nodes COW'd
-/// into the current block.
+/// "Locally-written" means we descend only into non-backpointer children — backpointer children
+/// belong to earlier blocks and are skipped. This visits exactly the connected subtree of nodes
+/// COW'd into the current block.
 ///
-/// The callback receives the reconstructed full `TrieHash` key path
-/// (32 bytes accumulated from the root's path segment + branch bytes
-/// + each descendant's path segment) and a clone of the leaf's
-/// `MARFValue`.
+/// The callback receives the reconstructed full `TrieHash` key path (32 bytes accumulated from the
+/// root's path segment + branch bytes
+/// + each descendant's path segment) and a clone of the leaf's `MARFValue`.
 fn walk_local_leaves<T: MarfTrieId, F>(
     conn: &mut impl TrieReadStorage<T>,
     callback: &mut F,
@@ -584,10 +592,9 @@ where
     let root_ptr = conn.root_trieptr();
     let mut scratch = MarfReadState::new();
 
-    // Single mutable path buffer with push/pop. Each stack entry
-    // records (ptr, parent_depth): the path_buf length to restore
-    // before adding this child's chr byte. The root is special-cased
-    // (no chr byte; parent_depth = 0).
+    // Single mutable path buffer with push/pop. Each stack entry records (ptr, parent_depth): the
+    // path_buf length to restore before adding this child's chr byte. The root is special-cased (no
+    // chr byte; parent_depth = 0).
     let mut path_buf: Vec<u8> = Vec::with_capacity(32);
 
     // Stack entries: (TriePtr, parent_depth, is_root)
@@ -642,19 +649,18 @@ where
 
 /// Build the per-key value-transition history map for FullHistory mode.
 ///
-/// For each block height in `min_height..=max_height`, opens the block
-/// and walks only its locally-written subtree to find leaves. Builds
-/// a map from full `TrieHash` key → `Vec<(height, MARFValue)>` sorted
-/// ascending by height.
+/// For each block height in `min_height..=max_height`, opens the block and walks only its
+/// locally-written subtree to find leaves. Builds a map from full `TrieHash` key → `Vec<(height,
+/// MARFValue)>` sorted ascending by height.
 ///
-/// Structural-rewrite duplicates (from `promote_leaf_to_node4`) are
-/// filtered by comparing each new value against the last entry for
-/// that key — if the value is byte-identical, the entry is skipped.
+/// Structural-rewrite duplicates (from `promote_leaf_to_node4`) are filtered by comparing each new
+/// value against the last entry for that key — if the value is byte-identical, the entry is
+/// skipped.
 ///
 /// The `OWN_BLOCK_HEIGHT_KEY` is excluded (see `is_marf_internal_key`).
 ///
-/// `block_hashes` must be a slice of length `max_height - min_height + 1`
-/// where `block_hashes[i]` is the block hash at height `min_height + i`.
+/// `block_hashes` must be a slice of length `max_height - min_height + 1` where `block_hashes[i]`
+/// is the block hash at height `min_height + i`.
 pub fn collect_history<T: MarfTrieId>(
     marf: &mut MARF<T>,
     block_hashes: &[T],
@@ -755,10 +761,11 @@ pub fn squash_level<T: MarfTrieId>(
     let tip_block = find_tip_block(&mut src_marf, max_height)?;
 
     // ---------------------------------------------------------------
-    // Step 2: Collect per-height metadata (block hashes, root hashes)
+    // Step 2: Collect per-height metadata (block hashes, root hashes, block ids)
     // ---------------------------------------------------------------
     let mut root_hashes: Vec<TrieHash> = Vec::with_capacity((max_height + 1) as usize);
     let mut block_hashes_raw: Vec<[u8; 32]> = Vec::with_capacity((max_height + 1) as usize);
+    let mut block_ids_per_height: Vec<u32> = Vec::with_capacity((max_height + 1) as usize);
 
     for h in 0..=max_height {
         let block_hash_at_h = src_marf
@@ -766,11 +773,13 @@ pub fn squash_level<T: MarfTrieId>(
             .ok_or_else(|| Error::CorruptionError(format!("No block hash found at height {h}")))?;
 
         let root_hash = src_marf.get_root_hash_at(&block_hash_at_h)?;
+        let block_id = trie_sql::get_block_identifier(src_marf.sqlite_conn(), &block_hash_at_h)?;
 
         let mut bhh_bytes = [0u8; 32];
         bhh_bytes.copy_from_slice(block_hash_at_h.as_bytes());
         block_hashes_raw.push(bhh_bytes);
         root_hashes.push(root_hash);
+        block_ids_per_height.push(block_id);
     }
 
     // ---------------------------------------------------------------
@@ -819,8 +828,8 @@ pub fn squash_level<T: MarfTrieId>(
         });
         stats.nodes_collected += 1;
 
-        // FullHistory path tracking: accumulate trie path bytes during DFS
-        // so we can reconstruct the full 32-byte TrieHash key for each leaf.
+        // FullHistory path tracking: accumulate trie path bytes during DFS so we can reconstruct
+        // the full 32-byte TrieHash key for each leaf.
         let mut path_buf: Vec<u8> = Vec::with_capacity(if full_history { 32 } else { 0 });
 
         if full_history {
@@ -834,8 +843,8 @@ pub fn squash_level<T: MarfTrieId>(
             }
         }
 
-        // DFS stack: (ptr, return_block_hash, return_block_id, parent_depth)
-        // parent_depth is only meaningful when full_history == true.
+        // DFS stack: (ptr, return_block_hash, return_block_id, parent_depth) parent_depth is only
+        // meaningful when full_history == true.
         let mut dfs_stack: Vec<(TriePtr, T, Option<u32>, usize)> = Vec::new();
 
         // Push children of root onto stack
@@ -992,27 +1001,24 @@ pub fn squash_level<T: MarfTrieId>(
                 Some(kh) => kh,
                 None => continue,
             };
+            // Base-level squash: no inheritance from prior levels, so every in-range write needs a
+            // height-tagged entry so that reads at heights below the first write return None via
+            // `value_at_height`. Keys not in `history` are internal MARF keys and stay plain.
             let transitions = match history.get(key_hash) {
-                Some(t) if t.len() > 1 => t,
-                _ => continue, // single-write or internal key: keep as plain TrieLeaf
+                Some(t) if !t.is_empty() => t,
+                _ => continue,
             };
 
-            // Read the existing serialized leaf to get its hash and path bytes
+            // Read the existing serialized leaf to get its path bytes.
+            // Leaf bytes in node_store are hash-free: [body] only.
             let raw = node_store.read_node_bytes(i)?;
-            if raw.len() < TRIEHASH_ENCODED_SIZE {
-                return Err(Error::CorruptionError(
-                    "Serialized leaf too short for hash prefix".into(),
-                ));
-            }
-            let hash_bytes = &raw[..TRIEHASH_ENCODED_SIZE];
 
             // Decode the leaf to get its path (NodePath)
-            let node_body = &raw[TRIEHASH_ENCODED_SIZE..];
-            let node_id_byte = *node_body.first().ok_or_else(|| {
+            let node_id_byte = *raw.first().ok_or_else(|| {
                 Error::CorruptionError("Empty node body during FullHistory leaf replace".into())
             })?;
             let node_id = clear_backptr(node_id_byte) & 0x3f;
-            let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(node_body, node_id)?;
+            let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(&raw, node_id)?;
             let path_slice = existing_node.path_bytes();
 
             // Build the TrieLeafSquashed: entries must be sorted descending by height
@@ -1021,11 +1027,9 @@ pub fn squash_level<T: MarfTrieId>(
 
             let squashed = TrieLeafSquashed::new(path_slice, entries)?;
 
-            // Re-serialize with the same hash (hash covers tip value only)
+            // Re-serialize without hash prefix (leaf hashes are omitted in squash blobs)
             let squashed_node = TrieNodeType::LeafSquashed(squashed);
-            let mut new_buf =
-                Vec::with_capacity(TRIEHASH_ENCODED_SIZE + squashed_node.byte_len() + 1);
-            new_buf.extend_from_slice(hash_bytes);
+            let mut new_buf = Vec::with_capacity(squashed_node.byte_len() + 1);
             squashed_node.write_bytes(&mut new_buf)?;
 
             node_store.update(i, &new_buf)?;
@@ -1196,8 +1200,8 @@ pub fn squash_level<T: MarfTrieId>(
 
     let mut dst_marf = MARF::<T>::from_path(dst_path, dst_open_opts)?;
 
-    // Stream the blob to the destination file in chunks to avoid holding the
-    // entire 2+ GB node payload in memory at once.
+    // Stream the blob to the destination file in chunks to avoid holding the entire 2+ GB node
+    // payload in memory at once.
 
     // Store the blob via the destination MARF's storage
     {
@@ -1240,12 +1244,13 @@ pub fn squash_level<T: MarfTrieId>(
         // Build the trailer into a separate buffer (small relative to node data)
         let trailer_offset = write_pos - blob_offset;
 
-        let mut sorted_block_entries: Vec<([u8; 32], u32)> = block_hashes_raw
+        let mut sorted_block_entries: Vec<([u8; 32], u32, u32)> = block_hashes_raw
             .iter()
+            .zip(block_ids_per_height.iter())
             .enumerate()
-            .map(|(i, bhh)| (*bhh, i as u32))
+            .map(|(i, (bhh, &bid))| (*bhh, i as u32, bid))
             .collect();
-        sorted_block_entries.sort_by_key(|(bhh, _)| *bhh);
+        sorted_block_entries.sort_by_key(|(bhh, _, _)| *bhh);
 
         let trailer = SquashTrailer {
             info: SquashInfo {
@@ -1411,10 +1416,19 @@ fn find_tip_block_by_scanning<T: MarfTrieId>(
     )))
 }
 
-/// Serialize a node as: hash_bytes (32) + node_body.
+/// Serialize a node for storage in a squash blob.
+///
+/// * Non-leaf nodes are stored as `[hash(32)][body]`.
+/// * Leaf nodes are stored as `[body]` only — the hash is omitted from the blob (it lives in the
+///   `NodeStore` side-table during construction and can be recomputed on read via `get_leaf_hash` /
+///   `get_nodetype_hash_bytes`).
 fn serialize_node(node: &TrieNodeType, hash: &TrieHash) -> Result<Vec<u8>, Error> {
-    let mut buf = Vec::with_capacity(TRIEHASH_ENCODED_SIZE + node.byte_len() + 1);
-    buf.extend_from_slice(hash.as_bytes());
+    let omit_hash = node.is_leaf();
+    let hash_size = if omit_hash { 0 } else { TRIEHASH_ENCODED_SIZE };
+    let mut buf = Vec::with_capacity(hash_size + node.byte_len() + 1);
+    if !omit_hash {
+        buf.extend_from_slice(hash.as_bytes());
+    }
     node.write_bytes(&mut buf)?;
     Ok(buf)
 }
@@ -1447,10 +1461,10 @@ fn remap_child_ptrs(
         if let Some(&child_idx) = ptr_to_idx.get(&(lookup_block_id, lookup_ptr)) {
             let new_offset = seq_offsets[child_idx];
             if is_backptr(ptr.id()) {
-                // Intra-level backpointer: preserve backptr bit and original back_block.
-                // Only update the ptr offset to the new blob-local position.
-                // This maintains correct canonical hashing (consensus bytes use
-                // block_hash(back_block)) and prevents COW from re-targeting the pointer.
+                // * Intra-level backpointer: preserve backptr bit and original back_block.
+                // * Only update the ptr offset to the new blob-local position.
+                // * This maintains correct canonical hashing (consensus bytes use
+                //   block_hash(back_block)) and prevents COW from re-targeting the pointer.
                 ptr.ptr = new_offset;
             } else {
                 // Direct child (same block as parent): stays direct with new offset.
@@ -1503,8 +1517,8 @@ impl<T: MarfTrieId> BlockMap for SquashBlockMap<T> {
 
 /// A `BlockMap` backed by a real `block_id → block_hash` mapping for incremental squash.
 ///
-/// Used during rehash of incremental squash blobs where backpointers are preserved.
-/// Consensus bytes need the actual block hash for each backpointer target.
+/// * Used during rehash of incremental squash blobs where backpointers are preserved.
+/// * Consensus bytes need the actual block hash for each backpointer target.
 struct IncrementalSquashBlockMap<T: MarfTrieId> {
     block_id_to_hash: HashMap<u32, T>,
 }
@@ -1586,7 +1600,8 @@ fn bhh_to_key<T: MarfTrieId>(bhh: &T) -> [u8; 32] {
 /// per-block blob, since block_ids auto-increment), resolve its height, and verify it equals
 /// `max_height`.
 fn verify_no_descendants<T: MarfTrieId>(marf: &mut MARF<T>, max_height: u32) -> Result<(), Error> {
-    let squash_index = marf.storage.data.squash_block_index.clone();
+    let squash_meta = Arc::clone(&marf.storage.data.squash_meta);
+    let squash_index = &squash_meta.block_index;
 
     // Find the highest confirmed block_id in marf_data. Filter out unconfirmed rows — they are
     // in-progress writes that should not block squashing of the confirmed tip suffix.
@@ -1662,9 +1677,10 @@ pub fn squash_level_incremental<T: MarfTrieId>(
     // Precondition: max_height must be the chain tip
     verify_no_descendants(&mut marf, max_height)?;
 
-    // Snapshot the squash block index for cross-level detection during DFS. This must be cloned
-    // before the mutable storage borrow in the DFS block.
-    let squash_index = marf.storage.data.squash_block_index.clone();
+    // Snapshot the squash metadata for cross-level detection during DFS. Arc::clone is a
+    // cheap reference-count bump — no deep copy of the block index.
+    let squash_meta = Arc::clone(&marf.storage.data.squash_meta);
+    let squash_index = &squash_meta.block_index;
 
     // Determine the next level_id from existing levels and verify that prior levels contiguously
     // cover heights 0..min_height-1.
@@ -1717,6 +1733,7 @@ pub fn squash_level_incremental<T: MarfTrieId>(
     let height_count = (max_height - min_height + 1) as usize;
     let mut root_hashes: Vec<TrieHash> = Vec::with_capacity(height_count);
     let mut block_hashes_raw: Vec<[u8; 32]> = Vec::with_capacity(height_count);
+    let mut block_ids_per_height: Vec<u32> = Vec::with_capacity(height_count);
     let mut block_id_to_hash: HashMap<u32, T> = HashMap::with_capacity(height_count);
 
     for h in min_height..=max_height {
@@ -1732,6 +1749,7 @@ pub fn squash_level_incremental<T: MarfTrieId>(
         root_hashes.push(root_hash);
 
         let block_id = trie_sql::get_block_identifier(marf.sqlite_conn(), &block_hash_at_h)?;
+        block_ids_per_height.push(block_id);
         block_id_to_hash.insert(block_id, block_hash_at_h);
     }
 
@@ -1826,7 +1844,7 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                 let bhh_key = bhh_to_key(&back_block_hash);
 
                 match squash_index.get(&bhh_key) {
-                    Some(&(_, h, _, _)) if h < min_height => {
+                    Some(&(_, h, _, _, _)) if h < min_height => {
                         // Cross-level backpointer: record block_id → block_hash for
                         // consensus hash computation. No need to read the target node;
                         // the child hash contribution is the ancestor block hash.
@@ -1835,7 +1853,7 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                             .or_insert_with(|| back_block_hash.clone());
                         continue;
                     }
-                    Some(&(_, h, _, _)) => {
+                    Some(&(_, h, _, _, _)) => {
                         // Target is in a squash level at height >= min_height. This shouldn't
                         // happen — blocks in the current range should be per-block blobs, not
                         // already squashed.
@@ -2003,9 +2021,14 @@ pub fn squash_level_incremental<T: MarfTrieId>(
 
         let mut history = collect_history(&mut marf, &block_hashes_typed, min_height, max_height)?;
 
-        // Baseline lookup: for keys whose earliest entry has height > min_height,
-        // the key was inherited from a prior level. Walk the prior level's tip trie
-        // to get the inherited value and inject a synthetic (min_height - 1, value) entry.
+        // Keys whose single in-range write is dominated by the inherited value. Populated in the
+        // `min_height > 0` branch below; used when deciding which leaves to promote to
+        // `TrieLeafSquashed`.
+        let mut dominated_single_keys: HashSet<TrieHash> = HashSet::new();
+
+        // Baseline lookup: for keys whose earliest entry has height > min_height, the key was
+        // inherited from a prior level. Walk the prior level's tip trie to get the inherited value
+        // and inject a synthetic (min_height - 1, value) entry.
         if min_height > 0 {
             let prior_tip_block =
                 MarfConnection::get_block_at_height(&mut marf, min_height - 1, &tip_block)?
@@ -2019,8 +2042,8 @@ pub fn squash_level_incremental<T: MarfTrieId>(
             let keys_needing_baseline: Vec<TrieHash> = history
                 .iter()
                 .filter_map(|(key_hash, entries)| {
-                    // entries from collect_history are ascending by height;
-                    // first() is the earliest write.
+                    // entries from collect_history are ascending by height; first() is the earliest
+                    // write.
                     if entries.first().map_or(false, |&(h, _)| h > min_height) {
                         Some(*key_hash)
                     } else {
@@ -2029,25 +2052,31 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                 })
                 .collect();
 
+            // Keys whose single in-range write is byte-identical to the inherited value from the
+            // prior level. These can safely stay as plain `TrieLeaf` because reading the same value
+            // at every height in range is correct (the merged trie is only reachable from blocks
+            // within the range, where the inherited value already applied before the structural
+            // re-insert).
             for key_hash in &keys_needing_baseline {
                 if let Some(inherited_value) =
                     MarfConnection::get_from_hash(&mut marf, &prior_tip_block, key_hash)?
                 {
                     if let Some(entries) = history.get_mut(key_hash) {
-                        // Only skip the baseline when the key has a single entry with the
-                        // same value — it will stay as a plain TrieLeaf and doesn't need
-                        // a synthetic entry. For multi-entry keys (which become
-                        // TrieLeafSquashed), always add the baseline so that
-                        // value_at_height covers heights before the first in-range write.
                         let dominated_single = entries.len() == 1
                             && entries
                                 .first()
                                 .map_or(false, |&(_, ref v)| *v == inherited_value);
-                        if !dominated_single {
+                        if dominated_single {
+                            dominated_single_keys.insert(*key_hash);
+                        } else {
                             entries.insert(0, (min_height - 1, inherited_value));
                         }
                     }
                 }
+                // If the key has no prior-level value, it is a new key whose first write is at h >
+                // min_height. We leave `entries` single-element; the promotion filter below will
+                // still convert it to `TrieLeafSquashed` so that reads in [min_height, first_write)
+                // return `None`.
             }
         }
 
@@ -2060,27 +2089,26 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                 Some(kh) => kh,
                 None => continue,
             };
+            // Promote any leaf with an in-range write to `TrieLeafSquashed` so that historical
+            // reads below the first in-range write return `None` (for new keys) or the inherited
+            // baseline (for keys with an injected baseline entry above). Dominated-single keys stay
+            // plain — their single in-range write matches the inherited value, so plain-leaf reads
+            // are correct at every range height.
             let transitions = match history.get(key_hash) {
-                Some(t) if t.len() > 1 => t,
-                _ => continue, // single-write or internal key: keep as plain TrieLeaf
+                Some(t) if !t.is_empty() && !dominated_single_keys.contains(key_hash) => t,
+                _ => continue,
             };
 
-            // Read the existing serialized leaf to get its hash and path bytes
+            // Read the existing serialized leaf to get its path bytes.
+            // Leaf bytes in node_store are hash-free: [body] only.
             let raw = node_store.read_node_bytes(i)?;
-            if raw.len() < TRIEHASH_ENCODED_SIZE {
-                return Err(Error::CorruptionError(
-                    "Serialized leaf too short for hash prefix".into(),
-                ));
-            }
-            let hash_bytes = &raw[..TRIEHASH_ENCODED_SIZE];
 
             // Decode the leaf to get its path (NodePath)
-            let node_body = &raw[TRIEHASH_ENCODED_SIZE..];
-            let node_id_byte = *node_body.first().ok_or_else(|| {
+            let node_id_byte = *raw.first().ok_or_else(|| {
                 Error::CorruptionError("Empty node body during FullHistory leaf replace".into())
             })?;
             let node_id = clear_backptr(node_id_byte) & 0x3f;
-            let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(node_body, node_id)?;
+            let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(&raw, node_id)?;
             let path_slice = existing_node.path_bytes();
 
             // Build the TrieLeafSquashed: entries must be sorted descending by height
@@ -2089,11 +2117,9 @@ pub fn squash_level_incremental<T: MarfTrieId>(
 
             let squashed = TrieLeafSquashed::new(path_slice, entries)?;
 
-            // Re-serialize with the same hash (hash covers tip value only)
+            // Re-serialize without hash prefix (leaf hashes are omitted in squash blobs)
             let squashed_node = TrieNodeType::LeafSquashed(squashed);
-            let mut new_buf =
-                Vec::with_capacity(TRIEHASH_ENCODED_SIZE + squashed_node.byte_len() + 1);
-            new_buf.extend_from_slice(hash_bytes);
+            let mut new_buf = Vec::with_capacity(squashed_node.byte_len() + 1);
             squashed_node.write_bytes(&mut new_buf)?;
 
             node_store.update(i, &new_buf)?;
@@ -2172,9 +2198,8 @@ pub fn squash_level_incremental<T: MarfTrieId>(
     // Step 4: Recompute hashes bottom-up (backpointer-aware)
     // ---------------------------------------------------------------
 
-    // Build block map for consensus byte hash computation. Covers all block_ids
-    // that appear as backpointer targets (intra-level from height metadata,
-    // cross-level from DFS detection).
+    // Build block map for consensus byte hash computation. Covers all block_ids that appear as
+    // backpointer targets (intra-level from height metadata, cross-level from DFS detection).
     let mut block_map = IncrementalSquashBlockMap { block_id_to_hash };
 
     for i in (0..node_count).rev() {
@@ -2258,12 +2283,13 @@ pub fn squash_level_incremental<T: MarfTrieId>(
     // Step 5: Stream blob and finalize (in-place on same MARF)
     // ---------------------------------------------------------------
     // Build the trailer into a separate buffer (small relative to node data).
-    let mut sorted_block_entries: Vec<([u8; 32], u32)> = block_hashes_raw
+    let mut sorted_block_entries: Vec<([u8; 32], u32, u32)> = block_hashes_raw
         .iter()
+        .zip(block_ids_per_height.iter())
         .enumerate()
-        .map(|(i, bhh)| (*bhh, min_height + i as u32))
+        .map(|(i, (bhh, &bid))| (*bhh, min_height + i as u32, bid))
         .collect();
-    sorted_block_entries.sort_by_key(|(bhh, _)| *bhh);
+    sorted_block_entries.sort_by_key(|(bhh, _, _)| *bhh);
 
     let trailer = SquashTrailer {
         info: SquashInfo {
@@ -2279,8 +2305,22 @@ pub fn squash_level_incremental<T: MarfTrieId>(
         sorted_block_entries,
     };
 
-    // Write blob and update DB (in-place on the same MARF)
-    {
+    // Write blob and update DB (in-place on the same MARF), under the shared-blob
+    // quiesce so concurrent readers on other handles can't see torn mmap views or
+    // SIGBUS on the `ftruncate`.
+    //
+    // `publish_squash` handles the strict ordering:
+    //   1. set `truncate_pending`
+    //   2. wait for `active_reads` to drain (readers holding `BlobReadGuard`s finish)
+    //   3. run this closure — the actual mutation + metadata rebuild
+    //   4. install the returned `SquashMeta` atomically
+    //   5. bump the shared generation (triggers per-handle refresh on next read)
+    //   6. clear `truncate_pending`
+    //
+    // Because we publish BEFORE clearing `truncate_pending`, any reader that wakes
+    // up is guaranteed to see the new generation and re-sync its local state.
+    let shared = Arc::clone(&marf.storage.data.shared_squash);
+    shared.publish_squash(|| -> Result<SquashMeta, Error> {
         let storage = marf.storage_backend_mut();
 
         trie_sql::create_squash_levels_table(storage.sqlite_conn())?;
@@ -2389,7 +2429,11 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                 )?;
             }
         }
-    }
+
+        // Build the fresh SquashMeta snapshot from the just-updated SQL + blob file.
+        // `publish_squash` will install it atomically with the generation bump.
+        build_squash_meta_from_sql(storage.sqlite_conn(), storage.blobs.as_ref())
+    })?;
 
     node_store.finish()?;
 
@@ -2401,14 +2445,12 @@ pub fn squash_level_incremental<T: MarfTrieId>(
     Ok(stats)
 }
 
-/// Create a stub squash level covering `min_height..=max_height` with no
-/// actual squash blob. Used by the late-enablement guard when the first L0
-/// range exceeds [`STUB_THRESHOLD`].
+/// Create a stub squash level covering `min_height..=max_height` with no actual squash blob. Used
+/// by the late-enablement guard when the first L0 range exceeds [`STUB_THRESHOLD`].
 ///
-/// The stub satisfies the contiguity precondition for subsequent real
-/// levels. Reads for blocks in the stub range continue to use original
-/// per-block blobs. `blob_offset` is set to the current end of the blob
-/// file so that future reclaim operations do not truncate per-block data.
+/// The stub satisfies the contiguity precondition for subsequent real levels. Reads for blocks in
+/// the stub range continue to use original per-block blobs. `blob_offset` is set to the current end
+/// of the blob file so that future reclaim operations do not truncate per-block data.
 pub fn create_stub_level<T: MarfTrieId>(
     marf_path: &str,
     min_height: u32,
@@ -2426,9 +2468,9 @@ pub fn create_stub_level<T: MarfTrieId>(
 
     let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
 
-    // Guard: stub levels are only valid as the first level (L0). If levels
-    // already exist, this is a programming error — the caller should have
-    // checked squash_min_height_for_marf() and skipped the stub path.
+    // Guard: stub levels are only valid as the first level (L0). If levels already exist, this is a
+    // programming error — the caller should have checked squash_min_height_for_marf() and skipped
+    // the stub path.
     let existing = trie_sql::read_squash_levels(marf.sqlite_conn())?;
     if !existing.is_empty() {
         return Err(Error::NotSupportedError(

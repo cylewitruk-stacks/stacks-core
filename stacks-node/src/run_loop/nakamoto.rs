@@ -27,7 +27,7 @@ use stacks::chainstate::coordinator::comm::{CoordinatorChannels, CoordinatorRece
 use stacks::chainstate::coordinator::{
     ChainsCoordinator, ChainsCoordinatorConfig, CoordinatorCommunication,
 };
-use stacks::chainstate::stacks::db::{ChainStateBootData, SharedChainstate, StacksChainState};
+use stacks::chainstate::stacks::db::{ChainStateBootData, StacksChainState};
 use stacks::chainstate::stacks::miner::{signal_mining_blocked, signal_mining_ready, MinerStatus};
 use stacks::core::StacksEpochId;
 use stacks::net::atlas::{AtlasConfig, AtlasDB, Attachment};
@@ -279,7 +279,7 @@ impl RunLoop {
         burnchain_config: &Burnchain,
         coordinator_receivers: CoordinatorReceivers,
         miner_status: Arc<Mutex<MinerStatus>>,
-        shared_chainstate: SharedChainstate,
+        chain_state_db: StacksChainState,
     ) -> JoinHandle<()> {
         let use_test_genesis_data = use_test_genesis_chainstate(&self.config);
 
@@ -326,7 +326,7 @@ impl RunLoop {
                 };
                 ChainsCoordinator::run(
                     coord_config,
-                    shared_chainstate,
+                    chain_state_db,
                     moved_burnchain_config,
                     &coordinator_dispatcher,
                     coordinator_receivers,
@@ -457,15 +457,19 @@ impl RunLoop {
             LeaderKeyRegistrationState::default(),
         );
 
-        // Boot chainstate (runs genesis/migrations) and wrap in the shared
-        // handle. This single SharedChainstate is used by the coordinator,
-        // relayer, and p2p threads — all access is serialized through the
-        // mutex so there is exactly one live mmap of the .blobs file.
-        let shared_chainstate = {
-            let chainstate = self.boot_chainstate(&burnchain_config);
-            SharedChainstate::new(chainstate)
-        };
-        globals.set_shared_chainstate(shared_chainstate.clone());
+        // Boot the chainstate — runs genesis/migrations. The returned handle is moved
+        // directly into the coordinator thread (the coordinator is the sole accessor of
+        // its own `chain_state_db` field).
+        //
+        // Before handing it off, snapshot the `SharedUnconfirmedState` slot (Arc bump) and
+        // install it in `globals`. The relayer/p2p/miner threads each open their OWN
+        // independent `StacksChainState` handle at thread start via
+        // `StacksChainState::open_with_shared_unconfirmed`, passing this slot in so that
+        // every handle observes the same in-memory unconfirmed view through one inner mutex.
+        // Confirmed-state operations on each thread proceed without any cross-thread lock.
+        let coordinator_chainstate = self.boot_chainstate(&burnchain_config);
+        let shared_unconfirmed = coordinator_chainstate.unconfirmed_state.clone();
+        globals.set_shared_unconfirmed(shared_unconfirmed);
         self.set_globals(globals.clone());
 
         // have headers; boot up the chains coordinator and instantiate the chain state
@@ -473,7 +477,7 @@ impl RunLoop {
             &burnchain_config,
             coordinator_receivers,
             globals.get_miner_status(),
-            shared_chainstate,
+            coordinator_chainstate,
         );
         self.start_prometheus();
 

@@ -781,11 +781,15 @@ impl<'a> StacksMicroblockBuilder<'a> {
         burn_dbconn: &'a dyn BurnStateDB,
         settings: BlockBuilderSettings,
     ) -> Result<StacksMicroblockBuilder<'a>, Error> {
-        let runtime = if let Some(unconfirmed_state) = chainstate.unconfirmed_state.as_ref() {
-            MicroblockMinerRuntime::from(unconfirmed_state)
-        } else {
-            warn!("No unconfirmed state instantiated; cannot mine microblocks");
-            return Err(Error::NoSuchBlockError);
+        // The clarity_tx for `new()` comes from the confirmed state via `block_begin`, so the
+        // unconfirmed slot is only consulted for runtime metadata — a brief lock that releases
+        // before the builder is constructed.
+        let runtime = match chainstate.unconfirmed_state.lock().as_ref() {
+            Some(unconfirmed_state) => MicroblockMinerRuntime::from(unconfirmed_state),
+            None => {
+                warn!("No unconfirmed state instantiated; cannot mine microblocks");
+                return Err(Error::NoSuchBlockError);
+            }
         };
 
         let (header_reader, _) = chainstate.reopen()?;
@@ -845,52 +849,47 @@ impl<'a> StacksMicroblockBuilder<'a> {
 
     /// Create a microblock miner off of the _unconfirmed_ chaintip, i.e., resuming construction of
     /// a microblock stream.
+    ///
+    /// `unconfirmed` is borrowed externally — caller acquires
+    /// [`SharedUnconfirmedState::lock`](crate::chainstate::stacks::db::SharedUnconfirmedState::lock)
+    /// and passes the resulting `&mut UnconfirmedState` here. The returned builder's
+    /// internal `clarity_tx` borrows from `unconfirmed.clarity_inst`, so the caller MUST
+    /// keep the lock guard alive for the builder's entire lifetime (typically by binding it
+    /// to a stack variable in the same enclosing scope).
     pub fn resume_unconfirmed(
-        chainstate: &'a mut StacksChainState,
+        chainstate: &'a StacksChainState,
+        unconfirmed: &'a mut UnconfirmedState,
         burn_dbconn: &'a dyn BurnStateDB,
         cost_so_far: &ExecutionCost,
         settings: BlockBuilderSettings,
     ) -> Result<StacksMicroblockBuilder<'a>, Error> {
-        let runtime = if let Some(unconfirmed_state) = chainstate.unconfirmed_state.as_ref() {
-            MicroblockMinerRuntime::from(unconfirmed_state)
-        } else {
-            warn!("No unconfirmed state instantiated; cannot mine microblocks");
-            return Err(Error::NoSuchBlockError);
-        };
+        let runtime = MicroblockMinerRuntime::from(&*unconfirmed);
 
         let (header_reader, _) = chainstate.reopen()?;
-        let (anchored_consensus_hash, anchored_block_hash, anchored_block_height) =
-            if let Some(unconfirmed) = chainstate.unconfirmed_state.as_ref() {
-                let header_info =
-                    StacksChainState::get_stacks_block_header_info_by_index_block_hash(
-                        chainstate.db(),
-                        &unconfirmed.confirmed_chain_tip,
-                    )?
-                    .ok_or_else(|| {
-                        warn!(
-                            "No such confirmed block {}",
-                            &unconfirmed.confirmed_chain_tip
-                        );
-                        Error::NoSuchBlockError
-                    })?;
-                (
-                    header_info.consensus_hash,
-                    header_info.anchored_header.block_hash(),
-                    header_info.stacks_block_height,
-                )
-            } else {
-                // unconfirmed state needs to be initialized
-                debug!("Unconfirmed chainstate not initialized");
-                return Err(Error::NoSuchBlockError)?;
-            };
-
-        let mut clarity_tx = chainstate.begin_unconfirmed(burn_dbconn).ok_or_else(|| {
+        let header_info = StacksChainState::get_stacks_block_header_info_by_index_block_hash(
+            chainstate.db(),
+            &unconfirmed.confirmed_chain_tip,
+        )?
+        .ok_or_else(|| {
             warn!(
-                "Failed to begin-unconfirmed on {}/{}",
-                &anchored_consensus_hash, &anchored_block_hash
+                "No such confirmed block {}",
+                &unconfirmed.confirmed_chain_tip
             );
             Error::NoSuchBlockError
         })?;
+        let anchored_consensus_hash = header_info.consensus_hash;
+        let anchored_block_hash = header_info.anchored_header.block_hash();
+        let anchored_block_height = header_info.stacks_block_height;
+
+        let mut clarity_tx = chainstate
+            .begin_unconfirmed(burn_dbconn, unconfirmed)
+            .ok_or_else(|| {
+                warn!(
+                    "Failed to begin-unconfirmed on {}/{}",
+                    &anchored_consensus_hash, &anchored_block_hash
+                );
+                Error::NoSuchBlockError
+            })?;
 
         debug!(
             "Resume microblock mining from {} from unconfirmed state with cost {:?}",

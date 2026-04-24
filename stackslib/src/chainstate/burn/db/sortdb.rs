@@ -2654,16 +2654,16 @@ impl SortitionDB {
         chainstate: &StacksChainState,
         stacks_block_id: &StacksBlockId,
     ) -> Result<SortitionHandleConn<'a>, db_error> {
-        let lookup_block_id = if let Some(ref unconfirmed_state) = chainstate.unconfirmed_state {
-            if &unconfirmed_state.unconfirmed_chain_tip == stacks_block_id {
-                &unconfirmed_state.confirmed_chain_tip
-            } else {
-                stacks_block_id
+        // Resolve queries for the unconfirmed tip back to the confirmed tip — the unconfirmed
+        // MARF doesn't carry block-level headers. Lock briefly, clone the relevant id out of
+        // the guard, then release before the SQL lookup below.
+        let lookup_block_id = match chainstate.unconfirmed_state.lock().as_ref() {
+            Some(unconfirmed) if &unconfirmed.unconfirmed_chain_tip == stacks_block_id => {
+                unconfirmed.confirmed_chain_tip.clone()
             }
-        } else {
-            stacks_block_id
+            _ => stacks_block_id.clone(),
         };
-        let header = match NakamotoChainState::get_block_header(chainstate.db(), lookup_block_id) {
+        let header = match NakamotoChainState::get_block_header(chainstate.db(), &lookup_block_id) {
             Ok(Some(x)) => x,
             x => {
                 debug!("Failed to get block header: {:?}", x);

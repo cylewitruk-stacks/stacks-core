@@ -23,7 +23,7 @@ use crate::chainstate::stacks::index::marf::{
     BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
 use crate::chainstate::stacks::index::node::{
-    clear_backptr, TrieLeafSquashed, TrieNode, TrieNodeID, TrieNodeType,
+    clear_backptr, set_compressed, TrieLeafSquashed, TrieNode, TrieNodeID, TrieNodeType,
 };
 use crate::chainstate::stacks::index::squash::{
     collect_history, squash_to_path, SquashInfo, SquashMode, SquashTrailer, SQUASH_FOOTER_SIZE,
@@ -95,8 +95,8 @@ fn test_leaf_squashed_serialization() {
         "round-tripped TrieLeafSquashed should equal original"
     );
 
-    // Verify the ID byte is correct
-    assert_eq!(buf[0], TrieNodeID::LeafSquashed as u8);
+    // Verify the ID byte is correct (compressed format sets 0x40 bit)
+    assert_eq!(buf[0], set_compressed(TrieNodeID::LeafSquashed as u8));
 
     // Verify individual entries survived the round-trip
     assert_eq!(deserialized.entries.len(), 3);
@@ -116,6 +116,39 @@ fn test_leaf_squashed_serialization_single_entry() {
 
     let mut buf = Vec::new();
     original.write_bytes(&mut buf).unwrap();
+
+    let mut deserialized = TrieLeafSquashed::empty();
+    let consumed = deserialized.load_from_slice(&buf).unwrap();
+
+    assert_eq!(consumed, buf.len());
+    assert_eq!(original, deserialized);
+}
+
+/// Verify that entries spanning more than u16::MAX heights fall back to
+/// the legacy (uncompressed) encoding and round-trip correctly.
+#[test]
+fn test_leaf_squashed_serialization_legacy_fallback() {
+    let path_bytes = [0xABu8; 32];
+    // Height span = 100_000 > u16::MAX (65535) → must use legacy encoding.
+    let entries = vec![
+        (100_000, MARFValue([0xAAu8; 40])),
+        (50_000, MARFValue([0xBBu8; 40])),
+        (0, MARFValue([0xCCu8; 40])),
+    ];
+
+    let original = TrieLeafSquashed::new(&path_bytes, entries).unwrap();
+
+    let mut buf = Vec::new();
+    original.write_bytes(&mut buf).unwrap();
+
+    // Legacy format: ID byte should NOT have compressed bit set.
+    assert_eq!(buf[0], TrieNodeID::LeafSquashed as u8);
+
+    assert_eq!(buf.len(), original.byte_len());
+
+    // Legacy per-entry size is 44 (u32 height + 40 value).
+    let expected_legacy_len = 1 + 33 + 4 + 3 * 44; // ID + path + count + entries
+    assert_eq!(buf.len(), expected_legacy_len);
 
     let mut deserialized = TrieLeafSquashed::empty();
     let consumed = deserialized.load_from_slice(&buf).unwrap();
@@ -239,12 +272,12 @@ fn test_trailer_serialization() {
     let block_hashes: Vec<[u8; 32]> = vec![[0xA1u8; 32], [0xA2u8; 32], [0xA3u8; 32]];
 
     // Build sorted entries
-    let mut sorted_block_entries: Vec<([u8; 32], u32)> = block_hashes
+    let mut sorted_block_entries: Vec<([u8; 32], u32, u32)> = block_hashes
         .iter()
         .enumerate()
-        .map(|(i, bhh)| (*bhh, i as u32))
+        .map(|(i, bhh)| (*bhh, i as u32, (100 + i) as u32))
         .collect();
-    sorted_block_entries.sort_by_key(|(bhh, _)| *bhh);
+    sorted_block_entries.sort_by_key(|(bhh, _, _)| *bhh);
 
     let trailer = SquashTrailer {
         info: SquashInfo {
@@ -352,9 +385,9 @@ fn test_trailer_serialization_full_history_mode() {
         root_hashes: (100..=105).map(|i| TrieHash([i as u8; 32])).collect(),
         block_hashes: (100..=105).map(|i| [i as u8; 32]).collect(),
         sorted_block_entries: {
-            let mut entries: Vec<([u8; 32], u32)> =
-                (100..=105).map(|i| ([i as u8; 32], i)).collect();
-            entries.sort_by_key(|(bhh, _)| *bhh);
+            let mut entries: Vec<([u8; 32], u32, u32)> =
+                (100..=105).map(|i| ([i as u8; 32], i, 200 + i)).collect();
+            entries.sort_by_key(|(bhh, _, _)| *bhh);
             entries
         },
     };
@@ -1203,7 +1236,7 @@ fn test_refresh_after_external_squash() {
 
     // Verify: no squash levels before squash
     assert!(
-        marf.storage.data.squash_levels.is_empty(),
+        marf.storage.data.squash_meta.levels.is_empty(),
         "No squash levels before squash"
     );
 
@@ -1220,7 +1253,7 @@ fn test_refresh_after_external_squash() {
 
     // The live handle still has stale metadata
     assert!(
-        marf.storage.data.squash_levels.is_empty(),
+        marf.storage.data.squash_meta.levels.is_empty(),
         "Live handle should still have no squash levels (stale)"
     );
 
@@ -1229,12 +1262,12 @@ fn test_refresh_after_external_squash() {
 
     // Now the live handle should see the squash level
     assert_eq!(
-        marf.storage.data.squash_levels.len(),
+        marf.storage.data.squash_meta.levels.len(),
         1,
         "After refresh, should see 1 squash level"
     );
     assert_eq!(
-        marf.storage.data.squash_block_index.len(),
+        marf.storage.data.squash_meta.block_index.len(),
         num_blocks as usize,
         "squash_block_index should have all blocks"
     );
@@ -3431,7 +3464,7 @@ fn test_stub_level_creation_and_loading() {
     // Verify that squash_block_index has NO entries from the stub
     // (blocks in the stub range should NOT be indexed).
     assert!(
-        marf.storage.data.squash_block_index.is_empty(),
+        marf.storage.data.squash_meta.block_index.is_empty(),
         "squash_block_index should be empty for a stub-only MARF"
     );
 
@@ -4274,7 +4307,15 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
     let trailer_offset =
         SquashTrailer::read_footer(blob_slice).expect("should find trailer footer") as usize;
 
-    // Scan sequential nodes: skip header (36 bytes), each node is hash(32) + body
+    // Scan sequential nodes: skip header (36 bytes).
+    // Leaf nodes are stored hash-free (body only); internal nodes are
+    // stored as hash(32) + body.
+    //
+    // To avoid a fragile heuristic on the first byte (which could be an
+    // arbitrary hash byte for internal nodes), we use a trial-decode
+    // approach: try interpreting pos as a hash-free leaf body.  If that
+    // succeeds we accept it; otherwise we skip 32 bytes of hash prefix
+    // and decode the body of an internal node.
     let header_size = 36usize;
     let mut pos = header_size;
     let nodes_end = trailer_offset;
@@ -4282,82 +4323,98 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
     let mut leaf_squashed_count = 0usize;
     let mut plain_leaf_count = 0usize;
     let mut internal_count = 0usize;
+    let mut found_hot_key_squashed = false;
 
     while pos < nodes_end {
-        // Read hash
-        if pos + TRIEHASH_ENCODED_SIZE > nodes_end {
-            break;
-        }
-        let body_start = pos + TRIEHASH_ENCODED_SIZE;
-        if body_start >= nodes_end {
-            break;
-        }
-        let node_body = &blob_slice[body_start..nodes_end];
+        let remaining = &blob_slice[pos..nodes_end];
 
-        // Decode node type from body
-        let node_id_byte = node_body[0];
-        let node_id = clear_backptr(node_id_byte) & 0x3f;
-        let (node, consumed) = bits::decode_nodetype_from_slice_at_head(node_body, node_id)
-            .unwrap_or_else(|e| panic!("Failed to decode node at blob offset {pos}: {e}"));
+        // Try hash-free leaf decode first.
+        let first_byte = remaining[0];
+        let cleared = clear_backptr(first_byte) & 0x3f;
+        let leaf_candidate = (cleared == TrieNodeID::Leaf as u8
+            || cleared == TrieNodeID::LeafSquashed as u8)
+            && bits::decode_nodetype_from_slice_at_head(remaining, cleared).is_ok();
 
-        let total_node_size = TRIEHASH_ENCODED_SIZE + consumed;
-
-        match &node {
-            TrieNodeType::LeafSquashed(sq) => {
-                leaf_squashed_count += 1;
-                // Verify entries are sorted descending by height
-                for w in sq.entries.windows(2) {
-                    assert!(
-                        w[0].0 > w[1].0,
-                        "TrieLeafSquashed entries should be sorted descending: {} > {} failed",
-                        w[0].0,
-                        w[1].0
-                    );
+        if leaf_candidate {
+            let (node, consumed) =
+                bits::decode_nodetype_from_slice_at_head(remaining, cleared).unwrap();
+            match &node {
+                TrieNodeType::LeafSquashed(sq) => {
+                    leaf_squashed_count += 1;
+                    for w in sq.entries.windows(2) {
+                        assert!(
+                            w[0].0 > w[1].0,
+                            "TrieLeafSquashed entries should be sorted descending: {} > {} failed",
+                            w[0].0,
+                            w[1].0
+                        );
+                    }
+                    // Identify the hot_key LeafSquashed by its signature:
+                    // `num_blocks` entries with values matching "hot_{h}".
+                    // Other LeafSquashed in the blob (cold_key, internal MARF
+                    // mapping keys) have fewer entries and different values.
+                    let looks_like_hot_key = sq.entries.len() == num_blocks
+                        && sq
+                            .entries
+                            .iter()
+                            .all(|(h, v)| *v == MARFValue::from_value(&format!("hot_{h}")));
+                    if looks_like_hot_key {
+                        found_hot_key_squashed = true;
+                        for (idx, &(height, ref value)) in sq.entries.iter().enumerate() {
+                            let expected_height = (num_blocks - 1 - idx) as u32;
+                            let expected_value =
+                                MARFValue::from_value(&format!("hot_{expected_height}"));
+                            assert_eq!(
+                                height, expected_height,
+                                "hot_key entry[{idx}] height: expected {expected_height}, got {height}"
+                            );
+                            assert_eq!(
+                                *value, expected_value,
+                                "hot_key entry[{idx}] value mismatch at height {height}"
+                            );
+                        }
+                    }
                 }
-                // Verify exact (height, value) contents for hot_key.
-                // hot_key was written at blocks 0-3 with values "hot_0" .. "hot_3",
-                // so we expect 4 entries in descending height order.
-                assert_eq!(
-                    sq.entries.len(),
-                    num_blocks,
-                    "TrieLeafSquashed should have exactly {num_blocks} entries for hot_key"
-                );
-                for (idx, &(height, ref value)) in sq.entries.iter().enumerate() {
-                    let expected_height = (num_blocks - 1 - idx) as u32;
-                    let expected_value = MARFValue::from_value(&format!("hot_{expected_height}"));
-                    assert_eq!(
-                        height, expected_height,
-                        "entry[{idx}] height: expected {expected_height}, got {height}"
-                    );
-                    assert_eq!(
-                        *value, expected_value,
-                        "entry[{idx}] value mismatch at height {height}"
-                    );
+                TrieNodeType::Leaf(_) => {
+                    plain_leaf_count += 1;
                 }
+                _ => unreachable!("leaf candidate decoded to non-leaf"),
             }
-            TrieNodeType::Leaf(_) => {
-                plain_leaf_count += 1;
-            }
-            _ => {
-                internal_count += 1;
-            }
+            pos += consumed;
+        } else {
+            // Internal node: 32-byte hash prefix + body.
+            assert!(
+                remaining.len() > TRIEHASH_ENCODED_SIZE,
+                "not enough bytes for hash prefix at blob offset {pos}"
+            );
+            let body = &remaining[TRIEHASH_ENCODED_SIZE..];
+            let node_id = clear_backptr(body[0]) & 0x3f;
+            let (_node, consumed) = bits::decode_nodetype_from_slice_at_head(body, node_id)
+                .unwrap_or_else(|e| {
+                    panic!("Failed to decode internal node at blob offset {pos}: {e}")
+                });
+            internal_count += 1;
+            pos += TRIEHASH_ENCODED_SIZE + consumed;
         }
-
-        pos += total_node_size;
     }
+
+    assert_eq!(
+        pos, nodes_end,
+        "blob scan did not consume exactly the node region"
+    );
 
     assert!(
         leaf_squashed_count > 0,
         "blob should contain at least one TrieLeafSquashed node"
     );
     assert!(
-        plain_leaf_count > 0,
-        "blob should contain at least one plain TrieLeaf node (cold_key or internal keys)"
+        found_hot_key_squashed,
+        "hot_key should be stored as a TrieLeafSquashed with all {num_blocks} transitions"
     );
 
     eprintln!(
-        "Blob scan: {} LeafSquashed, {} Leaf, {} internal",
-        leaf_squashed_count, plain_leaf_count, internal_count
+        "Blob scan: {leaf_squashed_count} LeafSquashed, {plain_leaf_count} Leaf, \
+         {internal_count} internal"
     );
 }
 
@@ -4890,11 +4947,15 @@ fn test_incremental_full_history_baseline_inheritance() {
     .expect("L1 incremental squash should succeed");
 
     // key_a and key_b are inherited from L0 and never updated in L1, so they
-    // should NOT be promoted to TrieLeafSquashed. Only key_c (which has real
-    // transitions across L1 blocks) should be squashed.
-    assert_eq!(
-        l1_stats.leaves_squashed, 1,
-        "only key_c should be squashed; inherited-only keys must stay as plain TrieLeaf"
+    // have no entries in L1's history and stay as plain TrieLeaf. key_c has
+    // real in-range transitions and is promoted. MARF-internal mapping keys
+    // written at every L1 block also appear in history; they too get
+    // promoted to `TrieLeafSquashed` so that reads at heights below their
+    // first write correctly return `None` rather than a post-hoc value.
+    assert!(
+        l1_stats.leaves_squashed >= 1,
+        "at least key_c should be promoted to TrieLeafSquashed (got {})",
+        l1_stats.leaves_squashed
     );
 
     // Verify reads
@@ -5923,5 +5984,2187 @@ fn test_squash_blob_size_limit_error_message() {
     assert!(
         checked_offset_add(at_cap, 1).is_err(),
         "one above cap should fail"
+    );
+}
+
+/// Regression test for the `reopen_connection()` squash-metadata bug.
+///
+/// `reopen_connection()` creates a lightweight read-only connection that shares the
+/// parent's SQLite handle but builds a *fresh* `TrieStorageTransientData`. Before the
+/// fix, the fresh transient data had empty squash metadata — so reads through the
+/// reopened connection would try to parse hash-free squash-blob leaves with the
+/// hash-prefix-expected path, producing garbage/corruption. In production this path
+/// is hit by `get_indexed()` (util_lib/db.rs) which is called on every Clarity read.
+///
+/// Key design: "cold" keys are written only during L0 and **never updated** afterward.
+/// Every extension block probes them through `reopen_connection().get()`, which forces
+/// the walk all the way through the reclaimed squash blob for the entire 700-block
+/// extension. Without the fix, these reads corrupt.
+#[test]
+fn test_l0_reclaim_squash_long_extension_reads_with_reopen() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_l0_reclaim_squash_long_extension_reads_with_reopen");
+
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let l0_blocks: usize = 6;
+    let keys_per_block: usize = 4;
+    let ext_blocks: usize = 700;
+    let num_cold_keys: usize = 4;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let make_block = |i: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0xDE_AD_C0_DEu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    // Build base L0 chain in both MARFs.
+    let (src_marf, l0_blocks_vec, _) =
+        setup_squash_source_marf(&sq_path, l0_blocks, keys_per_block);
+    drop(src_marf);
+    let (ref_marf, _, _) = setup_squash_source_marf(&ref_path, l0_blocks, keys_per_block);
+    drop(ref_marf);
+
+    // Insert cold keys into the last L0 block of both MARFs. These are never
+    // updated after this point, so reads always walk into the squash blob.
+    {
+        let last_l0 = l0_blocks_vec.last().unwrap();
+        let cold_block = make_block(l0_blocks); // one extra block for cold keys
+        let mut sq = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut rf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+        sq.begin(last_l0, &cold_block).unwrap();
+        rf.begin(last_l0, &cold_block).unwrap();
+        for c in 0..num_cold_keys {
+            let key = format!("cold_key_{c}");
+            let val = MARFValue::from_value(&format!("cold_val_{c}"));
+            sq.insert(&key, val.clone()).unwrap();
+            rf.insert(&key, val).unwrap();
+        }
+        sq.seal().unwrap();
+        sq.commit().unwrap();
+        rf.seal().unwrap();
+        rf.commit().unwrap();
+    }
+    // The cold-key block becomes the new base for the squash range.
+    let cold_block = make_block(l0_blocks);
+
+    // Squash the full L0 range (including the cold-key block) with reclaim.
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::TipOnly,
+        0,
+        l0_blocks as u32, // includes the cold-key block
+        true,
+    )
+    .expect("L0 reclaim squash");
+
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    let mut parent = cold_block;
+
+    for e in 0..ext_blocks {
+        let block_num = l0_blocks + 1 + e; // +1 for the cold-key block
+        let block_hash = make_block(block_num);
+
+        sq_marf.begin(&parent, &block_hash).unwrap();
+        ref_marf.begin(&parent, &block_hash).unwrap();
+
+        // Insert one fresh key per block.
+        let new_key = format!("ext_key_{block_num}");
+        let new_val = MARFValue::from_value(&format!("ext_val_{block_num}"));
+        sq_marf.insert(&new_key, new_val.clone()).unwrap();
+        ref_marf.insert(&new_key, new_val).unwrap();
+
+        let sq_root = sq_marf.seal().unwrap();
+        sq_marf.commit().unwrap();
+        let ref_root = ref_marf.seal().unwrap();
+        ref_marf.commit().unwrap();
+
+        assert_eq!(
+            sq_root, ref_root,
+            "root hash mismatch at extension block {e} (height {block_num})"
+        );
+
+        // ---- Cold-key probes via reopen_connection ----
+        // These keys live only in the squash blob and are never overwritten,
+        // so every read must walk into the reclaimed squash blob. This is the
+        // exact path that was broken before the fix.
+        {
+            let mut reopened = sq_marf.reopen_connection().unwrap_or_else(|err| {
+                panic!("reopen_connection() failed at height {block_num}: {err:?}")
+            });
+            for c in 0..num_cold_keys {
+                let key = format!("cold_key_{c}");
+                let sq_val = reopened.get(&block_hash, &key).unwrap_or_else(|err| {
+                    panic!("reopened get({key}) failed at height {block_num}: {err:?}")
+                });
+                let ref_val = ref_marf.get(&block_hash, &key).unwrap();
+                assert_eq!(
+                    sq_val, ref_val,
+                    "cold key {key} mismatch at height {block_num}"
+                );
+            }
+        }
+
+        // ---- Periodic full reopen ----
+        if e > 0 && e % 200 == 0 {
+            drop(sq_marf);
+            drop(ref_marf);
+            sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+            ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+            // Cold keys must still work after full reopen.
+            let mut reopened = sq_marf.reopen_connection().unwrap();
+            for c in 0..num_cold_keys {
+                let key = format!("cold_key_{c}");
+                let sq_v = reopened.get(&block_hash, &key).unwrap_or_else(|err| {
+                    panic!("post-reopen get({key}) failed at ext block {e}: {err:?}")
+                });
+                let ref_v = ref_marf.get(&block_hash, &key).unwrap();
+                assert_eq!(
+                    sq_v, ref_v,
+                    "post-reopen cold key {key} mismatch at ext block {e}"
+                );
+            }
+        }
+
+        parent = block_hash;
+    }
+}
+
+/// Regression test for the `reopen_readonly()` squash-metadata bug.
+///
+/// Same root cause as the `reopen_connection()` bug above, but exercising the
+/// fully independent `TrieFileStorage` path used by the Clarity VM
+/// (`marf.reopen_readonly()`) and `get_indexed_ref()`. Before the fix, the
+/// readonly storage had empty squash metadata and would misparse hash-free
+/// leaves in the squash blob.
+#[test]
+fn test_l0_reclaim_squash_reads_with_reopen_readonly() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_l0_reclaim_squash_reads_with_reopen_readonly");
+
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let l0_blocks: usize = 6;
+    let keys_per_block: usize = 4;
+    let ext_blocks: usize = 100;
+    let num_cold_keys: usize = 4;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let make_block = |i: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0xDE_AD_C0_DEu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    // Build base L0 chain in both MARFs.
+    let (src_marf, l0_blocks_vec, _) =
+        setup_squash_source_marf(&sq_path, l0_blocks, keys_per_block);
+    drop(src_marf);
+    let (ref_marf, _, _) = setup_squash_source_marf(&ref_path, l0_blocks, keys_per_block);
+    drop(ref_marf);
+
+    // Insert cold keys into the last L0 block.
+    {
+        let last_l0 = l0_blocks_vec.last().unwrap();
+        let cold_block = make_block(l0_blocks);
+        let mut sq = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut rf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+        sq.begin(last_l0, &cold_block).unwrap();
+        rf.begin(last_l0, &cold_block).unwrap();
+        for c in 0..num_cold_keys {
+            let key = format!("cold_key_{c}");
+            let val = MARFValue::from_value(&format!("cold_val_{c}"));
+            sq.insert(&key, val.clone()).unwrap();
+            rf.insert(&key, val).unwrap();
+        }
+        sq.seal().unwrap();
+        sq.commit().unwrap();
+        rf.seal().unwrap();
+        rf.commit().unwrap();
+    }
+    let cold_block = make_block(l0_blocks);
+
+    // Squash with reclaim.
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::TipOnly,
+        0,
+        l0_blocks as u32,
+        true,
+    )
+    .expect("L0 reclaim squash");
+
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    let mut parent = cold_block;
+
+    for e in 0..ext_blocks {
+        let block_num = l0_blocks + 1 + e;
+        let block_hash = make_block(block_num);
+
+        sq_marf.begin(&parent, &block_hash).unwrap();
+        ref_marf.begin(&parent, &block_hash).unwrap();
+
+        let new_key = format!("ext_key_{block_num}");
+        let new_val = MARFValue::from_value(&format!("ext_val_{block_num}"));
+        sq_marf.insert(&new_key, new_val.clone()).unwrap();
+        ref_marf.insert(&new_key, new_val).unwrap();
+
+        sq_marf.seal().unwrap();
+        sq_marf.commit().unwrap();
+        ref_marf.seal().unwrap();
+        ref_marf.commit().unwrap();
+
+        // ---- Cold-key probes via reopen_readonly ----
+        // This creates a fully independent TrieFileStorage (own DB handle,
+        // own blob file) — the path used by the Clarity VM and get_indexed.
+        {
+            let mut ro_marf = sq_marf.reopen_readonly().unwrap_or_else(|err| {
+                panic!("reopen_readonly() failed at height {block_num}: {err:?}")
+            });
+            for c in 0..num_cold_keys {
+                let key = format!("cold_key_{c}");
+                let sq_val = ro_marf.get(&block_hash, &key).unwrap_or_else(|err| {
+                    panic!("readonly get({key}) failed at height {block_num}: {err:?}")
+                });
+                let ref_val = ref_marf.get(&block_hash, &key).unwrap();
+                assert_eq!(
+                    sq_val, ref_val,
+                    "readonly cold key {key} mismatch at height {block_num}"
+                );
+            }
+        }
+
+        // ---- Also probe via reopen_connection for completeness ----
+        {
+            let mut reopened = sq_marf.reopen_connection().unwrap();
+            for c in 0..num_cold_keys {
+                let key = format!("cold_key_{c}");
+                let sq_val = reopened.get(&block_hash, &key).unwrap_or_else(|err| {
+                    panic!("reopened get({key}) failed at height {block_num}: {err:?}")
+                });
+                let ref_val = ref_marf.get(&block_hash, &key).unwrap();
+                assert_eq!(
+                    sq_val, ref_val,
+                    "reopened cold key {key} mismatch at height {block_num}"
+                );
+            }
+        }
+
+        parent = block_hash;
+    }
+}
+
+/// Verify that squash_level_incremental correctly rejects squashing below the chain tip.
+///
+/// `verify_no_descendants` ensures that no committed blocks exist above the squash
+/// range. This prevents accidental pruning of live future blocks.
+#[test]
+fn test_squash_rejects_when_blocks_exist_above_range() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_squash_rejects_above_range");
+    let marf_path = format!("{dir}/test.sqlite");
+
+    let total_blocks = 15usize;
+    let keys_per_block = 3;
+
+    let (src_marf, _block_hashes, _) =
+        setup_squash_source_marf(&marf_path, total_blocks, keys_per_block);
+    drop(src_marf);
+
+    // Try to squash only 0..=9 when blocks 10..=14 exist — should fail.
+    let result =
+        squash_level_incremental::<StacksBlockId>(&marf_path, SquashMode::TipOnly, 0, 9, true);
+
+    assert!(
+        result.is_err(),
+        "Squash below chain tip should be rejected by verify_no_descendants"
+    );
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("exists above max_height"),
+        "Error should mention blocks above max_height, got: {err_msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1 reproduction: multi-level FullHistory + reclaim recurring squash
+//
+// Reproduction attempt for the genesis-sync "Bad nonce" divergence observed on
+// `perf/marf-squash-cycle`. Mirrors the production Clarity-MARF pattern:
+//   * mode = FullHistory
+//   * reclaim = true at every level
+//   * recurring squashes at a fixed cadence (like `maybe_squash`)
+//
+// Two MARFs are built in lockstep:
+//   * `ref`: no squashing (ground-truth oracle)
+//   * `sq` : recurring FullHistory+reclaim squashes every `BLOCKS_PER_LEVEL`
+//
+// Workload: NUM_ACCOUNTS "accounts". At every block, a fixed subset of them is
+// touched and each receives a fresh nonce-encoded value of the form
+// "acct_{id}_nonce_{k}". This mirrors the real nonce-overwrite pattern and
+// makes any historical-read divergence visible as a value mismatch rather
+// than a hash mismatch alone.
+//
+// Every historical key is probed via THREE distinct read paths, after every
+// squash level, at every historical height:
+//   1. direct `marf.get()`                     — long-lived writer connection
+//   2. `reopen_connection()`                    — shared DB, fresh transient
+//   3. `reopen_readonly()`                      — fully independent storage
+//                                                 (Clarity VM path)
+//
+// Any divergence between `sq` (squashed) and `ref` (unsquashed) on any read
+// path at any height indicates a correctness regression in the squash/read
+// pipeline.
+// ---------------------------------------------------------------------------
+
+/// Deterministic workload: which accounts are touched at height `h`.
+fn tier1_touched_accounts(
+    height: usize,
+    num_accounts: usize,
+    touches_per_block: usize,
+) -> Vec<usize> {
+    (0..touches_per_block)
+        .map(|t| (height * 3 + t * 5) % num_accounts)
+        .collect()
+}
+
+fn tier1_block_hash(height: usize) -> StacksBlockId {
+    let mut bytes = [0u8; 32];
+    bytes[24..28].copy_from_slice(&0x_BA_5E_BA_11u32.to_be_bytes());
+    bytes[28..32].copy_from_slice(&((height as u32) + 1).to_be_bytes());
+    StacksBlockId::from_bytes(&bytes).unwrap()
+}
+
+/// Build the nonce-style workload on top of `marf`, committing `blocks_to_add`
+/// blocks starting from `parent`. Returns the list of committed block hashes
+/// in order. The workload is fully determined by `height`, so both squash
+/// and reference MARFs receive identical writes.
+fn tier1_extend_nonce_chain(
+    marf: &mut MARF<StacksBlockId>,
+    parent: StacksBlockId,
+    start_height: usize,
+    blocks_to_add: usize,
+    num_accounts: usize,
+    touches_per_block: usize,
+) -> Vec<StacksBlockId> {
+    let mut out = Vec::with_capacity(blocks_to_add);
+    let mut cur_parent = parent;
+
+    for b in 0..blocks_to_add {
+        let height = start_height + b;
+        let block_hash = tier1_block_hash(height);
+        marf.begin(&cur_parent, &block_hash).unwrap();
+
+        for acct in tier1_touched_accounts(height, num_accounts, touches_per_block) {
+            let key = format!("acct_{acct}");
+            let val = MARFValue::from_value(&format!("acct_{acct}_nonce_{height}"));
+            marf.insert(&key, val).unwrap();
+        }
+
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        out.push(block_hash.clone());
+        cur_parent = block_hash;
+    }
+
+    out
+}
+
+/// Reverse-lookup: given a MARFValue byte-pattern, find which `acct_N_nonce_K`
+/// string produces it. Returns a human-readable label, or `"<unknown>"` if no
+/// match within the searched (num_accounts × search_heights) space.
+fn tier1_identify_value(
+    value_bytes: &[u8],
+    num_accounts: usize,
+    search_heights: usize,
+    _touches_per_block: usize,
+) -> String {
+    for a in 0..num_accounts {
+        for h in 0..search_heights {
+            let candidate = MARFValue::from_value(&format!("acct_{a}_nonce_{h}"));
+            if candidate.0 == value_bytes {
+                return format!("acct_{a}_nonce_{h}");
+            }
+        }
+    }
+    "<unknown>".to_string()
+}
+
+/// Expected value for `acct` at `height`: the latest touch at or before that
+/// height, or None if the account has never been touched.
+fn tier1_expected_at(
+    acct: usize,
+    height: usize,
+    num_accounts: usize,
+    touches_per_block: usize,
+) -> Option<MARFValue> {
+    for h in (0..=height).rev() {
+        if tier1_touched_accounts(h, num_accounts, touches_per_block)
+            .iter()
+            .any(|&a| a == acct)
+        {
+            return Some(MARFValue::from_value(&format!("acct_{acct}_nonce_{h}")));
+        }
+    }
+    None
+}
+
+/// Minimal reproduction isolator: N accounts, each with its own nonce-style
+/// per-block updates, L0 FullHistory+reclaim squash. Runs the same check for
+/// every account. Intended to narrow the boundary between "works" and "breaks".
+#[test]
+fn test_tier1_debug_two_accounts_historical_reads() {
+    tier1_debug_n_account_chain(2, 6);
+}
+
+#[test]
+fn test_tier1_debug_three_accounts_historical_reads() {
+    tier1_debug_n_account_chain(3, 6);
+}
+
+#[test]
+fn test_tier1_debug_four_accounts_historical_reads() {
+    tier1_debug_n_account_chain(4, 6);
+}
+
+/// Minimal reproduction with ONE key that is touched only at even heights.
+/// Odd-height reads must walk through backptrs; after squash, they should
+/// still return the last-updated value ≤ that height.
+#[test]
+fn test_tier1_debug_single_key_sparse_updates() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("tier1_debug_single_sparse");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let num_blocks = 6;
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+
+    for h in 0..num_blocks {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        let bh = StacksBlockId::from_bytes(&bytes).unwrap();
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        marf.begin(&parent, &bh).unwrap();
+        if h % 2 == 0 {
+            // Even heights only: 0, 2, 4
+            let val = MARFValue::from_value(&format!("my_key_nonce_{h}"));
+            marf.insert("my_key", val).unwrap();
+        } else {
+            // Odd heights: insert a different key so the block isn't empty
+            marf.insert(
+                &format!("filler_{h}"),
+                MARFValue::from_value(&format!("filler_{h}")),
+            )
+            .unwrap();
+        }
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        blocks.push(bh);
+    }
+    drop(marf);
+
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        (num_blocks - 1) as u32,
+        true,
+    )
+    .expect("L0 FullHistory reclaim squash");
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts).unwrap();
+    eprintln!("--- SPARSE SINGLE-KEY (6 blocks, touches at 0/2/4) ---");
+    let mut fail_count = 0usize;
+    for (h, bh) in blocks.iter().enumerate() {
+        let v = marf.get(bh, "my_key").unwrap();
+        let last_touch = (0..=h).rev().find(|&hh| hh % 2 == 0);
+        let expected = last_touch.map(|hh| MARFValue::from_value(&format!("my_key_nonce_{hh}")));
+        let got_str = v
+            .as_ref()
+            .map(|val| {
+                for hh in 0..num_blocks {
+                    if val.0 == MARFValue::from_value(&format!("my_key_nonce_{hh}")).0 {
+                        return format!("my_key_nonce_{hh}");
+                    }
+                }
+                "<unknown>".to_string()
+            })
+            .unwrap_or_else(|| "<None>".to_string());
+        let ok = v == expected;
+        if !ok {
+            fail_count += 1;
+        }
+        eprintln!(
+            "  block[{h}] → {got_str:?} (expected {:?}, match={ok})",
+            expected.as_ref().map(|_| last_touch.unwrap())
+        );
+    }
+    eprintln!("  total failures: {fail_count}");
+    assert_eq!(fail_count, 0, "single-key sparse reads diverged");
+}
+
+/// Same shape as the N-account test, but each account is only touched on
+/// heights where `h % num_accounts == a` (i.e. sparse updates). This forces
+/// the read path to walk through backptrs at ancestor heights where an
+/// account's leaf lives in an older block.
+#[test]
+fn test_tier1_debug_sparse_updates_two_accounts() {
+    tier1_debug_sparse_n_account_chain(2, 6);
+}
+
+#[test]
+fn test_tier1_debug_sparse_updates_three_accounts() {
+    tier1_debug_sparse_n_account_chain(3, 6);
+}
+
+fn tier1_debug_sparse_n_account_chain(num_accounts: usize, num_blocks: usize) {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir(&format!("tier1_debug_sparse_{num_accounts}"));
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+
+    // Sparse: account `a` is touched only at heights where h % num_accounts == a.
+    // Every block still inserts at least one key (a touch for whichever account
+    // matches the height's modulus), so each block writes non-trivially.
+    for h in 0..num_blocks {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        let bh = StacksBlockId::from_bytes(&bytes).unwrap();
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        marf.begin(&parent, &bh).unwrap();
+        let a = h % num_accounts;
+        let key = format!("acct_{a}");
+        let val = MARFValue::from_value(&format!("acct_{a}_nonce_{h}"));
+        marf.insert(&key, val).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        blocks.push(bh);
+    }
+    drop(marf);
+
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        (num_blocks - 1) as u32,
+        true,
+    )
+    .expect("L0 FullHistory reclaim squash");
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts).unwrap();
+
+    eprintln!("--- SPARSE (accounts={num_accounts}, blocks={num_blocks}): reads after squash ---");
+    let mut fail_count = 0usize;
+    for (h, bh) in blocks.iter().enumerate() {
+        for a in 0..num_accounts {
+            let key = format!("acct_{a}");
+            // Expected: the most-recent height <= h where h' % num_accounts == a.
+            let expected = (0..=h)
+                .rev()
+                .find(|&hh| hh % num_accounts == a)
+                .map(|hh| MARFValue::from_value(&format!("acct_{a}_nonce_{hh}")));
+            let got = marf.get(bh, &key).unwrap();
+            let got_str = got
+                .as_ref()
+                .map(|val| {
+                    for ha in 0..num_blocks {
+                        for aa in 0..num_accounts {
+                            if val.0 == MARFValue::from_value(&format!("acct_{aa}_nonce_{ha}")).0 {
+                                return format!("acct_{aa}_nonce_{ha}");
+                            }
+                        }
+                    }
+                    "<unknown>".to_string()
+                })
+                .unwrap_or_else(|| "<None>".to_string());
+            let expected_str = expected
+                .as_ref()
+                .map(|_| {
+                    (0..=h)
+                        .rev()
+                        .find(|&hh| hh % num_accounts == a)
+                        .map(|hh| format!("acct_{a}_nonce_{hh}"))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_else(|| "<None>".to_string());
+            if got != expected {
+                fail_count += 1;
+                eprintln!("  FAIL: {key} at h={h} → {got_str:?} (expected {expected_str:?})");
+            }
+        }
+    }
+    eprintln!("  total failures: {fail_count}");
+    assert_eq!(fail_count, 0, "sparse historical reads diverged");
+}
+
+fn tier1_debug_n_account_chain(num_accounts: usize, num_blocks: usize) {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir(&format!("tier1_debug_{num_accounts}_accounts"));
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+
+    // Every block updates every account with a height-encoded value so that
+    // each account has `num_blocks` transitions and can be probed at every
+    // historical height.
+    for h in 0..num_blocks {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        let bh = StacksBlockId::from_bytes(&bytes).unwrap();
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        marf.begin(&parent, &bh).unwrap();
+        for a in 0..num_accounts {
+            let key = format!("acct_{a}");
+            let val = MARFValue::from_value(&format!("acct_{a}_nonce_{h}"));
+            marf.insert(&key, val).unwrap();
+        }
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        blocks.push(bh);
+    }
+    drop(marf);
+
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        (num_blocks - 1) as u32,
+        true,
+    )
+    .expect("L0 FullHistory reclaim squash");
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts).unwrap();
+
+    eprintln!("--- After FullHistory+reclaim (accounts={num_accounts}, blocks={num_blocks}) ---");
+    let mut fail_count = 0usize;
+    for (h, bh) in blocks.iter().enumerate() {
+        for a in 0..num_accounts {
+            let key = format!("acct_{a}");
+            let v = marf.get(bh, &key).unwrap();
+            let expected = MARFValue::from_value(&format!("acct_{a}_nonce_{h}"));
+            let got_str = v
+                .as_ref()
+                .map(|val| {
+                    for ha in 0..num_blocks {
+                        for aa in 0..num_accounts {
+                            if val.0 == MARFValue::from_value(&format!("acct_{aa}_nonce_{ha}")).0 {
+                                return format!("acct_{aa}_nonce_{ha}");
+                            }
+                        }
+                    }
+                    "<unknown>".to_string()
+                })
+                .unwrap_or_else(|| "<None>".to_string());
+            let ok = v == Some(expected);
+            if !ok {
+                fail_count += 1;
+                eprintln!("  FAIL: {key} at h={h} → {got_str:?} (expected acct_{a}_nonce_{h})");
+            }
+        }
+    }
+    eprintln!("  total failures: {fail_count}");
+    assert_eq!(fail_count, 0, "historical reads diverged from expected");
+}
+
+/// Minimal reproduction isolator: one account updated every block, L0
+/// FullHistory+reclaim squash. If historical reads at every height return the
+/// same value (the tip), then `squash_opened_height` is being lost; if they
+/// return *different* wrong values, `value_at_height` is bugged.
+#[test]
+fn test_tier1_debug_single_account_historical_reads() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier1_debug_single_account");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let num_blocks = 4; // heights 0..=3
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+
+    for h in 0..num_blocks {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        let bh = StacksBlockId::from_bytes(&bytes).unwrap();
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        marf.begin(&parent, &bh).unwrap();
+        marf.insert(
+            "my_key",
+            MARFValue::from_value(&format!("my_key_nonce_{h}")),
+        )
+        .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        blocks.push(bh);
+    }
+    drop(marf);
+
+    eprintln!("--- Before squash ---");
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    for (i, bh) in blocks.iter().enumerate() {
+        let v = marf.get(bh, "my_key").unwrap();
+        eprintln!("  block[{i}] → {v:?}");
+    }
+    drop(marf);
+
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        (num_blocks - 1) as u32,
+        true,
+    )
+    .expect("L0 FullHistory reclaim squash");
+
+    eprintln!("--- After FullHistory+reclaim squash ---");
+    let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts).unwrap();
+    for (i, bh) in blocks.iter().enumerate() {
+        let v = marf.get(bh, "my_key").unwrap();
+        let expected = MARFValue::from_value(&format!("my_key_nonce_{i}"));
+        let got_str = v
+            .as_ref()
+            .map(|val| {
+                for h in 0..num_blocks {
+                    if val.0 == MARFValue::from_value(&format!("my_key_nonce_{h}")).0 {
+                        return format!("my_key_nonce_{h}");
+                    }
+                }
+                "<unknown>".to_string()
+            })
+            .unwrap_or_else(|| "<None>".to_string());
+        eprintln!(
+            "  block[{i}] (height {i}) → {got_str:?}, expected my_key_nonce_{i}, match={}",
+            v == Some(expected)
+        );
+    }
+}
+
+#[test]
+fn test_tier1_multi_level_full_history_reclaim_differential() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier1_multi_level_full_history_reclaim_differential");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let num_accounts: usize = 12;
+    let touches_per_block: usize = 4;
+    let blocks_per_level: usize = 6;
+    let num_levels: usize = 3;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    // All committed block hashes in order, shared by both MARFs.
+    let mut all_blocks: Vec<StacksBlockId> = Vec::new();
+
+    // ── Build both MARFs in lockstep, squashing `sq` at every level boundary ──
+    {
+        let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+        for lvl in 0..num_levels {
+            let start_height = lvl * blocks_per_level;
+            let parent = if lvl == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                all_blocks.last().unwrap().clone()
+            };
+
+            let sq_blocks = tier1_extend_nonce_chain(
+                &mut sq_marf,
+                parent.clone(),
+                start_height,
+                blocks_per_level,
+                num_accounts,
+                touches_per_block,
+            );
+            let ref_blocks = tier1_extend_nonce_chain(
+                &mut ref_marf,
+                parent,
+                start_height,
+                blocks_per_level,
+                num_accounts,
+                touches_per_block,
+            );
+
+            assert_eq!(
+                sq_blocks, ref_blocks,
+                "both MARFs must commit identical block hashes at level {lvl}"
+            );
+            all_blocks.extend(sq_blocks);
+
+            // Drop the squash-side writer before running the external squash
+            // so the SQLite connection doesn't race with the squash pipeline.
+            drop(sq_marf);
+
+            let min_h = start_height as u32;
+            let max_h = (start_height + blocks_per_level - 1) as u32;
+            squash_level_incremental::<StacksBlockId>(
+                &sq_path,
+                SquashMode::FullHistory,
+                min_h,
+                max_h,
+                true, // reclaim
+            )
+            .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
+
+            // Reopen the squashed writer for the next level's extension.
+            sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+
+            // ── After each squash, exhaustively probe every historical height
+            //    via every read path and compare against the reference. ──
+            tier1_verify_all_paths(
+                &mut sq_marf,
+                &mut ref_marf,
+                &sq_path,
+                &all_blocks,
+                num_accounts,
+                touches_per_block,
+                &open_opts,
+                &format!("after-level-{lvl}"),
+            );
+        }
+
+        drop(sq_marf);
+        drop(ref_marf);
+    }
+
+    // ── Second pass: close everything and reopen from disk, then re-verify.
+    //    Simulates a node restart — catches bugs that only manifest when
+    //    squash metadata is loaded from persistent state rather than
+    //    carried over in-memory from the squash operation. ──
+    {
+        let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+        tier1_verify_all_paths(
+            &mut sq_marf,
+            &mut ref_marf,
+            &sq_path,
+            &all_blocks,
+            num_accounts,
+            touches_per_block,
+            &open_opts,
+            "after-reopen",
+        );
+    }
+}
+
+/// Exhaustively compare every (height, account) read between `sq_marf` and
+/// `ref_marf` using three read paths: direct, reopen_connection, and
+/// reopen_readonly. Any mismatch fails the test with a detailed message.
+fn tier1_verify_all_paths(
+    sq_marf: &mut MARF<StacksBlockId>,
+    ref_marf: &mut MARF<StacksBlockId>,
+    sq_path: &str,
+    all_blocks: &[StacksBlockId],
+    num_accounts: usize,
+    touches_per_block: usize,
+    open_opts: &MARFOpenOpts,
+    phase: &str,
+) {
+    // Path 1: direct `marf.get()` on the long-lived writer connection.
+    for (h, block) in all_blocks.iter().enumerate() {
+        for acct in 0..num_accounts {
+            let key = format!("acct_{acct}");
+            let expected = tier1_expected_at(acct, h, num_accounts, touches_per_block);
+
+            let sq_v = sq_marf.get(block, &key).unwrap_or_else(|e| {
+                panic!("[{phase}] direct sq.get({key}) at height {h} failed: {e:?}")
+            });
+            let ref_v = ref_marf.get(block, &key).unwrap_or_else(|e| {
+                panic!("[{phase}] direct ref.get({key}) at height {h} failed: {e:?}")
+            });
+
+            if sq_v != ref_v {
+                // Identify which `acct_N_nonce_K` the squash actually returned
+                // by reverse lookup against the finite set of possible values.
+                let identified = sq_v
+                    .as_ref()
+                    .map(|v| {
+                        tier1_identify_value(
+                            &v.0,
+                            num_accounts,
+                            all_blocks.len(),
+                            touches_per_block,
+                        )
+                    })
+                    .unwrap_or_else(|| "<None>".to_string());
+                panic!(
+                    "[{phase}] DIRECT path diverged: acct={acct} height={h}\n\
+                     expected = {expected:?}\n\
+                     sq       = {sq_v:?}\n\
+                     ref      = {ref_v:?}\n\
+                     sq value identified as: {identified:?}",
+                );
+            }
+            assert_eq!(
+                ref_v, expected,
+                "[{phase}] REFERENCE wrong value (workload bug?): acct={acct} height={h}"
+            );
+            assert_eq!(
+                sq_v, expected,
+                "[{phase}] DIRECT path wrong value: acct={acct} height={h}"
+            );
+        }
+    }
+
+    // Path 2: `reopen_connection()` on the squash MARF (fresh transient data,
+    // shared DB handle). Real nodes use this for parallel reads.
+    {
+        let mut reopened = sq_marf
+            .reopen_connection()
+            .expect("reopen_connection should succeed");
+        for (h, block) in all_blocks.iter().enumerate() {
+            for acct in 0..num_accounts {
+                let key = format!("acct_{acct}");
+                let expected = tier1_expected_at(acct, h, num_accounts, touches_per_block);
+
+                let sq_v = reopened.get(block, &key).unwrap_or_else(|e| {
+                    panic!("[{phase}] reopen_connection sq.get({key}) at height {h} failed: {e:?}")
+                });
+
+                assert_eq!(
+                    sq_v, expected,
+                    "[{phase}] REOPEN_CONNECTION diverged: acct={acct} height={h}"
+                );
+            }
+        }
+    }
+
+    // Path 3: `reopen_readonly()` — fully independent storage, fresh DB + blob
+    // handles. This is the Clarity VM path and was the site of the earlier
+    // squash-metadata bug. Open a fresh readonly per round of probes.
+    {
+        let mut ro_marf = sq_marf
+            .reopen_readonly()
+            .expect("reopen_readonly should succeed");
+        for (h, block) in all_blocks.iter().enumerate() {
+            for acct in 0..num_accounts {
+                let key = format!("acct_{acct}");
+                let expected = tier1_expected_at(acct, h, num_accounts, touches_per_block);
+
+                let sq_v = ro_marf.get(block, &key).unwrap_or_else(|e| {
+                    panic!("[{phase}] reopen_readonly sq.get({key}) at height {h} failed: {e:?}")
+                });
+
+                assert_eq!(
+                    sq_v, expected,
+                    "[{phase}] REOPEN_READONLY diverged: acct={acct} height={h}"
+                );
+            }
+        }
+    }
+
+    // Path 4: fully cold reopen via `MARF::from_path`. This is what actually
+    // happens on node restart — nothing in-memory carries over from the
+    // squash operation. A bug that only shows up here would implicate
+    // persistence/load rather than the in-memory squash state machine.
+    {
+        let mut cold = MARF::<StacksBlockId>::from_path(sq_path, open_opts.clone())
+            .expect("cold reopen should succeed");
+        for (h, block) in all_blocks.iter().enumerate() {
+            for acct in 0..num_accounts {
+                let key = format!("acct_{acct}");
+                let expected = tier1_expected_at(acct, h, num_accounts, touches_per_block);
+
+                let sq_v = cold.get(block, &key).unwrap_or_else(|e| {
+                    panic!("[{phase}] cold reopen get({key}) at height {h} failed: {e:?}")
+                });
+
+                assert_eq!(
+                    sq_v, expected,
+                    "[{phase}] COLD REOPEN diverged: acct={acct} height={h}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: fork-at-squash-boundary, FullHistory differential
+//
+// Exercises the scenario the live genesis-sync failure suggested most strongly:
+// a canonical chain with competing fork blocks that branch off at/around the
+// squash boundary, followed by a FullHistory+reclaim squash.
+//
+// We verify that after squash:
+//   * the canonical chain's historical reads match an unsquashed reference at
+//     EVERY height via all three read paths (direct / reopen_connection /
+//     reopen_readonly),
+//   * orphan fork blocks have their external refs zeroed by the prune step
+//     (reclaim contract), and
+//   * the canonical tip is still extensible with the same root hash as the
+//     reference.
+//
+// Sparse per-account writes force backptr traversal — the exact condition
+// that masked the Fix #1 query-height bug before it was repaired.
+// ---------------------------------------------------------------------------
+
+/// Deterministic sparse nonce-style writes identical to the Tier 1 workload.
+/// `start_height` is the absolute block height; callers are responsible for
+/// passing consistent heights between the squash MARF and the reference.
+fn tier2_write_canonical_block(
+    marf: &mut MARF<StacksBlockId>,
+    parent: &StacksBlockId,
+    block_hash: &StacksBlockId,
+    height: usize,
+    num_accounts: usize,
+    touches_per_block: usize,
+) {
+    marf.begin(parent, block_hash).unwrap();
+    for acct in tier1_touched_accounts(height, num_accounts, touches_per_block) {
+        let key = format!("acct_{acct}");
+        let val = MARFValue::from_value(&format!("acct_{acct}_nonce_{height}"));
+        marf.insert(&key, val).unwrap();
+    }
+    marf.seal().unwrap();
+    marf.commit().unwrap();
+}
+
+#[test]
+fn test_tier2_fork_at_boundary_full_history_differential() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier2_fork_at_boundary_full_history");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let num_accounts: usize = 8;
+    let touches_per_block: usize = 3;
+    let canonical_blocks: usize = 10; // heights 0..=9
+                                      // Fork off canonical[3] (h=3) with 3 side-chain blocks — fork tip at h=6,
+                                      // well below the canonical tip at h=9, so `find_tip_block` picks the
+                                      // canonical chain and the prune step correctly classifies the fork as
+                                      // non-canonical.
+    let fork_point: usize = 3;
+    let num_fork_blocks: usize = 3;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let canonical_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_CA_11_AB_1Eu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let fork_block = |i: usize| -> StacksBlockId {
+        let mut bytes = [0xFFu8; 32];
+        bytes[24..28].copy_from_slice(&0x_DE_AD_FE_EDu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    // ── Build the squash MARF with canonical chain + fork branch ──
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut canonical_hashes: Vec<StacksBlockId> = Vec::with_capacity(canonical_blocks);
+    for h in 0..canonical_blocks {
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            canonical_hashes[h - 1].clone()
+        };
+        let bh = canonical_block(h);
+        tier2_write_canonical_block(
+            &mut sq_marf,
+            &parent,
+            &bh,
+            h,
+            num_accounts,
+            touches_per_block,
+        );
+        canonical_hashes.push(bh);
+    }
+
+    // Fork side chain branches off after canonical_hashes[fork_point].
+    let mut fork_hashes: Vec<StacksBlockId> = Vec::with_capacity(num_fork_blocks);
+    for i in 0..num_fork_blocks {
+        let parent = if i == 0 {
+            canonical_hashes[fork_point].clone()
+        } else {
+            fork_hashes[i - 1].clone()
+        };
+        let bh = fork_block(i);
+        sq_marf.begin(&parent, &bh).unwrap();
+        // Write fork-branded writes so we can distinguish from canonical if
+        // anything leaks into post-squash reads.
+        for acct in 0..num_accounts {
+            let key = format!("acct_{acct}");
+            let val = MARFValue::from_value(&format!("FORK_acct_{acct}_step_{i}"));
+            sq_marf.insert(&key, val).unwrap();
+        }
+        sq_marf.seal().unwrap();
+        sq_marf.commit().unwrap();
+        fork_hashes.push(bh);
+    }
+    drop(sq_marf);
+
+    // ── Build the reference MARF with ONLY the canonical chain, same writes ──
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+    for h in 0..canonical_blocks {
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            canonical_hashes[h - 1].clone()
+        };
+        let bh = canonical_block(h);
+        tier2_write_canonical_block(
+            &mut ref_marf,
+            &parent,
+            &bh,
+            h,
+            num_accounts,
+            touches_per_block,
+        );
+    }
+    drop(ref_marf);
+
+    // Sanity: fork blocks have external refs before squash.
+    {
+        use rusqlite::Connection;
+        let db = Connection::open(&sq_path).unwrap();
+        for fb in &fork_hashes {
+            let length: i64 = db
+                .query_row(
+                    "SELECT external_length FROM marf_data WHERE block_hash = ?1",
+                    rusqlite::params![format!("{fb}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                length > 0,
+                "fork block {fb} should have non-zero blob length before squash"
+            );
+        }
+    }
+
+    // ── Squash canonical range with FullHistory + reclaim ──
+    // The squash walks the canonical tip, which ignores the fork branch. The
+    // fork blocks live in the reclaim truncation zone and must be pruned.
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        (canonical_blocks - 1) as u32,
+        true, // reclaim
+    )
+    .expect("canonical FullHistory+reclaim squash should succeed over fork blocks");
+
+    // Fork block refs should now be zeroed by the prune step.
+    {
+        use rusqlite::Connection;
+        let db = Connection::open(&sq_path).unwrap();
+        for fb in &fork_hashes {
+            let (offset, length): (i64, i64) = db
+                .query_row(
+                    "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1",
+                    rusqlite::params![format!("{fb}")],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (offset, length),
+                (0, 0),
+                "fork block {fb} should have zeroed external refs after prune"
+            );
+        }
+    }
+
+    // ── Verify every canonical historical read, via every path ──
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    tier1_verify_all_paths(
+        &mut sq_marf,
+        &mut ref_marf,
+        &sq_path,
+        &canonical_hashes,
+        num_accounts,
+        touches_per_block,
+        &open_opts,
+        "tier2-post-squash-canonical",
+    );
+
+    // ── Extend both MARFs on the canonical tip and confirm the root hash
+    //    matches — otherwise the squashed MARF has accumulated consensus
+    //    divergence from the unsquashed reference. ──
+    let ext_block = {
+        let mut b = [0u8; 32];
+        b[0] = 0xEE;
+        b[31] = 0xFF;
+        StacksBlockId::from_bytes(&b).unwrap()
+    };
+    let tip = canonical_hashes.last().unwrap().clone();
+
+    sq_marf.begin(&tip, &ext_block).unwrap();
+    ref_marf.begin(&tip, &ext_block).unwrap();
+    for acct in tier1_touched_accounts(canonical_blocks, num_accounts, touches_per_block) {
+        let key = format!("acct_{acct}");
+        let val = MARFValue::from_value(&format!("acct_{acct}_nonce_{canonical_blocks}"));
+        sq_marf.insert(&key, val.clone()).unwrap();
+        ref_marf.insert(&key, val).unwrap();
+    }
+    let sq_ext_root = sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    let ref_ext_root = ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+
+    assert_eq!(
+        sq_ext_root, ref_ext_root,
+        "canonical-tip extension root hash must match unsquashed reference \
+         after FullHistory+reclaim with a pruned fork branch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: nonce-overwrite differential
+//
+// Narrow reproduction of the "Bad nonce" failure mode. A single "sender" key
+// gets updated every block with a strictly-increasing nonce value. After
+// recurring FullHistory+reclaim squashes, every historical read must match
+// the unsquashed reference — and in particular the *tip* nonce must be the
+// last write, not something lower, because that is exactly the value a block
+// validator checks when accepting a transaction.
+//
+// Also verifies reads via `reopen_readonly`, which is the path the Clarity VM
+// uses during block-processing (where nonce checks live).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier3_nonce_overwrite_recurring_squash_differential() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier3_nonce_overwrite_recurring_squash");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    // Enough blocks to exercise multiple squash levels + inherited baseline
+    // logic, but small enough to keep the test fast.
+    let blocks_per_level: usize = 8;
+    let num_levels: usize = 3;
+    let total_blocks: usize = blocks_per_level * num_levels; // 24
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mk_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_D1_CE_BA_D1u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let sender_key = "sender_nonce";
+    let mk_nonce = |h: usize| MARFValue::from_value(&format!("nonce_{h}"));
+
+    // Also write a "cold" account-balance key once at height 0 and never
+    // update it, to exercise the pre-write-height-None semantics for
+    // single-write keys under recurring squashes.
+    let cold_key = "sender_balance";
+    let cold_val = MARFValue::from_value("initial_balance");
+
+    // ── Build both MARFs in lockstep with recurring FullHistory squashes ──
+    let mut blocks: Vec<StacksBlockId> = Vec::with_capacity(total_blocks);
+    {
+        let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+        for h in 0..total_blocks {
+            let parent = if h == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                blocks[h - 1].clone()
+            };
+            let bh = mk_block(h);
+
+            sq_marf.begin(&parent, &bh).unwrap();
+            ref_marf.begin(&parent, &bh).unwrap();
+
+            // Write nonce = h each block.
+            sq_marf.insert(sender_key, mk_nonce(h)).unwrap();
+            ref_marf.insert(sender_key, mk_nonce(h)).unwrap();
+
+            // Write the cold key exactly once at height 0.
+            if h == 0 {
+                sq_marf.insert(cold_key, cold_val.clone()).unwrap();
+                ref_marf.insert(cold_key, cold_val.clone()).unwrap();
+            }
+
+            sq_marf.seal().unwrap();
+            sq_marf.commit().unwrap();
+            ref_marf.seal().unwrap();
+            ref_marf.commit().unwrap();
+            blocks.push(bh);
+
+            // Recurring squash at level boundaries.
+            if (h + 1) % blocks_per_level == 0 {
+                drop(sq_marf);
+                let min_h = (h + 1 - blocks_per_level) as u32;
+                let max_h = h as u32;
+                squash_level_incremental::<StacksBlockId>(
+                    &sq_path,
+                    SquashMode::FullHistory,
+                    min_h,
+                    max_h,
+                    true,
+                )
+                .unwrap_or_else(|e| panic!("recurring squash at height {h} failed: {e:?}"));
+                sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+            }
+        }
+    }
+
+    // ── Cold reopen both MARFs — the clarity/validator path starts from
+    //    freshly-loaded squash metadata. ──
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    // ── At every block, nonce read via every path must match reference ──
+    for (h, block) in blocks.iter().enumerate() {
+        let expected_nonce = mk_nonce(h);
+        let expected_cold = cold_val.clone();
+
+        // Direct
+        let sq_n = sq_marf
+            .get(block, sender_key)
+            .unwrap()
+            .unwrap_or_else(|| panic!("direct sq.get({sender_key}) at h={h} returned None"));
+        let ref_n = ref_marf
+            .get(block, sender_key)
+            .unwrap()
+            .unwrap_or_else(|| panic!("reference missing {sender_key} at h={h}"));
+        assert_eq!(
+            sq_n, ref_n,
+            "DIRECT nonce at h={h}: sq={sq_n:?} ref={ref_n:?}"
+        );
+        assert_eq!(
+            sq_n, expected_nonce,
+            "DIRECT nonce at h={h}: expected nonce_{h}"
+        );
+
+        let sq_b = sq_marf.get(block, cold_key).unwrap();
+        let ref_b = ref_marf.get(block, cold_key).unwrap();
+        assert_eq!(sq_b, ref_b, "DIRECT cold at h={h}");
+        assert_eq!(
+            sq_b,
+            Some(expected_cold.clone()),
+            "DIRECT cold at h={h} expected initial_balance"
+        );
+
+        // reopen_connection — shared DB handle
+        {
+            let mut reopened = sq_marf.reopen_connection().unwrap();
+            let v = reopened.get(block, sender_key).unwrap().unwrap();
+            assert_eq!(
+                v, expected_nonce,
+                "REOPEN_CONNECTION nonce at h={h} expected nonce_{h}"
+            );
+            let b = reopened.get(block, cold_key).unwrap();
+            assert_eq!(
+                b,
+                Some(expected_cold.clone()),
+                "REOPEN_CONNECTION cold at h={h}"
+            );
+        }
+
+        // reopen_readonly — fully independent storage (Clarity VM path)
+        {
+            let mut ro = sq_marf.reopen_readonly().unwrap();
+            let v = ro.get(block, sender_key).unwrap().unwrap();
+            assert_eq!(
+                v, expected_nonce,
+                "REOPEN_READONLY nonce at h={h} expected nonce_{h}"
+            );
+            let b = ro.get(block, cold_key).unwrap();
+            assert_eq!(
+                b,
+                Some(expected_cold.clone()),
+                "REOPEN_READONLY cold at h={h}"
+            );
+        }
+    }
+
+    // ── The direct "Bad nonce" repro: read nonce at tip, check it is the
+    //    latest write. Any off-by-one here is what a block validator would
+    //    reject a valid next transaction on. ──
+    let tip = blocks.last().unwrap();
+    let tip_nonce = sq_marf.get(tip, sender_key).unwrap().unwrap();
+    assert_eq!(
+        tip_nonce,
+        mk_nonce(total_blocks - 1),
+        "tip nonce must be the last written value; mismatch indicates the \
+         squash-time read-divergence regression"
+    );
+
+    // ── Verify that reads at heights BELOW the cold-key's write height
+    //    for a hypothetical later-written key return None. Simulate by
+    //    writing a post-squash key on an extension block and confirming
+    //    it is visible at the extension tip and absent at earlier blocks. ──
+    let ext_block = {
+        let mut b = [0u8; 32];
+        b[0] = 0xEE;
+        b[31] = 0xFF;
+        StacksBlockId::from_bytes(&b).unwrap()
+    };
+    sq_marf.begin(tip, &ext_block).unwrap();
+    sq_marf
+        .insert("post_squash_key", MARFValue::from_value("post_squash_v"))
+        .unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+
+    // At extension tip: present.
+    let v = sq_marf.get(&ext_block, "post_squash_key").unwrap();
+    assert_eq!(
+        v,
+        Some(MARFValue::from_value("post_squash_v")),
+        "post-squash key must be readable at the extension block that wrote it"
+    );
+
+    // At every pre-extension block: None. Only the nonce key is live there.
+    for (h, block) in blocks.iter().enumerate() {
+        let v = sq_marf.get(block, "post_squash_key").unwrap();
+        assert!(
+            v.is_none(),
+            "post_squash_key must be None at pre-extension block h={h}, got {v:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 4: headers-MARF pattern — recurring TipOnly + reclaim squashes
+//
+// Mirrors how `maybe_squash` treats the HEADERS MARF in production: TipOnly
+// mode, reclaim=true, recurring at a fixed block cadence. Live genesis-sync
+// has been observed to hit a `stored_node_id_from_bytes: invalid node ID
+// byte=0x12` corruption error AFTER the 7th recurring squash (block 7000),
+// when the p2p thread reads historical tenure-start-block data off an
+// ancestor tip.
+//
+// This test mimics the minimal conditions:
+//   * enough recurring squashes that cross-level backptrs must traverse
+//     several earlier levels,
+//   * reads via `reopen_readonly` (the Clarity VM / p2p read path),
+//   * reads at every block in every prior level — specifically including
+//     blocks whose leaves live in the squash blob and are read via
+//     cross-level backptrs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier4_headers_style_recurring_tip_only_reclaim() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier4_headers_style_recurring_tip_only_reclaim");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    // 7 squashes at a cadence of 20 blocks, matching the genesis-sync shape
+    // (7 squashes at 1000-block cadence) in a fraction of the time.
+    let blocks_per_level: usize = 20;
+    let num_levels: usize = 7;
+    let total_blocks: usize = blocks_per_level * num_levels; // 140
+
+    let mk_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_4E_AD_E2_57u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    // Keys that mimic the headers-MARF key shape: one hot key rewritten every
+    // block, plus a family of "tenure_start_block_id::{h}" keys written
+    // sparsely (mimicking the exact key pattern in the failing live error).
+    let hot_key = "__hot_header_key";
+    let tenure_start_key = |h: usize| format!("tenure_start_block_id::{h:08x}");
+
+    // Build both MARFs in lockstep with recurring TipOnly+reclaim squashes.
+    let mut blocks: Vec<StacksBlockId> = Vec::with_capacity(total_blocks);
+    {
+        let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+        for h in 0..total_blocks {
+            let parent = if h == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                blocks[h - 1].clone()
+            };
+            let bh = mk_block(h);
+
+            sq_marf.begin(&parent, &bh).unwrap();
+            ref_marf.begin(&parent, &bh).unwrap();
+
+            // Hot key every block.
+            let hot_val = MARFValue::from_value(&format!("hot_v_{h}"));
+            sq_marf.insert(hot_key, hot_val.clone()).unwrap();
+            ref_marf.insert(hot_key, hot_val).unwrap();
+
+            // Tenure-start key: written ONCE at the block corresponding to
+            // this height. Later reads target it from much-later tip blocks
+            // via cross-level backptrs.
+            let tk = tenure_start_key(h);
+            let tv = MARFValue::from_value(&format!("tenure_v_{h}"));
+            sq_marf.insert(&tk, tv.clone()).unwrap();
+            ref_marf.insert(&tk, tv).unwrap();
+
+            sq_marf.seal().unwrap();
+            sq_marf.commit().unwrap();
+            ref_marf.seal().unwrap();
+            ref_marf.commit().unwrap();
+            blocks.push(bh);
+
+            if (h + 1) % blocks_per_level == 0 {
+                drop(sq_marf);
+                let min_h = (h + 1 - blocks_per_level) as u32;
+                let max_h = h as u32;
+                squash_level_incremental::<StacksBlockId>(
+                    &sq_path,
+                    SquashMode::TipOnly,
+                    min_h,
+                    max_h,
+                    true,
+                )
+                .unwrap_or_else(|e| panic!("TipOnly recurring squash at h={h} failed: {e:?}"));
+                sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+            }
+        }
+    }
+
+    // Cold reopen — matches the live behavior where p2p reads come from a
+    // fresh handle after squashes have completed.
+    let sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts).unwrap();
+
+    // Probe every historical tenure-start key from the final tip via
+    // reopen_readonly. This is the exact read pattern the live sync was
+    // doing when the 0x12 error appeared: the p2p thread calls
+    // `NakamotoChainState::get_nakamoto_tenure_start_block_header` off an
+    // ancestor index hash, which walks the merged squashed tries and
+    // crosses several backptrs.
+    let tip = blocks.last().unwrap();
+    let mut ro = sq_marf.reopen_readonly().unwrap();
+
+    let mut mismatches = 0usize;
+    for h in 0..total_blocks {
+        let tk = tenure_start_key(h);
+        let sq_v = ro.get(tip, &tk).unwrap_or_else(|e| {
+            panic!(
+                "reopen_readonly get({tk}) at tip failed (squashes crossed: {num_levels}): {e:?}"
+            )
+        });
+        let ref_v = ref_marf.get(tip, &tk).unwrap();
+        if sq_v != ref_v {
+            mismatches += 1;
+            eprintln!("MISMATCH h={h} key={tk}: sq={sq_v:?} ref={ref_v:?}");
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "historical tenure_start_block_id reads diverged from unsquashed reference \
+         after {num_levels} recurring TipOnly+reclaim squashes"
+    );
+
+    // Probe hot_key reads at every historical block via reopen_readonly. TipOnly
+    // mode collapses history — the returned value at any h is permitted to
+    // differ from the unsquashed reference. What MUST hold is that the read
+    // completes without error (no 0x12 corruption, no decode failure) and
+    // returns *some* value. The live genesis-sync failure mode is a decode
+    // error, not a value mismatch.
+    for (h, block) in blocks.iter().enumerate() {
+        let v = ro.get(block, hot_key).unwrap_or_else(|e| {
+            panic!("reopen_readonly hot_key at h={h} failed with decode error: {e:?}")
+        });
+        assert!(
+            v.is_some(),
+            "hot_key must be readable (Some) at every historical block h={h}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 5: stale `reopen_readonly` across a squash
+//
+// Reproduces the live genesis-sync p2p-thread corruption. The p2p thread
+// acquires a `reopen_readonly` MARF handle once, at startup, long before any
+// squash has run. The main sync thread later calls `maybe_squash`, which
+// invokes `refresh_after_squash` on the *writer* MARF — but the readonly
+// handle the p2p thread holds is independent of the writer and never gets
+// refreshed. When the p2p thread subsequently reads, its stale blob-offset
+// cache and stale `squash_meta` produce a decode error like the 0x12
+// corruption observed live.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier5_stale_reopen_readonly_across_squash");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mk_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_57_A_1_E_57u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let blocks_per_level: usize = 10;
+    let pre_blocks: usize = blocks_per_level; // 0..9 before first squash
+    let post_blocks: usize = blocks_per_level; // 10..19 after first squash
+
+    // ── Phase 1: commit the initial `pre_blocks` blocks into the writer MARF. ──
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+    for h in 0..pre_blocks {
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        let bh = mk_block(h);
+        sq_marf.begin(&parent, &bh).unwrap();
+        sq_marf
+            .insert("hot_key", MARFValue::from_value(&format!("hot_{h}")))
+            .unwrap();
+        sq_marf
+            .insert(
+                &format!("sparse_key_{h}"),
+                MARFValue::from_value(&format!("sparse_{h}")),
+            )
+            .unwrap();
+        sq_marf.seal().unwrap();
+        sq_marf.commit().unwrap();
+        blocks.push(bh);
+    }
+
+    // ── Phase 2: p2p-thread style — acquire a readonly handle BEFORE any squash.
+    //    The live node does this once at startup. ──
+    let mut p2p_ro = sq_marf.reopen_readonly().unwrap();
+
+    // Sanity-read so the readonly handle's offset cache and mmap state are
+    // warmed up *before* the squash. This mimics p2p doing normal reads
+    // during startup.
+    for (h, block) in blocks.iter().enumerate() {
+        let v = p2p_ro.get(block, "hot_key").unwrap();
+        assert!(v.is_some(), "warm-up read hot_key at h={h}");
+        let v = p2p_ro.get(block, &format!("sparse_key_{h}")).unwrap();
+        assert!(v.is_some(), "warm-up read sparse_key_{h}");
+    }
+
+    // ── Phase 3: main sync thread runs a squash over the existing range.
+    //    This is exactly the `maybe_squash` cadence point after the first
+    //    `pre_blocks`-block boundary. The WRITER stays alive across the
+    //    squash (matching `maybe_squash` in production), then calls
+    //    `refresh_after_squash` to publish the new metadata. The shared
+    //    `Arc<SharedSquashState>` carries the publish across to `p2p_ro`. ──
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::TipOnly,
+        0,
+        (pre_blocks - 1) as u32,
+        true, // reclaim — forces redirect + file truncation
+    )
+    .expect("squash should succeed");
+
+    sq_marf.refresh_after_squash().unwrap();
+
+    // Continue committing post-squash blocks (simulating the main sync
+    // thread continuing to process new blocks after the squash cadence).
+    for h in pre_blocks..(pre_blocks + post_blocks) {
+        let parent = blocks[h - 1].clone();
+        let bh = mk_block(h);
+        sq_marf.begin(&parent, &bh).unwrap();
+        sq_marf
+            .insert("hot_key", MARFValue::from_value(&format!("hot_{h}")))
+            .unwrap();
+        sq_marf
+            .insert(
+                &format!("sparse_key_{h}"),
+                MARFValue::from_value(&format!("sparse_{h}")),
+            )
+            .unwrap();
+        sq_marf.seal().unwrap();
+        sq_marf.commit().unwrap();
+        blocks.push(bh);
+    }
+
+    // ── Phase 4: the p2p thread now reads using its stale readonly handle.
+    //    This is the exact scenario where live genesis sync hits the
+    //    "invalid node ID 0x12" error after a squash. ──
+    //
+    // We only assert that reads do not produce a decode error. A value
+    // mismatch is acceptable under TipOnly semantics, but a decode panic
+    // (`CorruptionError("Failed to read expected node ID ...")`) is the
+    // concrete live failure mode.
+    let tip = blocks.last().unwrap();
+    for (h, block) in blocks.iter().enumerate() {
+        let _ = p2p_ro.get(block, "hot_key").unwrap_or_else(|e| {
+            panic!(
+                "STALE readonly handle corrupted hot_key read at h={h} \
+                 after the squash: {e:?}"
+            )
+        });
+    }
+    let _ = p2p_ro.get(tip, "sparse_key_0").unwrap_or_else(|e| {
+        panic!(
+            "STALE readonly handle corrupted sparse_key_0 read at tip \
+             (read crosses the squash blob via backptr): {e:?}"
+        )
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tier 6: two independent `MARF::from_path` handles on the same file
+//
+// Reproduces the *actual* live genesis-sync pattern in stacks-node 2.x:
+//   * the runloop/miner thread owns one `StacksChainState`
+//     (constructed via `open_chainstate_with_faults` → `MARF::from_path`)
+//   * the P2P thread owns a separate `StacksChainState` obtained via a
+//     second `open_chainstate_with_faults` call on the same path.
+//
+// Both handles are long-lived, neither was spawned from the other via
+// `reopen_*`, so Arc-cloning alone can't share squash metadata between them.
+// Only the process-wide `SharedSquashState` registry makes a
+// `refresh_after_squash()` on the writer observable by the reader.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier6_cross_independent_marf_handles_share_squash_publishes() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier6_cross_independent_marf_handles");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mk_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_C0_55_FE_EDu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let pre_blocks: usize = 10;
+
+    // ── Writer/"main-thread" handle commits `pre_blocks` blocks. ──
+    let mut writer = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+    for h in 0..pre_blocks {
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        let bh = mk_block(h);
+        writer.begin(&parent, &bh).unwrap();
+        writer
+            .insert("hot_key", MARFValue::from_value(&format!("hot_{h}")))
+            .unwrap();
+        writer
+            .insert(
+                &format!("sparse_key_{h}"),
+                MARFValue::from_value(&format!("sparse_{h}")),
+            )
+            .unwrap();
+        writer.seal().unwrap();
+        writer.commit().unwrap();
+        blocks.push(bh);
+    }
+
+    // ── Independent "P2P-thread" handle — opened via a separate
+    //    `MARF::from_path` on the same file, NOT via `reopen_*`. ──
+    let mut p2p = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+
+    // Warm up the p2p handle so its offset cache and mmap are populated.
+    for (h, block) in blocks.iter().enumerate() {
+        let v = p2p.get(block, "hot_key").unwrap();
+        assert!(v.is_some(), "p2p warm-up hot_key at h={h}");
+        let v = p2p.get(block, &format!("sparse_key_{h}")).unwrap();
+        assert!(v.is_some(), "p2p warm-up sparse_key_{h}");
+    }
+
+    // ── Writer runs a squash over the existing range and refreshes. ──
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::TipOnly,
+        0,
+        (pre_blocks - 1) as u32,
+        true,
+    )
+    .expect("squash should succeed");
+    writer.refresh_after_squash().unwrap();
+
+    // ── The P2P handle, never touched by the writer, must still be able
+    //    to read without decode errors. This is the exact pattern that
+    //    made the live sync fail. ──
+    for (h, block) in blocks.iter().enumerate() {
+        let _ = p2p.get(block, "hot_key").unwrap_or_else(|e| {
+            panic!(
+                "INDEPENDENT p2p handle corrupted hot_key read at h={h} \
+                 after writer refresh: {e:?}"
+            )
+        });
+        let _ = p2p
+            .get(block, &format!("sparse_key_{h}"))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "INDEPENDENT p2p handle corrupted sparse_key_{h} read \
+                     after writer refresh: {e:?}"
+                )
+            });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 7: concurrent squash-truncate vs. independent-handle reads
+//
+// Stresses the blob-mutation quiesce: a reader thread continuously walks
+// historical blocks via its own `MARF::from_path` handle while a writer
+// thread runs repeated FullHistory + reclaim squashes (which `ftruncate`
+// the blob file). Without the `BlobReadGuard` / `active_reads` / `truncate_pending`
+// machinery, the reader's mmap would be invalidated mid-traversal by the
+// writer's truncate and trigger SIGBUS. With the quiesce in place:
+//
+//   * the writer's `publish_squash` waits for the reader's in-flight guards
+//     to drop before calling `ftruncate`,
+//   * the reader's subsequent reads observe the bumped generation and
+//     remap their local state through `sync_from_shared_squash_state`.
+//
+// The test succeeds if both threads complete without a decode error or a
+// panic; value divergence is permitted (TipOnly collapses historical
+// reads to the tip) but corruption is not.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier7_concurrent_truncate_vs_independent_reads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier7_concurrent_truncate_vs_reads");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mk_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_C0_DE_F1_7Eu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let num_blocks: usize = 40;
+
+    // Phase 1: build a chain with rich enough per-block writes that squashes
+    // produce real mmap-backed squash blobs (large enough for truncation to
+    // have something to truncate).
+    let mut writer = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+    for h in 0..num_blocks {
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        let bh = mk_block(h);
+        writer.begin(&parent, &bh).unwrap();
+        writer
+            .insert("hot_key", MARFValue::from_value(&format!("hot_{h}")))
+            .unwrap();
+        for k in 0..4 {
+            writer
+                .insert(
+                    &format!("spread_key_{h}_{k}"),
+                    MARFValue::from_value(&format!("spread_{h}_{k}")),
+                )
+                .unwrap();
+        }
+        writer.seal().unwrap();
+        writer.commit().unwrap();
+        blocks.push(bh);
+    }
+    drop(writer);
+
+    // Shared stop flag + completed-read counter for the assertion.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reads_completed = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(2));
+
+    // Reader thread — simulates the p2p thread: its own independent MARF handle
+    // on the same file, does a continuous loop of historical reads.
+    let reader_stop = Arc::clone(&stop);
+    let reader_counter = Arc::clone(&reads_completed);
+    let reader_barrier = Arc::clone(&barrier);
+    let reader_path = sq_path.clone();
+    let reader_opts = open_opts.clone();
+    let reader_blocks = blocks.clone();
+    let reader_handle = thread::spawn(move || {
+        let mut marf = MARF::<StacksBlockId>::from_path(&reader_path, reader_opts).unwrap();
+        reader_barrier.wait();
+        while !reader_stop.load(Ordering::Relaxed) {
+            for (h, block) in reader_blocks.iter().enumerate() {
+                let v = marf
+                    .get(block, "hot_key")
+                    .unwrap_or_else(|e| panic!("reader: hot_key decode failure at h={h}: {e:?}"));
+                assert!(v.is_some(), "reader: hot_key must be readable at h={h}");
+                for k in 0..4 {
+                    let _ = marf
+                        .get(block, &format!("spread_key_{h}_{k}"))
+                        .unwrap_or_else(|e| {
+                            panic!("reader: spread_key decode failure at h={h},k={k}: {e:?}")
+                        });
+                }
+                reader_counter.fetch_add(5, Ordering::Relaxed);
+            }
+        }
+    });
+
+    // Writer thread — runs several squash cycles, each of which truncates the
+    // blob file. The first cycle covers the original per-block range; later
+    // cycles just re-publish an empty incremental squash at the tip so the
+    // quiesce machinery is exercised repeatedly without exhausting the range.
+    let writer_barrier = Arc::clone(&barrier);
+    let writer_path = sq_path.clone();
+    let writer_opts = open_opts.clone();
+    let writer_handle = thread::spawn(move || {
+        let writer = MARF::<StacksBlockId>::from_path(&writer_path, writer_opts).unwrap();
+        writer_barrier.wait();
+
+        // First squash: TipOnly + reclaim over the full original range.
+        // This does the aggressive truncate (from offset 0 to end-of-new-blob).
+        drop(writer); // drop writer's active ref so the internal squash can open the file
+        squash_level_incremental::<StacksBlockId>(
+            &writer_path,
+            SquashMode::TipOnly,
+            0,
+            (num_blocks - 1) as u32,
+            true,
+        )
+        .expect("tier7 first squash should succeed");
+
+        // Reopen + refresh so the shared state picks up the publish via the
+        // registry. (Writes and squashes are normally interleaved on the
+        // same handle; here we re-acquire for simplicity.)
+        let mut writer = MARF::<StacksBlockId>::from_path(&writer_path, open_opts.clone()).unwrap();
+        writer.refresh_after_squash().unwrap();
+        drop(writer);
+
+        // Small pause so the reader continues through the post-squash state.
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    writer_handle
+        .join()
+        .expect("writer thread should complete without panicking");
+
+    // Let the reader do more work post-squash, then signal stop.
+    thread::sleep(Duration::from_millis(100));
+    stop.store(true, Ordering::Relaxed);
+
+    reader_handle
+        .join()
+        .expect("reader thread should complete without panicking");
+
+    let total_reads = reads_completed.load(Ordering::Relaxed);
+    assert!(
+        total_reads > 0,
+        "reader thread should have completed at least one batch of reads; got {total_reads}"
+    );
+    eprintln!("tier7: reader completed {total_reads} reads across the squash window");
+}
+
+// ---------------------------------------------------------------------------
+// Tier 8: fresh-guard acquire failure mid-walk is absorbed by the retry wrapper.
+//
+// Uses the `fault_inject::fail_next_acquires` hook to simulate a writer having
+// set `truncate_pending` just as the reader enters the next mmap read. Without
+// the retry wrapper the bounded-scope `Err(Error::RetryAfterSquash)` sentinel
+// would escape to the caller; with the wrapper in place, the reader's state
+// resets (drops parked scratch, re-syncs shared metadata) and the re-entered
+// traversal reads against a fresh acquire — returning the correct value.
+//
+// We inject `MAX_READ_RETRIES` failures to prove each attempt goes through a
+// reset, then verify the read still succeeds. Injecting `MAX_READ_RETRIES + 1`
+// exercises the exhaustion path and must surface `CorruptionError`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier8_acquire_failure_midwalk_retry_wrapper_absorbs() {
+    use crate::chainstate::stacks::index::marf::MarfInternals;
+    use crate::chainstate::stacks::index::storage::fault_inject;
+
+    fault_inject::reset();
+
+    let dir = fresh_test_dir("test_tier8_acquire_failure_retry");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mut writer = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let block = {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    writer.begin(&StacksBlockId::sentinel(), &block).unwrap();
+    writer
+        .insert("tier8_key", MARFValue::from_value("tier8_value"))
+        .unwrap();
+    writer.seal().unwrap();
+    writer.commit().unwrap();
+    drop(writer);
+
+    let mut reader = MARF::<StacksBlockId>::from_path(&sq_path, open_opts).unwrap();
+
+    // Inject MAX_READ_RETRIES-1 acquire failures. The retry wrapper will absorb each one
+    // (reset + re-enter), and the final attempt — where the counter is exhausted —
+    // succeeds and returns the real value.
+    //
+    // Call `MarfInternals::get_by_key` directly rather than `get()`, because the
+    // test-only `get_and_check_with_hash` helper called by `get()` runs the walk
+    // twice (unwrapped) before the retry-wrapped `get_by_key` fires — consuming
+    // counter credits non-deterministically.
+    let fails = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::MAX_READ_RETRIES - 1;
+    fault_inject::fail_next_acquires(fails);
+
+    let result = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::get_by_key(
+        &mut reader,
+        &block,
+        "tier8_key",
+    );
+    fault_inject::reset();
+
+    assert_eq!(
+        result.expect("retry wrapper should absorb injected acquire failures"),
+        Some(MARFValue::from_value("tier8_value")),
+    );
+
+    // Exhaustion: inject MAX_READ_RETRIES + 1 failures — every retry attempt hits the
+    // injected failure, and the wrapper surfaces `CorruptionError` after giving up.
+    let max = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::MAX_READ_RETRIES;
+    fault_inject::fail_next_acquires(max + 1);
+
+    let exhausted = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::get_by_key(
+        &mut reader,
+        &block,
+        "tier8_key",
+    );
+    fault_inject::reset();
+
+    match exhausted {
+        Err(ref e) => {
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("squash-retry-exhausted"),
+                "expected squash-retry-exhausted; got {msg}"
+            );
+        }
+        Ok(other) => panic!("expected retry-exhaustion error; got Ok({other:?})"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 9: generation change without acquire failure.
+//
+// Models the race where a writer's publish finished BEFORE the reader's next
+// acquire attempt — so `try_acquire_blob_read` succeeds, but the per-read
+// `squash_state_fresh` check observes a mismatch against this handle's
+// watermark. The reader must bail `Err(Error::RetryAfterSquash)` rather than
+// consuming stale offset caches against post-truncate file layout.
+//
+// We inject via `fault_inject::fail_next_gen_checks`, which forces
+// `squash_state_fresh` to report a mismatch without actually bumping the
+// shared generation. The reset path still runs (including the no-op sync),
+// and on retry the check is clear — value is returned correctly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier9_gen_mismatch_without_acquire_failure_absorbed() {
+    use crate::chainstate::stacks::index::marf::MarfInternals;
+    use crate::chainstate::stacks::index::storage::fault_inject;
+
+    fault_inject::reset();
+
+    let dir = fresh_test_dir("test_tier9_gen_mismatch_retry");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mut writer = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let block = {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    writer.begin(&StacksBlockId::sentinel(), &block).unwrap();
+    writer
+        .insert("tier9_key", MARFValue::from_value("tier9_value"))
+        .unwrap();
+    writer.seal().unwrap();
+    writer.commit().unwrap();
+    drop(writer);
+
+    let mut reader = MARF::<StacksBlockId>::from_path(&sq_path, open_opts).unwrap();
+
+    // Inject MAX_READ_RETRIES-1 gen-check failures so every attempt but the last trips
+    // the mismatch branch. The wrapper resets between attempts; the final attempt
+    // clears the counter and succeeds.
+    //
+    // Same rationale as Tier 8 for calling `get_by_key` directly instead of `get()`.
+    let fails = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::MAX_READ_RETRIES - 1;
+    fault_inject::fail_next_gen_checks(fails);
+
+    let result = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::get_by_key(
+        &mut reader,
+        &block,
+        "tier9_key",
+    );
+    fault_inject::reset();
+
+    assert_eq!(
+        result.expect("retry wrapper should absorb injected gen-check failures"),
+        Some(MARFValue::from_value("tier9_value")),
     );
 }

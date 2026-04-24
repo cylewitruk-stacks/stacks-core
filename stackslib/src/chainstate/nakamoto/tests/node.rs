@@ -1257,7 +1257,7 @@ impl TestStacksNode {
         // Actually attempt to process the accepted block added to nakamoto_staging_blocks
         // Will attempt to execute the transactions via a call to append_block
         let res = NakamotoChainState::process_next_nakamoto_block(
-            &mut *coord.chain_state_db.lock(),
+            &mut coord.chain_state_db,
             &mut coord.sortition_db,
             &coord.canonical_sortition_tip.clone().expect(
                 "FAIL: processing a new Stacks block, but don't have a canonical sortition tip",

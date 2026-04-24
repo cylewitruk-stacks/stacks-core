@@ -1570,10 +1570,11 @@ impl StacksChainState {
         let index_block_hash =
             StacksBlockHeader::make_index_block_hash(consensus_hash, &block_hash);
 
-        let attachable = {
+        let (attachable, parent_is_orphaned) = {
             // if this block has an unprocessed staging parent, then it's not attachable until its parent is.
             let has_unprocessed_parent_sql = "SELECT anchored_block_hash FROM staging_blocks WHERE anchored_block_hash = ?1 AND consensus_hash = ?2 AND processed = 0 AND orphaned = 0 LIMIT 1";
-            let has_parent_sql = "SELECT anchored_block_hash FROM staging_blocks WHERE anchored_block_hash = ?1 AND consensus_hash = ?2 LIMIT 1";
+            let has_live_parent_sql = "SELECT anchored_block_hash FROM staging_blocks WHERE anchored_block_hash = ?1 AND consensus_hash = ?2 AND orphaned = 0 LIMIT 1";
+            let parent_orphaned_sql = "SELECT orphaned FROM staging_blocks WHERE anchored_block_hash = ?1 AND consensus_hash = ?2 LIMIT 1";
             let has_parent_args = params![block.header.parent_block, parent_consensus_hash];
             let has_unprocessed_parent_rows = query_row_columns::<BlockHeaderHash, _>(
                 tx,
@@ -1582,26 +1583,35 @@ impl StacksChainState {
                 "anchored_block_hash",
             )
             .map_err(Error::DBError)?;
-            let has_parent_rows = query_row_columns::<BlockHeaderHash, _>(
+
+            let has_live_parent_rows = query_row_columns::<BlockHeaderHash, _>(
                 tx,
-                has_parent_sql,
+                has_live_parent_sql,
                 has_parent_args,
                 "anchored_block_hash",
             )
             .map_err(Error::DBError)?;
-            let parent_not_in_staging_blocks =
-                has_parent_rows.is_empty() && block.header.parent_block != FIRST_STACKS_BLOCK_HASH;
-            if !has_unprocessed_parent_rows.is_empty() || parent_not_in_staging_blocks {
+
+            let parent_orphaned_rows =
+                query_row_columns::<i64, _>(tx, parent_orphaned_sql, has_parent_args, "orphaned")
+                    .map_err(Error::DBError)?;
+
+            let parent_is_orphaned = parent_orphaned_rows.first().copied() == Some(1);
+
+            let parent_not_in_live_staging_blocks = has_live_parent_rows.is_empty()
+                && block.header.parent_block != FIRST_STACKS_BLOCK_HASH;
+
+            if !has_unprocessed_parent_rows.is_empty() || parent_not_in_live_staging_blocks {
                 // still have unprocessed parent OR its parent is not in staging_blocks at all -- this block is not attachable
                 debug!(
                     "Store non-attachable anchored block {}/{}",
                     consensus_hash,
                     block.block_hash()
                 );
-                0
+                (0, parent_is_orphaned)
             } else {
                 // no unprocessed parents -- this block is potentially attachable
-                1
+                (1, false)
             }
         };
 
@@ -1659,6 +1669,21 @@ impl StacksChainState {
 
         tx.execute(children_sql, &children_args)
             .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+
+        if parent_is_orphaned {
+            debug!(
+                "Reject newly-staged block {}/{} because parent {}/{} is already orphaned",
+                consensus_hash, &block_hash, parent_consensus_hash, &block.header.parent_block
+            );
+            StacksChainState::set_block_processed(
+                tx,
+                None,
+                blocks_path,
+                consensus_hash,
+                &block_hash,
+                false,
+            )?;
+        }
 
         Ok(())
     }
@@ -3756,6 +3781,8 @@ impl StacksChainState {
         test_debug!("Find next staging block");
 
         let mut to_delete = vec![];
+        let mut to_orphan = vec![];
+        let mut to_demote = vec![];
 
         // put this in a block so stmt goes out of scope before we start to delete PoX-orphaned
         // blocks
@@ -3848,6 +3875,38 @@ impl StacksChainState {
                             }
                             None => {
                                 // no parent processed for this block
+                                let parent_state_sql = "SELECT orphaned FROM staging_blocks WHERE anchored_block_hash = ?1 AND consensus_hash = ?2 LIMIT 1";
+                                let parent_state_args = params![
+                                    &candidate.parent_anchored_block_hash,
+                                    &candidate.parent_consensus_hash
+                                ];
+                                let parent_state = query_row_columns::<i64, _>(
+                                    blocks_tx,
+                                    parent_state_sql,
+                                    parent_state_args,
+                                    "orphaned",
+                                )
+                                .map_err(Error::DBError)?;
+
+                                if parent_state.first().copied() == Some(1) {
+                                    to_orphan.push((
+                                        candidate.consensus_hash.clone(),
+                                        candidate.anchored_block_hash.clone(),
+                                    ));
+                                } else {
+                                    debug!(
+                                        "Demote stale attachable block {}/{}: parent {}/{} is not processed yet",
+                                        &candidate.consensus_hash,
+                                        &candidate.anchored_block_hash,
+                                        &candidate.parent_consensus_hash,
+                                        &candidate.parent_anchored_block_hash
+                                    );
+                                    to_demote.push((
+                                        candidate.consensus_hash.clone(),
+                                        candidate.anchored_block_hash.clone(),
+                                    ));
+                                }
+
                                 debug!(
                                     "No such parent {}/{} for block, cannot process",
                                     &candidate.parent_consensus_hash,
@@ -3897,6 +3956,30 @@ impl StacksChainState {
                     }
                 }
             }
+        }
+
+        for (consensus_hash, anchored_block_hash) in to_demote.into_iter() {
+            let sql = "UPDATE staging_blocks SET attachable = 0 WHERE consensus_hash = ?1 AND anchored_block_hash = ?2";
+            blocks_tx
+                .execute(sql, params![&consensus_hash, &anchored_block_hash])
+                .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+        }
+
+        for (consensus_hash, anchored_block_hash) in to_orphan.into_iter() {
+            info!(
+                "Orphan stale attachable block {consensus_hash}/{anchored_block_hash}: its parent is already orphaned"
+            );
+            let _ = StacksChainState::set_block_processed(
+                blocks_tx,
+                None,
+                blocks_path,
+                &consensus_hash,
+                &anchored_block_hash,
+                false,
+            )
+            .inspect_err(|e| {
+                warn!("Failed to orphan {consensus_hash}/{anchored_block_hash}: {e:?}")
+            });
         }
 
         for (consensus_hash, anchored_block_hash) in to_delete.into_iter() {
@@ -9517,6 +9600,147 @@ pub mod test {
                 assert!(!res);
             }
         }
+    }
+
+    #[test]
+    fn stacks_db_staging_block_child_of_orphaned_parent_not_attachable() {
+        let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
+        let privk = StacksPrivateKey::from_hex(
+            "eb05c83546fdd2c79f10f5ad5434a90dd28f7e3acb7c092157aa1bc3656b012c01",
+        )
+        .unwrap();
+
+        let mut block_1 = make_empty_coinbase_block(&privk);
+        let mut block_2 = make_empty_coinbase_block(&privk);
+
+        block_1.header.parent_block = FIRST_STACKS_BLOCK_HASH;
+        block_2.header.parent_block = block_1.block_hash();
+
+        let consensus_hashes = [ConsensusHash([2u8; 20]), ConsensusHash([3u8; 20])];
+        let parent_consensus_hashes = [FIRST_BURNCHAIN_CONSENSUS_HASH, ConsensusHash([2u8; 20])];
+
+        store_staging_block(
+            &mut chainstate,
+            &consensus_hashes[0],
+            &block_1,
+            &parent_consensus_hashes[0],
+            1,
+            2,
+        );
+
+        set_block_processed(
+            &mut chainstate,
+            &consensus_hashes[0],
+            &block_1.block_hash(),
+            false,
+        );
+
+        store_staging_block(
+            &mut chainstate,
+            &consensus_hashes[1],
+            &block_2,
+            &parent_consensus_hashes[1],
+            1,
+            2,
+        );
+
+        assert_block_stored_rejected(&mut chainstate, &consensus_hashes[1], &block_2);
+        assert!(!StacksChainState::has_staging_block(
+            chainstate.db(),
+            &consensus_hashes[1],
+            &block_2.block_hash(),
+        )
+        .unwrap());
+        assert!(StacksChainState::is_block_orphaned(
+            chainstate.db(),
+            &consensus_hashes[1],
+            &block_2.block_hash(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn stacks_db_find_next_staging_block_orphans_stale_attachable_child() {
+        let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
+        let privk = StacksPrivateKey::from_hex(
+            "eb05c83546fdd2c79f10f5ad5434a90dd28f7e3acb7c092157aa1bc3656b012c01",
+        )
+        .unwrap();
+        let mut sortdb = SortitionDB::connect_test(100, &BurnchainHeaderHash([0u8; 32])).unwrap();
+        let consensus_hash = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn())
+            .unwrap()
+            .consensus_hash;
+
+        let mut block_1 = make_empty_coinbase_block(&privk);
+        let mut block_2 = make_empty_coinbase_block(&privk);
+
+        block_1.header.parent_block = FIRST_STACKS_BLOCK_HASH;
+        block_2.header.parent_block = block_1.block_hash();
+
+        store_staging_block(
+            &mut chainstate,
+            &consensus_hash,
+            &block_1,
+            &FIRST_BURNCHAIN_CONSENSUS_HASH,
+            1,
+            2,
+        );
+        set_block_processed(
+            &mut chainstate,
+            &consensus_hash,
+            &block_1.block_hash(),
+            false,
+        );
+
+        store_staging_block(
+            &mut chainstate,
+            &consensus_hash,
+            &block_2,
+            &consensus_hash,
+            1,
+            2,
+        );
+
+        let tx = chainstate.db_tx_begin().unwrap();
+        tx.execute(
+            "UPDATE staging_blocks SET processed = 0, orphaned = 0, attachable = 1 WHERE consensus_hash = ?1 AND anchored_block_hash = ?2",
+            params![&consensus_hash, &block_2.block_hash()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let stale_child = StacksChainState::load_staging_block(
+            chainstate.db(),
+            &chainstate.blocks_path,
+            &consensus_hash,
+            &block_2.block_hash(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(stale_child.attachable);
+
+        let blocks_path = chainstate.blocks_path.clone();
+        let mut block_tx = chainstate.index_tx_begin();
+        let mut sort_tx = sortdb.tx_begin_at_tip();
+        let next =
+            StacksChainState::find_next_staging_block(&mut block_tx, &blocks_path, &mut sort_tx)
+                .unwrap();
+        assert!(next.is_none());
+        block_tx.commit().unwrap();
+
+        assert_block_stored_rejected(&mut chainstate, &consensus_hash, &block_2);
+        assert!(!StacksChainState::has_staging_block(
+            chainstate.db(),
+            &consensus_hash,
+            &block_2.block_hash(),
+        )
+        .unwrap());
+        assert!(StacksChainState::is_block_orphaned(
+            chainstate.db(),
+            &consensus_hash,
+            &block_2.block_hash(),
+        )
+        .unwrap());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use stacks::chainstate::burn::operations::LeaderKeyRegisterOp;
 use stacks::chainstate::burn::BlockSnapshot;
 use stacks::chainstate::coordinator::comm::CoordinatorChannels;
 use stacks::chainstate::stacks::db::unconfirmed::UnconfirmedTxMap;
-use stacks::chainstate::stacks::db::{SharedChainstate, StacksChainState};
+use stacks::chainstate::stacks::db::{SharedUnconfirmedState, StacksChainState};
 use stacks::chainstate::stacks::miner::MinerStatus;
 use stacks::config::{BurnchainConfig, MinerConfig};
 use stacks::net::NetworkResult;
@@ -77,10 +77,16 @@ pub struct Globals<T> {
     /// Initiative flag.
     /// Raised when the main loop should wake up and do something.
     initiative: Arc<Mutex<Option<String>>>,
-    /// Shared chainstate handle.
-    /// All threads access the single `StacksChainState` instance through this
-    /// mutex-protected wrapper. Set during boot after `open_and_exec()`.
-    shared_chainstate: Option<SharedChainstate>,
+    /// Cross-thread shared slot for in-memory unconfirmed/microblock state.
+    ///
+    /// Threads (relayer, p2p, miner) each open their **own** `StacksChainState` handle at
+    /// thread-start via [`StacksChainState::open_with_shared_unconfirmed`], passing this slot
+    /// in. All handles thus see the same `UnconfirmedState` through the slot's inner mutex,
+    /// while each thread holds its confirmed-state handle exclusively (no outer mutex,
+    /// no cross-thread serialization on confirmed reads/writes).
+    ///
+    /// Set during boot before any thread is spawned.
+    shared_unconfirmed: Option<SharedUnconfirmedState>,
 }
 
 // Need to manually implement Clone, because [derive(Clone)] requires
@@ -105,7 +111,7 @@ impl<T> Clone for Globals<T> {
             estimated_winning_probs: self.estimated_winning_probs.clone(),
             previous_best_tips: self.previous_best_tips.clone(),
             initiative: self.initiative.clone(),
-            shared_chainstate: self.shared_chainstate.clone(),
+            shared_unconfirmed: self.shared_unconfirmed.clone(),
         }
     }
 }
@@ -139,22 +145,30 @@ impl<T> Globals<T> {
             estimated_winning_probs: Arc::new(Mutex::new(HashMap::new())),
             previous_best_tips: Arc::new(Mutex::new(BTreeMap::new())),
             initiative: Arc::new(Mutex::new(None)),
-            shared_chainstate: None,
+            shared_unconfirmed: None,
         }
     }
 
-    /// Set the shared chainstate handle. Called once during boot after
-    /// `StacksChainState::open_and_exec()` completes.
-    pub fn set_shared_chainstate(&mut self, chainstate: SharedChainstate) {
-        self.shared_chainstate = Some(chainstate);
+    /// Install the cross-thread shared unconfirmed-state slot. Called once during boot,
+    /// before any worker thread is spawned, with the slot extracted from the bootstrap
+    /// chainstate (`bootstrap.unconfirmed_state.clone()` — Arc bump).
+    pub fn set_shared_unconfirmed(&mut self, shared_unconfirmed: SharedUnconfirmedState) {
+        self.shared_unconfirmed = Some(shared_unconfirmed);
     }
 
-    /// Get the shared chainstate handle.
-    /// Panics if called before `set_shared_chainstate()`.
-    pub fn get_shared_chainstate(&self) -> &SharedChainstate {
-        self.shared_chainstate
+    /// Snapshot of the shared unconfirmed slot. Cheap (Arc clone). Threads call this once
+    /// at startup and pass the result to [`StacksChainState::open_with_shared_unconfirmed`]
+    /// so their independent chainstate handle participates in the shared in-memory view.
+    ///
+    /// Panics if called before [`Self::set_shared_unconfirmed`].
+    pub fn get_shared_unconfirmed(&self) -> SharedUnconfirmedState {
+        self.shared_unconfirmed
             .as_ref()
-            .expect("BUG: shared_chainstate not initialized — set_shared_chainstate() was not called during boot")
+            .expect(
+                "BUG: shared_unconfirmed not initialized — set_shared_unconfirmed() \
+                 was not called during boot",
+            )
+            .clone()
     }
 
     /// Does the inventory sync watcher think we still need to
@@ -211,7 +225,8 @@ impl<T> Globals<T> {
     /// need to do the disk I/O needed to instantiate the unconfirmed state trie they represent.
     /// Clears the unconfirmed transactions, and replaces them with the chainstate's.
     pub fn send_unconfirmed_txs(&self, chainstate: &StacksChainState) {
-        let Some(ref unconfirmed) = chainstate.unconfirmed_state else {
+        let unconfirmed_guard = chainstate.unconfirmed_state.lock();
+        let Some(ref unconfirmed) = *unconfirmed_guard else {
             return;
         };
         let mut txs = self.unconfirmed_txs.lock().unwrap_or_else(|e| {
@@ -226,7 +241,8 @@ impl<T> Globals<T> {
     /// Called by the p2p thread to accept the unconfirmed tx state processed by the relayer.
     /// Puts the shared unconfirmed transactions to chainstate.
     pub fn recv_unconfirmed_txs(&self, chainstate: &mut StacksChainState) {
-        let Some(ref mut unconfirmed) = chainstate.unconfirmed_state else {
+        let mut unconfirmed_guard = chainstate.unconfirmed_state.lock();
+        let Some(ref mut unconfirmed) = *unconfirmed_guard else {
             return;
         };
         let txs = self.unconfirmed_txs.lock().unwrap_or_else(|e| {

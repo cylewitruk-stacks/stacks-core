@@ -67,6 +67,7 @@ use super::{Config, Error as NakamotoNodeError, EventDispatcher, Keychain};
 use crate::nakamoto_node::signer_coordinator::SignerCoordinator;
 use crate::nakamoto_node::VRF_MOCK_MINER_KEY;
 use crate::neon_node;
+use crate::neon_node::open_chainstate_with_faults_shared;
 use crate::run_loop::nakamoto::Globals;
 use crate::run_loop::RegisteredKey;
 
@@ -507,7 +508,15 @@ impl BlockMinerThread {
         let mut stackerdbs = StackerDBs::connect(&self.config.get_stacker_db_file_path(), true)?;
         let mut last_block_rejected = false;
 
-        let reward_set = self.load_signer_set()?;
+        // Open this thread's own chainstate. Owned locally to the miner thread; threaded
+        // through `attempt_mine_and_propose_block` and helpers as `&mut *chain_state` so
+        // method receivers (`&mut self`) and the chainstate borrow stay disjoint.
+        let mut chain_state = open_chainstate_with_faults_shared(
+            &self.config,
+            self.globals.get_shared_unconfirmed(),
+        )?;
+
+        let reward_set = self.load_signer_set(&mut chain_state)?;
         let Some(miner_privkey) = self.config.miner.mining_key.clone() else {
             return Err(NakamotoNodeError::MinerConfigurationFailed(
                 "No mining key configured, cannot mine",
@@ -543,6 +552,7 @@ impl BlockMinerThread {
             if let Err(e) = self.attempt_mine_and_propose_block(
                 &mut coordinator,
                 &sortdb,
+                &mut chain_state,
                 &mut stackerdbs,
                 &mut last_block_rejected,
                 &reward_set,
@@ -588,13 +598,12 @@ impl BlockMinerThread {
         &mut self,
         coordinator: &mut SignerCoordinator,
         sortdb: &SortitionDB,
+        chain_state: &mut StacksChainState,
         stackerdbs: &mut StackerDBs,
         last_block_rejected: &mut bool,
         reward_set: &RewardSet,
     ) -> Result<(), NakamotoNodeError> {
         Self::fault_injection_miner_stall();
-        let shared_chainstate = self.globals.get_shared_chainstate().clone();
-        let mut chain_state = shared_chainstate.lock();
         // Late block tenures are initiated only to issue the BlockFound
         //  tenure change tx (because they can be immediately extended to
         //  the next burn view). This checks whether or not we're in such a
@@ -608,7 +617,7 @@ impl BlockMinerThread {
         // actual tenure winner committed to yet. So, before attempting to
         // mock mine, check if the parent is processed.
         if self.config.get_node_config(false).mock_mining
-            && !self.is_parent_processed(&mut chain_state)?
+            && !self.is_parent_processed(chain_state)?
         {
             info!("Mock miner has not processed parent block yet, sleeping and trying again");
             thread::sleep(Duration::from_millis(ABORT_TRY_AGAIN_MS));
@@ -638,7 +647,7 @@ impl BlockMinerThread {
             }
         }
 
-        let Some(new_block) = self.mine_block_and_handle_result(coordinator)? else {
+        let Some(new_block) = self.mine_block_and_handle_result(coordinator, chain_state)? else {
             // We should reattempt to mine
             return Ok(());
         };
@@ -646,6 +655,7 @@ impl BlockMinerThread {
         if !self.propose_new_block_and_broadcast(
             coordinator,
             sortdb,
+            chain_state,
             stackerdbs,
             last_block_rejected,
             reward_set,
@@ -656,7 +666,7 @@ impl BlockMinerThread {
         }
 
         // Wait until the last block has been mined and processed
-        self.wait_for_last_block_mined_and_processed(&mut chain_state)?;
+        self.wait_for_last_block_mined_and_processed(chain_state)?;
 
         Ok(())
     }
@@ -693,10 +703,11 @@ impl BlockMinerThread {
     fn mine_block_and_handle_result(
         &mut self,
         coordinator: &mut SignerCoordinator,
+        chain_state: &mut StacksChainState,
     ) -> Result<Option<NakamotoBlock>, NakamotoNodeError> {
-        match self.mine_block(coordinator) {
+        match self.mine_block(coordinator, chain_state) {
             Ok(x) => {
-                if !self.validate_timestamp(&x)? {
+                if !self.validate_timestamp(chain_state, &x)? {
                     info!("Block mined too quickly. Will try again.";
                         "block_timestamp" => x.header.timestamp,
                     );
@@ -781,6 +792,7 @@ impl BlockMinerThread {
         &mut self,
         coordinator: &mut SignerCoordinator,
         sortdb: &SortitionDB,
+        chain_state: &mut StacksChainState,
         stackerdbs: &mut StackerDBs,
         last_block_rejected: &mut bool,
         reward_set: &RewardSet,
@@ -792,6 +804,7 @@ impl BlockMinerThread {
             coordinator,
             &mut new_block,
             sortdb,
+            chain_state,
             stackerdbs,
         ) {
             Ok(x) => x,
@@ -833,7 +846,7 @@ impl BlockMinerThread {
         *last_block_rejected = false;
 
         new_block.header.signer_signature = signer_signature;
-        if let Err(e) = self.broadcast(new_block.clone(), reward_set, stackerdbs) {
+        if let Err(e) = self.broadcast(chain_state, new_block.clone(), reward_set, stackerdbs) {
             warn!("Error accepting own block: {e:?}. Will try mining again.");
             return Ok(false);
         } else {
@@ -941,6 +954,7 @@ impl BlockMinerThread {
         coordinator: &mut SignerCoordinator,
         new_block: &mut NakamotoBlock,
         sortdb: &SortitionDB,
+        chain_state: &mut StacksChainState,
         stackerdbs: &mut StackerDBs,
     ) -> Result<Vec<MessageSignature>, NakamotoNodeError> {
         if self.config.get_node_config(false).mock_mining {
@@ -948,13 +962,11 @@ impl BlockMinerThread {
             return Ok(Vec::new());
         }
 
-        let shared_chainstate = self.globals.get_shared_chainstate().clone();
-        let mut chain_state = shared_chainstate.lock();
         coordinator.propose_block(
             new_block,
             &self.burnchain,
             sortdb,
-            &mut chain_state,
+            &mut *chain_state,
             stackerdbs,
             &self.globals.counters,
             &self.burn_election_block,
@@ -966,7 +978,10 @@ impl BlockMinerThread {
     ///  active reward set during `self.burn_election_block`. The miner
     ///  thread caches this information, and this method will consult
     ///  that cache (or populate it if necessary).
-    fn load_signer_set(&mut self) -> Result<RewardSet, NakamotoNodeError> {
+    fn load_signer_set(
+        &mut self,
+        chain_state: &mut StacksChainState,
+    ) -> Result<RewardSet, NakamotoNodeError> {
         if let Some(set) = self.signer_set_cache.as_ref() {
             return Ok(set.clone());
         }
@@ -982,9 +997,6 @@ impl BlockMinerThread {
             ))
         })?;
 
-        let shared_chainstate = self.globals.get_shared_chainstate().clone();
-        let mut chain_state = shared_chainstate.lock();
-
         let burn_election_height = self.burn_election_block.block_height;
 
         let reward_cycle = self
@@ -996,7 +1008,7 @@ impl BlockMinerThread {
             reward_cycle,
             &self.burn_election_block.sortition_id,
             &self.burnchain,
-            &mut chain_state,
+            &mut *chain_state,
             &self.parent_tenure_id,
             &sort_db,
             &OnChainRewardSetProvider::new(),
@@ -1108,6 +1120,7 @@ impl BlockMinerThread {
 
     fn broadcast(
         &mut self,
+        chain_state: &mut StacksChainState,
         block: NakamotoBlock,
         reward_set: &RewardSet,
         stackerdbs: &StackerDBs,
@@ -1123,8 +1136,6 @@ impl BlockMinerThread {
             ));
         };
 
-        let shared_chainstate = self.globals.get_shared_chainstate().clone();
-        let mut chain_state = shared_chainstate.lock();
         let sort_db = SortitionDB::open(
             &self.config.get_burn_db_file_path(),
             true,
@@ -1134,7 +1145,7 @@ impl BlockMinerThread {
         .expect("FATAL: could not open sortition DB");
 
         // push block via p2p block push
-        self.broadcast_p2p(&sort_db, &mut chain_state, &block, reward_set)
+        self.broadcast_p2p(&sort_db, &mut *chain_state, &block, reward_set)
             .map_err(NakamotoNodeError::AcceptFailure)?;
 
         let Some(ref miner_privkey) = self.config.miner.mining_key else {
@@ -1430,9 +1441,11 @@ impl BlockMinerThread {
 
     /// Check that the provided block is not mined too quickly after the parent block.
     /// This is to ensure that the signers do not reject the block due to the block being mined within the same second as the parent block.
-    fn validate_timestamp(&self, x: &NakamotoBlock) -> Result<bool, NakamotoNodeError> {
-        let shared_chainstate = self.globals.get_shared_chainstate().clone();
-        let chain_state = shared_chainstate.lock();
+    fn validate_timestamp(
+        &self,
+        chain_state: &StacksChainState,
+        x: &NakamotoBlock,
+    ) -> Result<bool, NakamotoNodeError> {
         let stacks_parent_header =
             NakamotoChainState::get_block_header(chain_state.db(), &x.header.parent_block_id)
                 .map_err(|e| {
@@ -1459,12 +1472,13 @@ impl BlockMinerThread {
     fn mine_block(
         &mut self,
         coordinator: &mut SignerCoordinator,
+        chain_state: &mut StacksChainState,
     ) -> Result<NakamotoBlock, NakamotoNodeError> {
         debug!("block miner thread ID is {:?}", thread::current().id());
         info!("Miner: Mining block");
 
         let burn_db_path = self.config.get_burn_db_file_path();
-        let reward_set = self.load_signer_set()?;
+        let reward_set = self.load_signer_set(chain_state)?;
 
         // NOTE: read-write access is needed in order to be able to query the recipient set.
         // This is an artifact of the way the MARF is built (see #1449)
@@ -1475,9 +1489,6 @@ impl BlockMinerThread {
             Some(self.config.node.get_marf_opts()),
         )
         .expect("FATAL: could not open sortition DB");
-
-        let shared_chainstate = self.globals.get_shared_chainstate().clone();
-        let mut chain_state = shared_chainstate.lock();
 
         self.check_burn_tip_changed(&burn_db)?;
         if Self::fault_injection_block_mining_skip() {
@@ -1495,7 +1506,7 @@ impl BlockMinerThread {
                 .map_err(|_| NakamotoNodeError::SnapshotNotFoundForChainTip)?
                 .expect("FATAL: no epoch defined")
                 .epoch_id;
-        let mut parent_block_info = self.load_block_parent_info(&mut burn_db, &mut chain_state)?;
+        let mut parent_block_info = self.load_block_parent_info(&mut burn_db, &mut *chain_state)?;
         let vrf_proof = self
             .make_vrf_proof()
             .ok_or_else(|| NakamotoNodeError::BadVrfConstruction)?;
