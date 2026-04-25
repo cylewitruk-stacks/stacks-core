@@ -7471,6 +7471,228 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
     }
 }
 
+#[test]
+fn test_tier3_live_handle_refresh_after_recurring_squash_tip_nonce() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier3_live_handle_refresh_after_recurring_squash_tip_nonce");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    // Match the live shape more closely: many recurring squashes on one long-lived
+    // writer handle, with immediate post-refresh reads on the same handle.
+    let blocks_per_level: usize = 10;
+    let num_levels: usize = 11;
+    let total_blocks: usize = blocks_per_level * num_levels;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mk_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_D1_CE_FA_11u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let sender_key = "sender_nonce";
+    let mk_nonce = |h: usize| MARFValue::from_value(&format!("nonce_{h}"));
+
+    let mut blocks: Vec<StacksBlockId> = Vec::with_capacity(total_blocks);
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    for h in 0..total_blocks {
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        let bh = mk_block(h);
+
+        sq_marf.begin(&parent, &bh).unwrap();
+        ref_marf.begin(&parent, &bh).unwrap();
+
+        sq_marf.insert(sender_key, mk_nonce(h)).unwrap();
+        ref_marf.insert(sender_key, mk_nonce(h)).unwrap();
+
+        // Add a sparse key family so post-squash reads exercise more than one path.
+        if h % 3 == 0 {
+            let sparse_key = format!("sparse_sender_{h}");
+            let sparse_value = MARFValue::from_value(&format!("sparse_nonce_{h}"));
+            sq_marf.insert(&sparse_key, sparse_value.clone()).unwrap();
+            ref_marf.insert(&sparse_key, sparse_value).unwrap();
+        }
+
+        sq_marf.seal().unwrap();
+        sq_marf.commit().unwrap();
+        ref_marf.seal().unwrap();
+        ref_marf.commit().unwrap();
+        blocks.push(bh.clone());
+
+        // Warm the live handle's direct read cursor before the next external squash.
+        let live_tip_nonce = sq_marf.get(&bh, sender_key).unwrap().unwrap();
+        assert_eq!(
+            live_tip_nonce,
+            mk_nonce(h),
+            "live handle tip nonce before squash"
+        );
+        if h > 0 {
+            let prev = sq_marf.get(&blocks[h - 1], sender_key).unwrap().unwrap();
+            assert_eq!(
+                prev,
+                mk_nonce(h - 1),
+                "live handle previous nonce before squash"
+            );
+        }
+
+        if (h + 1) % blocks_per_level == 0 {
+            let min_h = (h + 1 - blocks_per_level) as u32;
+            let max_h = h as u32;
+
+            squash_level_incremental::<StacksBlockId>(
+                &sq_path,
+                SquashMode::FullHistory,
+                min_h,
+                max_h,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("live-handle recurring squash at height {h} failed: {e:?}"));
+
+            sq_marf.refresh_after_squash().unwrap();
+
+            let tip = blocks.last().unwrap();
+            let live_tip_nonce = sq_marf.get(tip, sender_key).unwrap().unwrap();
+            let ref_tip_nonce = ref_marf.get(tip, sender_key).unwrap().unwrap();
+            assert_eq!(
+                live_tip_nonce, ref_tip_nonce,
+                "live handle tip nonce diverged immediately after refresh at level ending h={h}"
+            );
+
+            for idx in [
+                min_h as usize,
+                ((min_h + max_h) / 2) as usize,
+                max_h as usize,
+            ] {
+                let live_nonce = sq_marf.get(&blocks[idx], sender_key).unwrap().unwrap();
+                let ref_nonce = ref_marf.get(&blocks[idx], sender_key).unwrap().unwrap();
+                assert_eq!(
+                    live_nonce, ref_nonce,
+                    "live handle historical nonce diverged after refresh at block index {idx}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_tier3_live_handle_refresh_after_recurring_sparse_nonce_squash() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let dir = fresh_test_dir("test_tier3_live_handle_refresh_after_recurring_sparse_nonce_squash");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    // Match the live report more closely: many recurring squashes, but the sender nonce key is
+    // sparse instead of being rewritten every block.
+    let blocks_per_level: usize = 10;
+    let num_levels: usize = 11;
+    let total_blocks: usize = blocks_per_level * num_levels;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let mk_block = |h: usize| -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_D1_CE_5A_11u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let sender_key = "sender_nonce";
+    let hot_key = "hot_key";
+    let mk_sender_nonce = |h: usize| MARFValue::from_value(&format!("sender_nonce_{h}"));
+    let mk_hot_value = |h: usize| MARFValue::from_value(&format!("hot_{h}"));
+
+    let mut blocks: Vec<StacksBlockId> = Vec::with_capacity(total_blocks);
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    for h in 0..total_blocks {
+        let parent = if h == 0 {
+            StacksBlockId::sentinel()
+        } else {
+            blocks[h - 1].clone()
+        };
+        let bh = mk_block(h);
+
+        sq_marf.begin(&parent, &bh).unwrap();
+        ref_marf.begin(&parent, &bh).unwrap();
+
+        // A hot key rewrites every block so the trie keeps evolving densely.
+        sq_marf.insert(hot_key, mk_hot_value(h)).unwrap();
+        ref_marf.insert(hot_key, mk_hot_value(h)).unwrap();
+
+        // Sparse sender nonce: only every third block, like a sender who submits
+        // transactions intermittently across the squashed range.
+        if h % 3 == 0 {
+            sq_marf.insert(sender_key, mk_sender_nonce(h)).unwrap();
+            ref_marf.insert(sender_key, mk_sender_nonce(h)).unwrap();
+        }
+
+        sq_marf.seal().unwrap();
+        sq_marf.commit().unwrap();
+        ref_marf.seal().unwrap();
+        ref_marf.commit().unwrap();
+        blocks.push(bh.clone());
+
+        let expected_sender = (0..=h).rev().find(|hh| hh % 3 == 0).map(mk_sender_nonce);
+        let live_sender = sq_marf.get(&bh, sender_key).unwrap();
+        assert_eq!(
+            live_sender, expected_sender,
+            "live handle sparse sender nonce before squash at h={h}"
+        );
+
+        if (h + 1) % blocks_per_level == 0 {
+            let min_h = (h + 1 - blocks_per_level) as u32;
+            let max_h = h as u32;
+
+            squash_level_incremental::<StacksBlockId>(
+                &sq_path,
+                SquashMode::FullHistory,
+                min_h,
+                max_h,
+                true,
+            )
+            .unwrap_or_else(|e| {
+                panic!("sparse live-handle recurring squash at height {h} failed: {e:?}")
+            });
+
+            sq_marf.refresh_after_squash().unwrap();
+
+            let tip = blocks.last().unwrap();
+            let live_sender = sq_marf.get(tip, sender_key).unwrap();
+            let ref_sender = ref_marf.get(tip, sender_key).unwrap();
+            assert_eq!(
+                live_sender, ref_sender,
+                "live handle sparse sender nonce diverged immediately after refresh at level ending h={h}"
+            );
+
+            let probe_indices = [
+                min_h as usize,
+                ((min_h + max_h) / 2) as usize,
+                max_h as usize,
+            ];
+            for idx in probe_indices {
+                let live = sq_marf.get(&blocks[idx], sender_key).unwrap();
+                let reference = ref_marf.get(&blocks[idx], sender_key).unwrap();
+                assert_eq!(
+                    live, reference,
+                    "sparse sender nonce diverged after refresh at block index {idx}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tier 4: headers-MARF pattern — recurring TipOnly + reclaim squashes
 //
@@ -8166,5 +8388,937 @@ fn test_tier9_gen_mismatch_without_acquire_failure_absorbed() {
     assert_eq!(
         result.expect("retry wrapper should absorb injected gen-check failures"),
         Some(MARFValue::from_value("tier9_value")),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 10: same-height sibling read after squash consults parent state.
+//
+// **FIX-PROTECTION REGRESSION TEST** for the genesis-sync stall at block
+// 11000 (April 2026). The pre-fix behavior: a competing fork-sibling block
+// at the same Stacks height as the canonical tip, downloaded slightly after
+// the squash, was rejected with `Bad nonce` because the squashed-leaf
+// representation in the Clarity MARF keys per-key history by height alone
+// (`TrieLeafSquashed { entries: Vec<(u32, MARFValue)> }` +
+// `TrieLeafSquashed::value_at_height(height)` in `node.rs`). The read
+// pipeline used to capture the sibling's *own* height as the squashed-leaf
+// query height, which collided with the canonical sibling's already-applied
+// transition at that height — returning the canonical's value instead of
+// the parent's.
+//
+// The fix (in `open_block_impl`'s uncommitted-match branch in `storage.rs`)
+// propagates the PARENT's squash height as the snapshot height when opening
+// a non-squash uncommitted block whose parent IS in the squash.
+// `value_at_height(parent_h)` then returns the parent's view (the fork
+// point) rather than the canonical tip — which matches the unsquashed
+// reference and lets the sibling validate against the correct pre-fork
+// state.
+//
+// The test runs both a squashed MARF and an unsquashed reference through
+// the same scenario (parent P → canonical sibling A → fresh sibling B with
+// parent P) and asserts they read identically. Any future regression that
+// reintroduces the height-only collision will fail the second assertion
+// with the failure message describing the structural cause.
+//
+// Limitation: only uncommitted blocks (`marf.begin(parent, child)` followed
+// by reads against `child`) get the snapshot-height fast path. Committed-
+// non-canonical-fork blocks (deeper forks already in `marf_data`) would
+// need a parent-chain walk via either a `marf_data.parent_block_hash`
+// schema addition or a chainstate-level snapshot-height pass-through on
+// `open_block`. Tracked as a follow-up.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_tier10_same_height_sibling");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    // Three blocks: parent P at height 0, canonical sibling A at height 1
+    // (extends P), and competing sibling B at height 1 (also extends P).
+    let parent_block = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_DA_DA_DA_DAu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let canonical_a = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_CA_11_AB_1Eu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let sibling_b = {
+        let mut bytes = [0xFFu8; 32];
+        bytes[24..28].copy_from_slice(&0x_5B_11_BC_2Au32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let key = "shared_key";
+    let parent_val = MARFValue::from_value("parent_value");
+    let canonical_val = MARFValue::from_value("canonical_sibling_value");
+
+    // ── Build the squashed MARF: P → A, then squash through A ──
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    // Parent commits the original value at height 0.
+    sq_marf
+        .begin(&StacksBlockId::sentinel(), &parent_block)
+        .unwrap();
+    sq_marf.insert(key, parent_val.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    // Canonical sibling A overwrites at height 1 (mirrors a tx that bumps a
+    // nonce / overwrites a contract var).
+    sq_marf.begin(&parent_block, &canonical_a).unwrap();
+    sq_marf.insert(key, canonical_val.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    drop(sq_marf);
+
+    // Squash heights 0..=1 with reclaim=true (matches the production
+    // `maybe_squash` path that triggered the production stall).
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true)
+        .expect("squash should succeed");
+
+    // Sibling B arrives AFTER the squash and extends the same parent P.
+    // Importantly, B writes nothing yet — we read the shared key purely
+    // against B's pre-write view, which should be P's state.
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf.refresh_after_squash().unwrap();
+    sq_marf.begin(&parent_block, &sibling_b).unwrap();
+    let sq_read = sq_marf.get(&sibling_b, key).expect("read should succeed");
+    sq_marf.drop_current();
+    drop(sq_marf);
+
+    // ── Reference MARF (no squash): P → A and a parallel B branch ──
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+    ref_marf
+        .begin(&StacksBlockId::sentinel(), &parent_block)
+        .unwrap();
+    ref_marf.insert(key, parent_val.clone()).unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&parent_block, &canonical_a).unwrap();
+    ref_marf.insert(key, canonical_val.clone()).unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&parent_block, &sibling_b).unwrap();
+    let ref_read = ref_marf.get(&sibling_b, key).expect("read should succeed");
+    ref_marf.drop_current();
+    drop(ref_marf);
+
+    // The unsquashed reference returns P's value (B is a fresh branch from P
+    // and B has not written yet). The squashed MARF MUST do the same; if
+    // instead it returns the canonical sibling A's value, that is the bug
+    // this test documents — same-height siblings collide because the
+    // squashed-leaf history is keyed by height alone, with no branch identity.
+    assert_eq!(
+        ref_read,
+        Some(parent_val.clone()),
+        "reference (unsquashed) sibling B should read parent's value"
+    );
+    assert_eq!(
+        sq_read, ref_read,
+        "squashed sibling B should read the same as the unsquashed reference \
+         (parent's value). A regression here means the snapshot-height \
+         propagation in `open_block_impl`'s uncommitted-match branch is no \
+         longer setting `squash_opened_height` from the parent's squash entry, \
+         so the squashed-leaf lookup falls back to the canonical sibling's \
+         height and shadows the parent's value."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 11: depth-2 (committed) fork reads ancestor's pre-fork view via
+// parent-chain walk after squash.
+//
+// **FIX-PROTECTION REGRESSION TEST** for the multi-block-Bitcoin-reorg case
+// flagged in Tier 10's "Limitation" docstring. Tier 10 only covers the
+// uncommitted same-height sibling path; this exercises the deeper case:
+//
+//   P  (h=0, squashed canonical, sets shared_key = parent_val)
+//   ├── A   (h=1, squashed canonical, overwrites shared_key = canonical_val)
+//   └── B1  (h=1, committed non-canonical, parent=P, no shared_key write)
+//          └── B2 (h=2, committed non-canonical, parent=B1, READS shared_key)
+//
+// After squashing 0..=1 with reclaim=true, both P and A are folded into a
+// single squashed leaf with entries `[(0, parent_val), (1, canonical_val)]`.
+// B1 and B2 are committed, NOT in the squash. Reading `shared_key` from B2
+// must return `parent_val` (P's pre-fork value), NOT `canonical_val` (A's
+// height-1 entry).
+//
+// The fix path under test (lazy resolution in `snapshot_height_for_block()`):
+//   B2 read of `shared_key` → walk reaches a `LeafSquashed` → marf walk's
+//   `WalkAction::FoundSquashedLeaf` branch calls
+//   `storage.snapshot_height_for_block(B2_hash, B2_id)` → eager paths didn't
+//   set `squash_opened_height` for B2 → memoized walker fires
+//   `compute_snapshot_height_via_parent_chain`:
+//     1. B2 not in squash → read B2's blob header → parent = B1
+//     2. B1 not in squash → read B1's blob header → parent = P
+//     3. P is in squash at height 0 → return Some(0)
+//   → `value_at_height(0)` returns parent_val = correct.
+//
+// Note: Tier 11 here uses a depth-2 fork (B2 → B1 → P) where B1 wrote at
+// least one marker key — that forces B1's marker child in B2's root to be a
+// depth-1 backptr to B1. So a naive "min-depth root backptr" walker would
+// coincidentally land on B1 (then walk to P) and arrive at the correct
+// answer. The truly adversarial case — where root backptrs in B2 point to
+// ancestors *deeper than the fork point* — is covered by Tier 11b below.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_tier11_depth_two_committed_fork");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let parent_block = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_DA_DA_DA_DAu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let canonical_a = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_CA_11_AB_1Eu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let fork_b1 = {
+        let mut bytes = [0xFFu8; 32];
+        bytes[24..28].copy_from_slice(&0x_5B_11_BC_2Au32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let fork_b2 = {
+        let mut bytes = [0xFFu8; 32];
+        bytes[24..28].copy_from_slice(&0x_5B_22_BC_2Au32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&3u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let key = "shared_key";
+    let parent_val = MARFValue::from_value("parent_value");
+    let canonical_val = MARFValue::from_value("canonical_sibling_value");
+    // B1 / B2 each commit a fork-branded write on a DIFFERENT key so the trie
+    // is non-empty (commits require at least one insert), without touching
+    // the key under test — the read against `shared_key` from B2 should fall
+    // all the way through to the squashed leaf.
+    let b1_marker_key = "b1_marker";
+    let b2_marker_key = "b2_marker";
+    let b1_marker_val = MARFValue::from_value("fork_b1_marker");
+    let b2_marker_val = MARFValue::from_value("fork_b2_marker");
+
+    // ── Build the squashed MARF: P → A (canonical), then squash. Then commit
+    // B1 (parent=P), then B2 (parent=B1). Both B1/B2 land in marf_data as
+    // committed-non-canonical blocks — exactly the production case for a
+    // multi-block live Bitcoin reorg landing post-squash. ──
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf
+        .begin(&StacksBlockId::sentinel(), &parent_block)
+        .unwrap();
+    sq_marf.insert(key, parent_val.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    sq_marf.begin(&parent_block, &canonical_a).unwrap();
+    sq_marf.insert(key, canonical_val.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    drop(sq_marf);
+
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true)
+        .expect("squash should succeed");
+
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf.refresh_after_squash().unwrap();
+    // B1: commit a marker write so its trie blob is well-formed in marf_data.
+    sq_marf.begin(&parent_block, &fork_b1).unwrap();
+    sq_marf
+        .insert(b1_marker_key, b1_marker_val.clone())
+        .unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    // B2: commit ANOTHER marker write (still no touch of `shared_key`) so we
+    // can read against fully-committed state, exercising the
+    // `open_block_known_id_impl` path rather than the uncommitted shortcut.
+    sq_marf.begin(&fork_b1, &fork_b2).unwrap();
+    sq_marf
+        .insert(b2_marker_key, b2_marker_val.clone())
+        .unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    let sq_read = sq_marf.get(&fork_b2, key).expect("read should succeed");
+    drop(sq_marf);
+
+    // ── Reference MARF: same scenario without the squash ──
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+    ref_marf
+        .begin(&StacksBlockId::sentinel(), &parent_block)
+        .unwrap();
+    ref_marf.insert(key, parent_val.clone()).unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&parent_block, &canonical_a).unwrap();
+    ref_marf.insert(key, canonical_val.clone()).unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&parent_block, &fork_b1).unwrap();
+    ref_marf
+        .insert(b1_marker_key, b1_marker_val.clone())
+        .unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&fork_b1, &fork_b2).unwrap();
+    ref_marf
+        .insert(b2_marker_key, b2_marker_val.clone())
+        .unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    let ref_read = ref_marf.get(&fork_b2, key).expect("read should succeed");
+    drop(ref_marf);
+
+    assert_eq!(
+        ref_read,
+        Some(parent_val.clone()),
+        "reference (unsquashed) depth-2 fork B2 should read parent's value"
+    );
+    assert_eq!(
+        sq_read, ref_read,
+        "squashed depth-2 fork B2 should read the same as the unsquashed reference \
+         (parent's value). A regression here means \
+         `compute_snapshot_height_via_parent_chain` is not walking B2 → B1 → P \
+         through blob headers to find P's squash entry, so the squashed-leaf \
+         lookup falls back to the canonical sibling A's height-1 value instead."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 11b: adversarial backptr setup — fork's root contains backptrs to a
+// squashed ancestor *deeper* than the true fork point, exercising the
+// scenario Codex flagged: "the first root backptr points to an older
+// squashed ancestor than the true parent-chain fork point".
+//
+// Layout:
+//
+//   G  (h=0, squashed, writes oldest_key=v_oldest  AND shared_key=v_g)
+//   └── P  (h=1, squashed, writes shared_key=v_p; oldest_key untouched)
+//       ├── A   (h=2, squashed canonical, writes shared_key=v_canonical)
+//       └── B1  (h=2, committed fork, parent=P, writes only b1_marker)
+//              └── B2 (h=3, committed fork, parent=B1, writes only b2_marker;
+//                      READS shared_key)
+//
+// Heights 0..=2 are squashed (G + P + A). The squashed leaf for `shared_key`
+// has entries `[(0, v_g), (1, v_p), (2, v_canonical)]`. The squashed leaf
+// for `oldest_key` has the single entry `[(0, v_oldest)]`.
+//
+// Why this is adversarial: `oldest_key`'s subtree was last touched at G and
+// never modified by P, A, B1, or B2. By COW, B2's root child for that
+// subtree is a backptr that resolves all the way back to G (depth 3 from
+// B2's frame: B2 → B1 → P → G). A naive walker that picked *any* root
+// backptr in B2 and used its target's squash height as the snapshot height
+// could land on G's height (0), and `value_at_height(0)` for `shared_key`
+// would return v_g — WRONG. The correct answer is v_p (P's view, since the
+// fork point is P).
+//
+// The blob-header walker in `compute_snapshot_height_via_parent_chain` does
+// not look at backptrs at all — it reads the *exact* parent block hash from
+// each per-block trie blob's header (captured at commit time in
+// `TrieRAM::dump`). For B2: parent header → B1; B1 header → P; P is in the
+// squash at height 1 → `value_at_height(1)` returns v_p. Correct.
+//
+// This test would fail under any future regression that:
+//   - Replaces blob-header walking with first-root-backptr inference, or
+//   - Uses any backptr depth as a proxy for parent-chain depth.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tier11b_adversarial_root_backptr_to_older_squashed_ancestor() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_tier11b_adversarial_root_backptr");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let grandparent_g = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_6E_5A_DA_DAu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let parent_p = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_DA_DA_DA_DAu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let canonical_a = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_CA_11_AB_1Eu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&3u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let fork_b1 = {
+        let mut bytes = [0xFFu8; 32];
+        bytes[24..28].copy_from_slice(&0x_5B_11_BC_2Au32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&3u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let fork_b2 = {
+        let mut bytes = [0xFFu8; 32];
+        bytes[24..28].copy_from_slice(&0x_5B_22_BC_2Au32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&4u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let shared_key = "shared_key";
+    let oldest_key = "oldest_key";
+    let v_oldest = MARFValue::from_value("oldest_value_at_g");
+    let v_g = MARFValue::from_value("shared_at_g");
+    let v_p = MARFValue::from_value("shared_at_p_fork_point");
+    let v_canonical = MARFValue::from_value("shared_at_canonical_a");
+    let b1_marker_key = "b1_marker";
+    let b2_marker_key = "b2_marker";
+    let b1_marker_val = MARFValue::from_value("fork_b1_marker");
+    let b2_marker_val = MARFValue::from_value("fork_b2_marker");
+
+    // ── Build squashed MARF: G → P → A canonical, then squash 0..=2. Then
+    // commit B1 (parent=P) and B2 (parent=B1). ──
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf
+        .begin(&StacksBlockId::sentinel(), &grandparent_g)
+        .unwrap();
+    sq_marf.insert(oldest_key, v_oldest.clone()).unwrap();
+    sq_marf.insert(shared_key, v_g.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    sq_marf.begin(&grandparent_g, &parent_p).unwrap();
+    sq_marf.insert(shared_key, v_p.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    sq_marf.begin(&parent_p, &canonical_a).unwrap();
+    sq_marf.insert(shared_key, v_canonical.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    drop(sq_marf);
+
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 2, true)
+        .expect("squash should succeed");
+
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf.refresh_after_squash().unwrap();
+    sq_marf.begin(&parent_p, &fork_b1).unwrap();
+    sq_marf
+        .insert(b1_marker_key, b1_marker_val.clone())
+        .unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    sq_marf.begin(&fork_b1, &fork_b2).unwrap();
+    sq_marf
+        .insert(b2_marker_key, b2_marker_val.clone())
+        .unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    let sq_read_shared = sq_marf
+        .get(&fork_b2, shared_key)
+        .expect("shared_key read should succeed");
+    let sq_read_oldest = sq_marf
+        .get(&fork_b2, oldest_key)
+        .expect("oldest_key read should succeed");
+    drop(sq_marf);
+
+    // ── Reference (unsquashed) MARF: identical scenario without squash ──
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+    ref_marf
+        .begin(&StacksBlockId::sentinel(), &grandparent_g)
+        .unwrap();
+    ref_marf.insert(oldest_key, v_oldest.clone()).unwrap();
+    ref_marf.insert(shared_key, v_g.clone()).unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&grandparent_g, &parent_p).unwrap();
+    ref_marf.insert(shared_key, v_p.clone()).unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&parent_p, &canonical_a).unwrap();
+    ref_marf.insert(shared_key, v_canonical.clone()).unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&parent_p, &fork_b1).unwrap();
+    ref_marf
+        .insert(b1_marker_key, b1_marker_val.clone())
+        .unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    ref_marf.begin(&fork_b1, &fork_b2).unwrap();
+    ref_marf
+        .insert(b2_marker_key, b2_marker_val.clone())
+        .unwrap();
+    ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+    let ref_read_shared = ref_marf
+        .get(&fork_b2, shared_key)
+        .expect("shared_key read should succeed");
+    let ref_read_oldest = ref_marf
+        .get(&fork_b2, oldest_key)
+        .expect("oldest_key read should succeed");
+    drop(ref_marf);
+
+    assert_eq!(
+        ref_read_shared,
+        Some(v_p.clone()),
+        "reference (unsquashed) fork B2 should read shared_key as P's value (fork point)"
+    );
+    assert_eq!(
+        ref_read_oldest,
+        Some(v_oldest.clone()),
+        "reference (unsquashed) fork B2 should read oldest_key as G's value (only ever written there)"
+    );
+    assert_eq!(
+        sq_read_shared, ref_read_shared,
+        "squashed fork B2 must read shared_key as v_p (P's view, the true fork point). \
+         Failure modes: \
+         (a) returns v_g — implementation regressed to using a deep root-backptr (e.g. \
+             oldest_key's path), incorrectly setting snapshot_height = G's height (0); \
+         (b) returns v_canonical — implementation isn't setting snapshot_height at all \
+             and is falling back to tip-read. \
+         The blob-header walker must read B2 → B1 → P from blob headers and land on P's \
+         squash entry (height 1)."
+    );
+    assert_eq!(
+        sq_read_oldest, ref_read_oldest,
+        "squashed fork B2 must read oldest_key as v_oldest. This catches the corner case \
+         where the snapshot height resolution disturbs unrelated keys (e.g. by setting \
+         level_idx in a way that triggers root-hash override on the fork block)."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Perf-shape regression test for the LeafSquashed read path.
+//
+// **Goal**: prove that the marf walk routes `LeafSquashed` resolution through
+// the *deferred / re-read* path introduced by Option 2, NOT the previous
+// "always clone the entries vector in Phase 1" path. The previous design
+// heap-allocated and copied `Vec<(u32, MARFValue)>` on every LeafSquashed
+// read — including dormant tip reads on canonical chains past a squash
+// where the cloned entries were ultimately unused (we returned `tip_value`).
+// On a long-running node with FullHistory squashes, that wasted allocation
+// scaled with how often the key was rewritten across the squash range.
+//
+// The Option 2 design clones only `path` + `tip_value` (small, fixed-size)
+// in Phase 1. Phase 2 then either:
+//   - returns `tip_value` directly (when snapshot-height resolves to `None`,
+//     i.e. tip-fallback fast path — rare), or
+//   - re-reads the leaf into the scratch buffer to look up `entries[idx]`
+//     by reference (when `Some(h)` — the historical / fork / canonical-
+//     past-squash path).
+//
+// Either way, no `entries.to_vec()` clone happens. The counters used in this
+// test (`squashed_entries_reread_count`, `squashed_tip_fallback_count`) are
+// the only paths that reach a `LeafSquashed` after the walk; if a future
+// change reintroduces the eager clone, **neither** counter would increment
+// for a dormant tip read — and this test would fail.
+//
+// Test layout:
+//   G   (h=0, writes shared_key=v_g + marker_g)
+//   └── H (h=1, writes shared_key=v_h)
+//       Squash 0..=1: LeafSquashed(shared_key) has entries
+//                     [(0, v_g), (1, v_h)], tip_value = v_h
+//       └── C (committed canonical extension, writes only marker_c — does
+//             NOT touch shared_key, so reads of shared_key from C resolve
+//             via backptr down to the squashed LeafSquashed)
+//
+// Scenarios under test:
+//   A. Dormant tip read: get(C, shared_key). C is canonical-past-squash; the
+//      lazy walker walks C → H, finds H in the squash, returns Some(1). Phase 2
+//      takes the re-read path. EXPECT: entries_reread_count > 0; result = v_h.
+//      A regression to the eager-clone Phase-1 design would leave
+//      entries_reread_count at 0.
+//
+//   B. Historical read at H: get(H, shared_key). H is in-squash, so
+//      eager_user_height = Some(1) and Phase 2 re-reads. EXPECT:
+//      entries_reread_count > 0; result = v_h (entries[1]).
+//
+//   C. Historical read at G: get(G, shared_key). G is in-squash at height 0
+//      → re-read path with idx pointing to entries[0]. EXPECT:
+//      entries_reread_count > 0; result = v_g — proving the value-at-height
+//      lookup correctly indexes into the older squashed entry.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_leaf_squashed_read_path_perf_shape() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_leaf_squashed_perf_shape");
+    let sq_path = format!("{dir}/squashed.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let block_g = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_6E_AA_6E_AAu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let block_h = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_8B_AA_8B_AAu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let block_c = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_C0_AA_C0_AAu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&3u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let shared_key = "perf_shape_shared_key";
+    let v_g = MARFValue::from_value("v_at_g");
+    let v_h = MARFValue::from_value("v_at_h");
+    let marker_g_key = "marker_g";
+    let marker_g_val = MARFValue::from_value("marker_g_val");
+    let marker_c_key = "marker_c";
+    let marker_c_val = MARFValue::from_value("marker_c_val");
+
+    // Build G → H, then squash 0..=1, then commit canonical C.
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf.begin(&StacksBlockId::sentinel(), &block_g).unwrap();
+    sq_marf.insert(shared_key, v_g.clone()).unwrap();
+    sq_marf.insert(marker_g_key, marker_g_val.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    sq_marf.begin(&block_g, &block_h).unwrap();
+    sq_marf.insert(shared_key, v_h.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    drop(sq_marf);
+
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true)
+        .expect("squash should succeed");
+
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf.refresh_after_squash().unwrap();
+    sq_marf.begin(&block_h, &block_c).unwrap();
+    sq_marf.insert(marker_c_key, marker_c_val.clone()).unwrap();
+    sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+
+    // Helper to snapshot counter values from the live MARF storage.
+    let read_counters = |marf: &mut MARF<StacksBlockId>| -> (u64, u64) {
+        let storage = marf.borrow_storage_backend();
+        (
+            storage.transient_data().squashed_tip_fallback_count.get(),
+            storage.transient_data().squashed_entries_reread_count.get(),
+        )
+    };
+    let reset_counters = |marf: &mut MARF<StacksBlockId>| {
+        let storage = marf.borrow_storage_backend();
+        storage.transient_data().squashed_tip_fallback_count.set(0);
+        storage
+            .transient_data()
+            .squashed_entries_reread_count
+            .set(0);
+    };
+
+    // ── Scenario A: dormant tip read on canonical-past-squash. The lazy walker
+    // walks C → H, finds H in the squash, returns Some(1). Phase 2 re-reads. ──
+    reset_counters(&mut sq_marf);
+    let tip_read = sq_marf
+        .get(&block_c, shared_key)
+        .expect("tip read should succeed");
+    let (tip_fallback_a, entries_reread_a) = read_counters(&mut sq_marf);
+    assert_eq!(
+        tip_read,
+        Some(v_h.clone()),
+        "tip read of shared_key from C should return H's value (the squash tip)"
+    );
+    assert!(
+        entries_reread_a >= 1,
+        "dormant tip read on canonical-past-squash MUST take the deferred re-read path \
+         (Option 2's Phase 2). A regression to the eager-clone-entries design (cloning \
+         `Vec<(u32, MARFValue)>` in Phase 1) would leave this counter at 0 because that \
+         path was deleted. Got entries_reread_count={entries_reread_a}."
+    );
+    assert_eq!(
+        tip_fallback_a, 0,
+        "tip-fallback fast path is for the rare case where the walker finds NO squashed \
+         ancestor (e.g. uncommitted block off a non-squash chain). For canonical-past-\
+         squash reads the walker finds the immediate squashed ancestor and the re-read \
+         path is taken instead."
+    );
+
+    // ── Scenario B: historical read at H (in-squash) → entries re-read path. ──
+    reset_counters(&mut sq_marf);
+    let historical_h = sq_marf
+        .get(&block_h, shared_key)
+        .expect("historical read at H should succeed");
+    let (tip_fallback_b, entries_reread_b) = read_counters(&mut sq_marf);
+    assert_eq!(
+        historical_h,
+        Some(v_h.clone()),
+        "in-squash read of shared_key at H should return v_h (entries[1])"
+    );
+    assert!(
+        entries_reread_b >= 1,
+        "historical read at an in-squash block MUST hit the entries re-read path \
+         (eager_user_height = Some(h)) to look up value_at_height. \
+         Got entries_reread_count={entries_reread_b}."
+    );
+    assert_eq!(
+        tip_fallback_b, 0,
+        "historical read MUST NOT take the tip_value fast path when an explicit \
+         snapshot height is set."
+    );
+
+    // ── Scenario C: historical read at G (in-squash, older entry — proves
+    // value_at_height correctly resolves to the older squashed entry). ──
+    reset_counters(&mut sq_marf);
+    let historical_g = sq_marf
+        .get(&block_g, shared_key)
+        .expect("historical read at G should succeed");
+    let (_tip_fallback_c, entries_reread_c) = read_counters(&mut sq_marf);
+    assert_eq!(
+        historical_g,
+        Some(v_g.clone()),
+        "in-squash read of shared_key at G should return v_g (entries[0]) — proving \
+         the value-at-height lookup correctly indexes back into the older squashed entry."
+    );
+    assert!(
+        entries_reread_c >= 1,
+        "historical read at G MUST hit the entries re-read path at least once."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Smoke test: canonical-tip extension past a squash. Each post-squash block
+// extends the squash TIP, so `OWN_BLOCK_HEIGHT_KEY` resolves to the correct
+// height (the merged trie's tip value IS the squash tip's value), and
+// `inner_get_extension_height` computes the right child height. This test
+// caught a few subtle regressions in the Tier 11 / Option 2 work; the
+// next test below is the actual fork-from-non-tip regression test for the
+// `get_block_height_miner_tip` in-squash override fix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_seal_after_squash_canonical_tip_extension_smoke() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_seal_after_squash_canonical_smoke");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+
+    const N: u32 = 50;
+    const KEYS_PER_BLOCK: u32 = 10;
+    let block_hashes: Vec<StacksBlockId> = (0..N)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[24..28].copy_from_slice(&0x_C0_FF_EEu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&i.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        let mut parent = StacksBlockId::sentinel();
+        for (i, bh) in block_hashes.iter().enumerate() {
+            marf.begin(&parent, bh).unwrap();
+            for k in 0..KEYS_PER_BLOCK {
+                let key = format!("dummy_key_{i}_{k}");
+                marf.insert(&key, MARFValue::from(i as u32 * 100 + k))
+                    .unwrap();
+            }
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+            parent = bh.clone();
+        }
+    }
+
+    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, N - 1, true)
+        .expect("squash should succeed");
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    marf.refresh_after_squash().unwrap();
+    let mut parent = block_hashes.last().unwrap().clone();
+    for j in 0..20u32 {
+        let next_block = {
+            let mut bytes = [0u8; 32];
+            bytes[24..28].copy_from_slice(&0x_FF_FF_FFu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&(N + j).to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        };
+        marf.begin(&parent, &next_block).unwrap();
+        for k in 0..KEYS_PER_BLOCK {
+            let key = format!("post_squash_key_{j}_{k}");
+            marf.insert(&key, MARFValue::from(j * 1000 + k)).unwrap();
+        }
+        marf.seal()
+            .unwrap_or_else(|e| panic!("seal failed for block at h={}: {e:?}", N + j));
+        marf.commit().unwrap();
+        parent = next_block;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// **REGRESSION TEST** for the genesis-sync seal panic:
+//   "Could not obtain block hash at block height 999"
+//
+// **Bug**: the squash blob is a single MERGED tip trie with one leaf per path,
+// so `OWN_BLOCK_HEIGHT_KEY` reads from any in-squash block return the SQUASH
+// TIP's height, not the per-block height. `MARF::begin` calls
+// `inner_get_extension_height` → `get_block_height_miner_tip(parent, parent)`,
+// and when `parent` is a non-tip squashed block, that lookup returns the
+// squash-tip height. The new block then computes
+// `child_height = squash_tip_height + 1` (e.g. 1001) instead of
+// `parent_height + 1` (e.g. 811), writes that wrong height into its own
+// `OWN_BLOCK_HEIGHT_KEY` via `set_block_heights`, and at seal the geometric
+// ancestor lookup queries `::H` for `H` derived from the wrong `cur_height`
+// — landing on entries whose recorded heights are above the parent's true
+// `squash_opened_height`, so `value_at_height` returns `None` and the seal
+// panics.
+//
+// **Fix**: `get_block_height_miner_tip` self-lookup now bypasses the
+// merged-trie `OWN_BLOCK_HEIGHT_KEY` read for in-squash blocks and pulls the
+// per-block height from the squash trailer via `squash_opened_height()`.
+//
+// **Test layout**: Build N=50 blocks (heights 0..=49), squash 0..=49 with
+// `FullHistory + reclaim=true`, then begin a fork from a NON-TIP squashed
+// parent (`block_hashes[30]` at height 30). Without the fix:
+//   - `inner_get_extension_height` reads `OWN_BLOCK_HEIGHT_KEY` from the
+//     merged trie → returns 49 (squash tip).
+//   - Child computes its height as `49 + 1 = 50` instead of `31`.
+//   - `set_block_heights` writes `OWN_BLOCK_HEIGHT_KEY = 50`, `::50 = child`,
+//     `::49 = parent` (the parent's hash recorded at the wrong height key).
+//   - Seal's geometric lookup queries `::49`, `::48`, `::46`, ... with
+//     `eager_user_height = Some(30)` (parent's true squash height from
+//     `parent_squash_entry`), and `value_at_height(30)` on `::49`'s entries
+//     `[(49, h)]` returns `None` → panic.
+// With the fix: child correctly computes height 31, OWN_BLOCK_HEIGHT_KEY = 31,
+// geometric lookup queries `::30, ::29, ::27, ::23, ::15`, all of which have
+// `value_at_height(30) = Some(...)` because every entry's write_height is ≤ 30.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_repro_seal_fork_from_non_tip_squashed_parent() {
+    use crate::chainstate::stacks::index::marf::MarfInternals;
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_repro_seal_fork_from_non_tip");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+
+    const N: u32 = 50;
+    const KEYS_PER_BLOCK: u32 = 10;
+    const FORK_PARENT_INDEX: usize = 30; // non-tip: parent at height 30, not 49
+
+    let block_hashes: Vec<StacksBlockId> = (0..N)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[24..28].copy_from_slice(&0x_C0_FF_EEu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&i.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        let mut parent = StacksBlockId::sentinel();
+        for (i, bh) in block_hashes.iter().enumerate() {
+            marf.begin(&parent, bh).unwrap();
+            for k in 0..KEYS_PER_BLOCK {
+                let key = format!("dummy_key_{i}_{k}");
+                marf.insert(&key, MARFValue::from(i as u32 * 100 + k))
+                    .unwrap();
+            }
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+            parent = bh.clone();
+        }
+    }
+
+    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, N - 1, true)
+        .expect("squash should succeed");
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    marf.refresh_after_squash().unwrap();
+
+    // Fork: extend a NON-TIP squashed parent. This is the case that was
+    // broken — `get_block_height_miner_tip` would return the squash tip's
+    // height (49) instead of the parent's true height (30).
+    let fork_parent = block_hashes[FORK_PARENT_INDEX].clone();
+    let expected_fork_parent_height = FORK_PARENT_INDEX as u32;
+
+    // Sanity check: query parent's height via MARF::get_block_height_miner_tip.
+    // After the fix, this returns the trailer's per-block height (30), not
+    // the merged-trie's OWN_BLOCK_HEIGHT_KEY value (49).
+    let parent_height_via_marf =
+        <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::get_block_height_miner_tip(
+            &mut marf,
+            &fork_parent,
+            &fork_parent,
+        )
+        .expect("get_block_height_miner_tip should succeed");
+    assert_eq!(
+        parent_height_via_marf,
+        Some(expected_fork_parent_height),
+        "MARF::get_block_height_miner_tip self-lookup on a non-tip squashed block \
+         must return the per-block height ({expected_fork_parent_height}), not the squash \
+         tip's height ({}). A regression to the merged-trie OWN_BLOCK_HEIGHT_KEY \
+         read would return Some({}) here.",
+        N - 1,
+        N - 1
+    );
+
+    let fork_block = {
+        let mut bytes = [0xFFu8; 32];
+        bytes[24..28].copy_from_slice(&0x_F0_F0_F0u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&(FORK_PARENT_INDEX as u32 + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    // Begin the fork. `inner_get_extension_height` queries the parent's height
+    // via `get_block_height_miner_tip` — with the fix, it returns 30, so
+    // `child_height = 31`. Without the fix, it returns 49, so `child_height = 50`.
+    marf.begin(&fork_parent, &fork_block).unwrap();
+    marf.insert("fork_marker_key", MARFValue::from(0xCAFEu32))
+        .unwrap();
+
+    // Seal computes the MARF root via `get_trie_ancestor_hashes_bytes`, which
+    // queries `::H` for `H = cur_height - 2^k`. With the fix, cur_height=31 →
+    // queries 30, 29, 27, 23, 15 — all resolvable against `eager_user_height=30`.
+    // Without the fix, cur_height=50 → queries 49, 48, 46, 42, 34, 18 — and
+    // `value_at_height(30)` on `::49`'s entries `[(49, h)]` returns None →
+    // panic with "Could not obtain block hash at block height 49".
+    marf.seal()
+        .unwrap_or_else(|e| panic!("seal of fork from non-tip squashed parent failed: {e:?}"));
+    marf.commit().unwrap();
+
+    // Cross-check via storage that the committed fork block was registered at
+    // the right height (parent_height + 1, NOT squash_tip + 1).
+    let fork_block_height_via_marf =
+        <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::get_block_height_miner_tip(
+            &mut marf,
+            &fork_block,
+            &fork_block,
+        )
+        .expect("post-commit get_block_height_miner_tip should succeed");
+    assert_eq!(
+        fork_block_height_via_marf,
+        Some(expected_fork_parent_height + 1),
+        "fork block (committed extension of non-tip squashed parent) must \
+         have height = parent_height + 1 = {}, not squash_tip + 1 = {}",
+        expected_fork_parent_height + 1,
+        N
     );
 }

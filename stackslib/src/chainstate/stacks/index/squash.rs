@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read as _, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, MARF, OWN_BLOCK_HEIGHT_KEY,
@@ -570,6 +571,24 @@ static OWN_BLOCK_HEIGHT_KEY_HASH: std::sync::LazyLock<TrieHash> =
 /// FullHistory history collection. Currently filters only `OWN_BLOCK_HEIGHT_KEY`.
 fn is_marf_internal_key(key_hash: &TrieHash) -> bool {
     *key_hash == *OWN_BLOCK_HEIGHT_KEY_HASH
+}
+
+/// Human-readable byte size formatter for squash log lines. Picks GB / MB / KB
+/// based on magnitude, with two decimals of precision; falls back to raw bytes
+/// for sub-KB values.
+fn fmt_bytes(bytes: u64) -> String {
+    const KB: u64 = 1 << 10;
+    const MB: u64 = 1 << 20;
+    const GB: u64 = 1 << 30;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Walk the locally-written subtree of the currently-opened block, invoking `callback` for every
@@ -1659,6 +1678,31 @@ pub fn squash_level_incremental<T: MarfTrieId>(
     max_height: u32,
     reclaim: bool,
 ) -> Result<SquashStats, Error> {
+    // Phase-timing instrumentation. Each phase's duration is captured into a
+    // `phase_*_ms` binding and reported in the final summary log so we can see
+    // where the wall-clock time actually goes (DFS vs collect_history vs leaf
+    // replacement vs publish_squash vs prune+truncate vs SQL updates).
+    //
+    // Style note: phases assigned in the *outer* function body that are
+    // unconditionally set (DFS, remap, publish_overhead) use `let … = …` at
+    // the assignment site to avoid an `unused_assignments` warning on the
+    // initial `0`. Phases assigned inside `if full_history` AND phases
+    // assigned inside the `publish_squash` closure must be declared up front
+    // here because (a) they may not be reached on the false branch, or
+    // (b) the closure captures them by `&mut` and the outer summary log
+    // needs visibility.
+    let t_start = Instant::now();
+    let mut phase_collect_history_ms: u128 = 0;
+    let mut phase_baseline_ms: u128 = 0;
+    let mut phase_baseline_keys: usize = 0;
+    let mut phase_leaf_replace_ms: u128 = 0;
+    let mut phase_leaf_replace_flush_ms: u128 = 0;
+    let mut phase_prune_ms: u128 = 0;
+    let mut phase_blob_write_ms: u128 = 0;
+    let mut phase_finish_blob_ms: u128 = 0;
+    let mut phase_sql_updates_ms: u128 = 0;
+    let mut phase_build_meta_ms: u128 = 0;
+
     let mut stats = SquashStats::default();
     let full_history = mode == SquashMode::FullHistory;
 
@@ -1998,6 +2042,12 @@ pub fn squash_level_incremental<T: MarfTrieId>(
 
     node_store.flush()?;
 
+    // Time from function entry through DFS completion. Pre-DFS setup
+    // (`MARF::from_path`, `verify_no_descendants`, `read_squash_levels`, the
+    // contiguity check) lands inside this number — it's typically a few ms
+    // for L0 and grows slowly with the number of prior squash levels.
+    let phase_dfs_ms = t_start.elapsed().as_millis();
+
     info!(
         "Incremental squash DFS: collected {} nodes ({} leaves), {} block_id→hash entries",
         stats.nodes_collected,
@@ -2019,7 +2069,9 @@ pub fn squash_level_incremental<T: MarfTrieId>(
             .map(|bhh| T::from_bytes(*bhh))
             .collect();
 
+        let t_collect_history = Instant::now();
         let mut history = collect_history(&mut marf, &block_hashes_typed, min_height, max_height)?;
+        phase_collect_history_ms = t_collect_history.elapsed().as_millis();
 
         // Keys whose single in-range write is dominated by the inherited value. Populated in the
         // `min_height > 0` branch below; used when deciding which leaves to promote to
@@ -2029,6 +2081,7 @@ pub fn squash_level_incremental<T: MarfTrieId>(
         // Baseline lookup: for keys whose earliest entry has height > min_height, the key was
         // inherited from a prior level. Walk the prior level's tip trie to get the inherited value
         // and inject a synthetic (min_height - 1, value) entry.
+        let t_baseline = Instant::now();
         if min_height > 0 {
             let prior_tip_block =
                 MarfConnection::get_block_at_height(&mut marf, min_height - 1, &tip_block)?
@@ -2051,6 +2104,7 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                     }
                 })
                 .collect();
+            phase_baseline_keys = keys_needing_baseline.len();
 
             // Keys whose single in-range write is byte-identical to the inherited value from the
             // prior level. These can safely stay as plain `TrieLeaf` because reading the same value
@@ -2079,7 +2133,9 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                 // return `None`.
             }
         }
+        phase_baseline_ms = t_baseline.elapsed().as_millis();
 
+        let t_leaf_replace = Instant::now();
         let node_count_before = node_store.len();
         for i in 0..node_count_before {
             if !collected[i].is_leaf {
@@ -2125,14 +2181,22 @@ pub fn squash_level_incremental<T: MarfTrieId>(
             node_store.update(i, &new_buf)?;
             stats.leaves_squashed += 1;
         }
+        phase_leaf_replace_ms = t_leaf_replace.elapsed().as_millis();
 
+        let t_replace_flush = Instant::now();
         node_store.flush()?;
+        phase_leaf_replace_flush_ms = t_replace_flush.elapsed().as_millis();
 
         info!(
             "Incremental FullHistory: replaced {} leaves with TrieLeafSquashed",
             stats.leaves_squashed
         );
     }
+
+    // Mark the boundary between FullHistory leaf replacement and Step 3+4
+    // (pointer remap + offset compute) so we can attribute time to the
+    // structural prep that runs before publish_squash.
+    let t_remap = Instant::now();
 
     // ---------------------------------------------------------------
     // Step 3: Compute sequential byte offsets and remap pointers
@@ -2319,44 +2383,75 @@ pub fn squash_level_incremental<T: MarfTrieId>(
     //
     // Because we publish BEFORE clearing `truncate_pending`, any reader that wakes
     // up is guaranteed to see the new generation and re-sync its local state.
+    let phase_remap_ms = t_remap.elapsed().as_millis();
+
+    let t_publish_call = Instant::now();
+    // Capture `closure_start` inside the closure to separate publish_squash's
+    // own overhead (lock acquisition + quiesce wait) from the closure's work.
+    let mut closure_start_ms: Option<u128> = None;
     let shared = Arc::clone(&marf.storage.data.shared_squash);
-    shared.publish_squash(|| -> Result<SquashMeta, Error> {
+    shared.publish_squash(|guard| -> Result<SquashMeta, Error> {
+        closure_start_ms = Some(t_publish_call.elapsed().as_millis());
         let storage = marf.storage_backend_mut();
 
+        // ── Preflight (safe-to-retry): everything that can return Err WITHOUT leaving
+        // partially-mutated SQL rows or a partially-written blob behind.
+        // `create_squash_levels_table` is `CREATE TABLE IF NOT EXISTS` DDL — it does
+        // mutate schema state, but the mutation is idempotent (retrying succeeds), so
+        // an Err on a fresh DB just leaves the table absent and the next attempt
+        // recreates it cleanly. Anything beyond this block is part of the irreversible
+        // mutation phase covered by `guard.arm()`.
         trie_sql::create_squash_levels_table(storage.sqlite_conn())?;
 
-        let blob_offset = if reclaim {
+        let (blob_offset, superseded_for_prune) = if reclaim {
             let write_offset = if let Some(top_prior) = existing_levels.last() {
                 top_prior.blob_offset + top_prior.blob_length
             } else {
                 0
             };
-
             let superseded: Vec<T> = trailer
                 .block_hashes
                 .iter()
                 .map(|bhh| T::from_bytes(*bhh))
                 .collect();
+            (write_offset, Some(superseded))
+        } else {
+            (storage.get_blob_append_offset()?, None)
+        };
 
+        // ── Mutation phase begins. From here on, every operation is irreversible:
+        //    * `prune_orphaned_external_refs` zeroes `external_offset`/`length` on
+        //      non-canonical rows in `marf_data` — partial success leaves the SQL
+        //      state with pruned refs that no published squash level claims.
+        //    * `validate_truncation_zone` is read-only but runs AFTER pruning, so
+        //      any Err it surfaces is post-mutation.
+        //    * `pwrite`, `ftruncate`, and `remap_and_invalidate` are all
+        //      irreversible blob mutations.
+        //    * The post-write SQL updates (`write_squash_level`,
+        //      `update_external_trie_blob_by_hash`) depend on the new blob layout.
+        //
+        // Any Err past `arm()` is upgraded to `process::abort` by `publish_squash`.
+        guard.arm();
+
+        let t_prune = Instant::now();
+        if let Some(superseded) = superseded_for_prune {
             let pruned = trie_sql::prune_orphaned_external_refs(
                 storage.sqlite_conn(),
-                write_offset,
+                blob_offset,
                 &superseded,
             )?;
             if pruned > 0 {
                 warn!(
                     "Pruned {pruned} non-canonical external trie ref(s) in reclaim \
-                     truncation zone (offset >= {write_offset})"
+                     truncation zone (offset >= {blob_offset})"
                 );
             }
 
-            trie_sql::validate_truncation_zone(storage.sqlite_conn(), write_offset, &superseded)?;
+            trie_sql::validate_truncation_zone(storage.sqlite_conn(), blob_offset, &superseded)?;
+        }
+        phase_prune_ms = t_prune.elapsed().as_millis();
 
-            write_offset
-        } else {
-            storage.get_blob_append_offset()?
-        };
-
+        let t_blob_write = Instant::now();
         // Stream header
         let mut write_pos = blob_offset;
         let mut header = [0u8; BLOB_HEADER_SIZE as usize];
@@ -2396,18 +2491,36 @@ pub fn squash_level_incremental<T: MarfTrieId>(
         write_pos += trailer_buf.len() as u64;
 
         let blob_len = write_pos - blob_offset;
+        phase_blob_write_ms = t_blob_write.elapsed().as_millis();
 
-        // Finalize: sync, optionally truncate, remap
+        // Finalize: sync, optionally truncate, remap.
+        //
+        // For reclaim, capture the on-disk file length BEFORE `finish_blob_write`
+        // so we can report bytes actually freed by the truncate. The pwrite
+        // calls above may have *grown* the file (if `write_pos` extends past
+        // the prior end) — we want the size right before the ftruncate, which
+        // is exactly the file's length now.
+        let t_finish_blob = Instant::now();
         if reclaim {
+            let pre_truncate_len = storage.get_blob_file_len()?;
             storage.finish_blob_write(Some(write_pos))?;
+            let freed = pre_truncate_len.saturating_sub(write_pos);
             info!(
-                "Reclaimed dead blob space: wrote {} bytes at offset {}, truncated file",
-                blob_len, blob_offset
+                "Reclaimed dead blob space: wrote {} ({}) at offset {}, \
+                 truncated file from {} to {} (freed {})",
+                blob_len,
+                fmt_bytes(blob_len),
+                blob_offset,
+                fmt_bytes(pre_truncate_len),
+                fmt_bytes(write_pos),
+                fmt_bytes(freed),
             );
         } else {
             storage.finish_blob_write(None)?;
         }
+        phase_finish_blob_ms = t_finish_blob.elapsed().as_millis();
 
+        let t_sql_updates = Instant::now();
         let row = SquashLevelRow {
             level_id: next_level_id,
             min_height,
@@ -2429,17 +2542,55 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                 )?;
             }
         }
+        phase_sql_updates_ms = t_sql_updates.elapsed().as_millis();
 
         // Build the fresh SquashMeta snapshot from the just-updated SQL + blob file.
         // `publish_squash` will install it atomically with the generation bump.
-        build_squash_meta_from_sql(storage.sqlite_conn(), storage.blobs.as_ref())
+        let t_build_meta = Instant::now();
+        let result = build_squash_meta_from_sql(storage.sqlite_conn(), storage.blobs.as_ref());
+        phase_build_meta_ms = t_build_meta.elapsed().as_millis();
+        result
     })?;
+    // `publish_squash` pre-closure overhead = lock acquisition + quiesce wait
+    // for in-flight `BlobReadGuard`s to drain. Captured by the time delta from
+    // `t_publish_call` until the closure body started running.
+    let phase_publish_overhead_ms = closure_start_ms.unwrap_or(0);
 
     node_store.finish()?;
+
+    let total_ms = t_start.elapsed().as_millis();
 
     info!(
         "Incremental squash level {} complete: {} nodes, {} blob bytes, {} trailer bytes",
         next_level_id, stats.nodes_collected, stats.blob_bytes, stats.trailer_bytes
+    );
+
+    // Phase-timing summary. Sums may not equal total exactly: setup time before
+    // DFS, small inter-phase gaps (e.g. log calls, struct construction), and
+    // sub-millisecond rounding all land in the unattributed remainder. The
+    // intent is order-of-magnitude attribution to identify the dominant phase
+    // for parallelization, not a perfect breakdown.
+    info!(
+        "Squash level {} phase timing (ms): \
+         dfs={}, collect_history={}, baseline={}({} keys), \
+         leaf_replace={}, leaf_replace_flush={}, \
+         remap={}, publish_overhead={}, prune={}, \
+         blob_write={}, finish_blob={}, sql_updates={}, build_meta={}, total={}",
+        next_level_id,
+        phase_dfs_ms,
+        phase_collect_history_ms,
+        phase_baseline_ms,
+        phase_baseline_keys,
+        phase_leaf_replace_ms,
+        phase_leaf_replace_flush_ms,
+        phase_remap_ms,
+        phase_publish_overhead_ms,
+        phase_prune_ms,
+        phase_blob_write_ms,
+        phase_finish_blob_ms,
+        phase_sql_updates_ms,
+        phase_build_meta_ms,
+        total_ms,
     );
 
     Ok(stats)

@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
@@ -1868,7 +1869,7 @@ impl SharedStorageState {
     /// per-handle mmap.
     pub fn publish_squash<F>(&self, rebuild: F) -> Result<(), Error>
     where
-        F: FnOnce() -> Result<SquashMeta, Error>,
+        F: FnOnce(&PublishMutationGuard) -> Result<SquashMeta, Error>,
     {
         // 1. Claim the mutation window.
         self.truncate_pending.store(true, Ordering::Release);
@@ -1879,31 +1880,109 @@ impl SharedStorageState {
             std::thread::yield_now();
         }
 
-        // 3. Exclusive window — run the writer's mutation.
-        let rebuild_result = rebuild();
+        // 3. Run the entire mutation phase (file mutation + metadata install + generation
+        //    bump) inside `catch_unwind` so that a panic anywhere in this window aborts the
+        //    process instead of releasing readers against an inconsistent file/metadata pair.
+        //
+        //    The unsafe window is real: `rebuild` typically does `pwrite` + `ftruncate` +
+        //    `remap_and_invalidate` BEFORE returning the new `SquashMeta`. A panic — or an
+        //    `Err` return — between the truncate and the meta install would leave the
+        //    on-disk file mutated but the in-memory `meta` still describing the pre-truncate
+        //    layout. If we cleared `truncate_pending` on that path, every subsequent reader
+        //    would consult the old metadata against the new file (truncated offsets, stale
+        //    block index), serving wrong bytes or hitting decode errors. There is no
+        //    transactional rollback for `ftruncate`, so a partial mutation is unrecoverable
+        //    in-process — `process::abort` is the only safe response.
+        //
+        //    To distinguish safe pre-mutation `Err` returns from unsafe post-mutation ones
+        //    we hand the closure a [`PublishMutationGuard`] which it MUST `arm()`
+        //    immediately before its first irreversible operation. After arming, any `Err`
+        //    returned from the closure is treated like a panic and aborts the process.
+        //    Before arming, an `Err` is safe to surface to the caller (the file is
+        //    untouched).
+        let mutation_guard = PublishMutationGuard {
+            armed: AtomicBool::new(false),
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let new_meta = rebuild(&mutation_guard)?;
+            // 4. Install the new metadata snapshot.
+            *self.meta.write() = Arc::new(new_meta);
+            // 5. Bump generation BEFORE clearing `truncate_pending` (step 6, below the
+            //    catch). Readers that observe `!truncate_pending` are guaranteed to see the
+            //    bumped generation on their next check, which forces a per-handle resync.
+            self.generation.fetch_add(1, Ordering::Release);
+            Ok::<(), Error>(())
+        }));
+        let armed = mutation_guard.armed.load(Ordering::Acquire);
 
-        match rebuild_result {
-            Ok(new_meta) => {
-                // 4. Install the new metadata snapshot.
-                *self.meta.write() = Arc::new(new_meta);
-
-                // 5. Bump generation BEFORE clearing truncate_pending so any reader that
-                //    observes `!truncate_pending` will see the new generation on its next
-                //    check (and thereby re-sync its local per-handle state).
-                self.generation.fetch_add(1, Ordering::Release);
-
-                // 6. Release waiters.
+        match outcome {
+            Ok(Ok(())) => {
+                // 6. Successful publish: release waiters.
                 self.truncate_pending.store(false, Ordering::Release);
                 Ok(())
             }
-            Err(e) => {
-                // Release waiters without publishing. The metadata and file are left in
-                // whatever state `rebuild` saw before failing; callers using transactional
-                // rebuilds can retry safely.
+            Ok(Err(e)) if !armed => {
+                // Pre-mutation failure: the closure errored before arming the guard, so the
+                // blob/file is untouched. Releasing readers is safe.
                 self.truncate_pending.store(false, Ordering::Release);
                 Err(e)
             }
+            Ok(Err(e)) => {
+                // Post-mutation failure: the closure had armed the mutation guard, meaning
+                // the blob has already been pwritten/ftruncated/remapped. The metadata
+                // snapshot has NOT been installed and the generation has NOT been bumped, so
+                // releasing readers here would re-enter the same inconsistent
+                // file/metadata state we abort on for panics. Same response: log and abort.
+                error!(
+                    "FATAL: squash rebuild returned Err({e:?}) after arming the mutation \
+                     guard — aborting process to avoid serving stale squash metadata against \
+                     a possibly-truncated blob"
+                );
+                std::process::abort();
+            }
+            Err(_panic) => {
+                // Unrecoverable: the file may be partly mutated and metadata stale. Aborting
+                // is the only path that doesn't risk serving wrong data. Readers blocked on
+                // `wait_for_publish_complete` are released by process exit.
+                error!(
+                    "FATAL: squash mutation panicked inside publish_squash — aborting process \
+                     to avoid serving stale squash metadata against a possibly-truncated blob"
+                );
+                std::process::abort();
+            }
         }
+    }
+}
+
+/// Marker handed to the `rebuild` closure of [`SharedStorageState::publish_squash`].
+///
+/// The closure MUST call [`Self::arm`] immediately before its first irreversible operation.
+/// "Irreversible" includes both file mutations (`pwrite_blob_chunk`, `finish_blob_write`'s
+/// optional `ftruncate`, `remap_and_invalidate`) AND in-place SQL mutations that have no
+/// transactional rollback in the surrounding code path — notably
+/// `prune_orphaned_external_refs` (zeroes `external_offset`/`length` on non-canonical
+/// `marf_data` rows) and the post-write `write_squash_level` /
+/// `update_external_trie_blob_by_hash` updates that depend on the new blob layout.
+///
+/// After arming, any `Err` returned by the closure — or any panic that escapes — aborts
+/// the process rather than releasing readers against a half-mutated file/SQL pair with
+/// stale published metadata.
+///
+/// This converts an implicit convention ("don't return `Err` after mutation") into a
+/// runtime check that catches violations rather than silently corrupting the index.
+pub struct PublishMutationGuard {
+    armed: AtomicBool,
+}
+
+impl PublishMutationGuard {
+    /// Mark the mutation phase as begun. Call this immediately before the first irreversible
+    /// operation in the rebuild closure — that includes irreversible SQL mutations
+    /// (`prune_orphaned_external_refs`, post-write row updates) as well as blob writes
+    /// (`pwrite`, `ftruncate`, `remap_and_invalidate`). After arming, the only safe
+    /// outcomes for the closure are `Ok(SquashMeta)` (publish succeeds) or process abort
+    /// (via `Err` or panic).
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
     }
 }
 
@@ -2187,6 +2266,35 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// `reads_redirected` is true for the squash level (i.e. the marf_data rows
     /// point to the squash blob, not original per-block blobs).
     pub leaf_hashes_omitted: bool,
+
+    /// Memoized result of `compute_snapshot_height_via_parent_chain`, keyed by the
+    /// **user's** original opened block_id. The parent-chain walk is lazy — it only
+    /// runs when `snapshot_height_for_block()` is called from a `LeafSquashed` resolution
+    /// in the marf walk, and only for blocks whose eager paths (in-squash block, or
+    /// uncommitted-parent-of-squash) haven't already populated `squash_opened_height`.
+    ///
+    /// Stored as `(user_block_id, walk_result)` so the cache survives backptr resolution
+    /// (which mutates `cur_block_id` mid-walk). On a different user block, the entry is
+    /// overwritten — single-entry cache is enough because typical reads target one block
+    /// at a time.
+    ///
+    /// Inner walk result: `Some(h)` = squashed ancestor at height `h`; `None` =
+    /// sentinel/cap-exhaustion/pruned-ancestor (caller falls back to tip-read, which is
+    /// correct for canonical descendants and the best we can do for pathological deep forks).
+    pub resolved_snapshot_height: Cell<Option<(u32, Option<u32>)>>,
+
+    /// Perf-shape counter: number of `LeafSquashed` reads where snapshot-height resolved
+    /// to `None` and the walk used `tip_value` directly (no `entries` materialization, no
+    /// node re-read). Asserted in tests to prove the dormant-tip-read fast path works.
+    #[cfg(test)]
+    pub squashed_tip_fallback_count: Cell<u64>,
+
+    /// Perf-shape counter: number of `LeafSquashed` reads where snapshot-height resolved
+    /// to `Some(h)` and the walk re-read the leaf node to look up `entries[h]`. Asserted
+    /// in tests to prove the historical/fork path still exercises the value-at-height
+    /// lookup correctly.
+    #[cfg(test)]
+    pub squashed_entries_reread_count: Cell<u64>,
 }
 
 // disk-backed Trie.
@@ -2246,6 +2354,11 @@ impl<T: MarfTrieId> Default for TrieStorageTransientData<T> {
             squash_opened_height: None,
             squash_opened_level_idx: None,
             leaf_hashes_omitted: false,
+            resolved_snapshot_height: Cell::new(None),
+            #[cfg(test)]
+            squashed_tip_fallback_count: Cell::new(0),
+            #[cfg(test)]
+            squashed_entries_reread_count: Cell::new(0),
         }
     }
 }
@@ -2274,6 +2387,7 @@ impl<T: MarfTrieId> TrieStorageTransientData<T> {
         self.squash_opened_height = None;
         self.squash_opened_level_idx = None;
         self.leaf_hashes_omitted = false;
+        self.resolved_snapshot_height.set(None);
     }
 
     fn clear_block_id(&mut self) {
@@ -2458,7 +2572,7 @@ fn open_block_impl<T: MarfTrieId>(
         return Ok(());
     }
 
-    if let Some((ref uncommitted_bhh, _)) = data.uncommitted_writes {
+    if let Some((ref uncommitted_bhh, ref uncommitted_state)) = data.uncommitted_writes {
         if uncommitted_bhh == bhh {
             if data.unconfirmed
                 && data.cur_block_id == trie_sql::get_unconfirmed_block_identifier(db, bhh)?
@@ -2470,7 +2584,40 @@ fn open_block_impl<T: MarfTrieId>(
                 );
                 data.unconfirmed_block_id = data.cur_block_id;
             }
+
+            // Snapshot-height propagation for sibling-fork reads.
+            //
+            // Without this, opening a freshly-begun sibling block whose canonical sibling has been
+            // squashed leaves `squash_opened_height` as `None`. When the read pipeline later hits a
+            // `LeafSquashed` (because the sibling's trie falls through to the squashed canonical
+            // state), the absent height context drops it into the "tip read" branch in `marf::walk`
+            // — which returns the canonical sibling's value instead of the parent's. That is the
+            // exact bug Tier 10 documents and the production stall at block 11000 hit.
+            //
+            // Fix: if this uncommitted block's parent is in the squash, capture the parent's squash
+            // height here so subsequent squashed-leaf lookups via `value_at_height` resolve to the
+            // parent's view (the fork point) rather than the canonical sibling's tip value.
+            //
+            // Limitation: this only handles uncommitted blocks whose IMMEDIATE parent is in the
+            // squash. Committed-non-canonical blocks (deeper forks) are not yet covered — they
+            // would require a parent-chain walk via either a `marf_data.parent_block_hash` schema
+            // addition or a chainstate-level snapshot-height passthrough on `open_block`.
+            let parent_bhh = uncommitted_state.trie_ram_ref().parent.clone();
+            let parent_key: [u8; 32] = parent_bhh
+                .as_bytes()
+                .get(..32)
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0u8; 32]);
+            let parent_squash_entry = data.squash_meta.block_index.get(&parent_key).copied();
+
             data.set_block(bhh.clone(), None);
+
+            if let Some((level_idx, parent_height, _, reads_redirected, _)) = parent_squash_entry {
+                data.squash_opened_height = Some(parent_height);
+                data.squash_opened_level_idx = Some(level_idx);
+                data.leaf_hashes_omitted = reads_redirected;
+            }
+
             bench.open_block_finish(true);
             return Ok(());
         }
@@ -2522,8 +2669,145 @@ fn open_block_impl<T: MarfTrieId>(
     })?;
 
     data.set_block(bhh.clone(), Some(block_id));
+
+    // Snapshot-height propagation for committed non-squash blocks is deferred to
+    // `snapshot_height_for_block()` on the connection, called from the marf walk's
+    // `LeafSquashed` branch. Walking the parent chain here on every committed open would
+    // add up to `MAX_PARENT_CHAIN_DEPTH` SQL/blob-header lookups per open — catastrophic
+    // for canonical chains extended many blocks past the last squash, which are the vast
+    // majority of opens. The lazy resolver caches per user_block_id in
+    // `data.resolved_snapshot_height`, so the walk fires at most once per user-level open
+    // and only when a squashed leaf is actually reached.
+
     bench.open_block_finish(false);
     Ok(())
+}
+
+/// Walk a block's parent chain — reading the exact parent block hash from each per-block
+/// trie blob's header, NOT inferring it from root-node backptrs (which can point to older
+/// ancestors past COW chains and would mis-classify the snapshot height).
+///
+/// Each iteration:
+/// 1. Check whether the current block is in the squash. If yes, return its squash height —
+///    `value_at_height(height)` against this height returns the parent's view of the keys,
+///    which is exactly what a non-canonical descendant should consult.
+/// 2. Otherwise, read 32 bytes at the start of this block's trie blob — that's the parent
+///    block hash captured at commit time (see `TrieRAM::dump` and `TrieRAM::load`).
+/// 3. If the parent is the chain sentinel, the chain has no squashed ancestor — return
+///    `None` (caller falls through to the "no height context" branch).
+/// 4. Otherwise look up the parent's `block_id` and continue with the parent.
+///
+/// Returns only the snapshot height. The caller must not propagate the squash level index
+/// or `reads_redirected` flag — those are properties of an in-squash block's own blob (the
+/// merged squash blob with omitted leaf hashes), not of a fork descendant whose own blob is
+/// a regular per-block blob with hashes.
+///
+/// **Bounded by `MAX_PARENT_CHAIN_DEPTH`** (a generous cap relative to realistic Bitcoin
+/// reorg depths — Bitcoin's deepest historical reorg was 6 blocks). On exhaustion we
+/// return `None` and emit a `debug!` trace; correctness is preserved because `None` falls
+/// through to the tip-read branch — *correct* for canonical descendants extended far past
+/// the last squash (the common reason for exhaustion), and the best we can do for
+/// pathological deep forks. Hence `debug!`, not `warn!`: warning here would be operator
+/// noise on long-canonical-chain reads.
+///
+/// **Pruned-ancestor caveat:** if a non-canonical ancestor was already reclaimed by a
+/// previous squash (its `external_offset`/`external_length` zeroed by
+/// `prune_orphaned_external_refs`), we cannot read its blob header and the walk halts at
+/// `None`. This is the pre-existing limitation of the reclaim path and the durable fix is
+/// `marf_data.parent_block_hash` going forward; this helper degrades gracefully rather
+/// than panicking.
+const MAX_PARENT_CHAIN_DEPTH: u32 = 64;
+
+fn compute_snapshot_height_via_parent_chain<T: MarfTrieId>(
+    data: &TrieStorageTransientData<T>,
+    db: &Connection,
+    blobs: Option<&TrieFile>,
+    start_block_hash: &T,
+    start_block_id: u32,
+) -> Option<u32> {
+    // Fast path: no squash exists, so there's no squashed ancestor to find.
+    // Without this guard, every committed `open_block` would walk up to
+    // `MAX_PARENT_CHAIN_DEPTH` blob headers + SQL lookups before bailing — a hot-path
+    // disaster for the (overwhelmingly common) no-squash case.
+    if data.squash_meta.block_index.is_empty() {
+        return None;
+    }
+
+    let blobs = blobs?;
+    let sentinel = T::sentinel();
+    let mut current_hash: T = start_block_hash.clone();
+    let mut current_id: u32 = start_block_id;
+
+    for _ in 0..MAX_PARENT_CHAIN_DEPTH {
+        // 1. In-squash check.
+        let key: [u8; 32] = current_hash
+            .as_bytes()
+            .get(..32)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or([0u8; 32]);
+        if let Some(&(_level_idx, height, _, _reads_redirected, _)) =
+            data.squash_meta.block_index.get(&key)
+        {
+            return Some(height);
+        }
+
+        // 2. Read parent hash from the trie blob's header.
+        // `debug!` (not `warn!`) on failure: a missing offset usually means a pruned
+        // non-canonical ancestor (benign; caller falls back to tip-read which is already
+        // the correct answer for canonical descendants), so spamming warnings would be noise.
+        let trie_offset = match blobs.get_trie_offset(db, current_id) {
+            Ok(o) => o,
+            Err(e) => {
+                debug!(
+                    "compute_snapshot_height: cannot read trie offset for block_id={current_id} \
+                     ({current_hash}) — likely a pruned non-canonical ancestor. \
+                     Falling back to tip-read. Error: {e}"
+                );
+                return None;
+            }
+        };
+        let parent_hash_bytes = match blobs.read_parent_hash_at(trie_offset) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(
+                    "compute_snapshot_height: blob header read failed at block_id={current_id} \
+                     offset={trie_offset}: {e}"
+                );
+                return None;
+            }
+        };
+        let parent_hash: T = T::from_bytes(parent_hash_bytes);
+
+        // 3. Sentinel parent ⇒ end of chain, no squashed ancestor.
+        if parent_hash == sentinel {
+            return None;
+        }
+
+        // 4. Resolve parent's block_id for the next iteration.
+        let parent_id = match trie_sql::get_block_identifier(db, &parent_hash) {
+            Ok(id) => id,
+            Err(e) => {
+                debug!(
+                    "compute_snapshot_height: parent {parent_hash} not in marf_data \
+                     (looked up from block_id={current_id}'s blob header): {e}"
+                );
+                return None;
+            }
+        };
+        current_hash = parent_hash;
+        current_id = parent_id;
+    }
+
+    // `debug!` (not `warn!`): cap exhaustion is expected and correct for canonical chains
+    // extended far past the last squash (tip-read is the right answer for those). It's only
+    // incorrect for pathological deep forks, which are rare enough that a debug trace is
+    // sufficient — a `warn!` here would spam operator logs on every read of a long-canonical
+    // block whose key hits a `LeafSquashed`.
+    debug!(
+        "compute_snapshot_height: exceeded MAX_PARENT_CHAIN_DEPTH ({MAX_PARENT_CHAIN_DEPTH}) \
+         walking from block_id={start_block_id} ({start_block_hash}); falling back to tip-read"
+    );
+    None
 }
 
 /// Shared implementation for `TrieReadStorage::open_block_known_id`, used by both
@@ -2567,6 +2851,8 @@ fn open_block_known_id_impl<T: MarfTrieId>(
             data.cur_block_trie_offset = Some(squash_blob_offset);
         }
     }
+    // Committed non-squash blocks: parent-chain walk is deferred to
+    // `squash_opened_height()` on the connection (lazy; see `open_block_impl`).
 
     Ok(())
 }
@@ -2975,7 +3261,59 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
     }
 
     fn squash_opened_height(&self) -> Option<u32> {
+        // Eager getter only — returns the height set by `open_block_impl` when the
+        // currently-open block is in a squash level (or its uncommitted-parent-of-squash).
+        // For committed non-squash blocks (fork descendants, canonical past last squash),
+        // this is `None`; the lazy parent-chain walk lives in `snapshot_height_for_block`,
+        // which the marf walk only invokes if it actually hits a `LeafSquashed`.
         self.data.squash_opened_height
+    }
+
+    #[cfg(test)]
+    fn bump_squashed_tip_fallback_count(&self) {
+        let c = &self.data.squashed_tip_fallback_count;
+        c.set(c.get() + 1);
+    }
+
+    #[cfg(test)]
+    fn bump_squashed_entries_reread_count(&self) {
+        let c = &self.data.squashed_entries_reread_count;
+        c.set(c.get() + 1);
+    }
+
+    fn snapshot_height_for_block(&self, block_hash: &T, block_id: u32) -> Option<u32> {
+        // Eager fast path: the requested block is the currently-open block AND was
+        // detected as in-squash by `open_block_impl`. No walk needed.
+        if self.data.cur_block_id == Some(block_id) {
+            if let Some(h) = self.data.squash_opened_height {
+                return Some(h);
+            }
+        }
+        // No squash exists ⇒ no squashed ancestor to find. Cheap predicate that drops
+        // canonical-only chains (the common case) before any walk machinery.
+        if self.data.squash_meta.block_index.is_empty() {
+            return None;
+        }
+        // Memoized walk, keyed by user_block_id. Survives backptr resolution — which
+        // mutates `cur_block_id` mid-walk — because the cache key is the user's identity,
+        // passed in explicitly. Single-entry cache: a different user query overwrites it,
+        // which is fine since reads target one user block at a time.
+        if let Some((cached_id, cached_result)) = self.data.resolved_snapshot_height.get() {
+            if cached_id == block_id {
+                return cached_result;
+            }
+        }
+        let resolved = compute_snapshot_height_via_parent_chain(
+            self.data,
+            &self.db,
+            self.blobs.as_deref(),
+            block_hash,
+            block_id,
+        );
+        self.data
+            .resolved_snapshot_height
+            .set(Some((block_id, resolved)));
+        resolved
     }
 
     fn write_children_hashes_by_ptrs<W: Write + ?Sized>(
@@ -3200,6 +3538,21 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         trie_sql::get_external_blobs_length(&self.db)
     }
 
+    /// Actual on-disk length of the external blobs file, queried via filesystem
+    /// metadata (NOT the SQL-tracked `external_blobs_length` row, which may lag
+    /// or precede the file during in-flight pwrites/truncates).
+    ///
+    /// Used by squash bookkeeping to compute reclaimed bytes around the
+    /// `finish_blob_write` truncate boundary.
+    pub(crate) fn get_blob_file_len(&self) -> Result<u64, Error> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| {
+            Error::NotSupportedError(
+                "Cannot query blob file length: external_blobs not enabled".into(),
+            )
+        })?;
+        blobs.current_file_len()
+    }
+
     /// Reload squash level metadata and remap the blob file after an external squash operation
     /// has modified both the SQLite DB and the `.blobs` file through a separate handle.
     ///
@@ -3216,7 +3569,13 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         // `publish_squash` runs our rebuild under the quiesce. Inside the closure all other
         // readers on this db path have drained, so remap_and_invalidate + trailer reads see a
         // stable file. The generation bump and writer-flag release happen after we return.
-        let rebuild = || -> Result<SquashMeta, Error> {
+        //
+        // We never arm the mutation guard here: `refresh_after_squash` is the
+        // *consumer* path — a separate publisher has already truncated the file, and
+        // this rebuild only remaps THIS handle's mmap and re-reads the SQL trailer.
+        // No irreversible file mutation occurs, so any `Err` is safely surfaced to the
+        // caller without risk to other readers.
+        let rebuild = |_guard: &PublishMutationGuard| -> Result<SquashMeta, Error> {
             if let Some(b) = blobs.as_mut() {
                 b.remap_and_invalidate()?;
             }

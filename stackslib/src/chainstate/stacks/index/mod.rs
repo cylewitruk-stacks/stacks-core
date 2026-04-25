@@ -774,24 +774,51 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
 
     /// Return the opened block's height within a squash level, if any.
     ///
-    /// Used by `walk` to resolve `TrieLeafSquashed` entries at the correct
-    /// point-in-time. Returns `None` when the currently-open block is not
-    /// inside a squash range.
+    /// Eager-only getter: returns the height set by `open_block` when the currently-open block
+    /// lives inside a squash level (or is an uncommitted block whose parent does). Used by
+    /// `read_node_hash` for the per-block root-hash override on in-squash blocks.
+    ///
+    /// Returns `None` for committed non-squash blocks (forks, canonical-past-squash); callers
+    /// needing the snapshot-height for `LeafSquashed` resolution there should use
+    /// [`snapshot_height_for_block`](Self::snapshot_height_for_block).
     fn squash_opened_height(&self) -> Option<u32> {
         None
     }
 
-    /// Hook invoked by the top-level retry wrapper after an internal
-    /// [`Error::RetryAfterSquash`] fires. Backends that cache squash-dependent state (mmap
-    /// region, offset cache, current-block context, snapshotted [`SquashMeta`]) should refresh
-    /// from the shared storage state here so the retry attempt reads against the freshly
-    /// published layout.
+    /// Resolve the snapshot height for `LeafSquashed` reads on a *specific* block, independent of
+    /// the currently-open `cur_block` (which the marf walk mutates during backptr resolution).
     ///
-    /// Default implementation is a no-op — suitable for pure-SQL / in-memory storage backends
-    /// that don't observe the shared squash generation.
+    /// Walks the parent chain via per-block trie blob headers, finding the closest squashed
+    /// ancestor, with memoization keyed on `block_id`. The walk only fires when (a) the marf walk
+    /// actually encountered a `LeafSquashed` (i.e. this method is called), (b) at least one squash
+    /// level exists, and (c) the requested block isn't already eagerly classified as in-squash.
+    /// Backends without a squash concept return `None`.
+    fn snapshot_height_for_block(&self, _block_hash: &T, _block_id: u32) -> Option<u32> {
+        None
+    }
+
+    /// Hook invoked by the top-level retry wrapper after an internal [`Error::RetryAfterSquash`]
+    /// fires. Backends that cache squash-dependent state (mmap region, offset cache, current-block
+    /// context, snapshotted [`SquashMeta`]) should refresh from the shared storage state here so
+    /// the retry attempt reads against the freshly published layout.
+    ///
+    /// Default implementation is a no-op — suitable for pure-SQL / in-memory storage backends that
+    /// don't observe the shared squash generation.
     fn refresh_after_concurrent_squash(&mut self) -> Result<(), Error> {
         Ok(())
     }
+
+    /// Test-only perf-shape counter hook: bump when a `LeafSquashed` resolves to `None` snapshot
+    /// height and the walk returns `tip_value` directly (no entries access, no node re-read). Tests
+    /// assert this is `> 0` for dormant tip reads to prove the hot-path optimization is live.
+    #[cfg(test)]
+    fn bump_squashed_tip_fallback_count(&self) {}
+
+    /// Test-only perf-shape counter hook: bump when a `LeafSquashed` resolves to a `Some(height)`
+    /// and the walk re-reads the leaf to look up `entries[idx]`. Tests assert this is `> 0` for
+    /// historical / fork reads.
+    #[cfg(test)]
+    fn bump_squashed_entries_reread_count(&self) {}
 }
 
 /// Bundles a [`TrieReadStorage`] reference with a [`TrieNodeReadState`] for convenient node

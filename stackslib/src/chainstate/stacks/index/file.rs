@@ -516,6 +516,48 @@ impl TrieFile {
         Ok(offset)
     }
 
+    /// Read the 32-byte parent block hash that's prefixed at the start of every per-block
+    /// trie blob (see `TrieRAM::dump` / `TrieRAM::load` for the format). Used by
+    /// `compute_snapshot_height_via_parent_chain` in `storage.rs` to walk a fork's parent
+    /// chain to find the closest squashed ancestor — the parent hash from the blob header
+    /// is the *exact* parent (captured at commit time), not the inferable-but-unsafe
+    /// "first non-empty root backptr" which can point to older ancestors past COW chains.
+    ///
+    /// Deliberately bypasses the `mmap` region on the Disk variant and issues a direct
+    /// `pread`, for two reasons:
+    /// 1. This call is made from `open_block`-time logic that runs outside the
+    ///    `BlobReadGuard`/quiesce protocol, so touching the mmap here would reopen the
+    ///    SIGBUS/stale-mmap race against a concurrent squash truncation.
+    /// 2. Only 32 bytes are read, so skipping the mmap fast-path costs at most one syscall.
+    pub(super) fn read_parent_hash_at(
+        &self,
+        trie_offset: u64,
+    ) -> Result<[u8; crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE], Error> {
+        const N: usize = crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
+        let mut buf = [0u8; N];
+        let n = match self {
+            TrieFile::Disk(ref disk) => {
+                pread(&disk.fd, &mut buf, trie_offset).map_err(Error::IOError)?
+            }
+            TrieFile::RAM(ref ram) => {
+                let data = ram.fd.get_ref();
+                let start = trie_offset as usize;
+                let bytes = data.get(start..).ok_or(Error::NotFoundError)?;
+                let len = N.min(bytes.len());
+                let src = bytes.get(..len).ok_or(Error::NotFoundError)?;
+                let dst = buf.get_mut(..len).ok_or(Error::NotFoundError)?;
+                dst.copy_from_slice(src);
+                len
+            }
+        };
+        if n < N {
+            return Err(Error::CorruptionError(format!(
+                "read_parent_hash_at: short read ({n} bytes) at offset {trie_offset}"
+            )));
+        }
+        Ok(buf)
+    }
+
     /// Read bytes at a given file offset into `buf` without modifying any cursor state.
     /// Uses mmap when available and the offset is in range; otherwise falls back to `pread`.
     ///
@@ -1057,6 +1099,20 @@ impl TrieFile {
             }
         }
         Ok(())
+    }
+
+    /// On-disk length of the blob file in bytes. Queries the filesystem
+    /// directly (or the in-memory buffer for the RAM backend), so it reflects
+    /// the actual current file size — not a SQL-tracked offset that may lag
+    /// or precede the file due to in-flight pwrites/truncates.
+    ///
+    /// Used by squash bookkeeping to compute "bytes reclaimed" =
+    /// `pre_squash_len - post_truncate_len`.
+    pub fn current_file_len(&self) -> Result<u64, Error> {
+        match self {
+            TrieFile::Disk(disk) => Ok(disk.fd.metadata().map_err(Error::IOError)?.len()),
+            TrieFile::RAM(ram) => Ok(ram.fd.get_ref().len() as u64),
+        }
     }
 
     /// Remap the mmap (if any) to cover the current file extent and clear

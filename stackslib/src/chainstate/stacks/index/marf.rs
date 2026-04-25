@@ -887,6 +887,47 @@ impl<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>
                 }
             }
 
+            // In-squash override for self-lookup of `OWN_BLOCK_HEIGHT_KEY`.
+            //
+            // The squash blob is a single MERGED tip trie shared by every block in the
+            // squash range. There is exactly one leaf per path, so reading
+            // `OWN_BLOCK_HEIGHT_KEY` from any in-squash block returns the SQUASH TIP's
+            // height (the value from the highest-height block in the range), not the
+            // requested block's per-block height.
+            //
+            // Without this override, a fork extending a non-tip squashed block (e.g.
+            // canonical_810 inside a 0..=1000 squash) would compute
+            // `new_block_height = squash_tip + 1 = 1001` instead of `parent + 1 = 811`.
+            // The wrong height then propagates into `set_block_heights`, into the
+            // sealed MARF root via `get_trie_ancestor_hashes_bytes`, and panics when
+            // a `value_at_height(parent_height_810)` lookup misses entries written at
+            // heights {1000, 999}.
+            //
+            // The fix: read the per-block height from the squash trailer (via
+            // `squash_opened_height()`) instead of the merged-trie lookup. The trailer
+            // records the correct per-block height for every in-squash block.
+            //
+            // Filter: only apply when `cur_block_id` is `Some(_)` after open. That
+            // distinguishes a true in-squash block (case we want) from an uncommitted
+            // block whose parent is in-squash (Tier 10 sets `squash_opened_height` to
+            // the *parent's* height in that case, which is NOT this block's height —
+            // its TrieRAM has the correct value via the regular lookup below).
+            if block_hash == current_block_hash {
+                let in_squash_height = this.with_restored_block_context(|this| {
+                    this.open_block(current_block_hash, None)?;
+                    let storage = this.storage();
+                    let cur_block_id = storage.get_cur_block_and_id().1;
+                    Ok(if cur_block_id.is_some() {
+                        storage.squash_opened_height()
+                    } else {
+                        None
+                    })
+                })?;
+                if let Some(h) = in_squash_height {
+                    return Ok(Some(h));
+                }
+            }
+
             let marf_value = if block_hash == current_block_hash {
                 this.get_by_key(current_block_hash, OWN_BLOCK_HEIGHT_KEY)?
             } else {
@@ -1674,18 +1715,23 @@ impl<T: MarfTrieId> MARF<T> {
             storage.open_block(block_hash)?;
             cursor.reset(path, storage.root_trieptr());
 
-            // Capture the user's query height NOW, right after opening the target block and before
-            // any backptr traversal can change it.
+            // Capture the user's target block identity AND any eagerly-set snapshot height NOW,
+            // before backptr resolution can mutate them mid-walk. The parent-chain *walk* itself is
+            // deferred to the `LeafSquashed` branch — most reads never touch a squashed leaf, so
+            // paying for that walk up-front would be wasted work on canonical-only and post-squash
+            // key reads.
             //
-            // `squash_opened_height` on storage is overloaded: it tracks the currently-opened
-            // block's height (used by `read_node_hash` for per-block root-hash lookups). Backptr
-            // resolution calls `open_block_known_id` on the backptr target, which within a squash
-            // range overwrites this field with the target block's height. For `value_at_height` on
-            // a squashed leaf we always want the *user's* query height, not the height of whatever
-            // block a backptr happens to point at — those are generally different when the key was
-            // written sparsely and a historical read must chase backptrs to find the leaf in the
-            // merged squash trie.
-            let user_query_height = storage.squash_opened_height();
+            // What's captured here:
+            //   - `user_block_hash` / `user_block_id`: the user's open target. Backptr resolution
+            //     calls `open_block_known_id` and mutates `cur_block_id`, so `snapshot_height_for_block`
+            //     in the LeafSquashed branch must use *these* (not the post-mutation cur_block).
+            //   - `eager_user_height`: O(1) field read of `data.squash_opened_height`. Set
+            //     non-None for in-squash user blocks (`read_node_hash` per-block root-hash override
+            //     consumer) AND for uncommitted blocks whose parent is in the squash (Tier 10 fix).
+            //     For uncommitted blocks `user_block_id` is `None`, so the LeafSquashed branch
+            //     can't fall back to a block-id-keyed walk — the eager capture is the only signal.
+            let (user_block_hash, user_block_id) = storage.get_cur_block_and_id();
+            let eager_user_height = storage.squash_opened_height();
 
             let mut node_ptr = storage.root_trieptr();
 
@@ -1693,32 +1739,50 @@ impl<T: MarfTrieId> MARF<T> {
                 enum WalkAction {
                     Next(TriePtr),
                     FoundLeaf(TrieLeaf),
+                    /// `LeafSquashed` deferred so the `read_session` borrow can be released before
+                    /// we call `snapshot_height_for_block` on storage (which reborrows it). Carries
+                    /// only the small `path` + `tip_value` clones — NOT the (potentially large)
+                    /// `entries` vector — and the original `node_ptr` for a *conditional* re-read.
+                    ///
+                    /// Hot path (dormant tip read on canonical chain past a squash):
+                    /// snapshot-height resolves to `None` and `tip_value` is used directly, so
+                    /// `entries` is never materialized and the leaf isn't re-read. Historical/fork
+                    /// path (height = `Some`): re-decodes this same `node_ptr` into the scratch
+                    /// buffer to look up `entries[idx]`. The re-read is one decode pass — cheaper
+                    /// than cloning a potentially large `Vec<(u32, MARFValue)>` and bounded
+                    /// regardless of how frequently the key was overwritten across the squash
+                    /// range.
+                    FoundSquashedLeaf {
+                        path: Vec<u8>,
+                        tip_value: MARFValue,
+                        node_ptr: TriePtr,
+                    },
                     FollowBackptr(TriePtr),
                     NotFound,
                 }
 
                 let cur_block = storage.get_cur_block();
                 storage.bench_mut().marf_walk_from_start();
-                let mut read_session = TrieReadSession::new(storage, decode_scratch);
-                let read = read_session.read_node(&node_ptr)?;
-                let action = match cursor.walk_read(&read, &cur_block) {
-                    Ok(Some(next_ptr)) => WalkAction::Next(next_ptr),
-                    Ok(None) => {
-                        // Ptr-hint sanity check (unchanged)
-                        let ptr_base = clear_backptr(cursor.ptr().id());
-                        if ptr_base != TrieNodeID::Leaf as u8
-                            && ptr_base != TrieNodeID::LeafSquashed as u8
-                        {
-                            return Err(Error::CorruptionError(
-                                "Non-leaf encountered at end of path".to_string(),
-                            ));
-                        }
+                let action = {
+                    let mut read_session = TrieReadSession::new(storage, decode_scratch);
+                    let read = read_session.read_node(&node_ptr)?;
+                    match cursor.walk_read(&read, &cur_block) {
+                        Ok(Some(next_ptr)) => WalkAction::Next(next_ptr),
+                        Ok(None) => {
+                            // Ptr-hint sanity check (unchanged)
+                            let ptr_base = clear_backptr(cursor.ptr().id());
+                            if ptr_base != TrieNodeID::Leaf as u8
+                                && ptr_base != TrieNodeID::LeafSquashed as u8
+                            {
+                                return Err(Error::CorruptionError(
+                                    "Non-leaf encountered at end of path".to_string(),
+                                ));
+                            }
 
-                        // Branch on the decoded node type (ground truth from the
-                        // blob), not the ptr hint which can be stale.
-                        let leaf = match read.node_type() {
-                            Some(TrieNodeID::LeafSquashed) => {
-                                if let Some(height) = user_query_height {
+                            // Branch on the decoded node type (ground truth from the
+                            // blob), not the ptr hint which can be stale.
+                            match read.node_type() {
+                                Some(TrieNodeID::LeafSquashed) => {
                                     let sq = read.as_leaf_squashed_ref()?.ok_or_else(|| {
                                         Error::CorruptionError(
                                             "LeafSquashed node_type but \
@@ -1726,34 +1790,38 @@ impl<T: MarfTrieId> MARF<T> {
                                                 .into(),
                                         )
                                     })?;
-                                    let value =
-                                        sq.value_at_height(height).ok_or(Error::NotFoundError)?;
-                                    TrieLeaf::from_value(sq.path, value.clone())
-                                } else {
-                                    // No height context (tip read) — return tip value
+                                    // Phase 1: extract only the small fixed-size data — no
+                                    // `entries` clone. Save `node_ptr` so Phase 2 can conditionally
+                                    // re-read this exact node if a height resolves and
+                                    // `entries[idx]` is needed.
+                                    WalkAction::FoundSquashedLeaf {
+                                        path: sq.path.to_vec(),
+                                        tip_value: sq.tip_value.clone(),
+                                        node_ptr,
+                                    }
+                                }
+                                _ => {
                                     let lr = read.as_leaf()?.ok_or_else(|| {
                                         Error::CorruptionError(
                                             "Path reached a non-leaf".to_string(),
                                         )
                                     })?;
-                                    TrieLeaf::from_value(lr.path, lr.data.clone())
+                                    WalkAction::FoundLeaf(TrieLeaf::from_value(
+                                        lr.path,
+                                        lr.data.clone(),
+                                    ))
                                 }
                             }
-                            _ => {
-                                let lr = read.as_leaf()?.ok_or_else(|| {
-                                    Error::CorruptionError("Path reached a non-leaf".to_string())
-                                })?;
-                                TrieLeaf::from_value(lr.path, lr.data.clone())
-                            }
-                        };
-                        WalkAction::FoundLeaf(leaf)
+                        }
+                        Err(Error::CursorError(CursorError::PathDiverged))
+                        | Err(Error::CursorError(CursorError::ChrNotFound)) => WalkAction::NotFound,
+                        Err(Error::CursorError(CursorError::BackptrEncountered(ptr))) => {
+                            WalkAction::FollowBackptr(ptr)
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(Error::CursorError(CursorError::PathDiverged))
-                    | Err(Error::CursorError(CursorError::ChrNotFound)) => WalkAction::NotFound,
-                    Err(Error::CursorError(CursorError::BackptrEncountered(ptr))) => {
-                        WalkAction::FollowBackptr(ptr)
-                    }
-                    Err(e) => return Err(e),
+                    // read_session dropped here, releasing the storage borrow so the
+                    // FoundSquashedLeaf branch below can call snapshot_height_for_block.
                 };
 
                 match action {
@@ -1762,6 +1830,77 @@ impl<T: MarfTrieId> MARF<T> {
                         continue;
                     }
                     WalkAction::FoundLeaf(leaf) => {
+                        storage.bench_mut().marf_walk_from_finish();
+                        return Ok(leaf);
+                    }
+                    WalkAction::FoundSquashedLeaf {
+                        path,
+                        tip_value,
+                        node_ptr: leaf_node_ptr,
+                    } => {
+                        // Snapshot-height resolution, in priority order:
+                        //   1. `eager_user_height` (captured before walk): covers in-squash and
+                        //      uncommitted-of-squash users — backptr resolution may have mutated
+                        //      `data.squash_opened_height` since.
+                        //   2. Lazy parent-chain walk for committed non-squash users (forks past
+                        //      the squash). Memoized per user_block_id; fires at most once per
+                        //      user-level open, only when this branch is reached.
+                        //   3. None — uncommitted with no eager set (no squash exists or parent
+                        //      isn't in one) → tip-read fallback.
+                        let user_query_height = match (eager_user_height, user_block_id) {
+                            (Some(h), _) => Some(h),
+                            (None, Some(id)) => {
+                                storage.snapshot_height_for_block(&user_block_hash, id)
+                            }
+                            (None, None) => None,
+                        };
+                        let leaf = if let Some(height) = user_query_height {
+                            // Historical/fork path: re-read the leaf to access `entries[idx]`.
+                            // `cur_block` is unchanged since Phase 1 (the snapshot-height walker
+                            // doesn't open blocks), so `leaf_node_ptr` resolves to the same
+                            // squashed leaf we just decoded. Cost: one decode pass on bytes
+                            // typically still resident in mmap/page cache. Bounded re-read, unlike
+                            // cloning a potentially large entries vector.
+                            #[cfg(test)]
+                            storage.bump_squashed_entries_reread_count();
+                            let mut read_session = TrieReadSession::new(storage, decode_scratch);
+                            let read = read_session.read_node(&leaf_node_ptr)?;
+                            let sq = read.as_leaf_squashed_ref()?.ok_or_else(|| {
+                                Error::CorruptionError(
+                                    "LeafSquashed node_type lost between phase-1 decode \
+                                     and phase-2 re-read"
+                                        .into(),
+                                )
+                            })?;
+                            let value = sq.value_at_height(height).cloned().ok_or_else(|| {
+                                // `debug!` (not `warn!`): None here is an explicit signal
+                                // to the caller that the key didn't exist at the requested
+                                // snapshot height — semantically valid (e.g. for a key
+                                // first written above `height`). For unexpected cases (the
+                                // genesis-sync seal panic), this debug line provides the
+                                // entries vector + resolved height, queryable with
+                                // `STACKS_LOG_DEBUG=1` if a regression resurfaces.
+                                let entry_heights: Vec<u32> =
+                                    sq.entries.iter().map(|(h, _)| *h).collect();
+                                debug!(
+                                    "MARF::walk LeafSquashed value_at_height returned None: \
+                                     user_block_hash={user_block_hash}, user_block_id={user_block_id:?}, \
+                                     eager_user_height={eager_user_height:?}, \
+                                     resolved_height={height}, \
+                                     leaf_path={}, entries_heights={entry_heights:?}",
+                                    crate::util::hash::to_hex(&path)
+                                );
+                                Error::NotFoundError
+                            })?;
+                            TrieLeaf::from_value(&path, value)
+                        } else {
+                            // Hot path: dormant tip read on canonical chain past a squash, or
+                            // pruned-ancestor walk fallback. `tip_value` is already in hand; no
+                            // entries materialization, no node re-read.
+                            #[cfg(test)]
+                            storage.bump_squashed_tip_fallback_count();
+                            TrieLeaf::from_value(&path, tip_value)
+                        };
                         storage.bench_mut().marf_walk_from_finish();
                         return Ok(leaf);
                     }

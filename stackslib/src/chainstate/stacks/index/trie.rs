@@ -826,12 +826,23 @@ impl Trie {
 
         let mut log_depth = 0;
         while log_depth < 32 && (1u32 << log_depth) <= cur_block_height {
+            let target_height = cur_block_height - (1u32 << log_depth);
             let prev_block_header = read_ctx
-                .get_block_at_height(cur_block_height - (1u32 << log_depth), &cur_block_header)?
+                .get_block_at_height(target_height, &cur_block_header)?
                 .ok_or_else(|| {
+                    // `debug!` (not `error!`): the panic site already produces a clear
+                    // FATAL message via `.expect()` in `calculate_marf_root_hash`. This
+                    // diagnostic line attaches the geometric-lookup context (which target
+                    // and which log_depth produced the None), retrievable with
+                    // `STACKS_LOG_DEBUG=1` if a regression in the get_block_at_height
+                    // pipeline resurfaces.
+                    debug!(
+                        "get_trie_ancestor_hashes_bytes lookup returned None: \
+                         cur_block_header={cur_block_header}, cur_block_height={cur_block_height}, \
+                         target_height={target_height}, log_depth={log_depth}"
+                    );
                     Error::CorruptionError(format!(
-                        "Could not obtain block hash at block height {}",
-                        cur_block_height - (1u32 << log_depth)
+                        "Could not obtain block hash at block height {target_height}"
                     ))
                 })?;
 

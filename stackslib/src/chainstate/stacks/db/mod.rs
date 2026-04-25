@@ -2337,6 +2337,8 @@ impl StacksChainState {
     /// `sortdb_conn` is a connection to the sortition database, used to
     /// resolve the epoch 3.4 burn-height boundary for mode selection.
     pub fn maybe_squash(&mut self, block_height: u64, sortdb_conn: &Connection) {
+        use std::thread;
+
         use crate::chainstate::stacks::index::squash::{
             create_stub_level, squash_level_incremental, SquashMode, STUB_THRESHOLD,
         };
@@ -2360,127 +2362,157 @@ impl StacksChainState {
 
         let tip_height = block_height as u32;
 
-        // Determine squash range for the headers MARF.
-        let headers_path = self.state_index.get_db_path().to_string();
-        let headers_min = Self::squash_min_height_for(&self.state_index);
+        // --- Phase 1: Plan both MARFs (sequential, fast) ---
 
-        // Determine squash range for the Clarity MARF.
-        let clarity_result: (String, u32) = self.clarity_state.with_marf(|clarity_marf| {
-            let path = clarity_marf.get_db_path().to_string();
-            let min = Self::squash_min_height_for_marf(clarity_marf);
-            (path, min)
-        });
-        let (clarity_path, clarity_min) = clarity_result;
-
-        // --- Mode selection ---
         // Headers MARF: always TipOnly (no at-block reads target the headers MARF).
-        let headers_mode = SquashMode::TipOnly;
+        let headers_plan = SquashPlan {
+            label: "headers",
+            path: self.state_index.get_db_path().to_string(),
+            tip_height,
+            min_height: Self::squash_min_height_for(&self.state_index),
+            mode: SquashMode::TipOnly,
+        };
 
-        // Clarity MARF: determine effective mode from configured preference
-        // and epoch 3.4 boundary.
+        // Clarity MARF: read path + current min in one `with_marf` borrow.
+        let (clarity_path, clarity_min) = self.clarity_state.with_marf(|clarity_marf| {
+            (
+                clarity_marf.get_db_path().to_string(),
+                Self::squash_min_height_for_marf(clarity_marf),
+            )
+        });
+        // Determine effective Clarity mode from configured preference + epoch 3.4 boundary.
         let configured = self
             .marf_opts
             .as_ref()
             .map(|o| o.squash_mode)
             .unwrap_or(SquashMode::TipOnly);
-        let clarity_mode =
-            Self::effective_squash_mode(configured, clarity_min, self.db(), sortdb_conn);
+        let clarity_plan = SquashPlan {
+            label: "clarity",
+            path: clarity_path,
+            tip_height,
+            min_height: clarity_min,
+            mode: Self::effective_squash_mode(configured, clarity_min, self.db(), sortdb_conn),
+        };
 
-        // --- Late-enablement guard for headers MARF ---
-        // If no prior levels exist and the range is too large (pre-existing
-        // chainstate), create a stub level instead of attempting a squash
-        // that would exceed the u32 pointer space.
-        let headers_block_count = (tip_height as u64) - (headers_min as u64) + 1;
-        if headers_min == 0 && headers_block_count > STUB_THRESHOLD {
-            info!(
-                "Late-enablement: headers MARF range ({headers_block_count} blocks) exceeds \
-                 STUB_THRESHOLD ({STUB_THRESHOLD}). Creating stub level."
-            );
-            match create_stub_level::<StacksBlockId>(&headers_path, 0, tip_height) {
-                Ok(()) => {
-                    info!("Stub level created for headers MARF (0..={tip_height})");
-                    if let Err(e) = self.state_index.refresh_after_squash() {
-                        warn!("Failed to refresh headers MARF after stub creation: {e}");
-                    }
+        // --- Phase 2: Run both squash/stub operations in parallel ---
+        //
+        // Each `squash_level_incremental` opens its own SQLite + MARF handle internally and
+        // operates against a distinct file path, so the two threads share no mutable state.
+        // The process-wide `SharedStorageState` registry is keyed by db path, so each thread
+        // gets its own slot — no inner-mutex contention between them. Refresh of this
+        // chainstate's live handles happens after the join, on the calling thread, where the
+        // borrow checker is satisfied with sequential `&mut self` access.
+        //
+        // Panic propagation: join both threads, then re-raise if either panicked. This
+        // preserves "don't abandon the other thread mid-flight" without silently swallowing
+        // a panic — a swallowed worker panic here would mask a loud failure mode the caller
+        // expects, and a stuck `truncate_pending` flag from a half-finished publish_squash
+        // would deadlock all future readers (`SharedStorageState::publish_squash` clears
+        // that flag via an RAII drop-guard for exactly this reason, but we still want the
+        // caller's thread to crash visibly rather than continue against possibly-corrupted
+        // file state).
+        let (headers_should_refresh, clarity_should_refresh) = thread::scope(|s| {
+            let headers_handle = s.spawn(|| run_squash_plan(&headers_plan));
+            let clarity_handle = s.spawn(|| run_squash_plan(&clarity_plan));
+            // Always join both before reacting to either, so one panic doesn't leak the
+            // other thread.
+            let headers_join = headers_handle.join();
+            let clarity_join = clarity_handle.join();
+            match (headers_join, clarity_join) {
+                (Ok(h), Ok(c)) => (h, c),
+                (Err(panic), Ok(_)) => {
+                    error!("Auto-squash headers MARF thread panicked");
+                    std::panic::resume_unwind(panic);
                 }
-                Err(e) => {
-                    warn!("Failed to create stub level for headers MARF: {e}");
+                (Ok(_), Err(panic)) => {
+                    error!("Auto-squash clarity MARF thread panicked");
+                    std::panic::resume_unwind(panic);
+                }
+                (Err(headers_panic), Err(_clarity_panic)) => {
+                    error!("Auto-squash headers AND clarity MARF threads panicked");
+                    // Re-raise the headers panic; the clarity panic payload is dropped but
+                    // the log line above records that both occurred.
+                    std::panic::resume_unwind(headers_panic);
                 }
             }
-        } else {
-            // Squash headers MARF.
-            info!(
-                "Auto-squash: headers MARF heights {headers_min}..={tip_height} \
-                 (path: {headers_path})"
-            );
-            match squash_level_incremental::<StacksBlockId>(
-                &headers_path,
-                headers_mode,
-                headers_min,
-                tip_height,
-                true, // reclaim=true; for L0 this is append-only since no prior levels exist
-            ) {
-                Ok(stats) => {
-                    info!(
-                        "Auto-squash headers MARF complete: {} nodes, {} leaves",
-                        stats.nodes_collected, stats.leaves_collected
-                    );
-                    if let Err(e) = self.state_index.refresh_after_squash() {
-                        warn!("Failed to refresh headers MARF after squash: {e}");
-                    }
-                }
-                Err(e) => {
-                    warn!("Auto-squash headers MARF failed: {e}");
-                }
+        });
+
+        // --- Phase 3: Refresh live handles on this thread (sequential is required: the
+        // refresh paths take `&mut self.state_index` / `&mut self.clarity_state`). ---
+        if headers_should_refresh {
+            if let Err(e) = self.state_index.refresh_after_squash() {
+                warn!("Failed to refresh headers MARF after squash: {e}");
             }
         }
+        if clarity_should_refresh {
+            self.clarity_state.with_marf(|clarity_marf| {
+                if let Err(e) = clarity_marf.refresh_after_squash() {
+                    warn!("Failed to refresh clarity MARF after squash: {e}");
+                }
+            });
+        }
 
-        // --- Late-enablement guard for clarity MARF ---
-        let clarity_block_count = (tip_height as u64) - (clarity_min as u64) + 1;
-        if clarity_min == 0 && clarity_block_count > STUB_THRESHOLD {
-            info!(
-                "Late-enablement: clarity MARF range ({clarity_block_count} blocks) exceeds \
-                 STUB_THRESHOLD ({STUB_THRESHOLD}). Creating stub level."
-            );
-            match create_stub_level::<StacksBlockId>(&clarity_path, 0, tip_height) {
-                Ok(()) => {
-                    info!("Stub level created for clarity MARF (0..={tip_height})");
-                    self.clarity_state.with_marf(|clarity_marf| {
-                        if let Err(e) = clarity_marf.refresh_after_squash() {
-                            warn!("Failed to refresh clarity MARF after stub creation: {e}");
-                        }
-                    });
+        // --- Inline helpers ---
+
+        struct SquashPlan {
+            label: &'static str,
+            path: String,
+            tip_height: u32,
+            min_height: u32,
+            mode: SquashMode,
+        }
+
+        /// Run a squash (or stub-level fallback if the range exceeds `STUB_THRESHOLD` and no
+        /// prior levels exist). Returns `true` iff the calling thread should refresh its live
+        /// MARF handle; on hard failure, returns `false` so the live handle keeps pointing at
+        /// the unmodified file.
+        fn run_squash_plan(plan: &SquashPlan) -> bool {
+            let block_count = (plan.tip_height as u64) - (plan.min_height as u64) + 1;
+            // Late-enablement guard: a fresh range > u32 pointer space is too large to squash
+            // in one shot — install a stub level instead.
+            if plan.min_height == 0 && block_count > STUB_THRESHOLD {
+                info!(
+                    "Late-enablement: {} MARF range ({block_count} blocks) exceeds \
+                     STUB_THRESHOLD ({STUB_THRESHOLD}). Creating stub level.",
+                    plan.label
+                );
+                match create_stub_level::<StacksBlockId>(&plan.path, 0, plan.tip_height) {
+                    Ok(()) => {
+                        info!(
+                            "Stub level created for {} MARF (0..={})",
+                            plan.label, plan.tip_height
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        warn!("Failed to create stub level for {} MARF: {e}", plan.label);
+                        false
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to create stub level for clarity MARF: {e}");
-                }
-            }
-        } else {
-            // Squash Clarity MARF.
-            info!(
-                "Auto-squash: clarity MARF heights {clarity_min}..={tip_height} \
-                 (path: {clarity_path})"
-            );
-            match squash_level_incremental::<StacksBlockId>(
-                &clarity_path,
-                clarity_mode,
-                clarity_min,
-                tip_height,
-                true,
-            ) {
-                Ok(stats) => {
-                    info!(
-                        "Auto-squash clarity MARF complete: {} nodes, {} leaves",
-                        stats.nodes_collected, stats.leaves_collected
-                    );
-                    self.clarity_state.with_marf(|clarity_marf| {
-                        if let Err(e) = clarity_marf.refresh_after_squash() {
-                            warn!("Failed to refresh clarity MARF after squash: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    warn!("Auto-squash clarity MARF failed: {e}");
+            } else {
+                info!(
+                    "Auto-squash: {} MARF heights {}..={} (path: {})",
+                    plan.label, plan.min_height, plan.tip_height, plan.path
+                );
+                // reclaim=true; for L0 this is append-only since no prior levels exist.
+                match squash_level_incremental::<StacksBlockId>(
+                    &plan.path,
+                    plan.mode,
+                    plan.min_height,
+                    plan.tip_height,
+                    true,
+                ) {
+                    Ok(stats) => {
+                        info!(
+                            "Auto-squash {} MARF complete: {} nodes, {} leaves",
+                            plan.label, stats.nodes_collected, stats.leaves_collected
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        warn!("Auto-squash {} MARF failed: {e}", plan.label);
+                        false
+                    }
                 }
             }
         }
@@ -2506,15 +2538,14 @@ impl StacksChainState {
         }
     }
 
-    /// Determine the effective squash mode for a level whose range starts
-    /// at `min_height` (a Stacks block height).
+    /// Determine the effective squash mode for a level whose range starts at `min_height` (a Stacks
+    /// block height).
     ///
     /// Rules:
     /// - If the user configured `FullHistory`, always use `FullHistory`.
-    /// - If the user configured `TipOnly`, force `FullHistory` when the
-    ///   range contains pre-epoch-3.4 blocks (required for consensus-correct
-    ///   replay of `at-block`). Once the entire range is post-3.4, honour
-    ///   the `TipOnly` preference.
+    /// - If the user configured `TipOnly`, force `FullHistory` when the range contains
+    ///   pre-epoch-3.4 blocks (required for consensus-correct replay of `at-block`). Once the
+    ///   entire range is post-3.4, honour the `TipOnly` preference.
     pub(crate) fn effective_squash_mode(
         configured: SquashMode,
         min_height: u32,
