@@ -9170,45 +9170,42 @@ fn test_seal_after_squash_canonical_tip_extension_smoke() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// **REGRESSION TEST** for the genesis-sync seal panic:
-//   "Could not obtain block hash at block height 999"
+/// **REGRESSION TEST** for the genesis-sync seal panic:
+///   "Could not obtain block hash at block height 999"
 //
-// **Bug**: the squash blob is a single MERGED tip trie with one leaf per path,
-// so `OWN_BLOCK_HEIGHT_KEY` reads from any in-squash block return the SQUASH
-// TIP's height, not the per-block height. `MARF::begin` calls
-// `inner_get_extension_height` → `get_block_height_miner_tip(parent, parent)`,
-// and when `parent` is a non-tip squashed block, that lookup returns the
-// squash-tip height. The new block then computes
-// `child_height = squash_tip_height + 1` (e.g. 1001) instead of
-// `parent_height + 1` (e.g. 811), writes that wrong height into its own
-// `OWN_BLOCK_HEIGHT_KEY` via `set_block_heights`, and at seal the geometric
-// ancestor lookup queries `::H` for `H` derived from the wrong `cur_height`
-// — landing on entries whose recorded heights are above the parent's true
-// `squash_opened_height`, so `value_at_height` returns `None` and the seal
-// panics.
+/// **Bug**: the squash blob is a single MERGED tip trie with one leaf per path,
+/// so `OWN_BLOCK_HEIGHT_KEY` reads from any in-squash block return the SQUASH
+/// TIP's height, not the per-block height. `MARF::begin` calls
+/// `inner_get_extension_height` → `get_block_height_miner_tip(parent, parent)`,
+/// and when `parent` is a non-tip squashed block, that lookup returns the
+/// squash-tip height. The new block then computes
+/// `child_height = squash_tip_height + 1` (e.g. 1001) instead of
+/// `parent_height + 1` (e.g. 811), writes that wrong height into its own
+/// `OWN_BLOCK_HEIGHT_KEY` via `set_block_heights`, and at seal the geometric
+/// ancestor lookup queries `::H` for `H` derived from the wrong `cur_height`
+/// — landing on entries whose recorded heights are above the parent's true
+/// `squash_opened_height`, so `value_at_height` returns `None` and the seal
+/// panics.
 //
-// **Fix**: `get_block_height_miner_tip` self-lookup now bypasses the
-// merged-trie `OWN_BLOCK_HEIGHT_KEY` read for in-squash blocks and pulls the
-// per-block height from the squash trailer via `squash_opened_height()`.
+/// **Fix**: `get_block_height_miner_tip` self-lookup now bypasses the
+/// merged-trie `OWN_BLOCK_HEIGHT_KEY` read for in-squash blocks and pulls the
+/// per-block height from the squash trailer via `squash_opened_height()`.
 //
-// **Test layout**: Build N=50 blocks (heights 0..=49), squash 0..=49 with
-// `FullHistory + reclaim=true`, then begin a fork from a NON-TIP squashed
-// parent (`block_hashes[30]` at height 30). Without the fix:
-//   - `inner_get_extension_height` reads `OWN_BLOCK_HEIGHT_KEY` from the
-//     merged trie → returns 49 (squash tip).
-//   - Child computes its height as `49 + 1 = 50` instead of `31`.
-//   - `set_block_heights` writes `OWN_BLOCK_HEIGHT_KEY = 50`, `::50 = child`,
-//     `::49 = parent` (the parent's hash recorded at the wrong height key).
-//   - Seal's geometric lookup queries `::49`, `::48`, `::46`, ... with
-//     `eager_user_height = Some(30)` (parent's true squash height from
-//     `parent_squash_entry`), and `value_at_height(30)` on `::49`'s entries
-//     `[(49, h)]` returns `None` → panic.
-// With the fix: child correctly computes height 31, OWN_BLOCK_HEIGHT_KEY = 31,
-// geometric lookup queries `::30, ::29, ::27, ::23, ::15`, all of which have
-// `value_at_height(30) = Some(...)` because every entry's write_height is ≤ 30.
-// ---------------------------------------------------------------------------
-
+/// **Test layout**: Build N=50 blocks (heights 0..=49), squash 0..=49 with
+/// `FullHistory + reclaim=true`, then begin a fork from a NON-TIP squashed
+/// parent (`block_hashes[30]` at height 30). Without the fix:
+///   - `inner_get_extension_height` reads `OWN_BLOCK_HEIGHT_KEY` from the
+///     merged trie → returns 49 (squash tip).
+///   - Child computes its height as `49 + 1 = 50` instead of `31`.
+///   - `set_block_heights` writes `OWN_BLOCK_HEIGHT_KEY = 50`, `::50 = child`,
+///     `::49 = parent` (the parent's hash recorded at the wrong height key).
+///   - Seal's geometric lookup queries `::49`, `::48`, `::46`, ... with
+///     `eager_user_height = Some(30)` (parent's true squash height from
+///     `parent_squash_entry`), and `value_at_height(30)` on `::49`'s entries
+///     `[(49, h)]` returns `None` → panic.
+/// With the fix: child correctly computes height 31, OWN_BLOCK_HEIGHT_KEY = 31,
+/// geometric lookup queries `::30, ::29, ::27, ::23, ::15`, all of which have
+/// `value_at_height(30) = Some(...)` because every entry's write_height is ≤ 30.
 #[test]
 fn test_repro_seal_fork_from_non_tip_squashed_parent() {
     use crate::chainstate::stacks::index::marf::MarfInternals;
@@ -9216,6 +9213,7 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
 
     let dir = fresh_test_dir("test_repro_seal_fork_from_non_tip");
     let path = format!("{dir}/marf.sqlite");
+    let ref_path = format!("{dir}/ref-marf.sqlite");
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
 
     const N: u32 = 50;
@@ -9231,8 +9229,8 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
         })
         .collect();
 
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    for build_path in [&path, &ref_path] {
+        let mut marf = MARF::<StacksBlockId>::from_path(build_path, open_opts.clone()).unwrap();
         let mut parent = StacksBlockId::sentinel();
         for (i, bh) in block_hashes.iter().enumerate() {
             marf.begin(&parent, bh).unwrap();
@@ -9300,9 +9298,25 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
     // Without the fix, cur_height=50 → queries 49, 48, 46, 42, 34, 18 — and
     // `value_at_height(30)` on `::49`'s entries `[(49, h)]` returns None →
     // panic with "Could not obtain block hash at block height 49".
-    marf.seal()
+    let squashed_fork_root = marf
+        .seal()
         .unwrap_or_else(|e| panic!("seal of fork from non-tip squashed parent failed: {e:?}"));
     marf.commit().unwrap();
+
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+    ref_marf.begin(&fork_parent, &fork_block).unwrap();
+    ref_marf
+        .insert("fork_marker_key", MARFValue::from(0xCAFEu32))
+        .unwrap();
+    let reference_fork_root = ref_marf
+        .seal()
+        .unwrap_or_else(|e| panic!("seal of unsquashed reference fork failed: {e:?}"));
+    ref_marf.commit().unwrap();
+    assert_eq!(
+        squashed_fork_root, reference_fork_root,
+        "fork from a non-tip reclaimed squash parent must seal to the same root \
+         as an unsquashed reference"
+    );
 
     // Cross-check via storage that the committed fork block was registered at
     // the right height (parent_height + 1, NOT squash_tip + 1).
@@ -9320,5 +9334,137 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
          have height = parent_height + 1 = {}, not squash_tip + 1 = {}",
         expected_fork_parent_height + 1,
         N
+    );
+}
+
+/// **REGRESSION TEST** for the `collect_history_parallel` block_hashes slice
+/// indexing bug.
+//
+/// **Bug**: `collect_history_parallel` divides `min_height..=max_height` into
+/// chunks across worker threads. Each worker calls `collect_history_into` with
+/// the chunk's start as `min_height` parameter, but originally received the
+/// FULL `block_hashes` slice. `collect_history_into` indexes that slice as
+/// `block_hashes[(h - min_height)]` — which for any worker after the first
+/// reads `block_hashes[0]` (the OUTER min_height's block) instead of the
+/// chunk's actual block hash. The resulting partial history is wrong: every
+/// worker chunk past the first records leaves under the wrong block heights,
+/// producing incorrect `Vec<(height, value)>` entries.
+//
+/// **Fix**: each worker now slices `block_hashes` to just its chunk's range
+/// (`chunk_block_hashes = &block_hashes[chunk_offset_lo..chunk_offset_hi]`),
+/// so the indexing within `collect_history_into` is valid.
+//
+/// **Why existing tests didn't catch it**: the long-horizon differential tests
+/// use `l0_blocks: usize = 6`, well below `HISTORY_MIN_HEIGHTS_FOR_PARALLEL =
+/// 64`. They take the serial fallback in `collect_history_parallel` and never
+/// exercised the parallel path. This test uses `N = 80` so the parallel path
+/// is guaranteed to fire (at least 2 workers on any multi-core host).
+//
+/// **What this test verifies**: read every key at every height from the
+/// squashed MARF and compare against an unsquashed reference. If `collect_history`
+/// produces the wrong per-key entries (e.g., a value recorded under the wrong
+/// height), the squashed `LeafSquashed`'s `value_at_height(h)` will return the
+/// wrong value at some height, and the differential will diverge.
+#[test]
+fn test_repro_collect_history_parallel_block_hashes_indexing() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_repro_collect_history_parallel_indexing");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+
+    // 80 blocks comfortably exceeds HISTORY_MIN_HEIGHTS_FOR_PARALLEL = 64,
+    // ensuring `collect_history_parallel` takes the parallel path with
+    // multiple workers (each handling ~10 heights at 8 workers).
+    const N: u32 = 80;
+    const KEYS_PER_BLOCK: u32 = 6;
+
+    let block_hashes: Vec<StacksBlockId> = (0..N)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[24..28].copy_from_slice(&0x_C_AFE_BABEu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&i.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    // Build the chain twice — once for the squashed copy, once for the
+    // unsquashed reference. Mix repeated and unique writes so the per-key
+    // history has both single-entry and multi-entry leaves to merge.
+    for path in &[&sq_path, &ref_path] {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        let mut parent = StacksBlockId::sentinel();
+        for (i, bh) in block_hashes.iter().enumerate() {
+            marf.begin(&parent, bh).unwrap();
+            for k in 0..KEYS_PER_BLOCK {
+                // Mix two patterns:
+                //  - shared_key_<k>: rewritten in every block with a value
+                //    derived from (i, k) → produces multi-entry LeafSquashed
+                //    that crosses chunk seams.
+                //  - per_block_key_<i>_<k>: written once per block → produces
+                //    single-entry LeafSquashed cleanly inside one chunk.
+                marf.insert(
+                    &format!("shared_key_{k}"),
+                    MARFValue::from(i as u32 * 1000 + k),
+                )
+                .unwrap();
+                marf.insert(
+                    &format!("per_block_key_{i}_{k}"),
+                    MARFValue::from(0xBEEF_0000u32 + i as u32 * 100 + k),
+                )
+                .unwrap();
+            }
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+            parent = bh.clone();
+        }
+        drop(marf);
+    }
+
+    // Squash the squashed copy, leave the reference alone.
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, N - 1, true)
+        .expect("squash should succeed");
+
+    // Differential: read every key at every block from both MARFs and assert
+    // they match. With the bug, parallel-collected history records entries
+    // under the wrong heights, so `value_at_height(h)` lookups for `shared_key_*`
+    // diverge from the reference at some heights.
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    sq_marf.refresh_after_squash().unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    let mut total_compared = 0usize;
+    for (i, bh) in block_hashes.iter().enumerate() {
+        // Sample `shared_key_*` (multi-entry LeafSquashed; sensitive to height
+        // assignment in the parallel path).
+        for k in 0..KEYS_PER_BLOCK {
+            let key = format!("shared_key_{k}");
+            let sq_val = sq_marf.get(bh, &key).unwrap();
+            let ref_val = ref_marf.get(bh, &key).unwrap();
+            assert_eq!(
+                sq_val, ref_val,
+                "divergence at block {i} for {key}: squashed={sq_val:?}, reference={ref_val:?}. \
+                 If the squashed MARF disagrees with the unsquashed reference for a \
+                 multi-write key, `collect_history_parallel` likely recorded entries \
+                 under the wrong heights — exactly the indexing bug this test guards."
+            );
+            total_compared += 1;
+        }
+        // Spot-check `per_block_key_*` — single-entry LeafSquashed where chunk
+        // assignment determines whether the entry exists at all.
+        let key = format!("per_block_key_{i}_0");
+        let sq_val = sq_marf.get(bh, &key).unwrap();
+        let ref_val = ref_marf.get(bh, &key).unwrap();
+        assert_eq!(
+            sq_val, ref_val,
+            "divergence at block {i} for per-block key {key}: squashed={sq_val:?}, reference={ref_val:?}"
+        );
+        total_compared += 1;
+    }
+
+    assert!(
+        total_compared >= (N as usize) * (KEYS_PER_BLOCK as usize + 1),
+        "differential check should compare >= one read per (block, key) pair"
     );
 }

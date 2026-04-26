@@ -2283,6 +2283,29 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// correct for canonical descendants and the best we can do for pathological deep forks).
     pub resolved_snapshot_height: Cell<Option<(u32, Option<u32>)>>,
 
+    /// **Experimental — for squash-internal read-only handles only.**
+    ///
+    /// When `true`, all `BlobReadGuard` acquisitions in the read pipeline are
+    /// skipped (and the zero-copy mmap fast path is bypassed in favor of the
+    /// scratch-decode slow path, which doesn't return mmap-borrowed bytes).
+    /// This eliminates atomic contention on `shared_squash.active_reads` —
+    /// the per-read fetch_add/fetch_sub pair that bounces a single cache line
+    /// between worker cores during heavy parallel reads.
+    ///
+    /// **Safety**: only safe to set on read-only MARF handles created inside
+    /// `squash_level_incremental` for its own pre-publish read phases
+    /// (`collect_history_parallel`, baseline lookups). During those phases:
+    ///   - The squash thread itself hasn't called `publish_squash` yet, so no
+    ///     `ftruncate` / `remap_and_invalidate` can fire on this MARF.
+    ///   - `squash_level_incremental` is single-threaded per MARF (no other
+    ///     squash on this MARF can run concurrently).
+    /// Both guard purposes (SIGBUS protection from concurrent truncate, and
+    /// staleness detection from a mid-walk publish) are therefore moot.
+    ///
+    /// Setting this on any external handle (RPC reader, chainstate read, etc.)
+    /// would expose the handle to SIGBUS or stale-state reads and is unsafe.
+    pub bypass_blob_guard: bool,
+
     /// Perf-shape counter: number of `LeafSquashed` reads where snapshot-height resolved
     /// to `None` and the walk used `tip_value` directly (no `entries` materialization, no
     /// node re-read). Asserted in tests to prove the dormant-tip-read fast path works.
@@ -2355,6 +2378,7 @@ impl<T: MarfTrieId> Default for TrieStorageTransientData<T> {
             squash_opened_level_idx: None,
             leaf_hashes_omitted: false,
             resolved_snapshot_height: Cell::new(None),
+            bypass_blob_guard: false,
             #[cfg(test)]
             squashed_tip_fallback_count: Cell::new(0),
             #[cfg(test)]
@@ -3012,7 +3036,13 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
         // restarts against the freshly published metadata. Also verify the generation hasn't
         // drifted since `open_block` sync'd: if it has, the mmap layout we cached at
         // block-open time is stale and the traversal must restart.
-        if self.data.unconfirmed_block_id != Some(id) {
+        //
+        // `bypass_blob_guard` (squash-internal use only) skips the fast path entirely so we
+        // never return mmap-borrowed bytes — the caller must own its bytes via scratch
+        // decode below. This avoids the per-read atomic on `active_reads` and the cache-
+        // line ping-pong that contention causes across worker cores. Safe only when the
+        // caller knows no concurrent publish can fire on this MARF (see field doc).
+        if self.data.unconfirmed_block_id != Some(id) && !self.data.bypass_blob_guard {
             if let Some(ref blobs) = self.blobs {
                 let guard = self
                     .data
@@ -3054,7 +3084,10 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
         // of this function suffices. Skip acquisition when the blob file is absent (pure-SQL
         // backend has no mmap to protect). Generation check guards against stale `trie_offset`
         // / `leaf_hashes_omitted` cached on `self.data` after a mid-walk publish.
-        let _slow_path_guard = if self.blobs.is_some() {
+        //
+        // `bypass_blob_guard` skips both: no atomic acquire, no staleness check. Safe only
+        // when the caller knows no concurrent publish can fire on this MARF.
+        let _slow_path_guard = if self.blobs.is_some() && !self.data.bypass_blob_guard {
             let guard = self
                 .data
                 .shared_squash
@@ -3167,8 +3200,9 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             Some(block_id) => {
                 // Per-read guard: `inner_read_persisted_node_hash` calls `blobs.get_node_hash`
                 // which touches the mmap. The returned `TrieHash` is an owned 32-byte copy, so
-                // the guard can be local. Skip when blobs aren't enabled (pure-SQL backend).
-                let _guard = if self.blobs.is_some() {
+                // the guard can be local. Skip when blobs aren't enabled (pure-SQL backend) or
+                // when `bypass_blob_guard` is set (squash-internal handles only).
+                let _guard = if self.blobs.is_some() && !self.data.bypass_blob_guard {
                     let guard = self
                         .data
                         .shared_squash
@@ -3225,18 +3259,24 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
         if self.blobs.is_some() {
             // Per-read guard for the mmap-backed path. Hash/type decode yields owned values
             // (Copy types), so the guard is local to this call and drops at scope end.
-            let _guard = self
-                .data
-                .shared_squash
-                .try_acquire_blob_read()
-                .ok_or(Error::RetryAfterSquash)?;
-            if !self
-                .data
-                .shared_squash
-                .squash_state_fresh(self.data.seen_squash_generation)
-            {
-                return Err(Error::RetryAfterSquash);
-            }
+            // Skipped when `bypass_blob_guard` is set (squash-internal handles only).
+            let _guard = if !self.data.bypass_blob_guard {
+                let guard = self
+                    .data
+                    .shared_squash
+                    .try_acquire_blob_read()
+                    .ok_or(Error::RetryAfterSquash)?;
+                if !self
+                    .data
+                    .shared_squash
+                    .squash_state_fresh(self.data.seen_squash_generation)
+                {
+                    return Err(Error::RetryAfterSquash);
+                }
+                Some(guard)
+            } else {
+                None
+            };
             let blobs = self
                 .blobs
                 .as_mut()
@@ -3349,18 +3389,24 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             // Per-read guard covers the entire `inner_write_children_hashes` walk — the hash
             // reader does multiple mmap accesses across sibling pointers, all of which must
             // stay protected against a concurrent ftruncate until this call returns.
-            let _guard = self
-                .data
-                .shared_squash
-                .try_acquire_blob_read()
-                .ok_or(Error::RetryAfterSquash)?;
-            if !self
-                .data
-                .shared_squash
-                .squash_state_fresh(self.data.seen_squash_generation)
-            {
-                return Err(Error::RetryAfterSquash);
-            }
+            // Skipped when `bypass_blob_guard` is set (squash-internal handles only).
+            let _guard = if !self.data.bypass_blob_guard {
+                let guard = self
+                    .data
+                    .shared_squash
+                    .try_acquire_blob_read()
+                    .ok_or(Error::RetryAfterSquash)?;
+                if !self
+                    .data
+                    .shared_squash
+                    .squash_state_fresh(self.data.seen_squash_generation)
+                {
+                    return Err(Error::RetryAfterSquash);
+                }
+                Some(guard)
+            } else {
+                None
+            };
             let start_time = self.bench.write_children_hashes_start();
             let block_id = self.data.cur_block_id.ok_or_else(|| {
                 error!("Failed to get cur block as hash reader");

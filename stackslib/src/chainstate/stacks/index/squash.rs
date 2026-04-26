@@ -573,6 +573,38 @@ fn is_marf_internal_key(key_hash: &TrieHash) -> bool {
     *key_hash == *OWN_BLOCK_HEIGHT_KEY_HASH
 }
 
+/// Decode an existing serialized leaf, build a `TrieLeafSquashed` carrying the
+/// given transitions (sorted descending by height for `value_at_height` binary
+/// search), and re-serialize the new node body.
+///
+/// Hash-free: leaf bodies in the squash blob are stored without the 32-byte
+/// hash prefix (squash blobs use `leaf_hashes_omitted`).
+///
+/// Extracted as a helper so it can be called from both the serial fallback and
+/// the parallel `thread::scope` workers in `squash_level_incremental` Step 2.5.
+fn build_squashed_leaf_bytes(
+    raw: &[u8],
+    transitions: &[(u32, MARFValue)],
+) -> Result<Vec<u8>, Error> {
+    let node_id_byte = *raw.first().ok_or_else(|| {
+        Error::CorruptionError("Empty node body during FullHistory leaf replace".into())
+    })?;
+    let node_id = clear_backptr(node_id_byte) & 0x3f;
+    let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(raw, node_id)?;
+    let path_slice = existing_node.path_bytes();
+
+    // `transitions` from `collect_history` is ascending by height; `TrieLeafSquashed`
+    // wants descending so `value_at_height`'s `partition_point(|h| *h > query)` works.
+    let mut entries: Vec<(u32, MARFValue)> = transitions.to_vec();
+    entries.reverse();
+
+    let squashed = TrieLeafSquashed::new(path_slice, entries)?;
+    let squashed_node = TrieNodeType::LeafSquashed(squashed);
+    let mut new_buf = Vec::with_capacity(squashed_node.byte_len() + 1);
+    squashed_node.write_bytes(&mut new_buf)?;
+    Ok(new_buf)
+}
+
 /// Human-readable byte size formatter for squash log lines. Picks GB / MB / KB
 /// based on magnitude, with two decimals of precision; falls back to raw bytes
 /// for sub-KB values.
@@ -699,11 +731,34 @@ pub fn collect_history<T: MarfTrieId>(
     let storage = marf.storage_backend_mut();
     let mut conn = storage.connection();
 
+    collect_history_into(
+        &mut conn,
+        block_hashes,
+        min_height,
+        max_height,
+        &mut history,
+    )?;
+
+    Ok(history)
+}
+
+/// Walk a contiguous height range and append discovered (height, value) entries
+/// per key into `history`. Within-range dedup of consecutive same values is
+/// applied here; cross-range boundary dedup is the caller's responsibility (the
+/// parallel `collect_history_parallel` merges per-worker `history` maps and
+/// re-applies dedup at the chunk seams).
+fn collect_history_into<T: MarfTrieId, R: TrieReadStorage<T>>(
+    conn: &mut R,
+    block_hashes: &[T],
+    min_height: u32,
+    max_height: u32,
+    history: &mut HashMap<TrieHash, Vec<(u32, MARFValue)>>,
+) -> Result<(), Error> {
     for h in min_height..=max_height {
         let block_hash = &block_hashes[(h - min_height) as usize];
         conn.open_block(block_hash)?;
 
-        walk_local_leaves(&mut conn, &mut |full_key_hash, leaf_value| {
+        walk_local_leaves(conn, &mut |full_key_hash, leaf_value| {
             // Skip the pathological internal key.
             if is_marf_internal_key(full_key_hash) {
                 return;
@@ -716,7 +771,161 @@ pub fn collect_history<T: MarfTrieId>(
             entries.push((h, leaf_value));
         })?;
     }
+    Ok(())
+}
 
+/// Parallel variant of [`collect_history`]. For ranges large enough to amortize
+/// the per-worker setup cost (opening N read-only MARF handles), divides
+/// `min_height..=max_height` into N contiguous height chunks, walks each chunk
+/// on its own worker thread with its own read-only MARF handle (own SQL
+/// connection + mmap), and merges the per-worker partial histories at the end.
+///
+/// The merge concatenates per-key entries in worker order — workers process
+/// disjoint ascending height ranges, so the concatenated entries remain
+/// ascending. A boundary dedup pass at chunk seams handles the case where
+/// worker N's last value for a key equals worker N+1's first value.
+///
+/// Falls back to the serial [`collect_history`] when (a) the range is small
+/// enough that thread/handle setup would dominate, (b) only one core is
+/// available, or (c) `available_parallelism()` returns an error.
+fn collect_history_parallel<T: MarfTrieId + Send + Sync>(
+    marf: &mut MARF<T>,
+    block_hashes: &[T],
+    min_height: u32,
+    max_height: u32,
+) -> Result<HashMap<TrieHash, Vec<(u32, MARFValue)>>, Error> {
+    let expected_len = (max_height - min_height + 1) as usize;
+    if block_hashes.len() != expected_len {
+        return Err(Error::CorruptionError(format!(
+            "collect_history_parallel: block_hashes length {} does not match height range [{min_height}, {max_height}] (expected {expected_len})",
+            block_hashes.len()
+        )));
+    }
+
+    const HISTORY_MAX_WORKERS: usize = 8;
+    const HISTORY_MIN_HEIGHTS_FOR_PARALLEL: usize = 64;
+    let num_heights = expected_len;
+    let n_workers = if num_heights < HISTORY_MIN_HEIGHTS_FOR_PARALLEL {
+        0
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(HISTORY_MAX_WORKERS))
+            .unwrap_or(1)
+            .max(1)
+            .min(num_heights)
+    };
+
+    if n_workers <= 1 {
+        return collect_history(marf, block_hashes, min_height, max_height);
+    }
+
+    // Pre-open N read-only MARF handles so any open error propagates as a
+    // normal Err (vs being a thread-panic inside the scope).
+    //
+    // Set `bypass_blob_guard` on each handle: workers do many small reads
+    // (every node decode in `walk_local_leaves` would otherwise hit the
+    // `shared_squash.active_reads` atomic), and the cache-line ping-pong
+    // across cores can dominate. Safe here because the caller is inside
+    // `squash_level_incremental` for this MARF — no concurrent publish can
+    // truncate the blob during the read phases.
+    let mut ro_marfs: Vec<MARF<T>> = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let mut ro = marf.reopen_readonly()?;
+        ro.storage_backend_mut().data.bypass_blob_guard = true;
+        ro_marfs.push(ro);
+    }
+
+    // Divide heights into contiguous chunks. The last worker takes the
+    // remainder if `num_heights` doesn't divide evenly.
+    let heights_per_worker = num_heights.div_ceil(n_workers).max(1);
+    let block_hashes_ref: &[T] = block_hashes;
+
+    let partial_histories: Vec<HashMap<TrieHash, Vec<(u32, MARFValue)>>> =
+        std::thread::scope(|s| -> Result<Vec<_>, Error> {
+            let handles: Vec<_> = ro_marfs
+                .iter_mut()
+                .enumerate()
+                .map(|(idx, ro_marf)| {
+                    let chunk_start_h = min_height + (idx * heights_per_worker) as u32;
+                    let chunk_end_h_excl =
+                        min_height.saturating_add(((idx + 1) * heights_per_worker) as u32);
+                    let chunk_end_h = chunk_end_h_excl.min(max_height + 1);
+                    // Slice `block_hashes` to just this chunk's height range so
+                    // `collect_history_into`'s `(h - chunk_start_h)` indexing is
+                    // valid. Without this slice, every worker after the first would
+                    // index past offset 0 of the FULL block_hashes slice — which is
+                    // wrong (block_hashes[0] is at the OUTER min_height, not the
+                    // chunk's start).
+                    let chunk_offset_lo = (chunk_start_h.saturating_sub(min_height)) as usize;
+                    let chunk_offset_hi = (chunk_end_h.saturating_sub(min_height)) as usize;
+                    let chunk_block_hashes = &block_hashes_ref[chunk_offset_lo..chunk_offset_hi];
+                    s.spawn(
+                        move || -> Result<HashMap<TrieHash, Vec<(u32, MARFValue)>>, Error> {
+                            let mut partial: HashMap<TrieHash, Vec<(u32, MARFValue)>> =
+                                HashMap::new();
+                            if chunk_start_h >= chunk_end_h {
+                                return Ok(partial);
+                            }
+                            let storage = ro_marf.storage_backend_mut();
+                            let mut conn = storage.connection();
+                            collect_history_into(
+                                &mut conn,
+                                chunk_block_hashes,
+                                chunk_start_h,
+                                chunk_end_h - 1,
+                                &mut partial,
+                            )?;
+                            Ok(partial)
+                        },
+                    )
+                })
+                .collect();
+
+            // Drain ALL handles before returning (see baseline-lookup loop for
+            // the rationale — leaving workers unjoined on early-return risks
+            // scope-drop panics that bypass our wrapped error).
+            let mut partials = Vec::with_capacity(n_workers);
+            let mut first_err: Option<Error> = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(partial)) => partials.push(partial),
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    Err(_panic_payload) => {
+                        if first_err.is_none() {
+                            first_err = Some(Error::CorruptionError(
+                                "collect_history worker thread panicked".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            Ok(partials)
+        })?;
+
+    // Merge: concatenate per-key entries in worker order. Workers process
+    // disjoint ascending height ranges, so the concatenation is globally
+    // ascending. Re-apply dedup at chunk seams (worker N's last value for a
+    // key may equal worker N+1's first value — e.g. a key whose value is
+    // unchanged across the seam).
+    let mut history: HashMap<TrieHash, Vec<(u32, MARFValue)>> = HashMap::new();
+    for partial in partial_histories {
+        for (key, entries) in partial {
+            let merged = history.entry(key).or_default();
+            for (h, v) in entries {
+                if merged.last().is_some_and(|(_, lv)| *lv == v) {
+                    continue;
+                }
+                merged.push((h, v));
+            }
+        }
+    }
     Ok(history)
 }
 
@@ -1577,8 +1786,8 @@ impl<T: MarfTrieId> BlockMap for IncrementalSquashBlockMap<T> {
 /// Compute the hash for a node using canonical MARF consensus bytes.
 ///
 /// Uses `write_consensus_bytes` (not `write_bytes`) to match the hash computation in
-/// `bits::get_node_hash`. The provided `BlockMap` resolves backpointer block IDs to
-/// block hashes for the consensus bytes contribution.
+/// `bits::get_node_hash`. The provided `BlockMap` resolves backpointer block IDs to block hashes
+/// for the consensus bytes contribution.
 fn compute_node_hash<T: MarfTrieId, M: BlockMap<TrieId = T>>(
     node: &TrieNodeType,
     child_hashes: &[TrieHash],
@@ -1671,26 +1880,24 @@ fn verify_no_descendants<T: MarfTrieId>(marf: &mut MARF<T>, max_height: u32) -> 
 ///
 /// Cross-level backpointers into prior levels are preserved as-is. Only intra-range nodes are
 /// collected and remapped to sequential offsets in the new squash blob.
-pub fn squash_level_incremental<T: MarfTrieId>(
+pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
     marf_path: &str,
     mode: SquashMode,
     min_height: u32,
     max_height: u32,
     reclaim: bool,
 ) -> Result<SquashStats, Error> {
-    // Phase-timing instrumentation. Each phase's duration is captured into a
-    // `phase_*_ms` binding and reported in the final summary log so we can see
-    // where the wall-clock time actually goes (DFS vs collect_history vs leaf
-    // replacement vs publish_squash vs prune+truncate vs SQL updates).
+    // Phase-timing instrumentation. Each phase's duration is captured into a `phase_*_ms` binding
+    // and reported in the final summary log so we can see where the wall-clock time actually goes
+    // (DFS vs collect_history vs leaf replacement vs publish_squash vs prune+truncate vs SQL
+    // updates).
     //
-    // Style note: phases assigned in the *outer* function body that are
-    // unconditionally set (DFS, remap, publish_overhead) use `let … = …` at
-    // the assignment site to avoid an `unused_assignments` warning on the
-    // initial `0`. Phases assigned inside `if full_history` AND phases
-    // assigned inside the `publish_squash` closure must be declared up front
-    // here because (a) they may not be reached on the false branch, or
-    // (b) the closure captures them by `&mut` and the outer summary log
-    // needs visibility.
+    // Style note: phases assigned in the *outer* function body that are unconditionally set (DFS,
+    // remap, publish_overhead) use `let … = …` at the assignment site to avoid an
+    // `unused_assignments` warning on the initial `0`. Phases assigned inside `if full_history` AND
+    // phases assigned inside the `publish_squash` closure must be declared up front here because
+    // (a) they may not be reached on the false branch, or (b) the closure captures them by `&mut`
+    // and the outer summary log needs visibility.
     let t_start = Instant::now();
     let mut phase_collect_history_ms: u128 = 0;
     let mut phase_baseline_ms: u128 = 0;
@@ -2070,7 +2277,8 @@ pub fn squash_level_incremental<T: MarfTrieId>(
             .collect();
 
         let t_collect_history = Instant::now();
-        let mut history = collect_history(&mut marf, &block_hashes_typed, min_height, max_height)?;
+        let mut history =
+            collect_history_parallel(&mut marf, &block_hashes_typed, min_height, max_height)?;
         phase_collect_history_ms = t_collect_history.elapsed().as_millis();
 
         // Keys whose single in-range write is dominated by the inherited value. Populated in the
@@ -2106,24 +2314,141 @@ pub fn squash_level_incremental<T: MarfTrieId>(
                 .collect();
             phase_baseline_keys = keys_needing_baseline.len();
 
+            // Parallelize the baseline `get_from_hash` lookups across worker threads.
+            // Each lookup is an independent read against the same `prior_tip_block`,
+            // and the prior tip lives in a previously-published squash level — so all
+            // lookups are read-only against settled state with no cross-iteration
+            // dependencies.
+            //
+            // For Stacks 2.x clarity workloads this phase dominates squash wall-time
+            // at scale (~100µs per key × 100k+ keys per range). Each worker holds its
+            // own read-only MARF handle (own SQL connection + mmap), so workers don't
+            // contend on a shared connection. Phase B (mutating `history` and
+            // `dominated_single_keys`) stays serial because the maps aren't
+            // thread-safe and the mutations are O(1) per result anyway.
+            //
+            // Sizing: capped at `MAX_BASELINE_WORKERS` to bound mmap/SQL handle count
+            // and avoid oversaturating I/O on smaller ranges. The serial fallback
+            // kicks in below `MIN_KEYS_FOR_PARALLEL` because spawning + opening N
+            // read-only MARF handles costs ~tens of ms — for small key counts that
+            // setup overhead dwarfs the actual lookup work.
+            const MAX_BASELINE_WORKERS: usize = 8;
+            const MIN_KEYS_FOR_PARALLEL: usize = 1024;
+            let n_workers = if keys_needing_baseline.len() < MIN_KEYS_FOR_PARALLEL {
+                0
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(MAX_BASELINE_WORKERS))
+                    .unwrap_or(1)
+                    .max(1)
+                    .min(keys_needing_baseline.len())
+            };
+
+            let lookups: Vec<(TrieHash, Option<MARFValue>)> = if n_workers <= 1 {
+                // Serial fallback: identical to the pre-parallelization path. Used
+                // when (a) the baseline set is small enough that thread/handle
+                // setup would dominate, (b) only one core is available, or
+                // (c) `available_parallelism()` returns an error.
+                let mut results = Vec::with_capacity(keys_needing_baseline.len());
+                for key_hash in &keys_needing_baseline {
+                    let val = MarfConnection::get_from_hash(&mut marf, &prior_tip_block, key_hash)?;
+                    results.push((*key_hash, val));
+                }
+                results
+            } else {
+                // Pre-open N read-only MARF handles. `reopen_readonly` opens its own
+                // SQL connection per handle so workers don't contend on the writer's
+                // connection. Build before scope so any open error propagates as a
+                // normal Err return (vs being a thread-panic inside the scope).
+                //
+                // Set `bypass_blob_guard` on each handle: workers do many small reads,
+                // and the per-read atomic on `shared_squash.active_reads` causes cache-
+                // line ping-pong across cores. Safe here because we're inside
+                // `squash_level_incremental` for this MARF — no concurrent publish can
+                // truncate the blob during the read phases (publish happens after).
+                let mut ro_marfs: Vec<MARF<T>> = Vec::with_capacity(n_workers);
+                for _ in 0..n_workers {
+                    let mut ro = marf.reopen_readonly()?;
+                    ro.storage_backend_mut().data.bypass_blob_guard = true;
+                    ro_marfs.push(ro);
+                }
+
+                let chunk_size = keys_needing_baseline.len().div_ceil(n_workers).max(1);
+                let prior_tip_block_ref = &prior_tip_block;
+                let keys_ref: &[TrieHash] = &keys_needing_baseline;
+
+                std::thread::scope(|s| -> Result<Vec<(TrieHash, Option<MARFValue>)>, Error> {
+                    let handles: Vec<_> = ro_marfs
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(idx, ro_marf)| {
+                            let chunk_start = (idx * chunk_size).min(keys_ref.len());
+                            let chunk_end = ((idx + 1) * chunk_size).min(keys_ref.len());
+                            let chunk = &keys_ref[chunk_start..chunk_end];
+                            s.spawn(
+                                move || -> Result<Vec<(TrieHash, Option<MARFValue>)>, Error> {
+                                    let mut results = Vec::with_capacity(chunk.len());
+                                    for key_hash in chunk {
+                                        let val = MarfConnection::get_from_hash(
+                                            ro_marf,
+                                            prior_tip_block_ref,
+                                            key_hash,
+                                        )?;
+                                        results.push((*key_hash, val));
+                                    }
+                                    Ok(results)
+                                },
+                            )
+                        })
+                        .collect();
+
+                    // Drain ALL handles before returning. Using `??` to short-circuit
+                    // on the first error would leave later workers unjoined; if any
+                    // of those subsequently panicked, `thread::scope`'s drop would
+                    // re-panic, bypassing our wrapped `Error::CorruptionError`. By
+                    // joining every handle and recording only the first failure, we
+                    // guarantee the wrapper fires for any worker outcome.
+                    let mut all = Vec::with_capacity(keys_ref.len());
+                    let mut first_err: Option<Error> = None;
+                    for handle in handles {
+                        match handle.join() {
+                            Ok(Ok(chunk_results)) => all.extend(chunk_results),
+                            Ok(Err(e)) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                            Err(_panic_payload) => {
+                                if first_err.is_none() {
+                                    first_err = Some(Error::CorruptionError(
+                                        "Baseline-lookup worker thread panicked".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(e) = first_err {
+                        return Err(e);
+                    }
+                    Ok(all)
+                })?
+            };
+
+            // Phase B (serial): apply the lookups to `history` and `dominated_single_keys`.
             // Keys whose single in-range write is byte-identical to the inherited value from the
-            // prior level. These can safely stay as plain `TrieLeaf` because reading the same value
-            // at every height in range is correct (the merged trie is only reachable from blocks
-            // within the range, where the inherited value already applied before the structural
-            // re-insert).
-            for key_hash in &keys_needing_baseline {
-                if let Some(inherited_value) =
-                    MarfConnection::get_from_hash(&mut marf, &prior_tip_block, key_hash)?
-                {
-                    if let Some(entries) = history.get_mut(key_hash) {
+            // prior level are recorded in `dominated_single_keys`; they can safely stay as plain
+            // `TrieLeaf` because reading the same value at every height in range is correct (the
+            // merged trie is only reachable from blocks within the range, where the inherited
+            // value already applied before the structural re-insert).
+            for (key_hash, inherited_value) in lookups {
+                if let Some(value) = inherited_value {
+                    if let Some(entries) = history.get_mut(&key_hash) {
                         let dominated_single = entries.len() == 1
-                            && entries
-                                .first()
-                                .map_or(false, |&(_, ref v)| *v == inherited_value);
+                            && entries.first().map_or(false, |&(_, ref v)| *v == value);
                         if dominated_single {
-                            dominated_single_keys.insert(*key_hash);
+                            dominated_single_keys.insert(key_hash);
                         } else {
-                            entries.insert(0, (min_height - 1, inherited_value));
+                            entries.insert(0, (min_height - 1, value));
                         }
                     }
                 }
@@ -2137,47 +2462,128 @@ pub fn squash_level_incremental<T: MarfTrieId>(
 
         let t_leaf_replace = Instant::now();
         let node_count_before = node_store.len();
-        for i in 0..node_count_before {
-            if !collected[i].is_leaf {
-                continue;
+
+        // Promote any leaf with an in-range write to `TrieLeafSquashed` so that historical
+        // reads below the first in-range write return `None` (for new keys) or the inherited
+        // baseline (for keys with an injected baseline entry above). Dominated-single keys stay
+        // plain — their single in-range write matches the inherited value, so plain-leaf reads
+        // are correct at every range height.
+        //
+        // Two-phase parallelization. Phase A (parallel) decodes each squashable
+        // leaf, constructs `TrieLeafSquashed`, and serializes the new bytes —
+        // all CPU-bound and per-leaf independent. `NodeStore::read_node_bytes`
+        // takes `&self` and opens a fresh file handle per call, so concurrent
+        // reads are safe (effectively `Sync`). Phase B (serial) applies the
+        // new bytes via `node_store.update(&mut self)`.
+        //
+        // Pre-filter the index list serially so workers get evenly-sized
+        // chunks regardless of where squashable leaves cluster in `node_store`.
+        // This pre-pass is fast (slice indexing + HashMap reads only).
+        let squashable: Vec<(usize, TrieHash)> = (0..node_count_before)
+            .filter_map(|i| {
+                if !collected[i].is_leaf {
+                    return None;
+                }
+                let key_hash = leaf_key_hashes[i].as_ref()?;
+                let transitions = history.get(key_hash)?;
+                if transitions.is_empty() || dominated_single_keys.contains(key_hash) {
+                    return None;
+                }
+                Some((i, *key_hash))
+            })
+            .collect();
+
+        const LEAF_MAX_WORKERS: usize = 8;
+        const LEAF_MIN_FOR_PARALLEL: usize = 1024;
+        let leaf_n_workers = if squashable.len() < LEAF_MIN_FOR_PARALLEL {
+            0
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(LEAF_MAX_WORKERS))
+                .unwrap_or(1)
+                .max(1)
+                .min(squashable.len())
+        };
+
+        let updates: Vec<(usize, Vec<u8>)> = if leaf_n_workers <= 1 {
+            // Serial fallback: identical to the pre-parallelization path. Used
+            // when (a) the squashable count is small enough that thread setup
+            // would dominate, or (b) only one core is available.
+            let mut results = Vec::with_capacity(squashable.len());
+            for (i, key_hash) in &squashable {
+                let transitions = history.get(key_hash).ok_or_else(|| {
+                    Error::CorruptionError(
+                        "key_hash disappeared from history between pre-filter and apply".into(),
+                    )
+                })?;
+                let raw = node_store.read_node_bytes(*i)?;
+                let new_buf = build_squashed_leaf_bytes(&raw, transitions)?;
+                results.push((*i, new_buf));
             }
-            let key_hash = match &leaf_key_hashes[i] {
-                Some(kh) => kh,
-                None => continue,
-            };
-            // Promote any leaf with an in-range write to `TrieLeafSquashed` so that historical
-            // reads below the first in-range write return `None` (for new keys) or the inherited
-            // baseline (for keys with an injected baseline entry above). Dominated-single keys stay
-            // plain — their single in-range write matches the inherited value, so plain-leaf reads
-            // are correct at every range height.
-            let transitions = match history.get(key_hash) {
-                Some(t) if !t.is_empty() && !dominated_single_keys.contains(key_hash) => t,
-                _ => continue,
-            };
+            results
+        } else {
+            let chunk_size = squashable.len().div_ceil(leaf_n_workers).max(1);
+            let history_ref = &history;
+            let node_store_ref = &node_store;
+            let squashable_ref: &[(usize, TrieHash)] = &squashable;
 
-            // Read the existing serialized leaf to get its path bytes.
-            // Leaf bytes in node_store are hash-free: [body] only.
-            let raw = node_store.read_node_bytes(i)?;
+            std::thread::scope(|s| -> Result<Vec<(usize, Vec<u8>)>, Error> {
+                let handles: Vec<_> = (0..leaf_n_workers)
+                    .map(|idx| {
+                        let chunk_start = (idx * chunk_size).min(squashable_ref.len());
+                        let chunk_end = ((idx + 1) * chunk_size).min(squashable_ref.len());
+                        let chunk = &squashable_ref[chunk_start..chunk_end];
+                        s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>, Error> {
+                            let mut chunk_updates = Vec::with_capacity(chunk.len());
+                            for (i, key_hash) in chunk {
+                                let transitions = history_ref.get(key_hash).ok_or_else(|| {
+                                    Error::CorruptionError(
+                                        "key_hash disappeared from history \
+                                         between pre-filter and apply"
+                                            .into(),
+                                    )
+                                })?;
+                                let raw = node_store_ref.read_node_bytes(*i)?;
+                                let new_buf = build_squashed_leaf_bytes(&raw, transitions)?;
+                                chunk_updates.push((*i, new_buf));
+                            }
+                            Ok(chunk_updates)
+                        })
+                    })
+                    .collect();
 
-            // Decode the leaf to get its path (NodePath)
-            let node_id_byte = *raw.first().ok_or_else(|| {
-                Error::CorruptionError("Empty node body during FullHistory leaf replace".into())
-            })?;
-            let node_id = clear_backptr(node_id_byte) & 0x3f;
-            let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(&raw, node_id)?;
-            let path_slice = existing_node.path_bytes();
+                // Drain all handles before returning (see baseline-lookup loop
+                // for the rationale — leaving workers unjoined risks scope-drop
+                // panics that bypass our wrapped error).
+                let mut all = Vec::with_capacity(squashable_ref.len());
+                let mut first_err: Option<Error> = None;
+                for handle in handles {
+                    match handle.join() {
+                        Ok(Ok(chunk_updates)) => all.extend(chunk_updates),
+                        Ok(Err(e)) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                        Err(_panic_payload) => {
+                            if first_err.is_none() {
+                                first_err = Some(Error::CorruptionError(
+                                    "Leaf-replace worker thread panicked".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(e) = first_err {
+                    return Err(e);
+                }
+                Ok(all)
+            })?
+        };
 
-            // Build the TrieLeafSquashed: entries must be sorted descending by height
-            let mut entries: Vec<(u32, MARFValue)> = transitions.clone();
-            entries.reverse(); // history map is ascending; TrieLeafSquashed wants descending
-
-            let squashed = TrieLeafSquashed::new(path_slice, entries)?;
-
-            // Re-serialize without hash prefix (leaf hashes are omitted in squash blobs)
-            let squashed_node = TrieNodeType::LeafSquashed(squashed);
-            let mut new_buf = Vec::with_capacity(squashed_node.byte_len() + 1);
-            squashed_node.write_bytes(&mut new_buf)?;
-
+        // Phase B (serial): apply updates to node_store. `update` takes `&mut self`
+        // so this stays single-threaded.
+        for (i, new_buf) in updates {
             node_store.update(i, &new_buf)?;
             stats.leaves_squashed += 1;
         }
