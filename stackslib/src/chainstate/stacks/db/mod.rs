@@ -218,6 +218,27 @@ impl From<NakamotoBlockHeader> for StacksBlockHeaderTypes {
     }
 }
 
+/// Reorg-divergence record returned by
+/// [`StacksChainState::detect_squash_divergence`]. Indicates that the most
+/// recent squash level committed to a different canonical block at
+/// `diverging_height` than the chain currently believes is canonical.
+/// Descendants of `new_canonical` will read stale state through the merged
+/// blob's tip view; the caller must re-squash the level (preferred) or
+/// fail-stop further processing of those descendants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SquashDivergence {
+    /// Level whose recorded canonical chain disagrees with the new tip.
+    pub level_id: u32,
+    /// First height (walking back from the new tip) at which the recorded
+    /// canonical and new canonical disagree. Note: this is the *deepest*
+    /// disagreement encountered; the actual fork point may be earlier.
+    pub diverging_height: u32,
+    /// What the squash level recorded as canonical at this height.
+    pub recorded_canonical: StacksBlockId,
+    /// What the new tip's ancestry says is canonical at this height.
+    pub new_canonical: StacksBlockId,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StacksHeaderInfo {
     /// Stacks block header
@@ -2326,6 +2347,326 @@ impl StacksChainState {
         self.clarity_state.with_marf(f)
     }
 
+    /// Walk a single Stacks tip's index-block-hash backward via the headers
+    /// tables (`block_headers` for Stacks 2.x, `nakamoto_block_headers` for
+    /// Nakamoto), returning the block's height and its parent's
+    /// index-block-hash. Returns `None` if the tip isn't recorded in either
+    /// table — the caller should treat that as "ancestry unknowable from this
+    /// chainstate" rather than a fatal error.
+    fn lookup_height_and_parent(
+        conn: &Connection,
+        index_block_hash: &StacksBlockId,
+    ) -> Result<Option<(u32, StacksBlockId)>, Error> {
+        let sql_2x = "SELECT block_height, parent_block_id FROM block_headers \
+                      WHERE index_block_hash = ?1";
+        if let Some(row) = conn
+            .query_row(sql_2x, params![index_block_hash], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, StacksBlockId>(1)?))
+            })
+            .optional()
+            .map_err(|e| Error::DBError(db_error::SqliteError(e)))?
+        {
+            return Ok(Some((row.0 as u32, row.1)));
+        }
+        let sql_nak = "SELECT block_height, parent_block_id FROM nakamoto_block_headers \
+                       WHERE index_block_hash = ?1";
+        let row = conn
+            .query_row(sql_nak, params![index_block_hash], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, StacksBlockId>(1)?))
+            })
+            .optional()
+            .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+        Ok(row.map(|(h, p)| (h as u32, p)))
+    }
+
+    /// Walk the given Stacks tip's ancestry and compare each ancestor at
+    /// heights inside the most recent squash level's range against the
+    /// canonical chain the squash committed to.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — ancestry is aligned with the squash, OR no squash exists,
+    ///   OR the tip pre-dates the level's range.
+    /// - `Ok(Some(SquashDivergence))` — the new tip's ancestor at some height
+    ///   in the level's range differs from what the squash recorded as
+    ///   canonical. Descendants of this tip will read stale state through the
+    ///   merged blob (the bug class observed at level 11). Caller should
+    ///   either re-squash that level or fail-stop.
+    pub fn detect_squash_divergence(
+        &self,
+        new_tip: &StacksBlockId,
+    ) -> Result<Option<SquashDivergence>, Error> {
+        let canonical = self.state_index.latest_squash_level_canonical_chain();
+        let Some(canonical) = canonical else {
+            return Ok(None);
+        };
+
+        // Walk cap: a sane upper bound on how many ancestor steps we should
+        // need to take before either landing inside the level's range, finding
+        // a mismatch, or walking past `min_height`. The level's span itself is
+        // `max_height - min_height + 1`; a generous 4× covers reorg-window
+        // gaps between the chain tip and the squash boundary without risking
+        // an unbounded loop on a malformed headers table.
+        let walk_cap = (canonical
+            .max_height
+            .saturating_sub(canonical.min_height)
+            .saturating_add(2))
+        .saturating_mul(4) as u32;
+        let mut current = new_tip.clone();
+        let conn = self.db();
+        for _ in 0..walk_cap {
+            let Some((height, parent)) =
+                Self::lookup_height_and_parent(conn, &current)?
+            else {
+                // Tip's ancestry truncates outside the headers tables. This is
+                // either a brand-new chainstate (sentinel reached) or a
+                // headers-DB inconsistency. Treat as "no detectable
+                // divergence" — callers will catch any actual MARF read
+                // failure downstream.
+                return Ok(None);
+            };
+
+            if height < canonical.min_height {
+                return Ok(None);
+            }
+            if height <= canonical.max_height {
+                let idx = (height - canonical.min_height) as usize;
+                let recorded = canonical.block_hashes.get(idx).ok_or_else(|| {
+                    Error::DBError(db_error::Other(format!(
+                        "detect_squash_divergence: height {height} outside \
+                         canonical chain index range (level_id={}, \
+                         min_height={}, max_height={}, len={})",
+                        canonical.level_id,
+                        canonical.min_height,
+                        canonical.max_height,
+                        canonical.block_hashes.len()
+                    )))
+                })?;
+                if recorded != &current {
+                    return Ok(Some(SquashDivergence {
+                        level_id: canonical.level_id,
+                        diverging_height: height,
+                        recorded_canonical: recorded.clone(),
+                        new_canonical: current.clone(),
+                    }));
+                }
+            }
+
+            // Sentinel parent — chain origin reached without divergence.
+            if parent.as_bytes() == &[0u8; 32] {
+                return Ok(None);
+            }
+            current = parent;
+        }
+        Err(Error::DBError(db_error::Other(format!(
+            "detect_squash_divergence: walk cap ({walk_cap}) exhausted from \
+             tip {new_tip} without entering or passing level_id={} range \
+             [{}..={}]",
+            canonical.level_id, canonical.min_height, canonical.max_height
+        ))))
+    }
+
+    /// Walk forward from a `new_canonical` block via the headers tables'
+    /// `parent_block_id` reverse linkage and return the index-block-hash of
+    /// the first committed descendant whose row exists in `marf_data`, if
+    /// any.
+    ///
+    /// Used as a safety gate before re-squashing a level: if any descendant
+    /// of the new canonical has already been committed to the MARF, that
+    /// descendant has written backptrs into the OLD merged blob's address
+    /// space. Re-squashing would invalidate those backptrs (the heavy
+    /// child-trie update path the user has explicitly rejected). In that
+    /// case the caller must fail-stop and require operator intervention,
+    /// rather than silently producing inconsistent reads.
+    ///
+    /// The walk is bounded — we stop after `walk_cap` total rows visited to
+    /// avoid pathological behavior on a malformed headers table.
+    pub fn first_committed_descendant_in_marf(
+        &self,
+        new_canonical: &StacksBlockId,
+    ) -> Result<Option<StacksBlockId>, Error> {
+        // Reverse BFS through both legacy (`block_headers`) and Nakamoto
+        // (`nakamoto_block_headers`) parent linkage. Either era could contain
+        // the descendants; both share the chainstate sqlite, so a single
+        // `self.db()` connection serves both.
+        let conn = self.db();
+        let walk_cap: u32 = 4096;
+        let mut visited: u32 = 0;
+        let mut to_visit: Vec<StacksBlockId> = vec![new_canonical.clone()];
+
+        while let Some(current) = to_visit.pop() {
+            visited = visited.saturating_add(1);
+            if visited > walk_cap {
+                return Err(Error::DBError(db_error::Other(format!(
+                    "first_committed_descendant_in_marf: walk cap ({walk_cap}) \
+                     exhausted starting from {new_canonical}"
+                ))));
+            }
+
+            for sql in [
+                "SELECT index_block_hash FROM block_headers WHERE parent_block_id = ?1",
+                "SELECT index_block_hash FROM nakamoto_block_headers WHERE parent_block_id = ?1",
+            ] {
+                let mut stmt = conn
+                    .prepare(sql)
+                    .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+                let mut rows = stmt
+                    .query(params![&current])
+                    .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|e| Error::DBError(db_error::SqliteError(e)))?
+                {
+                    let child: StacksBlockId = row
+                        .get(0)
+                        .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+                    if &child == new_canonical {
+                        // Self-edge; ignore.
+                        continue;
+                    }
+                    if Self::is_committed_in_headers_marf(conn, &child)? {
+                        return Ok(Some(child));
+                    }
+                    to_visit.push(child);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Probe whether a Stacks block's index-block-hash has a committed entry
+    /// in the headers MARF's `marf_data` table. Used as the
+    /// "is this block actually persisted in the MARF" check inside
+    /// [`Self::first_committed_descendant_in_marf`]. Membership in
+    /// `staging_blocks` is *not* the same as membership in MARF — a block can
+    /// be staged but never reach MARF commit (e.g. validation failure), and
+    /// only the latter writes backptrs.
+    fn is_committed_in_headers_marf(
+        conn: &Connection,
+        index_block_hash: &StacksBlockId,
+    ) -> Result<bool, Error> {
+        let sql = "SELECT 1 FROM marf_data WHERE block_hash = ?1 AND unconfirmed = 0 LIMIT 1";
+        let exists: Option<i64> = conn
+            .query_row(sql, params![index_block_hash], |r| r.get(0))
+            .optional()
+            .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
+        Ok(exists.is_some())
+    }
+
+    /// Run divergence detection + safety check on the just-advanced tip.
+    /// On detected divergence, attempt automatic recovery via
+    /// [`re_squash_level`](crate::chainstate::stacks::index::squash::re_squash_level)
+    /// for both the headers and Clarity MARFs (they're squashed in lockstep
+    /// by [`Self::maybe_squash`], so they share level structure).
+    ///
+    /// Returns `Ok(())` if the chain's view of canonical history is
+    /// consistent OR if recovery succeeded.
+    ///
+    /// Returns `Err(...)` if recovery is impossible: a committed
+    /// `marf_data` block already descends from the new canonical at the
+    /// diverging height, so re-squashing would invalidate that descendant's
+    /// backptrs into the old merged blob's address space (the heavy
+    /// child-trie update path that has been explicitly rejected as out of
+    /// scope). In that case the operator-recovery path is to wipe the
+    /// chainstate and re-sync from a peer.
+    pub fn assert_squash_consistency(
+        &mut self,
+        new_tip: &StacksBlockId,
+        sortdb_conn: &Connection,
+    ) -> Result<(), Error> {
+        use crate::chainstate::stacks::index::squash::{re_squash_level, SquashMode};
+
+        let Some(divergence) = self.detect_squash_divergence(new_tip)? else {
+            return Ok(());
+        };
+
+        let descendant = self
+            .first_committed_descendant_in_marf(&divergence.new_canonical)
+            .ok()
+            .flatten();
+        if let Some(descendant_block) = descendant {
+            let msg = format!(
+                "MARF squash divergence detected: level_id={} recorded {} as \
+                 canonical at height {}, but chain has reorg'd to {}. \
+                 Recovery is BLOCKED: committed marf_data block {} already \
+                 descends from the new canonical and has written backptrs \
+                 into the old merged blob's address space. Re-squashing \
+                 would invalidate those backptrs (the heavy child-trie \
+                 update path is out of scope). Operator-recovery: wipe the \
+                 chainstate and re-sync from a peer.",
+                divergence.level_id,
+                divergence.recorded_canonical,
+                divergence.diverging_height,
+                divergence.new_canonical,
+                descendant_block,
+            );
+            error!("{msg}");
+            return Err(Error::DBError(db_error::Other(msg)));
+        }
+
+        // Recovery is safe. Re-squash both MARFs against the chain's
+        // current canonical view. The headers MARF and Clarity MARF share
+        // level structure (they're squashed in lockstep by
+        // `maybe_squash`), so the same `level_id` applies to both.
+        info!(
+            "MARF squash divergence detected at level_id={}: recorded {} as \
+             canonical at height {}, chain has reorg'd to {}. Recovery is \
+             safe (no committed descendants). Re-squashing both headers \
+             and clarity MARFs.",
+            divergence.level_id,
+            divergence.recorded_canonical,
+            divergence.diverging_height,
+            divergence.new_canonical,
+        );
+
+        let retention_levels = self
+            .marf_opts
+            .as_ref()
+            .map(|o| o.squash_root_snapshot_retention_levels)
+            .unwrap_or(
+                crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            );
+
+        // Headers MARF: always TipOnly (no at-block reads target it; this
+        // matches `maybe_squash`'s headers-side configuration).
+        let headers_path = self.state_index.get_db_path().to_string();
+        re_squash_level::<StacksBlockId>(
+            &headers_path,
+            divergence.level_id,
+            SquashMode::TipOnly,
+            /* reclaim = */ true,
+            retention_levels,
+        )?;
+        self.state_index.refresh_after_squash()?;
+
+        // Clarity MARF: mode depends on configured preference + epoch 3.4
+        // boundary, mirroring `maybe_squash`'s clarity-side mode selection.
+        let (clarity_path, clarity_min) = self
+            .clarity_state
+            .with_marf(|m| (m.get_db_path().to_string(), Self::squash_min_height_for_marf(m)));
+        let configured = self
+            .marf_opts
+            .as_ref()
+            .map(|o| o.squash_mode)
+            .unwrap_or(SquashMode::TipOnly);
+        let clarity_mode =
+            Self::effective_squash_mode(configured, clarity_min, self.db(), sortdb_conn);
+        re_squash_level::<StacksBlockId>(
+            &clarity_path,
+            divergence.level_id,
+            clarity_mode,
+            /* reclaim = */ true,
+            retention_levels,
+        )?;
+        self.clarity_state.with_marf(|m| m.refresh_after_squash())?;
+
+        info!(
+            "MARF squash divergence recovery complete: level_id={} now \
+             reflects new canonical {} at height {}.",
+            divergence.level_id, divergence.new_canonical, divergence.diverging_height,
+        );
+        Ok(())
+    }
+
     /// Check whether automatic MARF squash should run at this block height and, if so, squash both
     /// the headers MARF and the Clarity MARF.
     ///
@@ -2364,6 +2705,20 @@ impl StacksChainState {
 
         // --- Phase 1: Plan both MARFs (sequential, fast) ---
 
+        // Pull the configured squash-root snapshot retention from the
+        // chainstate's `MARFOpenOpts`, falling back to the
+        // crate-level constant if no `marf_opts` was provided. Both
+        // MARFs share the same retention so cross-MARF coverage stays
+        // consistent (a Bitcoin reorg that needs N blocks of fork-
+        // extension capability needs it on both headers and clarity).
+        let retention_levels = self
+            .marf_opts
+            .as_ref()
+            .map(|o| o.squash_root_snapshot_retention_levels)
+            .unwrap_or(
+                crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            );
+
         // Headers MARF: always TipOnly (no at-block reads target the headers MARF).
         let headers_plan = SquashPlan {
             label: "headers",
@@ -2371,6 +2726,7 @@ impl StacksChainState {
             tip_height,
             min_height: Self::squash_min_height_for(&self.state_index),
             mode: SquashMode::TipOnly,
+            retention_levels,
         };
 
         // Clarity MARF: read path + current min in one `with_marf` borrow.
@@ -2392,6 +2748,7 @@ impl StacksChainState {
             tip_height,
             min_height: clarity_min,
             mode: Self::effective_squash_mode(configured, clarity_min, self.db(), sortdb_conn),
+            retention_levels,
         };
 
         // --- Phase 2: Run both squash/stub operations in parallel ---
@@ -2460,6 +2817,11 @@ impl StacksChainState {
             tip_height: u32,
             min_height: u32,
             mode: SquashMode,
+            /// Per-deployment retention window for squash-root snapshot
+            /// sidecars; passed into `squash_level_incremental` so its
+            /// post-publish trim hook uses the configured value rather
+            /// than the crate-level constant.
+            retention_levels: u32,
         }
 
         /// Run a squash (or stub-level fallback if the range exceeds `STUB_THRESHOLD` and no
@@ -2510,6 +2872,7 @@ impl StacksChainState {
                     plan.min_height,
                     plan.tip_height,
                     true,
+                    plan.retention_levels,
                 ) {
                     Ok(stats) => {
                         info!(
@@ -4000,6 +4363,7 @@ pub mod test {
             0,
             max_height,
             true,
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         )
         .expect("squash should succeed");
         assert!(stats.nodes_collected > 0);

@@ -465,6 +465,18 @@ pub struct MARFOpenOpts {
     /// `FullHistory` for pre-epoch-3.4 squash ranges regardless of
     /// this setting.
     pub squash_mode: SquashMode,
+    /// Number of recent squash levels whose per-height root + orphan
+    /// sidecars are kept on disk. Levels older than
+    /// `current_squash_tip_level - squash_root_snapshot_retention_levels`
+    /// are eligible for trim. Drives both the in-squash post-publish
+    /// trim hook and the `Error::SnapshotTrimmed` policy reported to
+    /// callers attempting to fork-extend off a level outside the window.
+    /// Defaults to
+    /// [`crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS`].
+    /// Tunable per deployment (mainnet/testnet/devnet/tests) via the
+    /// builder; correctness only requires it to be `>= 1` so at least
+    /// one fork-extension-capable level is retained behind the tip.
+    pub squash_root_snapshot_retention_levels: u32,
 }
 
 impl MARFOpenOpts {
@@ -477,6 +489,8 @@ impl MARFOpenOpts {
             compress: false,
             mmap: false,
             squash_mode: SquashMode::TipOnly,
+            squash_root_snapshot_retention_levels:
+                crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         }
     }
 
@@ -493,6 +507,8 @@ impl MARFOpenOpts {
             compress: false,
             mmap: false,
             squash_mode: SquashMode::TipOnly,
+            squash_root_snapshot_retention_levels:
+                crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         }
     }
 
@@ -508,6 +524,13 @@ impl MARFOpenOpts {
 
     pub fn with_squash_mode(mut self, mode: SquashMode) -> Self {
         self.squash_mode = mode;
+        self
+    }
+
+    /// Override the per-deployment retention window for squash-root
+    /// snapshot sidecars. See the field doc for semantics.
+    pub fn with_squash_root_snapshot_retention_levels(mut self, n: u32) -> Self {
+        self.squash_root_snapshot_retention_levels = n;
         self
     }
 }
@@ -2152,6 +2175,23 @@ impl<T: MarfTrieId> MARF<T> {
 }
 
 // instance methods
+/// Snapshot of a single squash level's recorded canonical chain. Used by the
+/// reorg-divergence detector at chain-advance time: the chainstate walks the
+/// newly-promoted tip's ancestry and compares each ancestor at heights inside
+/// `[min_height ..= max_height]` against `block_hashes[height - min_height]`.
+/// A mismatch means the squash level captured a canonical chain that the
+/// chainstate has since reorg'd away from — descendants of the new canonical
+/// would read through the merged blob's stale tip view.
+#[derive(Debug, Clone)]
+pub struct SquashLevelCanonical<T: MarfTrieId> {
+    pub level_id: u32,
+    pub min_height: u32,
+    pub max_height: u32,
+    /// Canonical block hash at each height in `[min_height ..= max_height]`,
+    /// indexed by `height - min_height`.
+    pub block_hashes: Vec<T>,
+}
+
 impl<T: MarfTrieId> MARF<T> {
     /// Check if a block hash falls within any loaded squash level's range.
     pub fn is_in_squash_range(&self, block_hash: &T) -> bool {
@@ -2165,6 +2205,30 @@ impl<T: MarfTrieId> MARF<T> {
             .squash_meta
             .block_index
             .contains_key(&bhh_key)
+    }
+
+    /// Return the most recent squash level's recorded canonical chain, or
+    /// `None` if no squash levels are loaded.
+    ///
+    /// The reorg-divergence detector consumes this to verify that a
+    /// newly-promoted chain tip's ancestry matches what the squash level
+    /// committed to. A mismatch at any height in the level's range means the
+    /// chain has reorg'd past a squash boundary and descendants of the new
+    /// canonical will read stale state through the merged blob.
+    ///
+    /// Empty `block_hashes` (stub levels with no per-height entries) yields
+    /// `None` — those levels have nothing to diverge against.
+    pub fn latest_squash_level_canonical_chain(&self) -> Option<SquashLevelCanonical<T>> {
+        let last = self.storage.data.squash_meta.levels.last()?;
+        if last.block_hashes.is_empty() {
+            return None;
+        }
+        Some(SquashLevelCanonical {
+            level_id: last.info.level_id,
+            min_height: last.info.min_height,
+            max_height: last.info.max_height,
+            block_hashes: last.block_hashes.iter().map(|b| T::from_bytes(*b)).collect(),
+        })
     }
 
     pub fn begin_tx(&mut self) -> Result<MarfTransaction<'_, T>, Error> {

@@ -67,7 +67,7 @@ pub const STUB_THRESHOLD: u64 = 50_000;
 /// ≈ ~250 MB of disk for the live snapshot window. Set via the
 /// `root_snapshot_retention_levels` knob on [`MARFOpenOpts`] (TBD) or
 /// edit this constant for now.
-pub const MARF_ROOT_SNAPSHOT_RETENTION_LEVELS: u32 = 100;
+pub const MARF_ROOT_SNAPSHOT_RETENTION_LEVELS: u32 = 2;
 
 /// Checked offset accumulation for squash blob node regions. Returns the
 /// new offset after adding `size`, or an error if the result exceeds
@@ -444,6 +444,16 @@ pub struct SquashLevelRow {
     /// `false`; iteration 2 will set `true` after `unlink`-ing the sidecar
     /// for a level that has aged past the retention threshold.
     pub root_sidecar_trimmed: bool,
+    /// Logical offset (`TriePtr.ptr()`-style, relative to the level's
+    /// `BLOB_HEADER_SIZE`) at which orphan structural nodes begin in the
+    /// merged-blob/sidecar address space. Tip-reachable nodes have all
+    /// direct child pointers in `[BLOB_HEADER_SIZE .. orphan_split_offset)`;
+    /// orphan nodes occupy `[orphan_split_offset .. orphan_split_offset + O)`.
+    /// PR1 records this value; PR2 uses it to route reads. When a level has
+    /// no orphans (or pre-PR1 levels), this equals the end-of-tip-reachable
+    /// offset and the routing check `ptr < orphan_split_offset` always
+    /// resolves to "merged blob".
+    pub orphan_split_offset: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -979,7 +989,7 @@ fn collect_history_parallel<T: MarfTrieId + Send + Sync>(
 // ---------------------------------------------------------------------------
 
 /// Size of the blob header: block_header_hash (32 bytes) + block_id (4 bytes).
-const BLOB_HEADER_SIZE: u64 = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
+pub(crate) const BLOB_HEADER_SIZE: u64 = (BLOCK_HEADER_HASH_ENCODED_SIZE as u64) + 4;
 
 /// A collected node with its metadata, used during the DFS collection phase.
 struct CollectedNode {
@@ -1023,6 +1033,8 @@ pub fn squash_level<T: MarfTrieId>(
         compress: false,
         mmap: false,
         squash_mode: SquashMode::TipOnly,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
     };
 
     let mut src_marf = MARF::<T>::from_path(src_path, open_opts.clone())?;
@@ -1506,6 +1518,8 @@ pub fn squash_level<T: MarfTrieId>(
         compress: false,
         mmap: false,
         squash_mode: SquashMode::TipOnly,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
     };
 
     let mut dst_marf = MARF::<T>::from_path(dst_path, dst_open_opts)?;
@@ -1523,6 +1537,11 @@ pub fn squash_level<T: MarfTrieId>(
         min_height,
         max_height,
         per_height_root_node_bodies,
+        // Base-squash code path (squash_to_path): does not collect orphans
+        // separately. PR2 will revisit if/when this path also needs an
+        // orphan section; for now, omit it.
+        Vec::new(),
+        0,
     )?;
 
     // Stream the blob to the destination file in chunks to avoid holding the entire 2+ GB node
@@ -1616,6 +1635,13 @@ pub fn squash_level<T: MarfTrieId>(
             reads_redirected: true,
             root_sidecar_present: true,
             root_sidecar_trimmed: false,
+            // squash_to_path code path: orphan-section split offset is not
+            // tracked here. PR1's invariant + sidecar routing target the
+            // incremental squash path; this base-squash code path stays
+            // pre-split (all nodes are tip-reachable from the writer's
+            // perspective), so 0 means "no orphans, route all reads to
+            // merged blob".
+            orphan_split_offset: 0,
         };
         trie_sql::write_squash_level(storage.sqlite_conn(), &row)?;
 
@@ -2053,23 +2079,41 @@ fn capture_per_height_root_nodes<T: MarfTrieId>(
 /// mutation has occurred yet). The corresponding
 /// `marf_squash_levels.root_sidecar_present` flag is set inside the
 /// `publish_squash` SQL transaction once we know the rename succeeded.
+/// Atomically publish the per-level squash sidecar.
+///
+/// Always emits a `SquashRootNode` section with one root body per height.
+/// When `orphan_bytes` is non-empty, also emits an `OrphanNode` section
+/// containing exactly those bytes — a verbatim copy of the merged blob's
+/// `[orphan_split_offset .. end_of_nodes)` byte range. The encoding
+/// matches the merged blob (non-leaves are `[hash(32) | body]`, leaves
+/// are `[body]` under `leaf_hashes_omitted`); the writer treats the
+/// payload as opaque.
+///
+/// PR1: the orphan section is shadow-published — orphan nodes still live
+/// in the merged blob, and the read path doesn't yet route into the
+/// section. PR2 stops writing orphans into the merged blob and adds the
+/// split-offset routing in the read primitives.
 fn write_squash_root_sidecar(
     db_path: &Path,
     level_id: u32,
     min_height: u32,
     max_height: u32,
     bodies: Vec<Vec<u8>>,
+    orphan_bytes: Vec<u8>,
+    orphan_record_count: u32,
 ) -> Result<(), Error> {
     use crate::chainstate::stacks::index::sidecar::{
-        squash_root_sidecar_path, squash_sidecar_dir_for_db, RecordKind, SidecarHeader,
+        squash_root_sidecar_path, squash_sidecar_dir_for_db, SidecarHeader, SidecarSection,
         SidecarWriter, SIDECAR_FORMAT_VERSION,
     };
 
     info!(
-        "write_squash_root_sidecar: ENTER db_path={} level_id={} heights=[{min_height}..={max_height}] bodies={}",
+        "write_squash_root_sidecar: ENTER db_path={} level_id={} heights=[{min_height}..={max_height}] bodies={} orphan_bytes={} orphan_records={}",
         db_path.display(),
         level_id,
         bodies.len(),
+        orphan_bytes.len(),
+        orphan_record_count,
     );
 
     let count_usize = (max_height as usize)
@@ -2087,11 +2131,6 @@ fn write_squash_root_sidecar(
             bodies.len()
         )));
     }
-    let count = u32::try_from(count_usize).map_err(|_| {
-        Error::CorruptionError(format!(
-            "write_squash_root_sidecar: count {count_usize} exceeds u32::MAX"
-        ))
-    })?;
 
     let sidecar_dir = squash_sidecar_dir_for_db(db_path);
     std::fs::create_dir_all(&sidecar_dir).map_err(|e| {
@@ -2104,18 +2143,26 @@ fn write_squash_root_sidecar(
     let header = SidecarHeader {
         format_version: SIDECAR_FORMAT_VERSION,
         schema_flags: 0,
-        record_kind: RecordKind::SquashRootNode,
         level_id,
         min_height,
         max_height,
-        count,
+        // Overwritten by the writer at finalize time from `sections.len()`.
+        section_count: 0,
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
     };
+    let mut sections: Vec<SidecarSection> = Vec::with_capacity(2);
+    sections.push(SidecarSection::RootSnapshot { bodies });
+    if !orphan_bytes.is_empty() {
+        sections.push(SidecarSection::OrphanNode {
+            bytes: orphan_bytes,
+            record_count: orphan_record_count,
+        });
+    }
     let path = squash_root_sidecar_path(db_path, level_id, min_height, max_height);
-    SidecarWriter::new(path.clone(), header, bodies).finalize()?;
+    SidecarWriter::new(path.clone(), header, sections).finalize()?;
 
     // Best-effort parent-dir fsync for rename durability. Not load-bearing
     // for content correctness; only matters across power-loss between rename
@@ -2506,12 +2553,60 @@ fn verify_no_descendants<T: MarfTrieId>(marf: &mut MARF<T>, max_height: u32) -> 
 ///
 /// Cross-level backpointers into prior levels are preserved as-is. Only intra-range nodes are
 /// collected and remapped to sequential offsets in the new squash blob.
+/// Distinguishes whether [`squash_level_incremental`] is producing a *new*
+/// squash level (the original use) or *replacing* an existing one (the
+/// re-squash path used by reorg-divergence recovery).
+///
+/// `Append` is the historical behavior: assigns `next_level_id` from the
+/// existing level set and enforces the strict contiguity invariant (each new
+/// level's `min_height` must equal `prior_max + 1`).
+///
+/// `Replace { level_id }` is used by [`re_squash_level`]. The function:
+///   1. Skips the contiguity check (the existing level for `[min..=max]`
+///      already covers that range — its row's deletion + the new row's
+///      insertion happens atomically inside `publish_squash`).
+///   2. Uses the supplied `level_id` instead of `prior_max + 1`.
+///   3. Always writes the new merged blob at `get_blob_append_offset()` —
+///      reusing the old level's offset is unsafe because the build phase
+///      must read through the still-published old level to discover ancestor
+///      state, and overlapping the writes would corrupt that input.
+///   4. Skips the reclaim-mode "blob_offset = top_prior + length" logic for
+///      the same reason (writing over the old region while it's still being
+///      read from would corrupt the source data mid-build). The old offset's
+///      bytes become dead space; v2 may add a follow-up reclaim pass.
+#[derive(Debug, Clone, Copy)]
+pub enum SquashTarget {
+    Append,
+    Replace { level_id: u32 },
+}
+
 pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
     marf_path: &str,
     mode: SquashMode,
     min_height: u32,
     max_height: u32,
     reclaim: bool,
+    retention_levels: u32,
+) -> Result<SquashStats, Error> {
+    squash_level_incremental_with_target::<T>(
+        marf_path,
+        mode,
+        min_height,
+        max_height,
+        reclaim,
+        retention_levels,
+        SquashTarget::Append,
+    )
+}
+
+pub fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
+    marf_path: &str,
+    mode: SquashMode,
+    min_height: u32,
+    max_height: u32,
+    reclaim: bool,
+    retention_levels: u32,
+    target: SquashTarget,
 ) -> Result<SquashStats, Error> {
     // Phase-timing instrumentation. Each phase's duration is captured into a `phase_*_ms` binding
     // and reported in the final summary log so we can see where the wall-clock time actually goes
@@ -2547,6 +2642,8 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
         compress: false,
         mmap: false,
         squash_mode: SquashMode::TipOnly,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
     };
 
     let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
@@ -2567,9 +2664,20 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
             "Incremental squash requires prior levels, but none exist (min_height={min_height})"
         )));
     }
-    // Check that prior levels cover 0..=min_height-1 without gaps. When min_height=0 (L0
-    // bootstrap), no prior levels are needed.
-    if min_height > 0 {
+    // For Append mode: enforce strict contiguity — prior levels must cover
+    // `0..=min_height-1` without gaps (L0 bootstrap with `min_height=0` is the
+    // only case where no priors are needed).
+    //
+    // For Replace mode: the level being replaced already covers `[min..=max]`;
+    // contiguity is guaranteed by the existence of the row we're replacing.
+    // Skip the check (running it would falsely flag the existing-level row as
+    // a "duplicate range" because it covers exactly the heights we're about
+    // to re-squash).
+    let replace_level_id = match target {
+        SquashTarget::Replace { level_id } => Some(level_id),
+        SquashTarget::Append => None,
+    };
+    if replace_level_id.is_none() && min_height > 0 {
         let mut covered_up_to: Option<u32> = None;
         for level in &existing_levels {
             let expected_start = covered_up_to.map_or(0, |h| h + 1);
@@ -2591,11 +2699,31 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
             )));
         }
     }
-    let next_level_id = existing_levels
-        .iter()
-        .map(|r| r.level_id)
-        .max()
-        .map_or(0, |m| m + 1);
+    if let Some(id) = replace_level_id {
+        let target_level = existing_levels.iter().find(|r| r.level_id == id);
+        let target_level = target_level.ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "Replace target level_id {id} not found in marf_squash_levels"
+            ))
+        })?;
+        if target_level.min_height != min_height || target_level.max_height != max_height {
+            return Err(Error::CorruptionError(format!(
+                "Replace target level_id {id} covers [{}..={}] but caller requested \
+                 re-squash of [{min_height}..={max_height}]",
+                target_level.min_height, target_level.max_height
+            )));
+        }
+    }
+    // For Append: assign the next sequential level_id.
+    // For Replace: reuse the supplied level_id (validated above to exist).
+    let next_level_id = match target {
+        SquashTarget::Replace { level_id } => level_id,
+        SquashTarget::Append => existing_levels
+            .iter()
+            .map(|r| r.level_id)
+            .max()
+            .map_or(0, |m| m + 1),
+    };
 
     // Detect stub level: any prior level with blob_length == 0 has no
     // block entries in squash_block_index, so backpointers into its range
@@ -2874,6 +3002,18 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
     }
 
     node_store.flush()?;
+
+    // Snapshot the count of nodes collected by the tip-rooted DFS BEFORE the
+    // orphan-extension pass below. This is the load-bearing input for the
+    // PR1 layout invariant: nodes at indices `[0..tip_reachable_count)` are
+    // strictly tip-reachable (every direct child ptr resolves to another
+    // tip-reachable index, by graph closure), and nodes at
+    // `[tip_reachable_count..node_count)` are orphans added solely to keep
+    // per-height root sidecars usable. The remap pass below preserves this
+    // ordering, so `seq_offsets[tip_reachable_count]` becomes the
+    // `orphan_split_offset` that PR2's read path uses to route ptrs into
+    // either the merged blob or the orphan-section sidecar.
+    let tip_reachable_count = collected.len();
 
     // Step 2b: Extend the structural closure to cover every canonical root —
     // RECLAIM-ONLY. For no-reclaim levels, marf_data still points each
@@ -3408,6 +3548,74 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
         current_offset = checked_offset_add(current_offset, node_sizes[i])?;
     }
 
+    // PR1 layout invariant: with `seq_offsets` finalized, derive the
+    // `orphan_split_offset` and verify that every tip-reachable node's
+    // direct child pointers stay strictly below it. This is the load-bearing
+    // input for PR2's read-path routing — `ptr.ptr() < orphan_split_offset`
+    // must always pick the merged blob for a tip-rooted traversal, and
+    // `ptr.ptr() >= orphan_split_offset` must always pick the orphan-
+    // sidecar section. A violation here means the writer's tip-reachable
+    // closure leaked into the orphan address range, which would break PR2's
+    // routing silently. Catch it pre-publish so the squash is rejected
+    // before any blob mutation runs.
+    //
+    // Cost: O(tip_reachable_count) node decodes, one pass. On a 60k-node
+    // squash this is ~tens of ms — dominated by the multi-second blob write
+    // that follows. Always-on (not gated on debug_assertions) because PR2's
+    // routing correctness depends on the invariant holding in production.
+    let orphan_split_offset: u32 = if tip_reachable_count == 0 {
+        // Pathological: empty tip set. Treat the whole blob as orphan.
+        BLOB_HEADER_SIZE as u32
+    } else if tip_reachable_count >= node_count {
+        // No orphans (e.g. no-reclaim path, or extend pass added nothing).
+        // The split sits at end-of-nodes; every direct child ptr is < split.
+        current_offset
+    } else {
+        seq_offsets[tip_reachable_count]
+    };
+
+    for i in 0..tip_reachable_count {
+        if collected[i].is_leaf {
+            // Leaves have no child ptrs; nothing to check.
+            continue;
+        }
+        let raw = node_store.read_node_bytes(i)?;
+        if raw.len() < TRIEHASH_ENCODED_SIZE {
+            return Err(Error::CorruptionError(format!(
+                "Squash writer invariant: tip-reachable node {i} too short for hash prefix"
+            )));
+        }
+        let node_body = &raw[TRIEHASH_ENCODED_SIZE..];
+        let node_id_byte = *node_body.first().ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "Squash writer invariant: tip-reachable node {i} has empty body"
+            ))
+        })?;
+        let node_id = clear_backptr(node_id_byte) & 0x3f;
+        let (node, _consumed) = bits::decode_nodetype_from_slice_at_head(node_body, node_id)?;
+        for child_ptr in node.ptrs() {
+            if child_ptr.id() == TrieNodeID::Empty as u8 {
+                continue;
+            }
+            // Backpointers reference offsets in OTHER blocks (the back_block),
+            // not in this blob. The orphan-split invariant only constrains
+            // direct children whose `ptr.ptr()` indexes into this blob.
+            if is_backptr(child_ptr.id()) {
+                continue;
+            }
+            if child_ptr.ptr() >= orphan_split_offset {
+                return Err(Error::CorruptionError(format!(
+                    "Squash writer invariant violated: tip-reachable node {i} \
+                     (offset={}) has direct child ptr.ptr()={} >= orphan_split_offset={} \
+                     (tip_reachable_count={tip_reachable_count}, node_count={node_count})",
+                    seq_offsets[i],
+                    child_ptr.ptr(),
+                    orphan_split_offset,
+                )));
+            }
+        }
+    }
+
     let squash_root_hash = *node_store.hash(0);
     let archival_root_hash = root_hashes.last().copied().unwrap_or(TrieHash::EMPTY);
 
@@ -3430,21 +3638,107 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
         Vec::new()
     };
 
-    // Publish the per-height root sidecar BEFORE entering `publish_squash`'s
-    // arm region. A failure here returns an error from this function with no
-    // chainstate mutation having occurred. After arm, the
-    // `marf_squash_levels.root_sidecar_present` flag is set to `true` inside
-    // the same SQL transaction that registers the level, so SQL is the
-    // source of truth and any orphan sidecar from a crash between rename
-    // and SQL commit is reaped by startup orphan-scan.
+    // Build the orphan-section payload: a single pre-concatenated buffer
+    // matching the merged blob's `[orphan_split_offset .. end_of_nodes)`
+    // byte image. Each appended record uses the same encoding as the
+    // merged blob — `[hash | body]` for non-leaves, `[body]` for
+    // hash-omitted leaves (the `serialize_node` / `leaf_hashes_omitted`
+    // convention). PR1 shadow-publishes this section alongside the
+    // existing root-snapshot section; orphans still live in the merged
+    // blob too, and the read path doesn't yet route into the section.
+    // PR2 stops writing orphans into the merged blob and adds the
+    // `ptr.ptr() >= orphan_split_offset` routing in the read primitive.
+    //
+    // Pre-concatenating into one `Vec<u8>` (rather than a `Vec<Vec<u8>>`
+    // of per-record buffers) drops a transient O(orphan_bytes) copy in
+    // the sidecar writer. On mainnet FullHistory squashes the orphan
+    // section is ~150 MB; the saved copy is meaningful.
+    let (orphan_bytes, orphan_record_count): (Vec<u8>, u32) = if reclaim
+        && tip_reachable_count < node_count
+    {
+        // Pre-size to exactly the byte image we're about to assemble.
+        // `current_offset - orphan_split_offset` is the byte count of
+        // all orphan records (current_offset is end-of-nodes after
+        // the final remap pass; orphan_split_offset is where they
+        // start). The two MUST agree — if they don't, PR2's read
+        // routing (which uses `ptr - orphan_split_offset` as a
+        // sidecar offset) would silently misalign. Use `checked_sub`
+        // and reject with `CorruptionError` rather than letting the
+        // post-loop length mismatch slip through in release builds.
+        let expected_len = current_offset
+                .checked_sub(orphan_split_offset)
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "Squash writer: current_offset={current_offset} < \
+                         orphan_split_offset={orphan_split_offset} (tip_reachable_count={tip_reachable_count}, \
+                         node_count={node_count})"
+                    ))
+                })? as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(expected_len);
+        for i in tip_reachable_count..node_count {
+            let record = node_store.read_node_bytes(i)?;
+            buf.extend_from_slice(&record);
+            // Per-record buffer dropped here — peak transient is one
+            // record (~tens to hundreds of bytes), not the whole
+            // section.
+        }
+        if buf.len() != expected_len {
+            return Err(Error::CorruptionError(format!(
+                "Squash writer: orphan byte concatenation diverged from \
+                     current_offset - orphan_split_offset (got {} bytes, \
+                     expected {expected_len}; tip_reachable_count={tip_reachable_count}, \
+                     node_count={node_count}, current_offset={current_offset}, \
+                     orphan_split_offset={orphan_split_offset})",
+                buf.len(),
+            )));
+        }
+        let count = u32::try_from(node_count - tip_reachable_count).map_err(|_| {
+            Error::CorruptionError(format!(
+                "orphan record count {} exceeds u32::MAX",
+                node_count - tip_reachable_count
+            ))
+        })?;
+        (buf, count)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    // Publish the per-level sidecar.
+    //
+    // For `SquashTarget::Append`: write BEFORE entering `publish_squash`'s
+    // arm region. The new level's sidecar lives at a level_id-derived path
+    // that no reader is consulting yet (the level doesn't exist in the
+    // SquashMeta until publish), so the rename is safely racy with reads —
+    // they can't observe the new sidecar through any block-index entry that
+    // points at it.
+    //
+    // For `SquashTarget::Replace`: defer the write into `publish_squash`'s
+    // post-arm region. The sidecar's canonical path is the same as the old
+    // level's. A pre-arm rename would leave a window where readers observe
+    // the new sidecar bytes against the old SquashMeta's offsets — a real
+    // race that produces silently wrong reads. Inside `publish_squash`
+    // post-arm, `truncate_pending` is set and any new sidecar open via
+    // `try_read_orphan_bytes` bails with `RetryAfterSquash`, so the
+    // canonical-path rename is observed only after the SquashMeta refresh.
+    let mut deferred_sidecar_inputs: Option<(Vec<Vec<u8>>, Vec<u8>, u32)> = None;
     let sidecar_published = if reclaim {
-        write_squash_root_sidecar(
-            Path::new(marf_path),
-            next_level_id,
-            min_height,
-            max_height,
-            per_height_root_node_bodies,
-        )?;
+        match target {
+            SquashTarget::Append => {
+                write_squash_root_sidecar(
+                    Path::new(marf_path),
+                    next_level_id,
+                    min_height,
+                    max_height,
+                    per_height_root_node_bodies,
+                    orphan_bytes,
+                    orphan_record_count,
+                )?;
+            }
+            SquashTarget::Replace { .. } => {
+                deferred_sidecar_inputs =
+                    Some((per_height_root_node_bodies, orphan_bytes, orphan_record_count));
+            }
+        }
         true
     } else {
         false
@@ -3511,10 +3805,27 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
         trie_sql::create_squash_levels_table(storage.sqlite_conn())?;
 
         let (blob_offset, superseded_for_prune) = if reclaim {
-            let write_offset = if let Some(top_prior) = existing_levels.last() {
-                top_prior.blob_offset + top_prior.blob_length
-            } else {
-                0
+            // For Append + reclaim: write at `top_prior.blob_offset +
+            // top_prior.blob_length`, reusing the just-vacated tail of the
+            // .blobs file (we're absorbing per-block blobs into the merged
+            // blob and truncating to here).
+            //
+            // For Replace + reclaim: writing at `top_prior + length` would
+            // overwrite the per-block blobs of any sibling (e.g. the new
+            // canonical reorg-target) that arrived AFTER the original squash
+            // and now sits in the active region between `top_prior + length`
+            // and `get_blob_append_offset`. Since the build phase reads
+            // through those siblings to discover the new canonical's
+            // ancestors, overlapping the write would corrupt the input
+            // mid-build. Always append at the end of the file in Replace
+            // mode; the old level's region becomes dead bytes (a follow-up
+            // reclaim pass can compact it later if desired).
+            let write_offset = match target {
+                SquashTarget::Replace { .. } => storage.get_blob_append_offset()?,
+                SquashTarget::Append => existing_levels
+                    .last()
+                    .map(|top_prior| top_prior.blob_offset + top_prior.blob_length)
+                    .unwrap_or(0),
             };
             let superseded: Vec<T> = trailer
                 .block_hashes
@@ -3539,6 +3850,28 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
         //
         // Any Err past `arm()` is upgraded to `process::abort` by `publish_squash`.
         guard.arm();
+
+        // For `SquashTarget::Replace`: write the per-level sidecar inside the
+        // arm region so the canonical-path rename happens with
+        // `truncate_pending` set, closing the race where a reader could
+        // observe the new sidecar bytes against the old SquashMeta. Failure
+        // here aborts the process — sidecar disk writes are normally
+        // infallible, and process abort is the correct response if they're
+        // not (the file system is in an unknown state and silent
+        // continuation would corrupt reads on every other handle).
+        if let Some((bodies, orphan_bytes, orphan_record_count)) =
+            deferred_sidecar_inputs.take()
+        {
+            write_squash_root_sidecar(
+                Path::new(marf_path),
+                next_level_id,
+                min_height,
+                max_height,
+                bodies,
+                orphan_bytes,
+                orphan_record_count,
+            )?;
+        }
 
         let t_prune = Instant::now();
         if let Some(superseded) = superseded_for_prune {
@@ -3566,11 +3899,21 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
         storage.pwrite_blob_chunk(&header, write_pos)?;
         write_pos += BLOB_HEADER_SIZE;
 
-        // Stream nodes through a fixed-size write buffer (1 MB)
+        // PR2: stream only the **tip-reachable** nodes into the merged
+        // blob. Orphan nodes (indices `[tip_reachable_count..node_count)`)
+        // were already published into the level's sidecar `OrphanNode`
+        // section above; the read path routes `ptr.ptr() >=
+        // orphan_split_offset` into the sidecar, so duplicating those
+        // bytes in the merged blob is wasted disk.
+        //
+        // The writer-time invariant (asserted earlier in this function)
+        // guarantees every tip-reachable node's direct child ptr stays
+        // strictly below `orphan_split_offset`, so the truncated merged
+        // blob is fully self-consistent for tip traversals.
         const WRITE_BUF_CAP: usize = 1 << 20;
         let mut write_buf: Vec<u8> = Vec::with_capacity(WRITE_BUF_CAP);
 
-        for i in 0..node_count {
+        for i in 0..tip_reachable_count {
             let node_bytes = node_store.read_node_bytes(i)?;
             if write_buf.len() + node_bytes.len() > WRITE_BUF_CAP && !write_buf.is_empty() {
                 storage.pwrite_blob_chunk(&write_buf, write_pos)?;
@@ -3641,6 +3984,10 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
             // startup reconciliation deletes.
             root_sidecar_present: sidecar_published,
             root_sidecar_trimmed: false,
+            // PR1: wired up in a later step of this PR. Computed in the
+            // outer scope from `seq_offsets[tip_reachable_count]` and
+            // captured by the closure.
+            orphan_split_offset,
         };
         trie_sql::write_squash_level(storage.sqlite_conn(), &row)?;
 
@@ -3688,7 +4035,7 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
             &mut marf,
             Path::new(marf_path),
             next_level_id,
-            MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            retention_levels,
         ) {
             Ok(trim_report) => {
                 if trim_report.levels_trimmed > 0
@@ -3699,7 +4046,7 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
                         "MARF squash root-sidecar trim after level {next_level_id}: \
                          levels_trimmed={}, already_trimmed={}, trim_failures={}, \
                          unlink_failures={} \
-                         (retention_levels={MARF_ROOT_SNAPSHOT_RETENTION_LEVELS})",
+                         (retention_levels={retention_levels})",
                         trim_report.levels_trimmed,
                         trim_report.already_trimmed,
                         trim_report.trim_failures,
@@ -3774,6 +4121,8 @@ pub fn create_stub_level<T: MarfTrieId>(
         compress: false,
         mmap: false,
         squash_mode: SquashMode::TipOnly,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
     };
 
     let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
@@ -3802,6 +4151,8 @@ pub fn create_stub_level<T: MarfTrieId>(
             reads_redirected: false,
             root_sidecar_present: false,
             root_sidecar_trimmed: false,
+            // Stub levels have no nodes and therefore no orphans.
+            orphan_split_offset: 0,
         };
         trie_sql::write_squash_level(storage.sqlite_conn(), &row)?;
         offset
@@ -3813,4 +4164,119 @@ pub fn create_stub_level<T: MarfTrieId>(
     );
 
     Ok(())
+}
+
+/// Re-squash an existing squash level with a different canonical chain.
+///
+/// Called by the chainstate's reorg-divergence path when a tip advance
+/// changes which block was canonical at one or more heights inside an
+/// already-squashed range. The level's merged blob, trailer, per-height
+/// root snapshot sidecar, and `marf_squash_levels` row are all rewritten
+/// atomically against the new canonical.
+///
+/// # Inputs
+///
+/// - `marf_path`: path to the MARF sqlite file (same as
+///   `squash_level_incremental`).
+/// - `level_id`: which squash level to rewrite. Must already exist in
+///   `marf_squash_levels`.
+/// - `new_canonical_by_height`: the new canonical block hash at each height
+///   in `[min_height ..= max_height]`, indexed by `height - min_height`.
+///   Length must equal `max_height - min_height + 1`. Caller-supplied because
+///   the squash itself doesn't know the chain layer's reorg outcome.
+///
+/// # Required preconditions (caller's responsibility)
+///
+/// 1. **No committed descendants** of any block in `new_canonical_by_height`
+///    that diverges from the old canonical. Verified at the chainstate layer
+///    via `StacksChainState::first_committed_descendant_in_marf` before this
+///    is called. Re-squashing in the presence of such descendants would
+///    invalidate their backptrs into the old merged blob's address space,
+///    requiring the heavy child-trie backptr walk that has been explicitly
+///    rejected as out of scope.
+/// 2. **Per-block deltas** for any new-canonical block that wasn't the
+///    canonical at original squash time must be present in the active region
+///    (i.e. its row in `marf_data` retains a non-truncated `external_offset`/
+///    `external_length` pointing into the per-block blob file). For the
+///    common reorg-near-boundary case (sibling that arrived after the
+///    squash), this is automatically true. For deeper reorg-into-pre-squash-
+///    sibling scenarios, the per-block delta has been pruned and re-squash
+///    is impossible without chainstate-level replay — return
+///    `Error::NotSupportedError`.
+/// 3. The `SharedSquashState` for this MARF must be quiesced (no concurrent
+///    reads or writes) for the duration of the rewrite. The chainstate-side
+///    wiring takes the same `&mut self` lock that protects normal squash.
+///
+/// Re-squash an existing level by re-running the squash pipeline against the
+/// chainstate's *current* canonical chain (which the caller has just
+/// confirmed has reorg'd away from what the level recorded).
+///
+/// The caller is responsible for:
+///   1. Verifying divergence via
+///      [`StacksChainState::detect_squash_divergence`].
+///   2. Running the safety gate via
+///      [`StacksChainState::first_committed_descendant_in_marf`] and refusing
+///      to call this if any committed MARF block descends from the new
+///      canonical at the diverging height. This function does NOT re-run
+///      that check internally — its precondition is "there are no children
+///      of the new-canonical-at-diverging-height in `marf_data` that need
+///      backptr updates."
+///
+/// `mode` and `reclaim` should match the original level's mode/reclaim
+/// settings to keep the semantic of the level unchanged. Caller passes
+/// `retention_levels` from `MARFOpenOpts`. The supplied `level_id` must
+/// reference an existing row in `marf_squash_levels`; the function reads
+/// `min_height` and `max_height` from that row.
+///
+/// On success the level row is replaced atomically (under `publish_squash`'s
+/// quiesce window) and the new SquashMeta is installed across all open
+/// handles via the shared-generation bump. The old merged blob's bytes
+/// remain in the .blobs file as dead space — a follow-up reclaim pass can
+/// compact it later if desired.
+pub fn re_squash_level<T: MarfTrieId + Send + Sync>(
+    marf_path: &str,
+    level_id: u32,
+    mode: SquashMode,
+    reclaim: bool,
+    retention_levels: u32,
+) -> Result<SquashStats, Error> {
+    // Read the level's range from SQL — caller doesn't supply min/max
+    // because the row is the durable source of truth for them.
+    //
+    // We open a temporary connection here just to read the row; the actual
+    // squash will open its own MARF inside `squash_level_incremental_with_target`.
+    let conn = rusqlite::Connection::open_with_flags(
+        marf_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(Error::SQLError)?;
+    let levels = trie_sql::read_squash_levels(&conn)?;
+    drop(conn);
+
+    let target = levels
+        .iter()
+        .find(|r| r.level_id == level_id)
+        .ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "re_squash_level: level_id {level_id} not found in marf_squash_levels"
+            ))
+        })?;
+
+    info!(
+        "re_squash_level: rebuilding level {level_id} covering heights \
+         [{}..={}] (mode={mode:?}, reclaim={reclaim}). The chainstate's \
+         current canonical chain at these heights becomes the new recorded \
+         canonical.",
+        target.min_height, target.max_height,
+    );
+
+    squash_level_incremental_with_target::<T>(
+        marf_path,
+        mode,
+        target.min_height,
+        target.max_height,
+        reclaim,
+        retention_levels,
+        SquashTarget::Replace { level_id },
+    )
 }

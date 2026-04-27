@@ -16,37 +16,59 @@
 
 //! Per-level sidecar files for MARF squash auxiliary records.
 //!
-//! Each squash level that requires a per-height structural snapshot (currently
-//! only redirected/reclaim levels, for fork-extension correctness in
-//! [`crate::chainstate::stacks::index::marf::MARF::root_copy`]) gets one
-//! self-describing sidecar file. The file format is fixed-header + dense
-//! head-located index + concatenated bodies; reads are a single positional
-//! index entry lookup followed by a single positional body read. Trim
-//! decommissions a level's records by `unlink`-ing its sidecar — no file
-//! collapse, no offset rewrites, no SQL bookkeeping per record.
+//! Each squash level that requires per-block structural snapshots gets one
+//! self-describing **multi-section** sidecar file. v1 emits up to two
+//! sections per file:
 //!
-//! The format reserves a `record_kind` field so future MARF auxiliary record
-//! types (per-height ancestor-hash precomputations, etc.) can share the same
-//! container without a format-version bump. v1 only emits
-//! [`RecordKind::SquashRootNode`].
+//! - [`RecordKind::SquashRootNode`]: per-height post-remap root node bodies,
+//!   one body per height in `[min_height ..= max_height]`. Index-addressable
+//!   by height slot. Required for [`crate::chainstate::stacks::index::marf::MARF::root_copy`]
+//!   when fork-extending off a non-tip squashed parent.
+//! - [`RecordKind::OrphanNode`]: contiguous trie-node records for
+//!   structural nodes reachable from per-height roots but NOT from the
+//!   merged-tip root. Each record uses the **same encoding as the
+//!   merged blob**: non-leaves are `[hash(32) | body]`, hash-omitted
+//!   leaves are `[body]` (set by the level's `leaf_hashes_omitted` flag,
+//!   which is always true for reclaim levels). Byte-offset-addressable:
+//!   a node at logical `TriePtr.ptr() = orphan_split_offset + d` lives
+//!   at section-relative offset `d`. v1 (PR1) writes this section but
+//!   the read path doesn't yet route into it; PR2 introduces the
+//!   routing in [`crate::chainstate::stacks::index::storage`].
 //!
-//! # On-disk layout (v1)
+//! Both sections share a single file's lifetime: published atomically
+//! together, reconciled together, trimmed together. Trim removes the
+//! file as a unit when the level ages past the retention window.
+//!
+//! # On-disk layout (v1, multi-section)
 //!
 //! ```text
-//! +---------------------------------+ offset 0
-//! | Header (40 bytes, fixed)        |
-//! +---------------------------------+ offset SIDECAR_HEADER_SIZE
-//! | Index (count × ENTRY_SIZE bytes)|  (offset u64, length u32, reserved u32)
-//! +---------------------------------+ offset SIDECAR_HEADER_SIZE + count*ENTRY_SIZE
-//! | Body 0  (raw bytes)             |
-//! +---------------------------------+
-//! | Body 1                          |
-//! +---------------------------------+
-//! | ...                             |
-//! +---------------------------------+
-//! | Body N-1                        |
-//! +---------------------------------+ EOF
+//! +----------------------------------------+ offset 0
+//! | FileHeader (40 bytes, fixed)           |
+//! +----------------------------------------+ offset SIDECAR_HEADER_SIZE
+//! | SectionTable (section_count × 32 bytes)|  one descriptor per section
+//! +----------------------------------------+
+//! | Section 0 body (per kind's layout)     |
+//! +----------------------------------------+
+//! | Section 1 body                         |
+//! +----------------------------------------+
+//! | ...                                    |
+//! +----------------------------------------+ EOF
 //! ```
+//!
+//! Per-section internal layouts:
+//!
+//! - `SquashRootNode`: `[Index: count × 16 bytes (body_offset, body_length, reserved)]`
+//!   followed by `[Bodies (concatenated)]`. `body_offset` is an absolute
+//!   file offset.
+//! - `OrphanNode`: a verbatim copy of the merged blob's
+//!   `[orphan_split_offset .. end_of_nodes)` byte range, concatenated
+//!   record-by-record. Each record encodes a single trie node using the
+//!   **same convention as the merged blob**: non-leaf nodes are
+//!   `[hash(32) | body]`, hash-omitted leaves are `[body]` (controlled by
+//!   the level's `leaf_hashes_omitted` flag, which is always set for
+//!   reclaim levels). No internal index; the consumer derives the
+//!   in-section offset from `TriePtr.ptr() - orphan_split_offset` and
+//!   uses the standard node-decode path to determine record length.
 //!
 //! # Atomicity
 //!
@@ -63,66 +85,77 @@ use std::path::{Path, PathBuf};
 use crate::chainstate::stacks::index::Error;
 
 /// Magic bytes identifying a MARF sidecar file. Appears at the start of the
-/// header (and is verified at open time).
+/// file header (and is verified at open time).
 pub const SIDECAR_MAGIC: [u8; 8] = *b"MARFSCAR";
 
-/// Format version byte. Bump only on incompatible changes.
+/// Format version. Bump only on incompatible changes.
 pub const SIDECAR_FORMAT_VERSION: u16 = 1;
 
-/// Fixed header size in bytes.
+/// Fixed file-header size in bytes.
 ///
-/// magic(8) + format_version(2) + schema_flags(2) + record_kind(2) +
-/// reserved(2) + level_id(4) + min_height(4) + max_height(4) + count(4) +
+/// magic(8) + format_version(2) + schema_flags(2) + reserved(4) +
+/// level_id(4) + min_height(4) + max_height(4) + section_count(4) +
 /// created_at(8) = 40 bytes.
 pub const SIDECAR_HEADER_SIZE: usize = 40;
 
-/// Size of a single index entry: body_offset(8) + body_length(4) +
-/// reserved/crc32(4) = 16 bytes.
+/// Fixed per-section descriptor size in bytes.
+///
+/// record_kind(2) + schema_flags(2) + reserved(4) + offset_in_file(8) +
+/// length(8) + count(4) + reserved(4) = 32 bytes.
+pub const SIDECAR_SECTION_DESCRIPTOR_SIZE: usize = 32;
+
+/// Size of a single root-snapshot index entry: body_offset(8) +
+/// body_length(4) + reserved/crc32(4) = 16 bytes.
 pub const SIDECAR_INDEX_ENTRY_SIZE: usize = 16;
 
-/// Sidecar record-kind tags. The `u16` encoding leaves 65k future kinds.
+/// Sidecar section kinds. The `u16` encoding leaves 65k future kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum RecordKind {
-    /// Per-height post-remap squash-level root node body (Node256/Node48/...).
-    /// One body per height in `[min_height ..= max_height]`.
+    /// Per-height post-remap squash-level root node body. Index-addressable
+    /// by height slot.
     SquashRootNode = 0x0001,
+    /// Orphan structural nodes reachable from per-height roots but not
+    /// from the merged tip. Byte-offset-addressable; each record uses
+    /// the merged blob's encoding (non-leaves: `[hash(32) | body]`,
+    /// hash-omitted leaves: `[body]`), concatenated in writer-determined
+    /// order.
+    OrphanNode = 0x0002,
 }
 
 impl RecordKind {
     pub fn from_u16(v: u16) -> Option<Self> {
         match v {
             0x0001 => Some(Self::SquashRootNode),
+            0x0002 => Some(Self::OrphanNode),
             _ => None,
         }
     }
 }
 
-/// Parsed sidecar header.
+/// File-level header. Identifies the level + height range; per-section
+/// metadata lives in the [`SectionDescriptor`] table that follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarHeader {
     pub format_version: u16,
     pub schema_flags: u16,
-    pub record_kind: RecordKind,
     pub level_id: u32,
     pub min_height: u32,
     pub max_height: u32,
-    pub count: u32,
+    pub section_count: u32,
     /// Unix epoch seconds. Diagnostic only.
     pub created_at: u64,
 }
 
 impl SidecarHeader {
-    /// Number of entries that the index must contain to fully cover this
-    /// header's height range.
-    pub fn expected_count(&self) -> u32 {
-        // count == max - min + 1, validated at parse time. Returned here so
-        // callers don't recompute.
-        self.count
+    /// Number of heights covered by this file (inclusive).
+    pub fn height_count(&self) -> u32 {
+        // max < min is rejected at parse time; safe to compute.
+        self.max_height - self.min_height + 1
     }
 
     /// Convert an absolute height into a 0-based index slot, or `None` if
-    /// the height is out of range for this header.
+    /// the height is out of range.
     pub fn slot_for_height(&self, height: u32) -> Option<u32> {
         if height < self.min_height || height > self.max_height {
             return None;
@@ -134,12 +167,11 @@ impl SidecarHeader {
         w.write_all(&SIDECAR_MAGIC)?;
         w.write_all(&self.format_version.to_be_bytes())?;
         w.write_all(&self.schema_flags.to_be_bytes())?;
-        w.write_all(&(self.record_kind as u16).to_be_bytes())?;
-        w.write_all(&[0u8, 0u8])?; // reserved
+        w.write_all(&[0u8; 4])?; // reserved
         w.write_all(&self.level_id.to_be_bytes())?;
         w.write_all(&self.min_height.to_be_bytes())?;
         w.write_all(&self.max_height.to_be_bytes())?;
-        w.write_all(&self.count.to_be_bytes())?;
+        w.write_all(&self.section_count.to_be_bytes())?;
         w.write_all(&self.created_at.to_be_bytes())?;
         Ok(())
     }
@@ -165,17 +197,11 @@ impl SidecarHeader {
             )));
         }
         let schema_flags = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
-        let record_kind_raw = u16::from_be_bytes(bytes[12..14].try_into().unwrap());
-        let record_kind = RecordKind::from_u16(record_kind_raw).ok_or_else(|| {
-            Error::CorruptionError(format!(
-                "Unknown sidecar record_kind: 0x{record_kind_raw:04x}"
-            ))
-        })?;
-        // bytes[14..16] reserved, ignored.
+        // bytes[12..16] reserved, ignored.
         let level_id = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
         let min_height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
         let max_height = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
-        let count = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
+        let section_count = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
         let created_at = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
 
         if max_height < min_height {
@@ -183,28 +209,80 @@ impl SidecarHeader {
                 "Sidecar header: max_height {max_height} < min_height {min_height}"
             )));
         }
-        let expected = max_height - min_height + 1;
-        if count != expected {
-            return Err(Error::CorruptionError(format!(
-                "Sidecar header: count {count} does not match height range \
-                 [{min_height}, {max_height}] (expected {expected})"
-            )));
-        }
         Ok(Self {
             format_version,
             schema_flags,
-            record_kind,
             level_id,
             min_height,
             max_height,
-            count,
+            section_count,
             created_at,
         })
     }
 }
 
-/// One entry in the head-located index. `body_offset` is relative to the
-/// start of the file.
+/// Per-section descriptor in the section table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionDescriptor {
+    pub record_kind: RecordKind,
+    pub schema_flags: u16,
+    /// Absolute file offset where this section's body starts.
+    pub offset_in_file: u64,
+    /// Section body length in bytes.
+    pub length: u64,
+    /// Number of records in this section. Section-kind-specific:
+    /// for `SquashRootNode` this equals the height range count; for
+    /// `OrphanNode` this is the number of trie-node records the writer
+    /// concatenated. Note that for `OrphanNode`, addressing is
+    /// byte-offset-based (driven by `length`), not record-index-based —
+    /// `count` is informational only.
+    pub count: u32,
+}
+
+impl SectionDescriptor {
+    fn write<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+        w.write_all(&(self.record_kind as u16).to_be_bytes())?;
+        w.write_all(&self.schema_flags.to_be_bytes())?;
+        w.write_all(&[0u8; 4])?; // reserved
+        w.write_all(&self.offset_in_file.to_be_bytes())?;
+        w.write_all(&self.length.to_be_bytes())?;
+        w.write_all(&self.count.to_be_bytes())?;
+        w.write_all(&[0u8; 4])?; // reserved
+        Ok(())
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < SIDECAR_SECTION_DESCRIPTOR_SIZE {
+            return Err(Error::CorruptionError(format!(
+                "Sidecar section descriptor too short: {} < {}",
+                bytes.len(),
+                SIDECAR_SECTION_DESCRIPTOR_SIZE
+            )));
+        }
+        let record_kind_raw = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+        let record_kind = RecordKind::from_u16(record_kind_raw).ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "Unknown sidecar record_kind: 0x{record_kind_raw:04x}"
+            ))
+        })?;
+        let schema_flags = u16::from_be_bytes(bytes[2..4].try_into().unwrap());
+        // bytes[4..8] reserved
+        let offset_in_file = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let length = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let count = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
+        // bytes[28..32] reserved
+        Ok(Self {
+            record_kind,
+            schema_flags,
+            offset_in_file,
+            length,
+            count,
+        })
+    }
+}
+
+/// One entry in the head-located index for a `SquashRootNode` section.
+/// `body_offset` is an absolute file offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidecarIndexEntry {
     pub body_offset: u64,
@@ -238,23 +316,98 @@ impl SidecarIndexEntry {
     }
 }
 
-/// Build a sidecar file in-RAM and atomically publish it to disk via
-/// `<path>.tmp` → `fsync` → `rename`. Caller is responsible for fsync of the
+/// Section payload provided to a [`SidecarWriter`]. Each variant defines
+/// its own internal layout; the writer streams them in declared order
+/// into the tmp file at writer-computed offsets.
+pub enum SidecarSection {
+    /// Per-height root node bodies. Length must equal the file header's
+    /// height range count, validated at finalize time.
+    RootSnapshot {
+        /// One body per height in `[min_height ..= max_height]`, ordered
+        /// by ascending height.
+        bodies: Vec<Vec<u8>>,
+    },
+    /// Orphan structural nodes, byte-for-byte copy of the merged blob's
+    /// `[orphan_split_offset .. end_of_nodes)` byte range. Each record
+    /// uses the same encoding as the merged blob: non-leaves are
+    /// `[hash(32) | body]`, hash-omitted leaves are `[body]`. The order
+    /// is load-bearing: a consumer computes a record's section-relative
+    /// offset from `TriePtr.ptr() - orphan_split_offset`. `record_count`
+    /// is the number of nodes the writer concatenated; the section's
+    /// length comes from `bytes.len()`.
+    OrphanNode {
+        /// Pre-concatenated record bytes. Passing this as a single buffer
+        /// (rather than `Vec<Vec<u8>>`) drops one transient copy on the
+        /// 100 MB+ orphan sections seen in mainnet squashes.
+        bytes: Vec<u8>,
+        /// Diagnostic: number of trie nodes packed into `bytes`. Stored
+        /// in the section descriptor's `count` for diagnostics; not
+        /// load-bearing for read-side correctness (offset addressing
+        /// uses `bytes.len()`, not `record_count`).
+        record_count: u32,
+    },
+}
+
+impl SidecarSection {
+    pub fn record_kind(&self) -> RecordKind {
+        match self {
+            SidecarSection::RootSnapshot { .. } => RecordKind::SquashRootNode,
+            SidecarSection::OrphanNode { .. } => RecordKind::OrphanNode,
+        }
+    }
+
+    pub fn record_count(&self) -> usize {
+        match self {
+            SidecarSection::RootSnapshot { bodies } => bodies.len(),
+            SidecarSection::OrphanNode { record_count, .. } => *record_count as usize,
+        }
+    }
+
+    /// Byte length of this section's body once written, used by the
+    /// writer to compute section descriptors before any bytes hit the
+    /// tmp file.
+    fn body_length(&self) -> Result<u64, Error> {
+        match self {
+            SidecarSection::RootSnapshot { bodies } => {
+                let index_size = bodies
+                    .len()
+                    .checked_mul(SIDECAR_INDEX_ENTRY_SIZE)
+                    .ok_or_else(|| {
+                        Error::CorruptionError("Sidecar root section: index size overflow".into())
+                    })?;
+                let bodies_total: usize = bodies.iter().map(|b| b.len()).sum();
+                let total = index_size.checked_add(bodies_total).ok_or_else(|| {
+                    Error::CorruptionError("Sidecar root section: total size overflow".into())
+                })?;
+                Ok(total as u64)
+            }
+            SidecarSection::OrphanNode { bytes, .. } => Ok(bytes.len() as u64),
+        }
+    }
+}
+
+/// Stream-write a sidecar file to `<path>.tmp` → `fsync` → `rename` for
+/// atomic publish. Section input buffers are dropped as they're written,
+/// so peak transient memory is bounded by the largest single section's
+/// input rather than the full file image (see [`Self::finalize`] for the
+/// memory profile in detail). Caller is responsible for fsync of the
 /// parent directory after [`Self::finalize`] returns.
 ///
-/// Bodies are passed by reference and copied into the staging buffer; the
-/// caller's `Vec<Vec<u8>>` can be dropped after [`Self::finalize`].
+/// Sections are passed by value; [`Self::finalize`] consumes them and
+/// streams each section's bytes through a `BufWriter` directly into the
+/// tmp file, dropping each section's input buffers as soon as they're
+/// written.
 pub struct SidecarWriter {
     final_path: PathBuf,
     tmp_path: PathBuf,
     header: SidecarHeader,
-    bodies: Vec<Vec<u8>>,
+    sections: Vec<SidecarSection>,
 }
 
 impl SidecarWriter {
-    /// `bodies.len()` must equal `header.count`. The writer enforces this at
-    /// [`Self::finalize`] time.
-    pub fn new(final_path: PathBuf, header: SidecarHeader, bodies: Vec<Vec<u8>>) -> Self {
+    /// Construct a new writer. `header.section_count` is overwritten at
+    /// `finalize` time from `sections.len()`, so callers can leave it 0.
+    pub fn new(final_path: PathBuf, header: SidecarHeader, sections: Vec<SidecarSection>) -> Self {
         let mut tmp_path = final_path.clone();
         let mut tmp_name = tmp_path
             .file_name()
@@ -266,85 +419,103 @@ impl SidecarWriter {
             final_path,
             tmp_path,
             header,
-            bodies,
+            sections,
         }
     }
 
-    /// Build the sidecar bytes in-RAM, write to `<path>.tmp`, fsync, and
-    /// rename to the final path. After this returns, the caller should
-    /// fsync the parent directory (best-effort; not required for content
-    /// correctness, only for rename-durability across power loss).
+    /// Stream-write the sidecar to `<path>.tmp`, fsync, and rename to the
+    /// final path. After this returns, the caller should fsync the parent
+    /// directory (best-effort; not required for content correctness, only
+    /// for rename-durability across power loss).
+    ///
+    /// **Memory profile:** this writer never holds the full file image in
+    /// RAM. The peak transient allocation is dominated by the largest
+    /// single section's input buffers — for orphan sections, the
+    /// pre-concatenated `bytes: Vec<u8>` the caller passes in (which is
+    /// then moved through to the file via `BufWriter`). On mainnet
+    /// FullHistory squashes (~150 MB orphan sections), the peak ~doubles
+    /// from this writer's perspective dropped from "input + section
+    /// payload + file image" (~3×) in the prior implementation to roughly
+    /// "input only" (~1×) here.
     pub fn finalize(self) -> Result<(), Error> {
         let SidecarWriter {
             final_path,
             tmp_path,
-            header,
-            bodies,
+            mut header,
+            sections,
         } = self;
 
-        if bodies.len() as u32 != header.count {
-            return Err(Error::CorruptionError(format!(
-                "Sidecar writer: bodies.len()={} does not match header.count={}",
-                bodies.len(),
-                header.count,
-            )));
-        }
+        // Populate section_count from the actual sections vector. Callers
+        // construct the header before knowing the section list, so we own
+        // this field at finalize time.
+        header.section_count = u32::try_from(sections.len()).map_err(|_| {
+            Error::CorruptionError(format!(
+                "Sidecar writer: section_count {} exceeds u32::MAX",
+                sections.len()
+            ))
+        })?;
 
-        // Build the file in one buffer: header + index + bodies.
-        let header_size = SIDECAR_HEADER_SIZE;
-        let index_size = (header.count as usize)
-            .checked_mul(SIDECAR_INDEX_ENTRY_SIZE)
+        // Per-section validation.
+        let height_count_usize = (header.max_height as usize)
+            .checked_sub(header.min_height as usize)
+            .and_then(|n| n.checked_add(1))
             .ok_or_else(|| {
-                Error::CorruptionError("Sidecar index size overflow during write".into())
-            })?;
-        let bodies_total: usize = bodies.iter().map(|b| b.len()).sum();
-        let total_size = header_size
-            .checked_add(index_size)
-            .and_then(|n| n.checked_add(bodies_total))
-            .ok_or_else(|| Error::CorruptionError("Sidecar total size overflow".into()))?;
-
-        let mut buf: Vec<u8> = Vec::with_capacity(total_size);
-
-        // Header.
-        header.write(&mut buf)?;
-        debug_assert_eq!(buf.len(), header_size);
-
-        // Compute index entries first, then write index then bodies. Index
-        // entries' body_offset values are absolute file offsets, anchored at
-        // the position immediately after the index region.
-        let mut index_entries: Vec<SidecarIndexEntry> = Vec::with_capacity(bodies.len());
-        let bodies_region_start = (header_size + index_size) as u64;
-        let mut next_body_offset = bodies_region_start;
-        for body in &bodies {
-            let body_length = u32::try_from(body.len()).map_err(|_| {
                 Error::CorruptionError(format!(
-                    "Sidecar body too large for u32 length: {} bytes",
-                    body.len()
+                    "Sidecar writer: bad height range [{}, {}]",
+                    header.min_height, header.max_height
                 ))
             })?;
-            index_entries.push(SidecarIndexEntry {
-                body_offset: next_body_offset,
-                body_length,
-                reserved: 0,
+        for section in &sections {
+            if let SidecarSection::RootSnapshot { bodies } = section {
+                if bodies.len() != height_count_usize {
+                    return Err(Error::CorruptionError(format!(
+                        "Sidecar writer: RootSnapshot bodies.len()={} does not match \
+                         height range [{}, {}] (expected {height_count_usize})",
+                        bodies.len(),
+                        header.min_height,
+                        header.max_height,
+                    )));
+                }
+            }
+        }
+
+        // ── Pass 1: compute layout (descriptors + offsets) without
+        // materializing any payloads. The writer needs each section's
+        // `offset_in_file` and `length` populated in the section table
+        // before any section bytes hit the tmp file.
+        let table_size = sections
+            .len()
+            .checked_mul(SIDECAR_SECTION_DESCRIPTOR_SIZE)
+            .ok_or_else(|| {
+                Error::CorruptionError("Sidecar writer: section table size overflow".into())
+            })?;
+        let mut next_offset: u64 = (SIDECAR_HEADER_SIZE as u64)
+            .checked_add(table_size as u64)
+            .ok_or_else(|| {
+                Error::CorruptionError("Sidecar writer: post-table offset overflow".into())
+            })?;
+
+        let mut descriptors: Vec<SectionDescriptor> = Vec::with_capacity(sections.len());
+        for section in &sections {
+            let length = section.body_length()?;
+            let count = u32::try_from(section.record_count()).map_err(|_| {
+                Error::CorruptionError(format!(
+                    "Sidecar writer: section record_count {} exceeds u32::MAX",
+                    section.record_count()
+                ))
+            })?;
+            descriptors.push(SectionDescriptor {
+                record_kind: section.record_kind(),
+                schema_flags: 0,
+                offset_in_file: next_offset,
+                length,
+                count,
             });
-            next_body_offset = next_body_offset
-                .checked_add(body_length as u64)
-                .ok_or_else(|| {
-                    Error::CorruptionError("Sidecar body offset overflow during write".into())
-                })?;
+            next_offset = next_offset.checked_add(length).ok_or_else(|| {
+                Error::CorruptionError("Sidecar writer: section offset overflow".into())
+            })?;
         }
-
-        // Index.
-        for entry in &index_entries {
-            entry.write(&mut buf)?;
-        }
-        debug_assert_eq!(buf.len(), header_size + index_size);
-
-        // Bodies.
-        for body in &bodies {
-            buf.extend_from_slice(body);
-        }
-        debug_assert_eq!(buf.len(), total_size);
+        let total_size = next_offset;
 
         // Ensure the parent directory exists. This is the
         // `<db>.squash_sidecars/` dir; making the writer responsible for
@@ -358,10 +529,12 @@ impl SidecarWriter {
             })?;
         }
 
-        // Atomic publish: write .tmp, fsync, rename. If the .tmp already
-        // exists from a prior crashed attempt, truncate-overwrite it.
-        {
-            let mut tmp_file = OpenOptions::new()
+        // ── Pass 2: stream the file. Header + section table + each
+        // section body, in declared order. Each section's input buffer is
+        // dropped as soon as its bytes are written, keeping peak memory
+        // bounded by the largest single section's input.
+        let bytes_written = {
+            let tmp_file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
@@ -372,9 +545,50 @@ impl SidecarWriter {
                         tmp_path.display()
                     ))
                 })?;
-            tmp_file.write_all(&buf).map_err(|e| {
+            // 1 MiB write buffer: amortizes syscall overhead while staying
+            // small relative to the largest sections we expect (~150 MB).
+            let mut bw = std::io::BufWriter::with_capacity(1 << 20, tmp_file);
+
+            // File header.
+            let mut header_buf = Vec::with_capacity(SIDECAR_HEADER_SIZE);
+            header.write(&mut header_buf)?;
+            debug_assert_eq!(header_buf.len(), SIDECAR_HEADER_SIZE);
+            bw.write_all(&header_buf).map_err(|e| {
                 Error::CorruptionError(format!(
-                    "Sidecar writer: write_all to {} failed: {e}",
+                    "Sidecar writer: write file header to {} failed: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+
+            // Section table.
+            let mut table_buf = Vec::with_capacity(table_size);
+            for descriptor in &descriptors {
+                descriptor.write(&mut table_buf)?;
+            }
+            debug_assert_eq!(table_buf.len(), table_size);
+            bw.write_all(&table_buf).map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Sidecar writer: write section table to {} failed: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+
+            // Section bodies. `sections.into_iter()` consumes the Vec so
+            // each section's input buffers are dropped after streaming.
+            for (section, descriptor) in sections.into_iter().zip(descriptors.iter()) {
+                stream_section_body(&mut bw, section, descriptor.offset_in_file, &tmp_path)?;
+            }
+
+            // Flush BufWriter, then sync_all on the underlying File.
+            let mut tmp_file = bw.into_inner().map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Sidecar writer: BufWriter flush to {} failed: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            tmp_file.flush().map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Sidecar writer: final flush to {} failed: {e}",
                     tmp_path.display()
                 ))
             })?;
@@ -384,7 +598,8 @@ impl SidecarWriter {
                     tmp_path.display()
                 ))
             })?;
-        } // close the file handle before rename for cross-platform sanity
+            total_size
+        }; // file handle closed here for cross-platform rename sanity
 
         std::fs::rename(&tmp_path, &final_path).map_err(|e| {
             Error::CorruptionError(format!(
@@ -395,10 +610,11 @@ impl SidecarWriter {
         })?;
 
         info!(
-            "Sidecar writer: renamed {} -> {} ({} bytes)",
+            "Sidecar writer: renamed {} -> {} ({} bytes, {} sections)",
             tmp_path.display(),
             final_path.display(),
-            buf.len(),
+            bytes_written,
+            descriptors.len(),
         );
 
         // Post-rename existence check: catches the "rename returned Ok but
@@ -425,39 +641,121 @@ impl SidecarWriter {
     }
 }
 
-/// Opens a published sidecar file, validates its header, and reads the
-/// index. The caller can then [`Self::read_body_at_height`] to fetch
-/// individual bodies via positional reads. The file handle is closed when
-/// the reader is dropped.
+/// Stream a single section's body into `w`. Consumes the section, so its
+/// input buffers are dropped as soon as their bytes are written. Anchored
+/// at `section_file_offset` (used to compute absolute body offsets in the
+/// `SquashRootNode` index, which `read_body_at_height` later seeks to).
+fn stream_section_body<W: Write>(
+    w: &mut W,
+    section: SidecarSection,
+    section_file_offset: u64,
+    tmp_path: &Path,
+) -> Result<(), Error> {
+    match section {
+        SidecarSection::RootSnapshot { bodies } => {
+            let count = bodies.len();
+            let index_size = count.checked_mul(SIDECAR_INDEX_ENTRY_SIZE).ok_or_else(|| {
+                Error::CorruptionError("Sidecar root section: index size overflow".into())
+            })?;
+            let bodies_region_start = section_file_offset
+                .checked_add(index_size as u64)
+                .ok_or_else(|| {
+                    Error::CorruptionError(
+                        "Sidecar root section: bodies-region offset overflow".into(),
+                    )
+                })?;
+            // Build the index buffer in RAM (small: 16 B × count). Bodies
+            // are streamed one-by-one to keep peak memory bounded by the
+            // largest single body.
+            let mut index_buf: Vec<u8> = Vec::with_capacity(index_size);
+            let mut next_body_offset = bodies_region_start;
+            for body in &bodies {
+                let body_length = u32::try_from(body.len()).map_err(|_| {
+                    Error::CorruptionError(format!(
+                        "Sidecar root section: body too large for u32 length: {} bytes",
+                        body.len()
+                    ))
+                })?;
+                let entry = SidecarIndexEntry {
+                    body_offset: next_body_offset,
+                    body_length,
+                    reserved: 0,
+                };
+                entry.write(&mut index_buf)?;
+                next_body_offset = next_body_offset
+                    .checked_add(body_length as u64)
+                    .ok_or_else(|| {
+                        Error::CorruptionError("Sidecar root section: body offset overflow".into())
+                    })?;
+            }
+            debug_assert_eq!(index_buf.len(), index_size);
+            w.write_all(&index_buf).map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Sidecar writer: write root-section index to {} failed: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            for body in bodies {
+                w.write_all(&body).map_err(|e| {
+                    Error::CorruptionError(format!(
+                        "Sidecar writer: write root-section body to {} failed: {e}",
+                        tmp_path.display()
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+        SidecarSection::OrphanNode { bytes, .. } => {
+            // Single contiguous write. The caller pre-concatenated the
+            // record bytes (matching the merged blob's encoding), so the
+            // payload is exactly the byte image the section descriptor
+            // declared. After this returns, `bytes` is dropped and its
+            // ~100 MB+ allocation is freed.
+            w.write_all(&bytes).map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Sidecar writer: write orphan-section body to {} failed: {e}",
+                    tmp_path.display()
+                ))
+            })?;
+            Ok(())
+        }
+    }
+}
+
+/// Opens a published sidecar file, validates its file header + section
+/// table, and exposes per-section accessors. The file handle is closed
+/// when the reader is dropped.
 #[derive(Debug)]
 pub struct SidecarReader {
     file: File,
     pub header: SidecarHeader,
-    pub index: Vec<SidecarIndexEntry>,
+    pub sections: Vec<SectionDescriptor>,
+    /// Cached `SquashRootNode` section index, if the section is present.
+    /// Loaded eagerly at `open` time so [`Self::read_body_at_height`] is a
+    /// single positional read.
+    root_index: Option<Vec<SidecarIndexEntry>>,
 }
 
 /// Caller's expectation about a sidecar's identity, validated by
 /// [`SidecarReader::open`]. Any field set to `Some` is enforced; `None`
-/// means "trust the file." Production callers pass the full set so a
-/// stale file with a partially-matching header (e.g. right `level_id`
-/// but wrong `min_height`/`max_height`) is rejected rather than serving
-/// the wrong slot's body.
+/// means "trust the file." Production callers populate the full identity
+/// tuple (`level_id`, `min_height`, `max_height`) so a stale file with a
+/// partially-matching header (e.g. right `level_id` but wrong height
+/// range) is rejected rather than serving the wrong slot's body.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SidecarExpectation {
     pub level_id: Option<u32>,
-    pub record_kind: Option<RecordKind>,
     pub min_height: Option<u32>,
     pub max_height: Option<u32>,
-    pub count: Option<u32>,
+    /// If `Some(kind)`, the file must contain a section with that kind;
+    /// otherwise [`SidecarReader::open`] returns `CorruptionError`.
+    pub require_section: Option<RecordKind>,
 }
 
 impl SidecarReader {
-    /// Open a sidecar at `path`, validating header and parsing the full
-    /// index. Every field of `expect` set to `Some` is verified against
-    /// the parsed header — production callers should populate all five
-    /// (`level_id`, `record_kind`, `min_height`, `max_height`, `count`)
-    /// so a stale or corrupt sidecar with the right `level_id` but a
-    /// shifted height range can't return the wrong slot's body.
+    /// Open a sidecar at `path`, validating the file header, section
+    /// table, and (if present) the `SquashRootNode` section's index. The
+    /// `expect` fields are checked against the file header / sections.
     pub fn open(path: &Path, expect: SidecarExpectation) -> Result<Self, Error> {
         let mut file = OpenOptions::new().read(true).open(path).map_err(|e| {
             Error::CorruptionError(format!(
@@ -466,7 +764,7 @@ impl SidecarReader {
             ))
         })?;
 
-        // Header.
+        // ── File header ─────────────────────────────────────────────────
         let mut header_buf = [0u8; SIDECAR_HEADER_SIZE];
         file.read_exact(&mut header_buf).map_err(|e| {
             Error::CorruptionError(format!(
@@ -482,16 +780,6 @@ impl SidecarReader {
                     "Sidecar reader: level_id mismatch in {} (file says {}, caller expected {})",
                     path.display(),
                     header.level_id,
-                    want,
-                )));
-            }
-        }
-        if let Some(want) = expect.record_kind {
-            if header.record_kind != want {
-                return Err(Error::CorruptionError(format!(
-                    "Sidecar reader: record_kind mismatch in {} (file says {:?}, caller expected {:?})",
-                    path.display(),
-                    header.record_kind,
                     want,
                 )));
             }
@@ -516,42 +804,29 @@ impl SidecarReader {
                 )));
             }
         }
-        if let Some(want) = expect.count {
-            if header.count != want {
-                return Err(Error::CorruptionError(format!(
-                    "Sidecar reader: count mismatch in {} (file says {}, caller expected {})",
-                    path.display(),
-                    header.count,
-                    want,
-                )));
-            }
-        }
 
-        // Index.
-        let index_size = (header.count as usize)
-            .checked_mul(SIDECAR_INDEX_ENTRY_SIZE)
-            .ok_or_else(|| Error::CorruptionError("Sidecar reader: index size overflow".into()))?;
-        let mut index_buf = vec![0u8; index_size];
-        file.read_exact(&mut index_buf).map_err(|e| {
+        // ── Section table ───────────────────────────────────────────────
+        let table_size = (header.section_count as usize)
+            .checked_mul(SIDECAR_SECTION_DESCRIPTOR_SIZE)
+            .ok_or_else(|| {
+                Error::CorruptionError("Sidecar reader: section table size overflow".into())
+            })?;
+        let mut table_buf = vec![0u8; table_size];
+        file.read_exact(&mut table_buf).map_err(|e| {
             Error::CorruptionError(format!(
-                "Sidecar reader: short read of index from {}: {e}",
+                "Sidecar reader: short read of section table from {}: {e}",
                 path.display()
             ))
         })?;
-        let mut index = Vec::with_capacity(header.count as usize);
-        for i in 0..(header.count as usize) {
-            let start = i * SIDECAR_INDEX_ENTRY_SIZE;
-            let end = start + SIDECAR_INDEX_ENTRY_SIZE;
-            index.push(SidecarIndexEntry::parse(&index_buf[start..end])?);
+        let mut sections: Vec<SectionDescriptor> =
+            Vec::with_capacity(header.section_count as usize);
+        for i in 0..(header.section_count as usize) {
+            let start = i * SIDECAR_SECTION_DESCRIPTOR_SIZE;
+            let end = start + SIDECAR_SECTION_DESCRIPTOR_SIZE;
+            sections.push(SectionDescriptor::parse(&table_buf[start..end])?);
         }
 
-        // Validate every index entry's `(body_offset, body_length)` against
-        // the file's bounds before returning the reader. A corrupt index
-        // entry that points into the header/index region, overflows
-        // `u64`, or extends past EOF must fail closed at open time —
-        // otherwise the body read could silently return nonsense bytes
-        // (or bytes from the index/header) and `MARF::root_copy` would
-        // then decode garbage as a `TrieNodeType`.
+        // ── Section-table bounds checks ─────────────────────────────────
         let file_len = file
             .metadata()
             .map_err(|e| {
@@ -561,56 +836,193 @@ impl SidecarReader {
                 ))
             })?
             .len();
-        let bodies_region_start = (SIDECAR_HEADER_SIZE as u64)
-            .checked_add(index_size as u64)
+        let post_table_offset = (SIDECAR_HEADER_SIZE as u64)
+            .checked_add(table_size as u64)
             .ok_or_else(|| {
-                Error::CorruptionError("Sidecar reader: bodies region offset overflow".into())
+                Error::CorruptionError("Sidecar reader: post-table offset overflow".into())
             })?;
-        for (slot, entry) in index.iter().enumerate() {
-            if entry.body_offset < bodies_region_start {
+        for (idx, descriptor) in sections.iter().enumerate() {
+            if descriptor.offset_in_file < post_table_offset {
                 return Err(Error::CorruptionError(format!(
-                    "Sidecar reader: index entry {slot} body_offset {} encroaches \
-                     into the header/index region (must be >= {bodies_region_start}) in {}",
-                    entry.body_offset,
+                    "Sidecar reader: section {idx} ({:?}) offset_in_file {} encroaches \
+                     into the file header / section table (must be >= {post_table_offset}) in {}",
+                    descriptor.record_kind,
+                    descriptor.offset_in_file,
                     path.display(),
                 )));
             }
-            let end = entry.body_offset.checked_add(entry.body_length as u64).ok_or_else(|| {
-                Error::CorruptionError(format!(
-                    "Sidecar reader: index entry {slot} body_offset {} + length {} overflows u64 in {}",
-                    entry.body_offset,
-                    entry.body_length,
-                    path.display(),
-                ))
-            })?;
+            let end = descriptor
+                .offset_in_file
+                .checked_add(descriptor.length)
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "Sidecar reader: section {idx} ({:?}) offset+length overflows u64 in {}",
+                        descriptor.record_kind,
+                        path.display(),
+                    ))
+                })?;
             if end > file_len {
                 return Err(Error::CorruptionError(format!(
-                    "Sidecar reader: index entry {slot} body extends past EOF \
+                    "Sidecar reader: section {idx} ({:?}) extends past EOF \
                      ({}+{}={end} > file_len {file_len}) in {}",
-                    entry.body_offset,
-                    entry.body_length,
+                    descriptor.record_kind,
+                    descriptor.offset_in_file,
+                    descriptor.length,
                     path.display(),
                 )));
             }
         }
 
+        // ── Required-section enforcement ────────────────────────────────
+        if let Some(want) = expect.require_section {
+            if !sections.iter().any(|s| s.record_kind == want) {
+                return Err(Error::CorruptionError(format!(
+                    "Sidecar reader: required section {want:?} not present in {}",
+                    path.display()
+                )));
+            }
+        }
+
+        // ── Eagerly load the SquashRootNode section's index (if present) ─
+        let root_index = if let Some(descriptor) = sections
+            .iter()
+            .find(|s| s.record_kind == RecordKind::SquashRootNode)
+            .copied()
+        {
+            // Validate count against the file's height range — root snapshot
+            // count must equal max - min + 1.
+            let expected_count = header.height_count();
+            if descriptor.count != expected_count {
+                return Err(Error::CorruptionError(format!(
+                    "Sidecar reader: SquashRootNode section count {} does not match \
+                     header height range count {expected_count} in {}",
+                    descriptor.count,
+                    path.display()
+                )));
+            }
+            let count = descriptor.count as usize;
+            let index_size = count.checked_mul(SIDECAR_INDEX_ENTRY_SIZE).ok_or_else(|| {
+                Error::CorruptionError("Sidecar reader: root index size overflow".into())
+            })?;
+            if (index_size as u64) > descriptor.length {
+                return Err(Error::CorruptionError(format!(
+                    "Sidecar reader: SquashRootNode index region ({index_size} bytes) \
+                     exceeds section length {} in {}",
+                    descriptor.length,
+                    path.display(),
+                )));
+            }
+            let mut index_buf = vec![0u8; index_size];
+            file.seek(SeekFrom::Start(descriptor.offset_in_file))
+                .map_err(|e| {
+                    Error::CorruptionError(format!(
+                        "Sidecar reader: seek to root section start failed: {e}"
+                    ))
+                })?;
+            file.read_exact(&mut index_buf).map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Sidecar reader: short read of root index from {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut index = Vec::with_capacity(count);
+            for i in 0..count {
+                let start = i * SIDECAR_INDEX_ENTRY_SIZE;
+                let end = start + SIDECAR_INDEX_ENTRY_SIZE;
+                index.push(SidecarIndexEntry::parse(&index_buf[start..end])?);
+            }
+            // Per-entry bounds check: entries must lie within the bodies
+            // sub-region of the section (i.e., past the index, before the
+            // section ends). Same defensive posture as the prior format.
+            let bodies_region_start = descriptor
+                .offset_in_file
+                .checked_add(index_size as u64)
+                .ok_or_else(|| {
+                    Error::CorruptionError("Sidecar reader: bodies region offset overflow".into())
+                })?;
+            let section_end = descriptor
+                .offset_in_file
+                .checked_add(descriptor.length)
+                .ok_or_else(|| {
+                    Error::CorruptionError("Sidecar reader: section end overflow".into())
+                })?;
+            for (slot, entry) in index.iter().enumerate() {
+                if entry.body_offset < bodies_region_start {
+                    return Err(Error::CorruptionError(format!(
+                        "Sidecar reader: root index entry {slot} body_offset {} encroaches \
+                         into the section's index region (must be >= {bodies_region_start}) in {}",
+                        entry.body_offset,
+                        path.display(),
+                    )));
+                }
+                let entry_end = entry
+                    .body_offset
+                    .checked_add(entry.body_length as u64)
+                    .ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Sidecar reader: root index entry {slot} body_offset {} + length {} \
+                             overflows u64 in {}",
+                            entry.body_offset,
+                            entry.body_length,
+                            path.display(),
+                        ))
+                    })?;
+                if entry_end > section_end {
+                    return Err(Error::CorruptionError(format!(
+                        "Sidecar reader: root index entry {slot} body extends past section end \
+                         ({}+{}={entry_end} > section_end {section_end}) in {}",
+                        entry.body_offset,
+                        entry.body_length,
+                        path.display(),
+                    )));
+                }
+            }
+            Some(index)
+        } else {
+            None
+        };
+
         Ok(Self {
             file,
             header,
-            index,
+            sections,
+            root_index,
         })
     }
 
-    /// Fetch the body bytes for `height`. Returns `None` if `height` is out
-    /// of the file's `[min_height, max_height]` range.
+    /// Locate the descriptor for a section of the given kind, if present.
+    pub fn find_section(&self, kind: RecordKind) -> Option<&SectionDescriptor> {
+        self.sections.iter().find(|s| s.record_kind == kind)
+    }
+
+    /// Convenience accessor: descriptor for the `SquashRootNode` section.
+    pub fn root_section(&self) -> Option<&SectionDescriptor> {
+        self.find_section(RecordKind::SquashRootNode)
+    }
+
+    /// Convenience accessor: descriptor for the `OrphanNode` section.
+    pub fn orphan_section(&self) -> Option<&SectionDescriptor> {
+        self.find_section(RecordKind::OrphanNode)
+    }
+
+    /// Fetch the root body bytes for `height` from the `SquashRootNode`
+    /// section. Returns `None` if `height` is out of the file's range.
+    /// Returns `CorruptionError` if the file does not contain a
+    /// `SquashRootNode` section.
     pub fn read_body_at_height(&mut self, height: u32) -> Result<Option<Vec<u8>>, Error> {
         let Some(slot) = self.header.slot_for_height(height) else {
             return Ok(None);
         };
-        let entry = self.index.get(slot as usize).ok_or_else(|| {
+        let index = self.root_index.as_ref().ok_or_else(|| {
+            Error::CorruptionError(
+                "Sidecar reader: read_body_at_height called but file has no SquashRootNode section"
+                    .into(),
+            )
+        })?;
+        let entry = index.get(slot as usize).ok_or_else(|| {
             Error::CorruptionError(format!(
-                "Sidecar reader: slot {slot} out of bounds for index len {}",
-                self.index.len()
+                "Sidecar reader: slot {slot} out of bounds for root index len {}",
+                index.len()
             ))
         })?;
         self.file
@@ -629,6 +1041,146 @@ impl SidecarReader {
             ))
         })?;
         Ok(Some(body))
+    }
+
+    /// Read the entire `OrphanNode` section into a single byte vector.
+    /// Used by tests for differential validation against the merged blob;
+    /// PR2's read-path migration will introduce a positional accessor that
+    /// fetches a single node by section-relative offset.
+    pub fn read_orphan_section_bytes(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        let Some(descriptor) = self.orphan_section().copied() else {
+            return Ok(None);
+        };
+        self.file
+            .seek(SeekFrom::Start(descriptor.offset_in_file))
+            .map_err(|e| {
+                Error::CorruptionError(format!(
+                    "Sidecar reader: seek to orphan section failed: {e}"
+                ))
+            })?;
+        let mut buf = vec![0u8; descriptor.length as usize];
+        self.file.read_exact(&mut buf).map_err(|e| {
+            Error::CorruptionError(format!(
+                "Sidecar reader: short read of orphan section (len={}): {e}",
+                descriptor.length
+            ))
+        })?;
+        Ok(Some(buf))
+    }
+}
+
+/// Long-lived, positional-read handle to a sidecar's `OrphanNode`
+/// section. Opens its own `File` handle so consumers can issue concurrent
+/// `pread`s without contending on a shared cursor.
+///
+/// PR2 read-path routing uses this: a `TrieStorageConnection` caches one
+/// of these whenever the currently-opened block is in a squashed level
+/// that has orphans, so subsequent reads of `TriePtr.ptr() >=
+/// split_offset` can fetch bytes from the sidecar's orphan section
+/// instead of from the merged blob (which no longer contains them).
+#[derive(Debug)]
+pub struct OrphanSidecarHandle {
+    file: File,
+    /// Absolute file offset where the `OrphanNode` section's body begins.
+    /// Cached at open time from the section descriptor; stable for the
+    /// lifetime of the handle.
+    section_offset_in_file: u64,
+    /// Section body length in bytes. Used to bounds-check positional
+    /// reads so callers can never `pread` past the section into another
+    /// section's bytes.
+    section_length: u64,
+    /// The level's `orphan_split_offset`. A read at logical
+    /// `TriePtr.ptr() = P` (where `P >= split_offset`) maps to
+    /// section-relative offset `P - split_offset`.
+    pub split_offset: u32,
+}
+
+impl OrphanSidecarHandle {
+    /// Open a sidecar at `path`, validate it against `expect`, locate its
+    /// `OrphanNode` section, and return a handle with its own `File` so
+    /// positional reads can run concurrently with other handles on the
+    /// same file.
+    ///
+    /// Returns `Err(CorruptionError)` if the file is missing, fails
+    /// validation, or has no `OrphanNode` section. Caller is responsible
+    /// for handling the trim case (`root_sidecar_trimmed = true` in SQL)
+    /// before reaching this constructor — by then the file may already
+    /// be unlinked.
+    pub fn open(path: &Path, expect: SidecarExpectation, split_offset: u32) -> Result<Self, Error> {
+        // Open through SidecarReader to get header/section validation,
+        // then drop it and reopen our own File for positional reads —
+        // we don't share the reader's seek cursor.
+        let reader = SidecarReader::open(path, expect)?;
+        let descriptor = reader.orphan_section().copied().ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "OrphanSidecarHandle::open: no OrphanNode section in {}",
+                path.display()
+            ))
+        })?;
+        drop(reader);
+        let file = OpenOptions::new().read(true).open(path).map_err(|e| {
+            Error::CorruptionError(format!(
+                "OrphanSidecarHandle::open: cannot reopen {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self {
+            file,
+            section_offset_in_file: descriptor.offset_in_file,
+            section_length: descriptor.length,
+            split_offset,
+        })
+    }
+
+    /// Section body length in bytes. Caller can use this to size buffers
+    /// or bounds-check. PR2's writer-time invariant ensures
+    /// `section_length == end_of_nodes - orphan_split_offset` for the
+    /// level, but readers should not assume that.
+    pub fn section_length(&self) -> u64 {
+        self.section_length
+    }
+
+    /// Read up to `buf.len()` bytes from the orphan section starting at
+    /// the section-relative `relative_offset`. Returns the number of
+    /// bytes read. Returns `0` (Ok) if `relative_offset` is at or past
+    /// the section's end, matching the convention for short reads at
+    /// EOF. Per-call buffer size is bounded by the caller; the reader
+    /// caps the read at the section's remaining bytes so it can never
+    /// stray into another section's data.
+    pub fn pread_at(&self, buf: &mut [u8], relative_offset: u64) -> Result<usize, Error> {
+        if relative_offset >= self.section_length {
+            return Ok(0);
+        }
+        let available = self.section_length - relative_offset;
+        let read_len = buf.len().min(available as usize);
+        if read_len == 0 {
+            return Ok(0);
+        }
+        let absolute_offset = self.section_offset_in_file.checked_add(relative_offset).ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "OrphanSidecarHandle::pread_at: section_offset_in_file {} + relative_offset {} overflows",
+                self.section_offset_in_file, relative_offset,
+            ))
+        })?;
+        let dst = &mut buf[..read_len];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file
+                .read_at(dst, absolute_offset)
+                .map_err(Error::IOError)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            self.file
+                .seek_read(dst, absolute_offset)
+                .map_err(Error::IOError)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            compile_error!("OrphanSidecarHandle::pread_at: unsupported platform");
+        }
     }
 }
 
@@ -649,9 +1201,14 @@ pub fn squash_sidecar_dir_for_db(db_path: &Path) -> PathBuf {
     p
 }
 
-/// Construct the canonical path for a per-level squash root-node sidecar.
+/// Construct the canonical path for a per-level squash sidecar.
 /// Sidecars live in `<db>.squash_sidecars/`; filenames embed level_id and
 /// the height range for human readability when listing the directory.
+///
+/// Each level has exactly one sidecar file regardless of section count;
+/// the file name is unchanged from v1's single-section layout
+/// (`marf-roots-level-NNNNNN-hHHHHHHHH-HHHHHHHH.dat`) so reconcile and
+/// trim treat the file as a unit.
 pub fn squash_root_sidecar_path(
     db_path: &Path,
     level_id: u32,
@@ -868,16 +1425,16 @@ mod tests {
         SidecarHeader {
             format_version: SIDECAR_FORMAT_VERSION,
             schema_flags: 0,
-            record_kind: RecordKind::SquashRootNode,
             level_id,
             min_height: min_h,
             max_height: max_h,
-            count: max_h - min_h + 1,
+            // section_count is overwritten by the writer at finalize time.
+            section_count: 0,
             created_at: 1_700_000_000,
         }
     }
 
-    fn make_bodies(count: u32) -> Vec<Vec<u8>> {
+    fn make_root_bodies(count: u32) -> Vec<Vec<u8>> {
         (0..count)
             .map(|i| {
                 // Per-body content is "[height_index_byte; some_length]". Vary
@@ -889,9 +1446,27 @@ mod tests {
             .collect()
     }
 
+    fn make_orphan_records(count: u32) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|i| {
+                let mut record = Vec::with_capacity(32 + 5);
+                // hash bytes: encode the index in the first 4 hash bytes
+                let mut hash = [0u8; 32];
+                hash[0..4].copy_from_slice(&i.to_be_bytes());
+                record.extend_from_slice(&hash);
+                // body: variable length, stamped with the index for round-trip checks
+                let body_len = 5 + (i as usize % 9);
+                let body = vec![0xa0 | (i as u8 & 0x0f); body_len];
+                record.extend_from_slice(&body);
+                record
+            })
+            .collect()
+    }
+
     #[test]
     fn header_round_trip() {
-        let h = make_header(7, 100, 105);
+        let mut h = make_header(7, 100, 105);
+        h.section_count = 2;
         let mut buf = Vec::new();
         h.write(&mut buf).unwrap();
         assert_eq!(buf.len(), SIDECAR_HEADER_SIZE);
@@ -919,21 +1494,9 @@ mod tests {
     }
 
     #[test]
-    fn header_rejects_unknown_record_kind() {
-        let h = make_header(0, 0, 0);
-        let mut buf = Vec::new();
-        h.write(&mut buf).unwrap();
-        // Patch record_kind (bytes 12..14) to something undefined.
-        buf[12..14].copy_from_slice(&0xFFFFu16.to_be_bytes());
-        let err = SidecarHeader::parse(&buf).unwrap_err();
-        assert!(matches!(err, Error::CorruptionError(_)));
-    }
-
-    #[test]
     fn header_rejects_bad_height_range() {
         let mut h = make_header(0, 100, 105);
         h.max_height = 99; // less than min
-        h.count = 0;
         let mut buf = Vec::new();
         h.write(&mut buf).unwrap();
         let err = SidecarHeader::parse(&buf).unwrap_err();
@@ -941,41 +1504,49 @@ mod tests {
     }
 
     #[test]
-    fn header_rejects_count_height_mismatch() {
-        let h = SidecarHeader {
-            format_version: SIDECAR_FORMAT_VERSION,
-            schema_flags: 0,
-            record_kind: RecordKind::SquashRootNode,
-            level_id: 0,
-            min_height: 0,
-            max_height: 9,
-            count: 3, // should be 10
-            created_at: 0,
+    fn section_descriptor_round_trip() {
+        let d = SectionDescriptor {
+            record_kind: RecordKind::OrphanNode,
+            schema_flags: 0xABCD,
+            offset_in_file: 0x1234_5678_9ABC_DEF0,
+            length: 0x0000_FFFF_FFFF_0000,
+            count: 12345,
         };
         let mut buf = Vec::new();
-        h.write(&mut buf).unwrap();
-        let err = SidecarHeader::parse(&buf).unwrap_err();
+        d.write(&mut buf).unwrap();
+        assert_eq!(buf.len(), SIDECAR_SECTION_DESCRIPTOR_SIZE);
+        let parsed = SectionDescriptor::parse(&buf).unwrap();
+        assert_eq!(parsed, d);
+    }
+
+    #[test]
+    fn section_descriptor_rejects_unknown_kind() {
+        let mut buf = vec![0u8; SIDECAR_SECTION_DESCRIPTOR_SIZE];
+        buf[0..2].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        let err = SectionDescriptor::parse(&buf).unwrap_err();
         assert!(matches!(err, Error::CorruptionError(_)));
     }
 
     #[test]
-    fn writer_reader_round_trip() {
-        let dir = temp_dir("writer_reader_round_trip");
-        // Sidecar paths are anchored at a synthetic db file under `dir`;
-        // the helper computes `<db>.squash_sidecars/` next to it. We
-        // create the parent dir; the writer creates the sidecar subdir.
-
+    fn writer_reader_round_trip_root_only() {
+        let dir = temp_dir("writer_reader_round_trip_root_only");
         let level_id = 42;
         let min_h = 100;
         let max_h = 199;
         let count = max_h - min_h + 1;
         let header = make_header(level_id, min_h, max_h);
-        let bodies = make_bodies(count);
+        let bodies = make_root_bodies(count);
 
         let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h);
-        SidecarWriter::new(path.clone(), header.clone(), bodies.clone())
-            .finalize()
-            .unwrap();
+        SidecarWriter::new(
+            path.clone(),
+            header.clone(),
+            vec![SidecarSection::RootSnapshot {
+                bodies: bodies.clone(),
+            }],
+        )
+        .finalize()
+        .unwrap();
 
         // The .tmp file must NOT remain after rename.
         let mut tmp_path = path.clone();
@@ -989,15 +1560,20 @@ mod tests {
             &path,
             SidecarExpectation {
                 level_id: Some(level_id),
-                record_kind: Some(RecordKind::SquashRootNode),
                 min_height: Some(min_h),
                 max_height: Some(max_h),
-                count: Some(count),
+                require_section: Some(RecordKind::SquashRootNode),
             },
         )
         .unwrap();
-        assert_eq!(reader.header, header);
-        assert_eq!(reader.index.len(), count as usize);
+        assert_eq!(reader.header.level_id, level_id);
+        assert_eq!(reader.header.min_height, min_h);
+        assert_eq!(reader.header.max_height, max_h);
+        assert_eq!(reader.header.section_count, 1);
+        assert_eq!(reader.sections.len(), 1);
+        assert_eq!(reader.sections[0].record_kind, RecordKind::SquashRootNode);
+        assert_eq!(reader.sections[0].count, count);
+        assert!(reader.orphan_section().is_none());
 
         // Read every body and check it round-trips.
         for h in min_h..=max_h {
@@ -1014,15 +1590,79 @@ mod tests {
     }
 
     #[test]
-    fn writer_rejects_count_mismatch() {
-        let dir = temp_dir("writer_rejects_count_mismatch");
-        // Sidecar paths are anchored at a synthetic db file under `dir`;
-        // the helper computes `<db>.squash_sidecars/` next to it. We
-        // create the parent dir; the writer creates the sidecar subdir.
-        let header = make_header(1, 0, 9); // count = 10
-        let bodies = make_bodies(5); // wrong length
+    fn writer_reader_round_trip_root_plus_orphan() {
+        let dir = temp_dir("writer_reader_round_trip_root_plus_orphan");
+        let level_id = 7;
+        let min_h = 0;
+        let max_h = 9;
+        let count = max_h - min_h + 1;
+        let header = make_header(level_id, min_h, max_h);
+        let bodies = make_root_bodies(count);
+        let orphans_per_record = make_orphan_records(13);
+        // The writer takes a single pre-concatenated buffer + record count.
+        // Mirrors what `squash.rs` does with `node_store.read_node_bytes`
+        // accumulated into one Vec before publish.
+        let orphan_record_count = orphans_per_record.len() as u32;
+        let orphan_bytes: Vec<u8> = orphans_per_record
+            .iter()
+            .flat_map(|r| r.iter().copied())
+            .collect();
+
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h);
+        SidecarWriter::new(
+            path.clone(),
+            header,
+            vec![
+                SidecarSection::RootSnapshot {
+                    bodies: bodies.clone(),
+                },
+                SidecarSection::OrphanNode {
+                    bytes: orphan_bytes.clone(),
+                    record_count: orphan_record_count,
+                },
+            ],
+        )
+        .finalize()
+        .unwrap();
+
+        let mut reader = SidecarReader::open(
+            &path,
+            SidecarExpectation {
+                level_id: Some(level_id),
+                min_height: Some(min_h),
+                max_height: Some(max_h),
+                require_section: Some(RecordKind::OrphanNode),
+            },
+        )
+        .unwrap();
+        assert_eq!(reader.header.section_count, 2);
+        assert_eq!(reader.sections.len(), 2);
+        assert!(reader.root_section().is_some());
+        let orphan_desc = reader.orphan_section().copied().expect("orphan section");
+        assert_eq!(orphan_desc.record_kind, RecordKind::OrphanNode);
+        assert_eq!(orphan_desc.count, orphan_record_count);
+
+        // Roots are still readable.
+        for h in min_h..=max_h {
+            let got = reader.read_body_at_height(h).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(bodies[(h - min_h) as usize].as_slice())
+            );
+        }
+
+        // Orphan section bytes are the verbatim pre-concatenated input.
+        let got = reader.read_orphan_section_bytes().unwrap().unwrap();
+        assert_eq!(got, orphan_bytes);
+    }
+
+    #[test]
+    fn writer_rejects_root_count_mismatch() {
+        let dir = temp_dir("writer_rejects_root_count_mismatch");
+        let header = make_header(1, 0, 9); // height range = 10
+        let bodies = make_root_bodies(5); // wrong length
         let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 1, 0, 9);
-        let err = SidecarWriter::new(path, header, bodies)
+        let err = SidecarWriter::new(path, header, vec![SidecarSection::RootSnapshot { bodies }])
             .finalize()
             .unwrap_err();
         assert!(matches!(err, Error::CorruptionError(_)));
@@ -1031,15 +1671,16 @@ mod tests {
     #[test]
     fn reader_rejects_level_id_mismatch() {
         let dir = temp_dir("reader_rejects_level_id_mismatch");
-        // Sidecar paths are anchored at a synthetic db file under `dir`;
-        // the helper computes `<db>.squash_sidecars/` next to it. We
-        // create the parent dir; the writer creates the sidecar subdir.
         let header = make_header(7, 0, 4);
-        let bodies = make_bodies(5);
+        let bodies = make_root_bodies(5);
         let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 7, 0, 4);
-        SidecarWriter::new(path.clone(), header, bodies)
-            .finalize()
-            .unwrap();
+        SidecarWriter::new(
+            path.clone(),
+            header,
+            vec![SidecarSection::RootSnapshot { bodies }],
+        )
+        .finalize()
+        .unwrap();
         let err = SidecarReader::open(
             &path,
             SidecarExpectation {
@@ -1052,28 +1693,23 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_record_kind_mismatch() {
-        let dir = temp_dir("reader_rejects_record_kind_mismatch");
-        // Sidecar paths are anchored at a synthetic db file under `dir`;
-        // the helper computes `<db>.squash_sidecars/` next to it. We
-        // create the parent dir; the writer creates the sidecar subdir.
+    fn reader_rejects_missing_required_section() {
+        let dir = temp_dir("reader_rejects_missing_required_section");
         let header = make_header(0, 0, 4);
-        let bodies = make_bodies(5);
+        let bodies = make_root_bodies(5);
         let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4);
-        SidecarWriter::new(path.clone(), header, bodies)
-            .finalize()
-            .unwrap();
-        // The only kind v1 emits is SquashRootNode; ask for a hypothetical
-        // future kind via a hand-constructed enum patch. The cleanest way
-        // to assert this from outside the enum is to reach in via the raw
-        // byte (offset 12..14 in the header).
-        let mut bytes = fs::read(&path).unwrap();
-        bytes[12..14].copy_from_slice(&0xFFFFu16.to_be_bytes());
-        fs::write(&path, &bytes).unwrap();
+        SidecarWriter::new(
+            path.clone(),
+            header,
+            vec![SidecarSection::RootSnapshot { bodies }],
+        )
+        .finalize()
+        .unwrap();
+        // File only has SquashRootNode; require OrphanNode → err.
         let err = SidecarReader::open(
             &path,
             SidecarExpectation {
-                record_kind: Some(RecordKind::SquashRootNode),
+                require_section: Some(RecordKind::OrphanNode),
                 ..Default::default()
             },
         )
@@ -1085,89 +1721,21 @@ mod tests {
     fn reader_rejects_truncated_file() {
         let dir = temp_dir("reader_rejects_truncated_file");
         let header = make_header(0, 0, 9);
-        let bodies = make_bodies(10);
+        let bodies = make_root_bodies(10);
         let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 9);
-        SidecarWriter::new(path.clone(), header, bodies)
-            .finalize()
-            .unwrap();
+        SidecarWriter::new(
+            path.clone(),
+            header,
+            vec![SidecarSection::RootSnapshot { bodies }],
+        )
+        .finalize()
+        .unwrap();
 
         // Truncate to mid-body.
         let len = fs::metadata(&path).unwrap().len();
         let f = OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(len - 5).unwrap();
         drop(f);
-
-        // The bounds check during `open` catches the last index entry
-        // pointing past EOF — fail closed at open time, not at read time.
-        let err = SidecarReader::open(&path, SidecarExpectation::default()).unwrap_err();
-        assert!(matches!(err, Error::CorruptionError(_)));
-    }
-
-    /// Patch a single index entry in an already-published sidecar file.
-    /// Used by the bounds-check tests to plant deliberately corrupt
-    /// `(body_offset, body_length)` values without going through the
-    /// writer (which validates and would refuse to write them).
-    fn patch_index_entry(path: &Path, slot: usize, body_offset: u64, body_length: u32) {
-        let mut bytes = fs::read(path).unwrap();
-        let entry_start = SIDECAR_HEADER_SIZE + slot * SIDECAR_INDEX_ENTRY_SIZE;
-        bytes[entry_start..entry_start + 8].copy_from_slice(&body_offset.to_be_bytes());
-        bytes[entry_start + 8..entry_start + 12].copy_from_slice(&body_length.to_be_bytes());
-        // Leave reserved bytes (entry_start+12..+16) as-is.
-        fs::write(path, &bytes).unwrap();
-    }
-
-    #[test]
-    fn reader_rejects_index_entry_pointing_into_header_or_index() {
-        let dir = temp_dir("reader_rejects_index_into_header");
-        let header = make_header(0, 0, 4);
-        let bodies = make_bodies(5);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4);
-        SidecarWriter::new(path.clone(), header, bodies)
-            .finalize()
-            .unwrap();
-
-        // Patch slot 0 to point at offset 16 (deep inside the header) with
-        // a small length. open() must reject this before the body is read.
-        patch_index_entry(&path, 0, 16, 4);
-
-        let err = SidecarReader::open(&path, SidecarExpectation::default()).unwrap_err();
-        assert!(matches!(err, Error::CorruptionError(_)));
-    }
-
-    #[test]
-    fn reader_rejects_index_entry_overflowing_u64() {
-        let dir = temp_dir("reader_rejects_index_overflow");
-        let header = make_header(0, 0, 4);
-        let bodies = make_bodies(5);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4);
-        SidecarWriter::new(path.clone(), header, bodies)
-            .finalize()
-            .unwrap();
-
-        // body_offset = u64::MAX, body_length = 1 → checked_add overflows.
-        patch_index_entry(&path, 0, u64::MAX, 1);
-
-        let err = SidecarReader::open(&path, SidecarExpectation::default()).unwrap_err();
-        assert!(matches!(err, Error::CorruptionError(_)));
-    }
-
-    #[test]
-    fn reader_rejects_index_entry_extending_past_eof() {
-        let dir = temp_dir("reader_rejects_index_past_eof");
-        let header = make_header(0, 0, 4);
-        let bodies = make_bodies(5);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4);
-        SidecarWriter::new(path.clone(), header, bodies)
-            .finalize()
-            .unwrap();
-
-        // Set slot 0's body_offset to a valid bodies-region offset but
-        // length large enough to extend past file end. This is the
-        // partial-write / corrupt-during-rename case.
-        let file_len = fs::metadata(&path).unwrap().len();
-        let bodies_region_start = SIDECAR_HEADER_SIZE as u64 + 5 * SIDECAR_INDEX_ENTRY_SIZE as u64;
-        let runaway_length = (file_len - bodies_region_start + 64) as u32;
-        patch_index_entry(&path, 0, bodies_region_start, runaway_length);
 
         let err = SidecarReader::open(&path, SidecarExpectation::default()).unwrap_err();
         assert!(matches!(err, Error::CorruptionError(_)));
@@ -1180,11 +1748,9 @@ mod tests {
         let dir = temp_dir("writer_overwrites_existing_tmp");
 
         let header = make_header(3, 0, 4);
-        let bodies = make_bodies(5);
+        let bodies = make_root_bodies(5);
         let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 3, 0, 4);
 
-        // Plant a stale .tmp with junk bytes. Create the sidecar parent
-        // dir manually because the writer hasn't run yet to create it.
         let mut tmp_path = path.clone();
         let mut tmp_name = tmp_path.file_name().unwrap().to_os_string();
         tmp_name.push(".tmp");
@@ -1195,9 +1761,15 @@ mod tests {
         fs::write(&tmp_path, b"garbage from a prior crash").unwrap();
         assert!(tmp_path.exists());
 
-        SidecarWriter::new(path.clone(), header, bodies.clone())
-            .finalize()
-            .unwrap();
+        SidecarWriter::new(
+            path.clone(),
+            header,
+            vec![SidecarSection::RootSnapshot {
+                bodies: bodies.clone(),
+            }],
+        )
+        .finalize()
+        .unwrap();
 
         // .tmp is gone; .dat readable and matches.
         assert!(!tmp_path.exists());
@@ -1231,5 +1803,107 @@ mod tests {
                  marf-roots-level-000005-h00004001-00005000.dat"
             )
         );
+    }
+
+    #[test]
+    fn orphan_sidecar_handle_pread_at_round_trip() {
+        // PR2 read-path entry: open the orphan section via
+        // OrphanSidecarHandle, pread arbitrary slices, and verify the
+        // returned bytes match the writer's input.
+        let dir = temp_dir("orphan_sidecar_handle_pread_at_round_trip");
+        let level_id = 11;
+        let min_h = 0;
+        let max_h = 4;
+        let split_offset = 0x1234_5678u32; // arbitrary; not validated by handle
+        let header = make_header(level_id, min_h, max_h);
+        let bodies = make_root_bodies(max_h - min_h + 1);
+        let orphans = make_orphan_records(7);
+        let orphan_record_count = orphans.len() as u32;
+        let orphan_bytes: Vec<u8> = orphans.iter().flat_map(|r| r.iter().copied()).collect();
+
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h);
+        SidecarWriter::new(
+            path.clone(),
+            header,
+            vec![
+                SidecarSection::RootSnapshot { bodies },
+                SidecarSection::OrphanNode {
+                    bytes: orphan_bytes.clone(),
+                    record_count: orphan_record_count,
+                },
+            ],
+        )
+        .finalize()
+        .unwrap();
+
+        let handle = OrphanSidecarHandle::open(
+            &path,
+            SidecarExpectation {
+                level_id: Some(level_id),
+                min_height: Some(min_h),
+                max_height: Some(max_h),
+                require_section: Some(RecordKind::OrphanNode),
+            },
+            split_offset,
+        )
+        .unwrap();
+
+        assert_eq!(handle.split_offset, split_offset);
+        assert_eq!(handle.section_length(), orphan_bytes.len() as u64);
+
+        // Read the entire section in one shot.
+        let mut buf = vec![0u8; orphan_bytes.len()];
+        let n = handle.pread_at(&mut buf, 0).unwrap();
+        assert_eq!(n, orphan_bytes.len());
+        assert_eq!(buf, orphan_bytes);
+
+        // Read random sub-ranges and verify against the input.
+        for &(off, len) in &[(0, 4), (3, 17), (10, 11), (orphan_bytes.len() / 2, 8)] {
+            let mut buf = vec![0u8; len];
+            let n = handle.pread_at(&mut buf, off as u64).unwrap();
+            assert!(n <= len);
+            let expected_end = (off + len).min(orphan_bytes.len());
+            assert_eq!(n, expected_end - off);
+            assert_eq!(&buf[..n], &orphan_bytes[off..expected_end]);
+        }
+
+        // Read past EOS returns Ok(0).
+        let mut buf = vec![0u8; 8];
+        let n = handle
+            .pread_at(&mut buf, orphan_bytes.len() as u64)
+            .unwrap();
+        assert_eq!(n, 0);
+        let n = handle
+            .pread_at(&mut buf, orphan_bytes.len() as u64 + 100)
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // Tail-spanning read is capped at the section's remaining bytes.
+        let off = orphan_bytes.len() - 3;
+        let mut buf = vec![0u8; 16];
+        let n = handle.pread_at(&mut buf, off as u64).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], &orphan_bytes[off..]);
+    }
+
+    #[test]
+    fn orphan_sidecar_handle_rejects_file_without_orphan_section() {
+        // If a sidecar has only a RootSnapshot section,
+        // OrphanSidecarHandle::open must surface CorruptionError instead
+        // of silently constructing a handle to nonexistent bytes.
+        let dir = temp_dir("orphan_sidecar_handle_rejects_no_orphan");
+        let header = make_header(0, 0, 4);
+        let bodies = make_root_bodies(5);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4);
+        SidecarWriter::new(
+            path.clone(),
+            header,
+            vec![SidecarSection::RootSnapshot { bodies }],
+        )
+        .finalize()
+        .unwrap();
+
+        let err = OrphanSidecarHandle::open(&path, SidecarExpectation::default(), 42).unwrap_err();
+        assert!(matches!(err, Error::CorruptionError(_)));
     }
 }

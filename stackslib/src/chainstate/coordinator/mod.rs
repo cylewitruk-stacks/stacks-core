@@ -1667,7 +1667,15 @@ impl<
             let chainstate = &mut self.chain_state_db;
             let result = chainstate.process_blocks(sortdb_handle, 1, self.dispatcher)?;
             // Auto-squash MARF if cadence is met for the just-processed block.
+            //
+            // Before squash (and before any subsequent block that would read through this
+            // tip), assert that the new canonical chain is consistent with the most recent
+            // squash level's recorded canonical. A divergence here means a prior reorg
+            // crossed a squash boundary; descendants of the new tip would otherwise read
+            // stale state from the merged blob — the failure mode observed at level 11.
             if let Some((Some(ref receipt), _)) = result.first() {
+                let new_tip = receipt.header.index_block_hash();
+                chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
                 chainstate
                     .maybe_squash(receipt.header.stacks_block_height, self.sortition_db.conn());
             }
@@ -1780,8 +1788,10 @@ impl<
             processed_blocks = {
                 let chainstate = &mut self.chain_state_db;
                 let result = chainstate.process_blocks(sortdb_handle, 1, self.dispatcher)?;
-                // Auto-squash MARF if cadence is met for the just-processed block.
+                // See the divergence-check note in the corresponding block above.
                 if let Some((Some(ref receipt), _)) = result.first() {
+                    let new_tip = receipt.header.index_block_hash();
+                    chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
                     chainstate
                         .maybe_squash(receipt.header.stacks_block_height, self.sortition_db.conn());
                 }
