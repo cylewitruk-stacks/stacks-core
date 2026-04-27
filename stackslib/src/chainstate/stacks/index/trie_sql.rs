@@ -84,7 +84,12 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
     max_height INTEGER NOT NULL,
     blob_offset INTEGER NOT NULL,
     blob_length INTEGER NOT NULL,
-    reads_redirected INTEGER NOT NULL DEFAULT 0
+    reads_redirected INTEGER NOT NULL DEFAULT 0,
+    -- Per-height root node sidecar tracking. `present`: true when this level
+    -- has a published root sidecar file at the canonical path. `trimmed`:
+    -- reserved for the eventual trim policy; v1 always 0.
+    root_sidecar_present INTEGER NOT NULL DEFAULT 0,
+    root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0
 );
 
 DELETE FROM schema_version;
@@ -752,20 +757,34 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
     max_height INTEGER NOT NULL,
     blob_offset INTEGER NOT NULL,
     blob_length INTEGER NOT NULL,
-    reads_redirected INTEGER NOT NULL DEFAULT 0
+    reads_redirected INTEGER NOT NULL DEFAULT 0,
+    root_sidecar_present INTEGER NOT NULL DEFAULT 0,
+    root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0
 );
 ";
 
 pub fn create_squash_levels_table(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(SQL_SQUASH_LEVELS_TABLE)?;
+    // Best-effort, idempotent column-add for existing schemas.
+    // `ALTER TABLE ... ADD COLUMN` errors if the column already exists; we
+    // ignore that error and propagate any other.
+    let _ = conn.execute_batch(
+        "ALTER TABLE marf_squash_levels \
+         ADD COLUMN root_sidecar_present INTEGER NOT NULL DEFAULT 0",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE marf_squash_levels \
+         ADD COLUMN root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0",
+    );
     Ok(())
 }
 
 pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(), Error> {
     conn.execute(
         "INSERT OR REPLACE INTO marf_squash_levels \
-         (level_id, min_height, max_height, blob_offset, blob_length, reads_redirected) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         (level_id, min_height, max_height, blob_offset, blob_length, \
+          reads_redirected, root_sidecar_present, root_sidecar_trimmed) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             row.level_id,
             row.min_height,
@@ -773,7 +792,47 @@ pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(),
             row.blob_offset as i64,
             row.blob_length as i64,
             row.reads_redirected as i64,
+            row.root_sidecar_present as i64,
+            row.root_sidecar_trimmed as i64,
         ],
+    )?;
+    Ok(())
+}
+
+/// Mark `root_sidecar_present` for a level. Used at squash publish time
+/// once the sidecar file has been atomically renamed into place. Idempotent.
+pub fn set_root_sidecar_present(
+    conn: &Connection,
+    level_id: u32,
+    present: bool,
+) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE marf_squash_levels SET root_sidecar_present = ?1 WHERE level_id = ?2",
+        params![present as i64, level_id],
+    )?;
+    Ok(())
+}
+
+/// Mark `root_sidecar_trimmed` for a level. Idempotent.
+///
+/// This is intentionally called at trim time **before** the sidecar
+/// file is `unlink`-ed: the SQL flag is the load-bearing source of
+/// truth for the read path's `Error::SnapshotTrimmed` policy, and
+/// flipping it first (followed by a `SquashMeta` republish) ensures
+/// that no live handle ever observes the (file-missing, trimmed=false)
+/// corruption window. The subsequent `unlink` is best-effort disk
+/// hygiene; if it fails, the file is reaped by
+/// [`crate::chainstate::stacks::index::sidecar::reconcile_squash_sidecars`]
+/// on the next startup. See `trim_aged_root_sidecars` in `squash.rs`
+/// for the full ordering rationale.
+pub fn set_root_sidecar_trimmed(
+    conn: &Connection,
+    level_id: u32,
+    trimmed: bool,
+) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE marf_squash_levels SET root_sidecar_trimmed = ?1 WHERE level_id = ?2",
+        params![trimmed as i64, level_id],
     )?;
     Ok(())
 }
@@ -812,7 +871,9 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
 
     let mut stmt = conn.prepare(
         "SELECT level_id, min_height, max_height, blob_offset, blob_length, \
-         COALESCE(reads_redirected, 0) AS reads_redirected \
+         COALESCE(reads_redirected, 0) AS reads_redirected, \
+         COALESCE(root_sidecar_present, 0) AS root_sidecar_present, \
+         COALESCE(root_sidecar_trimmed, 0) AS root_sidecar_trimmed \
          FROM marf_squash_levels ORDER BY min_height ASC",
     )?;
     let rows = stmt
@@ -824,6 +885,8 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
                 blob_offset: row.get::<_, i64>("blob_offset")? as u64,
                 blob_length: row.get::<_, i64>("blob_length")? as u64,
                 reads_redirected: row.get::<_, i64>("reads_redirected")? != 0,
+                root_sidecar_present: row.get::<_, i64>("root_sidecar_present")? != 0,
+                root_sidecar_trimmed: row.get::<_, i64>("root_sidecar_trimmed")? != 0,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

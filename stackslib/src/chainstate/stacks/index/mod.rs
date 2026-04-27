@@ -39,6 +39,7 @@ pub mod node;
 pub mod profile;
 pub mod proofs;
 pub mod scratch;
+pub mod sidecar;
 pub mod squash;
 pub mod storage;
 pub mod trie;
@@ -410,6 +411,32 @@ pub enum Error {
     /// that returns it. Use [`Error::is_retry_after_squash`] to branch on it internally.
     #[doc(hidden)]
     RetryAfterSquash,
+
+    /// Fork-extension was attempted off a parent in a squash level whose
+    /// per-height root snapshot has been deleted by the trim policy. This
+    /// is an *expected* policy outcome (not data damage): the level was
+    /// trimmed because it sits past `root_snapshot_retention_levels` from
+    /// the current squash tip, and the operator has accepted that fork
+    /// extension off such ancient parents is not supported. Higher layers
+    /// should convert this into a chainstate-level rejection of the
+    /// in-progress block / alternate-chain validation; do NOT treat it
+    /// as corruption.
+    SnapshotTrimmed {
+        level_id: u32,
+        retention_levels: u32,
+    },
+
+    /// Fork-extension was attempted off a parent in a squash level that
+    /// predates the per-height-root-sidecar feature: SQL says the level
+    /// exists and is reads-redirected, but `root_sidecar_present = 0`.
+    /// This means the level was squashed against an older binary that
+    /// didn't write sidecars at all, and the merged blob's single
+    /// materialized root cannot reconstruct the parent's actual root
+    /// shape. Operationally: re-squash this level (or wipe and resync)
+    /// with a binary that includes the iteration-1 fix.
+    UnsupportedLegacyLevel {
+        level_id: u32,
+    },
 }
 
 impl Error {
@@ -1268,6 +1295,22 @@ impl fmt::Display for Error {
                 );
                 write!(f, "Internal retry sentinel leaked — report as a bug")
             }
+            Error::SnapshotTrimmed {
+                level_id,
+                retention_levels,
+            } => write!(
+                f,
+                "Squash level {level_id}'s per-height root snapshot has been trimmed by \
+                 the configured retention policy (root_snapshot_retention_levels={retention_levels}). \
+                 Fork-extension off a parent in this level is not supported."
+            ),
+            Error::UnsupportedLegacyLevel { level_id } => write!(
+                f,
+                "Squash level {level_id} predates the per-height root sidecar feature \
+                 (root_sidecar_present=0). Fork-extension off a parent in this level cannot \
+                 produce a structurally-correct root. Re-squash this level (or wipe and \
+                 resync) with a binary that includes the fork-extension correctness fix."
+            ),
         }
     }
 }

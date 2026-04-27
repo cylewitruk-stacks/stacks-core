@@ -1469,11 +1469,23 @@ impl<T: MarfTrieId> MARF<T> {
         let (mut child_node, _) = child_read.into_owned_node()?;
 
         // Flatten LeafSquashed → Leaf for per-block COW. Squash history
-        // must not be carried forward into per-block blobs.
+        // must not be carried forward into per-block blobs. If the copied
+        // child was reached inside a reclaimed FullHistory squash, preserve
+        // the value at the opened snapshot height, not the merged squash tip.
         if let TrieNodeType::LeafSquashed(ref sq) = child_node {
+            let value = match storage.squash_opened_height() {
+                Some(height) => sq.value_at_height(height).cloned().ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "LeafSquashed COW copy could not resolve value at opened \
+                         squash height {height} for path {}",
+                        crate::util::hash::to_hex(sq.path.as_slice())
+                    ))
+                })?,
+                None => sq.tip_value()?.clone(),
+            };
             child_node = TrieNodeType::Leaf(TrieLeaf {
                 path: sq.path,
-                data: sq.tip_value()?.clone(),
+                data: value,
             });
         }
 
@@ -1518,18 +1530,58 @@ impl<T: MarfTrieId> MARF<T> {
             )
         });
 
-        let mut prev_root = {
-            let root_read = Trie::read_root(storage, decode_scratch)?;
-            root_read.into_owned_node()?.0
+        // If the parent block is in a reclaim-squash level, the squash blob
+        // has only one materialized root (the merged tip's), so reading via
+        // `Trie::read_root` would return the merged shape regardless of
+        // which block we opened — leaving the fork's seal hash structurally
+        // wrong. Use the per-height root snapshot captured in the squash
+        // trailer instead. The captured body is post-remap, so its child
+        // ptrs already resolve into this level's blob, and `node_copy_update`
+        // below converts direct ptrs into backptrs targeting
+        // `prev_block_identifier` exactly as it does in the unsquashed path.
+        //
+        // `squash_opened_root_node_bytes` fails closed: it returns `None`
+        // for blocks not in a squash level and for no-reclaim levels (whose
+        // original blobs still serve the per-block root via
+        // `ROOT_PTR_DISK`), but errors if a reclaim level somehow lacks a
+        // saved snapshot. We propagate that error rather than silently
+        // falling back.
+        let saved_root_node: Option<TrieNodeType> = match storage.squash_opened_root_node_bytes()? {
+            Some(body) => {
+                let head = *body.first().ok_or_else(|| {
+                    Error::CorruptionError("squash sidecar per-height root body is empty".into())
+                })?;
+                let node_id = clear_backptr(head) & 0x3f;
+                let (node, _consumed) = bits::decode_nodetype_from_slice_at_head(&body, node_id)?;
+                Some(node)
+            }
+            None => None,
+        };
+        let using_saved_root_node = saved_root_node.is_some();
+        let mut prev_root = match saved_root_node {
+            Some(n) => n,
+            None => {
+                let root_read = Trie::read_root(storage, decode_scratch)?;
+                root_read.into_owned_node()?.0
+            }
         };
         if prev_block_hash != &T::sentinel() {
-            let mut prev_root_backptr = TriePtr::new(
-                set_backptr(TrieNodeID::Node256 as u8),
-                0,
-                storage.root_ptr(),
-            );
-            prev_root_backptr.back_block = prev_block_identifier;
-            prev_root.set_cow_ptr(TrieCowPtr::new(prev_block_hash.clone(), prev_root_backptr));
+            if !using_saved_root_node {
+                // Normal roots are addressable at ROOT_PTR_DISK in the
+                // parent block, so the flush path can encode this copied root
+                // as a patch against that base. Saved sidecar roots are not
+                // addressable there: opening ROOT_PTR_DISK for any reclaimed
+                // in-squash block yields the merged-tip root. Patching a
+                // per-height root against that merged root produces bogus
+                // diffs, so saved roots are written as full nodes.
+                let mut prev_root_backptr = TriePtr::new(
+                    set_backptr(TrieNodeID::Node256 as u8),
+                    0,
+                    storage.root_ptr(),
+                );
+                prev_root_backptr.back_block = prev_block_identifier;
+                prev_root.set_cow_ptr(TrieCowPtr::new(prev_block_hash.clone(), prev_root_backptr));
+            }
         }
         let new_root_hash = Self::node_copy_update(&mut prev_root, prev_block_identifier)?;
 

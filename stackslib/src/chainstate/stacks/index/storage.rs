@@ -1652,6 +1652,15 @@ pub struct SquashMeta {
     pub block_index: HashMap<[u8; 32], (usize, u32, u64, bool, u32)>,
     /// Set of block_ids whose blobs have leaf hashes omitted (reclaimed squash levels).
     pub leaf_hash_omitted_blocks: HashSet<u32>,
+    /// Per-level `root_sidecar_present` flag, parallel to `levels`. True
+    /// once the level's per-height root snapshot sidecar file has been
+    /// atomically published. Used by the fork-extension read path to
+    /// distinguish "sidecar should exist" from "level predates sidecars".
+    pub root_sidecar_present: Vec<bool>,
+    /// Per-level `root_sidecar_trimmed` flag, parallel to `levels`. v1
+    /// (PR 1) always false; iteration 2's trim policy will set it to true
+    /// after `unlink`-ing the corresponding sidecar.
+    pub root_sidecar_trimmed: Vec<bool>,
 }
 
 impl SquashMeta {
@@ -1660,6 +1669,8 @@ impl SquashMeta {
             levels: Vec::new(),
             block_index: HashMap::new(),
             leaf_hash_omitted_blocks: HashSet::new(),
+            root_sidecar_present: Vec::new(),
+            root_sidecar_trimmed: Vec::new(),
         }
     }
 }
@@ -2128,16 +2139,22 @@ pub(crate) fn build_squash_meta_from_sql(
     let mut levels = Vec::with_capacity(squash_level_rows.len());
     let mut block_index = HashMap::new();
     let mut leaf_hash_omitted = HashSet::new();
+    let mut root_sidecar_present = Vec::with_capacity(squash_level_rows.len());
+    let mut root_sidecar_trimmed = Vec::with_capacity(squash_level_rows.len());
 
     for row in &squash_level_rows {
         if row.blob_length == 0 {
             levels.push(SquashTrailer::empty());
+            root_sidecar_present.push(row.root_sidecar_present);
+            root_sidecar_trimmed.push(row.root_sidecar_trimmed);
             continue;
         }
         let Some(blobs_ref) = blobs else {
             // External-blobs disabled but a level is present: defensive fallback — register an
             // empty stub so reads fall through to the legacy SQL path.
             levels.push(SquashTrailer::empty());
+            root_sidecar_present.push(row.root_sidecar_present);
+            root_sidecar_trimmed.push(row.root_sidecar_trimmed);
             continue;
         };
 
@@ -2151,7 +2168,13 @@ pub(crate) fn build_squash_meta_from_sql(
         let trailer_abs_offset = row.blob_offset + trailer_rel_offset;
         let trailer_length = row.blob_offset + row.blob_length - trailer_abs_offset;
         let trailer_bytes = blobs_ref.read_blob_range(trailer_abs_offset, trailer_length)?;
-        let trailer = SquashTrailer::read_from(&trailer_bytes)?;
+        let trailer = SquashTrailer::read_from(&trailer_bytes, trailer_abs_offset)?;
+
+        // Per-file existence probing for sidecars happens in a separate
+        // startup pass that has access to the marf directory path. This
+        // helper just records the SQL-side flags onto the in-memory
+        // SquashMeta so the read path can fail-closed when the flags say
+        // a sidecar should be present but the open later fails.
 
         let level_idx = levels.len();
         for &(bhh, height, block_id) in &trailer.sorted_block_entries {
@@ -2170,12 +2193,16 @@ pub(crate) fn build_squash_meta_from_sql(
             }
         }
         levels.push(trailer);
+        root_sidecar_present.push(row.root_sidecar_present);
+        root_sidecar_trimmed.push(row.root_sidecar_trimmed);
     }
 
     Ok(SquashMeta {
         levels,
         block_index,
         leaf_hash_omitted_blocks: leaf_hash_omitted,
+        root_sidecar_present,
+        root_sidecar_trimmed,
     })
 }
 
@@ -3727,11 +3754,69 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         // thread's chainstate and the runloop's chainstate both targeting the same headers MARF)
         // will share the Arc with us, so a `refresh_after_squash()` publish on either handle is
         // observable by the other via the generation counter.
+        //
+        // Sidecar reconcile runs INSIDE the build closure so it fires exactly
+        // once per process per db path — bound to the lifetime of the shared
+        // state entry. This is load-bearing for correctness: a squash on
+        // handle A is a two-step (write file → commit SQL row) operation,
+        // and a concurrent open on handle B that runs reconcile mid-window
+        // would see "file present, no SQL row" and delete the in-flight
+        // sidecar as an orphan. Confining reconcile to the first open per
+        // process eliminates the race because no further reconciles can
+        // execute concurrently with a squash.
+        //
+        // Crash-recovery semantics are preserved: when the last handle for a
+        // db path is dropped, the registry's `Weak` dies, and the next open
+        // re-runs the build closure (and thus reconcile) — picking up any
+        // crash-leaked orphan files.
         let shared = {
             let db_for_build = &db;
             let blobs_for_build = blobs.as_ref();
+            let db_path_for_reconcile = std::path::PathBuf::from(&db_path);
             shared_squash_state_for(&db_path, || {
-                build_squash_meta_from_sql(db_for_build, blobs_for_build)
+                let meta = build_squash_meta_from_sql(db_for_build, blobs_for_build)?;
+
+                // Reconcile the squash root-node sidecar dir against SQL state:
+                //   - ignore `.tmp` files because they may belong to an in-flight
+                //     sidecar writer on another handle;
+                //   - delete any `.dat` files whose level_id has no SQL row, has
+                //     `root_sidecar_present=0`, or is `root_sidecar_trimmed=1`
+                //     (trimmed sidecar cleanup);
+                //   - if any level marked `root_sidecar_present=1 && trimmed=0`
+                //     has no on-disk sidecar, raise a corruption error here
+                //     rather than letting fork-extension silently fail later.
+                // For pure-SQL setups (no external blobs) this is a no-op:
+                // sidecars only exist alongside reclaim levels that themselves
+                // require external blobs. Readonly opens still run reconcile here
+                // because this is the first-open path: the per-process registry
+                // serializes us against any concurrent squash, and a readonly
+                // first-open is just as valid a startup-cleanup trigger as a
+                // read-write one.
+                use crate::chainstate::stacks::index::sidecar::{
+                    reconcile_squash_sidecars, ExpectedSidecar,
+                };
+                let expected: Vec<ExpectedSidecar> = meta
+                    .levels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| ExpectedSidecar {
+                        level_id: t.info.level_id,
+                        min_height: t.info.min_height,
+                        max_height: t.info.max_height,
+                        present: meta.root_sidecar_present.get(i).copied().unwrap_or(false),
+                        trimmed: meta.root_sidecar_trimmed.get(i).copied().unwrap_or(false),
+                    })
+                    .collect();
+                let report = reconcile_squash_sidecars(&db_path_for_reconcile, &expected)?;
+                if report.tmp_orphans_deleted > 0 || report.dat_orphans_deleted > 0 {
+                    info!(
+                        "MARF squash sidecar reconcile: tmp_orphans_deleted={}, \
+                         dat_orphans_deleted={}, dat_kept={}",
+                        report.tmp_orphans_deleted, report.dat_orphans_deleted, report.dat_kept,
+                    );
+                }
+
+                Ok(meta)
             })?
         };
         data.squash_meta = shared.snapshot();
@@ -4218,6 +4303,187 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
 
     pub fn unconfirmed(&self) -> bool {
         self.data.unconfirmed
+    }
+
+    /// If the currently-open block sits inside a redirected squash level,
+    /// read its per-height root node body from the level's sidecar file
+    /// and return it (post-remap, no hash prefix). Decode via
+    /// [`crate::chainstate::stacks::index::bits::decode_nodetype_from_slice_at_head`].
+    ///
+    /// Returns `Ok(None)` when the currently-open block is not in any
+    /// squash level, or when it's in a no-reclaim/append-only squash
+    /// level whose original blob still serves the per-block root via
+    /// `ROOT_PTR_DISK`.
+    ///
+    /// **Lifecycle.** The sidecar file is opened, its header validated,
+    /// its index parsed, and the requested body read — all on each call.
+    /// PR 1 deliberately avoids caching open file handles or parsed
+    /// indexes; the fork-extension code path is rare (one call per
+    /// fork-from-squashed-parent, not per read), so the open-read-close
+    /// per call is fine. Iteration 2 may add a small bounded LRU index
+    /// cache if profiling shows it matters.
+    ///
+    /// **Fails closed.** A redirected level whose SQL row carries
+    /// `root_sidecar_present = 1` MUST have its sidecar file on disk and
+    /// readable; if it doesn't, we surface a corruption error rather
+    /// than silently fall back to `Trie::read_root` (which on a
+    /// redirected blob returns the merged-tip's root, reintroducing the
+    /// bug this fix addresses). PR 2 will introduce a distinct
+    /// "trimmed-by-policy" error path; in PR 1 a missing-or-trimmed
+    /// sidecar always reports as corruption.
+    ///
+    /// Used by `MARF::root_copy` so that fork-extending a non-tip squashed
+    /// block reconstructs the parent's actual root shape rather than
+    /// reading the merged tip's root.
+    pub fn squash_opened_root_node_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
+        use crate::chainstate::stacks::index::sidecar::{
+            squash_root_sidecar_path, RecordKind, SidecarExpectation, SidecarReader,
+        };
+
+        let Some(height) = self.data.squash_opened_height else {
+            return Ok(None);
+        };
+        let Some(level_idx) = self.data.squash_opened_level_idx else {
+            return Ok(None);
+        };
+        if !self.data.leaf_hashes_omitted {
+            // No-reclaim / append-only level: the original per-block blob
+            // still serves the correct per-block root via `ROOT_PTR_DISK`.
+            // No saved snapshot is required (or written).
+            return Ok(None);
+        }
+        let level = self.data.squash_meta.levels.get(level_idx).ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "squash_opened_level_idx={level_idx} but SquashMeta has no matching level"
+            ))
+        })?;
+        let trimmed = self
+            .data
+            .squash_meta
+            .root_sidecar_trimmed
+            .get(level_idx)
+            .copied()
+            .unwrap_or(false);
+        let present = self
+            .data
+            .squash_meta
+            .root_sidecar_present
+            .get(level_idx)
+            .copied()
+            .unwrap_or(false);
+        if trimmed {
+            // Expected outcome: this level was trimmed by the retention
+            // policy. Surface the dedicated `SnapshotTrimmed` variant so
+            // higher layers can convert it into a chainstate-level
+            // rejection (don't treat as corruption).
+            return Err(Error::SnapshotTrimmed {
+                level_id: level.info.level_id,
+                retention_levels:
+                    crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            });
+        }
+        if !present {
+            // Level predates the sidecar feature: its merged blob doesn't
+            // contain the per-block root snapshots and there's no path
+            // forward without a re-squash.
+            return Err(Error::UnsupportedLegacyLevel {
+                level_id: level.info.level_id,
+            });
+        }
+
+        // Compute the canonical sidecar path. The dir is per-DB
+        // (`<db>.squash_sidecars/`) so peer MARFs sharing the same parent
+        // dir don't collide on each other's sidecars.
+        let sidecar_path = squash_root_sidecar_path(
+            std::path::Path::new(self.db_path),
+            level.info.level_id,
+            level.info.min_height,
+            level.info.max_height,
+        );
+
+        info!(
+            "squash_opened_root_node_bytes: db_path={} level_id={} heights=[{}..={}] height={height} reading {}",
+            self.db_path,
+            level.info.level_id,
+            level.info.min_height,
+            level.info.max_height,
+            sidecar_path.display(),
+        );
+
+        // If the file is missing, dump the parent dir contents and the raw
+        // SQL view of `marf_squash_levels` so we can see whether the
+        // disagreement is "writer never wrote", "trim/reconcile deleted",
+        // or "stale SQL pointing at wrong identity tuple".
+        if !sidecar_path.exists() {
+            error!(
+                "squash_opened_root_node_bytes: sidecar MISSING at {} \
+                 (level_id={}, heights=[{}..={}], present={}, trimmed={})",
+                sidecar_path.display(),
+                level.info.level_id,
+                level.info.min_height,
+                level.info.max_height,
+                present,
+                trimmed,
+            );
+            if let Some(parent) = sidecar_path.parent() {
+                match std::fs::read_dir(parent) {
+                    Ok(entries) => {
+                        let names: Vec<String> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect();
+                        error!(
+                            "squash_opened_root_node_bytes: parent dir {} contains: [{}]",
+                            parent.display(),
+                            names.join(", "),
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "squash_opened_root_node_bytes: cannot read parent dir {}: {e}",
+                            parent.display(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Open + validate header + parse index + read body. Pass the
+        // full expected tuple from the trailer so a stale or corrupt
+        // sidecar with the right `level_id` but wrong height range can't
+        // serve the wrong slot's body. The sidecar's file lifetime is
+        // independent of the squash blob's truncate window, so no
+        // blob-read-guard interaction is needed here.
+        let expected_count = level
+            .info
+            .max_height
+            .checked_sub(level.info.min_height)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "Squash level (idx={level_idx}) has bad height range \
+                     [{}..={}]",
+                    level.info.min_height, level.info.max_height,
+                ))
+            })?;
+        let mut reader = SidecarReader::open(
+            &sidecar_path,
+            SidecarExpectation {
+                level_id: Some(level.info.level_id),
+                record_kind: Some(RecordKind::SquashRootNode),
+                min_height: Some(level.info.min_height),
+                max_height: Some(level.info.max_height),
+                count: Some(expected_count),
+            },
+        )?;
+        let body = reader.read_body_at_height(height)?.ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "Sidecar for level_id={} (heights [{}..={}]) does not contain a record \
+                 for height={height}",
+                level.info.level_id, level.info.min_height, level.info.max_height,
+            ))
+        })?;
+        Ok(Some(body))
     }
 
     pub fn clear_cached_ancestor_hashes_bytes(&mut self) {

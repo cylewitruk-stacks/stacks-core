@@ -2467,7 +2467,16 @@ impl StacksChainState {
         /// MARF handle; on hard failure, returns `false` so the live handle keeps pointing at
         /// the unmodified file.
         fn run_squash_plan(plan: &SquashPlan) -> bool {
-            let block_count = (plan.tip_height as u64) - (plan.min_height as u64) + 1;
+            let Some(block_count) =
+                StacksChainState::squash_block_count(plan.min_height, plan.tip_height)
+            else {
+                info!(
+                    "Auto-squash: {} MARF skipping empty range {}..={} \
+                     (path: {})",
+                    plan.label, plan.min_height, plan.tip_height, plan.path
+                );
+                return false;
+            };
             // Late-enablement guard: a fresh range > u32 pointer space is too large to squash
             // in one shot — install a stub level instead.
             if plan.min_height == 0 && block_count > STUB_THRESHOLD {
@@ -2515,6 +2524,14 @@ impl StacksChainState {
                     }
                 }
             }
+        }
+    }
+
+    fn squash_block_count(min_height: u32, tip_height: u32) -> Option<u64> {
+        if min_height > tip_height {
+            None
+        } else {
+            Some((tip_height as u64) - (min_height as u64) + 1)
         }
     }
 
@@ -3776,6 +3793,19 @@ pub mod test {
             .unwrap();
         }
         conn
+    }
+
+    #[test]
+    fn test_squash_block_count_empty_duplicate_height_range() {
+        assert_eq!(StacksChainState::squash_block_count(39_001, 39_000), None);
+        assert_eq!(
+            StacksChainState::squash_block_count(39_000, 39_000),
+            Some(1)
+        );
+        assert_eq!(
+            StacksChainState::squash_block_count(38_001, 39_000),
+            Some(1_000)
+        );
     }
 
     #[test]
