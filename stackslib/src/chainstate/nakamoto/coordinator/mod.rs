@@ -837,6 +837,7 @@ impl<
                 chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
                 chainstate.maybe_squash(
                     block_receipt.header.stacks_block_height,
+                    new_tip,
                     self.sortition_db.conn(),
                 );
             }

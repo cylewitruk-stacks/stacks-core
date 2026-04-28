@@ -1676,8 +1676,11 @@ impl<
             if let Some((Some(ref receipt), _)) = result.first() {
                 let new_tip = receipt.header.index_block_hash();
                 chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
-                chainstate
-                    .maybe_squash(receipt.header.stacks_block_height, self.sortition_db.conn());
+                chainstate.maybe_squash(
+                    receipt.header.stacks_block_height,
+                    new_tip,
+                    self.sortition_db.conn(),
+                );
             }
             result
         };
@@ -1792,8 +1795,11 @@ impl<
                 if let Some((Some(ref receipt), _)) = result.first() {
                     let new_tip = receipt.header.index_block_hash();
                     chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
-                    chainstate
-                        .maybe_squash(receipt.header.stacks_block_height, self.sortition_db.conn());
+                    chainstate.maybe_squash(
+                        receipt.header.stacks_block_height,
+                        new_tip,
+                        self.sortition_db.conn(),
+                    );
                 }
                 result
             };

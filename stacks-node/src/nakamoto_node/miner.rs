@@ -999,7 +999,6 @@ impl BlockMinerThread {
             return Ok(Vec::new());
         }
 
-
         let burn_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn()).map_err(|e| {
             NakamotoNodeError::SigningCoordinatorFailure(format!(
                 "Failed to open sortition DB. Cannot mine! {e:?}"

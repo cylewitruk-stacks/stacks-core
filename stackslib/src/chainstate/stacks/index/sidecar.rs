@@ -108,6 +108,59 @@ pub const SIDECAR_SECTION_DESCRIPTOR_SIZE: usize = 32;
 /// body_length(4) + reserved/crc32(4) = 16 bytes.
 pub const SIDECAR_INDEX_ENTRY_SIZE: usize = 16;
 
+/// Read a big-endian `u16` at a fixed offset within a byte slice.
+///
+/// Used by the sidecar header / descriptor / index-entry parsers, all of
+/// which know their field offsets at compile time. Each parser does an
+/// up-front length check before calling these helpers, but using `.get()`
+/// here keeps the slicing bounds-checked at the helper boundary too —
+/// silences `clippy::indexing_slicing` and gives a useful corruption error
+/// instead of a panic if the upstream length check is ever weakened.
+#[inline]
+fn read_be_u16_at(bytes: &[u8], offset: usize) -> Result<u16, Error> {
+    let arr: [u8; 2] = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "sidecar: read_be_u16_at(offset={offset}) out of bounds (slice len {})",
+                bytes.len()
+            ))
+        })?
+        .try_into()
+        .expect("get(offset..offset+2) yields exactly 2 bytes when Some");
+    Ok(u16::from_be_bytes(arr))
+}
+
+#[inline]
+fn read_be_u32_at(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+    let arr: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "sidecar: read_be_u32_at(offset={offset}) out of bounds (slice len {})",
+                bytes.len()
+            ))
+        })?
+        .try_into()
+        .expect("get(offset..offset+4) yields exactly 4 bytes when Some");
+    Ok(u32::from_be_bytes(arr))
+}
+
+#[inline]
+fn read_be_u64_at(bytes: &[u8], offset: usize) -> Result<u64, Error> {
+    let arr: [u8; 8] = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "sidecar: read_be_u64_at(offset={offset}) out of bounds (slice len {})",
+                bytes.len()
+            ))
+        })?
+        .try_into()
+        .expect("get(offset..offset+8) yields exactly 8 bytes when Some");
+    Ok(u64::from_be_bytes(arr))
+}
+
 /// Sidecar section kinds. The `u16` encoding leaves 65k future kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -184,25 +237,27 @@ impl SidecarHeader {
                 SIDECAR_HEADER_SIZE
             )));
         }
-        if &bytes[0..8] != &SIDECAR_MAGIC {
+        let magic = bytes
+            .get(0..8)
+            .ok_or_else(|| Error::CorruptionError("Sidecar header: magic slice missing".into()))?;
+        if magic != SIDECAR_MAGIC {
             return Err(Error::CorruptionError(format!(
-                "Sidecar bad magic: {:?}",
-                &bytes[0..8]
+                "Sidecar bad magic: {magic:?}"
             )));
         }
-        let format_version = u16::from_be_bytes(bytes[8..10].try_into().unwrap());
+        let format_version = read_be_u16_at(bytes, 8)?;
         if format_version != SIDECAR_FORMAT_VERSION {
             return Err(Error::CorruptionError(format!(
                 "Unsupported sidecar format version: {format_version}"
             )));
         }
-        let schema_flags = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
+        let schema_flags = read_be_u16_at(bytes, 10)?;
         // bytes[12..16] reserved, ignored.
-        let level_id = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-        let min_height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-        let max_height = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
-        let section_count = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
-        let created_at = u64::from_be_bytes(bytes[32..40].try_into().unwrap());
+        let level_id = read_be_u32_at(bytes, 16)?;
+        let min_height = read_be_u32_at(bytes, 20)?;
+        let max_height = read_be_u32_at(bytes, 24)?;
+        let section_count = read_be_u32_at(bytes, 28)?;
+        let created_at = read_be_u64_at(bytes, 32)?;
 
         if max_height < min_height {
             return Err(Error::CorruptionError(format!(
@@ -259,17 +314,17 @@ impl SectionDescriptor {
                 SIDECAR_SECTION_DESCRIPTOR_SIZE
             )));
         }
-        let record_kind_raw = u16::from_be_bytes(bytes[0..2].try_into().unwrap());
+        let record_kind_raw = read_be_u16_at(bytes, 0)?;
         let record_kind = RecordKind::from_u16(record_kind_raw).ok_or_else(|| {
             Error::CorruptionError(format!(
                 "Unknown sidecar record_kind: 0x{record_kind_raw:04x}"
             ))
         })?;
-        let schema_flags = u16::from_be_bytes(bytes[2..4].try_into().unwrap());
+        let schema_flags = read_be_u16_at(bytes, 2)?;
         // bytes[4..8] reserved
-        let offset_in_file = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let length = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
-        let count = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
+        let offset_in_file = read_be_u64_at(bytes, 8)?;
+        let length = read_be_u64_at(bytes, 16)?;
+        let count = read_be_u32_at(bytes, 24)?;
         // bytes[28..32] reserved
         Ok(Self {
             record_kind,
@@ -309,9 +364,9 @@ impl SidecarIndexEntry {
             )));
         }
         Ok(Self {
-            body_offset: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
-            body_length: u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
-            reserved: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+            body_offset: read_be_u64_at(bytes, 0)?,
+            body_length: read_be_u32_at(bytes, 8)?,
+            reserved: read_be_u32_at(bytes, 12)?,
         })
     }
 }
@@ -820,10 +875,17 @@ impl SidecarReader {
         })?;
         let mut sections: Vec<SectionDescriptor> =
             Vec::with_capacity(header.section_count as usize);
-        for i in 0..(header.section_count as usize) {
-            let start = i * SIDECAR_SECTION_DESCRIPTOR_SIZE;
-            let end = start + SIDECAR_SECTION_DESCRIPTOR_SIZE;
-            sections.push(SectionDescriptor::parse(&table_buf[start..end])?);
+        // `chunks_exact` is bounds-safe by construction: it yields exactly
+        // `len / SIDECAR_SECTION_DESCRIPTOR_SIZE` chunks of the requested
+        // size, dropping any partial trailing remainder. We've already
+        // validated `table_buf.len() >= header.section_count *
+        // SIDECAR_SECTION_DESCRIPTOR_SIZE` above, so the chunk count
+        // matches and there is no remainder to consider.
+        for chunk in table_buf
+            .chunks_exact(SIDECAR_SECTION_DESCRIPTOR_SIZE)
+            .take(header.section_count as usize)
+        {
+            sections.push(SectionDescriptor::parse(chunk)?);
         }
 
         // ── Section-table bounds checks ─────────────────────────────────
@@ -926,10 +988,13 @@ impl SidecarReader {
                 ))
             })?;
             let mut index = Vec::with_capacity(count);
-            for i in 0..count {
-                let start = i * SIDECAR_INDEX_ENTRY_SIZE;
-                let end = start + SIDECAR_INDEX_ENTRY_SIZE;
-                index.push(SidecarIndexEntry::parse(&index_buf[start..end])?);
+            // `chunks_exact` is bounds-safe by construction (see the
+            // section-table parser above for the matching pattern). The
+            // upstream length check ensures `index_buf.len() >= count *
+            // SIDECAR_INDEX_ENTRY_SIZE`, so `take(count)` yields exactly
+            // the entries we need with no partial trailing chunk.
+            for chunk in index_buf.chunks_exact(SIDECAR_INDEX_ENTRY_SIZE).take(count) {
+                index.push(SidecarIndexEntry::parse(chunk)?);
             }
             // Per-entry bounds check: entries must lie within the bodies
             // sub-region of the section (i.e., past the index, before the
@@ -1162,7 +1227,13 @@ impl OrphanSidecarHandle {
                 self.section_offset_in_file, relative_offset,
             ))
         })?;
-        let dst = &mut buf[..read_len];
+        // `read_len = buf.len().min(...)` ⇒ `read_len ≤ buf.len()` by
+        // construction, so `get_mut(..read_len)` is always `Some`. We use
+        // `get_mut` rather than indexing to keep the bounds check explicit
+        // for `clippy::indexing_slicing`.
+        let dst = buf
+            .get_mut(..read_len)
+            .expect("read_len ≤ buf.len() by construction (see min above)");
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -1386,7 +1457,7 @@ pub fn reconcile_squash_sidecars(
     // Presence check: every expected sidecar with present=true && trimmed=false
     // must exist on disk after the orphan-cleanup pass.
     for exp in expected_by_level {
-        if !(exp.present && !exp.trimmed) {
+        if !exp.present || exp.trimmed {
             continue;
         }
         let path = squash_root_sidecar_path(db_path, exp.level_id, exp.min_height, exp.max_height);

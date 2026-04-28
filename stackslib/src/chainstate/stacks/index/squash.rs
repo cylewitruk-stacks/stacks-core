@@ -2596,6 +2596,45 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
         reclaim,
         retention_levels,
         SquashTarget::Append,
+        /* canonical_tip = */ None,
+    )
+}
+
+/// Same as [`squash_level_incremental`], but lets the caller pin the canonical
+/// tip explicitly instead of relying on `find_tip_block`'s MARF-block-id
+/// heuristic.
+///
+/// **This is the production entry point.** `maybe_squash` knows which block
+/// just advanced the chainstate's canonical tip and should pass that
+/// `index_block_hash` here. Without this, `find_tip_block` walks `marf_data`
+/// block_ids descending and picks the first one at height ≥ `max_height` —
+/// during fresh genesis sync (or any time multiple competing tips exist at
+/// the boundary), the highest `block_id` is whichever block was committed
+/// most recently, NOT necessarily the chainstate's canonical. The squash
+/// then absorbs a non-canonical chain and the divergence detector fires on
+/// the next block, even at well-buried mainnet heights.
+///
+/// Passing `Some(canonical_tip)` skips `find_tip_block` and uses
+/// `canonical_tip` directly as the tip — the squash records exactly what
+/// the chainstate considers canonical at squash time.
+pub fn squash_level_incremental_with_canonical_tip<T: MarfTrieId + Send + Sync>(
+    marf_path: &str,
+    mode: SquashMode,
+    min_height: u32,
+    max_height: u32,
+    reclaim: bool,
+    retention_levels: u32,
+    canonical_tip: T,
+) -> Result<SquashStats, Error> {
+    squash_level_incremental_with_target::<T>(
+        marf_path,
+        mode,
+        min_height,
+        max_height,
+        reclaim,
+        retention_levels,
+        SquashTarget::Append,
+        Some(canonical_tip),
     )
 }
 
@@ -2607,6 +2646,7 @@ pub fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
     reclaim: bool,
     retention_levels: u32,
     target: SquashTarget,
+    canonical_tip: Option<T>,
 ) -> Result<SquashStats, Error> {
     // Phase-timing instrumentation. Each phase's duration is captured into a `phase_*_ms` binding
     // and reported in the final summary log so we can see where the wall-clock time actually goes
@@ -2733,7 +2773,43 @@ pub fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
     // ---------------------------------------------------------------
     // Step 1: Find tip block, collect per-height metadata
     // ---------------------------------------------------------------
-    let tip_block = find_tip_block(&mut marf, max_height)?;
+    //
+    // If the caller (e.g. `maybe_squash`) supplied a `canonical_tip`, use it
+    // directly. Otherwise fall back to `find_tip_block`'s MARF-block-id
+    // heuristic. The explicit-tip path is the production-correct one — it
+    // anchors the squash to the chainstate's just-advanced canonical view
+    // instead of "whichever block at height ≥ max_height has the highest
+    // block_id in marf_data", which during fresh sync can be a non-canonical
+    // sibling that briefly led the MARF commit ordering. The fallback path
+    // remains for tests and any non-chainstate caller that doesn't have a
+    // canonical tip to provide.
+    //
+    // Sanity check on the supplied tip: it must be reachable in the MARF AND
+    // its `OWN_BLOCK_HEIGHT_KEY` value must be ≥ max_height — otherwise the
+    // per-height walk below would ask for heights the tip's view doesn't
+    // cover. We let `get_block_height_of` enforce this implicitly via its
+    // `Option<u32>` return; an invariant failure surfaces as a
+    // CorruptionError on the first `get_block_at_height` call.
+    let tip_block: T = match canonical_tip {
+        Some(tip) => {
+            let tip_height_check = marf.get_block_height_of(&tip, &tip)?.ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "squash_level_incremental: caller-supplied canonical_tip {tip} \
+                     has no recorded height in MARF; cannot anchor squash to it"
+                ))
+            })?;
+            if tip_height_check < max_height {
+                return Err(Error::CorruptionError(format!(
+                    "squash_level_incremental: caller-supplied canonical_tip {tip} \
+                     is at height {tip_height_check}, below max_height {max_height}; \
+                     squash would not have a canonical block at every height in \
+                     [{min_height}..={max_height}]"
+                )));
+            }
+            tip
+        }
+        None => find_tip_block(&mut marf, max_height)?,
+    };
 
     let height_count = (max_height - min_height + 1) as usize;
     let mut root_hashes: Vec<TrieHash> = Vec::with_capacity(height_count);
@@ -2858,13 +2934,40 @@ pub fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
                             .or_insert_with(|| back_block_hash.clone());
                         continue;
                     }
+                    Some(&(level_idx, h, _, _, _))
+                        if matches!(target, SquashTarget::Replace { level_id }
+                                    if squash_meta
+                                        .levels
+                                        .get(level_idx)
+                                        .map(|l| l.info.level_id)
+                                        == Some(level_id)) =>
+                    {
+                        // Replace mode: target is inside the level being rebuilt. The
+                        // level's old merged blob is still active (we haven't swapped
+                        // it yet), so the open + read below routes through that blob
+                        // and returns the correct ancestor data. After publish, the
+                        // new merged blob will have remapped offsets and children
+                        // written henceforth use those.
+                        //
+                        // For Append mode this branch is unreachable — blocks in the
+                        // range being squashed are per-block blobs at this point and
+                        // not in any squash level's block_index. The next arm catches
+                        // any spurious match as the original-intended corruption
+                        // signal.
+                        let _ = (level_idx, h);
+                        // Fall through to the open + read below.
+                    }
                     Some(&(_, h, _, _, _)) => {
-                        // Target is in a squash level at height >= min_height. This shouldn't
-                        // happen — blocks in the current range should be per-block blobs, not
-                        // already squashed.
+                        // Target is in a squash level at height >= min_height. For
+                        // Append mode this is a programming error (blocks in the
+                        // range should be per-block blobs). For Replace mode the
+                        // arm above handled the expected case; if we land here it
+                        // means the target is in some OTHER level within the range,
+                        // which violates non-overlapping-level-range invariants.
                         return Err(Error::CorruptionError(format!(
                             "Backpointer target at height {h} is in a squash level \
-                             but within the range being squashed (min_height={min_height})"
+                             but within the range being squashed (min_height={min_height}, \
+                             target={target:?})"
                         )));
                     }
                     None => {
@@ -3735,8 +3838,11 @@ pub fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
                 )?;
             }
             SquashTarget::Replace { .. } => {
-                deferred_sidecar_inputs =
-                    Some((per_height_root_node_bodies, orphan_bytes, orphan_record_count));
+                deferred_sidecar_inputs = Some((
+                    per_height_root_node_bodies,
+                    orphan_bytes,
+                    orphan_record_count,
+                ));
             }
         }
         true
@@ -3859,9 +3965,7 @@ pub fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
         // infallible, and process abort is the correct response if they're
         // not (the file system is in an unknown state and silent
         // continuation would corrupt reads on every other handle).
-        if let Some((bodies, orphan_bytes, orphan_record_count)) =
-            deferred_sidecar_inputs.take()
-        {
+        if let Some((bodies, orphan_bytes, orphan_record_count)) = deferred_sidecar_inputs.take() {
             write_squash_root_sidecar(
                 Path::new(marf_path),
                 next_level_id,
@@ -4240,6 +4344,47 @@ pub fn re_squash_level<T: MarfTrieId + Send + Sync>(
     reclaim: bool,
     retention_levels: u32,
 ) -> Result<SquashStats, Error> {
+    re_squash_level_inner::<T>(marf_path, level_id, mode, reclaim, retention_levels, None)
+}
+
+/// Same as [`re_squash_level`], but lets the caller pin the canonical tip
+/// explicitly (the chainstate's just-advanced `index_block_hash` from
+/// [`StacksChainState::assert_squash_consistency`]).
+///
+/// This is the production-correct entry point for the recovery path. Without
+/// the explicit tip, the recovery falls back to `find_tip_block`'s
+/// MARF-block-id heuristic — same heuristic that caused the original squash's
+/// non-canonical-tip bug `assert_squash_consistency` is recovering from. If
+/// the caller already knows the chainstate's canonical tip (which it does at
+/// every divergence-detection site), passing it through here keeps the
+/// recovery anchored to ground truth instead of rediscovering it through the
+/// same heuristic.
+pub fn re_squash_level_with_canonical_tip<T: MarfTrieId + Send + Sync>(
+    marf_path: &str,
+    level_id: u32,
+    mode: SquashMode,
+    reclaim: bool,
+    retention_levels: u32,
+    canonical_tip: T,
+) -> Result<SquashStats, Error> {
+    re_squash_level_inner::<T>(
+        marf_path,
+        level_id,
+        mode,
+        reclaim,
+        retention_levels,
+        Some(canonical_tip),
+    )
+}
+
+fn re_squash_level_inner<T: MarfTrieId + Send + Sync>(
+    marf_path: &str,
+    level_id: u32,
+    mode: SquashMode,
+    reclaim: bool,
+    retention_levels: u32,
+    canonical_tip: Option<T>,
+) -> Result<SquashStats, Error> {
     // Read the level's range from SQL — caller doesn't supply min/max
     // because the row is the durable source of truth for them.
     //
@@ -4264,10 +4409,15 @@ pub fn re_squash_level<T: MarfTrieId + Send + Sync>(
 
     info!(
         "re_squash_level: rebuilding level {level_id} covering heights \
-         [{}..={}] (mode={mode:?}, reclaim={reclaim}). The chainstate's \
-         current canonical chain at these heights becomes the new recorded \
-         canonical.",
-        target.min_height, target.max_height,
+         [{}..={}] (mode={mode:?}, reclaim={reclaim}, canonical_tip={}). \
+         The chainstate's current canonical chain at these heights becomes \
+         the new recorded canonical.",
+        target.min_height,
+        target.max_height,
+        canonical_tip
+            .as_ref()
+            .map(|t| format!("{t}"))
+            .unwrap_or_else(|| "find_tip_block".to_string()),
     );
 
     squash_level_incremental_with_target::<T>(
@@ -4278,5 +4428,6 @@ pub fn re_squash_level<T: MarfTrieId + Send + Sync>(
         reclaim,
         retention_levels,
         SquashTarget::Replace { level_id },
+        canonical_tip,
     )
 }

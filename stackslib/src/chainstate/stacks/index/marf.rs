@@ -2227,7 +2227,11 @@ impl<T: MarfTrieId> MARF<T> {
             level_id: last.info.level_id,
             min_height: last.info.min_height,
             max_height: last.info.max_height,
-            block_hashes: last.block_hashes.iter().map(|b| T::from_bytes(*b)).collect(),
+            block_hashes: last
+                .block_hashes
+                .iter()
+                .map(|b| T::from_bytes(*b))
+                .collect(),
         })
     }
 

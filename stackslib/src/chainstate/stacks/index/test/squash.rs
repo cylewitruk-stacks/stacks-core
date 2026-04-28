@@ -1411,8 +1411,15 @@ fn test_squash_preserves_per_block_root_hashes() {
 
     // -- Squash --
     let tip_height = (num_blocks - 1) as u32;
-    squash_level_incremental::<StacksBlockId>(&src_path, SquashMode::TipOnly, 0, tip_height, false, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &src_path,
+        SquashMode::TipOnly,
+        0,
+        tip_height,
+        false,
+        100,
+    )
+    .expect("squash should succeed");
 
     // -- Reopen and verify per-block root hashes --
     let mut marf = MARF::<StacksBlockId>::from_path(&src_path, open_opts.clone()).unwrap();
@@ -6049,7 +6056,7 @@ fn test_full_history_tip_read_benchmark() {
             0,
             max_height,
             true,
-        100,
+            100,
         )
         .expect("FullHistory squash should succeed");
 
@@ -7004,7 +7011,7 @@ fn test_tier1_multi_level_full_history_reclaim_differential() {
                 min_h,
                 max_h,
                 true, // reclaim
-        100,
+                100,
             )
             .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
 
@@ -7507,7 +7514,7 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
                     min_h,
                     max_h,
                     true,
-        100,
+                    100,
                 )
                 .unwrap_or_else(|e| panic!("recurring squash at height {h} failed: {e:?}"));
                 sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
@@ -7716,7 +7723,7 @@ fn test_tier3_live_handle_refresh_after_recurring_squash_tip_nonce() {
                 min_h,
                 max_h,
                 true,
-        100,
+                100,
             )
             .unwrap_or_else(|e| panic!("live-handle recurring squash at height {h} failed: {e:?}"));
 
@@ -7823,7 +7830,7 @@ fn test_tier3_live_handle_refresh_after_recurring_sparse_nonce_squash() {
                 min_h,
                 max_h,
                 true,
-        100,
+                100,
             )
             .unwrap_or_else(|e| {
                 panic!("sparse live-handle recurring squash at height {h} failed: {e:?}")
@@ -7950,7 +7957,7 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
                     min_h,
                     max_h,
                     true,
-        100,
+                    100,
                 )
                 .unwrap_or_else(|e| panic!("TipOnly recurring squash at h={h} failed: {e:?}"));
                 sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
@@ -8371,7 +8378,7 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
             0,
             (num_blocks - 1) as u32,
             true,
-        100,
+            100,
         )
         .expect("tier7 first squash should succeed");
 
@@ -9602,8 +9609,15 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
     }
 
     // Squash the squashed copy, leave the reference alone.
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, N - 1, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        N - 1,
+        true,
+        100,
+    )
+    .expect("squash should succeed");
 
     // Differential: read every key at every block from both MARFs and assert
     // they match. With the bug, parallel-collected history records entries
@@ -10697,11 +10711,8 @@ fn test_latest_squash_level_canonical_chain_returns_recorded_tip() {
                 block_hashes[(i - 1) as usize].clone()
             };
             marf.begin(&parent, &block_hashes[i as usize]).unwrap();
-            marf.insert(
-                &format!("k_{i}"),
-                MARFValue::from_value(&format!("v_{i}")),
-            )
-            .unwrap();
+            marf.insert(&format!("k_{i}"), MARFValue::from_value(&format!("v_{i}")))
+                .unwrap();
             marf.seal().unwrap();
             marf.commit().unwrap();
         }
@@ -10970,8 +10981,14 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
     // `marf_data`, `find_tip_block_by_scanning` picks B as the new tip at
     // height 1, and the re-squash walks B's chain (P → B) as the new
     // canonical.
-    re_squash_level::<StacksBlockId>(&path, /* level_id = */ 0, SquashMode::FullHistory, true, 100)
-        .expect("re_squash_level should succeed when no committed descendants exist");
+    re_squash_level::<StacksBlockId>(
+        &path,
+        /* level_id = */ 0,
+        SquashMode::FullHistory,
+        true,
+        100,
+    )
+    .expect("re_squash_level should succeed when no committed descendants exist");
 
     // Post-recovery: level 0 now records B as canonical at height 1.
     {
@@ -11004,6 +11021,169 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
             marf.get(&block_b, key).unwrap(),
             Some(b_val.clone()),
             "post-recovery: B's view via the new merged blob must still read b_val"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// **REGRESSION TEST** for the intra-range-backpointer corruption error
+// observed during re_squash_level on a fresh genesis sync at level 11
+// (commit log: "Backpointer target at height 10663 is in a squash level
+// but within the range being squashed").
+//
+// The earlier `test_re_squash_level_recovers_post_reorg_canonical` test only
+// covers heights 0..=1, where the canonical chain is too short for any
+// intra-range backpointers to fire. Real chains have backpointer chains
+// that cross many heights inside a single squash level — when re-squashing,
+// the DFS from the new canonical's tip walks those backpointers, and the
+// targets land in the level being replaced (which is still active during
+// the build). The Append-mode invariant "blocks in the range being squashed
+// are per-block blobs, not in any squash level" was being enforced
+// unconditionally and would surface as `CorruptionError("Backpointer
+// target at height H is in a squash level but within the range being
+// squashed")` on any non-trivial chain.
+//
+// What this test exercises:
+//   * A 5-block canonical chain (heights 0..=4) with shared keys overwritten
+//     at every block — the resulting MARF has backpointers at every height,
+//     hitting every intra-range height during re-squash DFS.
+//   * Squash heights 0..=4 with the original tip as canonical.
+//   * Commit a sibling B at height 4 (parent = canonical at height 3).
+//   * Re-squash level 0; the DFS from B's tip walks backpointers through
+//     heights 3, 2, 1, 0 — every one of which is in the level being
+//     replaced. With the Replace-aware branch in the cross-level check,
+//     this completes successfully.
+//   * Verify reads via B return B's value, confirming the re-squash
+//     captured the new canonical correctly even with deep backpointer
+//     traversal through the old level.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_re_squash_level_handles_deep_intra_range_backpointers() {
+    use crate::chainstate::stacks::index::squash::{
+        re_squash_level, squash_level_incremental, SquashMode,
+    };
+
+    let dir = fresh_test_dir("test_re_squash_deep_backpointers");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    const NUM_HEIGHTS: u32 = 5;
+    let make_block = |chr: u8, idx: u32| -> StacksBlockId {
+        let mut bytes = [chr; 32];
+        bytes[28..32].copy_from_slice(&idx.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    // Canonical chain at squash time: blocks A_0..A_4. shared_key overwritten
+    // every block to force backpointer chains across all heights.
+    let canonical: Vec<StacksBlockId> = (0..NUM_HEIGHTS).map(|i| make_block(0xAA, i + 1)).collect();
+    let key_shared = "shared";
+    let key_per_height = |h: u32| format!("k_{h}");
+
+    // Phase 1: build canonical chain.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        for (i, block) in canonical.iter().enumerate() {
+            let parent = if i == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                canonical[i - 1].clone()
+            };
+            marf.begin(&parent, block).unwrap();
+            marf.insert(key_shared, MARFValue::from_value(&format!("a_h{i}")))
+                .unwrap();
+            marf.insert(
+                &key_per_height(i as u32),
+                MARFValue::from_value(&format!("h{i}_unique")),
+            )
+            .unwrap();
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+        }
+    }
+
+    // Phase 2: squash level 0 covering [0..=NUM_HEIGHTS-1].
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        NUM_HEIGHTS - 1,
+        true,
+        100,
+    )
+    .expect("initial squash should succeed");
+
+    // Phase 3: commit sibling B at the tip height (parent = canonical at
+    // height NUM_HEIGHTS-2). This puts B's per-block blob in the active
+    // region with every prior height inside the squash level.
+    let block_b = make_block(0xBB, NUM_HEIGHTS);
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        let parent = canonical[(NUM_HEIGHTS - 2) as usize].clone();
+        marf.begin(&parent, &block_b).unwrap();
+        marf.insert(key_shared, MARFValue::from_value("b_tip"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+
+    // Phase 4: re_squash_level should NOT fail with the
+    // "Backpointer target at height H is in a squash level" corruption
+    // error. The DFS from B's tip walks backpointers across heights
+    // NUM_HEIGHTS-2, NUM_HEIGHTS-3, ..., 0 — every one is in level 0.
+    re_squash_level::<StacksBlockId>(
+        &path,
+        /* level_id = */ 0,
+        SquashMode::FullHistory,
+        true,
+        100,
+    )
+    .expect(
+        "re_squash_level must handle backpointers into the level being \
+             replaced; failure here means the cross-level check at \
+             squash.rs:2861 didn't allow Replace-mode intra-range targets",
+    );
+
+    // Phase 5: verify the post-recovery layout.
+    let marf_check = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    let canonical_chain = marf_check
+        .latest_squash_level_canonical_chain()
+        .expect("level 0 present after re-squash");
+    assert_eq!(canonical_chain.level_id, 0);
+    assert_eq!(canonical_chain.min_height, 0);
+    assert_eq!(canonical_chain.max_height, NUM_HEIGHTS - 1);
+    assert_eq!(
+        canonical_chain.block_hashes[(NUM_HEIGHTS - 1) as usize],
+        block_b,
+        "B is now canonical at the tip height after re-squash"
+    );
+    // Heights 0..=NUM_HEIGHTS-2 are unchanged (they're shared by both
+    // canonical chains since B forks from canonical at NUM_HEIGHTS-2).
+    for i in 0..(NUM_HEIGHTS - 1) {
+        assert_eq!(
+            canonical_chain.block_hashes[i as usize], canonical[i as usize],
+            "heights below the fork point are unchanged: height {i}",
+        );
+    }
+    drop(marf_check);
+
+    // Phase 6: verify reads through B return B's writes (and inherit
+    // ancestor values from before the fork point).
+    let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    marf.refresh_after_squash().unwrap();
+    assert_eq!(
+        marf.get(&block_b, key_shared).unwrap(),
+        Some(MARFValue::from_value("b_tip")),
+        "reads via B's tip return B's overwrite of shared_key"
+    );
+    // Per-height keys from before the fork point are inherited from the
+    // canonical chain (B doesn't rewrite them).
+    for i in 0..(NUM_HEIGHTS - 1) {
+        assert_eq!(
+            marf.get(&block_b, &key_per_height(i)).unwrap(),
+            Some(MARFValue::from_value(&format!("h{i}_unique"))),
+            "B inherits per-height key from canonical at height {i}",
         );
     }
 }
