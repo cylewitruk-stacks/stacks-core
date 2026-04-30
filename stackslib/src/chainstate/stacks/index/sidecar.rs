@@ -1273,14 +1273,45 @@ pub fn squash_sidecar_dir_for_db(db_path: &Path) -> PathBuf {
 }
 
 /// Construct the canonical path for a per-level squash sidecar.
-/// Sidecars live in `<db>.squash_sidecars/`; filenames embed level_id and
-/// the height range for human readability when listing the directory.
 ///
-/// Each level has exactly one sidecar file regardless of section count;
-/// the file name is unchanged from v1's single-section layout
-/// (`marf-roots-level-NNNNNN-hHHHHHHHH-HHHHHHHH.dat`) so reconcile and
-/// trim treat the file as a unit.
+/// The path includes the level's `blob_offset` so each publish lands at
+/// a unique path. Without this, a `Replace` would have to overwrite the
+/// previous active sidecar at the same path, opening a crash window
+/// where SQL still describes the old level but the canonical path holds
+/// new sidecar contents (split-brain). With the `blob_offset` suffix,
+/// the new sidecar lands at a fresh path; the old sidecar at the prior
+/// `blob_offset` path stays in place and is referenced by the retired
+/// SQL row. Both rows resolve their sidecars unambiguously.
+///
+/// Same path scheme used for retired levels: a retired row carries the
+/// pre-Replace `blob_offset`, which uniquely identifies its sidecar.
+///
+/// File pattern:
+/// `marf-roots-level-{level_id:06}-h{min:08}-{max:08}-blob-{blob_offset:016x}.dat`.
+///
+/// Sidecars live in `<db>.squash_sidecars/`. See
+/// [`migrate_legacy_sidecar_paths`] for the one-shot rename that brings
+/// pre-versioned (`...-h{min}-{max}.dat`) sidecars onto this scheme.
 pub fn squash_root_sidecar_path(
+    db_path: &Path,
+    level_id: u32,
+    min_height: u32,
+    max_height: u32,
+    blob_offset: u64,
+) -> PathBuf {
+    let mut p = squash_sidecar_dir_for_db(db_path);
+    p.push(format!(
+        "marf-roots-level-{:06}-h{:08}-{:08}-blob-{:016x}.dat",
+        level_id, min_height, max_height, blob_offset,
+    ));
+    p
+}
+
+/// Pre-versioning sidecar path (no `blob_offset` suffix). Used only by
+/// [`migrate_legacy_sidecar_paths`] to find existing on-disk files
+/// produced by older publishes and rename them onto the versioned
+/// scheme. New code MUST use [`squash_root_sidecar_path`].
+pub fn squash_root_sidecar_path_legacy(
     db_path: &Path,
     level_id: u32,
     min_height: u32,
@@ -1294,35 +1325,76 @@ pub fn squash_root_sidecar_path(
     p
 }
 
-/// Parse a sidecar filename of the form
-/// `marf-roots-level-{level_id:06}-h{min_height:08}-{max_height:08}.dat` and
-/// return its `(level_id, min_height, max_height)`. Returns `None` for
-/// filenames that don't match the canonical pattern (which the orphan-scan
-/// then ignores rather than touches).
-fn parse_squash_root_sidecar_filename(name: &str) -> Option<(u32, u32, u32)> {
+/// Parsed identity tuple for a sidecar filename.
+///
+/// `blob_offset` is `Some(...)` for the versioned form
+/// (`...-blob-{blob_offset:016x}.dat`) and `None` for the legacy
+/// pre-versioning form (`...-h{min}-{max}.dat`). Reconcile uses the
+/// presence/absence to decide which on-disk files belong to which SQL
+/// row and to drive the legacy → versioned migration.
+struct ParsedSidecarName {
+    level_id: u32,
+    min_height: u32,
+    max_height: u32,
+    blob_offset: Option<u64>,
+}
+
+/// Parse a sidecar filename of either the versioned form
+/// (`marf-roots-level-{lid:06}-h{min:08}-{max:08}-blob-{offset:016x}.dat`)
+/// or the legacy unversioned form
+/// (`marf-roots-level-{lid:06}-h{min:08}-{max:08}.dat`).
+///
+/// Returns `None` for filenames that don't match either pattern (the
+/// orphan-scan then ignores rather than touches them — operator
+/// artifacts, future record kinds, etc. live under different names).
+fn parse_squash_root_sidecar_filename(name: &str) -> Option<ParsedSidecarName> {
     let stem = name.strip_suffix(".dat")?;
     let after_prefix = stem.strip_prefix("marf-roots-level-")?;
-    // expected: "{level_id}-h{min}-{max}"
+    // Expected: "{level_id}-h{min}-{max}" optionally followed by
+    // "-blob-{blob_offset:016x}".
     let mut parts = after_prefix.splitn(2, "-h");
     let level_str = parts.next()?;
     let h_str = parts.next()?;
     let level_id: u32 = level_str.parse().ok()?;
+
     let mut h_parts = h_str.splitn(2, '-');
     let min_str = h_parts.next()?;
-    let max_str = h_parts.next()?;
+    let rest = h_parts.next()?;
     let min_h: u32 = min_str.parse().ok()?;
+
+    // `rest` is either `{max:08}` (legacy) or `{max:08}-blob-{offset:016x}`
+    // (versioned). Split on `-blob-` to disambiguate.
+    let (max_str, blob_offset) = match rest.split_once("-blob-") {
+        Some((max_str, offset_hex)) => {
+            let off = u64::from_str_radix(offset_hex, 16).ok()?;
+            (max_str, Some(off))
+        }
+        None => (rest, None),
+    };
     let max_h: u32 = max_str.parse().ok()?;
-    Some((level_id, min_h, max_h))
+    Some(ParsedSidecarName {
+        level_id,
+        min_height: min_h,
+        max_height: max_h,
+        blob_offset,
+    })
 }
 
 /// One level's expected sidecar state, as derived from
-/// `marf_squash_levels`. Used by [`reconcile_squash_sidecars`] to decide
-/// which on-disk files to keep, delete, or treat as missing.
+/// `marf_squash_levels` (active) or `marf_retired_squash_levels`
+/// (retired). Used by [`reconcile_squash_sidecars`] to decide which
+/// on-disk files to keep, delete, or treat as missing.
+///
+/// `blob_offset` is included so reconcile can match on the versioned
+/// canonical pattern (`...-blob-{blob_offset:016x}.dat`) and
+/// distinguish a current sidecar from a stale-but-same-(level_id,
+/// height-range) pre-Replace sidecar.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpectedSidecar {
     pub level_id: u32,
     pub min_height: u32,
     pub max_height: u32,
+    pub blob_offset: u64,
     pub present: bool,
     pub trimmed: bool,
 }
@@ -1378,14 +1450,31 @@ pub fn reconcile_squash_sidecars(
 ) -> Result<ReconcileReport, Error> {
     let sidecar_dir = squash_sidecar_dir_for_db(db_path);
 
-    // Index expected by level_id for O(1) lookup during the scan.
-    let mut expected_by_id: std::collections::HashMap<u32, ExpectedSidecar> =
+    // Multiple expected entries can share a `level_id` (one active + N
+    // retired). Index by `(level_id, blob_offset)` for exact matching.
+    // The legacy index keys only on `(level_id, min, max)` — used to
+    // migrate pre-versioning sidecars that don't carry blob_offset in
+    // their filename.
+    let mut expected_by_full: std::collections::HashMap<(u32, u64), ExpectedSidecar> =
+        std::collections::HashMap::with_capacity(expected_by_level.len());
+    let mut expected_by_legacy: std::collections::HashMap<(u32, u32, u32), ExpectedSidecar> =
         std::collections::HashMap::with_capacity(expected_by_level.len());
     for &exp in expected_by_level {
-        expected_by_id.insert(exp.level_id, exp);
+        expected_by_full.insert((exp.level_id, exp.blob_offset), exp);
+        // Legacy migration: only migrate the *active* (non-retired)
+        // sidecar — retired entries can never have a legacy filename
+        // because retired rows are introduced alongside the versioned
+        // path scheme. This map's value gets overwritten if multiple
+        // entries share `(level_id, min, max)`; that's fine, the legacy
+        // file at most matches one of them, and we prefer to migrate it
+        // toward whichever is present-and-not-trimmed.
+        if exp.present && !exp.trimmed {
+            expected_by_legacy.insert((exp.level_id, exp.min_height, exp.max_height), exp);
+        }
     }
 
     let mut report = ReconcileReport::default();
+    let mut needs_dir_fsync = false;
 
     // If the directory doesn't exist yet, there's nothing to scan; the
     // presence check below catches the case where SQL claims sidecars
@@ -1411,64 +1500,183 @@ pub fn reconcile_squash_sidecars(
             if name.ends_with(".tmp") {
                 continue;
             }
-            if let Some((file_level_id, file_min, file_max)) =
-                parse_squash_root_sidecar_filename(&name)
-            {
-                // Match the FULL canonical tuple, not just `level_id`. A
-                // stale sidecar with the same `level_id` but a different
-                // height range (e.g. left over from a prior squash that
-                // covered a different range) is an orphan and must be
-                // deleted, not kept.
-                let keep = expected_by_id
-                    .get(&file_level_id)
-                    .map(|e| {
-                        e.present
-                            && !e.trimmed
-                            && e.min_height == file_min
-                            && e.max_height == file_max
-                    })
-                    .unwrap_or(false);
-                if !keep {
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => {
-                            info!(
-                                "reconcile_squash_sidecars: deleted orphan sidecar {} \
-                                 (level_id={file_level_id}, heights=[{file_min}..={file_max}])",
-                                path.display(),
-                            );
-                            report.dat_orphans_deleted += 1;
+            let Some(parsed) = parse_squash_root_sidecar_filename(&name) else {
+                // Non-matching filename — operator artifact, future
+                // record kind, or pending-retire scratch file. Leave it
+                // alone.
+                continue;
+            };
+
+            match parsed.blob_offset {
+                Some(blob_offset) => {
+                    // Versioned form. Match on full identity. Any file
+                    // whose `(level_id, blob_offset)` doesn't appear in
+                    // SQL is an orphan: either it's a partially-published
+                    // sidecar from a Replace whose SQL commit was lost,
+                    // or a level row that was deleted post-publish.
+                    let exp = expected_by_full
+                        .get(&(parsed.level_id, blob_offset))
+                        .copied();
+                    let keep = exp
+                        .map(|e| {
+                            e.present
+                                && !e.trimmed
+                                && e.min_height == parsed.min_height
+                                && e.max_height == parsed.max_height
+                        })
+                        .unwrap_or(false);
+                    if !keep {
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => {
+                                info!(
+                                    "reconcile_squash_sidecars: deleted orphan versioned \
+                                     sidecar {} (level_id={}, heights=[{}..={}], \
+                                     blob_offset={:#x})",
+                                    path.display(),
+                                    parsed.level_id,
+                                    parsed.min_height,
+                                    parsed.max_height,
+                                    blob_offset,
+                                );
+                                report.dat_orphans_deleted += 1;
+                                needs_dir_fsync = true;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "reconcile_squash_sidecars: failed to delete \
+                                     versioned orphan {}: {e}",
+                                    path.display()
+                                );
+                                report.delete_failures += 1;
+                            }
                         }
-                        Err(e) => {
-                            warn!(
-                                "reconcile_squash_sidecars: failed to delete .dat orphan {}: {e}",
-                                path.display()
-                            );
-                            report.delete_failures += 1;
+                    } else {
+                        report.dat_kept += 1;
+                    }
+                }
+                None => {
+                    // Legacy form (pre-versioning). If a SQL row
+                    // matches `(level_id, min, max)` AND is
+                    // `present && !trimmed`, migrate by renaming to
+                    // the versioned path. Otherwise it's an orphan.
+                    let key = (parsed.level_id, parsed.min_height, parsed.max_height);
+                    let exp = expected_by_legacy.get(&key).copied();
+                    if let Some(e) = exp {
+                        let target = squash_root_sidecar_path(
+                            db_path,
+                            e.level_id,
+                            e.min_height,
+                            e.max_height,
+                            e.blob_offset,
+                        );
+                        if target.exists() {
+                            // Versioned target already in place — the
+                            // legacy file is a stale duplicate. Delete it.
+                            match std::fs::remove_file(&path) {
+                                Ok(()) => {
+                                    info!(
+                                        "reconcile_squash_sidecars: deleted stale legacy \
+                                         sidecar {} (versioned target already at {})",
+                                        path.display(),
+                                        target.display()
+                                    );
+                                    report.dat_orphans_deleted += 1;
+                                    needs_dir_fsync = true;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "reconcile_squash_sidecars: failed to delete \
+                                         legacy duplicate {}: {err}",
+                                        path.display()
+                                    );
+                                    report.delete_failures += 1;
+                                }
+                            }
+                        } else {
+                            // Migrate.
+                            match std::fs::rename(&path, &target) {
+                                Ok(()) => {
+                                    info!(
+                                        "reconcile_squash_sidecars: migrated legacy {} -> {}",
+                                        path.display(),
+                                        target.display()
+                                    );
+                                    report.dat_kept += 1;
+                                    needs_dir_fsync = true;
+                                }
+                                Err(err) => {
+                                    return Err(Error::CorruptionError(format!(
+                                        "reconcile_squash_sidecars: legacy migration \
+                                         {} -> {} failed: {err}",
+                                        path.display(),
+                                        target.display()
+                                    )));
+                                }
+                            }
+                        }
+                    } else {
+                        // No SQL row claims this legacy file. Orphan.
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => {
+                                info!(
+                                    "reconcile_squash_sidecars: deleted orphan legacy \
+                                     sidecar {} (no SQL row at level_id={}, \
+                                     heights=[{}..={}])",
+                                    path.display(),
+                                    parsed.level_id,
+                                    parsed.min_height,
+                                    parsed.max_height,
+                                );
+                                report.dat_orphans_deleted += 1;
+                                needs_dir_fsync = true;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "reconcile_squash_sidecars: failed to delete legacy \
+                                     orphan {}: {err}",
+                                    path.display()
+                                );
+                                report.delete_failures += 1;
+                            }
                         }
                     }
-                } else {
-                    report.dat_kept += 1;
                 }
             }
-            // Non-matching filenames are intentionally left alone.
+        }
+    }
+
+    // fsync the dir so any rename/delete from the migration is durable
+    // before the caller proceeds (and writes new sidecars or starts
+    // serving reads). Best-effort — same precedent as the canonical
+    // sidecar publish path.
+    if needs_dir_fsync && sidecar_dir.exists() {
+        if let Ok(handle) = std::fs::File::open(&sidecar_dir) {
+            let _ = handle.sync_all();
         }
     }
 
     // Presence check: every expected sidecar with present=true && trimmed=false
-    // must exist on disk after the orphan-cleanup pass.
+    // must exist on disk after the migration / orphan-cleanup pass.
     for exp in expected_by_level {
         if !exp.present || exp.trimmed {
             continue;
         }
-        let path = squash_root_sidecar_path(db_path, exp.level_id, exp.min_height, exp.max_height);
+        let path = squash_root_sidecar_path(
+            db_path,
+            exp.level_id,
+            exp.min_height,
+            exp.max_height,
+            exp.blob_offset,
+        );
         if !path.exists() {
             return Err(Error::CorruptionError(format!(
-                "reconcile_squash_sidecars: SQL marks level_id={} (heights [{}..={}]) \
-                 as root_sidecar_present=1 but the canonical sidecar file is missing: \
-                 {}",
+                "reconcile_squash_sidecars: SQL marks level_id={} (heights [{}..={}], \
+                 blob_offset={:#x}) as root_sidecar_present=1 but the versioned \
+                 sidecar file is missing: {}",
                 exp.level_id,
                 exp.min_height,
                 exp.max_height,
+                exp.blob_offset,
                 path.display(),
             )));
         }
@@ -1608,7 +1816,7 @@ mod tests {
         let header = make_header(level_id, min_h, max_h);
         let bodies = make_root_bodies(count);
 
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h, 0);
         SidecarWriter::new(
             path.clone(),
             header.clone(),
@@ -1679,7 +1887,7 @@ mod tests {
             .flat_map(|r| r.iter().copied())
             .collect();
 
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h, 0);
         SidecarWriter::new(
             path.clone(),
             header,
@@ -1732,7 +1940,7 @@ mod tests {
         let dir = temp_dir("writer_rejects_root_count_mismatch");
         let header = make_header(1, 0, 9); // height range = 10
         let bodies = make_root_bodies(5); // wrong length
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 1, 0, 9);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 1, 0, 9, 0);
         let err = SidecarWriter::new(path, header, vec![SidecarSection::RootSnapshot { bodies }])
             .finalize()
             .unwrap_err();
@@ -1744,7 +1952,7 @@ mod tests {
         let dir = temp_dir("reader_rejects_level_id_mismatch");
         let header = make_header(7, 0, 4);
         let bodies = make_root_bodies(5);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 7, 0, 4);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 7, 0, 4, 0);
         SidecarWriter::new(
             path.clone(),
             header,
@@ -1768,7 +1976,7 @@ mod tests {
         let dir = temp_dir("reader_rejects_missing_required_section");
         let header = make_header(0, 0, 4);
         let bodies = make_root_bodies(5);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4, 0);
         SidecarWriter::new(
             path.clone(),
             header,
@@ -1793,7 +2001,7 @@ mod tests {
         let dir = temp_dir("reader_rejects_truncated_file");
         let header = make_header(0, 0, 9);
         let bodies = make_root_bodies(10);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 9);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 9, 0);
         SidecarWriter::new(
             path.clone(),
             header,
@@ -1820,7 +2028,7 @@ mod tests {
 
         let header = make_header(3, 0, 4);
         let bodies = make_root_bodies(5);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 3, 0, 4);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 3, 0, 4, 0);
 
         let mut tmp_path = path.clone();
         let mut tmp_name = tmp_path.file_name().unwrap().to_os_string();
@@ -1860,18 +2068,25 @@ mod tests {
 
     #[test]
     fn path_format_is_stable() {
-        // Filename encodes level_id and height range with fixed-width
-        // padding so directory listings sort in level order. The sidecar
-        // dir is `<db>.squash_sidecars/` so peer DBs in the same parent
-        // directory (e.g. squashed.sqlite + reference.sqlite in tests)
-        // don't share a sidecar dir.
-        let p =
-            squash_root_sidecar_path(std::path::Path::new("/marf/squashed.sqlite"), 5, 4001, 5000);
+        // Filename encodes level_id, height range, and merged-blob offset
+        // with fixed-width padding so directory listings sort in level
+        // order. The blob_offset suffix versions the sidecar so each
+        // publish lands at a unique path (avoids overwriting the
+        // canonical sidecar before the SQL state transition commits).
+        // The sidecar dir is `<db>.squash_sidecars/` so peer DBs in the
+        // same parent directory don't share a sidecar dir.
+        let p = squash_root_sidecar_path(
+            std::path::Path::new("/marf/squashed.sqlite"),
+            5,
+            4001,
+            5000,
+            0xdead_beef_u64,
+        );
         assert_eq!(
             p,
             PathBuf::from(
                 "/marf/squashed.sqlite.squash_sidecars/\
-                 marf-roots-level-000005-h00004001-00005000.dat"
+                 marf-roots-level-000005-h00004001-00005000-blob-00000000deadbeef.dat"
             )
         );
     }
@@ -1892,7 +2107,7 @@ mod tests {
         let orphan_record_count = orphans.len() as u32;
         let orphan_bytes: Vec<u8> = orphans.iter().flat_map(|r| r.iter().copied()).collect();
 
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), level_id, min_h, max_h, 0);
         SidecarWriter::new(
             path.clone(),
             header,
@@ -1965,7 +2180,7 @@ mod tests {
         let dir = temp_dir("orphan_sidecar_handle_rejects_no_orphan");
         let header = make_header(0, 0, 4);
         let bodies = make_root_bodies(5);
-        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4);
+        let path = squash_root_sidecar_path(&dir.join("test.sqlite"), 0, 0, 4, 0);
         SidecarWriter::new(
             path.clone(),
             header,

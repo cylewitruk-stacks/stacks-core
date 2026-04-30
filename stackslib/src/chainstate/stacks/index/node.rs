@@ -613,6 +613,12 @@ impl TriePtr {
         })
     }
 
+    /// Gets whether or not this TriePtr is a back-pointer, based on its ID.
+    #[inline]
+    pub fn is_backptr(&self) -> bool {
+        is_backptr(self.id)
+    }
+
     /// Size of this TriePtr on disk, if compression is to be used.
     #[inline]
     pub fn compressed_size(&self) -> usize {

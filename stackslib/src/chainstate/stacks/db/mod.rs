@@ -2553,7 +2553,7 @@ impl StacksChainState {
 
     /// Run divergence detection + safety check on the just-advanced tip.
     /// On detected divergence, attempt automatic recovery via
-    /// [`re_squash_level_with_canonical_tip`](crate::chainstate::stacks::index::squash::re_squash_level_with_canonical_tip)
+    /// [`re_squash_level`](crate::chainstate::stacks::index::squash::re_squash_level)
     /// for both the headers and Clarity MARFs (they're squashed in lockstep
     /// by [`Self::maybe_squash`], so they share level structure). The
     /// recovery is anchored to `new_tip` so it doesn't redo the original
@@ -2652,7 +2652,22 @@ impl StacksChainState {
                 level_max_height,
             );
             error!("{msg}");
-            return Err(Error::DBError(db_error::Other(msg)));
+            // Fail-stop: the chainstate is in a state the squash design cannot repair
+            // automatically. Returning Err here used to let the coordinator log a WARN
+            // and continue processing — the next block then panicked deep inside
+            // `MarfedKV::begin` with `inner_read_nodetype_at_head: stored empty node
+            // type`, hiding the real diagnostic behind a noisier symptom. Panicking
+            // here surfaces the operator-recovery message and stops the corruption
+            // cascade in the same crash. The pre-append guards in
+            // `process_next_staging_block` / `process_next_nakamoto_block` should
+            // prevent this branch from firing in normal operation; reaching it means
+            // either a prior session committed the descendant before the guard
+            // shipped, or the guard itself was bypassed somehow — both cases require
+            // operator intervention.
+            panic!(
+                "FATAL: MARF squash divergence with committed descendants — \
+                 chainstate is unrecoverable, operator must wipe and re-sync.\n{msg}"
+            );
         }
 
         // Recovery is safe. Re-squash both MARFs against the chain's
@@ -2684,9 +2699,7 @@ impl StacksChainState {
         // instead of `find_tip_block`'s MARF-block-id heuristic — same fix
         // as the original-squash path, but applied to recovery.
         let headers_path = self.state_index.get_db_path().to_string();
-        crate::chainstate::stacks::index::squash::re_squash_level_with_canonical_tip::<
-            StacksBlockId,
-        >(
+        crate::chainstate::stacks::index::squash::re_squash_level::<StacksBlockId>(
             &headers_path,
             divergence.level_id,
             SquashMode::TipOnly,
@@ -2711,9 +2724,7 @@ impl StacksChainState {
             .unwrap_or(SquashMode::TipOnly);
         let clarity_mode =
             Self::effective_squash_mode(configured, clarity_min, self.db(), sortdb_conn);
-        crate::chainstate::stacks::index::squash::re_squash_level_with_canonical_tip::<
-            StacksBlockId,
-        >(
+        crate::chainstate::stacks::index::squash::re_squash_level::<StacksBlockId>(
             &clarity_path,
             divergence.level_id,
             clarity_mode,
@@ -2956,18 +2967,20 @@ impl StacksChainState {
                     plan.label, plan.min_height, plan.tip_height, plan.path
                 );
                 // reclaim=true; for L0 this is append-only since no prior levels exist.
-                // `with_canonical_tip` anchors the squash to the chainstate's
-                // canonical view at squash time, avoiding `find_tip_block`'s
-                // MARF-block-id heuristic that can pick non-canonical siblings
-                // during fresh sync.
-                match crate::chainstate::stacks::index::squash::squash_level_incremental_with_canonical_tip::<StacksBlockId>(
+                // The explicit `Some(canonical_tip)` anchors the squash to the
+                // chainstate's canonical view at squash time, avoiding
+                // `find_tip_block`'s MARF-block-id heuristic that can pick
+                // non-canonical siblings during fresh sync.
+                match crate::chainstate::stacks::index::squash::squash_level_incremental::<
+                    StacksBlockId,
+                >(
                     &plan.path,
                     plan.mode,
                     plan.min_height,
                     plan.tip_height,
                     true,
                     plan.retention_levels,
-                    plan.canonical_tip.clone(),
+                    Some(plan.canonical_tip.clone()),
                 ) {
                     Ok(stats) => {
                         info!(
@@ -4459,6 +4472,7 @@ pub mod test {
             max_height,
             true,
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            None,
         )
         .expect("squash should succeed");
         assert!(stats.nodes_collected > 0);
@@ -4486,5 +4500,305 @@ pub mod test {
             .expect("key should exist at tip");
         // They should differ (key was updated every block)
         assert_ne!(val, tip_val, "historical and tip values should differ");
+    }
+
+    // -------------------------------------------------------------------
+    // Pre-append squash-divergence guard regression tests
+    //
+    // Codex's review of the level-14 mainnet panic fix asked for a
+    // chainstate-level test that proves a squash-boundary parent gets
+    // re-anchored before the first above-level descendant is committed.
+    // The MARF-level tests in `chainstate::stacks::index::test::squash`
+    // already cover `re_squash_level` correctness; this test adds the
+    // chainstate-level wiring: `assert_squash_consistency` walking the
+    // chainstate's `block_headers` table to detect divergence, then
+    // re-anchoring BOTH the headers MARF and the Clarity MARF in lockstep
+    // via `re_squash_level`.
+    //
+    // The test does NOT drive the full block-processing pipeline (that
+    // would require a TestPeer-style harness); instead it engineers the
+    // exact mid-state the guard observes: a squash level recording one
+    // canonical at the boundary, a `block_headers` view recording a
+    // different canonical (chain reorg), and no above-level descendants
+    // committed yet. The guard's job at that moment is to call
+    // `assert_squash_consistency(parent_block_id, sortdb_conn)` and have
+    // it succeed — exactly what's exercised below.
+    // -------------------------------------------------------------------
+
+    /// Insert a `block_headers` row with the minimum fields required for
+    /// `detect_squash_divergence` to walk this block's ancestry. Non-essential
+    /// columns get plausible-but-unused values; the row is sufficient to satisfy
+    /// the schema's NOT NULL constraints and `lookup_height_and_parent`'s SELECT.
+    #[cfg(test)]
+    fn insert_test_block_header_minimal(
+        conn: &Connection,
+        index_block_hash: &StacksBlockId,
+        parent_block_id: &StacksBlockId,
+        block_height: u32,
+        consensus_hash: &ConsensusHash,
+        block_hash: &BlockHeaderHash,
+    ) {
+        use stacks_common::types::chainstate::VRFSeed;
+
+        use crate::chainstate::stacks::TrieHash;
+
+        let zero_hash = TrieHash([0u8; 32]);
+        let zero_vrf = VRFSeed([0u8; 32]);
+        let zero_block_hash = BlockHeaderHash([0u8; 32]);
+        let pubkey_hash = stacks_common::util::hash::Hash160([0u8; 20]);
+        let burn_hash = stacks_common::types::chainstate::BurnchainHeaderHash([0u8; 32]);
+
+        // NOTE: `affirmation_weight` was dropped from the schema in a prior migration
+        // (see migration to db version 11), so it is not in the INSERT despite being
+        // listed in the original `CREATE TABLE` text in this file's source.
+        conn.execute(
+            "INSERT INTO block_headers (
+                version, total_burn, total_work, proof, parent_block, parent_microblock,
+                parent_microblock_sequence, tx_merkle_root, state_index_root,
+                microblock_pubkey_hash, block_hash, index_block_hash, block_height,
+                index_root, consensus_hash, burn_header_hash, burn_header_height,
+                burn_header_timestamp, parent_block_id, cost, block_size
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21
+            )",
+            rusqlite::params![
+                0i64,            // version
+                "0",             // total_burn (TEXT)
+                "0",             // total_work (TEXT)
+                zero_vrf,        // proof
+                zero_block_hash, // parent_block
+                zero_block_hash, // parent_microblock
+                0i64,            // parent_microblock_sequence
+                zero_hash,       // tx_merkle_root
+                zero_hash,       // state_index_root
+                pubkey_hash,     // microblock_pubkey_hash
+                block_hash,      // block_hash
+                index_block_hash,
+                block_height as i64,
+                zero_hash,       // index_root
+                consensus_hash,
+                burn_hash,       // burn_header_hash
+                0i64,            // burn_header_height
+                0i64,            // burn_header_timestamp
+                parent_block_id,
+                "{\"write_length\":0,\"write_count\":0,\"read_length\":0,\"read_count\":0,\"runtime\":0}", // cost
+                "0",             // block_size (TEXT)
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Chainstate-level regression: `assert_squash_consistency`, when called on
+    /// the parent of a not-yet-committed block whose lineage diverges from the
+    /// most-recent squash level's recorded canonical, must re-anchor BOTH
+    /// MARFs (headers + Clarity) on the new lineage — the exact behavior the
+    /// pre-append guards in `process_next_staging_block` /
+    /// `process_next_nakamoto_block` rely on.
+    ///
+    /// Setup: build identical chains B0→B1→B2→Ba in both MARFs, squash level 0
+    /// anchored to Ba on both, then add a sibling Bb at the boundary on both.
+    /// Insert `block_headers` rows reflecting the chain having reorged from Ba
+    /// to Bb at height 3 (Bb canonical, Ba absent). At this point no above-
+    /// level descendant of Bb exists in `marf_data`, so the safety check
+    /// permits recovery.
+    ///
+    /// Expectation: `chainstate.assert_squash_consistency(&block_b, &sortdb)`
+    /// returns `Ok`, both MARFs now record `block_b` as canonical at height 3,
+    /// and a follow-up call returns no divergence.
+    #[test]
+    fn test_assert_squash_consistency_re_anchors_divergent_parent_2x() {
+        use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
+
+        use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
+        use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+        use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
+        use crate::chainstate::stacks::index::MARFValue;
+
+        let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
+        // Sortdb conn for `effective_squash_mode` lookups inside the recovery.
+        // No epoch 3.4 row → caller mode (TipOnly here) is upgraded to FullHistory.
+        let sortdb_conn = mock_sortdb_conn(None);
+
+        let blk = |chr: u8, idx: u32| -> StacksBlockId {
+            let mut bytes = [chr; 32];
+            bytes[28..32].copy_from_slice(&idx.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        };
+        let bh = |id: u32| -> BlockHeaderHash {
+            let mut bytes = [0u8; 32];
+            bytes[28..32].copy_from_slice(&id.to_be_bytes());
+            BlockHeaderHash::from_bytes(&bytes).unwrap()
+        };
+        let chash = |id: u32| -> ConsensusHash {
+            let mut bytes = [0u8; 20];
+            bytes[16..20].copy_from_slice(&id.to_be_bytes());
+            ConsensusHash::from_bytes(&bytes).unwrap()
+        };
+
+        let block_0 = blk(0xA0, 0);
+        let block_1 = blk(0xA1, 1);
+        let block_2 = blk(0xA2, 2);
+        let block_a = blk(0xAA, 3); // pre-reorg canonical at boundary
+        let block_b = blk(0xBB, 3); // post-reorg canonical (sibling)
+
+        let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+        let headers_path = chainstate.state_index.get_db_path().to_string();
+        let clarity_path = chainstate
+            .clarity_state
+            .with_marf(|m| m.get_db_path().to_string());
+
+        // The chainstate's MARFs already contain the boot block. We extend from
+        // `StacksBlockId::sentinel()` onto our test chain via direct MARF API —
+        // bypassing `block_begin` / Clarity boot-code so the test stays focused
+        // on the squash-divergence recovery wiring rather than block validation.
+        let extend_chain = |path: &str| {
+            let mut marf = MARF::<StacksBlockId>::from_path(path, opts.clone()).unwrap();
+            let mut commit = |parent: &StacksBlockId, child: &StacksBlockId, label: &str| {
+                marf.begin(parent, child).unwrap();
+                marf.insert("k", MARFValue::from_value(label)).unwrap();
+                marf.seal().unwrap();
+                marf.commit().unwrap();
+            };
+            commit(&StacksBlockId::sentinel(), &block_0, "v0");
+            commit(&block_0, &block_1, "v1");
+            commit(&block_1, &block_2, "v2");
+            commit(&block_2, &block_a, "va");
+        };
+        extend_chain(&headers_path);
+        extend_chain(&clarity_path);
+
+        // Squash level 0 [0..=3] anchored to block_a on both MARFs in lockstep.
+        // FullHistory on both keeps historical reads usable.
+        for path in [&headers_path, &clarity_path] {
+            squash_level_incremental::<StacksBlockId>(
+                path,
+                SquashMode::FullHistory,
+                0,
+                3,
+                /* reclaim = */ true,
+                100,
+                None,
+            )
+            .expect("initial squash should succeed");
+        }
+        chainstate.state_index.refresh_after_squash().unwrap();
+        chainstate
+            .clarity_state
+            .with_marf(|m| m.refresh_after_squash())
+            .unwrap();
+
+        // Add the sibling block_b on both MARFs (chain has reorged).
+        let commit_sibling = |path: &str| {
+            let mut marf = MARF::<StacksBlockId>::from_path(path, opts.clone()).unwrap();
+            marf.refresh_after_squash().unwrap();
+            marf.begin(&block_2, &block_b).unwrap();
+            marf.insert("k", MARFValue::from_value("vb")).unwrap();
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+        };
+        commit_sibling(&headers_path);
+        commit_sibling(&clarity_path);
+        chainstate.state_index.refresh_after_squash().unwrap();
+        chainstate
+            .clarity_state
+            .with_marf(|m| m.refresh_after_squash())
+            .unwrap();
+
+        // Populate block_headers so `detect_squash_divergence` can walk the new
+        // canonical (block_b)'s ancestry. block_a is intentionally absent — the
+        // chain has reorged away from it. block_0..block_2 are shared.
+        insert_test_block_header_minimal(
+            chainstate.db(),
+            &block_0,
+            &StacksBlockId::sentinel(),
+            0,
+            &chash(0xA0),
+            &bh(0xA0),
+        );
+        insert_test_block_header_minimal(
+            chainstate.db(),
+            &block_1,
+            &block_0,
+            1,
+            &chash(0xA1),
+            &bh(0xA1),
+        );
+        insert_test_block_header_minimal(
+            chainstate.db(),
+            &block_2,
+            &block_1,
+            2,
+            &chash(0xA2),
+            &bh(0xA2),
+        );
+        insert_test_block_header_minimal(
+            chainstate.db(),
+            &block_b,
+            &block_2,
+            3,
+            &chash(0xBB),
+            &bh(0xBB),
+        );
+
+        // Sanity: divergence is detectable. The level recorded block_a as
+        // canonical at height 3, the chain (block_headers) records block_b.
+        let divergence = chainstate
+            .detect_squash_divergence(&block_b)
+            .expect("divergence walk should not fail")
+            .expect(
+                "divergence expected: level recorded block_a but block_headers has \
+                 block_b at the boundary",
+            );
+        assert_eq!(divergence.recorded_canonical, block_a);
+        assert_eq!(divergence.new_canonical, block_b);
+        assert_eq!(divergence.diverging_height, 3);
+
+        // No above-level committed descendants exist (block_b is at height 3,
+        // not strictly above), so the safety check passes and recovery proceeds.
+        assert!(chainstate
+            .first_committed_block_above_level(3)
+            .unwrap()
+            .is_none());
+
+        // **The behavior under test:** the pre-append guards call
+        // `assert_squash_consistency(&parent_block_id, sortdb_conn)`. Here
+        // parent_block_id is block_b (the candidate parent of a yet-to-be-
+        // committed descendant at height 4). The call must re-anchor BOTH
+        // MARFs on block_b's lineage in lockstep, without panicking.
+        chainstate
+            .assert_squash_consistency(&block_b, &sortdb_conn)
+            .expect("recovery must succeed when no above-level descendants exist");
+
+        // Both MARFs now record block_b as canonical at height 3.
+        let headers_canonical = chainstate
+            .state_index
+            .latest_squash_level_canonical_chain()
+            .expect("headers MARF should still have a squash level after Replace");
+        assert_eq!(
+            headers_canonical.block_hashes.last(),
+            Some(&block_b),
+            "headers MARF level canonical at boundary should be block_b after Replace"
+        );
+        assert_eq!(headers_canonical.max_height, 3);
+
+        let clarity_canonical = chainstate
+            .clarity_state
+            .with_marf(|m| m.latest_squash_level_canonical_chain())
+            .expect("clarity MARF should still have a squash level after Replace");
+        assert_eq!(
+            clarity_canonical.block_hashes.last(),
+            Some(&block_b),
+            "clarity MARF level canonical at boundary should be block_b after Replace"
+        );
+        assert_eq!(clarity_canonical.max_height, 3);
+
+        // Idempotence: a second call on the now-aligned chain reports no
+        // divergence (the post-process belt-and-suspenders check would be a
+        // no-op here).
+        assert!(chainstate
+            .detect_squash_divergence(&block_b)
+            .unwrap()
+            .is_none());
     }
 }

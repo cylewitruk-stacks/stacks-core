@@ -2207,8 +2207,8 @@ impl<T: MarfTrieId> MARF<T> {
             .contains_key(&bhh_key)
     }
 
-    /// Return the most recent squash level's recorded canonical chain, or
-    /// `None` if no squash levels are loaded.
+    /// Return the most recent **active** squash level's recorded canonical
+    /// chain, or `None` if no active squash levels are loaded.
     ///
     /// The reorg-divergence detector consumes this to verify that a
     /// newly-promoted chain tip's ancestry matches what the squash level
@@ -2216,18 +2216,34 @@ impl<T: MarfTrieId> MARF<T> {
     /// chain has reorg'd past a squash boundary and descendants of the new
     /// canonical will read stale state through the merged blob.
     ///
+    /// Filters retired levels — those represent prior canonical claims that
+    /// have already been superseded by `Replace` and are kept only for
+    /// fork-block readability, not as the chain's current canonical view.
+    ///
     /// Empty `block_hashes` (stub levels with no per-height entries) yields
     /// `None` — those levels have nothing to diverge against.
     pub fn latest_squash_level_canonical_chain(&self) -> Option<SquashLevelCanonical<T>> {
-        let last = self.storage.data.squash_meta.levels.last()?;
-        if last.block_hashes.is_empty() {
+        let meta = &self.storage.data.squash_meta;
+        // Walk back to the last non-retired entry. `build_squash_meta_from_sql`
+        // currently loads retired levels first and active levels second —
+        // but we don't depend on that order: indexed iteration with an
+        // explicit `!is_retired[idx]` filter is correct regardless of
+        // how the builder chooses to interleave them.
+        let last_active = meta
+            .levels
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(idx, _)| !meta.is_retired.get(*idx).copied().unwrap_or(false))
+            .map(|(_, lvl)| lvl)?;
+        if last_active.block_hashes.is_empty() {
             return None;
         }
         Some(SquashLevelCanonical {
-            level_id: last.info.level_id,
-            min_height: last.info.min_height,
-            max_height: last.info.max_height,
-            block_hashes: last
+            level_id: last_active.info.level_id,
+            min_height: last_active.info.min_height,
+            max_height: last_active.info.max_height,
+            block_hashes: last_active
                 .block_hashes
                 .iter()
                 .map(|b| T::from_bytes(*b))

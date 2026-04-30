@@ -518,7 +518,7 @@ impl TrieFile {
 
     /// Read the 32-byte parent block hash that's prefixed at the start of every per-block
     /// trie blob (see `TrieRAM::dump` / `TrieRAM::load` for the format). Used by
-    /// `compute_snapshot_height_via_parent_chain` in `storage.rs` to walk a fork's parent
+    /// `compute_snapshot_context_via_parent_chain` in `storage.rs` to walk a fork's parent
     /// chain to find the closest squashed ancestor — the parent hash from the blob header
     /// is the *exact* parent (captured at commit time), not the inferable-but-unsafe
     /// "first non-empty root backptr" which can point to older ancestors past COW chains.

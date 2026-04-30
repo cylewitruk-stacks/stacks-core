@@ -1018,13 +1018,58 @@ impl<T: MarfTrieId> TrieRAM<T> {
         storage_tx: &mut TrieStorageTransaction<T>,
         base_ptr: TrieCowPtr,
         node: &TrieNodeType,
+        source_snapshot_context: Option<(usize, u32)>,
         decode_scratch: &mut impl TrieNodeReadState,
     ) -> Result<Option<TrieNodePatch>, Error> {
         // Save block state. We use `set_block` to restore instead of `open_block` because the
         // current block may be the uncommitted trie (which has been `.take()`'d from storage during
         // `dump_compressed_consume`), making it unreachable via `open_block`.
         let (cur_block, cur_block_id) = storage_tx.get_cur_block_and_id();
-        storage_tx.open_block(&base_ptr.block_id())?;
+        let cur_block_trie_offset = storage_tx.data.cur_block_trie_offset;
+        let cur_leaf_hashes_omitted = storage_tx.data.leaf_hashes_omitted;
+        let cur_squash_opened_height = storage_tx.data.squash_opened_height;
+        let cur_squash_opened_level_idx = storage_tx.data.squash_opened_level_idx;
+        if storage_tx.data.squash_opened_level_idx.is_none() {
+            if let Some((source_level_idx, source_height)) = source_snapshot_context {
+                let source_leaf_hashes_omitted = *storage_tx
+                    .data
+                    .squash_meta
+                    .level_reads_redirected
+                    .get(source_level_idx)
+                    .ok_or_else(|| {
+                        Error::corruption(&format!(
+                            "SquashMeta.level_reads_redirected missing entry for \
+                             source_level_idx={source_level_idx}"
+                        ))
+                    })?;
+
+                // `dump_compressed_consume` temporarily removes the uncommitted trie from
+                // storage, so the current block can no longer be opened normally. Preserve the
+                // snapshot context of the block being dumped explicitly; inherited COW ptrs may
+                // name shared-ancestor block IDs that also exist in the active replacement level,
+                // and patch-base reads must stay in the source level's blob/sidecar.
+                storage_tx.data.squash_opened_height = Some(source_height);
+                storage_tx.data.squash_opened_level_idx = Some(source_level_idx);
+                storage_tx.data.leaf_hashes_omitted = source_leaf_hashes_omitted;
+            }
+        }
+        let restore_current_block = |data: &mut TrieStorageTransientData<T>| {
+            data.set_block(cur_block.clone(), cur_block_id);
+            data.cur_block_trie_offset = cur_block_trie_offset;
+            data.leaf_hashes_omitted = cur_leaf_hashes_omitted;
+            data.squash_opened_height = cur_squash_opened_height;
+            data.squash_opened_level_idx = cur_squash_opened_level_idx;
+        };
+        let base_block_id = base_ptr.ptr().back_block();
+        open_block_known_id_impl(
+            storage_tx.data,
+            &storage_tx.db,
+            storage_tx.blobs.as_deref(),
+            &base_ptr.block_id(),
+            base_block_id,
+        )?;
+        let base_trie_offset = storage_tx.data.cur_block_trie_offset;
+        let base_leaf_hashes_omitted = storage_tx.data.leaf_hashes_omitted;
 
         let base_trie_ptr = base_ptr.ptr().from_backptr();
         let base_is_orphan_sidecar = match storage_tx.data.squash_opened_level_idx {
@@ -1046,18 +1091,18 @@ impl<T: MarfTrieId> TrieRAM<T> {
             // that ptr through the merged-blob/SQL path without orphan-sidecar routing. A patch
             // against an orphan-only base would later chase into reclaimed blob space, so keep
             // this node self-contained.
-            storage_tx.data.set_block(cur_block, cur_block_id);
+            restore_current_block(storage_tx.data);
             return Ok(None);
         }
 
         match storage_tx.read_node_with_state(base_ptr.ptr(), decode_scratch) {
             Ok(read) => {
                 if read.patch_depth >= MAX_PATCH_DEPTH as usize {
-                    storage_tx.data.set_block(cur_block, cur_block_id);
+                    restore_current_block(storage_tx.data);
                     return Ok(None);
                 }
                 if read.path_bytes()? != node.path_bytes() {
-                    storage_tx.data.set_block(cur_block, cur_block_id);
+                    restore_current_block(storage_tx.data);
                     return Ok(None);
                 }
 
@@ -1069,11 +1114,11 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     node
                 );
                 let result = TrieNodePatch::try_from_noderef(*base_ptr.ptr(), old_node, &node);
-                storage_tx.data.set_block(cur_block, cur_block_id);
+                restore_current_block(storage_tx.data);
                 return Ok(result);
             }
             Err(Error::Patch(_, _old_patch)) => {
-                storage_tx.data.set_block(cur_block, cur_block_id);
+                restore_current_block(storage_tx.data);
 
                 // building atop an existing patch.
                 // Make sure that the base node's path isn't different from this node
@@ -1082,11 +1127,12 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     &storage_tx.db,
                     storage_tx.blobs.as_deref(),
                     storage_tx.data.unconfirmed_block_id,
-                    base_ptr.ptr().back_block(),
+                    base_block_id,
                     *base_ptr.ptr(),
-                    None,
-                    storage_tx.data.leaf_hashes_omitted,
-                    &storage_tx.data.squash_meta.leaf_hash_omitted_blocks,
+                    base_trie_offset,
+                    base_leaf_hashes_omitted,
+                    source_snapshot_context,
+                    &storage_tx.data.squash_meta,
                     scratch,
                 )?;
                 if read.patch_depth >= MAX_PATCH_DEPTH as usize {
@@ -1107,7 +1153,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 ));
             }
             Err(e) => {
-                storage_tx.data.set_block(cur_block, cur_block_id);
+                restore_current_block(storage_tx.data);
                 return Err(e);
             }
         }
@@ -1145,6 +1191,12 @@ impl<T: MarfTrieId> TrieRAM<T> {
         let mut ptr = BLOCK_HEADER_HASH_ENCODED_SIZE as u64 + 4;
 
         let mut decode_scratch = MarfReadState::new();
+        let source_snapshot_context = patch_source_context_for_block_hash(
+            storage_tx.data,
+            &storage_tx.db,
+            storage_tx.blobs.as_deref(),
+            &self.parent,
+        );
 
         while let Some(pointer) = frontier.pop_front() {
             let (node, node_hash) = self.get_nodetype(pointer)?;
@@ -1152,51 +1204,60 @@ impl<T: MarfTrieId> TrieRAM<T> {
             // IMPROVEMENT: if we can, store a patch node instead of the whole node.
             // Only applies to non-leaf nodes, and only if doing so results in a stack of patches
             // that's less than MAX_PATCH_DEPTH. Also, only patch a node if the path is the same.
-            let mut patch_node_opt = if !node.is_leaf()
-                && node.patch_depth() < MAX_PATCH_DEPTH as usize
-            {
-                if let Some((last_patch_block_id, last_patch_ptr)) = node.last_patch_source() {
-                    // this node is a patch to a node in a previous trie.  Try to amend a patch
-                    // atop it.
-                    let block_hash = storage_tx.get_block_hash_caching(last_patch_block_id)?;
+            let mut patch_node_opt =
+                if !node.is_leaf() && node.patch_depth() < MAX_PATCH_DEPTH as usize {
+                    if let Some((last_patch_block_id, last_patch_ptr)) = node.last_patch_source() {
+                        // this node is a patch to a node in a previous trie.  Try to amend a patch
+                        // atop it.
+                        let block_hash = storage_tx.get_block_hash_caching(last_patch_block_id)?;
 
-                    // construct a COW pointer to this patch node
-                    let mut patch_ptr = TriePtr::new(
-                        set_backptr(TrieNodeID::Patch as u8),
-                        last_patch_ptr.chr(),
-                        last_patch_ptr.ptr(),
-                    );
-                    patch_ptr.back_block = last_patch_block_id;
-
-                    let base_ptr = TrieCowPtr::new(block_hash.clone(), patch_ptr);
-                    let patch_node_opt =
-                        Self::make_node_patch(storage_tx, base_ptr, &node, &mut decode_scratch)?;
-                    if let Some(patch_node) = patch_node_opt {
-                        trace!(
-                            "Create amendment patch for node at {:?}: {:?}",
-                            &base_ptr,
-                            &node
+                        // construct a COW pointer to this patch node
+                        let mut patch_ptr = TriePtr::new(
+                            set_backptr(TrieNodeID::Patch as u8),
+                            last_patch_ptr.chr(),
+                            last_patch_ptr.ptr(),
                         );
-                        Some((node_hash.to_bytes(), patch_node))
-                    } else {
-                        None
-                    }
-                } else if let Some(cowptr) = node.get_cow_ptr() {
-                    // this node was a COW node for this trie
-                    let patch_node_opt =
-                        Self::make_node_patch(storage_tx, *cowptr, &node, &mut decode_scratch)?;
-                    if let Some(patch_node) = patch_node_opt {
-                        trace!("Create COW patch for node at {:?}: {:?}", &cowptr, &node);
-                        Some((node_hash.to_bytes(), patch_node))
+                        patch_ptr.back_block = last_patch_block_id;
+
+                        let base_ptr = TrieCowPtr::new(block_hash.clone(), patch_ptr);
+                        let patch_node_opt = Self::make_node_patch(
+                            storage_tx,
+                            base_ptr,
+                            &node,
+                            source_snapshot_context,
+                            &mut decode_scratch,
+                        )?;
+                        if let Some(patch_node) = patch_node_opt {
+                            trace!(
+                                "Create amendment patch for node at {:?}: {:?}",
+                                &base_ptr,
+                                &node
+                            );
+                            Some((node_hash.to_bytes(), patch_node))
+                        } else {
+                            None
+                        }
+                    } else if let Some(cowptr) = node.get_cow_ptr() {
+                        // this node was a COW node for this trie
+                        let patch_node_opt = Self::make_node_patch(
+                            storage_tx,
+                            *cowptr,
+                            &node,
+                            source_snapshot_context,
+                            &mut decode_scratch,
+                        )?;
+                        if let Some(patch_node) = patch_node_opt {
+                            trace!("Create COW patch for node at {:?}: {:?}", &cowptr, &node);
+                            Some((node_hash.to_bytes(), patch_node))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             // calculate size
             if let Some((_, patch_node)) = patch_node_opt.as_ref() {
@@ -1669,11 +1730,30 @@ pub struct TrieStorageConnection<'a, T: MarfTrieId, Db: Deref<Target = Connectio
 
 /// Immutable squash metadata snapshot. Cheap to clone (held behind `Arc`),
 /// replaced wholesale by writers via [`SharedSquashState`].
+///
+/// **Active vs retired levels.** `levels` contains both the canonical
+/// active levels and any retired levels that prior `Replace` publishes
+/// have superseded. Retired levels still expose their trailer's block
+/// hashes through `block_index` so reads on old-trailer hashes (which
+/// may still be referenced by staged fork descendants) resolve through
+/// the squash path, with `leaf_hashes_omitted = true` and the on-disk
+/// retired blob bytes intact. The parallel `is_retired` flag separates
+/// the two: canonical-only iteration (height → canonical hash,
+/// divergence detection, append contiguity) MUST filter on
+/// `!is_retired[i]`; read-path lookups via `block_index` work uniformly
+/// for both.
 pub struct SquashMeta {
-    /// Loaded squash level trailers (sorted by min_height). Empty for non-squashed MARFs.
+    /// Loaded squash level trailers. The builder
+    /// ([`build_squash_meta_from_sql`]) loads retired levels first, then
+    /// active levels — so any shared block hash has its `block_index`
+    /// entry overwritten by the active level's offset (which matches the
+    /// `marf_data` row's redirect after `Replace`). The parallel
+    /// `is_retired` flag distinguishes the two; iteration order itself
+    /// is not load-bearing for correctness, only for which entry wins
+    /// in `block_index` collisions. Empty for non-squashed MARFs.
     pub levels: Vec<SquashTrailer>,
     /// O(1) block-hash → (level_index, height, blob_offset, reads_redirected, block_id) index built
-    /// from all trailers.
+    /// from all trailers, active and retired.
     pub block_index: HashMap<[u8; 32], (usize, u32, u64, bool, u32)>,
     /// Set of block_ids whose blobs have leaf hashes omitted (reclaimed squash levels).
     pub leaf_hash_omitted_blocks: HashSet<u32>,
@@ -1696,6 +1776,60 @@ pub struct SquashMeta {
     /// the routing check `ptr < orphan_split_offset` always picks the
     /// merged blob in that case.
     pub orphan_split_offset: Vec<u32>,
+    /// Per-level `is_retired` flag, parallel to `levels`. False for
+    /// canonical (active) levels; true for retired levels carried for
+    /// fork-block readability. Canonical-claim iterators MUST filter on
+    /// `!is_retired[i]` — retired entries still have valid block hashes
+    /// and trailers, but they don't represent the chain's view of
+    /// canonical history at any height.
+    pub is_retired: Vec<bool>,
+    /// Per-level merged-blob offset, parallel to `levels`. Required for
+    /// resolving the level's versioned sidecar path
+    /// (`marf-roots-level-...-blob-{blob_offset:016x}.dat`). The same
+    /// `blob_offset` value is what `block_index` entries carry as their
+    /// third tuple element, but a per-level array makes it accessible
+    /// without a block-index round-trip when only a `level_idx` is in
+    /// hand (e.g. inside `squash_opened_root_node_bytes`).
+    pub level_blob_offsets: Vec<u64>,
+    /// Per-level `block_id → height` map, parallel to `levels`. Required
+    /// by retired-context-aware backptr resolution: when a read inside
+    /// squash level `level_idx` follows a backptr whose
+    /// `back_block` (a `marf_data.rowid`) is also recorded in level
+    /// `level_idx`'s trailer, the resolution must stay inside that
+    /// same level — its merged-blob offsets are the layout the backptr
+    /// was written for. Only when the target block_id is **not** in
+    /// the current level's trailer (cross-level backptr) does
+    /// resolution fall back to the global `block_index`.
+    ///
+    /// Without this per-level map, a backptr from within a retired
+    /// blob targeting a shared-ancestor block (which appears in both
+    /// retired and active trailers) would resolve through the global
+    /// `block_index` to the **active** level's offset and apply the
+    /// retired-blob-relative `ptr.ptr()` to the active blob's bytes —
+    /// which is structurally wrong because each level's merged-blob
+    /// layout is independent.
+    pub level_block_id_to_height: Vec<HashMap<u32, u32>>,
+    /// Per-level `reads_redirected` flag, parallel to `levels`. Mirrors
+    /// the `reads_redirected` column on each row of
+    /// `marf_squash_levels` / `marf_retired_squash_levels`. Required
+    /// for retired-context-aware backptr resolution: when a backptr
+    /// stays within squash level `L`, the leaf-hash policy that
+    /// applies to the read is `L`'s — NOT the global
+    /// [`Self::leaf_hash_omitted_blocks`] union. The global set is
+    /// keyed only by block_id, so a shared-ancestor block_id whose
+    /// active and retired levels disagree on `reads_redirected` would
+    /// silently apply the wrong policy when read through the retired
+    /// blob.
+    pub level_reads_redirected: Vec<bool>,
+    /// Block IDs that appear in two or more squash levels — i.e. shared
+    /// ancestors carried in both an active and a retired level. Used as
+    /// a fast gate for the parent-chain context walk in
+    /// `open_block_known_id_impl`: only when the backptr target id is in
+    /// this set does the global `block_index` answer become ambiguous
+    /// (active vs. retired blob), and only then is the walk actually
+    /// needed. For ids in zero or exactly one level the global lookup is
+    /// already correct, so the walk is skipped entirely.
+    pub ambiguous_block_ids: HashSet<u32>,
 }
 
 impl SquashMeta {
@@ -1707,6 +1841,11 @@ impl SquashMeta {
             root_sidecar_present: Vec::new(),
             root_sidecar_trimmed: Vec::new(),
             orphan_split_offset: Vec::new(),
+            is_retired: Vec::new(),
+            level_blob_offsets: Vec::new(),
+            level_block_id_to_height: Vec::new(),
+            level_reads_redirected: Vec::new(),
+            ambiguous_block_ids: HashSet::new(),
         }
     }
 }
@@ -2158,83 +2297,148 @@ where
     Ok(arc)
 }
 
-/// Build a [`SquashMeta`] by reading `marf_squash_levels` from SQLite and parsing each level's
+/// Build a [`SquashMeta`] by reading `marf_squash_levels` and
+/// `marf_retired_squash_levels` from SQLite and parsing each level's
 /// trailer from the blob file.
 ///
-/// Returns an empty `SquashMeta` if no squash levels have been recorded or if all present levels
-/// are stubs (blob_length == 0) with no trailers.
+/// Active and retired levels are loaded into a single `levels` vec; the
+/// parallel `is_retired` flag distinguishes them. `block_index` covers
+/// hashes from both: read-path lookups resolve uniformly through it,
+/// while canonical-claim iteration must filter on `!is_retired[i]`.
+///
+/// **Conflict resolution for shared block hashes.** When a hash exists
+/// in both an active level (e.g. a shared ancestor whose row was
+/// re-redirected to the new merged blob) and a retired level (its old
+/// trailer entry), the active entry is the one indexed. Retired levels
+/// are inserted *first* so the subsequent active insertion overwrites —
+/// the read path always prefers the active blob's offsets, which match
+/// the current `marf_data` row. Old-only hashes (in retired but not in
+/// any active trailer) keep their retired entry and resolve to the old
+/// blob.
+///
+/// Returns an empty `SquashMeta` if no squash levels have been recorded
+/// or if all present levels are stubs (blob_length == 0) with no
+/// trailers.
 pub(crate) fn build_squash_meta_from_sql(
     db: &Connection,
     blobs: Option<&TrieFile>,
 ) -> Result<SquashMeta, Error> {
     let squash_level_rows = trie_sql::read_squash_levels(db)?;
-    if squash_level_rows.is_empty() {
+    let retired_level_rows = trie_sql::read_retired_squash_levels(db)?;
+    if squash_level_rows.is_empty() && retired_level_rows.is_empty() {
         return Ok(SquashMeta::empty());
     }
 
-    let mut levels = Vec::with_capacity(squash_level_rows.len());
+    let total_levels = squash_level_rows.len() + retired_level_rows.len();
+    let mut levels = Vec::with_capacity(total_levels);
     let mut block_index = HashMap::new();
     let mut leaf_hash_omitted = HashSet::new();
-    let mut root_sidecar_present = Vec::with_capacity(squash_level_rows.len());
-    let mut root_sidecar_trimmed = Vec::with_capacity(squash_level_rows.len());
-    let mut orphan_split_offset = Vec::with_capacity(squash_level_rows.len());
+    let mut root_sidecar_present = Vec::with_capacity(total_levels);
+    let mut root_sidecar_trimmed = Vec::with_capacity(total_levels);
+    let mut orphan_split_offset = Vec::with_capacity(total_levels);
+    let mut is_retired = Vec::with_capacity(total_levels);
+    let mut level_blob_offsets = Vec::with_capacity(total_levels);
+    let mut level_block_id_to_height: Vec<HashMap<u32, u32>> = Vec::with_capacity(total_levels);
+    let mut level_reads_redirected = Vec::with_capacity(total_levels);
+    // Tracks block_ids seen during trailer iteration. The first sighting goes into
+    // `seen_block_ids`; the second sighting (across any level) promotes the id into
+    // `ambiguous_block_ids`. Cardinality is bounded by the count of shared ancestors
+    // between active and retired forks — typically tiny relative to total block count.
+    let mut seen_block_ids: HashSet<u32> = HashSet::new();
+    let mut ambiguous_block_ids: HashSet<u32> = HashSet::new();
 
-    for row in &squash_level_rows {
-        if row.blob_length == 0 {
-            levels.push(SquashTrailer::empty());
-            root_sidecar_present.push(row.root_sidecar_present);
-            root_sidecar_trimmed.push(row.root_sidecar_trimmed);
-            orphan_split_offset.push(row.orphan_split_offset);
-            continue;
-        }
-        let Some(blobs_ref) = blobs else {
-            // External-blobs disabled but a level is present: defensive fallback — register an
-            // empty stub so reads fall through to the legacy SQL path.
-            levels.push(SquashTrailer::empty());
-            root_sidecar_present.push(row.root_sidecar_present);
-            root_sidecar_trimmed.push(row.root_sidecar_trimmed);
-            orphan_split_offset.push(row.orphan_split_offset);
-            continue;
+    // Pass 1: retired levels first. Their block_index entries get
+    // overwritten below by any active level that re-claims the same hash
+    // (shared-ancestor case). Hashes that appear ONLY in a retired
+    // trailer (the old-only fork tip) survive the pass and resolve to
+    // the retired blob — that's the load-bearing case for fork-block
+    // readability.
+    for row in &retired_level_rows {
+        let trailer_opt = if row.blob_length == 0 {
+            None
+        } else {
+            blobs
+                .map(|b| read_level_trailer(b, row.blob_offset, row.blob_length))
+                .transpose()?
         };
-
-        let footer_offset = row.blob_offset + row.blob_length
-            - crate::chainstate::stacks::index::squash::SQUASH_FOOTER_SIZE as u64;
-        let footer_bytes = blobs_ref.read_blob_range(footer_offset, 12)?;
-        let trailer_rel_offset = SquashTrailer::read_footer(&footer_bytes).ok_or_else(|| {
-            Error::CorruptionError("Squash level blob has no valid trailer footer".into())
-        })?;
-
-        let trailer_abs_offset = row.blob_offset + trailer_rel_offset;
-        let trailer_length = row.blob_offset + row.blob_length - trailer_abs_offset;
-        let trailer_bytes = blobs_ref.read_blob_range(trailer_abs_offset, trailer_length)?;
-        let trailer = SquashTrailer::read_from(&trailer_bytes, trailer_abs_offset)?;
-
-        // Per-file existence probing for sidecars happens in a separate
-        // startup pass that has access to the marf directory path. This
-        // helper just records the SQL-side flags onto the in-memory
-        // SquashMeta so the read path can fail-closed when the flags say
-        // a sidecar should be present but the open later fails.
+        let trailer = trailer_opt.unwrap_or_else(SquashTrailer::empty);
 
         let level_idx = levels.len();
-        for &(bhh, height, block_id) in &trailer.sorted_block_entries {
-            block_index.insert(
-                bhh,
-                (
-                    level_idx,
-                    height,
-                    row.blob_offset,
-                    row.reads_redirected,
-                    block_id,
-                ),
-            );
-            if row.reads_redirected {
-                leaf_hash_omitted.insert(block_id);
+        let mut per_level_block_ids: HashMap<u32, u32> = HashMap::new();
+        if row.blob_length > 0 {
+            for &(bhh, height, block_id) in &trailer.sorted_block_entries {
+                block_index.insert(
+                    bhh,
+                    (
+                        level_idx,
+                        height,
+                        row.blob_offset,
+                        row.reads_redirected,
+                        block_id,
+                    ),
+                );
+                per_level_block_ids.insert(block_id, height);
+                if row.reads_redirected {
+                    leaf_hash_omitted.insert(block_id);
+                }
+                if !seen_block_ids.insert(block_id) {
+                    ambiguous_block_ids.insert(block_id);
+                }
             }
         }
         levels.push(trailer);
         root_sidecar_present.push(row.root_sidecar_present);
         root_sidecar_trimmed.push(row.root_sidecar_trimmed);
         orphan_split_offset.push(row.orphan_split_offset);
+        is_retired.push(true);
+        level_blob_offsets.push(row.blob_offset);
+        level_block_id_to_height.push(per_level_block_ids);
+        level_reads_redirected.push(row.reads_redirected);
+    }
+
+    // Pass 2: active levels. Their block_index entries take priority,
+    // overwriting any retired-level entry for the same hash.
+    for row in &squash_level_rows {
+        let trailer_opt = if row.blob_length == 0 {
+            None
+        } else {
+            blobs
+                .map(|b| read_level_trailer(b, row.blob_offset, row.blob_length))
+                .transpose()?
+        };
+        let trailer = trailer_opt.unwrap_or_else(SquashTrailer::empty);
+
+        let level_idx = levels.len();
+        let mut per_level_block_ids: HashMap<u32, u32> = HashMap::new();
+        if row.blob_length > 0 {
+            for &(bhh, height, block_id) in &trailer.sorted_block_entries {
+                block_index.insert(
+                    bhh,
+                    (
+                        level_idx,
+                        height,
+                        row.blob_offset,
+                        row.reads_redirected,
+                        block_id,
+                    ),
+                );
+                per_level_block_ids.insert(block_id, height);
+                if row.reads_redirected {
+                    leaf_hash_omitted.insert(block_id);
+                }
+                if !seen_block_ids.insert(block_id) {
+                    ambiguous_block_ids.insert(block_id);
+                }
+            }
+        }
+        levels.push(trailer);
+        root_sidecar_present.push(row.root_sidecar_present);
+        root_sidecar_trimmed.push(row.root_sidecar_trimmed);
+        orphan_split_offset.push(row.orphan_split_offset);
+        is_retired.push(false);
+        level_blob_offsets.push(row.blob_offset);
+        level_block_id_to_height.push(per_level_block_ids);
+        level_reads_redirected.push(row.reads_redirected);
     }
 
     Ok(SquashMeta {
@@ -2244,7 +2448,33 @@ pub(crate) fn build_squash_meta_from_sql(
         root_sidecar_present,
         root_sidecar_trimmed,
         orphan_split_offset,
+        is_retired,
+        level_blob_offsets,
+        level_block_id_to_height,
+        level_reads_redirected,
+        ambiguous_block_ids,
     })
+}
+
+/// Parse a squash trailer from disk for a level whose `(blob_offset,
+/// blob_length)` describe a non-stub on-disk extent. Used by
+/// [`build_squash_meta_from_sql`] for both active and retired rows.
+fn read_level_trailer(
+    blobs: &TrieFile,
+    blob_offset: u64,
+    blob_length: u64,
+) -> Result<SquashTrailer, Error> {
+    let footer_offset = blob_offset + blob_length
+        - crate::chainstate::stacks::index::squash::SQUASH_FOOTER_SIZE as u64;
+    let footer_bytes = blobs.read_blob_range(footer_offset, 12)?;
+    let trailer_rel_offset = SquashTrailer::read_footer(&footer_bytes).ok_or_else(|| {
+        Error::CorruptionError("Squash level blob has no valid trailer footer".into())
+    })?;
+
+    let trailer_abs_offset = blob_offset + trailer_rel_offset;
+    let trailer_length = blob_offset + blob_length - trailer_abs_offset;
+    let trailer_bytes = blobs.read_blob_range(trailer_abs_offset, trailer_length)?;
+    SquashTrailer::read_from(&trailer_bytes, trailer_abs_offset)
 }
 
 /// TrieStorageTransientData holds all the data that _isn't_ committed to the underlying SQL
@@ -2367,21 +2597,23 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// `open_opts` paths overwrite it from the supplied `MARFOpenOpts`.
     pub squash_root_snapshot_retention_levels: u32,
 
-    /// Memoized result of `compute_snapshot_height_via_parent_chain`, keyed by the
-    /// **user's** original opened block_id. The parent-chain walk is lazy — it only
-    /// runs when `snapshot_height_for_block()` is called from a `LeafSquashed` resolution
-    /// in the marf walk, and only for blocks whose eager paths (in-squash block, or
-    /// uncommitted-parent-of-squash) haven't already populated `squash_opened_height`.
+    /// Memoized result of `compute_snapshot_context_via_parent_chain`, keyed by the
+    /// resolved block's id. The parent-chain walk is lazy — it only runs when
+    /// `snapshot_height_for_block()` is called from a `LeafSquashed` resolution in
+    /// the marf walk, or when a committed non-squash descendant follows an
+    /// **ambiguous** backptr (target id present in multiple squash levels).
     ///
-    /// Stored as `(user_block_id, walk_result)` so the cache survives backptr resolution
-    /// (which mutates `cur_block_id` mid-walk). On a different user block, the entry is
-    /// overwritten — single-entry cache is enough because typical reads target one block
-    /// at a time.
+    /// Stored as `(block_id, walk_result)`. The cache deliberately survives
+    /// `set_block` (cache key is `block_id`, not `cur_block_id`), so repeated
+    /// reads of the same descendant — and multi-call read paths within a single
+    /// user query — avoid re-walking. Only `squash_meta` replacement
+    /// (`refresh_squash_state` / `refresh_after_squash`) invalidates it, since
+    /// that's the only event that can change which level a `block_id` resolves
+    /// into.
     ///
-    /// Inner walk result: `Some(h)` = squashed ancestor at height `h`; `None` =
-    /// sentinel/cap-exhaustion/pruned-ancestor (caller falls back to tip-read, which is
-    /// correct for canonical descendants and the best we can do for pathological deep forks).
-    pub resolved_snapshot_height: Cell<Option<(u32, Option<u32>)>>,
+    /// Inner walk result: `Some((level_idx, h))` = squashed ancestor in `level_idx` at height
+    /// `h`; `None` = sentinel/cap-exhaustion/pruned-ancestor.
+    pub resolved_snapshot_context: Cell<Option<(u32, Option<(usize, u32)>)>>,
 
     /// **Experimental — for squash-internal read-only handles only.**
     ///
@@ -2481,7 +2713,7 @@ impl<T: MarfTrieId> Default for TrieStorageTransientData<T> {
             orphan_read_scratch: Vec::new(),
             squash_root_snapshot_retention_levels:
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
-            resolved_snapshot_height: Cell::new(None),
+            resolved_snapshot_context: Cell::new(None),
             bypass_blob_guard: false,
             #[cfg(test)]
             squashed_tip_fallback_count: Cell::new(0),
@@ -2507,6 +2739,14 @@ impl<T: MarfTrieId> TrieStorageTransientData<T> {
     /// Target the transient data to a particular block, and optionally its block ID.
     ///
     /// Clears the cached trie offset (it will be re-populated on first read).
+    ///
+    /// Note: `resolved_snapshot_context` is **not** cleared here. The cache is
+    /// keyed by block_id and remains valid as long as `squash_meta` itself has
+    /// not been replaced — invalidation is tied to squash-meta refreshes
+    /// (`refresh_squash_state` / `refresh_after_squash`), not per-block
+    /// transitions. Keeping it across `set_block` lets repeated reads of the
+    /// same descendant block (and multi-call read paths within a single user
+    /// query) avoid re-walking the parent chain.
     fn set_block(&mut self, bhh: T, id: Option<u32>) {
         trace!("set_block({},{:?})", &bhh, &id);
         self.cur_block_id = id;
@@ -2519,7 +2759,6 @@ impl<T: MarfTrieId> TrieStorageTransientData<T> {
         // populate a fresh one if the new block lives in a level that has
         // an orphan section.
         self.orphan_sidecar = None;
-        self.resolved_snapshot_height.set(None);
     }
 
     fn clear_block_id(&mut self) {
@@ -2606,6 +2845,13 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
         scratch: &'b mut impl NodePatching,
     ) -> Result<ReadTrieNode<'b>, Error> {
         let block_id = self.data.cur_block_id.ok_or(Error::NotFoundError)?;
+        let patch_source_context = patch_source_context_for_open_block(
+            &self.data,
+            self.db,
+            self.blobs.as_ref(),
+            &self.data.cur_block,
+            block_id,
+        );
         read_patched_persisted_node(
             self.db,
             self.blobs.as_ref(),
@@ -2614,7 +2860,8 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
             ptr.from_backptr(),
             self.data.cur_block_trie_offset,
             self.data.leaf_hashes_omitted,
-            &self.data.squash_meta.leaf_hash_omitted_blocks,
+            patch_source_context,
+            &self.data.squash_meta,
             scratch,
         )
     }
@@ -2662,6 +2909,9 @@ fn sync_from_shared_squash_state<T: MarfTrieId>(
     // than short-circuiting on the cached cur_block.
     data.set_block(T::sentinel(), None);
     data.trie_ancestor_hash_bytes_cache = None;
+    // Cached level_idx values reference the *prior* squash_meta; replacing meta
+    // can change which level a block_id resolves into.
+    data.resolved_snapshot_context.set(None);
 
     data.seen_squash_generation = current_gen;
     Ok(())
@@ -2804,14 +3054,13 @@ fn open_block_impl<T: MarfTrieId>(
 
     data.set_block(bhh.clone(), Some(block_id));
 
-    // Snapshot-height propagation for committed non-squash blocks is deferred to
-    // `snapshot_height_for_block()` on the connection, called from the marf walk's
-    // `LeafSquashed` branch. Walking the parent chain here on every committed open would
+    // Snapshot-context propagation for committed non-squash blocks is deferred to
+    // `snapshot_height_for_block()` / backptr resolution. Walking the parent chain here on every committed open would
     // add up to `MAX_PARENT_CHAIN_DEPTH` SQL/blob-header lookups per open — catastrophic
     // for canonical chains extended many blocks past the last squash, which are the vast
     // majority of opens. The lazy resolver caches per user_block_id in
-    // `data.resolved_snapshot_height`, so the walk fires at most once per user-level open
-    // and only when a squashed leaf is actually reached.
+    // `data.resolved_snapshot_context`, so the walk fires at most once per user-level open
+    // and only when a squashed leaf or inherited squash-level backptr is actually reached.
 
     bench.open_block_finish(false);
     Ok(())
@@ -2852,13 +3101,13 @@ fn open_block_impl<T: MarfTrieId>(
 /// than panicking.
 const MAX_PARENT_CHAIN_DEPTH: u32 = 64;
 
-fn compute_snapshot_height_via_parent_chain<T: MarfTrieId>(
+fn compute_snapshot_context_via_parent_chain<T: MarfTrieId>(
     data: &TrieStorageTransientData<T>,
     db: &Connection,
     blobs: Option<&TrieFile>,
     start_block_hash: &T,
     start_block_id: u32,
-) -> Option<u32> {
+) -> Option<(usize, u32)> {
     // Fast path: no squash exists, so there's no squashed ancestor to find.
     // Without this guard, every committed `open_block` would walk up to
     // `MAX_PARENT_CHAIN_DEPTH` blob headers + SQL lookups before bailing — a hot-path
@@ -2879,10 +3128,10 @@ fn compute_snapshot_height_via_parent_chain<T: MarfTrieId>(
             .get(..32)
             .and_then(|s| s.try_into().ok())
             .unwrap_or([0u8; 32]);
-        if let Some(&(_level_idx, height, _, _reads_redirected, _)) =
+        if let Some(&(level_idx, height, _, _reads_redirected, _)) =
             data.squash_meta.block_index.get(&key)
         {
-            return Some(height);
+            return Some((level_idx, height));
         }
 
         // 2. Read parent hash from the trie blob's header.
@@ -2944,6 +3193,62 @@ fn compute_snapshot_height_via_parent_chain<T: MarfTrieId>(
     None
 }
 
+fn snapshot_context_for_block<T: MarfTrieId>(
+    data: &TrieStorageTransientData<T>,
+    db: &Connection,
+    blobs: Option<&TrieFile>,
+    block_hash: &T,
+    block_id: u32,
+) -> Option<(usize, u32)> {
+    if data.squash_meta.block_index.is_empty() {
+        return None;
+    }
+    if let Some((cached_id, cached_result)) = data.resolved_snapshot_context.get() {
+        if cached_id == block_id {
+            return cached_result;
+        }
+    }
+    let resolved = compute_snapshot_context_via_parent_chain(data, db, blobs, block_hash, block_id);
+    data.resolved_snapshot_context
+        .set(Some((block_id, resolved)));
+    resolved
+}
+
+fn patch_source_context_for_open_block<T: MarfTrieId>(
+    data: &TrieStorageTransientData<T>,
+    db: &Connection,
+    blobs: Option<&TrieFile>,
+    block_hash: &T,
+    block_id: u32,
+) -> Option<(usize, u32)> {
+    data.squash_opened_level_idx
+        .zip(data.squash_opened_height)
+        .or_else(|| {
+            if data.squash_meta.ambiguous_block_ids.is_empty() {
+                return None;
+            }
+            snapshot_context_for_block(data, db, blobs, block_hash, block_id)
+        })
+}
+
+fn patch_source_context_for_block_hash<T: MarfTrieId>(
+    data: &TrieStorageTransientData<T>,
+    db: &Connection,
+    blobs: Option<&TrieFile>,
+    block_hash: &T,
+) -> Option<(usize, u32)> {
+    let block_key: [u8; 32] = block_hash
+        .as_bytes()
+        .get(..32)
+        .and_then(|s| s.try_into().ok())?;
+    if let Some(&(level_idx, height, _, _, _)) = data.squash_meta.block_index.get(&block_key) {
+        return Some((level_idx, height));
+    }
+
+    let block_id = trie_sql::get_block_identifier(db, block_hash).ok()?;
+    snapshot_context_for_block(data, db, blobs, block_hash, block_id)
+}
+
 /// Shared implementation for `TrieReadStorage::open_block_known_id`, used by both
 /// `TrieStorageConnection` and `ReopenedTrieStorageConnection`.
 ///
@@ -2953,6 +3258,8 @@ fn compute_snapshot_height_via_parent_chain<T: MarfTrieId>(
 /// lives in a squash level, mirroring the squash-aware path in `open_block_impl`.
 fn open_block_known_id_impl<T: MarfTrieId>(
     data: &mut TrieStorageTransientData<T>,
+    db: &Connection,
+    blobs: Option<&TrieFile>,
     bhh: &T,
     id: u32,
 ) -> Result<(), Error> {
@@ -2966,7 +3273,89 @@ fn open_block_known_id_impl<T: MarfTrieId>(
         }
     }
 
+    // Capture the prior squash-level context BEFORE `set_block` resets it.
+    // The retired-context-aware branch below needs to know which level the
+    // *caller* is reading from; without this snapshot the level idx would
+    // already be `None` by the time we test it.
+    //
+    // The parent-chain fallback walk is gated on `ambiguous_block_ids` because
+    // it only changes the answer when the target id has dual+ membership across
+    // squash levels (shared ancestors carried in both an active and a retired
+    // level). For ids in zero or exactly one level the global `block_index`
+    // resolution at the end of this function is already unambiguous, and
+    // walking would just be wasted I/O. This collapses walk frequency from
+    // "~1 per user-level read" to "only on retired-fork descendants reaching
+    // a shared ancestor" — the actual case the fix exists for.
+    let source_block = data.cur_block.clone();
+    let source_block_id = data.cur_block_id;
+    let prior_level_idx = data.squash_opened_level_idx.or_else(|| {
+        if !data.squash_meta.ambiguous_block_ids.contains(&id) {
+            return None;
+        }
+        source_block_id.and_then(|source_id| {
+            snapshot_context_for_block(data, db, blobs, &source_block, source_id)
+                .map(|(level_idx, _height)| level_idx)
+        })
+    });
+
     data.set_block(bhh.clone(), Some(id));
+
+    // **Retired-context-aware backptr resolution.** When the read pipeline
+    // is currently inside squash level `L` and follows a backptr whose
+    // target `id` is also recorded in `L`'s trailer, stay in `L`. Each
+    // squash level's merged-blob layout is independent — backptr offsets
+    // baked into `L`'s nodes are self-relative to `L`'s blob, and routing
+    // the target through the global `block_index` would land us in some
+    // *other* level (typically the active level, which won the Replace-
+    // time overwrite for shared ancestors) and apply `L`'s offset to the
+    // wrong blob's bytes. The failure mode is silent corruption / wrong
+    // leaf — it surfaced as a bounded-fork-test divergence where reads
+    // from a retired blob returned `None` for keys whose leaf was
+    // reachable through a backptr to a shared ancestor. Only when the
+    // target `id` is **not** in `L`'s trailer (a real cross-level
+    // backptr) do we fall through to the global `block_index`.
+    if let Some(cur_level_idx) = prior_level_idx {
+        if let Some(&target_height) = data
+            .squash_meta
+            .level_block_id_to_height
+            .get(cur_level_idx)
+            .and_then(|m| m.get(&id))
+        {
+            // Strict per-level lookups: the parallel vectors
+            // (`level_blob_offsets`, `level_reads_redirected`) are sized
+            // identically to `levels` by `build_squash_meta_from_sql`.
+            // A missing entry here would mean `SquashMeta` is internally
+            // inconsistent — surface that as a corruption error rather
+            // than silently substituting offset 0 / `false`, which would
+            // route a redirected read to the start of the file or apply
+            // the wrong leaf-hash policy.
+            let cur_level_blob_offset = *data
+                .squash_meta
+                .level_blob_offsets
+                .get(cur_level_idx)
+                .ok_or_else(|| {
+                    Error::corruption(&format!(
+                        "SquashMeta.level_blob_offsets missing entry for level_idx={cur_level_idx}"
+                    ))
+                })?;
+            let cur_level_reads_redirected = *data
+                .squash_meta
+                .level_reads_redirected
+                .get(cur_level_idx)
+                .ok_or_else(|| {
+                    Error::corruption(&format!(
+                        "SquashMeta.level_reads_redirected missing entry for level_idx={cur_level_idx}"
+                    ))
+                })?;
+            data.squash_opened_height = Some(target_height);
+            data.squash_opened_level_idx = Some(cur_level_idx);
+            data.leaf_hashes_omitted = cur_level_reads_redirected;
+            if cur_level_reads_redirected {
+                data.cur_block_trie_offset = Some(cur_level_blob_offset);
+            }
+            return Ok(());
+        }
+    }
 
     // Restore squash context so that root-hash lookups and trie reads use the
     // squash blob/trailer instead of the (possibly reclaimed) per-block blobs.
@@ -3025,7 +3414,8 @@ fn read_patched_persisted_node<'b>(
     mut ptr: TriePtr,
     cur_block_trie_offset: Option<u64>,
     leaf_hashes_omitted: bool,
-    leaf_hash_omitted_blocks: &HashSet<u32>,
+    patch_source_context: Option<(usize, u32)>,
+    squash_meta: &SquashMeta,
     scratch: &'b mut impl NodePatching,
 ) -> Result<ReadTrieNode<'b>, Error> {
     let target_block_id = block_id;
@@ -3051,9 +3441,6 @@ fn read_patched_persisted_node<'b>(
                 None => trie_sql::read_trie_item(db, block_id, &ptr, scratch)?,
             }
         };
-        // Clear the hint after the first iteration — subsequent reads chase into
-        // different blocks via backptrs and need fresh offset lookups.
-        trie_offset_hint = None;
         let ReadTrieItem { hash, kind, .. } = read;
 
         match kind {
@@ -3089,7 +3476,36 @@ fn read_patched_persisted_node<'b>(
 
                 ptr = new_ptr;
                 block_id = new_block_id;
-                cur_leaf_hashes_omitted = leaf_hash_omitted_blocks.contains(&block_id);
+                if let Some((source_level_idx, _)) = patch_source_context {
+                    if squash_meta
+                        .level_block_id_to_height
+                        .get(source_level_idx)
+                        .is_some_and(|m| m.contains_key(&block_id))
+                    {
+                        trie_offset_hint = Some(*squash_meta.level_blob_offsets.get(source_level_idx).ok_or_else(|| {
+                            Error::corruption(&format!(
+                                "SquashMeta.level_blob_offsets missing entry for source_level_idx={source_level_idx}"
+                            ))
+                        })?);
+                        cur_leaf_hashes_omitted = *squash_meta
+                            .level_reads_redirected
+                            .get(source_level_idx)
+                            .ok_or_else(|| {
+                                Error::corruption(&format!(
+                                    "SquashMeta.level_reads_redirected missing entry for \
+                                     source_level_idx={source_level_idx}"
+                                ))
+                            })?;
+                    } else {
+                        trie_offset_hint = None;
+                        cur_leaf_hashes_omitted =
+                            squash_meta.leaf_hash_omitted_blocks.contains(&block_id);
+                    }
+                } else {
+                    trie_offset_hint = None;
+                    cur_leaf_hashes_omitted =
+                        squash_meta.leaf_hash_omitted_blocks.contains(&block_id);
+                }
                 if node_hash_opt.is_none() {
                     node_hash_opt = hash;
                 }
@@ -3302,6 +3718,13 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             None
         };
         self.bench.read_nodetype_start();
+        let patch_source_context = patch_source_context_for_open_block(
+            self.data,
+            &self.db,
+            self.blobs.as_deref(),
+            &self.data.cur_block,
+            id,
+        );
         let result = read_patched_persisted_node(
             &self.db,
             self.blobs.as_deref(),
@@ -3310,7 +3733,8 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             clear_ptr,
             trie_offset,
             self.data.leaf_hashes_omitted,
-            &self.data.squash_meta.leaf_hash_omitted_blocks,
+            patch_source_context,
+            &self.data.squash_meta,
             state,
         );
         self.bench.read_nodetype_finish(false);
@@ -3354,7 +3778,7 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
         // No auto-refresh here: `open_block_known_id` is called during backptr resolution with a
         // pre-resolved block_id. The parent `open_block` has already run the staleness check for
         // this walk.
-        open_block_known_id_impl(self.data, bhh, id)
+        open_block_known_id_impl(self.data, &self.db, self.blobs.as_deref(), bhh, id)
     }
 
     fn get_cur_block_and_id(&self) -> (T, Option<u32>) {
@@ -3573,22 +3997,14 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
         // mutates `cur_block_id` mid-walk — because the cache key is the user's identity,
         // passed in explicitly. Single-entry cache: a different user query overwrites it,
         // which is fine since reads target one user block at a time.
-        if let Some((cached_id, cached_result)) = self.data.resolved_snapshot_height.get() {
-            if cached_id == block_id {
-                return cached_result;
-            }
-        }
-        let resolved = compute_snapshot_height_via_parent_chain(
+        let resolved = snapshot_context_for_block(
             self.data,
             &self.db,
             self.blobs.as_deref(),
             block_hash,
             block_id,
         );
-        self.data
-            .resolved_snapshot_height
-            .set(Some((block_id, resolved)));
-        resolved
+        resolved.map(|(_level_idx, height)| height)
     }
 
     fn write_children_hashes_by_ptrs<W: Write + ?Sized>(
@@ -3874,6 +4290,9 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         self.cache = BlockCache::new("noop");
         self.data.set_block(T::sentinel(), None);
         self.data.trie_ancestor_hash_bytes_cache = None;
+        // Cached level_idx values reference the *prior* squash_meta; replacing meta
+        // can change which level a block_id resolves into.
+        self.data.resolved_snapshot_context.set(None);
 
         Ok(())
     }
@@ -4009,18 +4428,44 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                 use crate::chainstate::stacks::index::sidecar::{
                     reconcile_squash_sidecars, ExpectedSidecar,
                 };
+                // Strict per-level lookups: the parallel vectors are
+                // sized identically to `meta.levels` by
+                // `build_squash_meta_from_sql`. A missing entry would
+                // mean `SquashMeta` is internally inconsistent. Surface
+                // that as corruption — silently substituting `0` for
+                // `blob_offset` would let reconcile misidentify the
+                // canonical sidecar (whose path is keyed by blob_offset)
+                // as an orphan and unlink it.
                 let expected: Vec<ExpectedSidecar> = meta
                     .levels
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| ExpectedSidecar {
-                        level_id: t.info.level_id,
-                        min_height: t.info.min_height,
-                        max_height: t.info.max_height,
-                        present: meta.root_sidecar_present.get(i).copied().unwrap_or(false),
-                        trimmed: meta.root_sidecar_trimmed.get(i).copied().unwrap_or(false),
+                    .map(|(i, t)| {
+                        let blob_offset = *meta.level_blob_offsets.get(i).ok_or_else(|| {
+                            Error::corruption(&format!(
+                                "SquashMeta.level_blob_offsets missing entry for level_idx={i}"
+                            ))
+                        })?;
+                        let present = *meta.root_sidecar_present.get(i).ok_or_else(|| {
+                            Error::corruption(&format!(
+                                "SquashMeta.root_sidecar_present missing entry for level_idx={i}"
+                            ))
+                        })?;
+                        let trimmed = *meta.root_sidecar_trimmed.get(i).ok_or_else(|| {
+                            Error::corruption(&format!(
+                                "SquashMeta.root_sidecar_trimmed missing entry for level_idx={i}"
+                            ))
+                        })?;
+                        Ok::<ExpectedSidecar, Error>(ExpectedSidecar {
+                            level_id: t.info.level_id,
+                            min_height: t.info.min_height,
+                            max_height: t.info.max_height,
+                            blob_offset,
+                            present,
+                            trimmed,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, Error>>()?;
                 let report = reconcile_squash_sidecars(&db_path_for_reconcile, &expected)?;
                 if report.tmp_orphans_deleted > 0 || report.dat_orphans_deleted > 0 {
                     info!(
@@ -4604,14 +5049,32 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             });
         }
 
-        // Compute the canonical sidecar path. The dir is per-DB
-        // (`<db>.squash_sidecars/`) so peer MARFs sharing the same parent
-        // dir don't collide on each other's sidecars.
+        // Compute the sidecar path from the level's `(level_id,
+        // min_height, max_height, blob_offset)` tuple. Including
+        // `blob_offset` in the path makes each Replace publish land at
+        // a unique path: the new active sidecar at the new
+        // `blob_offset`'s path, the retired predecessor untouched at
+        // its old `blob_offset`'s path. Both rows resolve their
+        // sidecars unambiguously without retired-specific dispatch.
+        let level_blob_offset = self
+            .data
+            .squash_meta
+            .level_blob_offsets
+            .get(level_idx)
+            .copied()
+            .ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "squash_opened_root_node_bytes: level_idx {level_idx} \
+                     out of range for level_blob_offsets ({})",
+                    self.data.squash_meta.level_blob_offsets.len()
+                ))
+            })?;
         let sidecar_path = squash_root_sidecar_path(
             std::path::Path::new(self.db_path),
             level.info.level_id,
             level.info.min_height,
             level.info.max_height,
+            level_blob_offset,
         );
 
         info!(
@@ -4824,11 +5287,30 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             let level_id = level.info.level_id;
             let min_h = level.info.min_height;
             let max_h = level.info.max_height;
+            // Versioned sidecar path: active and retired levels both
+            // resolve through `(level_id, min_height, max_height,
+            // blob_offset)`. Each Replace lands at a unique
+            // `blob_offset`-suffixed path so retired predecessors stay
+            // readable at their original path.
+            let level_blob_offset = self
+                .data
+                .squash_meta
+                .level_blob_offsets
+                .get(level_idx)
+                .copied()
+                .ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "try_read_orphan_bytes: level_idx {level_idx} out of \
+                         range for level_blob_offsets ({})",
+                        self.data.squash_meta.level_blob_offsets.len()
+                    ))
+                })?;
             let path = squash_root_sidecar_path(
                 std::path::Path::new(self.db_path),
                 level_id,
                 min_h,
                 max_h,
+                level_blob_offset,
             );
             let expectation = SidecarExpectation {
                 level_id: Some(level_id),

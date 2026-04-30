@@ -651,6 +651,7 @@ fn test_squash_incremental_basic() {
         l1_max,
         false,
         100,
+        None,
     )
     .expect("Incremental squash should succeed");
 
@@ -759,6 +760,7 @@ fn test_squash_incremental_cross_level_reads_and_proofs() {
         l1_max,
         false,
         100,
+        None,
     )
     .expect("Level 1 squash");
 
@@ -871,6 +873,7 @@ fn test_squash_post_incremental_extension() {
         l1_max,
         false,
         100,
+        None,
     )
     .expect("Level 1 squash");
 
@@ -1020,6 +1023,7 @@ fn test_squash_incremental_reclaim() {
         l1_max,
         true, // reclaim!
         100,
+        None,
     )
     .expect("Incremental squash with reclaim should succeed");
 
@@ -1139,6 +1143,7 @@ fn test_squash_incremental_l0_bootstrap() {
         num_blocks - 1,
         false,
         100,
+        None,
     )
     .unwrap();
 
@@ -1197,6 +1202,7 @@ fn test_squash_incremental_l0_bootstrap() {
         num_blocks + l1_count - 1,
         false,
         100,
+        None,
     )
     .unwrap();
     assert!(stats.nodes_collected > 0);
@@ -1272,6 +1278,7 @@ fn test_refresh_after_external_squash() {
         num_blocks - 1,
         false,
         100,
+        None,
     )
     .unwrap();
     assert!(stats.nodes_collected > 0);
@@ -1418,6 +1425,7 @@ fn test_squash_preserves_per_block_root_hashes() {
         tip_height,
         false,
         100,
+        None,
     )
     .expect("squash should succeed");
 
@@ -1513,6 +1521,7 @@ fn test_cow_write_through_reclaimed_parent() {
         (l0_blocks - 1) as u32,
         false, // L0: no reclaim
         100,
+        None,
     )
     .expect("L0 squash");
 
@@ -1558,6 +1567,7 @@ fn test_cow_write_through_reclaimed_parent() {
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
         100,
+        None,
     )
     .expect("L1 reclaim squash");
 
@@ -1692,6 +1702,7 @@ fn test_l1_reclaim_squash_extend_matches_unsquashed_reference() {
         (l0_blocks - 1) as u32,
         true, // reclaim=true, but existing_levels is empty so actually_reclaimed=false
         100,
+        None,
     )
     .expect("L0 squash");
 
@@ -1738,6 +1749,7 @@ fn test_l1_reclaim_squash_extend_matches_unsquashed_reference() {
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
         100,
+        None,
     )
     .expect("L1 reclaim squash");
 
@@ -1886,6 +1898,7 @@ fn test_l1_no_reclaim_squash_extend_matches_unsquashed_reference() {
         (l0_blocks - 1) as u32,
         false,
         100,
+        None,
     )
     .expect("L0 squash");
 
@@ -1923,6 +1936,7 @@ fn test_l1_no_reclaim_squash_extend_matches_unsquashed_reference() {
         (l0_blocks + l1_blocks - 1) as u32,
         false, // no reclaim
         100,
+        None,
     )
     .expect("L1 no-reclaim squash");
 
@@ -2049,6 +2063,7 @@ fn test_l1_reclaim_squash_multi_extend_matches_unsquashed_reference() {
         (l0_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 squash");
 
@@ -2082,6 +2097,7 @@ fn test_l1_reclaim_squash_multi_extend_matches_unsquashed_reference() {
         (l0_blocks + l1_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L1 reclaim squash");
 
@@ -2221,6 +2237,7 @@ fn test_l0_reclaim_squash_extend_matches_unsquashed_reference() {
         (l0_blocks - 1) as u32,
         true, // L0 reclaim!
         100,
+        None,
     )
     .expect("L0 reclaim squash");
 
@@ -2319,6 +2336,7 @@ fn test_l0_reclaim_squash_multi_extend_matches_unsquashed_reference() {
         (l0_blocks - 1) as u32,
         true, // L0 reclaim!
         100,
+        None,
     )
     .expect("L0 reclaim squash");
 
@@ -2421,6 +2439,7 @@ fn test_l0_reclaim_squash_heavy_updates_matches_unsquashed_reference() {
         (l0_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 reclaim squash");
 
@@ -2544,6 +2563,7 @@ fn test_l0_reclaim_squash_long_horizon_heavy_updates_matches_unsquashed_referenc
         (l0_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 reclaim squash");
 
@@ -2653,6 +2673,7 @@ fn test_l0_reclaim_squash_long_horizon_historical_reads_match_unsquashed_referen
         (l0_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 reclaim squash");
 
@@ -2759,16 +2780,14 @@ fn test_l0_reclaim_squash_long_horizon_historical_reads_match_unsquashed_referen
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: build a linear canonical chain with committed fork blocks.
-//
-// Creates `num_blocks` canonical blocks, then at `fork_point` (index into
-// block list) creates `num_fork_blocks` side-branch blocks.  All blocks —
-// canonical and fork — are committed as unconfirmed=0 and written to the
-// external .blobs file.  The fork blocks share a common parent in the
-// canonical chain but are NOT ancestors of the canonical tip, so
-// `get_block_at_height` from the tip will never reach them.
-// ---------------------------------------------------------------------------
+/// Helper: build a linear canonical chain with committed fork blocks.
+///
+/// Creates `num_blocks` canonical blocks, then at `fork_point` (index into block list) creates
+/// `num_fork_blocks` side-branch blocks.  All blocks — canonical and fork — are committed as
+/// unconfirmed=0 and written to the external .blobs file.
+///
+/// The fork blocks share a common parent in the canonical chain but are NOT ancestors of the
+/// canonical tip, so `get_block_at_height` from the tip will never reach them.
 fn setup_marf_with_fork_blocks(
     path: &str,
     num_blocks: usize,
@@ -2855,28 +2874,23 @@ fn setup_marf_with_fork_blocks(
     (marf, blocks, fork_blocks)
 }
 
-// ---------------------------------------------------------------------------
-// Orphaned fork blocks: L0 reclaim prunes non-canonical refs and succeeds.
-//
-// When the MARF contains committed (unconfirmed=0) blocks from an abandoned
-// fork, their blobs exist in the .blobs file.  L0 reclaim's truncation zone
-// covers the entire file (from_offset=0).  Before Approach A's prune step,
-// validate_truncation_zone would reject these rows — this is the production
-// failure observed at height 172,000:
-//   "Live marf_data row for block 65549a... references offset ... but is not
-//    being superseded"
-//
-// The prune step zeroes external_offset/external_length for these non-canonical
-// rows, allowing truncation to proceed.  This is intentional fork-state
-// pruning: those fork trie blobs become permanently unreadable.
-//
-// This test verifies:
-//   1. Fork blocks initially have external blob refs
-//   2. L0 reclaim succeeds (prune fires before validation)
-//   3. Fork block refs are zeroed after reclaim
-//   4. Root hash matches unsquashed reference
-// ---------------------------------------------------------------------------
-
+/// Orphaned fork blocks: L0 reclaim prunes non-canonical refs and succeeds.
+///
+/// When the MARF contains committed (unconfirmed=0) blocks from an abandoned fork, their blobs
+/// exist in the .blobs file.  L0 reclaim's truncation zone covers the entire file (from_offset=0).
+/// Before Approach A's prune step, validate_truncation_zone would reject these rows — this is the
+/// production failure observed at height 172,000: "Live marf_data row for block 65549a...
+/// references offset ... but is not being superseded"
+///
+/// The prune step zeroes external_offset/external_length for these non-canonical rows, allowing
+/// truncation to proceed.  This is intentional fork-state pruning: those fork trie blobs become
+/// permanently unreadable.
+///
+/// This test verifies:
+///   1. Fork blocks initially have external blob refs
+///   2. L0 reclaim succeeds (prune fires before validation)
+///   3. Fork block refs are zeroed after reclaim
+///   4. Root hash matches unsquashed reference
 #[test]
 fn test_l0_reclaim_prunes_fork_blocks_and_succeeds() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -2931,6 +2945,7 @@ fn test_l0_reclaim_prunes_fork_blocks_and_succeeds() {
         (num_blocks - 1) as u32,
         true, // reclaim
         100,
+        None,
     )
     .expect("L0 reclaim should succeed after pruning orphaned fork block refs");
 
@@ -3055,6 +3070,7 @@ fn test_l1_reclaim_succeeds_with_orphaned_fork_blocks() {
         (l0_blocks - 1) as u32,
         false, // append-only
         100,
+        None,
     )
     .expect("L0 append-only squash should succeed despite fork blocks");
 
@@ -3117,6 +3133,7 @@ fn test_l1_reclaim_succeeds_with_orphaned_fork_blocks() {
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
         100,
+        None,
     )
     .expect("L1 reclaim squash should succeed even with orphaned fork blocks");
 
@@ -3244,6 +3261,7 @@ fn test_l1_reclaim_prunes_fork_blocks_in_l1_range() {
         (l0_blocks - 1) as u32,
         false, // append-only L0
         100,
+        None,
     )
     .expect("L0 append-only squash");
 
@@ -3331,6 +3349,7 @@ fn test_l1_reclaim_prunes_fork_blocks_in_l1_range() {
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
         100,
+        None,
     )
     .expect("L1 reclaim should succeed after pruning fork blocks in L1 range");
 
@@ -3606,6 +3625,7 @@ fn test_squash_after_stub_with_reclaim() {
         l1_max,
         true, // reclaim
         100,
+        None,
     )
     .expect("incremental squash after stub should succeed");
 
@@ -3672,6 +3692,7 @@ fn test_reclaim_after_stub_preserves_per_block_data() {
         (total_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("squash after stub");
 
@@ -4091,8 +4112,8 @@ fn test_collect_history_block_star_dedup() {
 
     let history = collect_history(&mut marf, &blocks, 0, (num_blocks - 1) as u32).unwrap();
 
-    // Check every BLOCK_HEIGHT_TO_HASH key: each should have exactly 1
-    // transition after dedup (the re-confirmation write is value-identical).
+    // Check every BLOCK_HEIGHT_TO_HASH key: each should have exactly 1 transition after dedup (the
+    // re-confirmation write is value-identical).
     for h in 0..num_blocks {
         let key = format!("{BLOCK_HEIGHT_TO_HASH_MAPPING_KEY}::{h}");
         let key_hash = TrieHash::from_key(&key);
@@ -4104,8 +4125,8 @@ fn test_collect_history_block_star_dedup() {
                 entries.len()
             );
         }
-        // A key might not appear if it was only written at a height outside
-        // the range, or if both writes landed in the same block (height 0).
+        // A key might not appear if it was only written at a height outside the range, or if both
+        // writes landed in the same block (height 0).
     }
 
     // Check every BLOCK_HASH_TO_HEIGHT key similarly.
@@ -4130,19 +4151,17 @@ fn test_collect_history_block_star_dedup() {
     );
 }
 
-/// Benchmark: measure `collect_history` wall-clock time at representative
-/// block counts. Run with `--ignored --nocapture` to see output.
+/// Benchmark: measure `collect_history` wall-clock time at representative block counts. Run with
+/// `--ignored --nocapture` to see output.
 ///
-/// This is an `#[ignore]`d test rather than a criterion bench because
-/// stackslib does not depend on criterion and the test is too expensive
-/// for CI.
+/// This is an `#[ignore]`d test rather than a criterion bench because stackslib does not depend on
+/// criterion and the test is too expensive for CI.
 #[test]
 #[ignore]
 fn bench_collect_history_wall_clock() {
     use std::time::Instant;
 
-    // Representative block counts — small enough to run locally,
-    // large enough to measure.
+    // Representative block counts — small enough to run locally, large enough to measure.
     let block_counts: &[usize] = &[100, 500, 1000];
     // Keys per block: a realistic mix of hot (every-block) and cold keys.
     let keys_per_block = 20;
@@ -4214,8 +4233,7 @@ fn bench_collect_history_wall_clock() {
 // Phase 2: FullHistory blob write tests
 // ---------------------------------------------------------------------------
 
-/// Basic end-to-end test: squash with FullHistory mode, verify stats,
-/// tip reads, and trailer mode.
+/// Basic end-to-end test: squash with FullHistory mode, verify stats, tip reads, and trailer mode.
 #[test]
 fn test_squash_full_history_basic() {
     let test_dir = fresh_test_dir("test_squash_full_history_basic");
@@ -4278,9 +4296,9 @@ fn test_squash_full_history_basic() {
     let footer_offset =
         SquashTrailer::read_footer(blob_slice).expect("should find trailer footer in blob");
     let trailer_end = blob_slice.len() - SQUASH_FOOTER_SIZE;
-    // Use the blob-relative trailer offset as `trailer_file_offset`. We're
-    // not consulting `root_node_locations` in this test, so the absolute
-    // anchor doesn't matter — any consistent value works.
+    // Use the blob-relative trailer offset as `trailer_file_offset`. We're not consulting
+    // `root_node_locations` in this test, so the absolute anchor doesn't matter — any consistent
+    // value works.
     let trailer = SquashTrailer::read_from(
         &blob_slice[footer_offset as usize..trailer_end],
         levels[0].blob_offset + footer_offset,
@@ -4294,9 +4312,9 @@ fn test_squash_full_history_basic() {
     );
 }
 
-/// Verify the blob actually contains TrieLeafSquashed nodes for multi-
-/// transition keys and TrieLeaf for single-write keys. Scans the raw
-/// blob and decodes each node to check its type and entry contents.
+/// Verify the blob actually contains TrieLeafSquashed nodes for multi- transition keys and TrieLeaf
+/// for single-write keys. Scans the raw blob and decodes each node to check its type and entry
+/// contents.
 #[test]
 fn test_squash_full_history_blob_contains_leaf_squashed() {
     let test_dir = fresh_test_dir("test_squash_full_history_blob_leaf_squashed");
@@ -4366,14 +4384,13 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
         SquashTrailer::read_footer(blob_slice).expect("should find trailer footer") as usize;
 
     // Scan sequential nodes: skip header (36 bytes).
-    // Leaf nodes are stored hash-free (body only); internal nodes are
-    // stored as hash(32) + body.
     //
-    // To avoid a fragile heuristic on the first byte (which could be an
-    // arbitrary hash byte for internal nodes), we use a trial-decode
-    // approach: try interpreting pos as a hash-free leaf body.  If that
-    // succeeds we accept it; otherwise we skip 32 bytes of hash prefix
-    // and decode the body of an internal node.
+    // Leaf nodes are stored hash-free (body only); internal nodes are stored as hash(32) + body.
+    //
+    // To avoid a fragile heuristic on the first byte (which could be an arbitrary hash byte for
+    // internal nodes), we use a trial-decode approach: try interpreting pos as a hash-free leaf
+    // body.  If that succeeds we accept it; otherwise we skip 32 bytes of hash prefix and decode
+    // the body of an internal node.
     let header_size = 36usize;
     let mut pos = header_size;
     let nodes_end = trailer_offset;
@@ -4407,10 +4424,11 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
                             w[1].0
                         );
                     }
-                    // Identify the hot_key LeafSquashed by its signature:
-                    // `num_blocks` entries with values matching "hot_{h}".
-                    // Other LeafSquashed in the blob (cold_key, internal MARF
-                    // mapping keys) have fewer entries and different values.
+                    // Identify the hot_key LeafSquashed by its signature: `num_blocks` entries with
+                    // values matching "hot_{h}".
+                    //
+                    // Other LeafSquashed in the blob (cold_key, internal MARF mapping keys) have
+                    // fewer entries and different values.
                     let looks_like_hot_key = sq.entries.len() == num_blocks
                         && sq
                             .entries
@@ -4476,8 +4494,8 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
     );
 }
 
-/// Verify that squashing with FullHistory produces the same root hashes
-/// as TipOnly (the Merkle hash model is identical — hash covers tip value only).
+/// Verify that squashing with FullHistory produces the same root hashes as `TipOnly` (the Merkle
+/// hash model is identical — hash covers tip value only).
 #[test]
 fn test_squash_full_history_root_hashes_match_tip_only() {
     let test_dir = fresh_test_dir("test_squash_full_history_roots_match");
@@ -4520,9 +4538,9 @@ fn test_squash_full_history_root_hashes_match_tip_only() {
 // Phase 3: Read path integration tests
 // ---------------------------------------------------------------------------
 
-/// Open a FullHistory squash blob at various historical block hashes and
-/// verify that `marf.get(historical_block, key)` returns the correct
-/// point-in-time value for multi-transition keys.
+/// Open a FullHistory squash blob at various historical block hashes and verify that
+/// `marf.get(historical_block, key)` returns the correct point-in-time value for multi-transition
+/// keys.
 #[test]
 fn test_full_history_read_at_historical_heights() {
     let test_dir = fresh_test_dir("test_full_history_read_historical");
@@ -4609,8 +4627,8 @@ fn test_full_history_read_at_historical_heights() {
     }
 }
 
-/// Verify that `value_at_height` returns `None` for pre-first-write heights,
-/// which propagates as `Ok(None)` (NotFoundError → None) through `marf.get`.
+/// Verify that `value_at_height` returns `None` for pre-first-write heights, which propagates as
+/// `Ok(None)` (NotFoundError → None) through `marf.get`.
 #[test]
 fn test_full_history_read_before_first_write_returns_none() {
     let test_dir = fresh_test_dir("test_full_history_read_before_write");
@@ -4694,9 +4712,8 @@ fn test_full_history_read_before_first_write_returns_none() {
     );
 }
 
-/// Verify that tip reads through a FullHistory squash blob still return
-/// the tip value (not a historical value) even though the underlying leaf
-/// is a TrieLeafSquashed.
+/// Verify that tip reads through a FullHistory squash blob still return the tip value (not a
+/// historical value) even though the underlying leaf is a TrieLeafSquashed.
 #[test]
 fn test_full_history_tip_reads_return_tip_value() {
     let test_dir = fresh_test_dir("test_full_history_tip_reads");
@@ -4735,9 +4752,9 @@ fn test_full_history_tip_reads_return_tip_value() {
 // Phase 4: Incremental squash with FullHistory
 // ---------------------------------------------------------------------------
 
-/// Two-level incremental squash with FullHistory: build L0 (blocks 0..4),
-/// squash L0, add L1 blocks (5..9) that update a hot key each block,
-/// squash L1 with FullHistory, verify historical reads across both levels.
+/// Two-level incremental squash with FullHistory: build L0 (blocks 0..4), squash L0, add L1 blocks
+/// (5..9) that update a hot key each block, squash L1 with FullHistory, verify historical reads
+/// across both levels.
 #[test]
 fn test_incremental_full_history_basic() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -4797,15 +4814,15 @@ fn test_incremental_full_history_basic() {
     .expect("L0 squash should succeed");
 
     // ── Commit L1 blocks onto squashed MARF ──
-    // The L1 blocks are already in the source; we need them in the dst.
-    // Simpler approach: copy the source before any squash, then squash in-place.
-    // But setup_squash_source_marf writes to src_path. Let's use the already-
-    // squashed dst and write L1 blocks on top of it. Since we already wrote all
-    // blocks to the source, we need a different approach.
     //
-    // Actually, let's re-approach: build all blocks in src, squash L0 to dst,
-    // then for L1 we need the blocks in the dst file. The simplest way is:
-    // build L0 blocks, squash L0, open squashed, commit L1 blocks, close, squash L1.
+    // The L1 blocks are already in the source; we need them in the dst. Simpler approach: copy the
+    // source before any squash, then squash in-place. But setup_squash_source_marf writes to
+    // src_path. Let's use the already- squashed dst and write L1 blocks on top of it. Since we
+    // already wrote all blocks to the source, we need a different approach.
+    //
+    // Actually, let's re-approach: build all blocks in src, squash L0 to dst, then for L1 we need
+    // the blocks in the dst file. The simplest way is: build L0 blocks, squash L0, open squashed,
+    // commit L1 blocks, close, squash L1.
 
     // Let's redo this with two-phase write.
     let _ = std::fs::remove_dir_all(&test_dir);
@@ -4883,6 +4900,7 @@ fn test_incremental_full_history_basic() {
         (l0_blocks + l1_blocks - 1) as u32,
         false,
         100,
+        None,
     )
     .expect("L1 incremental squash should succeed");
 
@@ -4917,8 +4935,9 @@ fn test_incremental_full_history_basic() {
 }
 
 /// Verify baseline inheritance: a key written only in L0 is inherited by L1.
-/// After incremental FullHistory squash of L1, reading the key at L1 heights
-/// should return the L0 tip value (via the synthetic baseline entry).
+///
+/// After incremental FullHistory squash of L1, reading the key at L1 heights should return the L0
+/// tip value (via the synthetic baseline entry).
 #[test]
 fn test_incremental_full_history_baseline_inheritance() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -5003,15 +5022,15 @@ fn test_incremental_full_history_baseline_inheritance() {
         (l0_blocks + l1_blocks - 1) as u32,
         false,
         100,
+        None,
     )
     .expect("L1 incremental squash should succeed");
 
-    // key_a and key_b are inherited from L0 and never updated in L1, so they
-    // have no entries in L1's history and stay as plain TrieLeaf. key_c has
-    // real in-range transitions and is promoted. MARF-internal mapping keys
-    // written at every L1 block also appear in history; they too get
-    // promoted to `TrieLeafSquashed` so that reads at heights below their
-    // first write correctly return `None` rather than a post-hoc value.
+    // key_a and key_b are inherited from L0 and never updated in L1, so they have no entries in
+    // L1's history and stay as plain TrieLeaf. key_c has real in-range transitions and is promoted.
+    // MARF-internal mapping keys written at every L1 block also appear in history; they too get
+    // promoted to `TrieLeafSquashed` so that reads at heights below their first write correctly
+    // return `None` rather than a post-hoc value.
     assert!(
         l1_stats.leaves_squashed >= 1,
         "at least key_c should be promoted to TrieLeafSquashed (got {})",
@@ -5058,8 +5077,9 @@ fn test_incremental_full_history_baseline_inheritance() {
 }
 
 /// Two-level incremental squash with FullHistory and `reclaim = true`.
-/// Verifies that blob space is reclaimed and historical reads still work
-/// across both levels after the L1 blob overwrites dead L1 per-block data.
+///
+/// Verifies that blob space is reclaimed and historical reads still work across both levels after
+/// the L1 blob overwrites dead L1 per-block data.
 #[test]
 fn test_incremental_full_history_reclaim() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -5141,6 +5161,7 @@ fn test_incremental_full_history_reclaim() {
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim
         100,
+        None,
     )
     .expect("L1 incremental squash with reclaim should succeed");
 
@@ -5171,10 +5192,10 @@ fn test_incremental_full_history_reclaim() {
     );
 }
 
-/// Regression test for baseline coverage when a key is inherited across the
-/// level boundary, structurally rewritten with the same value inside L1, and
-/// then changed later in L1. The baseline entry must still be present so that
-/// `value_at_height` covers heights at the start of the L1 range.
+/// Regression test for baseline coverage when a key is inherited across the level boundary,
+/// structurally rewritten with the same value inside L1, and then changed later in L1. The baseline
+/// entry must still be present so that `value_at_height` covers heights at the start of the L1
+/// range.
 #[test]
 fn test_incremental_full_history_baseline_with_later_transition() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -5262,6 +5283,7 @@ fn test_incremental_full_history_baseline_with_later_transition() {
         (l0_blocks + l1_blocks - 1) as u32,
         false,
         100,
+        None,
     )
     .expect("L1 incremental squash should succeed");
 
@@ -5329,6 +5351,7 @@ fn test_get_with_proof_in_squash_range_returns_error() {
         max_height,
         true,
         100,
+        None,
     )
     .expect("squash should succeed");
 
@@ -5381,9 +5404,8 @@ fn test_full_history_squash_end_to_end() {
 
     let num_blocks: usize = 10;
 
-    // Build a MARF where "key_a" is updated at every block (simulating a hot
-    // key that `at-block` might reference historically) and "key_b" is written
-    // once and never updated (cold key).
+    // Build a MARF where "key_a" is updated at every block (simulating a hot key that `at-block`
+    // might reference historically) and "key_b" is written once and never updated (cold key).
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
     let mut marf = MARF::<StacksBlockId>::from_path(&src_path, open_opts.clone()).unwrap();
 
@@ -5482,8 +5504,8 @@ fn test_full_history_squash_end_to_end() {
 // Phase 6, Item 1: post-squash COW correctly flattens LeafSquashed → Leaf
 // ---------------------------------------------------------------------------
 
-/// After a FullHistory squash, extending the MARF with a new block that
-/// writes to a key currently stored as `TrieLeafSquashed` should:
+/// After a FullHistory squash, extending the MARF with a new block that writes to a key currently
+/// stored as `TrieLeafSquashed` should:
 ///   - Produce a plain `TrieLeaf` in the new block's trie (COW flattening).
 ///   - Return the new value when read at the new tip.
 ///   - Still return correct historical values when read at old squashed blocks.
@@ -5542,6 +5564,7 @@ fn test_cow_flattens_leaf_squashed_to_leaf() {
         max_height,
         true, // reclaim
         100,
+        None,
     )
     .expect("FullHistory squash should succeed");
     assert!(
@@ -5703,6 +5726,7 @@ fn test_cow_flattens_leaf_squashed_at_non_tip_parent_height() {
         (NUM_BLOCKS - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("FullHistory squash should succeed");
 
@@ -5743,11 +5767,11 @@ fn test_cow_flattens_leaf_squashed_at_non_tip_parent_height() {
 // Phase 6, Item 2: mixed stack — FullHistory L0 + TipOnly L1
 // ---------------------------------------------------------------------------
 
-/// Simulates the steady-state for a `TipOnly`-configured node that
-/// replayed pre-3.4 blocks with `FullHistory`. Lower level uses
-/// `FullHistory`; upper level uses `TipOnly`. Verifies:
-///   - Historical reads into the FullHistory range return correct
-///     point-in-time values.
+/// Simulates the steady-state for a `TipOnly`-configured node that replayed pre-3.4 blocks with
+/// `FullHistory`. Lower level uses `FullHistory`; upper level uses `TipOnly`.
+///
+/// Verifies:
+///   - Historical reads into the FullHistory range return correct point-in-time values.
 ///   - Tip reads across both levels return the correct final values.
 #[test]
 fn test_mixed_stack_full_history_l0_tip_only_l1() {
@@ -5827,6 +5851,7 @@ fn test_mixed_stack_full_history_l0_tip_only_l1() {
         l0_max,
         true, // reclaim per-block blobs
         100,
+        None,
     )
     .expect("L0 FullHistory squash should succeed");
     assert!(
@@ -5881,6 +5906,7 @@ fn test_mixed_stack_full_history_l0_tip_only_l1() {
         l1_max,
         false,
         100,
+        None,
     )
     .expect("L1 TipOnly squash should succeed");
     assert!(l1_stats.nodes_collected > 0);
@@ -5952,12 +5978,10 @@ fn test_mixed_stack_full_history_l0_tip_only_l1() {
         );
     }
 
-    // --- Verify intermediate L1 reads after TipOnly squash ---
-    // TipOnly preserves the full trie structure with separate per-block
-    // leaf nodes (unlike FullHistory which merges them into
-    // TrieLeafSquashed). Reads at intermediate L1 blocks should still
-    // return the correct historical values, matching the unsquashed
-    // reference MARF.
+    // --- Verify intermediate L1 reads after TipOnly squash --- TipOnly preserves the full trie
+    // structure with separate per-block leaf nodes (unlike FullHistory which merges them into
+    // TrieLeafSquashed). Reads at intermediate L1 blocks should still return the correct historical
+    // values, matching the unsquashed reference MARF.
     for i in l0_blocks..total_blocks {
         let hot = marf
             .get(&blocks[i], "hot_key")
@@ -6005,10 +6029,9 @@ fn test_mixed_stack_full_history_l0_tip_only_l1() {
 // Phase 6, Item 3: benchmark — FullHistory tip-read overhead
 // ---------------------------------------------------------------------------
 
-/// Measure tip-read performance for `TrieLeafSquashed` nodes with varying
-/// entry counts. This documents the baseline for future lazy-decode
-/// optimization. Not a correctness test — it asserts only that reads
-/// succeed and prints timing information.
+/// Measure tip-read performance for `TrieLeafSquashed` nodes with varying entry counts. This
+/// documents the baseline for future lazy-decode optimization. Not a correctness test — it asserts
+/// only that reads succeed and prints timing information.
 #[test]
 fn test_full_history_tip_read_benchmark() {
     use std::time::Instant;
@@ -6057,6 +6080,7 @@ fn test_full_history_tip_read_benchmark() {
             max_height,
             true,
             100,
+            None,
         )
         .expect("FullHistory squash should succeed");
 
@@ -6089,11 +6113,10 @@ fn test_full_history_tip_read_benchmark() {
 // Phase 6, Item 4: FullHistory squash with oversized node region
 // ---------------------------------------------------------------------------
 
-/// Verify that `checked_offset_add` correctly rejects oversized squash
-/// blobs.  We cannot practically generate a 3.5 GiB blob in a test, so
-/// we test the guard function directly with boundary values. The
-/// existing `test_checked_offset_add_overflow` covers the arithmetic;
-/// this test verifies the error message is actionable.
+/// Verify that `checked_offset_add` correctly rejects oversized squash blobs.  We cannot
+/// practically generate a 3.5 GiB blob in a test, so we test the guard function directly with
+/// boundary values. The existing `test_checked_offset_add_overflow` covers the arithmetic; this
+/// test verifies the error message is actionable.
 #[test]
 fn test_squash_blob_size_limit_error_message() {
     use crate::chainstate::stacks::index::squash::{
@@ -6148,17 +6171,17 @@ fn test_squash_blob_size_limit_error_message() {
 
 /// Regression test for the `reopen_connection()` squash-metadata bug.
 ///
-/// `reopen_connection()` creates a lightweight read-only connection that shares the
-/// parent's SQLite handle but builds a *fresh* `TrieStorageTransientData`. Before the
-/// fix, the fresh transient data had empty squash metadata — so reads through the
-/// reopened connection would try to parse hash-free squash-blob leaves with the
-/// hash-prefix-expected path, producing garbage/corruption. In production this path
-/// is hit by `get_indexed()` (util_lib/db.rs) which is called on every Clarity read.
+/// `reopen_connection()` creates a lightweight read-only connection that shares the parent's SQLite
+/// handle but builds a *fresh* `TrieStorageTransientData`. Before the fix, the fresh transient data
+/// had empty squash metadata — so reads through the reopened connection would try to parse
+/// hash-free squash-blob leaves with the hash-prefix-expected path, producing garbage/corruption.
+/// In production this path is hit by `get_indexed()` (util_lib/db.rs) which is called on every
+/// Clarity read.
 ///
-/// Key design: "cold" keys are written only during L0 and **never updated** afterward.
-/// Every extension block probes them through `reopen_connection().get()`, which forces
-/// the walk all the way through the reclaimed squash blob for the entire 700-block
-/// extension. Without the fix, these reads corrupt.
+/// Key design: "cold" keys are written only during L0 and **never updated** afterward. Every
+/// extension block probes them through `reopen_connection().get()`, which forces the walk all the
+/// way through the reclaimed squash blob for the entire 700-block extension. Without the fix, these
+/// reads corrupt.
 #[test]
 fn test_l0_reclaim_squash_long_extension_reads_with_reopen() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -6189,8 +6212,8 @@ fn test_l0_reclaim_squash_long_extension_reads_with_reopen() {
     let (ref_marf, _, _) = setup_squash_source_marf(&ref_path, l0_blocks, keys_per_block);
     drop(ref_marf);
 
-    // Insert cold keys into the last L0 block of both MARFs. These are never
-    // updated after this point, so reads always walk into the squash blob.
+    // Insert cold keys into the last L0 block of both MARFs. These are never updated after this
+    // point, so reads always walk into the squash blob.
     {
         let last_l0 = l0_blocks_vec.last().unwrap();
         let cold_block = make_block(l0_blocks); // one extra block for cold keys
@@ -6220,6 +6243,7 @@ fn test_l0_reclaim_squash_long_extension_reads_with_reopen() {
         l0_blocks as u32, // includes the cold-key block
         true,
         100,
+        None,
     )
     .expect("L0 reclaim squash");
 
@@ -6251,10 +6275,9 @@ fn test_l0_reclaim_squash_long_extension_reads_with_reopen() {
             "root hash mismatch at extension block {e} (height {block_num})"
         );
 
-        // ---- Cold-key probes via reopen_connection ----
-        // These keys live only in the squash blob and are never overwritten,
-        // so every read must walk into the reclaimed squash blob. This is the
-        // exact path that was broken before the fix.
+        // ---- Cold-key probes via reopen_connection ---- These keys live only in the squash blob
+        // and are never overwritten, so every read must walk into the reclaimed squash blob. This
+        // is the exact path that was broken before the fix.
         {
             let mut reopened = sq_marf.reopen_connection().unwrap_or_else(|err| {
                 panic!("reopen_connection() failed at height {block_num}: {err:?}")
@@ -6300,11 +6323,10 @@ fn test_l0_reclaim_squash_long_extension_reads_with_reopen() {
 
 /// Regression test for the `reopen_readonly()` squash-metadata bug.
 ///
-/// Same root cause as the `reopen_connection()` bug above, but exercising the
-/// fully independent `TrieFileStorage` path used by the Clarity VM
-/// (`marf.reopen_readonly()`) and `get_indexed_ref()`. Before the fix, the
-/// readonly storage had empty squash metadata and would misparse hash-free
-/// leaves in the squash blob.
+/// Same root cause as the `reopen_connection()` bug above, but exercising the fully independent
+/// `TrieFileStorage` path used by the Clarity VM (`marf.reopen_readonly()`) and
+/// `get_indexed_ref()`. Before the fix, the readonly storage had empty squash metadata and would
+/// misparse hash-free leaves in the squash blob.
 #[test]
 fn test_l0_reclaim_squash_reads_with_reopen_readonly() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -6364,6 +6386,7 @@ fn test_l0_reclaim_squash_reads_with_reopen_readonly() {
         l0_blocks as u32,
         true,
         100,
+        None,
     )
     .expect("L0 reclaim squash");
 
@@ -6389,9 +6412,9 @@ fn test_l0_reclaim_squash_reads_with_reopen_readonly() {
         ref_marf.seal().unwrap();
         ref_marf.commit().unwrap();
 
-        // ---- Cold-key probes via reopen_readonly ----
-        // This creates a fully independent TrieFileStorage (own DB handle,
-        // own blob file) — the path used by the Clarity VM and get_indexed.
+        // ---- Cold-key probes via reopen_readonly ---- This creates a fully independent
+        // TrieFileStorage (own DB handle, own blob file) — the path used by the Clarity VM and
+        // get_indexed.
         {
             let mut ro_marf = sq_marf.reopen_readonly().unwrap_or_else(|err| {
                 panic!("reopen_readonly() failed at height {block_num}: {err:?}")
@@ -6431,8 +6454,8 @@ fn test_l0_reclaim_squash_reads_with_reopen_readonly() {
 
 /// Verify that squash_level_incremental correctly rejects squashing below the chain tip.
 ///
-/// `verify_no_descendants` ensures that no committed blocks exist above the squash
-/// range. This prevents accidental pruning of live future blocks.
+/// `verify_no_descendants` ensures that no committed blocks exist above the squash range. This
+/// prevents accidental pruning of live future blocks.
 #[test]
 fn test_squash_rejects_when_blocks_exist_above_range() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -6448,8 +6471,15 @@ fn test_squash_rejects_when_blocks_exist_above_range() {
     drop(src_marf);
 
     // Try to squash only 0..=9 when blocks 10..=14 exist — should fail.
-    let result =
-        squash_level_incremental::<StacksBlockId>(&marf_path, SquashMode::TipOnly, 0, 9, true, 100);
+    let result = squash_level_incremental::<StacksBlockId>(
+        &marf_path,
+        SquashMode::TipOnly,
+        0,
+        9,
+        true,
+        100,
+        None,
+    );
 
     assert!(
         result.is_err(),
@@ -6511,10 +6541,9 @@ fn tier1_block_hash(height: usize) -> StacksBlockId {
     StacksBlockId::from_bytes(&bytes).unwrap()
 }
 
-/// Build the nonce-style workload on top of `marf`, committing `blocks_to_add`
-/// blocks starting from `parent`. Returns the list of committed block hashes
-/// in order. The workload is fully determined by `height`, so both squash
-/// and reference MARFs receive identical writes.
+/// Build the nonce-style workload on top of `marf`, committing `blocks_to_add` blocks starting from
+/// `parent`. Returns the list of committed block hashes in order. The workload is fully determined
+/// by `height`, so both squash and reference MARFs receive identical writes.
 fn tier1_extend_nonce_chain(
     marf: &mut MARF<StacksBlockId>,
     parent: StacksBlockId,
@@ -6546,9 +6575,9 @@ fn tier1_extend_nonce_chain(
     out
 }
 
-/// Reverse-lookup: given a MARFValue byte-pattern, find which `acct_N_nonce_K`
-/// string produces it. Returns a human-readable label, or `"<unknown>"` if no
-/// match within the searched (num_accounts × search_heights) space.
+/// Reverse-lookup: given a MARFValue byte-pattern, find which `acct_N_nonce_K` string produces it.
+/// Returns a human-readable label, or `"<unknown>"` if no match within the searched (num_accounts ×
+/// search_heights) space.
 fn tier1_identify_value(
     value_bytes: &[u8],
     num_accounts: usize,
@@ -6566,8 +6595,8 @@ fn tier1_identify_value(
     "<unknown>".to_string()
 }
 
-/// Expected value for `acct` at `height`: the latest touch at or before that
-/// height, or None if the account has never been touched.
+/// Expected value for `acct` at `height`: the latest touch at or before that height, or None if the
+/// account has never been touched.
 fn tier1_expected_at(
     acct: usize,
     height: usize,
@@ -6585,9 +6614,9 @@ fn tier1_expected_at(
     None
 }
 
-/// Minimal reproduction isolator: N accounts, each with its own nonce-style
-/// per-block updates, L0 FullHistory+reclaim squash. Runs the same check for
-/// every account. Intended to narrow the boundary between "works" and "breaks".
+/// Minimal reproduction isolator: N accounts, each with its own nonce-style per-block updates, L0
+/// FullHistory+reclaim squash. Runs the same check for every account. Intended to narrow the
+/// boundary between "works" and "breaks".
 #[test]
 fn test_tier1_debug_two_accounts_historical_reads() {
     tier1_debug_n_account_chain(2, 6);
@@ -6603,9 +6632,9 @@ fn test_tier1_debug_four_accounts_historical_reads() {
     tier1_debug_n_account_chain(4, 6);
 }
 
-/// Minimal reproduction with ONE key that is touched only at even heights.
-/// Odd-height reads must walk through backptrs; after squash, they should
-/// still return the last-updated value ≤ that height.
+/// Minimal reproduction with ONE key that is touched only at even heights. Odd-height reads must
+/// walk through backptrs; after squash, they should still return the last-updated value ≤ that
+/// height.
 #[test]
 fn test_tier1_debug_single_key_sparse_updates() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -6653,6 +6682,7 @@ fn test_tier1_debug_single_key_sparse_updates() {
         (num_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 FullHistory reclaim squash");
 
@@ -6687,10 +6717,9 @@ fn test_tier1_debug_single_key_sparse_updates() {
     assert_eq!(fail_count, 0, "single-key sparse reads diverged");
 }
 
-/// Same shape as the N-account test, but each account is only touched on
-/// heights where `h % num_accounts == a` (i.e. sparse updates). This forces
-/// the read path to walk through backptrs at ancestor heights where an
-/// account's leaf lives in an older block.
+/// Same shape as the N-account test, but each account is only touched on heights where `h %
+/// num_accounts == a` (i.e. sparse updates). This forces the read path to walk through backptrs at
+/// ancestor heights where an account's leaf lives in an older block.
 #[test]
 fn test_tier1_debug_sparse_updates_two_accounts() {
     tier1_debug_sparse_n_account_chain(2, 6);
@@ -6711,9 +6740,9 @@ fn tier1_debug_sparse_n_account_chain(num_accounts: usize, num_blocks: usize) {
     let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     let mut blocks: Vec<StacksBlockId> = Vec::new();
 
-    // Sparse: account `a` is touched only at heights where h % num_accounts == a.
-    // Every block still inserts at least one key (a touch for whichever account
-    // matches the height's modulus), so each block writes non-trivially.
+    // Sparse: account `a` is touched only at heights where h % num_accounts == a. Every block still
+    // inserts at least one key (a touch for whichever account matches the height's modulus), so
+    // each block writes non-trivially.
     for h in 0..num_blocks {
         let mut bytes = [0u8; 32];
         bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
@@ -6741,6 +6770,7 @@ fn tier1_debug_sparse_n_account_chain(num_accounts: usize, num_blocks: usize) {
         (num_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 FullHistory reclaim squash");
 
@@ -6800,9 +6830,8 @@ fn tier1_debug_n_account_chain(num_accounts: usize, num_blocks: usize) {
     let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     let mut blocks: Vec<StacksBlockId> = Vec::new();
 
-    // Every block updates every account with a height-encoded value so that
-    // each account has `num_blocks` transitions and can be probed at every
-    // historical height.
+    // Every block updates every account with a height-encoded value so that each account has
+    // `num_blocks` transitions and can be probed at every historical height.
     for h in 0..num_blocks {
         let mut bytes = [0u8; 32];
         bytes[28..32].copy_from_slice(&((h as u32) + 1).to_be_bytes());
@@ -6831,6 +6860,7 @@ fn tier1_debug_n_account_chain(num_accounts: usize, num_blocks: usize) {
         (num_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 FullHistory reclaim squash");
 
@@ -6867,10 +6897,9 @@ fn tier1_debug_n_account_chain(num_accounts: usize, num_blocks: usize) {
     assert_eq!(fail_count, 0, "historical reads diverged from expected");
 }
 
-/// Minimal reproduction isolator: one account updated every block, L0
-/// FullHistory+reclaim squash. If historical reads at every height return the
-/// same value (the tip), then `squash_opened_height` is being lost; if they
-/// return *different* wrong values, `value_at_height` is bugged.
+/// Minimal reproduction isolator: one account updated every block, L0 FullHistory+reclaim squash.
+/// If historical reads at every height return the same value (the tip), then `squash_opened_height`
+/// is being lost; if they return *different* wrong values, `value_at_height` is bugged.
 #[test]
 fn test_tier1_debug_single_account_historical_reads() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -6919,6 +6948,7 @@ fn test_tier1_debug_single_account_historical_reads() {
         (num_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("L0 FullHistory reclaim squash");
 
@@ -6999,8 +7029,8 @@ fn test_tier1_multi_level_full_history_reclaim_differential() {
             );
             all_blocks.extend(sq_blocks);
 
-            // Drop the squash-side writer before running the external squash
-            // so the SQLite connection doesn't race with the squash pipeline.
+            // Drop the squash-side writer before running the external squash so the SQLite
+            // connection doesn't race with the squash pipeline.
             drop(sq_marf);
 
             let min_h = start_height as u32;
@@ -7012,14 +7042,15 @@ fn test_tier1_multi_level_full_history_reclaim_differential() {
                 max_h,
                 true, // reclaim
                 100,
+                None,
             )
             .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
 
             // Reopen the squashed writer for the next level's extension.
             sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
 
-            // ── After each squash, exhaustively probe every historical height
-            //    via every read path and compare against the reference. ──
+            // ── After each squash, exhaustively probe every historical height via every read path
+            //    and compare against the reference. ──
             tier1_verify_all_paths(
                 &mut sq_marf,
                 &mut ref_marf,
@@ -7036,10 +7067,9 @@ fn test_tier1_multi_level_full_history_reclaim_differential() {
         drop(ref_marf);
     }
 
-    // ── Second pass: close everything and reopen from disk, then re-verify.
-    //    Simulates a node restart — catches bugs that only manifest when
-    //    squash metadata is loaded from persistent state rather than
-    //    carried over in-memory from the squash operation. ──
+    // ── Second pass: close everything and reopen from disk, then re-verify. Simulates a node
+    //    restart — catches bugs that only manifest when squash metadata is loaded from persistent
+    //    state rather than carried over in-memory from the squash operation. ──
     {
         let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
         let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
@@ -7057,9 +7087,9 @@ fn test_tier1_multi_level_full_history_reclaim_differential() {
     }
 }
 
-/// Exhaustively compare every (height, account) read between `sq_marf` and
-/// `ref_marf` using three read paths: direct, reopen_connection, and
-/// reopen_readonly. Any mismatch fails the test with a detailed message.
+/// Exhaustively compare every (height, account) read between `sq_marf` and `ref_marf` using three
+/// read paths: direct, reopen_connection, and reopen_readonly. Any mismatch fails the test with a
+/// detailed message.
 fn tier1_verify_all_paths(
     sq_marf: &mut MARF<StacksBlockId>,
     ref_marf: &mut MARF<StacksBlockId>,
@@ -7084,8 +7114,8 @@ fn tier1_verify_all_paths(
             });
 
             if sq_v != ref_v {
-                // Identify which `acct_N_nonce_K` the squash actually returned
-                // by reverse lookup against the finite set of possible values.
+                // Identify which `acct_N_nonce_K` the squash actually returned by reverse lookup
+                // against the finite set of possible values.
                 let identified = sq_v
                     .as_ref()
                     .map(|v| {
@@ -7116,8 +7146,8 @@ fn tier1_verify_all_paths(
         }
     }
 
-    // Path 2: `reopen_connection()` on the squash MARF (fresh transient data,
-    // shared DB handle). Real nodes use this for parallel reads.
+    // Path 2: `reopen_connection()` on the squash MARF (fresh transient data, shared DB handle).
+    // Real nodes use this for parallel reads.
     {
         let mut reopened = sq_marf
             .reopen_connection()
@@ -7139,9 +7169,9 @@ fn tier1_verify_all_paths(
         }
     }
 
-    // Path 3: `reopen_readonly()` — fully independent storage, fresh DB + blob
-    // handles. This is the Clarity VM path and was the site of the earlier
-    // squash-metadata bug. Open a fresh readonly per round of probes.
+    // Path 3: `reopen_readonly()` — fully independent storage, fresh DB + blob handles. This is the
+    // Clarity VM path and was the site of the earlier squash-metadata bug. Open a fresh readonly
+    // per round of probes.
     {
         let mut ro_marf = sq_marf
             .reopen_readonly()
@@ -7163,10 +7193,9 @@ fn tier1_verify_all_paths(
         }
     }
 
-    // Path 4: fully cold reopen via `MARF::from_path`. This is what actually
-    // happens on node restart — nothing in-memory carries over from the
-    // squash operation. A bug that only shows up here would implicate
-    // persistence/load rather than the in-memory squash state machine.
+    // Path 4: fully cold reopen via `MARF::from_path`. This is what actually happens on node
+    // restart — nothing in-memory carries over from the squash operation. A bug that only shows up
+    // here would implicate persistence/load rather than the in-memory squash state machine.
     {
         let mut cold = MARF::<StacksBlockId>::from_path(sq_path, open_opts.clone())
             .expect("cold reopen should succeed");
@@ -7188,29 +7217,9 @@ fn tier1_verify_all_paths(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tier 2: fork-at-squash-boundary, FullHistory differential
-//
-// Exercises the scenario the live genesis-sync failure suggested most strongly:
-// a canonical chain with competing fork blocks that branch off at/around the
-// squash boundary, followed by a FullHistory+reclaim squash.
-//
-// We verify that after squash:
-//   * the canonical chain's historical reads match an unsquashed reference at
-//     EVERY height via all three read paths (direct / reopen_connection /
-//     reopen_readonly),
-//   * orphan fork blocks have their external refs zeroed by the prune step
-//     (reclaim contract), and
-//   * the canonical tip is still extensible with the same root hash as the
-//     reference.
-//
-// Sparse per-account writes force backptr traversal — the exact condition
-// that masked the Fix #1 query-height bug before it was repaired.
-// ---------------------------------------------------------------------------
-
-/// Deterministic sparse nonce-style writes identical to the Tier 1 workload.
-/// `start_height` is the absolute block height; callers are responsible for
-/// passing consistent heights between the squash MARF and the reference.
+/// Deterministic sparse nonce-style writes identical to the Tier 1 workload. `start_height` is the
+/// absolute block height; callers are responsible for passing consistent heights between the squash
+/// MARF and the reference.
 fn tier2_write_canonical_block(
     marf: &mut MARF<StacksBlockId>,
     parent: &StacksBlockId,
@@ -7229,6 +7238,20 @@ fn tier2_write_canonical_block(
     marf.commit().unwrap();
 }
 
+/// Tier 2: fork-at-squash-boundary, FullHistory differential
+///
+/// Exercises the scenario the live genesis-sync failure suggested most strongly: a canonical chain
+/// with competing fork blocks that branch off at/around the squash boundary, followed by a
+/// FullHistory+reclaim squash.
+///
+/// We verify that after squash:
+///   * the canonical chain's historical reads match an unsquashed reference at EVERY height via all
+///     three read paths (direct / reopen_connection / reopen_readonly),
+///   * orphan fork blocks have their external refs zeroed by the prune step (reclaim contract), and
+///   * the canonical tip is still extensible with the same root hash as the reference.
+///
+/// Sparse per-account writes force backptr traversal — the exact condition that masked the Fix #1
+/// query-height bug before it was repaired.
 #[test]
 fn test_tier2_fork_at_boundary_full_history_differential() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -7345,9 +7368,9 @@ fn test_tier2_fork_at_boundary_full_history_differential() {
         }
     }
 
-    // ── Squash canonical range with FullHistory + reclaim ──
-    // The squash walks the canonical tip, which ignores the fork branch. The
-    // fork blocks live in the reclaim truncation zone and must be pruned.
+    // ── Squash canonical range with FullHistory + reclaim ── The squash walks the canonical tip,
+    // which ignores the fork branch. The fork blocks live in the reclaim truncation zone and must
+    // be pruned.
     squash_level_incremental::<StacksBlockId>(
         &sq_path,
         SquashMode::FullHistory,
@@ -7355,6 +7378,7 @@ fn test_tier2_fork_at_boundary_full_history_differential() {
         (canonical_blocks - 1) as u32,
         true, // reclaim
         100,
+        None,
     )
     .expect("canonical FullHistory+reclaim squash should succeed over fork blocks");
 
@@ -7393,9 +7417,8 @@ fn test_tier2_fork_at_boundary_full_history_differential() {
         "tier2-post-squash-canonical",
     );
 
-    // ── Extend both MARFs on the canonical tip and confirm the root hash
-    //    matches — otherwise the squashed MARF has accumulated consensus
-    //    divergence from the unsquashed reference. ──
+    // ── Extend both MARFs on the canonical tip and confirm the root hash matches — otherwise the
+    //    squashed MARF has accumulated consensus divergence from the unsquashed reference. ──
     let ext_block = {
         let mut b = [0u8; 32];
         b[0] = 0xEE;
@@ -7424,20 +7447,16 @@ fn test_tier2_fork_at_boundary_full_history_differential() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Tier 3: nonce-overwrite differential
-//
-// Narrow reproduction of the "Bad nonce" failure mode. A single "sender" key
-// gets updated every block with a strictly-increasing nonce value. After
-// recurring FullHistory+reclaim squashes, every historical read must match
-// the unsquashed reference — and in particular the *tip* nonce must be the
-// last write, not something lower, because that is exactly the value a block
-// validator checks when accepting a transaction.
-//
-// Also verifies reads via `reopen_readonly`, which is the path the Clarity VM
-// uses during block-processing (where nonce checks live).
-// ---------------------------------------------------------------------------
-
+/// Tier 3: nonce-overwrite differential
+///
+/// Narrow reproduction of the "Bad nonce" failure mode. A single "sender" key gets updated every
+/// block with a strictly-increasing nonce value. After recurring FullHistory+reclaim squashes,
+/// every historical read must match the unsquashed reference — and in particular the *tip* nonce
+/// must be the last write, not something lower, because that is exactly the value a block validator
+/// checks when accepting a transaction.
+///
+/// Also verifies reads via `reopen_readonly`, which is the path the Clarity VM uses during
+/// block-processing (where nonce checks live).
 #[test]
 fn test_tier3_nonce_overwrite_recurring_squash_differential() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -7446,8 +7465,8 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
     let sq_path = format!("{dir}/squashed.sqlite");
     let ref_path = format!("{dir}/reference.sqlite");
 
-    // Enough blocks to exercise multiple squash levels + inherited baseline
-    // logic, but small enough to keep the test fast.
+    // Enough blocks to exercise multiple squash levels + inherited baseline logic, but small enough
+    // to keep the test fast.
     let blocks_per_level: usize = 8;
     let num_levels: usize = 3;
     let total_blocks: usize = blocks_per_level * num_levels; // 24
@@ -7464,9 +7483,8 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
     let sender_key = "sender_nonce";
     let mk_nonce = |h: usize| MARFValue::from_value(&format!("nonce_{h}"));
 
-    // Also write a "cold" account-balance key once at height 0 and never
-    // update it, to exercise the pre-write-height-None semantics for
-    // single-write keys under recurring squashes.
+    // Also write a "cold" account-balance key once at height 0 and never update it, to exercise the
+    // pre-write-height-None semantics for single-write keys under recurring squashes.
     let cold_key = "sender_balance";
     let cold_val = MARFValue::from_value("initial_balance");
 
@@ -7515,6 +7533,7 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
                     max_h,
                     true,
                     100,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("recurring squash at height {h} failed: {e:?}"));
                 sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
@@ -7522,8 +7541,8 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
         }
     }
 
-    // ── Cold reopen both MARFs — the clarity/validator path starts from
-    //    freshly-loaded squash metadata. ──
+    // ── Cold reopen both MARFs — the clarity/validator path starts from freshly-loaded squash
+    //    metadata. ──
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
 
@@ -7592,9 +7611,8 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
         }
     }
 
-    // ── The direct "Bad nonce" repro: read nonce at tip, check it is the
-    //    latest write. Any off-by-one here is what a block validator would
-    //    reject a valid next transaction on. ──
+    // ── The direct "Bad nonce" repro: read nonce at tip, check it is the latest write. Any
+    //    off-by-one here is what a block validator would reject a valid next transaction on. ──
     let tip = blocks.last().unwrap();
     let tip_nonce = sq_marf.get(tip, sender_key).unwrap().unwrap();
     assert_eq!(
@@ -7604,10 +7622,9 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
          squash-time read-divergence regression"
     );
 
-    // ── Verify that reads at heights BELOW the cold-key's write height
-    //    for a hypothetical later-written key return None. Simulate by
-    //    writing a post-squash key on an extension block and confirming
-    //    it is visible at the extension tip and absent at earlier blocks. ──
+    // ── Verify that reads at heights BELOW the cold-key's write height for a hypothetical
+    //    later-written key return None. Simulate by writing a post-squash key on an extension block
+    //    and confirming it is visible at the extension tip and absent at earlier blocks. ──
     let ext_block = {
         let mut b = [0u8; 32];
         b[0] = 0xEE;
@@ -7647,8 +7664,8 @@ fn test_tier3_live_handle_refresh_after_recurring_squash_tip_nonce() {
     let sq_path = format!("{dir}/squashed.sqlite");
     let ref_path = format!("{dir}/reference.sqlite");
 
-    // Match the live shape more closely: many recurring squashes on one long-lived
-    // writer handle, with immediate post-refresh reads on the same handle.
+    // Match the live shape more closely: many recurring squashes on one long-lived writer handle,
+    // with immediate post-refresh reads on the same handle.
     let blocks_per_level: usize = 10;
     let num_levels: usize = 11;
     let total_blocks: usize = blocks_per_level * num_levels;
@@ -7724,6 +7741,7 @@ fn test_tier3_live_handle_refresh_after_recurring_squash_tip_nonce() {
                 max_h,
                 true,
                 100,
+                None,
             )
             .unwrap_or_else(|e| panic!("live-handle recurring squash at height {h} failed: {e:?}"));
 
@@ -7800,8 +7818,8 @@ fn test_tier3_live_handle_refresh_after_recurring_sparse_nonce_squash() {
         sq_marf.insert(hot_key, mk_hot_value(h)).unwrap();
         ref_marf.insert(hot_key, mk_hot_value(h)).unwrap();
 
-        // Sparse sender nonce: only every third block, like a sender who submits
-        // transactions intermittently across the squashed range.
+        // Sparse sender nonce: only every third block, like a sender who submits transactions
+        // intermittently across the squashed range.
         if h % 3 == 0 {
             sq_marf.insert(sender_key, mk_sender_nonce(h)).unwrap();
             ref_marf.insert(sender_key, mk_sender_nonce(h)).unwrap();
@@ -7831,6 +7849,7 @@ fn test_tier3_live_handle_refresh_after_recurring_sparse_nonce_squash() {
                 max_h,
                 true,
                 100,
+                None,
             )
             .unwrap_or_else(|e| {
                 panic!("sparse live-handle recurring squash at height {h} failed: {e:?}")
@@ -7863,25 +7882,19 @@ fn test_tier3_live_handle_refresh_after_recurring_sparse_nonce_squash() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tier 4: headers-MARF pattern — recurring TipOnly + reclaim squashes
-//
-// Mirrors how `maybe_squash` treats the HEADERS MARF in production: TipOnly
-// mode, reclaim=true, recurring at a fixed block cadence. Live genesis-sync
-// has been observed to hit a `stored_node_id_from_bytes: invalid node ID
-// byte=0x12` corruption error AFTER the 7th recurring squash (block 7000),
-// when the p2p thread reads historical tenure-start-block data off an
-// ancestor tip.
-//
-// This test mimics the minimal conditions:
-//   * enough recurring squashes that cross-level backptrs must traverse
-//     several earlier levels,
-//   * reads via `reopen_readonly` (the Clarity VM / p2p read path),
-//   * reads at every block in every prior level — specifically including
-//     blocks whose leaves live in the squash blob and are read via
-//     cross-level backptrs.
-// ---------------------------------------------------------------------------
-
+/// Tier 4: headers-MARF pattern — recurring TipOnly + reclaim squashes
+///
+/// Mirrors how `maybe_squash` treats the HEADERS MARF in production: TipOnly mode, reclaim=true,
+/// recurring at a fixed block cadence. Live genesis-sync has been observed to hit a
+/// `stored_node_id_from_bytes: invalid node ID byte=0x12` corruption error AFTER the 7th recurring
+/// squash (block 7000), when the p2p thread reads historical tenure-start-block data off an
+/// ancestor tip.
+///
+/// This test mimics the minimal conditions:
+///   * enough recurring squashes that cross-level backptrs must traverse several earlier levels,
+///   * reads via `reopen_readonly` (the Clarity VM / p2p read path),
+///   * reads at every block in every prior level — specifically including blocks whose leaves live
+///     in the squash blob and are read via cross-level backptrs.
 #[test]
 fn test_tier4_headers_style_recurring_tip_only_reclaim() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -7892,8 +7905,8 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
 
-    // 7 squashes at a cadence of 20 blocks, matching the genesis-sync shape
-    // (7 squashes at 1000-block cadence) in a fraction of the time.
+    // 7 squashes at a cadence of 20 blocks, matching the genesis-sync shape (7 squashes at
+    // 1000-block cadence) in a fraction of the time.
     let blocks_per_level: usize = 20;
     let num_levels: usize = 7;
     let total_blocks: usize = blocks_per_level * num_levels; // 140
@@ -7905,9 +7918,9 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
         StacksBlockId::from_bytes(&bytes).unwrap()
     };
 
-    // Keys that mimic the headers-MARF key shape: one hot key rewritten every
-    // block, plus a family of "tenure_start_block_id::{h}" keys written
-    // sparsely (mimicking the exact key pattern in the failing live error).
+    // Keys that mimic the headers-MARF key shape: one hot key rewritten every block, plus a family
+    // of "tenure_start_block_id::{h}" keys written sparsely (mimicking the exact key pattern in the
+    // failing live error).
     let hot_key = "__hot_header_key";
     let tenure_start_key = |h: usize| format!("tenure_start_block_id::{h:08x}");
 
@@ -7933,9 +7946,8 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
             sq_marf.insert(hot_key, hot_val.clone()).unwrap();
             ref_marf.insert(hot_key, hot_val).unwrap();
 
-            // Tenure-start key: written ONCE at the block corresponding to
-            // this height. Later reads target it from much-later tip blocks
-            // via cross-level backptrs.
+            // Tenure-start key: written ONCE at the block corresponding to this height. Later reads
+            // target it from much-later tip blocks via cross-level backptrs.
             let tk = tenure_start_key(h);
             let tv = MARFValue::from_value(&format!("tenure_v_{h}"));
             sq_marf.insert(&tk, tv.clone()).unwrap();
@@ -7958,6 +7970,7 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
                     max_h,
                     true,
                     100,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("TipOnly recurring squash at h={h} failed: {e:?}"));
                 sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
@@ -7965,17 +7978,15 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
         }
     }
 
-    // Cold reopen — matches the live behavior where p2p reads come from a
-    // fresh handle after squashes have completed.
+    // Cold reopen — matches the live behavior where p2p reads come from a fresh handle after
+    // squashes have completed.
     let sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts).unwrap();
 
-    // Probe every historical tenure-start key from the final tip via
-    // reopen_readonly. This is the exact read pattern the live sync was
-    // doing when the 0x12 error appeared: the p2p thread calls
-    // `NakamotoChainState::get_nakamoto_tenure_start_block_header` off an
-    // ancestor index hash, which walks the merged squashed tries and
-    // crosses several backptrs.
+    // Probe every historical tenure-start key from the final tip via reopen_readonly. This is the
+    // exact read pattern the live sync was doing when the 0x12 error appeared: the p2p thread calls
+    // `NakamotoChainState::get_nakamoto_tenure_start_block_header` off an ancestor index hash,
+    // which walks the merged squashed tries and crosses several backptrs.
     let tip = blocks.last().unwrap();
     let mut ro = sq_marf.reopen_readonly().unwrap();
 
@@ -7999,12 +8010,11 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
          after {num_levels} recurring TipOnly+reclaim squashes"
     );
 
-    // Probe hot_key reads at every historical block via reopen_readonly. TipOnly
-    // mode collapses history — the returned value at any h is permitted to
-    // differ from the unsquashed reference. What MUST hold is that the read
-    // completes without error (no 0x12 corruption, no decode failure) and
-    // returns *some* value. The live genesis-sync failure mode is a decode
-    // error, not a value mismatch.
+    // Probe hot_key reads at every historical block via reopen_readonly. TipOnly mode collapses
+    // history — the returned value at any h is permitted to differ from the unsquashed reference.
+    // What MUST hold is that the read completes without error (no 0x12 corruption, no decode
+    // failure) and returns *some* value. The live genesis-sync failure mode is a decode error, not
+    // a value mismatch.
     for (h, block) in blocks.iter().enumerate() {
         let v = ro.get(block, hot_key).unwrap_or_else(|e| {
             panic!("reopen_readonly hot_key at h={h} failed with decode error: {e:?}")
@@ -8016,19 +8026,16 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tier 5: stale `reopen_readonly` across a squash
-//
-// Reproduces the live genesis-sync p2p-thread corruption. The p2p thread
-// acquires a `reopen_readonly` MARF handle once, at startup, long before any
-// squash has run. The main sync thread later calls `maybe_squash`, which
-// invokes `refresh_after_squash` on the *writer* MARF — but the readonly
-// handle the p2p thread holds is independent of the writer and never gets
-// refreshed. When the p2p thread subsequently reads, its stale blob-offset
-// cache and stale `squash_meta` produce a decode error like the 0x12
-// corruption observed live.
-// ---------------------------------------------------------------------------
-
+/// Tier 5: stale `reopen_readonly` across a squash
+///
+/// Reproduces the live genesis-sync p2p-thread corruption. The p2p thread
+/// acquires a `reopen_readonly` MARF handle once, at startup, long before any
+/// squash has run. The main sync thread later calls `maybe_squash`, which
+/// invokes `refresh_after_squash` on the *writer* MARF — but the readonly
+/// handle the p2p thread holds is independent of the writer and never gets
+/// refreshed. When the p2p thread subsequently reads, its stale blob-offset
+/// cache and stale `squash_meta` produce a decode error like the 0x12
+/// corruption observed live.
 #[test]
 fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -8073,13 +8080,12 @@ fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
         blocks.push(bh);
     }
 
-    // ── Phase 2: p2p-thread style — acquire a readonly handle BEFORE any squash.
-    //    The live node does this once at startup. ──
+    // ── Phase 2: p2p-thread style — acquire a readonly handle BEFORE any squash. The live node
+    //    does this once at startup. ──
     let mut p2p_ro = sq_marf.reopen_readonly().unwrap();
 
-    // Sanity-read so the readonly handle's offset cache and mmap state are
-    // warmed up *before* the squash. This mimics p2p doing normal reads
-    // during startup.
+    // Sanity-read so the readonly handle's offset cache and mmap state are warmed up *before* the
+    // squash. This mimics p2p doing normal reads during startup.
     for (h, block) in blocks.iter().enumerate() {
         let v = p2p_ro.get(block, "hot_key").unwrap();
         assert!(v.is_some(), "warm-up read hot_key at h={h}");
@@ -8087,12 +8093,11 @@ fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
         assert!(v.is_some(), "warm-up read sparse_key_{h}");
     }
 
-    // ── Phase 3: main sync thread runs a squash over the existing range.
-    //    This is exactly the `maybe_squash` cadence point after the first
-    //    `pre_blocks`-block boundary. The WRITER stays alive across the
-    //    squash (matching `maybe_squash` in production), then calls
-    //    `refresh_after_squash` to publish the new metadata. The shared
-    //    `Arc<SharedSquashState>` carries the publish across to `p2p_ro`. ──
+    // ── Phase 3: main sync thread runs a squash over the existing range. This is exactly the
+    //    `maybe_squash` cadence point after the first `pre_blocks`-block boundary. The WRITER stays
+    //    alive across the squash (matching `maybe_squash` in production), then calls
+    //    `refresh_after_squash` to publish the new metadata. The shared `Arc<SharedSquashState>`
+    //    carries the publish across to `p2p_ro`. ──
     squash_level_incremental::<StacksBlockId>(
         &sq_path,
         SquashMode::TipOnly,
@@ -8100,6 +8105,7 @@ fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
         (pre_blocks - 1) as u32,
         true, // reclaim — forces redirect + file truncation
         100,
+        None,
     )
     .expect("squash should succeed");
 
@@ -8125,14 +8131,12 @@ fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
         blocks.push(bh);
     }
 
-    // ── Phase 4: the p2p thread now reads using its stale readonly handle.
-    //    This is the exact scenario where live genesis sync hits the
-    //    "invalid node ID 0x12" error after a squash. ──
+    // ── Phase 4: the p2p thread now reads using its stale readonly handle. This is the exact
+    //    scenario where live genesis sync hits the "invalid node ID 0x12" error after a squash. ──
     //
-    // We only assert that reads do not produce a decode error. A value
-    // mismatch is acceptable under TipOnly semantics, but a decode panic
-    // (`CorruptionError("Failed to read expected node ID ...")`) is the
-    // concrete live failure mode.
+    // We only assert that reads do not produce a decode error. A value mismatch is acceptable under
+    // TipOnly semantics, but a decode panic (`CorruptionError("Failed to read expected node ID
+    // ...")`) is the concrete live failure mode.
     let tip = blocks.last().unwrap();
     for (h, block) in blocks.iter().enumerate() {
         let _ = p2p_ro.get(block, "hot_key").unwrap_or_else(|e| {
@@ -8150,21 +8154,17 @@ fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Tier 6: two independent `MARF::from_path` handles on the same file
-//
-// Reproduces the *actual* live genesis-sync pattern in stacks-node 2.x:
-//   * the runloop/miner thread owns one `StacksChainState`
-//     (constructed via `open_chainstate_with_faults` → `MARF::from_path`)
-//   * the P2P thread owns a separate `StacksChainState` obtained via a
-//     second `open_chainstate_with_faults` call on the same path.
-//
-// Both handles are long-lived, neither was spawned from the other via
-// `reopen_*`, so Arc-cloning alone can't share squash metadata between them.
-// Only the process-wide `SharedSquashState` registry makes a
-// `refresh_after_squash()` on the writer observable by the reader.
-// ---------------------------------------------------------------------------
-
+/// Tier 6: two independent `MARF::from_path` handles on the same file
+///
+/// Reproduces the *actual* live genesis-sync pattern in stacks-node 2.x:
+///   * the runloop/miner thread owns one `StacksChainState` (constructed via
+///     `open_chainstate_with_faults` → `MARF::from_path`)
+///   * the P2P thread owns a separate `StacksChainState` obtained via a second
+///     `open_chainstate_with_faults` call on the same path.
+///
+/// Both handles are long-lived, neither was spawned from the other via `reopen_*`, so Arc-cloning
+/// alone can't share squash metadata between them. Only the process-wide `SharedSquashState`
+/// registry makes a `refresh_after_squash()` on the writer observable by the reader.
 #[test]
 fn test_tier6_cross_independent_marf_handles_share_squash_publishes() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -8207,8 +8207,8 @@ fn test_tier6_cross_independent_marf_handles_share_squash_publishes() {
         blocks.push(bh);
     }
 
-    // ── Independent "P2P-thread" handle — opened via a separate
-    //    `MARF::from_path` on the same file, NOT via `reopen_*`. ──
+    // ── Independent "P2P-thread" handle — opened via a separate `MARF::from_path` on the same
+    //    file, NOT via `reopen_*`. ──
     let mut p2p = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
 
     // Warm up the p2p handle so its offset cache and mmap are populated.
@@ -8227,13 +8227,13 @@ fn test_tier6_cross_independent_marf_handles_share_squash_publishes() {
         (pre_blocks - 1) as u32,
         true,
         100,
+        None,
     )
     .expect("squash should succeed");
     writer.refresh_after_squash().unwrap();
 
-    // ── The P2P handle, never touched by the writer, must still be able
-    //    to read without decode errors. This is the exact pattern that
-    //    made the live sync fail. ──
+    // ── The P2P handle, never touched by the writer, must still be able to read without decode
+    //    errors. This is the exact pattern that made the live sync fail. ──
     for (h, block) in blocks.iter().enumerate() {
         let _ = p2p.get(block, "hot_key").unwrap_or_else(|e| {
             panic!(
@@ -8252,26 +8252,21 @@ fn test_tier6_cross_independent_marf_handles_share_squash_publishes() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tier 7: concurrent squash-truncate vs. independent-handle reads
-//
-// Stresses the blob-mutation quiesce: a reader thread continuously walks
-// historical blocks via its own `MARF::from_path` handle while a writer
-// thread runs repeated FullHistory + reclaim squashes (which `ftruncate`
-// the blob file). Without the `BlobReadGuard` / `active_reads` / `truncate_pending`
-// machinery, the reader's mmap would be invalidated mid-traversal by the
-// writer's truncate and trigger SIGBUS. With the quiesce in place:
-//
-//   * the writer's `publish_squash` waits for the reader's in-flight guards
-//     to drop before calling `ftruncate`,
-//   * the reader's subsequent reads observe the bumped generation and
-//     remap their local state through `sync_from_shared_squash_state`.
-//
-// The test succeeds if both threads complete without a decode error or a
-// panic; value divergence is permitted (TipOnly collapses historical
-// reads to the tip) but corruption is not.
-// ---------------------------------------------------------------------------
-
+/// Tier 7: concurrent squash-truncate vs. independent-handle reads
+///
+/// Stresses the blob-mutation quiesce: a reader thread continuously walks historical blocks via its
+/// own `MARF::from_path` handle while a writer thread runs repeated FullHistory + reclaim squashes
+/// (which `ftruncate` the blob file). Without the `BlobReadGuard` / `active_reads` /
+/// `truncate_pending` machinery, the reader's mmap would be invalidated mid-traversal by the
+/// writer's truncate and trigger SIGBUS. With the quiesce in place:
+///
+///   * the writer's `publish_squash` waits for the reader's in-flight guards to drop before calling
+///     `ftruncate`,
+///   * the reader's subsequent reads observe the bumped generation and remap their local state
+///     through `sync_from_shared_squash_state`.
+///
+/// The test succeeds if both threads complete without a decode error or a panic; value divergence
+/// is permitted (TipOnly collapses historical reads to the tip) but corruption is not.
 #[test]
 fn test_tier7_concurrent_truncate_vs_independent_reads() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8294,9 +8289,8 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
 
     let num_blocks: usize = 40;
 
-    // Phase 1: build a chain with rich enough per-block writes that squashes
-    // produce real mmap-backed squash blobs (large enough for truncation to
-    // have something to truncate).
+    // Phase 1: build a chain with rich enough per-block writes that squashes produce real
+    // mmap-backed squash blobs (large enough for truncation to have something to truncate).
     let mut writer = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     let mut blocks: Vec<StacksBlockId> = Vec::new();
     for h in 0..num_blocks {
@@ -8329,8 +8323,8 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
     let reads_completed = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(2));
 
-    // Reader thread — simulates the p2p thread: its own independent MARF handle
-    // on the same file, does a continuous loop of historical reads.
+    // Reader thread — simulates the p2p thread: its own independent MARF handle on the same file,
+    // does a continuous loop of historical reads.
     let reader_stop = Arc::clone(&stop);
     let reader_counter = Arc::clone(&reads_completed);
     let reader_barrier = Arc::clone(&barrier);
@@ -8358,10 +8352,10 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
         }
     });
 
-    // Writer thread — runs several squash cycles, each of which truncates the
-    // blob file. The first cycle covers the original per-block range; later
-    // cycles just re-publish an empty incremental squash at the tip so the
-    // quiesce machinery is exercised repeatedly without exhausting the range.
+    // Writer thread — runs several squash cycles, each of which truncates the blob file. The first
+    // cycle covers the original per-block range; later cycles just re-publish an empty incremental
+    // squash at the tip so the quiesce machinery is exercised repeatedly without exhausting the
+    // range.
     let writer_barrier = Arc::clone(&barrier);
     let writer_path = sq_path.clone();
     let writer_opts = open_opts.clone();
@@ -8369,8 +8363,8 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
         let writer = MARF::<StacksBlockId>::from_path(&writer_path, writer_opts).unwrap();
         writer_barrier.wait();
 
-        // First squash: TipOnly + reclaim over the full original range.
-        // This does the aggressive truncate (from offset 0 to end-of-new-blob).
+        // First squash: TipOnly + reclaim over the full original range. This does the aggressive
+        // truncate (from offset 0 to end-of-new-blob).
         drop(writer); // drop writer's active ref so the internal squash can open the file
         squash_level_incremental::<StacksBlockId>(
             &writer_path,
@@ -8379,12 +8373,12 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
             (num_blocks - 1) as u32,
             true,
             100,
+            None,
         )
         .expect("tier7 first squash should succeed");
 
-        // Reopen + refresh so the shared state picks up the publish via the
-        // registry. (Writes and squashes are normally interleaved on the
-        // same handle; here we re-acquire for simplicity.)
+        // Reopen + refresh so the shared state picks up the publish via the registry. (Writes and
+        // squashes are normally interleaved on the same handle; here we re-acquire for simplicity.)
         let mut writer = MARF::<StacksBlockId>::from_path(&writer_path, open_opts.clone()).unwrap();
         writer.refresh_after_squash().unwrap();
         drop(writer);
@@ -8413,21 +8407,17 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
     eprintln!("tier7: reader completed {total_reads} reads across the squash window");
 }
 
-// ---------------------------------------------------------------------------
-// Tier 8: fresh-guard acquire failure mid-walk is absorbed by the retry wrapper.
-//
-// Uses the `fault_inject::fail_next_acquires` hook to simulate a writer having
-// set `truncate_pending` just as the reader enters the next mmap read. Without
-// the retry wrapper the bounded-scope `Err(Error::RetryAfterSquash)` sentinel
-// would escape to the caller; with the wrapper in place, the reader's state
-// resets (drops parked scratch, re-syncs shared metadata) and the re-entered
-// traversal reads against a fresh acquire — returning the correct value.
-//
-// We inject `MAX_READ_RETRIES` failures to prove each attempt goes through a
-// reset, then verify the read still succeeds. Injecting `MAX_READ_RETRIES + 1`
-// exercises the exhaustion path and must surface `CorruptionError`.
-// ---------------------------------------------------------------------------
-
+/// Tier 8: fresh-guard acquire failure mid-walk is absorbed by the retry wrapper.
+///
+/// Uses the `fault_inject::fail_next_acquires` hook to simulate a writer having set
+/// `truncate_pending` just as the reader enters the next mmap read. Without the retry wrapper the
+/// bounded-scope `Err(Error::RetryAfterSquash)` sentinel would escape to the caller; with the
+/// wrapper in place, the reader's state resets (drops parked scratch, re-syncs shared metadata) and
+/// the re-entered traversal reads against a fresh acquire — returning the correct value.
+///
+/// We inject `MAX_READ_RETRIES` failures to prove each attempt goes through a reset, then verify
+/// the read still succeeds. Injecting `MAX_READ_RETRIES + 1` exercises the exhaustion path and must
+/// surface `CorruptionError`.
 #[test]
 fn test_tier8_acquire_failure_midwalk_retry_wrapper_absorbs() {
     use crate::chainstate::stacks::index::marf::MarfInternals;
@@ -8455,14 +8445,13 @@ fn test_tier8_acquire_failure_midwalk_retry_wrapper_absorbs() {
 
     let mut reader = MARF::<StacksBlockId>::from_path(&sq_path, open_opts).unwrap();
 
-    // Inject MAX_READ_RETRIES-1 acquire failures. The retry wrapper will absorb each one
-    // (reset + re-enter), and the final attempt — where the counter is exhausted —
-    // succeeds and returns the real value.
+    // Inject MAX_READ_RETRIES-1 acquire failures. The retry wrapper will absorb each one (reset +
+    // re-enter), and the final attempt — where the counter is exhausted — succeeds and returns the
+    // real value.
     //
-    // Call `MarfInternals::get_by_key` directly rather than `get()`, because the
-    // test-only `get_and_check_with_hash` helper called by `get()` runs the walk
-    // twice (unwrapped) before the retry-wrapped `get_by_key` fires — consuming
-    // counter credits non-deterministically.
+    // Call `MarfInternals::get_by_key` directly rather than `get()`, because the test-only
+    // `get_and_check_with_hash` helper called by `get()` runs the walk twice (unwrapped) before the
+    // retry-wrapped `get_by_key` fires — consuming counter credits non-deterministically.
     let fails = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::MAX_READ_RETRIES - 1;
     fault_inject::fail_next_acquires(fails);
 
@@ -8478,8 +8467,8 @@ fn test_tier8_acquire_failure_midwalk_retry_wrapper_absorbs() {
         Some(MARFValue::from_value("tier8_value")),
     );
 
-    // Exhaustion: inject MAX_READ_RETRIES + 1 failures — every retry attempt hits the
-    // injected failure, and the wrapper surfaces `CorruptionError` after giving up.
+    // Exhaustion: inject MAX_READ_RETRIES + 1 failures — every retry attempt hits the injected
+    // failure, and the wrapper surfaces `CorruptionError` after giving up.
     let max = <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::MAX_READ_RETRIES;
     fault_inject::fail_next_acquires(max + 1);
 
@@ -8502,21 +8491,16 @@ fn test_tier8_acquire_failure_midwalk_retry_wrapper_absorbs() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tier 9: generation change without acquire failure.
-//
-// Models the race where a writer's publish finished BEFORE the reader's next
-// acquire attempt — so `try_acquire_blob_read` succeeds, but the per-read
-// `squash_state_fresh` check observes a mismatch against this handle's
-// watermark. The reader must bail `Err(Error::RetryAfterSquash)` rather than
-// consuming stale offset caches against post-truncate file layout.
-//
-// We inject via `fault_inject::fail_next_gen_checks`, which forces
-// `squash_state_fresh` to report a mismatch without actually bumping the
-// shared generation. The reset path still runs (including the no-op sync),
-// and on retry the check is clear — value is returned correctly.
-// ---------------------------------------------------------------------------
-
+/// Tier 9: generation change without acquire failure.
+///
+/// Models the race where a writer's publish finished BEFORE the reader's next acquire attempt — so
+/// `try_acquire_blob_read` succeeds, but the per-read `squash_state_fresh` check observes a
+/// mismatch against this handle's watermark. The reader must bail `Err(Error::RetryAfterSquash)`
+/// rather than consuming stale offset caches against post-truncate file layout.
+///
+/// We inject via `fault_inject::fail_next_gen_checks`, which forces `squash_state_fresh` to report
+/// a mismatch without actually bumping the shared generation. The reset path still runs (including
+/// the no-op sync), and on retry the check is clear — value is returned correctly.
 #[test]
 fn test_tier9_gen_mismatch_without_acquire_failure_absorbed() {
     use crate::chainstate::stacks::index::marf::MarfInternals;
@@ -8565,43 +8549,33 @@ fn test_tier9_gen_mismatch_without_acquire_failure_absorbed() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Tier 10: same-height sibling read after squash consults parent state.
-//
-// **FIX-PROTECTION REGRESSION TEST** for the genesis-sync stall at block
-// 11000 (April 2026). The pre-fix behavior: a competing fork-sibling block
-// at the same Stacks height as the canonical tip, downloaded slightly after
-// the squash, was rejected with `Bad nonce` because the squashed-leaf
-// representation in the Clarity MARF keys per-key history by height alone
-// (`TrieLeafSquashed { entries: Vec<(u32, MARFValue)> }` +
-// `TrieLeafSquashed::value_at_height(height)` in `node.rs`). The read
-// pipeline used to capture the sibling's *own* height as the squashed-leaf
-// query height, which collided with the canonical sibling's already-applied
-// transition at that height — returning the canonical's value instead of
-// the parent's.
-//
-// The fix (in `open_block_impl`'s uncommitted-match branch in `storage.rs`)
-// propagates the PARENT's squash height as the snapshot height when opening
-// a non-squash uncommitted block whose parent IS in the squash.
-// `value_at_height(parent_h)` then returns the parent's view (the fork
-// point) rather than the canonical tip — which matches the unsquashed
-// reference and lets the sibling validate against the correct pre-fork
-// state.
-//
-// The test runs both a squashed MARF and an unsquashed reference through
-// the same scenario (parent P → canonical sibling A → fresh sibling B with
-// parent P) and asserts they read identically. Any future regression that
-// reintroduces the height-only collision will fail the second assertion
-// with the failure message describing the structural cause.
-//
-// Limitation: only uncommitted blocks (`marf.begin(parent, child)` followed
-// by reads against `child`) get the snapshot-height fast path. Committed-
-// non-canonical-fork blocks (deeper forks already in `marf_data`) would
-// need a parent-chain walk via either a `marf_data.parent_block_hash`
-// schema addition or a chainstate-level snapshot-height pass-through on
-// `open_block`. Tracked as a follow-up.
-// ---------------------------------------------------------------------------
-
+/// Tier 10: same-height sibling read after squash consults parent state.
+///
+/// **FIX-PROTECTION REGRESSION TEST** for the genesis-sync stall at block 11000 (April 2026). The
+/// pre-fix behavior: a competing fork-sibling block at the same Stacks height as the canonical tip,
+/// downloaded slightly after the squash, was rejected with `Bad nonce` because the squashed-leaf
+/// representation in the Clarity MARF keys per-key history by height alone (`TrieLeafSquashed {
+/// entries: Vec<(u32, MARFValue)> }` + `TrieLeafSquashed::value_at_height(height)` in `node.rs`).
+/// The read pipeline used to capture the sibling's *own* height as the squashed-leaf query height,
+/// which collided with the canonical sibling's already-applied transition at that height —
+/// returning the canonical's value instead of the parent's.
+///
+/// The fix (in `open_block_impl`'s uncommitted-match branch in `storage.rs`) propagates the
+/// PARENT's squash height as the snapshot height when opening a non-squash uncommitted block whose
+/// parent IS in the squash. `value_at_height(parent_h)` then returns the parent's view (the fork
+/// point) rather than the canonical tip — which matches the unsquashed reference and lets the
+/// sibling validate against the correct pre-fork state.
+///
+/// The test runs both a squashed MARF and an unsquashed reference through the same scenario (parent
+/// P → canonical sibling A → fresh sibling B with parent P) and asserts they read identically. Any
+/// future regression that reintroduces the height-only collision will fail the second assertion
+/// with the failure message describing the structural cause.
+///
+/// Limitation: only uncommitted blocks (`marf.begin(parent, child)` followed by reads against
+/// `child`) get the snapshot-height fast path. Committed- non-canonical-fork blocks (deeper forks
+/// already in `marf_data`) would need a parent-chain walk via either a
+/// `marf_data.parent_block_hash` schema addition or a chainstate-level snapshot-height pass-through
+/// on `open_block`. Tracked as a follow-up.
 #[test]
 fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
     use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
@@ -8612,8 +8586,8 @@ fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
 
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
 
-    // Three blocks: parent P at height 0, canonical sibling A at height 1
-    // (extends P), and competing sibling B at height 1 (also extends P).
+    // Three blocks: parent P at height 0, canonical sibling A at height 1 (extends P), and
+    // competing sibling B at height 1 (also extends P).
     let parent_block = {
         let mut bytes = [0u8; 32];
         bytes[24..28].copy_from_slice(&0x_DA_DA_DA_DAu32.to_be_bytes());
@@ -8654,14 +8628,22 @@ fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
     sq_marf.commit().unwrap();
     drop(sq_marf);
 
-    // Squash heights 0..=1 with reclaim=true (matches the production
-    // `maybe_squash` path that triggered the production stall).
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true, 100)
-        .expect("squash should succeed");
+    // Squash heights 0..=1 with reclaim=true (matches the production `maybe_squash` path that
+    // triggered the production stall).
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        1,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
-    // Sibling B arrives AFTER the squash and extends the same parent P.
-    // Importantly, B writes nothing yet — we read the shared key purely
-    // against B's pre-write view, which should be P's state.
+    // Sibling B arrives AFTER the squash and extends the same parent P. Importantly, B writes
+    // nothing yet — we read the shared key purely against B's pre-write view, which should be P's
+    // state.
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
     sq_marf.begin(&parent_block, &sibling_b).unwrap();
@@ -8686,10 +8668,9 @@ fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
     ref_marf.drop_current();
     drop(ref_marf);
 
-    // The unsquashed reference returns P's value (B is a fresh branch from P
-    // and B has not written yet). The squashed MARF MUST do the same; if
-    // instead it returns the canonical sibling A's value, that is the bug
-    // this test documents — same-height siblings collide because the
+    // The unsquashed reference returns P's value (B is a fresh branch from P and B has not written
+    // yet). The squashed MARF MUST do the same; if instead it returns the canonical sibling A's
+    // value, that is the bug this test documents — same-height siblings collide because the
     // squashed-leaf history is keyed by height alone, with no branch identity.
     assert_eq!(
         ref_read,
@@ -8719,43 +8700,43 @@ fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
 // near the end of this file covers the MARF-side input that the
 // chainstate-level guard depends on.
 
-// ---------------------------------------------------------------------------
-// Tier 11: depth-2 (committed) fork reads ancestor's pre-fork view via
-// parent-chain walk after squash.
-//
-// **FIX-PROTECTION REGRESSION TEST** for the multi-block-Bitcoin-reorg case
-// flagged in Tier 10's "Limitation" docstring. Tier 10 only covers the
-// uncommitted same-height sibling path; this exercises the deeper case:
-//
-//   P  (h=0, squashed canonical, sets shared_key = parent_val)
-//   ├── A   (h=1, squashed canonical, overwrites shared_key = canonical_val)
-//   └── B1  (h=1, committed non-canonical, parent=P, no shared_key write)
-//          └── B2 (h=2, committed non-canonical, parent=B1, READS shared_key)
-//
-// After squashing 0..=1 with reclaim=true, both P and A are folded into a
-// single squashed leaf with entries `[(0, parent_val), (1, canonical_val)]`.
-// B1 and B2 are committed, NOT in the squash. Reading `shared_key` from B2
-// must return `parent_val` (P's pre-fork value), NOT `canonical_val` (A's
-// height-1 entry).
-//
-// The fix path under test (lazy resolution in `snapshot_height_for_block()`):
-//   B2 read of `shared_key` → walk reaches a `LeafSquashed` → marf walk's
-//   `WalkAction::FoundSquashedLeaf` branch calls
-//   `storage.snapshot_height_for_block(B2_hash, B2_id)` → eager paths didn't
-//   set `squash_opened_height` for B2 → memoized walker fires
-//   `compute_snapshot_height_via_parent_chain`:
-//     1. B2 not in squash → read B2's blob header → parent = B1
-//     2. B1 not in squash → read B1's blob header → parent = P
-//     3. P is in squash at height 0 → return Some(0)
-//   → `value_at_height(0)` returns parent_val = correct.
-//
-// Note: Tier 11 here uses a depth-2 fork (B2 → B1 → P) where B1 wrote at
-// least one marker key — that forces B1's marker child in B2's root to be a
-// depth-1 backptr to B1. So a naive "min-depth root backptr" walker would
-// coincidentally land on B1 (then walk to P) and arrive at the correct
-// answer. The truly adversarial case — where root backptrs in B2 point to
-// ancestors *deeper than the fork point* — is covered by Tier 11b below.
-// ---------------------------------------------------------------------------
+/// Tier 11: depth-2 (committed) fork reads ancestor's pre-fork view via parent-chain walk after
+/// squash.
+///
+/// **FIX-PROTECTION REGRESSION TEST** for the multi-block-Bitcoin-reorg case flagged in Tier 10's
+/// "Limitation" docstring. Tier 10 only covers the uncommitted same-height sibling path; this
+/// exercises the deeper case:
+///
+/// ```text
+///   P  (h=0, squashed canonical, sets shared_key = parent_val)
+///   ├── A   (h=1, squashed canonical, overwrites shared_key = canonical_val)
+///   └── B1  (h=1, committed non-canonical, parent=P, no shared_key write)
+///          └── B2 (h=2, committed non-canonical, parent=B1, READS shared_key)
+/// ```
+///
+/// After squashing 0..=1 with reclaim=true, both P and A are folded into a single squashed leaf
+/// with entries `[(0, parent_val), (1, canonical_val)]`. B1 and B2 are committed, NOT in the
+/// squash. Reading `shared_key` from B2 must return `parent_val` (P's pre-fork value), NOT
+/// `canonical_val` (A's height-1 entry).
+///
+/// The fix path under test (lazy resolution in `snapshot_height_for_block()`):
+/// ```text
+///   B2 read of `shared_key` → walk reaches a `LeafSquashed` → marf walk's
+///   `WalkAction::FoundSquashedLeaf` branch calls
+///   `storage.snapshot_height_for_block(B2_hash, B2_id)` → eager paths didn't set
+///   `squash_opened_height` for B2 → memoized walker fires
+///   `compute_snapshot_context_via_parent_chain`:
+///     1. B2 not in squash → read B2's blob header → parent = B1
+///     2. B1 not in squash → read B1's blob header → parent = P
+///     3. P is in squash at height 0 → return Some(0)
+///   → `value_at_height(0)` returns parent_val = correct.
+/// ```
+///
+/// Note: Tier 11 here uses a depth-2 fork (B2 → B1 → P) where B1 wrote at least one marker key —
+/// that forces B1's marker child in B2's root to be a depth-1 backptr to B1. So a naive "min-depth
+/// root backptr" walker would coincidentally land on B1 (then walk to P) and arrive at the correct
+/// answer. The truly adversarial case — where root backptrs in B2 point to ancestors *deeper than
+/// the fork point* — is covered by Tier 11b below.
 
 #[test]
 fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
@@ -8795,19 +8776,17 @@ fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
     let key = "shared_key";
     let parent_val = MARFValue::from_value("parent_value");
     let canonical_val = MARFValue::from_value("canonical_sibling_value");
-    // B1 / B2 each commit a fork-branded write on a DIFFERENT key so the trie
-    // is non-empty (commits require at least one insert), without touching
-    // the key under test — the read against `shared_key` from B2 should fall
-    // all the way through to the squashed leaf.
+    // B1 / B2 each commit a fork-branded write on a DIFFERENT key so the trie is non-empty (commits
+    // require at least one insert), without touching the key under test — the read against
+    // `shared_key` from B2 should fall all the way through to the squashed leaf.
     let b1_marker_key = "b1_marker";
     let b2_marker_key = "b2_marker";
     let b1_marker_val = MARFValue::from_value("fork_b1_marker");
     let b2_marker_val = MARFValue::from_value("fork_b2_marker");
 
-    // ── Build the squashed MARF: P → A (canonical), then squash. Then commit
-    // B1 (parent=P), then B2 (parent=B1). Both B1/B2 land in marf_data as
-    // committed-non-canonical blocks — exactly the production case for a
-    // multi-block live Bitcoin reorg landing post-squash. ──
+    // ── Build the squashed MARF: P → A (canonical), then squash. Then commit B1 (parent=P), then
+    // B2 (parent=B1). Both B1/B2 land in marf_data as committed-non-canonical blocks — exactly the
+    // production case for a multi-block live Bitcoin reorg landing post-squash. ──
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf
         .begin(&StacksBlockId::sentinel(), &parent_block)
@@ -8821,8 +8800,16 @@ fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
     sq_marf.commit().unwrap();
     drop(sq_marf);
 
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        1,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
@@ -8833,9 +8820,9 @@ fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
         .unwrap();
     sq_marf.seal().unwrap();
     sq_marf.commit().unwrap();
-    // B2: commit ANOTHER marker write (still no touch of `shared_key`) so we
-    // can read against fully-committed state, exercising the
-    // `open_block_known_id_impl` path rather than the uncommitted shortcut.
+    // B2: commit ANOTHER marker write (still no touch of `shared_key`) so we can read against
+    // fully-committed state, exercising the `open_block_known_id_impl` path rather than the
+    // uncommitted shortcut.
     sq_marf.begin(&fork_b1, &fork_b2).unwrap();
     sq_marf
         .insert(b2_marker_key, b2_marker_val.clone())
@@ -8881,50 +8868,46 @@ fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
         sq_read, ref_read,
         "squashed depth-2 fork B2 should read the same as the unsquashed reference \
          (parent's value). A regression here means \
-         `compute_snapshot_height_via_parent_chain` is not walking B2 → B1 → P \
+         `compute_snapshot_context_via_parent_chain` is not walking B2 → B1 → P \
          through blob headers to find P's squash entry, so the squashed-leaf \
          lookup falls back to the canonical sibling A's height-1 value instead."
     );
 }
 
-// ---------------------------------------------------------------------------
-// Tier 11b: adversarial backptr setup — fork's root contains backptrs to a
-// squashed ancestor *deeper* than the true fork point, exercising the
-// scenario Codex flagged: "the first root backptr points to an older
-// squashed ancestor than the true parent-chain fork point".
-//
-// Layout:
-//
-//   G  (h=0, squashed, writes oldest_key=v_oldest  AND shared_key=v_g)
-//   └── P  (h=1, squashed, writes shared_key=v_p; oldest_key untouched)
-//       ├── A   (h=2, squashed canonical, writes shared_key=v_canonical)
-//       └── B1  (h=2, committed fork, parent=P, writes only b1_marker)
-//              └── B2 (h=3, committed fork, parent=B1, writes only b2_marker;
-//                      READS shared_key)
-//
-// Heights 0..=2 are squashed (G + P + A). The squashed leaf for `shared_key`
-// has entries `[(0, v_g), (1, v_p), (2, v_canonical)]`. The squashed leaf
-// for `oldest_key` has the single entry `[(0, v_oldest)]`.
-//
-// Why this is adversarial: `oldest_key`'s subtree was last touched at G and
-// never modified by P, A, B1, or B2. By COW, B2's root child for that
-// subtree is a backptr that resolves all the way back to G (depth 3 from
-// B2's frame: B2 → B1 → P → G). A naive walker that picked *any* root
-// backptr in B2 and used its target's squash height as the snapshot height
-// could land on G's height (0), and `value_at_height(0)` for `shared_key`
-// would return v_g — WRONG. The correct answer is v_p (P's view, since the
-// fork point is P).
-//
-// The blob-header walker in `compute_snapshot_height_via_parent_chain` does
-// not look at backptrs at all — it reads the *exact* parent block hash from
-// each per-block trie blob's header (captured at commit time in
-// `TrieRAM::dump`). For B2: parent header → B1; B1 header → P; P is in the
-// squash at height 1 → `value_at_height(1)` returns v_p. Correct.
-//
-// This test would fail under any future regression that:
-//   - Replaces blob-header walking with first-root-backptr inference, or
-//   - Uses any backptr depth as a proxy for parent-chain depth.
-// ---------------------------------------------------------------------------
+/// Tier 11b: adversarial backptr setup — fork's root contains backptrs to a squashed ancestor
+/// *deeper* than the true fork point, exercising the scenario Codex flagged: "the first root
+/// backptr points to an older squashed ancestor than the true parent-chain fork point".
+///
+/// **Layout:**
+///
+/// ```text
+///   G  (h=0, squashed, writes oldest_key=v_oldest  AND shared_key=v_g)
+///   └── P  (h=1, squashed, writes shared_key=v_p; oldest_key untouched)
+///       ├── A   (h=2, squashed canonical, writes shared_key=v_canonical)
+///       └── B1  (h=2, committed fork, parent=P, writes only b1_marker)
+///              └── B2 (h=3, committed fork, parent=B1, writes only b2_marker;
+///                      READS shared_key)
+/// ```
+///
+/// Heights 0..=2 are squashed (G + P + A). The squashed leaf for `shared_key` has entries `[(0,
+/// v_g), (1, v_p), (2, v_canonical)]`. The squashed leaf for `oldest_key` has the single entry
+/// `[(0, v_oldest)]`.
+///
+/// Why this is adversarial: `oldest_key`'s subtree was last touched at G and never modified by P,
+/// A, B1, or B2. By COW, B2's root child for that subtree is a backptr that resolves all the way
+/// back to G (depth 3 from B2's frame: B2 → B1 → P → G). A naive walker that picked *any* root
+/// backptr in B2 and used its target's squash height as the snapshot height could land on G's
+/// height (0), and `value_at_height(0)` for `shared_key` would return v_g — WRONG. The correct
+/// answer is v_p (P's view, since the fork point is P).
+///
+/// The blob-header walker in `compute_snapshot_context_via_parent_chain` does not look at backptrs
+/// at all — it reads the *exact* parent block hash from each per-block trie blob's header (captured
+/// at commit time in `TrieRAM::dump`). For B2: parent header → B1; B1 header → P; P is in the
+/// squash at height 1 → `value_at_height(1)` returns v_p. Correct.
+///
+/// This test would fail under any future regression that:
+///   - Replaces blob-header walking with first-root-backptr inference, or
+///   - Uses any backptr depth as a proxy for parent-chain depth.
 
 #[test]
 fn test_tier11b_adversarial_root_backptr_to_older_squashed_ancestor() {
@@ -8998,8 +8981,16 @@ fn test_tier11b_adversarial_root_backptr_to_older_squashed_ancestor() {
     sq_marf.commit().unwrap();
     drop(sq_marf);
 
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 2, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        2,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
@@ -9089,58 +9080,49 @@ fn test_tier11b_adversarial_root_backptr_to_older_squashed_ancestor() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Perf-shape regression test for the LeafSquashed read path.
-//
-// **Goal**: prove that the marf walk routes `LeafSquashed` resolution through
-// the *deferred / re-read* path introduced by Option 2, NOT the previous
-// "always clone the entries vector in Phase 1" path. The previous design
-// heap-allocated and copied `Vec<(u32, MARFValue)>` on every LeafSquashed
-// read — including dormant tip reads on canonical chains past a squash
-// where the cloned entries were ultimately unused (we returned `tip_value`).
-// On a long-running node with FullHistory squashes, that wasted allocation
-// scaled with how often the key was rewritten across the squash range.
-//
-// The Option 2 design clones only `path` + `tip_value` (small, fixed-size)
-// in Phase 1. Phase 2 then either:
-//   - returns `tip_value` directly (when snapshot-height resolves to `None`,
-//     i.e. tip-fallback fast path — rare), or
-//   - re-reads the leaf into the scratch buffer to look up `entries[idx]`
-//     by reference (when `Some(h)` — the historical / fork / canonical-
-//     past-squash path).
-//
-// Either way, no `entries.to_vec()` clone happens. The counters used in this
-// test (`squashed_entries_reread_count`, `squashed_tip_fallback_count`) are
-// the only paths that reach a `LeafSquashed` after the walk; if a future
-// change reintroduces the eager clone, **neither** counter would increment
-// for a dormant tip read — and this test would fail.
-//
-// Test layout:
-//   G   (h=0, writes shared_key=v_g + marker_g)
-//   └── H (h=1, writes shared_key=v_h)
-//       Squash 0..=1: LeafSquashed(shared_key) has entries
-//                     [(0, v_g), (1, v_h)], tip_value = v_h
-//       └── C (committed canonical extension, writes only marker_c — does
-//             NOT touch shared_key, so reads of shared_key from C resolve
-//             via backptr down to the squashed LeafSquashed)
-//
-// Scenarios under test:
-//   A. Dormant tip read: get(C, shared_key). C is canonical-past-squash; the
-//      lazy walker walks C → H, finds H in the squash, returns Some(1). Phase 2
-//      takes the re-read path. EXPECT: entries_reread_count > 0; result = v_h.
-//      A regression to the eager-clone Phase-1 design would leave
-//      entries_reread_count at 0.
-//
-//   B. Historical read at H: get(H, shared_key). H is in-squash, so
-//      eager_user_height = Some(1) and Phase 2 re-reads. EXPECT:
-//      entries_reread_count > 0; result = v_h (entries[1]).
-//
-//   C. Historical read at G: get(G, shared_key). G is in-squash at height 0
-//      → re-read path with idx pointing to entries[0]. EXPECT:
-//      entries_reread_count > 0; result = v_g — proving the value-at-height
-//      lookup correctly indexes into the older squashed entry.
-// ---------------------------------------------------------------------------
-
+/// Perf-shape regression test for the LeafSquashed read path.
+///
+/// **Goal**: prove that the marf walk routes `LeafSquashed` resolution through the *deferred /
+/// re-read* path introduced by Option 2, NOT the previous "always clone the entries vector in Phase
+/// 1" path. The previous design heap-allocated and copied `Vec<(u32, MARFValue)>` on every
+/// LeafSquashed read — including dormant tip reads on canonical chains past a squash where the
+/// cloned entries were ultimately unused (we returned `tip_value`). On a long-running node with
+/// FullHistory squashes, that wasted allocation scaled with how often the key was rewritten across
+/// the squash range.
+///
+/// The Option 2 design clones only `path` + `tip_value` (small, fixed-size) in Phase 1. Phase 2
+/// then either:
+///   - returns `tip_value` directly (when snapshot-height resolves to `None`, i.e. tip-fallback
+///     fast path — rare), or
+///   - re-reads the leaf into the scratch buffer to look up `entries[idx]` by reference (when
+///     `Some(h)` — the historical / fork / canonical- past-squash path).
+///
+/// Either way, no `entries.to_vec()` clone happens. The counters used in this test
+/// (`squashed_entries_reread_count`, `squashed_tip_fallback_count`) are the only paths that reach a
+/// `LeafSquashed` after the walk; if a future change reintroduces the eager clone, **neither**
+/// counter would increment for a dormant tip read — and this test would fail.
+///
+/// Test layout:
+/// ```text
+///   G   (h=0, writes shared_key=v_g + marker_g)
+///   └── H (h=1, writes shared_key=v_h)
+///       Squash 0..=1: LeafSquashed(shared_key) has entries
+///                     [(0, v_g), (1, v_h)], tip_value = v_h
+///       └── C (committed canonical extension, writes only marker_c — does NOT touch shared_key,
+///             so reads of shared_key from C resolve via backptr down to the squashed LeafSquashed)
+/// ```
+///
+/// Scenarios under test: A. Dormant tip read: get(C, shared_key). C is canonical-past-squash; the
+///   lazy walker walks C → H, finds H in the squash, returns Some(1). Phase 2 takes the re-read
+///      path. EXPECT: entries_reread_count > 0; result = v_h. A regression to the eager-clone
+///      Phase-1 design would leave entries_reread_count at 0.
+///
+///   B. Historical read at H: get(H, shared_key). H is in-squash, so eager_user_height = Some(1)
+///      and Phase 2 re-reads. EXPECT: entries_reread_count > 0; result = v_h (entries[1]).
+///
+///   C. Historical read at G: get(G, shared_key). G is in-squash at height 0 → re-read path with
+///      idx pointing to entries[0]. EXPECT: entries_reread_count > 0; result = v_g — proving the
+///      value-at-height lookup correctly indexes into the older squashed entry.
 #[test]
 fn test_leaf_squashed_read_path_perf_shape() {
     use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
@@ -9190,8 +9172,16 @@ fn test_leaf_squashed_read_path_perf_shape() {
     sq_marf.commit().unwrap();
     drop(sq_marf);
 
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        1,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
@@ -9217,8 +9207,8 @@ fn test_leaf_squashed_read_path_perf_shape() {
             .set(0);
     };
 
-    // ── Scenario A: dormant tip read on canonical-past-squash. The lazy walker
-    // walks C → H, finds H in the squash, returns Some(1). Phase 2 re-reads. ──
+    // ── Scenario A: dormant tip read on canonical-past-squash. The lazy walker walks C → H, finds
+    // H in the squash, returns Some(1). Phase 2 re-reads. ──
     reset_counters(&mut sq_marf);
     let tip_read = sq_marf
         .get(&block_c, shared_key)
@@ -9267,8 +9257,8 @@ fn test_leaf_squashed_read_path_perf_shape() {
          snapshot height is set."
     );
 
-    // ── Scenario C: historical read at G (in-squash, older entry — proves
-    // value_at_height correctly resolves to the older squashed entry). ──
+    // ── Scenario C: historical read at G (in-squash, older entry — proves value_at_height
+    // correctly resolves to the older squashed entry). ──
     reset_counters(&mut sq_marf);
     let historical_g = sq_marf
         .get(&block_g, shared_key)
@@ -9286,16 +9276,12 @@ fn test_leaf_squashed_read_path_perf_shape() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Smoke test: canonical-tip extension past a squash. Each post-squash block
-// extends the squash TIP, so `OWN_BLOCK_HEIGHT_KEY` resolves to the correct
-// height (the merged trie's tip value IS the squash tip's value), and
-// `inner_get_extension_height` computes the right child height. This test
-// caught a few subtle regressions in the Tier 11 / Option 2 work; the
-// next test below is the actual fork-from-non-tip regression test for the
-// `get_block_height_miner_tip` in-squash override fix.
-// ---------------------------------------------------------------------------
-
+/// Smoke test: canonical-tip extension past a squash. Each post-squash block extends the squash
+/// TIP, so `OWN_BLOCK_HEIGHT_KEY` resolves to the correct height (the merged trie's tip value IS
+/// the squash tip's value), and `inner_get_extension_height` computes the right child height. This
+/// test caught a few subtle regressions in the Tier 11 / Option 2 work; the next test below is the
+/// actual fork-from-non-tip regression test for the `get_block_height_miner_tip` in-squash override
+/// fix.
 #[test]
 fn test_seal_after_squash_canonical_tip_extension_smoke() {
     use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
@@ -9331,8 +9317,16 @@ fn test_seal_after_squash_canonical_tip_extension_smoke() {
         }
     }
 
-    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, N - 1, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        N - 1,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
     let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
     marf.refresh_after_squash().unwrap();
@@ -9356,42 +9350,38 @@ fn test_seal_after_squash_canonical_tip_extension_smoke() {
     }
 }
 
-/// **REGRESSION TEST** for the genesis-sync seal panic:
-///   "Could not obtain block hash at block height 999"
-//
-/// **Bug**: the squash blob is a single MERGED tip trie with one leaf per path,
-/// so `OWN_BLOCK_HEIGHT_KEY` reads from any in-squash block return the SQUASH
-/// TIP's height, not the per-block height. `MARF::begin` calls
-/// `inner_get_extension_height` → `get_block_height_miner_tip(parent, parent)`,
-/// and when `parent` is a non-tip squashed block, that lookup returns the
-/// squash-tip height. The new block then computes
-/// `child_height = squash_tip_height + 1` (e.g. 1001) instead of
-/// `parent_height + 1` (e.g. 811), writes that wrong height into its own
-/// `OWN_BLOCK_HEIGHT_KEY` via `set_block_heights`, and at seal the geometric
-/// ancestor lookup queries `::H` for `H` derived from the wrong `cur_height`
-/// — landing on entries whose recorded heights are above the parent's true
-/// `squash_opened_height`, so `value_at_height` returns `None` and the seal
-/// panics.
-//
-/// **Fix**: `get_block_height_miner_tip` self-lookup now bypasses the
-/// merged-trie `OWN_BLOCK_HEIGHT_KEY` read for in-squash blocks and pulls the
-/// per-block height from the squash trailer via `squash_opened_height()`.
-//
-/// **Test layout**: Build N=50 blocks (heights 0..=49), squash 0..=49 with
-/// `FullHistory + reclaim=true`, then begin a fork from a NON-TIP squashed
-/// parent (`block_hashes[30]` at height 30). Without the fix:
-///   - `inner_get_extension_height` reads `OWN_BLOCK_HEIGHT_KEY` from the
-///     merged trie → returns 49 (squash tip).
+/// **REGRESSION TEST** for the genesis-sync seal panic: "Could not obtain block hash at block
+///   height 999"
+///
+/// **Bug**: the squash blob is a single MERGED tip trie with one leaf per path, so
+/// `OWN_BLOCK_HEIGHT_KEY` reads from any in-squash block return the SQUASH TIP's height, not the
+/// per-block height. `MARF::begin` calls `inner_get_extension_height` →
+/// `get_block_height_miner_tip(parent, parent)`, and when `parent` is a non-tip squashed block,
+/// that lookup returns the squash-tip height. The new block then computes `child_height =
+/// squash_tip_height + 1` (e.g. 1001) instead of `parent_height + 1` (e.g. 811), writes that wrong
+/// height into its own `OWN_BLOCK_HEIGHT_KEY` via `set_block_heights`, and at seal the geometric
+/// ancestor lookup queries `::H` for `H` derived from the wrong `cur_height` — landing on entries
+/// whose recorded heights are above the parent's true `squash_opened_height`, so `value_at_height`
+/// returns `None` and the seal panics.
+///
+/// **Fix**: `get_block_height_miner_tip` self-lookup now bypasses the merged-trie
+/// `OWN_BLOCK_HEIGHT_KEY` read for in-squash blocks and pulls the per-block height from the squash
+/// trailer via `squash_opened_height()`.
+///
+/// **Test layout**: Build N=50 blocks (heights 0..=49), squash 0..=49 with `FullHistory +
+/// reclaim=true`, then begin a fork from a NON-TIP squashed parent (`block_hashes[30]` at height
+/// 30). Without the fix:
+///   - `inner_get_extension_height` reads `OWN_BLOCK_HEIGHT_KEY` from the merged trie → returns 49
+///     (squash tip).
 ///   - Child computes its height as `49 + 1 = 50` instead of `31`.
-///   - `set_block_heights` writes `OWN_BLOCK_HEIGHT_KEY = 50`, `::50 = child`,
-///     `::49 = parent` (the parent's hash recorded at the wrong height key).
-///   - Seal's geometric lookup queries `::49`, `::48`, `::46`, ... with
-///     `eager_user_height = Some(30)` (parent's true squash height from
-///     `parent_squash_entry`), and `value_at_height(30)` on `::49`'s entries
-///     `[(49, h)]` returns `None` → panic.
-/// With the fix: child correctly computes height 31, OWN_BLOCK_HEIGHT_KEY = 31,
-/// geometric lookup queries `::30, ::29, ::27, ::23, ::15`, all of which have
-/// `value_at_height(30) = Some(...)` because every entry's write_height is ≤ 30.
+///   - `set_block_heights` writes `OWN_BLOCK_HEIGHT_KEY = 50`, `::50 = child`, `::49 = parent` (the
+///     parent's hash recorded at the wrong height key).
+///   - Seal's geometric lookup queries `::49`, `::48`, `::46`, ... with `eager_user_height =
+///     Some(30)` (parent's true squash height from `parent_squash_entry`), and
+///     `value_at_height(30)` on `::49`'s entries `[(49, h)]` returns `None` → panic. With the fix:
+///     child correctly computes height 31, OWN_BLOCK_HEIGHT_KEY = 31, geometric lookup queries
+/// `::30, ::29, ::27, ::23, ::15`, all of which have `value_at_height(30) = Some(...)` because
+/// every entry's write_height is ≤ 30.
 #[test]
 fn test_repro_seal_fork_from_non_tip_squashed_parent() {
     use crate::chainstate::stacks::index::marf::MarfInternals;
@@ -9431,21 +9421,30 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
         }
     }
 
-    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, N - 1, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        N - 1,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
     let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
     marf.refresh_after_squash().unwrap();
 
-    // Fork: extend a NON-TIP squashed parent. This is the case that was
-    // broken — `get_block_height_miner_tip` would return the squash tip's
-    // height (49) instead of the parent's true height (30).
+    // Fork: extend a NON-TIP squashed parent. This is the case that was broken —
+    // `get_block_height_miner_tip` would return the squash tip's height (49) instead of the
+    // parent's true height (30).
     let fork_parent = block_hashes[FORK_PARENT_INDEX].clone();
     let expected_fork_parent_height = FORK_PARENT_INDEX as u32;
 
     // Sanity check: query parent's height via MARF::get_block_height_miner_tip.
-    // After the fix, this returns the trailer's per-block height (30), not
-    // the merged-trie's OWN_BLOCK_HEIGHT_KEY value (49).
+    //
+    // After the fix, this returns the trailer's per-block height (30), not the merged-trie's
+    // OWN_BLOCK_HEIGHT_KEY value (49).
     let parent_height_via_marf =
         <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::get_block_height_miner_tip(
             &mut marf,
@@ -9471,19 +9470,20 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
         StacksBlockId::from_bytes(&bytes).unwrap()
     };
 
-    // Begin the fork. `inner_get_extension_height` queries the parent's height
-    // via `get_block_height_miner_tip` — with the fix, it returns 30, so
-    // `child_height = 31`. Without the fix, it returns 49, so `child_height = 50`.
+    // Begin the fork. `inner_get_extension_height` queries the parent's height via
+    // `get_block_height_miner_tip` — with the fix, it returns 30, so `child_height = 31`. Without
+    // the fix, it returns 49, so `child_height = 50`.
     marf.begin(&fork_parent, &fork_block).unwrap();
     marf.insert("fork_marker_key", MARFValue::from(0xCAFEu32))
         .unwrap();
 
-    // Seal computes the MARF root via `get_trie_ancestor_hashes_bytes`, which
-    // queries `::H` for `H = cur_height - 2^k`. With the fix, cur_height=31 →
-    // queries 30, 29, 27, 23, 15 — all resolvable against `eager_user_height=30`.
-    // Without the fix, cur_height=50 → queries 49, 48, 46, 42, 34, 18 — and
-    // `value_at_height(30)` on `::49`'s entries `[(49, h)]` returns None →
-    // panic with "Could not obtain block hash at block height 49".
+    // Seal computes the MARF root via `get_trie_ancestor_hashes_bytes`, which queries `::H` for `H
+    // = cur_height - 2^k`. With the fix, cur_height=31 → queries 30, 29, 27, 23, 15 — all
+    // resolvable against `eager_user_height=30`.
+    //
+    // Without the fix, cur_height=50 → queries 49, 48, 46, 42, 34, 18 — and `value_at_height(30)`
+    // on `::49`'s entries `[(49, h)]` returns None → panic with "Could not obtain block hash at
+    // block height 49".
     let squashed_fork_root = marf
         .seal()
         .unwrap_or_else(|e| panic!("seal of fork from non-tip squashed parent failed: {e:?}"));
@@ -9504,8 +9504,8 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
          as an unsquashed reference"
     );
 
-    // Cross-check via storage that the committed fork block was registered at
-    // the right height (parent_height + 1, NOT squash_tip + 1).
+    // Cross-check via storage that the committed fork block was registered at the right height
+    // (parent_height + 1, NOT squash_tip + 1).
     let fork_block_height_via_marf =
         <MARF<StacksBlockId> as MarfInternals<StacksBlockId>>::get_block_height_miner_tip(
             &mut marf,
@@ -9523,34 +9523,29 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
     );
 }
 
-/// **REGRESSION TEST** for the `collect_history_parallel` block_hashes slice
-/// indexing bug.
-//
-/// **Bug**: `collect_history_parallel` divides `min_height..=max_height` into
-/// chunks across worker threads. Each worker calls `collect_history_into` with
-/// the chunk's start as `min_height` parameter, but originally received the
-/// FULL `block_hashes` slice. `collect_history_into` indexes that slice as
-/// `block_hashes[(h - min_height)]` — which for any worker after the first
-/// reads `block_hashes[0]` (the OUTER min_height's block) instead of the
-/// chunk's actual block hash. The resulting partial history is wrong: every
-/// worker chunk past the first records leaves under the wrong block heights,
-/// producing incorrect `Vec<(height, value)>` entries.
-//
-/// **Fix**: each worker now slices `block_hashes` to just its chunk's range
-/// (`chunk_block_hashes = &block_hashes[chunk_offset_lo..chunk_offset_hi]`),
-/// so the indexing within `collect_history_into` is valid.
-//
-/// **Why existing tests didn't catch it**: the long-horizon differential tests
-/// use `l0_blocks: usize = 6`, well below `HISTORY_MIN_HEIGHTS_FOR_PARALLEL =
-/// 64`. They take the serial fallback in `collect_history_parallel` and never
-/// exercised the parallel path. This test uses `N = 80` so the parallel path
-/// is guaranteed to fire (at least 2 workers on any multi-core host).
-//
-/// **What this test verifies**: read every key at every height from the
-/// squashed MARF and compare against an unsquashed reference. If `collect_history`
-/// produces the wrong per-key entries (e.g., a value recorded under the wrong
-/// height), the squashed `LeafSquashed`'s `value_at_height(h)` will return the
-/// wrong value at some height, and the differential will diverge.
+/// **REGRESSION TEST** for the `collect_history_parallel` block_hashes slice indexing bug.
+///
+/// **Bug**: `collect_history_parallel` divides `min_height..=max_height` into chunks across worker
+/// threads. Each worker calls `collect_history_into` with the chunk's start as `min_height`
+/// parameter, but originally received the FULL `block_hashes` slice. `collect_history_into` indexes
+/// that slice as `block_hashes[(h - min_height)]` — which for any worker after the first reads
+/// `block_hashes[0]` (the OUTER min_height's block) instead of the chunk's actual block hash. The
+/// resulting partial history is wrong: every worker chunk past the first records leaves under the
+/// wrong block heights, producing incorrect `Vec<(height, value)>` entries.
+///
+/// **Fix**: each worker now slices `block_hashes` to just its chunk's range (`chunk_block_hashes =
+/// &block_hashes[chunk_offset_lo..chunk_offset_hi]`), so the indexing within `collect_history_into`
+/// is valid.
+///
+/// **Why existing tests didn't catch it**: the long-horizon differential tests use `l0_blocks:
+/// usize = 6`, well below `HISTORY_MIN_HEIGHTS_FOR_PARALLEL = 64`. They take the serial fallback in
+/// `collect_history_parallel` and never exercised the parallel path. This test uses `N = 80` so the
+/// parallel path is guaranteed to fire (at least 2 workers on any multi-core host).
+///
+/// **What this test verifies**: read every key at every height from the squashed MARF and compare
+/// against an unsquashed reference. If `collect_history` produces the wrong per-key entries (e.g.,
+/// a value recorded under the wrong height), the squashed `LeafSquashed`'s `value_at_height(h)`
+/// will return the wrong value at some height, and the differential will diverge.
 #[test]
 fn test_repro_collect_history_parallel_block_hashes_indexing() {
     use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
@@ -9560,9 +9555,9 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
     let ref_path = format!("{dir}/reference.sqlite");
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
 
-    // 80 blocks comfortably exceeds HISTORY_MIN_HEIGHTS_FOR_PARALLEL = 64,
-    // ensuring `collect_history_parallel` takes the parallel path with
-    // multiple workers (each handling ~10 heights at 8 workers).
+    // 80 blocks comfortably exceeds HISTORY_MIN_HEIGHTS_FOR_PARALLEL = 64, ensuring
+    // `collect_history_parallel` takes the parallel path with multiple workers (each handling ~10
+    // heights at 8 workers).
     const N: u32 = 80;
     const KEYS_PER_BLOCK: u32 = 6;
 
@@ -9575,9 +9570,9 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
         })
         .collect();
 
-    // Build the chain twice — once for the squashed copy, once for the
-    // unsquashed reference. Mix repeated and unique writes so the per-key
-    // history has both single-entry and multi-entry leaves to merge.
+    // Build the chain twice — once for the squashed copy, once for the unsquashed reference. Mix
+    // repeated and unique writes so the per-key history has both single-entry and multi-entry
+    // leaves to merge.
     for path in &[&sq_path, &ref_path] {
         let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
         let mut parent = StacksBlockId::sentinel();
@@ -9585,11 +9580,10 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
             marf.begin(&parent, bh).unwrap();
             for k in 0..KEYS_PER_BLOCK {
                 // Mix two patterns:
-                //  - shared_key_<k>: rewritten in every block with a value
-                //    derived from (i, k) → produces multi-entry LeafSquashed
-                //    that crosses chunk seams.
-                //  - per_block_key_<i>_<k>: written once per block → produces
-                //    single-entry LeafSquashed cleanly inside one chunk.
+                //  - shared_key_<k>: rewritten in every block with a value derived from (i, k) →
+                //    produces multi-entry LeafSquashed that crosses chunk seams.
+                //  - per_block_key_<i>_<k>: written once per block → produces single-entry
+                //    LeafSquashed cleanly inside one chunk.
                 marf.insert(
                     &format!("shared_key_{k}"),
                     MARFValue::from(i as u32 * 1000 + k),
@@ -9616,21 +9610,21 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
         N - 1,
         true,
         100,
+        None,
     )
     .expect("squash should succeed");
 
-    // Differential: read every key at every block from both MARFs and assert
-    // they match. With the bug, parallel-collected history records entries
-    // under the wrong heights, so `value_at_height(h)` lookups for `shared_key_*`
-    // diverge from the reference at some heights.
+    // Differential: read every key at every block from both MARFs and assert they match. With the
+    // bug, parallel-collected history records entries under the wrong heights, so
+    // `value_at_height(h)` lookups for `shared_key_*` diverge from the reference at some heights.
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
     let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
 
     let mut total_compared = 0usize;
     for (i, bh) in block_hashes.iter().enumerate() {
-        // Sample `shared_key_*` (multi-entry LeafSquashed; sensitive to height
-        // assignment in the parallel path).
+        // Sample `shared_key_*` (multi-entry LeafSquashed; sensitive to height assignment in the
+        // parallel path).
         for k in 0..KEYS_PER_BLOCK {
             let key = format!("shared_key_{k}");
             let sq_val = sq_marf.get(bh, &key).unwrap();
@@ -9644,8 +9638,8 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
             );
             total_compared += 1;
         }
-        // Spot-check `per_block_key_*` — single-entry LeafSquashed where chunk
-        // assignment determines whether the entry exists at all.
+        // Spot-check `per_block_key_*` — single-entry LeafSquashed where chunk assignment
+        // determines whether the entry exists at all.
         let key = format!("per_block_key_{i}_0");
         let sq_val = sq_marf.get(bh, &key).unwrap();
         let ref_val = ref_marf.get(bh, &key).unwrap();
@@ -9662,55 +9656,46 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// **REGRESSION TEST** that forces the specific orphan-type-mismatch case the
-// `Leaf` vs `Node4` redirect approach would have failed on.
-//
-// **Setup**: pick two keys whose paths share their first byte (a chr-collision
-// at the root-level Node256) and one key whose path's first byte differs.
-// Then build a five-block chain where:
-//
-//   - Block 0 writes only `c1`.  Root.children[TARGET_CHR] is a direct
-//     `Leaf` ptr (single-key subtree).
-//   - Block 1 OVERWRITES `c1` with a new value.  Root.children[TARGET_CHR]
-//     is still a direct `Leaf`, but block 0's old leaf for `c1` is now
-//     orphaned — block 1's new leaf supersedes it and nothing in the tip's
-//     view backptrs to the old offset.
-//   - Block 2 writes `c2`.  Root.children[TARGET_CHR] becomes a direct
-//     `Node4` (two leaves under the shared chr).
-//   - Blocks 3 and 4 keep `c1` and `c2` live so the tip's view also
-//     resolves chr=TARGET to a `Node4`.
-//
-// Squash 0..=4 with `FullHistory + reclaim=true`, then fork from block 0.
-// Block 0's root has a direct `Leaf` ptr at chr=TARGET that points at an
-// orphan offset (block 0's old leaf is unreachable from the tip's DFS).
-// The merged tip root's chr=TARGET child is a `Node4`.
-//
-// **What this test would catch**: a "redirect-to-tip-same-chr" fallback for
-// orphan ptrs would set the captured root's chr=TARGET ptr to the tip's
-// `Node4` offset while keeping the captured ptr's `id`=`Leaf` (because
-// changing `id` changes consensus bytes via [`TriePtr::write_consensus_bytes`]
-// and breaks seal-hash equivalence). After [`MARF::node_copy_update`] flips
-// directs to backptrs, walking the fork's chr=TARGET backptr opens the
-// reclaimed parent, lands at the redirect offset, and tries to decode it
-// using the leaf-format read pipeline (`leaf_hashes_omitted=true` +
-// id=`Leaf`). The bytes there are a `Node4` body with hash prefix, so the
-// decode fails before seal even runs.
-//
-// **What the proper fix does**: the orphan-DFS extension pass adds block
-// 0's original leaf for `c1` to the merged blob; remap then rewrites the
-// captured root's chr=TARGET ptr to that leaf's merged-blob offset. The
-// captured ptr's `id` stays `Leaf`, so consensus bytes match the unsquashed
-// reference and the read lands on a real `Leaf` node. Reads succeed and the
-// fork's seal hash equals the unsquashed-reference fork's seal hash.
-// ---------------------------------------------------------------------------
-
+/// **REGRESSION TEST** that forces the specific orphan-type-mismatch case the `Leaf` vs `Node4`
+/// redirect approach would have failed on.
+///
+/// **Setup**: pick two keys whose paths share their first byte (a chr-collision at the root-level
+/// Node256) and one key whose path's first byte differs. Then build a five-block chain where:
+///
+///   - Block 0 writes only `c1`.  Root.children[TARGET_CHR] is a direct `Leaf` ptr (single-key
+///     subtree).
+///   - Block 1 OVERWRITES `c1` with a new value.  Root.children[TARGET_CHR] is still a direct
+///     `Leaf`, but block 0's old leaf for `c1` is now orphaned — block 1's new leaf supersedes it
+///     and nothing in the tip's view backptrs to the old offset.
+///   - Block 2 writes `c2`.  Root.children[TARGET_CHR] becomes a direct `Node4` (two leaves under
+///     the shared chr).
+///   - Blocks 3 and 4 keep `c1` and `c2` live so the tip's view also resolves chr=TARGET to a
+///     `Node4`.
+///
+/// Squash 0..=4 with `FullHistory + reclaim=true`, then fork from block 0. Block 0's root has a
+/// direct `Leaf` ptr at chr=TARGET that points at an orphan offset (block 0's old leaf is
+/// unreachable from the tip's DFS). The merged tip root's chr=TARGET child is a `Node4`.
+///
+/// **What this test would catch**: a "redirect-to-tip-same-chr" fallback for orphan ptrs would set
+/// the captured root's chr=TARGET ptr to the tip's `Node4` offset while keeping the captured ptr's
+/// `id`=`Leaf` (because changing `id` changes consensus bytes via
+/// [`TriePtr::write_consensus_bytes`] and breaks seal-hash equivalence). After
+/// [`MARF::node_copy_update`] flips directs to backptrs, walking the fork's chr=TARGET backptr
+/// opens the reclaimed parent, lands at the redirect offset, and tries to decode it using the
+/// leaf-format read pipeline (`leaf_hashes_omitted=true` + id=`Leaf`). The bytes there are a
+/// `Node4` body with hash prefix, so the decode fails before seal even runs.
+///
+/// **What the proper fix does**: the orphan-DFS extension pass adds block 0's original leaf for
+/// `c1` to the merged blob; remap then rewrites the captured root's chr=TARGET ptr to that leaf's
+/// merged-blob offset. The captured ptr's `id` stays `Leaf`, so consensus bytes match the
+/// unsquashed reference and the read lands on a real `Leaf` node. Reads succeed and the fork's seal
+/// hash equals the unsquashed-reference fork's seal hash.
 #[test]
 fn test_repro_orphan_leaf_to_node4_redirect_would_be_unsafe() {
     use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
 
-    /// Search for `count` distinct key strings whose `TrieHash::from_key`
-    /// path has its first byte equal to `target_byte`.
+    /// Search for `count` distinct key strings whose `TrieHash::from_key` path has its first byte
+    /// equal to `target_byte`.
     fn find_keys_with_first_byte(prefix: &str, target_byte: u8, count: usize) -> Vec<String> {
         let mut found = Vec::new();
         for i in 0u64..1_000_000 {
@@ -9808,17 +9793,24 @@ fn test_repro_orphan_leaf_to_node4_redirect_would_be_unsafe() {
     build_chain(&sq_path);
     build_chain(&ref_path);
 
-    // Squash with reclaim — the path that requires per-height saved roots
-    // and the orphan-DFS structural extension.
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 4, true, 100)
-        .expect("squash should succeed");
+    // Squash with reclaim — the path that requires per-height saved roots and the orphan-DFS
+    // structural extension.
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        4,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
-    // Fork from block 0. With the proper fix, block 0's root's direct Leaf
-    // child at chr=TARGET resolves through the merged blob to block 0's
-    // original leaf for c1 (preserved by the orphan-DFS pass). With a
-    // redirect-only fallback that copied the tip ptr's offset while keeping
-    // the captured ptr's id=Leaf, the next line would panic — walk_cow
-    // would land at the tip's Node4 offset and try to decode it as a leaf.
+    // Fork from block 0. With the proper fix, block 0's root's direct Leaf child at chr=TARGET
+    // resolves through the merged blob to block 0's original leaf for c1 (preserved by the
+    // orphan-DFS pass). With a redirect-only fallback that copied the tip ptr's offset while
+    // keeping the captured ptr's id=Leaf, the next line would panic — walk_cow would land at the
+    // tip's Node4 offset and try to decode it as a leaf.
     let mut marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     marf.refresh_after_squash().unwrap();
     let fork_block = {
@@ -9859,21 +9851,19 @@ fn test_repro_orphan_leaf_to_node4_redirect_would_be_unsafe() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// **REGRESSION TEST** for the genesis-sync commit panic:
-//   assertion `left == right` failed in TrieRAM::dump_compressed_consume
-//
-// The panic happened after forking from a reclaimed squashed parent. `root_copy`
-// correctly loaded the parent's saved per-height root from the sidecar, but
-// still marked that root as COW-copied from `(parent, ROOT_PTR_DISK)`. In a
-// reclaimed squash, `ROOT_PTR_DISK` resolves to the merged tip's root, not the
-// saved per-height root. On commit, the patch writer diffed the fork root
-// against the merged-tip root and produced a huge patch diff, while the fork
-// root only had a handful of same-block direct children to serialize.
-//
-// Saved sidecar roots are structural snapshots, not addressable blob nodes, so
-// they must be written as full roots instead of patch nodes.
-// ---------------------------------------------------------------------------
+/// **REGRESSION TEST** for the genesis-sync commit panic:
+///   assertion `left == right` failed in TrieRAM::dump_compressed_consume
+///
+/// The panic happened after forking from a reclaimed squashed parent. `root_copy`
+/// correctly loaded the parent's saved per-height root from the sidecar, but
+/// still marked that root as COW-copied from `(parent, ROOT_PTR_DISK)`. In a
+/// reclaimed squash, `ROOT_PTR_DISK` resolves to the merged tip's root, not the
+/// saved per-height root. On commit, the patch writer diffed the fork root
+/// against the merged-tip root and produced a huge patch diff, while the fork
+/// root only had a handful of same-block direct children to serialize.
+///
+/// Saved sidecar roots are structural snapshots, not addressable blob nodes, so
+/// they must be written as full roots instead of patch nodes.
 #[test]
 fn test_repro_saved_root_sidecar_root_is_not_patched_against_merged_tip_root() {
     use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
@@ -9912,12 +9902,11 @@ fn test_repro_saved_root_sidecar_root_is_not_patched_against_merged_tip_root() {
     let dir = fresh_test_dir("test_repro_saved_root_sidecar_root_not_patched");
     let sq_path = format!("{dir}/squashed.sqlite");
     // Compression MUST be enabled to exercise the patch encoding path in
-    // `TrieRAM::dump_compressed_consume` — the production binary's
-    // `compress=true` is what causes the COW patch flow to fire on a
-    // root with `cow_ptr` set, which is where the assertion at
-    // `storage.rs:1199` (left=num_new_nodes != right=ptr_diff.len()) was
-    // hit. Without `with_compression(true)` the flush goes through
-    // `dump_consume` instead and never enters the patch path.
+    // `TrieRAM::dump_compressed_consume` — the production binary's `compress=true` is what causes
+    // the COW patch flow to fire on a root with `cow_ptr` set, which is where the assertion at
+    // `storage.rs:1199` (left=num_new_nodes != right=ptr_diff.len()) was hit. Without
+    // `with_compression(true)` the flush goes through `dump_consume` instead and never enters the
+    // patch path.
     let open_opts =
         MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
 
@@ -9959,8 +9948,16 @@ fn test_repro_saved_root_sidecar_root_is_not_patched_against_merged_tip_root() {
     marf.commit().unwrap();
     drop(marf);
 
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 2, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        2,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
     let fork_block = {
         let mut bytes = [0xFEu8; 32];
@@ -9981,22 +9978,18 @@ fn test_repro_saved_root_sidecar_root_is_not_patched_against_merged_tip_root() {
         .expect("commit must not try to patch saved root against merged-tip root");
 }
 
-// ---------------------------------------------------------------------------
-// **REGRESSION TEST** for PR2 orphan-sidecar nodes plus compressed patches.
-//
-// PR2 removes orphan structural nodes from the merged blob and serves them
-// from the sidecar. Direct reads are routed through the sidecar, but patch
-// chasing in `read_patched_persisted_node` follows only the merged-blob/SQL
-// path. If the compressor emits a `TrieNodePatch` whose base ptr lives in
-// the orphan sidecar, a later read of that patch will chase into reclaimed
-// blob space and fail parsing the node hash.
-//
-// Build a block-0 root child that is a non-leaf Node4, overwrite it in block
-// 1 so block 0's Node4 becomes orphan-sidecar-only after squash, then fork
-// from block 0 and mutate inside that copied Node4 with compression enabled.
-// The fork block must be readable after commit; this requires storing the
-// copied orphan-sidecar base as a full node, not as a patch.
-// ---------------------------------------------------------------------------
+/// **REGRESSION TEST** for PR2 orphan-sidecar nodes plus compressed patches.
+///
+/// PR2 removes orphan structural nodes from the merged blob and serves them from the sidecar.
+/// Direct reads are routed through the sidecar, but patch chasing in `read_patched_persisted_node`
+/// follows only the merged-blob/SQL path. If the compressor emits a `TrieNodePatch` whose base ptr
+/// lives in the orphan sidecar, a later read of that patch will chase into reclaimed blob space and
+/// fail parsing the node hash.
+///
+/// Build a block-0 root child that is a non-leaf Node4, overwrite it in block 1 so block 0's Node4
+/// becomes orphan-sidecar-only after squash, then fork from block 0 and mutate inside that copied
+/// Node4 with compression enabled. The fork block must be readable after commit; this requires
+/// storing the copied orphan-sidecar base as a full node, not as a patch.
 #[test]
 fn test_pr2_compression_does_not_patch_against_orphan_sidecar_base() {
     use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
@@ -10068,8 +10061,16 @@ fn test_pr2_compression_does_not_patch_against_orphan_sidecar_base() {
     build_chain(&sq_path);
     build_chain(&ref_path);
 
-    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 2, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        2,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
     let fork_block = {
         let mut bytes = [0xF3u8; 32];
@@ -10111,42 +10112,182 @@ fn test_pr2_compression_does_not_patch_against_orphan_sidecar_base() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// **REGRESSION TEST** for the iteration-2 trim policy.
-//
-// Trims sidecars for levels older than a configurable retention window. In
-// production this runs after every `squash_level_incremental` using the
-// retention from the chainstate's `MARFOpenOpts`
-// (`squash_root_snapshot_retention_levels`, defaulting to the crate-level
-// `MARF_ROOT_SNAPSHOT_RETENTION_LEVELS`). This test drives the trim helper
-// directly with a small retention so we don't have to build many levels.
-//
-// To exercise the trim policy without interference from the in-squash trim
-// hook, the test sets `MARFOpenOpts::with_squash_root_snapshot_retention_levels`
-// to a large value (`TEST_TRIM_RETENTION_DISABLED`) on every handle and
-// passes the same value when invoking `squash_level_incremental` directly,
-// so the post-publish trim hook is effectively a no-op for the 5 levels we
-// build. Trim behavior is then driven explicitly via
-// `trim_aged_root_sidecars(latest=4, retention=2)`.
-//
-// What this test verifies, end-to-end:
-//
-// 1. Build N=5 squash levels of small height ranges.
-// 2. Confirm all 5 sidecar files exist on disk and `root_sidecar_present=1`
-//    in SQL.
-// 3. Run `trim_aged_root_sidecars(latest_level=4, retention=2)`. Levels
-//    older than `4 - 2 = 2` (i.e. levels 0 and 1) should be trimmed; levels
-//    2, 3, 4 are within the retention window and kept.
-// 4. Confirm SQL flags + on-disk file presence.
-// 5. Re-run trim (idempotency): `already_trimmed=2`, no new deletes.
-// 6. Reopen the MARF (forces `build_squash_meta_from_sql` and the startup
-//    reconcile). Reconcile must not raise — trimmed-with-flag-set is
-//    valid.
-// 7. Fork-extension off a parent in a TRIMMED level: `MARF::root_copy`
-//    surfaces `Error::SnapshotTrimmed { level_id, retention_levels }`.
-// 8. Fork-extension off a parent in a KEPT level: still works.
-// ---------------------------------------------------------------------------
+/// Regression for compressed commits extending a retired squash-level root after Replace.
+///
+/// This combines the PR2 orphan-sidecar shape with the cadence-boundary Replace shape: a
+/// non-canonical root child is only available through the old level's sidecar, the old level is
+/// then retired by Replace, and a compressed child is committed on top of the retired canonical.
+/// The compressor must keep all base-node resolution in the retired level's blob/sidecar context;
+/// otherwise it can decode bytes from the active level and fail with corruption such as
+/// "Node path is longer than 32 bytes".
+#[test]
+fn test_replace_retired_orphan_sidecar_child_compressed_commit_to() {
+    use crate::chainstate::stacks::index::squash::{
+        re_squash_level, squash_level_incremental, SquashMode,
+    };
 
+    fn find_keys_with_first_byte(prefix: &str, target_byte: u8, count: usize) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut seen_second = [false; 256];
+        for i in 0u64..1_000_000 {
+            let key = format!("{prefix}_{i}");
+            let path = TrieHash::from_key(&key);
+            if path.0[0] == target_byte && !seen_second[path.0[1] as usize] {
+                seen_second[path.0[1] as usize] = true;
+                found.push(key);
+                if found.len() == count {
+                    return found;
+                }
+            }
+        }
+        panic!("Could not find {count} keys with first-path-byte 0x{target_byte:02x}");
+    }
+
+    const TARGET_CHR: u8 = 0x6d;
+
+    let dir = fresh_test_dir("test_replace_retired_orphan_compressed_commit_to");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+    let open_opts =
+        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
+
+    let keys = find_keys_with_first_byte("replace_retired_orphan", TARGET_CHR, 4);
+    let k1 = keys[0].clone();
+    let k2 = keys[1].clone();
+    let k3 = keys[2].clone();
+
+    let block = |tag: u8, height: u32| {
+        let mut bytes = [tag; 32];
+        bytes[28..32].copy_from_slice(&height.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let block_0 = block(0x10, 0);
+    let block_1 = block(0x11, 1);
+    let block_2 = block(0x12, 2);
+    let block_a = block(0xAA, 3);
+    let block_b = block(0xBB, 3);
+    let child_tmp = block(0xCC, 4);
+    let child_commit = block(0xC1, 4);
+
+    let build_chain = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+
+        marf.begin(&StacksBlockId::sentinel(), &block_0).unwrap();
+        marf.insert(&k1, MARFValue::from_value("b0_k1")).unwrap();
+        marf.insert(&k2, MARFValue::from_value("b0_k2")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        marf.begin(&block_0, &block_1).unwrap();
+        marf.insert(&k1, MARFValue::from_value("b1_k1")).unwrap();
+        marf.insert(&k2, MARFValue::from_value("b1_k2")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        marf.begin(&block_1, &block_2).unwrap();
+        marf.insert("pre_tip_marker", MARFValue::from_value("block_2"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        marf.begin(&block_2, &block_a).unwrap();
+        marf.insert("a_marker", MARFValue::from_value("block_a"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    };
+    build_chain(&sq_path);
+    build_chain(&ref_path);
+
+    squash_level_incremental::<StacksBlockId>(
+        &sq_path,
+        SquashMode::FullHistory,
+        0,
+        3,
+        true,
+        100,
+        None,
+    )
+    .expect("initial squash should succeed");
+
+    let commit_b = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_2, &block_b).unwrap();
+        marf.insert("b_marker", MARFValue::from_value("block_b"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    };
+    commit_b(&sq_path);
+    commit_b(&ref_path);
+
+    re_squash_level::<StacksBlockId>(
+        &sq_path,
+        0,
+        SquashMode::FullHistory,
+        true,
+        100,
+        block_b.clone(),
+    )
+    .expect("Replace re-squash should succeed");
+
+    let commit_child = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_a, &child_tmp).unwrap();
+        marf.insert(&k3, MARFValue::from_value("child_k3")).unwrap();
+        marf.seal().unwrap();
+        marf.commit_to(&child_commit)
+            .expect("compressed commit_to from retired sidecar root must succeed");
+        marf
+    };
+    let mut sq_marf = commit_child(&sq_path);
+    let mut ref_marf = commit_child(&ref_path);
+
+    assert_eq!(
+        sq_marf.get_root_hash_at(&child_commit).unwrap(),
+        ref_marf.get_root_hash_at(&child_commit).unwrap(),
+        "compressed child root from retired canonical must match unsquashed reference"
+    );
+    for key in [&k1, &k2, &k3] {
+        assert_eq!(
+            sq_marf.get(&child_commit, key).unwrap(),
+            ref_marf.get(&child_commit, key).unwrap(),
+            "child value for key {key} must match unsquashed reference"
+        );
+    }
+}
+
+/// **REGRESSION TEST** for the iteration-2 trim policy.
+///
+/// Trims sidecars for levels older than a configurable retention window. In production this runs
+/// after every `squash_level_incremental` using the retention from the chainstate's `MARFOpenOpts`
+/// (`squash_root_snapshot_retention_levels`, defaulting to the crate-level
+/// `MARF_ROOT_SNAPSHOT_RETENTION_LEVELS`). This test drives the trim helper directly with a small
+/// retention so we don't have to build many levels.
+///
+/// To exercise the trim policy without interference from the in-squash trim hook, the test sets
+/// `MARFOpenOpts::with_squash_root_snapshot_retention_levels` to a large value
+/// (`TEST_TRIM_RETENTION_DISABLED`) on every handle and passes the same value when invoking
+/// `squash_level_incremental` directly, so the post-publish trim hook is effectively a no-op for
+/// the 5 levels we build. Trim behavior is then driven explicitly via
+/// `trim_aged_root_sidecars(latest=4, retention=2)`.
+///
+/// What this test verifies, end-to-end:
+///
+/// 1. Build N=5 squash levels of small height ranges.
+/// 2. Confirm all 5 sidecar files exist on disk and `root_sidecar_present=1` in SQL.
+/// 3. Run `trim_aged_root_sidecars(latest_level=4, retention=2)`. Levels older than `4 - 2 = 2`
+///    (i.e. levels 0 and 1) should be trimmed; levels 2, 3, 4 are within the retention window and
+///    kept.
+/// 4. Confirm SQL flags + on-disk file presence.
+/// 5. Re-run trim (idempotency): `already_trimmed=2`, no new deletes.
+/// 6. Reopen the MARF (forces `build_squash_meta_from_sql` and the startup reconcile). Reconcile
+///    must not raise — trimmed-with-flag-set is valid.
+/// 7. Fork-extension off a parent in a TRIMMED level: `MARF::root_copy` surfaces
+///    `Error::SnapshotTrimmed { level_id, retention_levels }`.
+/// 8. Fork-extension off a parent in a KEPT level: still works.
 #[test]
 fn test_iteration2_trim_policy_end_to_end() {
     use crate::chainstate::stacks::index::squash::{
@@ -10154,10 +10295,9 @@ fn test_iteration2_trim_policy_end_to_end() {
     };
     use crate::chainstate::stacks::index::Error;
 
-    // Effectively-disable the in-squash trim hook so this test can drive
-    // trim behavior explicitly. With 5 levels built, retention >= 5
-    // guarantees the post-publish hook never fires; we use a much larger
-    // value to make the intent obvious.
+    // Effectively-disable the in-squash trim hook so this test can drive trim behavior explicitly.
+    // With 5 levels built, retention >= 5 guarantees the post-publish hook never fires; we use a
+    // much larger value to make the intent obvious.
     const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
 
     let dir = fresh_test_dir("test_iteration2_trim_policy_end_to_end");
@@ -10178,10 +10318,9 @@ fn test_iteration2_trim_policy_end_to_end() {
         })
         .collect();
 
-    // Build + squash interleaved. `squash_level_incremental` requires
-    // `max_height` to be the current chain tip, so we extend the chain by
-    // `HEIGHTS_PER_LEVEL` blocks then squash that window before extending
-    // further.
+    // Build + squash interleaved. `squash_level_incremental` requires `max_height` to be the
+    // current chain tip, so we extend the chain by `HEIGHTS_PER_LEVEL` blocks then squash that
+    // window before extending further.
     let mut parent = StacksBlockId::sentinel();
     for level_id in 0..N_LEVELS {
         let lo = level_id * HEIGHTS_PER_LEVEL;
@@ -10211,6 +10350,7 @@ fn test_iteration2_trim_policy_end_to_end() {
             hi,
             true, // reclaim — sidecars are written
             TEST_TRIM_RETENTION_DISABLED,
+            None,
         )
         .unwrap_or_else(|e| panic!("squash_level_incremental({lo}..={hi}) failed: {e:?}"));
     }
@@ -10234,8 +10374,8 @@ fn test_iteration2_trim_policy_end_to_end() {
                 "level {i}: sidecar should NOT be trimmed pre-trim"
             );
             let sidecar_path = format!(
-                "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}.dat",
-                path, row.level_id, row.min_height, row.max_height,
+                "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}-blob-{:016x}.dat",
+                path, row.level_id, row.min_height, row.max_height, row.blob_offset,
             );
             assert!(
                 std::path::Path::new(&sidecar_path).exists(),
@@ -10244,16 +10384,13 @@ fn test_iteration2_trim_policy_end_to_end() {
         }
     }
 
-    // Drive the trim with `retention=2` on a handle that we keep alive
-    // afterwards, so we can verify the SAME-HANDLE behavior immediately
-    // after trim: the `trim_aged_root_sidecars` helper republishes
-    // `SquashMeta` when any levels were trimmed, and the
-    // `refresh_after_squash` it calls internally also updates
-    // `data.squash_meta` on this handle. A subsequent fork-extension
-    // attempt off a trimmed parent on this same handle must therefore
-    // surface `SnapshotTrimmed`, not `CorruptionError` (which would
-    // indicate the cached `SquashMeta` snapshot was still stale and the
-    // read path tried to open the just-deleted sidecar).
+    // Drive the trim with `retention=2` on a handle that we keep alive afterwards, so we can verify
+    // the SAME-HANDLE behavior immediately after trim: the `trim_aged_root_sidecars` helper
+    // republishes `SquashMeta` when any levels were trimmed, and the `refresh_after_squash` it
+    // calls internally also updates `data.squash_meta` on this handle. A subsequent fork-extension
+    // attempt off a trimmed parent on this same handle must therefore surface `SnapshotTrimmed`,
+    // not `CorruptionError` (which would indicate the cached `SquashMeta` snapshot was still stale
+    // and the read path tried to open the just-deleted sidecar).
     let mut trim_handle = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
     let report = trim_aged_root_sidecars(
         &mut trim_handle,
@@ -10270,11 +10407,9 @@ fn test_iteration2_trim_policy_end_to_end() {
     assert_eq!(report.unlink_failures, 0);
     assert_eq!(report.already_trimmed, 0);
 
-    // Same-handle regression: fork-extension off a trimmed parent on
-    // the handle that just performed the trim. Without the
-    // `refresh_after_squash` republish in `trim_aged_root_sidecars`,
-    // this would surface a generic `CorruptionError` instead of
-    // `SnapshotTrimmed`.
+    // Same-handle regression: fork-extension off a trimmed parent on the handle that just performed
+    // the trim. Without the `refresh_after_squash` republish in `trim_aged_root_sidecars`, this
+    // would surface a generic `CorruptionError` instead of `SnapshotTrimmed`.
     let same_handle_trimmed_parent = block_hashes[0].clone();
     let same_handle_fork_block = {
         let mut bytes = [0xCCu8; 32];
@@ -10307,8 +10442,8 @@ fn test_iteration2_trim_policy_end_to_end() {
                 row.root_sidecar_trimmed
             );
             let sidecar_path = format!(
-                "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}.dat",
-                path, row.level_id, row.min_height, row.max_height,
+                "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}-blob-{:016x}.dat",
+                path, row.level_id, row.min_height, row.max_height, row.blob_offset,
             );
             let exists = std::path::Path::new(&sidecar_path).exists();
             assert_eq!(
@@ -10328,43 +10463,63 @@ fn test_iteration2_trim_policy_end_to_end() {
     assert_eq!(report2.unlink_failures, 0);
     assert_eq!(report2.already_trimmed, 2);
 
-    // Crash-window simulation: pretend a previous trim flipped SQL
-    // `root_sidecar_trimmed=true` for level 2 but crashed before
-    // unlinking the file. The new SQL-first ordering guarantees this
-    // intermediate state is reachable; the read path must surface
-    // `SnapshotTrimmed` (driven by SQL flag, not file existence), and
-    // startup reconcile must delete the orphan file. Verifying both
-    // proves we don't regress to "missing-file CorruptionError" if a
-    // crash happens between SQL commit and unlink.
+    // Crash-window simulation: pretend a previous trim flipped SQL `root_sidecar_trimmed=true` for
+    // level 2 but crashed before unlinking the file. The new SQL-first ordering guarantees this
+    // intermediate state is reachable; the read path must surface `SnapshotTrimmed` (driven by SQL
+    // flag, not file existence), and startup reconcile must delete the orphan file. Verifying both
+    // proves we don't regress to "missing-file CorruptionError" if a crash happens between SQL
+    // commit and unlink.
     {
-        // Re-create the level 2 sidecar manually (it was trimmed clean
-        // above, so the file is gone). We synthesize a small file with
-        // a valid header so reconcile's parser-based filter recognizes
-        // it as a canonical-named entry.
-        // We can simply re-run the squash for level 2's range — but
-        // that would change other state; easier to copy from level 3
-        // (which is still kept) into the level 2 path. The exact bytes
-        // don't matter for this assertion: reconcile keys off the
-        // filename + SQL flag, not the contents.
+        // Re-create the level 2 sidecar manually (it was trimmed clean above, so the file is gone).
+        // We synthesize a small file with a valid header so reconcile's parser-based filter
+        // recognizes it as a canonical-named entry.
+        //
+        // We can simply re-run the squash for level 2's range — but that would change other state;
+        // easier to copy from level 3 (which is still kept) into the level 2 path. The exact bytes
+        // don't matter for this assertion: reconcile keys off the filename + SQL flag, not the
+        // contents.
+        //
+        // Look up the actual blob_offsets for levels 2 and 3 — the versioned sidecar path includes
+        // them as a suffix so reconcile can disambiguate post-Replace contents at the same
+        // level_id.
+        let (lvl2_blob_off, lvl3_blob_off) = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let two: i64 = conn
+                .query_row(
+                    "SELECT blob_offset FROM marf_squash_levels WHERE level_id = 2",
+                    rusqlite::params![],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let three: i64 = conn
+                .query_row(
+                    "SELECT blob_offset FROM marf_squash_levels WHERE level_id = 3",
+                    rusqlite::params![],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (two as u64, three as u64)
+        };
         let lvl2_path = format!(
-            "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}.dat",
+            "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}-blob-{:016x}.dat",
             path,
             2,
             2 * HEIGHTS_PER_LEVEL,
             2 * HEIGHTS_PER_LEVEL + HEIGHTS_PER_LEVEL - 1,
+            lvl2_blob_off,
         );
         let lvl3_path = format!(
-            "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}.dat",
+            "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}-blob-{:016x}.dat",
             path,
             3,
             3 * HEIGHTS_PER_LEVEL,
             3 * HEIGHTS_PER_LEVEL + HEIGHTS_PER_LEVEL - 1,
+            lvl3_blob_off,
         );
         std::fs::copy(&lvl3_path, &lvl2_path).unwrap();
 
-        // Set level 2's `root_sidecar_trimmed=true` directly via SQL —
-        // simulating a successful Phase-1 SET that crashed before
-        // Phase-2 unlink. The file we just copied stays on disk.
+        // Set level 2's `root_sidecar_trimmed=true` directly via SQL — simulating a successful
+        // Phase-1 SET that crashed before Phase-2 unlink. The file we just copied stays on disk.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE marf_squash_levels SET root_sidecar_trimmed = 1 WHERE level_id = 2",
@@ -10373,9 +10528,8 @@ fn test_iteration2_trim_policy_end_to_end() {
         .unwrap();
         drop(conn);
 
-        // Reopen — startup reconcile must NOT raise (orphan file with
-        // trimmed=true is a valid, recoverable state, not corruption).
-        // Reconcile should also delete the orphan file.
+        // Reopen — startup reconcile must NOT raise (orphan file with trimmed=true is a valid,
+        // recoverable state, not corruption). Reconcile should also delete the orphan file.
         assert!(
             std::path::Path::new(&lvl2_path).exists(),
             "orphan was planted"
@@ -10386,8 +10540,8 @@ fn test_iteration2_trim_policy_end_to_end() {
             "startup reconcile should have deleted the orphan trimmed-with-file-present sidecar"
         );
 
-        // And fork-extension off level 2 still surfaces SnapshotTrimmed
-        // (driven by the SQL flag, not file existence).
+        // And fork-extension off level 2 still surfaces SnapshotTrimmed (driven by the SQL flag,
+        // not file existence).
         let mut probe = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
         let probe_parent = block_hashes[(2 * HEIGHTS_PER_LEVEL) as usize].clone();
         let probe_fork = {
@@ -10404,16 +10558,14 @@ fn test_iteration2_trim_policy_end_to_end() {
         );
     }
 
-    // Reopen — startup reconcile must accept the trimmed-with-flag state
-    // without raising.
+    // Reopen — startup reconcile must accept the trimmed-with-flag state without raising.
     let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
     marf.refresh_after_squash().unwrap();
 
-    // Fork-extension off a parent in a KEPT level (level 4 — the last
-    // level): root_copy succeeds, seal produces a hash. We exercise this
-    // FIRST so a fully-completed begin/seal/commit cycle leaves the
-    // handle in a consistent state before we attempt the trimmed-level
-    // extension below (whose `begin` is expected to fail).
+    // Fork-extension off a parent in a KEPT level (level 4 — the last level): root_copy succeeds,
+    // seal produces a hash. We exercise this FIRST so a fully-completed begin/seal/commit cycle
+    // leaves the handle in a consistent state before we attempt the trimmed-level extension below
+    // (whose `begin` is expected to fail).
     let kept_parent = block_hashes[((N_LEVELS - 1) * HEIGHTS_PER_LEVEL) as usize].clone();
     let kept_fork_block = {
         let mut bytes = [0xEEu8; 32];
@@ -10430,9 +10582,9 @@ fn test_iteration2_trim_policy_end_to_end() {
     marf.commit()
         .expect("commit of fork off a kept level must succeed");
 
-    // Fork-extension off a parent in a TRIMMED level (level 0):
-    // `MARF::root_copy` should surface `Error::SnapshotTrimmed`. Reopen
-    // the MARF to avoid any handle-local state from the prior begin.
+    // Fork-extension off a parent in a TRIMMED level (level 0): `MARF::root_copy` should surface
+    // `Error::SnapshotTrimmed`. Reopen the MARF to avoid any handle-local state from the prior
+    // begin.
     let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
     let trimmed_parent = block_hashes[0].clone(); // height 0, in level 0 (trimmed)
     let fork_block = {
@@ -10447,9 +10599,8 @@ fn test_iteration2_trim_policy_end_to_end() {
             retention_levels,
         } => {
             assert_eq!(*level_id, 0, "trimmed parent is in level 0");
-            // The error should reflect the retention configured on this
-            // handle's `MARFOpenOpts`, not the crate-level default. The
-            // test handle was opened with
+            // The error should reflect the retention configured on this handle's `MARFOpenOpts`,
+            // not the crate-level default. The test handle was opened with
             // `with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED)`.
             assert_eq!(
                 *retention_levels, TEST_TRIM_RETENTION_DISABLED,
@@ -10463,33 +10614,27 @@ fn test_iteration2_trim_policy_end_to_end() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// **PR2 RECLAIM-SAVINGS TEST** for the orphan-section sidecar layout.
-//
-// PR1 split each squash blob's logical address space into a tip-reachable
-// region `[BLOB_HEADER_SIZE .. orphan_split_offset)` and an orphan region
-// `[orphan_split_offset ..)` and shadow-published the orphan bytes into the
-// per-level sidecar's `OrphanNode` section. PR2 stops writing those orphan
-// bytes into the merged blob — the sidecar is now the *only* source — and
-// adds read-path routing so `ptr.ptr() >= orphan_split_offset` reads from
-// the sidecar instead of the merged blob.
-//
-// The realized win is reclaim space: the merged blob now ends right at
-// `orphan_split_offset` (followed by trailer + footer), instead of
-// extending through the full orphan region. This test asserts the new
-// layout: nodes-region length == orphan_split_offset - BLOB_HEADER_SIZE,
-// and the trailer immediately follows.
-//
-// Workload:
-// - 30 blocks of FullHistory chain with shared keys updated every block,
-//   so `extend_squash_dfs_with_canonical_roots` adds real orphan nodes.
-// - One squash with `reclaim=true`.
-// - Verify the merged blob's nodes region ends at the split, the orphan
-//   sidecar section is non-empty, and the merged blob did NOT contain
-//   those orphan bytes (its total length is smaller than blob_offset +
-//   orphan_split_offset + orphan_section_length).
-// ---------------------------------------------------------------------------
-
+/// **PR2 RECLAIM-SAVINGS TEST** for the orphan-section sidecar layout.
+///
+/// PR1 split each squash blob's logical address space into a tip-reachable region
+/// `[BLOB_HEADER_SIZE .. orphan_split_offset)` and an orphan region `[orphan_split_offset ..)` and
+/// shadow-published the orphan bytes into the per-level sidecar's `OrphanNode` section. PR2 stops
+/// writing those orphan bytes into the merged blob — the sidecar is now the *only* source — and
+/// adds read-path routing so `ptr.ptr() >= orphan_split_offset` reads from the sidecar instead of
+/// the merged blob.
+///
+/// The realized win is reclaim space: the merged blob now ends right at `orphan_split_offset`
+/// (followed by trailer + footer), instead of extending through the full orphan region. This test
+/// asserts the new layout: nodes-region length == orphan_split_offset - BLOB_HEADER_SIZE, and the
+/// trailer immediately follows.
+///
+/// Workload:
+/// - 30 blocks of FullHistory chain with shared keys updated every block, so
+///   `extend_squash_dfs_with_canonical_roots` adds real orphan nodes.
+/// - One squash with `reclaim=true`.
+/// - Verify the merged blob's nodes region ends at the split, the orphan sidecar section is
+///   non-empty, and the merged blob did NOT contain those orphan bytes (its total length is smaller
+///   than blob_offset + orphan_split_offset + orphan_section_length).
 #[test]
 fn test_pr2_merged_blob_omits_orphan_region() {
     use std::io::{Read, Seek, SeekFrom};
@@ -10524,9 +10669,8 @@ fn test_pr2_merged_blob_omits_orphan_region() {
         let mut parent = StacksBlockId::sentinel();
         for (i, bh) in block_hashes.iter().enumerate() {
             marf.begin(&parent, bh).unwrap();
-            // Re-insert "shared" keys at every height so the trie structure
-            // changes across heights, leaving structurally-orphan nodes in
-            // older per-height roots' subtrees.
+            // Re-insert "shared" keys at every height so the trie structure changes across heights,
+            // leaving structurally-orphan nodes in older per-height roots' subtrees.
             for k in 0..KEYS_PER_BLOCK {
                 let key = format!("shared_key_{}", k);
                 marf.insert(&key, MARFValue::from(i as u32 * 100 + k))
@@ -10542,8 +10686,8 @@ fn test_pr2_merged_blob_omits_orphan_region() {
         }
     }
 
-    // Squash the whole chain with FullHistory + reclaim. This is the
-    // production-shape that produces orphan-extension nodes.
+    // Squash the whole chain with FullHistory + reclaim. This is the production-shape that produces
+    // orphan-extension nodes.
     squash_level_incremental::<StacksBlockId>(
         &path,
         SquashMode::FullHistory,
@@ -10551,6 +10695,7 @@ fn test_pr2_merged_blob_omits_orphan_region() {
         NUM_BLOCKS - 1,
         true,
         100,
+        None,
     )
     .expect("squash should succeed");
 
@@ -10567,14 +10712,14 @@ fn test_pr2_merged_blob_omits_orphan_region() {
         "orphan_split_offset should be set post-squash for a non-trivial level"
     );
 
-    // Open the sidecar and confirm the orphan section is present and
-    // non-empty — if it weren't, the test workload no longer produces
-    // orphans and the reclaim-savings check is vacuous.
+    // Open the sidecar and confirm the orphan section is present and non-empty — if it weren't, the
+    // test workload no longer produces orphans and the reclaim-savings check is vacuous.
     let sidecar_path = squash_root_sidecar_path(
         std::path::Path::new(&path),
         level.level_id,
         level.min_height,
         level.max_height,
+        level.blob_offset,
     );
     let reader = SidecarReader::open(
         &sidecar_path,
@@ -10595,11 +10740,10 @@ fn test_pr2_merged_blob_omits_orphan_region() {
         "orphan section should be non-empty for this workload"
     );
 
-    // PR2 invariant: the merged blob's nodes region ends right at
-    // `orphan_split_offset`. The trailer (followed by the footer) lives
-    // at byte `level.blob_offset + orphan_split_offset` in the .blobs
-    // file. Extract the embedded trailer offset from the footer and
-    // confirm it equals `orphan_split_offset` exactly.
+    // PR2 invariant: the merged blob's nodes region ends right at `orphan_split_offset`. The
+    // trailer (followed by the footer) lives at byte `level.blob_offset + orphan_split_offset` in
+    // the .blobs file. Extract the embedded trailer offset from the footer and confirm it equals
+    // `orphan_split_offset` exactly.
     let blob_path = format!("{path}.blobs");
     let mut blob = std::fs::File::open(&blob_path).unwrap();
     let footer_offset_in_file = level.blob_offset + level.blob_length - SQUASH_FOOTER_SIZE as u64;
@@ -10614,15 +10758,13 @@ fn test_pr2_merged_blob_omits_orphan_region() {
         level.orphan_split_offset, trailer_rel_offset,
     );
 
-    // PR2 exact-layout assertion. The merged blob is laid out as:
-    //   [BLOB_HEADER (36 B)][tip-reachable nodes][trailer][footer (12 B)]
-    // The trailer's start in-blob equals `orphan_split_offset` (asserted
-    // above). The footer's end in-blob equals `blob_length`. So the
-    // trailer's body length is `blob_length - orphan_split_offset -
-    // SQUASH_FOOTER_SIZE`. There is no room left for an orphan region —
-    // the merged blob does not contain the orphan bytes. (Pre-PR2 the
-    // same level's blob would have been ~`orphan_desc.length` bytes
-    // longer, since orphans were duplicated into the merged blob.)
+    // PR2 exact-layout assertion. The merged blob is laid out as: [BLOB_HEADER (36
+    //   B)][tip-reachable nodes][trailer][footer (12 B)] The trailer's start in-blob equals
+    // `orphan_split_offset` (asserted above). The footer's end in-blob equals `blob_length`. So the
+    // trailer's body length is `blob_length - orphan_split_offset - SQUASH_FOOTER_SIZE`. There is
+    // no room left for an orphan region — the merged blob does not contain the orphan bytes.
+    // (Pre-PR2 the same level's blob would have been ~`orphan_desc.length` bytes longer, since
+    // orphans were duplicated into the merged blob.)
     let expected_min_blob_length = level.orphan_split_offset as u64 + SQUASH_FOOTER_SIZE as u64;
     assert!(
         level.blob_length >= expected_min_blob_length,
@@ -10652,29 +10794,25 @@ fn test_pr2_merged_blob_omits_orphan_region() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Reorg-divergence detector inputs.
-//
-// `MARF::latest_squash_level_canonical_chain` is the chainstate-side hook for
-// the reorg-divergence detector wired into the chain-advance path
-// (`StacksChainState::detect_squash_divergence`). It must return the most
-// recent squash level's recorded canonical block hashes so the chainstate
-// can compare them against the chain's current canonical view at the same
-// heights and surface a fail-stop error if they disagree.
-//
-// What this test verifies:
-//   - The accessor returns `Some(...)` after a squash level has been written.
-//   - `level_id`, `min_height`, `max_height` match the level we just produced.
-//   - `block_hashes.len() == max_height - min_height + 1`.
-//   - Each height's block hash matches the canonical chain we built (i.e.
-//     what the chainstate would also see as canonical-at-height-H).
-//   - On a fresh MARF with no levels, the accessor returns `None`.
-//
-// This is the load-bearing input for the chainstate-side detector — if this
-// is wrong, divergence detection silently misfires (false positives or
-// negatives) and the v1 fail-stop guard fails to protect the chain from
-// silent state corruption.
-// ---------------------------------------------------------------------------
+/// Reorg-divergence detector inputs.
+///
+/// `MARF::latest_squash_level_canonical_chain` is the chainstate-side hook for the reorg-divergence
+/// detector wired into the chain-advance path (`StacksChainState::detect_squash_divergence`). It
+/// must return the most recent squash level's recorded canonical block hashes so the chainstate can
+/// compare them against the chain's current canonical view at the same heights and surface a
+/// fail-stop error if they disagree.
+///
+/// What this test verifies:
+///   - The accessor returns `Some(...)` after a squash level has been written.
+///   - `level_id`, `min_height`, `max_height` match the level we just produced.
+///   - `block_hashes.len() == max_height - min_height + 1`.
+///   - Each height's block hash matches the canonical chain we built (i.e. what the chainstate
+///     would also see as canonical-at-height-H).
+///   - On a fresh MARF with no levels, the accessor returns `None`.
+///
+/// This is the load-bearing input for the chainstate-side detector — if this is wrong, divergence
+/// detection silently misfires (false positives or negatives) and the v1 fail-stop guard fails to
+/// protect the chain from silent state corruption.
 #[test]
 fn test_latest_squash_level_canonical_chain_returns_recorded_tip() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -10726,6 +10864,7 @@ fn test_latest_squash_level_canonical_chain_returns_recorded_tip() {
         NUM_BLOCKS - 1,
         true,
         100,
+        None,
     )
     .expect("squash should succeed");
 
@@ -10753,19 +10892,15 @@ fn test_latest_squash_level_canonical_chain_returns_recorded_tip() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reorg-divergence detection ground-truth: a sibling that arrives AFTER a
-// squash and is later promoted to canonical via reorg must trigger the
-// chainstate-side detector. The MARF accessor reports the OLD canonical;
-// when the chainstate later compares its (post-reorg) view, the mismatch
-// is what fires the fail-stop guard.
-//
-// This test exercises the MARF half end-to-end: the accessor must continue
-// to report the squash-time canonical even after a sibling has been
-// committed and the MARF's height-index has been updated. The chainstate
-// detector compares this against its own canonical view; agreement vs.
-// disagreement at any height in the level's range is the divergence signal.
-// ---------------------------------------------------------------------------
+/// Reorg-divergence detection ground-truth: a sibling that arrives AFTER a squash and is later
+/// promoted to canonical via reorg must trigger the chainstate-side detector. The MARF accessor
+/// reports the OLD canonical; when the chainstate later compares its (post-reorg) view, the
+/// mismatch is what fires the fail-stop guard.
+///
+/// This test exercises the MARF half end-to-end: the accessor must continue to report the
+/// squash-time canonical even after a sibling has been committed and the MARF's height-index has
+/// been updated. The chainstate detector compares this against its own canonical view; agreement
+/// vs. disagreement at any height in the level's range is the divergence signal.
 #[test]
 fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
@@ -10774,8 +10909,8 @@ fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
     let path = format!("{dir}/marf.sqlite");
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
 
-    // Build genesis + one block, squash level 0 covering heights 0..=1
-    // with the genesis block and one specific child as canonical.
+    // Build genesis + one block, squash level 0 covering heights 0..=1 with the genesis block and
+    // one specific child as canonical.
     let genesis_block = {
         let mut bytes = [0u8; 32];
         bytes[24..28].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
@@ -10810,12 +10945,19 @@ fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
         marf.commit().unwrap();
     }
 
-    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, 1, true, 100)
-        .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        1,
+        true,
+        100,
+        None,
+    )
+    .expect("squash should succeed");
 
-    // After squash, write a sibling at height 1 that re-uses genesis as parent
-    // (same as the canonical's parent). This sibling now lives in the active
-    // region, NOT the squash level.
+    // After squash, write a sibling at height 1 that re-uses genesis as parent (same as the
+    // canonical's parent). This sibling now lives in the active region, NOT the squash level.
     {
         let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
         marf.refresh_after_squash().unwrap();
@@ -10826,12 +10968,11 @@ fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
         marf.commit().unwrap();
     }
 
-    // The accessor must STILL report `canonical_at_squash_time` as canonical
-    // at height 1 — the squash recorded that, and a post-squash sibling
-    // addition cannot revise the squash's commitment. Divergence detection
-    // at the chainstate layer relies on this stability: the chainstate's
-    // current canonical view (which may have flipped to `late_sibling` after
-    // a reorg) is compared against this immutable squash-time record.
+    // The accessor must STILL report `canonical_at_squash_time` as canonical at height 1 — the
+    // squash recorded that, and a post-squash sibling addition cannot revise the squash's
+    // commitment. Divergence detection at the chainstate layer relies on this stability: the
+    // chainstate's current canonical view (which may have flipped to `late_sibling` after a reorg)
+    // is compared against this immutable squash-time record.
     let marf = MARF::<StacksBlockId>::from_path(&path, open_opts).unwrap();
     let canonical = marf
         .latest_squash_level_canonical_chain()
@@ -10849,44 +10990,35 @@ fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// End-to-end recovery via `re_squash_level`.
-//
-// Models the level-11 mainnet failure:
-//   1. Build P (height 0), then A (height 1) extending P.
-//   2. Squash heights 0..=1 with A as canonical at height 1. Level 0 commits
-//      A's tip view: `k = a_val`.
-//   3. Commit B as a sibling of A at height 1 (B's parent is also P, B writes
-//      a different value for `k`). B's per-block blob lives in the active
-//      region and is NOT in level 0.
-//   4. At this point, level 0 still records A as canonical. Reads via A's
-//      tip return `a_val` (correct for A's view); reads via B return
-//      `b_val` (correct for B's view, served from B's per-block blob).
-//      The chainstate has NOT yet promoted B to canonical at height 1.
-//   5. Promote B to canonical by calling `re_squash_level(level_id=0)`. The
-//      function uses `find_tip_block(max_height=1)` which scans `marf_data`
-//      from the highest `block_id` downward — B was committed last so it
-//      has the highest `block_id`, and `find_tip_block` picks it as the
-//      level's new canonical at height 1.
-//   6. After re-squash, level 0's recorded canonical at height 1 is B.
-//      A is no longer in the squash (its old per-block blob still occupies
-//      dead bytes in the merged blob region, but no level claims those
-//      bytes anymore).
-//   7. Reads through B (the new canonical) return `b_val` — and now those
-//      reads route through the new merged blob, not B's per-block blob.
-//
-// What this test exercises end-to-end:
-//   * `SquashTarget::Replace { level_id }` plumbing inside
-//     `squash_level_incremental_with_target` (contiguity skip + level_id
-//     reuse + always-append blob offset).
-//   * The deferred-sidecar publish path (sidecar rename happens inside
-//     `publish_squash`'s arm region, replacing level 0's old sidecar
-//     atomically).
-//   * `update_external_trie_blob_by_hash` re-pointing B's `marf_data` row
-//     at the new merged blob's offset.
-//   * `INSERT OR REPLACE` semantics for the `marf_squash_levels` row at the
-//     same `level_id`.
-// ---------------------------------------------------------------------------
+/// End-to-end recovery via `re_squash_level`.
+///
+/// Models the level-11 mainnet failure:
+///   1. Build P (height 0), then A (height 1) extending P.
+///   2. Squash heights 0..=1 with A as canonical at height 1. Level 0 commits A's tip view: `k =
+///      a_val`.
+///   3. Commit B as a sibling of A at height 1 (B's parent is also P, B writes a different value
+///      for `k`). B's per-block blob lives in the active region and is NOT in level 0.
+///   4. At this point, level 0 still records A as canonical. Reads via A's tip return `a_val`
+///      (correct for A's view); reads via B return `b_val` (correct for B's view, served from B's
+///      per-block blob). The chainstate has NOT yet promoted B to canonical at height 1.
+///   5. Promote B to canonical by calling `re_squash_level(level_id=0)`. The function uses
+///      `find_tip_block(max_height=1)` which scans `marf_data` from the highest `block_id` downward
+///      — B was committed last so it has the highest `block_id`, and `find_tip_block` picks it as
+///      the level's new canonical at height 1.
+///   6. After re-squash, level 0's recorded canonical at height 1 is B. A is no longer in the
+///      squash (its old per-block blob still occupies dead bytes in the merged blob region, but no
+///      level claims those bytes anymore).
+///   7. Reads through B (the new canonical) return `b_val` — and now those reads route through the
+///      new merged blob, not B's per-block blob.
+///
+/// What this test exercises end-to-end:
+///   * `SquashTarget::Replace { level_id }` plumbing inside `squash_level_incremental_with_target`
+///     (contiguity skip + level_id reuse + always-append blob offset).
+///   * The deferred-sidecar publish path (sidecar rename happens inside `publish_squash`'s arm
+///     region, replacing level 0's old sidecar atomically).
+///   * `update_external_trie_blob_by_hash` re-pointing B's `marf_data` row at the new merged blob's
+///     offset.
+///   * `INSERT OR REPLACE` semantics for the `marf_squash_levels` row at the same `level_id`.
 #[test]
 fn test_re_squash_level_recovers_post_reorg_canonical() {
     use crate::chainstate::stacks::index::squash::{
@@ -10935,8 +11067,16 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
     }
 
     // Squash level 0 covering [0..=1] with A as canonical.
-    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, 1, true, 100)
-        .expect("initial squash should succeed");
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        1,
+        true,
+        100,
+        None,
+    )
+    .expect("initial squash should succeed");
 
     // Sanity: level 0 records A as canonical at height 1.
     {
@@ -10948,8 +11088,8 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
         assert_eq!(canonical.block_hashes[1], block_a);
     }
 
-    // Commit B as a post-squash sibling of A. B's per-block blob lives in
-    // the active region (not absorbed into level 0).
+    // Commit B as a post-squash sibling of A. B's per-block blob lives in the active region (not
+    // absorbed into level 0).
     {
         let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
         marf.refresh_after_squash().unwrap();
@@ -10959,9 +11099,8 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
         marf.commit().unwrap();
     }
 
-    // Pre-recovery: A's view (in the squash) returns a_val; B's view (in
-    // the active region) returns b_val. Both are correct under the
-    // pre-recovery layout.
+    // Pre-recovery: A's view (in the squash) returns a_val; B's view (in the active region) returns
+    // b_val. Both are correct under the pre-recovery layout.
     {
         let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
         marf.refresh_after_squash().unwrap();
@@ -10977,16 +11116,15 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
         );
     }
 
-    // Recovery: re-squash level 0. With B's `block_id` higher than A's in
-    // `marf_data`, `find_tip_block_by_scanning` picks B as the new tip at
-    // height 1, and the re-squash walks B's chain (P → B) as the new
-    // canonical.
+    // Recovery: re-squash level 0 with B as the explicit canonical tip. The re-squash walks B's
+    // chain (P → B) and records it as the level's new canonical at height 1.
     re_squash_level::<StacksBlockId>(
         &path,
         /* level_id = */ 0,
         SquashMode::FullHistory,
         true,
         100,
+        block_b.clone(),
     )
     .expect("re_squash_level should succeed when no committed descendants exist");
 
@@ -11012,8 +11150,8 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
         );
     }
 
-    // Post-recovery reads via B return b_val. After the re-squash these
-    // reads route through the NEW merged blob, not B's old per-block blob.
+    // Post-recovery reads via B return b_val. After the re-squash these reads route through the NEW
+    // merged blob, not B's old per-block blob.
     {
         let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
         marf.refresh_after_squash().unwrap();
@@ -11025,38 +11163,807 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// **REGRESSION TEST** for the intra-range-backpointer corruption error
-// observed during re_squash_level on a fresh genesis sync at level 11
-// (commit log: "Backpointer target at height 10663 is in a squash level
-// but within the range being squashed").
-//
-// The earlier `test_re_squash_level_recovers_post_reorg_canonical` test only
-// covers heights 0..=1, where the canonical chain is too short for any
-// intra-range backpointers to fire. Real chains have backpointer chains
-// that cross many heights inside a single squash level — when re-squashing,
-// the DFS from the new canonical's tip walks those backpointers, and the
-// targets land in the level being replaced (which is still active during
-// the build). The Append-mode invariant "blocks in the range being squashed
-// are per-block blobs, not in any squash level" was being enforced
-// unconditionally and would surface as `CorruptionError("Backpointer
-// target at height H is in a squash level but within the range being
-// squashed")` on any non-trivial chain.
-//
-// What this test exercises:
-//   * A 5-block canonical chain (heights 0..=4) with shared keys overwritten
-//     at every block — the resulting MARF has backpointers at every height,
-//     hitting every intra-range height during re-squash DFS.
-//   * Squash heights 0..=4 with the original tip as canonical.
-//   * Commit a sibling B at height 4 (parent = canonical at height 3).
-//   * Re-squash level 0; the DFS from B's tip walks backpointers through
-//     heights 3, 2, 1, 0 — every one of which is in the level being
-//     replaced. With the Replace-aware branch in the cross-level check,
-//     this completes successfully.
-//   * Verify reads via B return B's value, confirming the re-squash
-//     captured the new canonical correctly even with deep backpointer
-//     traversal through the old level.
-// ---------------------------------------------------------------------------
+/// **REGRESSION TEST** for the post-Replace fork-readability invariant.
+///
+/// When `Replace` swaps the canonical claim at heights covered by a `reclaim=true` squash level
+/// (the originals were destroyed by the original squash, so the merged blob is the *only* readable
+/// copy), block hashes that were in the OLD trailer but drop from the NEW trailer must remain
+/// readable. Otherwise:
+///
+/// 1. Reads on the old hash mis-decode (pre-fix bug: hash-omitted leaves read as hash-prefixed →
+///    `CorruptionError`).
+/// 2. *Or* if the row is pruned, reads fail-fast as `NotFoundError`, which a coordinator extending
+///    a fork descendant of that hash surfaces as a fatal panic in `MarfedKV::begin`.
+///
+/// The retired-level architecture preserves the old level's trailer, blob extent, and sidecar under
+/// `marf_retired_squash_levels` and `marf-roots-level-...-retired-{retired_id:08}.dat` paths. Reads
+/// on old hashes resolve through `SquashMeta` as `is_retired = true`, hash-omitted leaves decode
+/// correctly, and fork descendants of the retired-canonical block remain extendable.
+///
+/// What this test exercises:
+///   * Build P → A and squash level 0 with A as canonical (reclaim=true, FullHistory). Reading A
+///     returns A's value.
+///   * Commit B as a post-squash sibling of A (parent = P).
+///   * `re_squash_level` with B as the explicit canonical tip. A drops from the active trailer →
+///     retired.
+///   * Assert: `latest_squash_level_canonical_chain` reflects B (not A).
+///   * Assert: reading A still returns A's value (via the retired path).
+///   * Assert: appending a child C of A succeeds (the forking case the prior prune-based fix
+///     broke).
+#[test]
+fn test_re_squash_level_retires_old_canonical_for_fork_readability() {
+    use crate::chainstate::stacks::index::squash::{
+        re_squash_level, squash_level_incremental, SquashMode,
+    };
+
+    let dir = fresh_test_dir("test_re_squash_retires_for_fork_readability");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let block_p = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let block_a = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0xCAFE_F00Du32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let block_b = {
+        let mut bytes = [0xBBu8; 32];
+        bytes[24..28].copy_from_slice(&0x_5B_11_BC_2Au32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    // Child of A (height 2) — exercises the fork-extension case the
+    // retired-level architecture must support.
+    let block_c = {
+        let mut bytes = [0xCCu8; 32];
+        bytes[24..28].copy_from_slice(&0x_C0_C0_FF_EEu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&3u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    let key = "k";
+    let p_val = MARFValue::from_value("p_val");
+    let a_val = MARFValue::from_value("a_val");
+    let b_val = MARFValue::from_value("b_val");
+    let c_val = MARFValue::from_value("c_val");
+
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.begin(&StacksBlockId::sentinel(), &block_p).unwrap();
+        marf.insert(key, p_val.clone()).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        marf.begin(&block_p, &block_a).unwrap();
+        marf.insert(key, a_val.clone()).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        1,
+        true, // reclaim=true is the load-bearing case: A's per-block blob is gone after this
+        100,
+        None,
+    )
+    .expect("initial squash should succeed");
+
+    // Sanity: pre-recovery read of A returns a_val via the squash path.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        assert_eq!(
+            marf.get(&block_a, key).unwrap(),
+            Some(a_val.clone()),
+            "pre-recovery: A reads via the (about-to-be-retired) merged blob"
+        );
+    }
+
+    // Commit B as a sibling of A.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_p, &block_b).unwrap();
+        marf.insert(key, b_val.clone()).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+
+    // Replace the level — A is now retired, B is canonical at height 1.
+    re_squash_level::<StacksBlockId>(
+        &path,
+        /* level_id = */ 0,
+        SquashMode::FullHistory,
+        true,
+        100,
+        block_b.clone(),
+    )
+    .expect("re_squash_level should succeed");
+
+    // Assertion 1: canonical-chain query reflects B at height 1.
+    {
+        let marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        let canonical = marf
+            .latest_squash_level_canonical_chain()
+            .expect("level 0 present (active) after re-squash");
+        assert_eq!(canonical.level_id, 0);
+        assert_eq!(canonical.min_height, 0);
+        assert_eq!(canonical.max_height, 1);
+        assert_eq!(canonical.block_hashes[0], block_p);
+        assert_eq!(
+            canonical.block_hashes[1], block_b,
+            "active canonical at height 1 must be B (the retired entry holding A \
+             must NOT appear in the canonical-chain query)"
+        );
+    }
+
+    // Assertion 2: a row was inserted into marf_retired_squash_levels.
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM marf_retired_squash_levels",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "Replace must have inserted exactly one retired-level row \
+             (got {count})"
+        );
+    }
+
+    // Assertion 3: A's marf_data row was NOT pruned — it still points at the retired blob's extent.
+    // (The retired logic must preserve read access; pruning would destroy it.)
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let (a_offset, a_length): (i64, i64) = db
+            .query_row(
+                "SELECT external_offset, external_length FROM marf_data \
+                 WHERE block_hash = ?1",
+                rusqlite::params![format!("{block_a}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            a_length > 0,
+            "Post-Replace: A's marf_data row must NOT have been pruned \
+             (external_length must be non-zero so the row still points at \
+             the retired blob). Got (offset={a_offset}, length={a_length})."
+        );
+    }
+
+    // Assertion 4: reads on A still return a_val. Resolves through the retired SquashMeta entry →
+    // retired blob → hash-omitted decode. This is the load-bearing assertion: without
+    // retired-levels this either corrupts (`CorruptionError`) or fails clean (`NotFoundError`).
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        let got = marf.get(&block_a, key).unwrap_or_else(|e| {
+            panic!(
+                "Post-Replace read on retired hash A failed: {e:?}. \
+                 The retired-level architecture must preserve read \
+                 access for old-trailer hashes."
+            );
+        });
+        assert_eq!(
+            got,
+            Some(a_val.clone()),
+            "Post-Replace: A must still read a_val via the retired blob \
+             (got {got:?})"
+        );
+    }
+
+    // Assertion 5: B's reads still work via the new active blob.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        assert_eq!(
+            marf.get(&block_b, key).unwrap(),
+            Some(b_val.clone()),
+            "Post-Replace: B reads via the new active blob"
+        );
+    }
+
+    // Assertion 6: appending a child of A (the retired-canonical hash) must succeed. This is the
+    // production scenario that broke under the prior prune-based fix: a staged fork descendant of
+    // the now-retired canonical hash needs to be appendable. With retired-levels, A is still
+    // openable and `MarfedKV::begin` finds its height correctly.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_a, &block_c)
+            .expect("appending a child of retired-canonical A must succeed");
+        marf.insert(key, c_val.clone()).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+
+    // Assertion 7: read C's value via C's view; read A's value via A's view.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        assert_eq!(
+            marf.get(&block_c, key).unwrap(),
+            Some(c_val.clone()),
+            "C's view should reflect c_val"
+        );
+        assert_eq!(
+            marf.get(&block_a, key).unwrap(),
+            Some(a_val.clone()),
+            "A's view (now an ancestor of C) should still reflect a_val \
+             — retired-level reads must remain self-consistent"
+        );
+    }
+}
+
+/// **REGRESSION TEST** for the cadence-boundary fork-flip pattern observed at the level-14 squash
+/// on mainnet around block 15000 (nonce-mismatch stall). The shape:
+///
+///   1. The chain reaches a cadence boundary (e.g. height 15000) with a canonical tip A.
+///      Auto-squash absorbs `[range_min..=15000]` with A as canonical.
+///   2. A competing same-height tip B becomes canonical immediately after.
+///   3. `re_squash_level` (Replace) rebuilds the level anchored to B.
+///   4. A child block C (parent = B) is processed. Its txs execute against B's state.
+///
+/// The contract is: every block hash that may be used as a parent later must open to exactly the
+/// same MARF state it opened to before squashing. The test uses two parallel MARFs as parallel
+/// histories:
+///   - the squashed MARF runs the squash + Replace pipeline,
+///   - the unsquashed reference MARF performs the identical workload with no squash, and acts as
+///     the oracle.
+///
+/// **Why value reads, not root-hash reads.** `get_root_hash_at` on a squashed block returns the
+/// trailer's pre-stored `root_hashes[h]`, captured *pre-squash*. Comparing that to the unsquashed
+/// root is tautological by construction. The non-tautological signal is `marf.get(&block_hash,
+/// key)`, which traverses the squashed trie's actual structure (LeafSquashed / value_at_height /
+/// backptrs) to find the leaf. If `collect_history` / remap / rehash produced wrong leaf state,
+/// value reads diverge. We check root_hash too — for blocks outside the squash range (block_c) it's
+/// a real check; for in-range blocks it's a sanity assertion that the trailer matches expectations.
+///
+/// Per Codex's framing: the comparison set is scoped, not "every row in marf_data". We compare the
+/// canonical chain in the squashed range, the same-height sibling A (must remain readable via
+/// retired path), the descendant of the post-Replace canonical (the analog of the 2fa2 child),
+/// and a child/grandchild extending the retired canonical fork. The latter is the level-14
+/// genesis-sync panic shape: a per-block child copied from a retired sidecar root must not strand
+/// inherited pointers that still identify shared ancestors by global block id.
+/// Multiple keys with overlapping transition patterns force the test through
+/// `LeafSquashed::value_at_height` rather than degenerate single-transition leaves.
+fn replace_at_cadence_boundary_preserves_state_roots_with_opts(
+    test_name: &str,
+    open_opts: MARFOpenOpts,
+) {
+    use crate::chainstate::stacks::index::squash::{
+        re_squash_level, squash_level_incremental, SquashMode,
+    };
+
+    let dir = fresh_test_dir(test_name);
+    let squashed_path = format!("{dir}/squashed.sqlite");
+    let unsquashed_path = format!("{dir}/unsquashed.sqlite");
+    let compressed_opts = open_opts.clone();
+
+    let blk = |chr: u8, idx: u32| -> StacksBlockId {
+        let mut bytes = [chr; 32];
+        bytes[28..32].copy_from_slice(&idx.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let block_0 = blk(0xA0, 0);
+    let block_1 = blk(0xA1, 1);
+    let block_2 = blk(0xA2, 2);
+    let block_a = blk(0xAA, 3);
+    let block_b = blk(0xBB, 3);
+    let block_c = blk(0xCC, 4);
+    let block_d = blk(0xDD, 4);
+    let block_e = blk(0xEE, 5);
+    let block_d_commit = blk(0xD1, 4);
+    let block_e_commit = blk(0xE1, 5);
+
+    // Multi-key, multi-transition workload: every canonical block writes the same set of keys with
+    // distinct values, so for any (block, key) pair the expected value is "the value written to
+    // `key` at the most recent ancestor on the chain ending at `block`." This forces the squash
+    // through `LeafSquashed::value_at_height` for keys with multiple in-range transitions,
+    // exercising the actual leaf-encoding logic rather than a single-transition degenerate case.
+    let keys = [
+        "k_shared", "k_pre", "k_a_only", "k_b_only", "k_c_only", "k_d_only", "k_e_only",
+    ];
+    let val = |block: &str, key: &str| MARFValue::from_value(&format!("{block}/{key}"));
+
+    let build_chain = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        // Each commit writes k_shared (every block) plus k_pre (only on pre-tip blocks). This
+        // ensures k_shared has 4 in-range transitions (heights 0..=3) on the canonical chain.
+        let mut commit_with_writes =
+            |parent: &StacksBlockId, child: &StacksBlockId, label: &str, includes: &[&str]| {
+                marf.begin(parent, child).unwrap();
+                for k in includes {
+                    marf.insert(k, val(label, k)).unwrap();
+                }
+                marf.seal().unwrap();
+                marf.commit().unwrap();
+            };
+        commit_with_writes(
+            &StacksBlockId::sentinel(),
+            &block_0,
+            "block_0",
+            &["k_shared", "k_pre"],
+        );
+        commit_with_writes(&block_0, &block_1, "block_1", &["k_shared", "k_pre"]);
+        commit_with_writes(&block_1, &block_2, "block_2", &["k_shared", "k_pre"]);
+        commit_with_writes(&block_2, &block_a, "block_a", &["k_shared", "k_a_only"]);
+    };
+    build_chain(&squashed_path);
+    build_chain(&unsquashed_path);
+
+    // SQUASHED MARF ONLY: squash level 0 covering [0..=3] with A canonical. This is the
+    // "auto-squash at cadence boundary" step that absorbs A as the recorded canonical.
+    squash_level_incremental::<StacksBlockId>(
+        &squashed_path,
+        SquashMode::FullHistory,
+        0,
+        3,
+        /* reclaim = */ true,
+        100,
+        None,
+    )
+    .expect("initial squash on the squashed MARF");
+
+    // BOTH: commit B as a sibling of A (parent = block_2, height 3).
+    let commit_b = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_2, &block_b).unwrap();
+        marf.insert("k_shared", val("block_b", "k_shared")).unwrap();
+        marf.insert("k_b_only", val("block_b", "k_b_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    };
+    commit_b(&squashed_path);
+    commit_b(&unsquashed_path);
+
+    // SQUASHED MARF ONLY: Replace level 0 anchored to B. This is the "competing same-height tip
+    // wins, recovery rebuilds level" recovery path.
+    re_squash_level::<StacksBlockId>(
+        &squashed_path,
+        /* level_id = */ 0,
+        SquashMode::FullHistory,
+        true,
+        100,
+        block_b.clone(),
+    )
+    .expect("re_squash_level anchored to B");
+
+    // BOTH: commit C as a child of B (parent = block_b, height 4). This exercises the same code
+    // path as 2fa2's processing in the mainnet 15k stall — child of the post-Replace canonical.
+    let commit_c = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_b, &block_c).unwrap();
+        marf.insert("k_shared", val("block_c", "k_shared")).unwrap();
+        marf.insert("k_c_only", val("block_c", "k_c_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    };
+    commit_c(&squashed_path);
+    commit_c(&unsquashed_path);
+
+    // BOTH: commit D and E on the retired-A fork after Replace (A -> D -> E). This is the
+    // level-14 panic shape: D is a normal per-block child whose root was copied from A's retired
+    // sidecar root. E then extends D and must be able to follow D's inherited pointers back into
+    // the retired blob, even when those pointers originally targeted shared ancestors that also
+    // exist in the new active level.
+    let commit_d = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, compressed_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_a, &block_d).unwrap();
+        marf.insert("k_shared", val("block_d", "k_shared")).unwrap();
+        // k_pre's latest ancestor value is in block_2, which is a shared ancestor present in both
+        // the retired and active squash levels after Replace. Updating it from a child of the
+        // retired canonical exercises compressed patching against an ambiguous inherited pointer.
+        marf.insert("k_pre", val("block_d", "k_pre")).unwrap();
+        marf.insert("k_d_only", val("block_d", "k_d_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit_to(&block_d_commit).unwrap();
+    };
+    commit_d(&squashed_path);
+    commit_d(&unsquashed_path);
+
+    let commit_e = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, compressed_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_d_commit, &block_e).unwrap();
+        marf.insert("k_shared", val("block_e", "k_shared")).unwrap();
+        marf.insert("k_e_only", val("block_e", "k_e_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit_to(&block_e_commit).unwrap();
+    };
+    commit_e(&squashed_path);
+    commit_e(&unsquashed_path);
+
+    // Comparison set: blocks the chain may legitimately read after the Replace. block_a is the
+    // retired canonical (must remain readable via the retired-level path). block_b is the
+    // post-Replace canonical. block_c is the descendant of the post-Replace canonical. block_d and
+    // block_e are descendants of the retired canonical; block_e is the mainnet panic analog where
+    // a grandchild read follows pointers inherited from a child that copied a retired sidecar root.
+    let comparison_set: &[(&str, StacksBlockId)] = &[
+        ("block_0 (canonical, in squash range)", block_0.clone()),
+        ("block_1 (canonical, in squash range)", block_1.clone()),
+        ("block_2 (canonical, in squash range)", block_2.clone()),
+        (
+            "block_a (retired canonical at cadence boundary)",
+            block_a.clone(),
+        ),
+        (
+            "block_b (post-Replace canonical at cadence boundary)",
+            block_b.clone(),
+        ),
+        (
+            "block_c (descendant of post-Replace canonical)",
+            block_c.clone(),
+        ),
+        (
+            "block_d (child of retired canonical)",
+            block_d_commit.clone(),
+        ),
+        (
+            "block_e (grandchild of retired canonical)",
+            block_e_commit.clone(),
+        ),
+    ];
+
+    let mut squashed_marf =
+        MARF::<StacksBlockId>::from_path(&squashed_path, open_opts.clone()).unwrap();
+    squashed_marf.refresh_after_squash().unwrap();
+    let mut unsquashed_marf =
+        MARF::<StacksBlockId>::from_path(&unsquashed_path, open_opts.clone()).unwrap();
+
+    let mut divergences: Vec<String> = Vec::new();
+
+    // Stage 1: root_hash equivalence. For in-range blocks this comes from the trailer's pre-stored
+    // value (tautological with the pre-squash captured root) — kept as a sanity-floor assertion.
+    // For block_c (above-range), the root is computed live from the per-block trie, so a mismatch
+    // there is a real signal.
+    for (label, hash) in comparison_set {
+        let squashed = squashed_marf.get_root_hash_at(hash);
+        let unsquashed = unsquashed_marf.get_root_hash_at(hash);
+        match (squashed, unsquashed) {
+            (Ok(s), Ok(u)) if s == u => {
+                eprintln!("OK  root  {label} ({hash}): root={s}");
+            }
+            (Ok(s), Ok(u)) => divergences.push(format!(
+                "ROOT MISMATCH at {label}\n  block_hash:       {hash}\n  squashed root:    {s}\n  unsquashed root:  {u}"
+            )),
+            (Err(s_err), Ok(u)) => divergences.push(format!(
+                "READ FAILURE on squashed MARF (root) at {label}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed root:  {u}"
+            )),
+            (Ok(s), Err(u_err)) => divergences.push(format!(
+                "READ FAILURE on unsquashed MARF (root) at {label}\n  block_hash:       {hash}\n  squashed root:    {s}\n  unsquashed err:   {u_err:?}"
+            )),
+            (Err(s_err), Err(u_err)) => divergences.push(format!(
+                "BOTH FAILED (root) at {label}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed err:   {u_err:?}"
+            )),
+        }
+    }
+
+    // Stage 2: per-key value equivalence. THIS is the non-tautological signal —
+    // `marf.get(&block_hash, key)` traverses the squashed trie's actual structure
+    // (LeafSquashed::value_at_height, backptrs, height-key resolution) to find the leaf. If
+    // collect_history / remap / rehash produced wrong leaf state for any (block, key) pair, this
+    // loop catches it. The 15k mainnet stall would surface here as a value mismatch (or a NotFound
+    // on a key that should resolve via the squashed view).
+    for (label, hash) in comparison_set {
+        for key in &keys {
+            let squashed = squashed_marf.get(hash, key);
+            let unsquashed = unsquashed_marf.get(hash, key);
+            match (&squashed, &unsquashed) {
+                (Ok(s), Ok(u)) if s == u => {
+                    eprintln!("OK  value {label} key={key:?}: value={s:?}");
+                }
+                (Ok(s), Ok(u)) => divergences.push(format!(
+                    "VALUE MISMATCH at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed value:   {s:?}\n  unsquashed value: {u:?}"
+                )),
+                (Err(s_err), Ok(u)) => divergences.push(format!(
+                    "READ FAILURE on squashed MARF (value) at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed value: {u:?}"
+                )),
+                (Ok(s), Err(u_err)) => divergences.push(format!(
+                    "READ FAILURE on unsquashed MARF (value) at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed value:   {s:?}\n  unsquashed err:   {u_err:?}"
+                )),
+                (Err(s_err), Err(u_err)) => divergences.push(format!(
+                    "BOTH FAILED (value) at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed err:   {u_err:?}"
+                )),
+            }
+        }
+    }
+
+    if !divergences.is_empty() {
+        panic!(
+            "Squashed-vs-unsquashed equivalence failed at {} read(s):\n\n{}",
+            divergences.len(),
+            divergences.join("\n\n")
+        );
+    }
+}
+
+#[test]
+fn test_replace_at_cadence_boundary_preserves_state_roots() {
+    replace_at_cadence_boundary_preserves_state_roots_with_opts(
+        "test_replace_cadence_boundary_state_roots",
+        MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true),
+    );
+}
+
+#[test]
+fn test_replace_at_cadence_boundary_preserves_state_roots_compressed_commit_to() {
+    replace_at_cadence_boundary_preserves_state_roots_with_opts(
+        "test_replace_cadence_boundary_state_roots_compressed",
+        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true),
+    );
+}
+
+/// Regression for the level-14 mainnet panic shape: `begin()` extending a retired-fork
+/// descendant after Replace.
+///
+/// The earlier cadence-boundary tests exercise *reads* (`marf.get`, `get_root_hash_at`) on
+/// retired-fork descendants but not the *write* setup path. The mainnet panic happens during
+/// `MARFedKV::begin` → `clarity_tx_begin` → `MARF::begin`, which calls
+/// [`MARF::extend_trie`] → [`MARF::root_copy`]. `root_copy` reads the parent block's root,
+/// follows whatever Patch/backptr chain it discovers, and writes a fresh root (with COW
+/// pointers) into the new block. If any read along that chain decodes bytes from the wrong
+/// blob, the failure surfaces as `"inner_read_nodetype_at_head: stored empty node type"`.
+///
+/// Setup (compressed `commit_to`, mirroring `test_replace_at_cadence_boundary_*`):
+///   1. Build canonical chain `block_0..=block_a` and squash it.
+///   2. Commit `block_b` as a same-height sibling of `block_a`, then `re_squash_level` anchored
+///      to `block_b`. After this, `block_a` survives only via the retired level; `block_b` is
+///      the new active canonical at the cadence boundary.
+///   3. Commit `block_c` extending the post-Replace canonical, plus `block_d_commit` and
+///      `block_e_commit` extending the retired canonical (compressed `commit_to`).
+///   4. Now extend each comparison block by calling `marf.begin(parent, new_child)` —
+///      especially `block_e_commit`, the retired-fork grandchild whose patch chain crosses
+///      heights ambiguously canonical between active and retired levels.
+///
+/// Each `begin()` triggers `root_copy` which walks the parent's root through
+/// [`read_patched_persisted_node`]. Any routing bug between the source's level and an
+/// ambiguous backptr target manifests here as a `CorruptionError`.
+#[test]
+fn test_replace_at_cadence_boundary_begin_extends_retired_fork_descendant_compressed() {
+    use crate::chainstate::stacks::index::squash::{
+        re_squash_level, squash_level_incremental, SquashMode,
+    };
+
+    let dir = fresh_test_dir("test_replace_cadence_begin_retired_fork_descendant");
+    let squashed_path = format!("{dir}/squashed.sqlite");
+    let unsquashed_path = format!("{dir}/unsquashed.sqlite");
+    let open_opts =
+        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
+
+    let blk = |chr: u8, idx: u32| -> StacksBlockId {
+        let mut bytes = [chr; 32];
+        bytes[28..32].copy_from_slice(&idx.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let block_0 = blk(0xA0, 0);
+    let block_1 = blk(0xA1, 1);
+    let block_2 = blk(0xA2, 2);
+    let block_a = blk(0xAA, 3);
+    let block_b = blk(0xBB, 3);
+    let block_c = blk(0xCC, 4);
+    let block_d_tmp = blk(0xDD, 4);
+    let block_d_commit = blk(0xD1, 4);
+    let block_e_tmp = blk(0xEE, 5);
+    let block_e_commit = blk(0xE1, 5);
+
+    let val = |block: &str, key: &str| MARFValue::from_value(&format!("{block}/{key}"));
+
+    let build_chain = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        let mut commit_with_writes =
+            |parent: &StacksBlockId, child: &StacksBlockId, label: &str, includes: &[&str]| {
+                marf.begin(parent, child).unwrap();
+                for k in includes {
+                    marf.insert(k, val(label, k)).unwrap();
+                }
+                marf.seal().unwrap();
+                marf.commit().unwrap();
+            };
+        commit_with_writes(
+            &StacksBlockId::sentinel(),
+            &block_0,
+            "block_0",
+            &["k_shared", "k_pre"],
+        );
+        commit_with_writes(&block_0, &block_1, "block_1", &["k_shared", "k_pre"]);
+        commit_with_writes(&block_1, &block_2, "block_2", &["k_shared", "k_pre"]);
+        commit_with_writes(&block_2, &block_a, "block_a", &["k_shared", "k_a_only"]);
+    };
+    build_chain(&squashed_path);
+    build_chain(&unsquashed_path);
+
+    // SQUASHED: initial squash level 0 [0..=3] with block_a canonical.
+    squash_level_incremental::<StacksBlockId>(
+        &squashed_path,
+        SquashMode::FullHistory,
+        0,
+        3,
+        true,
+        100,
+        None,
+    )
+    .expect("initial squash");
+
+    // BOTH: commit block_b (sibling of block_a, parent = block_2).
+    let commit_b = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_2, &block_b).unwrap();
+        marf.insert("k_shared", val("block_b", "k_shared")).unwrap();
+        marf.insert("k_b_only", val("block_b", "k_b_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    };
+    commit_b(&squashed_path);
+    commit_b(&unsquashed_path);
+
+    // SQUASHED: Replace level 0 anchored on block_b, retiring block_a's canonical.
+    re_squash_level::<StacksBlockId>(
+        &squashed_path,
+        0,
+        SquashMode::FullHistory,
+        true,
+        100,
+        block_b.clone(),
+    )
+    .expect("Replace anchored to block_b");
+
+    // BOTH: commit block_c extending the post-Replace canonical.
+    let commit_c = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_b, &block_c).unwrap();
+        marf.insert("k_shared", val("block_c", "k_shared")).unwrap();
+        marf.insert("k_c_only", val("block_c", "k_c_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    };
+    commit_c(&squashed_path);
+    commit_c(&unsquashed_path);
+
+    // BOTH: commit block_d_commit extending block_a (retired canonical) via compressed
+    // commit_to. block_d_commit's per-block trie inherits the retired sidecar root.
+    let commit_d = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_a, &block_d_tmp).unwrap();
+        marf.insert("k_shared", val("block_d", "k_shared")).unwrap();
+        marf.insert("k_pre", val("block_d", "k_pre")).unwrap();
+        marf.insert("k_d_only", val("block_d", "k_d_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit_to(&block_d_commit).unwrap();
+    };
+    commit_d(&squashed_path);
+    commit_d(&unsquashed_path);
+
+    // BOTH: commit block_e_commit extending block_d_commit (retired-fork grandchild).
+    let commit_e = |path: &str| {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.refresh_after_squash().unwrap();
+        marf.begin(&block_d_commit, &block_e_tmp).unwrap();
+        marf.insert("k_shared", val("block_e", "k_shared")).unwrap();
+        marf.insert("k_e_only", val("block_e", "k_e_only")).unwrap();
+        marf.seal().unwrap();
+        marf.commit_to(&block_e_commit).unwrap();
+    };
+    commit_e(&squashed_path);
+    commit_e(&unsquashed_path);
+
+    // ─── The actual regression check ───────────────────────────────────────────
+    //
+    // For each parent block in the comparison set, call `begin(parent, new_child)` and
+    // assert the underlying root_copy of the parent's state succeeds. This is what
+    // setup_block / inner_clarity_tx_begin / MARFedKV::begin does on every Stacks block
+    // that gets processed; the mainnet panic surfaces here.
+    //
+    // The retired-fork descendants (`block_d_commit`, `block_e_commit`) are the load-
+    // bearing cases — their patch chains touch ambiguous shared ancestors (`block_2` and
+    // earlier) that exist in both the retired and active level trailers, so the
+    // patch_source_context routing in `read_patched_persisted_node` must keep all reads
+    // anchored to the retired level's blob/sidecar.
+    let extension_set: &[(&str, StacksBlockId, StacksBlockId)] = &[
+        (
+            "begin extending block_a (retired canonical at boundary)",
+            block_a.clone(),
+            blk(0xF1, 4),
+        ),
+        (
+            "begin extending block_b (post-Replace canonical at boundary)",
+            block_b.clone(),
+            blk(0xF2, 4),
+        ),
+        (
+            "begin extending block_c (descendant of post-Replace canonical)",
+            block_c.clone(),
+            blk(0xF3, 5),
+        ),
+        (
+            "begin extending block_d_commit (child of retired canonical)",
+            block_d_commit.clone(),
+            blk(0xF4, 5),
+        ),
+        (
+            "begin extending block_e_commit (grandchild of retired canonical)",
+            block_e_commit.clone(),
+            blk(0xF5, 6),
+        ),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for (label, parent, child) in extension_set {
+        let mut squashed_marf =
+            MARF::<StacksBlockId>::from_path(&squashed_path, open_opts.clone()).unwrap();
+        squashed_marf.refresh_after_squash().unwrap();
+        let mut unsquashed_marf =
+            MARF::<StacksBlockId>::from_path(&unsquashed_path, open_opts.clone()).unwrap();
+
+        let sq_result = squashed_marf.begin(parent, child);
+        let un_result = unsquashed_marf.begin(parent, child);
+
+        match (&sq_result, &un_result) {
+            (Ok(_), Ok(_)) => {
+                eprintln!("OK  begin {label}");
+            }
+            (Err(s), Ok(_)) => failures.push(format!(
+                "BEGIN FAILURE on squashed MARF: {label}\n  parent: {parent}\n  child:  {child}\n  squashed err:   {s:?}",
+            )),
+            (Ok(_), Err(u)) => failures.push(format!(
+                "BEGIN FAILURE on unsquashed MARF (reference): {label}\n  parent: {parent}\n  child:  {child}\n  unsquashed err: {u:?}",
+            )),
+            (Err(s), Err(u)) => failures.push(format!(
+                "BOTH FAILED to begin: {label}\n  parent: {parent}\n  child:  {child}\n  squashed err:   {s:?}\n  unsquashed err: {u:?}",
+            )),
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "begin() extension failed for {} parent block(s):\n\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+}
+
+/// **REGRESSION TEST** for the intra-range-backpointer corruption error observed during
+/// re_squash_level on a fresh genesis sync at level 11 (commit log: "Backpointer target at height
+/// 10663 is in a squash level but within the range being squashed").
+///
+/// The earlier `test_re_squash_level_recovers_post_reorg_canonical` test only covers heights 0..=1,
+/// where the canonical chain is too short for any intra-range backpointers to fire. Real chains
+/// have backpointer chains that cross many heights inside a single squash level — when
+/// re-squashing, the DFS from the new canonical's tip walks those backpointers, and the targets
+/// land in the level being replaced (which is still active during the build). The Append-mode
+/// invariant "blocks in the range being squashed are per-block blobs, not in any squash level" was
+/// being enforced unconditionally and would surface as `CorruptionError("Backpointer target at
+/// height H is in a squash level but within the range being squashed")` on any non-trivial chain.
+///
+/// What this test exercises:
+///   * A 5-block canonical chain (heights 0..=4) with shared keys overwritten at every block — the
+///     resulting MARF has backpointers at every height, hitting every intra-range height during
+///     re-squash DFS.
+///   * Squash heights 0..=4 with the original tip as canonical.
+///   * Commit a sibling B at height 4 (parent = canonical at height 3).
+///   * Re-squash level 0; the DFS from B's tip walks backpointers through heights 3, 2, 1, 0 —
+///     every one of which is in the level being replaced. With the Replace-aware branch in the
+///     cross-level check, this completes successfully.
+///   * Verify reads via B return B's value, confirming the re-squash captured the new canonical
+///     correctly even with deep backpointer traversal through the old level.
 #[test]
 fn test_re_squash_level_handles_deep_intra_range_backpointers() {
     use crate::chainstate::stacks::index::squash::{
@@ -11110,6 +12017,7 @@ fn test_re_squash_level_handles_deep_intra_range_backpointers() {
         NUM_HEIGHTS - 1,
         true,
         100,
+        None,
     )
     .expect("initial squash should succeed");
 
@@ -11138,6 +12046,7 @@ fn test_re_squash_level_handles_deep_intra_range_backpointers() {
         SquashMode::FullHistory,
         true,
         100,
+        block_b.clone(),
     )
     .expect(
         "re_squash_level must handle backpointers into the level being \

@@ -754,7 +754,7 @@ pub fn clear_tables(tx: &Transaction) -> Result<(), Error> {
 
 // --- Squash level registry ---
 
-use crate::chainstate::stacks::index::squash::SquashLevelRow;
+use crate::chainstate::stacks::index::squash::{RetiredSquashLevelRow, SquashLevelRow};
 
 static SQL_SQUASH_LEVELS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS marf_squash_levels (
@@ -770,11 +770,44 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
 );
 ";
 
+/// Schema for retired squash levels — superseded by `Replace` publish but kept on disk so reads on
+/// old-trailer block hashes (which may still be referenced by staged fork descendants) continue to
+/// resolve correctly.
+///
+/// A retired row preserves the level's merged-blob extent and trailer metadata at the moment it was
+/// replaced. The blob bytes themselves remain in the `.blobs` file as dead space until a future
+/// reclaim pass (out of scope here) compacts them.
+///
+/// **Sidecar identity is keyed by `blob_offset`.** Active sidecar paths already include
+/// `blob_offset` as a suffix (`marf-roots-level-...-blob-{blob_offset:016x}.dat`), so a `Replace`
+/// publish writes its new sidecar at a different path from the OLD active level's sidecar. The
+/// retired row's `blob_offset` field resolves to the OLD sidecar's path on read — no rename, copy,
+/// or hard-link is needed at retire time.
+///
+/// `retired_id` is the table's primary key and is informational only (diagnostics, ordering). It is
+/// **not** part of the sidecar path.
+static SQL_RETIRED_SQUASH_LEVELS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS marf_retired_squash_levels (
+    retired_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    original_level_id INTEGER NOT NULL,
+    min_height INTEGER NOT NULL,
+    max_height INTEGER NOT NULL,
+    blob_offset INTEGER NOT NULL,
+    blob_length INTEGER NOT NULL,
+    reads_redirected INTEGER NOT NULL DEFAULT 1,
+    root_sidecar_present INTEGER NOT NULL DEFAULT 0,
+    root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0,
+    orphan_split_offset INTEGER NOT NULL DEFAULT 0,
+    retired_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_retired_squash_levels_height
+    ON marf_retired_squash_levels(min_height, max_height);
+";
+
 pub fn create_squash_levels_table(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(SQL_SQUASH_LEVELS_TABLE)?;
-    // Best-effort, idempotent column-add for existing schemas.
-    // `ALTER TABLE ... ADD COLUMN` errors if the column already exists; we
-    // ignore that error and propagate any other.
+    // Best-effort, idempotent column-add for existing schemas. `ALTER TABLE ... ADD COLUMN` errors
+    // if the column already exists; we ignore that error and propagate any other.
     let _ = conn.execute_batch(
         "ALTER TABLE marf_squash_levels \
          ADD COLUMN root_sidecar_present INTEGER NOT NULL DEFAULT 0",
@@ -787,7 +820,85 @@ pub fn create_squash_levels_table(conn: &Connection) -> Result<(), Error> {
         "ALTER TABLE marf_squash_levels \
          ADD COLUMN orphan_split_offset INTEGER NOT NULL DEFAULT 0",
     );
+    // Retired-levels table is created here too — it shares the same creation lifecycle as the
+    // active table (any squash-aware DB needs both, since `Replace` publish writes into both
+    // atomically).
+    conn.execute_batch(SQL_RETIRED_SQUASH_LEVELS_TABLE)?;
     Ok(())
+}
+
+/// Insert a row into `marf_retired_squash_levels`, capturing the active level's state at the moment
+/// of `Replace` publish. The auto-incremented `retired_id` is returned for diagnostic/log use; the
+/// row's `blob_offset` is what identifies the retired sidecar on read.
+///
+/// Accepts `&Connection` rather than `&Transaction` so callers can use either an autocommit
+/// connection or a transaction (deref coercion). SQLite's `last_insert_rowid()` is
+/// connection-scoped, so reading it right after the INSERT is safe in either context.
+pub fn insert_retired_squash_level(
+    conn: &Connection,
+    row: &RetiredSquashLevelRow,
+) -> Result<u32, Error> {
+    conn.execute(
+        "INSERT INTO marf_retired_squash_levels \
+         (original_level_id, min_height, max_height, blob_offset, blob_length, \
+          reads_redirected, root_sidecar_present, root_sidecar_trimmed, \
+          orphan_split_offset, retired_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            row.original_level_id,
+            row.min_height,
+            row.max_height,
+            row.blob_offset as i64,
+            row.blob_length as i64,
+            row.reads_redirected as i64,
+            row.root_sidecar_present as i64,
+            row.root_sidecar_trimmed as i64,
+            row.orphan_split_offset as i64,
+            row.retired_at as i64,
+        ],
+    )?;
+    let retired_id: i64 = conn.last_insert_rowid();
+    Ok(retired_id as u32)
+}
+
+pub fn read_retired_squash_levels(conn: &Connection) -> Result<Vec<RetiredSquashLevelRow>, Error> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master \
+             WHERE type='table' AND name='marf_retired_squash_levels'",
+            NO_PARAMS,
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT retired_id, original_level_id, min_height, max_height, \
+                blob_offset, blob_length, reads_redirected, \
+                root_sidecar_present, root_sidecar_trimmed, \
+                orphan_split_offset, retired_at \
+         FROM marf_retired_squash_levels \
+         ORDER BY retired_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(NO_PARAMS, |row| {
+            Ok(RetiredSquashLevelRow {
+                retired_id: row.get::<_, u32>("retired_id")?,
+                original_level_id: row.get::<_, u32>("original_level_id")?,
+                min_height: row.get::<_, u32>("min_height")?,
+                max_height: row.get::<_, u32>("max_height")?,
+                blob_offset: row.get::<_, i64>("blob_offset")? as u64,
+                blob_length: row.get::<_, i64>("blob_length")? as u64,
+                reads_redirected: row.get::<_, i64>("reads_redirected")? != 0,
+                root_sidecar_present: row.get::<_, i64>("root_sidecar_present")? != 0,
+                root_sidecar_trimmed: row.get::<_, i64>("root_sidecar_trimmed")? != 0,
+                orphan_split_offset: row.get::<_, i64>("orphan_split_offset")? as u32,
+                retired_at: row.get::<_, i64>("retired_at")? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(), Error> {
@@ -828,16 +939,13 @@ pub fn set_root_sidecar_present(
 
 /// Mark `root_sidecar_trimmed` for a level. Idempotent.
 ///
-/// This is intentionally called at trim time **before** the sidecar
-/// file is `unlink`-ed: the SQL flag is the load-bearing source of
-/// truth for the read path's `Error::SnapshotTrimmed` policy, and
-/// flipping it first (followed by a `SquashMeta` republish) ensures
-/// that no live handle ever observes the (file-missing, trimmed=false)
-/// corruption window. The subsequent `unlink` is best-effort disk
-/// hygiene; if it fails, the file is reaped by
-/// [`crate::chainstate::stacks::index::sidecar::reconcile_squash_sidecars`]
-/// on the next startup. See `trim_aged_root_sidecars` in `squash.rs`
-/// for the full ordering rationale.
+/// This is intentionally called at trim time **before** the sidecar file is `unlink`-ed: the SQL
+/// flag is the load-bearing source of truth for the read path's `Error::SnapshotTrimmed` policy,
+/// and flipping it first (followed by a `SquashMeta` republish) ensures that no live handle ever
+/// observes the (file-missing, trimmed=false) corruption window. The subsequent `unlink` is
+/// best-effort disk hygiene; if it fails, the file is reaped by
+/// [`crate::chainstate::stacks::index::sidecar::reconcile_squash_sidecars`] on the next startup.
+/// See `trim_aged_root_sidecars` in `squash.rs` for the full ordering rationale.
 pub fn set_root_sidecar_trimmed(
     conn: &Connection,
     level_id: u32,
@@ -850,9 +958,9 @@ pub fn set_root_sidecar_trimmed(
     Ok(())
 }
 
-/// Update an existing `marf_data` row by block hash to point to a new external
-/// blob location. Used by the incremental squash pipeline to redirect per-block
-/// blob entries to the squash blob. The inline `data` column is cleared.
+/// Update an existing `marf_data` row by block hash to point to a new external blob location. Used
+/// by the incremental squash pipeline to redirect per-block blob entries to the squash blob. The
+/// inline `data` column is cleared.
 pub fn update_external_trie_blob_by_hash<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
@@ -908,11 +1016,12 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
     Ok(rows)
 }
 
-/// Validate that no live references point into the byte range `[from_offset, +∞)` in the
-/// blob file, except for blocks whose `block_hash` is in `superseded_hashes`.
+/// Validate that no live references point into the byte range `[from_offset, +∞)` in the blob file,
+/// except for blocks whose `block_hash` is in `superseded_hashes`.
 ///
-/// Returns `Ok(())` if the truncation zone is safe to overwrite/truncate.
-/// Returns `Err(CorruptionError)` if any live reference would be destroyed.
+/// Returns:
+/// - `Ok(())` if the truncation zone is safe to overwrite/truncate, or
+/// - `Err(CorruptionError)` if any live reference would be destroyed.
 ///
 /// Checks both `marf_data` and `marf_squash_levels`.
 pub fn validate_truncation_zone<T: MarfTrieId>(
@@ -966,18 +1075,17 @@ pub fn validate_truncation_zone<T: MarfTrieId>(
     Ok(())
 }
 
-/// Prune external blob references for non-canonical `marf_data` rows whose blob
-/// data falls within the reclaim truncation zone.
+/// Prune external blob references for non-canonical `marf_data` rows whose blob data falls within
+/// the reclaim truncation zone.
 ///
-/// After blob export, committed fork blocks have `external_offset/external_length`
-/// pointing into the `.blobs` file and `data = x''` (empty).  These rows are
-/// unreachable from the canonical chain tip (`get_block_at_height` only walks
-/// the canonical ancestry), but `validate_truncation_zone` correctly rejects
-/// them because they are not in the canonical `superseded_hashes` set.
+/// After blob export, committed fork blocks have `external_offset/external_length` pointing into
+/// the `.blobs` file and `data = x''` (empty).  These rows are unreachable from the canonical chain
+/// tip (`get_block_at_height` only walks the canonical ancestry), but `validate_truncation_zone`
+/// correctly rejects them because they are not in the canonical `superseded_hashes` set.
 ///
-/// This function zeroes their external refs so that reclaim truncation can
-/// proceed.  **This is an intentional pruning of non-canonical fork state**:
-/// those trie blobs become permanently unreadable after this call.
+/// This function zeroes their external refs so that reclaim truncation can proceed.  **This is an
+/// intentional pruning of non-canonical fork state**: those trie blobs become permanently
+/// unreadable after this call.
 ///
 /// Returns the number of orphaned rows pruned.
 pub fn prune_orphaned_external_refs<T: MarfTrieId>(

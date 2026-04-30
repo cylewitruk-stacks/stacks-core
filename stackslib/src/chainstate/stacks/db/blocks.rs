@@ -6079,7 +6079,10 @@ impl StacksChainState {
         dispatcher_opt: Option<&T>,
     ) -> Result<(Option<StacksEpochReceipt>, Option<TransactionPayload>), Error> {
         let blocks_path = self.blocks_path.clone();
-        let (mut chainstate_tx, clarity_instance) = self.chainstate_tx_begin();
+        // First chainstate_tx covers staging-block discovery and pre-append validation.
+        // Its clarity handle is unused here — the squash-divergence guard below flushes
+        // and re-acquires both before `append_block` runs.
+        let (mut chainstate_tx, _clarity_instance) = self.chainstate_tx_begin();
 
         // this is a transaction against both the headers and staging blocks databases!
         let (next_microblocks, next_staging_block) =
@@ -6259,6 +6262,32 @@ impl StacksChainState {
             next_staging_block.parent_microblock_seq,
             last_microblock_seq
         );
+
+        // ── MARF squash-divergence guard (2.x) ────────────────────────────────────
+        // Before durably committing this block to the MARF, verify that the most-recent
+        // squash level is consistent with the parent's lineage. If the chain has reorged
+        // across a squash boundary (parent descends from a now-retired canonical), this
+        // call re-anchors the level on the new lineage via `re_squash_level`.
+        //
+        // Without this pre-append guard, divergence is only detected by the post-process
+        // `assert_squash_consistency` in the coordinator — by which time `append_block` has
+        // already written the new block, and `re_squash_level`'s safety check refuses
+        // recovery (committed-non-squash descendants exist above the level). The chain is
+        // then left in a state where reads through the new block decode garbage from the
+        // wrong blob (the level-14 mainnet panic's downstream symptom).
+        //
+        // We flush the validation transaction before the call so any orphan/demote marks
+        // accumulated by `find_next_staging_block` persist regardless of the recovery's
+        // outcome, then re-acquire chainstate_tx + clarity_instance because
+        // `assert_squash_consistency` may refresh the MARF state via
+        // `refresh_after_squash`.
+        let parent_block_id = StacksBlockId::new(
+            &parent_header_info.consensus_hash,
+            &parent_header_info.anchored_header.block_hash(),
+        );
+        chainstate_tx.commit().map_err(Error::DBError)?;
+        self.assert_squash_consistency(&parent_block_id, sort_tx.tx())?;
+        let (mut chainstate_tx, clarity_instance) = self.chainstate_tx_begin();
 
         // attach the block to the chain state and calculate the next chain tip.
         // Execute the confirmed microblocks' transactions against the chain state, and then

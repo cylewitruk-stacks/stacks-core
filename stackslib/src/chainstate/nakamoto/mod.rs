@@ -1936,6 +1936,68 @@ impl NakamotoChainState {
                "parent_block_id" => %next_ready_block.header.parent_block_id,
         );
 
+        // ── Parent header lookup ────────────────────────────────────────────────────
+        // Resolved BEFORE the reward-set load, because the load reads MARF state via
+        // the parent (`read_reward_set_nakamoto_of_cycle` evaluates Clarity boot-code
+        // against the parent block). The squash-divergence guard must run between the
+        // lookup and any MARF-backed read; otherwise a divergent/retired squash lineage
+        // can corrupt the read before the guard has a chance to re-anchor.
+        let parent_header_info_opt = {
+            let (chainstate_tx, _clarity) = stacks_chain_state.chainstate_tx_begin();
+            Self::get_block_header(&chainstate_tx.tx, &next_ready_block.header.parent_block_id)?
+            // chainstate_tx + _clarity dropped here — read-only, no commit needed.
+        };
+        let parent_header_info = match parent_header_info_opt {
+            Some(p) => p,
+            None => {
+                debug!("Cannot process Nakamoto block: missing parent header";
+                       "consensus_hash" => %next_ready_block.header.consensus_hash,
+                       "stacks_block_hash" => %next_ready_block.header.block_hash(),
+                       "stacks_block_id" => %next_ready_block.header.block_id(),
+                       "parent_block_id" => %next_ready_block.header.parent_block_id
+                );
+                return Ok(None);
+            }
+        };
+
+        // sanity check -- must attach to parent
+        let parent_block_id = StacksBlockId::new(
+            &parent_header_info.consensus_hash,
+            &parent_header_info.anchored_header.block_hash(),
+        );
+        if parent_block_id != next_ready_block.header.parent_block_id {
+            let msg = "Discontinuous Nakamoto Stacks block";
+            warn!("{}", &msg;
+                  "child parent_block_id" => %next_ready_block.header.parent_block_id,
+                  "expected parent_block_id" => %parent_block_id,
+                  "consensus_hash" => %next_ready_block.header.consensus_hash,
+                  "stacks_block_hash" => %next_ready_block.header.block_hash(),
+                  "stacks_block_id" => %next_ready_block.header.block_id()
+            );
+            let staging_block_tx = stacks_chain_state.staging_db_tx_begin()?;
+            staging_block_tx.set_block_orphaned(&block_id)?;
+            staging_block_tx.commit()?;
+            return Err(ChainstateError::InvalidStacksBlock(msg.into()));
+        }
+
+        // ── MARF squash-divergence guard (Nakamoto) ─────────────────────────────────
+        // Before any MARF-backed read of the parent — including the reward-set load
+        // below, which evaluates Clarity boot-code against the parent — verify the
+        // most-recent squash level is consistent with the parent's lineage. If the
+        // chain has reorged across a squash boundary (parent descends from a
+        // now-retired canonical), this call re-anchors the level on the new lineage
+        // via `re_squash_level`.
+        //
+        // Without this pre-append guard, divergence is only detected by the post-
+        // process `assert_squash_consistency` in `handle_new_nakamoto_stacks_block` —
+        // by which time `append_block` has already committed, and `re_squash_level`'s
+        // safety check refuses recovery (committed-non-squash descendants exist above
+        // the level). The chain is then left in a state where reads through the new
+        // block decode garbage from the wrong blob (the level-14 mainnet panic's
+        // downstream symptom).
+        stacks_chain_state.assert_squash_consistency(&parent_block_id, sort_db.conn())?;
+
+        // ── Reward-set load (now safe — squash level is re-anchored if needed) ──────
         let elected_height = sort_db
             .get_consensus_hash_height(&next_ready_block.header.consensus_hash)?
             .ok_or_else(|| ChainstateError::NoSuchBlockError)?;
@@ -1964,43 +2026,8 @@ impl NakamotoChainState {
             );
             ChainstateError::NoSuchBlockError
         })?;
+
         let (mut chainstate_tx, clarity_instance) = stacks_chain_state.chainstate_tx_begin();
-
-        // find parent header
-        let Some(parent_header_info) =
-            Self::get_block_header(&chainstate_tx.tx, &next_ready_block.header.parent_block_id)?
-        else {
-            // no parent; cannot process yet
-            debug!("Cannot process Nakamoto block: missing parent header";
-                   "consensus_hash" => %next_ready_block.header.consensus_hash,
-                   "stacks_block_hash" => %next_ready_block.header.block_hash(),
-                   "stacks_block_id" => %next_ready_block.header.block_id(),
-                   "parent_block_id" => %next_ready_block.header.parent_block_id
-            );
-            return Ok(None);
-        };
-
-        // sanity check -- must attach to parent
-        let parent_block_id = StacksBlockId::new(
-            &parent_header_info.consensus_hash,
-            &parent_header_info.anchored_header.block_hash(),
-        );
-        if parent_block_id != next_ready_block.header.parent_block_id {
-            drop(chainstate_tx);
-
-            let msg = "Discontinuous Nakamoto Stacks block";
-            warn!("{}", &msg;
-                  "child parent_block_id" => %next_ready_block.header.parent_block_id,
-                  "expected parent_block_id" => %parent_block_id,
-                  "consensus_hash" => %next_ready_block.header.consensus_hash,
-                  "stacks_block_hash" => %next_ready_block.header.block_hash(),
-                  "stacks_block_id" => %next_ready_block.header.block_id()
-            );
-            let staging_block_tx = stacks_chain_state.staging_db_tx_begin()?;
-            staging_block_tx.set_block_orphaned(&block_id)?;
-            staging_block_tx.commit()?;
-            return Err(ChainstateError::InvalidStacksBlock(msg.into()));
-        }
 
         // set the sortition handle's pointer to the block's burnchain view.
         //   this is either:
