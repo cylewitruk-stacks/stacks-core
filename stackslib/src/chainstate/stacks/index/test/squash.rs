@@ -650,7 +650,6 @@ fn test_squash_incremental_basic() {
         l1_min,
         l1_max,
         false,
-        100,
         None,
     )
     .expect("Incremental squash should succeed");
@@ -759,7 +758,6 @@ fn test_squash_incremental_cross_level_reads_and_proofs() {
         l1_min,
         l1_max,
         false,
-        100,
         None,
     )
     .expect("Level 1 squash");
@@ -872,7 +870,6 @@ fn test_squash_post_incremental_extension() {
         l1_min,
         l1_max,
         false,
-        100,
         None,
     )
     .expect("Level 1 squash");
@@ -1022,7 +1019,6 @@ fn test_squash_incremental_reclaim() {
         l1_min,
         l1_max,
         true, // reclaim!
-        100,
         None,
     )
     .expect("Incremental squash with reclaim should succeed");
@@ -1142,7 +1138,6 @@ fn test_squash_incremental_l0_bootstrap() {
         0,
         num_blocks - 1,
         false,
-        100,
         None,
     )
     .unwrap();
@@ -1201,7 +1196,6 @@ fn test_squash_incremental_l0_bootstrap() {
         num_blocks,
         num_blocks + l1_count - 1,
         false,
-        100,
         None,
     )
     .unwrap();
@@ -1277,7 +1271,6 @@ fn test_refresh_after_external_squash() {
         0,
         num_blocks - 1,
         false,
-        100,
         None,
     )
     .unwrap();
@@ -1424,7 +1417,6 @@ fn test_squash_preserves_per_block_root_hashes() {
         0,
         tip_height,
         false,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -1520,7 +1512,6 @@ fn test_cow_write_through_reclaimed_parent() {
         0,
         (l0_blocks - 1) as u32,
         false, // L0: no reclaim
-        100,
         None,
     )
     .expect("L0 squash");
@@ -1566,7 +1557,6 @@ fn test_cow_write_through_reclaimed_parent() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
-        100,
         None,
     )
     .expect("L1 reclaim squash");
@@ -1701,7 +1691,6 @@ fn test_l1_reclaim_squash_extend_matches_unsquashed_reference() {
         0,
         (l0_blocks - 1) as u32,
         true, // reclaim=true, but existing_levels is empty so actually_reclaimed=false
-        100,
         None,
     )
     .expect("L0 squash");
@@ -1748,7 +1737,6 @@ fn test_l1_reclaim_squash_extend_matches_unsquashed_reference() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
-        100,
         None,
     )
     .expect("L1 reclaim squash");
@@ -1897,7 +1885,6 @@ fn test_l1_no_reclaim_squash_extend_matches_unsquashed_reference() {
         0,
         (l0_blocks - 1) as u32,
         false,
-        100,
         None,
     )
     .expect("L0 squash");
@@ -1935,7 +1922,6 @@ fn test_l1_no_reclaim_squash_extend_matches_unsquashed_reference() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         false, // no reclaim
-        100,
         None,
     )
     .expect("L1 no-reclaim squash");
@@ -2062,7 +2048,6 @@ fn test_l1_reclaim_squash_multi_extend_matches_unsquashed_reference() {
         0,
         (l0_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 squash");
@@ -2096,7 +2081,6 @@ fn test_l1_reclaim_squash_multi_extend_matches_unsquashed_reference() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L1 reclaim squash");
@@ -2236,7 +2220,6 @@ fn test_l0_reclaim_squash_extend_matches_unsquashed_reference() {
         0,
         (l0_blocks - 1) as u32,
         true, // L0 reclaim!
-        100,
         None,
     )
     .expect("L0 reclaim squash");
@@ -2335,7 +2318,6 @@ fn test_l0_reclaim_squash_multi_extend_matches_unsquashed_reference() {
         0,
         (l0_blocks - 1) as u32,
         true, // L0 reclaim!
-        100,
         None,
     )
     .expect("L0 reclaim squash");
@@ -2438,7 +2420,6 @@ fn test_l0_reclaim_squash_heavy_updates_matches_unsquashed_reference() {
         0,
         (l0_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 reclaim squash");
@@ -2562,7 +2543,6 @@ fn test_l0_reclaim_squash_long_horizon_heavy_updates_matches_unsquashed_referenc
         0,
         (l0_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 reclaim squash");
@@ -2672,7 +2652,6 @@ fn test_l0_reclaim_squash_long_horizon_historical_reads_match_unsquashed_referen
         0,
         (l0_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 reclaim squash");
@@ -2944,7 +2923,6 @@ fn test_l0_reclaim_prunes_fork_blocks_and_succeeds() {
         0,
         (num_blocks - 1) as u32,
         true, // reclaim
-        100,
         None,
     )
     .expect("L0 reclaim should succeed after pruning orphaned fork block refs");
@@ -3069,7 +3047,6 @@ fn test_l1_reclaim_succeeds_with_orphaned_fork_blocks() {
         0,
         (l0_blocks - 1) as u32,
         false, // append-only
-        100,
         None,
     )
     .expect("L0 append-only squash should succeed despite fork blocks");
@@ -3132,7 +3109,6 @@ fn test_l1_reclaim_succeeds_with_orphaned_fork_blocks() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
-        100,
         None,
     )
     .expect("L1 reclaim squash should succeed even with orphaned fork blocks");
@@ -3260,7 +3236,6 @@ fn test_l1_reclaim_prunes_fork_blocks_in_l1_range() {
         0,
         (l0_blocks - 1) as u32,
         false, // append-only L0
-        100,
         None,
     )
     .expect("L0 append-only squash");
@@ -3348,7 +3323,6 @@ fn test_l1_reclaim_prunes_fork_blocks_in_l1_range() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim!
-        100,
         None,
     )
     .expect("L1 reclaim should succeed after pruning fork blocks in L1 range");
@@ -3624,7 +3598,6 @@ fn test_squash_after_stub_with_reclaim() {
         l1_min,
         l1_max,
         true, // reclaim
-        100,
         None,
     )
     .expect("incremental squash after stub should succeed");
@@ -3691,7 +3664,6 @@ fn test_reclaim_after_stub_preserves_per_block_data() {
         stub_max + 1,
         (total_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("squash after stub");
@@ -4899,7 +4871,6 @@ fn test_incremental_full_history_basic() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         false,
-        100,
         None,
     )
     .expect("L1 incremental squash should succeed");
@@ -5021,7 +4992,6 @@ fn test_incremental_full_history_baseline_inheritance() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         false,
-        100,
         None,
     )
     .expect("L1 incremental squash should succeed");
@@ -5160,7 +5130,6 @@ fn test_incremental_full_history_reclaim() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         true, // reclaim
-        100,
         None,
     )
     .expect("L1 incremental squash with reclaim should succeed");
@@ -5282,7 +5251,6 @@ fn test_incremental_full_history_baseline_with_later_transition() {
         l0_blocks as u32,
         (l0_blocks + l1_blocks - 1) as u32,
         false,
-        100,
         None,
     )
     .expect("L1 incremental squash should succeed");
@@ -5350,7 +5318,6 @@ fn test_get_with_proof_in_squash_range_returns_error() {
         0,
         max_height,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -5563,7 +5530,6 @@ fn test_cow_flattens_leaf_squashed_to_leaf() {
         0,
         max_height,
         true, // reclaim
-        100,
         None,
     )
     .expect("FullHistory squash should succeed");
@@ -5725,7 +5691,6 @@ fn test_cow_flattens_leaf_squashed_at_non_tip_parent_height() {
         0,
         (NUM_BLOCKS - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("FullHistory squash should succeed");
@@ -5850,7 +5815,6 @@ fn test_mixed_stack_full_history_l0_tip_only_l1() {
         0,
         l0_max,
         true, // reclaim per-block blobs
-        100,
         None,
     )
     .expect("L0 FullHistory squash should succeed");
@@ -5905,7 +5869,6 @@ fn test_mixed_stack_full_history_l0_tip_only_l1() {
         l1_min,
         l1_max,
         false,
-        100,
         None,
     )
     .expect("L1 TipOnly squash should succeed");
@@ -6079,7 +6042,6 @@ fn test_full_history_tip_read_benchmark() {
             0,
             max_height,
             true,
-            100,
             None,
         )
         .expect("FullHistory squash should succeed");
@@ -6242,7 +6204,6 @@ fn test_l0_reclaim_squash_long_extension_reads_with_reopen() {
         0,
         l0_blocks as u32, // includes the cold-key block
         true,
-        100,
         None,
     )
     .expect("L0 reclaim squash");
@@ -6385,7 +6346,6 @@ fn test_l0_reclaim_squash_reads_with_reopen_readonly() {
         0,
         l0_blocks as u32,
         true,
-        100,
         None,
     )
     .expect("L0 reclaim squash");
@@ -6477,7 +6437,6 @@ fn test_squash_rejects_when_blocks_exist_above_range() {
         0,
         9,
         true,
-        100,
         None,
     );
 
@@ -6681,7 +6640,6 @@ fn test_tier1_debug_single_key_sparse_updates() {
         0,
         (num_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 FullHistory reclaim squash");
@@ -6769,7 +6727,6 @@ fn tier1_debug_sparse_n_account_chain(num_accounts: usize, num_blocks: usize) {
         0,
         (num_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 FullHistory reclaim squash");
@@ -6859,7 +6816,6 @@ fn tier1_debug_n_account_chain(num_accounts: usize, num_blocks: usize) {
         0,
         (num_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 FullHistory reclaim squash");
@@ -6947,7 +6903,6 @@ fn test_tier1_debug_single_account_historical_reads() {
         0,
         (num_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("L0 FullHistory reclaim squash");
@@ -7041,7 +6996,6 @@ fn test_tier1_multi_level_full_history_reclaim_differential() {
                 min_h,
                 max_h,
                 true, // reclaim
-                100,
                 None,
             )
             .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
@@ -7377,7 +7331,6 @@ fn test_tier2_fork_at_boundary_full_history_differential() {
         0,
         (canonical_blocks - 1) as u32,
         true, // reclaim
-        100,
         None,
     )
     .expect("canonical FullHistory+reclaim squash should succeed over fork blocks");
@@ -7532,7 +7485,6 @@ fn test_tier3_nonce_overwrite_recurring_squash_differential() {
                     min_h,
                     max_h,
                     true,
-                    100,
                     None,
                 )
                 .unwrap_or_else(|e| panic!("recurring squash at height {h} failed: {e:?}"));
@@ -7740,7 +7692,6 @@ fn test_tier3_live_handle_refresh_after_recurring_squash_tip_nonce() {
                 min_h,
                 max_h,
                 true,
-                100,
                 None,
             )
             .unwrap_or_else(|e| panic!("live-handle recurring squash at height {h} failed: {e:?}"));
@@ -7848,7 +7799,6 @@ fn test_tier3_live_handle_refresh_after_recurring_sparse_nonce_squash() {
                 min_h,
                 max_h,
                 true,
-                100,
                 None,
             )
             .unwrap_or_else(|e| {
@@ -7969,7 +7919,6 @@ fn test_tier4_headers_style_recurring_tip_only_reclaim() {
                     min_h,
                     max_h,
                     true,
-                    100,
                     None,
                 )
                 .unwrap_or_else(|e| panic!("TipOnly recurring squash at h={h} failed: {e:?}"));
@@ -8104,7 +8053,6 @@ fn test_tier5_stale_reopen_readonly_across_squash_reproduces_corruption() {
         0,
         (pre_blocks - 1) as u32,
         true, // reclaim — forces redirect + file truncation
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -8226,7 +8174,6 @@ fn test_tier6_cross_independent_marf_handles_share_squash_publishes() {
         0,
         (pre_blocks - 1) as u32,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -8372,7 +8319,6 @@ fn test_tier7_concurrent_truncate_vs_independent_reads() {
             0,
             (num_blocks - 1) as u32,
             true,
-            100,
             None,
         )
         .expect("tier7 first squash should succeed");
@@ -8636,7 +8582,6 @@ fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
         0,
         1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -8806,7 +8751,6 @@ fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
         0,
         1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -8987,7 +8931,6 @@ fn test_tier11b_adversarial_root_backptr_to_older_squashed_ancestor() {
         0,
         2,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -9178,7 +9121,6 @@ fn test_leaf_squashed_read_path_perf_shape() {
         0,
         1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -9323,7 +9265,6 @@ fn test_seal_after_squash_canonical_tip_extension_smoke() {
         0,
         N - 1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -9427,7 +9368,6 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
         0,
         N - 1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -9609,7 +9549,6 @@ fn test_repro_collect_history_parallel_block_hashes_indexing() {
         0,
         N - 1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -9801,7 +9740,6 @@ fn test_repro_orphan_leaf_to_node4_redirect_would_be_unsafe() {
         0,
         4,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -9954,7 +9892,6 @@ fn test_repro_saved_root_sidecar_root_is_not_patched_against_merged_tip_root() {
         0,
         2,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -10067,7 +10004,6 @@ fn test_pr2_compression_does_not_patch_against_orphan_sidecar_base() {
         0,
         2,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -10205,7 +10141,6 @@ fn test_replace_retired_orphan_sidecar_child_compressed_commit_to() {
         0,
         3,
         true,
-        100,
         None,
     )
     .expect("initial squash should succeed");
@@ -10227,7 +10162,6 @@ fn test_replace_retired_orphan_sidecar_child_compressed_commit_to() {
         0,
         SquashMode::FullHistory,
         true,
-        100,
         block_b.clone(),
     )
     .expect("Replace re-squash should succeed");
@@ -10349,7 +10283,6 @@ fn test_iteration2_trim_policy_end_to_end() {
             lo,
             hi,
             true, // reclaim — sidecars are written
-            TEST_TRIM_RETENTION_DISABLED,
             None,
         )
         .unwrap_or_else(|e| panic!("squash_level_incremental({lo}..={hi}) failed: {e:?}"));
@@ -10392,11 +10325,19 @@ fn test_iteration2_trim_policy_end_to_end() {
     // not `CorruptionError` (which would indicate the cached `SquashMeta` snapshot was still stale
     // and the read path tried to open the just-deleted sidecar).
     let mut trim_handle = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    // 3 levels × HEIGHTS_PER_LEVEL = 12 blocks of retention preserves the
+    // historical "retention_levels = 2" intent under the new block-count
+    // semantics (retain at least N blocks of fork-extension; everything
+    // strictly older trims). Walking newest-first with span=4 each level:
+    //   level 4: accumulated 0 < 12, credit  (acc=4)
+    //   level 3: accumulated 4 < 12, credit  (acc=8)
+    //   level 2: accumulated 8 < 12, credit  (acc=12)
+    //   level 1: accumulated 12 >= 12, TRIM
+    //   level 0: accumulated 12 >= 12, TRIM
     let report = trim_aged_root_sidecars(
         &mut trim_handle,
         std::path::Path::new(&path),
-        N_LEVELS - 1,
-        2,
+        (HEIGHTS_PER_LEVEL * 3) as u32,
     )
     .unwrap();
     assert_eq!(
@@ -10453,10 +10394,15 @@ fn test_iteration2_trim_policy_end_to_end() {
         }
     }
 
-    // Idempotency: re-run trim. Same `latest_level=4, retention=2`.
+    // Idempotency: re-run trim with the same retention; nothing new should change.
     let report2 = {
         let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        trim_aged_root_sidecars(&mut marf, std::path::Path::new(&path), N_LEVELS - 1, 2).unwrap()
+        trim_aged_root_sidecars(
+            &mut marf,
+            std::path::Path::new(&path),
+            (HEIGHTS_PER_LEVEL * 3) as u32,
+        )
+        .unwrap()
     };
     assert_eq!(report2.levels_trimmed, 0);
     assert_eq!(report2.trim_failures, 0);
@@ -10596,15 +10542,18 @@ fn test_iteration2_trim_policy_end_to_end() {
     match &begin_err {
         Error::SnapshotTrimmed {
             level_id,
-            retention_levels,
+            retention_blocks,
         } => {
             assert_eq!(*level_id, 0, "trimmed parent is in level 0");
             // The error should reflect the retention configured on this handle's `MARFOpenOpts`,
-            // not the crate-level default. The test handle was opened with
-            // `with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED)`.
+            // resolved through `resolve_retention_blocks` to a block count. The test handle was
+            // opened with `with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED)`,
+            // which legacy-converts to `legacy * MARF_SQUASH_CADENCE_BLOCKS` blocks.
             assert_eq!(
-                *retention_levels, TEST_TRIM_RETENTION_DISABLED,
-                "retention_levels should reflect the retention configured on this handle's MARFOpenOpts",
+                *retention_blocks,
+                TEST_TRIM_RETENTION_DISABLED
+                    .saturating_mul(crate::core::MARF_SQUASH_CADENCE_BLOCKS as u32),
+                "retention_blocks should reflect the legacy-converted retention from MARFOpenOpts",
             );
         }
         other => panic!(
@@ -10694,7 +10643,6 @@ fn test_pr2_merged_blob_omits_orphan_region() {
         0,
         NUM_BLOCKS - 1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -10863,7 +10811,6 @@ fn test_latest_squash_level_canonical_chain_returns_recorded_tip() {
         0,
         NUM_BLOCKS - 1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -10951,7 +10898,6 @@ fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
         0,
         1,
         true,
-        100,
         None,
     )
     .expect("squash should succeed");
@@ -11073,7 +11019,6 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
         0,
         1,
         true,
-        100,
         None,
     )
     .expect("initial squash should succeed");
@@ -11123,7 +11068,6 @@ fn test_re_squash_level_recovers_post_reorg_canonical() {
         /* level_id = */ 0,
         SquashMode::FullHistory,
         true,
-        100,
         block_b.clone(),
     )
     .expect("re_squash_level should succeed when no committed descendants exist");
@@ -11251,7 +11195,6 @@ fn test_re_squash_level_retires_old_canonical_for_fork_readability() {
         0,
         1,
         true, // reclaim=true is the load-bearing case: A's per-block blob is gone after this
-        100,
         None,
     )
     .expect("initial squash should succeed");
@@ -11283,7 +11226,6 @@ fn test_re_squash_level_retires_old_canonical_for_fork_readability() {
         /* level_id = */ 0,
         SquashMode::FullHistory,
         true,
-        100,
         block_b.clone(),
     )
     .expect("re_squash_level should succeed");
@@ -11511,7 +11453,6 @@ fn replace_at_cadence_boundary_preserves_state_roots_with_opts(
         0,
         3,
         /* reclaim = */ true,
-        100,
         None,
     )
     .expect("initial squash on the squashed MARF");
@@ -11536,7 +11477,6 @@ fn replace_at_cadence_boundary_preserves_state_roots_with_opts(
         /* level_id = */ 0,
         SquashMode::FullHistory,
         true,
-        100,
         block_b.clone(),
     )
     .expect("re_squash_level anchored to B");
@@ -11794,7 +11734,6 @@ fn test_replace_at_cadence_boundary_begin_extends_retired_fork_descendant_compre
         0,
         3,
         true,
-        100,
         None,
     )
     .expect("initial squash");
@@ -11818,7 +11757,6 @@ fn test_replace_at_cadence_boundary_begin_extends_retired_fork_descendant_compre
         0,
         SquashMode::FullHistory,
         true,
-        100,
         block_b.clone(),
     )
     .expect("Replace anchored to block_b");
@@ -12016,7 +11954,6 @@ fn test_re_squash_level_handles_deep_intra_range_backpointers() {
         0,
         NUM_HEIGHTS - 1,
         true,
-        100,
         None,
     )
     .expect("initial squash should succeed");
@@ -12045,7 +11982,6 @@ fn test_re_squash_level_handles_deep_intra_range_backpointers() {
         /* level_id = */ 0,
         SquashMode::FullHistory,
         true,
-        100,
         block_b.clone(),
     )
     .expect(
@@ -12095,4 +12031,990 @@ fn test_re_squash_level_handles_deep_intra_range_backpointers() {
             "B inherits per-height key from canonical at height {i}",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `published_max_block_id` watermark tests (Step 2 of adaptive cadence)
+// ---------------------------------------------------------------------------
+
+/// `MARF::squash`-style publish records the watermark = `MAX(block_id) FROM
+/// marf_data WHERE unconfirmed = 0` snapshotted inside the publish
+/// transaction. After a single squash over a freshly-built `N`-block chain
+/// (no prior squashes), the new active level's `published_max_block_id`
+/// equals the rowid of the last commit.
+#[test]
+fn test_published_max_block_id_set_at_squash_publish() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_published_max_block_id_set_at_squash_publish");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    let num_blocks = 5;
+    let (src_marf, _, _) = setup_squash_source_marf(&marf_path, num_blocks, 2);
+    drop(src_marf);
+
+    let pre_squash_max = {
+        let conn = rusqlite::Connection::open(&marf_path).unwrap();
+        trie_sql::current_published_max_block_id(&conn).unwrap()
+    };
+    // Sanity: each `commit()` adds one `marf_data` row with a fresh rowid;
+    // after `num_blocks` commits the watermark probe sees them all.
+    assert_eq!(pre_squash_max, num_blocks as u32);
+
+    squash_level_incremental::<StacksBlockId>(
+        &marf_path,
+        SquashMode::TipOnly,
+        0,
+        (num_blocks - 1) as u32,
+        /* reclaim = */ true,
+        None,
+    )
+    .expect("squash should succeed");
+
+    // Reopen and read the level row's watermark column.
+    let conn = rusqlite::Connection::open(&marf_path).unwrap();
+    let levels = trie_sql::read_squash_levels(&conn).expect("read_squash_levels");
+    assert_eq!(levels.len(), 1, "exactly one active level after first squash");
+    let level = &levels[0];
+    assert_eq!(
+        level.published_max_block_id, pre_squash_max,
+        "active level's watermark should match publish-time MAX(block_id)"
+    );
+}
+
+/// `create_stub_level` snapshots the publish-time watermark even though it
+/// writes no merged blob. Late-enablement deployments typically run a stub
+/// over an already-populated `marf_data`; without snapshotting MAX(block_id)
+/// at stub time the next stats reconstruction would over-count over the
+/// entire pre-stub table until the next real squash.
+#[test]
+fn test_published_max_block_id_set_at_stub_create() {
+    use crate::chainstate::stacks::index::squash::create_stub_level;
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_published_max_block_id_set_at_stub_create");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    let num_blocks = 7;
+    let (src_marf, _, _) = setup_squash_source_marf(&marf_path, num_blocks, 2);
+    drop(src_marf);
+
+    let pre_stub_max = {
+        let conn = rusqlite::Connection::open(&marf_path).unwrap();
+        trie_sql::current_published_max_block_id(&conn).unwrap()
+    };
+    assert_eq!(pre_stub_max, num_blocks as u32);
+
+    create_stub_level::<StacksBlockId>(&marf_path, 0, (num_blocks - 1) as u32)
+        .expect("create_stub_level should succeed");
+
+    let conn = rusqlite::Connection::open(&marf_path).unwrap();
+    let levels = trie_sql::read_squash_levels(&conn).expect("read_squash_levels");
+    assert_eq!(levels.len(), 1);
+    let stub = &levels[0];
+    assert_eq!(stub.blob_length, 0, "stub level has no merged blob");
+    assert_eq!(
+        stub.published_max_block_id, pre_stub_max,
+        "stub watermark should match publish-time MAX(block_id) so the next stats \
+         reconstruction starts from the right rowid"
+    );
+}
+
+/// Direct exercise of the v3 -> v4 migration branch in
+/// `migrate_tables_if_needed`: build a SQLite DB with v3 schema (no
+/// `published_max_block_id`), insert a row in the legacy column shape, run the
+/// migration, and verify the column was added with default 0 and
+/// `read_squash_levels` returns it cleanly. Without this, the migration code
+/// only gets exercised indirectly when an out-of-tree v3 DB is opened — a
+/// deployment scenario the unit suite otherwise doesn't cover.
+#[test]
+fn test_migrate_v3_to_v4_adds_published_max_block_id_default_zero() {
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_migrate_v3_to_v4_adds_published_max_block_id_default_zero");
+    let db_path = format!("{test_dir}/v3.sqlite");
+
+    // Hand-build a v3-shaped DB:
+    //   - schema_version + migrated_version tables at version=3
+    //   - `marf_data` with v2 columns (so trie_sql migration doesn't try to
+    //     re-add them)
+    //   - `marf_squash_levels` at v3 (no `published_max_block_id`)
+    // Mirroring `SQL_MARF_DATA_TABLE` and `SQL_MARF_DATA_TABLE_SCHEMA_3`.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE marf_data (
+             block_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             block_hash TEXT UNIQUE NOT NULL,
+             data BLOB NOT NULL,
+             unconfirmed INTEGER NOT NULL,
+             external_offset INTEGER DEFAULT 0 NOT NULL,
+             external_length INTEGER DEFAULT 0 NOT NULL
+         );
+         CREATE TABLE schema_version (version INTEGER DEFAULT 1 NOT NULL);
+         CREATE TABLE migrated_version (version INTEGER DEFAULT 1 NOT NULL);
+         CREATE TABLE marf_squash_levels (
+             level_id INTEGER PRIMARY KEY,
+             min_height INTEGER NOT NULL,
+             max_height INTEGER NOT NULL,
+             blob_offset INTEGER NOT NULL,
+             blob_length INTEGER NOT NULL,
+             reads_redirected INTEGER NOT NULL DEFAULT 0,
+             root_sidecar_present INTEGER NOT NULL DEFAULT 0,
+             root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0,
+             orphan_split_offset INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO schema_version (version) VALUES (3);
+         INSERT INTO migrated_version (version) VALUES (3);",
+    )
+    .unwrap();
+
+    // Simulate a pre-existing squash row written under v3.
+    conn.execute(
+        "INSERT INTO marf_squash_levels \
+         (level_id, min_height, max_height, blob_offset, blob_length, \
+          reads_redirected, root_sidecar_present, root_sidecar_trimmed, \
+          orphan_split_offset) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![7i64, 100i64, 199i64, 4096i64, 16384i64, 1i64, 1i64, 0i64, 0i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Run the public migration. v3 is now -> v4.
+    let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+    let prior_version =
+        trie_sql::migrate_tables_if_needed::<StacksBlockId>(&mut conn).expect("migration must succeed");
+    assert_eq!(prior_version, 3, "test setup expected to start at v3");
+
+    // The new column exists, default 0 is applied to the pre-existing row, and
+    // `read_squash_levels` returns it without erroring.
+    let levels = trie_sql::read_squash_levels(&conn).expect("read_squash_levels post-migration");
+    assert_eq!(levels.len(), 1);
+    let level = &levels[0];
+    assert_eq!(level.level_id, 7);
+    assert_eq!(level.min_height, 100);
+    assert_eq!(level.max_height, 199);
+    assert_eq!(
+        level.published_max_block_id, 0,
+        "v3 rows must default to 0 after migration; the next squash overwrites with a real watermark"
+    );
+
+    // Idempotent: a second migration call is a no-op (still v4) and the row
+    // is unchanged.
+    let prior_version_2 =
+        trie_sql::migrate_tables_if_needed::<StacksBlockId>(&mut conn).expect("idempotent migration");
+    assert_eq!(prior_version_2, trie_sql::SQL_MARF_SCHEMA_VERSION);
+    let levels_after = trie_sql::read_squash_levels(&conn).unwrap();
+    assert_eq!(levels_after.len(), 1);
+    assert_eq!(levels_after[0].published_max_block_id, 0);
+}
+
+/// Replace publish (`re_squash_level`): the retired row inherits the OLD
+/// active row's `published_max_block_id` verbatim, and the new active row
+/// captures a fresh publish-time `MAX(block_id)` (which is `>=` the old
+/// watermark since rowids are monotonic).
+#[test]
+fn test_published_max_block_id_replace_inherits_old_and_writes_fresh() {
+    use crate::chainstate::stacks::index::squash::{re_squash_level, squash_level_incremental};
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir =
+        fresh_test_dir("test_published_max_block_id_replace_inherits_old_and_writes_fresh");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    // Phase 1: build a chain and run an initial squash to create level 0.
+    let l0_blocks = 4;
+    let (src_marf, blocks_l0, _) = setup_squash_source_marf(&marf_path, l0_blocks, 2);
+    drop(src_marf);
+
+    let pre_l0_squash_max = {
+        let conn = rusqlite::Connection::open(&marf_path).unwrap();
+        trie_sql::current_published_max_block_id(&conn).unwrap()
+    };
+
+    squash_level_incremental::<StacksBlockId>(
+        &marf_path,
+        SquashMode::TipOnly,
+        0,
+        (l0_blocks - 1) as u32,
+        /* reclaim = */ true,
+        None,
+    )
+    .expect("initial squash");
+
+    // Read level 0 and capture the watermark we expect the retired row to
+    // inherit on Replace.
+    let original_l0_watermark = {
+        let conn = rusqlite::Connection::open(&marf_path).unwrap();
+        let levels = trie_sql::read_squash_levels(&conn).unwrap();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].published_max_block_id, pre_l0_squash_max);
+        levels[0].published_max_block_id
+    };
+
+    // Phase 2: commit a sibling block within the level's height range so
+    // `MAX(block_id)` advances past `original_l0_watermark` *without*
+    // tripping Replace's "no commits above max_height" safety check (a
+    // sibling shares its parent's height + 1, which here lands inside the
+    // squashed range, so `block_height <= max_height` and the check passes).
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+    let tip_l0 = blocks_l0[l0_blocks - 1].clone();
+    // Use a parent that's a non-tip ancestor (height = l0_blocks - 2), so the
+    // sibling lands at `l0_blocks - 1 = max_height`, still in the level.
+    let sibling_parent = blocks_l0[l0_blocks - 2].clone();
+    let sibling = {
+        let mut bytes = [0xEEu8; 32];
+        bytes[28..32].copy_from_slice(&((l0_blocks as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    marf.begin(&sibling_parent, &sibling).unwrap();
+    marf.insert("k_sibling", MARFValue::from_value("v_sibling"))
+        .unwrap();
+    marf.seal().unwrap();
+    marf.commit().unwrap();
+    drop(marf);
+
+    let pre_replace_max = {
+        let conn = rusqlite::Connection::open(&marf_path).unwrap();
+        trie_sql::current_published_max_block_id(&conn).unwrap()
+    };
+    assert!(
+        pre_replace_max > original_l0_watermark,
+        "sibling commit must advance MAX(block_id) for the freshness check to be meaningful"
+    );
+
+    // Phase 3: Replace level 0, anchored to the original L0 tip (still
+    // canonical-correct for level 0's range).
+    re_squash_level::<StacksBlockId>(
+        &marf_path,
+        /* level_id = */ 0,
+        SquashMode::TipOnly,
+        /* reclaim = */ true,
+        tip_l0.clone(),
+    )
+    .expect("Replace should succeed");
+
+    // The retired row carries the OLD watermark; the new active row carries
+    // a fresh measurement.
+    let conn = rusqlite::Connection::open(&marf_path).unwrap();
+    let active = trie_sql::read_squash_levels(&conn).unwrap();
+    assert_eq!(active.len(), 1, "still one active row after Replace");
+    assert_eq!(
+        active[0].published_max_block_id, pre_replace_max,
+        "new active row's watermark = publish-time MAX(block_id) at Replace"
+    );
+
+    let retired = trie_sql::read_retired_squash_levels(&conn).unwrap();
+    assert_eq!(retired.len(), 1, "one retired row after Replace");
+    assert_eq!(
+        retired[0].published_max_block_id, original_l0_watermark,
+        "retired row inherits the OLD active row's watermark verbatim"
+    );
+    assert_eq!(retired[0].original_level_id, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Live-handle squash methods: equivalence with path-based wrappers (Step 3)
+// ---------------------------------------------------------------------------
+
+/// Read the .blobs file's bytes verbatim. Used by the equivalence tests below
+/// to compare merged-blob output between path-based and live-handle squashes.
+fn read_blob_file(marf_path: &str) -> Vec<u8> {
+    std::fs::read(format!("{marf_path}.blobs")).expect("blob file should exist")
+}
+
+/// Compare two `marf_squash_levels` row sets by every field except cosmetic
+/// differences (none currently — all fields are load-bearing). The watermark
+/// is included: equivalence tests build the two DBs identically, so the
+/// publish-time MAX(block_id) snapshots agree.
+fn assert_squash_levels_equivalent(
+    a: &[crate::chainstate::stacks::index::squash::SquashLevelRow],
+    b: &[crate::chainstate::stacks::index::squash::SquashLevelRow],
+) {
+    assert_eq!(a.len(), b.len(), "row counts differ");
+    for (ra, rb) in a.iter().zip(b.iter()) {
+        assert_eq!(ra.level_id, rb.level_id, "level_id mismatch");
+        assert_eq!(ra.min_height, rb.min_height, "min_height mismatch");
+        assert_eq!(ra.max_height, rb.max_height, "max_height mismatch");
+        assert_eq!(ra.blob_offset, rb.blob_offset, "blob_offset mismatch");
+        assert_eq!(ra.blob_length, rb.blob_length, "blob_length mismatch");
+        assert_eq!(
+            ra.reads_redirected, rb.reads_redirected,
+            "reads_redirected mismatch"
+        );
+        assert_eq!(
+            ra.root_sidecar_present, rb.root_sidecar_present,
+            "root_sidecar_present mismatch"
+        );
+        assert_eq!(
+            ra.orphan_split_offset, rb.orphan_split_offset,
+            "orphan_split_offset mismatch"
+        );
+        assert_eq!(
+            ra.published_max_block_id, rb.published_max_block_id,
+            "published_max_block_id mismatch"
+        );
+    }
+}
+
+/// Build identical chains in two MARFs, run `squash_level_incremental` (path
+/// wrapper) on one and `MARF::squash` (live-handle) on the other, then verify
+/// they produce byte-identical merged blobs and equivalent `marf_squash_levels`
+/// rows. Guards against the live-handle refactor introducing any divergence
+/// from the historical path-based output.
+#[test]
+fn test_marf_squash_method_equivalence() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashLevelRow};
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_marf_squash_method_equivalence");
+    let path_a = format!("{test_dir}/path_based.sqlite");
+    let path_b = format!("{test_dir}/live_handle.sqlite");
+
+    let num_blocks = 6;
+    let keys_per_block = 2;
+
+    // Build identical source chains.
+    let (a_marf, _, _) = setup_squash_source_marf(&path_a, num_blocks, keys_per_block);
+    drop(a_marf);
+    let (b_marf, _, _) = setup_squash_source_marf(&path_b, num_blocks, keys_per_block);
+    drop(b_marf);
+
+    let max_height = (num_blocks - 1) as u32;
+
+    // Path-based wrapper.
+    squash_level_incremental::<StacksBlockId>(
+        &path_a,
+        SquashMode::TipOnly,
+        0,
+        max_height,
+        true,
+        None,
+    )
+    .expect("path-based squash should succeed");
+
+    // Live-handle method on the second MARF.
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf_b = MARF::<StacksBlockId>::from_path(&path_b, open_opts).unwrap();
+    marf_b
+        .squash(SquashMode::TipOnly, 0, max_height, true, None)
+        .expect("live-handle squash should succeed");
+    drop(marf_b);
+
+    // Compare rows.
+    let conn_a = rusqlite::Connection::open(&path_a).unwrap();
+    let conn_b = rusqlite::Connection::open(&path_b).unwrap();
+    let rows_a: Vec<SquashLevelRow> = trie_sql::read_squash_levels(&conn_a).unwrap();
+    let rows_b: Vec<SquashLevelRow> = trie_sql::read_squash_levels(&conn_b).unwrap();
+    assert_squash_levels_equivalent(&rows_a, &rows_b);
+
+    // Compare merged blob bytes.
+    let blob_a = read_blob_file(&path_a);
+    let blob_b = read_blob_file(&path_b);
+    assert_eq!(
+        blob_a.len(),
+        blob_b.len(),
+        "merged blob lengths differ between path-based and live-handle squash"
+    );
+    assert_eq!(
+        blob_a, blob_b,
+        "merged blob bytes differ between path-based and live-handle squash"
+    );
+}
+
+/// Equivalence test for the Replace path: build identical L0 + sibling-commit
+/// state in two MARFs, then run `re_squash_level` on one and `MARF::re_squash`
+/// on the other. Outputs must match byte-for-byte.
+#[test]
+fn test_marf_re_squash_method_equivalence() {
+    use crate::chainstate::stacks::index::squash::{
+        re_squash_level, squash_level_incremental, SquashLevelRow,
+    };
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_marf_re_squash_method_equivalence");
+    let path_a = format!("{test_dir}/path_based.sqlite");
+    let path_b = format!("{test_dir}/live_handle.sqlite");
+
+    let l0_blocks = 4;
+    let keys_per_block = 2;
+
+    // Build matching baseline + initial squash on each DB.
+    for path in [&path_a, &path_b] {
+        let (m, _, _) = setup_squash_source_marf(path, l0_blocks, keys_per_block);
+        drop(m);
+        squash_level_incremental::<StacksBlockId>(
+            path,
+            SquashMode::TipOnly,
+            0,
+            (l0_blocks - 1) as u32,
+            true,
+            None,
+        )
+        .expect("initial squash");
+    }
+
+    // Add an identical sibling commit on each so MAX(block_id) advances.
+    // `setup_squash_source_marf` builds blocks at heights 0..(num_blocks-1)
+    // with hash last-4-bytes = i+1, so block at height h has last_4 = h+1.
+    // Sibling parent sits at height (l0_blocks - 2) so the sibling itself
+    // lands at height (l0_blocks - 1) = max_height — inside the squash range,
+    // therefore not above-level and Replace's safety check still permits it.
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let sibling_parent = {
+        let mut bytes = [0u8; 32];
+        // height (l0_blocks - 2): last_4 = (l0_blocks - 2) + 1 = l0_blocks - 1
+        bytes[28..32].copy_from_slice(&((l0_blocks - 1) as u32).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let sibling = {
+        let mut bytes = [0xEEu8; 32];
+        bytes[28..32].copy_from_slice(&((l0_blocks as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    for path in [&path_a, &path_b] {
+        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
+        marf.begin(&sibling_parent, &sibling).unwrap();
+        marf.insert("k_sibling", MARFValue::from_value("v_sibling"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        drop(marf);
+    }
+
+    // Recovery anchors against the original L0 tip — the canonical block at
+    // `max_height = l0_blocks - 1`, whose hash has last_4 = l0_blocks.
+    let canonical_tip = {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&(l0_blocks as u32).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+
+    // Path-based Replace.
+    re_squash_level::<StacksBlockId>(
+        &path_a,
+        /* level_id = */ 0,
+        SquashMode::TipOnly,
+        true,
+        canonical_tip.clone(),
+    )
+    .expect("path-based re_squash");
+
+    // Live-handle Replace.
+    let mut marf_b = MARF::<StacksBlockId>::from_path(&path_b, open_opts).unwrap();
+    marf_b
+        .re_squash(0, SquashMode::TipOnly, true, canonical_tip)
+        .expect("live-handle re_squash");
+    drop(marf_b);
+
+    // Compare active + retired rows + merged blob.
+    let conn_a = rusqlite::Connection::open(&path_a).unwrap();
+    let conn_b = rusqlite::Connection::open(&path_b).unwrap();
+    let active_a: Vec<SquashLevelRow> = trie_sql::read_squash_levels(&conn_a).unwrap();
+    let active_b: Vec<SquashLevelRow> = trie_sql::read_squash_levels(&conn_b).unwrap();
+    assert_squash_levels_equivalent(&active_a, &active_b);
+
+    let retired_a = trie_sql::read_retired_squash_levels(&conn_a).unwrap();
+    let retired_b = trie_sql::read_retired_squash_levels(&conn_b).unwrap();
+    assert_eq!(retired_a.len(), 1);
+    assert_eq!(retired_a.len(), retired_b.len());
+    assert_eq!(
+        retired_a[0].published_max_block_id, retired_b[0].published_max_block_id,
+        "retired watermarks differ"
+    );
+    assert_eq!(retired_a[0].blob_offset, retired_b[0].blob_offset);
+    assert_eq!(retired_a[0].blob_length, retired_b[0].blob_length);
+
+    let blob_a = read_blob_file(&path_a);
+    let blob_b = read_blob_file(&path_b);
+    assert_eq!(blob_a.len(), blob_b.len(), "Replace blob lengths differ");
+    assert_eq!(blob_a, blob_b, "Replace blob bytes differ");
+}
+
+/// Live-handle squash refuses to run while a block-write transaction is in
+/// progress (the §3.1.1 "open write state" guard). Without this guard the
+/// squash can clobber the in-flight write.
+#[test]
+fn test_marf_squash_refuses_with_open_chain_tip() {
+    let test_dir = fresh_test_dir("test_marf_squash_refuses_with_open_chain_tip");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    let num_blocks = 3;
+    let (mut marf, blocks, _) = setup_squash_source_marf(&marf_path, num_blocks, 1);
+
+    // Open a write transaction without committing.
+    let next = {
+        let mut bytes = [0xFFu8; 32];
+        bytes[28..32].copy_from_slice(&((num_blocks as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    marf.begin(&blocks[num_blocks - 1], &next).unwrap();
+
+    let result = marf.squash(SquashMode::TipOnly, 0, (num_blocks - 1) as u32, true, None);
+    let err = result.expect_err("squash with open write tx should error");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("open_chain_tip") || msg.contains("transaction is in progress"),
+        "expected open_chain_tip refusal, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-MARF squash-work counter (Step 4): MARF::stats backed by
+// TrieStorageTransientData.external_bytes_since_last_squash
+// ---------------------------------------------------------------------------
+
+/// Fresh MARF with no commits and no levels: stats reports 0.
+#[test]
+fn test_marf_stats_initial_state() {
+    let test_dir = fresh_test_dir("test_marf_stats_initial_state");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+    assert_eq!(marf.stats().external_bytes_since_last_squash, 0);
+}
+
+/// `MARF::commit*` writes go through `inner_flush` and increment the counter.
+/// The increment must equal the sum of `external_length` for the committed
+/// rows (matched against the SQL truth via `current_external_bytes_since_last_squash`).
+#[test]
+fn test_marf_stats_increment_on_commit() {
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_marf_stats_increment_on_commit");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    let num_blocks = 4;
+    let (marf, _, _) = setup_squash_source_marf(&marf_path, num_blocks, 2);
+
+    // The live MARF's counter should match the SQL truth.
+    let sql_total = {
+        let conn = rusqlite::Connection::open(&marf_path).unwrap();
+        trie_sql::current_external_bytes_since_last_squash(&conn).unwrap()
+    };
+    let in_memory = marf.stats().external_bytes_since_last_squash;
+    assert!(
+        in_memory > 0,
+        "counter must have advanced after {num_blocks} commits; got {in_memory}"
+    );
+    assert_eq!(
+        in_memory, sql_total,
+        "in-memory counter must equal SQL reconstruction for the same handle"
+    );
+}
+
+/// Counter resets to 0 after a successful `MARF::squash`. The squash's
+/// `published_max_block_id` covers every confirmed `marf_data` row in the
+/// range, so the post-publish reconstruction returns 0.
+#[test]
+fn test_marf_stats_reset_on_squash() {
+    let test_dir = fresh_test_dir("test_marf_stats_reset_on_squash");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    let num_blocks = 4;
+    let (m, _, _) = setup_squash_source_marf(&marf_path, num_blocks, 2);
+    drop(m);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+    assert!(marf.stats().external_bytes_since_last_squash > 0);
+
+    marf.squash(SquashMode::TipOnly, 0, (num_blocks - 1) as u32, true, None)
+        .expect("squash should succeed");
+    assert_eq!(
+        marf.stats().external_bytes_since_last_squash,
+        0,
+        "post-squash counter must be 0 (every row absorbed below the new watermark)"
+    );
+}
+
+/// Reopening the MARF reconstructs the counter from SQL via the published
+/// watermark. Build, squash, commit more blocks, drop, reopen, verify the
+/// counter equals the post-watermark sum.
+#[test]
+fn test_marf_stats_reconstructed_on_open() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_marf_stats_reconstructed_on_open");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    // Build, squash an L0, then commit more blocks.
+    let l0_blocks = 3;
+    let (m, blocks_l0, _) = setup_squash_source_marf(&marf_path, l0_blocks, 2);
+    drop(m);
+    squash_level_incremental::<StacksBlockId>(
+        &marf_path,
+        SquashMode::TipOnly,
+        0,
+        (l0_blocks - 1) as u32,
+        true,
+        None,
+    )
+    .unwrap();
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts.clone()).unwrap();
+    let extra = 2;
+    let mut prev = blocks_l0[l0_blocks - 1].clone();
+    for i in 0..extra {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&((l0_blocks as u32) + i as u32 + 1).to_be_bytes());
+        let next = StacksBlockId::from_bytes(&bytes).unwrap();
+        marf.begin(&prev, &next).unwrap();
+        marf.insert("k", MARFValue::from_value(&format!("v{i}"))).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        prev = next;
+    }
+    drop(marf);
+
+    // Reopen — counter should be reconstructed from SQL, equal to the sum
+    // of `external_length` over rows past the published watermark.
+    let marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+    let in_memory = marf.stats().external_bytes_since_last_squash;
+    let sql_total = {
+        let conn = rusqlite::Connection::open(&marf_path).unwrap();
+        trie_sql::current_external_bytes_since_last_squash(&conn).unwrap()
+    };
+    assert!(in_memory > 0, "extra commits must register in the counter");
+    assert_eq!(in_memory, sql_total, "reopen-reconstructed counter must equal SQL truth");
+}
+
+/// `MARF::stats()` on a peer / reopened handle resyncs to the post-publish
+/// counter once that handle observes the new shared generation (e.g. via
+/// the next `open_block` call). Without the resync the peer would keep
+/// reporting the pre-publish counter forever, since reopened-readonly
+/// handles never go through `inner_flush`.
+#[test]
+fn test_marf_stats_peer_handle_resyncs_after_publish() {
+    let test_dir = fresh_test_dir("test_marf_stats_peer_handle_resyncs_after_publish");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    // Build a chain so both handles see a non-zero baseline counter.
+    let num_blocks = 3;
+    let (m, blocks, _) = setup_squash_source_marf(&marf_path, num_blocks, 2);
+    drop(m);
+
+    // Two MARF handles on the same path share `SharedSquashState` via the
+    // process-wide registry (keyed by db_path).
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut writer = MARF::<StacksBlockId>::from_path(&marf_path, open_opts.clone()).unwrap();
+    let mut peer = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+
+    let baseline = writer.stats().external_bytes_since_last_squash;
+    assert!(baseline > 0);
+    assert_eq!(peer.stats().external_bytes_since_last_squash, baseline);
+
+    // Writer publishes a squash. Its own counter resets to 0 immediately
+    // via `sync_after_published_squash`.
+    writer
+        .squash(SquashMode::TipOnly, 0, (num_blocks - 1) as u32, true, None)
+        .expect("writer squash");
+    assert_eq!(writer.stats().external_bytes_since_last_squash, 0);
+
+    // Peer hasn't observed the publish yet — its in-memory counter is
+    // still the pre-publish value. The next read that goes through
+    // `open_block` triggers `sync_shared_squash_state`, which now resyncs
+    // the counter from SQL.
+    peer.open_block(&blocks[num_blocks - 1])
+        .expect("peer open_block triggers shared-state sync");
+    assert_eq!(
+        peer.stats().external_bytes_since_last_squash,
+        0,
+        "peer's counter must resync to the post-publish watermark on the next open_block"
+    );
+}
+
+/// `FlushOptions::MinedTable` writes go to `mined_blocks`, not `marf_data`,
+/// and must NOT increment the squash-work counter. Without the variant
+/// gate in `inner_flush` this would inflate the counter and trigger
+/// premature squashes on miner-heavy nodes.
+#[test]
+fn test_marf_stats_skips_mined_table_writes() {
+    let test_dir = fresh_test_dir("test_marf_stats_skips_mined_table_writes");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    // Start with a real chain so the counter has a known non-zero value.
+    let num_blocks = 2;
+    let (mut marf, blocks, _) = setup_squash_source_marf(&marf_path, num_blocks, 1);
+
+    let baseline = marf.stats().external_bytes_since_last_squash;
+    assert!(baseline > 0);
+
+    // Write a mined-block trie. The miner calls `begin(parent, opened_bhh)`,
+    // populates the trie, and finalizes via `commit_mined(real_bhh)`. The
+    // commit routes through `inner_flush(MinedTable(real_bhh))` which writes
+    // to `mined_blocks`, not `marf_data`, and must skip the counter.
+    let opened_bhh = {
+        let mut bytes = [0xCCu8; 32];
+        bytes[28..32].copy_from_slice(&((num_blocks as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let real_mined_bhh = {
+        let mut bytes = [0xDDu8; 32];
+        bytes[28..32].copy_from_slice(&((num_blocks as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    marf.begin(&blocks[num_blocks - 1], &opened_bhh).unwrap();
+    marf.insert("mined_key", MARFValue::from_value("v_mined")).unwrap();
+    marf.seal().unwrap();
+    marf.commit_mined(&real_mined_bhh).unwrap();
+
+    assert_eq!(
+        marf.stats().external_bytes_since_last_squash,
+        baseline,
+        "mined-block writes must not advance the squash-work counter"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Sidecar retention overhaul (Step 5): trim decoupling + block-count semantics
+// ---------------------------------------------------------------------------
+
+/// Helper: build N levels of `span` blocks each by interleaving commit +
+/// squash. `squash_level_incremental` requires `max_height` to be the chain
+/// tip, so each level's commits happen immediately before its squash.
+fn build_n_squash_levels(
+    marf_path: &str,
+    n_levels: u32,
+    span: u32,
+) -> Vec<StacksBlockId> {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let total = (n_levels * span) as usize;
+    let blocks: Vec<StacksBlockId> = (0..total)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut parent = StacksBlockId::sentinel();
+    for level in 0..n_levels {
+        let lo = level * span;
+        let hi = lo + span - 1;
+        {
+            let mut marf = MARF::<StacksBlockId>::from_path(marf_path, open_opts.clone()).unwrap();
+            for h in lo..=hi {
+                marf.begin(&parent, &blocks[h as usize]).unwrap();
+                marf.insert("k", MARFValue::from_value(&format!("v{h}"))).unwrap();
+                marf.seal().unwrap();
+                marf.commit().unwrap();
+                parent = blocks[h as usize].clone();
+            }
+        }
+        squash_level_incremental::<StacksBlockId>(
+            marf_path,
+            SquashMode::FullHistory,
+            lo,
+            hi,
+            true,
+            None,
+        )
+        .expect("squash should succeed");
+    }
+    blocks
+}
+
+/// `MARF::squash` no longer implicitly trims sidecars — trim is now a
+/// caller-driven concern. Build 3 levels of small height ranges, then verify
+/// *every pre-existing* sidecar's `root_sidecar_trimmed` flag is `false`.
+/// Guards against the post-publish trim hook re-introducing itself
+/// accidentally.
+#[test]
+fn test_squash_does_not_implicitly_trim_sidecars() {
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_squash_does_not_implicitly_trim_sidecars");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    // 3 levels of 4 blocks each = 12 blocks total.
+    let _blocks = build_n_squash_levels(&marf_path, 3, 4);
+
+    // Every level should still be `present=true, trimmed=false`. The old
+    // post-publish hook would have flipped some of them under any non-
+    // ridiculous retention threshold — its absence means all 3 stay intact.
+    let conn = rusqlite::Connection::open(&marf_path).unwrap();
+    let levels = trie_sql::read_squash_levels(&conn).unwrap();
+    assert_eq!(levels.len(), 3);
+    for (idx, row) in levels.iter().enumerate() {
+        assert!(row.root_sidecar_present, "level {idx}: sidecar should be present");
+        assert!(!row.root_sidecar_trimmed, "level {idx}: sidecar should NOT be trimmed (no implicit trim)");
+    }
+}
+
+/// Same property for the Replace path: `MARF::re_squash` must not
+/// collaterally trim — recovery often runs *because* of a Bitcoin reorg,
+/// exactly when retained sidecars are most valuable.
+#[test]
+fn test_re_squash_does_not_implicitly_trim_sidecars() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+    use crate::chainstate::stacks::index::trie_sql;
+
+    let test_dir = fresh_test_dir("test_re_squash_does_not_implicitly_trim_sidecars");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    // Build + initial squash of 4 blocks.
+    let l0_blocks = 4;
+    let (m, blocks_l0, _) = setup_squash_source_marf(&marf_path, l0_blocks, 1);
+    drop(m);
+    squash_level_incremental::<StacksBlockId>(
+        &marf_path,
+        SquashMode::TipOnly,
+        0,
+        (l0_blocks - 1) as u32,
+        true,
+        None,
+    )
+    .expect("initial squash");
+
+    // Re-squash on the same canonical tip via the live-handle method.
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+    marf.re_squash(0, SquashMode::TipOnly, true, blocks_l0[l0_blocks - 1].clone())
+        .expect("re_squash should succeed");
+    drop(marf);
+
+    let conn = rusqlite::Connection::open(&marf_path).unwrap();
+    let levels = trie_sql::read_squash_levels(&conn).unwrap();
+    assert_eq!(levels.len(), 1);
+    assert!(levels[0].root_sidecar_present);
+    assert!(
+        !levels[0].root_sidecar_trimmed,
+        "re_squash must not implicitly trim — recovery preserves retained sidecars"
+    );
+}
+
+/// `trim_sidecars` is idempotent: running it twice in succession with the
+/// same retention threshold reports `levels_trimmed = 0` on the second call
+/// and the trim flags from the first are observed via `already_trimmed`.
+#[test]
+fn test_trim_sidecars_idempotent() {
+    let test_dir = fresh_test_dir("test_trim_sidecars_idempotent");
+    let marf_path = format!("{test_dir}/marf.sqlite");
+
+    // 3 levels × 4 blocks each. With retention_blocks=4, walking newest-first:
+    //   level 2: acc=0 < 4, credit 4 (acc=4)
+    //   level 1: acc=4 >= 4, TRIM
+    //   level 0: TRIM
+    let span: u32 = 4;
+    let _blocks = build_n_squash_levels(&marf_path, 3, span);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts.clone()).unwrap();
+    let first = marf.trim_sidecars(span).expect("first trim");
+    assert_eq!(first.levels_trimmed, 2, "two oldest levels trimmed");
+    assert_eq!(first.already_trimmed, 0);
+    drop(marf);
+
+    let mut marf2 = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
+    let second = marf2.trim_sidecars(span).expect("second trim");
+    assert_eq!(second.levels_trimmed, 0, "idempotent: nothing new to trim");
+    assert_eq!(second.already_trimmed, 2, "previously-trimmed levels reported as such");
+}
+
+/// `resolve_retention_blocks` precedence:
+/// - `new_blocks` wins when present.
+/// - Otherwise legacy `retention_levels` is multiplied by the legacy
+///   `MARF_SQUASH_CADENCE_BLOCKS` global constant — *not* by any per-MARF
+///   `max_blocks`, which would be ambiguous between MARFs.
+/// - Otherwise the crate-level `MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS` default.
+#[test]
+fn test_resolve_retention_blocks_precedence() {
+    use crate::chainstate::stacks::index::squash::{
+        resolve_retention_blocks, MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS,
+    };
+    use crate::core::MARF_SQUASH_CADENCE_BLOCKS;
+
+    // (a) `new_blocks` wins — even with a legacy value also set.
+    assert_eq!(resolve_retention_blocks(Some(2), Some(3000)), 3000);
+    assert_eq!(resolve_retention_blocks(None, Some(3000)), 3000);
+
+    // (b) Fallback to legacy conversion when `new_blocks` is absent.
+    assert_eq!(
+        resolve_retention_blocks(Some(2), None),
+        2u32.saturating_mul(MARF_SQUASH_CADENCE_BLOCKS as u32),
+        "legacy_levels=2 must convert via MARF_SQUASH_CADENCE_BLOCKS"
+    );
+
+    // (c) Crate default when neither is supplied.
+    assert_eq!(
+        resolve_retention_blocks(None, None),
+        MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS
+    );
+}
+
+/// `provides_fork_extension` predicate: only reclaim-mode levels with a
+/// non-empty blob and an un-trimmed sidecar contribute to the trim
+/// algorithm. Stubs (`blob_length = 0`), no-reclaim (`reads_redirected =
+/// false`), and already-trimmed levels are excluded — they're invisible to
+/// both the accumulator and the trim-candidate set.
+#[test]
+fn test_provides_fork_extension_predicate() {
+    use crate::chainstate::stacks::index::squash::SquashLevelRow;
+
+    let real = SquashLevelRow {
+        level_id: 1,
+        min_height: 0,
+        max_height: 9,
+        blob_offset: 0,
+        blob_length: 100,
+        reads_redirected: true,
+        root_sidecar_present: true,
+        root_sidecar_trimmed: false,
+        orphan_split_offset: 0,
+        published_max_block_id: 0,
+    };
+    assert!(real.provides_fork_extension());
+    assert_eq!(real.height_span(), 10);
+
+    let stub = SquashLevelRow {
+        blob_length: 0,
+        ..real.clone()
+    };
+    assert!(!stub.provides_fork_extension(), "stub levels (blob_length=0) excluded");
+
+    let no_reclaim = SquashLevelRow {
+        reads_redirected: false,
+        ..real.clone()
+    };
+    assert!(
+        !no_reclaim.provides_fork_extension(),
+        "no-reclaim levels excluded — they have no sidecar"
+    );
+
+    let trimmed = SquashLevelRow {
+        root_sidecar_trimmed: true,
+        ..real.clone()
+    };
+    assert!(
+        !trimmed.provides_fork_extension(),
+        "already-trimmed levels excluded from re-trim"
+    );
+
+    // Legacy levels (created before the per-height-root-sidecar feature)
+    // have `root_sidecar_present = 0` even though `reads_redirected =
+    // true` and `blob_length > 0`. The read path treats those as
+    // `UnsupportedLegacyLevel`, not as fork-extension-capable; the trim
+    // algorithm must agree and exclude them from BOTH the retention
+    // accumulator (legacy levels don't represent retained fork-extension)
+    // AND the trim-candidate set (no sidecar file to unlink).
+    let legacy = SquashLevelRow {
+        root_sidecar_present: false,
+        ..real.clone()
+    };
+    assert!(
+        !legacy.provides_fork_extension(),
+        "legacy levels (root_sidecar_present=0) excluded — they have no sidecar"
+    );
+    assert!(
+        !legacy.has_sidecar_to_unlink(),
+        "legacy levels not trim candidates"
+    );
 }

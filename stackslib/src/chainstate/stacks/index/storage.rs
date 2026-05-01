@@ -2585,17 +2585,19 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// returned by [`Self::orphan_scratch_restore`].
     pub orphan_read_scratch: Vec<u8>,
 
-    /// Configured retention window for squash-root snapshot sidecars,
-    /// copied from `MARFOpenOpts::squash_root_snapshot_retention_levels`
-    /// at handle-open time. Drives the `Error::SnapshotTrimmed` policy
-    /// reported by the read path: callers attempting to fork-extend off
-    /// a level whose sidecar is trimmed see this value embedded in the
-    /// error, so they can distinguish "policy-trimmed; re-sync to
-    /// recover" from generic corruption. Defaults to
-    /// [`crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS`]
-    /// for handles built via [`Self::new`] / `Self::default`; the
-    /// `open_opts` paths overwrite it from the supplied `MARFOpenOpts`.
-    pub squash_root_snapshot_retention_levels: u32,
+    /// Configured retention window for squash-root snapshot sidecars, in
+    /// **Stacks blocks**. Resolved at handle-open time via
+    /// [`crate::chainstate::stacks::index::squash::resolve_retention_blocks`]
+    /// from `MARFOpenOpts`'s `squash_root_snapshot_retention_blocks`
+    /// (preferred) or legacy `squash_root_snapshot_retention_levels`
+    /// (converted via the legacy global cadence constant). Drives the
+    /// `Error::SnapshotTrimmed` policy reported by the read path: callers
+    /// attempting to fork-extend off a trimmed level see this value
+    /// embedded in the error, so they can distinguish "policy-trimmed;
+    /// re-sync to recover" from generic corruption. Defaults to
+    /// [`crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS`]
+    /// for handles built via [`Self::new`] / `Self::default`.
+    pub squash_root_snapshot_retention_blocks: u32,
 
     /// Memoized result of `compute_snapshot_context_via_parent_chain`, keyed by the
     /// resolved block's id. The parent-chain walk is lazy — it only runs when
@@ -2650,6 +2652,16 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// lookup correctly.
     #[cfg(test)]
     pub squashed_entries_reread_count: Cell<u64>,
+
+    /// Sum of `marf_data.external_length` for confirmed commits since the
+    /// latest squash level published. Backs the per-MARF squash-work counter
+    /// surfaced through `MARF::stats`. Reconstructed at handle-open time and
+    /// after [`Self::sync_after_published_squash`] / [`Self::refresh_after_squash`]
+    /// from `marf_data WHERE block_id > MAX(published_max_block_id) AND unconfirmed = 0`.
+    /// Mutated incrementally in `inner_flush` for `CurrentHeader` / `NewHeader` writes
+    /// (the only `FlushOptions` variants that produce confirmed `marf_data` rows).
+    /// Reset to 0 by [`MARF::squash`] / [`MARF::re_squash`] after a successful publish.
+    pub external_bytes_since_last_squash: u64,
 }
 
 // disk-backed Trie.
@@ -2711,14 +2723,15 @@ impl<T: MarfTrieId> Default for TrieStorageTransientData<T> {
             leaf_hashes_omitted: false,
             orphan_sidecar: None,
             orphan_read_scratch: Vec::new(),
-            squash_root_snapshot_retention_levels:
-                crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            squash_root_snapshot_retention_blocks:
+                crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS,
             resolved_snapshot_context: Cell::new(None),
             bypass_blob_guard: false,
             #[cfg(test)]
             squashed_tip_fallback_count: Cell::new(0),
             #[cfg(test)]
             squashed_entries_reread_count: Cell::new(0),
+            external_bytes_since_last_squash: 0,
         }
     }
 }
@@ -2883,10 +2896,25 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
 /// No SQL, no trailer parsing — those were already done by the publishing
 /// writer. This path is a single atomic load in the fast case (unchanged
 /// generation) and a short critical section in the slow case.
+/// Sync this handle's local squash state to the shared snapshot when a
+/// writer has bumped the generation. Invoked by the peer-handle read path
+/// (`TrieStorageConnection::sync_shared_squash_state`) and by the writer's
+/// post-publish path (`TrieFileStorage::sync_after_published_squash`).
+///
+/// All inputs come from the same `TrieFileStorage` / `TrieStorageConnection`
+/// — the caller passes them split so this helper can be called from inside
+/// `with_trie_blobs`-style closures that have already partial-borrowed.
+///
+/// Reconstructs the per-MARF squash-work counter from SQL when the
+/// generation bumps. That's what keeps [`MARF::stats`] authoritative on
+/// peer / reopened read-only handles after another handle publishes a
+/// squash: without the resync, the peer's counter would still reflect the
+/// pre-publish watermark and over-count rows that have just been absorbed.
 fn sync_from_shared_squash_state<T: MarfTrieId>(
     data: &mut TrieStorageTransientData<T>,
     mut blobs: Option<&mut TrieFile>,
     cache: &mut BlockCache<T>,
+    db: &Connection,
 ) -> Result<(), Error> {
     let current_gen = data.shared_squash.generation();
     if current_gen == data.seen_squash_generation {
@@ -2912,6 +2940,15 @@ fn sync_from_shared_squash_state<T: MarfTrieId>(
     // Cached level_idx values reference the *prior* squash_meta; replacing meta
     // can change which level a block_id resolves into.
     data.resolved_snapshot_context.set(None);
+
+    // Resync the per-MARF squash-work counter to the just-published
+    // watermark. Cheap (one indexed `SUM(external_length)` query) and
+    // necessary for `MARF::stats()` to stay authoritative on peer /
+    // reopened read-only handles after another handle publishes — without
+    // it, the peer's counter would still reflect the old watermark and
+    // include rows that have just been absorbed below the new one.
+    data.external_bytes_since_last_squash =
+        trie_sql::current_external_bytes_since_last_squash(db)?;
 
     data.seen_squash_generation = current_gen;
     Ok(())
@@ -4250,12 +4287,37 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         blobs.current_file_len()
     }
 
-    /// Reload squash level metadata and remap the blob file after an external squash operation
-    /// has modified both the SQLite DB and the `.blobs` file through a separate handle.
+    /// Lightweight local sync for the writer that just published a squash on
+    /// this same handle. The publishing path (`publish_squashed_blob` →
+    /// `SharedStorageState::publish_squash`) has already installed the new
+    /// `SquashMeta`, bumped the shared generation, and remapped this handle's
+    /// mmap from inside the rebuild closure. All that's left for the writer
+    /// is to refresh its handle-local view of the shared state (snapshot
+    /// pointer, `seen_squash_generation`, block cache, current-block context)
+    /// — done via the existing peer-sync helper, which does NOT re-enter
+    /// `publish_squash`. Avoids the redundant second global quiesce +
+    /// generation bump that calling [`Self::refresh_after_squash`] would do.
+    pub fn sync_after_published_squash(&mut self) -> Result<(), Error> {
+        sync_from_shared_squash_state(
+            &mut self.data,
+            self.blobs.as_mut(),
+            &mut self.cache,
+            &self.db,
+        )
+    }
+
+    /// Reload squash level metadata and remap the blob file after an external
+    /// squash operation has modified both the SQLite DB and the `.blobs` file
+    /// through a separate handle.
     ///
-    /// Runs the remap + metadata rebuild inside the shared quiesce window so that concurrent
-    /// readers on other handles cannot be holding mmap bytes when the file is mutated. See
-    /// [`SharedStorageState::publish_squash`] for the exact ordering guarantees.
+    /// Runs the remap + metadata rebuild inside the shared quiesce window so
+    /// that concurrent readers on other handles cannot be holding mmap bytes
+    /// when the file is mutated. See [`SharedStorageState::publish_squash`]
+    /// for the exact ordering guarantees.
+    ///
+    /// **For writers that just published a squash on this same handle, prefer
+    /// [`Self::sync_after_published_squash`]** — that path skips the second
+    /// `publish_squash` entry entirely.
     pub fn refresh_after_squash(&mut self) -> Result<(), Error> {
         // Split borrows so the closure captures the blobs+db directly rather than through
         // `&mut self` — lets us still access `self.data` and friends after.
@@ -4284,6 +4346,13 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         // Sync this handle's local snapshot + watermark to the fresh published state.
         self.data.squash_meta = self.data.shared_squash.snapshot();
         self.data.seen_squash_generation = self.data.shared_squash.generation();
+        // Reconstruct the per-MARF squash-work counter from SQL: the
+        // separate publishing handle has just advanced
+        // `published_max_block_id`, so any rows this handle had counted as
+        // "post-watermark" may now be inside the new level. Cheap query
+        // (O(post-watermark rows), index-driven).
+        self.data.external_bytes_since_last_squash =
+            trie_sql::current_external_bytes_since_last_squash(&self.db)?;
 
         // Clear the block cache and current-block context — stale after the squash redirected
         // blocks to new blob offsets.
@@ -4376,11 +4445,16 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
         let mut data = TrieStorageTransientData::new(T::sentinel(), None, readonly, unconfirmed);
         // Plumb the configured retention from MARFOpenOpts so per-handle
-        // reads (`Error::SnapshotTrimmed`) and per-handle squash trim hooks
-        // (when this handle drives a squash) report the deployment's
-        // configured value, not the global constant.
-        data.squash_root_snapshot_retention_levels =
-            marf_opts.squash_root_snapshot_retention_levels;
+        // reads (`Error::SnapshotTrimmed`) report the deployment's
+        // resolved block-count window. Resolved here so callers that match
+        // on `Error::SnapshotTrimmed { retention_blocks, .. }` get a value
+        // consistent with whichever `MARFOpenOpts` field was actually
+        // populated (legacy levels vs new blocks).
+        data.squash_root_snapshot_retention_blocks =
+            crate::chainstate::stacks::index::squash::resolve_retention_blocks(
+                Some(marf_opts.squash_root_snapshot_retention_levels),
+                marf_opts.squash_root_snapshot_retention_blocks,
+            );
 
         // Join (or create) the process-wide `SharedSquashState` entry for this db path. Any other
         // independent `MARF::from_path` opens against the same file (e.g. the Stacks 2.x P2P
@@ -4481,6 +4555,14 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         data.squash_meta = shared.snapshot();
         data.shared_squash = shared;
         data.seen_squash_generation = data.shared_squash.generation();
+        // Reconstruct the per-MARF squash-work counter from SQL. Cost is
+        // O(post-watermark rows) — sub-millisecond in steady state. On a
+        // freshly-migrated v3 -> v4 DB where every level's
+        // `published_max_block_id = 0`, this sums over the entire
+        // `marf_data` table once; the next squash overwrites the watermark
+        // and resets the counter to 0.
+        data.external_bytes_since_last_squash =
+            trie_sql::current_external_bytes_since_last_squash(&db)?;
 
         let ret = TrieFileStorage {
             db_path,
@@ -4695,6 +4777,20 @@ impl<'a, T: MarfTrieId> TrieStorageConnection<'a, T, Transaction<'a>> {
             trace!("Buffering block flush finished.");
             debug!("Flush: {} to {}", &bhh, flush_options);
 
+            // Per-MARF squash-work counter increment is gated on the
+            // FlushOptions variant: only `CurrentHeader` / `NewHeader` produce
+            // confirmed `marf_data` rows that the next squash will absorb.
+            // `MinedTable` writes go to `mined_blocks`; `UnconfirmedTable`
+            // writes go to the unconfirmed-trie path. Neither belongs in
+            // the squash work measurement. Additionally, inline-blob
+            // backends (`blobs.is_none()`) record `external_length = 0`,
+            // so they contribute nothing to squash blob bytes — skip the
+            // increment to match the SQL reconstruction path.
+            let increments_squash_counter = matches!(
+                flush_options,
+                FlushOptions::CurrentHeader | FlushOptions::NewHeader(_),
+            ) && self.blobs.is_some();
+            let buffer_len = buffer.len() as u64;
             let block_id = match flush_options {
                 FlushOptions::CurrentHeader => {
                     if self.unconfirmed() {
@@ -4742,6 +4838,10 @@ impl<'a, T: MarfTrieId> TrieStorageConnection<'a, T, Transaction<'a>> {
                     trie_sql::write_trie_blob_to_unconfirmed(&self.db, &bhh, &buffer)?
                 }
             };
+            if increments_squash_counter {
+                self.data.external_bytes_since_last_squash =
+                    self.data.external_bytes_since_last_squash.saturating_add(buffer_len);
+            }
 
             trie_sql::drop_lock(&self.db, &bhh)?;
 
@@ -4955,9 +5055,17 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
     ///
     /// Fast-path: a single atomic load with no lock, no SQL, no trailer
     /// parsing. Only the slow path (generation mismatch) acquires the
-    /// RwLock read guard to snapshot the fresh metadata.
+    /// RwLock read guard to snapshot the fresh metadata, and reconstructs
+    /// this handle's per-MARF squash-work counter from SQL — so [`MARF::stats`]
+    /// stays authoritative on peer / reopened read-only handles after
+    /// another handle publishes a squash.
     fn sync_shared_squash_state(&mut self) -> Result<(), Error> {
-        sync_from_shared_squash_state(self.data, self.blobs.as_deref_mut(), self.cache)
+        sync_from_shared_squash_state(
+            self.data,
+            self.blobs.as_deref_mut(),
+            self.cache,
+            &*self.db,
+        )
     }
 
     pub fn unconfirmed(&self) -> bool {
@@ -5037,7 +5145,7 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             // rejection (don't treat as corruption).
             return Err(Error::SnapshotTrimmed {
                 level_id: level.info.level_id,
-                retention_levels: self.data.squash_root_snapshot_retention_levels,
+                retention_blocks: self.data.squash_root_snapshot_retention_blocks,
             });
         }
         if !present {
@@ -5249,7 +5357,7 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             })?;
             return Err(Error::SnapshotTrimmed {
                 level_id: level.info.level_id,
-                retention_levels: self.data.squash_root_snapshot_retention_levels,
+                retention_blocks: self.data.squash_root_snapshot_retention_blocks,
             });
         }
 

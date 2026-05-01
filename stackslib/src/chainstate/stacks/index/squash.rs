@@ -51,23 +51,70 @@ pub const MAX_SQUASH_NODE_REGION_SIZE: u64 = 3_500_000_000;
 /// exceed the node-region cap regardless of block count.
 pub const STUB_THRESHOLD: u64 = 50_000;
 
-/// Default per-height root snapshot retention, in levels.
+/// Legacy default per-height root snapshot retention, in **levels**. Kept
+/// for backwards-compatible config conversion only — under fixed cadence
+/// "2 levels" mapped neatly to "~2000 blocks of fork-extension," but with
+/// adaptive cadence (variable-span levels) the level count loses operator
+/// meaning. New deployments should configure
+/// [`MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS`] directly via
+/// `MARFOpenOpts::squash_root_snapshot_retention_blocks` (or the
+/// operator-facing `Config` knob plumbed in step 6 of the adaptive squash
+/// cadence design).
 ///
-/// After each new squash, sidecar files for levels older than
-/// `current_squash_tip_level - MARF_ROOT_SNAPSHOT_RETENTION_LEVELS` are
-/// `unlink`ed and their `marf_squash_levels.root_sidecar_trimmed` flag is
-/// set to 1. Fork-extension off a parent in a trimmed level then surfaces
-/// [`Error::SnapshotTrimmed`] — an *expected* policy outcome that higher
-/// layers should convert into a chainstate-level rejection (don't treat
-/// it as data corruption).
-///
-/// 100 levels at a 1000-block cadence covers ~100k blocks of
-/// fork-extension capability — generous safety margin past the maximum
-/// realistic BTC reorg depth. Storage cost: ~100 × ~2.5 MB per sidecar
-/// ≈ ~250 MB of disk for the live snapshot window. Set via the
-/// `root_snapshot_retention_levels` knob on [`MARFOpenOpts`] (TBD) or
-/// edit this constant for now.
+/// See [`resolve_retention_blocks`] for the legacy-config conversion path
+/// (multiplies by `MARF_SQUASH_CADENCE_BLOCKS`, the old fixed-cadence
+/// constant — *not* a per-MARF cadence value, which would be ambiguous).
 pub const MARF_ROOT_SNAPSHOT_RETENTION_LEVELS: u32 = 2;
+
+/// Default per-height root snapshot retention, in **Stacks blocks**.
+/// `2000` matches the historical effective coverage of the legacy
+/// `MARF_ROOT_SNAPSHOT_RETENTION_LEVELS = 2` × `MARF_SQUASH_CADENCE_BLOCKS = 1000`,
+/// so adopting adaptive cadence with this default doesn't regress
+/// fork-extension reorg tolerance.
+///
+/// Trim policy: after a `MARF::trim_sidecars` call, [`trim_aged_root_sidecars`]
+/// walks active reclaim levels newest-to-oldest, accumulating each
+/// qualifying level's height span (`max_height - min_height + 1`). The
+/// first level whose accumulated span pushes the counter past
+/// `retention_blocks` is **kept** (the threshold is "at least this many
+/// blocks of cover," not "at most"); only strictly-older levels are
+/// trimmed. Stub levels and no-reclaim levels neither contribute to the
+/// accumulator nor are themselves trim candidates — see
+/// [`SquashLevelRow::provides_fork_extension`].
+///
+/// Under Nakamoto, divide by the typical Stacks-blocks-per-Bitcoin-block
+/// ratio (~5–10×) to approximate Bitcoin-block reorg tolerance. See
+/// `.docs/adaptive-squash-cadence.md` §3.5.2 for the rationale.
+pub const MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS: u32 = 2000;
+
+/// Resolve the effective `retention_blocks` value from the two operator
+/// inputs, preserving the historical fork-extension coverage of pre-step-5
+/// configurations on upgrade.
+///
+/// Precedence:
+/// - `new_blocks` wins when present (operator explicitly chose block-count).
+/// - Otherwise, legacy `legacy_levels` is converted via
+///   `levels × MARF_SQUASH_CADENCE_BLOCKS` (the *legacy global* cadence
+///   constant, *not* a per-MARF `max_blocks` value — the latter would be
+///   ambiguous between headers and Clarity MARFs once each gets its own
+///   cadence config in step 6).
+/// - Otherwise, [`MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS`] default.
+///
+/// A subtle consequence noted in the design (§3.5.3): an operator who was
+/// relying on legacy `retention_levels = 2` to mean "really big retention
+/// because my levels are huge" loses that under per-MARF adaptive cadence —
+/// the conversion always assumes 1000-block legacy levels, regardless of the
+/// operator's `max_blocks` choice. Operators wanting a larger window should
+/// switch to `retention_blocks` explicitly.
+pub fn resolve_retention_blocks(legacy_levels: Option<u32>, new_blocks: Option<u32>) -> u32 {
+    if let Some(b) = new_blocks {
+        return b;
+    }
+    if let Some(l) = legacy_levels {
+        return l.saturating_mul(crate::core::MARF_SQUASH_CADENCE_BLOCKS as u32);
+    }
+    MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS
+}
 
 /// Checked offset accumulation for squash blob node regions. Returns the
 /// new offset after adding `size`, or an error if the result exceeds
@@ -454,6 +501,62 @@ pub struct SquashLevelRow {
     /// offset and the routing check `ptr < orphan_split_offset` always
     /// resolves to "merged blob".
     pub orphan_split_offset: u32,
+    /// Publish-time `MAX(block_id) FROM marf_data WHERE unconfirmed = 0`,
+    /// snapshotted inside the squash publish transaction. Backs the per-MARF
+    /// squash-work counter's reconstruction at startup: confirmed `marf_data`
+    /// rows with `block_id > MAX(published_max_block_id)` are the
+    /// post-publish open-suffix work that the next squash will absorb.
+    /// Default 0 means "reconstruct over the entire `marf_data` table" — the
+    /// conservative one-time over-count that levels predating this column
+    /// produce on first read post-migration; cleared on the next successful
+    /// squash, which writes a real watermark and resets the counter.
+    pub published_max_block_id: u32,
+}
+
+impl SquashLevelRow {
+    /// Whether this level contributes to operator-visible reorg-tolerance
+    /// coverage AND has a sidecar on disk. Distinguishes "real" reclaim
+    /// levels from stubs (`blob_length = 0`), no-reclaim levels (which
+    /// have no sidecar and provide no fork-extension via squash trailer),
+    /// already-trimmed levels, AND legacy levels that pre-date the
+    /// per-height-root-sidecar feature (`root_sidecar_present = 0`). The
+    /// last case matters on upgrade: the read path treats those as
+    /// `UnsupportedLegacyLevel`, not as fork-extension-capable; counting
+    /// their height span toward the trim accumulator would misrepresent
+    /// retention coverage on the first squash post-upgrade.
+    ///
+    /// Used by [`trim_aged_root_sidecars`] to decide which levels both
+    /// contribute to the retention-window accumulator AND are themselves
+    /// trim candidates. The two predicates are equivalent in v1 (same
+    /// boolean expression) but the design (§3.5.1) names them separately
+    /// because a future variant might decouple "has sidecar" from
+    /// "provides coverage" (e.g., partial sidecars).
+    pub fn provides_fork_extension(&self) -> bool {
+        self.reads_redirected
+            && self.blob_length > 0
+            && self.root_sidecar_present
+            && !self.root_sidecar_trimmed
+    }
+
+    /// Whether this level has a sidecar file on disk that the trim policy
+    /// could unlink. In v1 this is the same boolean as
+    /// [`Self::provides_fork_extension`]; kept as a separate accessor at
+    /// the API boundary so future divergence (e.g., partial sidecars) is
+    /// expressible without touching every call site.
+    pub fn has_sidecar_to_unlink(&self) -> bool {
+        self.reads_redirected
+            && self.blob_length > 0
+            && self.root_sidecar_present
+            && !self.root_sidecar_trimmed
+    }
+
+    /// Height span this level covers, inclusive: `max_height - min_height + 1`.
+    /// Saturating on edge inputs.
+    pub fn height_span(&self) -> u32 {
+        self.max_height
+            .saturating_sub(self.min_height)
+            .saturating_add(1)
+    }
 }
 
 /// Row data for the `marf_retired_squash_levels` SQL table.
@@ -489,6 +592,11 @@ pub struct RetiredSquashLevelRow {
     pub orphan_split_offset: u32,
     /// Unix epoch seconds at retirement. Diagnostic / debugging only.
     pub retired_at: u64,
+    /// Inherited verbatim from the OLD active row's `published_max_block_id`
+    /// at retire time. Records "rows present when the original level
+    /// published" and stays meaningful for any future descendant whose
+    /// backptrs target the retired blob.
+    pub published_max_block_id: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,6 +1203,7 @@ pub fn squash_level<T: MarfTrieId>(
         squash_mode: SquashMode::TipOnly,
         squash_root_snapshot_retention_levels:
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+        squash_root_snapshot_retention_blocks: None,
     };
 
     let mut src_marf = MARF::<T>::from_path(src_path, open_opts.clone())?;
@@ -1568,6 +1677,7 @@ pub fn squash_level<T: MarfTrieId>(
         squash_mode: SquashMode::TipOnly,
         squash_root_snapshot_retention_levels:
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+        squash_root_snapshot_retention_blocks: None,
     };
 
     let mut dst_marf = MARF::<T>::from_path(dst_path, dst_open_opts)?;
@@ -1682,7 +1792,12 @@ pub fn squash_level<T: MarfTrieId>(
 
         // Register the squash level in the DB. The per-height root sidecar
         // was already atomically published before this block; its
-        // visibility is gated on this row commit.
+        // visibility is gated on this row commit. `squash_to_path` runs
+        // against a fresh DB (`marf_data` is being populated by this same
+        // call), so the watermark snapshot reflects "rows visible to this
+        // autocommit-style write at row-insert time" — equivalent to the
+        // tx-scoped measurement in the incremental publish path.
+        let watermark = trie_sql::current_published_max_block_id(storage.sqlite_conn())?;
         let row = SquashLevelRow {
             level_id: 0,
             min_height,
@@ -1699,6 +1814,7 @@ pub fn squash_level<T: MarfTrieId>(
             // perspective), so 0 means "no orphans, route all reads to
             // merged blob".
             orphan_split_offset: 0,
+            published_max_block_id: watermark,
         };
         trie_sql::write_squash_level(storage.sqlite_conn(), &row)?;
 
@@ -2327,67 +2443,87 @@ pub struct TrimReport {
 pub(crate) fn trim_aged_root_sidecars<T: MarfTrieId>(
     marf: &mut MARF<T>,
     db_path: &Path,
-    latest_level_id: u32,
-    retention_levels: u32,
+    retention_blocks: u32,
 ) -> Result<TrimReport, Error> {
     use crate::chainstate::stacks::index::sidecar::squash_root_sidecar_path;
 
     let mut report = TrimReport::default();
 
-    // Read the level registry. `read_squash_levels` already returns rows
-    // ordered by `min_height`, which monotonically tracks `level_id` for
-    // the squash sequence we produce, so iterating the natural order
-    // suffices.
+    // Read the level registry. `read_squash_levels` returns rows ordered by
+    // `min_height` ascending; we walk newest-first so we accumulate height
+    // span from the most recent level back, matching the operator-meaningful
+    // unit ("retain at least N blocks of fork-extension capability past the
+    // tip").
     let storage = marf.storage_backend_mut();
     let levels = trie_sql::read_squash_levels(storage.sqlite_conn())?;
 
-    // Phase 1: identify trim candidates and flip
-    // `root_sidecar_trimmed=1` in SQL. Files are NOT touched yet —
-    // peers may still be mid-read off them via cached `SquashMeta`
-    // snapshots that haven't synced to the new generation. By flipping
-    // SQL first and refreshing in phase 1.5 BEFORE any unlink, we
-    // guarantee that no handle ever observes the (file-missing,
-    // trimmed=false) corruption window.
+    // Phase 1: identify trim candidates and flip `root_sidecar_trimmed=1` in
+    // SQL. Files are NOT touched yet — peers may still be mid-read off them
+    // via cached `SquashMeta` snapshots that haven't synced to the new
+    // generation. By flipping SQL first and refreshing in phase 1.5 BEFORE
+    // any unlink, we guarantee that no handle ever observes the
+    // (file-missing, trimmed=false) corruption window.
+    //
+    // Algorithm: walk newest-first; for each level that
+    // `provides_fork_extension`, accumulate its `height_span()`. Once the
+    // accumulator reaches the retention threshold, every older qualifying
+    // level becomes a trim candidate. Levels that don't provide
+    // fork-extension (stubs, no-reclaim, already-trimmed) are skipped from
+    // BOTH the accumulator and the trim-candidate set — their span doesn't
+    // count toward coverage and there's nothing to unlink. Stubs in the
+    // middle of the level stack are transparent gaps; the accumulator
+    // crosses over them and surrounding real levels are evaluated against
+    // the threshold normally.
+    let mut accumulated: u32 = 0;
     let mut trim_candidates: Vec<(u32, std::path::PathBuf)> = Vec::new();
-    for row in levels {
-        // Only redirected (reclaim) levels carry sidecars; no-op others.
-        if !row.reads_redirected {
-            continue;
-        }
-        if row.root_sidecar_trimmed {
+    for row in levels.into_iter().rev() {
+        // already_trimmed is reported even when iteration is via
+        // `provides_fork_extension`-driven gating, since operators want to
+        // see "yep, it's still recorded as trimmed; no further work."
+        if row.reads_redirected && row.root_sidecar_trimmed {
             report.already_trimmed += 1;
             continue;
         }
-        // Compute "age in levels" via saturating subtraction so a
-        // mis-ordered row (level_id > latest) doesn't underflow.
-        let age = latest_level_id.saturating_sub(row.level_id);
-        if age <= retention_levels {
-            // Within retention window — keep the sidecar.
+        if !row.provides_fork_extension() {
+            // No coverage credit, no trim candidate. Skip entirely.
             continue;
         }
 
-        if let Err(e) =
-            trie_sql::set_root_sidecar_trimmed(storage.sqlite_conn(), row.level_id, true)
-        {
-            warn!(
-                "trim_aged_root_sidecars: SQL flag update failed for \
-                 level_id={}: {e:?}. File left in place; will retry on \
-                 next trim pass.",
+        if accumulated >= retention_blocks {
+            // Past the threshold: this level (and every older qualifying
+            // level the loop reaches) is a trim candidate. The first level
+            // crossing the threshold is itself **kept**, because the policy
+            // is "at least this many blocks of cover," not "at most" — that
+            // happens earlier in the iteration where `accumulated` is still
+            // below the threshold and the level is credited toward the
+            // accumulator instead of being trimmed.
+            if let Err(e) =
+                trie_sql::set_root_sidecar_trimmed(storage.sqlite_conn(), row.level_id, true)
+            {
+                warn!(
+                    "trim_aged_root_sidecars: SQL flag update failed for \
+                     level_id={}: {e:?}. File left in place; will retry on \
+                     next trim pass.",
+                    row.level_id,
+                );
+                report.trim_failures += 1;
+                continue;
+            }
+            report.levels_trimmed += 1;
+
+            let path = squash_root_sidecar_path(
+                db_path,
                 row.level_id,
+                row.min_height,
+                row.max_height,
+                row.blob_offset,
             );
-            report.trim_failures += 1;
+            trim_candidates.push((row.level_id, path));
             continue;
         }
-        report.levels_trimmed += 1;
 
-        let path = squash_root_sidecar_path(
-            db_path,
-            row.level_id,
-            row.min_height,
-            row.max_height,
-            row.blob_offset,
-        );
-        trim_candidates.push((row.level_id, path));
+        // Within retention window — keep the sidecar and credit its span.
+        accumulated = accumulated.saturating_add(row.height_span());
     }
 
     // Phase 1.5: republish `SquashMeta` so every live handle sees the
@@ -2925,6 +3061,7 @@ fn build_published_level_row(
     reclaim: bool,
     sidecar_published: bool,
     orphan_split_offset: u32,
+    published_max_block_id: u32,
 ) -> SquashLevelRow {
     SquashLevelRow {
         level_id: next_level_id,
@@ -2936,6 +3073,7 @@ fn build_published_level_row(
         root_sidecar_present: sidecar_published,
         root_sidecar_trimmed: false,
         orphan_split_offset,
+        published_max_block_id,
     }
 }
 
@@ -3545,54 +3683,6 @@ fn dfs_collect_for_squash<T: MarfTrieId + Send + Sync>(
         tip_reachable_count,
         orphan_nodes_added,
     })
-}
-
-/// Best-effort post-publish trim of per-height root-snapshot sidecars
-/// that have aged past the retention window.
-///
-/// The squash has already succeeded and been published by the time this
-/// runs, so any error here is logged at `warn` and swallowed — returning
-/// `Err` would imply the squash itself failed, which is misleading. Trim
-/// is retried after the next squash.
-///
-/// No-reclaim levels never wrote a sidecar, so trim is a no-op and the
-/// function returns immediately without consulting `retention_levels`.
-fn trim_root_sidecars_after_publish<T: MarfTrieId + Send + Sync>(
-    marf: &mut MARF<T>,
-    marf_path: &Path,
-    reclaim: bool,
-    next_level_id: u32,
-    retention_levels: u32,
-) {
-    if !reclaim {
-        return;
-    }
-    match trim_aged_root_sidecars(marf, marf_path, next_level_id, retention_levels) {
-        Ok(trim_report) => {
-            if trim_report.levels_trimmed > 0
-                || trim_report.trim_failures > 0
-                || trim_report.unlink_failures > 0
-            {
-                info!(
-                    "MARF squash root-sidecar trim after level {next_level_id}: \
-                     levels_trimmed={}, already_trimmed={}, trim_failures={}, \
-                     unlink_failures={} \
-                     (retention_levels={retention_levels})",
-                    trim_report.levels_trimmed,
-                    trim_report.already_trimmed,
-                    trim_report.trim_failures,
-                    trim_report.unlink_failures,
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                "MARF squash root-sidecar trim after level {next_level_id} failed: \
-                 {e:?}. The squash itself is fully committed; trim will be \
-                 retried after the next squash."
-            );
-        }
-    }
 }
 
 /// Outcome of the per-level sidecar publish decision: a boolean
@@ -4294,16 +4384,6 @@ fn publish_squashed_blob<T: MarfTrieId + Send + Sync>(
         timings.finish_blob_ms = t_finish_blob.elapsed().as_millis();
 
         let t_sql_updates = Instant::now();
-        let row = build_published_level_row(
-            next_level_id,
-            min_height,
-            max_height,
-            blob_offset,
-            blob_len,
-            reclaim,
-            sidecar_published,
-            orphan_split_offset,
-        );
 
         // Wrap the post-file SQL state transition in a single transaction so
         // the retired-level INSERT (Replace only), the new active level
@@ -4315,6 +4395,27 @@ fn publish_squashed_blob<T: MarfTrieId + Send + Sync>(
         // mutation would either hold a write lock across slow I/O or move
         // the validate to the wrong side of the truncate.
         let tx = storage.sqlite_tx()?;
+
+        // Watermark for the post-publish stats counter. Measured inside this
+        // transaction so it captures exactly the rows observable at commit
+        // time; future confirmed `marf_data` writes (`block_id` strictly
+        // greater than this) constitute open-suffix work the next squash
+        // will absorb. Includes non-canonical fork rows (their `block_id` may
+        // exceed the trailer's canonical max) — that's the precise behavior
+        // the no-reclaim mode requires, since fork rows preserved by the
+        // squash should not contribute to the post-squash work counter.
+        let watermark = trie_sql::current_published_max_block_id(&tx)?;
+        let row = build_published_level_row(
+            next_level_id,
+            min_height,
+            max_height,
+            blob_offset,
+            blob_len,
+            reclaim,
+            sidecar_published,
+            orphan_split_offset,
+            watermark,
+        );
 
         // Replace-only: insert the retired row carrying the OLD
         // `blob_offset`. That offset alone determines the OLD sidecar's
@@ -4336,6 +4437,13 @@ fn publish_squashed_blob<T: MarfTrieId + Send + Sync>(
                 root_sidecar_trimmed: pending.active_row.root_sidecar_trimmed,
                 orphan_split_offset: pending.active_row.orphan_split_offset,
                 retired_at: pending.retired_at,
+                // Carry the OLD active row's watermark verbatim. It records
+                // "rows present when the original level published" and stays
+                // meaningful for any future descendant whose backptrs target
+                // the retired blob. The new active row's `published_max_block_id`
+                // (set above on `row`) is computed fresh from the publish-time
+                // MAX(block_id) — see `build_published_level_row` callsite.
+                published_max_block_id: pending.active_row.published_max_block_id,
             };
             // `&Connection` accepts `&Transaction` via deref; the INSERT
             // is part of this tx and commits atomically with the new
@@ -4700,34 +4808,50 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
     Ok(())
 }
 
+/// Path-based wrapper around the live-handle [`MARF::squash`] method. Opens
+/// its own `MARF<T>` from `marf_path`, delegates to the live-handle method,
+/// and drops the handle on return. Use this for offline / one-shot tooling
+/// or for tests that don't already hold a live MARF; production code paths
+/// that own a live `MARF<T>` should call `MARF::squash` / `MARF::re_squash`
+/// directly to avoid the open + later refresh dance.
 pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
     marf_path: &str,
     mode: SquashMode,
     min_height: u32,
     max_height: u32,
     reclaim: bool,
-    retention_levels: u32,
     canonical_tip: Option<T>,
 ) -> Result<SquashStats, Error> {
+    let open_opts = MARFOpenOpts {
+        hash_calculation_mode: TrieHashCalculationMode::Immediate,
+        cache_strategy: "noop".to_string(),
+        external_blobs: true,
+        force_db_migrate: false,
+        compress: false,
+        mmap: false,
+        squash_mode: SquashMode::TipOnly,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+        squash_root_snapshot_retention_blocks: None,
+    };
+    let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
     squash_level_incremental_with_target::<T>(
-        marf_path,
+        &mut marf,
         mode,
         min_height,
         max_height,
         reclaim,
-        retention_levels,
         SquashTarget::Append,
         canonical_tip,
     )
 }
 
 pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
-    marf_path: &str,
+    marf: &mut MARF<T>,
     mode: SquashMode,
     min_height: u32,
     max_height: u32,
     reclaim: bool,
-    retention_levels: u32,
     target: SquashTarget,
     canonical_tip: Option<T>,
 ) -> Result<SquashStats, Error> {
@@ -4741,22 +4865,14 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
     let mut stats = SquashStats::default();
     let full_history = mode == SquashMode::FullHistory;
 
-    let open_opts = MARFOpenOpts {
-        hash_calculation_mode: TrieHashCalculationMode::Immediate,
-        cache_strategy: "noop".to_string(),
-        external_blobs: true,
-        force_db_migrate: false,
-        compress: false,
-        mmap: false,
-        squash_mode: SquashMode::TipOnly,
-        squash_root_snapshot_retention_levels:
-            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
-    };
-
-    let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
+    // Capture the DB path up-front; the live handle's storage is what backs
+    // it, but several helpers below want a `&Path` directly (sidecar emit,
+    // post-publish trim, etc.). One copy here keeps the borrow shape clean
+    // for the rest of the function body.
+    let marf_path = marf.get_db_path().to_string();
 
     // Precondition: max_height must be the chain tip
-    verify_no_descendants(&mut marf, max_height)?;
+    verify_no_descendants(marf, max_height)?;
 
     // Snapshot the squash metadata for cross-level detection during DFS. Arc::clone is a
     // cheap reference-count bump — no deep copy of the block index.
@@ -4775,14 +4891,14 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
     // ---------------------------------------------------------------
     // Step 1: Find tip block, collect per-height metadata
     // ---------------------------------------------------------------
-    let tip_block: T = resolve_canonical_tip(&mut marf, canonical_tip, min_height, max_height)?;
+    let tip_block: T = resolve_canonical_tip(&mut *marf, canonical_tip, min_height, max_height)?;
 
     let HeightMetadata {
         root_hashes,
         block_hashes_raw,
         block_ids_per_height,
         mut block_id_to_hash,
-    } = collect_per_height_metadata(&mut marf, &tip_block, min_height, max_height)?;
+    } = collect_per_height_metadata(&mut *marf, &tip_block, min_height, max_height)?;
 
     // ---------------------------------------------------------------
     // Step 2: DFS collect intra-range nodes, detect cross-level boundaries
@@ -4795,8 +4911,8 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
         tip_reachable_count,
         orphan_nodes_added,
     } = dfs_collect_for_squash(
-        &mut marf,
-        marf_path,
+        &mut *marf,
+        &marf_path,
         &tip_block,
         min_height,
         target,
@@ -4830,7 +4946,7 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
     // ---------------------------------------------------------------
     if full_history {
         replace_leaves_full_history(
-            &mut marf,
+            &mut *marf,
             &tip_block,
             min_height,
             max_height,
@@ -4921,7 +5037,7 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
     // (pwrite + ftruncate).
     let per_height_root_node_bodies = if reclaim {
         capture_per_height_root_nodes(
-            &mut marf,
+            &mut *marf,
             &block_hashes_raw,
             &block_ids_per_height,
             &ptr_to_idx,
@@ -4967,7 +5083,7 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
         sidecar_published,
         deferred: deferred_sidecar_inputs,
     } = publish_per_level_sidecar(
-        Path::new(marf_path),
+        Path::new(&marf_path),
         target,
         reclaim,
         next_level_id,
@@ -5000,8 +5116,8 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
     timings.remap_ms = t_remap.elapsed().as_millis();
 
     publish_squashed_blob(
-        &mut marf,
-        marf_path,
+        &mut *marf,
+        &marf_path,
         target,
         &existing_levels,
         reclaim,
@@ -5021,15 +5137,10 @@ pub(crate) fn squash_level_incremental_with_target<T: MarfTrieId + Send + Sync>(
 
     node_store.finish()?;
 
-    // Trim aged root-snapshot sidecars. Runs AFTER `publish_squash`
-    // committed the new level so it sees the latest level set.
-    trim_root_sidecars_after_publish(
-        &mut marf,
-        Path::new(marf_path),
-        reclaim,
-        next_level_id,
-        retention_levels,
-    );
+    // Sidecar trim is no longer coupled to the squash publish — it's a
+    // caller-driven concern (chainstate decides when to invoke
+    // `MARF::trim_sidecars` based on burnchain reorg-tolerance policy).
+    // See the adaptive-squash-cadence design doc §3.5.4 for rationale.
 
     timings.total_ms = t_start.elapsed().as_millis();
 
@@ -5064,6 +5175,7 @@ pub fn create_stub_level<T: MarfTrieId>(
         squash_mode: SquashMode::TipOnly,
         squash_root_snapshot_retention_levels:
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+        squash_root_snapshot_retention_blocks: None,
     };
 
     let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
@@ -5083,6 +5195,13 @@ pub fn create_stub_level<T: MarfTrieId>(
         trie_sql::create_squash_levels_table(storage.sqlite_conn())?;
         let offset = storage.get_blob_append_offset()?;
 
+        // Watermark for the post-stub stats counter. Late-enablement
+        // deployments typically have a populated `marf_data` table at this
+        // point — without snapshotting MAX(block_id) here, the next stats
+        // reconstruction would sum over the entire pre-stub table and
+        // overcount work until the next real squash absorbs the stub.
+        let watermark = trie_sql::current_published_max_block_id(storage.sqlite_conn())?;
+
         let row = SquashLevelRow {
             level_id: 0,
             min_height,
@@ -5094,6 +5213,7 @@ pub fn create_stub_level<T: MarfTrieId>(
             root_sidecar_trimmed: false,
             // Stub levels have no nodes and therefore no orphans.
             orphan_split_offset: 0,
+            published_max_block_id: watermark,
         };
         trie_sql::write_squash_level(storage.sqlite_conn(), &row)?;
         offset
@@ -5105,6 +5225,33 @@ pub fn create_stub_level<T: MarfTrieId>(
     );
 
     Ok(())
+}
+
+/// Path-based wrapper around the live-handle [`MARF::trim_sidecars`]
+/// method. Opens its own `MARF<T>` from `marf_path`, delegates, drops.
+/// Suitable for offline / one-shot disk-cleanup tooling against a stopped
+/// node; **not** safe to call while another process holds a writer handle
+/// against the same DB (this opens a second handle and conflicts with the
+/// live writer's exclusive-ownership assumption — see the design doc
+/// §3.1.0).
+pub fn trim_sidecars<T: MarfTrieId + Send + Sync>(
+    marf_path: &str,
+    retention_blocks: u32,
+) -> Result<TrimReport, Error> {
+    let open_opts = MARFOpenOpts {
+        hash_calculation_mode: TrieHashCalculationMode::Immediate,
+        cache_strategy: "noop".to_string(),
+        external_blobs: true,
+        force_db_migrate: false,
+        compress: false,
+        mmap: false,
+        squash_mode: SquashMode::TipOnly,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+        squash_root_snapshot_retention_blocks: None,
+    };
+    let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
+    marf.trim_sidecars(retention_blocks)
 }
 
 /// Replace an existing squash level by re-running the squash pipeline
@@ -5161,28 +5308,51 @@ pub fn create_stub_level<T: MarfTrieId>(
 ///
 /// Returns `Error::CorruptionError` if `level_id` is not present in
 /// `marf_squash_levels`.
+/// Path-based wrapper around the live-handle [`MARF::re_squash`] method.
+/// Same delegation pattern as [`squash_level_incremental`].
 pub fn re_squash_level<T: MarfTrieId + Send + Sync>(
     marf_path: &str,
     level_id: u32,
     mode: SquashMode,
     reclaim: bool,
-    retention_levels: u32,
     canonical_tip: T,
 ) -> Result<SquashStats, Error> {
-    // Read the level's range from SQL — caller doesn't supply min/max
-    // because the row is the durable source of truth for them. The actual
-    // squash opens its own MARF inside `squash_level_incremental_with_target`.
-    let conn = rusqlite::Connection::open_with_flags(
-        marf_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(Error::SQLError)?;
-    let levels = trie_sql::read_squash_levels(&conn)?;
-    drop(conn);
+    let open_opts = MARFOpenOpts {
+        hash_calculation_mode: TrieHashCalculationMode::Immediate,
+        cache_strategy: "noop".to_string(),
+        external_blobs: true,
+        force_db_migrate: false,
+        compress: false,
+        mmap: false,
+        squash_mode: SquashMode::TipOnly,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+        squash_root_snapshot_retention_blocks: None,
+    };
+    let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
+    re_squash_level_on_marf::<T>(&mut marf, level_id, mode, reclaim, canonical_tip)
+}
 
+/// Live-handle Replace path. Used by [`MARF::re_squash`] and by the
+/// path-based wrapper above. Reads the level row from the live handle's SQL
+/// connection (durable source of truth for `min_height` / `max_height`),
+/// then runs `squash_level_incremental_with_target` with
+/// `SquashTarget::Replace`.
+pub(crate) fn re_squash_level_on_marf<T: MarfTrieId + Send + Sync>(
+    marf: &mut MARF<T>,
+    level_id: u32,
+    mode: SquashMode,
+    reclaim: bool,
+    canonical_tip: T,
+) -> Result<SquashStats, Error> {
+    // Snapshot the level's range from the live handle's SQL connection.
+    // Cloned out of the `Vec` so the read doesn't hold a borrow into
+    // `marf` across the subsequent `&mut self` squash call.
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn())?;
     let target = levels
         .iter()
         .find(|r| r.level_id == level_id)
+        .cloned()
         .ok_or_else(|| {
             Error::CorruptionError(format!(
                 "re_squash_level: level_id {level_id} not found in marf_squash_levels"
@@ -5196,12 +5366,11 @@ pub fn re_squash_level<T: MarfTrieId + Send + Sync>(
     );
 
     squash_level_incremental_with_target::<T>(
-        marf_path,
+        marf,
         mode,
         target.min_height,
         target.max_height,
         reclaim,
-        retention_levels,
         SquashTarget::Replace { level_id },
         Some(canonical_tip),
     )
@@ -5237,6 +5406,7 @@ mod tests {
             root_sidecar_present: false,
             root_sidecar_trimmed: false,
             orphan_split_offset: 0,
+            published_max_block_id: 0,
         }
     }
 
@@ -5540,6 +5710,7 @@ mod tests {
                 root_sidecar_present: true,
                 root_sidecar_trimmed: false,
                 orphan_split_offset: 0,
+                published_max_block_id: 0,
             },
             SquashLevelRow {
                 level_id: 1,
@@ -5551,6 +5722,7 @@ mod tests {
                 root_sidecar_present: true,
                 root_sidecar_trimmed: false,
                 orphan_split_offset: 0,
+                published_max_block_id: 0,
             },
         ];
         // Top prior is level_id=1 ending at offset 1500.
@@ -5559,7 +5731,7 @@ mod tests {
 
     #[test]
     fn build_published_level_row_records_reclaim_and_sidecar() {
-        let row = build_published_level_row(7, 100, 199, 4096, 16384, true, true, 12345);
+        let row = build_published_level_row(7, 100, 199, 4096, 16384, true, true, 12345, 4321);
         assert_eq!(row.level_id, 7);
         assert_eq!(row.min_height, 100);
         assert_eq!(row.max_height, 199);
@@ -5570,14 +5742,16 @@ mod tests {
         // Always false at publish time; the trim policy mutates it later.
         assert!(!row.root_sidecar_trimmed);
         assert_eq!(row.orphan_split_offset, 12345);
+        assert_eq!(row.published_max_block_id, 4321);
     }
 
     #[test]
     fn build_published_level_row_no_reclaim_no_sidecar() {
-        let row = build_published_level_row(0, 0, 0, 0, 0, false, false, 0);
+        let row = build_published_level_row(0, 0, 0, 0, 0, false, false, 0, 0);
         assert!(!row.reads_redirected);
         assert!(!row.root_sidecar_present);
         assert!(!row.root_sidecar_trimmed);
+        assert_eq!(row.published_max_block_id, 0);
     }
 
     #[test]

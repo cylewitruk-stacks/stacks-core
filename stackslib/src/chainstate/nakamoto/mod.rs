@@ -1995,7 +1995,18 @@ impl NakamotoChainState {
         // the level). The chain is then left in a state where reads through the new
         // block decode garbage from the wrong blob (the level-14 mainnet panic's
         // downstream symptom).
-        stacks_chain_state.assert_squash_consistency(&parent_block_id, sort_db.conn())?;
+        // Prospective new block: the one this call is about to commit. Seeding it into the
+        // canonical-ancestry probe lets the guard catch the leading-edge divergence case where
+        // the new block itself is the first to diverge from `recorded[chain_length]`, which a
+        // parent-anchored ancestry walk alone cannot see.
+        let prospective_block_id = next_ready_block.header.block_id();
+        let prospective_height = u32::try_from(next_ready_block.header.chain_length)
+            .expect("FATAL: Nakamoto chain_length does not fit in u32");
+        stacks_chain_state.assert_squash_consistency_with_prospective(
+            &parent_block_id,
+            Some((prospective_block_id, prospective_height)),
+            sort_db.conn(),
+        )?;
 
         // ── Reward-set load (now safe — squash level is re-anchored if needed) ──────
         let elected_height = sort_db

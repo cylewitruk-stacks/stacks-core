@@ -75,7 +75,7 @@ DELETE FROM migrated_version;
 INSERT INTO migrated_version (version) VALUES (1);
 ";
 
-pub static SQL_MARF_SCHEMA_VERSION: u64 = 3;
+pub static SQL_MARF_SCHEMA_VERSION: u64 = 4;
 
 static SQL_MARF_DATA_TABLE_SCHEMA_3: &str = "
 CREATE TABLE IF NOT EXISTS marf_squash_levels (
@@ -102,6 +102,31 @@ DELETE FROM schema_version;
 INSERT INTO schema_version (version) VALUES (3);
 DELETE FROM migrated_version;
 INSERT INTO migrated_version (version) VALUES (3);
+";
+
+/// Schema 4: add `published_max_block_id` to both squash-level tables.
+/// Backs the per-MARF squash-work counter's reconstruction at startup
+/// (Step 2 of the adaptive squash cadence design — see
+/// `.docs/adaptive-squash-cadence.md` §3.2.1).
+///
+/// Existing v3 rows get `published_max_block_id = 0`, which means the next
+/// stats reconstruction sums `external_length` across the whole `marf_data`
+/// table — a one-time over-count cleared by the next successful squash,
+/// which writes a real publish-time watermark.
+///
+/// `marf_retired_squash_levels` may not exist yet on v3 DBs (it is created
+/// by `create_squash_levels_table` only on the first squash). The
+/// best-effort `ALTER TABLE` below silently no-ops if the table is absent;
+/// when `create_squash_levels_table` later creates it, the column lands
+/// from the embedded DDL.
+static SQL_MARF_DATA_TABLE_SCHEMA_4: &str = "
+ALTER TABLE marf_squash_levels
+    ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0;
+
+DELETE FROM schema_version;
+INSERT INTO schema_version (version) VALUES (4);
+DELETE FROM migrated_version;
+INSERT INTO migrated_version (version) VALUES (4);
 ";
 
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
@@ -160,6 +185,25 @@ pub fn migrate_tables_if_needed<T: MarfTrieId>(conn: &mut Connection) -> Result<
                 // add marf_squash_levels table
                 let tx = db::tx_begin_immediate(conn)?;
                 tx.execute_batch(SQL_MARF_DATA_TABLE_SCHEMA_3)?;
+                tx.commit()?;
+            }
+            3 => {
+                debug!("Migrate MARF data from schema 3 to schema 4");
+
+                // add published_max_block_id column to marf_squash_levels
+                // (and, if present, to marf_retired_squash_levels)
+                let tx = db::tx_begin_immediate(conn)?;
+                tx.execute_batch(SQL_MARF_DATA_TABLE_SCHEMA_4)?;
+                // `marf_retired_squash_levels` may not exist on v3 DBs (it is
+                // created lazily by `create_squash_levels_table` on the first
+                // squash). Suppress the "no such table" error so the migration
+                // succeeds either way; when the table is later created by
+                // `create_squash_levels_table`, the column lands from the
+                // embedded DDL or from the same idempotent ALTER call there.
+                let _ = tx.execute_batch(
+                    "ALTER TABLE marf_retired_squash_levels \
+                     ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0",
+                );
                 tx.commit()?;
             }
             x if x == SQL_MARF_SCHEMA_VERSION => {
@@ -766,7 +810,17 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
     reads_redirected INTEGER NOT NULL DEFAULT 0,
     root_sidecar_present INTEGER NOT NULL DEFAULT 0,
     root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0,
-    orphan_split_offset INTEGER NOT NULL DEFAULT 0
+    orphan_split_offset INTEGER NOT NULL DEFAULT 0,
+    -- Publish-time `MAX(block_id) FROM marf_data WHERE unconfirmed = 0`,
+    -- snapshotted inside the squash publish transaction. Backs the per-MARF
+    -- squash-work counter's reconstruction at startup: confirmed `marf_data`
+    -- rows with `block_id > MAX(published_max_block_id)` are the
+    -- post-publish open-suffix work that the next squash will absorb.
+    -- Default 0 means \"reconstruct over the entire `marf_data` table\" —
+    -- the conservative one-time over-count that levels predating this
+    -- column produce on first read post-migration; cleared on the next
+    -- successful squash.
+    published_max_block_id INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -798,7 +852,12 @@ CREATE TABLE IF NOT EXISTS marf_retired_squash_levels (
     root_sidecar_present INTEGER NOT NULL DEFAULT 0,
     root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0,
     orphan_split_offset INTEGER NOT NULL DEFAULT 0,
-    retired_at INTEGER NOT NULL
+    retired_at INTEGER NOT NULL,
+    -- Inherits the OLD active row's watermark verbatim at retire time. Records
+    -- \"rows present when the original level published\"; meaningful for any
+    -- future descendant whose backptrs target the retired blob. Default 0
+    -- matches `marf_squash_levels` migration semantics for legacy rows.
+    published_max_block_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_retired_squash_levels_height
     ON marf_retired_squash_levels(min_height, max_height);
@@ -820,11 +879,84 @@ pub fn create_squash_levels_table(conn: &Connection) -> Result<(), Error> {
         "ALTER TABLE marf_squash_levels \
          ADD COLUMN orphan_split_offset INTEGER NOT NULL DEFAULT 0",
     );
+    let _ = conn.execute_batch(
+        "ALTER TABLE marf_squash_levels \
+         ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0",
+    );
     // Retired-levels table is created here too — it shares the same creation lifecycle as the
     // active table (any squash-aware DB needs both, since `Replace` publish writes into both
     // atomically).
     conn.execute_batch(SQL_RETIRED_SQUASH_LEVELS_TABLE)?;
+    let _ = conn.execute_batch(
+        "ALTER TABLE marf_retired_squash_levels \
+         ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0",
+    );
     Ok(())
+}
+
+/// Snapshot the publish-time watermark — `MAX(block_id) FROM marf_data WHERE
+/// unconfirmed = 0`. Returns 0 when no confirmed rows exist (e.g. a freshly
+/// created stub with an empty `marf_data`). Callers should run this *inside*
+/// the squash publish transaction so the watermark reflects exactly the rows
+/// observable at commit time.
+pub fn current_published_max_block_id(conn: &Connection) -> Result<u32, Error> {
+    let watermark: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(block_id), 0) FROM marf_data WHERE unconfirmed = 0",
+            NO_PARAMS,
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Error::SQLError)?;
+    Ok(watermark as u32)
+}
+
+/// Reconstruct the per-MARF squash-work counter from SQL: sum
+/// `external_length` over confirmed `marf_data` rows with `block_id` strictly
+/// greater than the latest published level's watermark
+/// (`MAX(published_max_block_id)` across `marf_squash_levels`). Returns 0 when
+/// no confirmed rows have landed past the latest squash. The query uses the
+/// primary-key index on `block_id` so cost is O(post-watermark rows).
+///
+/// On a freshly-migrated v3 -> v4 DB the watermark defaults to 0 for every
+/// pre-existing level; the first reconstruction post-migration sums over the
+/// entire `marf_data` table — a documented one-time over-count cleared by the
+/// next squash, which writes a real watermark and resets the counter.
+///
+/// Pre-stub / pre-squash MARFs (no rows in `marf_squash_levels`) likewise sum
+/// over the full table; the next stub or squash absorbs that into a real
+/// watermark.
+pub fn current_external_bytes_since_last_squash(conn: &Connection) -> Result<u64, Error> {
+    // `marf_squash_levels` may not exist yet on pre-squash-code DBs (the
+    // table is created by the v2 -> v3 migration; opens against older
+    // schemas may briefly observe its absence). Match the
+    // `read_squash_levels` table-exists guard so this helper stays callable
+    // from those paths too.
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='marf_squash_levels'",
+            NO_PARAMS,
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let watermark: i64 = if table_exists {
+        conn.query_row(
+            "SELECT COALESCE(MAX(published_max_block_id), 0) FROM marf_squash_levels",
+            NO_PARAMS,
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Error::SQLError)?
+    } else {
+        0
+    };
+    let total: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(external_length), 0) FROM marf_data \
+             WHERE block_id > ?1 AND unconfirmed = 0",
+            params![watermark],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(Error::SQLError)?;
+    Ok(total as u64)
 }
 
 /// Insert a row into `marf_retired_squash_levels`, capturing the active level's state at the moment
@@ -842,8 +974,8 @@ pub fn insert_retired_squash_level(
         "INSERT INTO marf_retired_squash_levels \
          (original_level_id, min_height, max_height, blob_offset, blob_length, \
           reads_redirected, root_sidecar_present, root_sidecar_trimmed, \
-          orphan_split_offset, retired_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          orphan_split_offset, retired_at, published_max_block_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             row.original_level_id,
             row.min_height,
@@ -855,6 +987,7 @@ pub fn insert_retired_squash_level(
             row.root_sidecar_trimmed as i64,
             row.orphan_split_offset as i64,
             row.retired_at as i64,
+            row.published_max_block_id as i64,
         ],
     )?;
     let retired_id: i64 = conn.last_insert_rowid();
@@ -877,7 +1010,8 @@ pub fn read_retired_squash_levels(conn: &Connection) -> Result<Vec<RetiredSquash
         "SELECT retired_id, original_level_id, min_height, max_height, \
                 blob_offset, blob_length, reads_redirected, \
                 root_sidecar_present, root_sidecar_trimmed, \
-                orphan_split_offset, retired_at \
+                orphan_split_offset, retired_at, \
+                COALESCE(published_max_block_id, 0) AS published_max_block_id \
          FROM marf_retired_squash_levels \
          ORDER BY retired_id ASC",
     )?;
@@ -895,6 +1029,7 @@ pub fn read_retired_squash_levels(conn: &Connection) -> Result<Vec<RetiredSquash
                 root_sidecar_trimmed: row.get::<_, i64>("root_sidecar_trimmed")? != 0,
                 orphan_split_offset: row.get::<_, i64>("orphan_split_offset")? as u32,
                 retired_at: row.get::<_, i64>("retired_at")? as u64,
+                published_max_block_id: row.get::<_, i64>("published_max_block_id")? as u32,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -906,8 +1041,8 @@ pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(),
         "INSERT OR REPLACE INTO marf_squash_levels \
          (level_id, min_height, max_height, blob_offset, blob_length, \
           reads_redirected, root_sidecar_present, root_sidecar_trimmed, \
-          orphan_split_offset) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          orphan_split_offset, published_max_block_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             row.level_id,
             row.min_height,
@@ -918,6 +1053,7 @@ pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(),
             row.root_sidecar_present as i64,
             row.root_sidecar_trimmed as i64,
             row.orphan_split_offset as i64,
+            row.published_max_block_id as i64,
         ],
     )?;
     Ok(())
@@ -995,7 +1131,8 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
          COALESCE(reads_redirected, 0) AS reads_redirected, \
          COALESCE(root_sidecar_present, 0) AS root_sidecar_present, \
          COALESCE(root_sidecar_trimmed, 0) AS root_sidecar_trimmed, \
-         COALESCE(orphan_split_offset, 0) AS orphan_split_offset \
+         COALESCE(orphan_split_offset, 0) AS orphan_split_offset, \
+         COALESCE(published_max_block_id, 0) AS published_max_block_id \
          FROM marf_squash_levels ORDER BY min_height ASC",
     )?;
     let rows = stmt
@@ -1010,6 +1147,7 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
                 root_sidecar_present: row.get::<_, i64>("root_sidecar_present")? != 0,
                 root_sidecar_trimmed: row.get::<_, i64>("root_sidecar_trimmed")? != 0,
                 orphan_split_offset: row.get::<_, i64>("orphan_split_offset")? as u32,
+                published_max_block_id: row.get::<_, i64>("published_max_block_id")? as u32,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

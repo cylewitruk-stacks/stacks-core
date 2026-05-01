@@ -6285,8 +6285,23 @@ impl StacksChainState {
             &parent_header_info.consensus_hash,
             &parent_header_info.anchored_header.block_hash(),
         );
+        // Prospective new block: the one this call is about to commit. Seeding it into the
+        // canonical-ancestry probe lets the guard catch the leading-edge divergence case where
+        // the new block itself is the first to diverge from `recorded[parent_height + 1]`,
+        // which a parent-anchored ancestry walk alone cannot see.
+        let prospective_block_id = StacksBlockId::new(
+            &next_staging_block.consensus_hash,
+            &next_staging_block.anchored_block_hash,
+        );
+        let prospective_height = u32::try_from(parent_header_info.stacks_block_height)
+            .expect("FATAL: parent stacks_block_height does not fit in u32")
+            .saturating_add(1);
         chainstate_tx.commit().map_err(Error::DBError)?;
-        self.assert_squash_consistency(&parent_block_id, sort_tx.tx())?;
+        self.assert_squash_consistency_with_prospective(
+            &parent_block_id,
+            Some((prospective_block_id, prospective_height)),
+            sort_tx.tx(),
+        )?;
         let (mut chainstate_tx, clarity_instance) = self.chainstate_tx_begin();
 
         // attach the block to the chain state and calculate the next chain tip.

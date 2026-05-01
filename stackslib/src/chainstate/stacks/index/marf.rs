@@ -465,18 +465,24 @@ pub struct MARFOpenOpts {
     /// `FullHistory` for pre-epoch-3.4 squash ranges regardless of
     /// this setting.
     pub squash_mode: SquashMode,
-    /// Number of recent squash levels whose per-height root + orphan
-    /// sidecars are kept on disk. Levels older than
-    /// `current_squash_tip_level - squash_root_snapshot_retention_levels`
-    /// are eligible for trim. Drives both the in-squash post-publish
-    /// trim hook and the `Error::SnapshotTrimmed` policy reported to
-    /// callers attempting to fork-extend off a level outside the window.
-    /// Defaults to
-    /// [`crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS`].
-    /// Tunable per deployment (mainnet/testnet/devnet/tests) via the
-    /// builder; correctness only requires it to be `>= 1` so at least
-    /// one fork-extension-capable level is retained behind the tip.
+    /// **Legacy** retention window in *level count*. Kept for one-release
+    /// backwards compatibility with deployments that still use the
+    /// fixed-cadence-era config. Resolved through
+    /// [`crate::chainstate::stacks::index::squash::resolve_retention_blocks`]
+    /// (multiplies by `MARF_SQUASH_CADENCE_BLOCKS` to convert to the new
+    /// block-count unit). New deployments should use
+    /// [`Self::squash_root_snapshot_retention_blocks`] instead.
     pub squash_root_snapshot_retention_levels: u32,
+    /// Per-deployment retention window for squash-root snapshot sidecars,
+    /// in **Stacks blocks**. After each `MARF::trim_sidecars` call, levels
+    /// whose accumulated newest-first height span has already exceeded
+    /// this threshold are eligible for trim. `None` means "use legacy
+    /// `squash_root_snapshot_retention_levels` if non-default, else the
+    /// crate-level default
+    /// [`crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS`]"
+    /// — see [`crate::chainstate::stacks::index::squash::resolve_retention_blocks`]
+    /// for the precedence rules.
+    pub squash_root_snapshot_retention_blocks: Option<u32>,
 }
 
 impl MARFOpenOpts {
@@ -491,6 +497,7 @@ impl MARFOpenOpts {
             squash_mode: SquashMode::TipOnly,
             squash_root_snapshot_retention_levels:
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            squash_root_snapshot_retention_blocks: None,
         }
     }
 
@@ -509,6 +516,7 @@ impl MARFOpenOpts {
             squash_mode: SquashMode::TipOnly,
             squash_root_snapshot_retention_levels:
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+            squash_root_snapshot_retention_blocks: None,
         }
     }
 
@@ -528,9 +536,19 @@ impl MARFOpenOpts {
     }
 
     /// Override the per-deployment retention window for squash-root
-    /// snapshot sidecars. See the field doc for semantics.
+    /// snapshot sidecars (legacy, in level count). See the field doc for
+    /// semantics; new code should prefer
+    /// [`Self::with_squash_root_snapshot_retention_blocks`].
     pub fn with_squash_root_snapshot_retention_levels(mut self, n: u32) -> Self {
         self.squash_root_snapshot_retention_levels = n;
+        self
+    }
+
+    /// Override the per-deployment retention window for squash-root snapshot
+    /// sidecars, in Stacks blocks. Wins over
+    /// [`Self::with_squash_root_snapshot_retention_levels`] when set.
+    pub fn with_squash_root_snapshot_retention_blocks(mut self, n: u32) -> Self {
+        self.squash_root_snapshot_retention_blocks = Some(n);
         self
     }
 }
@@ -2175,21 +2193,95 @@ impl<T: MarfTrieId> MARF<T> {
 }
 
 // instance methods
-/// Snapshot of a single squash level's recorded canonical chain. Used by the
-/// reorg-divergence detector at chain-advance time: the chainstate walks the
-/// newly-promoted tip's ancestry and compares each ancestor at heights inside
-/// `[min_height ..= max_height]` against `block_hashes[height - min_height]`.
-/// A mismatch means the squash level captured a canonical chain that the
-/// chainstate has since reorg'd away from — descendants of the new canonical
-/// would read through the merged blob's stale tip view.
+
+/// Snapshot of a single squash level's recorded canonical chain.
+///
+/// Used by the reorg-divergence detector at chain-advance time: the chainstate walks the
+/// newly-promoted tip's ancestry and compares each ancestor at heights inside `[min_height ..=
+/// max_height]` against `block_hashes[height - min_height]`.
+///
+/// A mismatch means the squash level captured a canonical chain that the chainstate has since
+/// reorg'd away from — descendants of the new canonical would read through the merged blob's stale
+/// tip view.
 #[derive(Debug, Clone)]
 pub struct SquashLevelCanonical<T: MarfTrieId> {
     pub level_id: u32,
     pub min_height: u32,
     pub max_height: u32,
-    /// Canonical block hash at each height in `[min_height ..= max_height]`,
-    /// indexed by `height - min_height`.
+    /// Canonical block hash at each height in `[min_height ..= max_height]`, indexed by `height -
+    /// min_height`.
     pub block_hashes: Vec<T>,
+}
+
+/// Lightweight range metadata for the most recent **active** squash level.
+/// Returned by [`MARF::latest_squash_level_range`]; consumed by the
+/// chainstate's adaptive cadence policy to compute
+/// `blocks_since_last_squash = canonical_tip_height - max_height` and to
+/// size the divergence-detection precompute window
+/// (see `precompute_canonical_ancestors`).
+///
+/// Unlike [`SquashLevelCanonical`], this is also returned for **stub levels**
+/// (`blob_length = 0`, `block_hashes` empty): a stub still marks "the chain
+/// has been bookkept up to `max_height`," which the cadence policy needs
+/// for boundary tracking even though the stub has no canonical-chain
+/// payload to compare against during divergence detection.
+///
+/// `published_max_block_id` (the per-level stats watermark) is deliberately
+/// not exposed on this struct: it's an internal accounting detail consumed
+/// by the per-MARF stats counter's SQL reconstruction
+/// ([`crate::chainstate::stacks::index::trie_sql::current_external_bytes_since_last_squash`]),
+/// not a direct input to the cadence policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SquashLevelRange {
+    pub level_id: u32,
+    pub min_height: u32,
+    pub max_height: u32,
+}
+
+/// Snapshot of MARF squash-work activity since the last published squash
+/// level. Returned by [`MARF::stats`]; consumed by external cadence policy
+/// (e.g. `StacksChainState`'s adaptive squash trigger) to decide when the
+/// next squash should fire.
+///
+/// `external_bytes_since_last_squash` is a directional measure of squash
+/// cost: it correlates with the merged-blob byte count the next squash will
+/// produce, but not exactly with FullHistory orphan-section size (which
+/// depends on per-key write history). The cadence policy treats it as a
+/// proxy that MUST be calibrated against measured wall-clock per
+/// deployment. See `.docs/adaptive-squash-cadence.md` §4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarfSquashStats {
+    /// Sum of `marf_data.external_length` for confirmed commits whose
+    /// `block_id` is strictly greater than the latest squash level's
+    /// `published_max_block_id` watermark. Includes both canonical and
+    /// non-canonical (sibling/fork) commits in the open suffix —
+    /// over-estimates work in fork-heavy windows, which is acceptable for
+    /// v1 since fork-heavy windows tend to also be busy windows where
+    /// firing earlier isn't wrong.
+    pub external_bytes_since_last_squash: u64,
+}
+
+/// Reorg-divergence record returned by [`MARF::detect_divergence`].
+///
+/// Indicates that the most recent active squash level recorded a different canonical block at
+/// `diverging_height` than the caller-supplied per-height lookup reports.
+///
+/// Descendants of `new_canonical` will read stale state through the merged blob's tip view; the
+/// caller must re-squash the level (preferred) or fail-stop further processing of those
+/// descendants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SquashDivergence<T: MarfTrieId> {
+    /// Level whose recorded canonical chain disagrees with the caller's view.
+    pub level_id: u32,
+    /// Lowest in-range height at which the recorded canonical and the caller-supplied canonical
+    /// disagree. Iteration is `min_height` upward, so this is the deepest disagreement (closest to
+    /// the level's lower bound); the actual fork point may be earlier in chain history but outside
+    /// this level's range.
+    pub diverging_height: u32,
+    /// What the squash level recorded as canonical at this height.
+    pub recorded_canonical: T,
+    /// What the caller-supplied lookup says is canonical at this height.
+    pub new_canonical: T,
 }
 
 impl<T: MarfTrieId> MARF<T> {
@@ -2207,21 +2299,20 @@ impl<T: MarfTrieId> MARF<T> {
             .contains_key(&bhh_key)
     }
 
-    /// Return the most recent **active** squash level's recorded canonical
-    /// chain, or `None` if no active squash levels are loaded.
+    /// Return the most recent **active** squash level's recorded canonical chain, or `None` if no
+    /// active squash levels are loaded.
     ///
-    /// The reorg-divergence detector consumes this to verify that a
-    /// newly-promoted chain tip's ancestry matches what the squash level
-    /// committed to. A mismatch at any height in the level's range means the
-    /// chain has reorg'd past a squash boundary and descendants of the new
+    /// The reorg-divergence detector consumes this to verify that a newly-promoted chain tip's
+    /// ancestry matches what the squash level committed to. A mismatch at any height in the level's
+    /// range means the chain has reorg'd past a squash boundary and descendants of the new
     /// canonical will read stale state through the merged blob.
     ///
-    /// Filters retired levels — those represent prior canonical claims that
-    /// have already been superseded by `Replace` and are kept only for
-    /// fork-block readability, not as the chain's current canonical view.
+    /// Filters retired levels — those represent prior canonical claims that have already been
+    /// superseded by `Replace` and are kept only for fork-block readability, not as the chain's
+    /// current canonical view.
     ///
-    /// Empty `block_hashes` (stub levels with no per-height entries) yields
-    /// `None` — those levels have nothing to diverge against.
+    /// Empty `block_hashes` (stub levels with no per-height entries) yields `None` — those levels
+    /// have nothing to diverge against.
     pub fn latest_squash_level_canonical_chain(&self) -> Option<SquashLevelCanonical<T>> {
         let meta = &self.storage.data.squash_meta;
         // Walk back to the last non-retired entry. `build_squash_meta_from_sql`
@@ -2249,6 +2340,88 @@ impl<T: MarfTrieId> MARF<T> {
                 .map(|b| T::from_bytes(*b))
                 .collect(),
         })
+    }
+
+    /// Return the most recent **active** squash level's range, including
+    /// stub levels (which carry empty `block_hashes` arrays). `None` only
+    /// when no active levels exist at all.
+    ///
+    /// Distinguished from [`Self::latest_squash_level_canonical_chain`] in
+    /// the stub case: that method returns `None` for empty
+    /// canonical-chain entries because there's nothing to diverge against;
+    /// this method still surfaces the level so the cadence policy can
+    /// compute `blocks_since_last_squash = tip_height - max_height` and
+    /// the divergence-detection precompute can size its walk window via
+    /// `min_height`. Both are correct: stubs mark a height boundary but
+    /// have no per-height canonical claims to verify.
+    pub fn latest_squash_level_range(&self) -> Option<SquashLevelRange> {
+        let meta = &self.storage.data.squash_meta;
+        let last_active = meta
+            .levels
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(idx, _)| !meta.is_retired.get(*idx).copied().unwrap_or(false))
+            .map(|(_, lvl)| lvl)?;
+        Some(SquashLevelRange {
+            level_id: last_active.info.level_id,
+            min_height: last_active.info.min_height,
+            max_height: last_active.info.max_height,
+        })
+    }
+
+    /// Compare the latest squash level's recorded canonical chain against the caller-supplied
+    /// per-height lookup.
+    ///
+    /// Returns the first in-range height at which the recorded canonical disagrees with the lookup,
+    /// or `None` if the level matches the lookup over its entire range (or there is no level at
+    /// all).
+    ///
+    /// Iteration is over `[min_height ..= max_height]` ascending. Cost is O(level_span) closure
+    /// invocations; the caller should back the closure with a precomputed `height -> canonical` map
+    /// (see `precompute_canonical_ancestors` on `StacksChainState`) to keep each invocation O(1).
+    ///
+    /// **Missing-ancestry semantics**: if the closure returns `Ok(None)` for a height in the
+    /// level's range, the height is skipped — not treated as a divergence. This matches the older
+    /// walker's behavior of treating truncated headers ancestry as "ancestry unknowable from this
+    /// chainstate" rather than a fatal mismatch.
+    pub fn detect_divergence<F>(
+        &self,
+        mut canonical_at_height: F,
+    ) -> Result<Option<SquashDivergence<T>>, Error>
+    where
+        F: FnMut(u32) -> Result<Option<T>, Error>,
+    {
+        let level = match self.latest_squash_level_canonical_chain() {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        for height in level.min_height..=level.max_height {
+            let idx = (height - level.min_height) as usize;
+            let recorded = level.block_hashes.get(idx).ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "MARF::detect_divergence: height {height} outside canonical chain index range \
+                     (level_id={}, min_height={}, max_height={}, len={})",
+                    level.level_id,
+                    level.min_height,
+                    level.max_height,
+                    level.block_hashes.len()
+                ))
+            })?;
+            let chain = match canonical_at_height(height)? {
+                Some(h) => h,
+                None => continue,
+            };
+            if recorded != &chain {
+                return Ok(Some(SquashDivergence {
+                    level_id: level.level_id,
+                    diverging_height: height,
+                    recorded_canonical: recorded.clone(),
+                    new_canonical: chain,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     pub fn begin_tx(&mut self) -> Result<MarfTransaction<'_, T>, Error> {
@@ -2584,6 +2757,158 @@ impl<T: MarfTrieId> MARF<T> {
     /// external squash modified the underlying storage.
     pub fn refresh_after_squash(&mut self) -> Result<(), Error> {
         self.storage.refresh_after_squash()
+    }
+
+    /// Lightweight peer-style sync for the writer that just published a
+    /// squash on this same handle: the publishing path already updated the
+    /// shared `SquashMeta`, bumped the generation, and remapped the mmap
+    /// from inside `publish_squash`'s rebuild closure. All that's left for
+    /// the writer is to refresh its handle-local pointer + watermark + block
+    /// cache without re-entering `publish_squash`. Avoids the second global
+    /// quiesce / generation bump that [`Self::refresh_after_squash`] would
+    /// do, which other peer handles would observe as a redundant resync.
+    pub fn sync_after_published_squash(&mut self) -> Result<(), Error> {
+        self.storage.sync_after_published_squash()
+    }
+
+    /// Snapshot of this handle's MARF squash-work activity since the last
+    /// published squash level. Cheap (in-memory counter read; reconstructed
+    /// from SQL once at handle-open time and resynced after each squash
+    /// publish via the `published_max_block_id` watermark).
+    ///
+    /// The cadence policy at the chainstate layer reads this to drive
+    /// work-aware squash triggering — see
+    /// `.docs/adaptive-squash-cadence.md` §2.4.
+    pub fn stats(&self) -> MarfSquashStats {
+        MarfSquashStats {
+            external_bytes_since_last_squash: self.storage.data.external_bytes_since_last_squash,
+        }
+    }
+}
+
+// --- Live-handle squash entry points ----------------------------------------
+
+impl<T: MarfTrieId + Send + Sync> MARF<T> {
+    /// Run an incremental squash over `[min_height ..= max_height]` against
+    /// this live MARF handle. Anchors to the canonical chain tip resolved
+    /// from `canonical_tip` (or the MARF's `find_tip_block` heuristic when
+    /// `canonical_tip = None`); operates on `&mut self` so the post-publish
+    /// in-memory state (`squash_meta`, mmap, block cache, generation
+    /// watermark) is updated in place.
+    ///
+    /// Refuses to run while `open_chain_tip` is `Some` — a block-write
+    /// transaction is in progress and squashing under that state would
+    /// corrupt the in-flight write. This is the "open write state" guard
+    /// from the §3.1.1 acceptance checklist.
+    ///
+    /// The path-based [`crate::chainstate::stacks::index::squash::squash_level_incremental`]
+    /// is a thin delegating wrapper around this method for offline /
+    /// one-shot tooling.
+    pub fn squash(
+        &mut self,
+        mode: crate::chainstate::stacks::index::squash::SquashMode,
+        min_height: u32,
+        max_height: u32,
+        reclaim: bool,
+        canonical_tip: Option<T>,
+    ) -> Result<crate::chainstate::stacks::index::squash::SquashStats, Error> {
+        if self.open_chain_tip.is_some() {
+            return Err(Error::NotSupportedError(
+                "MARF::squash: a block-write transaction is in progress \
+                 (open_chain_tip is Some) — refusing to squash"
+                    .into(),
+            ));
+        }
+        let stats = crate::chainstate::stacks::index::squash::squash_level_incremental_with_target::<T>(
+            self,
+            mode,
+            min_height,
+            max_height,
+            reclaim,
+            crate::chainstate::stacks::index::squash::SquashTarget::Append,
+            canonical_tip,
+        )?;
+        // The squash publish already installed the new `SquashMeta`, bumped
+        // the shared generation, and remapped this handle's mmap from inside
+        // `publish_squash`'s rebuild closure. All that's left is the
+        // handle-local snapshot pointer + watermark + block cache; use the
+        // lightweight peer-style sync rather than `refresh_after_squash`,
+        // which would re-enter `publish_squash` and trigger a second global
+        // quiesce + generation bump (observable to every other handle).
+        self.sync_after_published_squash()?;
+        Ok(stats)
+    }
+
+    /// Replace an existing level (anchored to a new `canonical_tip`) on this
+    /// live MARF handle. Same shape as [`Self::squash`] but with
+    /// `SquashTarget::Replace { level_id }` semantics; the level's
+    /// `min_height` / `max_height` are sourced from the durable
+    /// `marf_squash_levels` row, not caller arguments.
+    ///
+    /// Same `open_chain_tip` guard applies as [`Self::squash`].
+    pub fn re_squash(
+        &mut self,
+        level_id: u32,
+        mode: crate::chainstate::stacks::index::squash::SquashMode,
+        reclaim: bool,
+        canonical_tip: T,
+    ) -> Result<crate::chainstate::stacks::index::squash::SquashStats, Error> {
+        if self.open_chain_tip.is_some() {
+            return Err(Error::NotSupportedError(
+                "MARF::re_squash: a block-write transaction is in progress \
+                 (open_chain_tip is Some) — refusing to re-squash"
+                    .into(),
+            ));
+        }
+        let stats = crate::chainstate::stacks::index::squash::re_squash_level_on_marf::<T>(
+            self,
+            level_id,
+            mode,
+            reclaim,
+            canonical_tip,
+        )?;
+        // Same lightweight sync rationale as `MARF::squash`: the publish
+        // already did the heavy lifting; just refresh handle-local state.
+        self.sync_after_published_squash()?;
+        Ok(stats)
+    }
+
+    /// Trim per-level root sidecars older than `retention_blocks` of
+    /// fork-extension capability. Walks active reclaim levels newest-to-oldest,
+    /// accumulating each qualifying level's height span; once the
+    /// accumulator passes `retention_blocks`, every older qualifying level
+    /// is marked for trim and its sidecar file unlinked. See
+    /// [`crate::chainstate::stacks::index::squash::trim_aged_root_sidecars`]
+    /// for the algorithm + crash-safety invariants (three-phase commit:
+    /// SQL flag → metadata refresh → file unlink).
+    ///
+    /// Caller-driven only: production code paths (chains-coordinator) call
+    /// this on their own schedule after each successful `MARF::squash`. The
+    /// squash publish itself no longer triggers a trim — see the design
+    /// doc §3.5.4 for the decoupling rationale (recovery shouldn't
+    /// implicitly trim, and operators may want trim and squash on
+    /// independent cadences).
+    ///
+    /// Idempotent. The `open_chain_tip` guard applies, same as
+    /// [`Self::squash`]: trimming under an in-flight write transaction
+    /// would race with the writer's view of `marf_squash_levels`.
+    pub fn trim_sidecars(
+        &mut self,
+        retention_blocks: u32,
+    ) -> Result<crate::chainstate::stacks::index::squash::TrimReport, Error> {
+        if self.open_chain_tip.is_some() {
+            return Err(Error::NotSupportedError(
+                "MARF::trim_sidecars: a block-write transaction is in progress \
+                 (open_chain_tip is Some) — refusing to trim"
+                    .into(),
+            ));
+        }
+        let db_path = self.get_db_path().to_string();
+        crate::chainstate::stacks::index::squash::trim_aged_root_sidecars(
+            self,
+            std::path::Path::new(&db_path),
+            retention_blocks,
+        )
     }
 }
 

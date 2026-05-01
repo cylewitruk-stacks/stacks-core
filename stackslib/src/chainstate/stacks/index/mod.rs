@@ -414,16 +414,20 @@ pub enum Error {
 
     /// Fork-extension was attempted off a parent in a squash level whose
     /// per-height root snapshot has been deleted by the trim policy. This
-    /// is an *expected* policy outcome (not data damage): the level was
-    /// trimmed because it sits past `root_snapshot_retention_levels` from
-    /// the current squash tip, and the operator has accepted that fork
-    /// extension off such ancient parents is not supported. Higher layers
-    /// should convert this into a chainstate-level rejection of the
-    /// in-progress block / alternate-chain validation; do NOT treat it
-    /// as corruption.
+    /// is an *expected* policy outcome (not data damage): the level sits
+    /// past the configured `retention_blocks` window from the current
+    /// squash tip, and the operator has accepted that fork extension off
+    /// such ancient parents is not supported. Higher layers should
+    /// convert this into a chainstate-level rejection of the in-progress
+    /// block / alternate-chain validation; do NOT treat it as corruption.
+    ///
+    /// `retention_blocks` is the resolved block-count window the handle
+    /// was opened with — see
+    /// [`crate::chainstate::stacks::index::squash::resolve_retention_blocks`]
+    /// for how legacy `retention_levels` configs map to this value.
     SnapshotTrimmed {
         level_id: u32,
-        retention_levels: u32,
+        retention_blocks: u32,
     },
 
     /// Fork-extension was attempted off a parent in a squash level that
@@ -1297,11 +1301,11 @@ impl fmt::Display for Error {
             }
             Error::SnapshotTrimmed {
                 level_id,
-                retention_levels,
+                retention_blocks,
             } => write!(
                 f,
                 "Squash level {level_id}'s per-height root snapshot has been trimmed by \
-                 the configured retention policy (root_snapshot_retention_levels={retention_levels}). \
+                 the configured retention policy (root_snapshot_retention_blocks={retention_blocks}). \
                  Fork-extension off a parent in this level is not supported."
             ),
             Error::UnsupportedLegacyLevel { level_id } => write!(
