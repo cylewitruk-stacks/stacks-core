@@ -34,6 +34,23 @@ lazy_static! {
         // Will use DEFAULT_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0] by default
     ), &["path"]).unwrap();
 
+    /// Wall time (seconds) of a Phase C hot-reclaim sweep call, per MARF.
+    ///
+    /// Recorded by `monitoring::with_marf_sweep_window_timer` from inside
+    /// `StacksChainState::sweep_after_promotions` per-MARF arm. Buckets sized for sub-ms to
+    /// ~5s — phase-c §2.2 puts sweep latency at "~ms for the canonical walk + closure check
+    /// + bounded SQL DELETEs + bounded unlink(2)s," so a regression into the seconds is
+    /// visible without losing resolution at the typical-range. The `marf` label is `"headers"`
+    /// or `"clarity"`.
+    pub static ref MARF_SWEEP_WINDOW_DURATION: HistogramVec = register_histogram_vec!(
+        histogram_opts!(
+            "stacks_node_marf_sweep_window_duration_seconds",
+            "Wall time of a Phase C hot-reclaim sweep call, per MARF",
+            vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+        ),
+        &["marf"]
+    ).unwrap();
+
     pub static ref STX_BLOCKS_RECEIVED_COUNTER: IntCounter = register_int_counter!(opts!(
         "stacks_node_stx_blocks_received_total",
         "Total number of Stacks blocks received"
@@ -271,4 +288,54 @@ lazy_static! {
 pub fn new_rpc_call_timer(path: &str) -> HistogramTimer {
     let histogram = RPC_CALL_LATENCIES_HISTOGRAM.with_label_values(&[path]);
     histogram.start_timer()
+}
+
+pub fn new_marf_sweep_window_timer(marf: &str) -> HistogramTimer {
+    let histogram = MARF_SWEEP_WINDOW_DURATION.with_label_values(&[marf]);
+    histogram.start_timer()
+}
+
+#[cfg(test)]
+mod tests {
+    use prometheus::core::Collector;
+
+    use super::*;
+
+    /// **D4b acceptance**: a sweep-window timer's Drop records a sample into the labeled
+    /// histogram. Pins the contract that `with_marf_sweep_window_timer` (in `monitoring/mod.rs`)
+    /// + this module's `new_marf_sweep_window_timer` actually wire to the histogram surface.
+    #[test]
+    fn marf_sweep_window_timer_drop_records_sample() {
+        // Use a fresh label so the test is independent of any prior calls that may have
+        // populated the canonical "headers" / "clarity" series during other tests.
+        let label = "test_marf_label";
+        let before = MARF_SWEEP_WINDOW_DURATION
+            .with_label_values(&[label])
+            .get_sample_count();
+
+        {
+            let _timer = new_marf_sweep_window_timer(label);
+            // Doing nothing — _timer's Drop fires when the scope exits.
+        }
+
+        let after = MARF_SWEEP_WINDOW_DURATION
+            .with_label_values(&[label])
+            .get_sample_count();
+        assert_eq!(
+            after,
+            before + 1,
+            "HistogramTimer Drop must record exactly one sample"
+        );
+    }
+
+    /// Smoke test that the metric registers under the expected name.
+    #[test]
+    fn marf_sweep_window_metric_is_registered_with_expected_shape() {
+        let mfs = MARF_SWEEP_WINDOW_DURATION.collect();
+        assert_eq!(mfs.len(), 1, "exactly one MetricFamily expected");
+        assert_eq!(
+            mfs[0].get_name(),
+            "stacks_node_marf_sweep_window_duration_seconds"
+        );
+    }
 }

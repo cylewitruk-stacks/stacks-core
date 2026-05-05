@@ -75,8 +75,36 @@ DELETE FROM migrated_version;
 INSERT INTO migrated_version (version) VALUES (1);
 ";
 
-pub static SQL_MARF_SCHEMA_VERSION: u64 = 4;
+pub static SQL_MARF_SCHEMA_VERSION: u64 = 3;
 
+/// Schema 3 — squashing v1.5 consolidated DDL.
+///
+/// **Consolidation note (Phase D, 2026-05-03)**: this branch's earlier
+/// development carried a v3 / v4 / v5 ladder of incremental migrations:
+///
+/// - v3 added `marf_squash_levels`.
+/// - v4 added `marf_squash_levels.published_max_block_id`.
+/// - v5 added `marf_data.storage_kind` / `storage_seq`, the
+///   `idx_marf_data_hot` partial index, and the `marf_state` singleton.
+///
+/// Mainnet is on v2. Since this branch hasn't shipped to mainnet yet,
+/// we collapse v3-v5 into a single v2→v3 jump rather than carrying three
+/// migration steps no real chainstate ever ran. The `marf_retired_squash_levels`
+/// table (B6.3 vestigial; no Phase A/B/C code reads or writes it) is
+/// dropped entirely. See
+/// [.docs/squashing-v1.5-phase-d.md](../../../../../.docs/squashing-v1.5-phase-d.md)
+/// for the consolidation rationale.
+///
+/// Existing v2 chainstates migrate forward in one step:
+///
+/// 1. `marf_squash_levels` table created (with `published_max_block_id`
+///    already in the DDL — no separate v4 ALTER).
+/// 2. `marf_data` gains `storage_kind` + `storage_seq` (existing rows
+///    get `storage_kind = 0`, treated as cold — preserves today's
+///    `<db>.blobs`-only layout for any pre-v3 chainstate).
+/// 3. `idx_marf_data_hot` partial index created (cheap on existing
+///    storage_kind = 0 rows since they're filtered out).
+/// 4. `marf_state` singleton row inserted.
 static SQL_MARF_DATA_TABLE_SCHEMA_3: &str = "
 CREATE TABLE IF NOT EXISTS marf_squash_levels (
     level_id INTEGER PRIMARY KEY,
@@ -93,40 +121,42 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
     -- TriePtr-style logical offset (relative to BLOB_HEADER_SIZE) at which
     -- orphan structural nodes begin. Tip-reachable nodes have all direct
     -- child ptrs in [BLOB_HEADER_SIZE .. orphan_split_offset); orphan nodes
-    -- live in [orphan_split_offset ..). Recorded by PR1; routed by PR2 for
-    -- orphan-sidecar reads. 0 means no split (legacy / no orphans).
-    orphan_split_offset INTEGER NOT NULL DEFAULT 0
+    -- live in [orphan_split_offset ..). 0 means no split (no orphans).
+    orphan_split_offset INTEGER NOT NULL DEFAULT 0,
+    -- Per-MARF squash-work watermark. Backs the cadence policy's reconstruction
+    -- of 'bytes since last squash' at startup (see
+    -- .docs/adaptive-squash-cadence.md §3.2.1). Existing rows get 0; the next
+    -- successful squash writes a real publish-time watermark.
+    published_max_block_id INTEGER NOT NULL DEFAULT 0
 );
+
+ALTER TABLE marf_data ADD COLUMN storage_kind INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE marf_data ADD COLUMN storage_seq INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_marf_data_hot
+    ON marf_data(storage_seq) WHERE storage_kind = 1;
+
+CREATE TABLE IF NOT EXISTS marf_state (
+    id                          INTEGER PRIMARY KEY CHECK (id = 1),
+    active_hot_seq              INTEGER NOT NULL DEFAULT 1,
+    horizon_burn_blocks         INTEGER NOT NULL DEFAULT 6,
+    -- Single-flight promotion lock (Phase B). Holds the level_id of an
+    -- in-flight promotion or NULL when idle. The plan file's presence is
+    -- the durable witness; this column is the in-process guard that
+    -- prevents a second cadence tick from starting a second background
+    -- promotion concurrently.
+    promotion_in_progress       INTEGER          DEFAULT NULL,
+    -- Reserved cold-blob extent for the in-flight promotion. The
+    -- 'next cold append offset' computation is
+    -- (committed level extents' end) + (this reservation when non-NULL).
+    promotion_reserved_offset   INTEGER          DEFAULT NULL,
+    promotion_reserved_length   INTEGER          DEFAULT NULL
+);
+INSERT OR IGNORE INTO marf_state (id) VALUES (1);
 
 DELETE FROM schema_version;
 INSERT INTO schema_version (version) VALUES (3);
 DELETE FROM migrated_version;
 INSERT INTO migrated_version (version) VALUES (3);
-";
-
-/// Schema 4: add `published_max_block_id` to both squash-level tables.
-/// Backs the per-MARF squash-work counter's reconstruction at startup
-/// (Step 2 of the adaptive squash cadence design — see
-/// `.docs/adaptive-squash-cadence.md` §3.2.1).
-///
-/// Existing v3 rows get `published_max_block_id = 0`, which means the next
-/// stats reconstruction sums `external_length` across the whole `marf_data`
-/// table — a one-time over-count cleared by the next successful squash,
-/// which writes a real publish-time watermark.
-///
-/// `marf_retired_squash_levels` may not exist yet on v3 DBs (it is created
-/// by `create_squash_levels_table` only on the first squash). The
-/// best-effort `ALTER TABLE` below silently no-ops if the table is absent;
-/// when `create_squash_levels_table` later creates it, the column lands
-/// from the embedded DDL.
-static SQL_MARF_DATA_TABLE_SCHEMA_4: &str = "
-ALTER TABLE marf_squash_levels
-    ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0;
-
-DELETE FROM schema_version;
-INSERT INTO schema_version (version) VALUES (4);
-DELETE FROM migrated_version;
-INSERT INTO migrated_version (version) VALUES (4);
 ";
 
 pub fn create_tables_if_needed(conn: &mut Connection) -> Result<(), Error> {
@@ -180,30 +210,13 @@ pub fn migrate_tables_if_needed<T: MarfTrieId>(conn: &mut Connection) -> Result<
                 tx.commit()?;
             }
             2 => {
-                debug!("Migrate MARF data from schema 2 to schema 3");
+                debug!("Migrate MARF data from schema 2 to schema 3(v1.5 consolidated)");
 
-                // add marf_squash_levels table
+                // Squashing v1.5 consolidated migration: v3 + (formerly v4) +
+                // (formerly v5), in one transaction. See SQL_MARF_DATA_TABLE_SCHEMA_3
+                // doc comment for the consolidation rationale.
                 let tx = db::tx_begin_immediate(conn)?;
                 tx.execute_batch(SQL_MARF_DATA_TABLE_SCHEMA_3)?;
-                tx.commit()?;
-            }
-            3 => {
-                debug!("Migrate MARF data from schema 3 to schema 4");
-
-                // add published_max_block_id column to marf_squash_levels
-                // (and, if present, to marf_retired_squash_levels)
-                let tx = db::tx_begin_immediate(conn)?;
-                tx.execute_batch(SQL_MARF_DATA_TABLE_SCHEMA_4)?;
-                // `marf_retired_squash_levels` may not exist on v3 DBs (it is
-                // created lazily by `create_squash_levels_table` on the first
-                // squash). Suppress the "no such table" error so the migration
-                // succeeds either way; when the table is later created by
-                // `create_squash_levels_table`, the column lands from the
-                // embedded DDL or from the same idempotent ALTER call there.
-                let _ = tx.execute_batch(
-                    "ALTER TABLE marf_retired_squash_levels \
-                     ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0",
-                );
                 tx.commit()?;
             }
             x if x == SQL_MARF_SCHEMA_VERSION => {
@@ -308,17 +321,59 @@ pub fn write_trie_blob<T: MarfTrieId>(
     Ok(block_id)
 }
 
+/// Storage tier for an external trie blob, mirroring the on-disk
+/// `marf_data.storage_kind` column. See `.docs/squashing-v1.5.md` §4.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKind {
+    /// Cold zone: bytes live in `<db>.blobs`. `storage_seq` is unused
+    /// (always 0). Today's behavior for promoted (squashed) blocks and
+    /// for any pre-v5 chainstate's existing rows.
+    Cold,
+    /// Hot zone: bytes live in `<db>.hot.{seq:08}`. `storage_seq` names
+    /// which rolling hot file holds the bytes. Phase A's new write
+    /// path lands here.
+    Hot,
+}
+
+impl StorageKind {
+    /// On-disk integer encoding (matches `marf_data.storage_kind`).
+    pub fn to_int(self) -> i64 {
+        match self {
+            StorageKind::Cold => 0,
+            StorageKind::Hot => 1,
+        }
+    }
+
+    /// Decode an integer read from `marf_data.storage_kind`. Returns
+    /// `Err` for unrecognized values to surface schema corruption.
+    pub fn from_int(v: i64) -> Result<Self, Error> {
+        match v {
+            0 => Ok(StorageKind::Cold),
+            1 => Ok(StorageKind::Hot),
+            _ => Err(Error::CorruptionError(format!(
+                "marf_data.storage_kind has unrecognized value {v}"
+            ))),
+        }
+    }
+}
+
 /// Write the offset/length of a trie blob that was stored to an external file.
 /// Do this only once the trie is actually stored, since only the presence of this information is
 /// what guarantees that the blob is persisted.
 /// If block_id is Some(..), then an existing block ID's metadata will be updated.  Otherwise, a
 /// new row will be created.
+///
+/// `kind` and `seq` populate the `storage_kind` / `storage_seq` columns
+/// added in schema 5. Cold writes pass `StorageKind::Cold` + `seq = 0`;
+/// hot writes pass `StorageKind::Hot` + the active hot-file sequence.
 fn inner_write_external_trie_blob<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
     offset: u64,
     length: u64,
     block_id: Option<u32>,
+    kind: StorageKind,
+    seq: u32,
 ) -> Result<u32, Error> {
     let block_id = if let Some(block_id) = block_id {
         // existing entry (i.e. a migration)
@@ -329,15 +384,17 @@ fn inner_write_external_trie_blob<T: MarfTrieId>(
             0,
             db::u64_to_sql(offset)?,
             db::u64_to_sql(length)?,
+            kind.to_int(),
+            seq as i64,
             block_id,
         ];
         let mut s =
-            conn.prepare("UPDATE marf_data SET block_hash = ?1, data = ?2, unconfirmed = ?3, external_offset = ?4, external_length = ?5 WHERE block_id = ?6")?;
+            conn.prepare("UPDATE marf_data SET block_hash = ?1, data = ?2, unconfirmed = ?3, external_offset = ?4, external_length = ?5, storage_kind = ?6, storage_seq = ?7 WHERE block_id = ?8")?;
         s.execute(args)?;
 
         debug!(
-            "Replaced block trie {} at rowid {} offset {}",
-            block_hash, block_id, offset
+            "Replaced block trie {} at rowid {} offset {} (kind={:?}, seq={})",
+            block_hash, block_id, offset, kind, seq
         );
         block_id
     } else {
@@ -349,17 +406,19 @@ fn inner_write_external_trie_blob<T: MarfTrieId>(
             0,
             db::u64_to_sql(offset)?,
             db::u64_to_sql(length)?,
+            kind.to_int(),
+            seq as i64,
         ];
         let mut s =
-            conn.prepare("INSERT INTO marf_data (block_hash, data, unconfirmed, external_offset, external_length) VALUES (?, ?, ?, ?, ?)")?;
+            conn.prepare("INSERT INTO marf_data (block_hash, data, unconfirmed, external_offset, external_length, storage_kind, storage_seq) VALUES (?, ?, ?, ?, ?, ?, ?)")?;
         let block_id = s
             .insert(args)?
             .try_into()
             .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
 
         debug!(
-            "Wrote block trie {} to rowid {} offset {}",
-            block_hash, block_id, offset
+            "Wrote block trie {} to rowid {} offset {} (kind={:?}, seq={})",
+            block_hash, block_id, offset, kind, seq
         );
         block_id
     };
@@ -369,6 +428,11 @@ fn inner_write_external_trie_blob<T: MarfTrieId>(
 
 /// Update the row for an external trie blob -- i.e. we're migrating blobs from sqlite storage to
 /// file storage.
+///
+/// **Cold-zone only.** Blob-migration is a one-time path that pulls
+/// inline-blob rows out into `<db>.blobs`; v1.5 doesn't migrate into the
+/// hot zone (new writes go there directly via [`write_external_trie_blob_hot`]),
+/// so this helper writes `storage_kind = Cold, storage_seq = 0`.
 pub fn update_external_trie_blob<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
@@ -376,19 +440,57 @@ pub fn update_external_trie_blob<T: MarfTrieId>(
     length: u64,
     block_id: u32,
 ) -> Result<u32, Error> {
-    inner_write_external_trie_blob(conn, block_hash, offset, length, Some(block_id))
+    inner_write_external_trie_blob(
+        conn,
+        block_hash,
+        offset,
+        length,
+        Some(block_id),
+        StorageKind::Cold,
+        0,
+    )
 }
 
-/// Add a new row for an external trie blob -- i.e. we're creating a new trie whose blob will be
-/// stored in an external file, but its metadata will be in the DB.
-/// Returns the new row ID
+/// Add a new row for an external trie blob in the **cold zone**
+/// (`<db>.blobs`).
+///
+/// Used by the squash-publish path (which appends merged blobs to
+/// `<db>.blobs`) and by legacy code paths that pre-date the hot tier.
+/// New block-write traffic in v1.5 goes through
+/// [`write_external_trie_blob_hot`] instead.
 pub fn write_external_trie_blob<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
     offset: u64,
     length: u64,
 ) -> Result<u32, Error> {
-    inner_write_external_trie_blob(conn, block_hash, offset, length, None)
+    inner_write_external_trie_blob(conn, block_hash, offset, length, None, StorageKind::Cold, 0)
+}
+
+/// Add a new row for an external trie blob in the **hot zone**
+/// (`<db>.hot.{seq:08}`).
+///
+/// Phase A's new block-write path: each block append lands at
+/// `(seq, offset)` in the rolling hot file, then this helper inserts a
+/// `marf_data` row with `storage_kind = Hot, storage_seq = seq`. A
+/// later squash publish (Phase B) flips the row back to cold by
+/// promoting the bytes into `<db>.blobs`.
+pub fn write_external_trie_blob_hot<T: MarfTrieId>(
+    conn: &Connection,
+    block_hash: &T,
+    seq: u32,
+    offset: u64,
+    length: u64,
+) -> Result<u32, Error> {
+    inner_write_external_trie_blob(
+        conn,
+        block_hash,
+        offset,
+        length,
+        None,
+        StorageKind::Hot,
+        seq,
+    )
 }
 
 /// Write a serialized trie blob for a trie that was mined
@@ -571,6 +673,20 @@ pub fn read_trie_blob_bytes(conn: &Connection, block_id: u32) -> Result<Vec<u8>,
 }
 
 /// Get the offset and length of a trie blob in the trie blobs file.
+///
+/// **Cold-zone-only**, kept for callers that already know the block is
+/// promoted (e.g. squash-publish bookkeeping). For the general read
+/// path, use [`get_trie_storage_location`] instead — it returns the
+/// `(kind, seq)` discriminator so the caller can dispatch to the right
+/// file in the hot/cold tier model.
+///
+/// Returns the `external_offset` / `external_length` columns regardless
+/// of the row's `storage_kind`. Hot rows have these populated relative
+/// to their hot file, not `<db>.blobs`; passing the result of this
+/// helper directly to a `TrieFile`-backed seek is **wrong** for hot
+/// rows. (Pre-v5 chainstates always have `storage_kind = 0`, so callers
+/// that haven't been ported yet still produce the same answer they did
+/// before for those rows.)
 pub fn get_external_trie_offset_length(
     conn: &Connection,
     block_id: u32,
@@ -583,6 +699,9 @@ pub fn get_external_trie_offset_length(
 }
 
 /// Get the offset of a trie blob in the blobs file, given its block header hash.
+///
+/// Same caveat as [`get_external_trie_offset_length`]: cold-zone-aware
+/// callers only.
 pub fn get_external_trie_offset_length_by_bhh<T: MarfTrieId>(
     conn: &Connection,
     bhh: &T,
@@ -594,16 +713,102 @@ pub fn get_external_trie_offset_length_by_bhh<T: MarfTrieId>(
     Ok((offset, length))
 }
 
-/// Determine the offset in the blobs file at which the last trie ends.  This is also the offset at
-/// which the next trie will be appended.
+/// Resolved storage location of a `marf_data` block: which tier holds
+/// the bytes, where, and how long. Returned by
+/// [`get_trie_storage_location`]; consumed by the read-path resolver
+/// that routes between `<db>.blobs` (cold) and `<db>.hot.NNNN` (hot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrieStorageLocation {
+    pub kind: StorageKind,
+    /// Hot files: the rolling-file sequence number. Cold files: always 0.
+    pub seq: u32,
+    /// Byte offset within the named file.
+    pub offset: u64,
+    /// Byte length within the named file.
+    pub length: u64,
+}
+
+/// Look up the full `(storage_kind, storage_seq, external_offset,
+/// external_length)` tuple for a `block_id`. This is the storage-tier-
+/// aware analog of [`get_external_trie_offset_length`]; the read path
+/// uses it to decide whether to dispatch the read to `<db>.blobs` or to
+/// a hot file.
+pub fn get_trie_storage_location(
+    conn: &Connection,
+    block_id: u32,
+) -> Result<TrieStorageLocation, Error> {
+    let row = conn
+        .query_row(
+            "SELECT storage_kind, storage_seq, external_offset, external_length \
+             FROM marf_data WHERE block_id = ?1",
+            params![block_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (kind_int, seq, offset, length) = row.ok_or(Error::NotFoundError)?;
+    Ok(TrieStorageLocation {
+        kind: StorageKind::from_int(kind_int)?,
+        seq: seq as u32,
+        offset: offset as u64,
+        length: length as u64,
+    })
+}
+
+/// Same as [`get_trie_storage_location`] but keyed by `block_hash`.
+pub fn get_trie_storage_location_by_bhh<T: MarfTrieId>(
+    conn: &Connection,
+    bhh: &T,
+) -> Result<TrieStorageLocation, Error> {
+    let row = conn
+        .query_row(
+            "SELECT storage_kind, storage_seq, external_offset, external_length \
+             FROM marf_data WHERE block_hash = ?1",
+            params![bhh],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (kind_int, seq, offset, length) = row.ok_or(Error::NotFoundError)?;
+    Ok(TrieStorageLocation {
+        kind: StorageKind::from_int(kind_int)?,
+        seq: seq as u32,
+        offset: offset as u64,
+        length: length as u64,
+    })
+}
+
+/// Determine the offset in the **cold blob file (`<db>.blobs`)** at
+/// which the last cold trie ends. This is the offset at which the next
+/// cold append (e.g. a squash publish) will land.
 ///
-/// Uses two index-friendly `ORDER BY … DESC LIMIT 1` queries instead of a
-/// `UNION ALL` + `MAX()` which would force full table scans on every append.
+/// **Filters on `storage_kind = 0`** so hot-zone rows — whose
+/// `external_offset` / `external_length` describe a region inside
+/// `<db>.hot.NNNN`, not `<db>.blobs` — don't poison the cold append
+/// offset. This is Codex finding 2's namespace fix from the v1.5 review.
+///
+/// Uses two index-friendly `ORDER BY … DESC LIMIT 1` queries instead of
+/// a `UNION ALL` + `MAX()` which would force full table scans on every
+/// append.
 pub fn get_external_blobs_length(conn: &Connection) -> Result<u64, Error> {
     let marf_end: u64 = db::query_row(
         conn,
         "SELECT (external_offset + external_length) AS end_offset \
-         FROM marf_data ORDER BY external_offset DESC LIMIT 1",
+         FROM marf_data \
+         WHERE storage_kind = 0 \
+         ORDER BY external_offset DESC LIMIT 1",
         NO_PARAMS,
     )?
     .unwrap_or(0);
@@ -619,9 +824,99 @@ pub fn get_external_blobs_length(conn: &Connection) -> Result<u64, Error> {
     Ok(marf_end.max(squash_end))
 }
 
+/// Determine the offset in the **active hot file** at which the last
+/// hot trie ends. This is the offset at which the next hot append will
+/// land for the given `storage_seq`.
+///
+/// Filters on `storage_kind = 1 AND storage_seq = ?` so the offset
+/// computation is per-hot-file. Used by startup recovery (Slice A6) to
+/// truncate any in-flight torn append on the active hot file.
+pub fn get_hot_file_committed_length(conn: &Connection, seq: u32) -> Result<u64, Error> {
+    let end: u64 = db::query_row(
+        conn,
+        "SELECT (external_offset + external_length) AS end_offset \
+         FROM marf_data \
+         WHERE storage_kind = 1 AND storage_seq = ?1 \
+         ORDER BY external_offset DESC LIMIT 1",
+        params![seq as i64],
+    )?
+    .unwrap_or(0);
+    Ok(end)
+}
+
+/// One `marf_data` row that still references a hot file at sweep time.
+///
+/// Returned by [`hot_rows_for_seq`]; consumed by Phase C's
+/// [`crate::chainstate::stacks::index::hot_reclaim::classify_hot_file`] to look up per-row block
+/// height + canonical-set membership.
+#[derive(Debug, Clone)]
+pub struct LiveHotRow<T: MarfTrieId> {
+    pub block_hash: T,
+    pub external_offset: u64,
+    pub external_length: u64,
+}
+
+/// List the live `marf_data` rows that still reference hot file `seq`.
+///
+/// Empty `Vec` means "no live rows" — under sweep semantics ([squashing-v1.5.md
+/// §7.1(a)](../../../../../.docs/squashing-v1.5.md)) this is the unconditionally-unlinkable "all
+/// blocks promoted" case and the file can be unlinked without per-row classification.
+///
+/// Used by Phase C's
+/// [`crate::chainstate::stacks::index::hot_reclaim::enumerate_hot_files_for_sweep`] to attach SQL
+/// row metadata after the file inventory has enumerated the candidate seq.
+pub fn hot_rows_for_seq<T: MarfTrieId>(
+    conn: &Connection,
+    seq: u32,
+) -> Result<Vec<LiveHotRow<T>>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT block_hash, external_offset, external_length \
+         FROM marf_data \
+         WHERE storage_kind = 1 AND storage_seq = ?1 \
+         ORDER BY external_offset ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![seq as i64], |row| {
+            Ok(LiveHotRow {
+                block_hash: row.get::<_, T>("block_hash")?,
+                external_offset: row.get::<_, i64>("external_offset")? as u64,
+                external_length: row.get::<_, i64>("external_length")? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Enumerate every distinct hot-file sequence number referenced by a `marf_data` row, paired with
+/// its committed extent `MAX(external_offset + external_length)`.
+///
+/// Used by [`crate::chainstate::stacks::index::hot_file::HotFileSet::open`] to validate that every
+/// hot file the SQL state expects actually exists on disk and is at least as long as the committed
+/// extent.
+pub fn referenced_hot_seqs_with_committed_len(conn: &Connection) -> Result<Vec<(u32, u64)>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT storage_seq, MAX(external_offset + external_length) AS end_offset \
+         FROM marf_data \
+         WHERE storage_kind = 1 \
+         GROUP BY storage_seq",
+    )?;
+    let rows = stmt
+        .query_map(NO_PARAMS, |row| {
+            Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u64))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Do we have a partially-migrated database?
+///
 /// Either all tries have offset and length 0, or they all don't.  If we have a mixture, then we're
 /// corrupted.
+///
+/// The check is **scoped to cold rows** (`storage_kind = 0`), because the v1 → v2 migration this
+/// helper detects is specifically the "inline-blob → cold `<db>.blobs`" transition. Hot-zone rows
+/// are always non-zero and `storage_kind = 1`, so including them in the "migrated/not-migrated"
+/// counts would falsely flag a healthy mixed hot/cold v5 chainstate as corrupt.
 pub fn detect_partial_migration(conn: &Connection) -> Result<bool, Error> {
     let migrated_version = get_migrated_version(conn);
     let schema_version = get_schema_version(conn);
@@ -631,12 +926,18 @@ pub fn detect_partial_migration(conn: &Connection) -> Result<bool, Error> {
 
     let num_migrated = db::query_count(
         conn,
-        "SELECT COUNT(*) FROM marf_data WHERE external_offset = 0 AND external_length = 0 AND unconfirmed = 0",
+        "SELECT COUNT(*) FROM marf_data \
+         WHERE storage_kind = 0 \
+         AND external_offset = 0 AND external_length = 0 \
+         AND unconfirmed = 0",
         NO_PARAMS,
     )?;
     let num_not_migrated = db::query_count(
         conn,
-        "SELECT COUNT(*) FROM marf_data WHERE external_offset != 0 AND external_length != 0 AND unconfirmed = 0",
+        "SELECT COUNT(*) FROM marf_data \
+         WHERE storage_kind = 0 \
+         AND external_offset != 0 AND external_length != 0 \
+         AND unconfirmed = 0",
         NO_PARAMS,
     )?;
     Ok(num_migrated > 0 && num_not_migrated > 0)
@@ -798,7 +1099,7 @@ pub fn clear_tables(tx: &Transaction) -> Result<(), Error> {
 
 // --- Squash level registry ---
 
-use crate::chainstate::stacks::index::squash::{RetiredSquashLevelRow, SquashLevelRow};
+use crate::chainstate::stacks::index::squash::SquashLevelRow;
 
 static SQL_SQUASH_LEVELS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS marf_squash_levels (
@@ -836,61 +1137,18 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
 /// `blob_offset` as a suffix (`marf-roots-level-...-blob-{blob_offset:016x}.dat`), so a `Replace`
 /// publish writes its new sidecar at a different path from the OLD active level's sidecar. The
 /// retired row's `blob_offset` field resolves to the OLD sidecar's path on read — no rename, copy,
-/// or hard-link is needed at retire time.
+/// Idempotent DDL for the squash-levels table. Called from squash entry points as a
+/// belt-and-suspenders measure; the same table is also created by the v2→v3 migration in
+/// [`SQL_MARF_DATA_TABLE_SCHEMA_3`], so this is a no-op on properly-migrated chainstates.
 ///
-/// `retired_id` is the table's primary key and is informational only (diagnostics, ordering). It is
-/// **not** part of the sidecar path.
-static SQL_RETIRED_SQUASH_LEVELS_TABLE: &str = "
-CREATE TABLE IF NOT EXISTS marf_retired_squash_levels (
-    retired_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    original_level_id INTEGER NOT NULL,
-    min_height INTEGER NOT NULL,
-    max_height INTEGER NOT NULL,
-    blob_offset INTEGER NOT NULL,
-    blob_length INTEGER NOT NULL,
-    reads_redirected INTEGER NOT NULL DEFAULT 1,
-    root_sidecar_present INTEGER NOT NULL DEFAULT 0,
-    root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0,
-    orphan_split_offset INTEGER NOT NULL DEFAULT 0,
-    retired_at INTEGER NOT NULL,
-    -- Inherits the OLD active row's watermark verbatim at retire time. Records
-    -- \"rows present when the original level published\"; meaningful for any
-    -- future descendant whose backptrs target the retired blob. Default 0
-    -- matches `marf_squash_levels` migration semantics for legacy rows.
-    published_max_block_id INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_retired_squash_levels_height
-    ON marf_retired_squash_levels(min_height, max_height);
-";
-
+/// Phase D (2026-05-03): the `marf_retired_squash_levels` table + its idempotent
+/// per-call ALTER series were removed alongside the v3-consolidation. The retired-levels
+/// infrastructure was vestigial since B6.3 (no Phase A/B/C path read or wrote it); under v3
+/// schema consolidation the table DDL is gone entirely. Per-call ALTERs for
+/// `marf_squash_levels`'s extra columns were also removed — the v3 DDL puts every column in
+/// the initial CREATE, so the ALTERs would never fire.
 pub fn create_squash_levels_table(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(SQL_SQUASH_LEVELS_TABLE)?;
-    // Best-effort, idempotent column-add for existing schemas. `ALTER TABLE ... ADD COLUMN` errors
-    // if the column already exists; we ignore that error and propagate any other.
-    let _ = conn.execute_batch(
-        "ALTER TABLE marf_squash_levels \
-         ADD COLUMN root_sidecar_present INTEGER NOT NULL DEFAULT 0",
-    );
-    let _ = conn.execute_batch(
-        "ALTER TABLE marf_squash_levels \
-         ADD COLUMN root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0",
-    );
-    let _ = conn.execute_batch(
-        "ALTER TABLE marf_squash_levels \
-         ADD COLUMN orphan_split_offset INTEGER NOT NULL DEFAULT 0",
-    );
-    let _ = conn.execute_batch(
-        "ALTER TABLE marf_squash_levels \
-         ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0",
-    );
-    // Retired-levels table is created here too — it shares the same creation lifecycle as the
-    // active table (any squash-aware DB needs both, since `Replace` publish writes into both
-    // atomically).
-    conn.execute_batch(SQL_RETIRED_SQUASH_LEVELS_TABLE)?;
-    let _ = conn.execute_batch(
-        "ALTER TABLE marf_retired_squash_levels \
-         ADD COLUMN published_max_block_id INTEGER NOT NULL DEFAULT 0",
-    );
     Ok(())
 }
 
@@ -910,27 +1168,23 @@ pub fn current_published_max_block_id(conn: &Connection) -> Result<u32, Error> {
     Ok(watermark as u32)
 }
 
-/// Reconstruct the per-MARF squash-work counter from SQL: sum
-/// `external_length` over confirmed `marf_data` rows with `block_id` strictly
-/// greater than the latest published level's watermark
-/// (`MAX(published_max_block_id)` across `marf_squash_levels`). Returns 0 when
-/// no confirmed rows have landed past the latest squash. The query uses the
-/// primary-key index on `block_id` so cost is O(post-watermark rows).
+/// Reconstruct the per-MARF squash-work counter from SQL: sum `external_length` over confirmed
+/// `marf_data` rows with `block_id` strictly greater than the latest published level's watermark
+/// (`MAX(published_max_block_id)` across `marf_squash_levels`). Returns 0 when no confirmed rows
+/// have landed past the latest squash. The query uses the primary-key index on `block_id` so cost
+/// is O(post-watermark rows).
 ///
-/// On a freshly-migrated v3 -> v4 DB the watermark defaults to 0 for every
-/// pre-existing level; the first reconstruction post-migration sums over the
-/// entire `marf_data` table — a documented one-time over-count cleared by the
-/// next squash, which writes a real watermark and resets the counter.
+/// On a freshly-migrated v2 -> v3 DB the watermark defaults to 0 for every pre-existing level; the
+/// first reconstruction post-migration sums over the entire `marf_data` table — a documented
+/// one-time over-count cleared by the next squash, which writes a real watermark and resets the
+/// counter.
 ///
-/// Pre-stub / pre-squash MARFs (no rows in `marf_squash_levels`) likewise sum
-/// over the full table; the next stub or squash absorbs that into a real
-/// watermark.
+/// Pre-stub / pre-squash MARFs (no rows in `marf_squash_levels`) likewise sum over the full table;
+/// the next stub or squash absorbs that into a real watermark.
 pub fn current_external_bytes_since_last_squash(conn: &Connection) -> Result<u64, Error> {
-    // `marf_squash_levels` may not exist yet on pre-squash-code DBs (the
-    // table is created by the v2 -> v3 migration; opens against older
-    // schemas may briefly observe its absence). Match the
-    // `read_squash_levels` table-exists guard so this helper stays callable
-    // from those paths too.
+    // `marf_squash_levels` may not exist yet on pre-squash-code DBs (the table is created by the v2
+    // -> v3 migration; opens against older schemas may briefly observe its absence). Match the
+    // `read_squash_levels` table-exists guard so this helper stays callable from those paths too.
     let table_exists: bool = conn
         .query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='marf_squash_levels'",
@@ -959,83 +1213,6 @@ pub fn current_external_bytes_since_last_squash(conn: &Connection) -> Result<u64
     Ok(total as u64)
 }
 
-/// Insert a row into `marf_retired_squash_levels`, capturing the active level's state at the moment
-/// of `Replace` publish. The auto-incremented `retired_id` is returned for diagnostic/log use; the
-/// row's `blob_offset` is what identifies the retired sidecar on read.
-///
-/// Accepts `&Connection` rather than `&Transaction` so callers can use either an autocommit
-/// connection or a transaction (deref coercion). SQLite's `last_insert_rowid()` is
-/// connection-scoped, so reading it right after the INSERT is safe in either context.
-pub fn insert_retired_squash_level(
-    conn: &Connection,
-    row: &RetiredSquashLevelRow,
-) -> Result<u32, Error> {
-    conn.execute(
-        "INSERT INTO marf_retired_squash_levels \
-         (original_level_id, min_height, max_height, blob_offset, blob_length, \
-          reads_redirected, root_sidecar_present, root_sidecar_trimmed, \
-          orphan_split_offset, retired_at, published_max_block_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            row.original_level_id,
-            row.min_height,
-            row.max_height,
-            row.blob_offset as i64,
-            row.blob_length as i64,
-            row.reads_redirected as i64,
-            row.root_sidecar_present as i64,
-            row.root_sidecar_trimmed as i64,
-            row.orphan_split_offset as i64,
-            row.retired_at as i64,
-            row.published_max_block_id as i64,
-        ],
-    )?;
-    let retired_id: i64 = conn.last_insert_rowid();
-    Ok(retired_id as u32)
-}
-
-pub fn read_retired_squash_levels(conn: &Connection) -> Result<Vec<RetiredSquashLevelRow>, Error> {
-    let table_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master \
-             WHERE type='table' AND name='marf_retired_squash_levels'",
-            NO_PARAMS,
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if !table_exists {
-        return Ok(Vec::new());
-    }
-    let mut stmt = conn.prepare(
-        "SELECT retired_id, original_level_id, min_height, max_height, \
-                blob_offset, blob_length, reads_redirected, \
-                root_sidecar_present, root_sidecar_trimmed, \
-                orphan_split_offset, retired_at, \
-                COALESCE(published_max_block_id, 0) AS published_max_block_id \
-         FROM marf_retired_squash_levels \
-         ORDER BY retired_id ASC",
-    )?;
-    let rows = stmt
-        .query_map(NO_PARAMS, |row| {
-            Ok(RetiredSquashLevelRow {
-                retired_id: row.get::<_, u32>("retired_id")?,
-                original_level_id: row.get::<_, u32>("original_level_id")?,
-                min_height: row.get::<_, u32>("min_height")?,
-                max_height: row.get::<_, u32>("max_height")?,
-                blob_offset: row.get::<_, i64>("blob_offset")? as u64,
-                blob_length: row.get::<_, i64>("blob_length")? as u64,
-                reads_redirected: row.get::<_, i64>("reads_redirected")? != 0,
-                root_sidecar_present: row.get::<_, i64>("root_sidecar_present")? != 0,
-                root_sidecar_trimmed: row.get::<_, i64>("root_sidecar_trimmed")? != 0,
-                orphan_split_offset: row.get::<_, i64>("orphan_split_offset")? as u32,
-                retired_at: row.get::<_, i64>("retired_at")? as u64,
-                published_max_block_id: row.get::<_, i64>("published_max_block_id")? as u32,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
 pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(), Error> {
     conn.execute(
         "INSERT OR REPLACE INTO marf_squash_levels \
@@ -1059,8 +1236,8 @@ pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(),
     Ok(())
 }
 
-/// Mark `root_sidecar_present` for a level. Used at squash publish time
-/// once the sidecar file has been atomically renamed into place. Idempotent.
+/// Mark `root_sidecar_present` for a level. Used at squash publish time once the sidecar file has
+/// been atomically renamed into place. Idempotent.
 pub fn set_root_sidecar_present(
     conn: &Connection,
     level_id: u32,
@@ -1097,6 +1274,16 @@ pub fn set_root_sidecar_trimmed(
 /// Update an existing `marf_data` row by block hash to point to a new external blob location. Used
 /// by the incremental squash pipeline to redirect per-block blob entries to the squash blob. The
 /// inline `data` column is cleared.
+///
+/// **v1.5**: also flips `storage_kind = Cold, storage_seq = 0`. Squash publish promotes blocks from
+/// the hot tier (`<db>.hot.NNNN`) into the cold merged blob (`<db>.blobs`); without resetting the
+/// kind/seq, the row would still appear hot and the read-path resolver would try to look up the new
+/// offset inside the wrong hot file.
+///
+/// **Bulk-redirecting an entire in-range block list?** Use
+/// [`crate::chainstate::stacks::index::squash_promote::redirect_in_range_blocks_to_cold`] instead.
+/// That helper prepares the statement once and reuses it across binds, materially shrinking the
+/// publish window for large promotions.
 pub fn update_external_trie_blob_by_hash<T: MarfTrieId>(
     conn: &Connection,
     block_hash: &T,
@@ -1105,7 +1292,8 @@ pub fn update_external_trie_blob_by_hash<T: MarfTrieId>(
 ) -> Result<(), Error> {
     let empty_blob: &[u8] = &[];
     conn.execute(
-        "UPDATE marf_data SET external_offset = ?1, external_length = ?2, data = ?3 \
+        "UPDATE marf_data SET external_offset = ?1, external_length = ?2, data = ?3, \
+         storage_kind = 0, storage_seq = 0 \
          WHERE block_hash = ?4",
         params![offset as i64, length as i64, empty_blob, block_hash],
     )?;
@@ -1162,6 +1350,10 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
 /// - `Err(CorruptionError)` if any live reference would be destroyed.
 ///
 /// Checks both `marf_data` and `marf_squash_levels`.
+///
+/// **Cold-zone scoped.** The query filters `storage_kind = 0` so hot-row extents — which name
+/// regions inside `<db>.hot.NNNN`, not `<db>.blobs` — can't be misinterpreted as overlapping the
+/// cold truncation zone by numeric coincidence (Codex finding 2 from the v1.5 review).
 pub fn validate_truncation_zone<T: MarfTrieId>(
     conn: &Connection,
     from_offset: u64,
@@ -1171,7 +1363,9 @@ pub fn validate_truncation_zone<T: MarfTrieId>(
     // A blob overlaps if its extent (offset + length) exceeds from_offset.
     let mut stmt = conn.prepare(
         "SELECT block_hash, external_offset, external_length FROM marf_data \
-         WHERE (external_offset + external_length) > ?1 AND external_length > 0",
+         WHERE storage_kind = 0 \
+         AND (external_offset + external_length) > ?1 \
+         AND external_length > 0",
     )?;
     let dangling: Vec<(String, u64)> = stmt
         .query_map(params![from_offset as i64], |row| {
@@ -1197,8 +1391,8 @@ pub fn validate_truncation_zone<T: MarfTrieId>(
         }
     }
 
-    // Check marf_squash_levels: any level whose blob extent overlaps the
-    // truncation zone? A level overlaps if blob_offset + blob_length > from_offset.
+    // Check marf_squash_levels: any level whose blob extent overlaps the truncation zone? A level
+    // overlaps if blob_offset + blob_length > from_offset.
     let levels = read_squash_levels(conn)?;
     for level in &levels {
         if level.blob_offset + level.blob_length > from_offset {
@@ -1226,6 +1420,11 @@ pub fn validate_truncation_zone<T: MarfTrieId>(
 /// unreadable after this call.
 ///
 /// Returns the number of orphaned rows pruned.
+///
+/// **Cold-zone scoped.** Filters `storage_kind = 0` for the same reason as
+/// [`validate_truncation_zone`]: hot rows live in a separate file namespace and must not be
+/// coalesced with cold offsets by numeric overlap (Codex finding 2 from the v1.5 review). Hot-zone
+/// orphan reclaim runs through the Phase C hot-file sweep, not through this helper.
 pub fn prune_orphaned_external_refs<T: MarfTrieId>(
     conn: &Connection,
     from_offset: u64,
@@ -1234,7 +1433,9 @@ pub fn prune_orphaned_external_refs<T: MarfTrieId>(
     // Same predicate as validate_truncation_zone: find rows in the zone.
     let mut stmt = conn.prepare(
         "SELECT block_hash, external_offset FROM marf_data \
-         WHERE (external_offset + external_length) > ?1 AND external_length > 0",
+         WHERE storage_kind = 0 \
+         AND (external_offset + external_length) > ?1 \
+         AND external_length > 0",
     )?;
     let candidates: Vec<(String, u64)> = stmt
         .query_map(params![from_offset as i64], |row| {
@@ -1264,4 +1465,104 @@ pub fn prune_orphaned_external_refs<T: MarfTrieId>(
         }
     }
     Ok(count)
+}
+
+// ============================================================================
+// `marf_state` singleton helpers (Schema 5+; see `.docs/squashing-v1.5.md` §4.2)
+// ============================================================================
+
+/// Snapshot of the MARF-wide state singleton.
+///
+/// Phase A populates `active_hot_seq` and `horizon_burn_blocks`. The `promotion_*` fields are part
+/// of Phase B's single-flight promotion lock; in Phase A they are always `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarfState {
+    /// Currently-active hot-file sequence number. Block appends go to `<db>.hot.{active_hot_seq}`.
+    /// Bumped by the hot-file rotation path (Phase A) when the active file crosses its size
+    /// threshold.
+    pub active_hot_seq: u32,
+    /// Burnchain reorg horizon used by horizon-gated squash (Phase B). The schema default is 6;
+    /// v1.5 carries the value durably so an operator can adjust it for a deployment without
+    /// recompiling.
+    pub horizon_burn_blocks: u32,
+    /// Phase B: `level_id` of an in-flight background promotion, or `None` when idle. Phase A
+    /// always reads `None`.
+    pub promotion_in_progress: Option<u32>,
+    /// Phase B: cold-blob extent reserved by an in-flight promotion. Phase A always reads `None`.
+    pub promotion_reserved_offset: Option<u64>,
+    /// Phase B: cold-blob extent length reserved by an in-flight promotion. Phase A always reads
+    /// `None`.
+    pub promotion_reserved_length: Option<u64>,
+}
+
+/// Read the MARF state singleton.
+///
+/// Returns `Ok(state)` for v5+ chainstates (the `INSERT OR IGNORE` in the schema migration
+/// guarantees a row exists). For v4 and earlier, the `marf_state` table doesn't exist; callers
+/// shouldn't reach this helper on pre-v5 schemas, but we return a clear error rather than panicking
+/// so the caller's diagnostic surfaces the real cause.
+pub fn read_marf_state(conn: &Connection) -> Result<MarfState, Error> {
+    let row = conn
+        .query_row(
+            "SELECT active_hot_seq, horizon_burn_blocks, \
+                    promotion_in_progress, \
+                    promotion_reserved_offset, promotion_reserved_length \
+             FROM marf_state WHERE id = 1",
+            NO_PARAMS,
+            |row| {
+                Ok(MarfState {
+                    active_hot_seq: row.get::<_, i64>("active_hot_seq")? as u32,
+                    horizon_burn_blocks: row.get::<_, i64>("horizon_burn_blocks")? as u32,
+                    promotion_in_progress: row
+                        .get::<_, Option<i64>>("promotion_in_progress")?
+                        .map(|v| v as u32),
+                    promotion_reserved_offset: row
+                        .get::<_, Option<i64>>("promotion_reserved_offset")?
+                        .map(|v| v as u64),
+                    promotion_reserved_length: row
+                        .get::<_, Option<i64>>("promotion_reserved_length")?
+                        .map(|v| v as u64),
+                })
+            },
+        )
+        .optional()?;
+    row.ok_or_else(|| {
+        Error::CorruptionError(
+            "marf_state singleton row missing — chainstate may be on a pre-v5 schema".into(),
+        )
+    })
+}
+
+/// Set the active hot-file sequence number. Used by the hot-file rotation path when the active file
+/// crosses its rotation threshold; Phase A is the only writer.
+pub fn set_active_hot_seq(conn: &Connection, new_seq: u32) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE marf_state SET active_hot_seq = ?1 WHERE id = 1",
+        params![new_seq as i64],
+    )?;
+    Ok(())
+}
+
+/// Clear the in-flight promotion state on the `marf_state` singleton: `promotion_in_progress`,
+/// `promotion_reserved_offset`, `promotion_reserved_length` all back to NULL.
+///
+/// Used by:
+/// - The swap phase's SQL transaction once the level row is committed (clears the lock as part of
+///   the same transaction so the lock release is atomic with publication).
+/// - Recovery, when an abandoned plan leaves stale state behind. Without this clear, the MARF would
+///   stay permanently single-flight-locked because every cadence tick sees `promotion_in_progress`
+///   set with no plan file backing it.
+///
+/// See `.docs/squashing-v1.5-phase-b.md` §7.1 step 2a (abandon path) and §6.3.2 step 5 (commit
+/// path).
+pub fn clear_promotion_state(conn: &Connection) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE marf_state SET \
+         promotion_in_progress = NULL, \
+         promotion_reserved_offset = NULL, \
+         promotion_reserved_length = NULL \
+         WHERE id = 1",
+        [],
+    )?;
+    Ok(())
 }

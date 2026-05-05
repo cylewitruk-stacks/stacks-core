@@ -100,6 +100,24 @@ pub fn increment_btc_blocks_received_counter() {
     prometheus::BTC_BLOCKS_RECEIVED_COUNTER.inc();
 }
 
+/// Run `f` while recording its wall time into the Phase C hot-reclaim sweep-window metric
+/// (`stacks_node_marf_sweep_window_duration_seconds`, labeled by `marf`).
+///
+/// `marf` is the per-MARF label (`"headers"` / `"clarity"`). The timer fires on Drop so
+/// `f`'s return value is observed regardless of whether `f` returns Ok or Err.
+///
+/// When the `monitoring_prom` feature is off, this just calls `f` with no observation —
+/// no per-call overhead beyond the function call itself.
+#[allow(unused_variables)]
+pub fn with_marf_sweep_window_timer<F, R>(marf: &str, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    #[cfg(feature = "monitoring_prom")]
+    let _timer = prometheus::new_marf_sweep_window_timer(marf);
+    f()
+}
+
 /// Log `execution_cost` as a ratio of `block_limit`.
 #[allow(unused_variables)]
 pub fn set_last_execution_cost_observed(

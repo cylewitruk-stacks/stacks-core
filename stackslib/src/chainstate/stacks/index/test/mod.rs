@@ -37,8 +37,11 @@ use crate::chainstate::stacks::index::{
 };
 use crate::chainstate::stacks::{BlockHeaderHash, TrieHash};
 
+pub mod byte_scanner;
 pub mod cache;
 pub mod file;
+pub mod hot_reclaim;
+pub mod hot_tier;
 pub mod marf;
 pub mod marf_perfs;
 pub mod node;
@@ -46,6 +49,8 @@ pub mod node_patch;
 pub mod proofs;
 pub mod scratch;
 pub mod squash;
+pub mod squash_promote;
+pub mod squash_recover;
 pub mod storage;
 pub mod trie;
 

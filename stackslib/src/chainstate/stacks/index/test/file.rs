@@ -280,6 +280,28 @@ fn test_reopened_connection_stable_blob_seam_external_backed() {
     if fs::metadata(test_blobs_file).is_ok() {
         fs::remove_file(test_blobs_file).unwrap();
     }
+    // Phase D (2026-05-04): hot tier is non-optional, so this test path also produces
+    // `<test_file>.hot.NNNNNNNN` files. Leftovers from prior runs would be picked up by the
+    // startup recovery's torn-append truncation and break the read assertions below; clean up.
+    let parent = std::path::Path::new(test_file).parent().unwrap();
+    let stem = std::path::Path::new(test_file)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let hot_prefix = format!("{stem}.hot.");
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .map(|n| n.starts_with(&hot_prefix))
+                .unwrap_or(false)
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 
     let (mut marf, block_header) = make_test_marf_with_single_block(test_file, true);
     assert!(fs::metadata(test_blobs_file).is_ok());

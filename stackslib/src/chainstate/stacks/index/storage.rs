@@ -31,8 +31,8 @@ use crate::chainstate::stacks::index::cache::*;
 use crate::chainstate::stacks::index::file::{TrieFile, TrieFileNodeHashReader};
 use crate::chainstate::stacks::index::marf::MARFOpenOpts;
 use crate::chainstate::stacks::index::node::{
-    is_backptr, is_leaf_type, set_backptr, TrieCowPtr, TrieNode, TrieNodeID, TrieNodePatch,
-    TrieNodeRef, TrieNodeTransientMeta, TrieNodeType, TriePtr,
+    clear_ctrl_bits, is_backptr, is_leaf_type, set_backptr, TrieCowPtr, TrieNode, TrieNodeID,
+    TrieNodePatch, TrieNodeRef, TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::scratch::MarfReadState;
@@ -1731,29 +1731,15 @@ pub struct TrieStorageConnection<'a, T: MarfTrieId, Db: Deref<Target = Connectio
 /// Immutable squash metadata snapshot. Cheap to clone (held behind `Arc`),
 /// replaced wholesale by writers via [`SharedSquashState`].
 ///
-/// **Active vs retired levels.** `levels` contains both the canonical
-/// active levels and any retired levels that prior `Replace` publishes
-/// have superseded. Retired levels still expose their trailer's block
-/// hashes through `block_index` so reads on old-trailer hashes (which
-/// may still be referenced by staged fork descendants) resolve through
-/// the squash path, with `leaf_hashes_omitted = true` and the on-disk
-/// retired blob bytes intact. The parallel `is_retired` flag separates
-/// the two: canonical-only iteration (height → canonical hash,
-/// divergence detection, append contiguity) MUST filter on
-/// `!is_retired[i]`; read-path lookups via `block_index` work uniformly
-/// for both.
+/// **B6.3 simplification.** Pre-B6.3 this struct carried both active and retired
+/// levels (the latter produced by the now-deleted `Replace`/`re_squash` path) and
+/// a parallel `is_retired: Vec<bool>` flag distinguished them. With retired-row
+/// emission gone, every level here is canonical; iteration is unconditional.
 pub struct SquashMeta {
-    /// Loaded squash level trailers. The builder
-    /// ([`build_squash_meta_from_sql`]) loads retired levels first, then
-    /// active levels — so any shared block hash has its `block_index`
-    /// entry overwritten by the active level's offset (which matches the
-    /// `marf_data` row's redirect after `Replace`). The parallel
-    /// `is_retired` flag distinguishes the two; iteration order itself
-    /// is not load-bearing for correctness, only for which entry wins
-    /// in `block_index` collisions. Empty for non-squashed MARFs.
+    /// Loaded squash level trailers. Empty for non-squashed MARFs.
     pub levels: Vec<SquashTrailer>,
     /// O(1) block-hash → (level_index, height, blob_offset, reads_redirected, block_id) index built
-    /// from all trailers, active and retired.
+    /// from all trailers.
     pub block_index: HashMap<[u8; 32], (usize, u32, u64, bool, u32)>,
     /// Set of block_ids whose blobs have leaf hashes omitted (reclaimed squash levels).
     pub leaf_hash_omitted_blocks: HashSet<u32>,
@@ -1776,13 +1762,6 @@ pub struct SquashMeta {
     /// the routing check `ptr < orphan_split_offset` always picks the
     /// merged blob in that case.
     pub orphan_split_offset: Vec<u32>,
-    /// Per-level `is_retired` flag, parallel to `levels`. False for
-    /// canonical (active) levels; true for retired levels carried for
-    /// fork-block readability. Canonical-claim iterators MUST filter on
-    /// `!is_retired[i]` — retired entries still have valid block hashes
-    /// and trailers, but they don't represent the chain's view of
-    /// canonical history at any height.
-    pub is_retired: Vec<bool>,
     /// Per-level merged-blob offset, parallel to `levels`. Required for
     /// resolving the level's versioned sidecar path
     /// (`marf-roots-level-...-blob-{blob_offset:016x}.dat`). The same
@@ -1792,7 +1771,7 @@ pub struct SquashMeta {
     /// hand (e.g. inside `squash_opened_root_node_bytes`).
     pub level_blob_offsets: Vec<u64>,
     /// Per-level `block_id → height` map, parallel to `levels`. Required
-    /// by retired-context-aware backptr resolution: when a read inside
+    /// by per-level-context backptr resolution: when a read inside
     /// squash level `level_idx` follows a backptr whose
     /// `back_block` (a `marf_data.rowid`) is also recorded in level
     /// `level_idx`'s trailer, the resolution must stay inside that
@@ -1800,35 +1779,23 @@ pub struct SquashMeta {
     /// was written for. Only when the target block_id is **not** in
     /// the current level's trailer (cross-level backptr) does
     /// resolution fall back to the global `block_index`.
-    ///
-    /// Without this per-level map, a backptr from within a retired
-    /// blob targeting a shared-ancestor block (which appears in both
-    /// retired and active trailers) would resolve through the global
-    /// `block_index` to the **active** level's offset and apply the
-    /// retired-blob-relative `ptr.ptr()` to the active blob's bytes —
-    /// which is structurally wrong because each level's merged-blob
-    /// layout is independent.
     pub level_block_id_to_height: Vec<HashMap<u32, u32>>,
     /// Per-level `reads_redirected` flag, parallel to `levels`. Mirrors
-    /// the `reads_redirected` column on each row of
-    /// `marf_squash_levels` / `marf_retired_squash_levels`. Required
-    /// for retired-context-aware backptr resolution: when a backptr
-    /// stays within squash level `L`, the leaf-hash policy that
-    /// applies to the read is `L`'s — NOT the global
-    /// [`Self::leaf_hash_omitted_blocks`] union. The global set is
-    /// keyed only by block_id, so a shared-ancestor block_id whose
-    /// active and retired levels disagree on `reads_redirected` would
-    /// silently apply the wrong policy when read through the retired
-    /// blob.
+    /// the `reads_redirected` column on each row of `marf_squash_levels`.
+    /// Required for per-level-context backptr resolution: when a backptr
+    /// stays within squash level `L`, the leaf-hash policy that applies
+    /// to the read is `L`'s — NOT the global
+    /// [`Self::leaf_hash_omitted_blocks`] union.
     pub level_reads_redirected: Vec<bool>,
-    /// Block IDs that appear in two or more squash levels — i.e. shared
-    /// ancestors carried in both an active and a retired level. Used as
-    /// a fast gate for the parent-chain context walk in
-    /// `open_block_known_id_impl`: only when the backptr target id is in
-    /// this set does the global `block_index` answer become ambiguous
-    /// (active vs. retired blob), and only then is the walk actually
-    /// needed. For ids in zero or exactly one level the global lookup is
-    /// already correct, so the walk is skipped entirely.
+    /// Block IDs that appear in two or more squash levels — historically
+    /// the shared-ancestor case where a block_id appeared in both an
+    /// active and a retired level. With retired-row emission removed
+    /// (B6.3), this set is effectively empty for all freshly-built
+    /// metas, but the field stays because the parent-chain context walk
+    /// in `open_block_known_id_impl` still uses it as a fast-path gate
+    /// (always-empty set → walk is always skipped, which is the correct
+    /// outcome). Retained on the struct so reading code stays unchanged
+    /// across the deletion.
     pub ambiguous_block_ids: HashSet<u32>,
 }
 
@@ -1841,7 +1808,6 @@ impl SquashMeta {
             root_sidecar_present: Vec::new(),
             root_sidecar_trimmed: Vec::new(),
             orphan_split_offset: Vec::new(),
-            is_retired: Vec::new(),
             level_blob_offsets: Vec::new(),
             level_block_id_to_height: Vec::new(),
             level_reads_redirected: Vec::new(),
@@ -2297,24 +2263,89 @@ where
     Ok(arc)
 }
 
+/// Per-path recovery state, held by every live `TrieFileStorage` for a given path. The `Arc` is
+/// stored on the storage instance and dropped when the storage is closed; the registry holds only
+/// a `Weak` so a path with no live handles ages out automatically.
+///
+/// `rw_recovery_done` distinguishes "some handle is open" from "an RW handle has completed
+/// truncate-on-startup + Phase B reconciliation." Readonly handles intentionally don't run those
+/// (truncate-on-startup is gated on `!readonly`; Phase B's readonly contract is fail-hard, not
+/// reconciliation), so the flag must NOT flip when a readonly opener is the first to claim the
+/// slot. Otherwise a later RW opener would observe the slot as alive, conclude recovery had run,
+/// and skip clearing a torn append left by a prior process crash.
+pub(crate) struct RecoveryState {
+    rw_recovery_done: Mutex<bool>,
+}
+
+impl RecoveryState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            rw_recovery_done: Mutex::new(false),
+        })
+    }
+}
+
+/// Process-wide registry of canonicalized MARF database paths to live [`RecoveryState`] entries.
+///
+/// **Why this exists.** Startup recovery (hot-file torn-append truncation + Phase B promotion-plan
+/// reconciliation in [`TrieFileStorage::open`]) is correct only against a process-cold MARF — i.e.
+/// no other handle is currently writing. In a `stacks-node` process, the chains-coordinator and
+/// the p2p threads each open their own MARF handles. If the second opener runs recovery while the
+/// first is mid-flight on a write transaction, it observes:
+///
+/// * `committed_len` (from a fresh SQL snapshot) at the value committed *before* the writer's
+///   in-progress transaction.
+/// * `on_disk_len` from the file, which already includes the writer's appended-but-uncommitted
+///   bytes (`append_to_active` fsyncs each append).
+///
+/// The recovery code then concludes "torn append" and truncates the in-flight bytes — destroying
+/// data the writer is about to point at via SQL once its transaction commits. The registry's
+/// `rw_recovery_done` flag, gated by a per-path mutex, ensures the truncate-on-startup runs at
+/// most once across all RW openers of a given path while at least one handle stays alive.
+/// Sequential open/close/reopen still re-runs recovery — each fully-closed cycle drops the last
+/// `Arc`, the `Weak` becomes dead, and the next opener mints a fresh `RecoveryState`.
+fn recovery_registry() -> &'static Mutex<HashMap<PathBuf, std::sync::Weak<RecoveryState>>> {
+    static REGISTRY: std::sync::OnceLock<Mutex<HashMap<PathBuf, std::sync::Weak<RecoveryState>>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve the [`RecoveryState`] for `db_path` in this process, minting one if no live entry
+/// exists. The returned `Arc` MUST be retained on the resulting `TrieFileStorage` so the live
+/// count stays accurate while the handle is open.
+///
+/// `:memory:` paths are never registered — each `:memory:` SQLite connection is an independent
+/// database that can't share state with another handle anyway. The returned state is a fresh
+/// `Arc<RecoveryState>` so the caller has a uniform interface.
+fn recovery_state_for(db_path: &str) -> Arc<RecoveryState> {
+    if db_path == ":memory:" {
+        return RecoveryState::new();
+    }
+    let key = registry_key(db_path);
+    let mut registry = recovery_registry().lock();
+    if let Some(weak) = registry.get(&key) {
+        if let Some(existing) = weak.upgrade() {
+            return existing;
+        }
+        // Weak is dead (last Arc dropped). Fall through to mint fresh state.
+    }
+    let state = RecoveryState::new();
+    registry.insert(key, Arc::downgrade(&state));
+    state
+}
+
 /// Build a [`SquashMeta`] by reading `marf_squash_levels` and
 /// `marf_retired_squash_levels` from SQLite and parsing each level's
 /// trailer from the blob file.
 ///
-/// Active and retired levels are loaded into a single `levels` vec; the
-/// parallel `is_retired` flag distinguishes them. `block_index` covers
-/// hashes from both: read-path lookups resolve uniformly through it,
-/// while canonical-claim iteration must filter on `!is_retired[i]`.
+/// Loads each level's trailer + parallel-array metadata from `marf_squash_levels`.
 ///
-/// **Conflict resolution for shared block hashes.** When a hash exists
-/// in both an active level (e.g. a shared ancestor whose row was
-/// re-redirected to the new merged blob) and a retired level (its old
-/// trailer entry), the active entry is the one indexed. Retired levels
-/// are inserted *first* so the subsequent active insertion overwrites —
-/// the read path always prefers the active blob's offsets, which match
-/// the current `marf_data` row. Old-only hashes (in retired but not in
-/// any active trailer) keep their retired entry and resolve to the old
-/// blob.
+/// **B6.3 simplification.** Pre-B6.3 also loaded `marf_retired_squash_levels` and
+/// produced an `is_retired` flag + ambiguous-block-id tracking for the shared-
+/// ancestor case. With retired-row emission gone (`Replace` / `re_squash` were
+/// deleted in B6.1), only active levels exist. The `ambiguous_block_ids` field
+/// stays on `SquashMeta` (consumers still gate on it; an empty set yields the
+/// correct fast-path behavior) but is unconditionally empty here.
 ///
 /// Returns an empty `SquashMeta` if no squash levels have been recorded
 /// or if all present levels are stubs (blob_length == 0) with no
@@ -2324,80 +2355,21 @@ pub(crate) fn build_squash_meta_from_sql(
     blobs: Option<&TrieFile>,
 ) -> Result<SquashMeta, Error> {
     let squash_level_rows = trie_sql::read_squash_levels(db)?;
-    let retired_level_rows = trie_sql::read_retired_squash_levels(db)?;
-    if squash_level_rows.is_empty() && retired_level_rows.is_empty() {
+    if squash_level_rows.is_empty() {
         return Ok(SquashMeta::empty());
     }
 
-    let total_levels = squash_level_rows.len() + retired_level_rows.len();
+    let total_levels = squash_level_rows.len();
     let mut levels = Vec::with_capacity(total_levels);
     let mut block_index = HashMap::new();
     let mut leaf_hash_omitted = HashSet::new();
     let mut root_sidecar_present = Vec::with_capacity(total_levels);
     let mut root_sidecar_trimmed = Vec::with_capacity(total_levels);
     let mut orphan_split_offset = Vec::with_capacity(total_levels);
-    let mut is_retired = Vec::with_capacity(total_levels);
     let mut level_blob_offsets = Vec::with_capacity(total_levels);
     let mut level_block_id_to_height: Vec<HashMap<u32, u32>> = Vec::with_capacity(total_levels);
     let mut level_reads_redirected = Vec::with_capacity(total_levels);
-    // Tracks block_ids seen during trailer iteration. The first sighting goes into
-    // `seen_block_ids`; the second sighting (across any level) promotes the id into
-    // `ambiguous_block_ids`. Cardinality is bounded by the count of shared ancestors
-    // between active and retired forks — typically tiny relative to total block count.
-    let mut seen_block_ids: HashSet<u32> = HashSet::new();
-    let mut ambiguous_block_ids: HashSet<u32> = HashSet::new();
 
-    // Pass 1: retired levels first. Their block_index entries get
-    // overwritten below by any active level that re-claims the same hash
-    // (shared-ancestor case). Hashes that appear ONLY in a retired
-    // trailer (the old-only fork tip) survive the pass and resolve to
-    // the retired blob — that's the load-bearing case for fork-block
-    // readability.
-    for row in &retired_level_rows {
-        let trailer_opt = if row.blob_length == 0 {
-            None
-        } else {
-            blobs
-                .map(|b| read_level_trailer(b, row.blob_offset, row.blob_length))
-                .transpose()?
-        };
-        let trailer = trailer_opt.unwrap_or_else(SquashTrailer::empty);
-
-        let level_idx = levels.len();
-        let mut per_level_block_ids: HashMap<u32, u32> = HashMap::new();
-        if row.blob_length > 0 {
-            for &(bhh, height, block_id) in &trailer.sorted_block_entries {
-                block_index.insert(
-                    bhh,
-                    (
-                        level_idx,
-                        height,
-                        row.blob_offset,
-                        row.reads_redirected,
-                        block_id,
-                    ),
-                );
-                per_level_block_ids.insert(block_id, height);
-                if row.reads_redirected {
-                    leaf_hash_omitted.insert(block_id);
-                }
-                if !seen_block_ids.insert(block_id) {
-                    ambiguous_block_ids.insert(block_id);
-                }
-            }
-        }
-        levels.push(trailer);
-        root_sidecar_present.push(row.root_sidecar_present);
-        root_sidecar_trimmed.push(row.root_sidecar_trimmed);
-        orphan_split_offset.push(row.orphan_split_offset);
-        is_retired.push(true);
-        level_blob_offsets.push(row.blob_offset);
-        level_block_id_to_height.push(per_level_block_ids);
-        level_reads_redirected.push(row.reads_redirected);
-    }
-
-    // Pass 2: active levels. Their block_index entries take priority,
-    // overwriting any retired-level entry for the same hash.
     for row in &squash_level_rows {
         let trailer_opt = if row.blob_length == 0 {
             None
@@ -2426,16 +2398,12 @@ pub(crate) fn build_squash_meta_from_sql(
                 if row.reads_redirected {
                     leaf_hash_omitted.insert(block_id);
                 }
-                if !seen_block_ids.insert(block_id) {
-                    ambiguous_block_ids.insert(block_id);
-                }
             }
         }
         levels.push(trailer);
         root_sidecar_present.push(row.root_sidecar_present);
         root_sidecar_trimmed.push(row.root_sidecar_trimmed);
         orphan_split_offset.push(row.orphan_split_offset);
-        is_retired.push(false);
         level_blob_offsets.push(row.blob_offset);
         level_block_id_to_height.push(per_level_block_ids);
         level_reads_redirected.push(row.reads_redirected);
@@ -2448,17 +2416,18 @@ pub(crate) fn build_squash_meta_from_sql(
         root_sidecar_present,
         root_sidecar_trimmed,
         orphan_split_offset,
-        is_retired,
         level_blob_offsets,
         level_block_id_to_height,
         level_reads_redirected,
-        ambiguous_block_ids,
+        ambiguous_block_ids: HashSet::new(),
     })
 }
 
 /// Parse a squash trailer from disk for a level whose `(blob_offset,
 /// blob_length)` describe a non-stub on-disk extent. Used by
-/// [`build_squash_meta_from_sql`] for both active and retired rows.
+/// [`build_squash_meta_from_sql`] for each `marf_squash_levels` row.
+/// (Pre-B6.3 also called for `marf_retired_squash_levels` rows; that
+/// table is no longer read at runtime.)
 fn read_level_trailer(
     blobs: &TrieFile,
     blob_offset: u64,
@@ -2678,6 +2647,12 @@ pub struct TrieFileStorage<T: MarfTrieId> {
     hash_calculation_mode: TrieHashCalculationMode,
     compress: bool,
     mmap: bool,
+
+    /// Process-wide recovery state for `db_path`. Held to keep the live count alive in
+    /// [`recovery_registry`]; the `rw_recovery_done` flag inside coordinates RW recovery across
+    /// concurrent openers (preventing the multi-handle race that would truncate the writer's
+    /// in-flight bytes). Dropped when this storage instance is dropped.
+    _recovery_state: Arc<RecoveryState>,
 
     // used in testing in order to short-circuit block-height lookups
     //   when the trie struct is tested outside of marf.rs usage
@@ -2947,8 +2922,7 @@ fn sync_from_shared_squash_state<T: MarfTrieId>(
     // reopened read-only handles after another handle publishes — without
     // it, the peer's counter would still reflect the old watermark and
     // include rows that have just been absorbed below the new one.
-    data.external_bytes_since_last_squash =
-        trie_sql::current_external_bytes_since_last_squash(db)?;
+    data.external_bytes_since_last_squash = trie_sql::current_external_bytes_since_last_squash(db)?;
 
     data.seen_squash_generation = current_gen;
     Ok(())
@@ -3175,27 +3149,32 @@ fn compute_snapshot_context_via_parent_chain<T: MarfTrieId>(
         // `debug!` (not `warn!`) on failure: a missing offset usually means a pruned
         // non-canonical ancestor (benign; caller falls back to tip-read which is already
         // the correct answer for canonical descendants), so spamming warnings would be noise.
-        let trie_offset = match blobs.get_trie_offset(db, current_id) {
-            Ok(o) => o,
+        // v1.5: route via storage location so hot-row offsets resolve
+        // against the right hot file rather than the cold blob fd.
+        let location = match trie_sql::get_trie_storage_location(db, current_id) {
+            Ok(loc) => loc,
             Err(e) => {
                 debug!(
-                    "compute_snapshot_height: cannot read trie offset for block_id={current_id} \
-                     ({current_hash}) — likely a pruned non-canonical ancestor. \
-                     Falling back to tip-read. Error: {e}"
+                    "compute_snapshot_height: cannot read storage location for \
+                     block_id={current_id} ({current_hash}) — likely a pruned non-canonical \
+                     ancestor. Falling back to tip-read. Error: {e}"
                 );
                 return None;
             }
         };
-        let parent_hash_bytes = match blobs.read_parent_hash_at(trie_offset) {
-            Ok(b) => b,
-            Err(e) => {
-                debug!(
-                    "compute_snapshot_height: blob header read failed at block_id={current_id} \
-                     offset={trie_offset}: {e}"
-                );
-                return None;
-            }
-        };
+        let trie_offset = location.offset;
+        let parent_hash_bytes =
+            match blobs.read_parent_hash_at(location.kind, location.seq, trie_offset) {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!(
+                        "compute_snapshot_height: blob header read failed at \
+                         block_id={current_id} offset={trie_offset} (kind={:?}, seq={}): {e}",
+                        location.kind, location.seq
+                    );
+                    return None;
+                }
+            };
         let parent_hash: T = T::from_bytes(parent_hash_bytes);
 
         // 3. Sentinel parent ⇒ end of chain, no squashed ancestor.
@@ -3648,6 +3627,20 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return Err(Error::NotFoundError);
         };
 
+        // ROOT_PTR_DISK fast-path for reclaim-squashed in-range blocks: serve the per-height
+        // root from the `SquashRootNode` sidecar instead of indexing the merged blob (where
+        // offset 36 points at the merged tip's root, the wrong answer for any non-tip
+        // in-range block). Mirrors `read_node_hash`'s ROOT_PTR_DISK fast-path and
+        // `MARF::root_copy`'s use of `squash_opened_root_node_bytes` — see
+        // [`Self::resolve_squash_root_via_sidecar`] for the resolution + fail-closed contract.
+        if let Some((stored_id, body, hash)) = self.resolve_squash_root_via_sidecar(&clear_ptr)? {
+            state.decode_node_from_slice(stored_id, &body)?;
+            return Ok(ReadTrieNode::from_state_borrowed(
+                state.get_ref(),
+                Some(hash),
+            ));
+        }
+
         // PR2 orphan-sidecar route: if the currently-opened block is in a
         // squashed level whose orphan section contains the byte range
         // `ptr.ptr()` addresses, fetch from the sidecar instead of from
@@ -3924,6 +3917,20 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return Ok((node_id, hash));
         }
 
+        // ROOT_PTR_DISK special case: for a reclaim-squashed in-range block, the per-height
+        // root body lives in the `SquashRootNode` sidecar section. Decode the stored type from
+        // the body's leading byte and pull the hash from the level's trailer (mirrors
+        // `read_node_hash`'s ROOT_PTR_DISK fast-path). Falls through to the normal read path
+        // when `squash_opened_root_node_bytes` returns `None` (non-squashed block, or
+        // no-reclaim level whose original blob still serves the root).
+        // ROOT_PTR_DISK fast-path mirroring `read_node_with_state` — see
+        // [`Self::resolve_squash_root_via_sidecar`] for the resolution + fail-closed contract.
+        // The body is unused here (we only need the type + hash); it's discarded along with the
+        // `Option`'s destructuring.
+        if let Some((stored_id, _body, hash)) = self.resolve_squash_root_via_sidecar(&clear_ptr)? {
+            return Ok((stored_id, hash));
+        }
+
         // PR2 orphan-sidecar route: orphan ptrs come from the level's
         // orphan section, not from the merged blob. Read bytes via
         // `try_read_orphan_bytes` and extract the (type, hash) pair using
@@ -4073,7 +4080,17 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             }
         }
 
-        if self.blobs.is_some() {
+        let cur_block_id = self.data.cur_block_id.ok_or_else(|| {
+            error!("Failed to get cur block as hash reader");
+            Error::NotFoundError
+        })?;
+        // Unconfirmed-trie rows live in the inline `data` blob (no external file backing),
+        // so route them through the SQL cursor even when blob storage is attached. Without
+        // this bypass the blob path resolves to `(StorageKind::Cold, offset=0)` from the
+        // unconfirmed row and fails on a positional read against an empty cold blob.
+        let unconfirmed_in_use = self.data.unconfirmed_block_id == Some(cur_block_id);
+
+        if self.blobs.is_some() && !unconfirmed_in_use {
             // Per-read guard covers the entire `inner_write_children_hashes` walk — the hash
             // reader does multiple mmap accesses across sibling pointers, all of which must
             // stay protected against a concurrent ftruncate until this call returns.
@@ -4096,10 +4113,6 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
                 None
             };
             let start_time = self.bench.write_children_hashes_start();
-            let block_id = self.data.cur_block_id.ok_or_else(|| {
-                error!("Failed to get cur block as hash reader");
-                Error::NotFoundError
-            })?;
             let blobs = self
                 .blobs
                 .as_mut()
@@ -4107,7 +4120,7 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             let mut cursor = TrieFileNodeHashReader::new(
                 &self.db,
                 blobs,
-                block_id,
+                cur_block_id,
                 self.data.leaf_hashes_omitted,
             );
             let res = Self::inner_write_children_hashes(&mut cursor, &mut map, ptrs, w, self.bench);
@@ -4117,10 +4130,7 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             let start_time = self.bench.write_children_hashes_start();
             let mut cursor = TrieSqlCursor {
                 db: &self.db,
-                block_id: self.data.cur_block_id.ok_or_else(|| {
-                    error!("Failed to get cur block as hash reader");
-                    Error::NotFoundError
-                })?,
+                block_id: cur_block_id,
             };
             let res = Self::inner_write_children_hashes(&mut cursor, &mut map, ptrs, w, self.bench);
             self.bench.write_children_hashes_finish(start_time, false);
@@ -4146,6 +4156,25 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
 }
 
 impl<T: MarfTrieId> TrieFileStorage<T> {
+    /// Split-borrow the SQL connection + the attached `HotFileSet` for Phase C's hot-reclaim
+    /// sweep. The sweep mutates the `HotFileSet` (`drop_seq` after `apply_unlinkable`) AND the
+    /// `marf_data` table (DELETE rows for the dropped seq) in the same call, so it needs both
+    /// borrows simultaneously — going through [`Self::connection`] would re-borrow `&mut self.data`
+    /// + everything else needlessly.
+    ///
+    /// Returns `None` if the storage handle is RAM-backed (no `TrieFile::Disk`, hence no hot
+    /// tier attached). Phase C has nothing to sweep on RAM-backed handles.
+    pub(crate) fn sweep_borrows(
+        &mut self,
+    ) -> Option<(
+        &Connection,
+        &mut crate::chainstate::stacks::index::hot_file::HotFileSet,
+    )> {
+        let blobs = self.blobs.as_mut()?;
+        let hot_files = blobs.hot_files_mut()?;
+        Some((&self.db, hot_files))
+    }
+
     pub fn connection(&mut self) -> TrieStorageConnection<'_, T> {
         // Per-read guard model: no connection-level acquisition. See the equivalent comment
         // on `ReopenedTrieStorageConnection::connection` for the full rationale.
@@ -4186,11 +4215,27 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         };
         // perf note: should we attempt to clone the cache
         let cache = BlockCache::default();
-        let blobs = if self.blobs.is_some() {
+        let mut blobs = if self.blobs.is_some() {
             Some(TrieFile::from_db_path(&self.db_path, true, self.mmap)?)
         } else {
             None
         };
+        // Phase D (2026-05-04): hot tier is non-optional, so the reopened readonly handle must
+        // attach a `HotFileSet` whenever the new blob handle is disk-backed. Without this, reads
+        // of `storage_kind = Hot` rows fail with `read_hot_bytes_at: storage_kind = Hot but no
+        // hot files attached`. Mirrors the attachment in `build_readonly_storage`.
+        if let Some(blobs_handle) = blobs.as_mut() {
+            if matches!(blobs_handle, TrieFile::Disk(_)) {
+                let hot_files = crate::chainstate::stacks::index::hot_file::HotFileSet::open(
+                    &self.db_path,
+                    &self.db,
+                    self.mmap,
+                    crate::chainstate::stacks::index::hot_file::DEFAULT_HOT_FILE_ROTATION_THRESHOLD_BYTES,
+                    /* readonly = */ true,
+                )?;
+                blobs_handle.attach_hot_files(hot_files)?;
+            }
+        }
         let bench = TrieBenchmark::new();
         let hash_calculation_mode = self.hash_calculation_mode;
         Ok(ReopenedTrieStorageConnection {
@@ -4413,6 +4458,13 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             trie_sql::create_tables_if_needed(&mut db)?;
         }
 
+        // Resolve the per-path recovery state up front. The state is moved into the resulting
+        // `TrieFileStorage` so the live count stays accurate while this handle is open; the
+        // inner `rw_recovery_done` flag (taken under a mutex) gates the in-process truncate-on-
+        // startup + Phase B promotion-recovery block below. See [`recovery_state_for`] for the
+        // multi-handle race this guards against.
+        let recovery_state = recovery_state_for(&db_path);
+
         let mut blobs = if marf_opts.external_blobs {
             Some(TrieFile::from_db_path(&db_path, readonly, marf_opts.mmap)?)
         } else {
@@ -4433,6 +4485,153 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         }
         if trie_sql::detect_partial_migration(&db)? {
             panic!("PARTIAL MIGRATION DETECTED! This is an irrecoverable error. You will need to restart your node from genesis.");
+        }
+
+        // v1.5 (Phase D 2026-05-03): hot tier is non-optional. Every disk-backed open attaches a
+        // `HotFileSet`; new block writes land in `<db>.hot.NNNN`, and the cold blob
+        // (`<db>.blobs`) is reserved for promoted (squashed) blocks. The Phase A `enable_hot_tier`
+        // opt-in flag was removed once Phase B + C shipped — leaving it in place was the only way
+        // production could still hit the legacy tip-only squash path (the level-34 panic class).
+        {
+            if let Some(blobs_handle) = blobs.as_mut() {
+                if matches!(blobs_handle, TrieFile::Disk(_)) {
+                    let mut hot_files = crate::chainstate::stacks::index::hot_file::HotFileSet::open(
+                        &db_path,
+                        &db,
+                        marf_opts.mmap,
+                        crate::chainstate::stacks::index::hot_file::DEFAULT_HOT_FILE_ROTATION_THRESHOLD_BYTES,
+                        readonly,
+                    )?;
+
+                    // Recovery dispatch:
+                    //
+                    //  * RW handles serialize on `recovery_state.rw_recovery_done` so the first
+                    //    RW opener for this path runs truncate-on-startup + Phase B reconciliation
+                    //    and any concurrent RW opener (e.g. p2p attaching while the chains-
+                    //    coordinator is mid-flight) sees `done = true` and skips. Crucially, a
+                    //    readonly-first ordering does NOT flip this flag: a readonly handle
+                    //    doesn't truncate (it would mutate disk on a readonly open) and doesn't
+                    //    reconcile (its Phase B contract is fail-hard, not commit/abandon), so a
+                    //    later RW opener still finds `done = false` and runs the cleanup.
+                    //
+                    //  * Readonly handles ALWAYS run [`recover_pending_promotions`] because that
+                    //    call's readonly mode is a state check, not a state mutation — it fails
+                    //    fast if any pending plan exists, regardless of what other handles have
+                    //    done. Skipping it under any condition would let a mid-swap state appear
+                    //    as wrong-but-readable bytes.
+                    if readonly {
+                        let recovery_stats = crate::chainstate::stacks::index::squash_recover::recover_pending_promotions::<T>(
+                            &mut db,
+                            &db_path,
+                            &mut hot_files,
+                            readonly,
+                        )?;
+                        if recovery_stats.plans_discovered > 0
+                            || recovery_stats.cold_tail_truncated_bytes > 0
+                        {
+                            info!(
+                                "Phase B promotion recovery: {} plan(s) discovered \
+                                 ({} committed, {} abandoned, {} rewrites applied, \
+                                 {} skipped, cold tail truncated by {} bytes)",
+                                recovery_stats.plans_discovered,
+                                recovery_stats.plans_committed,
+                                recovery_stats.plans_abandoned,
+                                recovery_stats.rewrites_applied,
+                                recovery_stats.rewrites_skipped,
+                                recovery_stats.cold_tail_truncated_bytes,
+                            );
+                            blobs_handle.remap_and_invalidate()?;
+                        }
+                    } else {
+                        let mut rw_done = recovery_state.rw_recovery_done.lock();
+                        if !*rw_done {
+                            // SQL-as-authoritative truncation for the active hot file
+                            // (Slice A6 / `.docs/squashing-v1.5.md` §5.3 (a)). The hot-file
+                            // write path fsyncs the file *before* committing the SQL row, so
+                            // any bytes past the last committed `external_offset +
+                            // external_length` belong to a torn append from a prior process
+                            // exit and are uncommitted. Truncate them so the next append lands
+                            // at the correct offset and the mmap doesn't expose unparsable
+                            // trailing bytes to the read path.
+                            let active_seq = hot_files.active_seq();
+                            let committed_len =
+                                trie_sql::get_hot_file_committed_length(&db, active_seq)?;
+                            let on_disk_len = hot_files.active_len()?;
+                            if on_disk_len > committed_len {
+                                info!(
+                                    "Hot-file recovery: truncating <db>.hot.{active_seq:08} from \
+                                     {on_disk_len} -> {committed_len} bytes (clipping torn append)"
+                                );
+                                hot_files.truncate_active(committed_len)?;
+                            }
+
+                            // v1.5 Phase B promotion recovery. Drives any pending
+                            // `<db>.squash_pending.*.plan` left over from a crashed promotion
+                            // to a consistent terminal state (committed or abandoned), then
+                            // truncates the cold blob's uncommitted tail. Must run BEFORE
+                            // attaching `hot_files` to `blobs_handle` because recovery needs
+                            // `&mut HotFileSet` (attach moves it into the TrieFile) and may
+                            // truncate `<db>.blobs` (the `remap_and_invalidate` call refreshes
+                            // the TrieFile's mmap to cover the post-truncation extent).
+                            let recovery_stats = crate::chainstate::stacks::index::squash_recover::recover_pending_promotions::<T>(
+                                &mut db,
+                                &db_path,
+                                &mut hot_files,
+                                readonly,
+                            )?;
+                            if recovery_stats.plans_discovered > 0
+                                || recovery_stats.cold_tail_truncated_bytes > 0
+                            {
+                                info!(
+                                    "Phase B promotion recovery: {} plan(s) discovered \
+                                     ({} committed, {} abandoned, {} rewrites applied, \
+                                     {} skipped, cold tail truncated by {} bytes)",
+                                    recovery_stats.plans_discovered,
+                                    recovery_stats.plans_committed,
+                                    recovery_stats.plans_abandoned,
+                                    recovery_stats.rewrites_applied,
+                                    recovery_stats.rewrites_skipped,
+                                    recovery_stats.cold_tail_truncated_bytes,
+                                );
+                                blobs_handle.remap_and_invalidate()?;
+                            }
+
+                            // Sweep stale `squash-nodes-{pid}-{ts}-{seq}.tmp` files left in the
+                            // MARF directory by a prior process that crashed mid-squash (before
+                            // [`crate::chainstate::stacks::index::squash::NodeStore`] grew its
+                            // `Drop` impl, the multi-handle recovery race was reliably leaking
+                            // these on every aborted run — multi-GB each, accumulating into
+                            // hundreds of GB on a long-running genesis sync). Gated on
+                            // `rw_recovery_done` so concurrent openers don't race each other and
+                            // can't trip the wrong-PID-still-live edge case (the lock-protected
+                            // first-RW-opener path is the only place this runs, and it runs
+                            // before any in-process `NodeStore::new` could have been called).
+                            if let Some(parent) = std::path::Path::new(&db_path).parent() {
+                                match crate::chainstate::stacks::index::squash::cleanup_stale_node_store_tmp_files(parent) {
+                                    Ok((removed, bytes)) if removed > 0 => {
+                                        info!(
+                                            "Squash NodeStore tmp sweep: removed {removed} \
+                                             stale file(s) reclaiming {bytes} bytes from {}",
+                                            parent.display()
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            "Squash NodeStore tmp sweep: failed scanning {}: {e}",
+                                            parent.display()
+                                        );
+                                    }
+                                }
+                            }
+
+                            *rw_done = true;
+                        }
+                    }
+
+                    blobs_handle.attach_hot_files(hot_files)?;
+                }
+            }
         }
 
         debug!(
@@ -4573,6 +4772,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             hash_calculation_mode: marf_opts.hash_calculation_mode,
             compress: marf_opts.compress,
             mmap: marf_opts.mmap,
+            _recovery_state: recovery_state,
 
             data,
 
@@ -4673,6 +4873,10 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 /// Build a fresh read-only `TrieFileStorage` from the given path and pre-constructed
 /// transient data. Both `reopen_readonly` implementations delegate here so the
 /// open-DB / open-blobs / construct-struct pattern lives in one place.
+///
+/// Disk-backed blobs always get a [`HotFileSet`] attached in readonly mode (no creation,
+/// no truncation) so reads of `storage_kind = Hot` rows resolve correctly. RAM-backed
+/// blobs and pure-SQL backends skip the attachment.
 fn build_readonly_storage<T: MarfTrieId>(
     db_path: &str,
     blobs_active: bool,
@@ -4682,12 +4886,30 @@ fn build_readonly_storage<T: MarfTrieId>(
     data: TrieStorageTransientData<T>,
     #[cfg(test)] test_genesis_block: Option<T>,
 ) -> Result<TrieFileStorage<T>, Error> {
+    // Hold a recovery state ref for this readonly handle's lifetime so the live count in
+    // [`recovery_registry`] reflects this opener too. Readonly opens never touch
+    // `rw_recovery_done` (they don't run the truncate-on-startup that owns that flag), so a
+    // readonly-first ordering still leaves a later RW opener observing `rw_recovery_done = false`
+    // and running the cleanup. See [`recovery_state_for`].
+    let recovery_state = recovery_state_for(db_path);
     let db = marf_sqlite_open(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY, false)?;
-    let blobs = if blobs_active {
+    let mut blobs = if blobs_active {
         Some(TrieFile::from_db_path(db_path, true, mmap)?)
     } else {
         None
     };
+    if let Some(blobs_handle) = blobs.as_mut() {
+        if matches!(blobs_handle, TrieFile::Disk(_)) {
+            let hot_files = crate::chainstate::stacks::index::hot_file::HotFileSet::open(
+                db_path,
+                &db,
+                mmap,
+                crate::chainstate::stacks::index::hot_file::DEFAULT_HOT_FILE_ROTATION_THRESHOLD_BYTES,
+                /* readonly = */ true,
+            )?;
+            blobs_handle.attach_hot_files(hot_files)?;
+        }
+    }
     let cache = BlockCache::default();
     Ok(TrieFileStorage {
         db_path: db_path.to_string(),
@@ -4698,6 +4920,7 @@ fn build_readonly_storage<T: MarfTrieId>(
         hash_calculation_mode,
         compress,
         mmap,
+        _recovery_state: recovery_state,
         data,
         #[cfg(test)]
         test_genesis_block,
@@ -4839,8 +5062,10 @@ impl<'a, T: MarfTrieId> TrieStorageConnection<'a, T, Transaction<'a>> {
                 }
             };
             if increments_squash_counter {
-                self.data.external_bytes_since_last_squash =
-                    self.data.external_bytes_since_last_squash.saturating_add(buffer_len);
+                self.data.external_bytes_since_last_squash = self
+                    .data
+                    .external_bytes_since_last_squash
+                    .saturating_add(buffer_len);
             }
 
             trie_sql::drop_lock(&self.db, &bhh)?;
@@ -5048,6 +5273,16 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
         self.data.readonly
     }
 
+    /// **Test-only** mutable accessor for the attached hot-file set, used by integration tests
+    /// to override the default 1 GiB rotation threshold so a test can rotate cheaply. Returns
+    /// `None` when the handle is RAM-backed (RAM handles never carry a [`HotFileSet`]).
+    #[cfg(test)]
+    pub fn hot_files_mut(
+        &mut self,
+    ) -> Option<&mut crate::chainstate::stacks::index::hot_file::HotFileSet> {
+        self.blobs.as_deref_mut().and_then(|b| b.hot_files_mut())
+    }
+
     /// Detect whether a writer has published a new [`SquashMeta`] since this
     /// handle last synced, and if so re-snapshot the shared metadata and
     /// invalidate the handle-local blob mmap + block cache + current-block
@@ -5060,12 +5295,7 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
     /// stays authoritative on peer / reopened read-only handles after
     /// another handle publishes a squash.
     fn sync_shared_squash_state(&mut self) -> Result<(), Error> {
-        sync_from_shared_squash_state(
-            self.data,
-            self.blobs.as_deref_mut(),
-            self.cache,
-            &*self.db,
-        )
+        sync_from_shared_squash_state(self.data, self.blobs.as_deref_mut(), self.cache, &*self.db)
     }
 
     pub fn unconfirmed(&self) -> bool {
@@ -5255,6 +5485,75 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             ))
         })?;
         Ok(Some(body))
+    }
+
+    /// Resolve a `ROOT_PTR_DISK` read against the per-height root saved in the
+    /// `SquashRootNode` sidecar section. Returns:
+    ///
+    /// * `Ok(None)` — `ptr.ptr() != ROOT_PTR_DISK`, or the currently-opened block isn't in a
+    ///   reclaim-squash level (`squash_opened_root_node_bytes` returned `None`). Callers should
+    ///   fall through to the normal read path.
+    /// * `Ok(Some((stored_id, body, hash)))` — the saved root is present and its trailer hash
+    ///   resolved cleanly. `stored_id` is decoded from the body's leading byte; `body` is the
+    ///   full saved bytes (caller decodes into its own scratch); `hash` is the per-height root
+    ///   hash from the squash trailer.
+    /// * `Err(CorruptionError)` — metadata drift: sidecar body present but `squash_opened_*`
+    ///   state, the `SquashMeta` level entry, or the trailer's per-height hash is missing.
+    ///   Surfaced (rather than fabricated as a zero hash or hashless node) so wrong-but-plausible
+    ///   reads can't propagate through the read pipeline.
+    ///
+    /// **Why this exists.** `read_node_with_state`, `read_node_type_id`, and `MARF::root_copy`
+    /// (and historically `read_node_hash`'s ROOT_PTR_DISK fast-path) all need to short-circuit a
+    /// `ROOT_PTR_DISK` read against an in-range squashed block's per-height root rather than
+    /// indexing into the merged blob at offset 36 (which would return the merged TIP's root).
+    /// Centralizing the resolution here keeps the four call sites consistent and lets the
+    /// fail-closed contract live in one place.
+    pub(crate) fn resolve_squash_root_via_sidecar(
+        &self,
+        ptr: &TriePtr,
+    ) -> Result<Option<(TrieNodeID, Vec<u8>, TrieHash)>, Error> {
+        if ptr.ptr() != ROOT_PTR_DISK {
+            return Ok(None);
+        }
+        let Some(body) = self.squash_opened_root_node_bytes()? else {
+            return Ok(None);
+        };
+        let head = *body.first().ok_or_else(|| {
+            Error::CorruptionError("squash sidecar per-height root body is empty".into())
+        })?;
+        let stored_id = TrieNodeID::from_u8(clear_ctrl_bits(head)).ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "squash sidecar per-height root: unknown stored node id {}",
+                clear_ctrl_bits(head)
+            ))
+        })?;
+        let height = self.data.squash_opened_height.ok_or_else(|| {
+            Error::CorruptionError(
+                "ROOT_PTR_DISK fast-path: `squash_opened_root_node_bytes` returned bytes but \
+                 `squash_opened_height` is unset"
+                    .into(),
+            )
+        })?;
+        let level_idx = self.data.squash_opened_level_idx.ok_or_else(|| {
+            Error::CorruptionError(
+                "ROOT_PTR_DISK fast-path: `squash_opened_root_node_bytes` returned bytes but \
+                 `squash_opened_level_idx` is unset"
+                    .into(),
+            )
+        })?;
+        let level = self.data.squash_meta.levels.get(level_idx).ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "ROOT_PTR_DISK fast-path: SquashMeta has no level at idx {level_idx}"
+            ))
+        })?;
+        let hash = level.root_hash_at(height).copied().ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "ROOT_PTR_DISK fast-path: trailer for level_idx={level_idx} has no root hash \
+                 for height={height} (metadata drift — sidecar body present but trailer entry \
+                 missing)"
+            ))
+        })?;
+        Ok(Some((stored_id, body, hash)))
     }
 
     /// PR2 read-path overlay: if the currently-opened block is in a

@@ -6267,41 +6267,27 @@ impl StacksChainState {
         // Before durably committing this block to the MARF, verify that the most-recent
         // squash level is consistent with the parent's lineage. If the chain has reorged
         // across a squash boundary (parent descends from a now-retired canonical), this
-        // call re-anchors the level on the new lineage via `re_squash_level`.
+        // call **panics**: chainstate is unrecoverable, operator must wipe + re-sync.
+        // (Pre-B6.1 this used to attempt auto-recovery via `re_squash_level`; that
+        // machinery was removed because horizon-gated promotion (Phase B) prevents
+        // divergence below the burnchain reorg horizon on hot-tier MARFs. On a legacy
+        // hot-tier-disabled MARF the guard is the only correctness gate keeping
+        // `append_block`'s pre-commit MARF reads — needed for state-transition
+        // computation against the parent — from operating on divergent state. B6.4
+        // briefly removed this guard before Codex caught the regression: removing the
+        // pre-append guard let `append_block` decode garbage from the wrong blob before
+        // the post-append guard in the coordinator could fire.)
         //
-        // Without this pre-append guard, divergence is only detected by the post-process
-        // `assert_squash_consistency` in the coordinator — by which time `append_block` has
-        // already written the new block, and `re_squash_level`'s safety check refuses
-        // recovery (committed-non-squash descendants exist above the level). The chain is
-        // then left in a state where reads through the new block decode garbage from the
-        // wrong blob (the level-14 mainnet panic's downstream symptom).
-        //
-        // We flush the validation transaction before the call so any orphan/demote marks
-        // accumulated by `find_next_staging_block` persist regardless of the recovery's
-        // outcome, then re-acquire chainstate_tx + clarity_instance because
-        // `assert_squash_consistency` may refresh the MARF state via
-        // `refresh_after_squash`.
-        let parent_block_id = StacksBlockId::new(
-            &parent_header_info.consensus_hash,
-            &parent_header_info.anchored_header.block_hash(),
-        );
-        // Prospective new block: the one this call is about to commit. Seeding it into the
-        // canonical-ancestry probe lets the guard catch the leading-edge divergence case where
-        // the new block itself is the first to diverge from `recorded[parent_height + 1]`,
-        // which a parent-anchored ancestry walk alone cannot see.
-        let prospective_block_id = StacksBlockId::new(
-            &next_staging_block.consensus_hash,
-            &next_staging_block.anchored_block_hash,
-        );
-        let prospective_height = u32::try_from(parent_header_info.stacks_block_height)
-            .expect("FATAL: parent stacks_block_height does not fit in u32")
-            .saturating_add(1);
+        // We flush the validation transaction before the call so any orphan/demote
+        // marks accumulated by `find_next_staging_block` persist regardless of the
+        // panic, then re-acquire chainstate_tx + clarity_instance.
+        // Phase D (2026-05-04): the pre-append divergence guard was deleted with the legacy
+        // squash-on-tip path. Hot tier is non-optional + horizon-gated promotion makes squash
+        // divergence below the burnchain reorg horizon unreachable, so the guard's only
+        // remaining purpose (catching leading-edge divergence on legacy hot-tier-disabled MARFs)
+        // no longer exists. The post-append `assert_squash_consistency` (called from the
+        // coordinator) remains as the operator-recovery tripwire for >horizon reorgs.
         chainstate_tx.commit().map_err(Error::DBError)?;
-        self.assert_squash_consistency_with_prospective(
-            &parent_block_id,
-            Some((prospective_block_id, prospective_height)),
-            sort_tx.tx(),
-        )?;
         let (mut chainstate_tx, clarity_instance) = self.chainstate_tx_begin();
 
         // attach the block to the chain state and calculate the next chain tip.

@@ -148,6 +148,24 @@ pub struct TrieFileDisk {
     /// Cached mapping from block_id → trie file offset. Interior-mutable so that
     /// read methods can populate the cache while taking `&self`.
     trie_offsets: RefCell<TrieIdOffsets>,
+    /// Hot-zone files for new (pre-promotion) block writes. Always `Some` on a fully
+    /// constructed disk-backed `TrieFile`: `TrieFileStorage`'s open path attaches the set
+    /// unconditionally post-D5, so an `Option<None>` is only observable transiently between
+    /// `new_disk` / `new_mmap` and the subsequent `attach_hot_files` call. See
+    /// `.docs/squashing-v1.5.md` §4.4 and §6.3 for the model; the wiring lives in
+    /// [`TrieFile::attach_hot_files`] / [`TrieFile::store_trie_blob`].
+    hot_files: Option<crate::chainstate::stacks::index::hot_file::HotFileSet>,
+    /// Block_id → (storage_kind, storage_seq) cache for read-path
+    /// dispatch. Populated lazily from `marf_data.storage_kind` /
+    /// `storage_seq`, then consulted on every `read_trie_item` /
+    /// `read_node_type_id` / etc. to choose between the cold blob
+    /// (`<db>.blobs`) and a hot file (`<db>.hot.NNNN`).
+    ///
+    /// Cleared on squash publish (analogous to the existing offset cache
+    /// invalidation), since a promotion flips a block from
+    /// `(Hot, seq)` to `(Cold, 0)`.
+    storage_kind_cache:
+        RefCell<HashMap<u32, (crate::chainstate::stacks::index::trie_sql::StorageKind, u32)>>,
 }
 
 /// Handle to a flat in-memory buffer containing Trie blobs (used for testing)
@@ -179,6 +197,8 @@ impl TrieFile {
             mmap_enabled: false,
             mmap: None,
             trie_offsets: RefCell::new(TrieIdOffsets::new()),
+            hot_files: None,
+            storage_kind_cache: RefCell::new(HashMap::new()),
         }))
     }
 
@@ -214,6 +234,8 @@ impl TrieFile {
             mmap_enabled: true,
             mmap,
             trie_offsets: RefCell::new(TrieIdOffsets::new()),
+            hot_files: None,
+            storage_kind_cache: RefCell::new(HashMap::new()),
         }))
     }
 
@@ -263,16 +285,155 @@ impl TrieFile {
     }
 
     /// Append a new trie blob to external storage, and add the offset and length to the trie DB.
-    /// Return the trie ID
+    /// Return the trie ID.
+    ///
+    /// **v1.5 dispatch**: when hot files are attached (see [`Self::attach_hot_files`]), the new
+    /// block lands in the active hot file (`<db>.hot.{active_seq:08}`) with `storage_kind = Hot`.
+    /// Otherwise it falls back to the legacy cold path (`<db>.blobs` with `storage_kind = Cold`) —
+    /// that branch is what RAM-backed and pre-v5 deployments take.
     pub fn store_trie_blob<T: MarfTrieId>(
         &mut self,
         db: &Connection,
         bhh: &T,
         buffer: &[u8],
     ) -> Result<u32, Error> {
+        if let TrieFile::Disk(disk) = self {
+            if disk.hot_files.is_some() {
+                return Self::store_trie_blob_hot(disk, db, bhh, buffer);
+            }
+        }
+        // RAM-backed cold path: append to the in-memory blob and insert a storage_kind=Cold
+        // marf_data row. Disk-backed handles always have hot files attached post-D5 and take the
+        // hot path above; squash publish writes promoted blobs into the cold zone via the
+        // separate `write_blob_at_and_truncate` primitive, not through this entry point.
         let offset = self.append_trie_blob(db, buffer)?;
-        test_debug!("Stored trie blob {} to offset {}", bhh, offset);
+        test_debug!("Stored trie blob {} to cold blob offset {}", bhh, offset);
         trie_sql::write_external_trie_blob(db, bhh, offset, buffer.len() as u64)
+    }
+
+    /// Hot-tier write path — used by [`Self::store_trie_blob`] when [`TrieFileDisk::hot_files`] is
+    /// attached.
+    ///
+    /// Sequence:
+    ///
+    /// 1. Append `buffer` to the active hot file (which fsyncs internally before returning, so the
+    ///    bytes are durable before SQL commits).
+    /// 2. Insert a `marf_data` row with `storage_kind = Hot` and `storage_seq = active_seq`
+    ///    pointing at the appended region.
+    /// 3. Cache the `(StorageKind::Hot, seq)` mapping for the new `block_id` so subsequent reads
+    ///    dispatch to the right file without a SQL lookup.
+    /// 4. If the active file crossed the rotation threshold, rotate to the next sequence number.
+    ///    Rotation runs *after* the row insert so a crash between append and rotate just leaves a
+    ///    slightly- over-threshold active file — recoverable by the standard truncate-on-startup
+    ///    path.
+    fn store_trie_blob_hot<T: MarfTrieId>(
+        disk: &mut TrieFileDisk,
+        db: &Connection,
+        bhh: &T,
+        buffer: &[u8],
+    ) -> Result<u32, Error> {
+        let hot_files = disk.hot_files.as_mut().ok_or_else(|| {
+            Error::CorruptionError("store_trie_blob_hot called without hot_files attached".into())
+        })?;
+        let (seq, offset) = hot_files.append_to_active(buffer)?;
+        let length = buffer.len() as u64;
+        let block_id = trie_sql::write_external_trie_blob_hot(db, bhh, seq, offset, length)?;
+        disk.storage_kind_cache
+            .borrow_mut()
+            .insert(block_id, (trie_sql::StorageKind::Hot, seq));
+        // Also seed the offset cache so a subsequent read of this block doesn't re-query SQL just
+        // to compute file_offset.
+        disk.trie_offsets.borrow_mut().insert(block_id, offset);
+        test_debug!("Stored trie blob {bhh} to hot file seq={seq} offset={offset} length={length}");
+
+        // Decide rotation after the row commits. Reads done between the append above and this point
+        // safely target the same active file because no other writer can race (single-writer per
+        // MARF).
+        if hot_files.should_rotate()? {
+            let new_seq = hot_files.rotate(db)?;
+            debug!(
+                "Hot-file rotation: bumped active_hot_seq from {} to {}",
+                seq, new_seq
+            );
+        }
+        Ok(block_id)
+    }
+
+    /// Attach a hot-file set to a disk-backed TrieFile. Subsequent calls to
+    /// [`Self::store_trie_blob`] route writes to the hot tier; reads dispatch by consulting
+    /// `marf_data.storage_kind`.
+    ///
+    /// Errors if called on a RAM-backed `TrieFile` (RAM tests don't use the hot tier — they
+    /// continue to use SQLite-inline storage and the cold path).
+    pub fn attach_hot_files(
+        &mut self,
+        hot_files: crate::chainstate::stacks::index::hot_file::HotFileSet,
+    ) -> Result<(), Error> {
+        match self {
+            TrieFile::Disk(disk) => {
+                disk.hot_files = Some(hot_files);
+                Ok(())
+            }
+            TrieFile::RAM(_) => Err(Error::NotSupportedError(
+                "TrieFile::attach_hot_files: hot files are not supported on RAM-backed TrieFiles"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Resolve the storage location (kind + seq) for a `block_id`, consulting the cache first and
+    /// falling back to a SQL lookup on miss. Populates the cache on miss.
+    ///
+    /// Used by the read entry points to dispatch between cold and hot reads. Returns
+    /// `(StorageKind::Cold, 0)` for any non-Disk variant — RAM tests don't use the hot tier.
+    fn resolve_storage_kind_seq(
+        &self,
+        db: &Connection,
+        block_id: u32,
+    ) -> Result<(trie_sql::StorageKind, u32), Error> {
+        if let TrieFile::Disk(disk) = self {
+            if let Some(hit) = disk.storage_kind_cache.borrow().get(&block_id).copied() {
+                return Ok(hit);
+            }
+            let location = trie_sql::get_trie_storage_location(db, block_id)?;
+            disk.storage_kind_cache
+                .borrow_mut()
+                .insert(block_id, (location.kind, location.seq));
+            Ok((location.kind, location.seq))
+        } else {
+            // RAM-backed TrieFile: cold-only, seq irrelevant.
+            Ok((trie_sql::StorageKind::Cold, 0))
+        }
+    }
+
+    /// Accessor for the hot file set. Used by integration tests to verify writes landed in the
+    /// right file, and by Phase B's promotion path to read descendant blocks for the rewrite-plan
+    /// scan.
+    pub fn hot_files(&self) -> Option<&crate::chainstate::stacks::index::hot_file::HotFileSet> {
+        match self {
+            TrieFile::Disk(disk) => disk.hot_files.as_ref(),
+            TrieFile::RAM(_) => None,
+        }
+    }
+
+    /// Whether this `TrieFile` has a [`HotFileSet`] attached. Used by the squash-prep path to
+    /// distinguish disk-backed handles (where the descendant translation map is needed) from
+    /// RAM-backed handles (where it isn't).
+    pub fn has_hot_files(&self) -> bool {
+        matches!(self, TrieFile::Disk(disk) if disk.hot_files.is_some())
+    }
+
+    /// Mutable accessor for the hot file set. Used by `TrieFileStorage` startup recovery to
+    /// truncate an in-flight torn append on the active hot file based on the SQL-authoritative
+    /// committed extent, and by Phase B's promotion path to drive descendant rewrites. Not part
+    /// of the read or write hot path.
+    pub fn hot_files_mut(
+        &mut self,
+    ) -> Option<&mut crate::chainstate::stacks::index::hot_file::HotFileSet> {
+        match self {
+            TrieFile::Disk(disk) => disk.hot_files.as_mut(),
+            TrieFile::RAM(_) => None,
+        }
     }
 
     /// Read a trie blob in its entirety from the DB
@@ -298,11 +459,18 @@ impl TrieFile {
         Ok(buf)
     }
 
+    /// Read the full bytes of `block_id`'s trie blob, dispatching to
+    /// the cold blob (`<db>.blobs`) or the appropriate hot file
+    /// (`<db>.hot.{seq:08}`) based on the row's `storage_kind`.
+    ///
+    /// Used by tooling and by the legacy export-to-blobs migration
+    /// path. v1.5: routes through `get_trie_storage_location` so it
+    /// works on hot rows as well as cold ones.
     pub fn read_trie_blob_bytes(&self, db: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
-        let (offset, length) = trie_sql::get_external_trie_offset_length(db, block_id)?;
-        let mut buf = vec![0u8; length as usize];
+        let location = trie_sql::get_trie_storage_location(db, block_id)?;
+        let mut buf = vec![0u8; location.length as usize];
         let n = self
-            .read_bytes_at(&mut buf, offset)
+            .read_routed_bytes_at(location.kind, location.seq, &mut buf, location.offset)
             .inspect_err(|e| error!("Failed to read trie blob {block_id}: {e:}"))?;
         buf.truncate(n);
         Ok(buf)
@@ -523,6 +691,11 @@ impl TrieFile {
     /// is the *exact* parent (captured at commit time), not the inferable-but-unsafe
     /// "first non-empty root backptr" which can point to older ancestors past COW chains.
     ///
+    /// **v1.5 dispatch**: `kind` and `seq` route the read between
+    /// `<db>.blobs` (cold) and `<db>.hot.{seq:08}` (hot). Without this
+    /// routing, hot-row offsets would be issued against the cold blob fd
+    /// and return either garbage bytes or an out-of-range read.
+    ///
     /// Deliberately bypasses the `mmap` region on the Disk variant and issues a direct
     /// `pread`, for two reasons:
     /// 1. This call is made from `open_block`-time logic that runs outside the
@@ -531,14 +704,27 @@ impl TrieFile {
     /// 2. Only 32 bytes are read, so skipping the mmap fast-path costs at most one syscall.
     pub(super) fn read_parent_hash_at(
         &self,
+        kind: trie_sql::StorageKind,
+        seq: u32,
         trie_offset: u64,
     ) -> Result<[u8; crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE], Error> {
         const N: usize = crate::types::chainstate::BLOCK_HEADER_HASH_ENCODED_SIZE;
         let mut buf = [0u8; N];
         let n = match self {
-            TrieFile::Disk(ref disk) => {
-                pread(&disk.fd, &mut buf, trie_offset).map_err(Error::IOError)?
-            }
+            TrieFile::Disk(ref disk) => match kind {
+                trie_sql::StorageKind::Cold => {
+                    pread(&disk.fd, &mut buf, trie_offset).map_err(Error::IOError)?
+                }
+                trie_sql::StorageKind::Hot => {
+                    let hot_files = disk.hot_files.as_ref().ok_or_else(|| {
+                        Error::CorruptionError(
+                            "read_parent_hash_at: storage_kind = Hot but no hot files attached"
+                                .into(),
+                        )
+                    })?;
+                    hot_files.read_at(seq, &mut buf, trie_offset)?
+                }
+            },
             TrieFile::RAM(ref ram) => {
                 let data = ram.fd.get_ref();
                 let start = trie_offset as usize;
@@ -552,10 +738,35 @@ impl TrieFile {
         };
         if n < N {
             return Err(Error::CorruptionError(format!(
-                "read_parent_hash_at: short read ({n} bytes) at offset {trie_offset}"
+                "read_parent_hash_at: short read ({n} bytes) at offset {trie_offset} \
+                 (kind={kind:?}, seq={seq})"
             )));
         }
         Ok(buf)
+    }
+
+    /// Hot-tier byte read for a single block. Resolves via the attached
+    /// [`HotFileSet`] and dispatches to the named `seq`'s hot file. Returns
+    /// the number of bytes read.
+    ///
+    /// Errors if hot files aren't attached (RAM-backed or pre-v5 path) —
+    /// callers reach this only after [`Self::resolve_storage_kind_seq`]
+    /// returned `(Hot, _)`, which only happens for Disk variants with
+    /// `hot_files = Some`.
+    fn read_hot_bytes_at(&self, seq: u32, buf: &mut [u8], offset: u64) -> Result<usize, Error> {
+        match self {
+            TrieFile::Disk(disk) => {
+                let hot_files = disk.hot_files.as_ref().ok_or_else(|| {
+                    Error::CorruptionError(
+                        "read_hot_bytes_at: storage_kind = Hot but no hot files attached".into(),
+                    )
+                })?;
+                hot_files.read_at(seq, buf, offset)
+            }
+            TrieFile::RAM(_) => Err(Error::NotSupportedError(
+                "read_hot_bytes_at: hot files not supported on RAM-backed TrieFile".into(),
+            )),
+        }
     }
 
     /// Read bytes at a given file offset into `buf` without modifying any cursor state.
@@ -614,23 +825,56 @@ impl TrieFile {
         }
     }
 
+    /// Internal helper: positional read at `(kind, seq, offset)`. For
+    /// cold reads (`kind = Cold`) this hits the cold blob via the
+    /// existing `read_bytes_at` (mmap-fast / pread fallback). For hot
+    /// reads, dispatches to the named hot file's `read_at`.
+    fn read_routed_bytes_at(
+        &self,
+        kind: trie_sql::StorageKind,
+        seq: u32,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, Error> {
+        match kind {
+            trie_sql::StorageKind::Cold => self.read_bytes_at(buf, offset),
+            trie_sql::StorageKind::Hot => self.read_hot_bytes_at(seq, buf, offset),
+        }
+    }
+
     /// Read bytes at a known file position into scratch, then decode.
     /// For mmap: slices directly into the mapped region (zero-copy decode).
     /// For disk: uses `pread` into scratch's node_bytes buffer.
     /// For RAM: slices the in-memory buffer.
+    ///
+    /// **v1.5 dispatch**: when `kind = Hot`, the read is routed to
+    /// `<db>.hot.{seq}` instead of `<db>.blobs`. The mmap zero-copy
+    /// fast-path is currently cold-only; hot reads always take the
+    /// pread slow-path. (Phase A correctness; Phase B can add a
+    /// per-hot-file mmap fast-path if profiling justifies it.)
     fn read_item_at_offset<'a>(
         &self,
+        kind: trie_sql::StorageKind,
+        seq: u32,
         file_offset: u64,
         ptr: &TriePtr,
         leaf_hashes_omitted: bool,
         scratch: &'a mut impl NodeDecodeScratch,
     ) -> Result<ReadTrieItem<'a>, Error> {
-        // Fast path: mmap slice available — decode directly from it.
-        if let Some(bytes) = self.mmap_slice_at(file_offset) {
-            if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
-                return bits::read_trie_item_from_slice_leaf_hash_free(bytes, ptr.id(), scratch);
+        // Fast path: cold mmap slice available — decode directly from it.
+        // Hot reads skip this and go straight to the slow path; the
+        // `mmap_slice_at` helper is cold-only.
+        if matches!(kind, trie_sql::StorageKind::Cold) {
+            if let Some(bytes) = self.mmap_slice_at(file_offset) {
+                if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
+                    return bits::read_trie_item_from_slice_leaf_hash_free(
+                        bytes,
+                        ptr.id(),
+                        scratch,
+                    );
+                }
+                return bits::read_trie_item_from_slice(bytes, ptr.id(), scratch);
             }
-            return bits::read_trie_item_from_slice(bytes, ptr.id(), scratch);
         }
 
         // Slow path: positional read into scratch's reusable buffer, then decode.
@@ -649,7 +893,7 @@ impl TrieFile {
         };
         let mut buf = scratch.take_node_bytes();
         buf.resize(hinted_max, 0);
-        let n = self.read_bytes_at(&mut buf, file_offset)?;
+        let n = self.read_routed_bytes_at(kind, seq, &mut buf, file_offset)?;
         buf.truncate(n);
 
         if is_leaf_hint {
@@ -658,7 +902,7 @@ impl TrieFile {
             let stored_max = bits::get_node_body_max_byte_len(stored_node_id as u8)?;
             if stored_max > hinted_max {
                 buf.resize(stored_max, 0);
-                let n = self.read_bytes_at(&mut buf, file_offset)?;
+                let n = self.read_routed_bytes_at(kind, seq, &mut buf, file_offset)?;
                 buf.truncate(n);
             }
             let _consumed = scratch.decode_node_from_slice(stored_node_id, &buf)?;
@@ -678,7 +922,7 @@ impl TrieFile {
         let stored_max = bits::get_node_max_byte_len(stored_node_id as u8)?;
         if stored_max > hinted_max {
             buf.resize(stored_max, 0);
-            let n = self.read_bytes_at(&mut buf, file_offset)?;
+            let n = self.read_routed_bytes_at(kind, seq, &mut buf, file_offset)?;
             buf.truncate(n);
             // Re-parse after the larger read.
             let (rehash, remaining) = bits::parse_hash_from_bytes(&buf)?;
@@ -715,13 +959,21 @@ impl TrieFile {
     }
 
     /// Read hash bytes at a known file position.
-    fn read_hash_at(&self, file_offset: u64) -> Result<TrieHash, Error> {
-        if let Some(bytes) = self.mmap_slice_at(file_offset) {
-            let (hash, _) = bits::parse_hash_from_bytes(bytes)?;
-            return Ok(hash);
+    fn read_hash_at(
+        &self,
+        kind: trie_sql::StorageKind,
+        seq: u32,
+        file_offset: u64,
+    ) -> Result<TrieHash, Error> {
+        // Cold-only mmap fast-path; hot reads take pread.
+        if matches!(kind, trie_sql::StorageKind::Cold) {
+            if let Some(bytes) = self.mmap_slice_at(file_offset) {
+                let (hash, _) = bits::parse_hash_from_bytes(bytes)?;
+                return Ok(hash);
+            }
         }
         let mut buf = [0u8; TRIEHASH_ENCODED_SIZE];
-        let n = self.read_bytes_at(&mut buf, file_offset)?;
+        let n = self.read_routed_bytes_at(kind, seq, &mut buf, file_offset)?;
         if n < TRIEHASH_ENCODED_SIZE {
             return Err(Error::CorruptionError(
                 "Failed to read hash in full via pread".to_string(),
@@ -734,7 +986,15 @@ impl TrieFile {
     /// its hash (SHA-512/256 of the canonical `write_bytes()` representation).
     /// For `TrieLeafSquashed`, the hash covers the tip value only (same as
     /// `get_nodetype_hash_bytes`).
-    fn recompute_leaf_hash_at(&self, file_offset: u64, ptr_id: u8) -> Result<TrieHash, Error> {
+    ///
+    /// **v1.5 dispatch**: cold-only mmap fast-path; hot reads pread.
+    fn recompute_leaf_hash_at(
+        &self,
+        kind: trie_sql::StorageKind,
+        seq: u32,
+        file_offset: u64,
+        ptr_id: u8,
+    ) -> Result<TrieHash, Error> {
         // Decode the leaf node from either the mmap slice (zero-copy) or a
         // positional read into a temporary buffer.
         let decode_from_slice = |slice: &[u8]| -> Result<TrieNodeType, Error> {
@@ -746,14 +1006,19 @@ impl TrieFile {
             Ok(node)
         };
 
-        let node = if let Some(bytes) = self.mmap_slice_at(file_offset) {
+        let mmap_bytes = if matches!(kind, trie_sql::StorageKind::Cold) {
+            self.mmap_slice_at(file_offset)
+        } else {
+            None
+        };
+        let node = if let Some(bytes) = mmap_bytes {
             // Zero-copy: decode directly from the mmap region.
             decode_from_slice(bytes)?
         } else {
             // Slow path: positional read into a temporary buffer.
             let hinted_max = bits::get_node_body_max_byte_len(ptr_id)?;
             let mut buf = vec![0u8; hinted_max];
-            let n = self.read_bytes_at(&mut buf, file_offset)?;
+            let n = self.read_routed_bytes_at(kind, seq, &mut buf, file_offset)?;
             buf.truncate(n);
 
             // If the stored type is larger than the hinted type, re-read.
@@ -763,7 +1028,7 @@ impl TrieFile {
             let stored_max = bits::get_node_body_max_byte_len(stored_id)?;
             if stored_max > hinted_max {
                 buf.resize(stored_max, 0);
-                let n = self.read_bytes_at(&mut buf, file_offset)?;
+                let n = self.read_routed_bytes_at(kind, seq, &mut buf, file_offset)?;
                 buf.truncate(n);
             }
 
@@ -800,13 +1065,22 @@ impl TrieFile {
     }
 
     /// Read node type ID and hash at a known file position.
-    fn read_node_type_at(&self, file_offset: u64) -> Result<(TrieNodeID, TrieHash), Error> {
-        if let Some(bytes) = self.mmap_slice_at(file_offset) {
-            return bits::read_stored_node_type_from_slice(bytes);
+    ///
+    /// **v1.5 dispatch**: cold-only mmap fast-path; hot reads pread.
+    fn read_node_type_at(
+        &self,
+        kind: trie_sql::StorageKind,
+        seq: u32,
+        file_offset: u64,
+    ) -> Result<(TrieNodeID, TrieHash), Error> {
+        if matches!(kind, trie_sql::StorageKind::Cold) {
+            if let Some(bytes) = self.mmap_slice_at(file_offset) {
+                return bits::read_stored_node_type_from_slice(bytes);
+            }
         }
         // hash (32 bytes) + node id (1 byte)
         let mut buf = [0u8; TRIEHASH_ENCODED_SIZE + 1];
-        let n = self.read_bytes_at(&mut buf, file_offset)?;
+        let n = self.read_routed_bytes_at(kind, seq, &mut buf, file_offset)?;
         if n < TRIEHASH_ENCODED_SIZE + 1 {
             return Err(Error::CorruptionError(
                 "Failed to read node type via pread".to_string(),
@@ -822,6 +1096,10 @@ impl TrieFile {
     ///
     /// When `leaf_hashes_omitted` is true, leaf nodes lack a hash prefix in
     /// the blob and the hash is recomputed from the node body.
+    ///
+    /// **v1.5 dispatch**: routes by the block's `storage_kind`. Hot reads
+    /// always go through pread (no mmap fast-path in Phase A); cold reads
+    /// keep the existing mmap fast-path.
     pub fn get_node_hash(
         &self,
         db: &Connection,
@@ -832,10 +1110,11 @@ impl TrieFile {
     ) -> Result<TrieHash, Error> {
         let offset = trie_offset.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
         let file_offset = offset + ptr.ptr() as u64;
+        let (kind, seq) = self.resolve_storage_kind_seq(db, block_id)?;
         if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
-            self.recompute_leaf_hash_at(file_offset, ptr.id())
+            self.recompute_leaf_hash_at(kind, seq, file_offset, ptr.id())
         } else {
-            self.read_hash_at(file_offset)
+            self.read_hash_at(kind, seq, file_offset)
         }
     }
 
@@ -856,6 +1135,11 @@ impl TrieFile {
     ///
     /// If `trie_offset` is `Some`, uses the pre-resolved offset (bypassing the offset
     /// cache). Otherwise resolves the offset from the cache or SQL.
+    ///
+    /// **v1.5 dispatch**: routes to the hot tier (`<db>.hot.NNNN`) when
+    /// the block's `storage_kind = Hot`, otherwise to the cold blob
+    /// (`<db>.blobs`). The kind/seq lookup is cached per-handle in
+    /// [`TrieFileDisk::storage_kind_cache`].
     pub fn read_trie_item<'a>(
         &self,
         db: &Connection,
@@ -866,7 +1150,15 @@ impl TrieFile {
         scratch: &'a mut impl NodeDecodeScratch,
     ) -> Result<ReadTrieItem<'a>, Error> {
         let offset = trie_offset.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
-        self.read_item_at_offset(offset + ptr.ptr() as u64, ptr, leaf_hashes_omitted, scratch)
+        let (kind, seq) = self.resolve_storage_kind_seq(db, block_id)?;
+        self.read_item_at_offset(
+            kind,
+            seq,
+            offset + ptr.ptr() as u64,
+            ptr,
+            leaf_hashes_omitted,
+            scratch,
+        )
     }
 
     /// Read a trie item as borrowed bytes from the mmap region (zero-copy). Returns `None`
@@ -887,6 +1179,17 @@ impl TrieFile {
         leaf_hashes_omitted: bool,
         guard: BlobReadGuard,
     ) -> Result<Option<ReadTrieItem<'a>>, Error> {
+        // **v1.5**: hot reads have no mmap fast-path in Phase A — the
+        // `BlobReadGuard` provided by the caller is keyed to the cold
+        // blob's quiesce mechanism. Returning `None` for hot reads steers
+        // the caller to fall back to `read_trie_item`, which dispatches
+        // hot reads through pread + scratch buffer (and doesn't need
+        // the borrowed-bytes lifetime that this method's mmap fast-path
+        // returns).
+        let (kind, _seq) = self.resolve_storage_kind_seq(db, block_id)?;
+        if matches!(kind, trie_sql::StorageKind::Hot) {
+            return Ok(None);
+        }
         let offset = trie_offset_hint.map_or_else(|| self.get_trie_offset(db, block_id), Ok)?;
         let Some(bytes) = self.mmap_slice_at(offset + ptr.ptr() as u64) else {
             return Ok(None);
@@ -943,25 +1246,29 @@ impl TrieFile {
     ) -> Result<(TrieNodeID, TrieHash), Error> {
         let offset = self.get_trie_offset(db, block_id)?;
         let file_offset = offset + ptr.ptr() as u64;
+        let (kind, seq) = self.resolve_storage_kind_seq(db, block_id)?;
         if leaf_hashes_omitted && node::is_leaf_type(ptr.id()) {
             // Hash-free leaf: ID at byte 0, recompute hash from body.
-            if let Some(bytes) = self.mmap_slice_at(file_offset) {
-                let stored_id = bits::stored_node_id_from_bytes(bytes)?;
-                let hash = self.recompute_leaf_hash_at(file_offset, ptr.id())?;
-                return Ok((stored_id, hash));
+            // Cold-only mmap fast-path; hot reads pread.
+            if matches!(kind, trie_sql::StorageKind::Cold) {
+                if let Some(bytes) = self.mmap_slice_at(file_offset) {
+                    let stored_id = bits::stored_node_id_from_bytes(bytes)?;
+                    let hash = self.recompute_leaf_hash_at(kind, seq, file_offset, ptr.id())?;
+                    return Ok((stored_id, hash));
+                }
             }
             let mut id_buf = [0u8; 1];
-            let n = self.read_bytes_at(&mut id_buf, file_offset)?;
+            let n = self.read_routed_bytes_at(kind, seq, &mut id_buf, file_offset)?;
             if n < 1 {
                 return Err(Error::CorruptionError(
                     "Failed to read node ID for hash-free leaf".into(),
                 ));
             }
             let stored_id = bits::stored_node_id_from_bytes(&id_buf)?;
-            let hash = self.recompute_leaf_hash_at(file_offset, ptr.id())?;
+            let hash = self.recompute_leaf_hash_at(kind, seq, file_offset, ptr.id())?;
             Ok((stored_id, hash))
         } else {
-            self.read_node_type_at(file_offset)
+            self.read_node_type_at(kind, seq, file_offset)
         }
     }
 
@@ -1040,8 +1347,13 @@ impl TrieFile {
 
         // Invalidate the trie offset cache — offsets for blocks that were in the
         // truncated region are now stale.
+        // v1.5: also invalidate the storage_kind cache, since promoted
+        // blocks (cold blob writes) can have flipped any block's tier.
         match self {
-            TrieFile::Disk(ref disk) => disk.trie_offsets.borrow_mut().clear(),
+            TrieFile::Disk(ref disk) => {
+                disk.trie_offsets.borrow_mut().clear();
+                disk.storage_kind_cache.borrow_mut().clear();
+            }
             TrieFile::RAM(ref ram) => ram.trie_offsets.borrow_mut().clear(),
         }
 
@@ -1090,6 +1402,10 @@ impl TrieFile {
                     disk.mmap = Some(unsafe { Mmap::map(&disk.fd)? });
                 }
                 disk.trie_offsets.borrow_mut().clear();
+                // v1.5: squash publish flips promoted blocks from
+                // hot → cold via `update_external_trie_blob_by_hash`,
+                // so any cached `(block_id, storage_kind)` pair is stale.
+                disk.storage_kind_cache.borrow_mut().clear();
             }
             TrieFile::RAM(ref mut ram) => {
                 if let Some(len) = truncate_to {
@@ -1130,6 +1446,10 @@ impl TrieFile {
                     }
                 }
                 disk.trie_offsets.borrow_mut().clear();
+                // v1.5: external squash on a peer handle may have
+                // flipped block kinds; invalidate our cache so the
+                // next read re-queries.
+                disk.storage_kind_cache.borrow_mut().clear();
             }
             TrieFile::RAM(ref ram) => {
                 ram.trie_offsets.borrow_mut().clear();
@@ -1159,8 +1479,12 @@ mod testing {
             bhh: &T,
             ptr: &TriePtr,
         ) -> Result<TrieHash, Error> {
-            let (offset, _length) = trie_sql::get_external_trie_offset_length_by_bhh(db, bhh)?;
-            self.read_hash_at(offset + ptr.ptr() as u64)
+            let location = trie_sql::get_trie_storage_location_by_bhh(db, bhh)?;
+            self.read_hash_at(
+                location.kind,
+                location.seq,
+                location.offset + ptr.ptr() as u64,
+            )
         }
 
         /// Get all (root hash, trie hash) pairs for this TrieFile
@@ -1168,18 +1492,22 @@ mod testing {
             &self,
             db: &Connection,
         ) -> Result<Vec<(TrieHash, T)>, Error> {
-            let mut s =
-                db.prepare("SELECT block_hash, external_offset FROM marf_data WHERE unconfirmed = 0 ORDER BY block_hash")?;
+            let mut s = db.prepare(
+                "SELECT block_hash, storage_kind, storage_seq, external_offset \
+                 FROM marf_data WHERE unconfirmed = 0 ORDER BY block_hash",
+            )?;
             let rows = s.query_and_then(params![], |row| {
                 let block_hash: T = row.get_unwrap("block_hash");
+                let kind = trie_sql::StorageKind::from_int(row.get_unwrap("storage_kind"))?;
+                let seq: i64 = row.get_unwrap("storage_seq");
                 let offset_i64: i64 = row.get_unwrap("external_offset");
                 let offset = offset_i64 as u64;
                 let start = storage::ROOT_PTR_DISK as u64;
 
-                let root_hash = self.read_hash_at(offset + start)?;
+                let root_hash = self.read_hash_at(kind, seq as u32, offset + start)?;
 
                 trace!(
-                    "Root hash for block {} at offset {} is {}",
+                    "Root hash for block {} at offset {} (kind={kind:?}, seq={seq}) is {}",
                     &block_hash,
                     offset + start,
                     &root_hash

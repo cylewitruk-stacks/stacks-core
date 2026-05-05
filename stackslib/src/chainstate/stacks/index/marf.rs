@@ -483,7 +483,19 @@ pub struct MARFOpenOpts {
     /// — see [`crate::chainstate::stacks::index::squash::resolve_retention_blocks`]
     /// for the precedence rules.
     pub squash_root_snapshot_retention_blocks: Option<u32>,
+    /// **v1.5 Phase B**: optional override for the burnchain reorg
+    /// horizon used by `should_squash`'s horizon predicate. `None`
+    /// reads from `marf_state.horizon_burn_blocks` (the on-disk
+    /// authoritative value); a `Some(_)` overrides for tests + ops
+    /// experimentation. See `.docs/squashing-v1.5-phase-b.md` §3.4.
+    pub squash_horizon_burn_blocks: Option<u32>,
 }
+
+// Phase D (2026-05-03): the `enable_hot_tier` flag was removed in the v1.5 cleanup pass. Hot tier
+// is now non-optional — every MARF open routes writes through the cold/hot tier dispatch + the
+// horizon-gated promotion path. The opt-in was a Phase A staging mechanism; once Phase B + C
+// shipped, leaving the flag in place was the only way production could still hit the legacy
+// tip-only squash path (the level-34 panic class). Removing the option closes that footgun.
 
 impl MARFOpenOpts {
     pub fn default() -> MARFOpenOpts {
@@ -498,6 +510,7 @@ impl MARFOpenOpts {
             squash_root_snapshot_retention_levels:
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
             squash_root_snapshot_retention_blocks: None,
+            squash_horizon_burn_blocks: None,
         }
     }
 
@@ -517,7 +530,18 @@ impl MARFOpenOpts {
             squash_root_snapshot_retention_levels:
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
             squash_root_snapshot_retention_blocks: None,
+            squash_horizon_burn_blocks: None,
         }
+    }
+
+    /// **v1.5 Phase B**: override the burnchain reorg horizon for this
+    /// MARF's squash cadence. Production deployments leave this `None`
+    /// (the value comes from `marf_state.horizon_burn_blocks`); tests
+    /// and ops experimentation can shorten it to drive horizon-gated
+    /// promotion through deterministic test scenarios.
+    pub fn with_squash_horizon_burn_blocks(mut self, blocks: Option<u32>) -> Self {
+        self.squash_horizon_burn_blocks = blocks;
+        self
     }
 
     pub fn with_compression(mut self, compression: bool) -> Self {
@@ -954,16 +978,24 @@ impl<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>
             // the *parent's* height in that case, which is NOT this block's height —
             // its TrieRAM has the correct value via the regular lookup below).
             if block_hash == current_block_hash {
-                let in_squash_height = this.with_restored_block_context(|this| {
-                    this.open_block(current_block_hash, None)?;
-                    let storage = this.storage();
-                    let cur_block_id = storage.get_cur_block_and_id().1;
-                    Ok(if cur_block_id.is_some() {
-                        storage.squash_opened_height()
-                    } else {
-                        None
+                let in_squash_height = this
+                    .with_restored_block_context(|this| {
+                        this.open_block(current_block_hash, None)?;
+                        let storage = this.storage();
+                        let cur_block_id = storage.get_cur_block_and_id().1;
+                        Ok(if cur_block_id.is_some() {
+                            storage.squash_opened_height()
+                        } else {
+                            None
+                        })
                     })
-                })?;
+                    .or_else(|e| match e {
+                        // The block isn't known to this MARF; fall through to the
+                        // regular lookup (which itself returns `Ok(None)` for the
+                        // same case via `get_by_key`'s `NotFoundError` handler).
+                        Error::NotFoundError => Ok(None),
+                        other => Err(other),
+                    })?;
                 if let Some(h) = in_squash_height {
                     return Ok(Some(h));
                 }
@@ -2299,42 +2331,31 @@ impl<T: MarfTrieId> MARF<T> {
             .contains_key(&bhh_key)
     }
 
-    /// Return the most recent **active** squash level's recorded canonical chain, or `None` if no
-    /// active squash levels are loaded.
+    /// Return the most recent squash level's recorded canonical chain, or `None` if no
+    /// squash levels are loaded.
     ///
     /// The reorg-divergence detector consumes this to verify that a newly-promoted chain tip's
     /// ancestry matches what the squash level committed to. A mismatch at any height in the level's
     /// range means the chain has reorg'd past a squash boundary and descendants of the new
     /// canonical will read stale state through the merged blob.
     ///
-    /// Filters retired levels — those represent prior canonical claims that have already been
-    /// superseded by `Replace` and are kept only for fork-block readability, not as the chain's
-    /// current canonical view.
-    ///
     /// Empty `block_hashes` (stub levels with no per-height entries) yields `None` — those levels
     /// have nothing to diverge against.
+    ///
+    /// **B6.3 simplification**: previously walked past retired levels (the `Replace`/`re_squash`
+    /// path inserted retired rows that needed to be skipped here). With B6.1 + B6.3 deletions
+    /// no retired rows are produced anymore; the walk is now a plain "last level" lookup.
     pub fn latest_squash_level_canonical_chain(&self) -> Option<SquashLevelCanonical<T>> {
         let meta = &self.storage.data.squash_meta;
-        // Walk back to the last non-retired entry. `build_squash_meta_from_sql`
-        // currently loads retired levels first and active levels second —
-        // but we don't depend on that order: indexed iteration with an
-        // explicit `!is_retired[idx]` filter is correct regardless of
-        // how the builder chooses to interleave them.
-        let last_active = meta
-            .levels
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(idx, _)| !meta.is_retired.get(*idx).copied().unwrap_or(false))
-            .map(|(_, lvl)| lvl)?;
-        if last_active.block_hashes.is_empty() {
+        let last = meta.levels.last()?;
+        if last.block_hashes.is_empty() {
             return None;
         }
         Some(SquashLevelCanonical {
-            level_id: last_active.info.level_id,
-            min_height: last_active.info.min_height,
-            max_height: last_active.info.max_height,
-            block_hashes: last_active
+            level_id: last.info.level_id,
+            min_height: last.info.min_height,
+            max_height: last.info.max_height,
+            block_hashes: last
                 .block_hashes
                 .iter()
                 .map(|b| T::from_bytes(*b))
@@ -2342,9 +2363,8 @@ impl<T: MarfTrieId> MARF<T> {
         })
     }
 
-    /// Return the most recent **active** squash level's range, including
-    /// stub levels (which carry empty `block_hashes` arrays). `None` only
-    /// when no active levels exist at all.
+    /// Return the most recent squash level's range, including stub levels (which carry empty
+    /// `block_hashes` arrays). `None` only when no levels exist at all.
     ///
     /// Distinguished from [`Self::latest_squash_level_canonical_chain`] in
     /// the stub case: that method returns `None` for empty
@@ -2356,17 +2376,11 @@ impl<T: MarfTrieId> MARF<T> {
     /// have no per-height canonical claims to verify.
     pub fn latest_squash_level_range(&self) -> Option<SquashLevelRange> {
         let meta = &self.storage.data.squash_meta;
-        let last_active = meta
-            .levels
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(idx, _)| !meta.is_retired.get(*idx).copied().unwrap_or(false))
-            .map(|(_, lvl)| lvl)?;
+        let last = meta.levels.last()?;
         Some(SquashLevelRange {
-            level_id: last_active.info.level_id,
-            min_height: last_active.info.min_height,
-            max_height: last_active.info.max_height,
+            level_id: last.info.level_id,
+            min_height: last.info.min_height,
+            max_height: last.info.max_height,
         })
     }
 
@@ -2819,15 +2833,9 @@ impl<T: MarfTrieId + Send + Sync> MARF<T> {
                     .into(),
             ));
         }
-        let stats = crate::chainstate::stacks::index::squash::squash_level_incremental_with_target::<T>(
-            self,
-            mode,
-            min_height,
-            max_height,
-            reclaim,
-            crate::chainstate::stacks::index::squash::SquashTarget::Append,
-            canonical_tip,
-        )?;
+        let stats = crate::chainstate::stacks::index::squash::squash_level_incremental_with_target::<
+            T,
+        >(self, mode, min_height, max_height, reclaim, canonical_tip)?;
         // The squash publish already installed the new `SquashMeta`, bumped
         // the shared generation, and remapped this handle's mmap from inside
         // `publish_squash`'s rebuild closure. All that's left is the
@@ -2835,40 +2843,6 @@ impl<T: MarfTrieId + Send + Sync> MARF<T> {
         // lightweight peer-style sync rather than `refresh_after_squash`,
         // which would re-enter `publish_squash` and trigger a second global
         // quiesce + generation bump (observable to every other handle).
-        self.sync_after_published_squash()?;
-        Ok(stats)
-    }
-
-    /// Replace an existing level (anchored to a new `canonical_tip`) on this
-    /// live MARF handle. Same shape as [`Self::squash`] but with
-    /// `SquashTarget::Replace { level_id }` semantics; the level's
-    /// `min_height` / `max_height` are sourced from the durable
-    /// `marf_squash_levels` row, not caller arguments.
-    ///
-    /// Same `open_chain_tip` guard applies as [`Self::squash`].
-    pub fn re_squash(
-        &mut self,
-        level_id: u32,
-        mode: crate::chainstate::stacks::index::squash::SquashMode,
-        reclaim: bool,
-        canonical_tip: T,
-    ) -> Result<crate::chainstate::stacks::index::squash::SquashStats, Error> {
-        if self.open_chain_tip.is_some() {
-            return Err(Error::NotSupportedError(
-                "MARF::re_squash: a block-write transaction is in progress \
-                 (open_chain_tip is Some) — refusing to re-squash"
-                    .into(),
-            ));
-        }
-        let stats = crate::chainstate::stacks::index::squash::re_squash_level_on_marf::<T>(
-            self,
-            level_id,
-            mode,
-            reclaim,
-            canonical_tip,
-        )?;
-        // Same lightweight sync rationale as `MARF::squash`: the publish
-        // already did the heavy lifting; just refresh handle-local state.
         self.sync_after_published_squash()?;
         Ok(stats)
     }

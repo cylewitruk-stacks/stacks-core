@@ -1,6 +1,7 @@
 mod blocks;
 mod manifest;
 mod node;
+mod plan;
 mod trie;
 mod walk;
 
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 pub use manifest::ManifestArgs;
 pub use node::NodeArgs;
+pub use plan::PlanArgs;
 use rusqlite::{Connection, OpenFlags};
 pub use trie::TrieArgs;
 pub use walk::WalkArgs;
@@ -34,6 +36,9 @@ pub enum Command {
 
     /// Inspect a single node at a given byte offset within a block's blob.
     Node(NodeArgs),
+
+    /// Inspect a pending squash-promotion plan file and its rewrite witnesses.
+    Plan(PlanArgs),
 
     /// Show a compressed serialization manifest for a block's trie.
     /// Lists each node in BFS order with: type, Normal/Patch, patch base, diff count, size.
@@ -97,6 +102,7 @@ impl Cli {
             Command::Blocks => blocks::exec(ctx),
             Command::Trie(args) => trie::exec(ctx, args),
             Command::Node(args) => node::exec(ctx, args),
+            Command::Plan(args) => plan::exec(ctx, args),
             Command::Manifest(args) => manifest::exec(ctx, args),
             Command::Walk(args) => walk::exec(ctx, args),
         }

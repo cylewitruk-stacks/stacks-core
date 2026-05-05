@@ -1380,15 +1380,14 @@ fn parse_squash_root_sidecar_filename(name: &str) -> Option<ParsedSidecarName> {
     })
 }
 
-/// One level's expected sidecar state, as derived from
-/// `marf_squash_levels` (active) or `marf_retired_squash_levels`
-/// (retired). Used by [`reconcile_squash_sidecars`] to decide which
-/// on-disk files to keep, delete, or treat as missing.
+/// One level's expected sidecar state, as derived from `marf_squash_levels`. Used by
+/// [`reconcile_squash_sidecars`] to decide which on-disk files to keep, delete, or treat as
+/// missing.
 ///
-/// `blob_offset` is included so reconcile can match on the versioned
-/// canonical pattern (`...-blob-{blob_offset:016x}.dat`) and
-/// distinguish a current sidecar from a stale-but-same-(level_id,
-/// height-range) pre-Replace sidecar.
+/// `blob_offset` is included so reconcile can match on the versioned canonical pattern
+/// (`...-blob-{blob_offset:016x}.dat`). (Pre-B6.3 it also distinguished current sidecars from
+/// stale pre-`Replace` ones; with retired-row emission gone there is at most one sidecar per
+/// `level_id`, but the offset-keyed match remains correct.)
 #[derive(Debug, Clone, Copy)]
 pub struct ExpectedSidecar {
     pub level_id: u32,
@@ -1450,20 +1449,20 @@ pub fn reconcile_squash_sidecars(
 ) -> Result<ReconcileReport, Error> {
     let sidecar_dir = squash_sidecar_dir_for_db(db_path);
 
-    // Multiple expected entries can share a `level_id` (one active + N
-    // retired). Index by `(level_id, blob_offset)` for exact matching.
-    // The legacy index keys only on `(level_id, min, max)` — used to
-    // migrate pre-versioning sidecars that don't carry blob_offset in
-    // their filename.
+    // Index expected sidecars by `(level_id, blob_offset)` for exact matching. The legacy index
+    // keys only on `(level_id, min, max)` — used to migrate pre-versioning sidecars that don't
+    // carry blob_offset in their filename. (Pre-B6.3 the active+retired split could yield
+    // multiple entries per `level_id`; with retired-row emission gone, at most one entry exists
+    // per level, but the keying scheme is unchanged.)
     let mut expected_by_full: std::collections::HashMap<(u32, u64), ExpectedSidecar> =
         std::collections::HashMap::with_capacity(expected_by_level.len());
     let mut expected_by_legacy: std::collections::HashMap<(u32, u32, u32), ExpectedSidecar> =
         std::collections::HashMap::with_capacity(expected_by_level.len());
     for &exp in expected_by_level {
         expected_by_full.insert((exp.level_id, exp.blob_offset), exp);
-        // Legacy migration: only migrate the *active* (non-retired)
-        // sidecar — retired entries can never have a legacy filename
-        // because retired rows are introduced alongside the versioned
+        // Legacy migration: a legacy filename (no `blob` suffix) maps onto the active row for
+        // this `(level_id, min, max)`. (Pre-B6.3 we explicitly skipped retired entries here
+        // because retired rows were introduced alongside the versioned
         // path scheme. This map's value gets overwritten if multiple
         // entries share `(level_id, min, max)`; that's fine, the legacy
         // file at most matches one of them, and we prefer to migrate it

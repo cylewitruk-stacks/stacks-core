@@ -830,7 +830,10 @@ impl<
             // level's recorded canonical. A divergence here means a prior reorg crossed a
             // squash boundary; descendants of the new tip would otherwise read stale state
             // from the merged blob — the failure mode observed at level 11 on mainnet
-            // replay. Fail-stop until `re_squash_level` ships.
+            // replay. Fail-stop with a "wipe + re-sync" operator message: B6.1 deleted
+            // the in-process `re_squash_level` recovery path because horizon-gated
+            // promotion (Phase B) makes divergence unreachable on hot-tier MARFs by
+            // design.
             {
                 let chainstate = &mut self.chain_state_db;
                 let new_tip = block_receipt.header.index_block_hash();

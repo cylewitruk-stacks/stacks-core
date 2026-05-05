@@ -32,8 +32,11 @@ use crate::chainstate::stacks::index::storage::{BlobReadGuard, TrieStorageConnec
 use crate::util_lib::db::Error as db_error;
 
 pub mod bits;
+pub mod byte_scanner;
 pub mod cache;
 pub mod file;
+pub mod hot_file;
+pub mod hot_reclaim;
 pub mod marf;
 pub mod node;
 pub mod profile;
@@ -41,6 +44,9 @@ pub mod proofs;
 pub mod scratch;
 pub mod sidecar;
 pub mod squash;
+pub mod squash_plan;
+pub mod squash_promote;
+pub mod squash_recover;
 pub mod storage;
 pub mod trie;
 pub mod trie_sql;

@@ -1980,35 +1980,16 @@ impl NakamotoChainState {
             return Err(ChainstateError::InvalidStacksBlock(msg.into()));
         }
 
-        // ── MARF squash-divergence guard (Nakamoto) ─────────────────────────────────
-        // Before any MARF-backed read of the parent — including the reward-set load
-        // below, which evaluates Clarity boot-code against the parent — verify the
-        // most-recent squash level is consistent with the parent's lineage. If the
-        // chain has reorged across a squash boundary (parent descends from a
-        // now-retired canonical), this call re-anchors the level on the new lineage
-        // via `re_squash_level`.
-        //
-        // Without this pre-append guard, divergence is only detected by the post-
-        // process `assert_squash_consistency` in `handle_new_nakamoto_stacks_block` —
-        // by which time `append_block` has already committed, and `re_squash_level`'s
-        // safety check refuses recovery (committed-non-squash descendants exist above
-        // the level). The chain is then left in a state where reads through the new
-        // block decode garbage from the wrong blob (the level-14 mainnet panic's
-        // downstream symptom).
-        // Prospective new block: the one this call is about to commit. Seeding it into the
-        // canonical-ancestry probe lets the guard catch the leading-edge divergence case where
-        // the new block itself is the first to diverge from `recorded[chain_length]`, which a
-        // parent-anchored ancestry walk alone cannot see.
-        let prospective_block_id = next_ready_block.header.block_id();
-        let prospective_height = u32::try_from(next_ready_block.header.chain_length)
-            .expect("FATAL: Nakamoto chain_length does not fit in u32");
-        stacks_chain_state.assert_squash_consistency_with_prospective(
-            &parent_block_id,
-            Some((prospective_block_id, prospective_height)),
-            sort_db.conn(),
-        )?;
+        // Phase D (2026-05-04): the pre-append divergence guard was deleted with the legacy
+        // squash-on-tip path. Hot tier is non-optional + horizon-gated promotion makes squash
+        // divergence below the burnchain reorg horizon unreachable. The B6.4 regression that
+        // forced this guard's restoration (legacy hot-tier-disabled MARFs operating on divergent
+        // state) no longer exists: there are no hot-tier-disabled MARFs. The post-append
+        // `assert_squash_consistency` in the coordinator remains as the operator-recovery
+        // tripwire for >horizon reorgs.
+        let _ = parent_block_id; // quiet the unused-binding warning until parent_block_id finds another caller
 
-        // ── Reward-set load (now safe — squash level is re-anchored if needed) ──────
+        // ── Reward-set load ────────────────────────────────────────────────────────
         let elected_height = sort_db
             .get_consensus_hash_height(&next_ready_block.header.consensus_hash)?
             .ok_or_else(|| ChainstateError::NoSuchBlockError)?;

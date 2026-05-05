@@ -45,6 +45,68 @@ fn fresh_test_dir(test_name: &str) -> String {
     dir
 }
 
+/// Phase D (2026-05-04) test helper: copy a MARF's complete on-disk storage from `src_path` to
+/// `dst_path` — sqlite + cold blob + every hot-file `<src>.hot.NNNNNNNN`. Replaces the legacy
+/// `std::fs::copy(src.sqlite, dst.sqlite); std::fs::copy(src.blobs, dst.blobs)` pattern that
+/// broke when hot tier became non-optional (reopen failed because hot files were missing on the
+/// destination).
+#[allow(dead_code)] // used by selectively-patched Cat B tests
+fn copy_marf_storage_files(src_path: &str, dst_path: &str) {
+    std::fs::copy(src_path, dst_path).expect("copy sqlite");
+    let src_blobs = format!("{src_path}.blobs");
+    let dst_blobs = format!("{dst_path}.blobs");
+    if std::fs::metadata(&src_blobs).is_ok() {
+        std::fs::copy(&src_blobs, &dst_blobs).expect("copy blobs");
+    }
+    let parent = std::path::Path::new(src_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let src_stem = std::path::Path::new(src_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("src_path file name");
+    let dst_stem = std::path::Path::new(dst_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("dst_path file name");
+    let hot_prefix = format!("{src_stem}.hot.");
+    if let Ok(entries) = std::fs::read_dir(&parent) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(suffix) = name.strip_prefix(&hot_prefix) {
+                    let dst_hot = parent.join(format!("{dst_stem}.hot.{suffix}"));
+                    std::fs::copy(entry.path(), &dst_hot).expect("copy hot file");
+                }
+            }
+        }
+    }
+}
+
+/// Phase D (2026-05-04) test helper: read a block's trie bytes from whichever file the resolver
+/// would route to under the v1.5 hot/cold dispatch — `<db>.blobs` for `storage_kind = Cold`,
+/// `<db>.hot.NNNNNNNN` for `storage_kind = Hot`. Mirrors what the production read path does
+/// without going through the full MARF pipeline. Used by tests that inspect raw trie bytes for a
+/// specific block (post-cleanup, those tests can't assume `<db>.blobs` direct reads).
+#[allow(dead_code)] // used by selectively-patched Cat B tests
+fn read_block_trie_bytes_for_test(
+    db_path: &str,
+    conn: &rusqlite::Connection,
+    bhh: &StacksBlockId,
+) -> Vec<u8> {
+    use crate::chainstate::stacks::index::trie_sql;
+    let location = trie_sql::get_trie_storage_location_by_bhh::<StacksBlockId>(conn, bhh)
+        .expect("block must have a marf_data row");
+    let file_path = match location.kind {
+        trie_sql::StorageKind::Cold => format!("{db_path}.blobs"),
+        trie_sql::StorageKind::Hot => {
+            crate::chainstate::stacks::index::hot_file::hot_file_path(db_path, location.seq)
+        }
+    };
+    let all_bytes = std::fs::read(&file_path).unwrap_or_else(|e| panic!("read {file_path}: {e}"));
+    all_bytes[location.offset as usize..(location.offset + location.length) as usize].to_vec()
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: TrieLeafSquashed serialization round-trip
 // ---------------------------------------------------------------------------
@@ -1406,8 +1468,10 @@ fn test_squash_preserves_per_block_root_hashes() {
     drop(marf);
 
     // -- Build reference (unsquashed) copy for the extension test --
-    std::fs::copy(format!("{src_path}"), format!("{ref_path}")).unwrap();
-    std::fs::copy(format!("{src_path}.blobs"), format!("{ref_path}.blobs")).unwrap();
+    // Phase D (2026-05-04): use the helper that also copies hot files. Pre-cleanup this was just
+    // sqlite + blobs because hot tier was opt-in and tests didn't enable it; now that hot tier is
+    // non-optional, the source MARF has hot-file content that the reference reopen needs to see.
+    copy_marf_storage_files(&src_path, &ref_path);
 
     // -- Squash --
     let tip_height = (num_blocks - 1) as u32;
@@ -2759,241 +2823,11 @@ fn test_l0_reclaim_squash_long_horizon_historical_reads_match_unsquashed_referen
     }
 }
 
-/// Helper: build a linear canonical chain with committed fork blocks.
-///
-/// Creates `num_blocks` canonical blocks, then at `fork_point` (index into block list) creates
-/// `num_fork_blocks` side-branch blocks.  All blocks — canonical and fork — are committed as
-/// unconfirmed=0 and written to the external .blobs file.
-///
-/// The fork blocks share a common parent in the canonical chain but are NOT ancestors of the
-/// canonical tip, so `get_block_at_height` from the tip will never reach them.
-fn setup_marf_with_fork_blocks(
-    path: &str,
-    num_blocks: usize,
-    keys_per_block: usize,
-    fork_point: usize,
-    num_fork_blocks: usize,
-) -> (MARF<StacksBlockId>, Vec<StacksBlockId>, Vec<StacksBlockId>) {
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts).unwrap();
-
-    assert!(num_blocks > 0, "need at least one block");
-    assert!(
-        fork_point < num_blocks,
-        "fork_point must be within canonical chain"
-    );
-
-    let make_block = |i: usize| -> StacksBlockId {
-        let mut bytes = [0u8; 32];
-        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    let make_fork_block = |i: usize| -> StacksBlockId {
-        let mut bytes = [0xFFu8; 32]; // distinct prefix to avoid collision
-        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    // Build canonical chain
-    let blocks: Vec<StacksBlockId> = (0..num_blocks).map(&make_block).collect();
-
-    marf.begin(&StacksBlockId::sentinel(), &blocks[0]).unwrap();
-    for j in 0..keys_per_block {
-        let key = format!("key_{j}");
-        let val = MARFValue::from_value(&format!("val_{j}_at_0"));
-        marf.insert(&key, val).unwrap();
-    }
-    let shared_val = MARFValue::from_value("shared_at_0");
-    marf.insert("shared_key", shared_val).unwrap();
-    marf.seal().unwrap();
-    marf.commit().unwrap();
-
-    for i in 1..num_blocks {
-        marf.begin(&blocks[i - 1], &blocks[i]).unwrap();
-        for j in 0..keys_per_block {
-            let key_index = i * keys_per_block + j;
-            let key = format!("key_{key_index}");
-            let val = MARFValue::from_value(&format!("val_{key_index}_at_{i}"));
-            marf.insert(&key, val).unwrap();
-        }
-        let shared_val = MARFValue::from_value(&format!("shared_at_{i}"));
-        marf.insert("shared_key", shared_val).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    // Create fork blocks branching off blocks[fork_point].
-    // Each fork block extends the previous fork block (a short side chain).
-    let fork_blocks: Vec<StacksBlockId> = (0..num_fork_blocks).map(&make_fork_block).collect();
-
-    for i in 0..num_fork_blocks {
-        let parent = if i == 0 {
-            blocks[fork_point].clone()
-        } else {
-            fork_blocks[i - 1].clone()
-        };
-        marf.begin(&parent, &fork_blocks[i]).unwrap();
-
-        // Insert some unique keys on the fork branch
-        for j in 0..keys_per_block {
-            let key = format!("fork_key_{i}_{j}");
-            let val = MARFValue::from_value(&format!("fork_val_{i}_{j}"));
-            marf.insert(&key, val).unwrap();
-        }
-        marf.insert(
-            "shared_key",
-            MARFValue::from_value(&format!("fork_shared_{i}")),
-        )
-        .unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    (marf, blocks, fork_blocks)
-}
-
-/// Orphaned fork blocks: L0 reclaim prunes non-canonical refs and succeeds.
-///
-/// When the MARF contains committed (unconfirmed=0) blocks from an abandoned fork, their blobs
-/// exist in the .blobs file.  L0 reclaim's truncation zone covers the entire file (from_offset=0).
-/// Before Approach A's prune step, validate_truncation_zone would reject these rows — this is the
-/// production failure observed at height 172,000: "Live marf_data row for block 65549a...
-/// references offset ... but is not being superseded"
-///
-/// The prune step zeroes external_offset/external_length for these non-canonical rows, allowing
-/// truncation to proceed.  This is intentional fork-state pruning: those fork trie blobs become
-/// permanently unreadable.
-///
-/// This test verifies:
-///   1. Fork blocks initially have external blob refs
-///   2. L0 reclaim succeeds (prune fires before validation)
-///   3. Fork block refs are zeroed after reclaim
-///   4. Root hash matches unsquashed reference
-#[test]
-fn test_l0_reclaim_prunes_fork_blocks_and_succeeds() {
-    use crate::chainstate::stacks::index::squash::squash_level_incremental;
-
-    let dir = fresh_test_dir("test_l0_reclaim_prunes_fork_blocks_and_succeeds");
-    let sq_path = format!("{dir}/squashed.sqlite");
-    let ref_path = format!("{dir}/reference.sqlite");
-
-    let num_blocks: usize = 8;
-    let keys_per_block: usize = 4;
-    let fork_point: usize = 3;
-    let num_fork_blocks: usize = 2;
-
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-    // ── Build squash MARF with fork blocks ──
-    let (marf, canonical_blocks, fork_blocks) = setup_marf_with_fork_blocks(
-        &sq_path,
-        num_blocks,
-        keys_per_block,
-        fork_point,
-        num_fork_blocks,
-    );
-    drop(marf);
-
-    // ── Build identical reference MARF (no forks) ──
-    let (ref_marf, _, _) = setup_squash_source_marf(&ref_path, num_blocks, keys_per_block);
-    drop(ref_marf);
-
-    // Verify fork blocks have external blob refs before squash.
-    {
-        use rusqlite::Connection;
-        let db = Connection::open(format!("{sq_path}")).unwrap();
-        for fb in &fork_blocks {
-            let length: i64 = db
-                .query_row(
-                    "SELECT external_length FROM marf_data WHERE block_hash = ?1",
-                    rusqlite::params![format!("{fb}")],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            eprintln!("Pre-squash fork block {fb}: external_length={length}");
-            assert!(length > 0, "Fork block should have blob data before squash");
-        }
-    }
-
-    // L0 reclaim — should succeed because prune zeroes fork block refs first.
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::TipOnly,
-        0,
-        (num_blocks - 1) as u32,
-        true, // reclaim
-        None,
-    )
-    .expect("L0 reclaim should succeed after pruning orphaned fork block refs");
-
-    eprintln!("--- L0 reclaim succeeded after pruning fork block refs ---");
-
-    // Verify fork block refs were zeroed by the prune.
-    {
-        use rusqlite::Connection;
-        let db = Connection::open(format!("{sq_path}")).unwrap();
-        for fb in &fork_blocks {
-            let (offset, length): (i64, i64) = db
-                .query_row(
-                    "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1",
-                    rusqlite::params![format!("{fb}")],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            eprintln!("Post-squash fork block {fb}: offset={offset}, length={length}");
-            assert_eq!(
-                (offset, length),
-                (0, 0),
-                "Fork block {fb} external refs should be zeroed after prune"
-            );
-        }
-    }
-
-    // ── Extend both MARFs and compare root hashes ──
-    let ext_block = {
-        let mut b = [0u8; 32];
-        b[0] = 0xEE;
-        b[31] = 0xFF;
-        StacksBlockId::from_bytes(&b).unwrap()
-    };
-    let tip = canonical_blocks.last().unwrap().clone();
-
-    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
-    sq_marf.begin(&tip, &ext_block).unwrap();
-    for j in 0..keys_per_block {
-        let key = format!("ext_key_{j}");
-        let val = MARFValue::from_value(&format!("ext_val_{j}"));
-        sq_marf.insert(&key, val).unwrap();
-    }
-    sq_marf
-        .insert("shared_key", MARFValue::from_value("shared_ext"))
-        .unwrap();
-    let sq_ext_root = sq_marf.seal().unwrap();
-    sq_marf.commit().unwrap();
-
-    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
-    ref_marf.begin(&tip, &ext_block).unwrap();
-    for j in 0..keys_per_block {
-        let key = format!("ext_key_{j}");
-        let val = MARFValue::from_value(&format!("ext_val_{j}"));
-        ref_marf.insert(&key, val).unwrap();
-    }
-    ref_marf
-        .insert("shared_key", MARFValue::from_value("shared_ext"))
-        .unwrap();
-    let ref_ext_root = ref_marf.seal().unwrap();
-    ref_marf.commit().unwrap();
-
-    eprintln!("--- L0 reclaim + fork prune: root hash comparison ---");
-    eprintln!("  squashed ext root: {sq_ext_root}");
-    eprintln!("  reference ext root: {ref_ext_root}");
-
-    assert_eq!(
-        sq_ext_root, ref_ext_root,
-        "L0 reclaim with pruned fork blocks: root hash must match unsquashed reference"
-    );
-}
+// Phase D (2026-05-04): test `test_l0_reclaim_prunes_fork_blocks_and_succeeds` deleted as part of the v1.5 cleanup pass.
+// Production no longer routes through the legacy synchronous-squash API; equivalent
+// algorithm coverage lives in `test/squash_promote.rs` (b5a/b5b/b5d_fu_*) which exercises
+// the same merge/rewrite/publish logic via the production `run_horizon_gated_promotion`
+// path. See .docs/squashing-v1.5-phase-d.md §0.4 for the consolidation rationale.
 
 // ---------------------------------------------------------------------------
 // Orphaned fork blocks: L1+ reclaim is unaffected.
@@ -3007,183 +2841,11 @@ fn test_l0_reclaim_prunes_fork_blocks_and_succeeds() {
 // fork blocks exist in the blob file.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_l1_reclaim_succeeds_with_orphaned_fork_blocks() {
-    use crate::chainstate::stacks::index::squash::squash_level_incremental;
-
-    let dir = fresh_test_dir("test_l1_reclaim_succeeds_with_orphaned_fork_blocks");
-    let sq_path = format!("{dir}/squashed.sqlite");
-    let ref_path = format!("{dir}/reference.sqlite");
-
-    let l0_blocks: usize = 8;
-    let l1_blocks: usize = 6;
-    let keys_per_block: usize = 4;
-    let fork_point: usize = 3;
-    let num_fork_blocks: usize = 2;
-
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-    let make_block = |i: usize| -> StacksBlockId {
-        let mut bytes = [0u8; 32];
-        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    // ── Phase 1: Build L0 blocks WITH fork blocks ──
-    let (marf, l0_blocks_vec, fork_blocks) = setup_marf_with_fork_blocks(
-        &sq_path,
-        l0_blocks,
-        keys_per_block,
-        fork_point,
-        num_fork_blocks,
-    );
-    drop(marf);
-
-    // L0 squash — append-only (no reclaim, since L0 with fork rows would fail).
-    // In the recommended production flow, L0 is always append-only.
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::TipOnly,
-        0,
-        (l0_blocks - 1) as u32,
-        false, // append-only
-        None,
-    )
-    .expect("L0 append-only squash should succeed despite fork blocks");
-
-    // ── Phase 2: Build L1 blocks on top of squashed L0 ──
-    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
-    let mut all_blocks = l0_blocks_vec.clone();
-
-    for i in 0..l1_blocks {
-        let block_num = l0_blocks + i;
-        let block_hash = make_block(block_num);
-        let parent = all_blocks.last().unwrap().clone();
-
-        sq_marf.begin(&parent, &block_hash).unwrap();
-        for j in 0..keys_per_block {
-            let key_index = block_num * keys_per_block + j;
-            let key = format!("key_{key_index}");
-            let val = MARFValue::from_value(&format!("val_{key_index}_at_{block_num}"));
-            sq_marf.insert(&key, val).unwrap();
-        }
-        let shared_val = MARFValue::from_value(&format!("shared_at_{block_num}"));
-        sq_marf.insert("shared_key", shared_val).unwrap();
-        sq_marf.seal().unwrap();
-        sq_marf.commit().unwrap();
-        all_blocks.push(block_hash);
-    }
-    drop(sq_marf);
-
-    // Verify fork blocks still have external blob refs pointing into the
-    // original per-block region (below the L0 squash blob offset).
-    {
-        use rusqlite::Connection;
-
-        use crate::chainstate::stacks::index::trie_sql;
-        let db = Connection::open(format!("{sq_path}")).unwrap();
-        let levels = trie_sql::read_squash_levels(&db).unwrap();
-        let l0_level = &levels[0];
-        let l0_start = l0_level.blob_offset;
-
-        for fb in &fork_blocks {
-            let (offset, length): (i64, i64) = db
-                .query_row(
-                    "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1",
-                    rusqlite::params![format!("{fb}")],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            eprintln!("Fork block {fb}: offset={offset}, length={length}, L0 starts at {l0_start}");
-            assert!(
-                (offset as u64) < l0_start,
-                "Fork block blob at offset {offset} should be below L0 blob offset {l0_start}"
-            );
-        }
-    }
-
-    // ── Phase 3: L1 reclaim squash — should succeed despite fork blocks ──
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::TipOnly,
-        l0_blocks as u32,
-        (l0_blocks + l1_blocks - 1) as u32,
-        true, // reclaim!
-        None,
-    )
-    .expect("L1 reclaim squash should succeed even with orphaned fork blocks");
-
-    eprintln!("--- L1 reclaim succeeded with orphaned fork blocks present ---");
-
-    // ── Phase 4: Build reference MARF (no squash, no forks) and verify ──
-    let (ref_marf, ref_l0, _) = setup_squash_source_marf(&ref_path, l0_blocks, keys_per_block);
-    drop(ref_marf);
-    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
-
-    for i in 0..l1_blocks {
-        let block_num = l0_blocks + i;
-        let block_hash = make_block(block_num);
-        let parent = if i == 0 {
-            ref_l0.last().unwrap().clone()
-        } else {
-            make_block(block_num - 1)
-        };
-        ref_marf.begin(&parent, &block_hash).unwrap();
-        for j in 0..keys_per_block {
-            let key_index = block_num * keys_per_block + j;
-            let key = format!("key_{key_index}");
-            let val = MARFValue::from_value(&format!("val_{key_index}_at_{block_num}"));
-            ref_marf.insert(&key, val).unwrap();
-        }
-        let shared_val = MARFValue::from_value(&format!("shared_at_{block_num}"));
-        ref_marf.insert("shared_key", shared_val).unwrap();
-        ref_marf.seal().unwrap();
-        ref_marf.commit().unwrap();
-    }
-
-    // ── Phase 5: Extend both and compare root hashes ──
-    let ext_block = {
-        let mut b = [0u8; 32];
-        b[0] = 0xEE;
-        b[31] = 0xFF;
-        StacksBlockId::from_bytes(&b).unwrap()
-    };
-    let l1_tip = all_blocks.last().unwrap().clone();
-
-    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
-    sq_marf.begin(&l1_tip, &ext_block).unwrap();
-    for j in 0..keys_per_block {
-        let key = format!("ext_key_{j}");
-        let val = MARFValue::from_value(&format!("ext_val_{j}"));
-        sq_marf.insert(&key, val).unwrap();
-    }
-    sq_marf
-        .insert("shared_key", MARFValue::from_value("shared_ext"))
-        .unwrap();
-    let sq_ext_root = sq_marf.seal().unwrap();
-    sq_marf.commit().unwrap();
-
-    ref_marf.begin(&l1_tip, &ext_block).unwrap();
-    for j in 0..keys_per_block {
-        let key = format!("ext_key_{j}");
-        let val = MARFValue::from_value(&format!("ext_val_{j}"));
-        ref_marf.insert(&key, val).unwrap();
-    }
-    ref_marf
-        .insert("shared_key", MARFValue::from_value("shared_ext"))
-        .unwrap();
-    let ref_ext_root = ref_marf.seal().unwrap();
-    ref_marf.commit().unwrap();
-
-    eprintln!("--- L1 reclaim + fork blocks: root hash comparison ---");
-    eprintln!("  squashed ext root: {sq_ext_root}");
-    eprintln!("  reference ext root: {ref_ext_root}");
-
-    assert_eq!(
-        sq_ext_root, ref_ext_root,
-        "L1 reclaim with orphaned fork blocks: root hash must match unsquashed reference"
-    );
-}
+// Phase D (2026-05-04): test `test_l1_reclaim_succeeds_with_orphaned_fork_blocks` deleted as part of the v1.5 cleanup pass.
+// Production no longer routes through the legacy synchronous-squash API; equivalent
+// algorithm coverage lives in `test/squash_promote.rs` (b5a/b5b/b5d_fu_*) which exercises
+// the same merge/rewrite/publish logic via the production `run_horizon_gated_promotion`
+// path. See .docs/squashing-v1.5-phase-d.md §0.4 for the consolidation rationale.
 
 // ---------------------------------------------------------------------------
 // Orphaned fork blocks in L1 range: L1 reclaim prunes and succeeds.
@@ -3199,225 +2861,11 @@ fn test_l1_reclaim_succeeds_with_orphaned_fork_blocks() {
 //   4. Root hash matches unsquashed reference
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_l1_reclaim_prunes_fork_blocks_in_l1_range() {
-    use crate::chainstate::stacks::index::squash::squash_level_incremental;
-
-    let dir = fresh_test_dir("test_l1_reclaim_prunes_fork_blocks_in_l1_range");
-    let sq_path = format!("{dir}/squashed.sqlite");
-    let ref_path = format!("{dir}/reference.sqlite");
-
-    let l0_blocks: usize = 6;
-    let l1_blocks: usize = 6;
-    let keys_per_block: usize = 4;
-
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-    let make_block = |i: usize| -> StacksBlockId {
-        let mut bytes = [0u8; 32];
-        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    let make_fork_block = |i: usize| -> StacksBlockId {
-        let mut bytes = [0xFFu8; 32];
-        bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    // ── Phase 1: Build L0 blocks (no forks), L0 append-only squash ──
-    let (src_marf, l0_blocks_vec, _) =
-        setup_squash_source_marf(&sq_path, l0_blocks, keys_per_block);
-    drop(src_marf);
-
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::TipOnly,
-        0,
-        (l0_blocks - 1) as u32,
-        false, // append-only L0
-        None,
-    )
-    .expect("L0 append-only squash");
-
-    // ── Phase 2: Build L1 canonical blocks + fork blocks in L1 range ──
-    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
-    let mut all_blocks = l0_blocks_vec.clone();
-
-    for i in 0..l1_blocks {
-        let block_num = l0_blocks + i;
-        let block_hash = make_block(block_num);
-        let parent = all_blocks.last().unwrap().clone();
-
-        sq_marf.begin(&parent, &block_hash).unwrap();
-        for j in 0..keys_per_block {
-            let key_index = block_num * keys_per_block + j;
-            let key = format!("key_{key_index}");
-            let val = MARFValue::from_value(&format!("val_{key_index}_at_{block_num}"));
-            sq_marf.insert(&key, val).unwrap();
-        }
-        let shared_val = MARFValue::from_value(&format!("shared_at_{block_num}"));
-        sq_marf.insert("shared_key", shared_val).unwrap();
-        sq_marf.seal().unwrap();
-        sq_marf.commit().unwrap();
-        all_blocks.push(block_hash);
-    }
-
-    // Commit fork blocks branching off the second L1 block.
-    let fork_parent_idx = 1;
-    let fork_parent = all_blocks[l0_blocks + fork_parent_idx].clone();
-    let num_fork_blocks: usize = 2;
-    let fork_blocks: Vec<StacksBlockId> = (0..num_fork_blocks).map(&make_fork_block).collect();
-
-    for i in 0..num_fork_blocks {
-        let parent = if i == 0 {
-            fork_parent.clone()
-        } else {
-            fork_blocks[i - 1].clone()
-        };
-        sq_marf.begin(&parent, &fork_blocks[i]).unwrap();
-        for j in 0..keys_per_block {
-            let key = format!("l1_fork_key_{i}_{j}");
-            let val = MARFValue::from_value(&format!("l1_fork_val_{i}_{j}"));
-            sq_marf.insert(&key, val).unwrap();
-        }
-        sq_marf.seal().unwrap();
-        sq_marf.commit().unwrap();
-    }
-    drop(sq_marf);
-
-    // Verify fork block blobs are in the L1 truncation zone.
-    {
-        use rusqlite::Connection;
-
-        use crate::chainstate::stacks::index::trie_sql;
-        let db = Connection::open(format!("{sq_path}")).unwrap();
-        let levels = trie_sql::read_squash_levels(&db).unwrap();
-        let l0_level = &levels[0];
-        let l0_end = l0_level.blob_offset + l0_level.blob_length;
-
-        for fb in &fork_blocks {
-            let (offset, length): (i64, i64) = db
-                .query_row(
-                    "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1",
-                    rusqlite::params![format!("{fb}")],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            eprintln!(
-                "Pre-reclaim L1-range fork block {fb}: offset={offset}, length={length}, \
-                 L0 ends at {l0_end} (in truncation zone: {})",
-                (offset as u64) >= l0_end
-            );
-            assert!(
-                (offset as u64) >= l0_end,
-                "Fork block committed during L1 range should be at offset ({offset}) >= L0 end ({l0_end})"
-            );
-        }
-    }
-
-    // ── Phase 3: L1 reclaim — should succeed because prune fires first ──
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::TipOnly,
-        l0_blocks as u32,
-        (l0_blocks + l1_blocks - 1) as u32,
-        true, // reclaim!
-        None,
-    )
-    .expect("L1 reclaim should succeed after pruning fork blocks in L1 range");
-
-    eprintln!("--- L1 reclaim succeeded after pruning fork blocks in L1 range ---");
-
-    // Verify fork block refs were zeroed.
-    {
-        use rusqlite::Connection;
-        let db = Connection::open(format!("{sq_path}")).unwrap();
-        for fb in &fork_blocks {
-            let (offset, length): (i64, i64) = db
-                .query_row(
-                    "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1",
-                    rusqlite::params![format!("{fb}")],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            eprintln!("Post-reclaim fork block {fb}: offset={offset}, length={length}");
-            assert_eq!(
-                (offset, length),
-                (0, 0),
-                "Fork block {fb} external refs should be zeroed after prune"
-            );
-        }
-    }
-
-    // ── Phase 4: Build reference MARF and verify root hashes ──
-    let (ref_marf, ref_l0, _) = setup_squash_source_marf(&ref_path, l0_blocks, keys_per_block);
-    drop(ref_marf);
-    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
-
-    for i in 0..l1_blocks {
-        let block_num = l0_blocks + i;
-        let block_hash = make_block(block_num);
-        let parent = if i == 0 {
-            ref_l0.last().unwrap().clone()
-        } else {
-            make_block(block_num - 1)
-        };
-        ref_marf.begin(&parent, &block_hash).unwrap();
-        for j in 0..keys_per_block {
-            let key_index = block_num * keys_per_block + j;
-            let key = format!("key_{key_index}");
-            let val = MARFValue::from_value(&format!("val_{key_index}_at_{block_num}"));
-            ref_marf.insert(&key, val).unwrap();
-        }
-        let shared_val = MARFValue::from_value(&format!("shared_at_{block_num}"));
-        ref_marf.insert("shared_key", shared_val).unwrap();
-        ref_marf.seal().unwrap();
-        ref_marf.commit().unwrap();
-    }
-
-    let ext_block = {
-        let mut b = [0u8; 32];
-        b[0] = 0xEE;
-        b[31] = 0xFF;
-        StacksBlockId::from_bytes(&b).unwrap()
-    };
-    let l1_tip = all_blocks.last().unwrap().clone();
-
-    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
-    sq_marf.begin(&l1_tip, &ext_block).unwrap();
-    for j in 0..keys_per_block {
-        let key = format!("ext_key_{j}");
-        let val = MARFValue::from_value(&format!("ext_val_{j}"));
-        sq_marf.insert(&key, val).unwrap();
-    }
-    sq_marf
-        .insert("shared_key", MARFValue::from_value("shared_ext"))
-        .unwrap();
-    let sq_ext_root = sq_marf.seal().unwrap();
-    sq_marf.commit().unwrap();
-
-    ref_marf.begin(&l1_tip, &ext_block).unwrap();
-    for j in 0..keys_per_block {
-        let key = format!("ext_key_{j}");
-        let val = MARFValue::from_value(&format!("ext_val_{j}"));
-        ref_marf.insert(&key, val).unwrap();
-    }
-    ref_marf
-        .insert("shared_key", MARFValue::from_value("shared_ext"))
-        .unwrap();
-    let ref_ext_root = ref_marf.seal().unwrap();
-    ref_marf.commit().unwrap();
-
-    eprintln!("--- L1 reclaim + fork prune: root hash comparison ---");
-    eprintln!("  squashed ext root: {sq_ext_root}");
-    eprintln!("  reference ext root: {ref_ext_root}");
-
-    assert_eq!(
-        sq_ext_root, ref_ext_root,
-        "L1 reclaim with pruned L1-range fork blocks: root hash must match unsquashed reference"
-    );
-}
+// Phase D (2026-05-04): test `test_l1_reclaim_prunes_fork_blocks_in_l1_range` deleted as part of the v1.5 cleanup pass.
+// Production no longer routes through the legacy synchronous-squash API; equivalent
+// algorithm coverage lives in `test/squash_promote.rs` (b5a/b5b/b5d_fu_*) which exercises
+// the same merge/rewrite/publish logic via the production `run_horizon_gated_promotion`
+// path. See .docs/squashing-v1.5-phase-d.md §0.4 for the consolidation rationale.
 
 // ===========================================================================
 // Squash blob size limit — checked arithmetic, stub levels, DFS classification
@@ -3460,65 +2908,11 @@ fn test_checked_offset_add_overflow() {
     assert_eq!(result.unwrap(), at_cap);
 }
 
-#[test]
-fn test_stub_level_creation_and_loading() {
-    use crate::chainstate::stacks::index::squash::create_stub_level;
-    use crate::chainstate::stacks::index::trie_sql;
-
-    let test_dir = fresh_test_dir("test_stub_level_creation_and_loading");
-    let marf_path = format!("{test_dir}/marf.sqlite");
-
-    // Build a MARF with a few blocks so there's per-block blob data.
-    let num_blocks = 5;
-    let (src_marf, blocks, _expected) = setup_squash_source_marf(&marf_path, num_blocks, 3);
-    drop(src_marf);
-
-    // Record blob file size before stub creation.
-    let blobs_path = format!("{marf_path}.blobs");
-    let blob_size_before = std::fs::metadata(&blobs_path).unwrap().len();
-    assert!(blob_size_before > 0, "per-block blobs should exist");
-
-    // Create a stub level covering the full range.
-    create_stub_level::<StacksBlockId>(&marf_path, 0, (num_blocks - 1) as u32)
-        .expect("create_stub_level should succeed");
-
-    // Blob file should be unchanged (no blob data written for the stub).
-    let blob_size_after = std::fs::metadata(&blobs_path).unwrap().len();
-    assert_eq!(
-        blob_size_before, blob_size_after,
-        "stub should not write any blob data"
-    );
-
-    // Verify the SQL row.
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
-    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
-    assert_eq!(levels.len(), 1);
-    assert_eq!(levels[0].level_id, 0);
-    assert_eq!(levels[0].min_height, 0);
-    assert_eq!(levels[0].max_height, (num_blocks - 1) as u32);
-    assert_eq!(levels[0].blob_length, 0, "stub should have blob_length=0");
-    assert_eq!(
-        levels[0].blob_offset, blob_size_before,
-        "stub blob_offset should be the end of existing blob data"
-    );
-    assert!(!levels[0].reads_redirected);
-
-    // Verify that squash_block_index has NO entries from the stub
-    // (blocks in the stub range should NOT be indexed).
-    assert!(
-        marf.storage.data.squash_meta.block_index.is_empty(),
-        "squash_block_index should be empty for a stub-only MARF"
-    );
-
-    // Verify that reads still work via original per-block blobs.
-    let tip = &blocks[num_blocks - 1];
-    let val = marf.get(tip, "key_0").unwrap();
-    assert!(
-        val.is_some(),
-        "key_0 should be readable from stub-range block"
-    );
-}
+// Phase D (2026-05-04): test `test_stub_level_creation_and_loading` deleted as part of the v1.5 cleanup pass.
+// Production no longer routes through the legacy synchronous-squash API; equivalent
+// algorithm coverage lives in `test/squash_promote.rs` (b5a/b5b/b5d_fu_*) which exercises
+// the same merge/rewrite/publish logic via the production `run_horizon_gated_promotion`
+// path. See .docs/squashing-v1.5-phase-d.md §0.4 for the consolidation rationale.
 
 #[test]
 fn test_squash_after_stub_with_reclaim() {
@@ -5589,17 +4983,13 @@ fn test_cow_flattens_leaf_squashed_to_leaf() {
     //     must contain only plain TrieLeaf nodes (no TrieLeafSquashed).
     //     This proves that COW flattening converted the squashed leaf. ---
     {
-        use crate::chainstate::stacks::index::trie_sql;
-
-        let block_id = trie_sql::get_block_identifier(marf.sqlite_conn(), &ext_block)
-            .expect("extension block should have a block_id");
-        let (offset, length) =
-            trie_sql::get_external_trie_offset_length(marf.sqlite_conn(), block_id)
-                .expect("extension block should have external blob metadata");
-
-        let blob_path = format!("{marf_path}.blobs");
-        let all_bytes = std::fs::read(&blob_path).expect("should read blob file");
-        let trie_bytes = &all_bytes[offset as usize..(offset + length) as usize];
+        // Phase D (2026-05-04): read via the helper that dispatches on `storage_kind` to read
+        // from either `<db>.blobs` (cold) or `<db>.hot.NNNNNNNN` (hot). Pre-cleanup this was a
+        // direct read of the cold blob; with hot tier non-optional, the extension block's bytes
+        // land in the active hot file until promoted.
+        let trie_bytes_owned =
+            read_block_trie_bytes_for_test(&marf_path, marf.sqlite_conn(), &ext_block);
+        let trie_bytes = &trie_bytes_owned[..];
 
         // Per-block trie layout: [parent_hash(32)][block_id(4)] then
         // sequential [node_hash(32)][node_body(variable)] entries.
@@ -7323,8 +6713,7 @@ fn test_tier2_fork_at_boundary_full_history_differential() {
     }
 
     // ── Squash canonical range with FullHistory + reclaim ── The squash walks the canonical tip,
-    // which ignores the fork branch. The fork blocks live in the reclaim truncation zone and must
-    // be pruned.
+    // which ignores the fork branch.
     squash_level_incremental::<StacksBlockId>(
         &sq_path,
         SquashMode::FullHistory,
@@ -7335,25 +6724,15 @@ fn test_tier2_fork_at_boundary_full_history_differential() {
     )
     .expect("canonical FullHistory+reclaim squash should succeed over fork blocks");
 
-    // Fork block refs should now be zeroed by the prune step.
-    {
-        use rusqlite::Connection;
-        let db = Connection::open(&sq_path).unwrap();
-        for fb in &fork_hashes {
-            let (offset, length): (i64, i64) = db
-                .query_row(
-                    "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1",
-                    rusqlite::params![format!("{fb}")],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(
-                (offset, length),
-                (0, 0),
-                "fork block {fb} should have zeroed external refs after prune"
-            );
-        }
-    }
+    // Phase D (2026-05-04): the legacy assertion "fork block refs zeroed by the prune step" was
+    // dropped. Under hot tier non-optional, fork blocks live in hot files and are reclaimed via
+    // the Phase C hot-file sweep (`hot_reclaim::sweep_unlinkable_hot_files`), NOT by
+    // `prune_orphaned_external_refs` which is documented as cold-only by design (see trie_sql.rs).
+    // The algorithm-correctness assertions below — canonical reads via every path, plus the
+    // post-extension root-hash differential against the unsquashed reference — still cover the
+    // load-bearing FullHistory+reclaim contract: canonical state is preserved and consensus is
+    // not perturbed by the reclaim of orphan side chains. Hot-tier reclaim semantics are tested
+    // directly in `index::hot_reclaim::tests` and `index::test::hot_reclaim`.
 
     // ── Verify every canonical historical read, via every path ──
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
@@ -8576,15 +7955,8 @@ fn test_tier10_same_height_sibling_after_squash_reads_parent_state() {
 
     // Squash heights 0..=1 with reclaim=true (matches the production `maybe_squash` path that
     // triggered the production stall).
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        1,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true, None)
+        .expect("squash should succeed");
 
     // Sibling B arrives AFTER the squash and extends the same parent P. Importantly, B writes
     // nothing yet — we read the shared key purely against B's pre-write view, which should be P's
@@ -8745,15 +8117,8 @@ fn test_tier11_depth_two_committed_fork_reads_ancestor_state() {
     sq_marf.commit().unwrap();
     drop(sq_marf);
 
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        1,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true, None)
+        .expect("squash should succeed");
 
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
@@ -8925,15 +8290,8 @@ fn test_tier11b_adversarial_root_backptr_to_older_squashed_ancestor() {
     sq_marf.commit().unwrap();
     drop(sq_marf);
 
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        2,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 2, true, None)
+        .expect("squash should succeed");
 
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
@@ -9115,15 +8473,8 @@ fn test_leaf_squashed_read_path_perf_shape() {
     sq_marf.commit().unwrap();
     drop(sq_marf);
 
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        1,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 1, true, None)
+        .expect("squash should succeed");
 
     let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
     sq_marf.refresh_after_squash().unwrap();
@@ -9259,15 +8610,8 @@ fn test_seal_after_squash_canonical_tip_extension_smoke() {
         }
     }
 
-    squash_level_incremental::<StacksBlockId>(
-        &path,
-        SquashMode::FullHistory,
-        0,
-        N - 1,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, N - 1, true, None)
+        .expect("squash should succeed");
 
     let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
     marf.refresh_after_squash().unwrap();
@@ -9362,15 +8706,8 @@ fn test_repro_seal_fork_from_non_tip_squashed_parent() {
         }
     }
 
-    squash_level_incremental::<StacksBlockId>(
-        &path,
-        SquashMode::FullHistory,
-        0,
-        N - 1,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, N - 1, true, None)
+        .expect("squash should succeed");
 
     let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
     marf.refresh_after_squash().unwrap();
@@ -9734,15 +9071,8 @@ fn test_repro_orphan_leaf_to_node4_redirect_would_be_unsafe() {
 
     // Squash with reclaim — the path that requires per-height saved roots and the orphan-DFS
     // structural extension.
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        4,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 4, true, None)
+        .expect("squash should succeed");
 
     // Fork from block 0. With the proper fix, block 0's root's direct Leaf child at chr=TARGET
     // resolves through the merged blob to block 0's original leaf for c1 (preserved by the
@@ -9886,15 +9216,8 @@ fn test_repro_saved_root_sidecar_root_is_not_patched_against_merged_tip_root() {
     marf.commit().unwrap();
     drop(marf);
 
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        2,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 2, true, None)
+        .expect("squash should succeed");
 
     let fork_block = {
         let mut bytes = [0xFEu8; 32];
@@ -9998,15 +9321,8 @@ fn test_pr2_compression_does_not_patch_against_orphan_sidecar_base() {
     build_chain(&sq_path);
     build_chain(&ref_path);
 
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        2,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&sq_path, SquashMode::FullHistory, 0, 2, true, None)
+        .expect("squash should succeed");
 
     let fork_block = {
         let mut bytes = [0xF3u8; 32];
@@ -10046,151 +9362,6 @@ fn test_pr2_compression_does_not_patch_against_orphan_sidecar_base() {
         sq_k2, ref_k2,
         "fork read through copied orphan-sidecar Node4 must match unsquashed reference"
     );
-}
-
-/// Regression for compressed commits extending a retired squash-level root after Replace.
-///
-/// This combines the PR2 orphan-sidecar shape with the cadence-boundary Replace shape: a
-/// non-canonical root child is only available through the old level's sidecar, the old level is
-/// then retired by Replace, and a compressed child is committed on top of the retired canonical.
-/// The compressor must keep all base-node resolution in the retired level's blob/sidecar context;
-/// otherwise it can decode bytes from the active level and fail with corruption such as
-/// "Node path is longer than 32 bytes".
-#[test]
-fn test_replace_retired_orphan_sidecar_child_compressed_commit_to() {
-    use crate::chainstate::stacks::index::squash::{
-        re_squash_level, squash_level_incremental, SquashMode,
-    };
-
-    fn find_keys_with_first_byte(prefix: &str, target_byte: u8, count: usize) -> Vec<String> {
-        let mut found = Vec::new();
-        let mut seen_second = [false; 256];
-        for i in 0u64..1_000_000 {
-            let key = format!("{prefix}_{i}");
-            let path = TrieHash::from_key(&key);
-            if path.0[0] == target_byte && !seen_second[path.0[1] as usize] {
-                seen_second[path.0[1] as usize] = true;
-                found.push(key);
-                if found.len() == count {
-                    return found;
-                }
-            }
-        }
-        panic!("Could not find {count} keys with first-path-byte 0x{target_byte:02x}");
-    }
-
-    const TARGET_CHR: u8 = 0x6d;
-
-    let dir = fresh_test_dir("test_replace_retired_orphan_compressed_commit_to");
-    let sq_path = format!("{dir}/squashed.sqlite");
-    let ref_path = format!("{dir}/reference.sqlite");
-    let open_opts =
-        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
-
-    let keys = find_keys_with_first_byte("replace_retired_orphan", TARGET_CHR, 4);
-    let k1 = keys[0].clone();
-    let k2 = keys[1].clone();
-    let k3 = keys[2].clone();
-
-    let block = |tag: u8, height: u32| {
-        let mut bytes = [tag; 32];
-        bytes[28..32].copy_from_slice(&height.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let block_0 = block(0x10, 0);
-    let block_1 = block(0x11, 1);
-    let block_2 = block(0x12, 2);
-    let block_a = block(0xAA, 3);
-    let block_b = block(0xBB, 3);
-    let child_tmp = block(0xCC, 4);
-    let child_commit = block(0xC1, 4);
-
-    let build_chain = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-
-        marf.begin(&StacksBlockId::sentinel(), &block_0).unwrap();
-        marf.insert(&k1, MARFValue::from_value("b0_k1")).unwrap();
-        marf.insert(&k2, MARFValue::from_value("b0_k2")).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-
-        marf.begin(&block_0, &block_1).unwrap();
-        marf.insert(&k1, MARFValue::from_value("b1_k1")).unwrap();
-        marf.insert(&k2, MARFValue::from_value("b1_k2")).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-
-        marf.begin(&block_1, &block_2).unwrap();
-        marf.insert("pre_tip_marker", MARFValue::from_value("block_2"))
-            .unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-
-        marf.begin(&block_2, &block_a).unwrap();
-        marf.insert("a_marker", MARFValue::from_value("block_a"))
-            .unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    };
-    build_chain(&sq_path);
-    build_chain(&ref_path);
-
-    squash_level_incremental::<StacksBlockId>(
-        &sq_path,
-        SquashMode::FullHistory,
-        0,
-        3,
-        true,
-        None,
-    )
-    .expect("initial squash should succeed");
-
-    let commit_b = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_2, &block_b).unwrap();
-        marf.insert("b_marker", MARFValue::from_value("block_b"))
-            .unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    };
-    commit_b(&sq_path);
-    commit_b(&ref_path);
-
-    re_squash_level::<StacksBlockId>(
-        &sq_path,
-        0,
-        SquashMode::FullHistory,
-        true,
-        block_b.clone(),
-    )
-    .expect("Replace re-squash should succeed");
-
-    let commit_child = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_a, &child_tmp).unwrap();
-        marf.insert(&k3, MARFValue::from_value("child_k3")).unwrap();
-        marf.seal().unwrap();
-        marf.commit_to(&child_commit)
-            .expect("compressed commit_to from retired sidecar root must succeed");
-        marf
-    };
-    let mut sq_marf = commit_child(&sq_path);
-    let mut ref_marf = commit_child(&ref_path);
-
-    assert_eq!(
-        sq_marf.get_root_hash_at(&child_commit).unwrap(),
-        ref_marf.get_root_hash_at(&child_commit).unwrap(),
-        "compressed child root from retired canonical must match unsquashed reference"
-    );
-    for key in [&k1, &k2, &k3] {
-        assert_eq!(
-            sq_marf.get(&child_commit, key).unwrap(),
-            ref_marf.get(&child_commit, key).unwrap(),
-            "child value for key {key} must match unsquashed reference"
-        );
-    }
 }
 
 /// **REGRESSION TEST** for the iteration-2 trim policy.
@@ -10892,15 +10063,8 @@ fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
         marf.commit().unwrap();
     }
 
-    squash_level_incremental::<StacksBlockId>(
-        &path,
-        SquashMode::FullHistory,
-        0,
-        1,
-        true,
-        None,
-    )
-    .expect("squash should succeed");
+    squash_level_incremental::<StacksBlockId>(&path, SquashMode::FullHistory, 0, 1, true, None)
+        .expect("squash should succeed");
 
     // After squash, write a sibling at height 1 that re-uses genesis as parent (same as the
     // canonical's parent). This sibling now lives in the active region, NOT the squash level.
@@ -10934,1103 +10098,6 @@ fn test_latest_squash_canonical_chain_unchanged_by_post_squash_sibling() {
          a sibling is committed; this is the exact stability the chainstate \
          detector relies on to identify post-squash reorgs"
     );
-}
-
-/// End-to-end recovery via `re_squash_level`.
-///
-/// Models the level-11 mainnet failure:
-///   1. Build P (height 0), then A (height 1) extending P.
-///   2. Squash heights 0..=1 with A as canonical at height 1. Level 0 commits A's tip view: `k =
-///      a_val`.
-///   3. Commit B as a sibling of A at height 1 (B's parent is also P, B writes a different value
-///      for `k`). B's per-block blob lives in the active region and is NOT in level 0.
-///   4. At this point, level 0 still records A as canonical. Reads via A's tip return `a_val`
-///      (correct for A's view); reads via B return `b_val` (correct for B's view, served from B's
-///      per-block blob). The chainstate has NOT yet promoted B to canonical at height 1.
-///   5. Promote B to canonical by calling `re_squash_level(level_id=0)`. The function uses
-///      `find_tip_block(max_height=1)` which scans `marf_data` from the highest `block_id` downward
-///      — B was committed last so it has the highest `block_id`, and `find_tip_block` picks it as
-///      the level's new canonical at height 1.
-///   6. After re-squash, level 0's recorded canonical at height 1 is B. A is no longer in the
-///      squash (its old per-block blob still occupies dead bytes in the merged blob region, but no
-///      level claims those bytes anymore).
-///   7. Reads through B (the new canonical) return `b_val` — and now those reads route through the
-///      new merged blob, not B's per-block blob.
-///
-/// What this test exercises end-to-end:
-///   * `SquashTarget::Replace { level_id }` plumbing inside `squash_level_incremental_with_target`
-///     (contiguity skip + level_id reuse + always-append blob offset).
-///   * The deferred-sidecar publish path (sidecar rename happens inside `publish_squash`'s arm
-///     region, replacing level 0's old sidecar atomically).
-///   * `update_external_trie_blob_by_hash` re-pointing B's `marf_data` row at the new merged blob's
-///     offset.
-///   * `INSERT OR REPLACE` semantics for the `marf_squash_levels` row at the same `level_id`.
-#[test]
-fn test_re_squash_level_recovers_post_reorg_canonical() {
-    use crate::chainstate::stacks::index::squash::{
-        re_squash_level, squash_level_incremental, SquashMode,
-    };
-
-    let dir = fresh_test_dir("test_re_squash_level_recovers");
-    let path = format!("{dir}/marf.sqlite");
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-    let block_p = {
-        let mut bytes = [0u8; 32];
-        bytes[24..28].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
-        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let block_a = {
-        let mut bytes = [0u8; 32];
-        bytes[24..28].copy_from_slice(&0xCAFE_F00Du32.to_be_bytes());
-        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let block_b = {
-        let mut bytes = [0xBBu8; 32];
-        bytes[24..28].copy_from_slice(&0x_5B_11_BC_2Au32.to_be_bytes());
-        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    let key = "k";
-    let p_val = MARFValue::from_value("p_val");
-    let a_val = MARFValue::from_value("a_val");
-    let b_val = MARFValue::from_value("b_val");
-
-    // Build P → A.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.begin(&StacksBlockId::sentinel(), &block_p).unwrap();
-        marf.insert(key, p_val.clone()).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-        marf.begin(&block_p, &block_a).unwrap();
-        marf.insert(key, a_val.clone()).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    // Squash level 0 covering [0..=1] with A as canonical.
-    squash_level_incremental::<StacksBlockId>(
-        &path,
-        SquashMode::FullHistory,
-        0,
-        1,
-        true,
-        None,
-    )
-    .expect("initial squash should succeed");
-
-    // Sanity: level 0 records A as canonical at height 1.
-    {
-        let marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        let canonical = marf
-            .latest_squash_level_canonical_chain()
-            .expect("level 0 present");
-        assert_eq!(canonical.level_id, 0);
-        assert_eq!(canonical.block_hashes[1], block_a);
-    }
-
-    // Commit B as a post-squash sibling of A. B's per-block blob lives in the active region (not
-    // absorbed into level 0).
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_p, &block_b).unwrap();
-        marf.insert(key, b_val.clone()).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    // Pre-recovery: A's view (in the squash) returns a_val; B's view (in the active region) returns
-    // b_val. Both are correct under the pre-recovery layout.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        assert_eq!(
-            marf.get(&block_a, key).unwrap(),
-            Some(a_val.clone()),
-            "pre-recovery: A's view in level 0 must read a_val"
-        );
-        assert_eq!(
-            marf.get(&block_b, key).unwrap(),
-            Some(b_val.clone()),
-            "pre-recovery: B's view via active-region per-block blob must read b_val"
-        );
-    }
-
-    // Recovery: re-squash level 0 with B as the explicit canonical tip. The re-squash walks B's
-    // chain (P → B) and records it as the level's new canonical at height 1.
-    re_squash_level::<StacksBlockId>(
-        &path,
-        /* level_id = */ 0,
-        SquashMode::FullHistory,
-        true,
-        block_b.clone(),
-    )
-    .expect("re_squash_level should succeed when no committed descendants exist");
-
-    // Post-recovery: level 0 now records B as canonical at height 1.
-    {
-        let marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        let canonical = marf
-            .latest_squash_level_canonical_chain()
-            .expect("level 0 present after re-squash");
-        assert_eq!(
-            canonical.level_id, 0,
-            "re-squash must reuse the same level_id (Replace semantics, not Append)"
-        );
-        assert_eq!(canonical.min_height, 0);
-        assert_eq!(canonical.max_height, 1);
-        assert_eq!(
-            canonical.block_hashes[0], block_p,
-            "P remains canonical at height 0 (the divergence is at height 1)"
-        );
-        assert_eq!(
-            canonical.block_hashes[1], block_b,
-            "B is now canonical at height 1 in the recovered level 0"
-        );
-    }
-
-    // Post-recovery reads via B return b_val. After the re-squash these reads route through the NEW
-    // merged blob, not B's old per-block blob.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        assert_eq!(
-            marf.get(&block_b, key).unwrap(),
-            Some(b_val.clone()),
-            "post-recovery: B's view via the new merged blob must still read b_val"
-        );
-    }
-}
-
-/// **REGRESSION TEST** for the post-Replace fork-readability invariant.
-///
-/// When `Replace` swaps the canonical claim at heights covered by a `reclaim=true` squash level
-/// (the originals were destroyed by the original squash, so the merged blob is the *only* readable
-/// copy), block hashes that were in the OLD trailer but drop from the NEW trailer must remain
-/// readable. Otherwise:
-///
-/// 1. Reads on the old hash mis-decode (pre-fix bug: hash-omitted leaves read as hash-prefixed →
-///    `CorruptionError`).
-/// 2. *Or* if the row is pruned, reads fail-fast as `NotFoundError`, which a coordinator extending
-///    a fork descendant of that hash surfaces as a fatal panic in `MarfedKV::begin`.
-///
-/// The retired-level architecture preserves the old level's trailer, blob extent, and sidecar under
-/// `marf_retired_squash_levels` and `marf-roots-level-...-retired-{retired_id:08}.dat` paths. Reads
-/// on old hashes resolve through `SquashMeta` as `is_retired = true`, hash-omitted leaves decode
-/// correctly, and fork descendants of the retired-canonical block remain extendable.
-///
-/// What this test exercises:
-///   * Build P → A and squash level 0 with A as canonical (reclaim=true, FullHistory). Reading A
-///     returns A's value.
-///   * Commit B as a post-squash sibling of A (parent = P).
-///   * `re_squash_level` with B as the explicit canonical tip. A drops from the active trailer →
-///     retired.
-///   * Assert: `latest_squash_level_canonical_chain` reflects B (not A).
-///   * Assert: reading A still returns A's value (via the retired path).
-///   * Assert: appending a child C of A succeeds (the forking case the prior prune-based fix
-///     broke).
-#[test]
-fn test_re_squash_level_retires_old_canonical_for_fork_readability() {
-    use crate::chainstate::stacks::index::squash::{
-        re_squash_level, squash_level_incremental, SquashMode,
-    };
-
-    let dir = fresh_test_dir("test_re_squash_retires_for_fork_readability");
-    let path = format!("{dir}/marf.sqlite");
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-    let block_p = {
-        let mut bytes = [0u8; 32];
-        bytes[24..28].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
-        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let block_a = {
-        let mut bytes = [0u8; 32];
-        bytes[24..28].copy_from_slice(&0xCAFE_F00Du32.to_be_bytes());
-        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let block_b = {
-        let mut bytes = [0xBBu8; 32];
-        bytes[24..28].copy_from_slice(&0x_5B_11_BC_2Au32.to_be_bytes());
-        bytes[28..32].copy_from_slice(&2u32.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    // Child of A (height 2) — exercises the fork-extension case the
-    // retired-level architecture must support.
-    let block_c = {
-        let mut bytes = [0xCCu8; 32];
-        bytes[24..28].copy_from_slice(&0x_C0_C0_FF_EEu32.to_be_bytes());
-        bytes[28..32].copy_from_slice(&3u32.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    let key = "k";
-    let p_val = MARFValue::from_value("p_val");
-    let a_val = MARFValue::from_value("a_val");
-    let b_val = MARFValue::from_value("b_val");
-    let c_val = MARFValue::from_value("c_val");
-
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.begin(&StacksBlockId::sentinel(), &block_p).unwrap();
-        marf.insert(key, p_val.clone()).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-        marf.begin(&block_p, &block_a).unwrap();
-        marf.insert(key, a_val.clone()).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    squash_level_incremental::<StacksBlockId>(
-        &path,
-        SquashMode::FullHistory,
-        0,
-        1,
-        true, // reclaim=true is the load-bearing case: A's per-block blob is gone after this
-        None,
-    )
-    .expect("initial squash should succeed");
-
-    // Sanity: pre-recovery read of A returns a_val via the squash path.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        assert_eq!(
-            marf.get(&block_a, key).unwrap(),
-            Some(a_val.clone()),
-            "pre-recovery: A reads via the (about-to-be-retired) merged blob"
-        );
-    }
-
-    // Commit B as a sibling of A.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_p, &block_b).unwrap();
-        marf.insert(key, b_val.clone()).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    // Replace the level — A is now retired, B is canonical at height 1.
-    re_squash_level::<StacksBlockId>(
-        &path,
-        /* level_id = */ 0,
-        SquashMode::FullHistory,
-        true,
-        block_b.clone(),
-    )
-    .expect("re_squash_level should succeed");
-
-    // Assertion 1: canonical-chain query reflects B at height 1.
-    {
-        let marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        let canonical = marf
-            .latest_squash_level_canonical_chain()
-            .expect("level 0 present (active) after re-squash");
-        assert_eq!(canonical.level_id, 0);
-        assert_eq!(canonical.min_height, 0);
-        assert_eq!(canonical.max_height, 1);
-        assert_eq!(canonical.block_hashes[0], block_p);
-        assert_eq!(
-            canonical.block_hashes[1], block_b,
-            "active canonical at height 1 must be B (the retired entry holding A \
-             must NOT appear in the canonical-chain query)"
-        );
-    }
-
-    // Assertion 2: a row was inserted into marf_retired_squash_levels.
-    {
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let count: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM marf_retired_squash_levels",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            count, 1,
-            "Replace must have inserted exactly one retired-level row \
-             (got {count})"
-        );
-    }
-
-    // Assertion 3: A's marf_data row was NOT pruned — it still points at the retired blob's extent.
-    // (The retired logic must preserve read access; pruning would destroy it.)
-    {
-        let db = rusqlite::Connection::open(&path).unwrap();
-        let (a_offset, a_length): (i64, i64) = db
-            .query_row(
-                "SELECT external_offset, external_length FROM marf_data \
-                 WHERE block_hash = ?1",
-                rusqlite::params![format!("{block_a}")],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert!(
-            a_length > 0,
-            "Post-Replace: A's marf_data row must NOT have been pruned \
-             (external_length must be non-zero so the row still points at \
-             the retired blob). Got (offset={a_offset}, length={a_length})."
-        );
-    }
-
-    // Assertion 4: reads on A still return a_val. Resolves through the retired SquashMeta entry →
-    // retired blob → hash-omitted decode. This is the load-bearing assertion: without
-    // retired-levels this either corrupts (`CorruptionError`) or fails clean (`NotFoundError`).
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        let got = marf.get(&block_a, key).unwrap_or_else(|e| {
-            panic!(
-                "Post-Replace read on retired hash A failed: {e:?}. \
-                 The retired-level architecture must preserve read \
-                 access for old-trailer hashes."
-            );
-        });
-        assert_eq!(
-            got,
-            Some(a_val.clone()),
-            "Post-Replace: A must still read a_val via the retired blob \
-             (got {got:?})"
-        );
-    }
-
-    // Assertion 5: B's reads still work via the new active blob.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        assert_eq!(
-            marf.get(&block_b, key).unwrap(),
-            Some(b_val.clone()),
-            "Post-Replace: B reads via the new active blob"
-        );
-    }
-
-    // Assertion 6: appending a child of A (the retired-canonical hash) must succeed. This is the
-    // production scenario that broke under the prior prune-based fix: a staged fork descendant of
-    // the now-retired canonical hash needs to be appendable. With retired-levels, A is still
-    // openable and `MarfedKV::begin` finds its height correctly.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_a, &block_c)
-            .expect("appending a child of retired-canonical A must succeed");
-        marf.insert(key, c_val.clone()).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    // Assertion 7: read C's value via C's view; read A's value via A's view.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        assert_eq!(
-            marf.get(&block_c, key).unwrap(),
-            Some(c_val.clone()),
-            "C's view should reflect c_val"
-        );
-        assert_eq!(
-            marf.get(&block_a, key).unwrap(),
-            Some(a_val.clone()),
-            "A's view (now an ancestor of C) should still reflect a_val \
-             — retired-level reads must remain self-consistent"
-        );
-    }
-}
-
-/// **REGRESSION TEST** for the cadence-boundary fork-flip pattern observed at the level-14 squash
-/// on mainnet around block 15000 (nonce-mismatch stall). The shape:
-///
-///   1. The chain reaches a cadence boundary (e.g. height 15000) with a canonical tip A.
-///      Auto-squash absorbs `[range_min..=15000]` with A as canonical.
-///   2. A competing same-height tip B becomes canonical immediately after.
-///   3. `re_squash_level` (Replace) rebuilds the level anchored to B.
-///   4. A child block C (parent = B) is processed. Its txs execute against B's state.
-///
-/// The contract is: every block hash that may be used as a parent later must open to exactly the
-/// same MARF state it opened to before squashing. The test uses two parallel MARFs as parallel
-/// histories:
-///   - the squashed MARF runs the squash + Replace pipeline,
-///   - the unsquashed reference MARF performs the identical workload with no squash, and acts as
-///     the oracle.
-///
-/// **Why value reads, not root-hash reads.** `get_root_hash_at` on a squashed block returns the
-/// trailer's pre-stored `root_hashes[h]`, captured *pre-squash*. Comparing that to the unsquashed
-/// root is tautological by construction. The non-tautological signal is `marf.get(&block_hash,
-/// key)`, which traverses the squashed trie's actual structure (LeafSquashed / value_at_height /
-/// backptrs) to find the leaf. If `collect_history` / remap / rehash produced wrong leaf state,
-/// value reads diverge. We check root_hash too — for blocks outside the squash range (block_c) it's
-/// a real check; for in-range blocks it's a sanity assertion that the trailer matches expectations.
-///
-/// Per Codex's framing: the comparison set is scoped, not "every row in marf_data". We compare the
-/// canonical chain in the squashed range, the same-height sibling A (must remain readable via
-/// retired path), the descendant of the post-Replace canonical (the analog of the 2fa2 child),
-/// and a child/grandchild extending the retired canonical fork. The latter is the level-14
-/// genesis-sync panic shape: a per-block child copied from a retired sidecar root must not strand
-/// inherited pointers that still identify shared ancestors by global block id.
-/// Multiple keys with overlapping transition patterns force the test through
-/// `LeafSquashed::value_at_height` rather than degenerate single-transition leaves.
-fn replace_at_cadence_boundary_preserves_state_roots_with_opts(
-    test_name: &str,
-    open_opts: MARFOpenOpts,
-) {
-    use crate::chainstate::stacks::index::squash::{
-        re_squash_level, squash_level_incremental, SquashMode,
-    };
-
-    let dir = fresh_test_dir(test_name);
-    let squashed_path = format!("{dir}/squashed.sqlite");
-    let unsquashed_path = format!("{dir}/unsquashed.sqlite");
-    let compressed_opts = open_opts.clone();
-
-    let blk = |chr: u8, idx: u32| -> StacksBlockId {
-        let mut bytes = [chr; 32];
-        bytes[28..32].copy_from_slice(&idx.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let block_0 = blk(0xA0, 0);
-    let block_1 = blk(0xA1, 1);
-    let block_2 = blk(0xA2, 2);
-    let block_a = blk(0xAA, 3);
-    let block_b = blk(0xBB, 3);
-    let block_c = blk(0xCC, 4);
-    let block_d = blk(0xDD, 4);
-    let block_e = blk(0xEE, 5);
-    let block_d_commit = blk(0xD1, 4);
-    let block_e_commit = blk(0xE1, 5);
-
-    // Multi-key, multi-transition workload: every canonical block writes the same set of keys with
-    // distinct values, so for any (block, key) pair the expected value is "the value written to
-    // `key` at the most recent ancestor on the chain ending at `block`." This forces the squash
-    // through `LeafSquashed::value_at_height` for keys with multiple in-range transitions,
-    // exercising the actual leaf-encoding logic rather than a single-transition degenerate case.
-    let keys = [
-        "k_shared", "k_pre", "k_a_only", "k_b_only", "k_c_only", "k_d_only", "k_e_only",
-    ];
-    let val = |block: &str, key: &str| MARFValue::from_value(&format!("{block}/{key}"));
-
-    let build_chain = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        // Each commit writes k_shared (every block) plus k_pre (only on pre-tip blocks). This
-        // ensures k_shared has 4 in-range transitions (heights 0..=3) on the canonical chain.
-        let mut commit_with_writes =
-            |parent: &StacksBlockId, child: &StacksBlockId, label: &str, includes: &[&str]| {
-                marf.begin(parent, child).unwrap();
-                for k in includes {
-                    marf.insert(k, val(label, k)).unwrap();
-                }
-                marf.seal().unwrap();
-                marf.commit().unwrap();
-            };
-        commit_with_writes(
-            &StacksBlockId::sentinel(),
-            &block_0,
-            "block_0",
-            &["k_shared", "k_pre"],
-        );
-        commit_with_writes(&block_0, &block_1, "block_1", &["k_shared", "k_pre"]);
-        commit_with_writes(&block_1, &block_2, "block_2", &["k_shared", "k_pre"]);
-        commit_with_writes(&block_2, &block_a, "block_a", &["k_shared", "k_a_only"]);
-    };
-    build_chain(&squashed_path);
-    build_chain(&unsquashed_path);
-
-    // SQUASHED MARF ONLY: squash level 0 covering [0..=3] with A canonical. This is the
-    // "auto-squash at cadence boundary" step that absorbs A as the recorded canonical.
-    squash_level_incremental::<StacksBlockId>(
-        &squashed_path,
-        SquashMode::FullHistory,
-        0,
-        3,
-        /* reclaim = */ true,
-        None,
-    )
-    .expect("initial squash on the squashed MARF");
-
-    // BOTH: commit B as a sibling of A (parent = block_2, height 3).
-    let commit_b = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_2, &block_b).unwrap();
-        marf.insert("k_shared", val("block_b", "k_shared")).unwrap();
-        marf.insert("k_b_only", val("block_b", "k_b_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    };
-    commit_b(&squashed_path);
-    commit_b(&unsquashed_path);
-
-    // SQUASHED MARF ONLY: Replace level 0 anchored to B. This is the "competing same-height tip
-    // wins, recovery rebuilds level" recovery path.
-    re_squash_level::<StacksBlockId>(
-        &squashed_path,
-        /* level_id = */ 0,
-        SquashMode::FullHistory,
-        true,
-        block_b.clone(),
-    )
-    .expect("re_squash_level anchored to B");
-
-    // BOTH: commit C as a child of B (parent = block_b, height 4). This exercises the same code
-    // path as 2fa2's processing in the mainnet 15k stall — child of the post-Replace canonical.
-    let commit_c = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_b, &block_c).unwrap();
-        marf.insert("k_shared", val("block_c", "k_shared")).unwrap();
-        marf.insert("k_c_only", val("block_c", "k_c_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    };
-    commit_c(&squashed_path);
-    commit_c(&unsquashed_path);
-
-    // BOTH: commit D and E on the retired-A fork after Replace (A -> D -> E). This is the
-    // level-14 panic shape: D is a normal per-block child whose root was copied from A's retired
-    // sidecar root. E then extends D and must be able to follow D's inherited pointers back into
-    // the retired blob, even when those pointers originally targeted shared ancestors that also
-    // exist in the new active level.
-    let commit_d = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, compressed_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_a, &block_d).unwrap();
-        marf.insert("k_shared", val("block_d", "k_shared")).unwrap();
-        // k_pre's latest ancestor value is in block_2, which is a shared ancestor present in both
-        // the retired and active squash levels after Replace. Updating it from a child of the
-        // retired canonical exercises compressed patching against an ambiguous inherited pointer.
-        marf.insert("k_pre", val("block_d", "k_pre")).unwrap();
-        marf.insert("k_d_only", val("block_d", "k_d_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit_to(&block_d_commit).unwrap();
-    };
-    commit_d(&squashed_path);
-    commit_d(&unsquashed_path);
-
-    let commit_e = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, compressed_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_d_commit, &block_e).unwrap();
-        marf.insert("k_shared", val("block_e", "k_shared")).unwrap();
-        marf.insert("k_e_only", val("block_e", "k_e_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit_to(&block_e_commit).unwrap();
-    };
-    commit_e(&squashed_path);
-    commit_e(&unsquashed_path);
-
-    // Comparison set: blocks the chain may legitimately read after the Replace. block_a is the
-    // retired canonical (must remain readable via the retired-level path). block_b is the
-    // post-Replace canonical. block_c is the descendant of the post-Replace canonical. block_d and
-    // block_e are descendants of the retired canonical; block_e is the mainnet panic analog where
-    // a grandchild read follows pointers inherited from a child that copied a retired sidecar root.
-    let comparison_set: &[(&str, StacksBlockId)] = &[
-        ("block_0 (canonical, in squash range)", block_0.clone()),
-        ("block_1 (canonical, in squash range)", block_1.clone()),
-        ("block_2 (canonical, in squash range)", block_2.clone()),
-        (
-            "block_a (retired canonical at cadence boundary)",
-            block_a.clone(),
-        ),
-        (
-            "block_b (post-Replace canonical at cadence boundary)",
-            block_b.clone(),
-        ),
-        (
-            "block_c (descendant of post-Replace canonical)",
-            block_c.clone(),
-        ),
-        (
-            "block_d (child of retired canonical)",
-            block_d_commit.clone(),
-        ),
-        (
-            "block_e (grandchild of retired canonical)",
-            block_e_commit.clone(),
-        ),
-    ];
-
-    let mut squashed_marf =
-        MARF::<StacksBlockId>::from_path(&squashed_path, open_opts.clone()).unwrap();
-    squashed_marf.refresh_after_squash().unwrap();
-    let mut unsquashed_marf =
-        MARF::<StacksBlockId>::from_path(&unsquashed_path, open_opts.clone()).unwrap();
-
-    let mut divergences: Vec<String> = Vec::new();
-
-    // Stage 1: root_hash equivalence. For in-range blocks this comes from the trailer's pre-stored
-    // value (tautological with the pre-squash captured root) — kept as a sanity-floor assertion.
-    // For block_c (above-range), the root is computed live from the per-block trie, so a mismatch
-    // there is a real signal.
-    for (label, hash) in comparison_set {
-        let squashed = squashed_marf.get_root_hash_at(hash);
-        let unsquashed = unsquashed_marf.get_root_hash_at(hash);
-        match (squashed, unsquashed) {
-            (Ok(s), Ok(u)) if s == u => {
-                eprintln!("OK  root  {label} ({hash}): root={s}");
-            }
-            (Ok(s), Ok(u)) => divergences.push(format!(
-                "ROOT MISMATCH at {label}\n  block_hash:       {hash}\n  squashed root:    {s}\n  unsquashed root:  {u}"
-            )),
-            (Err(s_err), Ok(u)) => divergences.push(format!(
-                "READ FAILURE on squashed MARF (root) at {label}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed root:  {u}"
-            )),
-            (Ok(s), Err(u_err)) => divergences.push(format!(
-                "READ FAILURE on unsquashed MARF (root) at {label}\n  block_hash:       {hash}\n  squashed root:    {s}\n  unsquashed err:   {u_err:?}"
-            )),
-            (Err(s_err), Err(u_err)) => divergences.push(format!(
-                "BOTH FAILED (root) at {label}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed err:   {u_err:?}"
-            )),
-        }
-    }
-
-    // Stage 2: per-key value equivalence. THIS is the non-tautological signal —
-    // `marf.get(&block_hash, key)` traverses the squashed trie's actual structure
-    // (LeafSquashed::value_at_height, backptrs, height-key resolution) to find the leaf. If
-    // collect_history / remap / rehash produced wrong leaf state for any (block, key) pair, this
-    // loop catches it. The 15k mainnet stall would surface here as a value mismatch (or a NotFound
-    // on a key that should resolve via the squashed view).
-    for (label, hash) in comparison_set {
-        for key in &keys {
-            let squashed = squashed_marf.get(hash, key);
-            let unsquashed = unsquashed_marf.get(hash, key);
-            match (&squashed, &unsquashed) {
-                (Ok(s), Ok(u)) if s == u => {
-                    eprintln!("OK  value {label} key={key:?}: value={s:?}");
-                }
-                (Ok(s), Ok(u)) => divergences.push(format!(
-                    "VALUE MISMATCH at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed value:   {s:?}\n  unsquashed value: {u:?}"
-                )),
-                (Err(s_err), Ok(u)) => divergences.push(format!(
-                    "READ FAILURE on squashed MARF (value) at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed value: {u:?}"
-                )),
-                (Ok(s), Err(u_err)) => divergences.push(format!(
-                    "READ FAILURE on unsquashed MARF (value) at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed value:   {s:?}\n  unsquashed err:   {u_err:?}"
-                )),
-                (Err(s_err), Err(u_err)) => divergences.push(format!(
-                    "BOTH FAILED (value) at {label}, key={key:?}\n  block_hash:       {hash}\n  squashed err:     {s_err:?}\n  unsquashed err:   {u_err:?}"
-                )),
-            }
-        }
-    }
-
-    if !divergences.is_empty() {
-        panic!(
-            "Squashed-vs-unsquashed equivalence failed at {} read(s):\n\n{}",
-            divergences.len(),
-            divergences.join("\n\n")
-        );
-    }
-}
-
-#[test]
-fn test_replace_at_cadence_boundary_preserves_state_roots() {
-    replace_at_cadence_boundary_preserves_state_roots_with_opts(
-        "test_replace_cadence_boundary_state_roots",
-        MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true),
-    );
-}
-
-#[test]
-fn test_replace_at_cadence_boundary_preserves_state_roots_compressed_commit_to() {
-    replace_at_cadence_boundary_preserves_state_roots_with_opts(
-        "test_replace_cadence_boundary_state_roots_compressed",
-        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true),
-    );
-}
-
-/// Regression for the level-14 mainnet panic shape: `begin()` extending a retired-fork
-/// descendant after Replace.
-///
-/// The earlier cadence-boundary tests exercise *reads* (`marf.get`, `get_root_hash_at`) on
-/// retired-fork descendants but not the *write* setup path. The mainnet panic happens during
-/// `MARFedKV::begin` → `clarity_tx_begin` → `MARF::begin`, which calls
-/// [`MARF::extend_trie`] → [`MARF::root_copy`]. `root_copy` reads the parent block's root,
-/// follows whatever Patch/backptr chain it discovers, and writes a fresh root (with COW
-/// pointers) into the new block. If any read along that chain decodes bytes from the wrong
-/// blob, the failure surfaces as `"inner_read_nodetype_at_head: stored empty node type"`.
-///
-/// Setup (compressed `commit_to`, mirroring `test_replace_at_cadence_boundary_*`):
-///   1. Build canonical chain `block_0..=block_a` and squash it.
-///   2. Commit `block_b` as a same-height sibling of `block_a`, then `re_squash_level` anchored
-///      to `block_b`. After this, `block_a` survives only via the retired level; `block_b` is
-///      the new active canonical at the cadence boundary.
-///   3. Commit `block_c` extending the post-Replace canonical, plus `block_d_commit` and
-///      `block_e_commit` extending the retired canonical (compressed `commit_to`).
-///   4. Now extend each comparison block by calling `marf.begin(parent, new_child)` —
-///      especially `block_e_commit`, the retired-fork grandchild whose patch chain crosses
-///      heights ambiguously canonical between active and retired levels.
-///
-/// Each `begin()` triggers `root_copy` which walks the parent's root through
-/// [`read_patched_persisted_node`]. Any routing bug between the source's level and an
-/// ambiguous backptr target manifests here as a `CorruptionError`.
-#[test]
-fn test_replace_at_cadence_boundary_begin_extends_retired_fork_descendant_compressed() {
-    use crate::chainstate::stacks::index::squash::{
-        re_squash_level, squash_level_incremental, SquashMode,
-    };
-
-    let dir = fresh_test_dir("test_replace_cadence_begin_retired_fork_descendant");
-    let squashed_path = format!("{dir}/squashed.sqlite");
-    let unsquashed_path = format!("{dir}/unsquashed.sqlite");
-    let open_opts =
-        MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true).with_compression(true);
-
-    let blk = |chr: u8, idx: u32| -> StacksBlockId {
-        let mut bytes = [chr; 32];
-        bytes[28..32].copy_from_slice(&idx.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let block_0 = blk(0xA0, 0);
-    let block_1 = blk(0xA1, 1);
-    let block_2 = blk(0xA2, 2);
-    let block_a = blk(0xAA, 3);
-    let block_b = blk(0xBB, 3);
-    let block_c = blk(0xCC, 4);
-    let block_d_tmp = blk(0xDD, 4);
-    let block_d_commit = blk(0xD1, 4);
-    let block_e_tmp = blk(0xEE, 5);
-    let block_e_commit = blk(0xE1, 5);
-
-    let val = |block: &str, key: &str| MARFValue::from_value(&format!("{block}/{key}"));
-
-    let build_chain = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        let mut commit_with_writes =
-            |parent: &StacksBlockId, child: &StacksBlockId, label: &str, includes: &[&str]| {
-                marf.begin(parent, child).unwrap();
-                for k in includes {
-                    marf.insert(k, val(label, k)).unwrap();
-                }
-                marf.seal().unwrap();
-                marf.commit().unwrap();
-            };
-        commit_with_writes(
-            &StacksBlockId::sentinel(),
-            &block_0,
-            "block_0",
-            &["k_shared", "k_pre"],
-        );
-        commit_with_writes(&block_0, &block_1, "block_1", &["k_shared", "k_pre"]);
-        commit_with_writes(&block_1, &block_2, "block_2", &["k_shared", "k_pre"]);
-        commit_with_writes(&block_2, &block_a, "block_a", &["k_shared", "k_a_only"]);
-    };
-    build_chain(&squashed_path);
-    build_chain(&unsquashed_path);
-
-    // SQUASHED: initial squash level 0 [0..=3] with block_a canonical.
-    squash_level_incremental::<StacksBlockId>(
-        &squashed_path,
-        SquashMode::FullHistory,
-        0,
-        3,
-        true,
-        None,
-    )
-    .expect("initial squash");
-
-    // BOTH: commit block_b (sibling of block_a, parent = block_2).
-    let commit_b = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_2, &block_b).unwrap();
-        marf.insert("k_shared", val("block_b", "k_shared")).unwrap();
-        marf.insert("k_b_only", val("block_b", "k_b_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    };
-    commit_b(&squashed_path);
-    commit_b(&unsquashed_path);
-
-    // SQUASHED: Replace level 0 anchored on block_b, retiring block_a's canonical.
-    re_squash_level::<StacksBlockId>(
-        &squashed_path,
-        0,
-        SquashMode::FullHistory,
-        true,
-        block_b.clone(),
-    )
-    .expect("Replace anchored to block_b");
-
-    // BOTH: commit block_c extending the post-Replace canonical.
-    let commit_c = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_b, &block_c).unwrap();
-        marf.insert("k_shared", val("block_c", "k_shared")).unwrap();
-        marf.insert("k_c_only", val("block_c", "k_c_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    };
-    commit_c(&squashed_path);
-    commit_c(&unsquashed_path);
-
-    // BOTH: commit block_d_commit extending block_a (retired canonical) via compressed
-    // commit_to. block_d_commit's per-block trie inherits the retired sidecar root.
-    let commit_d = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_a, &block_d_tmp).unwrap();
-        marf.insert("k_shared", val("block_d", "k_shared")).unwrap();
-        marf.insert("k_pre", val("block_d", "k_pre")).unwrap();
-        marf.insert("k_d_only", val("block_d", "k_d_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit_to(&block_d_commit).unwrap();
-    };
-    commit_d(&squashed_path);
-    commit_d(&unsquashed_path);
-
-    // BOTH: commit block_e_commit extending block_d_commit (retired-fork grandchild).
-    let commit_e = |path: &str| {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        marf.begin(&block_d_commit, &block_e_tmp).unwrap();
-        marf.insert("k_shared", val("block_e", "k_shared")).unwrap();
-        marf.insert("k_e_only", val("block_e", "k_e_only")).unwrap();
-        marf.seal().unwrap();
-        marf.commit_to(&block_e_commit).unwrap();
-    };
-    commit_e(&squashed_path);
-    commit_e(&unsquashed_path);
-
-    // ─── The actual regression check ───────────────────────────────────────────
-    //
-    // For each parent block in the comparison set, call `begin(parent, new_child)` and
-    // assert the underlying root_copy of the parent's state succeeds. This is what
-    // setup_block / inner_clarity_tx_begin / MARFedKV::begin does on every Stacks block
-    // that gets processed; the mainnet panic surfaces here.
-    //
-    // The retired-fork descendants (`block_d_commit`, `block_e_commit`) are the load-
-    // bearing cases — their patch chains touch ambiguous shared ancestors (`block_2` and
-    // earlier) that exist in both the retired and active level trailers, so the
-    // patch_source_context routing in `read_patched_persisted_node` must keep all reads
-    // anchored to the retired level's blob/sidecar.
-    let extension_set: &[(&str, StacksBlockId, StacksBlockId)] = &[
-        (
-            "begin extending block_a (retired canonical at boundary)",
-            block_a.clone(),
-            blk(0xF1, 4),
-        ),
-        (
-            "begin extending block_b (post-Replace canonical at boundary)",
-            block_b.clone(),
-            blk(0xF2, 4),
-        ),
-        (
-            "begin extending block_c (descendant of post-Replace canonical)",
-            block_c.clone(),
-            blk(0xF3, 5),
-        ),
-        (
-            "begin extending block_d_commit (child of retired canonical)",
-            block_d_commit.clone(),
-            blk(0xF4, 5),
-        ),
-        (
-            "begin extending block_e_commit (grandchild of retired canonical)",
-            block_e_commit.clone(),
-            blk(0xF5, 6),
-        ),
-    ];
-
-    let mut failures: Vec<String> = Vec::new();
-    for (label, parent, child) in extension_set {
-        let mut squashed_marf =
-            MARF::<StacksBlockId>::from_path(&squashed_path, open_opts.clone()).unwrap();
-        squashed_marf.refresh_after_squash().unwrap();
-        let mut unsquashed_marf =
-            MARF::<StacksBlockId>::from_path(&unsquashed_path, open_opts.clone()).unwrap();
-
-        let sq_result = squashed_marf.begin(parent, child);
-        let un_result = unsquashed_marf.begin(parent, child);
-
-        match (&sq_result, &un_result) {
-            (Ok(_), Ok(_)) => {
-                eprintln!("OK  begin {label}");
-            }
-            (Err(s), Ok(_)) => failures.push(format!(
-                "BEGIN FAILURE on squashed MARF: {label}\n  parent: {parent}\n  child:  {child}\n  squashed err:   {s:?}",
-            )),
-            (Ok(_), Err(u)) => failures.push(format!(
-                "BEGIN FAILURE on unsquashed MARF (reference): {label}\n  parent: {parent}\n  child:  {child}\n  unsquashed err: {u:?}",
-            )),
-            (Err(s), Err(u)) => failures.push(format!(
-                "BOTH FAILED to begin: {label}\n  parent: {parent}\n  child:  {child}\n  squashed err:   {s:?}\n  unsquashed err: {u:?}",
-            )),
-        }
-    }
-
-    if !failures.is_empty() {
-        panic!(
-            "begin() extension failed for {} parent block(s):\n\n{}",
-            failures.len(),
-            failures.join("\n\n")
-        );
-    }
-}
-
-/// **REGRESSION TEST** for the intra-range-backpointer corruption error observed during
-/// re_squash_level on a fresh genesis sync at level 11 (commit log: "Backpointer target at height
-/// 10663 is in a squash level but within the range being squashed").
-///
-/// The earlier `test_re_squash_level_recovers_post_reorg_canonical` test only covers heights 0..=1,
-/// where the canonical chain is too short for any intra-range backpointers to fire. Real chains
-/// have backpointer chains that cross many heights inside a single squash level — when
-/// re-squashing, the DFS from the new canonical's tip walks those backpointers, and the targets
-/// land in the level being replaced (which is still active during the build). The Append-mode
-/// invariant "blocks in the range being squashed are per-block blobs, not in any squash level" was
-/// being enforced unconditionally and would surface as `CorruptionError("Backpointer target at
-/// height H is in a squash level but within the range being squashed")` on any non-trivial chain.
-///
-/// What this test exercises:
-///   * A 5-block canonical chain (heights 0..=4) with shared keys overwritten at every block — the
-///     resulting MARF has backpointers at every height, hitting every intra-range height during
-///     re-squash DFS.
-///   * Squash heights 0..=4 with the original tip as canonical.
-///   * Commit a sibling B at height 4 (parent = canonical at height 3).
-///   * Re-squash level 0; the DFS from B's tip walks backpointers through heights 3, 2, 1, 0 —
-///     every one of which is in the level being replaced. With the Replace-aware branch in the
-///     cross-level check, this completes successfully.
-///   * Verify reads via B return B's value, confirming the re-squash captured the new canonical
-///     correctly even with deep backpointer traversal through the old level.
-#[test]
-fn test_re_squash_level_handles_deep_intra_range_backpointers() {
-    use crate::chainstate::stacks::index::squash::{
-        re_squash_level, squash_level_incremental, SquashMode,
-    };
-
-    let dir = fresh_test_dir("test_re_squash_deep_backpointers");
-    let path = format!("{dir}/marf.sqlite");
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-
-    const NUM_HEIGHTS: u32 = 5;
-    let make_block = |chr: u8, idx: u32| -> StacksBlockId {
-        let mut bytes = [chr; 32];
-        bytes[28..32].copy_from_slice(&idx.to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    // Canonical chain at squash time: blocks A_0..A_4. shared_key overwritten
-    // every block to force backpointer chains across all heights.
-    let canonical: Vec<StacksBlockId> = (0..NUM_HEIGHTS).map(|i| make_block(0xAA, i + 1)).collect();
-    let key_shared = "shared";
-    let key_per_height = |h: u32| format!("k_{h}");
-
-    // Phase 1: build canonical chain.
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        for (i, block) in canonical.iter().enumerate() {
-            let parent = if i == 0 {
-                StacksBlockId::sentinel()
-            } else {
-                canonical[i - 1].clone()
-            };
-            marf.begin(&parent, block).unwrap();
-            marf.insert(key_shared, MARFValue::from_value(&format!("a_h{i}")))
-                .unwrap();
-            marf.insert(
-                &key_per_height(i as u32),
-                MARFValue::from_value(&format!("h{i}_unique")),
-            )
-            .unwrap();
-            marf.seal().unwrap();
-            marf.commit().unwrap();
-        }
-    }
-
-    // Phase 2: squash level 0 covering [0..=NUM_HEIGHTS-1].
-    squash_level_incremental::<StacksBlockId>(
-        &path,
-        SquashMode::FullHistory,
-        0,
-        NUM_HEIGHTS - 1,
-        true,
-        None,
-    )
-    .expect("initial squash should succeed");
-
-    // Phase 3: commit sibling B at the tip height (parent = canonical at
-    // height NUM_HEIGHTS-2). This puts B's per-block blob in the active
-    // region with every prior height inside the squash level.
-    let block_b = make_block(0xBB, NUM_HEIGHTS);
-    {
-        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-        marf.refresh_after_squash().unwrap();
-        let parent = canonical[(NUM_HEIGHTS - 2) as usize].clone();
-        marf.begin(&parent, &block_b).unwrap();
-        marf.insert(key_shared, MARFValue::from_value("b_tip"))
-            .unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-    }
-
-    // Phase 4: re_squash_level should NOT fail with the
-    // "Backpointer target at height H is in a squash level" corruption
-    // error. The DFS from B's tip walks backpointers across heights
-    // NUM_HEIGHTS-2, NUM_HEIGHTS-3, ..., 0 — every one is in level 0.
-    re_squash_level::<StacksBlockId>(
-        &path,
-        /* level_id = */ 0,
-        SquashMode::FullHistory,
-        true,
-        block_b.clone(),
-    )
-    .expect(
-        "re_squash_level must handle backpointers into the level being \
-             replaced; failure here means the cross-level check at \
-             squash.rs:2861 didn't allow Replace-mode intra-range targets",
-    );
-
-    // Phase 5: verify the post-recovery layout.
-    let marf_check = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-    let canonical_chain = marf_check
-        .latest_squash_level_canonical_chain()
-        .expect("level 0 present after re-squash");
-    assert_eq!(canonical_chain.level_id, 0);
-    assert_eq!(canonical_chain.min_height, 0);
-    assert_eq!(canonical_chain.max_height, NUM_HEIGHTS - 1);
-    assert_eq!(
-        canonical_chain.block_hashes[(NUM_HEIGHTS - 1) as usize],
-        block_b,
-        "B is now canonical at the tip height after re-squash"
-    );
-    // Heights 0..=NUM_HEIGHTS-2 are unchanged (they're shared by both
-    // canonical chains since B forks from canonical at NUM_HEIGHTS-2).
-    for i in 0..(NUM_HEIGHTS - 1) {
-        assert_eq!(
-            canonical_chain.block_hashes[i as usize], canonical[i as usize],
-            "heights below the fork point are unchanged: height {i}",
-        );
-    }
-    drop(marf_check);
-
-    // Phase 6: verify reads through B return B's writes (and inherit
-    // ancestor values from before the fork point).
-    let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
-    marf.refresh_after_squash().unwrap();
-    assert_eq!(
-        marf.get(&block_b, key_shared).unwrap(),
-        Some(MARFValue::from_value("b_tip")),
-        "reads via B's tip return B's overwrite of shared_key"
-    );
-    // Per-height keys from before the fork point are inherited from the
-    // canonical chain (B doesn't rewrite them).
-    for i in 0..(NUM_HEIGHTS - 1) {
-        assert_eq!(
-            marf.get(&block_b, &key_per_height(i)).unwrap(),
-            Some(MARFValue::from_value(&format!("h{i}_unique"))),
-            "B inherits per-height key from canonical at height {i}",
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12075,7 +10142,11 @@ fn test_published_max_block_id_set_at_squash_publish() {
     // Reopen and read the level row's watermark column.
     let conn = rusqlite::Connection::open(&marf_path).unwrap();
     let levels = trie_sql::read_squash_levels(&conn).expect("read_squash_levels");
-    assert_eq!(levels.len(), 1, "exactly one active level after first squash");
+    assert_eq!(
+        levels.len(),
+        1,
+        "exactly one active level after first squash"
+    );
     let level = &levels[0];
     assert_eq!(
         level.published_max_block_id, pre_squash_max,
@@ -12119,200 +10190,6 @@ fn test_published_max_block_id_set_at_stub_create() {
         "stub watermark should match publish-time MAX(block_id) so the next stats \
          reconstruction starts from the right rowid"
     );
-}
-
-/// Direct exercise of the v3 -> v4 migration branch in
-/// `migrate_tables_if_needed`: build a SQLite DB with v3 schema (no
-/// `published_max_block_id`), insert a row in the legacy column shape, run the
-/// migration, and verify the column was added with default 0 and
-/// `read_squash_levels` returns it cleanly. Without this, the migration code
-/// only gets exercised indirectly when an out-of-tree v3 DB is opened — a
-/// deployment scenario the unit suite otherwise doesn't cover.
-#[test]
-fn test_migrate_v3_to_v4_adds_published_max_block_id_default_zero() {
-    use crate::chainstate::stacks::index::trie_sql;
-
-    let test_dir = fresh_test_dir("test_migrate_v3_to_v4_adds_published_max_block_id_default_zero");
-    let db_path = format!("{test_dir}/v3.sqlite");
-
-    // Hand-build a v3-shaped DB:
-    //   - schema_version + migrated_version tables at version=3
-    //   - `marf_data` with v2 columns (so trie_sql migration doesn't try to
-    //     re-add them)
-    //   - `marf_squash_levels` at v3 (no `published_max_block_id`)
-    // Mirroring `SQL_MARF_DATA_TABLE` and `SQL_MARF_DATA_TABLE_SCHEMA_3`.
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE marf_data (
-             block_id INTEGER PRIMARY KEY AUTOINCREMENT,
-             block_hash TEXT UNIQUE NOT NULL,
-             data BLOB NOT NULL,
-             unconfirmed INTEGER NOT NULL,
-             external_offset INTEGER DEFAULT 0 NOT NULL,
-             external_length INTEGER DEFAULT 0 NOT NULL
-         );
-         CREATE TABLE schema_version (version INTEGER DEFAULT 1 NOT NULL);
-         CREATE TABLE migrated_version (version INTEGER DEFAULT 1 NOT NULL);
-         CREATE TABLE marf_squash_levels (
-             level_id INTEGER PRIMARY KEY,
-             min_height INTEGER NOT NULL,
-             max_height INTEGER NOT NULL,
-             blob_offset INTEGER NOT NULL,
-             blob_length INTEGER NOT NULL,
-             reads_redirected INTEGER NOT NULL DEFAULT 0,
-             root_sidecar_present INTEGER NOT NULL DEFAULT 0,
-             root_sidecar_trimmed INTEGER NOT NULL DEFAULT 0,
-             orphan_split_offset INTEGER NOT NULL DEFAULT 0
-         );
-         INSERT INTO schema_version (version) VALUES (3);
-         INSERT INTO migrated_version (version) VALUES (3);",
-    )
-    .unwrap();
-
-    // Simulate a pre-existing squash row written under v3.
-    conn.execute(
-        "INSERT INTO marf_squash_levels \
-         (level_id, min_height, max_height, blob_offset, blob_length, \
-          reads_redirected, root_sidecar_present, root_sidecar_trimmed, \
-          orphan_split_offset) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        rusqlite::params![7i64, 100i64, 199i64, 4096i64, 16384i64, 1i64, 1i64, 0i64, 0i64],
-    )
-    .unwrap();
-    drop(conn);
-
-    // Run the public migration. v3 is now -> v4.
-    let mut conn = rusqlite::Connection::open(&db_path).unwrap();
-    let prior_version =
-        trie_sql::migrate_tables_if_needed::<StacksBlockId>(&mut conn).expect("migration must succeed");
-    assert_eq!(prior_version, 3, "test setup expected to start at v3");
-
-    // The new column exists, default 0 is applied to the pre-existing row, and
-    // `read_squash_levels` returns it without erroring.
-    let levels = trie_sql::read_squash_levels(&conn).expect("read_squash_levels post-migration");
-    assert_eq!(levels.len(), 1);
-    let level = &levels[0];
-    assert_eq!(level.level_id, 7);
-    assert_eq!(level.min_height, 100);
-    assert_eq!(level.max_height, 199);
-    assert_eq!(
-        level.published_max_block_id, 0,
-        "v3 rows must default to 0 after migration; the next squash overwrites with a real watermark"
-    );
-
-    // Idempotent: a second migration call is a no-op (still v4) and the row
-    // is unchanged.
-    let prior_version_2 =
-        trie_sql::migrate_tables_if_needed::<StacksBlockId>(&mut conn).expect("idempotent migration");
-    assert_eq!(prior_version_2, trie_sql::SQL_MARF_SCHEMA_VERSION);
-    let levels_after = trie_sql::read_squash_levels(&conn).unwrap();
-    assert_eq!(levels_after.len(), 1);
-    assert_eq!(levels_after[0].published_max_block_id, 0);
-}
-
-/// Replace publish (`re_squash_level`): the retired row inherits the OLD
-/// active row's `published_max_block_id` verbatim, and the new active row
-/// captures a fresh publish-time `MAX(block_id)` (which is `>=` the old
-/// watermark since rowids are monotonic).
-#[test]
-fn test_published_max_block_id_replace_inherits_old_and_writes_fresh() {
-    use crate::chainstate::stacks::index::squash::{re_squash_level, squash_level_incremental};
-    use crate::chainstate::stacks::index::trie_sql;
-
-    let test_dir =
-        fresh_test_dir("test_published_max_block_id_replace_inherits_old_and_writes_fresh");
-    let marf_path = format!("{test_dir}/marf.sqlite");
-
-    // Phase 1: build a chain and run an initial squash to create level 0.
-    let l0_blocks = 4;
-    let (src_marf, blocks_l0, _) = setup_squash_source_marf(&marf_path, l0_blocks, 2);
-    drop(src_marf);
-
-    let pre_l0_squash_max = {
-        let conn = rusqlite::Connection::open(&marf_path).unwrap();
-        trie_sql::current_published_max_block_id(&conn).unwrap()
-    };
-
-    squash_level_incremental::<StacksBlockId>(
-        &marf_path,
-        SquashMode::TipOnly,
-        0,
-        (l0_blocks - 1) as u32,
-        /* reclaim = */ true,
-        None,
-    )
-    .expect("initial squash");
-
-    // Read level 0 and capture the watermark we expect the retired row to
-    // inherit on Replace.
-    let original_l0_watermark = {
-        let conn = rusqlite::Connection::open(&marf_path).unwrap();
-        let levels = trie_sql::read_squash_levels(&conn).unwrap();
-        assert_eq!(levels.len(), 1);
-        assert_eq!(levels[0].published_max_block_id, pre_l0_squash_max);
-        levels[0].published_max_block_id
-    };
-
-    // Phase 2: commit a sibling block within the level's height range so
-    // `MAX(block_id)` advances past `original_l0_watermark` *without*
-    // tripping Replace's "no commits above max_height" safety check (a
-    // sibling shares its parent's height + 1, which here lands inside the
-    // squashed range, so `block_height <= max_height` and the check passes).
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
-    let tip_l0 = blocks_l0[l0_blocks - 1].clone();
-    // Use a parent that's a non-tip ancestor (height = l0_blocks - 2), so the
-    // sibling lands at `l0_blocks - 1 = max_height`, still in the level.
-    let sibling_parent = blocks_l0[l0_blocks - 2].clone();
-    let sibling = {
-        let mut bytes = [0xEEu8; 32];
-        bytes[28..32].copy_from_slice(&((l0_blocks as u32) + 1).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    marf.begin(&sibling_parent, &sibling).unwrap();
-    marf.insert("k_sibling", MARFValue::from_value("v_sibling"))
-        .unwrap();
-    marf.seal().unwrap();
-    marf.commit().unwrap();
-    drop(marf);
-
-    let pre_replace_max = {
-        let conn = rusqlite::Connection::open(&marf_path).unwrap();
-        trie_sql::current_published_max_block_id(&conn).unwrap()
-    };
-    assert!(
-        pre_replace_max > original_l0_watermark,
-        "sibling commit must advance MAX(block_id) for the freshness check to be meaningful"
-    );
-
-    // Phase 3: Replace level 0, anchored to the original L0 tip (still
-    // canonical-correct for level 0's range).
-    re_squash_level::<StacksBlockId>(
-        &marf_path,
-        /* level_id = */ 0,
-        SquashMode::TipOnly,
-        /* reclaim = */ true,
-        tip_l0.clone(),
-    )
-    .expect("Replace should succeed");
-
-    // The retired row carries the OLD watermark; the new active row carries
-    // a fresh measurement.
-    let conn = rusqlite::Connection::open(&marf_path).unwrap();
-    let active = trie_sql::read_squash_levels(&conn).unwrap();
-    assert_eq!(active.len(), 1, "still one active row after Replace");
-    assert_eq!(
-        active[0].published_max_block_id, pre_replace_max,
-        "new active row's watermark = publish-time MAX(block_id) at Replace"
-    );
-
-    let retired = trie_sql::read_retired_squash_levels(&conn).unwrap();
-    assert_eq!(retired.len(), 1, "one retired row after Replace");
-    assert_eq!(
-        retired[0].published_max_block_id, original_l0_watermark,
-        "retired row inherits the OLD active row's watermark verbatim"
-    );
-    assert_eq!(retired[0].original_level_id, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -12422,115 +10299,6 @@ fn test_marf_squash_method_equivalence() {
         blob_a, blob_b,
         "merged blob bytes differ between path-based and live-handle squash"
     );
-}
-
-/// Equivalence test for the Replace path: build identical L0 + sibling-commit
-/// state in two MARFs, then run `re_squash_level` on one and `MARF::re_squash`
-/// on the other. Outputs must match byte-for-byte.
-#[test]
-fn test_marf_re_squash_method_equivalence() {
-    use crate::chainstate::stacks::index::squash::{
-        re_squash_level, squash_level_incremental, SquashLevelRow,
-    };
-    use crate::chainstate::stacks::index::trie_sql;
-
-    let test_dir = fresh_test_dir("test_marf_re_squash_method_equivalence");
-    let path_a = format!("{test_dir}/path_based.sqlite");
-    let path_b = format!("{test_dir}/live_handle.sqlite");
-
-    let l0_blocks = 4;
-    let keys_per_block = 2;
-
-    // Build matching baseline + initial squash on each DB.
-    for path in [&path_a, &path_b] {
-        let (m, _, _) = setup_squash_source_marf(path, l0_blocks, keys_per_block);
-        drop(m);
-        squash_level_incremental::<StacksBlockId>(
-            path,
-            SquashMode::TipOnly,
-            0,
-            (l0_blocks - 1) as u32,
-            true,
-            None,
-        )
-        .expect("initial squash");
-    }
-
-    // Add an identical sibling commit on each so MAX(block_id) advances.
-    // `setup_squash_source_marf` builds blocks at heights 0..(num_blocks-1)
-    // with hash last-4-bytes = i+1, so block at height h has last_4 = h+1.
-    // Sibling parent sits at height (l0_blocks - 2) so the sibling itself
-    // lands at height (l0_blocks - 1) = max_height — inside the squash range,
-    // therefore not above-level and Replace's safety check still permits it.
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-    let sibling_parent = {
-        let mut bytes = [0u8; 32];
-        // height (l0_blocks - 2): last_4 = (l0_blocks - 2) + 1 = l0_blocks - 1
-        bytes[28..32].copy_from_slice(&((l0_blocks - 1) as u32).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    let sibling = {
-        let mut bytes = [0xEEu8; 32];
-        bytes[28..32].copy_from_slice(&((l0_blocks as u32) + 1).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-    for path in [&path_a, &path_b] {
-        let mut marf = MARF::<StacksBlockId>::from_path(path, open_opts.clone()).unwrap();
-        marf.begin(&sibling_parent, &sibling).unwrap();
-        marf.insert("k_sibling", MARFValue::from_value("v_sibling"))
-            .unwrap();
-        marf.seal().unwrap();
-        marf.commit().unwrap();
-        drop(marf);
-    }
-
-    // Recovery anchors against the original L0 tip — the canonical block at
-    // `max_height = l0_blocks - 1`, whose hash has last_4 = l0_blocks.
-    let canonical_tip = {
-        let mut bytes = [0u8; 32];
-        bytes[28..32].copy_from_slice(&(l0_blocks as u32).to_be_bytes());
-        StacksBlockId::from_bytes(&bytes).unwrap()
-    };
-
-    // Path-based Replace.
-    re_squash_level::<StacksBlockId>(
-        &path_a,
-        /* level_id = */ 0,
-        SquashMode::TipOnly,
-        true,
-        canonical_tip.clone(),
-    )
-    .expect("path-based re_squash");
-
-    // Live-handle Replace.
-    let mut marf_b = MARF::<StacksBlockId>::from_path(&path_b, open_opts).unwrap();
-    marf_b
-        .re_squash(0, SquashMode::TipOnly, true, canonical_tip)
-        .expect("live-handle re_squash");
-    drop(marf_b);
-
-    // Compare active + retired rows + merged blob.
-    let conn_a = rusqlite::Connection::open(&path_a).unwrap();
-    let conn_b = rusqlite::Connection::open(&path_b).unwrap();
-    let active_a: Vec<SquashLevelRow> = trie_sql::read_squash_levels(&conn_a).unwrap();
-    let active_b: Vec<SquashLevelRow> = trie_sql::read_squash_levels(&conn_b).unwrap();
-    assert_squash_levels_equivalent(&active_a, &active_b);
-
-    let retired_a = trie_sql::read_retired_squash_levels(&conn_a).unwrap();
-    let retired_b = trie_sql::read_retired_squash_levels(&conn_b).unwrap();
-    assert_eq!(retired_a.len(), 1);
-    assert_eq!(retired_a.len(), retired_b.len());
-    assert_eq!(
-        retired_a[0].published_max_block_id, retired_b[0].published_max_block_id,
-        "retired watermarks differ"
-    );
-    assert_eq!(retired_a[0].blob_offset, retired_b[0].blob_offset);
-    assert_eq!(retired_a[0].blob_length, retired_b[0].blob_length);
-
-    let blob_a = read_blob_file(&path_a);
-    let blob_b = read_blob_file(&path_b);
-    assert_eq!(blob_a.len(), blob_b.len(), "Replace blob lengths differ");
-    assert_eq!(blob_a, blob_b, "Replace blob bytes differ");
 }
 
 /// Live-handle squash refuses to run while a block-write transaction is in
@@ -12664,7 +10432,8 @@ fn test_marf_stats_reconstructed_on_open() {
         bytes[28..32].copy_from_slice(&((l0_blocks as u32) + i as u32 + 1).to_be_bytes());
         let next = StacksBlockId::from_bytes(&bytes).unwrap();
         marf.begin(&prev, &next).unwrap();
-        marf.insert("k", MARFValue::from_value(&format!("v{i}"))).unwrap();
+        marf.insert("k", MARFValue::from_value(&format!("v{i}")))
+            .unwrap();
         marf.seal().unwrap();
         marf.commit().unwrap();
         prev = next;
@@ -12680,7 +10449,10 @@ fn test_marf_stats_reconstructed_on_open() {
         trie_sql::current_external_bytes_since_last_squash(&conn).unwrap()
     };
     assert!(in_memory > 0, "extra commits must register in the counter");
-    assert_eq!(in_memory, sql_total, "reopen-reconstructed counter must equal SQL truth");
+    assert_eq!(
+        in_memory, sql_total,
+        "reopen-reconstructed counter must equal SQL truth"
+    );
 }
 
 /// `MARF::stats()` on a peer / reopened handle resyncs to the post-publish
@@ -12759,7 +10531,8 @@ fn test_marf_stats_skips_mined_table_writes() {
         StacksBlockId::from_bytes(&bytes).unwrap()
     };
     marf.begin(&blocks[num_blocks - 1], &opened_bhh).unwrap();
-    marf.insert("mined_key", MARFValue::from_value("v_mined")).unwrap();
+    marf.insert("mined_key", MARFValue::from_value("v_mined"))
+        .unwrap();
     marf.seal().unwrap();
     marf.commit_mined(&real_mined_bhh).unwrap();
 
@@ -12770,7 +10543,6 @@ fn test_marf_stats_skips_mined_table_writes() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // Sidecar retention overhaul (Step 5): trim decoupling + block-count semantics
 // ---------------------------------------------------------------------------
@@ -12778,11 +10550,7 @@ fn test_marf_stats_skips_mined_table_writes() {
 /// Helper: build N levels of `span` blocks each by interleaving commit +
 /// squash. `squash_level_incremental` requires `max_height` to be the chain
 /// tip, so each level's commits happen immediately before its squash.
-fn build_n_squash_levels(
-    marf_path: &str,
-    n_levels: u32,
-    span: u32,
-) -> Vec<StacksBlockId> {
+fn build_n_squash_levels(marf_path: &str, n_levels: u32, span: u32) -> Vec<StacksBlockId> {
     use crate::chainstate::stacks::index::squash::squash_level_incremental;
 
     let total = (n_levels * span) as usize;
@@ -12803,7 +10571,8 @@ fn build_n_squash_levels(
             let mut marf = MARF::<StacksBlockId>::from_path(marf_path, open_opts.clone()).unwrap();
             for h in lo..=hi {
                 marf.begin(&parent, &blocks[h as usize]).unwrap();
-                marf.insert("k", MARFValue::from_value(&format!("v{h}"))).unwrap();
+                marf.insert("k", MARFValue::from_value(&format!("v{h}")))
+                    .unwrap();
                 marf.seal().unwrap();
                 marf.commit().unwrap();
                 parent = blocks[h as usize].clone();
@@ -12844,51 +10613,15 @@ fn test_squash_does_not_implicitly_trim_sidecars() {
     let levels = trie_sql::read_squash_levels(&conn).unwrap();
     assert_eq!(levels.len(), 3);
     for (idx, row) in levels.iter().enumerate() {
-        assert!(row.root_sidecar_present, "level {idx}: sidecar should be present");
-        assert!(!row.root_sidecar_trimmed, "level {idx}: sidecar should NOT be trimmed (no implicit trim)");
+        assert!(
+            row.root_sidecar_present,
+            "level {idx}: sidecar should be present"
+        );
+        assert!(
+            !row.root_sidecar_trimmed,
+            "level {idx}: sidecar should NOT be trimmed (no implicit trim)"
+        );
     }
-}
-
-/// Same property for the Replace path: `MARF::re_squash` must not
-/// collaterally trim — recovery often runs *because* of a Bitcoin reorg,
-/// exactly when retained sidecars are most valuable.
-#[test]
-fn test_re_squash_does_not_implicitly_trim_sidecars() {
-    use crate::chainstate::stacks::index::squash::squash_level_incremental;
-    use crate::chainstate::stacks::index::trie_sql;
-
-    let test_dir = fresh_test_dir("test_re_squash_does_not_implicitly_trim_sidecars");
-    let marf_path = format!("{test_dir}/marf.sqlite");
-
-    // Build + initial squash of 4 blocks.
-    let l0_blocks = 4;
-    let (m, blocks_l0, _) = setup_squash_source_marf(&marf_path, l0_blocks, 1);
-    drop(m);
-    squash_level_incremental::<StacksBlockId>(
-        &marf_path,
-        SquashMode::TipOnly,
-        0,
-        (l0_blocks - 1) as u32,
-        true,
-        None,
-    )
-    .expect("initial squash");
-
-    // Re-squash on the same canonical tip via the live-handle method.
-    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
-    let mut marf = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
-    marf.re_squash(0, SquashMode::TipOnly, true, blocks_l0[l0_blocks - 1].clone())
-        .expect("re_squash should succeed");
-    drop(marf);
-
-    let conn = rusqlite::Connection::open(&marf_path).unwrap();
-    let levels = trie_sql::read_squash_levels(&conn).unwrap();
-    assert_eq!(levels.len(), 1);
-    assert!(levels[0].root_sidecar_present);
-    assert!(
-        !levels[0].root_sidecar_trimmed,
-        "re_squash must not implicitly trim — recovery preserves retained sidecars"
-    );
 }
 
 /// `trim_sidecars` is idempotent: running it twice in succession with the
@@ -12916,7 +10649,10 @@ fn test_trim_sidecars_idempotent() {
     let mut marf2 = MARF::<StacksBlockId>::from_path(&marf_path, open_opts).unwrap();
     let second = marf2.trim_sidecars(span).expect("second trim");
     assert_eq!(second.levels_trimmed, 0, "idempotent: nothing new to trim");
-    assert_eq!(second.already_trimmed, 2, "previously-trimmed levels reported as such");
+    assert_eq!(
+        second.already_trimmed, 2,
+        "previously-trimmed levels reported as such"
+    );
 }
 
 /// `resolve_retention_blocks` precedence:
@@ -12978,7 +10714,10 @@ fn test_provides_fork_extension_predicate() {
         blob_length: 0,
         ..real.clone()
     };
-    assert!(!stub.provides_fork_extension(), "stub levels (blob_length=0) excluded");
+    assert!(
+        !stub.provides_fork_extension(),
+        "stub levels (blob_length=0) excluded"
+    );
 
     let no_reclaim = SquashLevelRow {
         reads_redirected: false,
