@@ -873,7 +873,7 @@ impl ConsensusChain<'_> {
             })
             .map_err(|e| e.to_string())?;
 
-        StacksChainState::process_block_transactions(clarity_tx, block_txs, 0)
+        StacksChainState::process_block_transactions(clarity_tx, block_txs, 0, None)
             .map_err(|e| e.to_string())?;
 
         NakamotoChainState::finish_block(clarity_tx, None, false, burn_header_height)

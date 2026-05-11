@@ -293,6 +293,7 @@ impl UnconfirmedState {
                     match StacksChainState::process_microblocks_transactions(
                         &mut clarity_tx,
                         &[mblock.clone()],
+                        Some(0),
                     ) {
                         Ok(x) => x,
                         Err((e, _)) => {

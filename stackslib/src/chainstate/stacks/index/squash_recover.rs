@@ -43,7 +43,6 @@
 //! Silent-ignore would let a hybrid mid-swap state (some hot ptrs already rewritten, SQL still
 //! routing as hot) appear to a reader as valid-looking but wrong bytes.
 
-use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 #[cfg(test)]
 use std::io::{Seek, SeekFrom, Write};
@@ -58,31 +57,127 @@ use crate::chainstate::stacks::index::squash_plan::{
 };
 use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
 
-/// Counters reported by a recovery pass. Exposed for diagnostics + tests; production code logs
-/// them.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryStats {
-    /// Number of plan files found on disk.
-    pub plans_discovered: usize,
-    /// Number of plans that committed successfully (cold-blob region validated and replay
-    /// completed).
-    pub plans_committed: usize,
-    /// Number of plans abandoned because their cold-blob region or sidecar didn't match the
-    /// recorded hash. The plan file is removed and `marf_state.promotion_in_progress` is cleared.
-    pub plans_abandoned: usize,
-    /// Total rewrite entries applied via `pwrite` (does not include entries that were already in
-    /// the post-state when recovery looked at them).
+/// Snapshot of the canonical Stacks chain over a height range, used by
+/// [`MARF::drain_pending_plans`](crate::chainstate::stacks::index::marf::MARF::drain_pending_plans)
+/// to validate that a pending squash plan's recorded `block_hashes` still match what the chain
+/// considers canonical. Implementors typically wrap a read-only handle on the headers SQL tables.
+///
+/// **Iteration 1 placeholder**: this trait is the surface PR 2 will use to wire production startup
+/// through `DrainPolicy::Canonical`. PR 1 only adds the type so the rest of the API can be shaped
+/// against it; production callers continue to route through `DrainPolicy::TrustPlan` and never
+/// reach the trait's methods.
+pub trait CanonicalView {
+    /// Return the canonical Stacks block hash at the given height, or `None` if no canonical block
+    /// exists at that height yet (chain too short / pre-genesis).
+    fn canonical_at_height(&self, height: u32) -> Result<Option<[u8; 32]>, Error>;
+}
+
+/// Policy controlling whether [`MARF::drain_pending_plans`] revalidates pending plans against the
+/// live canonical chain before publishing them.
+///
+/// PR 1 ships both variants; production startup paths still pass [`DrainPolicy::TrustPlan`] (no
+/// revalidation, current behavior). PR 2 will switch the production startup paths to
+/// [`DrainPolicy::Canonical`] with a real headers-DB-backed [`CanonicalView`].
+pub enum DrainPolicy<'a> {
+    /// Trust the plan as written. Equivalent to today's behavior: every pending plan is published
+    /// (or abandoned on hash mismatch). Used by tests, tools, and PR 1's wrapper around the legacy
+    /// recovery path.
+    TrustPlan,
+    /// Validate each pending plan's recorded canonical chain (`plan.in_range_blocks[*].block_hash`)
+    /// against the supplied [`CanonicalView`] before publish. Plans whose recorded canonical no
+    /// longer matches the live chain are discarded instead of published.
+    Canonical(&'a dyn CanonicalView),
+}
+
+/// Per-plan outcome of a [`MARF::drain_pending_plans`] pass. Aggregated into [`DrainStats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// Plan was published successfully. The MARF's in-memory squash metadata may need refresh
+    /// (caller's responsibility — startup callers don't need this since no live handle exists yet).
+    Published {
+        level_id: u32,
+        in_range_block_count: usize,
+        rewrites_applied: usize,
+    },
+    /// Plan was discarded because its recorded canonical chain didn't match the live canonical
+    /// view. Only reachable under [`DrainPolicy::Canonical`].
+    DiscardedStale {
+        level_id: u32,
+        diverging_height: u32,
+        recorded_hash: [u8; 32],
+        canonical_hash: Option<[u8; 32]>,
+    },
+    /// Plan was abandoned because integrity-recovery (cold-blob hash mismatch, sidecar mismatch,
+    /// etc.) couldn't validate it. Mirrors the legacy `plans_abandoned` counter.
+    Abandoned { level_id: u32 },
+}
+
+/// Aggregated statistics for a single [`MARF::drain_pending_plans`] call. Production callers log
+/// this for operator visibility; tests assert on individual fields.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DrainStats {
+    /// Per-plan outcomes in the order they were processed.
+    pub outcomes: Vec<DrainOutcome>,
+    /// Total rewrite entries applied via `pwrite` across all published plans.
     pub rewrites_applied: usize,
-    /// Total rewrite entries that were already in the post-state and got skipped (idempotent
-    /// replay).
+    /// Total rewrite entries skipped because the on-disk bytes were already in the post-state
+    /// (idempotent replay).
     pub rewrites_skipped: usize,
-    /// Bytes truncated from the cold blob's uncommitted tail.
+    /// Bytes truncated from the cold blob's uncommitted tail at the end of the drain pass.
     pub cold_tail_truncated_bytes: u64,
+}
+
+impl DrainStats {
+    /// `true` if the drain pass found a pending plan (whether published, discarded, or abandoned).
+    pub fn any_plan_processed(&self) -> bool {
+        !self.outcomes.is_empty()
+    }
+
+    /// Total number of plans the drain pass processed (sum of published, abandoned, and
+    /// discarded-stale outcomes).
+    pub fn plans_discovered(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Number of plans that committed successfully ([`DrainOutcome::Published`]).
+    pub fn plans_committed(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o, DrainOutcome::Published { .. }))
+            .count()
+    }
+
+    /// Number of plans abandoned because of integrity-recovery failure ([`DrainOutcome::Abandoned`]).
+    pub fn plans_abandoned(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o, DrainOutcome::Abandoned { .. }))
+            .count()
+    }
+
+    /// Number of plans discarded because the live canonical chain has diverged from the plan's
+    /// recorded chain ([`DrainOutcome::DiscardedStale`]). Always zero under
+    /// [`DrainPolicy::TrustPlan`].
+    pub fn plans_discarded_stale(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o, DrainOutcome::DiscardedStale { .. }))
+            .count()
+    }
+
+    /// Iterator over the [`DrainOutcome::DiscardedStale`] outcomes, in process order. Callers
+    /// reach for this when they want the diagnostic detail (diverging height, recorded vs
+    /// canonical hash) attached to a stale-discard log line.
+    pub fn stale_discards(&self) -> impl Iterator<Item = &DrainOutcome> {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o, DrainOutcome::DiscardedStale { .. }))
+    }
 }
 
 /// Recover any pending promotions for the MARF at `db_path`.
 ///
-/// Returns a [`RecoveryStats`] summary on success. Returns an error if recovery cannot complete
+/// Returns a [`DrainStats`] summary on success. Returns an error if recovery cannot complete
 /// (corrupt plan file, unparseable rewrite witness, etc.) — the caller should propagate the error
 /// and refuse to open the MARF.
 ///
@@ -99,12 +194,12 @@ pub fn recover_pending_promotions<T: MarfTrieId>(
     db_path: &str,
     hot_files: &mut HotFileSet,
     readonly: bool,
-) -> Result<RecoveryStats, Error> {
-    let mut stats = RecoveryStats::default();
+    canonical_view: Option<&dyn CanonicalView>,
+) -> Result<DrainStats, Error> {
+    let mut stats = DrainStats::default();
 
     // ── Step 1: discover pending plans ────────────────────────────
     let plans = discover_pending_plans(db_path)?;
-    stats.plans_discovered = plans.len();
 
     if plans.is_empty() {
         // Common case: no promotion was in flight on the prior shutdown.
@@ -155,7 +250,14 @@ pub fn recover_pending_promotions<T: MarfTrieId>(
     // ── Step 2: process each plan in level_id order ───────────────
     let cold_blob_path = derive_cold_blob_path(db_path);
     for (level_id, plan_path) in plans {
-        match recover_one_plan::<T>(db, &plan_path, &cold_blob_path, hot_files, &mut stats) {
+        match recover_one_plan::<T>(
+            db,
+            &plan_path,
+            &cold_blob_path,
+            hot_files,
+            &mut stats,
+            canonical_view,
+        ) {
             Ok(()) => {
                 debug!("Recovered pending promotion plan: level_id={level_id}");
             }
@@ -181,7 +283,8 @@ fn recover_one_plan<T: MarfTrieId>(
     plan_path: &Path,
     cold_blob_path: &Path,
     hot_files: &mut HotFileSet,
-    stats: &mut RecoveryStats,
+    stats: &mut DrainStats,
+    canonical_view: Option<&dyn CanonicalView>,
 ) -> Result<(), Error> {
     // Decode the plan file.
     let plan = match read_plan_file(plan_path) {
@@ -193,6 +296,7 @@ fn recover_one_plan<T: MarfTrieId>(
             )));
         }
     };
+    let level_id = plan.header.level_id;
 
     // Verify cold-blob region. Mismatch / missing / short → abandon.
     let cold_ok = verify_cold_blob_region(cold_blob_path, &plan)?;
@@ -202,7 +306,7 @@ fn recover_one_plan<T: MarfTrieId>(
              will clear promotion state and remove plan file"
         );
         abandon_plan(db, plan_path)?;
-        stats.plans_abandoned += 1;
+        stats.outcomes.push(DrainOutcome::Abandoned { level_id });
         return Ok(());
     }
 
@@ -214,14 +318,104 @@ fn recover_one_plan<T: MarfTrieId>(
              will clear promotion state and remove plan file"
         );
         abandon_plan(db, plan_path)?;
-        stats.plans_abandoned += 1;
+        stats.outcomes.push(DrainOutcome::Abandoned { level_id });
         return Ok(());
     }
 
-    // Both checks pass → replay the plan idempotently.
-    replay_plan::<T>(db, plan_path, hot_files, &plan, stats)?;
-    stats.plans_committed += 1;
+    // Canonical-divergence check (only when caller passed [`DrainPolicy::Canonical`]).
+    //
+    // The plan's `in_range_blocks` vector records, in height-order, the block hash that was
+    // canonical at each height in `[plan.header.min_height ..= plan.header.max_height]` at plan-
+    // write time. Compare each entry to what the live `CanonicalView` reports at that height.
+    // First mismatch → discard the plan instead of publishing it. This is the production-side
+    // fix for the detached-worker stale-tip bug: a worker that snapshotted canonical at start
+    // can find canonical has shifted by the time it's ready to publish, and publishing anyway
+    // would commit a stale level that downstream divergence checks then trip on.
+    if let Some(view) = canonical_view {
+        if let Some(outcome) = check_canonical_divergence(view, &plan)? {
+            if let DrainOutcome::DiscardedStale {
+                diverging_height,
+                recorded_hash,
+                canonical_hash,
+                ..
+            } = &outcome
+            {
+                info!(
+                    "recovery: discarding plan {plan_path:?} (canonical divergence at height {}: \
+                     plan recorded {}, current canonical is {:?}); will clear promotion state \
+                     and remove plan file",
+                    diverging_height,
+                    stacks_common::util::hash::to_hex(recorded_hash),
+                    canonical_hash.map(|h| stacks_common::util::hash::to_hex(&h)),
+                );
+            }
+            abandon_plan(db, plan_path)?;
+            stats.outcomes.push(outcome);
+            return Ok(());
+        }
+    }
+
+    // All integrity + canonical checks pass → publish via the shared core. This is the same
+    // function the runtime publish path
+    // ([`crate::chainstate::stacks::index::squash_promote::apply_prepared_plan`]) calls — one
+    // publish path, one set of bugs to debug.
+    let in_range_block_count = plan.in_range_blocks.len();
+    let (plan_applied, plan_skipped) =
+        crate::chainstate::stacks::index::squash_promote::publish_prepared_inner::<T>(
+            db, hot_files, plan_path, &plan,
+        )?;
+    stats.rewrites_applied += plan_applied;
+    stats.rewrites_skipped += plan_skipped;
+    stats.outcomes.push(DrainOutcome::Published {
+        level_id,
+        in_range_block_count,
+        rewrites_applied: plan_applied,
+    });
     Ok(())
+}
+
+/// Compare the plan's recorded canonical chain against the live `CanonicalView`. Returns
+/// `Ok(None)` when every recorded `(height, block_hash)` pair matches what the view reports for
+/// that height (or the view returns `None` for that height — treated as "skip", consistent with
+/// the per-MARF divergence detector's three-state predicate). Returns `Ok(Some(record))` on the
+/// first mismatch, capturing the diverging height + recorded vs canonical hashes for diagnostic
+/// surfaces ([`DrainOutcome::DiscardedStale`] / log lines).
+///
+/// Index `i` of `plan.in_range_blocks` corresponds to height `plan.header.min_height + i` —
+/// `build_in_range_block_list` emits one entry per height in the inclusive range, in order, so
+/// the index→height map is exact without a second SQL hit.
+pub(crate) fn check_canonical_divergence(
+    view: &dyn CanonicalView,
+    plan: &SquashPlan,
+) -> Result<Option<DrainOutcome>, Error> {
+    for (i, entry) in plan.in_range_blocks.iter().enumerate() {
+        let height = plan
+            .header
+            .min_height
+            .checked_add(i as u32)
+            .ok_or_else(|| {
+                Error::CorruptionError("plan in_range_blocks index overflows u32 height".into())
+            })?;
+        let canonical = view.canonical_at_height(height)?;
+        match canonical {
+            // Match: plan's recorded canonical agrees with the live view at this height.
+            Some(c) if c == entry.block_hash => continue,
+            // Unmapped: the view doesn't know about this height (truncated ancestry).
+            // Skip per the three-state predicate — the per-MARF divergence detector
+            // treats unmapped heights as "skip", not as non-canonical.
+            None => continue,
+            // Mismatch: live view reports a different hash at this height.
+            Some(_) => {
+                return Ok(Some(DrainOutcome::DiscardedStale {
+                    level_id: plan.header.level_id,
+                    diverging_height: height,
+                    recorded_hash: entry.block_hash,
+                    canonical_hash: canonical,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Verify the plan's reserved cold-blob region matches the recorded hash. Returns `Ok(false)` for
@@ -310,251 +504,38 @@ fn verify_sidecar(parent: Option<&Path>, plan: &SquashPlan) -> Result<bool, Erro
     Ok(true)
 }
 
-/// Apply the rewrite plan idempotently and commit the SQL transaction.
-fn replay_plan<T: MarfTrieId>(
-    db: &mut Connection,
-    plan_path: &Path,
-    hot_files: &mut HotFileSet,
-    plan: &SquashPlan,
-    stats: &mut RecoveryStats,
-) -> Result<(), Error> {
-    // ── B5d-fu.2: catch-up scan ───────────────────────────────────
-    //
-    // Under the detached-spawn model (fu.2), the worker may have crashed with the coordinator still
-    // appending blocks. On recovery, the on-disk plan file lists rewrites for the descendants the
-    // worker observed at plan-build, but blocks committed after `tip_at_scan_start` (and before the
-    // crash and any subsequent restart) need their backptrs rewritten too — otherwise reads of
-    // those blocks would resolve through stale hot-layout offsets that the cold-blob promotion no
-    // longer covers.
-    //
-    // We re-run the live-path catch-up scan here. The scanner is tolerant of already-applied bytes
-    // (via the translation map's reverse set), so a partial pre-crash apply doesn't confuse it. New
-    // extras are merged with the on-disk plan and persisted via `write_plan_file_atomic`, so a
-    // *recurring* crash (recovery itself crashing mid-replay) sees the augmented plan on the next
-    // open.
-    //
-    // Under fu.1's `thread::scope` dispatch the catch-up scan produces zero entries — recovery's
-    // behavior is unchanged from B5a. fu.2 makes this load-bearing.
-    let in_range_block_ids: HashSet<u32> =
-        plan.in_range_blocks.iter().map(|b| b.block_id).collect();
-    let catchup_extras = {
-        let new_descendants =
-            crate::chainstate::stacks::index::squash_promote::enumerate_hot_descendants_above_block_id(
-                db,
-                plan.header.max_height,
-                plan.header.tip_at_scan_start,
-            )?;
-        let reverse_set =
-            crate::chainstate::stacks::index::squash_promote::build_translation_reverse_set(
-                &plan.translation_map,
-            );
-        let mut extras: Vec<RewriteEntry> = Vec::new();
-        for desc in &new_descendants {
-            crate::chainstate::stacks::index::squash_promote::scan_catchup_descendant(
-                hot_files,
-                desc,
-                &in_range_block_ids,
-                &plan.translation_map,
-                &reverse_set,
-                &mut extras,
-            )?;
-        }
-        extras
-    };
-
-    // Persist the augmented plan if catch-up emitted new entries. Recovery's apply step then
-    // replays the merged list. If the background phase already covered every descendant (no
-    // concurrent appends since), `extras` is empty and we skip the re-write.
-    let effective_rewrites = if catchup_extras.is_empty() {
-        plan.rewrite_plan.clone()
-    } else {
-        let merged = crate::chainstate::stacks::index::squash_promote::merge_catchup_into_plan(
-            &plan.rewrite_plan,
-            catchup_extras,
-        );
-        let augmented = SquashPlan {
-            header: plan.header.clone(),
-            in_range_blocks: plan.in_range_blocks.clone(),
-            translation_map: plan.translation_map.clone(),
-            rewrite_plan: merged.clone(),
-        };
-        crate::chainstate::stacks::index::squash_plan::write_plan_file_atomic(
-            plan_path, &augmented,
-        )?;
-        merged
-    };
-
-    // ── Classify entries (Phase 1: read with guards) ──────────────
-    //
-    // Originally recovery only ran at process startup, when no readers existed — the fence protocol
-    // was unnecessary. Under B5d-fu.2, recovery is reachable from the detached retry worker's
-    // `MARF::from_path` open, while the coordinator's live handle is still serving reads. The
-    // cross-handle fence registry (B5d cross-handle fix) shares each hot file's `Arc<ReaderFence>`
-    // across both handles, so setting `mutate_pending` on the worker's `HotFileSet` blocks readers
-    // on the coordinator's. We must use that protocol here.
-    //
-    // Tricky bit: `apply_rewrite_idempotent` reads bytes via `read_at`, which acquires a read
-    // guard. If we set `mutate_pending = true` first, the recovery process's own read would
-    // self-deadlock (its `try_from_fence` would see the flag and back off forever). So Phase 1
-    // reads — without the fence — to classify entries into "needs apply" and "already applied". No
-    // concurrent writer exists at this point (the promotion lock is held), so the read result is
-    // reliable. Phase 2 then sets the fence and pwrites only the "needs apply" entries.
-    let mut touched_hot_seqs: HashSet<u32> = HashSet::new();
-    let mut entries_to_apply: Vec<&RewriteEntry> = Vec::new();
-    for entry in &effective_rewrites {
-        match classify_rewrite(hot_files, entry)? {
-            ApplyOutcome::Applied => {
-                entries_to_apply.push(entry);
-                stats.rewrites_applied += 1;
-            }
-            ApplyOutcome::AlreadyApplied => {
-                stats.rewrites_skipped += 1;
-            }
-        }
-        touched_hot_seqs.insert(entry.hot_file_seq);
-    }
-
-    // ── Phase 2: fenced pwrite + fsync ────────────────────────────
-    //
-    // Apply the recovery publish under the same reader-fence protocol as `apply_swap_phase`: set
-    // `mutate_pending` for every touched file up front, drain `active_reads`, apply any needed
-    // pwrites, fsync, publish the SQL redirect, then clear `mutate_pending`. The clear runs even
-    // on error so a failed recovery doesn't leave the fence stuck.
-    if !touched_hot_seqs.is_empty() {
-        const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-        for seq in &touched_hot_seqs {
-            hot_files.set_mutate_pending(*seq, true)?;
-        }
-
-        // Test-only barrier: pauses here (after set_mutate_pending, before wait_for_quiesce) when
-        // armed. Lets a peer-reader regression test observe that the fence is engaged before
-        // recovery progresses.
-        #[cfg(test)]
-        crate::chainstate::stacks::index::squash_promote::test_hooks::maybe_pause_at_recovery_fence(
-            plan_path,
-        );
-
-        let publish_result = (|| -> Result<(), Error> {
-            for seq in &touched_hot_seqs {
-                hot_files.wait_for_quiesce(*seq, QUIESCE_TIMEOUT)?;
-            }
-            for entry in &entries_to_apply {
-                hot_files.pwrite_ptr_field(
-                    entry.hot_file_seq,
-                    entry.file_offset,
-                    entry.post_bytes,
-                )?;
-            }
-            for seq in &touched_hot_seqs {
-                hot_files.fsync_seq(*seq)?;
-            }
-            #[cfg(test)]
-            crate::chainstate::stacks::index::squash_promote::test_hooks::maybe_pause_after_recovery_rewrite_before_sql(
-                plan_path,
-            );
-            publish_recovery_sql::<T>(db, plan)
-        })();
-
-        for seq in &touched_hot_seqs {
-            if let Err(e) = hot_files.set_mutate_pending(*seq, false) {
-                warn!(
-                    "recovery: failed to clear mutate_pending on seq={seq}: {e} \
-                     (readers may block on next promotion until process restart)"
-                );
-            }
-        }
-
-        publish_result?;
-    } else {
-        publish_recovery_sql::<T>(db, plan)?;
-    }
-
-    // ── Remove the plan file. Best-effort: if removal fails, the next recovery pass replays
-    // idempotently (the rewrite witness bytes will all be in `post_bytes`, the SQL is `INSERT OR
-    // REPLACE`-safe), so we log and continue. ──
-    if let Err(e) = fs::remove_file(plan_path) {
-        warn!(
-            "recovery: failed to remove plan file {plan_path:?} after commit: {e} \
-             (will be retried on next open)",
-        );
-    }
-    Ok(())
-}
-
-fn publish_recovery_sql<T: MarfTrieId>(
-    db: &mut Connection,
-    plan: &SquashPlan,
-) -> Result<(), Error> {
-    (|| -> Result<(), Error> {
-        let tx = db.transaction().map_err(Error::SQLError)?;
-        crate::chainstate::stacks::index::squash_promote::redirect_in_range_blocks_to_cold::<T>(
-            &tx,
-            &plan.in_range_blocks,
-            plan.header.cold_blob_offset,
-            plan.header.cold_blob_length,
-        )?;
-        // Recompute the published-max-block-id watermark inside this SQL transaction (mirrors the
-        // live promotion path's Fix #4 semantics from the B5a Codex review). Falls back to the
-        // plan header value if the live computation fails — recovery is best-effort on this
-        // counter, since the worst case is a temporarily-inflated "bytes since last squash"
-        // reading until the next squash refreshes it.
-        let watermark = trie_sql::current_published_max_block_id(&tx)
-            .unwrap_or(plan.header.published_max_block_id);
-        let level_row = crate::chainstate::stacks::index::squash::SquashLevelRow {
-            level_id: plan.header.level_id,
-            min_height: plan.header.min_height,
-            max_height: plan.header.max_height,
-            blob_offset: plan.header.cold_blob_offset,
-            blob_length: plan.header.cold_blob_length,
-            reads_redirected: plan.header.reads_redirected,
-            root_sidecar_present: plan.header.root_sidecar_present,
-            root_sidecar_trimmed: plan.header.root_sidecar_trimmed,
-            orphan_split_offset: plan.header.orphan_split_offset,
-            published_max_block_id: watermark,
-        };
-        trie_sql::write_squash_level(&tx, &level_row)?;
-        trie_sql::clear_promotion_state(&tx)?;
-        tx.commit().map_err(Error::SQLError)?;
-        Ok(())
-    })()
-}
-
-/// Classification of one rewrite-plan entry against the on-disk bytes — drives whether the caller
-/// should `pwrite` (Applied) or skip (AlreadyApplied) under the fenced apply phase.
-enum ApplyOutcome {
-    /// On-disk bytes were `pre_bytes`; the caller must pwrite `post_bytes` under the fence.
-    Applied,
-    /// On-disk bytes were already `post_bytes`; no pwrite needed.
-    AlreadyApplied,
-}
-
 /// Read the 4 bytes at `(hot_file_seq, file_offset)` and classify against the rewrite entry's
-/// pre/post witnesses. Returns `Applied` if the bytes are still pre-promotion (caller will pwrite),
-/// `AlreadyApplied` if they are already post-promotion, or `CorruptionError` if neither.
+/// pre/post witnesses. Returns `Ok(true)` if the bytes are still pre-promotion (caller must
+/// pwrite under the fence), `Ok(false)` if the bytes are already post-promotion (no pwrite
+/// needed — only reachable in recovery from a partial pre-crash apply), or `CorruptionError` if
+/// neither — possibly a wrong plan file paired with this hot file, or external mutation.
 ///
-/// **Pure read** — no pwrites here. The actual pwrite happens in `replay_plan`'s Phase 2 under the
-/// reader-fence protocol so concurrent readers (on a peer `MARF` handle in fu.2's detached-spawn
-/// model) cannot observe a torn rewrite.
-fn classify_rewrite(hot_files: &HotFileSet, entry: &RewriteEntry) -> Result<ApplyOutcome, Error> {
+/// **Pure read.** The actual pwrite happens in
+/// [`crate::chainstate::stacks::index::squash_promote::publish_prepared_inner`]'s fenced Phase
+/// 2 so concurrent readers (on a peer `MARF` handle under detached-spawn dispatch) cannot
+/// observe a torn rewrite.
+pub(crate) fn classify_rewrite_for_publish(
+    hot_files: &HotFileSet,
+    entry: &RewriteEntry,
+) -> Result<bool, Error> {
     let mut current = [0u8; 4];
     let n = hot_files.read_at(entry.hot_file_seq, &mut current, entry.file_offset)?;
     if n != 4 {
         return Err(Error::CorruptionError(format!(
-            "recovery: short read at hot_file_seq={} file_offset={} (got {n} bytes)",
+            "publish: short read at hot_file_seq={} file_offset={} (got {n} bytes)",
             entry.hot_file_seq, entry.file_offset,
         )));
     }
     if current == entry.pre_bytes {
-        return Ok(ApplyOutcome::Applied);
+        return Ok(true);
     }
     if current == entry.post_bytes {
-        return Ok(ApplyOutcome::AlreadyApplied);
+        return Ok(false);
     }
     Err(Error::CorruptionError(format!(
-        "recovery: rewrite entry at hot_file_seq={} file_offset={} has neither pre nor post bytes \
-         (on-disk={current:02x?}, pre={pre:02x?}, post={post:02x?}). This is corruption — \
-         possibly a wrong plan file paired with this hot file, or external mutation.",
+        "publish: rewrite entry at hot_file_seq={} file_offset={} has neither pre nor post \
+         bytes (on-disk={current:02x?}, pre={pre:02x?}, post={post:02x?}). This is corruption \
+         — possibly a wrong plan file paired with this hot file, or external mutation.",
         entry.hot_file_seq,
         entry.file_offset,
         pre = entry.pre_bytes,

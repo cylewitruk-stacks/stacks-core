@@ -38,6 +38,7 @@ use rusqlite::Connection;
 use stacks_common::types::chainstate::{BlockHeaderHash, TrieHash};
 
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MarfInternals, MARF};
+use crate::chainstate::stacks::index::squash::SquashMode;
 use crate::chainstate::stacks::index::squash_plan::plan_file_path;
 use crate::chainstate::stacks::index::squash_promote::run_horizon_gated_promotion;
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
@@ -128,6 +129,7 @@ fn b5a_horizon_gated_promotion_publishes_level_and_rewrites_descendants() {
     // tip; b4..=b6 are descendants whose backptrs need rewriting.
     let stats = run_horizon_gated_promotion::<BlockHeaderHash>(
         &mut marf,
+        SquashMode::TipOnly,
         /* min_height */ 0,
         /* max_height */ 2,
         Some(b3.clone()),
@@ -256,8 +258,14 @@ fn b5a_published_sidecar_exists_at_canonical_path_after_promotion() {
     // abandoned).
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect("promotion succeeds");
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect("promotion succeeds");
         // Sanity: the plan file was removed post-success.
         let plans = discover_pending_plans(&db_path).unwrap();
         assert!(plans.is_empty(), "plan should be removed post-success");
@@ -321,7 +329,9 @@ fn b5b_real_mid_swap_crash_recovers_via_open_path() {
     let dir = fresh_test_dir(test_name);
     let db_path = format!("{dir}/marf.sqlite");
 
-    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_mmap(false)
+        .with_auto_recovery(true);
     let sentinel = BlockHeaderHash::sentinel();
     let (b1, b2, b3, b4, b5, b6) = {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
@@ -339,8 +349,14 @@ fn b5b_real_mid_swap_crash_recovers_via_open_path() {
     test_hooks::arm_abort_after_plan_write();
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        let err = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect_err("fault hook must trigger error");
+        let err = run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect_err("fault hook must trigger error");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("aborted after plan write"),
@@ -452,8 +468,14 @@ fn b5d_fu_1_catchup_with_forced_low_watermark_is_idempotent() {
     // re-enumerates every descendant the background phase already enumerated. The merger must dedupe; the swap proceeds
     // with the same effective rewrite plan as the un-overridden run.
     test_hooks::force_tip_at_scan_start(Some(0));
-    let stats = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-        .expect("promotion must succeed under forced low watermark");
+    let stats = run_horizon_gated_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .expect("promotion must succeed under forced low watermark");
     test_hooks::force_tip_at_scan_start(None);
 
     assert!(
@@ -516,7 +538,9 @@ fn b5d_fu_3_concurrent_writer_during_crash_window_is_caught_up_on_recovery() {
     let test_name = "b5d_fu_3_concurrent_writer_during_crash_window_is_caught_up_on_recovery";
     let dir = fresh_test_dir(test_name);
     let db_path = format!("{dir}/marf.sqlite");
-    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_mmap(false)
+        .with_auto_recovery(true);
     let sentinel = BlockHeaderHash::sentinel();
 
     // Phase 1: build the pre-crash chain.
@@ -535,8 +559,14 @@ fn b5d_fu_3_concurrent_writer_during_crash_window_is_caught_up_on_recovery() {
     test_hooks::arm_abort_after_plan_write();
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        let err = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect_err("fault hook must trigger error");
+        let err = run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect_err("fault hook must trigger error");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("aborted after plan write"),
@@ -672,8 +702,14 @@ fn b5d_fu_3_concurrent_reader_during_promotion_observes_consistent_state() {
     // Run the promotion on the main thread (mirroring fu.2's worker thread shape via direct call here).
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect("promotion must succeed under concurrent reader load");
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect("promotion must succeed under concurrent reader load");
     }
 
     // Stop the reader and inspect.
@@ -724,7 +760,9 @@ fn b5d_fu_3_recovery_catchup_dedupes_against_plan_rewrites() {
     let test_name = "b5d_fu_3_recovery_catchup_dedupes_against_plan_rewrites";
     let dir = fresh_test_dir(test_name);
     let db_path = format!("{dir}/marf.sqlite");
-    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_mmap(false)
+        .with_auto_recovery(true);
     let sentinel = BlockHeaderHash::sentinel();
 
     let (b1, b2, b3, b4, b5, b6) = {
@@ -745,8 +783,14 @@ fn b5d_fu_3_recovery_catchup_dedupes_against_plan_rewrites() {
     test_hooks::arm_abort_after_plan_write();
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        let err = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect_err("fault hook must trigger error");
+        let err = run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect_err("fault hook must trigger error");
         assert!(format!("{err:?}").contains("aborted after plan write"));
     }
     test_hooks::disarm_abort_after_plan_write();
@@ -792,102 +836,115 @@ fn b5d_fu_3_recovery_catchup_dedupes_against_plan_rewrites() {
     }
 }
 
-/// **B5d-fu.2 Codex round, Issue 2 regression**: a retry worker that observes a recovery-published level must report
-/// success even if its own live promotion fails on a stale range.
+/// Detached-worker `run_horizon_gated_promotion_at_path` must NOT auto-publish a leftover plan
+/// from a prior tick. The worker opens its MARF with `auto_recovery=false`, so recovery
+/// doesn't run on open. The pre-prep guards inside `prepare_promotion` see the leftover plan
+/// + held lock and return `InProgressError`; the leftover plan stays untouched on disk for the
+/// coordinator's `poll_pending_promotions` drain path (or `StacksChainState::recover` on
+/// process restart) to validate against the live canonical chain and publish-or-discard.
 ///
-/// Failure mode being pinned: `run_horizon_gated_promotion_at_path` is the path-based wrapper detached workers use.
-/// When invoked after a prior worker left a plan on disk, its `MARF::from_path` open synchronously runs
-/// `recover_pending_promotions`, which can publish a level. The subsequent live promotion uses the `[min, max]` the
-/// coordinator computed before the level was published — that range can fail `validate_squash_target`'s contiguity
-/// check (or be empty post-publish).
-///
-/// Pre-fix behavior: the wrapper returned `Err`, the worker reported `false`, the coordinator skipped
-/// `refresh_after_squash`, and the live MARF stayed pinned to a stale generation despite on-disk state having advanced.
-///
-/// Post-fix behavior (this test): the wrapper detects the recovery-side level publication via a `marf_squash_levels`
-/// row-count delta around the open, treats the live error as non-fatal, and returns `Ok`. Worker reports `true`;
-/// coordinator refreshes.
+/// **Why this matters**: the previous worker-side `auto_recovery=true` behavior was a
+/// correctness hole — a transient coordinator publish failure would leave a leftover plan, and
+/// the next worker's open-time `recover_pending_promotions` would TrustPlan-publish that plan
+/// without canonical validation, reopening the runtime stale-tip publish bug. Closing that
+/// path is the runtime fix this iteration locks in.
 #[test]
-fn b5d_fu_2_retry_worker_after_recovery_publishes_returns_success() {
+fn detached_worker_does_not_auto_publish_leftover_plan() {
     use crate::chainstate::stacks::index::squash_plan::discover_pending_plans;
     use crate::chainstate::stacks::index::squash_promote::{
         run_horizon_gated_promotion_at_path, test_hooks,
     };
 
-    let test_name = "b5d_fu_2_retry_worker_after_recovery_publishes_returns_success";
+    let test_name = "detached_worker_does_not_auto_publish_leftover_plan";
     let dir = fresh_test_dir(test_name);
     let db_path = format!("{dir}/marf.sqlite");
-    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_mmap(false)
+        .with_auto_recovery(true);
     let sentinel = BlockHeaderHash::sentinel();
 
-    let (b1, b2, b3, b4, b5, b6) = {
+    let b3 = {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
         let b1 = extend_with_block(&mut marf, &sentinel, 1);
         let b2 = extend_with_block(&mut marf, &b1, 2);
         let b3 = extend_with_block(&mut marf, &b2, 3);
-        let b4 = extend_with_block(&mut marf, &b3, 4);
-        let b5 = extend_with_block(&mut marf, &b4, 5);
-        let b6 = extend_with_block(&mut marf, &b5, 6);
-        (b1, b2, b3, b4, b5, b6)
+        let _b4 = extend_with_block(&mut marf, &b3, 4);
+        let _b5 = extend_with_block(&mut marf, &b3, 5);
+        b3
     };
 
-    // Worker A: arm abort, run promotion → plan-v1 on disk.
+    // Worker A: arm abort, run promotion → plan on disk + lock held.
     test_hooks::arm_abort_after_plan_write();
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        let err = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect_err("fault must trigger");
+        let err = run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect_err("fault must trigger");
         assert!(format!("{err:?}").contains("aborted after plan write"));
     }
     test_hooks::disarm_abort_after_plan_write();
 
-    // Sanity: no level published yet, plan present.
+    // Sanity: no level published yet, plan + lock present.
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let levels = trie_sql::read_squash_levels(&conn).unwrap();
         assert_eq!(levels.len(), 0);
-        let plans = discover_pending_plans(&db_path).unwrap();
-        assert_eq!(plans.len(), 1);
+        assert_eq!(discover_pending_plans(&db_path).unwrap().len(), 1);
+        let state = trie_sql::read_marf_state(&conn).unwrap();
+        assert!(
+            state.promotion_in_progress.is_some(),
+            "lock must remain held after a post-plan-fsync error"
+        );
     }
 
-    // Worker B retry: simulate the coordinator dispatching with the SAME stale range that worker A had. The wrapper's
-    // `from_path` open runs recovery — which publishes plan-v1's level for [0..=2]. The wrapper then calls
-    // `run_horizon_gated_promotion` for [0..=2], which fails contiguity validation against the just-published level.
-    // The wrapper detects the recovery-side publication and returns `Ok` (default stats) instead of surfacing the live
-    // error.
+    // Worker B: simulates the coordinator dispatching a fresh worker on the next tick.
+    // With `auto_recovery=false` on the worker's open, recovery does NOT run; the pre-prep
+    // guards inside `prepare_promotion` see the leftover plan + held lock and return
+    // `InProgressError`. The leftover plan must remain UNTOUCHED — the coordinator's drain
+    // path is responsible for publishing/discarding it under the canonical gate.
     let result = run_horizon_gated_promotion_at_path::<BlockHeaderHash>(
         &db_path,
+        SquashMode::TipOnly,
         /* min */ 0,
         /* max */ 2,
         Some(b3.clone()),
     );
-    let _stats = result
-        .expect("wrapper must return Ok when recovery published, even if live promotion erred");
-
-    // Verify: the level IS published, the plan IS removed, the promotion lock IS cleared.
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let levels = trie_sql::read_squash_levels(&conn).unwrap();
-    assert_eq!(
-        levels.len(),
-        1,
-        "recovery should have published exactly one level from plan-v1"
+    let err = result
+        .err()
+        .expect("worker must NOT auto-publish a leftover plan; expected InProgressError");
+    assert!(
+        matches!(
+            err,
+            crate::chainstate::stacks::index::Error::InProgressError
+        ),
+        "expected InProgressError (the pre-prep guard tripping); got {err:?}"
     );
-    let plans = discover_pending_plans(&db_path).unwrap();
-    assert!(plans.is_empty());
-    let state = trie_sql::read_marf_state(&conn).unwrap();
-    assert_eq!(state.promotion_in_progress, None);
 
-    // Reads work end-to-end: in-range, descendants, all values resolve correctly post-recovery.
-    let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts).unwrap();
-    for (bhh, byte) in [(&b1, 1u8), (&b2, 2), (&b3, 3), (&b4, 4), (&b5, 5), (&b6, 6)] {
-        let key = format!("k_{byte}");
-        let expected = MARFValue::from_value(&format!("v_{byte}"));
-        assert_eq!(
-            marf.get(bhh, &key).unwrap(),
-            Some(expected),
-            "post-retry-worker read of {key} failed"
-        );
-    }
+    // The leftover plan must still be on disk, the lock still held, NO level published. The
+    // coordinator's `poll_pending_promotions` drain path (or process-restart recovery) is the
+    // sole publish gate from this point.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        trie_sql::read_squash_levels(&conn).unwrap().len(),
+        0,
+        "worker auto-publish reopens the runtime stale-tip bug; level must NOT be published \
+         here (the coordinator's canonical-validated drain owns this work)"
+    );
+    assert_eq!(
+        discover_pending_plans(&db_path).unwrap().len(),
+        1,
+        "leftover plan must stay on disk for the coordinator's drain path"
+    );
+    let state = trie_sql::read_marf_state(&conn).unwrap();
+    assert!(
+        state.promotion_in_progress.is_some(),
+        "lock must remain held; clearing it would let a concurrent prepare race the leftover"
+    );
 }
 
 /// **B5d-fu.2 Codex round, Issue 1 (recovery uses fence) — deterministic regression**: closes the test gap noted in the
@@ -919,7 +976,9 @@ fn b5d_fu_2_recovery_apply_phase_blocks_concurrent_peer_reader() {
     let test_name = "b5d_fu_2_recovery_apply_phase_blocks_concurrent_peer_reader";
     let dir = fresh_test_dir(test_name);
     let db_path = format!("{dir}/marf.sqlite");
-    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_mmap(false)
+        .with_auto_recovery(true);
     let sentinel = BlockHeaderHash::sentinel();
 
     // Build chain so there are real hot rows + descendants for recovery to rewrite.
@@ -938,8 +997,14 @@ fn b5d_fu_2_recovery_apply_phase_blocks_concurrent_peer_reader() {
     test_hooks::arm_abort_after_plan_write();
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        let _ = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect_err("fault must trigger");
+        let _ = run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect_err("fault must trigger");
     }
     test_hooks::disarm_abort_after_plan_write();
 
@@ -1044,7 +1109,9 @@ fn b5d_fu_2_recovery_post_rewrite_pre_sql_window_blocks_concurrent_peer_reader()
     let test_name = "b5d_fu_2_recovery_post_rewrite_pre_sql_window_blocks_concurrent_peer_reader";
     let dir = fresh_test_dir(test_name);
     let db_path = format!("{dir}/marf.sqlite");
-    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_mmap(false)
+        .with_auto_recovery(true);
     let sentinel = BlockHeaderHash::sentinel();
 
     let (b1, b2, b3, _b4, _b5, _b6) = {
@@ -1061,8 +1128,14 @@ fn b5d_fu_2_recovery_post_rewrite_pre_sql_window_blocks_concurrent_peer_reader()
     test_hooks::arm_abort_after_plan_write();
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        let _ = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect_err("fault must trigger");
+        let _ = run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect_err("fault must trigger");
     }
     test_hooks::disarm_abort_after_plan_write();
 
@@ -1144,7 +1217,9 @@ fn b5d_fu_2_recovery_already_applied_post_rewrite_pre_sql_window_blocks_concurre
     let test_name = "b5d_fu_2_recovery_already_applied_post_rewrite_pre_sql_window_blocks_concurrent_peer_reader";
     let dir = fresh_test_dir(test_name);
     let db_path = format!("{dir}/marf.sqlite");
-    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_mmap(false)
+        .with_auto_recovery(true);
     let sentinel = BlockHeaderHash::sentinel();
 
     let (b1, b2, b3, _b4, _b5, _b6) = {
@@ -1161,8 +1236,14 @@ fn b5d_fu_2_recovery_already_applied_post_rewrite_pre_sql_window_blocks_concurre
     test_hooks::arm_abort_after_plan_write();
     {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
-        let _ = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 2, Some(b3.clone()))
-            .expect_err("fault must trigger");
+        let _ = run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(b3.clone()),
+        )
+        .expect_err("fault must trigger");
     }
     test_hooks::disarm_abort_after_plan_write();
 
@@ -1347,6 +1428,7 @@ fn repro_descendant_reads_remain_valid_during_post_rewrite_pre_sql_window() {
         for (min_height, max_height, tip_idx) in [(0u32, 2u32, 2usize), (3, 5, 5), (6, 8, 8)] {
             run_horizon_gated_promotion::<BlockHeaderHash>(
                 &mut marf,
+                SquashMode::TipOnly,
                 min_height,
                 max_height,
                 Some(blocks[tip_idx].clone()),
@@ -1363,8 +1445,14 @@ fn repro_descendant_reads_remain_valid_during_post_rewrite_pre_sql_window() {
     let worker_pending_tip = pending_tip;
     let worker = std::thread::spawn(move || {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&worker_db_path, worker_opts).unwrap();
-        run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 9, 11, Some(worker_pending_tip))
-            .unwrap();
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            9,
+            11,
+            Some(worker_pending_tip),
+        )
+        .unwrap();
     });
 
     if !barrier.wait_until_reached(Duration::from_secs(10)) {
@@ -1492,6 +1580,7 @@ fn repro_committed_descendant_during_post_rewrite_pre_sql_window_can_break_later
         for (min_height, max_height, tip_idx) in [(0u32, 2u32, 2usize), (3, 5, 5), (6, 8, 8)] {
             run_horizon_gated_promotion::<BlockHeaderHash>(
                 &mut marf,
+                SquashMode::TipOnly,
                 min_height,
                 max_height,
                 Some(blocks[tip_idx].clone()),
@@ -1509,8 +1598,14 @@ fn repro_committed_descendant_during_post_rewrite_pre_sql_window_can_break_later
     let worker_pending_tip = pending_tip;
     let worker = std::thread::spawn(move || {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&worker_db_path, worker_opts).unwrap();
-        run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 9, 11, Some(worker_pending_tip))
-            .unwrap();
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            9,
+            11,
+            Some(worker_pending_tip),
+        )
+        .unwrap();
     });
 
     if !barrier.wait_until_reached(Duration::from_secs(10)) {
@@ -1622,6 +1717,7 @@ fn control_committed_descendant_after_sql_commit_stays_healthy() {
         for (min_height, max_height, tip_idx) in [(0u32, 2u32, 2usize), (3, 5, 5), (6, 8, 8)] {
             run_horizon_gated_promotion::<BlockHeaderHash>(
                 &mut marf,
+                SquashMode::TipOnly,
                 min_height,
                 max_height,
                 Some(blocks[tip_idx].clone()),
@@ -1639,8 +1735,14 @@ fn control_committed_descendant_after_sql_commit_stays_healthy() {
     let worker_pending_tip = pending_tip;
     let worker = std::thread::spawn(move || {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&worker_db_path, worker_opts).unwrap();
-        run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 9, 11, Some(worker_pending_tip))
-            .unwrap();
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            9,
+            11,
+            Some(worker_pending_tip),
+        )
+        .unwrap();
     });
 
     if !barrier.wait_until_reached(Duration::from_secs(10)) {
@@ -1745,6 +1847,7 @@ fn control_already_open_peer_after_sql_commit_stays_healthy() {
         for (min_height, max_height, tip_idx) in [(0u32, 2u32, 2usize), (3, 5, 5), (6, 8, 8)] {
             run_horizon_gated_promotion::<BlockHeaderHash>(
                 &mut marf,
+                SquashMode::TipOnly,
                 min_height,
                 max_height,
                 Some(blocks[tip_idx].clone()),
@@ -1763,8 +1866,14 @@ fn control_already_open_peer_after_sql_commit_stays_healthy() {
     let worker_pending_tip = pending_tip;
     let worker = std::thread::spawn(move || {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&worker_db_path, worker_opts).unwrap();
-        run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 9, 11, Some(worker_pending_tip))
-            .unwrap();
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            9,
+            11,
+            Some(worker_pending_tip),
+        )
+        .unwrap();
     });
 
     if !barrier.wait_until_reached(Duration::from_secs(10)) {
@@ -1867,6 +1976,7 @@ fn sanity_latest_descendant_begin_before_pending_promotion_stays_healthy() {
         for (min_height, max_height, tip_idx) in [(0u32, 2u32, 2usize), (3, 5, 5), (6, 8, 8)] {
             run_horizon_gated_promotion::<BlockHeaderHash>(
                 &mut marf,
+                SquashMode::TipOnly,
                 min_height,
                 max_height,
                 Some(blocks[tip_idx].clone()),
@@ -1951,6 +2061,7 @@ fn sanity_latest_descendant_begin_after_clean_pending_promotion_stays_healthy() 
         {
             run_horizon_gated_promotion::<BlockHeaderHash>(
                 &mut marf,
+                SquashMode::TipOnly,
                 min_height,
                 max_height,
                 Some(blocks[tip_idx].clone()),
@@ -2038,6 +2149,7 @@ fn sanity_post_sql_manual_refresh_restores_peer_begin_health() {
         for (min_height, max_height, tip_idx) in [(0u32, 2u32, 2usize), (3, 5, 5), (6, 8, 8)] {
             run_horizon_gated_promotion::<BlockHeaderHash>(
                 &mut marf,
+                SquashMode::TipOnly,
                 min_height,
                 max_height,
                 Some(blocks[tip_idx].clone()),
@@ -2055,8 +2167,14 @@ fn sanity_post_sql_manual_refresh_restores_peer_begin_health() {
     let worker_pending_tip = pending_tip;
     let worker = std::thread::spawn(move || {
         let mut marf = MARF::<BlockHeaderHash>::from_path(&worker_db_path, worker_opts).unwrap();
-        run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 9, 11, Some(worker_pending_tip))
-            .unwrap();
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            9,
+            11,
+            Some(worker_pending_tip),
+        )
+        .unwrap();
     });
 
     if !barrier.wait_until_reached(Duration::from_secs(10)) {
@@ -2094,8 +2212,14 @@ fn b5a_promotion_rejects_when_lock_already_held() {
         )
         .unwrap();
 
-    let err = run_horizon_gated_promotion::<BlockHeaderHash>(&mut marf, 0, 1, Some(b1))
-        .expect_err("promotion must reject when lock is held");
+    let err = run_horizon_gated_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        1,
+        Some(b1),
+    )
+    .expect_err("promotion must reject when lock is held");
     assert!(matches!(
         err,
         crate::chainstate::stacks::index::Error::InProgressError
@@ -2127,13 +2251,26 @@ fn b5a_promotion_rejects_when_lock_already_held() {
 //    merged tip's root — wrong for any non-tip in-range block). This mirrors the existing
 //    fast-path in `read_node_hash` and the saved-root machinery in `MARF::root_copy`.
 
-/// Sharpest read-path regression: after a horizon-gated promotion, opening a NON-TIP in-range
-/// block and reading at `ROOT_PTR_DISK` returns the per-height root from the `SquashRootNode`
-/// sidecar — NOT the merged tip's root that lives at the same byte offset in the merged blob.
+/// Sharpest read-path regression for the fork-extension contract: after a horizon-gated
+/// promotion, opening a NON-TIP in-range block and reading at `ROOT_PTR_DISK` *under
+/// [`WalkIntent::ForkExtend`]* returns the per-height root from the `SquashRootNode`
+/// sidecar — NOT the merged tip's root that lives at the same byte offset in the merged
+/// blob.
 ///
-/// Verifies via `read_node_hash` + `read_node_with_state` that both entry points yield the
-/// per-height root hash captured in the squash trailer, and that the hash matches the block's
-/// actual root hash captured pre-promotion.
+/// Updated 2026-05-07 with the read-path / fork-extension intent split: the unconditional
+/// "ROOT_PTR_DISK always returns the per-height root" contract this test originally pinned
+/// has been split in two:
+///   * [`WalkIntent::ForkExtend`] (`MARF::root_copy`): per-height root via sidecar — what
+///     this test continues to verify, by wrapping the `read_node_with_state` call in
+///     `with_fork_extend_intent`.
+///   * [`WalkIntent::AtBlock`] (default; `MARF::get` style at-block walks): merged tip's
+///     root from offset 36 of the merged blob, with historical values resolved at the leaf
+///     via `LeafSquashed::value_at_height`. That contract is verified separately by
+///     `test_full_history_at_block_read_survives_sidecar_trim` in `index::test::squash`.
+///
+/// `read_node_hash`'s ROOT_PTR_DISK trailer override is still unconditional (the trailer is
+/// in-memory metadata, not a sidecar dependency, and the per-height *consensus* hash there
+/// is what backpointer-chain hash computation needs regardless of intent).
 #[test]
 fn root_ptr_disk_on_in_range_block_serves_saved_per_height_root() {
     use crate::chainstate::stacks::index::scratch::MarfReadState;
@@ -2166,6 +2303,7 @@ fn root_ptr_disk_on_in_range_block_serves_saved_per_height_root() {
     // Promote heights 0..=2 (in-range tip = b3); reclaim path so the merged blob takes over.
     let stats = run_horizon_gated_promotion::<BlockHeaderHash>(
         &mut marf,
+        SquashMode::TipOnly,
         /* min_height */ 0,
         /* max_height */ 2,
         Some(b3.clone()),
@@ -2209,19 +2347,31 @@ fn root_ptr_disk_on_in_range_block_serves_saved_per_height_root() {
              pre-promotion (not the merged tip's root hash)"
         );
 
-        // `read_node_with_state` ROOT_PTR_DISK special case (the new fix).
+        // `read_node_with_state` ROOT_PTR_DISK route — gated to `WalkIntent::ForkExtend`
+        // by the 2026-05-07 read-path / fork-extension intent split. Under the default
+        // `AtBlock` intent the read falls through to the merged blob's offset 36 (which is
+        // the merged tip's root, the correct body for at-block walks that resolve historical
+        // values via `LeafSquashed::value_at_height`). To keep this test pinning the
+        // *fork-extension* contract — that the per-height root sidecar IS consulted when a
+        // root-shape reconstruction caller (`MARF::root_copy`) reads `ROOT_PTR_DISK` — wrap
+        // the read in `with_fork_extend_intent`, which is what `MARF::root_copy` does in
+        // production.
         let mut scratch = MarfReadState::new();
-        let read_node = storage
-            .read_node_with_state(&root_ptr, &mut scratch)
-            .expect("read_node_with_state at ROOT_PTR_DISK must succeed");
-        let returned_hash = read_node
-            .hash
-            .expect("a non-leaf root must carry its hash through the read path");
+        let returned_hash = storage
+            .with_fork_extend_intent(|s| {
+                let read_node = s.read_node_with_state(&root_ptr, &mut scratch)?;
+                read_node.hash.ok_or_else(|| {
+                    crate::chainstate::stacks::index::Error::CorruptionError(
+                        "non-leaf root must carry its hash through the read path".into(),
+                    )
+                })
+            })
+            .expect("read_node_with_state at ROOT_PTR_DISK under ForkExtend must succeed");
         assert_eq!(
             returned_hash, pre_root_hashes[i],
-            "read_node_with_state for {bhh} must serve the per-height root from the sidecar; \
-             a mismatch means it fell through to the merged blob and read the merged tip's \
-             root (the bug we're regressing against)"
+            "read_node_with_state for {bhh} under ForkExtend must serve the per-height \
+             root from the sidecar; a mismatch means the sidecar route was bypassed (and \
+             fork-extension off this parent would produce a structurally-wrong fork root)"
         );
     }
 }
@@ -2253,6 +2403,7 @@ fn build_in_range_block_list_accepts_blocks_with_zero_translation_map_entries() 
     // contributes zero entries. Asserting `Ok` proves the check was relaxed.
     run_horizon_gated_promotion::<BlockHeaderHash>(
         &mut marf,
+        SquashMode::TipOnly,
         /* min_height */ 0,
         /* max_height */ 2,
         Some(b3.clone()),
@@ -2276,4 +2427,754 @@ fn build_in_range_block_list_accepts_blocks_with_zero_translation_map_entries() 
     let _ = marf
         .get(&b4, "k_4")
         .expect("post-promotion read on descendant b4 must succeed");
+}
+
+// ===========================================================================
+// Runtime coordinator-owned publish: prepare/apply split tests.
+//
+// These pin the prepare/apply split that closes the runtime stale-tip publish window. The
+// background worker stops after persisting a plan; the chains-coordinator's
+// `poll_pending_promotions` validates the plan against the live canonical chain via
+// `apply_prepared_plan` with `DrainPolicy::Canonical(view)`. Plans whose recorded canonical
+// chain has diverged from the live view are discarded instead of published.
+// ===========================================================================
+
+/// Mock [`crate::chainstate::stacks::index::squash_recover::CanonicalView`] backed by a fixed
+/// `height -> hash` map. Lets the test inject any canonical-vs-recorded relationship without
+/// needing a real headers DB or sortdb. Mirrors the helper in `test/squash_recover.rs`; kept
+/// per-module to avoid a cross-module test dependency.
+struct MockCanonicalView {
+    map: std::collections::HashMap<u32, [u8; 32]>,
+}
+
+impl crate::chainstate::stacks::index::squash_recover::CanonicalView for MockCanonicalView {
+    fn canonical_at_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<[u8; 32]>, crate::chainstate::stacks::index::Error> {
+        Ok(self.map.get(&height).copied())
+    }
+}
+
+/// Worker `prepare_promotion` returns a `PreparedPromotion` and stops. The level row must NOT
+/// be in `marf_squash_levels`, the plan file must be on disk, and the promotion lock must be
+/// held — the prepared plan is durable and waiting for the coordinator to publish.
+#[test]
+fn worker_prepare_returns_durable_plan_without_publishing() {
+    use crate::chainstate::stacks::index::squash_plan::discover_pending_plans;
+    use crate::chainstate::stacks::index::squash_promote::prepare_promotion;
+
+    let (mut marf, db_path) =
+        open_hot_tier_marf("worker_prepare_returns_durable_plan_without_publishing");
+
+    // Standard chain: sentinel → b1 → ... → b6. Promote [0..=2].
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+    let _b4 = extend_with_block(&mut marf, &b3, 4);
+    let _b5 = extend_with_block(&mut marf, &b3, 5);
+    let _b6 = extend_with_block(&mut marf, &b3, 6);
+
+    // `prepare_promotion` now owns the pre-prep guard + lock-set, so the test calls it
+    // directly without staging the lock manually.
+    let prepared = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .unwrap();
+
+    // Plan handle reflects the in-flight promotion's bounds.
+    assert_eq!(prepared.min_height, 0);
+    assert_eq!(prepared.max_height, 2);
+    // level_id is whatever `prepare_merge_outputs` assigned; on a fresh MARF this is 0.
+
+    // No level row in marf_squash_levels — publish hasn't run.
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert!(
+        levels.is_empty(),
+        "prepare must not publish; expected empty marf_squash_levels, got {} rows",
+        levels.len(),
+    );
+
+    // Plan file IS on disk and matches the prepared handle's path.
+    assert!(prepared.plan_path.exists(), "plan file must be durable");
+    let plans = discover_pending_plans(&db_path).unwrap();
+    assert_eq!(plans.len(), 1, "exactly one pending plan");
+
+    // Promotion lock is still set — the publish step (or recovery on next open) owns the
+    // clear.
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert!(
+        state.promotion_in_progress.is_some(),
+        "lock must remain set until the publish step clears it"
+    );
+}
+
+/// `apply_prepared_plan` with `DrainPolicy::Canonical(view)` where the view matches the plan's
+/// recorded canonical chain publishes the level. This is the happy path of the coordinator
+/// publish gate.
+#[test]
+fn coordinator_publishes_matched_plan() {
+    use crate::chainstate::stacks::index::squash_plan::read_plan_file;
+    use crate::chainstate::stacks::index::squash_promote::{
+        apply_prepared_plan, prepare_promotion,
+    };
+    use crate::chainstate::stacks::index::squash_recover::{DrainOutcome, DrainPolicy};
+
+    let (mut marf, _db_path) = open_hot_tier_marf("coordinator_publishes_matched_plan");
+
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+    let _b4 = extend_with_block(&mut marf, &b3, 4);
+    let _b5 = extend_with_block(&mut marf, &b3, 5);
+
+    let prepared = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .unwrap();
+
+    // Build a canonical view that matches the plan's recorded `in_range_blocks` exactly.
+    let plan = read_plan_file(&prepared.plan_path).unwrap();
+    let mut map = std::collections::HashMap::new();
+    for (i, entry) in plan.in_range_blocks.iter().enumerate() {
+        map.insert(plan.header.min_height + i as u32, entry.block_hash);
+    }
+    let view = MockCanonicalView { map };
+
+    let outcome =
+        apply_prepared_plan::<BlockHeaderHash>(&mut marf, &prepared, DrainPolicy::Canonical(&view))
+            .expect("publish must succeed under matching canonical view");
+    assert!(
+        matches!(outcome, DrainOutcome::Published { .. }),
+        "expected Published outcome, got {outcome:?}"
+    );
+
+    // Level row is now in marf_squash_levels.
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert_eq!(levels.len(), 1, "publish must commit one level row");
+    assert_eq!(levels[0].level_id, prepared.level_id);
+
+    // Plan file is removed (publish clears it via `publish_prepared_inner`).
+    assert!(
+        !prepared.plan_path.exists(),
+        "publish must remove the plan file"
+    );
+
+    // Lock is cleared (publish does it inside the SQL transaction).
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert!(
+        state.promotion_in_progress.is_none(),
+        "publish must clear promotion_in_progress"
+    );
+}
+
+/// `apply_prepared_plan` with `DrainPolicy::Canonical(view)` where the view DIVERGES from the
+/// plan's recorded canonical chain returns `DiscardedStale` and abandons the plan: no level
+/// row, plan file removed, lock cleared. This is the runtime stale-tip fix — committing the
+/// level here would record a chain that downstream `assert_squash_consistency` would later
+/// trip on.
+#[test]
+fn coordinator_discards_stale_plan_on_canonical_divergence() {
+    use crate::chainstate::stacks::index::squash_plan::read_plan_file;
+    use crate::chainstate::stacks::index::squash_promote::{
+        apply_prepared_plan, prepare_promotion,
+    };
+    use crate::chainstate::stacks::index::squash_recover::{DrainOutcome, DrainPolicy};
+
+    let (mut marf, _db_path) =
+        open_hot_tier_marf("coordinator_discards_stale_plan_on_canonical_divergence");
+
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+    let _b4 = extend_with_block(&mut marf, &b3, 4);
+
+    let prepared = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .unwrap();
+
+    // Snapshot what the plan recorded so we can assert the discarded outcome's diagnostic
+    // fields point at the right diverging height.
+    let plan = read_plan_file(&prepared.plan_path).unwrap();
+    let recorded_at_h1 = plan.in_range_blocks[1].block_hash;
+
+    // Construct a view that DISAGREES with the plan at height 1 (a sibling fork point). The
+    // first divergence is what the coordinator will report.
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, plan.in_range_blocks[0].block_hash); // matches
+    let mut sibling = recorded_at_h1;
+    sibling[0] ^= 0xff;
+    map.insert(1u32, sibling); // diverges
+    map.insert(2u32, plan.in_range_blocks[2].block_hash);
+    let view = MockCanonicalView { map };
+
+    let outcome = apply_prepared_plan::<BlockHeaderHash>(
+        &mut marf,
+        &prepared,
+        DrainPolicy::Canonical(&view),
+    )
+    .expect("publish must succeed even when discarding (the function returns Ok with the outcome)");
+    let diverging = match outcome {
+        DrainOutcome::DiscardedStale {
+            diverging_height,
+            recorded_hash,
+            ..
+        } => {
+            assert_eq!(recorded_hash, recorded_at_h1);
+            diverging_height
+        }
+        other => panic!("expected DiscardedStale, got {other:?}"),
+    };
+    assert_eq!(
+        diverging, 1,
+        "diverging_height must point at the first mismatch"
+    );
+
+    // No level row published.
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert!(
+        levels.is_empty(),
+        "discarded plan must not publish; expected empty marf_squash_levels, got {} rows",
+        levels.len(),
+    );
+
+    // Plan file removed (abandon path inside `apply_prepared_plan`).
+    assert!(
+        !prepared.plan_path.exists(),
+        "discarded plan file must be removed"
+    );
+
+    // Lock cleared.
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert!(
+        state.promotion_in_progress.is_none(),
+        "abandon must clear promotion_in_progress"
+    );
+}
+
+/// Integration-style: simulate the runtime canonical shift. Worker captures a canonical_tip,
+/// prepares a plan recording that chain. Between prepare and publish, canonical determination
+/// flips at one of the in-range heights (a Stacks-level fork resolution that happens during
+/// fresh sync at deep heights). When the coordinator validates the prepared plan against the
+/// new canonical view, the plan is correctly discarded — the level that would have been
+/// committed records a now-stale chain and would trip later
+/// `assert_squash_consistency` checks if published.
+///
+/// This is the substantive regression for the live failure: under the old swap-from-worker
+/// model, the worker would publish anyway, the level row would record a stale chain, and
+/// downstream divergence detection would panic during sync.
+#[test]
+fn runtime_canonical_shift_during_promotion_caught_by_coordinator() {
+    use crate::chainstate::stacks::index::squash_plan::read_plan_file;
+    use crate::chainstate::stacks::index::squash_promote::{
+        apply_prepared_plan, prepare_promotion,
+    };
+    use crate::chainstate::stacks::index::squash_recover::{DrainOutcome, DrainPolicy};
+
+    let (mut marf, _db_path) =
+        open_hot_tier_marf("runtime_canonical_shift_during_promotion_caught_by_coordinator");
+
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+
+    // Phase 1 (worker): prepare with `canonical_tip = b3`. This snapshots the chain
+    // [b1, b2, b3] into the plan's `in_range_blocks`.
+    let prepared = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .unwrap();
+    let plan = read_plan_file(&prepared.plan_path).unwrap();
+    assert_eq!(plan.in_range_blocks.len(), 3);
+
+    // Phase 2 (between prepare and publish): canonical determination shifts. We model this by
+    // building a canonical view that reports a different hash at height 2 (the in-range tip)
+    // — typical of the level-7 mainnet incident where deep-height fork resolution flipped
+    // between scan and apply.
+    let mut shifted_view_map = std::collections::HashMap::new();
+    shifted_view_map.insert(0u32, plan.in_range_blocks[0].block_hash);
+    shifted_view_map.insert(1u32, plan.in_range_blocks[1].block_hash);
+    let mut shifted_tip = plan.in_range_blocks[2].block_hash;
+    shifted_tip[31] ^= 0x01; // sibling
+    shifted_view_map.insert(2u32, shifted_tip);
+    let view = MockCanonicalView {
+        map: shifted_view_map,
+    };
+
+    // Phase 3 (coordinator publish): the validate-then-publish gate catches the divergence
+    // and discards the plan.
+    let outcome =
+        apply_prepared_plan::<BlockHeaderHash>(&mut marf, &prepared, DrainPolicy::Canonical(&view))
+            .expect("publish call must return Ok with the outcome (DiscardedStale)");
+    match outcome {
+        DrainOutcome::DiscardedStale {
+            diverging_height, ..
+        } => assert_eq!(diverging_height, 2, "the in-range tip should diverge"),
+        other => panic!(
+            "stale-tip flip must be caught by coordinator; got {other:?} (this is the bug \
+             that caused the level-7 mainnet sync panic — the old worker-publishes-itself \
+             model committed the level here)"
+        ),
+    }
+
+    // The pre-fix bug surface: a stale level row would be in marf_squash_levels and
+    // downstream `assert_squash_consistency` would later trip on the recorded chain not
+    // matching live canonical. Assert no row exists (the runtime gate is doing its job).
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert!(
+        levels.is_empty(),
+        "runtime canonical shift must NOT produce a published level row (regression target)"
+    );
+}
+
+/// **Codex round-2 regression**: a leftover plan from a prior tick's failed publish gets
+/// validated + published-or-discarded by the next tick's drain, without ever requiring a
+/// process restart and without going through the (now-closed) worker-side TrustPlan path.
+///
+/// Models the failure mode Codex flagged: worker A prepares plan A; coordinator's
+/// `apply_prepared_plan` would fail (we simulate this by skipping the call entirely, leaving
+/// plan A on disk + lock held). Subsequent `MARF::drain_pending_plans(Canonical(view))` —
+/// what `poll_pending_promotions` does on every tick — must publish plan A under the same
+/// canonical gate. If the gate diverges, plan A is discarded.
+#[test]
+fn drain_publishes_orphan_plan_left_by_failed_apply() {
+    use crate::chainstate::stacks::index::squash_plan::{discover_pending_plans, read_plan_file};
+    use crate::chainstate::stacks::index::squash_promote::prepare_promotion;
+    use crate::chainstate::stacks::index::squash_recover::DrainPolicy;
+
+    let (mut marf, db_path) =
+        open_hot_tier_marf("drain_publishes_orphan_plan_left_by_failed_apply");
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+    let _b4 = extend_with_block(&mut marf, &b3, 4);
+
+    // Worker A: prepare. Plan A is now on disk; lock held; no level published.
+    let prepared = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .unwrap();
+    let plan = read_plan_file(&prepared.plan_path).unwrap();
+
+    // Simulate "coordinator's apply_prepared_plan failed before publish": the prepared handle is
+    // dropped without applying. The plan file + lock are still on disk.
+    drop(prepared);
+    assert_eq!(discover_pending_plans(&db_path).unwrap().len(), 1);
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert!(state.promotion_in_progress.is_some());
+    assert_eq!(
+        trie_sql::read_squash_levels(marf.sqlite_conn())
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // Next coordinator tick: build a canonical view that matches the plan's recorded chain
+    // (typical case — canonical hasn't shifted), then call `drain_pending_plans(Canonical)`.
+    // The drain should publish plan A under the canonical gate.
+    let mut map = std::collections::HashMap::new();
+    for (i, entry) in plan.in_range_blocks.iter().enumerate() {
+        map.insert(plan.header.min_height + i as u32, entry.block_hash);
+    }
+    let view = MockCanonicalView { map };
+    let stats = marf
+        .drain_pending_plans(DrainPolicy::Canonical(&view))
+        .expect("drain must succeed under matching canonical view");
+    assert_eq!(
+        stats.plans_committed(),
+        1,
+        "drain must publish the orphan plan; got stats: {stats:?}"
+    );
+
+    // Plan removed, level published, lock cleared.
+    assert!(discover_pending_plans(&db_path).unwrap().is_empty());
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert_eq!(levels.len(), 1, "drain must commit the leftover level row");
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert!(
+        state.promotion_in_progress.is_none(),
+        "drain's publish must clear the promotion lock"
+    );
+}
+
+/// Companion to the previous test: when the orphan plan's recorded canonical chain has
+/// diverged from the live view (e.g., a Stacks-level fork resolution flipped between tick N
+/// and tick N+1), the drain discards the plan instead of publishing it. This proves the
+/// canonical gate covers BOTH the fast path (`apply_prepared_plan`) and the fallback
+/// (`drain_pending_plans`) — the leftover-plan drain is not a backdoor that bypasses the
+/// stale-tip protection.
+#[test]
+fn drain_discards_orphan_plan_when_canonical_diverged() {
+    use crate::chainstate::stacks::index::squash_plan::{discover_pending_plans, read_plan_file};
+    use crate::chainstate::stacks::index::squash_promote::prepare_promotion;
+    use crate::chainstate::stacks::index::squash_recover::DrainPolicy;
+
+    let (mut marf, db_path) =
+        open_hot_tier_marf("drain_discards_orphan_plan_when_canonical_diverged");
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+
+    let prepared = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .unwrap();
+    let plan = read_plan_file(&prepared.plan_path).unwrap();
+    drop(prepared);
+
+    // Build a canonical view that DIVERGES from the plan at the in-range tip — the same
+    // shape as the runtime stale-tip flip caught in the fast-path test, but exercised through
+    // the drain fallback.
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, plan.in_range_blocks[0].block_hash);
+    map.insert(1u32, plan.in_range_blocks[1].block_hash);
+    let mut diverged_tip = plan.in_range_blocks[2].block_hash;
+    diverged_tip[0] ^= 0x80;
+    map.insert(2u32, diverged_tip);
+    let view = MockCanonicalView { map };
+
+    let stats = marf
+        .drain_pending_plans(DrainPolicy::Canonical(&view))
+        .expect("drain call must return Ok with the outcome");
+    assert_eq!(
+        stats.plans_committed(),
+        0,
+        "drain must NOT publish a stale plan"
+    );
+    assert_eq!(
+        stats.plans_discarded_stale(),
+        1,
+        "drain must report exactly one stale-discard outcome"
+    );
+
+    // Plan removed (abandon path), no level published, lock cleared.
+    assert!(discover_pending_plans(&db_path).unwrap().is_empty());
+    assert_eq!(
+        trie_sql::read_squash_levels(marf.sqlite_conn())
+            .unwrap()
+            .len(),
+        0
+    );
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert!(state.promotion_in_progress.is_none());
+}
+
+/// **Race regression: enumerate-vs-watermark ordering in `prepare_promotion`.**
+///
+/// Pins the bug surfaced by mainnet level-8 sync (blocks 19039/19040 left with stale patch
+/// base ptr `(18711, 2506)` after publish). Pre-fix, `prepare_promotion` snapshotted
+/// `tip_at_scan_start` AFTER `enumerate_hot_descendants`. A block committed by a concurrent
+/// writer in the (enumerate, watermark] window had `block_id ≤ watermark`, so:
+/// - it wasn't in `enumerate`'s result (committed after enumerate ran), and
+/// - the catch-up filter at publish time excluded it (`block_id > watermark` is false).
+///
+/// Both rewrite passes missed it; descendant backptrs to in-range blocks survived as
+/// pre-publish offsets and resolved into mid-node bytes after the level committed.
+///
+/// Post-fix: watermark is captured BEFORE enumerate. The catch-up filter `> watermark` at
+/// publish time then covers any commit that happened AFTER watermark snap, regardless of
+/// whether `enumerate` happened to see it.
+///
+/// The test models a coordinator's runtime concurrent-commit scenario: a worker pauses
+/// inside `prepare_promotion` immediately AFTER `enumerate_hot_descendants` returns (via
+/// the `arm_after_descendant_enumerate_barrier` test hook — placed at the wall-clock spot
+/// where the buggy ordering captured the watermark). A peer MARF on the test thread commits
+/// a new descendant during the pause; the worker is then released and continues.
+///
+/// Under the FIX (watermark captured BEFORE enumerate), the watermark was snapshotted
+/// before the peer's commit, so `b7.block_id > tip_at_scan_start`. b7 is NOT in enumerate's
+/// result (committed after enumerate ran), but the catch-up filter `> tip_at_scan_start` at
+/// publish time DOES cover it — initial scan misses, catch-up catches.
+///
+/// Under the BUGGY ordering (watermark captured AFTER enumerate), the watermark would be
+/// snapshotted after the barrier release, equal to `b7.block_id`. b7 falls through both
+/// rewrite passes (not in initial scan, not `> watermark` in catch-up filter). Reads
+/// through b7's stale backptrs would land mid-node post-publish.
+#[test]
+fn prepare_watermark_precedes_enumerate_under_concurrent_commit() {
+    use crate::chainstate::stacks::index::squash_promote::test_hooks;
+
+    let test_name = "prepare_watermark_precedes_enumerate_under_concurrent_commit";
+    let dir = fresh_test_dir(test_name);
+    let db_path = format!("{dir}/marf.sqlite");
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+    let sentinel = BlockHeaderHash::sentinel();
+
+    // Phase 1: build a chain with in-range blocks b1..b3 and descendants b4..b6. Drop the
+    // handle so the worker thread can open its own.
+    let (b3, b6) = {
+        let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
+        let b1 = extend_with_block(&mut marf, &sentinel, 1);
+        let b2 = extend_with_block(&mut marf, &b1, 2);
+        let b3 = extend_with_block(&mut marf, &b2, 3);
+        let b4 = extend_with_block(&mut marf, &b3, 4);
+        let b5 = extend_with_block(&mut marf, &b4, 5);
+        let b6 = extend_with_block(&mut marf, &b5, 6);
+        let _ = (b1, b2, b4, b5);
+        (b3, b6)
+    };
+
+    // Phase 2: arm the prepare-phase barrier and spawn the worker. The worker opens its own
+    // MARF and runs `run_horizon_gated_promotion` (the synchronous all-in-one entry, which
+    // internally calls `prepare_promotion` followed by `apply_prepared_plan(TrustPlan)`).
+    // It will pause inside `prepare_promotion` between watermark snapshot and enumerate.
+    let barrier = test_hooks::arm_after_descendant_enumerate_barrier(db_path.clone());
+
+    let worker_db_path = db_path.clone();
+    let worker_opts = opts.clone();
+    let worker_b3 = b3.clone();
+    let worker = std::thread::spawn(move || {
+        let mut marf = MARF::<BlockHeaderHash>::from_path(&worker_db_path, worker_opts).unwrap();
+        run_horizon_gated_promotion::<BlockHeaderHash>(
+            &mut marf,
+            SquashMode::TipOnly,
+            0,
+            2,
+            Some(worker_b3),
+        )
+    });
+
+    // Phase 3: wait for the worker to reach the barrier. With a healthy build this fires
+    // within a few hundred ms (the merger walk + cold-blob append for a 6-block chain is
+    // fast). Bump the timeout if it ever flakes.
+    assert!(
+        barrier.wait_until_reached(std::time::Duration::from_secs(5)),
+        "worker did not reach the after-descendant-enumerate barrier"
+    );
+
+    // Phase 4: peer MARF commits a new descendant b7 while the worker is paused. b7 is
+    // committed AFTER the worker captured `tip_at_scan_start` AND after enumerate already
+    // ran, so:
+    //   - b7 is NOT in `enumerate`'s result (enumerate already returned before b7's commit).
+    //   - b7's block_id > tip_at_scan_start (watermark was snapshotted before b7's commit).
+    // The catch-up filter at publish time (`block_id > watermark`) is what covers b7. If
+    // the watermark had been captured AFTER enumerate (the buggy ordering), it would equal
+    // b7's block_id and the catch-up filter would exclude it — b7 would fall through both
+    // rewrite passes.
+    let b7 = {
+        let mut peer = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
+        extend_with_block(&mut peer, &b6, 7)
+    };
+
+    // Phase 5: release the worker. It resumes inside `prepare_promotion`, finishes the
+    // remaining prep steps, persists the plan, and proceeds to apply (publish) the level.
+    // The catch-up scan inside the publish phase picks up b7 via `block_id > watermark`.
+    barrier.release();
+    let result = worker.join().expect("worker thread must not panic");
+    result.expect("promotion must succeed under concurrent commit during prepare");
+
+    // Phase 6: open a fresh handle and verify the post-publish state.
+    //
+    // The load-bearing assertion is the read of `k_*` via b7. Under the fix, b7's in-range
+    // backptrs were rewritten by the catch-up scan (initial scan missed b7 since it was
+    // committed after enumerate; catch-up filter `> watermark` covers it). Under a
+    // regression to the buggy ordering, b7 would fall through both passes and reads through
+    // its stale backptrs would land mid-node in the merged blob.
+    let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts).unwrap();
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert_eq!(levels.len(), 1, "publish must commit exactly one level row");
+
+    // Read every key VIA b7 (the descendant committed during the prepare window). This walks
+    // b7's full backptr chain back to wherever the key was originally written; any stale
+    // descendant backptr to an in-range block (now redirected to the merged blob) would land
+    // mid-node and surface as a corruption error or wrong-bytes return.
+    //
+    // Reading via earlier blocks (e.g., `marf.get(&b1, "k_1")`) would NOT traverse b7's
+    // ptrs — it'd just walk b1's local trie. The b7 view is what makes this test load-bearing
+    // for catching missed descendant rewrites.
+    for byte in 1..=7u8 {
+        let key = format!("k_{byte}");
+        let expected = MARFValue::from_value(&format!("v_{byte}"));
+        assert_eq!(
+            marf.get(&block_hash(byte), &key).unwrap(),
+            Some(expected.clone()),
+            "post-promotion read of {key} via its own block failed",
+        );
+        // The load-bearing read: walk from b7 (concurrent-commit descendant) back through
+        // the chain. Any stale backptr in b7's structure to an in-range block surfaces here.
+        assert_eq!(
+            marf.get(&block_hash(7), &key).unwrap(),
+            Some(expected),
+            "post-promotion read of {key} VIA b7 failed — b7's backptr chain is corrupt \
+             (race regression: b7 was committed during prepare's enumerate window and its \
+             in-range backptrs were not rewritten by catch-up)",
+        );
+    }
+
+    // Additionally seal a fresh write atop b7. Sealing walks the full trie to compute the
+    // root hash; any stale descendant ptr that the read path happens to skip over would
+    // surface here. This is the closest single-process analog of mainnet's
+    // `calculate_marf_root_hash` panic during block append.
+    let b8 = extend_with_block(&mut marf, &block_hash(7), 8);
+    let _ = b8;
+}
+
+/// **Smoke test for post-publish reads through a chain with a non-empty orphan section.**
+///
+/// Builds a chain whose squash produces a non-empty orphan section (`orphan_split_offset >
+/// 0`), then exercises post-publish reads VIA a hot descendant. Exercises the patch-chase
+/// + cross-handle metadata-load + post-publish read flow end-to-end. With the orphan-
+/// routing fix in `read_patched_persisted_node` ([storage.rs]), reads through any
+/// descendant patch chain whose base ptrs land in orphan-section territory route through
+/// the level's sidecar instead of decoding garbage from the merged blob's main section.
+///
+/// **What this test does NOT deterministically exercise**: the specific
+/// patch-base-targets-orphan-offset shape that surfaced on mainnet (clarity level 18,
+/// block 29798's patch base ptr `(29796, 13539646)`). Producing that shape requires a
+/// mainnet-scale workload (thousands of keys per block, deep patch chains) where
+/// translation-map-driven rewrites of descendant patch bases can map to orphan-section
+/// offsets. The unit-level helpers (`open_orphan_sidecar_for_level`,
+/// `read_orphan_node_bytes_into`) and their callers (`try_read_orphan_bytes` for normal
+/// reads, `read_patched_persisted_node` for patch-chase reads) share the same code path,
+/// so the existing `try_read_orphan_bytes` coverage transitively validates the helper
+/// behavior; the load-bearing end-to-end witness is mainnet stress testing.
+///
+/// Workload: a chain of blocks that each re-insert a small set of shared keys, producing
+/// patch chains that thread back through earlier blocks' nodes. Squashing an in-range
+/// prefix with reclaim drops older subtrees into the orphan section. A hot descendant past
+/// the squash range exercises the post-publish patch-chase read path.
+#[test]
+fn read_patched_persisted_node_orphan_routing() {
+    use crate::chainstate::stacks::index::trie_sql::read_squash_levels;
+
+    let dir = fresh_test_dir("read_patched_persisted_node_orphan_routing");
+    let db_path = format!("{dir}/marf.sqlite");
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_mmap(false);
+
+    // Build a 6-block chain where each block re-inserts the same set of shared keys, plus
+    // one block-unique key. The shared-key updates produce patch chains whose intermediate
+    // bases target nodes in earlier blocks; the unique-key inserts broaden the trie so the
+    // squash's reclaim pass produces a non-empty orphan section.
+    const SHARED_KEYS: u32 = 8;
+    let extend_with_shared = |marf: &mut MARF<BlockHeaderHash>,
+                              parent: &BlockHeaderHash,
+                              block_byte: u8|
+     -> BlockHeaderHash {
+        let new_block = block_hash(block_byte);
+        marf.begin(parent, &new_block).unwrap();
+        for k in 0..SHARED_KEYS {
+            let key = format!("shared_{k}");
+            let value = MARFValue::from_value(&format!("v_{block_byte}_{k}"));
+            marf.insert(&key, value).unwrap();
+        }
+        // Block-unique key, for read assertions.
+        let unique_key = format!("k_{block_byte}");
+        let unique_value = MARFValue::from_value(&format!("v_{block_byte}"));
+        marf.insert(&unique_key, unique_value).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        new_block
+    };
+
+    let sentinel = BlockHeaderHash::sentinel();
+    let mut marf = MARF::<BlockHeaderHash>::from_path(&db_path, opts.clone()).unwrap();
+    let b1 = extend_with_shared(&mut marf, &sentinel, 1);
+    let b2 = extend_with_shared(&mut marf, &b1, 2);
+    let b3 = extend_with_shared(&mut marf, &b2, 3);
+    let b4 = extend_with_shared(&mut marf, &b3, 4);
+    let b5 = extend_with_shared(&mut marf, &b4, 5);
+    let b6 = extend_with_shared(&mut marf, &b5, 6);
+
+    // Squash [b1..=b3] (heights 0..=2) with reclaim. The shared-key inserts in b4..b6
+    // (descendants of the squash range) include patch chains whose bases reach back through
+    // b1..b3's nodes. With reclaim=true, the in-range nodes that aren't tip-reachable from
+    // b3's root land in the orphan section.
+    run_horizon_gated_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::TipOnly,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .expect("promotion must succeed");
+
+    // Confirm the level has a non-empty orphan section. If it's zero, the workload didn't
+    // produce orphans and the test is vacuous (would pass under both fix and bug); fail
+    // loudly so a regression in the workload doesn't silently weaken the test.
+    let levels = read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert_eq!(levels.len(), 1);
+    assert!(
+        levels[0].orphan_split_offset > 0,
+        "test workload must produce a non-empty orphan section to exercise the patch-chase \
+         orphan-routing path; got orphan_split_offset=0 (level={})",
+        levels[0].level_id,
+    );
+
+    // Load-bearing reads: traverse b6's full backptr chain. Reading every shared key VIA b6
+    // walks: b6 -> patch -> ... -> b1 (where shared_k was first written). Without orphan
+    // routing in `read_patched_persisted_node`, an intermediate patch base ptr that targets
+    // an orphan-section node decodes garbage; with orphan routing, the read traverses the
+    // sidecar correctly.
+    for k in 0..SHARED_KEYS {
+        let key = format!("shared_{k}");
+        let expected = MARFValue::from_value(&format!("v_6_{k}"));
+        assert_eq!(
+            marf.get(&b6, &key).unwrap(),
+            Some(expected),
+            "post-publish read of {key} VIA b6 failed — patch-chase orphan routing \
+             regression? (the failing chain follows b6 -> patch -> ... back through the \
+             squashed range, hitting in-range orphan-section nodes mid-walk)",
+        );
+    }
+
+    // Also seal a fresh write atop b6. Sealing walks the full trie; any stale descendant
+    // ptr that single-key reads happen to skip over surfaces here. This mirrors the
+    // mainnet `calculate_marf_root_hash` panic shape.
+    let b7 = extend_with_shared(&mut marf, &b6, 7);
+
+    // Final post-extend reads via the new tip — exercises BOTH the new b7 patches AND the
+    // older b6/b5/.../b1 chain via b7's view.
+    for k in 0..SHARED_KEYS {
+        let key = format!("shared_{k}");
+        let expected = MARFValue::from_value(&format!("v_7_{k}"));
+        assert_eq!(
+            marf.get(&b7, &key).unwrap(),
+            Some(expected),
+            "post-extend read of {key} VIA b7 failed",
+        );
+    }
+
+    // Block-unique reads via the same descendant tip — hits a different traversal pattern
+    // (no patch chain on the unique-key path itself, but the read still resolves through
+    // b7's structure which references squashed bases).
+    for byte in 1..=7u8 {
+        let key = format!("k_{byte}");
+        let expected = MARFValue::from_value(&format!("v_{byte}"));
+        assert_eq!(
+            marf.get(&b7, &key).unwrap(),
+            Some(expected),
+            "post-extend read of unique {key} VIA b7 failed",
+        );
+    }
 }

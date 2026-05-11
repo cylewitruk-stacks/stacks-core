@@ -49,6 +49,7 @@ opt-level = 1
 # but won't impact subsequent builds.
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
 
 [profile.release]
 debug = true

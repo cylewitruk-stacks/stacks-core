@@ -1,21 +1,40 @@
-use clap::Args;
+use clap::{Args, ValueEnum};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::hex_bytes;
-use stackslib::chainstate::stacks::index::marf::{
-    MARF, MARFOpenOpts, MarfConnection, OWN_BLOCK_HEIGHT_KEY,
-};
+use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnection};
 use stackslib::chainstate::stacks::index::storage::TrieFileStorage;
 
 use crate::cli::CliCtx;
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum WalkIntentArg {
+    /// Default at-block read path (merged-tip + `LeafSquashed::value_at_height`).
+    AtBlock,
+    /// Fork-extension read path (per-height-root sidecar).
+    ForkExtend,
+    /// Run BOTH and print each result; useful for diagnosing merged-tip vs sidecar divergence.
+    Both,
+}
 
 #[derive(Args)]
 pub struct WalkArgs {
     /// Block hash to walk (hex string, 64 chars)
     pub block_hash: String,
 
-    /// MARF key to look up (default: __MARF_BLOCK_HEIGHT_SELF)
-    #[arg(long, default_value = "__MARF_BLOCK_HEIGHT_SELF")]
-    pub key: String,
+    /// MARF key to look up (e.g., `vm::SP…boomboxes-cycle-18::4::b-18::…`). Hashed via
+    /// `TrieHash::from_key` to derive the trie path. Mutually exclusive with `--key-path`.
+    #[arg(long, conflicts_with = "key_path")]
+    pub key: Option<String>,
+
+    /// 32-byte trie path hex (64 chars). Use when you have the path directly (e.g. from a
+    /// `MARF_SQUASH_TRACE leaf_path` log line). Mutually exclusive with `--key`.
+    #[arg(long)]
+    pub key_path: Option<String>,
+
+    /// Which `WalkIntent` to use. `both` runs the lookup twice and prints both results — the
+    /// fastest way to diagnose merged-tip vs per-height-root sidecar divergence.
+    #[arg(long, value_enum, default_value_t = WalkIntentArg::AtBlock)]
+    pub walk_intent: WalkIntentArg,
 }
 
 pub fn exec(ctx: &CliCtx, args: WalkArgs) {
@@ -33,23 +52,59 @@ pub fn exec(ctx: &CliCtx, args: WalkArgs) {
         StacksBlockId::from_bytes(&bytes).expect("32 bytes should always work")
     };
 
-    let key = &args.key;
-    let path = TrieHash::from_key(key);
+    let (key_str, path) = match (&args.key, &args.key_path) {
+        (Some(k), None) => (Some(k.clone()), TrieHash::from_key(k)),
+        (None, Some(p)) => {
+            let bytes = hex_bytes(p).unwrap_or_else(|e| {
+                eprintln!("Invalid hex key path '{p}': {e}");
+                std::process::exit(1);
+            });
+            if bytes.len() != 32 {
+                eprintln!("Key path must be 32 bytes (64 hex chars)");
+                std::process::exit(1);
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            (None, TrieHash(arr))
+        }
+        (None, None) => {
+            eprintln!("must supply either --key or --key-path");
+            std::process::exit(1);
+        }
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+    };
 
-    println!("Block:   {block_hash}");
-    println!("Key:     {key}");
-    println!("Path:    {path}");
-    println!("Path[0]: 0x{:02x} (root child index)", path.0[0]);
+    println!("Block:        {block_hash}");
+    if let Some(k) = &key_str {
+        println!("Key:          {k}");
+    }
+    println!("Path:         {path}");
+    println!("Path[0]:      0x{:02x} (root child index)", path.0[0]);
+    println!("Walk-intent:  {:?}", args.walk_intent);
     println!();
 
-    // --- Test with mmap enabled ---
     println!("=== WITH MMAP ===");
-    run_walk(db_path, ctx.blobs_path().is_some(), true, &block_hash, key);
+    run_walk(
+        db_path,
+        ctx.blobs_path().is_some(),
+        true,
+        &block_hash,
+        &path,
+        key_str.as_deref(),
+        args.walk_intent,
+    );
 
-    // --- Test with mmap disabled ---
     println!();
     println!("=== WITHOUT MMAP ===");
-    run_walk(db_path, ctx.blobs_path().is_some(), false, &block_hash, key);
+    run_walk(
+        db_path,
+        ctx.blobs_path().is_some(),
+        false,
+        &block_hash,
+        &path,
+        key_str.as_deref(),
+        args.walk_intent,
+    );
 }
 
 fn run_walk(
@@ -57,12 +112,14 @@ fn run_walk(
     external_blobs: bool,
     mmap: bool,
     block_hash: &StacksBlockId,
-    key: &str,
+    path: &TrieHash,
+    key_str: Option<&str>,
+    walk_intent: WalkIntentArg,
 ) {
     let marf_opts = MARFOpenOpts {
         external_blobs,
         mmap,
-        compress: false, // Read-only, doesn't matter
+        compress: false,
         ..MARFOpenOpts::default()
     };
 
@@ -72,7 +129,6 @@ fn run_walk(
     });
     let mut marf = MARF::from_storage(f);
 
-    // Step 1: open_block
     match marf.open_block(block_hash) {
         Ok(()) => println!("  open_block: OK"),
         Err(e) => {
@@ -81,30 +137,34 @@ fn run_walk(
         }
     }
 
-    // Step 2: get_block_height_of (the exact crash call)
-    match marf.get_block_height_of(block_hash, block_hash) {
-        Ok(Some(height)) => println!("  get_block_height_of: Ok(Some({height}))"),
-        Ok(None) => println!("  get_block_height_of: Ok(None)  *** THIS IS THE BUG ***"),
-        Err(e) => println!("  get_block_height_of: Err({e:?})"),
-    }
-
-    // Step 3: get_by_key for OWN_BLOCK_HEIGHT_KEY
-    match MarfConnection::get(&mut marf, block_hash, key) {
-        Ok(Some(val)) => println!("  get(\"{key}\"): Ok(Some({val:?}))"),
-        Ok(None) => println!("  get(\"{key}\"): Ok(None)  *** KEY NOT FOUND ***"),
-        Err(e) => println!("  get(\"{key}\"): Err({e:?})"),
-    }
-
-    // Step 4: Check parent block
-    let parent_hash = StacksBlockId::from_bytes(
-        &hex_bytes("8b838a4c94912f96eef12c489e2ac1837cd19783b0b849dbc003d2f6eaab92c0").unwrap(),
-    )
-    .unwrap();
-    match MarfConnection::get(&mut marf, &parent_hash, OWN_BLOCK_HEIGHT_KEY) {
-        Ok(Some(val)) => println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Ok(Some({val:?}))"),
-        Ok(None) => {
-            println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Ok(None)  *** PARENT ALSO MISSING ***")
+    let lookup_at_block = |marf: &mut MARF<StacksBlockId>| {
+        if let Some(k) = key_str {
+            MarfConnection::get(marf, block_hash, k)
+        } else {
+            MarfConnection::get_from_hash(marf, block_hash, path)
         }
-        Err(e) => println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Err({e:?})"),
+    };
+
+    let lookup_fork_extend = |marf: &mut MARF<StacksBlockId>| {
+        if let Some(k) = key_str {
+            marf.get_with_fork_extend_intent(block_hash, k)
+        } else {
+            marf.get_path_with_fork_extend_intent(block_hash, path)
+        }
+    };
+
+    let print_result = |label: &str, res: Result<Option<_>, _>| match res {
+        Ok(Some(val)) => println!("  {label}: Ok(Some({val:?}))"),
+        Ok(None) => println!("  {label}: Ok(None)  *** key not found ***"),
+        Err(e) => println!("  {label}: Err({e:?})"),
+    };
+
+    match walk_intent {
+        WalkIntentArg::AtBlock => print_result("AtBlock   ", lookup_at_block(&mut marf)),
+        WalkIntentArg::ForkExtend => print_result("ForkExtend", lookup_fork_extend(&mut marf)),
+        WalkIntentArg::Both => {
+            print_result("AtBlock   ", lookup_at_block(&mut marf));
+            print_result("ForkExtend", lookup_fork_extend(&mut marf));
+        }
     }
 }

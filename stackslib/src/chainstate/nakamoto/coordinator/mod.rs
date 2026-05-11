@@ -841,7 +841,7 @@ impl<
                 chainstate.maybe_squash(
                     block_receipt.header.stacks_block_height,
                     new_tip,
-                    self.sortition_db.conn(),
+                    &self.sortition_db,
                 );
             }
 

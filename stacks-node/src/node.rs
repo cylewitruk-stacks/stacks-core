@@ -201,6 +201,12 @@ fn spawn_peer(
                     continue;
                 }
             };
+            // Per-thread peer-loop chainstate handle. No `with_auto_recovery(true)` opt-in:
+            // the run loop's startup `chainstate.recover()` already drained any pending squash
+            // plans, and this handle is opened mid-life by a worker thread spawned AFTER that
+            // boot step. The per-process recovery slot in `recovery_state_for(db_path)`
+            // additionally gates byte-level recovery so concurrent reopens from this thread
+            // don't redo work the run loop already performed.
             let (mut chainstate, _) = match StacksChainState::open(
                 is_mainnet,
                 chain_id,
@@ -314,12 +320,15 @@ impl Node {
             get_bulk_initial_names: Some(Box::new(move || get_names(use_test_genesis_data))),
         };
 
+        // Alternate node-construction path (no follow-up `chainstate.recover()` call). Opt in
+        // to inline auto-recovery so any pending squash plan from a prior crash gets resolved
+        // (TrustPlan semantics) at open time, matching pre-refactor behavior.
         let chain_state_result = StacksChainState::open_and_exec(
             config.is_mainnet(),
             config.burnchain.chain_id,
             &config.get_chainstate_path_str(),
             Some(&mut boot_data),
-            Some(config.node.get_marf_opts()),
+            Some(config.node.get_marf_opts().with_auto_recovery(true)),
         );
 
         let (chain_state, receipts) = match chain_state_result {

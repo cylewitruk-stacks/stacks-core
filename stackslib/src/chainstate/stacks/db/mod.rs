@@ -173,27 +173,46 @@ pub struct StacksChainState {
     pub(crate) clarity_promotion_handle: Option<PromotionTaskHandle>,
 }
 
-/// **B5d-fu.2**: handle for a detached hot-tier promotion worker.
+/// Handle for a detached hot-tier promotion **prepare** worker.
 ///
-/// Owns the spawned thread's `JoinHandle`. `is_finished()` is
-/// non-blocking and lets the coordinator poll without join-blocking.
-/// `join()` returns the worker's `Result`; on `Err` the worker
-/// panicked, which is treated as fatal — the coordinator
-/// `resume_unwind`s rather than continue with a possibly-corrupt
-/// chainstate (matches B5d's panic-propagation policy under
-/// `thread::scope`).
+/// Owns the spawned thread's `JoinHandle`. `is_finished()` is non-blocking and lets the
+/// coordinator poll without join-blocking. `join()` returns the worker's `Result`; on a
+/// `JoinHandle` panic the coordinator `resume_unwind`s rather than continue with a possibly-
+/// corrupt chainstate.
+///
+/// **Worker = prepare-only.** The thread runs
+/// [`crate::chainstate::stacks::index::squash_promote::run_horizon_gated_promotion_at_path`],
+/// which stops at "plan file is durable on disk" and returns a `PreparedPromotion`. The
+/// coordinator's [`StacksChainState::poll_pending_promotions`] reaps the worker, builds a
+/// canonical view anchored at the chainstate's just-advanced tip via
+/// [`crate::chainstate::stacks::db::headers::HeadersCanonicalView::from_chainstate_tip`]
+/// (same source [`StacksChainState::assert_squash_consistency`] walks for divergence
+/// detection), and calls `apply_prepared_plan` to validate + publish. This split is what
+/// closes the runtime stale-tip publish window: the publish gate sees the same canonical
+/// chain the divergence detector will see, not the worker's scan-start snapshot or the
+/// sortition's view of canonical (which can disagree with the chainstate's view during block
+/// processing).
 pub struct PromotionTaskHandle {
-    /// Diagnostic label: `"headers"` or `"clarity"`. Threaded
-    /// through to logs so polled completion / panic messages are
-    /// attributable.
+    /// Diagnostic label: `"headers"` or `"clarity"`. Threaded through to logs so polled
+    /// completion / panic messages are attributable.
     label: &'static str,
-    /// MARF db path the worker is operating on. Diagnostic /
-    /// debugging aid.
+    /// MARF db path the worker is operating on. Diagnostic / debugging aid.
     #[allow(dead_code)]
     path: String,
-    /// The worker thread. `bool` payload: `true` iff the worker
-    /// successfully published a level (coordinator should refresh).
-    join_handle: std::thread::JoinHandle<bool>,
+    /// The worker thread.
+    ///
+    /// Payload semantics:
+    /// - `Ok(Some(prepared))`: prepare completed; coordinator should validate + publish.
+    /// - `Ok(None)`: nothing to publish, but coordinator should `refresh_after_squash` (this
+    ///   happens when worker-side recovery published a prior plan during `from_path` and the
+    ///   live prepare's range is now stale).
+    /// - `Err(e)`: prepare failed; coordinator logs and skips publish for this MARF this tick.
+    join_handle: std::thread::JoinHandle<
+        Result<
+            Option<crate::chainstate::stacks::index::squash_promote::PreparedPromotion>,
+            marf_error,
+        >,
+    >,
 }
 
 /// Result of [`StacksChainState::poll_pending_promotions`]: which detached promotion workers
@@ -500,6 +519,109 @@ pub fn compute_horizon_gated_max_height_with_burn_tip(
     warn!(
         "compute_horizon_gated_max_height: walked {} steps from {canonical_tip} without finding \
          a block at or below burn_height {target_burn_height}; defer",
+        MAX_WALK_STEPS,
+    );
+    Ok(None)
+}
+
+/// Per-epoch variant of [`compute_horizon_gated_max_height`]. Walks back from `canonical_tip`
+/// looking for the highest in-range Stacks height `h` that satisfies the **per-epoch** horizon
+/// predicate:
+///
+/// ```text
+/// burn_at(h) + max(epoch_horizon(e, configured)
+///                  for e in epochs overlapping [burn_at(min_height) .. burn_at(h)])
+///   <= burn_tip
+/// ```
+///
+/// `min_height` is the prospective squash level's lower bound — typically the previous level's
+/// `max_height + 1`, or `0` for the first squash. Together with the candidate `h` (max_height),
+/// it determines the burn-range whose epoch span we evaluate.
+///
+/// The composition rule is **max-over-overlapped-epochs**: a level fully inside one epoch gets
+/// that epoch's horizon; a level spanning multiple epochs gets the max of their horizons. See
+/// [`StacksChainState::max_horizon_over_burn_range`] and
+/// [`StacksChainState::epoch_horizon_floor`] for the schedule and rationale.
+///
+/// Conservative-default behavior on lookup failures (epoch list, sortdb tip, or
+/// `burn_height_for_stacks_height(min_height)` returns `None`): the function returns `Ok(None)`,
+/// which the cadence policy interprets as "no eligible range yet — defer." Same posture as
+/// [`compute_horizon_gated_max_height`]'s short-chain handling.
+pub fn compute_per_epoch_horizon_gated_max_height(
+    chainstate_db: &Connection,
+    sortdb_conn: &Connection,
+    canonical_tip: &StacksBlockId,
+    min_height: u32,
+    configured_horizon: u32,
+) -> Result<Option<u32>, Error> {
+    let burn_tip_height = match SortitionDB::get_canonical_burn_chain_tip(sortdb_conn) {
+        Ok(s) => s.block_height as u32,
+        Err(_) => return Ok(None),
+    };
+
+    // Lower bound of the prospective level's burn range. If `min_height` isn't yet in
+    // `block_headers` (e.g. very early sync, genesis row not yet inserted), defer.
+    let burn_at_min =
+        match StacksChainState::burn_height_for_stacks_height(chainstate_db, min_height) {
+            Some(h) => h as u32,
+            None => return Ok(None),
+        };
+
+    // Pre-fetch all epochs once; the walk below queries against this list per candidate.
+    let epochs = match SortitionDB::get_stacks_epochs(sortdb_conn) {
+        Ok(list) => list,
+        Err(_) => return Ok(None),
+    };
+
+    const MAX_WALK_STEPS: u32 = 10_000;
+    let mut current = canonical_tip.clone();
+    for _ in 0..MAX_WALK_STEPS {
+        let row: Option<(i64, i64, StacksBlockId)> = chainstate_db
+            .query_row(
+                "SELECT block_height, burn_header_height, parent_block_id \
+                 FROM block_headers WHERE index_block_hash = ?1",
+                rusqlite::params![&current],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, StacksBlockId>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::DBError(crate::util_lib::db::Error::SqliteError(e)))?;
+        let (block_height, burn_header_height, parent) = match row {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let block_height = block_height as u32;
+        let burn_header_height = burn_header_height as u32;
+
+        // Walked below the prospective level's lower bound — no eligible candidate.
+        if block_height < min_height {
+            return Ok(None);
+        }
+
+        let span_horizon = StacksChainState::max_horizon_over_burn_range(
+            &epochs,
+            burn_at_min,
+            burn_header_height,
+            configured_horizon,
+        );
+
+        if burn_header_height.saturating_add(span_horizon) <= burn_tip_height {
+            return Ok(Some(block_height));
+        }
+
+        if parent.as_bytes() == &[0u8; 32] {
+            return Ok(None);
+        }
+        current = parent;
+    }
+    warn!(
+        "compute_per_epoch_horizon_gated_max_height: walked {} steps from {canonical_tip} \
+         without finding an eligible height; defer",
         MAX_WALK_STEPS,
     );
     Ok(None)
@@ -1646,6 +1768,12 @@ impl StacksChainState {
         test_debug!("Open MARF index at {}", marf_path);
         let mut open_opts = marf_opts.unwrap_or(MARFOpenOpts::default());
         open_opts.external_blobs = true;
+        // No auto-recovery override here — we honor whatever the caller passed. Production
+        // startup paths (run_loop neon/nakamoto) leave `auto_recovery = false` and drive
+        // canonical-validated recovery explicitly via [`StacksChainState::recover`]. Tests and
+        // tools that want legacy "open + recover inline" semantics can pass
+        // [`MARFOpenOpts::with_auto_recovery`] with `true`, or invoke
+        // [`MARF::drain_pending_plans`] with `DrainPolicy::TrustPlan` after opening.
         test_override_marf_compression(&mut open_opts);
         let marf = MARF::from_path(marf_path, open_opts).map_err(db_error::IndexError)?;
         Ok(marf)
@@ -2194,6 +2322,20 @@ impl StacksChainState {
         Ok(receipts)
     }
 
+    /// Open an existing chainstate without running boot.
+    ///
+    /// **Recovery contract for `marf_opts = None`**: this convenience entry point preserves the
+    /// pre-refactor "open + auto-recover inline" semantics for callers that don't pass explicit
+    /// opts. Specifically, `None` is internally substituted with
+    /// `MARFOpenOpts::default().with_auto_recovery(true)`, so any pending squash promotion plans
+    /// are published or abandoned (with `TrustPlan` semantics) as part of opening. This makes
+    /// `open()` a safe drop-in for tests, tools, and short-lived CLI handlers that didn't
+    /// previously coordinate with [`Self::recover`].
+    ///
+    /// **For long-lived production startup**, callers that want canonical-validated recovery
+    /// MUST pass `Some(opts)` with `auto_recovery = false` (the default for explicit opts) and
+    /// follow up with [`Self::recover`] against a real `CanonicalView`. The neon and nakamoto
+    /// run loops do this in `boot_chainstate`.
     pub fn open(
         mainnet: bool,
         chain_id: u32,
@@ -2301,6 +2443,15 @@ impl StacksChainState {
         Ok(())
     }
 
+    /// Open + (if `boot_data` is `Some`) initialize the chainstate.
+    ///
+    /// **Recovery contract for `marf_opts = None`**: identical to [`Self::open`] — `None` is
+    /// substituted with `MARFOpenOpts::default().with_auto_recovery(true)` so pre-refactor
+    /// callers (tests, tools, CLI handlers) that didn't coordinate with [`Self::recover`]
+    /// continue to get inline auto-recovery and a fully-recovered handle.
+    ///
+    /// Production startup paths (run_loop neon/nakamoto) pass `Some(opts)` with
+    /// `auto_recovery = false` and drive recovery explicitly via [`Self::recover`] afterward.
     pub fn open_and_exec(
         mainnet: bool,
         chain_id: u32,
@@ -2308,6 +2459,13 @@ impl StacksChainState {
         boot_data: Option<&mut ChainStateBootData>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
+        // Convenience-entry contract: `None` opts means the caller wants the pre-refactor
+        // "open + auto-recover inline" semantics. Substitute default opts with
+        // `auto_recovery = true` so recovery happens at open time. Callers that explicitly pass
+        // `Some(opts)` get whatever they specified — production startup uses `auto_recovery =
+        // false` and follows up with `chainstate.recover(view)`.
+        let marf_opts =
+            Some(marf_opts.unwrap_or_else(|| MARFOpenOpts::default().with_auto_recovery(true)));
         StacksChainState::make_chainstate_dirs(path_str)?;
         let path = PathBuf::from(path_str);
         let blocks_path = StacksChainState::blocks_path(path.clone());
@@ -2356,6 +2514,49 @@ impl StacksChainState {
         )
         .map_err(|e| Error::ClarityError(e.into()))?;
 
+        Self::from_marfs(
+            mainnet,
+            chain_id,
+            path_str,
+            blocks_path_root,
+            clarity_state_index_marf,
+            clarity_state_index_root,
+            nakamoto_staging_blocks_conn,
+            state_index,
+            vm_state,
+            init_required,
+            boot_data,
+            marf_opts,
+        )
+    }
+
+    /// Assemble a [`StacksChainState`] from already-opened MARF handles. Splits the
+    /// "compute-paths-and-open-MARFs" prelude (which lives in [`Self::open_and_exec`]) from the
+    /// "wire-the-chainstate-struct-and-run-boot-init" body so production startup can:
+    ///
+    /// 1. Open both MARFs in deferred mode (skipping canonical-sensitive recovery).
+    /// 2. Derive a single canonical view from the headers SQL tables.
+    /// 3. Drain pending plans on both MARFs against that canonical view.
+    /// 4. Hand fully-recovered handles to this constructor.
+    ///
+    /// PR 1 ships the constructor; `open_and_exec` continues to call it with handles opened via
+    /// the legacy `MARF::from_path` / `MarfedKV::open` shape, so behavior is unchanged for all
+    /// callers. PR 2 wires the production startup to use the deferred + drain shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_marfs(
+        mainnet: bool,
+        chain_id: u32,
+        path_str: &str,
+        blocks_path_root: String,
+        clarity_state_index_marf: String,
+        clarity_state_index_root: String,
+        nakamoto_staging_blocks_conn: NakamotoStagingBlocksConn,
+        state_index: MARF<StacksBlockId>,
+        vm_state: MarfedKV,
+        init_required: bool,
+        boot_data: Option<&mut ChainStateBootData>,
+        marf_opts: Option<MARFOpenOpts>,
+    ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
         let clarity_state = ClarityInstance::new(mainnet, chain_id, vm_state);
 
         // Resolve cadence + sidecar retention from baked-in defaults. The
@@ -2459,6 +2660,75 @@ impl StacksChainState {
         Ok((chainstate, receipts))
     }
 
+    /// Drive recovery on both the headers and clarity MARFs.
+    ///
+    /// **When to call this**: at startup, after constructing the chainstate via
+    /// [`Self::from_marfs`] (or [`Self::open_and_exec`]) with
+    /// [`crate::chainstate::stacks::index::marf::MARFOpenOpts::with_auto_recovery`] set to
+    /// `false`, and **before spawning the chains-coordinator / p2p / relayer threads**.
+    ///
+    /// **Why startup-only**: a `Some(canonical_view)` call resolves "latest known canonical
+    /// chain" to validate plans against. The view is typically built from
+    /// [`crate::chainstate::burn::db::sortdb::SortitionDB::get_canonical_stacks_chain_tip_hash_and_height`],
+    /// which is documented as unsafe to call during block processing because it returns
+    /// latest-data-known-to-the-node, not historical-block-assembly state. At startup this is
+    /// fine — there's no active block processing — but invoking `recover` from a mid-life
+    /// context (e.g. inside a chains-coordinator handler) would race the same block processing
+    /// the warning protects against. Don't.
+    ///
+    /// **`canonical_view` parameter:**
+    /// - `Some(view)`: drain pending squash plans against `view`. Plans whose recorded canonical
+    ///   chain has diverged from the view get discarded (logged as
+    ///   [`crate::chainstate::stacks::index::squash_recover::DrainOutcome::DiscardedStale`])
+    ///   instead of published — closing the detached-worker stale-tip publish window that
+    ///   produced the level-7 divergence panic.
+    /// - `None`: drain with
+    ///   [`crate::chainstate::stacks::index::squash_recover::DrainPolicy::TrustPlan`]. Use this
+    ///   on the bootstrap path before any canonical Stacks tip exists, or when the caller has
+    ///   no SortitionDB / headers context to derive a view.
+    ///
+    /// Resolving the canonical view from a SortitionDB + the chainstate's headers tables is the
+    /// caller's responsibility — typically by constructing
+    /// [`crate::chainstate::stacks::db::headers::HeadersCanonicalView`] from the SortDB-resolved
+    /// Stacks tip + this chainstate's [`Self::state_index`] connection. Decoupling the view
+    /// construction from `recover` keeps this method DB-agnostic and unit-testable with mock
+    /// views.
+    ///
+    /// Returns the per-MARF drain stats so callers can log the recovery outcome.
+    ///
+    /// **Idempotent.** Safe to call repeatedly; subsequent calls with no remaining plans return
+    /// empty stats.
+    pub fn recover(
+        &mut self,
+        canonical_view: Option<
+            &dyn crate::chainstate::stacks::index::squash_recover::CanonicalView,
+        >,
+    ) -> Result<RecoverResult, Error> {
+        use crate::chainstate::stacks::index::squash_recover::DrainPolicy;
+        let policy = match canonical_view {
+            Some(view) => DrainPolicy::Canonical(view),
+            None => DrainPolicy::TrustPlan,
+        };
+        let policy_was_canonical = matches!(policy, DrainPolicy::Canonical(_));
+
+        let headers_stats = self.state_index.drain_pending_plans(match &policy {
+            DrainPolicy::TrustPlan => DrainPolicy::TrustPlan,
+            DrainPolicy::Canonical(v) => DrainPolicy::Canonical(*v),
+        })?;
+        let clarity_stats = self.clarity_state.with_marf(|marf| {
+            marf.drain_pending_plans(match &policy {
+                DrainPolicy::TrustPlan => DrainPolicy::TrustPlan,
+                DrainPolicy::Canonical(v) => DrainPolicy::Canonical(*v),
+            })
+        })?;
+
+        Ok(RecoverResult {
+            headers: headers_stats,
+            clarity: clarity_stats,
+            policy_was_canonical,
+        })
+    }
+
     pub fn config(&self) -> DBConfig {
         DBConfig {
             mainnet: self.mainnet,
@@ -2466,7 +2736,23 @@ impl StacksChainState {
             version: CHAINSTATE_VERSION.to_string(),
         }
     }
+}
 
+/// Result of [`StacksChainState::recover`]. Aggregates per-MARF drain outcomes plus diagnostic
+/// info about which policy actually fired (callers log this so operators can tell whether
+/// canonical validation was active or the bootstrap fallback ran).
+#[derive(Debug)]
+pub struct RecoverResult {
+    /// Drain stats for the headers MARF (`state_index`).
+    pub headers: crate::chainstate::stacks::index::squash_recover::DrainStats,
+    /// Drain stats for the clarity MARF (`clarity_state`'s inner `MarfedKV`).
+    pub clarity: crate::chainstate::stacks::index::squash_recover::DrainStats,
+    /// `true` if recovery used `DrainPolicy::Canonical`, `false` if it fell back to `TrustPlan`
+    /// because the SortitionDB had no canonical Stacks tip yet.
+    pub policy_was_canonical: bool,
+}
+
+impl StacksChainState {
     /// Begin a transaction against the (indexed) stacks chainstate DB.
     /// Does not create a Clarity instance.
     pub fn index_tx_begin(&mut self) -> StacksDBTx<'_> {
@@ -3051,78 +3337,298 @@ impl StacksChainState {
     /// path (e.g. a torn write the swap protocol didn't catch). Continuing after such a panic risks
     /// observable corruption — the coordinator `resume_unwind`s onto its own thread, matching the
     /// policy B5d's `thread::scope` dispatch enforced via the same mechanism.
-    pub fn poll_pending_promotions(&mut self) -> PromotionsReaped {
+    /// Reap finished promotion workers and run the publish gate for any plan(s) on disk.
+    ///
+    /// **Canonical view source: chainstate-tip-anchored, NOT sortdb-anchored.** The publish
+    /// gate must validate against the same canonical chain
+    /// [`Self::assert_squash_consistency`] uses for divergence detection — that's the
+    /// chainstate's just-advanced canonical tip walked back through the headers tables. Using
+    /// `SortitionDB::get_canonical_stacks_chain_tip_hash_and_height` here would query a
+    /// different source (the sortition's view of canonical, latest-data-known-to-the-node)
+    /// which can disagree with the chainstate's just-advanced tip during block processing
+    /// and let a stale plan slip through the gate only to trip divergence later.
+    ///
+    /// `canonical_tip` and `tip_height` are the values the coordinator passes to
+    /// [`Self::maybe_squash`], i.e. the StacksBlockId / height of the block whose receipt
+    /// just triggered this call.
+    pub fn poll_pending_promotions(
+        &mut self,
+        canonical_tip: &StacksBlockId,
+        tip_height: u32,
+    ) -> PromotionsReaped {
+        use crate::chainstate::stacks::db::headers::HeadersCanonicalView;
+        use crate::chainstate::stacks::index::squash_promote::apply_prepared_plan;
+        use crate::chainstate::stacks::index::squash_recover::{DrainOutcome, DrainPolicy};
+
         let retention_blocks = self.squash_sidecar_retention_blocks;
         let mut reaped = PromotionsReaped::default();
 
-        if let Some(promoted) = Self::poll_promotion_handle(&mut self.headers_promotion_handle) {
-            if promoted {
-                reaped.headers_promoted = true;
+        // Phase 1: join finished workers. Empty slots and workers still in flight are skipped
+        // without contention.
+        let headers_prepared = Self::join_finished_prepare(&mut self.headers_promotion_handle);
+        let clarity_prepared = Self::join_finished_prepare(&mut self.clarity_promotion_handle);
+
+        // Phase 2: collect publish work for this tick. We need to handle three sources:
+        //   1. A worker just returned a fresh `PreparedPromotion` — fast path via
+        //      `apply_prepared_plan` (skips integrity re-hashing of bytes the worker just
+        //      wrote).
+        //   2. A plan file is on disk that the prior tick's `apply_prepared_plan` failed to
+        //      publish (transient SQL/IO error, etc.) — fall back to `drain_pending_plans`,
+        //      which re-runs integrity checks then publishes under the same canonical gate.
+        //   3. Orphan plans on disk from a previous worker that the coordinator never reaped
+        //      (e.g., process crash between worker join and publish) — also drained.
+        //
+        // Both #2 and #3 go through `MARF::drain_pending_plans(Canonical(view))`, so a
+        // transient failure on tick N is recovered on tick N+1 without requiring a process
+        // restart.
+        let headers_path = self.state_index.get_db_path().to_string();
+        let clarity_path = self
+            .clarity_state
+            .with_marf(|m| m.get_db_path().to_string());
+        let pending_paths: [&str; 2] = [headers_path.as_str(), clarity_path.as_str()];
+
+        // Compute the canonical-view walk bound. Use the lowest height across all sources so
+        // every `(min_height + i)` covered by any plan in this tick can be validated.
+        let low_height_from_prepared = match (
+            headers_prepared
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|m| m.as_ref()),
+            clarity_prepared
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|m| m.as_ref()),
+        ) {
+            (Some(h), Some(c)) => Some(h.min_height.min(c.min_height)),
+            (Some(h), None) => Some(h.min_height),
+            (None, Some(c)) => Some(c.min_height),
+            (None, None) => None,
+        };
+        // `lowest_pending_plan_height` propagates hard errors (corrupt plan file, IO failure on
+        // the plan-discovery glob). We MUST NOT swallow those — silently treating an unreadable
+        // plan as "no orphans on disk" lets a stuck failure go undetected indefinitely. Surface
+        // the error loudly and bail the tick; the next tick will hit the same condition until
+        // the operator (or a restart's `StacksChainState::recover`) clears it. We also peek
+        // `discover_pending_plans` separately so we can distinguish "no plans" from "lowest is
+        // genesis (height 0)" without ambiguity.
+        let pending_paths_have_plans = pending_paths.iter().any(|p| {
+            crate::chainstate::stacks::index::squash_plan::discover_pending_plans(p)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        });
+        let low_height_from_disk = if pending_paths_have_plans {
+            match HeadersCanonicalView::lowest_pending_plan_height(&pending_paths) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    warn!(
+                        "Auto-squash (hot-tier, detached): pending-plan scan failed: {e}; \
+                         deferring publish for this tick (plans remain durable on disk; if \
+                         this persists, operator must inspect — recovery on restart will hit \
+                         the same condition)"
+                    );
+                    return reaped;
+                }
+            }
+        } else {
+            None
+        };
+        let low_height = match (low_height_from_prepared, low_height_from_disk) {
+            (Some(p), Some(d)) => p.min(d),
+            (Some(p), None) => p,
+            (None, Some(d)) => d,
+            (None, None) => {
+                // No prepared from workers, no orphan plans on disk. Nothing to publish.
+                return reaped;
+            }
+        };
+        let canonical_view = match HeadersCanonicalView::from_chainstate_tip(
+            self.state_index.sqlite_conn(),
+            canonical_tip,
+            tip_height,
+            low_height,
+        ) {
+            Ok(view) => Some(view),
+            Err(e) => {
+                warn!(
+                    "Auto-squash (hot-tier, detached): canonical view build failed: {e}; \
+                     deferring publish (plans remain durable on disk for next tick or restart \
+                     recovery)"
+                );
+                return reaped;
+            }
+        };
+
+        // `DrainPolicy<'_>` borrows `&dyn CanonicalView`, which can't be `Clone`d. The
+        // underlying `canonical_view` is owned, so we re-build the policy at each call site.
+        // (Inlined rather than factored into a closure because closure lifetime inference
+        // doesn't tie the input lifetime to the output `DrainPolicy<'_>` cleanly.)
+
+        // Per-arm publish tracking. We separate "published via apply (already refreshed
+        // internally)" from "published via drain (drain doesn't refresh — coordinator must)"
+        // so the duplicate `refresh_after_squash` on the fast path is gone: refresh fires
+        // exactly once per published level, on the path that didn't already refresh.
+        let mut headers_published_via_apply = false;
+        let mut headers_published_via_drain = false;
+        if let Some(Ok(Some(prepared))) = headers_prepared {
+            let policy = match canonical_view.as_ref() {
+                Some(v) => DrainPolicy::Canonical(v),
+                None => DrainPolicy::TrustPlan,
+            };
+            match apply_prepared_plan(&mut self.state_index, &prepared, policy) {
+                Ok(DrainOutcome::Published { .. }) => {
+                    headers_published_via_apply = true;
+                }
+                Ok(DrainOutcome::DiscardedStale { .. }) | Ok(DrainOutcome::Abandoned { .. }) => {
+                    // Outcome logged inside `apply_prepared_plan`.
+                }
+                Err(e) => warn!(
+                    "Auto-squash (hot-tier, detached): headers apply_prepared_plan failed: \
+                     {e} (drain fallback will retry under canonical gate)"
+                ),
+            }
+        }
+        let headers_drain_policy = match canonical_view.as_ref() {
+            Some(v) => DrainPolicy::Canonical(v),
+            None => DrainPolicy::TrustPlan,
+        };
+        match self.state_index.drain_pending_plans(headers_drain_policy) {
+            Ok(stats) if stats.plans_committed() > 0 => {
+                headers_published_via_drain = true;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Auto-squash (hot-tier, detached): headers drain_pending_plans failed: {e} \
+                 (plans remain on disk for next tick or restart recovery)"
+            ),
+        }
+        if headers_published_via_apply || headers_published_via_drain {
+            reaped.headers_promoted = true;
+            // Refresh ONLY if the drain path was what published. `apply_prepared_plan` already
+            // refreshes internally on success — refreshing again here was wasted SQL + mmap
+            // work on every successful runtime publish.
+            if headers_published_via_drain {
                 if let Err(e) = self.state_index.refresh_after_squash() {
                     warn!(
-                        "Auto-squash (hot-tier, detached): headers refresh_after_squash failed: \
-                         {e}"
+                        "Auto-squash (hot-tier, detached): headers refresh_after_squash \
+                         (post-drain) failed: {e}"
                     );
                 }
-                if let Err(e) = self.state_index.trim_sidecars(retention_blocks) {
-                    warn!(
-                        "Auto-squash (hot-tier, detached): headers MARF sidecar trim failed: {e}"
-                    );
-                }
+            }
+            if let Err(e) = self.state_index.trim_sidecars(retention_blocks) {
+                warn!("Auto-squash (hot-tier, detached): headers MARF sidecar trim failed: {e}");
             }
         }
 
-        if let Some(promoted) = Self::poll_promotion_handle(&mut self.clarity_promotion_handle) {
-            if promoted {
-                reaped.clarity_promoted = true;
-                self.clarity_state.with_marf(|m| {
+        // Clarity arm: same pattern, on the clarity MARF.
+        let mut clarity_published_via_apply = false;
+        let mut clarity_published_via_drain = false;
+        if let Some(Ok(Some(prepared))) = clarity_prepared {
+            let policy = match canonical_view.as_ref() {
+                Some(v) => DrainPolicy::Canonical(v),
+                None => DrainPolicy::TrustPlan,
+            };
+            let outcome = self
+                .clarity_state
+                .with_marf(|m| apply_prepared_plan(m, &prepared, policy));
+            match outcome {
+                Ok(DrainOutcome::Published { .. }) => {
+                    clarity_published_via_apply = true;
+                }
+                Ok(DrainOutcome::DiscardedStale { .. }) | Ok(DrainOutcome::Abandoned { .. }) => {}
+                Err(e) => warn!(
+                    "Auto-squash (hot-tier, detached): clarity apply_prepared_plan failed: \
+                     {e} (drain fallback will retry under canonical gate)"
+                ),
+            }
+        }
+        let clarity_drain_policy = match canonical_view.as_ref() {
+            Some(v) => DrainPolicy::Canonical(v),
+            None => DrainPolicy::TrustPlan,
+        };
+        let clarity_drain_result = self
+            .clarity_state
+            .with_marf(|m| m.drain_pending_plans(clarity_drain_policy));
+        match clarity_drain_result {
+            Ok(stats) if stats.plans_committed() > 0 => {
+                clarity_published_via_drain = true;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Auto-squash (hot-tier, detached): clarity drain_pending_plans failed: {e} \
+                 (plans remain on disk for next tick or restart recovery)"
+            ),
+        }
+        if clarity_published_via_apply || clarity_published_via_drain {
+            reaped.clarity_promoted = true;
+            // Same refresh discipline as headers: only refresh if drain was the publisher.
+            self.clarity_state.with_marf(|m| {
+                if clarity_published_via_drain {
                     if let Err(e) = m.refresh_after_squash() {
                         warn!(
                             "Auto-squash (hot-tier, detached): clarity refresh_after_squash \
-                             failed: {e}"
+                             (post-drain) failed: {e}"
                         );
                     }
-                    if let Err(e) = m.trim_sidecars(retention_blocks) {
-                        warn!(
-                            "Auto-squash (hot-tier, detached): clarity MARF sidecar trim \
-                             failed: {e}"
-                        );
-                    }
-                });
-            }
+                }
+                if let Err(e) = m.trim_sidecars(retention_blocks) {
+                    warn!(
+                        "Auto-squash (hot-tier, detached): clarity MARF sidecar trim \
+                         failed: {e}"
+                    );
+                }
+            });
         }
 
         reaped
     }
 
-    /// Helper: try-join one slot. Returns:
+    /// Helper: try-join one prepare-worker slot. Returns:
     /// - `None` if the slot is empty or the worker is still running (`is_finished() == false`).
-    /// - `Some(promoted)` once the worker has finished and joined cleanly. Slot is taken (`None`
-    ///   after this returns `Some`).
+    /// - `Some(Ok(Some(prepared)))`: worker finished, prepare succeeded; coordinator should
+    ///   validate + publish.
+    /// - `Some(Ok(None))`: worker finished, but on-disk state is post-recovery; coordinator
+    ///   should not publish anything new (the next cadence tick re-dispatches if needed).
+    /// - `Some(Err(e))`: worker's prepare returned an error; coordinator skips publish this
+    ///   tick. The plan file (if any) remains on disk for next-open recovery.
     ///
-    /// `resume_unwind`s on worker panic — see [`Self::poll_pending_promotions`] for rationale.
-    fn poll_promotion_handle(slot: &mut Option<PromotionTaskHandle>) -> Option<bool> {
+    /// `resume_unwind`s on worker thread panic — a panicked prepare worker indicates a
+    /// soundness bug; continuing risks observable corruption.
+    fn join_finished_prepare(
+        slot: &mut Option<PromotionTaskHandle>,
+    ) -> Option<
+        Result<
+            Option<crate::chainstate::stacks::index::squash_promote::PreparedPromotion>,
+            marf_error,
+        >,
+    > {
         let needs_drain = slot.as_ref().is_some_and(|h| h.join_handle.is_finished());
         if !needs_drain {
             return None;
         }
-        // Safe: `is_finished()` was true → join() returns immediately. Take the slot so the join
-        // can consume the handle.
         let handle = slot.take()?;
         let label = handle.label;
         match handle.join_handle.join() {
-            Ok(promoted) => {
-                info!(
-                    "Auto-squash (hot-tier, detached): {label} worker finished: \
-                     promoted={promoted}"
-                );
-                Some(promoted)
+            Ok(result) => {
+                match &result {
+                    Ok(Some(p)) => info!(
+                        "Auto-squash (hot-tier, detached): {label} prepare worker finished: \
+                         level_id={} range=[{}..={}]",
+                        p.level_id, p.min_height, p.max_height,
+                    ),
+                    Ok(None) => info!(
+                        "Auto-squash (hot-tier, detached): {label} prepare worker finished: \
+                         nothing to publish (post-recovery state)"
+                    ),
+                    Err(e) => warn!(
+                        "Auto-squash (hot-tier, detached): {label} prepare worker errored: {e}"
+                    ),
+                }
+                Some(result)
             }
             Err(panic) => {
                 error!(
-                    "Auto-squash (hot-tier, detached): {label} worker thread panicked. \
-                     Resuming unwind on coordinator (panic propagates as fatal — same \
-                     policy as B5d thread::scope)."
+                    "Auto-squash (hot-tier, detached): {label} prepare worker thread panicked. \
+                     Resuming unwind on coordinator (panic propagates as fatal)."
                 );
                 std::panic::resume_unwind(panic);
             }
@@ -3167,11 +3673,30 @@ impl StacksChainState {
         // Horizon predicate. `None` means horizon hasn't been established yet — C2a treats that as
         // "all orphans retained" (conservative), so the sweep can still safely run; an absent
         // horizon just means no past-horizon orphans contribute.
+        //
+        // The sweep must not unlink orphans that any *future* squash level would still need.
+        // The smallest possible `min_height` for any future level across both MARFs is the
+        // smaller of `headers_latest_max + 1` and `clarity_latest_max + 1` (or `0` if a MARF
+        // has no levels yet). Using that bound — rather than a hardcoded `0` — lets the sweep
+        // get progressively tighter horizons as the chain advances past noisy 2.x epochs:
+        // a node already past Nakamoto activation has `min_height` solidly in epoch 3.0+
+        // territory, so the per-epoch resolver returns the small Nakamoto floor (6) instead
+        // of being permanently pinned to the worst 2.x floor.
         let horizon_blocks = self.squash_horizon_burn_blocks;
-        let horizon_max_height =
-            compute_horizon_gated_max_height(self.db(), sortdb_conn, canonical_tip, horizon_blocks)
-                .ok()
-                .flatten();
+        let sweep_min_height = std::cmp::min(
+            Self::squash_min_height_for(&self.state_index),
+            self.clarity_state
+                .with_marf(|m| Self::squash_min_height_for_marf(m)),
+        );
+        let horizon_max_height = compute_per_epoch_horizon_gated_max_height(
+            self.db(),
+            sortdb_conn,
+            canonical_tip,
+            sweep_min_height,
+            horizon_blocks,
+        )
+        .ok()
+        .flatten();
 
         // Build the canonical-chain precompute. `low_height = 0` is conservative — covers any
         // reasonably-aged orphan. The walk is O(tip_height + 1); cheap relative to the per-MARF
@@ -3303,21 +3828,32 @@ impl StacksChainState {
         &mut self,
         block_height: u64,
         canonical_tip: StacksBlockId,
-        sortdb_conn: &Connection,
+        sortdb: &SortitionDB,
     ) {
         use std::thread;
 
-        // B5d-fu.2: drain any previously-spawned detached workers that finished since the last
-        // cadence tick. Single-flight gating below depends on the slots being clear when a worker
-        // has finished, so this MUST run before the dispatch logic.
+        let sortdb_conn = sortdb.conn();
+        let tip_height = block_height as u32;
+
+        // Drain any previously-spawned detached prepare workers that finished since the last
+        // cadence tick. This is the publish gate: `poll_pending_promotions` validates each
+        // worker's prepared plan against the same canonical chain
+        // `assert_squash_consistency` will later use — i.e., the chainstate's just-advanced
+        // tip walked back through the headers tables. Threading `canonical_tip` + `tip_height`
+        // here (instead of `&SortitionDB`) ensures the gate's view matches the divergence
+        // detector's view; using the sortdb's `get_canonical_stacks_chain_tip_hash_and_height`
+        // would query a different (latest-data-known-to-the-node) source that can disagree
+        // during block processing and let stale plans slip through.
         //
-        // **Phase C C4**: capture which MARFs the poll just reaped, then run the hot-reclaim
-        // sweep against them. The sweep happens here (not later in this method) so the cadence
-        // early-return path still triggers the sweep on ticks where promotion finished but no
-        // *new* squash needs to fire. Sweep failures are logged + swallowed inside
-        // `sweep_after_promotions` — Phase C is purely additive (per .docs/squashing-v1.5.md §11
-        // risk note).
-        let reaped = self.poll_pending_promotions();
+        // Single-flight gating below depends on the slots being clear when a worker has
+        // finished, so this MUST run before the dispatch logic.
+        //
+        // **Phase C C4**: capture which MARFs the poll just published, then run the
+        // hot-reclaim sweep against them. The sweep happens here (not later in this method)
+        // so the cadence early-return path still triggers the sweep on ticks where publish
+        // finished but no *new* squash needs to fire. Sweep failures are logged + swallowed
+        // inside `sweep_after_promotions` — Phase C is purely additive.
+        let reaped = self.poll_pending_promotions(&canonical_tip, tip_height);
         if reaped.any_promoted() {
             self.sweep_after_promotions(&canonical_tip, sortdb_conn, reaped);
         }
@@ -3363,14 +3899,34 @@ impl StacksChainState {
         // B5c were removed since every disk-backed MARF now goes through the hot-tier path.
         let horizon_blocks = self.squash_horizon_burn_blocks;
 
-        // Compute the horizon-gated max_height once. Shared between headers + clarity since both
-        // anchor to the same canonical chain. `None` means "no canonical block on the chain yet
-        // satisfies `burn_at(h) <= burn_tip - horizon`" — typically chain too short, or burn-tip
-        // lookup failed.
-        let horizon_max_height = compute_horizon_gated_max_height(
+        // Compute horizon-gated max_height **per MARF** under the per-epoch horizon schedule.
+        // Each MARF's prospective level has its own `min_height` (the previous level's
+        // `max_height + 1`, or `0` for the first squash), and the effective horizon depends on
+        // which epochs the candidate range `[min_height..=max_height]` overlaps. See
+        // [`StacksChainState::epoch_horizon_floor`] for the schedule + rationale, and
+        // [`compute_per_epoch_horizon_gated_max_height`] for the walk.
+        //
+        // `None` means "no canonical block on the chain yet satisfies the per-epoch predicate"
+        // — typically chain too short, or `burn_at(min_height)` not yet in `block_headers`.
+        let headers_min_height = Self::squash_min_height_for(&self.state_index);
+        let clarity_min_height = self
+            .clarity_state
+            .with_marf(|m| Self::squash_min_height_for_marf(m));
+
+        let headers_horizon_max_height = compute_per_epoch_horizon_gated_max_height(
             self.db(),
             sortdb_conn,
             &canonical_tip,
+            headers_min_height,
+            horizon_blocks,
+        )
+        .ok()
+        .flatten();
+        let clarity_horizon_max_height = compute_per_epoch_horizon_gated_max_height(
+            self.db(),
+            sortdb_conn,
+            &canonical_tip,
+            clarity_min_height,
             horizon_blocks,
         )
         .ok()
@@ -3379,32 +3935,35 @@ impl StacksChainState {
         // Per-MARF blocks_since uses the horizon-gated effective height (the height of the
         // prospective squash range), so the cadence policy (`min_blocks` / `max_blocks` /
         // `work_target_bytes`) applies to the actual range that would be promoted.
-        let effective_height = horizon_max_height.unwrap_or(0);
+        let headers_effective_height = headers_horizon_max_height.unwrap_or(0);
+        let clarity_effective_height = clarity_horizon_max_height.unwrap_or(0);
         let headers_blocks_since = self
             .state_index
             .latest_squash_level_range()
-            .map(|r| effective_height.saturating_sub(r.max_height))
-            .unwrap_or(effective_height);
+            .map(|r| headers_effective_height.saturating_sub(r.max_height))
+            .unwrap_or(headers_effective_height);
         let clarity_blocks_since = self
             .clarity_state
             .with_marf(|m| m.latest_squash_level_range())
-            .map(|r| effective_height.saturating_sub(r.max_height))
-            .unwrap_or(effective_height);
+            .map(|r| clarity_effective_height.saturating_sub(r.max_height))
+            .unwrap_or(clarity_effective_height);
 
-        // Horizon closure for `should_squash`: pass iff `horizon_max_height` was computable.
-        let horizon_check = || horizon_max_height.is_some();
+        // Per-MARF horizon closure for `should_squash`: pass iff that MARF's per-epoch
+        // horizon-gated max height was computable.
+        let headers_horizon_check = || headers_horizon_max_height.is_some();
+        let clarity_horizon_check = || clarity_horizon_max_height.is_some();
 
         let headers_should_squash = should_squash(
             &headers_stats,
             headers_blocks_since,
             &self.squash_cadence_headers,
-            horizon_check,
+            headers_horizon_check,
         );
         let clarity_should_squash = should_squash(
             &clarity_stats,
             clarity_blocks_since,
             &self.squash_cadence_clarity,
-            horizon_check,
+            clarity_horizon_check,
         );
 
         if !headers_should_squash && !clarity_should_squash {
@@ -3444,12 +4003,39 @@ impl StacksChainState {
         let headers_already_running = self.headers_promotion_handle.is_some();
         let clarity_already_running = self.clarity_promotion_handle.is_some();
 
+        // Resolve the operator-configured squash mode and run it through
+        // `effective_squash_mode`. Two safety properties matter here:
+        //
+        // 1. **Operator intent is preserved.** Operators set `marf_full_history = true` (TOML)
+        //    when they want `FullHistory` regardless of epoch — e.g. an indexer that needs
+        //    historical reads against any past height. Reading the configured mode from
+        //    `self.marf_opts` (populated at chainstate-open time from `MARFOpenOpts.squash_mode`)
+        //    keeps that intent intact through worker dispatch.
+        //
+        // 2. **Pre-epoch-3.4 ranges are forced to `FullHistory`.** Even when the operator
+        //    configured `TipOnly`, `effective_squash_mode` upgrades to `FullHistory` whenever
+        //    the squash range starts pre-3.4, because Clarity `at-block` reads at any height
+        //    inside such a range require per-height transitions. Without this upgrade, every
+        //    pre-3.4 squash would corrupt historical reads at non-tip heights inside the level.
+        //
+        // Default is `TipOnly` if `marf_opts` is `None` (e.g. a programmatic chainstate handle
+        // built without going through `Config::get_marf_opts`); the conservative default matches
+        // the historical `MARFOpenOpts::default()` behavior.
+        let configured_mode = self.configured_squash_mode();
+
         let headers_hot_plan = if headers_should_squash && !headers_already_running {
-            let min_height = Self::squash_min_height_for(&self.state_index);
-            let max_height = horizon_max_height.unwrap_or(0);
+            let min_height = headers_min_height;
+            let max_height = headers_horizon_max_height.unwrap_or(0);
             if max_height >= min_height {
+                let mode = Self::effective_squash_mode(
+                    configured_mode,
+                    min_height,
+                    self.db(),
+                    sortdb_conn,
+                );
                 Some((
                     self.state_index.get_db_path().to_string(),
+                    mode,
                     min_height,
                     max_height,
                 ))
@@ -3470,15 +4056,19 @@ impl StacksChainState {
             None
         };
         let clarity_hot_plan = if clarity_should_squash && !clarity_already_running {
-            let max_height = horizon_max_height.unwrap_or(0);
-            let (clarity_path, clarity_min) = self.clarity_state.with_marf(|m| {
-                (
-                    m.get_db_path().to_string(),
-                    Self::squash_min_height_for_marf(m),
-                )
-            });
+            let max_height = clarity_horizon_max_height.unwrap_or(0);
+            let clarity_min = clarity_min_height;
+            let clarity_path = self
+                .clarity_state
+                .with_marf(|m| m.get_db_path().to_string());
             if max_height >= clarity_min {
-                Some((clarity_path, clarity_min, max_height))
+                let mode = Self::effective_squash_mode(
+                    configured_mode,
+                    clarity_min,
+                    self.db(),
+                    sortdb_conn,
+                );
+                Some((clarity_path, mode, clarity_min, max_height))
             } else {
                 info!(
                     "Auto-squash: clarity MARF skipping empty horizon-gated range \
@@ -3499,12 +4089,13 @@ impl StacksChainState {
         // Detached spawn. `thread::Builder::spawn` returns `io::Result<JoinHandle<_>>`; on rare
         // spawn failure (e.g. resource exhaustion) we log and skip — the cadence will retry on the
         // next block.
-        if let Some((path, min_h, max_h)) = headers_hot_plan {
+        if let Some((path, mode, min_h, max_h)) = headers_hot_plan {
             let tip = canonical_tip.clone();
             match thread::Builder::new()
                 .name("hot-tier-promote-headers".into())
-                .spawn(move || run_hot_tier_promotion_worker("headers", &path, min_h, max_h, tip))
-            {
+                .spawn(move || {
+                    run_hot_tier_promotion_worker("headers", &path, mode, min_h, max_h, tip)
+                }) {
                 Ok(join_handle) => {
                     self.headers_promotion_handle = Some(PromotionTaskHandle {
                         label: "headers",
@@ -3520,15 +4111,16 @@ impl StacksChainState {
                 }
             }
         }
-        if let Some((path, min_h, max_h)) = clarity_hot_plan {
+        if let Some((path, mode, min_h, max_h)) = clarity_hot_plan {
             let tip = canonical_tip.clone();
             let clarity_path_for_handle = self
                 .clarity_state
                 .with_marf(|m| m.get_db_path().to_string());
             match thread::Builder::new()
                 .name("hot-tier-promote-clarity".into())
-                .spawn(move || run_hot_tier_promotion_worker("clarity", &path, min_h, max_h, tip))
-            {
+                .spawn(move || {
+                    run_hot_tier_promotion_worker("clarity", &path, mode, min_h, max_h, tip)
+                }) {
                 Ok(join_handle) => {
                     self.clarity_promotion_handle = Some(PromotionTaskHandle {
                         label: "clarity",
@@ -3545,51 +4137,51 @@ impl StacksChainState {
             }
         }
 
-        // --- Inline helper: hot-tier promotion worker ---
+        // --- Inline helper: hot-tier promotion **prepare** worker ---
         //
-        // Phase D (2026-05-04): the legacy `SquashPlan` / `run_squash_plan` /
-        // `thread::scope` synchronous dispatch was removed. Hot tier is non-optional, so every
-        // MARF promotion runs through the detached `run_horizon_gated_promotion_at_path` worker
-        // above. The legacy path's `Phase 1-4` blocks (plan construction, parallel squash, refresh,
-        // trim) are gone — refresh + trim now happen at poll-time inside
-        // `poll_pending_promotions`.
+        // Returns the worker's prepared plan handle (or `None` if recovery published a level on
+        // open and the live prepare's range was stale, or `Err` if prepare failed). The
+        // coordinator's `poll_pending_promotions` reaps this on a later tick and runs the
+        // canonical-validated publish step.
 
-        /// Run a hot-tier horizon-gated promotion for one MARF in a `thread::scope` worker.
-        /// Returns `true` iff the calling coordinator should refresh its live MARF handle; on
-        /// failure logs and returns `false` so the live handle keeps pointing at the unmodified
-        /// file.
+        /// Run the prepare phase of a hot-tier horizon-gated promotion for one MARF on a
+        /// detached worker thread. Returns the prepared handle for the coordinator to validate
+        /// + publish.
         fn run_hot_tier_promotion_worker(
             label: &'static str,
             path: &str,
+            mode: SquashMode,
             min_height: u32,
             max_height: u32,
             canonical_tip: StacksBlockId,
-        ) -> bool {
+        ) -> Result<
+            Option<crate::chainstate::stacks::index::squash_promote::PreparedPromotion>,
+            marf_error,
+        > {
             info!(
-                "Auto-squash (hot-tier): {label} MARF horizon-gated promotion \
-                 [{min_height}..={max_height}] (canonical_tip={canonical_tip})"
+                "Auto-squash (hot-tier): {label} MARF prepare \
+                 [{min_height}..={max_height}] mode={mode:?} (canonical_tip={canonical_tip})"
             );
-            match crate::chainstate::stacks::index::squash_promote::run_horizon_gated_promotion_at_path::<
+            let result = crate::chainstate::stacks::index::squash_promote::run_horizon_gated_promotion_at_path::<
                 StacksBlockId,
-            >(
-                path, min_height, max_height, Some(canonical_tip),
-            ) {
-                Ok(stats) => {
-                    info!(
-                        "Auto-squash (hot-tier): {label} MARF promotion complete: \
-                         {} translation entries, {} descendants scanned, \
-                         {} rewrites planned",
-                        stats.translation_map_entries,
-                        stats.descendants_scanned,
-                        stats.rewrites_planned,
-                    );
-                    true
-                }
-                Err(e) => {
-                    warn!("Auto-squash (hot-tier): {label} MARF promotion failed: {e}");
-                    false
-                }
+            >(path, mode, min_height, max_height, Some(canonical_tip));
+            match &result {
+                Ok(Some(p)) => info!(
+                    "Auto-squash (hot-tier): {label} MARF prepare complete: \
+                     level_id={} translation_entries={} descendants_scanned={} \
+                     rewrites_planned={}",
+                    p.level_id,
+                    p.stats.translation_map_entries,
+                    p.stats.descendants_scanned,
+                    p.stats.rewrites_planned,
+                ),
+                Ok(None) => info!(
+                    "Auto-squash (hot-tier): {label} MARF prepare reported \
+                     nothing-to-publish (post-recovery state)"
+                ),
+                Err(e) => warn!("Auto-squash (hot-tier): {label} MARF prepare failed: {e}"),
             }
+            result
         }
     }
 
@@ -3624,6 +4216,26 @@ impl StacksChainState {
     /// Determine the effective squash mode for a level whose range starts at `min_height` (a Stacks
     /// block height).
     ///
+    /// Read the operator-configured squash mode (from `marf_full_history` in TOML, threaded
+    /// through `MARFOpenOpts.squash_mode` at chainstate-open time).
+    ///
+    /// Returns `TipOnly` if `marf_opts` is `None` — that case only arises for programmatic
+    /// chainstate handles built without going through `Config::get_marf_opts`, which preserves
+    /// the historical `MARFOpenOpts::default()` behavior. Production node startup always
+    /// populates `marf_opts`.
+    pub(crate) fn configured_squash_mode(&self) -> SquashMode {
+        Self::configured_squash_mode_from_opts(self.marf_opts.as_ref())
+    }
+
+    /// Static variant of [`Self::configured_squash_mode`] that operates on the raw
+    /// `Option<&MARFOpenOpts>`. Exposed so unit tests can pin the resolution rule
+    /// (operator-configured mode survives, default fallback is `TipOnly`) without standing up
+    /// a full `StacksChainState` fixture. The instance method MUST stay a thin wrapper around
+    /// this helper so production and tests exercise the same logic.
+    pub(crate) fn configured_squash_mode_from_opts(opts: Option<&MARFOpenOpts>) -> SquashMode {
+        opts.map(|o| o.squash_mode).unwrap_or(SquashMode::TipOnly)
+    }
+
     /// Rules:
     /// - If the user configured `FullHistory`, always use `FullHistory`.
     /// - If the user configured `TipOnly`, force `FullHistory` when the range contains
@@ -3693,6 +4305,128 @@ impl StacksChainState {
         })
         .ok()
         .flatten()
+    }
+
+    /// Bitcoin-reorg / measurement-error padding added on top of every epoch's observed maximum
+    /// same-Stacks-height burn-spread to derive its floor. See
+    /// [`Self::epoch_observed_max_burn_spread`] for the per-epoch observations and
+    /// [`.docs/squash-horizon-per-epoch.md`](../../../../../.docs/squash-horizon-per-epoch.md)
+    /// for the analysis methodology.
+    ///
+    /// Why `6`:
+    /// - Matches the historical "Bitcoin reorg margin + a little" used as the global default
+    ///   horizon pre-this-refactor, so 3.0+ epochs (where observed spread is `0`) land on
+    ///   floor=6 — the same number we'd want even in the absence of canonical churn.
+    /// - Absorbs absolute uncertainty in the empirical analysis (SQL accuracy, blocks present
+    ///   in the chain but absent from both Hiro archives). Both sources of error are
+    ///   bounded-additive, not proportional, so a small fixed pad is the right shape.
+    /// - 2.x history is frozen since the Nakamoto activation at burn `867_867` (2024-10-30),
+    ///   so the observed maxima are the actual maxima — proportional padding would be
+    ///   needlessly conservative.
+    pub(crate) const SQUASH_HORIZON_PADDING_BURN_BLOCKS: u32 = 6;
+
+    /// Maximum same-Stacks-height burn-spread observed in 2.x mainnet history per epoch, from
+    /// the two authoritative Hiro chainstate archives. The schedule is **frozen** as of the
+    /// Nakamoto activation; see [`.docs/squash-horizon-per-epoch.md`](../../../../../.docs/squash-horizon-per-epoch.md)
+    /// for the SQL methodology and per-archive numbers.
+    ///
+    /// | Epoch | Burn-height range | Observed max sibling spread |
+    /// | ---- | ---- | ---- |
+    /// | `2.0` | `666050..713000` | `1649` (outlier; height 287) |
+    /// | `2.05` | `713000..781551` | `35` |
+    /// | `2.1` | `781551..787651` | `10` |
+    /// | `2.2` | `787651..788240` | `3` |
+    /// | `2.3` | `788240..791551` | `146` |
+    /// | `2.4` | `791551..840360` | `116` |
+    /// | `2.5` | `840360..867867` | `7` |
+    /// | `3.0+` | `867867..` | `0` (no observed canonical-tip-hash churn under signer consensus) |
+    ///
+    /// Family-based fallback for epochs not in the empirical schedule:
+    /// - Future Nakamoto sub-epochs (`>= Epoch30`) inherit the Nakamoto observed-max of `0`
+    ///   (which combined with the padding gives floor=6). Signer-driven consensus forbids the
+    ///   two-blocks-at-the-same-Stacks-height race that 2.x history exhibits.
+    /// - Pre-`3.0` epochs not in the schedule (e.g. `Epoch10`) inherit the worst 2.x
+    ///   observed-max of `1649`. Conservative; never observed in mainnet practice.
+    ///
+    /// **Do not "simplify" this back into a single constant.** The values are empirical
+    /// per-epoch observations — see `.docs/squash-horizon-per-epoch.md` for the SQL queries
+    /// and per-archive results. A future epoch with a different sibling-spread profile would
+    /// need a fresh measurement and a new row in this table.
+    pub(crate) fn epoch_observed_max_burn_spread(
+        epoch: stacks_common::types::StacksEpochId,
+    ) -> u32 {
+        use stacks_common::types::StacksEpochId;
+        match epoch {
+            StacksEpochId::Epoch20 => 1649,
+            StacksEpochId::Epoch2_05 => 35,
+            StacksEpochId::Epoch21 => 10,
+            StacksEpochId::Epoch22 => 3,
+            StacksEpochId::Epoch23 => 146,
+            StacksEpochId::Epoch24 => 116,
+            StacksEpochId::Epoch25 => 7,
+            StacksEpochId::Epoch30
+            | StacksEpochId::Epoch31
+            | StacksEpochId::Epoch32
+            | StacksEpochId::Epoch33
+            | StacksEpochId::Epoch34 => 0,
+            // Family-based fallback for epochs outside the empirical schedule.
+            // - `>= Epoch30`: future Nakamoto sub-epoch — inherit the Nakamoto observed-max.
+            // - `< Epoch30` (e.g. Epoch10): conservatively inherit the worst 2.x observed-max.
+            other if other >= StacksEpochId::Epoch30 => 0,
+            _ => 1649,
+        }
+    }
+
+    /// Per-epoch minimum squash horizon (burn blocks).
+    ///
+    /// Equals `observed_max + SQUASH_HORIZON_PADDING_BURN_BLOCKS` for the epoch — the schedule
+    /// is structured so that the empirical observation and the safety padding stay separately
+    /// reviewable in source. Operators can still configure a *larger* horizon via
+    /// `MARFOpenOpts.squash_horizon_burn_blocks`; the runtime resolution is
+    /// `configured.max(epoch_horizon_floor(epoch))`.
+    pub(crate) fn epoch_horizon_floor(epoch: stacks_common::types::StacksEpochId) -> u32 {
+        Self::epoch_observed_max_burn_spread(epoch) + Self::SQUASH_HORIZON_PADDING_BURN_BLOCKS
+    }
+
+    /// Operator-configurable squash horizon for a single epoch. Returns the larger of the
+    /// configured value (typically defaulted from `MARFOpenOpts`) and the epoch's empirical floor,
+    /// preserving operator intent uniformly across epochs.
+    pub(crate) fn epoch_horizon(
+        epoch: stacks_common::types::StacksEpochId,
+        configured: u32,
+    ) -> u32 {
+        configured.max(Self::epoch_horizon_floor(epoch))
+    }
+
+    /// Compute the maximum per-epoch horizon over every epoch whose burn-range overlaps
+    /// `[burn_lo .. burn_hi]` (inclusive). The composition rule is `max-over-overlapped-epochs`:
+    /// a level spanning multiple epochs needs the largest horizon any of them requires, because
+    /// any in-range height is invalidated by a late sibling from any of them.
+    ///
+    /// Codex's two-archive analysis observed no same-height sibling pair with `burn_header_height`
+    /// values straddling an epoch boundary, so per-epoch horizons compose cleanly: the worst-case
+    /// for a level fully inside epoch `e` is bounded by `e`'s floor; for a level spanning epochs
+    /// `[e1..e2]`, by `max(e1.floor, e2.floor)` and so on.
+    ///
+    /// Falls back to `configured` if the epoch list is empty or no epoch contains any byte of the
+    /// range — defensive only; in practice the chain epochs cover the entire burn axis.
+    pub(crate) fn max_horizon_over_burn_range(
+        epochs: &crate::core::EpochList,
+        burn_lo: u32,
+        burn_hi: u32,
+        configured: u32,
+    ) -> u32 {
+        epochs
+            .iter()
+            .filter(|e| {
+                // Epoch [start..end) overlaps [burn_lo..=burn_hi]?
+                let e_start = e.start_height as u32;
+                let e_end = e.end_height as u32;
+                e_start <= burn_hi && (e_end == 0 || e_end > burn_lo)
+            })
+            .map(|e| Self::epoch_horizon(e.epoch_id, configured))
+            .max()
+            .unwrap_or(configured)
     }
 
     /// Run to_do on the state of the Clarity VM at the given chain tip.
@@ -4868,6 +5602,84 @@ pub mod test {
             StacksChainState::squash_block_count(38_001, 39_000),
             Some(1_000)
         );
+    }
+
+    /// Regression: the operator's `marf_full_history = true` config (threaded through
+    /// `MARFOpenOpts.squash_mode = FullHistory`) must survive the chainstate-open → `maybe_squash`
+    /// path without being silently downgraded to `TipOnly`. The previous fix wired the safety
+    /// check for pre-3.4 ranges but hardcoded `let configured_mode = SquashMode::TipOnly;` at the
+    /// `maybe_squash` entry; this test pins that the configured mode is actually read from
+    /// `MARFOpenOpts`.
+    #[test]
+    fn test_configured_squash_mode_reads_from_marf_opts() {
+        use crate::chainstate::stacks::index::marf::MARFOpenOpts;
+        use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
+
+        // Configured FullHistory.
+        let opts_full = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", false)
+            .with_squash_mode(SquashMode::FullHistory);
+        assert_eq!(
+            StacksChainState::configured_squash_mode_from_opts(Some(&opts_full)),
+            SquashMode::FullHistory,
+            "operator-configured FullHistory must be returned, not silently downgraded"
+        );
+
+        // Configured TipOnly (default).
+        let opts_tip = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", false)
+            .with_squash_mode(SquashMode::TipOnly);
+        assert_eq!(
+            StacksChainState::configured_squash_mode_from_opts(Some(&opts_tip)),
+            SquashMode::TipOnly,
+        );
+
+        // No `marf_opts` (programmatic handle, no config) — conservative default is TipOnly.
+        assert_eq!(
+            StacksChainState::configured_squash_mode_from_opts(None),
+            SquashMode::TipOnly,
+            "missing marf_opts must fall back to the historical TipOnly default"
+        );
+    }
+
+    /// End-to-end regression for the resolution chain that `maybe_squash` performs:
+    ///
+    /// `MARFOpenOpts → configured_squash_mode_from_opts → effective_squash_mode → final mode`.
+    ///
+    /// Pins the four cases that matter for operator-intent + safety:
+    /// 1. `FullHistory` configured + pre-3.4 range  → `FullHistory`
+    /// 2. `FullHistory` configured + post-3.4 range → `FullHistory` (operator intent preserved)
+    /// 3. `TipOnly`     configured + pre-3.4 range  → `FullHistory` (safety upgrade)
+    /// 4. `TipOnly`     configured + post-3.4 range → `TipOnly`     (default-throughput case)
+    #[test]
+    fn test_maybe_squash_mode_resolution_preserves_operator_intent() {
+        use crate::chainstate::stacks::index::marf::MARFOpenOpts;
+        use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
+
+        let sortdb = mock_sortdb_conn(Some(900_000));
+        let pre_34 = mock_headers_conn(&[(100, 500_000)]);
+        let post_34 = mock_headers_conn(&[(100, 1_000_000)]);
+
+        let opts_full = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", false)
+            .with_squash_mode(SquashMode::FullHistory);
+        let opts_tip = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", false)
+            .with_squash_mode(SquashMode::TipOnly);
+
+        let resolve = |opts: &MARFOpenOpts, headers: &Connection| -> SquashMode {
+            let configured = StacksChainState::configured_squash_mode_from_opts(Some(opts));
+            StacksChainState::effective_squash_mode(configured, 100, headers, &sortdb)
+        };
+
+        assert_eq!(resolve(&opts_full, &pre_34), SquashMode::FullHistory);
+        assert_eq!(
+            resolve(&opts_full, &post_34),
+            SquashMode::FullHistory,
+            "operator intent (FullHistory) must NOT be downgraded post-3.4"
+        );
+        assert_eq!(
+            resolve(&opts_tip, &pre_34),
+            SquashMode::FullHistory,
+            "TipOnly + pre-3.4 must be upgraded to FullHistory for at-block correctness"
+        );
+        assert_eq!(resolve(&opts_tip, &post_34), SquashMode::TipOnly);
     }
 
     #[test]
@@ -6192,18 +7004,28 @@ pub mod test {
     // B5d-fu.2: Detached promotion-task spawn/poll lifecycle
     // ===========================================================================
     //
-    // Unit tests for `poll_promotion_handle` — the inner mechanism
-    // `maybe_squash`'s detached dispatch + `poll_pending_promotions`
-    // are built on. Real-chainstate end-to-end exercise of the
-    // dispatch path is in [`b5d_fu_3_*`] under
-    // `chainstate::stacks::index::test::squash_promote`.
+    // Unit tests for `join_finished_prepare` — the inner slot-management mechanism
+    // `poll_pending_promotions` is built on. Real-chainstate end-to-end exercise of the dispatch
+    // path is in `chainstate::stacks::index::test::squash_promote`.
 
-    /// Build a synthetic [`PromotionTaskHandle`] backed by a thread
-    /// that returns `result` after sleeping `delay_ms`. Used to drive
-    /// the polling logic without requiring a real MARF.
+    /// Synthetic prepare-worker payload variant. Maps to the slot's `JoinHandle` payload type
+    /// without requiring a real MARF or `PreparedPromotion`.
+    #[derive(Clone, Copy)]
+    enum SyntheticPrepareOutcome {
+        /// `Ok(None)` — prepare reported nothing-to-publish (post-recovery state).
+        NothingToPublish,
+        /// `Err(...)` — prepare returned an error.
+        Errored,
+    }
+
+    /// Build a synthetic [`PromotionTaskHandle`] backed by a thread that returns the synthetic
+    /// outcome after sleeping `delay_ms`. Used to drive the slot-polling logic without requiring
+    /// a real MARF. Note: we don't synthesize `Ok(Some(prepared))` here — `PreparedPromotion`
+    /// holds a real plan-file path that `apply_prepared_plan` would try to read; the publish
+    /// path is exercised end-to-end in the squash-promote integration tests instead.
     fn synthetic_promotion_handle(
         label: &'static str,
-        result: bool,
+        outcome: SyntheticPrepareOutcome,
         delay_ms: u64,
     ) -> PromotionTaskHandle {
         let join_handle = std::thread::Builder::new()
@@ -6212,7 +7034,12 @@ pub mod test {
                 if delay_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 }
-                result
+                match outcome {
+                    SyntheticPrepareOutcome::NothingToPublish => Ok(None),
+                    SyntheticPrepareOutcome::Errored => Err(marf_error::CorruptionError(
+                        "synthetic prepare error".into(),
+                    )),
+                }
             })
             .unwrap();
         PromotionTaskHandle {
@@ -6222,8 +7049,8 @@ pub mod test {
         }
     }
 
-    /// Spin until `is_finished()` flips, capped at ~1s. Returns
-    /// when the worker has finished or after the timeout.
+    /// Spin until `is_finished()` flips, capped at ~1s. Returns when the worker has finished or
+    /// after the timeout.
     fn wait_for_handle_finish(slot: &Option<PromotionTaskHandle>) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while std::time::Instant::now() < deadline {
@@ -6238,86 +7065,355 @@ pub mod test {
         }
     }
 
-    /// `poll_promotion_handle` on an empty slot returns `None`
-    /// without contention.
+    /// `join_finished_prepare` on an empty slot returns `None` without contention.
     #[test]
-    fn b5d_fu_2_poll_returns_none_when_slot_empty() {
+    fn join_finished_prepare_returns_none_when_slot_empty() {
         let mut slot: Option<PromotionTaskHandle> = None;
-        assert!(StacksChainState::poll_promotion_handle(&mut slot).is_none());
+        assert!(StacksChainState::join_finished_prepare(&mut slot).is_none());
         assert!(slot.is_none());
     }
 
-    /// While a worker is in flight, polling returns `None` and
-    /// leaves the slot populated. This is the load-bearing
-    /// invariant for `maybe_squash`'s single-flight gating —
-    /// without it, a still-running worker would be mis-reaped and
-    /// the coordinator would either dispatch a duplicate or skip
-    /// the eventual refresh.
+    /// While a worker is in flight, polling returns `None` and leaves the slot populated. This
+    /// is the load-bearing invariant for `maybe_squash`'s single-flight gating — without it, a
+    /// still-running worker would be mis-reaped and the coordinator would either dispatch a
+    /// duplicate or skip the eventual publish.
     #[test]
-    fn b5d_fu_2_poll_returns_none_while_worker_running() {
-        let mut slot = Some(synthetic_promotion_handle("running", true, 200));
+    fn join_finished_prepare_returns_none_while_worker_running() {
+        let mut slot = Some(synthetic_promotion_handle(
+            "running",
+            SyntheticPrepareOutcome::NothingToPublish,
+            200,
+        ));
         // The worker sleeps 200ms; immediate poll must not drain.
-        assert!(StacksChainState::poll_promotion_handle(&mut slot).is_none());
+        assert!(StacksChainState::join_finished_prepare(&mut slot).is_none());
         assert!(
             slot.is_some(),
             "slot must remain populated while worker runs"
         );
         // Wait for the worker to finish, then poll again.
         wait_for_handle_finish(&slot);
-        assert_eq!(
-            StacksChainState::poll_promotion_handle(&mut slot),
-            Some(true)
-        );
+        let drained = StacksChainState::join_finished_prepare(&mut slot)
+            .expect("worker has finished, expected payload");
+        assert!(matches!(drained, Ok(None)));
         assert!(slot.is_none(), "slot must be drained after successful join");
     }
 
-    /// A worker that returned `true` (level published) is reaped
-    /// and the result propagates to the caller. This is the path
-    /// that triggers the coordinator's `refresh_after_squash` +
-    /// `trim_sidecars` in `poll_pending_promotions`.
+    /// A finished worker that reported `Ok(None)` (post-recovery, nothing to publish) is reaped
+    /// and propagated to the caller. The publish gate then skips the publish for this MARF.
     #[test]
-    fn b5d_fu_2_poll_returns_true_for_promoted_worker() {
-        let mut slot = Some(synthetic_promotion_handle("promoted", true, 0));
+    fn join_finished_prepare_reaps_nothing_to_publish() {
+        let mut slot = Some(synthetic_promotion_handle(
+            "nothing",
+            SyntheticPrepareOutcome::NothingToPublish,
+            0,
+        ));
         wait_for_handle_finish(&slot);
-        assert_eq!(
-            StacksChainState::poll_promotion_handle(&mut slot),
-            Some(true)
-        );
+        let drained = StacksChainState::join_finished_prepare(&mut slot)
+            .expect("worker has finished, expected payload");
+        assert!(matches!(drained, Ok(None)));
         assert!(slot.is_none());
     }
 
-    /// A worker that returned `false` (no level published — e.g.
-    /// the merger short-circuited or the promotion errored) is
-    /// reaped and the `false` propagates so the coordinator skips
-    /// `refresh_after_squash` (the cold blob and live MARF haven't
-    /// changed).
+    /// A finished worker that returned an error is reaped and its `Err` propagates so the
+    /// publish gate logs and skips this MARF for the tick. The plan file (if any) remains on
+    /// disk for next-open recovery.
     #[test]
-    fn b5d_fu_2_poll_returns_false_for_failed_worker() {
-        let mut slot = Some(synthetic_promotion_handle("failed", false, 0));
+    fn join_finished_prepare_reaps_errored_worker() {
+        let mut slot = Some(synthetic_promotion_handle(
+            "errored",
+            SyntheticPrepareOutcome::Errored,
+            0,
+        ));
         wait_for_handle_finish(&slot);
-        assert_eq!(
-            StacksChainState::poll_promotion_handle(&mut slot),
-            Some(false)
-        );
+        let drained = StacksChainState::join_finished_prepare(&mut slot)
+            .expect("worker has finished, expected payload");
+        assert!(drained.is_err());
         assert!(slot.is_none());
     }
 
-    /// `poll_promotion_handle` is idempotent at the slot level:
-    /// once a worker has been drained, subsequent polls on the
-    /// (now-empty) slot return `None`. Important because
-    /// `poll_pending_promotions` can be called more than once per
-    /// cadence tick (e.g. from an explicit drain on shutdown).
+    /// `join_finished_prepare` is idempotent at the slot level: once a worker has been drained,
+    /// subsequent polls on the (now-empty) slot return `None`. Important because
+    /// `poll_pending_promotions` can be called more than once per cadence tick (e.g. from an
+    /// explicit drain on shutdown).
     #[test]
-    fn b5d_fu_2_poll_is_idempotent_after_drain() {
-        let mut slot = Some(synthetic_promotion_handle("once", true, 0));
+    fn join_finished_prepare_is_idempotent_after_drain() {
+        let mut slot = Some(synthetic_promotion_handle(
+            "once",
+            SyntheticPrepareOutcome::NothingToPublish,
+            0,
+        ));
         wait_for_handle_finish(&slot);
         // First poll drains.
-        assert_eq!(
-            StacksChainState::poll_promotion_handle(&mut slot),
-            Some(true)
-        );
+        assert!(StacksChainState::join_finished_prepare(&mut slot).is_some());
         // Second + third polls see the now-empty slot.
-        assert!(StacksChainState::poll_promotion_handle(&mut slot).is_none());
-        assert!(StacksChainState::poll_promotion_handle(&mut slot).is_none());
+        assert!(StacksChainState::join_finished_prepare(&mut slot).is_none());
+        assert!(StacksChainState::join_finished_prepare(&mut slot).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Per-epoch squash horizon tests
+    //
+    // The empirical floors come from two-archive analysis (see
+    // `.docs/squash-horizon-per-epoch.md`). These tests pin the schedule
+    // and the composition rules so a future "simplification" can't quietly
+    // collapse the table back into a single constant.
+    // -------------------------------------------------------------------
+
+    /// Each epoch's observed max sibling-burn-spread, from the two-archive analysis.
+    #[test]
+    fn test_epoch_observed_max_burn_spread_matches_archive() {
+        use stacks_common::types::StacksEpochId;
+        let cases = [
+            (StacksEpochId::Epoch20, 1649),
+            (StacksEpochId::Epoch2_05, 35),
+            (StacksEpochId::Epoch21, 10),
+            (StacksEpochId::Epoch22, 3),
+            (StacksEpochId::Epoch23, 146),
+            (StacksEpochId::Epoch24, 116),
+            (StacksEpochId::Epoch25, 7),
+            (StacksEpochId::Epoch30, 0),
+            (StacksEpochId::Epoch31, 0),
+            (StacksEpochId::Epoch32, 0),
+            (StacksEpochId::Epoch33, 0),
+            (StacksEpochId::Epoch34, 0),
+        ];
+        for (epoch, expected) in cases {
+            assert_eq!(
+                StacksChainState::epoch_observed_max_burn_spread(epoch),
+                expected,
+                "epoch {epoch:?} observed-max mismatch"
+            );
+        }
+    }
+
+    /// Each epoch in the empirical schedule returns observed-max + padding.
+    #[test]
+    fn test_epoch_horizon_floor_known_epochs_equal_observed_plus_padding() {
+        use stacks_common::types::StacksEpochId;
+        let pad = StacksChainState::SQUASH_HORIZON_PADDING_BURN_BLOCKS;
+        let cases = [
+            StacksEpochId::Epoch20,
+            StacksEpochId::Epoch2_05,
+            StacksEpochId::Epoch21,
+            StacksEpochId::Epoch22,
+            StacksEpochId::Epoch23,
+            StacksEpochId::Epoch24,
+            StacksEpochId::Epoch25,
+            StacksEpochId::Epoch30,
+            StacksEpochId::Epoch31,
+            StacksEpochId::Epoch32,
+            StacksEpochId::Epoch33,
+            StacksEpochId::Epoch34,
+        ];
+        for epoch in cases {
+            let observed = StacksChainState::epoch_observed_max_burn_spread(epoch);
+            let floor = StacksChainState::epoch_horizon_floor(epoch);
+            assert_eq!(
+                floor,
+                observed + pad,
+                "epoch {epoch:?}: floor={floor} should equal observed_max ({observed}) + pad ({pad})"
+            );
+        }
+    }
+
+    /// Pin the absolute floor values so a future change to `SQUASH_HORIZON_PADDING_BURN_BLOCKS`
+    /// or to the observed-max table is loud and reviewable. If someone bumps the padding from
+    /// 6 to e.g. 100 because of a new analysis, this test fails and forces the reviewer to
+    /// confirm the new numbers are intentional.
+    #[test]
+    fn test_epoch_horizon_floor_absolute_values_today() {
+        use stacks_common::types::StacksEpochId;
+        let cases = [
+            (StacksEpochId::Epoch20, 1655),
+            (StacksEpochId::Epoch2_05, 41),
+            (StacksEpochId::Epoch21, 16),
+            (StacksEpochId::Epoch22, 9),
+            (StacksEpochId::Epoch23, 152),
+            (StacksEpochId::Epoch24, 122),
+            (StacksEpochId::Epoch25, 13),
+            (StacksEpochId::Epoch30, 6),
+            (StacksEpochId::Epoch31, 6),
+            (StacksEpochId::Epoch32, 6),
+            (StacksEpochId::Epoch33, 6),
+            (StacksEpochId::Epoch34, 6),
+        ];
+        for (epoch, expected) in cases {
+            assert_eq!(
+                StacksChainState::epoch_horizon_floor(epoch),
+                expected,
+                "epoch {epoch:?} should have floor {expected}"
+            );
+        }
+    }
+
+    /// Epoch10 is defined in the codebase but not in the empirical schedule; the family-based
+    /// fallback (`< Epoch30`) routes it to the worst 2.x observed-max + padding.
+    #[test]
+    fn test_epoch_horizon_floor_epoch10_falls_back_to_pre30_conservative() {
+        use stacks_common::types::StacksEpochId;
+        let pad = StacksChainState::SQUASH_HORIZON_PADDING_BURN_BLOCKS;
+        assert_eq!(
+            StacksChainState::epoch_observed_max_burn_spread(StacksEpochId::Epoch10),
+            1649,
+            "Epoch10 (pre-2.0) should fall back to the worst 2.x observed-max"
+        );
+        assert_eq!(
+            StacksChainState::epoch_horizon_floor(StacksEpochId::Epoch10),
+            1649 + pad,
+        );
+    }
+
+    /// `epoch_horizon` returns `configured.max(floor)` — operator's larger value wins, schedule
+    /// floor wins when configured is smaller. Tests both directions for both a noisy 2.x epoch and
+    /// a quiet Nakamoto epoch.
+    #[test]
+    fn test_epoch_horizon_preserves_operator_configured_via_max() {
+        use stacks_common::types::StacksEpochId;
+        // Quiet Nakamoto epoch: floor 6. Operator wants 1000 (extra paranoia) -> 1000 wins.
+        assert_eq!(
+            StacksChainState::epoch_horizon(StacksEpochId::Epoch30, 1000),
+            1000,
+            "configured > floor: configured wins"
+        );
+        // Same Nakamoto epoch with default-ish 6 -> floor wins (which equals 6).
+        assert_eq!(
+            StacksChainState::epoch_horizon(StacksEpochId::Epoch30, 6),
+            6,
+            "configured == floor: tied"
+        );
+        // Noisy 2.0 epoch: floor 1655 (= 1649 observed + 6 padding). Operator left default 6 ->
+        // floor wins.
+        assert_eq!(
+            StacksChainState::epoch_horizon(StacksEpochId::Epoch20, 6),
+            1655,
+            "configured < floor: floor wins (preserves safety)"
+        );
+        // Same epoch with operator-configured 5000 -> configured wins.
+        assert_eq!(
+            StacksChainState::epoch_horizon(StacksEpochId::Epoch20, 5000),
+            5000,
+            "configured > floor (even on noisy epochs): configured wins"
+        );
+    }
+
+    /// Build a synthetic `EpochList` for the per-archive boundaries used in the analysis. Burn
+    /// heights are the actual mainnet epoch start/end values from `core/mod.rs`. Block-limit and
+    /// network-epoch fields are zeroed — `max_horizon_over_burn_range` only inspects
+    /// `start_height`, `end_height`, and `epoch_id`.
+    fn synthetic_mainnet_epochs() -> crate::core::EpochList {
+        use clarity::vm::costs::ExecutionCost;
+        use stacks_common::types::{StacksEpoch, StacksEpochId};
+        let mk = |epoch_id: StacksEpochId, start: u64, end: u64| StacksEpoch {
+            epoch_id,
+            start_height: start,
+            end_height: end,
+            block_limit: ExecutionCost::ZERO,
+            network_epoch: 0,
+        };
+        crate::core::EpochList::from(vec![
+            mk(StacksEpochId::Epoch20, 666050, 713000),
+            mk(StacksEpochId::Epoch2_05, 713000, 781551),
+            mk(StacksEpochId::Epoch21, 781551, 787651),
+            mk(StacksEpochId::Epoch22, 787651, 788240),
+            mk(StacksEpochId::Epoch23, 788240, 791551),
+            mk(StacksEpochId::Epoch24, 791551, 840360),
+            mk(StacksEpochId::Epoch25, 840360, 867867),
+            mk(StacksEpochId::Epoch30, 867867, u64::MAX),
+        ])
+    }
+
+    /// A burn-range fully inside one epoch returns that epoch's floor.
+    #[test]
+    fn test_max_horizon_over_burn_range_single_epoch() {
+        let epochs = synthetic_mainnet_epochs();
+        // Range fully inside Epoch20: floor = 1649 + 6 = 1655.
+        assert_eq!(
+            StacksChainState::max_horizon_over_burn_range(
+                &epochs, 666_500, 700_000, /* configured */ 6
+            ),
+            1655,
+            "fully-Epoch20 range yields Epoch20 floor"
+        );
+        // Range fully inside Epoch2_05: floor = 35 + 6 = 41.
+        assert_eq!(
+            StacksChainState::max_horizon_over_burn_range(&epochs, 720_000, 750_000, 6),
+            41,
+            "fully-Epoch2_05 range yields Epoch2_05 floor"
+        );
+        // Range fully inside Epoch30: floor = 0 + 6 = 6.
+        assert_eq!(
+            StacksChainState::max_horizon_over_burn_range(&epochs, 900_000, 950_000, 6),
+            6,
+            "fully-Epoch30 range yields the small Nakamoto floor"
+        );
+    }
+
+    /// A burn-range spanning two epochs returns the **max** of their floors. This is the rule
+    /// that prevents a level-spanning-2.0 from being squashed under 2.05's small horizon.
+    #[test]
+    fn test_max_horizon_over_burn_range_spans_2x_to_205_uses_max() {
+        let epochs = synthetic_mainnet_epochs();
+        // 666800..=720000 spans Epoch20 (1655) and Epoch2_05 (41). Max wins.
+        let result = StacksChainState::max_horizon_over_burn_range(&epochs, 666_800, 720_000, 6);
+        assert_eq!(
+            result, 1655,
+            "span Epoch20→Epoch2_05 must use max (Epoch20's 1655), not min (41)"
+        );
+    }
+
+    /// A range spanning multiple 2.x epochs returns the worst floor among them. The worst
+    /// observed in 2.x was Epoch20 at 1655 (1649 + 6 padding).
+    #[test]
+    fn test_max_horizon_over_burn_range_spans_all_2x_uses_max() {
+        let epochs = synthetic_mainnet_epochs();
+        // Spans 2.0 through 2.5 (and a sliver of 3.0).
+        let result = StacksChainState::max_horizon_over_burn_range(&epochs, 666_100, 870_000, 6);
+        assert_eq!(
+            result, 1655,
+            "spanning all 2.x must yield the worst 2.x floor (Epoch20=1655)"
+        );
+    }
+
+    /// A post-3.0 range should yield the small Nakamoto floor regardless of configured value
+    /// equal to or smaller than 6.
+    #[test]
+    fn test_max_horizon_over_burn_range_post_3_0_uses_small_floor() {
+        let epochs = synthetic_mainnet_epochs();
+        // Fully inside Epoch30, `configured = 1`: floor (6) still wins.
+        assert_eq!(
+            StacksChainState::max_horizon_over_burn_range(&epochs, 870_000, 950_000, 1),
+            6
+        );
+    }
+
+    /// Operator-configured larger value wins even when the underlying epoch floor is small. Tests
+    /// the floor-vs-replacement rule end-to-end through `max_horizon_over_burn_range`.
+    #[test]
+    fn test_max_horizon_over_burn_range_configured_overrides_small_floors() {
+        let epochs = synthetic_mainnet_epochs();
+        // Inside Epoch30 (floor 6) with operator-configured 1000.
+        assert_eq!(
+            StacksChainState::max_horizon_over_burn_range(&epochs, 870_000, 950_000, 1000),
+            1000,
+            "configured 1000 must win over Epoch30 floor of 6"
+        );
+        // Configured 1000 is bigger than Epoch2_05's floor of 41, but smaller than Epoch20's
+        // floor of 1655. The max-over-overlapped-epochs rule should pick 1655 when spanning 2.0.
+        assert_eq!(
+            StacksChainState::max_horizon_over_burn_range(&epochs, 666_800, 720_000, 1000),
+            1655,
+            "Epoch20's floor (1655) wins over configured (1000) and Epoch2_05's floor (41)"
+        );
+    }
+
+    /// Empty epoch list yields the configured value as a defensive fallback. In practice the
+    /// chain epochs cover the whole burn axis, so this only fires under malformed test setups.
+    #[test]
+    fn test_max_horizon_over_burn_range_empty_epoch_list_returns_configured() {
+        let empty = crate::core::EpochList::from(Vec::new());
+        assert_eq!(
+            StacksChainState::max_horizon_over_burn_range(&empty, 100, 200, 42),
+            42
+        );
     }
 }

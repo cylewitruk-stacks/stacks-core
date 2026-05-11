@@ -23,10 +23,11 @@ use clarity::types::chainstate::SortitionId;
 use clarity::util::hash::{Sha512Trunc256Sum, to_hex};
 use clarity_cli::read_file_or_stdin;
 pub use cli::{
-    ContractHashArgs, ReplayMockMiningArgs, TryMineArgs, ValidateBlockArgs, ValidateBlockMode,
+    ContractHashArgs, ReplayEpoch2BlockFileArgs, ReplayMockMiningArgs, TryMineArgs,
+    ValidateBlockArgs, ValidateBlockMode,
 };
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::Hash160;
@@ -42,7 +43,7 @@ use stackslib::chainstate::nakamoto::miner::{
     BlockMetadata, NakamotoBlockBuilder, NakamotoTenureInfo,
 };
 use stackslib::chainstate::nakamoto::{NakamotoBlock, NakamotoChainState};
-use stackslib::chainstate::stacks::db::blocks::DummyEventDispatcher;
+use stackslib::chainstate::stacks::db::blocks::{DummyEventDispatcher, StagingBlock};
 use stackslib::chainstate::stacks::db::{
     ChainstateTx, StacksBlockHeaderTypes, StacksChainState, StacksHeaderInfo,
 };
@@ -54,7 +55,7 @@ use stackslib::config::{Config, DEFAULT_MAINNET_CONFIG};
 use stackslib::core::*;
 use stackslib::cost_estimates::UnitEstimator;
 use stackslib::cost_estimates::metrics::UnitMetric;
-use stackslib::util_lib::db::IndexDBTx;
+use stackslib::util_lib::db::{IndexDBTx, query_row};
 
 #[derive(Debug, Default)]
 pub struct CommonOpts {
@@ -386,6 +387,78 @@ fn validate_entry(db_path: &str, conf: &Config, entry: &BlockScanEntry) -> Resul
     }
 }
 
+/// Replay an epoch-2 staging row using block bytes supplied by path.
+///
+/// This is useful for MARF/squash investigations where the node preserved an invalid block as
+/// `<block-path>.invalid-*` and replaced the normal block file with a zero-byte tombstone.
+/// The staging metadata still comes from the local DB, but the serialized block bytes come from
+/// `args.block_path`.
+pub fn command_replay_epoch2_block_file(args: &ReplayEpoch2BlockFileArgs, conf: Option<&Config>) {
+    match replay_epoch2_block_file(args, conf) {
+        Ok(message) => {
+            println!("{message}");
+            process::exit(0);
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            process::exit(1);
+        }
+    }
+}
+
+pub fn replay_epoch2_block_file(
+    args: &ReplayEpoch2BlockFileArgs,
+    conf: Option<&Config>,
+) -> Result<String, String> {
+    let conf = conf.unwrap_or(&DEFAULT_MAINNET_CONFIG);
+    let block_id = StacksBlockId::from_hex(&args.index_block_hash)
+        .unwrap_or_else(|e| panic!("Invalid index block hash {}: {e:?}", args.index_block_hash));
+    let block_data = fs::read(&args.block_path)
+        .unwrap_or_else(|e| panic!("Failed to read block file {}: {e}", args.block_path));
+
+    let result = replay_staging_block_with_data(
+        &args.db_path,
+        &block_id,
+        Some((args.block_path.as_str(), block_data)),
+        conf,
+    );
+
+    if args.expect_error_contains.is_empty() {
+        return result.map(|()| format!("Replay succeeded for {block_id}"));
+    }
+
+    let Err(error) = result else {
+        return Err(format!(
+            "Replay unexpectedly succeeded for {block_id}; expected an error containing: {:?}",
+            args.expect_error_contains
+        ));
+    };
+
+    let missing: Vec<&str> = args
+        .expect_error_contains
+        .iter()
+        .filter_map(|needle| {
+            if error.contains(needle) {
+                None
+            } else {
+                Some(needle.as_str())
+            }
+        })
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(format!(
+            "Replay reproduced expected failure for {block_id}: {error}"
+        ));
+    }
+
+    Err(format!(
+        "Replay failed for {block_id}, but not with the expected shape.\n\
+         Missing expected substrings: {missing:?}\n\
+         Actual error: {error}"
+    ))
+}
+
 /// Replay mock mined blocks from JSON files
 /// Terminates on error using `process::exit()`
 ///
@@ -651,6 +724,15 @@ fn replay_staging_block(
     block_id: &StacksBlockId,
     conf: &Config,
 ) -> Result<(), String> {
+    replay_staging_block_with_data(db_path, block_id, None, conf)
+}
+
+fn replay_staging_block_with_data(
+    db_path: &str,
+    block_id: &StacksBlockId,
+    block_data_override: Option<(&str, Vec<u8>)>,
+    conf: &Config,
+) -> Result<(), String> {
     let chain_state_path = format!("{db_path}/chainstate/");
     let sort_db_path = format!("{db_path}/burnchain/sortition");
 
@@ -681,18 +763,27 @@ fn replay_staging_block(
 
     let blocks_path = chainstate.blocks_path.clone();
     let (chainstate_tx, clarity_instance) = chainstate.chainstate_tx_begin();
-    let mut next_staging_block =
-        StacksChainState::load_staging_block_info(&chainstate_tx.tx, block_id)
-            .map_err(|e| format!("Failed to load staging block info: {e:?}"))?
-            .ok_or_else(|| "No such index block hash in block database".to_string())?;
+    let mut next_staging_block = load_staging_block_info_for_replay(&chainstate_tx.tx, block_id)?;
 
-    next_staging_block.block_data = StacksChainState::load_block_bytes(
-        &blocks_path,
-        &next_staging_block.consensus_hash,
-        &next_staging_block.anchored_block_hash,
-    )
-    .map_err(|e| format!("Failed to load block bytes: {e:?}"))?
-    .unwrap_or_default();
+    if let Some((source_path, block_data)) = block_data_override {
+        info!(
+            "Replaying epoch-2 block from explicit bytes";
+            "index_block_hash" => %block_id,
+            "consensus_hash" => %next_staging_block.consensus_hash,
+            "anchored_block_hash" => %next_staging_block.anchored_block_hash,
+            "block_path" => source_path,
+            "block_bytes" => block_data.len()
+        );
+        next_staging_block.block_data = block_data;
+    } else {
+        next_staging_block.block_data = StacksChainState::load_block_bytes(
+            &blocks_path,
+            &next_staging_block.consensus_hash,
+            &next_staging_block.anchored_block_hash,
+        )
+        .map_err(|e| format!("Failed to load block bytes: {e:?}"))?
+        .unwrap_or_default();
+    }
 
     let parent_header_info =
         StacksChainState::get_parent_header_info(&chainstate_tx, &next_staging_block)
@@ -718,6 +809,35 @@ fn replay_staging_block(
         next_staging_block.commit_burn,
         next_staging_block.sortition_burn,
     )
+}
+
+fn load_staging_block_info_for_replay(
+    block_conn: &Connection,
+    block_id: &StacksBlockId,
+) -> Result<StagingBlock, String> {
+    let sql = "SELECT * FROM staging_blocks WHERE index_block_hash = ?1";
+    let staging_block = query_row::<StagingBlock, _>(block_conn, sql, params![block_id])
+        .map_err(|e| format!("Failed to load staging block info: {e:?}"))?
+        .ok_or_else(|| {
+            format!(
+                "No such index block hash in block database: {block_id}. \
+                 If you preserved a replay copy, pass that copy's data directory, e.g. \
+                 /Volumes/Extern/marf-squash.replay/data/mainnet"
+            )
+        })?;
+
+    info!(
+        "Loaded epoch-2 staging row for replay";
+        "index_block_hash" => %block_id,
+        "consensus_hash" => %staging_block.consensus_hash,
+        "anchored_block_hash" => %staging_block.anchored_block_hash,
+        "height" => staging_block.height,
+        "processed" => staging_block.processed,
+        "attachable" => staging_block.attachable,
+        "orphaned" => staging_block.orphaned,
+    );
+
+    Ok(staging_block)
 }
 
 /// Process a mock mined block and call `replay_block()` to validate
@@ -1285,4 +1405,47 @@ fn replay_block_nakamoto(
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CAPTURED_REPRO_DB_PATH: &str = "/Volumes/Extern/marf-squash/data/mainnet";
+    const CAPTURED_REPRO_INDEX_BLOCK_HASH: &str =
+        "db0e33df8e95345db7b52bffa9b543ed482d63e0ce68128cd7896de8a4744ba7";
+    const CAPTURED_REPRO_BLOCK_PATH: &str = "/Volumes/Extern/marf-squash/data/mainnet/chainstate/blocks/db0e/33df/db0e33df8e95345db7b52bffa9b543ed482d63e0ce68128cd7896de8a4744ba7.invalid-39eb89273ccc8636";
+    const CAPTURED_REPRO_EXPECTED_ROOT: &str =
+        "6bf6484d157e4c500624d889f8da18b36af154a832c4746042a25e95a20637e2";
+    const CAPTURED_REPRO_COMPUTED_ROOT: &str =
+        "14b2b9d3605afcf40c41d549c8cfa80ba1e199d23415918cb8e6942334e02ca7";
+
+    #[test]
+    #[ignore = "requires captured /Volumes/Extern/marf-squash mainnet chainstate"]
+    fn marf_squash_replays_captured_state_root_mismatch() {
+        let db_path = std::env::var("MARF_SQUASH_REPRO_DB_PATH")
+            .unwrap_or_else(|_| CAPTURED_REPRO_DB_PATH.to_string());
+        let block_path = std::env::var("MARF_SQUASH_REPRO_BLOCK_PATH")
+            .unwrap_or_else(|_| CAPTURED_REPRO_BLOCK_PATH.to_string());
+        let index_block_hash = std::env::var("MARF_SQUASH_REPRO_INDEX_BLOCK_HASH")
+            .unwrap_or_else(|_| CAPTURED_REPRO_INDEX_BLOCK_HASH.to_string());
+        let expected_root = std::env::var("MARF_SQUASH_REPRO_EXPECTED_ROOT")
+            .unwrap_or_else(|_| CAPTURED_REPRO_EXPECTED_ROOT.to_string());
+        let computed_root = std::env::var("MARF_SQUASH_REPRO_COMPUTED_ROOT")
+            .unwrap_or_else(|_| CAPTURED_REPRO_COMPUTED_ROOT.to_string());
+
+        let args = ReplayEpoch2BlockFileArgs {
+            db_path,
+            index_block_hash,
+            block_path,
+            expect_error_contains: vec![
+                "state root mismatch".to_string(),
+                expected_root,
+                computed_root,
+            ],
+        };
+
+        let message = replay_epoch2_block_file(&args, None).expect("captured replay failed");
+        assert!(message.contains("Replay reproduced expected failure"));
+    }
 }

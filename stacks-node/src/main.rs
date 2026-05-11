@@ -72,11 +72,15 @@ fn cli_pick_best_tip(config_path: &str, at_stacks_height: Option<u64>) -> TipCan
     let burn_db_path = config.get_burn_db_file_path();
     let stacks_chainstate_path = config.get_chainstate_path_str();
     let burnchain = config.get_burnchain();
+    // CLI subcommand: opt in to inline auto-recovery so a pending squash plan from a prior
+    // crash gets resolved (TrustPlan semantics) at open time. The CLI doesn't have a long-lived
+    // run loop to drive `chainstate.recover()` afterward, and it doesn't have canonical
+    // context anyway (no SortDB-derived tip resolution at this layer of the tooling).
     let (mut chainstate, _) = StacksChainState::open(
         config.is_mainnet(),
         config.burnchain.chain_id,
         &stacks_chainstate_path,
-        Some(config.node.get_marf_opts()),
+        Some(config.node.get_marf_opts().with_auto_recovery(true)),
     )
     .unwrap();
     let mut sortdb = SortitionDB::open(
@@ -119,11 +123,14 @@ fn cli_get_miner_spend(
     let burn_db_path = config.get_burn_db_file_path();
     let stacks_chainstate_path = config.get_chainstate_path_str();
     let burnchain = config.get_burnchain();
+    // CLI subcommand: opt in to inline auto-recovery so a pending squash plan from a prior
+    // crash gets resolved (TrustPlan semantics) at open time. See `cli_pick_best_tip` for
+    // rationale.
     let (mut chainstate, _) = StacksChainState::open(
         config.is_mainnet(),
         config.burnchain.chain_id,
         &stacks_chainstate_path,
-        Some(config.node.get_marf_opts()),
+        Some(config.node.get_marf_opts().with_auto_recovery(true)),
     )
     .unwrap();
     let mut sortdb = SortitionDB::open(

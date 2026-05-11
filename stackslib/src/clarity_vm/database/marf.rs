@@ -35,7 +35,10 @@ use crate::chainstate::stacks::index::marf::{
     MarfTransaction, MARF,
 };
 use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
-use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
+use crate::chainstate::stacks::index::{
+    marf_squash_trace_enter_or_exit_at_block, marf_squash_trace_scope_active,
+    marf_squash_trace_scope_depth, ClarityMarfTrieId, Error, MARFValue,
+};
 use crate::clarity_vm::clarity::{
     ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
 };
@@ -43,6 +46,36 @@ use crate::clarity_vm::database::ephemeral::EphemeralMarfStore;
 use crate::clarity_vm::special::handle_contract_call_special_cases;
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 use crate::util_lib::db::{Error as DatabaseError, IndexDBConn};
+
+fn describe_trace_value(value: Option<&str>) -> String {
+    match value {
+        Some(value) => {
+            let hash = Sha512Trunc256Sum::from_data(value.as_bytes());
+            format!("Some(len={},sha512t256={hash})", value.len())
+        }
+        None => "None".to_string(),
+    }
+}
+
+fn describe_trace_marf_value(value: Option<&MARFValue>) -> String {
+    match value {
+        Some(value) => format!("Some({})", value.to_hex()),
+        None => "None".to_string(),
+    }
+}
+
+fn describe_trace_key(key: &str) -> String {
+    format!(
+        "len={},path={},key={}",
+        key.len(),
+        TrieHash::from_key(key),
+        key
+    )
+}
+
+fn describe_trace_path(hash: &TrieHash) -> String {
+    format!("path={hash}")
+}
 
 /// The MarfedKV struct is used to wrap a MARF data structure and side-storage
 ///   for use as a K/V store for ClarityDB or the AnalysisDB.
@@ -80,6 +113,12 @@ impl MarfedKV {
 
         let mut marf_opts = marf_opts.unwrap_or(MARFOpenOpts::default());
         marf_opts.external_blobs = true;
+        // No auto-recovery override here — we honor whatever the caller passed. Production
+        // startup paths (run_loop neon/nakamoto) leave `auto_recovery = false` and drive
+        // canonical-validated recovery explicitly via [`StacksChainState::recover`]. Tests/tools
+        // that want legacy "open + recover inline" semantics can call
+        // [`MARFOpenOpts::with_auto_recovery`] with `true`, or invoke
+        // [`MARF::drain_pending_plans`] with `DrainPolicy::TrustPlan` after opening.
 
         test_override_marf_compression(&mut marf_opts);
 
@@ -141,6 +180,20 @@ impl MarfedKV {
             chain_tip,
             ephemeral_marf: None,
         })
+    }
+
+    /// Drain any pending squash promotion plans on the underlying MARF, applying the supplied
+    /// [`DrainPolicy`](crate::chainstate::stacks::index::squash_recover::DrainPolicy).
+    /// Counterpart to opening with [`MARFOpenOpts::with_auto_recovery`] set to `false`; see
+    /// [`MARF::drain_pending_plans`] for the contract. Idempotent.
+    pub fn drain_pending_plans(
+        &mut self,
+        policy: crate::chainstate::stacks::index::squash_recover::DrainPolicy<'_>,
+    ) -> Result<crate::chainstate::stacks::index::squash_recover::DrainStats, VmExecutionError>
+    {
+        self.marf
+            .drain_pending_plans(policy)
+            .map_err(|err| VmInternalError::MarfFailure(err.to_string()).into())
     }
 
     // used by benchmarks
@@ -445,9 +498,29 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
     /// Seal the trie -- compute the root hash.
     /// NOTE: This is a one-time operation for this implementation -- a subsequent call will panic.
     fn seal_trie(&mut self) -> TrieHash {
-        self.marf
+        let trace_context = self.trace_context();
+        let trace_enabled = trace_context.is_some();
+        let (trace_open_height, trace_open_tip) = trace_context.unwrap_or((None, None));
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE seal_trie begin";
+                "open_height" => ?trace_open_height,
+                "open_tip" => ?trace_open_tip,
+                "read_tip" => %self.chain_tip
+            );
+        }
+        let root = self
+            .marf
             .seal()
-            .expect("FATAL: failed to .seal() MARF transaction")
+            .expect("FATAL: failed to .seal() MARF transaction");
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE seal_trie end";
+                "open_height" => ?trace_open_height,
+                "root" => %root
+            );
+        }
+        root
     }
 
     /// Drop the trie being built. This just drops the data from RAM and aborts the underlying
@@ -476,13 +549,35 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
     /// Returns Ok(()) on success
     /// Returns Err(VmInternalError(..)) on sqlite failure
     fn commit_to_processed_block(mut self, target: &StacksBlockId) -> Result<(), VmExecutionError> {
+        let trace_context = self.trace_context();
+        let trace_enabled = trace_context.is_some();
+        let (trace_open_height, trace_open_tip) = trace_context.unwrap_or((None, None));
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE commit_to_processed_block begin";
+                "open_height" => ?trace_open_height,
+                "open_tip" => ?trace_open_tip,
+                "read_tip" => %self.chain_tip,
+                "target" => %target
+            );
+        }
         debug!("commit_to({})", target);
         self.commit_metadata_for_trie(target)?;
-        let _ = self.marf.commit_to(target).map_err(|e| {
+        let result: Result<(), VmExecutionError> = self.marf.commit_to(target).map_err(|e| {
             error!("Failed to commit to MARF block {target}: {e:?}");
-            VmInternalError::Expect("Failed to commit to MARF block".into())
-        })?;
-        Ok(())
+            VmExecutionError::from(VmInternalError::Expect(
+                "Failed to commit to MARF block".into(),
+            ))
+        });
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE commit_to_processed_block end";
+                "open_height" => ?trace_open_height,
+                "target" => %target,
+                "result" => ?result
+            );
+        }
+        result
     }
 
     /// Commit the outstanding trie to the `mined_blocks` table in the underlying MARF.
@@ -831,10 +926,82 @@ impl PersistentWritableMarfStore<'_> {
         let bhh = self.chain_tip.clone();
         self.commit_to_processed_block(&bhh).unwrap();
     }
+
+    fn trace_open_height(&mut self) -> Option<u32> {
+        self.marf.get_open_chain_tip_height()
+    }
+
+    fn trace_open_tip(&mut self) -> Option<StacksBlockId> {
+        self.marf.get_open_chain_tip().cloned()
+    }
+
+    fn trace_context(&mut self) -> Option<(Option<u32>, Option<StacksBlockId>)> {
+        if !marf_squash_trace_scope_active() {
+            return None;
+        }
+        Some((self.trace_open_height(), self.trace_open_tip()))
+    }
+
+    fn trace_at_block_oracle(
+        &mut self,
+        trace_open_height: Option<u32>,
+        trace_open_tip: Option<&StacksBlockId>,
+        read_tip: &StacksBlockId,
+        key: &str,
+        at_block_value: &Option<MARFValue>,
+    ) {
+        if trace_open_tip
+            .map(|open_tip| open_tip == read_tip)
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        match self.marf.get_with_fork_extend_intent(read_tip, key) {
+            Ok(fork_extend_value) => {
+                if &fork_extend_value != at_block_value {
+                    error!(
+                        "MARF_SQUASH_TRACE at_block_oracle_divergence";
+                        "open_height" => ?trace_open_height,
+                        "open_tip" => ?trace_open_tip,
+                        "read_tip" => %read_tip,
+                        "key" => %describe_trace_key(key),
+                        "at_block_value" => %describe_trace_marf_value(at_block_value.as_ref()),
+                        "fork_extend_value" => %describe_trace_marf_value(fork_extend_value.as_ref())
+                    );
+                } else {
+                    debug!(
+                        "MARF_SQUASH_TRACE at_block_oracle_match";
+                        "open_height" => ?trace_open_height,
+                        "open_tip" => ?trace_open_tip,
+                        "read_tip" => %read_tip,
+                        "key" => %describe_trace_key(key),
+                        "value" => %describe_trace_marf_value(at_block_value.as_ref())
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "MARF_SQUASH_TRACE at_block_oracle_unavailable";
+                    "open_height" => ?trace_open_height,
+                    "open_tip" => ?trace_open_tip,
+                    "read_tip" => %read_tip,
+                    "key" => %describe_trace_key(key),
+                    "at_block_value" => %describe_trace_marf_value(at_block_value.as_ref()),
+                    "err" => ?err
+                );
+            }
+        }
+    }
 }
 
 impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     fn set_block_hash(&mut self, bhh: StacksBlockId) -> Result<StacksBlockId, VmExecutionError> {
+        let trace_context = self.trace_context();
+        let trace_enabled = trace_context.is_some();
+        let (trace_open_height, trace_open_tip) = trace_context.unwrap_or((None, None));
+        let trace_old_tip = self.chain_tip.clone();
+
         self.marf
             .check_ancestor_block_hash(&bhh)
             .map_err(|e| match e {
@@ -862,6 +1029,22 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         let result = Ok(self.chain_tip.clone());
         self.chain_tip = bhh;
 
+        if trace_enabled {
+            marf_squash_trace_enter_or_exit_at_block(
+                trace_open_tip.as_ref(),
+                &trace_old_tip,
+                &self.chain_tip,
+            );
+            info!(
+                "MARF_SQUASH_TRACE set_block_hash";
+                "open_height" => ?trace_open_height,
+                "open_tip" => ?trace_open_tip,
+                "old_read_tip" => %trace_old_tip,
+                "new_read_tip" => %self.chain_tip,
+                "trace_scope_depth" => marf_squash_trace_scope_depth()
+            );
+        }
+
         result
     }
 
@@ -870,8 +1053,22 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     }
 
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
-        trace!("MarfedKV get: {:?} tip={}", key, &self.chain_tip);
-        self.marf
+        let trace_context = self.trace_context();
+        let trace_enabled = trace_context.is_some();
+        let (trace_open_height, trace_open_tip) = trace_context.unwrap_or((None, None));
+        let read_tip = self.chain_tip.clone();
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE get_data begin";
+                "open_height" => ?trace_open_height,
+                "open_tip" => ?trace_open_tip,
+                "read_tip" => %read_tip,
+                "key" => %describe_trace_key(key)
+            );
+        }
+
+        let marf_result = self
+            .marf
             .get(&self.chain_tip, key)
             .or_else(|e| match e {
                 Error::NotFoundError => {
@@ -890,7 +1087,19 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                     &self.chain_tip
                 );
                 VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into())
-            })?
+            })?;
+
+        if trace_enabled {
+            self.trace_at_block_oracle(
+                trace_open_height,
+                trace_open_tip.as_ref(),
+                &read_tip,
+                key,
+                &marf_result,
+            );
+        }
+
+        let result = marf_result
             .map(|marf_value| {
                 let side_key = marf_value.to_hex();
                 trace!("MarfedKV get side-key for {:?}: {:?}", key, &side_key);
@@ -902,12 +1111,51 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                     .into()
                 })
             })
-            .transpose()
+            .transpose();
+
+        if trace_enabled {
+            match &result {
+                Ok(value) => {
+                    info!(
+                        "MARF_SQUASH_TRACE get_data end";
+                        "open_height" => ?trace_open_height,
+                        "read_tip" => %read_tip,
+                        "key" => %describe_trace_key(key),
+                        "value" => %describe_trace_value(value.as_deref())
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "MARF_SQUASH_TRACE get_data error";
+                        "open_height" => ?trace_open_height,
+                        "read_tip" => %read_tip,
+                        "key" => %describe_trace_key(key),
+                        "err" => ?err
+                    );
+                }
+            }
+        }
+
+        result
     }
 
     fn get_data_from_path(&mut self, hash: &TrieHash) -> Result<Option<String>, VmExecutionError> {
-        trace!("MarfedKV get_from_hash: {:?} tip={}", hash, &self.chain_tip);
-        self.marf
+        let trace_context = self.trace_context();
+        let trace_enabled = trace_context.is_some();
+        let (trace_open_height, trace_open_tip) = trace_context.unwrap_or((None, None));
+        let read_tip = self.chain_tip.clone();
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE get_data_from_path begin";
+                "open_height" => ?trace_open_height,
+                "open_tip" => ?trace_open_tip,
+                "read_tip" => %read_tip,
+                "path" => %describe_trace_path(hash)
+            );
+        }
+
+        let result = self
+            .marf
             .get_from_hash(&self.chain_tip, hash)
             .or_else(|e| match e {
                 Error::NotFoundError => {
@@ -938,7 +1186,32 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
                     .into()
                 })
             })
-            .transpose()
+            .transpose();
+
+        if trace_enabled {
+            match &result {
+                Ok(value) => {
+                    info!(
+                        "MARF_SQUASH_TRACE get_data_from_path end";
+                        "open_height" => ?trace_open_height,
+                        "read_tip" => %read_tip,
+                        "path" => %describe_trace_path(hash),
+                        "value" => %describe_trace_value(value.as_deref())
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "MARF_SQUASH_TRACE get_data_from_path error";
+                        "open_height" => ?trace_open_height,
+                        "read_tip" => %read_tip,
+                        "path" => %describe_trace_path(hash),
+                        "err" => ?err
+                    );
+                }
+            }
+        }
+
+        result
     }
 
     fn get_data_with_proof(
@@ -1067,6 +1340,28 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     }
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
+        let trace_context = self.trace_context();
+        let trace_enabled = trace_context.is_some();
+        let (trace_open_height, trace_open_tip) = trace_context.unwrap_or((None, None));
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE put_all_data begin";
+                "open_height" => ?trace_open_height,
+                "open_tip" => ?trace_open_tip,
+                "read_tip" => %self.chain_tip,
+                "items" => items.len()
+            );
+            for (idx, (key, value)) in items.iter().enumerate() {
+                info!(
+                    "MARF_SQUASH_TRACE put_all_data item";
+                    "open_height" => ?trace_open_height,
+                    "idx" => idx,
+                    "key" => %describe_trace_key(key),
+                    "value" => %describe_trace_value(Some(value.as_str()))
+                );
+            }
+        }
+
         let mut keys = Vec::with_capacity(items.len());
         let mut values = Vec::with_capacity(items.len());
         for (key, value) in items.into_iter() {
@@ -1075,9 +1370,18 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             keys.push(key);
             values.push(marf_value);
         }
-        self.marf
+        let result = self
+            .marf
             .insert_batch(&keys, &values)
-            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())
+            .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into());
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE put_all_data end";
+                "open_height" => ?trace_open_height,
+                "result" => ?result
+            );
+        }
+        result
     }
 
     fn get_contract_hash(

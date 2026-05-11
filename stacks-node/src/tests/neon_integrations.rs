@@ -8381,14 +8381,17 @@ fn push_boot_receipts() {
         .start_bitcoind()
         .expect("Failed starting bitcoind");
 
-    let btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
+    let mut btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
 
     btc_regtest_controller.bootstrap_chain(201);
 
     eprintln!("Chain bootstrapped...");
 
     let mut run_loop = neon::RunLoop::new(conf);
-    let _chainstate = run_loop.boot_chainstate(&burnchain_config);
+    // `sortdb_mut()` lazily opens the sortdb so `boot_chainstate` can derive a canonical
+    // Stacks tip for the recovery drain it now runs after `open_and_exec`.
+    let _chainstate =
+        run_loop.boot_chainstate(&burnchain_config, btc_regtest_controller.sortdb_mut());
 
     // verify that the event observer got its boot receipts
     let blocks = test_observer::get_blocks();

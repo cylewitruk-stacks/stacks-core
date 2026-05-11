@@ -52,6 +52,9 @@ use crate::chainstate::stacks::db::accounts::MinerReward;
 use crate::chainstate::stacks::db::transactions::TransactionNonceMismatch;
 use crate::chainstate::stacks::db::*;
 use crate::chainstate::stacks::events::StacksBlockEventData;
+use crate::chainstate::stacks::index::{
+    marf_squash_trace_enabled_for_height, marf_squash_trace_scope_for_height,
+};
 use crate::chainstate::stacks::{
     Error, StacksBlockHeader, StacksMicroblockHeader, C32_ADDRESS_VERSION_MAINNET_MULTISIG,
     C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_MULTISIG,
@@ -4006,13 +4009,41 @@ impl StacksChainState {
     pub fn process_microblocks_transactions(
         clarity_tx: &mut ClarityTx,
         microblocks: &[StacksMicroblock],
+        trace_height: Option<u32>,
     ) -> Result<(u128, u128, Vec<StacksTransactionReceipt>), (Error, BlockHeaderHash)> {
         let mut fees = 0u128;
         let mut burns = 0u128;
         let mut receipts = vec![];
+        let trace_enabled = marf_squash_trace_enabled_for_height(trace_height);
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE microblock_phase begin";
+                "trace_height" => ?trace_height,
+                "microblocks" => microblocks.len()
+            );
+        }
         for microblock in microblocks.iter() {
             debug!("Process microblock {}", &microblock.block_hash());
+            if trace_enabled {
+                info!(
+                    "MARF_SQUASH_TRACE microblock begin";
+                    "microblock_hash" => %microblock.block_hash(),
+                    "parent" => %microblock.header.prev_block,
+                    "sequence" => microblock.header.sequence,
+                    "txs" => microblock.txs.len()
+                );
+            }
             for (tx_index, tx) in microblock.txs.iter().enumerate() {
+                if trace_enabled {
+                    info!(
+                        "MARF_SQUASH_TRACE tx begin";
+                        "phase" => "microblock",
+                        "microblock_hash" => %microblock.block_hash(),
+                        "tx_index" => tx_index,
+                        "txid" => %tx.txid(),
+                        "payload" => %tx.payload.name()
+                    );
+                }
                 let (tx_fee, mut tx_receipt) =
                     StacksChainState::process_transaction(clarity_tx, tx, false, None)
                         .map_err(|e| (e, microblock.block_hash()))?;
@@ -4023,8 +4054,37 @@ impl StacksChainState {
                 burns = burns
                     .checked_add(tx_receipt.stx_burned)
                     .expect("Burns overflow");
+                if trace_enabled {
+                    info!(
+                        "MARF_SQUASH_TRACE tx end";
+                        "phase" => "microblock",
+                        "microblock_hash" => %microblock.block_hash(),
+                        "tx_index" => tx_index,
+                        "txid" => %tx.txid(),
+                        "fee" => tx_fee,
+                        "stx_burned" => tx_receipt.stx_burned,
+                        "result" => ?tx_receipt.result
+                    );
+                }
                 receipts.push(tx_receipt);
             }
+            if trace_enabled {
+                info!(
+                    "MARF_SQUASH_TRACE microblock end";
+                    "microblock_hash" => %microblock.block_hash(),
+                    "fees_so_far" => fees,
+                    "burns_so_far" => burns,
+                    "receipts_so_far" => receipts.len()
+                );
+            }
+        }
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE microblock_phase end";
+                "fees" => fees,
+                "burns" => burns,
+                "receipts" => receipts.len()
+            );
         }
         Ok((fees, burns, receipts))
     }
@@ -4579,12 +4639,31 @@ impl StacksChainState {
         clarity_tx: &mut ClarityTx,
         block_txs: &[StacksTransaction],
         mut tx_index: u32,
+        trace_height: Option<u32>,
     ) -> Result<(u128, u128, Vec<StacksTransactionReceipt>), Error> {
         let mut fees = 0u128;
         let mut burns = 0u128;
         let mut receipts = vec![];
         let mut total_size = 0u64;
+        let trace_enabled = marf_squash_trace_enabled_for_height(trace_height);
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE anchored_phase begin";
+                "trace_height" => ?trace_height,
+                "txs" => block_txs.len(),
+                "first_tx_index" => tx_index
+            );
+        }
         for tx in block_txs.iter() {
+            if trace_enabled {
+                info!(
+                    "MARF_SQUASH_TRACE tx begin";
+                    "phase" => "anchored",
+                    "tx_index" => tx_index,
+                    "txid" => %tx.txid(),
+                    "payload" => %tx.payload.name()
+                );
+            }
             let (tx_fee, mut tx_receipt) =
                 StacksChainState::process_transaction(clarity_tx, tx, false, None)?;
             fees = fees.checked_add(u128::from(tx_fee)).expect("Fee overflow");
@@ -4600,8 +4679,28 @@ impl StacksChainState {
             burns = burns
                 .checked_add(tx_receipt.stx_burned)
                 .expect("Burns overflow");
+            if trace_enabled {
+                info!(
+                    "MARF_SQUASH_TRACE tx end";
+                    "phase" => "anchored",
+                    "tx_index" => tx_index,
+                    "txid" => %tx.txid(),
+                    "fee" => tx_fee,
+                    "stx_burned" => tx_receipt.stx_burned,
+                    "receipt_size_total" => total_size,
+                    "result" => ?tx_receipt.result
+                );
+            }
             receipts.push(tx_receipt);
             tx_index += 1;
+        }
+        if trace_enabled {
+            info!(
+                "MARF_SQUASH_TRACE anchored_phase end";
+                "fees" => fees,
+                "burns" => burns,
+                "receipts" => receipts.len()
+            );
         }
         Ok((fees, burns, receipts))
     }
@@ -5155,6 +5254,17 @@ impl StacksChainState {
             &MINER_BLOCK_CONSENSUS_HASH,
             &MINER_BLOCK_HEADER_HASH,
         );
+        let trace_height = u32::try_from(chain_tip.stacks_block_height.saturating_add(1)).ok();
+        if marf_squash_trace_enabled_for_height(trace_height) {
+            info!(
+                "MARF_SQUASH_TRACE setup_block opened temporary clarity trie";
+                "trace_height" => ?trace_height,
+                "parent" => %parent_index_hash,
+                "temporary_consensus_hash" => %MINER_BLOCK_CONSENSUS_HASH,
+                "temporary_block_hash" => %MINER_BLOCK_HEADER_HASH,
+                "parent_microblocks" => parent_microblocks.len()
+            );
+        }
 
         clarity_tx.reset_cost(parent_block_cost.clone());
 
@@ -5195,6 +5305,7 @@ impl StacksChainState {
             match StacksChainState::process_microblocks_transactions(
                 &mut clarity_tx,
                 parent_microblocks,
+                trace_height,
             ) {
                 Ok((fees, burns, events)) => (fees, burns, events),
                 Err((e, mblock_header_hash)) => {
@@ -5456,6 +5567,9 @@ impl StacksChainState {
             block.txs.len()
         );
 
+        let trace_height = u32::try_from(block.header.total_work.work).ok();
+        let _marf_squash_trace_scope = marf_squash_trace_scope_for_height(trace_height);
+
         let mainnet = chainstate_tx.get_config().mainnet;
         let next_block_height = block.header.total_work.work;
 
@@ -5658,6 +5772,7 @@ impl StacksChainState {
                     &block.txs,
                     u32::try_from(microblock_txs_receipts.len())
                         .expect("more than 2^32 tx receipts"),
+                    u32::try_from(block.header.total_work.work).ok(),
                 ) {
                     Err(e) => {
                         let msg = format!("Invalid Stacks block {}: {e:?}", block.block_hash());
@@ -5738,6 +5853,20 @@ impl StacksChainState {
             }
 
             let root_hash = clarity_tx.seal();
+            let trace_height = u32::try_from(block.header.total_work.work).ok();
+            if marf_squash_trace_enabled_for_height(trace_height) {
+                info!(
+                    "MARF_SQUASH_TRACE append_block seal";
+                    "trace_height" => ?trace_height,
+                    "block" => %block.block_hash(),
+                    "consensus_hash" => %chain_tip_consensus_hash,
+                    "parent_consensus_hash" => %parent_consensus_hash,
+                    "parent_block_hash" => %parent_block_hash,
+                    "expected_root" => %block.header.state_index_root,
+                    "computed_root" => %root_hash,
+                    "parent_microblocks" => microblocks.len()
+                );
+            }
             if root_hash != block.header.state_index_root {
                 let msg = format!(
                     "Block {} state root mismatch: expected {}, got {}",
@@ -6172,6 +6301,8 @@ impl StacksChainState {
             };
 
         let block = StacksChainState::extract_stacks_block(&next_staging_block)?;
+        let trace_height = u32::try_from(next_staging_block.height).ok();
+        let _marf_squash_trace_scope = marf_squash_trace_scope_for_height(trace_height);
         let block_size = u64::try_from(next_staging_block.block_data.len())
             .expect("FATAL: more than 2^64 transactions");
 

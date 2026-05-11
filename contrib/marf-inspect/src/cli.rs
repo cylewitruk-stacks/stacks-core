@@ -1,4 +1,5 @@
 mod blocks;
+mod levels;
 mod manifest;
 mod node;
 mod plan;
@@ -8,6 +9,7 @@ mod walk;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+pub use levels::LevelsArgs;
 pub use manifest::ManifestArgs;
 pub use node::NodeArgs;
 pub use plan::PlanArgs;
@@ -47,6 +49,9 @@ pub enum Command {
     /// Walk the MARF trie for a given block and key, using the full MARF read API.
     /// This exercises the exact same code path as `get_block_height_of`.
     Walk(WalkArgs),
+
+    /// List squash levels with their on-disk trailer metadata (mode, root hashes counts, etc.).
+    Levels(LevelsArgs),
 }
 
 pub struct CliCtx {
@@ -105,6 +110,7 @@ impl Cli {
             Command::Plan(args) => plan::exec(ctx, args),
             Command::Manifest(args) => manifest::exec(ctx, args),
             Command::Walk(args) => walk::exec(ctx, args),
+            Command::Levels(args) => levels::exec(ctx, args),
         }
     }
 }

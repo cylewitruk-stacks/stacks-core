@@ -16,6 +16,7 @@
 
 #![warn(dead_code)]
 
+use std::cell::Cell;
 use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
@@ -53,6 +54,114 @@ pub mod trie_sql;
 
 #[cfg(test)]
 pub mod test;
+
+thread_local! {
+    static MARF_SQUASH_TRACE_SCOPE_DEPTH: Cell<u32> = Cell::new(0);
+}
+
+pub(crate) fn marf_squash_trace_enabled() -> bool {
+    std::env::var_os("STACKS_MARF_SQUASH_TRACE").is_some()
+}
+
+pub(crate) fn marf_squash_trace_height_in_range(height: Option<u32>) -> bool {
+    if !marf_squash_trace_enabled() {
+        return false;
+    }
+
+    let Some(height) = height else {
+        return false;
+    };
+
+    if let Some(from_height) = std::env::var("STACKS_MARF_SQUASH_TRACE_FROM_HEIGHT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        if height < from_height {
+            return false;
+        }
+    }
+
+    if let Some(to_height) = std::env::var("STACKS_MARF_SQUASH_TRACE_TO_HEIGHT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        if height > to_height {
+            return false;
+        }
+    }
+
+    true
+}
+
+pub(crate) fn marf_squash_trace_scope_depth() -> u32 {
+    MARF_SQUASH_TRACE_SCOPE_DEPTH.with(Cell::get)
+}
+
+pub(crate) fn marf_squash_trace_scope_active() -> bool {
+    marf_squash_trace_scope_depth() > 0
+}
+
+pub(crate) fn marf_squash_trace_enabled_for_height(height: Option<u32>) -> bool {
+    marf_squash_trace_scope_active() || marf_squash_trace_height_in_range(height)
+}
+
+#[must_use]
+pub(crate) struct MarfSquashTraceScope {
+    previous_depth: u32,
+}
+
+impl Drop for MarfSquashTraceScope {
+    fn drop(&mut self) {
+        MARF_SQUASH_TRACE_SCOPE_DEPTH.with(|depth| depth.set(self.previous_depth));
+    }
+}
+
+/// Enter a per-thread MARF squash trace scope for one Stacks block.
+///
+/// If `height` is inside the configured trace window, all nested MARF/Clarity
+/// trace points in this thread are enabled, including historical `at-block`
+/// reads whose target Stacks heights fall outside the configured window.
+/// If `height` is outside the window, the scope is explicitly cleared to catch
+/// any stale depth left by an unusual early-exit path.
+pub(crate) fn marf_squash_trace_scope_for_height(height: Option<u32>) -> MarfSquashTraceScope {
+    let previous_depth = marf_squash_trace_scope_depth();
+    let new_depth = if marf_squash_trace_height_in_range(height) {
+        previous_depth.saturating_add(1)
+    } else {
+        0
+    };
+    MARF_SQUASH_TRACE_SCOPE_DEPTH.with(|depth| depth.set(new_depth));
+    MarfSquashTraceScope { previous_depth }
+}
+
+/// Update trace nesting when Clarity switches between the block under execution
+/// and a historical `at-block` read tip.
+///
+/// `set_block_hash()` is an enter/restore API rather than a closure API, so the
+/// trace scope cannot use a normal RAII guard for this nested part.  Instead, the
+/// transition into a historical read increments the thread-local depth, and the
+/// transition back to the open execution tip decrements it.
+pub(crate) fn marf_squash_trace_enter_or_exit_at_block<T: PartialEq>(
+    open_tip: Option<&T>,
+    old_read_tip: &T,
+    new_read_tip: &T,
+) {
+    let Some(open_tip) = open_tip else {
+        return;
+    };
+    if !marf_squash_trace_scope_active() {
+        return;
+    }
+
+    MARF_SQUASH_TRACE_SCOPE_DEPTH.with(|depth| {
+        let current = depth.get();
+        if old_read_tip == open_tip && new_read_tip != open_tip {
+            depth.set(current.saturating_add(1));
+        } else if old_read_tip != open_tip && new_read_tip == open_tip && current > 1 {
+            depth.set(current - 1);
+        }
+    });
+}
 
 use crate::chainstate::stacks::index::node::{
     ParkedNodeHandle, TrieLeafRef, TrieLeafSquashedRef, TrieNodeID, TrieNodePatch, TrieNodeRef,
@@ -510,6 +619,53 @@ impl OwnedNodeBytes {
     /// The raw serialized bytes.
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
+    }
+}
+
+/// Read-side intent that controls how the storage layer resolves `ROOT_PTR_DISK` reads
+/// against blocks inside a reclaimed FullHistory squash level.
+///
+/// Encodes the contract separation between historical *value lookup* and historical
+/// *root-shape reconstruction* at the level where it matters: the per-height root sidecar
+/// route (`squash_opened_root_node_bytes` via `resolve_squash_root_via_sidecar`).
+///
+/// * [`WalkIntent::AtBlock`] — the read is part of a `get(historical_block, key)` style
+///   walk. `ROOT_PTR_DISK` resolves to the merged tip's root from offset 36 of the merged
+///   blob, and historical values are resolved at the leaf via
+///   `LeafSquashed::value_at_height`. **No per-height root sidecar dependency**: trimming
+///   the sidecar (per the retention policy) must not prevent these reads, which is the
+///   contract a Clarity `at-block` from a deep height needs.
+///
+/// * [`WalkIntent::ForkExtend`] — the read is part of `MARF::root_copy` rebuilding the
+///   *historical* root shape so a new fork block can extend off a non-tip squashed parent.
+///   `ROOT_PTR_DISK` returns the per-height root from the sidecar so the fork's seal hash
+///   is structurally correct. If the sidecar has been trimmed under the retention policy,
+///   fork-extension fails closed with [`Error::SnapshotTrimmed`] — the documented
+///   operator-recovery contract.
+///
+/// **Orphan-section reads are NOT gated by intent.** Both at-block walks and fork-extension
+/// reads can legitimately reach orphan offsets: at-block walks of newly-extended fork
+/// blocks must follow backptrs that the per-height root copy carries into the orphan
+/// section under the default `AtBlock` intent (`seal()` after a fork extension off a
+/// non-tip squashed parent is the canonical example). Trim therefore severs *both*
+/// fork-extension off the trimmed parent AND seal-walks of fork blocks already extended
+/// from it; in practice that's bounded because fork blocks would have been canonicalized
+/// into newer levels before retention ages out the parent level.
+///
+/// `AtBlock` is the default. `ForkExtend` is set explicitly by the small set of call sites
+/// that legitimately need historical root-shape reconstruction (just `MARF::root_copy`
+/// today).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkIntent {
+    /// Historical-value read path. Uses the merged tip's root + `LeafSquashed::value_at_height`.
+    AtBlock,
+    /// Fork-extension root reconstruction. Uses the per-height root sidecar.
+    ForkExtend,
+}
+
+impl Default for WalkIntent {
+    fn default() -> Self {
+        Self::AtBlock
     }
 }
 

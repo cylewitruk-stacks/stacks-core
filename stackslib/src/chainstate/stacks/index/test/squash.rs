@@ -4078,6 +4078,643 @@ fn test_full_history_read_before_first_write_returns_none() {
     );
 }
 
+/// Differential oracle for the `WalkIntent::AtBlock` historical-read shortcut.
+///
+/// The mainnet 53k failure had this shape:
+///   1. A Clarity `at-block` read into an old squashed level originally failed with
+///      `SnapshotTrimmed`.
+///   2. After gating the per-height root sidecar route to `ForkExtend`, the read succeeded.
+///   3. The same block then failed with a state-root mismatch, which strongly suggests the
+///      replacement read returned a consensus-incorrect value.
+///
+/// This test keeps the sidecar present and compares both semantics directly:
+///   * default `MARF::get` = current `AtBlock` behavior, merged tip root + `value_at_height`.
+///   * `get_with_fork_extend_intent` = old per-height root-sidecar behavior, used as the oracle.
+///
+/// If these disagree before trimming, trimming would merely hide the oracle and let a bad value
+/// feed consensus execution.
+#[test]
+fn test_full_history_at_block_matches_sidecar_root_oracle_before_trim() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_full_history_at_block_matches_sidecar_root_oracle_before_trim");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_auto_recovery(true);
+
+    const CANONICAL_BLOCKS: u32 = 8;
+
+    let blocks: Vec<StacksBlockId> = (0..CANONICAL_BLOCKS)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[20..24].copy_from_slice(&0x_0A_7B_10_CCu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&i.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    let mut keys: Vec<String> = vec![
+        "hot_key".into(),
+        "early_only".into(),
+        "late_key".into(),
+        "every_other".into(),
+    ];
+    for i in 0..CANONICAL_BLOCKS {
+        keys.push(format!("per_block_{i}"));
+        keys.push(format!("spread_{i}_{}", i % 3));
+    }
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    let mut parent = StacksBlockId::sentinel();
+    for h in 0..CANONICAL_BLOCKS {
+        let bh = &blocks[h as usize];
+        marf.begin(&parent, bh).unwrap();
+
+        marf.insert("hot_key", MARFValue::from_value(&format!("hot_{h}")))
+            .unwrap();
+        marf.insert(
+            &format!("per_block_{h}"),
+            MARFValue::from_value(&format!("per_block_value_{h}")),
+        )
+        .unwrap();
+        marf.insert(
+            &format!("spread_{h}_{}", h % 3),
+            MARFValue::from_value(&format!("spread_value_{h}")),
+        )
+        .unwrap();
+        if h == 0 {
+            marf.insert("early_only", MARFValue::from_value("early"))
+                .unwrap();
+        }
+        if h >= 4 {
+            marf.insert("late_key", MARFValue::from_value(&format!("late_{h}")))
+                .unwrap();
+        }
+        if h % 2 == 0 {
+            marf.insert("every_other", MARFValue::from_value(&format!("even_{h}")))
+                .unwrap();
+        }
+
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        parent = bh.clone();
+    }
+    drop(marf);
+
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        CANONICAL_BLOCKS - 1,
+        true,
+        None,
+    )
+    .expect("FullHistory reclaim squash should succeed");
+
+    let mut reader = MARF::<StacksBlockId>::from_path(&path, open_opts).unwrap();
+    for h in 0..CANONICAL_BLOCKS {
+        for key in &keys {
+            let at_block = reader
+                .get(&blocks[h as usize], key)
+                .unwrap_or_else(|e| panic!("AtBlock read failed at height {h}, key={key}: {e:?}"));
+            let sidecar_oracle = reader
+                .get_with_fork_extend_intent(&blocks[h as usize], key)
+                .unwrap_or_else(|e| {
+                    panic!("sidecar oracle read failed at height {h}, key={key}: {e:?}")
+                });
+            assert_eq!(
+                at_block, sidecar_oracle,
+                "AtBlock merged-root read diverged from per-height sidecar-root oracle \
+                 at height {h}, key={key}"
+            );
+        }
+    }
+}
+
+/// A larger oracle for the mainnet-53161 failure shape.
+///
+/// The compact oracle above uses simple keys and small ranges. The observed failure involved
+/// Clarity-style keys with long shared prefixes, sparse first writes, repeated `none` writes, and a
+/// historical `at-block` read near the front of a large FullHistory squash level. Keep the sidecar
+/// present and compare the default merged-tip-root `AtBlock` walk against the per-height sidecar
+/// root walk before trimming can hide the reference answer.
+#[test]
+fn test_full_history_at_block_sidecar_oracle_mainnet_53161_key_shape() {
+    use crate::chainstate::stacks::index::squash::{squash_level_incremental, SquashMode};
+
+    let dir = fresh_test_dir("test_full_history_at_block_sidecar_oracle_mainnet_53161_key_shape");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_auto_recovery(true);
+
+    const BLOCKS: u32 = 192;
+    const ACCOUNTS: u32 = 384;
+
+    let blocks: Vec<StacksBlockId> = (0..BLOCKS)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[16..20].copy_from_slice(&0x_53_16_1BADu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&i.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    let mut watched_keys = vec![
+        "clarity-contract::SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.lydian-airdrop-v1-2"
+            .to_string(),
+        "clarity-contract::SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.stdiko-token".to_string(),
+        "clarity-contract::SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.arkadiko-governance-v2-1"
+            .to_string(),
+        "clarity-contract::SP3MBWGMCVC9KZ5DTAYFMG1D0AEJCR7NENTM3FTK5.wrapped-lydian-token"
+            .to_string(),
+        "vm-epoch::epoch-version".to_string(),
+        "vm::SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.stdiko-token::3::stdiko".to_string(),
+    ];
+    for acct in 0..ACCOUNTS {
+        watched_keys.push(format!("vm-account::synthetic-mainnet-user-{acct:04}::19"));
+        watched_keys.push(format!("vm-account::synthetic-mainnet-user-{acct:04}::18"));
+        watched_keys.push(format!(
+            "vm::SP3MBWGMCVC9KZ5DTAYFMG1D0AEJCR7NENTM3FTK5.wrapped-lydian-token::2::wrapped-lydian::{{\"Standard\":[22,[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]]}}",
+            acct % 251,
+            (acct + 1) % 251,
+            (acct + 2) % 251,
+            (acct + 3) % 251,
+            (acct + 4) % 251,
+            (acct + 5) % 251,
+            (acct + 6) % 251,
+            (acct + 7) % 251,
+            (acct + 8) % 251,
+            (acct + 9) % 251,
+            (acct + 10) % 251,
+            (acct + 11) % 251,
+            (acct + 12) % 251,
+            (acct + 13) % 251,
+            (acct + 14) % 251,
+            (acct + 15) % 251,
+            (acct + 16) % 251,
+            (acct + 17) % 251,
+            (acct + 18) % 251,
+            (acct + 19) % 251,
+        ));
+        watched_keys.push(format!(
+            "vm::SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.arkadiko-governance-v2-1::0::tokens-by-member::0c00000003066d656d626572{:08x}",
+            acct
+        ));
+    }
+
+    let none_value = "09"; // serialized Clarity `none`.
+    let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    let mut parent = StacksBlockId::sentinel();
+    for h in 0..BLOCKS {
+        let bh = &blocks[h as usize];
+        marf.begin(&parent, bh).unwrap();
+
+        // Contract/data-var style keys: present from the start, occasionally rewritten.
+        for key in watched_keys.iter().take(6) {
+            if h == 0 || h % 17 == 0 {
+                marf.insert(key, MARFValue::from_value(&format!("{key}:h{h}")))
+                    .unwrap();
+            }
+        }
+
+        // Sparse account/map keys with first writes spread across the range. Some get a later
+        // Clarity-`none` write, matching map-delete / NFT-burn shapes without physically deleting
+        // the MARF leaf.
+        for n in 0..96 {
+            let acct = (h * 37 + n * 11) % ACCOUNTS;
+            let acct_key = format!("vm-account::synthetic-mainnet-user-{acct:04}::19");
+            marf.insert(
+                &acct_key,
+                MARFValue::from_value(&format!("acct-{acct}-nonce-{h}")),
+            )
+            .unwrap();
+
+            if h % 5 == 0 {
+                let balance_key = format!(
+                    "vm::SP3MBWGMCVC9KZ5DTAYFMG1D0AEJCR7NENTM3FTK5.wrapped-lydian-token::2::wrapped-lydian::{{\"Standard\":[22,[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]]}}",
+                    acct % 251,
+                    (acct + 1) % 251,
+                    (acct + 2) % 251,
+                    (acct + 3) % 251,
+                    (acct + 4) % 251,
+                    (acct + 5) % 251,
+                    (acct + 6) % 251,
+                    (acct + 7) % 251,
+                    (acct + 8) % 251,
+                    (acct + 9) % 251,
+                    (acct + 10) % 251,
+                    (acct + 11) % 251,
+                    (acct + 12) % 251,
+                    (acct + 13) % 251,
+                    (acct + 14) % 251,
+                    (acct + 15) % 251,
+                    (acct + 16) % 251,
+                    (acct + 17) % 251,
+                    (acct + 18) % 251,
+                    (acct + 19) % 251,
+                );
+                let value = if h % 20 == 0 {
+                    none_value.to_string()
+                } else {
+                    format!("balance-{acct}-h{h}")
+                };
+                marf.insert(&balance_key, MARFValue::from_value(&value))
+                    .unwrap();
+            }
+        }
+
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+        parent = bh.clone();
+    }
+    drop(marf);
+
+    squash_level_incremental::<StacksBlockId>(
+        &path,
+        SquashMode::FullHistory,
+        0,
+        BLOCKS - 1,
+        true,
+        None,
+    )
+    .expect("FullHistory reclaim squash should succeed");
+
+    let mut reader = MARF::<StacksBlockId>::from_path(&path, open_opts).unwrap();
+    let probe_heights = [0, 1, 7, 31, 73, 127, BLOCKS - 1];
+    for h in probe_heights {
+        for key in &watched_keys {
+            let at_block = reader
+                .get(&blocks[h as usize], key)
+                .unwrap_or_else(|e| panic!("AtBlock read failed at height {h}, key={key}: {e:?}"));
+            let sidecar_oracle = reader
+                .get_with_fork_extend_intent(&blocks[h as usize], key)
+                .unwrap_or_else(|e| {
+                    panic!("sidecar oracle read failed at height {h}, key={key}: {e:?}")
+                });
+            assert_eq!(
+                at_block, sidecar_oracle,
+                "AtBlock merged-root read diverged from per-height sidecar-root oracle \
+                 at height {h}, key={key}"
+            );
+        }
+    }
+}
+
+/// Regression: an at-block GET against a block in a FullHistory squash level whose root
+/// sidecar has been trimmed must still return the historical value via the merged tip's
+/// structure + `LeafSquashed::value_at_height(H)`. Fork-extension off that same parent must
+/// continue to surface `Error::SnapshotTrimmed`.
+///
+/// This is the contract separation:
+///   * Historical GET -> tip-walk + `value_at_height(H)`. NO sidecar dependency.
+///   * Fork-extension -> `MARF::root_copy` rebuilds the historical root shape; needs sidecar.
+///
+/// The bug it guards against: today the read path routes `ROOT_PTR_DISK` through
+/// `resolve_squash_root_via_sidecar` for *any* in-range squashed open, so historical Clarity
+/// `at-block` reads in trimmed levels returned `SnapshotTrimmed`. Observed during mainnet
+/// sync at clarity level 48 (range 47427..=47858) once the chain advanced past the
+/// 2000-block retention horizon and an `at-block` contract read targeted that range.
+#[test]
+fn test_full_history_at_block_read_survives_sidecar_trim() {
+    use crate::chainstate::stacks::index::squash::{
+        squash_level_incremental, trim_aged_root_sidecars, SquashMode,
+    };
+    use crate::chainstate::stacks::index::Error;
+
+    // Effectively-disable the in-squash automatic trim hook; this test drives trim explicitly.
+    const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
+
+    let dir = fresh_test_dir("test_full_history_at_block_read_survives_sidecar_trim");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED)
+        .with_auto_recovery(true);
+
+    // Two FullHistory + reclaim squash levels of 4 blocks each. Level 0 will be trimmed;
+    // level 1 stays. `hot_key` is updated every block (multi-write within each level ->
+    // emits `LeafSquashed`); `cold_key` is single-write at block 0 -> stays plain `Leaf`,
+    // exercising the dominated-single tip-walk path.
+    const N_LEVELS: u32 = 2;
+    const HEIGHTS_PER_LEVEL: u32 = 4;
+    const TOTAL_BLOCKS: u32 = N_LEVELS * HEIGHTS_PER_LEVEL;
+
+    let block_hashes: Vec<StacksBlockId> = (0..TOTAL_BLOCKS)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[24..28].copy_from_slice(&0x_FE_ED_BE_EFu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&i.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    let cold_value = MARFValue::from(0x_0DDD_0DDDu32);
+    let mut expected_hot: Vec<MARFValue> = Vec::with_capacity(TOTAL_BLOCKS as usize);
+
+    let mut parent = StacksBlockId::sentinel();
+    for level_id in 0..N_LEVELS {
+        let lo = level_id * HEIGHTS_PER_LEVEL;
+        let hi = lo + HEIGHTS_PER_LEVEL - 1;
+        {
+            let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+            for h in lo..=hi {
+                let bh = &block_hashes[h as usize];
+                marf.begin(&parent, bh).unwrap();
+                let hot_val = MARFValue::from(0x_CAFE_0000u32 + h);
+                marf.insert("hot_key", hot_val.clone()).unwrap();
+                if h == 0 {
+                    marf.insert("cold_key", cold_value.clone()).unwrap();
+                }
+                marf.seal().unwrap();
+                marf.commit().unwrap();
+                parent = bh.clone();
+                expected_hot.push(hot_val);
+            }
+        }
+        squash_level_incremental::<StacksBlockId>(
+            &path,
+            SquashMode::FullHistory,
+            lo,
+            hi,
+            true, // reclaim — sidecars are written
+            None,
+        )
+        .unwrap_or_else(|e| panic!("squash level {level_id} ({lo}..={hi}): {e:?}"));
+    }
+
+    // Sanity: pre-trim, every hot_key historical GET works. This walks via the per-height
+    // root sidecar in the current code; both before AND after the WalkIntent fix it must
+    // succeed.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        for h in 0..TOTAL_BLOCKS {
+            let got = marf.get(&block_hashes[h as usize], "hot_key").unwrap();
+            assert_eq!(
+                got,
+                Some(expected_hot[h as usize].clone()),
+                "pre-trim hot_key at block {h}"
+            );
+        }
+        assert_eq!(
+            marf.get(&block_hashes[0], "cold_key").unwrap(),
+            Some(cold_value.clone()),
+        );
+    }
+
+    // Trim level 0. retention=HEIGHTS_PER_LEVEL keeps everything in the newest 4 blocks
+    // (= level 1) and trims everything strictly older (= level 0). Walking newest-first
+    // with span=4 each level:
+    //   level 1 (hi=7): accumulated 0 <  4, credit (acc=4)
+    //   level 0 (hi=3): accumulated 4 >= 4, TRIM
+    {
+        let mut trim_handle = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        let report = trim_aged_root_sidecars(
+            &mut trim_handle,
+            std::path::Path::new(&path),
+            HEIGHTS_PER_LEVEL,
+        )
+        .unwrap();
+        assert_eq!(
+            report.levels_trimmed, 1,
+            "exactly level 0 should be trimmed"
+        );
+        assert_eq!(report.trim_failures, 0);
+        assert_eq!(report.unlink_failures, 0);
+    }
+
+    // Verify on-disk + SQL state: level 0 sidecar gone + flagged trimmed; level 1 untouched.
+    {
+        let levels = {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::chainstate::stacks::index::trie_sql::read_squash_levels(&conn).unwrap()
+        };
+        assert_eq!(levels.len(), N_LEVELS as usize);
+        assert!(levels[0].root_sidecar_trimmed, "level 0 must be trimmed");
+        assert!(
+            !levels[1].root_sidecar_trimmed,
+            "level 1 must NOT be trimmed"
+        );
+        let l0_sidecar = format!(
+            "{}.squash_sidecars/marf-roots-level-{:06}-h{:08}-{:08}-blob-{:016x}.dat",
+            path,
+            levels[0].level_id,
+            levels[0].min_height,
+            levels[0].max_height,
+            levels[0].blob_offset,
+        );
+        assert!(
+            !std::path::Path::new(&l0_sidecar).exists(),
+            "level 0 sidecar file must be deleted (path={l0_sidecar})",
+        );
+    }
+
+    // Crux: open a fresh handle and read every block in trimmed level 0. This is the
+    // assertion that fails today and passes after the WalkIntent gating: at-block reads
+    // must walk via the merged tip's root + LeafSquashed::value_at_height(H), with no
+    // dependency on the per-height root sidecar.
+    let mut reader = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+    for h in 0..HEIGHTS_PER_LEVEL {
+        let got = reader
+            .get(&block_hashes[h as usize], "hot_key")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "GET against trimmed level 0 must succeed via tip-walk + \
+                     value_at_height(H); got error at block {h}: {e:?}"
+                )
+            });
+        assert_eq!(
+            got,
+            Some(expected_hot[h as usize].clone()),
+            "post-trim historical hot_key at block {h} (in trimmed level 0)",
+        );
+    }
+    // Single-write key at block 0 (plain Leaf in the merged tip): same contract.
+    assert_eq!(
+        reader.get(&block_hashes[0], "cold_key").unwrap(),
+        Some(cold_value.clone()),
+    );
+    // Level 1 (sidecar present) reads must continue to work.
+    for h in HEIGHTS_PER_LEVEL..TOTAL_BLOCKS {
+        let got = reader.get(&block_hashes[h as usize], "hot_key").unwrap();
+        assert_eq!(got, Some(expected_hot[h as usize].clone()));
+    }
+
+    // Boundary: fork-extension off a trimmed parent must STILL surface `SnapshotTrimmed`.
+    // This confirms the gating is intent-aware (read = `AtBlock` bypasses the sidecar;
+    // root-copy = `ForkExtend` keeps the existing fail-closed contract).
+    let trimmed_parent = block_hashes[0].clone();
+    let fork_block = {
+        let mut bytes = [0xFEu8; 32];
+        bytes[28..32].copy_from_slice(&0x_DEAD_BEEFu32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let fork_err = reader.begin(&trimmed_parent, &fork_block).unwrap_err();
+    assert!(
+        matches!(fork_err, Error::SnapshotTrimmed { level_id: 0, .. }),
+        "fork-extension off trimmed level 0 must return SnapshotTrimmed; got: {fork_err:?}",
+    );
+}
+
+/// Companion regression to `test_full_history_at_block_read_survives_sidecar_trim`. Covers
+/// the cross-level shape: build two FullHistory+reclaim levels, extend a new block off the
+/// latest (kept) level's tip so the extension carries patches/backptrs against squashed
+/// parents, trim level 0, and exercise the read paths the trimmed sidecar must NOT break:
+///
+/// 1. **Tip reads on the post-extension block.** The new block's trie was constructed via
+///    `MARF::root_copy` against level 1's tip; its `seal()` walked through orphan reads on
+///    level 1 (still kept). Reading it post-trim verifies the AtBlock walk's tip-rooted
+///    structure traversal works once any preserved orphan dependency is on a still-kept
+///    level. Walks via the merged tip's structure of the extension block.
+/// 2. **At-block GETs from the extension block's MARF handle back into trimmed level 0**
+///    — the canonical "Clarity `at-block` from a deep height" read shape that the mainnet
+///    panic exercised. Each of these reads opens the historical level-0 block directly,
+///    walks via the merged-tip's structure of *that* block, and resolves values via
+///    `LeafSquashed::value_at_height`. The per-height ROOT_PTR_DISK sidecar route is
+///    gated to `ForkExtend`, so trimming level 0's sidecar does not break this.
+///
+/// Note: this test does NOT pin the descendant-rooted-walk-through-the-slow-patch-path
+/// shape (a Patch step landing at `ptr.ptr() >= orphan_split_offset` of a trimmed level).
+/// Orphan-section reads stay routed unconditionally — at-block walks of newly-extended
+/// fork blocks legitimately need them via `seal()` of the per-height-root copy
+/// (`test_cow_flattens_leaf_squashed_at_non_tip_parent_height` exercises that path
+/// directly). A trimmed orphan section severs both fork-extension off the trimmed parent
+/// AND seal-walks of fork blocks already extended from it; that's the documented
+/// retention contract, not a contract this test pins.
+#[test]
+fn test_full_history_patched_descendant_read_survives_sidecar_trim() {
+    use crate::chainstate::stacks::index::squash::{
+        squash_level_incremental, trim_aged_root_sidecars, SquashMode,
+    };
+
+    const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
+
+    let dir = fresh_test_dir("test_full_history_patched_descendant_read_survives_sidecar_trim");
+    let path = format!("{dir}/marf.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED)
+        .with_auto_recovery(true);
+
+    const N_LEVELS: u32 = 2;
+    const HEIGHTS_PER_LEVEL: u32 = 4;
+    const TOTAL_BLOCKS: u32 = N_LEVELS * HEIGHTS_PER_LEVEL;
+
+    let block_hashes: Vec<StacksBlockId> = (0..TOTAL_BLOCKS)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[24..28].copy_from_slice(&0x_BA_DD_CA_FEu32.to_be_bytes());
+            bytes[28..32].copy_from_slice(&i.to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    let mut expected_hot: Vec<MARFValue> = Vec::with_capacity(TOTAL_BLOCKS as usize);
+    let mut parent = StacksBlockId::sentinel();
+    for level_id in 0..N_LEVELS {
+        let lo = level_id * HEIGHTS_PER_LEVEL;
+        let hi = lo + HEIGHTS_PER_LEVEL - 1;
+        {
+            let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+            for h in lo..=hi {
+                let bh = &block_hashes[h as usize];
+                marf.begin(&parent, bh).unwrap();
+                let hot_val = MARFValue::from(0x_F00D_0000u32 + h);
+                marf.insert("hot_key", hot_val.clone()).unwrap();
+                // Per-block fresh key forces tree growth (new interior structure each
+                // height), so the squash writer emits a non-trivial orphan section for
+                // structurally-displaced nodes — the patched-descendant slow path is
+                // exercisable post-trim.
+                marf.insert(&format!("per_block_{h}"), MARFValue::from(h))
+                    .unwrap();
+                marf.seal().unwrap();
+                marf.commit().unwrap();
+                parent = bh.clone();
+                expected_hot.push(hot_val);
+            }
+        }
+        squash_level_incremental::<StacksBlockId>(
+            &path,
+            SquashMode::FullHistory,
+            lo,
+            hi,
+            true,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("squash level {level_id} ({lo}..={hi}): {e:?}"));
+    }
+
+    // Extend ONE more block on top of the latest squashed tip. Level 1's tip is in a
+    // (kept) reclaim level, so `MARF::root_copy` consults the per-height sidecar and
+    // succeeds. The extension block is a *patched descendant* of level 1's tip — its trie
+    // is materialized largely as patches against the parent's nodes.
+    let ext_block = {
+        let mut bytes = [0xCCu8; 32];
+        bytes[28..32].copy_from_slice(&0x_DEAD_BEEFu32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let ext_hot_val = MARFValue::from(0x_F00D_FACEu32);
+    let ext_post_squash_key_val = MARFValue::from(0x_5EA1_5AC2u32);
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        marf.begin(block_hashes.last().unwrap(), &ext_block)
+            .unwrap();
+        marf.insert("hot_key", ext_hot_val.clone()).unwrap();
+        marf.insert("ext_only_key", ext_post_squash_key_val.clone())
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+
+    // Trim level 0 (oldest); level 1 + ext stay.
+    {
+        let mut trim_handle = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+        let report = trim_aged_root_sidecars(
+            &mut trim_handle,
+            std::path::Path::new(&path),
+            HEIGHTS_PER_LEVEL,
+        )
+        .unwrap();
+        assert_eq!(
+            report.levels_trimmed, 1,
+            "exactly level 0 should be trimmed"
+        );
+    }
+
+    // The crux: open a fresh handle and read across the boundary.
+    let mut reader = MARF::<StacksBlockId>::from_path(&path, open_opts.clone()).unwrap();
+
+    // (1) Tip-walk on the post-extension block. Confirms a fresh handle can open and read
+    // a block whose construction touched (still-kept) level 1's orphan section, while
+    // level 0 has been trimmed. No level-0 sidecar dependency for these reads.
+    assert_eq!(
+        reader.get(&ext_block, "hot_key").unwrap_or_else(|e| {
+            panic!("ext_block tip GET hot_key must succeed via AtBlock walk: {e:?}")
+        }),
+        Some(ext_hot_val.clone()),
+    );
+    assert_eq!(
+        reader
+            .get(&ext_block, "ext_only_key")
+            .unwrap_or_else(|e| panic!("ext_block tip GET ext_only_key: {e:?}")),
+        Some(ext_post_squash_key_val.clone()),
+    );
+
+    // (2) at-block GETs that open a historical block in trimmed level 0 directly. This is
+    // the exact mainnet read shape that surfaced the bug — open the historical block,
+    // walk via the merged tip's structure of that block, resolve via `value_at_height`.
+    // The per-height ROOT_PTR_DISK route is gated to `ForkExtend`, so trimming level 0's
+    // sidecar does not break this.
+    for h in 0..HEIGHTS_PER_LEVEL {
+        let got = reader
+            .get(&block_hashes[h as usize], "hot_key")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "at-block GET against trimmed level 0 must succeed via AtBlock walk + \
+                     value_at_height(H); got error at height {h}: {e:?}"
+                )
+            });
+        assert_eq!(got, Some(expected_hot[h as usize].clone()));
+    }
+}
+
 /// Verify that tip reads through a FullHistory squash blob still return the tip value (not a
 /// historical value) even though the underlying leaf is a TrieLeafSquashed.
 #[test]
@@ -4438,6 +5075,471 @@ fn test_incremental_full_history_baseline_inheritance() {
         Some(MARFValue::from_value("a_v2")),
         "key_a at block 2 should have updated value"
     );
+}
+
+// ---------------------------------------------------------------------------
+// dominated_single regression harness (mainnet state-root mismatch investigation)
+// ---------------------------------------------------------------------------
+
+/// Helper for the dominated_single regression tests: build a 3-level
+/// FullHistory chain in `dst_path` where each level has a single in-range
+/// write of `key` that matches the prior-level inherited value, plus a
+/// per-block `block_<i>` marker key so every block has at least one fresh
+/// leaf. Returns the block hashes (one per height) and the value the key
+/// should hold at every committed height in `[0..=last_height]`.
+///
+/// Layout:
+///   L0 [0..=1]   block 0 writes key=V0          (history: [(0, V0)])
+///   L1 [2..=3]   block 3 writes key=V0          (history: [(3, V0)] → dominated_single)
+///   L2 [4..=5]   block 5 writes key=V0          (history: [(5, V0)] → dominated_single)
+///
+/// At every committed height in `[0..=5]`, the canonical value of `key` is
+/// `V0`. If the dominated_single optimization is correct, an at-block read
+/// at any height returns `V0`; otherwise it returns the wrong value (and
+/// the test fails).
+fn build_dominated_single_chain(
+    dst_path: &str,
+    key: &str,
+    val: &MARFValue,
+) -> (Vec<StacksBlockId>, [u64; 3]) {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let key_write_heights: [usize; 3] = [0, 3, 5];
+
+    // Three commit-then-squash phases so each squash's `max_height` matches the current chain
+    // tip (incremental squash requires `max_height = chain_tip_height`):
+    //   phase 0: commit blocks 0,1, then squash L0 [0..=1]
+    //   phase 1: commit blocks 2,3, then squash L1 [2..=3]
+    //   phase 2: commit blocks 4,5, then squash L2 [4..=5]
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+    let mut leaves_squashed_per_phase: [u64; 3] = [0; 3];
+    for phase in 0..3usize {
+        let phase_start = phase * 2;
+        let phase_end = phase_start + 1;
+
+        let mut marf = MARF::<StacksBlockId>::from_path(dst_path, open_opts.clone()).unwrap();
+        for i in phase_start..=phase_end {
+            let mut bytes = [0u8; 32];
+            bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+            let bh = StacksBlockId::from_bytes(&bytes).unwrap();
+            let parent = if i == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                blocks[i - 1].clone()
+            };
+            marf.begin(&parent, &bh).unwrap();
+
+            if key_write_heights.contains(&i) {
+                marf.insert(key, val.clone()).unwrap();
+            }
+            let marker = MARFValue::from_value(&format!("marker_{i}"));
+            marf.insert(&format!("block_{i}"), marker).unwrap();
+
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+            blocks.push(bh);
+        }
+        drop(marf);
+
+        let stats = squash_level_incremental::<StacksBlockId>(
+            dst_path,
+            SquashMode::FullHistory,
+            phase_start as u32,
+            phase_end as u32,
+            false,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("L{phase} squash should succeed: {e:?}"));
+        leaves_squashed_per_phase[phase] = stats.leaves_squashed;
+    }
+
+    (blocks, leaves_squashed_per_phase)
+}
+
+/// Ensure the env-var bypass for `dominated_single` is cleared before/after each test so
+/// concurrent or out-of-order test execution can't leak state across the bypass on/off cases.
+struct DominatedSingleBypassGuard;
+impl DominatedSingleBypassGuard {
+    fn enable() -> Self {
+        std::env::set_var("STACKS_MARF_SQUASH_DISABLE_DOMINATED_SINGLE", "1");
+        Self
+    }
+    fn disable() -> Self {
+        std::env::remove_var("STACKS_MARF_SQUASH_DISABLE_DOMINATED_SINGLE");
+        Self
+    }
+}
+impl Drop for DominatedSingleBypassGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("STACKS_MARF_SQUASH_DISABLE_DOMINATED_SINGLE");
+    }
+}
+
+/// Baseline correctness: a 3-level chained FullHistory squash where every in-range write of
+/// `key` matches the prior-level inherited value (so `dominated_single` applies at L1 and L2).
+/// At-block reads at every height must return the correct (unchanged) value `V0`.
+///
+/// If this test fails with the optimization enabled (no env var), the dominated_single
+/// optimization itself is broken in the simple chained case — and the mainnet bug is reproduced
+/// by chained propagation alone.
+///
+/// If this test passes under both modes, dominated_single is internally consistent for the simple
+/// case and the mainnet bug must involve a more elaborate scenario (forks, microblock-bearing
+/// parents, structural-re-insert across multi-block levels, etc.).
+#[test]
+fn test_dominated_single_chained_correctness_default() {
+    let _guard = DominatedSingleBypassGuard::disable();
+    let test_dir = fresh_test_dir("test_dominated_single_chained_correctness_default");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+
+    let key = "K";
+    let v0 = MARFValue::from_value("V0");
+    let (blocks, leaves_per_phase) = build_dominated_single_chain(&dst_path, key, &v0);
+
+    // Every committed height should report `V0` for `key`.
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+
+    for (i, bh) in blocks.iter().enumerate() {
+        let observed = marf
+            .get(bh, key)
+            .unwrap_or_else(|e| panic!("get(block_{i}, {key}) failed: {e}"));
+        assert_eq!(
+            observed,
+            Some(v0.clone()),
+            "key '{key}' at block {i} (default mode) — wrong value: {observed:?}"
+        );
+    }
+
+    // Sanity: 3 squash levels were registered.
+    let levels =
+        crate::chainstate::stacks::index::trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert_eq!(levels.len(), 3, "expected 3 squash levels, got {levels:?}");
+
+    eprintln!("default-mode leaves_squashed per phase: {leaves_per_phase:?}");
+}
+
+/// Same scenario as `test_dominated_single_chained_correctness_default`, but with the
+/// `STACKS_MARF_SQUASH_DISABLE_DOMINATED_SINGLE=1` env var set during the L1 and L2 squashes.
+/// Verifies (a) the bypass produces correct at-block reads at every height (basic sanity for the
+/// bypass path itself), and (b) the bypass actually changes squash construction — at least one
+/// extra leaf is promoted to `TrieLeafSquashed` relative to the default-mode test.
+///
+/// We can't directly compare leaf counts here because each test runs in isolation, but the
+/// per-level `leaves_squashed` stat returned by `squash_level_incremental` would change. Logged
+/// for manual inspection rather than asserted.
+#[test]
+fn test_dominated_single_chained_correctness_bypass() {
+    let _guard = DominatedSingleBypassGuard::enable();
+    let test_dir = fresh_test_dir("test_dominated_single_chained_correctness_bypass");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+
+    let key = "K";
+    let v0 = MARFValue::from_value("V0");
+    let (blocks, leaves_per_phase) = build_dominated_single_chain(&dst_path, key, &v0);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+
+    for (i, bh) in blocks.iter().enumerate() {
+        let observed = marf
+            .get(bh, key)
+            .unwrap_or_else(|e| panic!("get(block_{i}, {key}) failed: {e}"));
+        assert_eq!(
+            observed,
+            Some(v0.clone()),
+            "key '{key}' at block {i} (bypass mode) — wrong value: {observed:?}"
+        );
+    }
+
+    let levels =
+        crate::chainstate::stacks::index::trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert_eq!(levels.len(), 3, "expected 3 squash levels, got {levels:?}");
+
+    eprintln!("bypass-mode leaves_squashed per phase: {leaves_per_phase:?}");
+}
+
+/// Fork-induced reproducer: build a chain that splits into two siblings before the L1 squash, then
+/// run the L1 squash anchored on FORK B's tip. After the squash, reads at FORK A's tip walk the
+/// merged blob (since A's per-block trie shape now competes with B's collected nodes for the
+/// shared structural slot), so any squash-time decision tied to B can leak into A's at-block reads.
+///
+/// Layout:
+/// ```text
+///   block 0 (h=0): K = V0     ── L0 [0..=1] published
+///   block 1 (h=1): no K writes
+///        |
+///        +── 2A (h=2): no K writes        ── FORK A (no L1 rewrite of K)
+///        |    └── 3A (h=3): no K writes
+///        |
+///        └── 2B (h=2): K = V_FORK         ── FORK B (L1 rewrite of K)
+///             └── 3B (h=3): no K writes  ── canonical_tip passed to L1 squash
+/// ```
+///
+/// L1 squash uses block 3B as canonical_tip. Then we try to read K at block 3A. If the squash
+/// captured B's view into the merged tip in a way that leaks into A's at-block walks, the read
+/// returns V_FORK instead of V0. That is exactly the failure mode mainnet would exhibit if a
+/// canonical_tip selection at squash trigger time was on a non-canonical fork.
+///
+/// This test is `#[ignore]` until we determine whether `MARF::begin` on a forked parent and a
+/// reclaim-true squash can in fact produce this divergence under the current squash impl. Reclaim
+/// behavior on per-block tries that are NOT on canonical_tip is the key variable.
+#[test]
+#[ignore = "fork-induced reproducer; documents target bug shape, may need reclaim/tip-selection \
+            tweaks before it actually triggers under the current squash impl"]
+fn test_dominated_single_fork_canonical_tip_divergence_repro() {
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let _guard = DominatedSingleBypassGuard::disable();
+    let test_dir = fresh_test_dir("test_dominated_single_fork_repro");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+
+    let key = "K";
+    let v0 = MARFValue::from_value("V0");
+    let v_fork = MARFValue::from_value("V_FORK");
+
+    fn block_id(label: u8) -> StacksBlockId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = label;
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    }
+
+    let block_0 = block_id(0x10);
+    let block_1 = block_id(0x11);
+    let block_2a = block_id(0x2a);
+    let block_3a = block_id(0x3a);
+    let block_2b = block_id(0x2b);
+    let block_3b = block_id(0x3b);
+
+    // Phase 0: write blocks 0 and 1 (L0 lineage), then squash L0 [0..=1].
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts.clone()).unwrap();
+
+        marf.begin(&StacksBlockId::sentinel(), &block_0).unwrap();
+        marf.insert(key, v0.clone()).unwrap();
+        marf.insert("block_0", MARFValue::from_value("m0")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        marf.begin(&block_0, &block_1).unwrap();
+        marf.insert("block_1", MARFValue::from_value("m1")).unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+    squash_level_incremental::<StacksBlockId>(
+        &dst_path,
+        SquashMode::FullHistory,
+        0,
+        1,
+        false,
+        None,
+    )
+    .expect("L0 squash");
+
+    // Phase 1: write FORK A (2A, 3A) onto block_1.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts.clone()).unwrap();
+
+        marf.begin(&block_1, &block_2a).unwrap();
+        marf.insert("block_2a", MARFValue::from_value("m2a"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        marf.begin(&block_2a, &block_3a).unwrap();
+        marf.insert("block_3a", MARFValue::from_value("m3a"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+
+    // Phase 2: write FORK B (2B, 3B) onto block_1. K is rewritten at h=2 in fork B.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts.clone()).unwrap();
+
+        marf.begin(&block_1, &block_2b).unwrap();
+        marf.insert(key, v_fork.clone()).unwrap();
+        marf.insert("block_2b", MARFValue::from_value("m2b"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+
+        marf.begin(&block_2b, &block_3b).unwrap();
+        marf.insert("block_3b", MARFValue::from_value("m3b"))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+
+    // Sanity: pre-squash, both forks should report the right K value at their tips.
+    {
+        let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts.clone()).unwrap();
+        let a = marf.get(&block_3a, key).unwrap();
+        let b = marf.get(&block_3b, key).unwrap();
+        assert_eq!(a, Some(v0.clone()), "pre-squash: fork A tip should see V0");
+        assert_eq!(
+            b,
+            Some(v_fork.clone()),
+            "pre-squash: fork B tip should see V_FORK"
+        );
+    }
+
+    // L1 squash anchored on FORK B's tip (3B). Reclaim=true so per-block tries inside [2..=3] get
+    // truncated, forcing reads through the merged blob.
+    squash_level_incremental::<StacksBlockId>(
+        &dst_path,
+        SquashMode::FullHistory,
+        2,
+        3,
+        true,
+        Some(block_3b.clone()),
+    )
+    .expect("L1 squash anchored on fork B");
+
+    // Post-squash reads.
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+    let observed_a = marf.get(&block_3a, key).unwrap();
+    let observed_b = marf.get(&block_3b, key).unwrap();
+
+    eprintln!("post-squash fork A tip K = {observed_a:?}");
+    eprintln!("post-squash fork B tip K = {observed_b:?}");
+
+    assert_eq!(
+        observed_b,
+        Some(v_fork.clone()),
+        "fork B tip should still see V_FORK after squash anchored on B"
+    );
+    assert_eq!(
+        observed_a,
+        Some(v0.clone()),
+        "fork A tip should see V0 (no rewrite on A) after squash anchored on B — \
+         if this fails, B's in-range write leaked into A's at-block walk"
+    );
+}
+
+/// Sanity check that the env-var bypass is not a silent no-op: under the bypass, L1 and L2 (the
+/// incremental phases where `min_height > 0`) must promote at least one MORE leaf than the
+/// default mode for the same input. L0 is unaffected because `dominated_single` runs only when
+/// `min_height > 0`. If this test fails, the bypass switch has no effect and any "bypass passes,
+/// default fails" signal from a future regression would be meaningless.
+#[test]
+fn test_dominated_single_bypass_changes_leaf_promotion_count() {
+    let key = "K";
+    let v0 = MARFValue::from_value("V0");
+
+    let default_counts = {
+        let _guard = DominatedSingleBypassGuard::disable();
+        let dir = fresh_test_dir("test_dominated_single_bypass_default");
+        let dst = format!("{dir}/squashed.sqlite");
+        let (_, counts) = build_dominated_single_chain(&dst, key, &v0);
+        counts
+    };
+
+    let bypass_counts = {
+        let _guard = DominatedSingleBypassGuard::enable();
+        let dir = fresh_test_dir("test_dominated_single_bypass_enabled");
+        let dst = format!("{dir}/squashed.sqlite");
+        let (_, counts) = build_dominated_single_chain(&dst, key, &v0);
+        counts
+    };
+
+    eprintln!("default leaves_squashed per phase: {default_counts:?}");
+    eprintln!("bypass  leaves_squashed per phase: {bypass_counts:?}");
+
+    assert_eq!(
+        default_counts[0], bypass_counts[0],
+        "L0 leaf promotion count must be identical (dominated_single only runs for min_height > 0)"
+    );
+    let default_incremental: u64 = default_counts[1] + default_counts[2];
+    let bypass_incremental: u64 = bypass_counts[1] + bypass_counts[2];
+    assert!(
+        bypass_incremental > default_incremental,
+        "bypass mode should promote MORE leaves than default mode \
+         (default={default_incremental}, bypass={bypass_incremental}) — env var has no effect?"
+    );
+}
+
+/// 3-level chain where each level introduces a NEW value for `key` (so dominated_single is NOT
+/// triggered — every in-range write differs from the inherited value, forcing LeafSquashed
+/// promotion with an explicit baseline entry). At every height the canonical value is whatever
+/// was last written; verify reads match.
+///
+/// This is a control test: if it passes but the chained-same-value tests above fail, the bug is
+/// specifically in the dominated_single shortcut. If it also fails, the bug is broader (in the
+/// LeafSquashed read path or the synthetic-baseline-entry insertion).
+#[test]
+fn test_dominated_single_chained_distinct_values_promoted() {
+    let _guard = DominatedSingleBypassGuard::disable();
+    use crate::chainstate::stacks::index::squash::squash_level_incremental;
+
+    let test_dir = fresh_test_dir("test_dominated_single_chained_distinct_values_promoted");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let key = "K";
+    let values: [MARFValue; 3] = [
+        MARFValue::from_value("V_at_h0"),
+        MARFValue::from_value("V_at_h3"),
+        MARFValue::from_value("V_at_h5"),
+    ];
+    let key_write_heights: [usize; 3] = [0, 3, 5];
+
+    let mut blocks: Vec<StacksBlockId> = Vec::new();
+    let mut expected_per_height: Vec<MARFValue> = Vec::with_capacity(6);
+    let mut last_value = values[0].clone();
+    for phase in 0..3usize {
+        let phase_start = phase * 2;
+        let phase_end = phase_start + 1;
+
+        let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts.clone()).unwrap();
+        for i in phase_start..=phase_end {
+            let mut bytes = [0u8; 32];
+            bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+            let bh = StacksBlockId::from_bytes(&bytes).unwrap();
+            let parent = if i == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                blocks[i - 1].clone()
+            };
+            marf.begin(&parent, &bh).unwrap();
+            if let Some(idx) = key_write_heights.iter().position(|h| *h == i) {
+                last_value = values[idx].clone();
+                marf.insert(key, last_value.clone()).unwrap();
+            }
+            let marker = MARFValue::from_value(&format!("marker_{i}"));
+            marf.insert(&format!("block_{i}"), marker).unwrap();
+
+            marf.seal().unwrap();
+            marf.commit().unwrap();
+            blocks.push(bh);
+            expected_per_height.push(last_value.clone());
+        }
+        drop(marf);
+
+        squash_level_incremental::<StacksBlockId>(
+            &dst_path,
+            SquashMode::FullHistory,
+            phase_start as u32,
+            phase_end as u32,
+            false,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("L{phase} squash: {e:?}"));
+    }
+
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+    for (i, bh) in blocks.iter().enumerate() {
+        let observed = marf
+            .get(bh, key)
+            .unwrap_or_else(|e| panic!("get(block_{i}, {key}) failed: {e}"));
+        assert_eq!(
+            observed,
+            Some(expected_per_height[i].clone()),
+            "key '{key}' at block {i} (distinct values, default) — wrong value"
+        );
+    }
 }
 
 /// Two-level incremental squash with FullHistory and `reclaim = true`.
@@ -6429,6 +7531,1173 @@ fn test_tier1_multi_level_full_history_reclaim_differential() {
             "after-reopen",
         );
     }
+}
+
+/// Test 2 in the mainnet-53161 reproduction ladder: compare an unsquashed reference MARF against
+/// a recurring FullHistory+reclaim MARF after old root sidecars have been trimmed.
+///
+/// This is the closest raw-read analogue of the observed failure:
+///   * the earlier binary failed explicitly with `SnapshotTrimmed` on a deep Clarity `at-block` GET,
+///   * the WalkIntent split made that GET succeed by walking the merged tip root,
+///   * the same chain then rejected block 53161 with a final state-root mismatch.
+///
+/// If the merged-root + `LeafSquashed::value_at_height` shortcut returns a wrong historical value
+/// once sidecars are gone, this differential should catch it before we need to model Clarity
+/// execution or block validation.
+#[test]
+fn test_tier2_trimmed_full_history_matches_unsquashed_reference() {
+    use crate::chainstate::stacks::index::squash::{
+        squash_level_incremental, trim_aged_root_sidecars,
+    };
+
+    const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
+
+    let dir = fresh_test_dir("test_tier2_trimmed_full_history_matches_reference");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let num_accounts: usize = 16;
+    let touches_per_block: usize = 5;
+    let blocks_per_level: usize = 8;
+    let num_levels: usize = 4;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED);
+
+    let mut all_blocks: Vec<StacksBlockId> = Vec::with_capacity(blocks_per_level * num_levels);
+
+    {
+        let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+        for lvl in 0..num_levels {
+            let start_height = lvl * blocks_per_level;
+            let parent = if lvl == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                all_blocks.last().unwrap().clone()
+            };
+
+            let sq_blocks = tier1_extend_nonce_chain(
+                &mut sq_marf,
+                parent.clone(),
+                start_height,
+                blocks_per_level,
+                num_accounts,
+                touches_per_block,
+            );
+            let ref_blocks = tier1_extend_nonce_chain(
+                &mut ref_marf,
+                parent,
+                start_height,
+                blocks_per_level,
+                num_accounts,
+                touches_per_block,
+            );
+            assert_eq!(sq_blocks, ref_blocks);
+            all_blocks.extend(sq_blocks);
+
+            drop(sq_marf);
+            let min_h = start_height as u32;
+            let max_h = (start_height + blocks_per_level - 1) as u32;
+            squash_level_incremental::<StacksBlockId>(
+                &sq_path,
+                SquashMode::FullHistory,
+                min_h,
+                max_h,
+                true,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
+            sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        }
+
+        drop(sq_marf);
+        drop(ref_marf);
+    }
+
+    // Keep only the newest level's sidecar. Older levels now have the same read contract as the
+    // mainnet failure point: raw historical GETs must be answered without root sidecars.
+    {
+        let mut trim_handle =
+            MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let report = trim_aged_root_sidecars(
+            &mut trim_handle,
+            std::path::Path::new(&sq_path),
+            blocks_per_level as u32,
+        )
+        .unwrap();
+        assert!(
+            report.levels_trimmed >= 1,
+            "expected at least one old FullHistory sidecar to be trimmed; report={report:?}"
+        );
+        assert_eq!(report.trim_failures, 0);
+        assert_eq!(report.unlink_failures, 0);
+    }
+
+    {
+        let levels = {
+            let conn = rusqlite::Connection::open(&sq_path).unwrap();
+            crate::chainstate::stacks::index::trie_sql::read_squash_levels(&conn).unwrap()
+        };
+        assert_eq!(levels.len(), num_levels);
+        assert!(
+            levels
+                .iter()
+                .take(num_levels - 1)
+                .any(|lvl| lvl.root_sidecar_trimmed),
+            "at least one non-newest level must be marked trimmed",
+        );
+        assert!(
+            !levels.last().unwrap().root_sidecar_trimmed,
+            "newest level should remain within retention",
+        );
+    }
+
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+    tier1_verify_all_paths(
+        &mut sq_marf,
+        &mut ref_marf,
+        &sq_path,
+        &all_blocks,
+        num_accounts,
+        touches_per_block,
+        &open_opts,
+        "after-trimmed-sidecars",
+    );
+}
+
+/// Test 3 in the mainnet-53161 reproduction ladder: historical reads from trimmed FullHistory
+/// levels feed writes in a later block, and the descendant root is compared against an unsquashed
+/// reference.
+///
+/// This models the actual consensus surface more closely than raw GETs. Block 53161 did not fail
+/// with a read error after the WalkIntent change; it failed with a final state-root mismatch. If
+/// a trimmed-level historical read returns a subtly wrong value that is then written into current
+/// state, this test should produce a root mismatch even when standalone reads appear plausible.
+#[test]
+fn test_tier3_trimmed_historical_reads_feed_descendant_root() {
+    use crate::chainstate::stacks::index::squash::{
+        squash_level_incremental, trim_aged_root_sidecars,
+    };
+
+    const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
+
+    let dir = fresh_test_dir("test_tier3_trimmed_historical_reads_feed_descendant_root");
+    let sq_path = format!("{dir}/squashed.sqlite");
+    let ref_path = format!("{dir}/reference.sqlite");
+
+    let num_accounts: usize = 16;
+    let touches_per_block: usize = 5;
+    let blocks_per_level: usize = 8;
+    let num_levels: usize = 4;
+    let total_blocks = blocks_per_level * num_levels;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED);
+
+    let mut all_blocks: Vec<StacksBlockId> = Vec::with_capacity(total_blocks);
+
+    {
+        let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+        for lvl in 0..num_levels {
+            let start_height = lvl * blocks_per_level;
+            let parent = if lvl == 0 {
+                StacksBlockId::sentinel()
+            } else {
+                all_blocks.last().unwrap().clone()
+            };
+
+            let sq_blocks = tier1_extend_nonce_chain(
+                &mut sq_marf,
+                parent.clone(),
+                start_height,
+                blocks_per_level,
+                num_accounts,
+                touches_per_block,
+            );
+            let ref_blocks = tier1_extend_nonce_chain(
+                &mut ref_marf,
+                parent,
+                start_height,
+                blocks_per_level,
+                num_accounts,
+                touches_per_block,
+            );
+            assert_eq!(sq_blocks, ref_blocks);
+            all_blocks.extend(sq_blocks);
+
+            drop(sq_marf);
+            let min_h = start_height as u32;
+            let max_h = (start_height + blocks_per_level - 1) as u32;
+            squash_level_incremental::<StacksBlockId>(
+                &sq_path,
+                SquashMode::FullHistory,
+                min_h,
+                max_h,
+                true,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
+            sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        }
+
+        drop(sq_marf);
+        drop(ref_marf);
+    }
+
+    {
+        let mut trim_handle =
+            MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+        let report = trim_aged_root_sidecars(
+            &mut trim_handle,
+            std::path::Path::new(&sq_path),
+            blocks_per_level as u32,
+        )
+        .unwrap();
+        assert!(
+            report.levels_trimmed >= 1,
+            "expected old sidecars to be trimmed before descendant-root probe; report={report:?}",
+        );
+        assert_eq!(report.trim_failures, 0);
+        assert_eq!(report.unlink_failures, 0);
+    }
+
+    let ext_block = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_53_16_1BADu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((total_blocks as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let tip = all_blocks.last().unwrap().clone();
+
+    let probe_heights = [
+        0,
+        1,
+        blocks_per_level - 1,
+        blocks_per_level,
+        (2 * blocks_per_level) - 1,
+        (3 * blocks_per_level) - 1,
+    ];
+
+    let mut sq_marf = MARF::<StacksBlockId>::from_path(&sq_path, open_opts.clone()).unwrap();
+    let mut ref_marf = MARF::<StacksBlockId>::from_path(&ref_path, open_opts.clone()).unwrap();
+
+    sq_marf.begin(&tip, &ext_block).unwrap();
+    ref_marf.begin(&tip, &ext_block).unwrap();
+
+    for (probe_idx, &height) in probe_heights.iter().enumerate() {
+        for acct in 0..num_accounts {
+            let source_key = format!("acct_{acct}");
+            let sq_v = sq_marf
+                .get(&all_blocks[height], &source_key)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "squashed historical read failed while descendant block is open: \
+                         height={height}, acct={acct}, err={e:?}"
+                    )
+                });
+            let ref_v = ref_marf
+                .get(&all_blocks[height], &source_key)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "reference historical read failed while descendant block is open: \
+                         height={height}, acct={acct}, err={e:?}"
+                    )
+                });
+            assert_eq!(
+                sq_v, ref_v,
+                "historical read feeding descendant write diverged: height={height}, acct={acct}"
+            );
+
+            let copied_value = sq_v.unwrap_or_else(|| {
+                MARFValue::from_value(&format!("NONE_height_{height}_acct_{acct}"))
+            });
+            sq_marf
+                .insert(
+                    &format!("claim_copy_{probe_idx}_{acct}"),
+                    copied_value.clone(),
+                )
+                .unwrap();
+            ref_marf
+                .insert(&format!("claim_copy_{probe_idx}_{acct}"), copied_value)
+                .unwrap();
+        }
+    }
+
+    sq_marf
+        .insert(
+            "descendant_marker",
+            MARFValue::from_value("squash-53161-shape"),
+        )
+        .unwrap();
+    ref_marf
+        .insert(
+            "descendant_marker",
+            MARFValue::from_value("squash-53161-shape"),
+        )
+        .unwrap();
+
+    let sq_root = sq_marf.seal().unwrap();
+    sq_marf.commit().unwrap();
+    let ref_root = ref_marf.seal().unwrap();
+    ref_marf.commit().unwrap();
+
+    assert_eq!(
+        sq_root, ref_root,
+        "descendant root diverged after historical reads from trimmed FullHistory levels fed writes"
+    );
+}
+
+/// Test 4 in the mainnet-53161 reproduction ladder: same scenario as
+/// `test_tier3_trimmed_historical_reads_feed_descendant_root`, but routed through the live
+/// `MarfedKV`/`ClarityDatabase` context-switching path.
+///
+/// The important ordering is:
+///   1. Open a writable descendant block.
+///   2. Simulate `(at-block ...)` with `ClarityDatabase::set_block_hash(old_tip, false)`.
+///      The `false` matters: Clarity hides pending writes inside at-block closures.
+///   3. `get_data` while the backing store is pointed at the old squashed+trimmed block.
+///   4. Restore the writable descendant tip and write the value into current state.
+///   5. Seal and compare the root with an unsquashed reference.
+///
+/// This covers the adapter behavior that pure MARF tests miss: `PersistentWritableMarfStore`
+/// temporarily changes only its `chain_tip` during at-block reads while the writable MARF
+/// transaction remains open.
+#[test]
+fn test_tier4_clarity_db_at_block_trimmed_history_feeds_descendant_root() {
+    use clarity::vm::test_util::{TEST_BURN_STATE_DB, TEST_HEADER_DB};
+
+    use crate::chainstate::stacks::index::squash::{
+        squash_level_incremental, trim_aged_root_sidecars,
+    };
+    use crate::clarity_vm::clarity::{ClarityMarfStore, ClarityMarfStoreTransaction};
+    use crate::clarity_vm::database::marf::MarfedKV;
+
+    const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
+
+    let dir = fresh_test_dir("test_tier4_clarity_db_at_block_trimmed_history");
+    let sq_dir = format!("{dir}/squashed");
+    let ref_dir = format!("{dir}/reference");
+    let sq_marf_path = format!("{sq_dir}/marf.sqlite");
+
+    let num_accounts: usize = 16;
+    let touches_per_block: usize = 5;
+    let blocks_per_level: usize = 8;
+    let num_levels: usize = 4;
+    let total_blocks = blocks_per_level * num_levels;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED);
+
+    let mut all_blocks: Vec<StacksBlockId> = Vec::with_capacity(total_blocks);
+
+    let write_clarity_block =
+        |kv: &mut MarfedKV, parent: &StacksBlockId, block: &StacksBlockId, height: usize| {
+            let mut store = kv.begin(parent, block);
+            {
+                let mut db = store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+                db.begin();
+                for acct in tier1_touched_accounts(height, num_accounts, touches_per_block) {
+                    db.put_data(
+                        &format!("acct_{acct}"),
+                        &format!("acct_{acct}_nonce_{height}"),
+                    )
+                    .unwrap();
+                }
+                // Extra per-block writes create more trie structure than the account keys alone.
+                db.put_data(
+                    &format!("block_marker_{height}"),
+                    &format!("marker_value_{height}"),
+                )
+                .unwrap();
+                db.commit().unwrap();
+            }
+            store.test_commit();
+        };
+
+    {
+        let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+
+        for lvl in 0..num_levels {
+            let start_height = lvl * blocks_per_level;
+            for offset in 0..blocks_per_level {
+                let height = start_height + offset;
+                let parent = if height == 0 {
+                    StacksBlockId::sentinel()
+                } else {
+                    all_blocks[height - 1].clone()
+                };
+                let block = tier1_block_hash(height);
+                write_clarity_block(&mut sq_kv, &parent, &block, height);
+                write_clarity_block(&mut ref_kv, &parent, &block, height);
+                all_blocks.push(block);
+            }
+
+            drop(sq_kv);
+            let min_h = start_height as u32;
+            let max_h = (start_height + blocks_per_level - 1) as u32;
+            squash_level_incremental::<StacksBlockId>(
+                &sq_marf_path,
+                SquashMode::FullHistory,
+                min_h,
+                max_h,
+                true,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
+            sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        }
+        drop(sq_kv);
+        drop(ref_kv);
+    }
+
+    {
+        let mut trim_handle =
+            MARF::<StacksBlockId>::from_path(&sq_marf_path, open_opts.clone()).unwrap();
+        let report = trim_aged_root_sidecars(
+            &mut trim_handle,
+            std::path::Path::new(&sq_marf_path),
+            blocks_per_level as u32,
+        )
+        .unwrap();
+        assert!(
+            report.levels_trimmed >= 1,
+            "expected old sidecars to be trimmed before Clarity at-block probe; report={report:?}",
+        );
+        assert_eq!(report.trim_failures, 0);
+        assert_eq!(report.unlink_failures, 0);
+    }
+
+    let ext_block = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_C1_A9_17DBu32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((total_blocks as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let tip = all_blocks.last().unwrap().clone();
+    let probe_heights = [
+        0,
+        1,
+        blocks_per_level - 1,
+        blocks_per_level,
+        (2 * blocks_per_level) - 1,
+        (3 * blocks_per_level) - 1,
+    ];
+
+    let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+    let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+
+    let mut sq_store = sq_kv.begin(&tip, &ext_block);
+    let mut ref_store = ref_kv.begin(&tip, &ext_block);
+
+    {
+        let mut sq_db = sq_store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+        let mut ref_db = ref_store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+        sq_db.begin();
+        ref_db.begin();
+
+        for (probe_idx, &height) in probe_heights.iter().enumerate() {
+            for acct in 0..num_accounts {
+                let source_key = format!("acct_{acct}");
+
+                let sq_restore = sq_db
+                    .set_block_hash(all_blocks[height].clone(), false)
+                    .unwrap();
+                let sq_v = sq_db.get_data::<String>(&source_key).unwrap();
+                sq_db.set_block_hash(sq_restore, true).unwrap();
+
+                let ref_restore = ref_db
+                    .set_block_hash(all_blocks[height].clone(), false)
+                    .unwrap();
+                let ref_v = ref_db.get_data::<String>(&source_key).unwrap();
+                ref_db.set_block_hash(ref_restore, true).unwrap();
+
+                assert_eq!(
+                    sq_v, ref_v,
+                    "ClarityDatabase at-block read diverged before descendant write: \
+                     height={height}, acct={acct}"
+                );
+
+                let copied_value =
+                    sq_v.unwrap_or_else(|| format!("NONE_height_{height}_acct_{acct}"));
+                sq_db
+                    .put_data(&format!("claim_copy_{probe_idx}_{acct}"), &copied_value)
+                    .unwrap();
+                ref_db
+                    .put_data(&format!("claim_copy_{probe_idx}_{acct}"), &copied_value)
+                    .unwrap();
+            }
+        }
+
+        sq_db
+            .put_data(
+                "descendant_marker",
+                &"clarity-db-at-block-53161-shape".to_string(),
+            )
+            .unwrap();
+        ref_db
+            .put_data(
+                "descendant_marker",
+                &"clarity-db-at-block-53161-shape".to_string(),
+            )
+            .unwrap();
+
+        sq_db.commit().unwrap();
+        ref_db.commit().unwrap();
+    }
+
+    let sq_root = sq_store.seal_trie();
+    sq_store.test_commit();
+    let ref_root = ref_store.seal_trie();
+    ref_store.test_commit();
+
+    assert_eq!(
+        sq_root, ref_root,
+        "ClarityDatabase at-block historical reads from trimmed FullHistory levels produced \
+         a descendant root mismatch"
+    );
+}
+
+/// Test 5 in the mainnet-53161 reproduction ladder: replay the block-processing shape that
+/// preceded the observed state-root mismatch.
+///
+/// The relevant log ordering was:
+///   1. A FullHistory clarity level was published and trimming deleted an older level sidecar.
+///   2. The node accepted more canonical blocks on top of the trimmed history.
+///   3. A later block was received in a batch, executed all transactions successfully, then failed
+///      only at the final `clarity_tx.seal()` root comparison.
+///
+/// The failed block's transaction mix was not a single historical GET. It had many per-transaction
+/// commits, post-condition rollbacks, return-`err` commits with no writes, high-fanout current-tip
+/// reads, and a few successful small writes immediately before seal. This test keeps the exact
+/// consensus surface: one writable `MarfedKV` block transaction, nested `ClarityDatabase`
+/// begin/commit/roll_back calls, at-block reads into trimmed FullHistory levels, and a final root
+/// comparison against an unsquashed reference.
+#[test]
+fn test_tier5_clarity_db_mainnet_53161_tx_ordering_repro() {
+    use clarity::vm::test_util::{TEST_BURN_STATE_DB, TEST_HEADER_DB};
+
+    use crate::chainstate::stacks::index::squash::{
+        squash_level_incremental, trim_aged_root_sidecars,
+    };
+    use crate::clarity_vm::clarity::{ClarityMarfStore, ClarityMarfStoreTransaction};
+    use crate::clarity_vm::database::marf::MarfedKV;
+
+    const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
+
+    let dir = fresh_test_dir("test_tier5_clarity_db_mainnet_53161_tx_ordering_repro");
+    let sq_dir = format!("{dir}/squashed");
+    let ref_dir = format!("{dir}/reference");
+    let sq_marf_path = format!("{sq_dir}/marf.sqlite");
+
+    let num_accounts: usize = 192;
+    let touches_per_block: usize = 37;
+    let blocks_per_level: usize = 10;
+    let num_levels: usize = 6;
+    let post_trim_blocks: usize = 8;
+    let total_squashed_blocks = blocks_per_level * num_levels;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED);
+
+    let mut all_blocks: Vec<StacksBlockId> =
+        Vec::with_capacity(total_squashed_blocks + post_trim_blocks + 1);
+
+    let write_clarity_block =
+        |kv: &mut MarfedKV, parent: &StacksBlockId, block: &StacksBlockId, height: usize| {
+            let mut store = kv.begin(parent, block);
+            {
+                let mut db = store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+                db.begin();
+
+                for acct in tier1_touched_accounts(height, num_accounts, touches_per_block) {
+                    db.put_data(
+                        &format!("acct_{acct}"),
+                        &format!("acct_{acct}_nonce_{height}"),
+                    )
+                    .unwrap();
+                }
+
+                // Contract-like fanout families.  These create stable, repeatedly-read keys with
+                // uneven update cadence, matching the staking-helper / NFT / names workload shape in
+                // the failing block without needing the actual Clarity contracts or private keys.
+                for idx in 0..24 {
+                    db.put_data(
+                        &format!("pool:{}:reward:{idx}", height % 5),
+                        &format!("pool_reward_h{height}_{idx}"),
+                    )
+                    .unwrap();
+                }
+                for idx in 0..16 {
+                    db.put_data(
+                        &format!("name-monkey:owner:{idx}:{}", (height + idx) % num_accounts),
+                        &format!("name_owner_h{height}_{idx}"),
+                    )
+                    .unwrap();
+                }
+                db.put_data(
+                    &format!("block_marker_{height}"),
+                    &format!("marker_value_{height}"),
+                )
+                .unwrap();
+
+                db.commit().unwrap();
+            }
+            store.test_commit();
+        };
+
+    {
+        let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+
+        for lvl in 0..num_levels {
+            let start_height = lvl * blocks_per_level;
+            for offset in 0..blocks_per_level {
+                let height = start_height + offset;
+                let parent = if height == 0 {
+                    StacksBlockId::sentinel()
+                } else {
+                    all_blocks[height - 1].clone()
+                };
+                let block = tier1_block_hash(height);
+                write_clarity_block(&mut sq_kv, &parent, &block, height);
+                write_clarity_block(&mut ref_kv, &parent, &block, height);
+                all_blocks.push(block);
+            }
+
+            drop(sq_kv);
+            let min_h = start_height as u32;
+            let max_h = (start_height + blocks_per_level - 1) as u32;
+            squash_level_incremental::<StacksBlockId>(
+                &sq_marf_path,
+                SquashMode::FullHistory,
+                min_h,
+                max_h,
+                true,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
+            sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        }
+        drop(sq_kv);
+        drop(ref_kv);
+    }
+
+    {
+        let mut trim_handle =
+            MARF::<StacksBlockId>::from_path(&sq_marf_path, open_opts.clone()).unwrap();
+        let report = trim_aged_root_sidecars(
+            &mut trim_handle,
+            std::path::Path::new(&sq_marf_path),
+            blocks_per_level as u32,
+        )
+        .unwrap();
+        assert!(
+            report.levels_trimmed >= 1,
+            "expected old sidecars to be trimmed before mainnet-ordering repro; report={report:?}",
+        );
+        assert_eq!(report.trim_failures, 0);
+        assert_eq!(report.unlink_failures, 0);
+    }
+
+    // Mainnet did not fail immediately after the sidecar trim; many blocks were accepted first.
+    {
+        let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+        for height in total_squashed_blocks..(total_squashed_blocks + post_trim_blocks) {
+            let parent = all_blocks.last().unwrap().clone();
+            let block = tier1_block_hash(height);
+            write_clarity_block(&mut sq_kv, &parent, &block, height);
+            write_clarity_block(&mut ref_kv, &parent, &block, height);
+            all_blocks.push(block);
+        }
+    }
+
+    let ext_block = {
+        let mut bytes = [0u8; 32];
+        bytes[24..28].copy_from_slice(&0x_53_16_1C61u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((all_blocks.len() as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let tip = all_blocks.last().unwrap().clone();
+    let historical_heights = [
+        1,
+        blocks_per_level - 1,
+        blocks_per_level,
+        (2 * blocks_per_level) + 3,
+        (4 * blocks_per_level) + 1,
+        total_squashed_blocks - 2,
+    ];
+
+    let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+    let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+    let mut sq_store = sq_kv.begin(&tip, &ext_block);
+    let mut ref_store = ref_kv.begin(&tip, &ext_block);
+
+    {
+        let mut sq_db = sq_store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+        let mut ref_db = ref_store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+
+        let mut run_tx = |tx_idx: usize,
+                          current_reads: usize,
+                          historical_reads: usize,
+                          writes: usize,
+                          commit: bool| {
+            sq_db.begin();
+            ref_db.begin();
+
+            let mut copied_values = Vec::with_capacity(historical_reads.min(16));
+
+            for read_idx in 0..current_reads {
+                let key = match read_idx % 5 {
+                    0 => format!("acct_{}", (tx_idx * 41 + read_idx) % num_accounts),
+                    1 => format!("pool:{}:reward:{}", (tx_idx + read_idx) % 5, read_idx % 24),
+                    2 => format!(
+                        "name-monkey:owner:{}:{}",
+                        read_idx % 16,
+                        (tx_idx + read_idx) % num_accounts
+                    ),
+                    3 => format!("block_marker_{}", read_idx % all_blocks.len()),
+                    _ => format!("missing-contract-key:{tx_idx}:{read_idx}"),
+                };
+
+                let sq_v = sq_db.get_data::<String>(&key).unwrap();
+                let ref_v = ref_db.get_data::<String>(&key).unwrap();
+                assert_eq!(
+                    sq_v, ref_v,
+                    "current-tip read diverged inside tx={tx_idx}, read_idx={read_idx}, key={key}"
+                );
+            }
+
+            for read_idx in 0..historical_reads {
+                let height = historical_heights[(tx_idx + read_idx) % historical_heights.len()];
+                let key = match read_idx % 4 {
+                    0 => format!("acct_{}", (tx_idx * 17 + read_idx) % num_accounts),
+                    1 => format!("pool:{}:reward:{}", (height + read_idx) % 5, read_idx % 24),
+                    2 => format!(
+                        "name-monkey:owner:{}:{}",
+                        read_idx % 16,
+                        (height + read_idx) % num_accounts
+                    ),
+                    _ => format!("block_marker_{height}"),
+                };
+
+                let sq_restore = sq_db
+                    .set_block_hash(all_blocks[height].clone(), false)
+                    .unwrap();
+                let sq_v = sq_db.get_data::<String>(&key).unwrap();
+                sq_db.set_block_hash(sq_restore, true).unwrap();
+
+                let ref_restore = ref_db
+                    .set_block_hash(all_blocks[height].clone(), false)
+                    .unwrap();
+                let ref_v = ref_db.get_data::<String>(&key).unwrap();
+                ref_db.set_block_hash(ref_restore, true).unwrap();
+
+                assert_eq!(
+                    sq_v, ref_v,
+                    "at-block read diverged inside tx={tx_idx}, height={height}, \
+                     read_idx={read_idx}, key={key}"
+                );
+
+                if copied_values.len() < 16 {
+                    copied_values.push(sq_v.unwrap_or_else(|| {
+                        format!("NONE_height_{height}_tx_{tx_idx}_read_{read_idx}")
+                    }));
+                }
+            }
+
+            for write_idx in 0..writes {
+                let copied = copied_values
+                    .get(write_idx % copied_values.len().max(1))
+                    .cloned()
+                    .unwrap_or_else(|| format!("current-only-tx-{tx_idx}-write-{write_idx}"));
+                let value = format!("{copied}:tx:{tx_idx}:write:{write_idx}");
+                let key = format!("tx:{tx_idx:03}:out:{write_idx:03}");
+                sq_db.put_data(&key, &value).unwrap();
+                ref_db.put_data(&key, &value).unwrap();
+            }
+
+            if commit {
+                sq_db.commit().unwrap();
+                ref_db.commit().unwrap();
+            } else {
+                sq_db.roll_back().unwrap();
+                ref_db.roll_back().unwrap();
+            }
+        };
+
+        // A compact synthetic version of the failed block's transaction mix.
+        for tx_idx in 0..24 {
+            match tx_idx % 8 {
+                // Post-condition abort shape: reads/writes happen, then rollback.
+                0 => run_tx(tx_idx, 96, 8, 6, false),
+                // Return-err shape: read-heavy, no writes, but transaction commits.
+                1 => run_tx(tx_idx, 308, 0, 0, true),
+                // Arkadiko-style swap/add-position shape.
+                2 | 3 => run_tx(tx_idx, 64, 6, 8, true),
+                // Lydian-style at-block/history-heavy claim shape.
+                4 => run_tx(tx_idx, 32, 31, 3, true),
+                // Staking-helper-style high-fanout current reads plus several writes.
+                5 | 6 => run_tx(tx_idx, 210, 11, 15, true),
+                // Small transfer/listing shape.
+                _ => run_tx(tx_idx, 18, 2, 2, true),
+            }
+        }
+
+        // The observed failing block ended with repeated high-fanout `names.name-monkey` calls and
+        // small successful writes immediately before the root mismatch.
+        run_tx(100, 2531, 0, 5, true);
+        run_tx(101, 15, 0, 0, true);
+        run_tx(102, 308, 0, 0, true);
+        run_tx(103, 2531, 0, 5, true);
+        run_tx(104, 2531, 0, 5, true);
+    }
+
+    let sq_root = sq_store.seal_trie();
+    sq_store.test_commit();
+    let ref_root = ref_store.seal_trie();
+    ref_store.test_commit();
+
+    assert_eq!(
+        sq_root, ref_root,
+        "mainnet-53161-style nested Clarity transaction ordering produced a squashed/reference \
+         state-root mismatch"
+    );
+}
+
+/// Test 6 in the mainnet-53161 reproduction ladder: model the confirmed-microblock block
+/// validation path more faithfully than Tier 5.
+///
+/// The observed failure was not simply "one anchored block does historical reads."  The rejected
+/// child block `15405.../436e...` confirmed parent microblock `6883...` from accepted parent
+/// `9b1847.../9b56...`.  In production, `setup_block` opens a temporary miner block on top of the
+/// accepted parent, applies the confirmed microblock transactions first, then applies the child
+/// anchored transactions, seals the temporary trie, and only then commits it to the child block ID.
+///
+/// This test preserves that ordering:
+///   1. Build/squash/trim old FullHistory levels.
+///   2. Accept several post-trim anchored blocks.
+///   3. Open a temporary miner block on the accepted parent.
+///   4. Apply a "confirmed microblock" phase that performs at-block reads into trimmed levels and
+///      writes values into current state.
+///   5. Apply a child anchored phase that reads the microblock writes and does the high-fanout
+///      transaction mix seen near the mainnet failure.
+///   6. Seal and compare against an unsquashed reference before committing to the child ID.
+#[test]
+fn test_tier6_confirmed_microblock_phase_mainnet_53161_repro() {
+    use clarity::vm::database::ClarityBackingStore;
+    use clarity::vm::test_util::{TEST_BURN_STATE_DB, TEST_HEADER_DB};
+
+    use crate::chainstate::stacks::index::squash::{
+        squash_level_incremental, trim_aged_root_sidecars,
+    };
+    use crate::chainstate::stacks::{MINER_BLOCK_CONSENSUS_HASH, MINER_BLOCK_HEADER_HASH};
+    use crate::clarity_vm::clarity::{ClarityMarfStore, ClarityMarfStoreTransaction};
+    use crate::clarity_vm::database::marf::MarfedKV;
+
+    const TEST_TRIM_RETENTION_DISABLED: u32 = 100;
+
+    let dir = fresh_test_dir("test_tier6_confirmed_microblock_phase_mainnet_53161_repro");
+    let sq_dir = format!("{dir}/squashed");
+    let ref_dir = format!("{dir}/reference");
+    let sq_marf_path = format!("{sq_dir}/marf.sqlite");
+
+    let num_accounts: usize = 192;
+    let touches_per_block: usize = 37;
+    let blocks_per_level: usize = 10;
+    let num_levels: usize = 6;
+    let post_trim_blocks: usize = 8;
+    let total_squashed_blocks = blocks_per_level * num_levels;
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true)
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED);
+
+    let mut all_blocks: Vec<StacksBlockId> =
+        Vec::with_capacity(total_squashed_blocks + post_trim_blocks + 1);
+
+    let write_clarity_block =
+        |kv: &mut MarfedKV, parent: &StacksBlockId, block: &StacksBlockId, height: usize| {
+            let mut store = kv.begin(parent, block);
+            {
+                let mut db = store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+                db.begin();
+
+                for acct in tier1_touched_accounts(height, num_accounts, touches_per_block) {
+                    db.put_data(
+                        &format!("acct_{acct}"),
+                        &format!("acct_{acct}_nonce_{height}"),
+                    )
+                    .unwrap();
+                }
+                for idx in 0..24 {
+                    db.put_data(
+                        &format!("pool:{}:reward:{idx}", height % 5),
+                        &format!("pool_reward_h{height}_{idx}"),
+                    )
+                    .unwrap();
+                }
+                for idx in 0..16 {
+                    db.put_data(
+                        &format!("name-monkey:owner:{idx}:{}", (height + idx) % num_accounts),
+                        &format!("name_owner_h{height}_{idx}"),
+                    )
+                    .unwrap();
+                }
+                db.put_data(
+                    &format!("block_marker_{height}"),
+                    &format!("marker_value_{height}"),
+                )
+                .unwrap();
+
+                db.commit().unwrap();
+            }
+            store.test_commit();
+        };
+
+    {
+        let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+
+        for lvl in 0..num_levels {
+            let start_height = lvl * blocks_per_level;
+            for offset in 0..blocks_per_level {
+                let height = start_height + offset;
+                let parent = if height == 0 {
+                    StacksBlockId::sentinel()
+                } else {
+                    all_blocks[height - 1].clone()
+                };
+                let block = tier1_block_hash(height);
+                write_clarity_block(&mut sq_kv, &parent, &block, height);
+                write_clarity_block(&mut ref_kv, &parent, &block, height);
+                all_blocks.push(block);
+            }
+
+            drop(sq_kv);
+            squash_level_incremental::<StacksBlockId>(
+                &sq_marf_path,
+                SquashMode::FullHistory,
+                start_height as u32,
+                (start_height + blocks_per_level - 1) as u32,
+                true,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("level {lvl} FullHistory reclaim squash failed: {e:?}"));
+            sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        }
+        drop(sq_kv);
+        drop(ref_kv);
+    }
+
+    {
+        let mut trim_handle =
+            MARF::<StacksBlockId>::from_path(&sq_marf_path, open_opts.clone()).unwrap();
+        let report = trim_aged_root_sidecars(
+            &mut trim_handle,
+            std::path::Path::new(&sq_marf_path),
+            blocks_per_level as u32,
+        )
+        .unwrap();
+        assert!(
+            report.levels_trimmed >= 1,
+            "expected old sidecars to be trimmed before microblock repro; report={report:?}",
+        );
+        assert_eq!(report.trim_failures, 0);
+        assert_eq!(report.unlink_failures, 0);
+    }
+
+    {
+        let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+        let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+        for height in total_squashed_blocks..(total_squashed_blocks + post_trim_blocks) {
+            let parent = all_blocks.last().unwrap().clone();
+            let block = tier1_block_hash(height);
+            write_clarity_block(&mut sq_kv, &parent, &block, height);
+            write_clarity_block(&mut ref_kv, &parent, &block, height);
+            all_blocks.push(block);
+        }
+    }
+
+    let parent_tip = all_blocks.last().unwrap().clone();
+    let temporary_miner_block =
+        StacksBlockId::new(&MINER_BLOCK_CONSENSUS_HASH, &MINER_BLOCK_HEADER_HASH);
+    let child_block = {
+        let mut bytes = [0u8; 32];
+        bytes[20..24].copy_from_slice(&0x_53_16_1C61u32.to_be_bytes());
+        bytes[28..32].copy_from_slice(&((all_blocks.len() as u32) + 1).to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let historical_heights = [
+        1,
+        blocks_per_level - 1,
+        blocks_per_level,
+        (2 * blocks_per_level) + 3,
+        (4 * blocks_per_level) + 1,
+        total_squashed_blocks - 2,
+    ];
+
+    let mut sq_kv = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+    let mut ref_kv = MarfedKV::open(&ref_dir, None, Some(open_opts.clone())).unwrap();
+    let mut sq_store = sq_kv.begin(&parent_tip, &temporary_miner_block);
+    let mut ref_store = ref_kv.begin(&parent_tip, &temporary_miner_block);
+
+    {
+        let mut sq_db = sq_store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+        let mut ref_db = ref_store.as_clarity_db(&TEST_HEADER_DB, &TEST_BURN_STATE_DB);
+
+        let mut run_tx = |phase: &str,
+                          tx_idx: usize,
+                          current_reads: usize,
+                          historical_reads: usize,
+                          writes: usize,
+                          commit: bool| {
+            sq_db.begin();
+            ref_db.begin();
+
+            let mut copied_values = Vec::with_capacity(historical_reads.min(16));
+
+            for read_idx in 0..current_reads {
+                let key = match read_idx % 6 {
+                    0 => format!("acct_{}", (tx_idx * 41 + read_idx) % num_accounts),
+                    1 => format!("pool:{}:reward:{}", (tx_idx + read_idx) % 5, read_idx % 24),
+                    2 => format!(
+                        "name-monkey:owner:{}:{}",
+                        read_idx % 16,
+                        (tx_idx + read_idx) % num_accounts
+                    ),
+                    3 => format!("block_marker_{}", read_idx % all_blocks.len()),
+                    4 => format!("microblock:carry:{}", read_idx % 32),
+                    _ => format!("missing-contract-key:{phase}:{tx_idx}:{read_idx}"),
+                };
+
+                let sq_v = sq_db.get_data::<String>(&key).unwrap();
+                let ref_v = ref_db.get_data::<String>(&key).unwrap();
+                assert_eq!(
+                    sq_v, ref_v,
+                    "{phase} current-tip read diverged inside tx={tx_idx}, \
+                     read_idx={read_idx}, key={key}"
+                );
+            }
+
+            for read_idx in 0..historical_reads {
+                let height = historical_heights[(tx_idx + read_idx) % historical_heights.len()];
+                let key = match read_idx % 4 {
+                    0 => format!("acct_{}", (tx_idx * 17 + read_idx) % num_accounts),
+                    1 => format!("pool:{}:reward:{}", (height + read_idx) % 5, read_idx % 24),
+                    2 => format!(
+                        "name-monkey:owner:{}:{}",
+                        read_idx % 16,
+                        (height + read_idx) % num_accounts
+                    ),
+                    _ => format!("block_marker_{height}"),
+                };
+
+                let sq_restore = sq_db
+                    .set_block_hash(all_blocks[height].clone(), false)
+                    .unwrap();
+                let sq_v = sq_db.get_data::<String>(&key).unwrap();
+                sq_db.set_block_hash(sq_restore, true).unwrap();
+
+                let ref_restore = ref_db
+                    .set_block_hash(all_blocks[height].clone(), false)
+                    .unwrap();
+                let ref_v = ref_db.get_data::<String>(&key).unwrap();
+                ref_db.set_block_hash(ref_restore, true).unwrap();
+
+                assert_eq!(
+                    sq_v, ref_v,
+                    "{phase} at-block read diverged inside tx={tx_idx}, height={height}, \
+                     read_idx={read_idx}, key={key}"
+                );
+
+                if copied_values.len() < 16 {
+                    copied_values.push(sq_v.unwrap_or_else(|| {
+                        format!("NONE_height_{height}_phase_{phase}_tx_{tx_idx}_read_{read_idx}")
+                    }));
+                }
+            }
+
+            for write_idx in 0..writes {
+                let copied = copied_values
+                    .get(write_idx % copied_values.len().max(1))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        format!("{phase}-current-only-tx-{tx_idx}-write-{write_idx}")
+                    });
+                let key = if phase == "microblock" {
+                    format!("microblock:carry:{}", write_idx % 32)
+                } else {
+                    format!("anchored:tx:{tx_idx:03}:out:{write_idx:03}")
+                };
+                let value = format!("{copied}:phase:{phase}:tx:{tx_idx}:write:{write_idx}");
+                sq_db.put_data(&key, &value).unwrap();
+                ref_db.put_data(&key, &value).unwrap();
+            }
+
+            if commit {
+                sq_db.commit().unwrap();
+                ref_db.commit().unwrap();
+            } else {
+                sq_db.roll_back().unwrap();
+                ref_db.roll_back().unwrap();
+            }
+        };
+
+        // Confirmed parent microblock phase.  The earlier binary failed explicitly here with
+        // `Unexpected MARF Failure on GET`; after the sidecar-read fix, this phase succeeds and its
+        // writes become part of the child block's final root.
+        run_tx("microblock", 0, 24, 31, 16, true);
+        run_tx("microblock", 1, 96, 8, 8, false);
+        run_tx("microblock", 2, 210, 11, 16, true);
+
+        // Anchored child phase.  The first reads deliberately consume microblock writes before the
+        // heavier mainnet-like transaction mix, matching "confirmed microblocks first, anchored
+        // transactions second" from `setup_block`.
+        for tx_idx in 0..24 {
+            match tx_idx % 8 {
+                0 => run_tx("anchored", tx_idx, 96, 8, 6, false),
+                1 => run_tx("anchored", tx_idx, 308, 0, 0, true),
+                2 | 3 => run_tx("anchored", tx_idx, 64, 6, 8, true),
+                4 => run_tx("anchored", tx_idx, 32, 31, 3, true),
+                5 | 6 => run_tx("anchored", tx_idx, 210, 11, 15, true),
+                _ => run_tx("anchored", tx_idx, 18, 2, 2, true),
+            }
+        }
+        run_tx("anchored", 100, 2531, 0, 5, true);
+        run_tx("anchored", 101, 15, 0, 0, true);
+        run_tx("anchored", 102, 308, 0, 0, true);
+        run_tx("anchored", 103, 2531, 0, 5, true);
+        run_tx("anchored", 104, 2531, 0, 5, true);
+    }
+
+    let sq_root = sq_store.seal_trie();
+    let ref_root = ref_store.seal_trie();
+
+    assert_eq!(
+        sq_root, ref_root,
+        "confirmed-microblock + child-anchored ordering produced a squashed/reference \
+         state-root mismatch before commit_to(child)"
+    );
+
+    sq_store.commit_to_processed_block(&child_block).unwrap();
+    ref_store.commit_to_processed_block(&child_block).unwrap();
+
+    let sq_reader = MarfedKV::open(&sq_dir, None, Some(open_opts.clone())).unwrap();
+    let ref_reader = MarfedKV::open(&ref_dir, None, Some(open_opts)).unwrap();
+    let mut sq_ro = sq_reader.begin_read_only(Some(&child_block));
+    let mut ref_ro = ref_reader.begin_read_only(Some(&child_block));
+    let sq_v = sq_ro.get_data("microblock:carry:0").unwrap();
+    let ref_v = ref_ro.get_data("microblock:carry:0").unwrap();
+    assert_eq!(
+        sq_v, ref_v,
+        "committed child block must preserve confirmed microblock writes identically"
+    );
 }
 
 /// Exhaustively compare every (height, account) read between `sq_marf` and `ref_marf` using three
@@ -9408,7 +11677,8 @@ fn test_iteration2_trim_policy_end_to_end() {
     let dir = fresh_test_dir("test_iteration2_trim_policy_end_to_end");
     let path = format!("{dir}/marf.sqlite");
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true)
-        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED);
+        .with_squash_root_snapshot_retention_levels(TEST_TRIM_RETENTION_DISABLED)
+        .with_auto_recovery(true);
 
     const N_LEVELS: u32 = 5;
     const HEIGHTS_PER_LEVEL: u32 = 4;

@@ -39,6 +39,24 @@ pub struct ReplayMockMiningArgs {
     pub mock_mining_output_path: String,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct ReplayEpoch2BlockFileArgs {
+    /// Path to network data directory, e.g. /path/to/data/mainnet
+    pub db_path: String,
+
+    /// Index block hash for the staging DB row to replay
+    pub index_block_hash: String,
+
+    /// Path to the serialized epoch-2 block bytes to replay
+    pub block_path: String,
+
+    /// Treat replay as successful only if the error contains every supplied string.
+    ///
+    /// Repeat this flag to pin a known failure shape, e.g. both expected and computed roots.
+    #[arg(long = "expect-error-contains")]
+    pub expect_error_contains: Vec<String>,
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum ValidateBlockMode {
     /// Validate blocks matching a hash prefix
@@ -483,6 +501,12 @@ pub enum Command {
         new_burnchain_path: String,
     },
 
+    /// Replay a staged epoch-2 block using explicit block bytes from disk.
+    ///
+    /// Diagnostic command: run against a throwaway snapshot/copy, not a production data dir.
+    #[command(name = "replay-epoch2-block-file")]
+    ReplayEpoch2BlockFile(ReplayEpoch2BlockFileArgs),
+
     // ================ PoX/Sortition Commands ================
     /// Evaluate PoX anchor selection at a block height
     #[command(name = "evaluate-pox-anchor")]
@@ -642,5 +666,37 @@ mod tests {
 
         assert_eq!(cli.config, Some("/path/to/config.toml".to_string()));
         assert!(matches!(cli.command, Command::DumpConsts));
+    }
+
+    #[test]
+    fn test_replay_epoch2_block_file_parsing() {
+        let cli = Cli::try_parse_from([
+            "stacks-inspect",
+            "replay-epoch2-block-file",
+            "/tmp/mainnet",
+            "db0e",
+            "/tmp/block.invalid",
+            "--expect-error-contains",
+            "state root mismatch",
+            "--expect-error-contains",
+            "computed-root",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::ReplayEpoch2BlockFile(args) => {
+                assert_eq!(args.db_path, "/tmp/mainnet");
+                assert_eq!(args.index_block_hash, "db0e");
+                assert_eq!(args.block_path, "/tmp/block.invalid");
+                assert_eq!(
+                    args.expect_error_contains,
+                    vec![
+                        "state root mismatch".to_string(),
+                        "computed-root".to_string()
+                    ]
+                );
+            }
+            _ => panic!("Expected ReplayEpoch2BlockFile command"),
+        }
     }
 }

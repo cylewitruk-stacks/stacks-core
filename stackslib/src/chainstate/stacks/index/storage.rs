@@ -39,9 +39,9 @@ use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::squash::SquashTrailer;
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
-    bits, trie_sql, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodePatching,
-    NodePath, ReadTrieItem, ReadTrieItemKind, ReadTrieNode, TrieHasher, TrieLeaf,
-    TrieNodeReadState, TrieReadStorage, MAX_PATCH_DEPTH,
+    bits, marf_squash_trace_enabled_for_height, trie_sql, BlockMap, ClarityMarfTrieId, Error,
+    MARFValue, MarfTrieId, NodePatching, NodePath, ReadTrieItem, ReadTrieItemKind, ReadTrieNode,
+    TrieHasher, TrieLeaf, TrieNodeReadState, TrieReadStorage, WalkIntent, MAX_PATCH_DEPTH,
 };
 use crate::codec::StacksMessageCodec;
 use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE};
@@ -1125,6 +1125,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                 let scratch = &mut MarfReadState::new();
                 let read = read_patched_persisted_node(
                     &storage_tx.db,
+                    storage_tx.db_path,
                     storage_tx.blobs.as_deref(),
                     storage_tx.data.unconfirmed_block_id,
                     base_block_id,
@@ -1133,6 +1134,7 @@ impl<T: MarfTrieId> TrieRAM<T> {
                     base_leaf_hashes_omitted,
                     source_snapshot_context,
                     &storage_tx.data.squash_meta,
+                    storage_tx.data.squash_root_snapshot_retention_blocks,
                     scratch,
                 )?;
                 if read.patch_depth >= MAX_PATCH_DEPTH as usize {
@@ -2609,6 +2611,20 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
     /// would expose the handle to SIGBUS or stale-state reads and is unsafe.
     pub bypass_blob_guard: bool,
 
+    /// Read-path intent: controls whether `ROOT_PTR_DISK` reads against blocks inside a
+    /// reclaim-squash level route through the per-height root sidecar
+    /// ([`WalkIntent::ForkExtend`]) or through the merged tip's root + `value_at_height`
+    /// ([`WalkIntent::AtBlock`], the default). See the [`WalkIntent`] doc for the contract;
+    /// note that orphan-section reads are not gated by this field.
+    ///
+    /// `AtBlock` is the default for ordinary `MARF::get(historical_block, key)` style walks
+    /// — these must not depend on the sidecar's per-height root so retention-trimmed levels
+    /// remain readable for value lookups. `ForkExtend` is set transiently by
+    /// [`crate::chainstate::stacks::index::marf::MARF::root_copy`] (and only there) so
+    /// that the historical root shape is reconstructed from the sidecar; trimmed levels
+    /// surface [`Error::SnapshotTrimmed`] as documented.
+    pub walk_intent: WalkIntent,
+
     /// Perf-shape counter: number of `LeafSquashed` reads where snapshot-height resolved
     /// to `None` and the walk used `tip_value` directly (no `entries` materialization, no
     /// node re-read). Asserted in tests to prove the dormant-tip-read fast path works.
@@ -2702,6 +2718,7 @@ impl<T: MarfTrieId> Default for TrieStorageTransientData<T> {
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_BLOCKS,
             resolved_snapshot_context: Cell::new(None),
             bypass_blob_guard: false,
+            walk_intent: WalkIntent::AtBlock,
             #[cfg(test)]
             squashed_tip_fallback_count: Cell::new(0),
             #[cfg(test)]
@@ -2842,6 +2859,7 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
         );
         read_patched_persisted_node(
             self.db,
+            self.db_path,
             self.blobs.as_ref(),
             self.data.unconfirmed_block_id,
             block_id,
@@ -2850,6 +2868,7 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
             self.data.leaf_hashes_omitted,
             patch_source_context,
             &self.data.squash_meta,
+            self.data.squash_root_snapshot_retention_blocks,
             scratch,
         )
     }
@@ -3416,14 +3435,209 @@ fn get_block_id_caching_impl<T: MarfTrieId>(
     }
 }
 
+/// Resolve a level's orphan sidecar, validate it, and open a fresh
+/// [`crate::chainstate::stacks::index::sidecar::OrphanSidecarHandle`]. Used by both:
+/// - [`TrieStorageConnection::try_read_orphan_bytes`] (the connection-scoped path, where it
+///   feeds the cached handle slot keyed on `split_offset`).
+/// - [`read_patched_persisted_node`] (the patch-chase path, which opens fresh per orphan
+///   step because chains can visit blocks across multiple levels in one call).
+///
+/// Returns `Err(Error::SnapshotTrimmed)` if the level's sidecar has been trimmed
+/// (operator-recovery condition); returns generic `CorruptionError` for missing or malformed
+/// sidecars. The handle's `split_offset` is set to the level's `orphan_split_offset` so the
+/// caller can compute relative-offset reads via [`read_orphan_node_bytes_into`].
+fn open_orphan_sidecar_for_level(
+    db_path: &str,
+    squash_meta: &SquashMeta,
+    level_idx: usize,
+    snapshot_retention_blocks: u32,
+) -> Result<crate::chainstate::stacks::index::sidecar::OrphanSidecarHandle, Error> {
+    use crate::chainstate::stacks::index::sidecar::{
+        squash_root_sidecar_path, OrphanSidecarHandle, RecordKind, SidecarExpectation,
+    };
+    let level = squash_meta.levels.get(level_idx).ok_or_else(|| {
+        Error::CorruptionError(format!(
+            "open_orphan_sidecar_for_level: level_idx {level_idx} out of range \
+             ({} levels)",
+            squash_meta.levels.len(),
+        ))
+    })?;
+    if squash_meta
+        .root_sidecar_trimmed
+        .get(level_idx)
+        .copied()
+        .unwrap_or(false)
+    {
+        return Err(Error::SnapshotTrimmed {
+            level_id: level.info.level_id,
+            retention_blocks: snapshot_retention_blocks,
+        });
+    }
+    let split = squash_meta
+        .orphan_split_offset
+        .get(level_idx)
+        .copied()
+        .unwrap_or(0);
+    if split == 0 {
+        return Err(Error::CorruptionError(format!(
+            "open_orphan_sidecar_for_level: level_idx {level_idx} has split_offset=0 \
+             (no orphan section)"
+        )));
+    }
+    let level_blob_offset = *squash_meta
+        .level_blob_offsets
+        .get(level_idx)
+        .ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "open_orphan_sidecar_for_level: level_idx {level_idx} missing blob_offset \
+                     (level_blob_offsets has {})",
+                squash_meta.level_blob_offsets.len(),
+            ))
+        })?;
+    let path = squash_root_sidecar_path(
+        std::path::Path::new(db_path),
+        level.info.level_id,
+        level.info.min_height,
+        level.info.max_height,
+        level_blob_offset,
+    );
+    let expectation = SidecarExpectation {
+        level_id: Some(level.info.level_id),
+        min_height: Some(level.info.min_height),
+        max_height: Some(level.info.max_height),
+        require_section: Some(RecordKind::OrphanNode),
+    };
+    OrphanSidecarHandle::open(&path, expectation, split)
+}
+
+/// Read trie-item bytes from an orphan sidecar via a pre-opened handle, with the same
+/// two-phase size resolution [`TrieFile::read_item_at_offset`]'s slow path uses on the
+/// merged blob:
+/// 1. pread `hinted_max` bytes (from the parent `ptr`'s type hint).
+/// 2. peek at the first byte for the actual stored node ID; if its max body is wider, pread
+///    again at the wider size into the resized buffer.
+///
+/// `buf` is filled in-place; on success the bytes are at `&buf[..]` (length matches the
+/// stored item). The caller's allocation is reused across both pread attempts (resize-up
+/// only), so a pooled scratch buffer can be threaded through without reallocating per call.
+///
+/// Concurrency: the handle's `pread` is lock-free, but callers reading against an actively-
+/// publishing MARF must hold a `BlobReadGuard` for the duration of the decode that follows.
+/// This helper does NOT acquire a guard; it expects the caller's broader read path to.
+fn read_orphan_node_bytes_into(
+    handle: &crate::chainstate::stacks::index::sidecar::OrphanSidecarHandle,
+    ptr: &TriePtr,
+    leaf_hashes_omitted: bool,
+    buf: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let is_leaf_hint = leaf_hashes_omitted && is_leaf_type(ptr.id());
+    let hinted_max = if is_leaf_hint {
+        bits::get_node_body_max_byte_len(ptr.id())?
+    } else {
+        bits::get_node_max_byte_len(ptr.id())?
+    };
+    let relative = (ptr.ptr() - handle.split_offset) as u64;
+
+    buf.clear();
+    buf.resize(hinted_max, 0);
+    let n = handle.pread_at(buf, relative)?;
+    if n == 0 {
+        return Err(Error::CorruptionError(format!(
+            "read_orphan_node_bytes_into: pread at relative_offset={relative} returned 0 \
+             bytes (split_offset={}, ptr.ptr()={}, section_length={})",
+            handle.split_offset,
+            ptr.ptr(),
+            handle.section_length(),
+        )));
+    }
+    buf.truncate(n);
+
+    let stored_max = if is_leaf_hint {
+        let stored_node_id = bits::stored_node_id_from_bytes(buf)?;
+        bits::get_node_body_max_byte_len(stored_node_id as u8)?
+    } else {
+        let (_hash, after_hash) = bits::parse_hash_from_bytes(buf)?;
+        let stored_node_id = bits::stored_node_id_from_bytes(after_hash)?;
+        bits::get_node_max_byte_len(stored_node_id as u8)?
+    };
+    if stored_max > buf.len() {
+        buf.resize(stored_max, 0);
+        let n = handle.pread_at(buf, relative)?;
+        buf.truncate(n);
+    }
+    Ok(())
+}
+
+/// Resolve the level index that owns `block_id` for a patch-chase step, using the same
+/// disambiguation rules `read_patched_persisted_node`'s merged-blob path uses for trie offset
+/// + leaf-hash policy:
+///
+/// 1. **Source-level preference**: if `patch_source_context` is `Some((src_idx, _))` and
+///    level `src_idx`'s trailer contains `block_id`, return `src_idx`. This handles the
+///    common case where the patch chain stays inside the level the read started in, and
+///    matches `open_block_known_id_impl`'s retired-context-aware backptr resolution
+///    contract: "when the read pipeline is currently inside squash level `L` and follows a
+///    backptr whose target id is also recorded in `L`'s trailer, stay in `L`."
+/// 2. **Global scan, gated on unambiguous block IDs**: if step 1 didn't match AND
+///    `block_id` is NOT in `squash_meta.ambiguous_block_ids`, scan
+///    `level_block_id_to_height` for the first level containing `block_id`. For unambiguous
+///    block IDs the scan returns the unique answer, so this is safe.
+/// 3. **Fall through (`None`)**: ambiguous block ID without a matching source-level —
+///    cannot pick a level safely; caller skips orphan routing and falls back to the
+///    merged-blob read path. (Covering this case correctly would require parent-chain
+///    disambiguation per orphan step, which the existing merged-blob path also doesn't do.)
+///
+/// Returning `None` means "don't orphan-route this step." The caller's existing merged-blob
+/// fallback applies — same behavior as the pre-fix code path for ambiguous blocks.
+fn resolve_orphan_routing_level(
+    squash_meta: &SquashMeta,
+    block_id: u32,
+    patch_source_context: Option<(usize, u32)>,
+) -> Option<usize> {
+    // Step 1: source-level preference.
+    if let Some((src_idx, _)) = patch_source_context {
+        if squash_meta
+            .level_block_id_to_height
+            .get(src_idx)
+            .is_some_and(|m| m.contains_key(&block_id))
+        {
+            return Some(src_idx);
+        }
+    }
+    // Step 2: gated global scan. Skip for ambiguous block IDs since the first match could be
+    // the wrong level for a retired-fork reader.
+    if squash_meta.ambiguous_block_ids.contains(&block_id) {
+        return None;
+    }
+    squash_meta
+        .level_block_id_to_height
+        .iter()
+        .position(|m| m.contains_key(&block_id))
+}
+
 /// Patch-aware per-node read shared by [`TrieStorageConnection`] and
 /// [`ReopenedTrieStorageConnection`].
 ///
 /// Inlines the dispatch from `inner_read_persisted_trie_item` (blobs vs. SQL, unconfirmed
 /// guard) and runs the full patch-chasing loop. Both storage types call this from their
 /// `TrieReadStorage::read_node_with_state` impls.
+///
+/// **Orphan-section routing**: each step in the patch chain checks whether `(block_id, ptr)`
+/// addresses bytes in a published level's orphan section (`ptr.ptr() >= orphan_split_offset`
+/// for the level that owns `block_id`). If so, the read is routed through that level's
+/// orphan sidecar via [`open_orphan_sidecar_for_level`] +
+/// [`read_orphan_node_bytes_into`] — the same primitives the connection's
+/// [`TrieStorageConnection::try_read_orphan_bytes`] uses for the normal-read path. Without
+/// this routing, descendant patch base ptrs that the publish phase rewrote into orphan-
+/// section logical offsets (correct rewrites — the node really does live there) would chase
+/// into reclaimed merged-blob bytes and decode garbage. Mainnet level-18 / clarity height
+/// 33190 hit this on the perf/marf-squash-cyle branch.
+///
+/// `db_path` is the MARF's sqlite db_path, threaded through so the orphan-routing helpers
+/// can resolve the level's sidecar file path.
 fn read_patched_persisted_node<'b>(
     db: &Connection,
+    db_path: &str,
     blobs: Option<&TrieFile>,
     unconfirmed_block_id: Option<u32>,
     mut block_id: u32,
@@ -3432,6 +3646,7 @@ fn read_patched_persisted_node<'b>(
     leaf_hashes_omitted: bool,
     patch_source_context: Option<(usize, u32)>,
     squash_meta: &SquashMeta,
+    snapshot_retention_blocks: u32,
     scratch: &'b mut impl NodePatching,
 ) -> Result<ReadTrieNode<'b>, Error> {
     let target_block_id = block_id;
@@ -3440,8 +3655,108 @@ fn read_patched_persisted_node<'b>(
     let mut trie_offset_hint = cur_block_trie_offset;
     let mut cur_leaf_hashes_omitted = leaf_hashes_omitted;
 
+    // Per-call cache: open each level's orphan sidecar at most once even if the patch chain
+    // visits the same level multiple times. Patch chains are bounded by `MAX_PATCH_DEPTH`,
+    // so the cache size is bounded by the number of distinct levels visited (≤ 9 in
+    // practice). Without the cache, deep chains paid an `OpenOptions::new().open(...)` +
+    // SidecarReader validation per orphan step. The cache stays local to this call —
+    // unlike the connection-side `data.orphan_sidecar` slot, which is keyed on
+    // `squash_opened_level_idx` and would conflict if a patch chain visits a level
+    // different from the currently-opened block's level.
+    let mut orphan_sidecar_cache: std::collections::HashMap<
+        usize,
+        crate::chainstate::stacks::index::sidecar::OrphanSidecarHandle,
+    > = std::collections::HashMap::new();
+    // Reusable scratch buffer for orphan-routed reads. Allocated lazily on first orphan
+    // step (chains that never hit an orphan offset pay nothing); resize-up only across
+    // subsequent steps so capacity carries.
+    let mut orphan_buf: Vec<u8> = Vec::new();
+
     for _ in 0..=MAX_PATCH_DEPTH {
-        let read = if unconfirmed_block_id == Some(block_id) {
+        // ── Orphan-section routing ─────────────────────────────────
+        //
+        // If the current `(block_id, ptr)` lands in a level's orphan section, route through
+        // the sidecar. Level resolution mirrors the merged-blob path's
+        // `patch_source_context`-first discipline (see `resolve_orphan_routing_level`):
+        // unambiguous block IDs use a global scan if the source level doesn't match;
+        // ambiguous block IDs without a matching source level skip orphan routing entirely
+        // (falling through to the merged-blob path — same behavior the pre-fix code took
+        // for those blocks).
+        //
+        // Skips for:
+        // - unconfirmed block reads (handled below by SQL — orphan routing only applies to
+        //   blocks that have been squashed into a published level).
+        // - blocks not in any squashed level (still hot, or older than the lowest-active
+        //   level — read from the merged blob's main section / SQL as normal).
+        // - reads where `ptr.ptr() < orphan_split_offset` (in the level's main section).
+        //
+        // `bypass_blob_guard` and the publish/quiesce guard are NOT acquired here; the
+        // caller's outer read path (e.g. `read_node_with_state`'s slow path) holds the
+        // guard for the duration of the decode that follows.
+        let orphan_routed = if unconfirmed_block_id != Some(block_id) {
+            if let Some(level_idx) =
+                resolve_orphan_routing_level(squash_meta, block_id, patch_source_context)
+            {
+                let split = squash_meta
+                    .orphan_split_offset
+                    .get(level_idx)
+                    .copied()
+                    .unwrap_or(0);
+                if split != 0 && ptr.ptr() >= split {
+                    // Lazy-open + cache the handle for this level. `entry().or_insert_with`
+                    // would require fallible construction; we use the explicit pattern.
+                    if !orphan_sidecar_cache.contains_key(&level_idx) {
+                        let handle = open_orphan_sidecar_for_level(
+                            db_path,
+                            squash_meta,
+                            level_idx,
+                            snapshot_retention_blocks,
+                        )?;
+                        orphan_sidecar_cache.insert(level_idx, handle);
+                    }
+                    let handle = orphan_sidecar_cache
+                        .get(&level_idx)
+                        .expect("inserted just above");
+                    read_orphan_node_bytes_into(
+                        handle,
+                        &ptr,
+                        cur_leaf_hashes_omitted,
+                        &mut orphan_buf,
+                    )?;
+                    let item = if cur_leaf_hashes_omitted {
+                        bits::read_trie_item_from_slice_leaf_hash_free(
+                            &orphan_buf,
+                            ptr.id(),
+                            scratch,
+                        )?
+                    } else {
+                        bits::read_trie_item_from_slice(&orphan_buf, ptr.id(), scratch)?
+                    };
+                    // Orphan records must encode complete node bytes — a Patch return here
+                    // would mean the orphan section contains a patch, which the writer
+                    // protocol forbids. Match the connection-side `try_read_orphan_bytes`
+                    // path's rejection.
+                    if matches!(item.kind, ReadTrieItemKind::Patch(_)) {
+                        scratch.restore_patch_chain_buf(patches);
+                        return Err(Error::CorruptionError(format!(
+                            "Orphan-section read at block_id={block_id} ptr={ptr:?} \
+                             returned Patch; orphan records must encode complete node bytes"
+                        )));
+                    }
+                    Some(item)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let read = if let Some(item) = orphan_routed {
+            item
+        } else if unconfirmed_block_id == Some(block_id) {
             trace!("Read persisted node from unconfirmed block id {block_id}");
             trie_sql::read_trie_item(db, block_id, &ptr, scratch)?
         } else {
@@ -3592,6 +3907,75 @@ fn recompute_orphan_leaf_hash_from_bytes(bytes: &[u8]) -> Result<TrieHash, Error
     Ok(TrieHash(out))
 }
 
+/// Investigation-only: dump leaf-level details when a `read_node_with_state` call lands on a
+/// `Leaf` or `LeafSquashed` while a squash trace window is active. Used to compare what the
+/// `AtBlock` (merged-tip) and `ForkExtend` (sidecar) routes actually find at the same path:
+/// physical `TriePtr`, `leaf_path`, and the full transition vector for `LeafSquashed`. Emit
+/// this from each return point inside `read_node_with_state` so we can correlate by
+/// `walk_intent` + `route`. Strip after the squash construction bug is identified.
+fn trace_leaf_at_squash_read<T: MarfTrieId>(
+    walk_intent: WalkIntent,
+    route: &str,
+    cur_block: &T,
+    cur_block_id: Option<u32>,
+    squash_opened_height: Option<u32>,
+    squash_opened_level_idx: Option<usize>,
+    ptr: &TriePtr,
+    node: &ReadTrieNode<'_>,
+) {
+    if !marf_squash_trace_enabled_for_height(squash_opened_height) {
+        return;
+    }
+    let Some(node_type) = node.node_type() else {
+        return;
+    };
+    match node_type {
+        TrieNodeID::Leaf => {
+            let Ok(Some(leaf_ref)) = node.as_leaf() else {
+                return;
+            };
+            info!(
+                "MARF_SQUASH_TRACE leaf_node_at_squash_read";
+                "kind" => "leaf",
+                "route" => route,
+                "walk_intent" => ?walk_intent,
+                "block" => %cur_block,
+                "block_id" => ?cur_block_id,
+                "height" => ?squash_opened_height,
+                "level_idx" => ?squash_opened_level_idx,
+                "ptr" => ?ptr,
+                "leaf_path" => %to_hex(leaf_ref.path),
+                "leaf_value" => %leaf_ref.data.to_hex()
+            );
+        }
+        TrieNodeID::LeafSquashed => {
+            let Ok(Some(sq)) = node.as_leaf_squashed_ref() else {
+                return;
+            };
+            let entries: Vec<String> = sq
+                .entries
+                .iter()
+                .map(|(h, v)| format!("{h}={}", v.to_hex()))
+                .collect();
+            info!(
+                "MARF_SQUASH_TRACE leaf_node_at_squash_read";
+                "kind" => "leaf_squashed",
+                "route" => route,
+                "walk_intent" => ?walk_intent,
+                "block" => %cur_block,
+                "block_id" => ?cur_block_id,
+                "height" => ?squash_opened_height,
+                "level_idx" => ?squash_opened_level_idx,
+                "ptr" => ?ptr,
+                "leaf_path" => %to_hex(sq.path),
+                "entry_count" => sq.entries.len(),
+                "entries" => %entries.join(",")
+            );
+        }
+        _ => {}
+    }
+}
+
 impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
     for TrieStorageConnection<'_, T, Db>
 {
@@ -3627,30 +4011,85 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return Err(Error::NotFoundError);
         };
 
-        // ROOT_PTR_DISK fast-path for reclaim-squashed in-range blocks: serve the per-height
-        // root from the `SquashRootNode` sidecar instead of indexing the merged blob (where
-        // offset 36 points at the merged tip's root, the wrong answer for any non-tip
-        // in-range block). Mirrors `read_node_hash`'s ROOT_PTR_DISK fast-path and
-        // `MARF::root_copy`'s use of `squash_opened_root_node_bytes` — see
-        // [`Self::resolve_squash_root_via_sidecar`] for the resolution + fail-closed contract.
-        if let Some((stored_id, body, hash)) = self.resolve_squash_root_via_sidecar(&clear_ptr)? {
-            state.decode_node_from_slice(stored_id, &body)?;
-            return Ok(ReadTrieNode::from_state_borrowed(
-                state.get_ref(),
-                Some(hash),
-            ));
+        // ROOT_PTR_DISK sidecar route (`WalkIntent::ForkExtend` only): rebuild the
+        // per-height root shape from the sidecar so `MARF::root_copy` can extend a fork
+        // off a non-tip squashed parent. For [`WalkIntent::AtBlock`] (the default —
+        // ordinary `MARF::get(historical_block, key)` walks), this sidecar route is
+        // skipped and the read falls through to the merged blob's offset-36 root, which
+        // is the merged tip's root body. The walk traverses tip-reachable nodes only;
+        // historical values are resolved at the leaf via `LeafSquashed::value_at_height`.
+        // Trimming the sidecar therefore cannot break at-block reads — only fork-extension
+        // surfaces `Error::SnapshotTrimmed`, as documented by the retention policy.
+        if clear_ptr.ptr() == ROOT_PTR_DISK
+            && marf_squash_trace_enabled_for_height(self.data.squash_opened_height)
+        {
+            info!(
+                "MARF_SQUASH_TRACE read_node_with_state root_route";
+                "block" => %self.data.cur_block,
+                "block_id" => ?self.data.cur_block_id,
+                "height" => ?self.data.squash_opened_height,
+                "level_idx" => ?self.data.squash_opened_level_idx,
+                "walk_intent" => ?self.data.walk_intent,
+                "route" => if self.data.walk_intent == WalkIntent::ForkExtend {
+                    "sidecar_if_available"
+                } else {
+                    "merged_tip_root"
+                }
+            );
+        }
+        if self.data.walk_intent == WalkIntent::ForkExtend {
+            if let Some((stored_id, body, hash)) =
+                self.resolve_squash_root_via_sidecar(&clear_ptr)?
+            {
+                if marf_squash_trace_enabled_for_height(self.data.squash_opened_height) {
+                    info!(
+                        "MARF_SQUASH_TRACE read_node_with_state root_sidecar_hit";
+                        "block" => %self.data.cur_block,
+                        "block_id" => ?self.data.cur_block_id,
+                        "height" => ?self.data.squash_opened_height,
+                        "level_idx" => ?self.data.squash_opened_level_idx,
+                        "stored_id" => ?stored_id,
+                        "hash" => %hash,
+                        "body_len" => body.len()
+                    );
+                }
+                state.decode_node_from_slice(stored_id, &body)?;
+                return Ok(ReadTrieNode::from_state_borrowed(
+                    state.get_ref(),
+                    Some(hash),
+                ));
+            }
         }
 
-        // PR2 orphan-sidecar route: if the currently-opened block is in a
-        // squashed level whose orphan section contains the byte range
-        // `ptr.ptr()` addresses, fetch from the sidecar instead of from
-        // the merged blob (which after PR2 no longer contains those
-        // bytes). The mmap fast path below is bypassed for orphan reads
-        // — the orphan sidecar is read via `pread`, decoded into the
-        // caller's `state` scratch via the same `bits::read_trie_item_*`
-        // helpers the slow path uses. The pread buffer is drawn from
-        // the connection-scoped scratch and restored before returning.
+        // PR2 orphan-sidecar route: orphan-section nodes are routed through the sidecar
+        // unconditionally — both fork-extension reconstruction and at-block walks can
+        // legitimately reach orphan offsets.
+        //
+        // `WalkIntent` does NOT gate this route, on purpose. The writer invariant
+        // ([`squash::verify_orphan_split_invariant`]) keeps tip-rooted historical
+        // *value-lookup* walks (the mainnet `at-block` GET shape that drove this fix)
+        // out of the orphan section, but it doesn't cover newly-extended fork blocks
+        // whose root was copied from a per-height historical root by `MARF::root_copy`:
+        // those copies preserve intra-level backptrs that may target orphan offsets, and
+        // `seal()` must follow them under the default `AtBlock` intent.
+        //
+        // Trim contract therefore stays as documented: at-block GETs against in-range
+        // squashed blocks survive trim (the per-height *root* route is what we gate, see
+        // `resolve_squash_root_via_sidecar` above); fork-extension off a non-tip squashed
+        // parent stops working once that level's sidecar has aged out, by design.
         if let Some(bytes) = self.try_read_orphan_bytes(&clear_ptr)? {
+            if marf_squash_trace_enabled_for_height(self.data.squash_opened_height) {
+                info!(
+                    "MARF_SQUASH_TRACE read_node_with_state orphan_route";
+                    "block" => %self.data.cur_block,
+                    "block_id" => ?self.data.cur_block_id,
+                    "height" => ?self.data.squash_opened_height,
+                    "level_idx" => ?self.data.squash_opened_level_idx,
+                    "walk_intent" => ?self.data.walk_intent,
+                    "ptr" => ?clear_ptr,
+                    "bytes_len" => bytes.len()
+                );
+            }
             let leaf_hashes_omitted = self.data.leaf_hashes_omitted;
             let item_result = if leaf_hashes_omitted {
                 bits::read_trie_item_from_slice_leaf_hash_free(&bytes, clear_ptr.id(), state)
@@ -3660,7 +4099,19 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             self.orphan_scratch_restore(bytes);
             let item = item_result?;
             return match item.kind {
-                ReadTrieItemKind::Node(node) => Ok(node),
+                ReadTrieItemKind::Node(node) => {
+                    trace_leaf_at_squash_read(
+                        self.data.walk_intent,
+                        "orphan_route",
+                        &self.data.cur_block,
+                        self.data.cur_block_id,
+                        self.data.squash_opened_height,
+                        self.data.squash_opened_level_idx,
+                        &clear_ptr,
+                        &node,
+                    );
+                    Ok(node)
+                }
                 ReadTrieItemKind::Patch(_) => Err(Error::CorruptionError(format!(
                     "Orphan-section read at ptr {clear_ptr:?} returned Patch; orphan \
                      records must encode complete node bytes"
@@ -3710,6 +4161,16 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
                     self.data.leaf_hashes_omitted,
                     guard,
                 )? {
+                    trace_leaf_at_squash_read(
+                        self.data.walk_intent,
+                        "mmap_fast_path",
+                        &self.data.cur_block,
+                        self.data.cur_block_id,
+                        self.data.squash_opened_height,
+                        self.data.squash_opened_level_idx,
+                        &clear_ptr,
+                        &node,
+                    );
                     return Ok(node);
                 }
             }
@@ -3757,6 +4218,7 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
         );
         let result = read_patched_persisted_node(
             &self.db,
+            self.db_path,
             self.blobs.as_deref(),
             self.data.unconfirmed_block_id,
             id,
@@ -3765,21 +4227,37 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             self.data.leaf_hashes_omitted,
             patch_source_context,
             &self.data.squash_meta,
+            self.data.squash_root_snapshot_retention_blocks,
             state,
         );
         self.bench.read_nodetype_finish(false);
-        if let Err(ref e) = result {
-            error!(
-                "read_node_with_state failed: block={}, block_id={id}, ptr={clear_ptr:?}, \
-                 leaf_hashes_omitted={}, squash_levels={}, squash_block_index_len={}, \
-                 trie_offset={trie_offset:?}, err={e:?}",
-                &self.data.cur_block,
-                self.data.leaf_hashes_omitted,
-                self.data.squash_meta.levels.len(),
-                self.data.squash_meta.block_index.len(),
-            );
+        match result {
+            Ok(node) => {
+                trace_leaf_at_squash_read(
+                    self.data.walk_intent,
+                    "slow_path",
+                    &self.data.cur_block,
+                    self.data.cur_block_id,
+                    self.data.squash_opened_height,
+                    self.data.squash_opened_level_idx,
+                    &clear_ptr,
+                    &node,
+                );
+                Ok(node)
+            }
+            Err(e) => {
+                error!(
+                    "read_node_with_state failed: block={}, block_id={id}, ptr={clear_ptr:?}, \
+                     leaf_hashes_omitted={}, squash_levels={}, squash_block_index_len={}, \
+                     trie_offset={trie_offset:?}, err={e:?}",
+                    &self.data.cur_block,
+                    self.data.leaf_hashes_omitted,
+                    self.data.squash_meta.levels.len(),
+                    self.data.squash_meta.block_index.len(),
+                );
+                Err(e)
+            }
         }
-        result
     }
 
     fn open_block(&mut self, bhh: &T) -> Result<(), Error> {
@@ -3829,11 +4307,17 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return uncommitted_trie.read_node_hash(ptr);
         }
 
-        // Squash fast-path: when reading the root node hash of a block inside a squash level,
-        // return the per-height root hash stored in the squash trailer instead of reading from the
-        // blob. The squash blob contains a single merged trie whose root node hash is the *tip's*
-        // hash, not the per-block hash, so the normal read path would return the wrong value for
-        // ancestor blocks.
+        // Per-height root-hash override: when reading `ROOT_PTR_DISK` for a block inside a
+        // squash level, return the per-height (consensus) root hash from the trailer instead
+        // of the merged blob's offset-36 hash prefix. The merged blob's hash prefix is the
+        // *post-remap* hash recomputed by the squash writer (a storage detail; child ptrs
+        // there were rewritten to merged-blob offsets), and does not match the original
+        // consensus hash that backpointer-chain hash computation depends on. The trailer is
+        // in-memory metadata, not a sidecar dependency, so this override is correct for both
+        // [`WalkIntent::AtBlock`] (e.g., back-chain hash lookups during `seal`) and
+        // [`WalkIntent::ForkExtend`] (historical seal-hash reconstruction). It must run
+        // unconditionally — gating it caused tip-extension seal-hash divergence from the
+        // unsquashed reference (see `test_tier2_fork_at_boundary_full_history_differential`).
         if ptr.ptr() == ROOT_PTR_DISK {
             if let (Some(h), Some(level_idx)) = (
                 self.data.squash_opened_height,
@@ -3847,12 +4331,11 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             }
         }
 
-        // PR2 orphan-sidecar route: orphan ptrs no longer live in the
-        // merged blob; fetch their bytes from the level's orphan section
-        // and extract the hash. Hash-omitted leaves carry no prefix, so
-        // the hash is recomputed from the body via the same logic used
-        // for the merged-blob hash-free path. Restores the orphan-read
-        // scratch buffer before returning so its capacity is reused.
+        // PR2 orphan-sidecar route: see [`Self::read_node_with_state`] for the full
+        // contract — orphan reads are routed unconditionally because fork-extension
+        // copies of per-height historical roots can carry intra-level backptrs that
+        // legitimately target orphan offsets, and `seal()` must follow them under the
+        // default `AtBlock` intent.
         if let Some(bytes) = self.try_read_orphan_bytes(ptr)? {
             let leaf_hashes_omitted = self.data.leaf_hashes_omitted;
             let result = read_orphan_node_hash_from_bytes(&bytes, ptr.id(), leaf_hashes_omitted);
@@ -3917,26 +4400,23 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
             return Ok((node_id, hash));
         }
 
-        // ROOT_PTR_DISK special case: for a reclaim-squashed in-range block, the per-height
-        // root body lives in the `SquashRootNode` sidecar section. Decode the stored type from
-        // the body's leading byte and pull the hash from the level's trailer (mirrors
-        // `read_node_hash`'s ROOT_PTR_DISK fast-path). Falls through to the normal read path
-        // when `squash_opened_root_node_bytes` returns `None` (non-squashed block, or
-        // no-reclaim level whose original blob still serves the root).
-        // ROOT_PTR_DISK fast-path mirroring `read_node_with_state` — see
-        // [`Self::resolve_squash_root_via_sidecar`] for the resolution + fail-closed contract.
-        // The body is unused here (we only need the type + hash); it's discarded along with the
-        // `Option`'s destructuring.
-        if let Some((stored_id, _body, hash)) = self.resolve_squash_root_via_sidecar(&clear_ptr)? {
-            return Ok((stored_id, hash));
+        // ROOT_PTR_DISK sidecar route (`WalkIntent::ForkExtend` only): mirrors
+        // [`Self::read_node_with_state`]'s gating. At-block reads walk from the merged
+        // tip's root, so its (type, hash) pair must come from the merged blob, not the
+        // per-height sidecar. Fork-extension routes through the sidecar to recover the
+        // historical root shape.
+        if self.data.walk_intent == WalkIntent::ForkExtend {
+            if let Some((stored_id, _body, hash)) =
+                self.resolve_squash_root_via_sidecar(&clear_ptr)?
+            {
+                return Ok((stored_id, hash));
+            }
         }
 
-        // PR2 orphan-sidecar route: orphan ptrs come from the level's
-        // orphan section, not from the merged blob. Read bytes via
-        // `try_read_orphan_bytes` and extract the (type, hash) pair using
-        // the same `bits::read_stored_node_type_*` helpers the merged-
-        // blob fast path uses. Restores the orphan-read scratch buffer
-        // before returning so its capacity is reused.
+        // Orphan-sidecar route: see [`Self::read_node_with_state`] for the unconditional
+        // contract — fork-extension copies of per-height historical roots may carry
+        // backptrs into the orphan section that `seal()` follows under the default
+        // `AtBlock` intent.
         if let Some(bytes) = self.try_read_orphan_bytes(&clear_ptr)? {
             let leaf_hashes_omitted = self.data.leaf_hashes_omitted;
             // IIFE: borrow `bytes` for the duration of the decode, then
@@ -4173,6 +4653,26 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         let blobs = self.blobs.as_mut()?;
         let hot_files = blobs.hot_files_mut()?;
         Some((&self.db, hot_files))
+    }
+
+    /// Borrow-split helper for the squash-promote publish phase. Returns `(&mut Connection,
+    /// &mut HotFileSet)` so [`crate::chainstate::stacks::index::squash_promote::apply_prepared_plan`]
+    /// can call the shared `publish_prepared_inner` core (which also runs in the recovery path
+    /// against raw `&mut Connection + &mut HotFileSet`). Direct field access from
+    /// `squash_promote.rs` would conflict because `db` is private; this method is the
+    /// load-bearing accessor.
+    ///
+    /// Returns `None` if the storage handle is RAM-backed or has no hot tier — the publish path
+    /// requires hot-tier-attached storage.
+    pub(crate) fn publish_borrows(
+        &mut self,
+    ) -> Option<(
+        &mut Connection,
+        &mut crate::chainstate::stacks::index::hot_file::HotFileSet,
+    )> {
+        let blobs = self.blobs.as_mut()?;
+        let hot_files = blobs.hot_files_mut()?;
+        Some((&mut self.db, hot_files))
     }
 
     pub fn connection(&mut self) -> TrieStorageConnection<'_, T> {
@@ -4417,6 +4917,12 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         unconfirmed: bool,
         marf_opts: MARFOpenOpts,
     ) -> Result<TrieFileStorage<T>, Error> {
+        // `auto_recovery = false` (set via [`MARFOpenOpts::with_auto_recovery`]) skips
+        // canonical-sensitive recovery (publish/discard of pending squash plans) at open time.
+        // Byte-level recovery (torn hot-tail truncation, stale tmp-file sweep) still runs. Caller
+        // is then responsible for invoking [`crate::chainstate::stacks::index::marf::MARF::drain_pending_plans`]
+        // before exposing the handle to readers.
+        let defer_canonical_recovery = !marf_opts.auto_recovery;
         let mut create_flag = false;
         let open_flags = if db_path != ":memory:" {
             match fs::metadata(db_path) {
@@ -4520,27 +5026,36 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                     //    done. Skipping it under any condition would let a mid-swap state appear
                     //    as wrong-but-readable bytes.
                     if readonly {
-                        let recovery_stats = crate::chainstate::stacks::index::squash_recover::recover_pending_promotions::<T>(
-                            &mut db,
-                            &db_path,
-                            &mut hot_files,
-                            readonly,
-                        )?;
-                        if recovery_stats.plans_discovered > 0
-                            || recovery_stats.cold_tail_truncated_bytes > 0
-                        {
-                            info!(
-                                "Phase B promotion recovery: {} plan(s) discovered \
-                                 ({} committed, {} abandoned, {} rewrites applied, \
-                                 {} skipped, cold tail truncated by {} bytes)",
-                                recovery_stats.plans_discovered,
-                                recovery_stats.plans_committed,
-                                recovery_stats.plans_abandoned,
-                                recovery_stats.rewrites_applied,
-                                recovery_stats.rewrites_skipped,
-                                recovery_stats.cold_tail_truncated_bytes,
-                            );
-                            blobs_handle.remap_and_invalidate()?;
+                        // Canonical-sensitive recovery is gated by `defer_canonical_recovery`. When
+                        // deferred, the caller is expected to invoke `MARF::drain_pending_plans`
+                        // before exposing the handle to readers; the readonly fail-fast on pending
+                        // plans then happens inside drain instead of here.
+                        if !defer_canonical_recovery {
+                            let recovery_stats = crate::chainstate::stacks::index::squash_recover::recover_pending_promotions::<T>(
+                                &mut db,
+                                &db_path,
+                                &mut hot_files,
+                                readonly,
+                                None,
+                            )?;
+                            if recovery_stats.any_plan_processed()
+                                || recovery_stats.cold_tail_truncated_bytes > 0
+                            {
+                                info!(
+                                    "Phase B promotion recovery: {} plan(s) discovered \
+                                     ({} committed, {} abandoned, {} discarded stale, \
+                                     {} rewrites applied, {} skipped, \
+                                     cold tail truncated by {} bytes)",
+                                    recovery_stats.plans_discovered(),
+                                    recovery_stats.plans_committed(),
+                                    recovery_stats.plans_abandoned(),
+                                    recovery_stats.plans_discarded_stale(),
+                                    recovery_stats.rewrites_applied,
+                                    recovery_stats.rewrites_skipped,
+                                    recovery_stats.cold_tail_truncated_bytes,
+                                );
+                                blobs_handle.remap_and_invalidate()?;
+                            }
                         }
                     } else {
                         let mut rw_done = recovery_state.rw_recovery_done.lock();
@@ -4573,27 +5088,41 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                             // `&mut HotFileSet` (attach moves it into the TrieFile) and may
                             // truncate `<db>.blobs` (the `remap_and_invalidate` call refreshes
                             // the TrieFile's mmap to cover the post-truncation extent).
-                            let recovery_stats = crate::chainstate::stacks::index::squash_recover::recover_pending_promotions::<T>(
-                                &mut db,
-                                &db_path,
-                                &mut hot_files,
-                                readonly,
-                            )?;
-                            if recovery_stats.plans_discovered > 0
-                                || recovery_stats.cold_tail_truncated_bytes > 0
-                            {
-                                info!(
-                                    "Phase B promotion recovery: {} plan(s) discovered \
-                                     ({} committed, {} abandoned, {} rewrites applied, \
-                                     {} skipped, cold tail truncated by {} bytes)",
-                                    recovery_stats.plans_discovered,
-                                    recovery_stats.plans_committed,
-                                    recovery_stats.plans_abandoned,
-                                    recovery_stats.rewrites_applied,
-                                    recovery_stats.rewrites_skipped,
-                                    recovery_stats.cold_tail_truncated_bytes,
-                                );
-                                blobs_handle.remap_and_invalidate()?;
+                            //
+                            // Gated by `defer_canonical_recovery`: when deferred, the caller is
+                            // expected to invoke `MARF::drain_pending_plans` after open returns,
+                            // so the canonical-sensitive recovery runs against an explicit
+                            // policy (TrustPlan or Canonical(view)) instead of inline here.
+                            // Byte-level recovery above (torn hot-tail truncation) and the tmp
+                            // sweep below are NOT gated — they run regardless because they need
+                            // no canonical context and must happen before any reader sees the
+                            // file.
+                            if !defer_canonical_recovery {
+                                let recovery_stats = crate::chainstate::stacks::index::squash_recover::recover_pending_promotions::<T>(
+                                    &mut db,
+                                    &db_path,
+                                    &mut hot_files,
+                                    readonly,
+                                    None,
+                                )?;
+                                if recovery_stats.any_plan_processed()
+                                    || recovery_stats.cold_tail_truncated_bytes > 0
+                                {
+                                    info!(
+                                        "Phase B promotion recovery: {} plan(s) discovered \
+                                         ({} committed, {} abandoned, {} discarded stale, \
+                                         {} rewrites applied, {} skipped, \
+                                         cold tail truncated by {} bytes)",
+                                        recovery_stats.plans_discovered(),
+                                        recovery_stats.plans_committed(),
+                                        recovery_stats.plans_abandoned(),
+                                        recovery_stats.plans_discarded_stale(),
+                                        recovery_stats.rewrites_applied,
+                                        recovery_stats.rewrites_skipped,
+                                        recovery_stats.cold_tail_truncated_bytes,
+                                    );
+                                    blobs_handle.remap_and_invalidate()?;
+                                }
                             }
 
                             // Sweep stale `squash-nodes-{pid}-{ts}-{seq}.tmp` files left in the
@@ -4739,13 +5268,20 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                         })
                     })
                     .collect::<Result<_, Error>>()?;
-                let report = reconcile_squash_sidecars(&db_path_for_reconcile, &expected)?;
-                if report.tmp_orphans_deleted > 0 || report.dat_orphans_deleted > 0 {
-                    info!(
-                        "MARF squash sidecar reconcile: tmp_orphans_deleted={}, \
-                         dat_orphans_deleted={}, dat_kept={}",
-                        report.tmp_orphans_deleted, report.dat_orphans_deleted, report.dat_kept,
-                    );
+                // When `defer_canonical_recovery` is set, the caller will run
+                // `drain_pending_plans` AFTER open returns. The drain may publish a level row
+                // whose sidecar currently appears as orphan to this reconcile pass — running
+                // reconcile here would unlink that sidecar before drain can validate/use it.
+                // So skip reconcile in the deferred path; drain re-runs it after publish.
+                if !defer_canonical_recovery {
+                    let report = reconcile_squash_sidecars(&db_path_for_reconcile, &expected)?;
+                    if report.tmp_orphans_deleted > 0 || report.dat_orphans_deleted > 0 {
+                        info!(
+                            "MARF squash sidecar reconcile: tmp_orphans_deleted={}, \
+                             dat_orphans_deleted={}, dat_kept={}",
+                            report.tmp_orphans_deleted, report.dat_orphans_deleted, report.dat_kept,
+                        );
+                    }
                 }
 
                 Ok(meta)
@@ -4808,6 +5344,119 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
         // no caching allowed for unconfirmed tries, since they can disappear
         marf_opts.cache_strategy = "noop".to_string();
         TrieFileStorage::open_opts(db_path, false, true, marf_opts)
+    }
+
+    /// Drain any pending squash promotion plans to a consistent terminal state. Counterpart to
+    /// opens that pass [`MARFOpenOpts::with_auto_recovery(false)`]; see
+    /// [`crate::chainstate::stacks::index::marf::MARF::drain_pending_plans`] for the user-facing
+    /// contract. Lives on `TrieFileStorage` (not on `MARF`) so the implementation has direct
+    /// access to the private `db` field; the `MARF::drain_pending_plans` method is a thin
+    /// delegation.
+    pub fn drain_pending_plans(
+        &mut self,
+        policy: crate::chainstate::stacks::index::squash_recover::DrainPolicy<'_>,
+    ) -> Result<crate::chainstate::stacks::index::squash_recover::DrainStats, Error> {
+        use crate::chainstate::stacks::index::squash_recover::{
+            CanonicalView, DrainPolicy, DrainStats,
+        };
+
+        let canonical_view: Option<&dyn CanonicalView> = match &policy {
+            DrainPolicy::TrustPlan => None,
+            DrainPolicy::Canonical(view) => Some(*view),
+        };
+
+        let Some(blobs_handle) = self.blobs.as_mut() else {
+            // RAM-backed storage has no on-disk plans to recover.
+            return Ok(DrainStats::default());
+        };
+        let Some(hot_files) = blobs_handle.hot_files_mut() else {
+            // Non-disk TrieFile: same situation as above.
+            return Ok(DrainStats::default());
+        };
+
+        let drain_stats =
+            crate::chainstate::stacks::index::squash_recover::recover_pending_promotions::<T>(
+                &mut self.db,
+                &self.db_path,
+                hot_files,
+                self.data.readonly,
+                canonical_view,
+            )?;
+
+        if drain_stats.any_plan_processed() || drain_stats.cold_tail_truncated_bytes > 0 {
+            info!(
+                "Phase B promotion drain: {} plan(s) discovered \
+                 ({} committed, {} abandoned, {} discarded stale, {} rewrites applied, \
+                 {} skipped, cold tail truncated by {} bytes)",
+                drain_stats.plans_discovered(),
+                drain_stats.plans_committed(),
+                drain_stats.plans_abandoned(),
+                drain_stats.plans_discarded_stale(),
+                drain_stats.rewrites_applied,
+                drain_stats.rewrites_skipped,
+                drain_stats.cold_tail_truncated_bytes,
+            );
+            blobs_handle.remap_and_invalidate()?;
+        }
+
+        // Reconcile the squash sidecar directory now that drain has finished publishing or
+        // abandoning plans. The `open_opts` path with `auto_recovery=false` skipped this step to
+        // avoid unlinking the sidecar of a yet-to-be-published level; with that decision now
+        // resolved, run the reconcile against the up-to-date `marf_squash_levels` state. Mirrors
+        // the post-build reconcile call inside `open_opts`'s auto-recovery path.
+        if drain_stats.any_plan_processed() {
+            // Recovery published or abandoned plans → SquashMeta is stale. Rebuild before
+            // reconcile so the expected-sidecar list reflects post-recovery SQL state.
+            self.refresh_after_squash()?;
+        }
+
+        {
+            use crate::chainstate::stacks::index::sidecar::{
+                reconcile_squash_sidecars, ExpectedSidecar,
+            };
+            let meta = &self.data.squash_meta;
+            let expected: Vec<ExpectedSidecar> = meta
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let blob_offset = *meta.level_blob_offsets.get(i).ok_or_else(|| {
+                        Error::corruption(&format!(
+                            "SquashMeta.level_blob_offsets missing entry for level_idx={i}"
+                        ))
+                    })?;
+                    let present = *meta.root_sidecar_present.get(i).ok_or_else(|| {
+                        Error::corruption(&format!(
+                            "SquashMeta.root_sidecar_present missing entry for level_idx={i}"
+                        ))
+                    })?;
+                    let trimmed = *meta.root_sidecar_trimmed.get(i).ok_or_else(|| {
+                        Error::corruption(&format!(
+                            "SquashMeta.root_sidecar_trimmed missing entry for level_idx={i}"
+                        ))
+                    })?;
+                    Ok::<ExpectedSidecar, Error>(ExpectedSidecar {
+                        level_id: t.info.level_id,
+                        min_height: t.info.min_height,
+                        max_height: t.info.max_height,
+                        blob_offset,
+                        present,
+                        trimmed,
+                    })
+                })
+                .collect::<Result<_, Error>>()?;
+            let db_path_for_reconcile = std::path::PathBuf::from(&self.db_path);
+            let report = reconcile_squash_sidecars(&db_path_for_reconcile, &expected)?;
+            if report.tmp_orphans_deleted > 0 || report.dat_orphans_deleted > 0 {
+                info!(
+                    "MARF squash sidecar reconcile (post-drain): tmp_orphans_deleted={}, \
+                     dat_orphans_deleted={}, dat_kept={}",
+                    report.tmp_orphans_deleted, report.dat_orphans_deleted, report.dat_kept,
+                );
+            }
+        }
+
+        Ok(drain_stats)
     }
 
     pub fn readonly(&self) -> bool {
@@ -5273,6 +5922,43 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
         self.data.readonly
     }
 
+    /// Run `f` with the read path's [`WalkIntent`] set to [`WalkIntent::ForkExtend`], then
+    /// restore the previous intent. Used by
+    /// [`crate::chainstate::stacks::index::marf::MARF::root_copy`] (the only legitimate
+    /// caller) so reads inside its body resolve `ROOT_PTR_DISK` against the per-height
+    /// root sidecar — required to reconstruct the historical root shape for fork-extension.
+    ///
+    /// **Panic safety.** Uses an RAII `Drop` guard so the previous intent is restored even
+    /// if `f` unwinds. The guard owns a `&mut TrieStorageConnection`; we hand `f` a fresh
+    /// re-borrow through the guard, so the guard's `Drop` impl reliably runs after `f`
+    /// returns (or unwinds), restoring `walk_intent`. No `catch_unwind` overhead on this
+    /// hot path: `MARF::root_copy` runs on every fork-extending block construction.
+    pub fn with_fork_extend_intent<R, F>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        struct IntentGuard<'a, 'b, T: MarfTrieId, Db: Deref<Target = Connection>> {
+            storage: &'a mut TrieStorageConnection<'b, T, Db>,
+            prev: WalkIntent,
+        }
+        impl<T: MarfTrieId, Db: Deref<Target = Connection>> Drop for IntentGuard<'_, '_, T, Db> {
+            fn drop(&mut self) {
+                self.storage.data.walk_intent = self.prev;
+            }
+        }
+        let prev = self.data.walk_intent;
+        self.data.walk_intent = WalkIntent::ForkExtend;
+        let guard = IntentGuard {
+            storage: self,
+            prev,
+        };
+        // Reborrow mutably through the guard's owned `&mut`: `guard.storage` already has
+        // type `&mut TrieStorageConnection`, so `&mut *guard.storage` is a fresh reborrow
+        // that's released by the time the statement ends, leaving the guard's `Drop` impl
+        // free to run after `f` returns or unwinds.
+        f(&mut *guard.storage)
+    }
+
     /// **Test-only** mutable accessor for the attached hot-file set, used by integration tests
     /// to override the default 1 GiB rotation threshold so a test can rotate cheaply. Returns
     /// `None` when the handle is RAM-backed (RAM handles never carry a [`HotFileSet`]).
@@ -5588,10 +6274,6 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
     /// fork-extending or otherwise descending from a per-height root,
     /// which is the documented post-trim contract.
     fn try_read_orphan_bytes(&mut self, ptr: &TriePtr) -> Result<Option<Vec<u8>>, Error> {
-        use crate::chainstate::stacks::index::sidecar::{
-            squash_root_sidecar_path, OrphanSidecarHandle, RecordKind, SidecarExpectation,
-        };
-
         let Some(level_idx) = self.data.squash_opened_level_idx else {
             return Ok(None);
         };
@@ -5636,96 +6318,21 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             None
         };
 
-        // Defensive trim check: if the level's sidecar has been trimmed,
-        // surface the policy error rather than letting the lazy-open
-        // attempt fall over with a generic CorruptionError on ENOENT.
-        let trimmed = self
-            .data
-            .squash_meta
-            .root_sidecar_trimmed
-            .get(level_idx)
-            .copied()
-            .unwrap_or(false);
-        if trimmed {
-            let level = self.data.squash_meta.levels.get(level_idx).ok_or_else(|| {
-                Error::CorruptionError(format!(
-                    "try_read_orphan_bytes: squash_opened_level_idx={level_idx} \
-                     out of range for SquashMeta::levels ({})",
-                    self.data.squash_meta.levels.len()
-                ))
-            })?;
-            return Err(Error::SnapshotTrimmed {
-                level_id: level.info.level_id,
-                retention_blocks: self.data.squash_root_snapshot_retention_blocks,
-            });
-        }
-
-        // Initial read size from the ptr's type hint. Mirrors
-        // [`TrieFile::read_item_at_offset`]'s slow path: `ptr.id()` is
-        // a hint, not authoritative — for squashed (reads_redirected)
-        // blobs the stored leaf type may be `LeafSquashed` even when
-        // the parent ptr says `Leaf`. We read the hinted size first and
-        // re-read at the larger stored size if the first byte reveals
-        // a wider type.
-        let leaf_hashes_omitted = self.data.leaf_hashes_omitted;
-        let is_leaf_hint = leaf_hashes_omitted && is_leaf_type(ptr.id());
-        let hinted_max = if is_leaf_hint {
-            bits::get_node_body_max_byte_len(ptr.id())?
-        } else {
-            bits::get_node_max_byte_len(ptr.id())?
-        };
-
-        // Lazy-open or reuse the cached handle. The handle is per-level;
-        // `set_block` invalidates the cache, so `split_offset` from the
-        // cached handle either matches the current level's split or the
-        // cache is `None` after a level change.
+        // Lazy-open or reuse the cached handle. The handle is per-level; `set_block`
+        // invalidates the cache, so `split_offset` from the cached handle either matches
+        // the current level's split or the cache is `None` after a level change. The open
+        // helper itself handles the trim check + sidecar path resolution.
         let needs_open = match self.data.orphan_sidecar.as_ref() {
             Some(h) if h.split_offset == split => false,
             _ => true,
         };
         if needs_open {
-            let level = self.data.squash_meta.levels.get(level_idx).ok_or_else(|| {
-                Error::CorruptionError(format!(
-                    "try_read_orphan_bytes: squash_opened_level_idx={level_idx} \
-                     out of range for SquashMeta::levels ({})",
-                    self.data.squash_meta.levels.len()
-                ))
-            })?;
-            let level_id = level.info.level_id;
-            let min_h = level.info.min_height;
-            let max_h = level.info.max_height;
-            // Versioned sidecar path: active and retired levels both
-            // resolve through `(level_id, min_height, max_height,
-            // blob_offset)`. Each Replace lands at a unique
-            // `blob_offset`-suffixed path so retired predecessors stay
-            // readable at their original path.
-            let level_blob_offset = self
-                .data
-                .squash_meta
-                .level_blob_offsets
-                .get(level_idx)
-                .copied()
-                .ok_or_else(|| {
-                    Error::CorruptionError(format!(
-                        "try_read_orphan_bytes: level_idx {level_idx} out of \
-                         range for level_blob_offsets ({})",
-                        self.data.squash_meta.level_blob_offsets.len()
-                    ))
-                })?;
-            let path = squash_root_sidecar_path(
-                std::path::Path::new(self.db_path),
-                level_id,
-                min_h,
-                max_h,
-                level_blob_offset,
-            );
-            let expectation = SidecarExpectation {
-                level_id: Some(level_id),
-                min_height: Some(min_h),
-                max_height: Some(max_h),
-                require_section: Some(RecordKind::OrphanNode),
-            };
-            self.data.orphan_sidecar = Some(OrphanSidecarHandle::open(&path, expectation, split)?);
+            self.data.orphan_sidecar = Some(open_orphan_sidecar_for_level(
+                self.db_path,
+                &self.data.squash_meta,
+                level_idx,
+                self.data.squash_root_snapshot_retention_blocks,
+            )?);
         }
 
         let handle = self
@@ -5733,76 +6340,19 @@ impl<'a, T: MarfTrieId, Db: Deref<Target = Connection>> TrieStorageConnection<'a
             .orphan_sidecar
             .as_ref()
             .expect("orphan_sidecar set just above; absent here is a logic error");
-        let relative = (ptr.ptr() - handle.split_offset) as u64;
-        // Reuse the connection-scoped scratch buffer (cleared, capacity
-        // preserved between calls). Mirrors the merged-blob slow path's
-        // `NodeDecodeScratch::take_node_bytes` pattern. The buffer is
-        // returned to `self.data.orphan_read_scratch` by
-        // [`Self::orphan_scratch_restore`] once the caller has finished
-        // decoding from it.
+        // Reuse the connection-scoped scratch buffer (cleared, capacity preserved between
+        // calls). The buffer is returned to `self.data.orphan_read_scratch` by
+        // [`Self::orphan_scratch_restore`] once the caller has finished decoding from it.
         let mut buf = std::mem::take(&mut self.data.orphan_read_scratch);
-        buf.clear();
-        buf.resize(hinted_max, 0);
-        let n = match handle.pread_at(&mut buf, relative) {
-            Ok(n) => n,
+        let leaf_hashes_omitted = self.data.leaf_hashes_omitted;
+        match read_orphan_node_bytes_into(handle, ptr, leaf_hashes_omitted, &mut buf) {
+            Ok(()) => Ok(Some(buf)),
             Err(e) => {
-                // Restore the scratch on error so we don't leak its
-                // capacity even when the caller's `?` short-circuits.
+                // Restore the scratch on error so we don't leak its capacity.
                 self.data.orphan_read_scratch = buf;
-                return Err(e);
+                Err(e)
             }
-        };
-        if n == 0 {
-            self.data.orphan_read_scratch = buf;
-            return Err(Error::CorruptionError(format!(
-                "try_read_orphan_bytes: pread at relative_offset={relative} returned 0 \
-                 bytes (split_offset={split}, ptr.ptr()={}, section_length={})",
-                ptr.ptr(),
-                handle.section_length(),
-            )));
         }
-        buf.truncate(n);
-
-        // Size-mismatch re-read: peek at the first byte to determine the
-        // actual stored node type (which may have a larger max body
-        // than the parent ptr's hint suggested), and re-read with the
-        // wider buffer if needed. This matches `read_item_at_offset`'s
-        // logic so the orphan path's decoder sees the same-shaped buffer.
-        //
-        // Wrap the size-resolution block in an IIFE so any `?` short-
-        // circuit returns through `Err` here, not out of
-        // `try_read_orphan_bytes` itself; we restore `buf` to the
-        // connection-scoped scratch on every error path so a malformed
-        // / misaligned orphan record never leaks capacity.
-        let stored_max_result: Result<usize, Error> = (|| {
-            if is_leaf_hint {
-                let stored_node_id = bits::stored_node_id_from_bytes(&buf)?;
-                bits::get_node_body_max_byte_len(stored_node_id as u8)
-            } else {
-                let (_hash, after_hash) = bits::parse_hash_from_bytes(&buf)?;
-                let stored_node_id = bits::stored_node_id_from_bytes(after_hash)?;
-                bits::get_node_max_byte_len(stored_node_id as u8)
-            }
-        })();
-        let stored_max = match stored_max_result {
-            Ok(v) => v,
-            Err(e) => {
-                self.data.orphan_read_scratch = buf;
-                return Err(e);
-            }
-        };
-        if stored_max > buf.len() {
-            buf.resize(stored_max, 0);
-            let n = match handle.pread_at(&mut buf, relative) {
-                Ok(n) => n,
-                Err(e) => {
-                    self.data.orphan_read_scratch = buf;
-                    return Err(e);
-                }
-            };
-            buf.truncate(n);
-        }
-        Ok(Some(buf))
     }
 
     /// Return an orphan-section read buffer to the connection-scoped

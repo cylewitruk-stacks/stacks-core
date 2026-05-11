@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use clarity::vm::costs::ExecutionCost;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,40 @@ use crate::util_lib::db::{DBConn, DBTx, Error as DBError};
 pub mod comm;
 #[cfg(test)]
 pub mod tests;
+
+const STACKS_NODE_STOP_AT_STACKS_HEIGHT_ENV: &str = "STACKS_NODE_STOP_AT_STACKS_HEIGHT";
+
+fn configured_stop_at_stacks_height() -> Option<u64> {
+    static STOP_AT_STACKS_HEIGHT: OnceLock<Option<u64>> = OnceLock::new();
+    *STOP_AT_STACKS_HEIGHT.get_or_init(|| {
+        let Ok(raw) = std::env::var(STACKS_NODE_STOP_AT_STACKS_HEIGHT_ENV) else {
+            return None;
+        };
+        match raw.parse::<u64>() {
+            Ok(height) => Some(height),
+            Err(err) => {
+                warn!("Ignoring invalid {STACKS_NODE_STOP_AT_STACKS_HEIGHT_ENV}={raw:?}: {err}");
+                None
+            }
+        }
+    })
+}
+
+fn maybe_stop_at_stacks_height(stacks_height: u64, block_id: &StacksBlockId) {
+    let Some(stop_height) = configured_stop_at_stacks_height() else {
+        return;
+    };
+    if stacks_height < stop_height {
+        return;
+    }
+
+    info!(
+        "Clean stop requested by {STACKS_NODE_STOP_AT_STACKS_HEIGHT_ENV}: \
+         processed Stacks height {stacks_height} at block {block_id}; exiting now \
+         before dispatching additional squash work"
+    );
+    std::process::exit(0);
+}
 
 /// The 3 different states for the current
 ///  reward cycle's relationship to its PoX anchor
@@ -1676,10 +1710,11 @@ impl<
             if let Some((Some(ref receipt), _)) = result.first() {
                 let new_tip = receipt.header.index_block_hash();
                 chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
+                maybe_stop_at_stacks_height(receipt.header.stacks_block_height, &new_tip);
                 chainstate.maybe_squash(
                     receipt.header.stacks_block_height,
                     new_tip,
-                    self.sortition_db.conn(),
+                    &self.sortition_db,
                 );
             }
             result
@@ -1795,10 +1830,11 @@ impl<
                 if let Some((Some(ref receipt), _)) = result.first() {
                     let new_tip = receipt.header.index_block_hash();
                     chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
+                    maybe_stop_at_stacks_height(receipt.header.stacks_block_height, &new_tip);
                     chainstate.maybe_squash(
                         receipt.header.stacks_block_height,
                         new_tip,
-                        self.sortition_db.conn(),
+                        &self.sortition_db,
                     );
                 }
                 result

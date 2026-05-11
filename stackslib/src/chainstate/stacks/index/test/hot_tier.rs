@@ -37,6 +37,7 @@ use stacks_common::types::chainstate::BlockHeaderHash;
 
 use crate::chainstate::stacks::index::hot_file::hot_file_path;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection, MARF};
+use crate::chainstate::stacks::index::squash::SquashMode;
 use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
 use crate::chainstate::stacks::index::{trie_sql, ClarityMarfTrieId, MARFValue};
 
@@ -708,6 +709,7 @@ fn promote_range_for_dispatch_test(
     use crate::chainstate::stacks::index::squash_promote::run_horizon_gated_promotion;
     run_horizon_gated_promotion::<BlockHeaderHash>(
         marf,
+        SquashMode::TipOnly,
         0,
         max_height_inclusive,
         Some(in_range_tip.clone()),

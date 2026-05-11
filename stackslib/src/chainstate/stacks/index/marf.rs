@@ -31,14 +31,15 @@ use crate::chainstate::stacks::index::node::{
     TrieCursor, TrieNode256, TrieNodeID, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::scratch::MarfReadState;
+use crate::chainstate::stacks::index::squash_recover::{DrainPolicy, DrainStats};
 use crate::chainstate::stacks::index::storage::{
     TrieFileStorage, TrieHashCalculationMode, TrieStorageConnection, TrieStorageTransaction,
 };
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
-    bits, Error, MARFValue, MarfTrieId, NodeDecodeScratch, NodeParking, ReadNodeBacking,
-    ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf, TrieMerkleProof, TrieNodeReadState,
-    TrieReadSession, TrieReadStorage,
+    bits, marf_squash_trace_enabled_for_height, Error, MARFValue, MarfTrieId, NodeDecodeScratch,
+    NodeParking, ReadNodeBacking, ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf, TrieMerkleProof,
+    TrieNodeReadState, TrieReadSession, TrieReadStorage,
 };
 use crate::util_lib::db::Error as db_error;
 
@@ -489,6 +490,31 @@ pub struct MARFOpenOpts {
     /// authoritative value); a `Some(_)` overrides for tests + ops
     /// experimentation. See `.docs/squashing-v1.5-phase-b.md` §3.4.
     pub squash_horizon_burn_blocks: Option<u32>,
+    /// Whether `TrieFileStorage::open` should run canonical-sensitive recovery
+    /// (publish/discard pending squash plans) inline as a side-effect of opening.
+    ///
+    /// **Default is `false` — opt-in.** Production startup runs recovery explicitly after open
+    /// via [`MARF::drain_pending_plans`] so the publish-or-discard decision is validated against
+    /// the live canonical chain (see [`crate::chainstate::stacks::index::squash_recover::DrainPolicy::Canonical`]).
+    /// Making auto-recovery opt-in prevents two foot-guns:
+    ///
+    /// 1. A production caller forgetting to opt-out would otherwise double-handle recovery —
+    ///    once at open with `TrustPlan` semantics, then again at drain with `Canonical`. The
+    ///    first pass could publish a stale plan before the second pass ever sees it.
+    /// 2. Multiple concurrent opens (coordinator + p2p) racing to handle recovery. The
+    ///    [`crate::chainstate::stacks::index::storage`] registry already gates this, but
+    ///    requiring explicit opt-in makes the "who owns recovery" decision visible at every
+    ///    call site.
+    ///
+    /// Tests and tools that need the legacy "open + recover in one step" shape should call
+    /// [`Self::with_auto_recovery`] with `true`, or invoke
+    /// [`MARF::drain_pending_plans`] with [`crate::chainstate::stacks::index::squash_recover::DrainPolicy::TrustPlan`]
+    /// after open.
+    ///
+    /// Byte-level recovery (torn hot-tail truncation, stale tmp-file sweep) runs regardless of
+    /// this flag — it doesn't need canonical context and must complete before any reader sees
+    /// the file.
+    pub auto_recovery: bool,
 }
 
 // Phase D (2026-05-03): the `enable_hot_tier` flag was removed in the v1.5 cleanup pass. Hot tier
@@ -511,6 +537,7 @@ impl MARFOpenOpts {
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
             squash_root_snapshot_retention_blocks: None,
             squash_horizon_burn_blocks: None,
+            auto_recovery: false,
         }
     }
 
@@ -531,7 +558,25 @@ impl MARFOpenOpts {
                 crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
             squash_root_snapshot_retention_blocks: None,
             squash_horizon_burn_blocks: None,
+            auto_recovery: false,
         }
+    }
+
+    /// Enable or disable inline canonical-sensitive recovery during
+    /// [`TrieFileStorage::open`] (and the convenience entry points that route through it).
+    ///
+    /// `true`: pending squash plans are published or abandoned inline at open time, using
+    /// `TrustPlan` semantics. Useful for tests, tools, and any caller that doesn't have a
+    /// canonical chain view to validate against.
+    ///
+    /// `false` (default): canonical-sensitive recovery is skipped at open time. Caller drives
+    /// it explicitly via [`MARF::drain_pending_plans`], typically with a
+    /// [`crate::chainstate::stacks::index::squash_recover::DrainPolicy::Canonical`] view so
+    /// stale plans get discarded instead of published. See the field doc on
+    /// [`Self::auto_recovery`] for the two-foot-gun rationale behind opt-in.
+    pub fn with_auto_recovery(mut self, auto: bool) -> Self {
+        self.auto_recovery = auto;
+        self
     }
 
     /// **v1.5 Phase B**: override the burnchain reorg horizon for this
@@ -1140,6 +1185,47 @@ impl<'a, T: MarfTrieId> MarfTransaction<'a, T> {
         self.open_chain_tip.as_ref().map(|tip| tip.height)
     }
 
+    pub fn get_with_fork_extend_intent(
+        &mut self,
+        block_hash: &T,
+        key: &str,
+    ) -> Result<Option<MARFValue>, Error> {
+        let path = TrieHash::from_key(key);
+        self.get_path_with_fork_extend_intent(block_hash, &path)
+    }
+
+    /// Like [`Self::get_with_fork_extend_intent`] but takes a pre-computed path. Useful for
+    /// diagnostics that need to query a specific 32-byte trie path without re-deriving it from
+    /// a key string.
+    pub fn get_path_with_fork_extend_intent(
+        &mut self,
+        block_hash: &T,
+        path: &TrieHash,
+    ) -> Result<Option<MARFValue>, Error> {
+        <Self as MarfInternals<T>>::with_read_retry(self, |this| {
+            this.with_read_ctx(|ctx| {
+                let block_ctx = ctx.storage().get_cur_block_and_id();
+                let result = ctx.with_read_state(|storage, cursor, read_state| {
+                    storage.with_fork_extend_intent(|storage| {
+                        let mut fork_ctx = MarfReadCtx::new(storage, cursor, read_state);
+                        fork_ctx
+                            .get_path(block_hash, path)
+                            .or_else(|e| match e {
+                                Error::NotFoundError => Ok(None),
+                                other => Err(other),
+                            })
+                            .map(|opt| opt.map(|leaf| leaf.data))
+                    })
+                });
+
+                ctx.storage()
+                    .open_block_maybe_id(&block_ctx.0, block_ctx.1)
+                    .map_err(|e| Error::RestoreMarfBlockError(Box::new(e)))?;
+                result
+            })
+        })
+    }
+
     pub fn get_block_height_of(
         &mut self,
         bhh: &T,
@@ -1472,6 +1558,47 @@ impl<T: MarfTrieId> MARF<T> {
         Ok(())
     }
 
+    pub fn get_with_fork_extend_intent(
+        &mut self,
+        block_hash: &T,
+        key: &str,
+    ) -> Result<Option<MARFValue>, Error> {
+        let path = TrieHash::from_key(key);
+        self.get_path_with_fork_extend_intent(block_hash, &path)
+    }
+
+    /// Like [`Self::get_with_fork_extend_intent`] but takes a pre-computed path. Useful for
+    /// diagnostics that need to query a specific 32-byte trie path without re-deriving it from
+    /// a key string.
+    pub fn get_path_with_fork_extend_intent(
+        &mut self,
+        block_hash: &T,
+        path: &TrieHash,
+    ) -> Result<Option<MARFValue>, Error> {
+        <Self as MarfInternals<T>>::with_read_retry(self, |this| {
+            this.with_read_ctx(|ctx| {
+                let block_ctx = ctx.storage().get_cur_block_and_id();
+                let result = ctx.with_read_state(|storage, cursor, read_state| {
+                    storage.with_fork_extend_intent(|storage| {
+                        let mut fork_ctx = MarfReadCtx::new(storage, cursor, read_state);
+                        fork_ctx
+                            .get_path(block_hash, path)
+                            .or_else(|e| match e {
+                                Error::NotFoundError => Ok(None),
+                                other => Err(other),
+                            })
+                            .map(|opt| opt.map(|leaf| leaf.data))
+                    })
+                });
+
+                ctx.storage()
+                    .open_block_maybe_id(&block_ctx.0, block_ctx.1)
+                    .map_err(|e| Error::RestoreMarfBlockError(Box::new(e)))?;
+                result
+            })
+        })
+    }
+
     #[cfg(test)]
     pub fn begin_unconfirmed(&mut self, chain_tip: &T) -> Result<T, Error> {
         let mut tx = self.begin_tx()?;
@@ -1590,6 +1717,34 @@ impl<T: MarfTrieId> MARF<T> {
     /// Copy the root node from the previous Trie to this Trie, updating its ptrs.
     /// s must point to the target Trie
     fn root_copy<S: TrieNodeReadState, Db: Deref<Target = Connection>>(
+        storage: &mut TrieStorageConnection<T, Db>,
+        prev_block_hash: &T,
+        decode_scratch: &mut S,
+    ) -> Result<(), Error> {
+        // `root_copy` is the fork-extension entry point: it must reconstruct the
+        // historical root *shape* (not just historical leaf values) so the new fork's
+        // seal hash matches what an unsquashed node would produce. Reads inside this
+        // body therefore run under [`WalkIntent::ForkExtend`], which routes
+        // `ROOT_PTR_DISK` reads through the per-height root sidecar
+        // (`squash_opened_root_node_bytes`).
+        //
+        // Contract scope: `WalkIntent` only gates the per-height ROOT_PTR_DISK route.
+        // At-block GET callers (default [`WalkIntent::AtBlock`]) bypass that route —
+        // their `ROOT_PTR_DISK` reads serve the merged tip's root from offset 36 and
+        // historical values resolve at the leaf via `LeafSquashed::value_at_height`, so
+        // retention-trimmed levels remain readable for value lookups. Fork-extension
+        // off a trimmed parent fails closed with `SnapshotTrimmed`, the documented
+        // operator-recovery contract. **Orphan-section reads stay routed
+        // unconditionally** — `seal()` of a fork block extended off a non-tip squashed
+        // parent must follow backptrs into the orphan section under the default
+        // `AtBlock` intent, and trimming the parent level severs that dependency
+        // independently of `WalkIntent`.
+        storage.with_fork_extend_intent(|storage| {
+            Self::root_copy_inner(storage, prev_block_hash, decode_scratch)
+        })
+    }
+
+    fn root_copy_inner<S: TrieNodeReadState, Db: Deref<Target = Connection>>(
         storage: &mut TrieStorageConnection<T, Db>,
         prev_block_hash: &T,
         decode_scratch: &mut S,
@@ -2017,6 +2172,25 @@ impl<T: MarfTrieId> MARF<T> {
                                 );
                                 Error::NotFoundError
                             })?;
+                            if marf_squash_trace_enabled_for_height(Some(height)) {
+                                let entries: Vec<String> = sq
+                                    .entries
+                                    .iter()
+                                    .map(|(h, v)| format!("{h}={}", v.to_hex()))
+                                    .collect();
+                                info!(
+                                    "MARF_SQUASH_TRACE leaf_squashed historical";
+                                    "user_block_hash" => %user_block_hash,
+                                    "user_block_id" => ?user_block_id,
+                                    "eager_user_height" => ?eager_user_height,
+                                    "resolved_height" => height,
+                                    "leaf_path" => %crate::util::hash::to_hex(&path),
+                                    "leaf_ptr" => ?leaf_node_ptr,
+                                    "entry_count" => sq.entries.len(),
+                                    "entries" => %entries.join(","),
+                                    "value_hash" => %value.to_hex()
+                                );
+                            }
                             TrieLeaf::from_value(&path, value)
                         } else {
                             // Hot path: dormant tip read on canonical chain past a squash, or
@@ -2024,6 +2198,17 @@ impl<T: MarfTrieId> MARF<T> {
                             // entries materialization, no node re-read.
                             #[cfg(test)]
                             storage.bump_squashed_tip_fallback_count();
+                            if marf_squash_trace_enabled_for_height(eager_user_height) {
+                                info!(
+                                    "MARF_SQUASH_TRACE leaf_squashed tip_fallback";
+                                    "user_block_hash" => %user_block_hash,
+                                    "user_block_id" => ?user_block_id,
+                                    "eager_user_height" => ?eager_user_height,
+                                    "leaf_path" => %crate::util::hash::to_hex(&path),
+                                    "leaf_ptr" => ?leaf_node_ptr,
+                                    "tip_value_hash" => %tip_value.to_hex()
+                                );
+                            }
                             TrieLeaf::from_value(&path, tip_value)
                         };
                         storage.bench_mut().marf_walk_from_finish();
@@ -2141,6 +2326,19 @@ impl<T: MarfTrieId> MARF<T> {
     /// Instantiate the MARF using a TrieFileStorage instance, from the given path on disk.
     /// This will have the side-effect of instantiating a new fork table from the tries encoded on
     /// disk. Performant code should call this method sparingly.
+    ///
+    /// **Recovery contract**: by default — when `open_opts` is [`MARFOpenOpts::default()`] or
+    /// [`MARFOpenOpts::new`] — `auto_recovery` is `false`, so canonical-sensitive recovery
+    /// (publish/discard of pending squash plans) does NOT run inline as part of opening. Callers
+    /// must drive recovery explicitly via [`Self::drain_pending_plans`] (typically with a
+    /// [`CanonicalView`](crate::chainstate::stacks::index::squash_recover::CanonicalView) derived
+    /// from the headers SQL tables) before exposing the handle to readers. Production startup
+    /// goes through [`crate::chainstate::stacks::db::StacksChainState::recover`] for this.
+    ///
+    /// To restore the legacy "open + recover inline" semantics — useful for tests, tools, and
+    /// any caller that lacks canonical context — pass [`MARFOpenOpts::with_auto_recovery`] with
+    /// `true`, or invoke [`Self::drain_pending_plans`] with `DrainPolicy::TrustPlan` after
+    /// opening.
     pub fn from_path(path: &str, open_opts: MARFOpenOpts) -> Result<MARF<T>, Error> {
         let file_storage = TrieFileStorage::open(path, open_opts)?;
         Ok(MARF::from_storage(file_storage))
@@ -2149,9 +2347,36 @@ impl<T: MarfTrieId> MARF<T> {
     /// Instantiate an unconfirmed MARF using a TrieFileStorage instance, from the given path on disk.
     /// This will have the side-effect of instantiating a new fork table from the tries encoded on
     /// disk. Performant code should call this method sparingly.
+    ///
+    /// See [`Self::from_path`] for the auto-recovery contract.
     pub fn from_path_unconfirmed(path: &str, open_opts: MARFOpenOpts) -> Result<MARF<T>, Error> {
         let file_storage = TrieFileStorage::open_unconfirmed(path, open_opts)?;
         Ok(MARF::from_storage(file_storage))
+    }
+
+    /// Drive any pending squash promotion plans to a consistent terminal state, applying the
+    /// supplied [`DrainPolicy`]. Idempotent and safe to call multiple times: subsequent calls on
+    /// a handle with no remaining plans are a no-op (returns an empty [`DrainStats`]).
+    ///
+    /// **When to call this**: any time the MARF was opened without inline auto-recovery — which
+    /// is the default for both [`MARFOpenOpts::default()`] and [`MARFOpenOpts::new`]. Callers
+    /// that explicitly opted in via [`MARFOpenOpts::with_auto_recovery`] with `true` already
+    /// ran recovery inside [`Self::from_path`], in which case this method is a no-op.
+    ///
+    /// **Policy semantics**:
+    /// - [`DrainPolicy::TrustPlan`] publishes every pending plan whose cold-blob and sidecar
+    ///   hashes match (legacy "open + recover inline" semantics).
+    /// - [`DrainPolicy::Canonical`] additionally validates each plan's recorded canonical chain
+    ///   (`plan.in_range_blocks[*].block_hash`) against the supplied
+    ///   [`CanonicalView`](crate::chainstate::stacks::index::squash_recover::CanonicalView).
+    ///   Plans whose recorded canonical chain has diverged from the live view are discarded
+    ///   (logged as
+    ///   [`DrainOutcome::DiscardedStale`](crate::chainstate::stacks::index::squash_recover::DrainOutcome::DiscardedStale))
+    ///   instead of published — closing the detached-worker stale-tip publish window. Production
+    ///   startup uses this variant via
+    ///   [`crate::chainstate::stacks::db::StacksChainState::recover`].
+    pub fn drain_pending_plans(&mut self, policy: DrainPolicy<'_>) -> Result<DrainStats, Error> {
+        self.storage.drain_pending_plans(policy)
     }
 
     /// Make an unconfirmed chain tip from an existing chain tip, so that it won't conflict with

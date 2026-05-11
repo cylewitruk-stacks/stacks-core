@@ -21,7 +21,8 @@ use crate::chainstate::stacks::index::storage::{
     build_squash_meta_from_sql, SquashMeta, TrieHashCalculationMode,
 };
 use crate::chainstate::stacks::index::{
-    bits, trie_sql, BlockMap, Error, MARFValue, MarfTrieId, TrieReadStorage,
+    bits, marf_squash_trace_enabled, trie_sql, BlockMap, Error, MARFValue, MarfTrieId,
+    TrieReadStorage,
 };
 use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE};
 
@@ -666,6 +667,23 @@ pub struct NodeStore {
     next_offset: u64,
 }
 
+/// Read `len` bytes starting at `offset` from the temp file at `path`.
+///
+/// Extracted from [`NodeStore::read_node_bytes`] so streaming Phase B workers in
+/// [`replace_leaves_full_history`] can read in parallel without holding `&NodeStore` —
+/// they hold `&Path` + `&[(u64, u32)]` slices instead, leaving the main thread free
+/// to hold `&mut NodeStore` for `update()`. Reads and writes are conflict-free at
+/// the file-handle level: each read opens its own `File::open`; writes go through a
+/// separate `BufWriter` at `next_offset`.
+fn read_node_bytes_at(path: &Path, offset: u64, len: u32) -> Result<Vec<u8>, Error> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len as usize];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 impl NodeStore {
     /// Create a new `NodeStore` backed by a temp file in `tmp_dir`.
     pub fn new(tmp_dir: &Path) -> Result<Self, Error> {
@@ -753,17 +771,29 @@ impl NodeStore {
         self.block_ids[idx]
     }
 
+    /// Path to the on-disk temp file backing this `NodeStore`.
+    ///
+    /// Exposed so streaming Phase B workers in [`replace_leaves_full_history`] can read
+    /// independently of `&NodeStore` — needed because the main thread holds `&mut self`
+    /// for `update()` while workers do reads. Reads are conflict-free with writes:
+    /// reads open a fresh `File::open` per call; writes go through a separate
+    /// buffered writer.
+    pub fn temp_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// File offset + byte length for node `idx`. Companion to [`Self::temp_path`] for
+    /// the same streaming-read use case.
+    pub fn file_offset(&self, idx: usize) -> (u64, u32) {
+        self.file_offsets[idx]
+    }
+
     /// Read back the serialized bytes for node at `idx`.
     ///
     /// Opens a fresh reader from the file path each time so that the writer can remain active.
     pub fn read_node_bytes(&self, idx: usize) -> Result<Vec<u8>, Error> {
         let (offset, len) = self.file_offsets[idx];
-        let file = File::open(&self.path)?;
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; len as usize];
-        reader.read_exact(&mut buf)?;
-        Ok(buf)
+        read_node_bytes_at(&self.path, offset, len)
     }
 
     /// Flush any buffered writes to disk. Must be called before reading data that was written via
@@ -1225,7 +1255,90 @@ fn collect_history_parallel<T: MarfTrieId + Send + Sync>(
             }
         }
     }
+
+    if marf_squash_trace_enabled() {
+        log_collect_history_stats(marf.get_db_path(), min_height, max_height, &history);
+    }
+
     Ok(history)
+}
+
+/// Emit a `MARF_SQUASH_TRACE collect_history` log line summarizing the in-memory
+/// history map's shape: unique key count, total/per-key entry counts (avg, max,
+/// p99), and byte estimates.
+///
+/// The `*_value_bytes` counters are stable across the future variable-length-value
+/// direction: today they are simply `entry_count * 40` (the fixed `MARFValue` size);
+/// when raw Clarity values move into the MARF the same field will track real
+/// value-byte length. Logging them now keeps the log schema stable for size
+/// comparisons across that change.
+///
+/// Gated by [`marf_squash_trace_enabled`] at the call site — the per-key scan and
+/// per-key sort are cheap (O(unique_keys)) but should not run in production by
+/// default.
+fn log_collect_history_stats(
+    marf_path: &str,
+    min_height: u32,
+    max_height: u32,
+    history: &HashMap<TrieHash, Vec<(u32, MARFValue)>>,
+) {
+    let unique_keys = history.len();
+    let mut entry_counts: Vec<usize> = Vec::with_capacity(unique_keys);
+    let mut total_entries: u64 = 0;
+    let mut max_entries: usize = 0;
+    for v in history.values() {
+        let l = v.len();
+        entry_counts.push(l);
+        total_entries += l as u64;
+        if l > max_entries {
+            max_entries = l;
+        }
+    }
+    let avg_entries = if unique_keys == 0 {
+        0.0
+    } else {
+        total_entries as f64 / unique_keys as f64
+    };
+    entry_counts.sort_unstable();
+    let p99_entries = if entry_counts.is_empty() {
+        0
+    } else {
+        let idx = ((entry_counts.len() as f64) * 0.99) as usize;
+        entry_counts[idx.min(entry_counts.len() - 1)]
+    };
+
+    // Per-entry payload: u32 height (4B) + MARFValue (40B) = 44B.
+    // HashMap per-key overhead estimate: TrieHash (32B) + Vec spine (24B) + hashbrown
+    // slot (~16B) ≈ 72B. Both estimates ignore Vec spare capacity and hashbrown's
+    // load-factor slack, so peak RSS is typically 1.5–2× these numbers.
+    const PER_ENTRY_PAYLOAD: u64 = 44;
+    const PER_KEY_OVERHEAD: u64 = 72;
+    const VALUE_BYTES_PER_ENTRY_TODAY: u64 = 40;
+
+    let total_history_value_bytes = total_entries * VALUE_BYTES_PER_ENTRY_TODAY;
+    let max_per_key_value_bytes = (max_entries as u64) * VALUE_BYTES_PER_ENTRY_TODAY;
+    let p99_per_key_value_bytes = (p99_entries as u64) * VALUE_BYTES_PER_ENTRY_TODAY;
+
+    let est_history_value_bytes = total_entries * PER_ENTRY_PAYLOAD;
+    let est_history_overhead_bytes = (unique_keys as u64) * PER_KEY_OVERHEAD;
+    let est_history_total_bytes = est_history_value_bytes + est_history_overhead_bytes;
+
+    info!(
+        "MARF_SQUASH_TRACE collect_history";
+        "marf" => marf_path,
+        "min_height" => min_height,
+        "max_height" => max_height,
+        "unique_keys" => unique_keys,
+        "total_entries" => total_entries,
+        "avg_entries_per_key" => format!("{avg_entries:.2}"),
+        "max_entries_per_key" => max_entries,
+        "p99_entries_per_key" => p99_entries,
+        "total_history_value_bytes" => total_history_value_bytes,
+        "max_per_key_value_bytes" => max_per_key_value_bytes,
+        "p99_per_key_value_bytes" => p99_per_key_value_bytes,
+        "est_history_total_bytes" => est_history_total_bytes,
+        "est_history_total" => fmt_bytes(est_history_total_bytes),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1281,6 +1394,11 @@ pub fn squash_level<T: MarfTrieId>(
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         squash_root_snapshot_retention_blocks: None,
         squash_horizon_burn_blocks: None,
+        // Path-based legacy/test wrappers don't carry canonical context; opening with
+        // `auto_recovery=false` keeps the TrustPlan recovery hole closed that the runtime
+        // refactor sealed elsewhere. Callers that need recovery on this open should drive
+        // `MARF::drain_pending_plans` or `StacksChainState::recover` explicitly first.
+        auto_recovery: false,
     };
 
     let mut src_marf = MARF::<T>::from_path(src_path, open_opts.clone())?;
@@ -1752,6 +1870,11 @@ pub fn squash_level<T: MarfTrieId>(
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         squash_root_snapshot_retention_blocks: None,
         squash_horizon_burn_blocks: None,
+        // Path-based legacy/test wrappers don't carry canonical context; opening with
+        // `auto_recovery=false` keeps the TrustPlan recovery hole closed that the runtime
+        // refactor sealed elsewhere. Callers that need recovery on this open should drive
+        // `MARF::drain_pending_plans` or `StacksChainState::recover` explicitly first.
+        auto_recovery: false,
     };
 
     let mut dst_marf = MARF::<T>::from_path(dst_path, dst_open_opts)?;
@@ -2484,6 +2607,13 @@ pub(crate) fn trim_aged_root_sidecars<T: MarfTrieId>(
     use crate::chainstate::stacks::index::sidecar::squash_root_sidecar_path;
 
     let mut report = TrimReport::default();
+    if std::env::var_os("STACKS_MARF_SQUASH_KEEP_SIDECARS").is_some() {
+        info!(
+            "trim_aged_root_sidecars: skipping sidecar trim because \
+             STACKS_MARF_SQUASH_KEEP_SIDECARS is set"
+        );
+        return Ok(report);
+    }
 
     // Read the level registry. `read_squash_levels` returns rows ordered by `min_height` ascending;
     // we walk newest-first so we accumulate height span from the most recent level back, matching
@@ -4429,10 +4559,20 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
         // reading the same value at every height in range is correct (the merged trie is only
         // reachable from blocks within the range, where the inherited value already applied before
         // the structural re-insert).
+        //
+        // Investigation switch: `STACKS_MARF_SQUASH_DISABLE_DOMINATED_SINGLE=1` disables the
+        // optimization — every key with an inherited value gets a synthetic `(min_height - 1,
+        // value)` baseline entry and the promotion filter below will convert all in-range leaves
+        // to `TrieLeafSquashed`. Used to A/B test whether the optimization is the source of
+        // mainnet at-block state-root divergence (see [marf-squash-state-root-mismatch-regression-notes.md]).
+        // Strip after the investigation concludes.
+        let disable_dominated_single =
+            std::env::var_os("STACKS_MARF_SQUASH_DISABLE_DOMINATED_SINGLE").is_some();
         for (key_hash, inherited_value) in lookups {
             if let Some(value) = inherited_value {
                 if let Some(entries) = history.get_mut(&key_hash) {
-                    let dominated_single = entries.len() == 1
+                    let dominated_single = !disable_dominated_single
+                        && entries.len() == 1
                         && entries.first().map_or(false, |&(_, ref v)| *v == value);
                     if dominated_single {
                         dominated_single_keys.insert(key_hash);
@@ -4445,6 +4585,14 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
             // min_height. We leave `entries` single-element; the promotion filter below will still
             // convert it to `TrieLeafSquashed` so that reads in [min_height, first_write) return
             // `None`.
+        }
+        if disable_dominated_single {
+            info!(
+                "MARF_SQUASH_TRACE dominated_single_disabled";
+                "min_height" => min_height,
+                "max_height" => max_height,
+                "lookups" => keys_needing_baseline.len()
+            );
         }
     }
     timings.baseline_ms = t_baseline.elapsed().as_millis();
@@ -4481,6 +4629,64 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
         })
         .collect();
 
+    // Diagnostic instrumentation. Two stories logged here:
+    //
+    // 1. Pre-streaming-Phase-B peak (what the prior `updates: Vec<(usize, Vec<u8>)>`
+    //    accumulator would have buffered). Captured for historical comparison; the
+    //    new channel-based Phase B holds at most ~`channel_cap` rewritten leaves at
+    //    a time.
+    //
+    // 2. Inline-rewrite amplification: the same `TrieHash` key appears as multiple
+    //    physical leaves in `node_store` (cross-block COW copies), and today every
+    //    physical leaf is rewritten with the FULL inline transition list for that key.
+    //    `est_squashable_history_entries` (per-leaf sum) over `distinct_squashable_total_entries`
+    //    (per-distinct-key sum) gives the redundancy factor — i.e., how many times
+    //    the same history bytes are written into the cold blob. Heavy hot-key skew
+    //    drives this far above the simple `squashable_leaves / distinct_keys` ratio,
+    //    which is why the weighted form is the meaningful one.
+    if marf_squash_trace_enabled() {
+        let squashable_n = squashable.len();
+        let est_squashable_history_entries: u64 = squashable
+            .iter()
+            .map(|(_, k)| history.get(k).map_or(0, |v| v.len() as u64))
+            .sum();
+        // Per-entry payload (44B) + per-leaf overhead (~64B for header + Vec spine).
+        let est_pre_streaming_peak_bytes =
+            est_squashable_history_entries * 44 + (squashable_n as u64) * 64;
+
+        // Distinct-key view: how much history would be written if we deduplicated
+        // by key (i.e., the floor that an out-of-line-history design could reach).
+        let mut distinct_squashable: HashSet<TrieHash> = HashSet::with_capacity(squashable_n);
+        let mut distinct_squashable_total_entries: u64 = 0;
+        for (_, k) in &squashable {
+            if distinct_squashable.insert(*k) {
+                if let Some(v) = history.get(k) {
+                    distinct_squashable_total_entries += v.len() as u64;
+                }
+            }
+        }
+        let distinct_squashable_keys = distinct_squashable.len();
+        let rewrite_amplification = if distinct_squashable_total_entries == 0 {
+            0.0
+        } else {
+            est_squashable_history_entries as f64 / distinct_squashable_total_entries as f64
+        };
+
+        info!(
+            "MARF_SQUASH_TRACE replace_leaves";
+            "marf" => marf.get_db_path(),
+            "min_height" => min_height,
+            "max_height" => max_height,
+            "squashable_leaves" => squashable_n,
+            "distinct_squashable_keys" => distinct_squashable_keys,
+            "est_squashable_history_entries" => est_squashable_history_entries,
+            "distinct_squashable_total_entries" => distinct_squashable_total_entries,
+            "rewrite_amplification" => format!("{rewrite_amplification:.2}"),
+            "est_pre_streaming_peak_bytes" => est_pre_streaming_peak_bytes,
+            "est_pre_streaming_peak" => fmt_bytes(est_pre_streaming_peak_bytes),
+        );
+    }
+
     const LEAF_MAX_WORKERS: usize = 8;
     const LEAF_MIN_FOR_PARALLEL: usize = 1024;
     let leaf_n_workers = decide_parallel_workers(
@@ -4492,11 +4698,27 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
         LEAF_MIN_FOR_PARALLEL,
     );
 
-    let updates: Vec<(usize, Vec<u8>)> = if leaf_n_workers <= 1 {
-        // Serial fallback: identical to the pre-parallelization path. Used when (a) the squashable
-        // count is small enough that thread setup would dominate, or (b) only one core is
-        // available.
-        let mut results = Vec::with_capacity(squashable.len());
+    // Streaming Phase B: workers send rewritten leaf bytes through a bounded channel; the main
+    // thread drains and applies `node_store.update` immediately. This eliminates the prior
+    // `updates: Vec<(usize, Vec<u8>)>` peak (which held every rewritten leaf body in memory before
+    // any apply). Channel capacity is `4 * leaf_n_workers` — small enough to keep in-flight peak
+    // bounded (~workers × avg_leaf_size), large enough that worker tail latency doesn't stall the
+    // main applier.
+    //
+    // Workers don't borrow `&node_store` because the main thread needs `&mut node_store` for
+    // `update()`. They take the temp file path and the per-index `(offset, len)` table, and call
+    // the free `read_node_bytes_at` helper. Reads and writes are conflict-free at the file-handle
+    // level: reads open their own `File::open`; writes go through `node_store`'s `BufWriter` at
+    // `next_offset`.
+    let temp_path = node_store.temp_path().to_path_buf();
+    let file_offsets: Vec<(u64, u32)> = (0..node_count_before)
+        .map(|i| node_store.file_offset(i))
+        .collect();
+
+    if leaf_n_workers <= 1 {
+        // Serial fallback: stream directly without spawning. Used when (a) the squashable count is
+        // small enough that thread setup would dominate, or (b) only one core is available. Same
+        // streaming shape as the parallel path — no staged Vec.
         for (i, key_hash) in &squashable {
             let transitions = history.get(key_hash).ok_or_else(|| {
                 Error::CorruptionError(
@@ -4505,52 +4727,98 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
             })?;
             let raw = node_store.read_node_bytes(*i)?;
             let new_buf = build_squashed_leaf_bytes(&raw, transitions)?;
-            results.push((*i, new_buf));
+            node_store.update(*i, &new_buf)?;
+            stats.leaves_squashed += 1;
         }
-        results
     } else {
         let chunk_size = squashable.len().div_ceil(leaf_n_workers).max(1);
         let history_ref = &history;
-        let node_store_ref = &*node_store;
         let squashable_ref: &[(usize, TrieHash)] = &squashable;
+        let file_offsets_ref: &[(u64, u32)] = &file_offsets;
+        let temp_path_ref: &Path = &temp_path;
 
-        std::thread::scope(|s| -> Result<Vec<(usize, Vec<u8>)>, Error> {
+        let channel_cap = (leaf_n_workers * 4).max(8);
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Result<(usize, Vec<u8>), Error>>(channel_cap);
+
+        let main_result: Result<(), Error> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..leaf_n_workers)
                 .map(|idx| {
                     let chunk_start = (idx * chunk_size).min(squashable_ref.len());
                     let chunk_end = ((idx + 1) * chunk_size).min(squashable_ref.len());
                     let chunk = &squashable_ref[chunk_start..chunk_end];
-                    s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>, Error> {
-                        let mut chunk_updates = Vec::with_capacity(chunk.len());
+                    let tx = tx.clone();
+                    s.spawn(move || {
                         for (i, key_hash) in chunk {
-                            let transitions = history_ref.get(key_hash).ok_or_else(|| {
-                                Error::CorruptionError(
-                                    "key_hash disappeared from history \
-                                         between pre-filter and apply"
-                                        .into(),
-                                )
-                            })?;
-                            let raw = node_store_ref.read_node_bytes(*i)?;
-                            let new_buf = build_squashed_leaf_bytes(&raw, transitions)?;
-                            chunk_updates.push((*i, new_buf));
+                            let result: Result<(usize, Vec<u8>), Error> = (|| {
+                                let transitions = history_ref.get(key_hash).ok_or_else(|| {
+                                    Error::CorruptionError(
+                                        "key_hash disappeared from history \
+                                             between pre-filter and apply"
+                                            .into(),
+                                    )
+                                })?;
+                                let (offset, len) = file_offsets_ref[*i];
+                                let raw = read_node_bytes_at(temp_path_ref, offset, len)?;
+                                let new_buf = build_squashed_leaf_bytes(&raw, transitions)?;
+                                Ok((*i, new_buf))
+                            })(
+                            );
+                            // Receiver dropped (main bailed on an earlier error) — exit cleanly so
+                            // we don't block the scope on an unreceived send.
+                            if tx.send(result).is_err() {
+                                return;
+                            }
                         }
-                        Ok(chunk_updates)
                     })
                 })
                 .collect();
-            drain_scoped_handles(
-                handles,
-                squashable_ref.len(),
-                "Leaf-replace worker thread panicked",
-            )
-        })?
-    };
+            // Drop the original sender so `rx.recv()` returns `Err(RecvError)` once all worker
+            // clones drop at end-of-spawn — that's how the drain loop knows to terminate.
+            drop(tx);
 
-    // Phase B (serial): apply updates to node_store. `update` takes `&mut self` so this stays
-    // single-threaded.
-    for (i, new_buf) in updates {
-        node_store.update(i, &new_buf)?;
-        stats.leaves_squashed += 1;
+            // Drain the channel: apply each Ok; capture the first error. Keep draining after a
+            // failure so workers don't block forever on `tx.send` waiting for a buffer slot the
+            // main thread would never read.
+            let mut first_err: Option<Error> = None;
+            while let Ok(item) = rx.recv() {
+                match item {
+                    Ok((i, new_buf)) => {
+                        if first_err.is_some() {
+                            continue;
+                        }
+                        if let Err(e) = node_store.update(i, &new_buf) {
+                            first_err = Some(e);
+                        } else {
+                            stats.leaves_squashed += 1;
+                        }
+                    }
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+
+            // Explicitly join every worker. With `std::thread::scope`, an unjoined panic is
+            // rethrown when the scope exits — which would bypass our `Error` return path and turn
+            // a worker panic into a process panic. Convert any panic into a `CorruptionError`
+            // matching the `drain_scoped_handles` convention used elsewhere.
+            for handle in handles {
+                if handle.join().is_err() && first_err.is_none() {
+                    first_err = Some(Error::CorruptionError(
+                        "Leaf-replace worker thread panicked".into(),
+                    ));
+                }
+            }
+
+            match first_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        });
+        main_result?;
     }
     timings.leaf_replace_ms = t_leaf_replace.elapsed().as_millis();
 
@@ -4591,6 +4859,11 @@ pub fn squash_level_incremental<T: MarfTrieId + Send + Sync>(
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         squash_root_snapshot_retention_blocks: None,
         squash_horizon_burn_blocks: None,
+        // Path-based legacy/test wrappers don't carry canonical context; opening with
+        // `auto_recovery=false` keeps the TrustPlan recovery hole closed that the runtime
+        // refactor sealed elsewhere. Callers that need recovery on this open should drive
+        // `MARF::drain_pending_plans` or `StacksChainState::recover` explicitly first.
+        auto_recovery: false,
     };
     let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
     squash_level_incremental_with_target::<T>(
@@ -5012,6 +5285,11 @@ pub fn create_stub_level<T: MarfTrieId>(
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         squash_root_snapshot_retention_blocks: None,
         squash_horizon_burn_blocks: None,
+        // Path-based legacy/test wrappers don't carry canonical context; opening with
+        // `auto_recovery=false` keeps the TrustPlan recovery hole closed that the runtime
+        // refactor sealed elsewhere. Callers that need recovery on this open should drive
+        // `MARF::drain_pending_plans` or `StacksChainState::recover` explicitly first.
+        auto_recovery: false,
     };
 
     let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
@@ -5083,6 +5361,11 @@ pub fn trim_sidecars<T: MarfTrieId + Send + Sync>(
             crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
         squash_root_snapshot_retention_blocks: None,
         squash_horizon_burn_blocks: None,
+        // Path-based legacy/test wrappers don't carry canonical context; opening with
+        // `auto_recovery=false` keeps the TrustPlan recovery hole closed that the runtime
+        // refactor sealed elsewhere. Callers that need recovery on this open should drive
+        // `MARF::drain_pending_plans` or `StacksChainState::recover` explicitly first.
+        auto_recovery: false,
     };
     let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
     marf.trim_sidecars(retention_blocks)

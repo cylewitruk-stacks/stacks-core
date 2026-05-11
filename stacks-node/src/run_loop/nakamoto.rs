@@ -27,7 +27,10 @@ use stacks::chainstate::coordinator::comm::{CoordinatorChannels, CoordinatorRece
 use stacks::chainstate::coordinator::{
     ChainsCoordinator, ChainsCoordinatorConfig, CoordinatorCommunication,
 };
+use stacks::chainstate::stacks::db::headers::HeadersCanonicalView;
 use stacks::chainstate::stacks::db::{ChainStateBootData, StacksChainState};
+use stacks::chainstate::stacks::index::marf::MarfConnection;
+use stacks::chainstate::stacks::index::squash_recover::CanonicalView;
 use stacks::chainstate::stacks::miner::{signal_mining_blocked, signal_mining_ready, MinerStatus};
 use stacks::core::StacksEpochId;
 use stacks::net::atlas::{AtlasConfig, AtlasDB, Attachment};
@@ -221,9 +224,18 @@ impl RunLoop {
     }
 
     /// Boot up the stacks chainstate.
-    /// Instantiate the chainstate and push out the boot receipts to observers
-    /// This is only public so we can test it.
-    fn boot_chainstate(&mut self, burnchain_config: &Burnchain) -> StacksChainState {
+    /// Instantiate the chainstate and push out the boot receipts to observers.
+    ///
+    /// `sortdb` is consulted to derive the canonical Stacks chain tip used for the
+    /// canonical-validated recovery drain that runs after `open_and_exec` returns. Pending squash
+    /// promotion plans whose recorded canonical chain has diverged from the live chain are
+    /// discarded instead of published — closing the detached-worker stale-tip publish window.
+    /// Must be called at startup, before the chains-coordinator and p2p threads are spawned.
+    fn boot_chainstate(
+        &mut self,
+        burnchain_config: &Burnchain,
+        sortdb: &SortitionDB,
+    ) -> StacksChainState {
         let use_test_genesis_data = use_test_genesis_chainstate(&self.config);
 
         // load up genesis balances
@@ -254,7 +266,7 @@ impl RunLoop {
             get_bulk_initial_names: Some(Box::new(move || get_names(use_test_genesis_data))),
         };
 
-        let (chain_state_db, receipts) = StacksChainState::open_and_exec(
+        let (mut chain_state_db, receipts) = StacksChainState::open_and_exec(
             self.config.is_mainnet(),
             self.config.burnchain.chain_id,
             &self.config.get_chainstate_path_str(),
@@ -262,6 +274,37 @@ impl RunLoop {
             Some(self.config.node.get_marf_opts()),
         )
         .unwrap();
+
+        // Canonical-validated recovery: discard any pending squash plan whose recorded canonical
+        // chain has diverged from the live chain.
+        //
+        // `low_height` bounds the canonical-view walk by the lowest pending plan height across
+        // both MARFs — no point walking back past where any plan needs validation. Falls
+        // through to `0` (full-chain walk) if no pending plans exist, which is a no-op anyway.
+        let headers_db_path = chain_state_db.state_index.get_db_path().to_string();
+        let clarity_db_path = chain_state_db
+            .clarity_state
+            .with_marf(|m| m.get_db_path().to_string());
+        let low_height =
+            HeadersCanonicalView::lowest_pending_plan_height(&[&headers_db_path, &clarity_db_path])
+                .expect("FATAL: failed to scan pending plans for canonical-view bound");
+        let canonical_view = HeadersCanonicalView::from_sortdb_and_headers(
+            sortdb,
+            chain_state_db.state_index.sqlite_conn(),
+            low_height,
+        )
+        .expect("FATAL: failed to build canonical view from sortdb + headers");
+
+        let recover_result = chain_state_db
+            .recover(canonical_view.as_ref().map(|v| v as &dyn CanonicalView))
+            .expect("FATAL: chainstate recovery failed");
+
+        info!(
+            "Chainstate startup recovery complete: headers drain {:?}, clarity drain {:?}, \
+             canonical view active = {}",
+            recover_result.headers, recover_result.clarity, recover_result.policy_was_canonical,
+        );
+
         run_loop::announce_boot_receipts(
             &mut self.event_dispatcher,
             &chain_state_db,
@@ -467,7 +510,13 @@ impl RunLoop {
         // `StacksChainState::open_with_shared_unconfirmed`, passing this slot in so that
         // every handle observes the same in-memory unconfirmed view through one inner mutex.
         // Confirmed-state operations on each thread proceed without any cross-thread lock.
-        let coordinator_chainstate = self.boot_chainstate(&burnchain_config);
+        // Force the sortdb open here (idempotent if already open) so `boot_chainstate` can
+        // derive a canonical Stacks tip via `sortdb_ref()` without relying on the implicit
+        // eager-open inside `instantiate_burnchain_state` — `sortdb_ref()` would panic on
+        // `None` if that path ever changed, and callers shouldn't be coupled to a distant
+        // initialization detail.
+        let coordinator_chainstate =
+            self.boot_chainstate(&burnchain_config, burnchain.sortdb_mut());
         let shared_unconfirmed = coordinator_chainstate.unconfirmed_state.clone();
         globals.set_shared_unconfirmed(shared_unconfirmed);
         self.set_globals(globals.clone());

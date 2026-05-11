@@ -54,8 +54,11 @@ use crate::chainstate::stacks::index::squash::{
     prepare_merge_outputs, PhaseTimings, PreparedMerge, SquashLevelRow, SquashStats,
 };
 use crate::chainstate::stacks::index::squash_plan::{
-    plan_file_path, write_plan_file_atomic, InRangeBlock, PlanHeader, RewriteEntry, SquashPlan,
-    TranslationMap,
+    plan_file_path, read_plan_file, write_plan_file_atomic, InRangeBlock, PlanHeader, RewriteEntry,
+    SquashPlan, TranslationMap,
+};
+use crate::chainstate::stacks::index::squash_recover::{
+    check_canonical_divergence, DrainOutcome, DrainPolicy,
 };
 use crate::chainstate::stacks::index::storage::ROOT_PTR_DISK;
 use crate::chainstate::stacks::index::{trie_sql, Error, MarfTrieId};
@@ -70,13 +73,43 @@ pub struct PromotionStats {
     pub cold_blob_bytes_written: u64,
 }
 
+/// Output of the prepare phase of a horizon-gated promotion. Handed off from the worker side
+/// (background thread) to the coordinator side (chains-coordinator) which performs the validate +
+/// publish step via [`apply_prepared_plan`].
+///
+/// The promotion's durable artifacts — cold-blob bytes, sidecar, and on-disk plan file — are all
+/// fsynced before this is returned, so a process crash between prepare and apply is recoverable on
+/// the next RW open via
+/// [`crate::chainstate::stacks::index::squash_recover::recover_pending_promotions`].
+///
+/// The merger's `node_store` temp state is finalized inside `prepare_promotion` before returning,
+/// so this handle holds no resources beyond plain values + a path to the durable plan file.
+#[derive(Debug, Clone)]
+pub struct PreparedPromotion {
+    /// Absolute path to the durable plan file. Both the runtime publish (via the coordinator's
+    /// [`apply_prepared_plan`] call) and crash recovery read the plan from this path; they share
+    /// one publish path so that startup and runtime go through the same validate/publish gate.
+    pub plan_path: PathBuf,
+    /// `next_level_id` baked into the plan. Reflected back so the coordinator can attribute log
+    /// lines without re-reading the plan.
+    pub level_id: u32,
+    /// In-range height bounds for the prepared promotion, inclusive. The coordinator uses
+    /// `min_height` to bound its [`crate::chainstate::stacks::index::squash_recover::CanonicalView`]
+    /// precompute walk without re-scanning disk plans.
+    pub min_height: u32,
+    pub max_height: u32,
+    /// Background-phase counters (translation map size, descendants scanned, rewrites planned,
+    /// cold-blob bytes written). The publish phase contributes nothing to these counters; it
+    /// produces a [`DrainOutcome::Published`] with `rewrites_applied` instead.
+    pub stats: PromotionStats,
+}
+
 /// Run a synchronous horizon-gated promotion publishing `[min_height ..= max_height]` as a new
 /// squash level on `marf`.
 ///
-/// **B5a caller obligations**:
+/// **Caller obligations**:
 /// - The MARF must be opened with hot tier enabled.
 /// - The horizon predicate must already have been verified by the caller (`should_squash`).
-/// - Single-threaded scope. B5b will add proper concurrency.
 ///
 /// On success, the new squash level is published in `marf_squash_levels`, in-range `marf_data` rows
 /// are flipped to `Cold` pointing at the merged blob, descendants' hot-file ptr fields are
@@ -85,20 +118,226 @@ pub struct PromotionStats {
 /// On error, the plan file (if any) remains on disk for
 /// [`crate::chainstate::stacks::index::squash_recover::recover_pending_promotions`] to drive
 /// forward at the next RW open.
+///
+/// **Synchronous all-in-one entry point.** Internally splits into [`prepare_promotion`] (durable
+/// merge artifacts + plan file) followed by [`apply_prepared_plan`] (catch-up scan + fenced
+/// rewrites + SQL publish). The detached-worker code path uses the prepare/apply split directly,
+/// with the chains-coordinator owning the publish step under a [`DrainPolicy::Canonical`]
+/// validation. This synchronous wrapper passes [`DrainPolicy::TrustPlan`] because the same call
+/// stack just produced the plan — no canonical check is meaningful in this scope.
 pub fn run_horizon_gated_promotion<T: MarfTrieId + Send + Sync>(
     marf: &mut MARF<T>,
+    mode: crate::chainstate::stacks::index::squash::SquashMode,
     min_height: u32,
     max_height: u32,
     canonical_tip: Option<T>,
 ) -> Result<PromotionStats, Error> {
     let marf_path = marf.get_db_path().to_string();
 
+    // Pre-prep guards (mirror `prepare_promotion`'s guards) — run BEFORE the inner call so the
+    // post-error lock-clear policy below only triggers on errors from our own prepare attempt,
+    // not on a pre-existing external lock that the caller wants preserved.
+    {
+        let state = trie_sql::read_marf_state(marf.sqlite_conn())?;
+        if state.promotion_in_progress.is_some() {
+            return Err(Error::InProgressError);
+        }
+    }
+    if !crate::chainstate::stacks::index::squash_plan::discover_pending_plans(&marf_path)?
+        .is_empty()
+    {
+        return Err(Error::InProgressError);
+    }
+
+    // Two distinct error-handling regimes:
+    //
+    // **Pre-plan-fsync**: any error clears the lock so the next cadence tick can retry. The plan
+    // file is not yet on disk so recovery has nothing to drive forward; clearing the lock is safe.
+    //
+    // **Post-plan-fsync**: the plan file is durable on disk. From this point on, recovery owns the
+    // cleanup — it'll either replay the plan to completion (committing the level + clearing the
+    // lock atomically) or abandon it (deleting the plan + clearing the lock). Clearing the lock now
+    // would let a second promotion start while the plan still exists, with potentially overlapping
+    // cold-blob reservations.
+    let result = (|| -> Result<PromotionStats, Error> {
+        let prepared = prepare_promotion::<T>(marf, mode, min_height, max_height, canonical_tip)?;
+
+        // ── B5b test fault hook ───────────────────────────────────
+        //
+        // After the plan file is durable, the swap phase is the load-bearing recovery boundary:
+        // any crash here must be replayable from the on-disk state. To exercise that property
+        // end-to-end we let tests force an early return *immediately after the plan file is
+        // fsynced* — leaving the cold blob, sidecar, pending plan, and partially-applied (or
+        // zero-applied) hot rewrites on disk for `recover_pending_promotions` to drive forward.
+        // Production builds compile this away via `#[cfg(test)]`.
+        #[cfg(test)]
+        if test_hooks::abort_after_plan_write_armed() {
+            return Err(Error::NotSupportedError(
+                "test fault: aborted after plan write".into(),
+            ));
+        }
+
+        // Synchronous-publish path: the same call stack just produced the plan, so canonical
+        // validation against a possibly-stale snapshot would add nothing. Detached-worker
+        // dispatch routes through the coordinator's `apply_prepared_plan(... Canonical(view))`
+        // instead.
+        match apply_prepared_plan::<T>(marf, &prepared, DrainPolicy::TrustPlan)? {
+            DrainOutcome::Published { .. } => Ok(prepared.stats),
+            // Unreachable under TrustPlan: the policy never produces DiscardedStale, and
+            // Abandoned is recovery-only (cold-blob/sidecar mismatch on bytes the caller just
+            // wrote is impossible). Surface as a hard error rather than swallow.
+            other => Err(Error::CorruptionError(format!(
+                "run_horizon_gated_promotion: unexpected publish outcome under TrustPlan: \
+                 {other:?}",
+            ))),
+        }
+    })();
+    match &result {
+        Ok(_) => {} // success: lock cleared atomically inside swap SQL tx
+        Err(_) => {
+            // Check whether a plan file is on disk for this MARF. If yes, recovery owns the
+            // cleanup; leave the lock set. If no, we crashed before plan fsync — clear the lock.
+            let plans_after =
+                crate::chainstate::stacks::index::squash_plan::discover_pending_plans(&marf_path)
+                    .unwrap_or_default();
+            if plans_after.is_empty() {
+                if let Err(clear_err) = trie_sql::clear_promotion_state(marf.sqlite_conn()) {
+                    warn!(
+                        "promotion: failed to clear promotion lock after pre-plan error on \
+                         {marf_path}: {clear_err}",
+                    );
+                }
+            } else {
+                warn!(
+                    "promotion: failed AFTER plan file became durable; leaving lock set \
+                     and {} plan file(s) on disk for `recover_pending_promotions` to drive \
+                     forward on next RW open",
+                    plans_after.len(),
+                );
+            }
+        }
+    }
+    result
+}
+
+/// Path-based wrapper that runs the **prepare phase only** of a horizon-gated promotion. Opens
+/// a fresh `MARF<T>` from `marf_path` with hot tier enabled (and `auto_recovery=false` —
+/// **load-bearing**, see below), runs the merge prep + cold-blob append + sidecar publish +
+/// descendant scan + plan persist, and returns a [`PreparedPromotion`] handle for the
+/// coordinator to validate + publish via [`apply_prepared_plan`].
+///
+/// Used by [`crate::chainstate::stacks::db::StacksChainState::maybe_squash`] to dispatch
+/// hot-tier promotions through detached worker threads. The coordinator's
+/// [`crate::chainstate::stacks::db::StacksChainState::poll_pending_promotions`] reaps the
+/// worker on a later tick, builds a
+/// [`crate::chainstate::stacks::index::squash_recover::CanonicalView`] from the chainstate-
+/// resolved canonical Stacks tip, and calls `apply_prepared_plan` with
+/// `DrainPolicy::Canonical(&view)`. Plans whose recorded canonical chain has diverged from the
+/// live view by publish time are discarded instead of published.
+///
+/// **Why `auto_recovery=false` is load-bearing**: this path is the detached worker. If the
+/// MARF open ran recovery under `DrainPolicy::TrustPlan` (the legacy worker-side default), a
+/// leftover plan from a prior tick's failed publish would get TrustPlan-published here —
+/// bypassing the coordinator's canonical gate. That reopens the exact stale-tip bug class this
+/// refactor closes. With recovery off, leftover plans block prepare via the pre-prep guards
+/// inside [`prepare_promotion`]; the coordinator's drain path
+/// (`MARF::drain_pending_plans(Canonical(view))` from `poll_pending_promotions`) is the sole
+/// runtime publish gate. Process-restart recovery goes through `StacksChainState::recover`,
+/// which also threads the canonical view.
+pub fn run_horizon_gated_promotion_at_path<T: MarfTrieId + Send + Sync>(
+    marf_path: &str,
+    mode: crate::chainstate::stacks::index::squash::SquashMode,
+    min_height: u32,
+    max_height: u32,
+    canonical_tip: Option<T>,
+) -> Result<Option<PreparedPromotion>, Error> {
+    use crate::chainstate::stacks::index::marf::MARFOpenOpts;
+    use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
+    let open_opts = MARFOpenOpts {
+        hash_calculation_mode: TrieHashCalculationMode::Immediate,
+        cache_strategy: "noop".to_string(),
+        external_blobs: true,
+        force_db_migrate: false,
+        compress: false,
+        mmap: false,
+        // The `squash_mode` field on `MARFOpenOpts` is informational for runtime opens; the
+        // actual mode used by this prepare phase is the `mode` argument threaded into
+        // `prepare_promotion`. Mirror it here for consistency in any downstream observability.
+        squash_mode: mode,
+        squash_root_snapshot_retention_levels:
+            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
+        squash_root_snapshot_retention_blocks: None,
+        squash_horizon_burn_blocks: None,
+        // See the "Why auto_recovery=false is load-bearing" note above. The worker has no
+        // canonical context; only the coordinator does.
+        auto_recovery: false,
+    };
+
+    let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
+
+    match prepare_promotion::<T>(&mut marf, mode, min_height, max_height, canonical_tip) {
+        Ok(prepared) => Ok(Some(prepared)),
+        Err(e) => {
+            // Lock-clear policy mirrors `run_horizon_gated_promotion`: pre-plan-fsync error →
+            // safe to clear (no plan on disk yet); post-plan-fsync error → leave lock + plan
+            // for the coordinator's drain path to drive forward on a subsequent tick.
+            //
+            // The InProgressError case (leftover plan tripped the pre-prep guard) lands here
+            // with no plan-file change of our own; we don't clear the lock because the
+            // existing plan is what's holding it.
+            let plans_after =
+                crate::chainstate::stacks::index::squash_plan::discover_pending_plans(marf_path)
+                    .unwrap_or_default();
+            if plans_after.is_empty() {
+                if let Err(clear_err) = trie_sql::clear_promotion_state(marf.sqlite_conn()) {
+                    warn!(
+                        "Auto-squash (hot-tier, detached): failed to clear promotion lock \
+                         after pre-plan error on {marf_path}: {clear_err}",
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// **Prepare phase**: pre-prep guards, merge prep, cold-blob append + fsync, sidecar publish,
+/// descendant scan, plan file fsync. Stops at "plan is durable on disk." Does NOT publish —
+/// that step is the caller's responsibility via [`apply_prepared_plan`] (runtime, with canonical
+/// validation) or [`crate::chainstate::stacks::index::squash_recover::recover_pending_promotions`]
+/// (startup recovery).
+///
+/// On `Ok`, returns a [`PreparedPromotion`] handle; the merger's `node_store` is finalized
+/// before returning (the publish phase has no need for it). The lock is left set so recovery /
+/// the coordinator's leftover-plan drain owns cleanup if the publish step crashes.
+///
+/// **Pre-prep guards** (single-flight lock + plan-file scan) live here so both the synchronous
+/// wrapper ([`run_horizon_gated_promotion`]) and the detached-worker entry
+/// ([`run_horizon_gated_promotion_at_path`]) bail uniformly on a leftover plan. With
+/// `auto_recovery=false` on the worker's MARF open, leftover plans are NOT auto-published on
+/// open — the coordinator's canonical-validated drain is the sole publish gate at runtime, and
+/// `StacksChainState::recover` is the sole gate at startup.
+///
+/// Post-error lock-clear policy lives in the callers since the wrapper-vs-worker contexts
+/// distinguish "pre-plan-fsync error → safe to clear" from "post-plan-fsync error → leave for
+/// drain/recovery to drive forward".
+pub(crate) fn prepare_promotion<T: MarfTrieId + Send + Sync>(
+    marf: &mut MARF<T>,
+    mode: crate::chainstate::stacks::index::squash::SquashMode,
+    min_height: u32,
+    max_height: u32,
+    canonical_tip: Option<T>,
+) -> Result<PreparedPromotion, Error> {
+    let marf_path = marf.get_db_path().to_string();
+
     // ── Pre-prep guards ───────────────────────────────────────────
     //
-    // Reject if **either** the in-memory single-flight lock is held OR a plan file exists on disk.
-    // The plan-file check covers a crashed prior promotion that left state behind without
-    // `recover_pending_promotions` running yet (e.g. the operator launched a CLI tool that doesn't
-    // run startup recovery). The SQL lock check covers an in-process concurrent caller.
+    // Reject if **either** the in-memory single-flight lock is held OR a plan file exists on
+    // disk. The plan-file check covers a previously-prepared plan that the coordinator hasn't
+    // published yet (e.g., a transient publish failure on a prior tick); the lock check covers
+    // a concurrent caller. Both conditions mean "another publish is pending — don't stack a
+    // new prepare on top." The coordinator's drain path on subsequent ticks resolves the
+    // pending plan; this guard exists to keep workers from racing past it.
     {
         let state = trie_sql::read_marf_state(marf.sqlite_conn())?;
         if state.promotion_in_progress.is_some() {
@@ -112,172 +351,17 @@ pub fn run_horizon_gated_promotion<T: MarfTrieId + Send + Sync>(
     }
 
     // Eagerly stage the lock with a placeholder level_id; the real value goes in once
-    // `prepare_merge_outputs` returns it.
+    // `prepare_merge_outputs` returns it. The lock-clear policy on error lives in the caller
+    // (`run_horizon_gated_promotion` / `run_horizon_gated_promotion_at_path`) — see the
+    // "post-plan-fsync" boundary explanation in those wrappers.
     set_promotion_lock(marf.sqlite_conn(), u32::MAX, 0, 0)?;
-
-    // Two distinct error-handling regimes:
-    //
-    // **Pre-plan-fsync**: any error clears the lock so the next cadence tick can retry. The plan
-    // file is not yet on disk so recovery has nothing to drive forward; clearing the lock is safe.
-    //
-    // **Post-plan-fsync**: the plan file is durable on disk. From this point on, recovery owns the
-    // cleanup — it'll either replay the plan to completion (committing the level + clearing the
-    // lock atomically) or abandon it (deleting the plan + clearing the lock). Clearing the lock now
-    // would let a second promotion start while the plan still exists, with potentially overlapping
-    // cold-blob reservations.
-    //
-    // The boundary is signaled by `PromotionFailureMode` returned from the inner function.
-    let result =
-        run_horizon_gated_promotion_inner::<T>(marf, min_height, max_height, canonical_tip);
-    match &result {
-        Ok(_) => {} // success: lock cleared atomically inside swap SQL tx
-        Err(_) => {
-            // Check whether a plan file is on disk for this MARF. If yes, recovery owns the
-            // cleanup; leave the lock set. If no, we crashed before plan fsync — clear the lock.
-            let plans_after =
-                crate::chainstate::stacks::index::squash_plan::discover_pending_plans(&marf_path)
-                    .unwrap_or_default();
-            if plans_after.is_empty() {
-                if let Err(clear_err) = trie_sql::clear_promotion_state(marf.sqlite_conn()) {
-                    warn!(
-                        "B5a: failed to clear promotion lock after pre-plan error on \
-                         {marf_path}: {clear_err}",
-                    );
-                }
-            } else {
-                warn!(
-                    "B5a: promotion failed AFTER plan file became durable; leaving lock set \
-                     and {} plan file(s) on disk for `recover_pending_promotions` to drive \
-                     forward on next RW open",
-                    plans_after.len(),
-                );
-            }
-        }
-    }
-    result
-}
-
-/// Path-based wrapper around [`run_horizon_gated_promotion`]. Opens a
-/// fresh `MARF<T>` from `marf_path` with hot tier enabled, runs the
-/// promotion, and drops the handle on return.
-///
-/// Used by [`crate::chainstate::stacks::db::StacksChainState::maybe_squash`]
-/// to dispatch hot-tier promotions through `thread::scope` workers
-/// (B5d): each worker thread owns its own `MARF` so the chainstate's
-/// live MARF doesn't have to be borrowed across the spawn boundary.
-/// The coordinator `MARF::refresh_after_squash` after the worker
-/// joins to pick up the new level + remap the cold-blob mmap.
-///
-/// Mirrors the shape of [`crate::chainstate::stacks::index::squash::squash_level_incremental`]
-/// (the legacy path-based wrapper).
-///
-/// **B5d-fu.2 retry-worker semantics**: when the previous worker
-/// crashed after persisting a plan file, this function's
-/// `MARF::from_path` open synchronously runs
-/// `recover_pending_promotions` BEFORE we attempt the live
-/// promotion. Recovery may publish a level using the prior plan's
-/// range, after which the live promotion's `[min_height,
-/// max_height]` (computed from the coordinator's stale view) can
-/// fail `validate_squash_target`'s contiguity check. We detect this
-/// by snapshotting `marf_squash_levels` row count before and after
-/// the open: if recovery published, the live error is non-fatal —
-/// the chainstate moved forward and the coordinator must
-/// `refresh_after_squash`. We collapse to `Ok(default stats)` so
-/// the caller (`run_hot_tier_promotion_worker`) reports
-/// `promoted = true`.
-pub fn run_horizon_gated_promotion_at_path<T: MarfTrieId + Send + Sync>(
-    marf_path: &str,
-    min_height: u32,
-    max_height: u32,
-    canonical_tip: Option<T>,
-) -> Result<PromotionStats, Error> {
-    use crate::chainstate::stacks::index::marf::MARFOpenOpts;
-    use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
-    let open_opts = MARFOpenOpts {
-        hash_calculation_mode: TrieHashCalculationMode::Immediate,
-        cache_strategy: "noop".to_string(),
-        external_blobs: true,
-        force_db_migrate: false,
-        compress: false,
-        mmap: false,
-        squash_mode: crate::chainstate::stacks::index::squash::SquashMode::TipOnly,
-        squash_root_snapshot_retention_levels:
-            crate::chainstate::stacks::index::squash::MARF_ROOT_SNAPSHOT_RETENTION_LEVELS,
-        squash_root_snapshot_retention_blocks: None,
-        squash_horizon_burn_blocks: None,
-    };
-
-    // Snapshot the level count BEFORE opening the MARF. A raw
-    // `rusqlite::Connection::open` doesn't trigger
-    // `recover_pending_promotions`, so this reflects the on-disk
-    // state at the moment the worker was dispatched. Best-effort:
-    // if the SQLite open fails (e.g., the DB was just created and
-    // the file isn't durable yet), default to 0 — recovery would
-    // also be a no-op in that case.
-    let pre_open_level_count: usize = match rusqlite::Connection::open(marf_path) {
-        Ok(conn) => trie_sql::read_squash_levels(&conn)
-            .map(|v| v.len())
-            .unwrap_or(0),
-        Err(_) => 0,
-    };
-
-    let mut marf = MARF::<T>::from_path(marf_path, open_opts)?;
-
-    // Snapshot AFTER recovery has run inside `from_path`. If the
-    // count grew, recovery published a level and the chainstate's
-    // on-disk state changed.
-    let post_open_level_count = trie_sql::read_squash_levels(marf.sqlite_conn())
-        .map(|v| v.len())
-        .unwrap_or(pre_open_level_count);
-    let recovery_published = post_open_level_count > pre_open_level_count;
-    if recovery_published {
-        info!(
-            "Auto-squash (hot-tier, detached): recovery published a level on open of \
-             {marf_path} (pre={pre_open_level_count}, post={post_open_level_count}); \
-             live promotion proceeds opportunistically."
-        );
-    }
-
-    let live_result =
-        run_horizon_gated_promotion::<T>(&mut marf, min_height, max_height, canonical_tip);
-    match live_result {
-        Ok(stats) => Ok(stats),
-        Err(e) if recovery_published => {
-            // Recovery did the load-bearing work; the live
-            // promotion's failure is downstream of a stale-range
-            // mismatch (the coordinator computed
-            // `[min_height, max_height]` from a pre-recovery view).
-            // Return `Ok` with zero-valued stats so the caller
-            // reports `promoted = true` and the coordinator runs
-            // `refresh_after_squash` to pick up recovery's level.
-            info!(
-                "Auto-squash (hot-tier, detached): live promotion error after \
-                 recovery-published level (range may have advanced past coordinator's view): \
-                 {e}. Treating as success since on-disk state is post-recovery."
-            );
-            Ok(PromotionStats::default())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Inner function whose error path triggers the outer wrapper's lock- clear. Splitting at this
-/// boundary keeps the `?`-heavy body free of inline cleanup while preserving the "any error → lock
-/// clear" invariant.
-fn run_horizon_gated_promotion_inner<T: MarfTrieId + Send + Sync>(
-    marf: &mut MARF<T>,
-    min_height: u32,
-    max_height: u32,
-    canonical_tip: Option<T>,
-) -> Result<PromotionStats, Error> {
-    let marf_path = marf.get_db_path().to_string();
 
     // ── Background phase: merge prep ──────────────────────────────
     let mut stats = SquashStats::default();
     let mut timings = PhaseTimings::default();
     let prepared = prepare_merge_outputs(
         marf,
-        crate::chainstate::stacks::index::squash::SquashMode::TipOnly,
+        mode,
         min_height,
         max_height,
         /* reclaim */ true,
@@ -313,6 +397,40 @@ fn run_horizon_gated_promotion_inner<T: MarfTrieId + Send + Sync>(
         .pwrite_blob_chunk(&merged_blob_bytes, cold_blob_offset)?;
     marf.storage.finish_blob_write(None)?;
 
+    // ── Background phase: snapshot the catch-up watermark FIRST ───
+    //
+    // The watermark must be captured BEFORE `enumerate_hot_descendants` runs. The catch-up scan
+    // at publish time uses `block_id > watermark` to find rows the initial pass didn't cover;
+    // any block committed between watermark capture and enumerate winds up in `enumerate`'s
+    // result (and is scanned in the initial pass), and any block committed AFTER enumerate has
+    // `block_id > watermark` (covered by catch-up). Both passes together cover the full
+    // descendant set at publish time, with `merge_catchup_into_plan` de-duping any overlap.
+    //
+    // **Don't reorder this with `enumerate_hot_descendants` below.** If the watermark is
+    // captured AFTER enumerate, blocks committed in the (enumerate, watermark] gap fall through
+    // both passes — not in the initial scan (committed after enumerate ran), not in catch-up
+    // (their block_id is ≤ watermark, so the `> watermark` filter excludes them). Their
+    // descendant backptrs to in-range blocks are then never rewritten, leaving stale pre-publish
+    // offsets that resolve into mid-node bytes after the level commits. Mainnet sync hit
+    // exactly this on the perf/marf-squash-cyle branch (level-8 panic, blocks 19039/19040 left
+    // with patch base ptr `(18711, 2506)` pointing inside 18711's merged-blob root).
+    //
+    // The regression test pinning this is
+    // [`prepare_watermark_precedes_enumerate_under_concurrent_commit`] in
+    // `test/squash_promote.rs`.
+    let catchup_watermark = {
+        #[cfg(test)]
+        {
+            test_hooks::forced_tip_at_scan_start()
+                .map(Ok)
+                .unwrap_or_else(|| trie_sql::current_published_max_block_id(marf.sqlite_conn()))?
+        }
+        #[cfg(not(test))]
+        {
+            trie_sql::current_published_max_block_id(marf.sqlite_conn())?
+        }
+    };
+
     // ── Background phase: descendant rewrite plan ─────────────────
     //
     // Resolve the COMPLETE in-range block_id set from the trailer (authoritative). Earlier code
@@ -333,9 +451,7 @@ fn run_horizon_gated_promotion_inner<T: MarfTrieId + Send + Sync>(
             .as_ref()
             .and_then(|b| b.hot_files())
             .ok_or_else(|| {
-                Error::CorruptionError(
-                    "run_horizon_gated_promotion: hot tier must be attached".into(),
-                )
+                Error::CorruptionError("prepare_promotion: hot tier must be attached".into())
             })?;
         for desc in &descendants {
             scan_one_descendant(
@@ -349,27 +465,15 @@ fn run_horizon_gated_promotion_inner<T: MarfTrieId + Send + Sync>(
     }
     rewrite_plan.sort_by_key(|e| (e.hot_file_seq, e.file_offset));
 
-    // ── Background phase: snapshot the catch-up watermark ─────────
-    //
-    // `MAX(block_id) FROM marf_data` at the end of the descendant
-    // enumeration above. Any hot row with `block_id > watermark` is
-    // a "new" descendant — written between this point and the swap.
-    // Under B5d's `thread::scope` dispatch the coordinator can't
-    // append while the worker runs, so the live catch-up scan finds
-    // zero entries; B5d-fu.2's detached-spawn is what makes this
-    // load-bearing.
-    let catchup_watermark = {
-        #[cfg(test)]
-        {
-            test_hooks::forced_tip_at_scan_start()
-                .map(Ok)
-                .unwrap_or_else(|| trie_sql::current_published_max_block_id(marf.sqlite_conn()))?
-        }
-        #[cfg(not(test))]
-        {
-            trie_sql::current_published_max_block_id(marf.sqlite_conn())?
-        }
-    };
+    // Test-only barrier: fires AFTER enumerate completes, simulating the window where the
+    // buggy ordering captured the watermark. A test arming this barrier injects a concurrent
+    // commit via a peer MARF handle; under the corrected ordering the watermark is already
+    // captured (snapshotted before enumerate above) and the catch-up filter at publish time
+    // covers the new commit. Under a (hypothetical) regression where watermark capture moved
+    // back here, the watermark would equal the new commit's block_id and catch-up would miss
+    // it — exactly the mainnet level-8 race.
+    #[cfg(test)]
+    test_hooks::maybe_pause_after_descendant_enumerate(&marf_path);
 
     // ── Background phase: capture sidecar witness ─────────────────
     //
@@ -387,7 +491,7 @@ fn run_horizon_gated_promotion_inner<T: MarfTrieId + Send + Sync>(
         );
         let bytes = std::fs::read(&abs_path).map_err(|e| {
             Error::CorruptionError(format!(
-                "B5a: sidecar at {abs_path:?} not readable after merge prep: {e}"
+                "prepare_promotion: sidecar at {abs_path:?} not readable after merge prep: {e}"
             ))
         })?;
         let hash = sha512_256_of(&bytes);
@@ -420,12 +524,9 @@ fn run_horizon_gated_promotion_inner<T: MarfTrieId + Send + Sync>(
             root_sidecar_present: prepared.merge.sidecar_published,
             root_sidecar_trimmed: false,
             orphan_split_offset: prepared.merge.orphan_split_offset,
-            // Fix #4 (B5a Codex review): the watermark must be `MAX(block_id) over committed
-            // marf_data` snapshotted inside the swap SQL transaction, not the in-range max.
-            // Placeholder here; the swap phase recomputes via `current_published_max_block_id(&tx)`
-            // and writes the real value into the published level row. The plan header still carries
-            // the in-range max as a recovery fallback — recovery's idempotent replay would prefer a
-            // fresh `current_published_max_block_id` lookup if it had a transaction, which it does.
+            // Placeholder; the publish phase recomputes via `current_published_max_block_id(&tx)`
+            // and writes the real value into the published level row. The plan header still
+            // carries the in-range max as a recovery fallback.
             published_max_block_id: in_range_blocks
                 .iter()
                 .map(|b| b.block_id)
@@ -439,47 +540,362 @@ fn run_horizon_gated_promotion_inner<T: MarfTrieId + Send + Sync>(
     let plan_path = PathBuf::from(plan_file_path(&marf_path, prepared.next_level_id));
     write_plan_file_atomic(&plan_path, &plan)?;
 
-    // ── B5b test fault hook ───────────────────────────────────────
-    //
-    // After the plan file is durable, the swap phase is the load- bearing recovery boundary: any
-    // crash here must be replayable from the on-disk state. To exercise that property end-to-end we
-    // let tests force an early return *immediately after the plan file is fsynced* — leaving the
-    // cold blob, sidecar, pending plan, and partially-applied (or zero-applied) hot rewrites on
-    // disk for `recover_pending_promotions` to drive forward. Production builds compile this away
-    // via `#[cfg(test)]`.
-    #[cfg(test)]
-    if test_hooks::abort_after_plan_write_armed() {
-        // Surface a sentinel error so the caller can distinguish this from real failures. The outer
-        // wrapper's lock-clear policy correctly leaves the lock set (the plan file is present),
-        // matching the production crash semantics.
-        return Err(Error::NotSupportedError(
-            "test fault: aborted after plan write".into(),
-        ));
-    }
-
-    // ── Swap phase ────────────────────────────────────────────────
     let translation_entries = prepared.merge.translation_map.entry_count();
-    apply_swap_phase::<T>(
-        marf,
-        &plan,
-        &plan_path,
-        cold_blob_offset,
-        cold_blob_length,
-        prepared.next_level_id,
-        prepared.merge.orphan_split_offset,
-        prepared.merge.sidecar_published,
-    )?;
+    let next_level_id = prepared.next_level_id;
+    let rewrites_planned = rewrite_plan.len();
 
-    // Tear down merge state (must happen after swap).
+    // Tear down merge state. The publish phase has no need for `node_store` — it works against
+    // durable artifacts (cold blob, sidecar, plan file). Letting `node_store` outlive plan
+    // persistence would keep the merge's temp file open across the prepare→publish handoff for
+    // no reason.
     prepared.merge.node_store.finish()?;
 
-    Ok(PromotionStats {
-        squash: stats,
-        translation_map_entries: translation_entries,
-        descendants_scanned,
-        rewrites_planned: rewrite_plan.len(),
-        cold_blob_bytes_written: cold_blob_length,
+    Ok(PreparedPromotion {
+        plan_path,
+        level_id: next_level_id,
+        min_height,
+        max_height,
+        stats: PromotionStats {
+            squash: stats,
+            translation_map_entries: translation_entries,
+            descendants_scanned,
+            rewrites_planned,
+            cold_blob_bytes_written: cold_blob_length,
+        },
     })
+}
+
+/// **Publish phase**: validate (optional), catch-up scan, fenced rewrites + fsync, SQL transaction
+/// (level row + redirect + clear lock), refresh in-memory squash meta, remove plan file.
+///
+/// Reads the durable plan from `prepared.plan_path`. Both the runtime publish path
+/// (chains-coordinator's [`crate::chainstate::stacks::db::StacksChainState::poll_pending_promotions`])
+/// and recovery
+/// ([`crate::chainstate::stacks::index::squash_recover::recover_pending_promotions`]) call this
+/// helper, so the same publish logic runs in both startup and runtime contexts.
+///
+/// **Policy semantics**:
+/// - [`DrainPolicy::TrustPlan`] publishes unconditionally. Used by the synchronous all-in-one
+///   entry point and by recovery (which has already run its own canonical-divergence check before
+///   reaching this helper).
+/// - [`DrainPolicy::Canonical`] validates the plan's `in_range_blocks[*].block_hash` against a
+///   live [`crate::chainstate::stacks::index::squash_recover::CanonicalView`] and discards the
+///   plan instead of publishing if the view has diverged. This is the runtime stale-tip fix —
+///   the chains-coordinator calls this with a view derived from the canonical Stacks chain tip
+///   each time it polls a finished worker.
+///
+/// **Outcome variants** (returned via `DrainOutcome`):
+/// - `Published` — level published, plan file removed, in-memory squash meta refreshed.
+/// - `DiscardedStale` — `Canonical(view)` flagged divergence; plan abandoned (cold-tail truncate
+///   left as best-effort by the caller; not done here so a single failed call can't lose work
+///   that was about to be valid on the next coordinator pass).
+/// - `Abandoned` — not produced here. Recovery's integrity checks (cold-blob hash mismatch,
+///   sidecar mismatch) live in `recover_one_plan`; this helper assumes the prepared bytes are
+///   self-consistent.
+pub fn apply_prepared_plan<T: MarfTrieId + Send + Sync>(
+    marf: &mut MARF<T>,
+    prepared: &PreparedPromotion,
+    policy: DrainPolicy<'_>,
+) -> Result<DrainOutcome, Error> {
+    let plan = read_plan_file(&prepared.plan_path)?;
+
+    // ── Optional canonical-divergence gate ────────────────────────
+    //
+    // Under `DrainPolicy::Canonical(view)` the publish gate validates the plan's recorded
+    // canonical chain against the live view. This is the runtime fix for the detached-worker
+    // stale-tip publish bug: the worker captures `canonical_tip` at scan-start, but Stacks-level
+    // fork resolution at deep heights can flip during sync between scan and publish; if it has,
+    // committing the level would record a stale chain that downstream `assert_squash_consistency`
+    // checks then trip on.
+    if let DrainPolicy::Canonical(view) = policy {
+        if let Some(outcome) = check_canonical_divergence(view, &plan)? {
+            if let DrainOutcome::DiscardedStale {
+                diverging_height,
+                recorded_hash,
+                canonical_hash,
+                ..
+            } = &outcome
+            {
+                let plan_path_disp = prepared.plan_path.display();
+                info!(
+                    "promotion publish: discarding plan {plan_path_disp} (canonical divergence \
+                     at height {diverging_height}: plan recorded {}, current canonical is {:?}); \
+                     will clear promotion state and remove plan file",
+                    stacks_common::util::hash::to_hex(recorded_hash),
+                    canonical_hash.map(|h| stacks_common::util::hash::to_hex(&h)),
+                );
+            }
+            // Same cleanup as recovery's `abandon_plan`: clear the in-flight promotion lock and
+            // remove the plan file. Doesn't truncate the cold blob's reserved-but-unpublished
+            // region — the next promotion's reserved offset is derived from the top committed
+            // level (not file EOF), so the orphan bytes are safely overwritten.
+            trie_sql::clear_promotion_state(marf.sqlite_conn())?;
+            if let Err(e) = std::fs::remove_file(&prepared.plan_path) {
+                let plan_path_disp = prepared.plan_path.display();
+                warn!(
+                    "promotion publish: failed to remove discarded plan file {plan_path_disp}: \
+                     {e} (will retry on next open)",
+                );
+            }
+            return Ok(outcome);
+        }
+    }
+
+    // ── Shared inner: catch-up + fenced apply + SQL publish + plan-remove ──
+    //
+    // `publish_prepared_inner` is the unified core both runtime publish (this function) and
+    // recovery's `recover_one_plan` route through. It operates on a `&mut Connection` +
+    // `&mut HotFileSet` so it doesn't depend on a live `MARF<T>` handle.
+    let (db, hot_files) = marf.storage.publish_borrows().ok_or_else(|| {
+        Error::CorruptionError("apply_prepared_plan: hot tier must be attached".into())
+    })?;
+    let (rewrites_applied, _rewrites_skipped) =
+        publish_prepared_inner::<T>(db, hot_files, &prepared.plan_path, &plan)?;
+
+    // ── Refresh in-memory squash meta + cold mmap on this handle ──
+    //
+    // Recovery's open-time call doesn't need this — the open path loads fresh state after
+    // recovery. The runtime publish does need it because the live MARF handle holds in-memory
+    // squash metadata + a cold-blob mmap that must pick up the new level's bytes.
+    marf.refresh_after_squash()?;
+
+    Ok(DrainOutcome::Published {
+        level_id: plan.header.level_id,
+        in_range_block_count: plan.in_range_blocks.len(),
+        rewrites_applied,
+    })
+}
+
+/// **Shared publish core.** Catch-up scan, plan augmentation, fenced rewrites + fsync, SQL
+/// transaction (level row + redirect + clear lock), plan-file remove. Returns
+/// `(rewrites_applied, rewrites_skipped)`.
+///
+/// This is the one publish path used by both:
+/// - [`apply_prepared_plan`] (runtime publish via the chains-coordinator's
+///   `poll_pending_promotions`), wrapped with the canonical-divergence gate and
+///   post-publish `MARF::refresh_after_squash`.
+/// - [`crate::chainstate::stacks::index::squash_recover::recover_pending_promotions`] (startup
+///   recovery), wrapped with cold-blob/sidecar integrity verification.
+///
+/// Operates on raw primitives (`&mut Connection`, `&mut HotFileSet`) so it has no dependency on
+/// `MARF<T>` and is callable from both contexts. Each per-rewrite entry is classified
+/// (`pre_bytes` → apply / `post_bytes` → skip) before the fence is engaged, so the apply phase
+/// is idempotent under recovery from a partial pre-crash apply, and bug-tolerant in the runtime
+/// case (any unexpected on-disk byte triggers `CorruptionError` rather than overwriting).
+pub(crate) fn publish_prepared_inner<T: MarfTrieId>(
+    db: &mut rusqlite::Connection,
+    hot_files: &mut crate::chainstate::stacks::index::hot_file::HotFileSet,
+    plan_path: &Path,
+    plan: &SquashPlan,
+) -> Result<(usize, usize), Error> {
+    use crate::chainstate::stacks::index::squash_recover::classify_rewrite_for_publish;
+
+    // ── Catch-up scan ─────────────────────────────────────────────
+    //
+    // Walk hot rows committed AFTER `plan.header.tip_at_scan_start` and emit rewrite entries for
+    // any in-range backptrs they captured. Under detached-spawn dispatch the coordinator may
+    // have committed additional hot rows since the worker snapshotted the watermark, and those
+    // rows need their backptrs rewritten too — otherwise reads of those blocks would resolve
+    // through stale hot-layout offsets that the cold-blob promotion no longer covers.
+    //
+    // Crash safety: if the catch-up scan emits new entries, we re-write the plan file
+    // atomically with the merged rewrite list *before* applying any pwrites. Recovery (which
+    // reloads the plan from disk and replays idempotently) sees the augmented list, so any
+    // catch-up rewrite that was applied pre-crash is replayable by witness.
+    let in_range_block_ids: HashSet<u32> =
+        plan.in_range_blocks.iter().map(|b| b.block_id).collect();
+    let catchup_extras = {
+        let new_descendants = enumerate_hot_descendants_above_block_id(
+            db,
+            plan.header.max_height,
+            plan.header.tip_at_scan_start,
+        )?;
+        let reverse_set = build_translation_reverse_set(&plan.translation_map);
+        let mut extras: Vec<RewriteEntry> = Vec::new();
+        for desc in &new_descendants {
+            scan_catchup_descendant(
+                hot_files,
+                desc,
+                &in_range_block_ids,
+                &plan.translation_map,
+                &reverse_set,
+                &mut extras,
+            )?;
+        }
+        extras
+    };
+
+    // Merge background-phase + catch-up entries. De-dupes on `(seq, file_offset)`; sorts for
+    // sequential I/O per file.
+    let effective_rewrites = if catchup_extras.is_empty() {
+        plan.rewrite_plan.clone()
+    } else {
+        let merged = merge_catchup_into_plan(&plan.rewrite_plan, catchup_extras);
+        let augmented = SquashPlan {
+            header: plan.header.clone(),
+            in_range_blocks: plan.in_range_blocks.clone(),
+            translation_map: plan.translation_map.clone(),
+            rewrite_plan: merged.clone(),
+        };
+        write_plan_file_atomic(plan_path, &augmented)?;
+        merged
+    };
+
+    // ── Classify entries (Phase 1: read with guards) ──────────────
+    //
+    // Each entry's on-disk bytes are either `pre_bytes` (need apply) or `post_bytes` (already
+    // applied — only possible in recovery from a partial pre-crash apply, but the check is a
+    // cheap correctness guard in the runtime path too). A neither/nor result is corruption;
+    // surface it before engaging the fence.
+    //
+    // Tricky bit: setting `mutate_pending = true` first and then trying to `read_at` would
+    // self-deadlock (our own read would back off forever). So Phase 1 reads without the fence
+    // — no concurrent writer exists at this point (the promotion lock is held). Phase 2 then
+    // sets the fence and pwrites only the "needs apply" entries.
+    let mut rewrites_applied = 0usize;
+    let mut rewrites_skipped = 0usize;
+    let mut entries_to_apply: Vec<&RewriteEntry> = Vec::new();
+    let mut touched_seqs: HashSet<u32> = HashSet::new();
+    for entry in &effective_rewrites {
+        if classify_rewrite_for_publish(hot_files, entry)? {
+            entries_to_apply.push(entry);
+            rewrites_applied += 1;
+        } else {
+            rewrites_skipped += 1;
+        }
+        touched_seqs.insert(entry.hot_file_seq);
+    }
+
+    // ── Phase 2: fenced pwrite + fsync + SQL publish ──────────────
+    //
+    // Reader-fence protocol: for each hot file the rewrite plan touches, set
+    // `mutate_pending = true` and wait for live readers (any `HotFileReadGuard` on this file)
+    // to drain before issuing any `pwrite`. Readers arriving while the flag is set back off
+    // until it clears (see `HotFileReadGuard::try_from_fence`).
+    //
+    // Quiesce timeout: 5s. The expected wait is single-digit milliseconds. A timeout signals a
+    // stuck reader (likely a bug in a read path that fails to drop its guard, or a deadlock).
+    // On timeout we abort the publish with `InProgressError`, leaving the plan file durable
+    // for the next RW open's recovery path to retry.
+    if !touched_seqs.is_empty() {
+        const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        // Set `mutate_pending` on every touched file BEFORE waiting on any. Setting them all
+        // up front prevents new readers from arriving on file B while we're draining file A.
+        for seq in &touched_seqs {
+            hot_files.set_mutate_pending(*seq, true)?;
+        }
+
+        // Test-only barrier: pauses here (after set_mutate_pending, before wait_for_quiesce)
+        // when armed. Lets a peer-reader regression test observe that the fence is engaged
+        // before publish progresses. Originally a recovery-only hook; fires on both publish
+        // paths now that they share this inner.
+        #[cfg(test)]
+        test_hooks::maybe_pause_at_recovery_fence(plan_path);
+
+        // Hold the reader fence across BOTH phases of publication: once descendant ptr
+        // rewrites become durable, readers must stay blocked until the SQL transaction
+        // redirects in-range rows into the same post-promotion address space.
+        let rewrite_result = (|| -> Result<(), Error> {
+            for seq in &touched_seqs {
+                hot_files.wait_for_quiesce(*seq, QUIESCE_TIMEOUT)?;
+            }
+            for entry in &entries_to_apply {
+                hot_files.pwrite_ptr_field(
+                    entry.hot_file_seq,
+                    entry.file_offset,
+                    entry.post_bytes,
+                )?;
+            }
+            for seq in &touched_seqs {
+                hot_files.fsync_seq(*seq)?;
+            }
+            Ok(())
+        })();
+
+        #[cfg(test)]
+        if rewrite_result.is_ok() {
+            test_hooks::maybe_pause_after_rewrite_before_sql(plan_path);
+            test_hooks::maybe_pause_after_recovery_rewrite_before_sql(plan_path);
+        }
+
+        let sql_result = if rewrite_result.is_ok() {
+            publish_level_sql::<T>(db, plan)
+        } else {
+            Ok(())
+        };
+
+        // Always clear `mutate_pending` — whether the rewrite phase or SQL publish failed. If
+        // we leave it set on error, readers would block on the next promotion attempt.
+        for seq in &touched_seqs {
+            if let Err(e) = hot_files.set_mutate_pending(*seq, false) {
+                warn!(
+                    "publish_prepared_inner: failed to clear mutate_pending on seq={seq}: {e} \
+                     (readers may block on next promotion until process restart)",
+                );
+            }
+        }
+
+        rewrite_result?;
+        sql_result?;
+    } else {
+        // No touched seqs (empty rewrite plan, or all entries already applied). Still publish
+        // the level row + redirect + clear lock.
+        publish_level_sql::<T>(db, plan)?;
+    }
+
+    #[cfg(test)]
+    test_hooks::maybe_pause_after_sql_commit_before_refresh(plan_path);
+
+    // ── Remove plan file (best-effort) ────────────────────────────
+    if let Err(e) = std::fs::remove_file(plan_path) {
+        let plan_path_disp = plan_path.display();
+        warn!(
+            "publish_prepared_inner: failed to remove plan file {plan_path_disp}: {e} \
+             (will be retried on next open)",
+        );
+    }
+
+    Ok((rewrites_applied, rewrites_skipped))
+}
+
+/// SQL transaction step shared by [`publish_prepared_inner`]'s two callers (runtime publish via
+/// `apply_prepared_plan`, and recovery via `recover_one_plan`). Redirects the in-range
+/// `marf_data` rows to the cold blob, writes the level row, and clears the in-flight promotion
+/// lock — all inside one transaction so the publish lands atomically.
+fn publish_level_sql<T: MarfTrieId>(
+    db: &mut rusqlite::Connection,
+    plan: &SquashPlan,
+) -> Result<(), Error> {
+    let tx = db.transaction().map_err(Error::SQLError)?;
+    redirect_in_range_blocks_to_cold::<T>(
+        &tx,
+        &plan.in_range_blocks,
+        plan.header.cold_blob_offset,
+        plan.header.cold_blob_length,
+    )?;
+    // Compute the post-publish watermark inside the same SQL transaction. The per-MARF "bytes
+    // since last squash" counter treats `block_id > watermark` as the post-publish open suffix.
+    // Falls back to the plan header value if the live computation fails (recovery is best-
+    // effort on this counter).
+    let watermark =
+        trie_sql::current_published_max_block_id(&tx).unwrap_or(plan.header.published_max_block_id);
+    let level_row = SquashLevelRow {
+        level_id: plan.header.level_id,
+        min_height: plan.header.min_height,
+        max_height: plan.header.max_height,
+        blob_offset: plan.header.cold_blob_offset,
+        blob_length: plan.header.cold_blob_length,
+        reads_redirected: plan.header.reads_redirected,
+        root_sidecar_present: plan.header.root_sidecar_present,
+        root_sidecar_trimmed: plan.header.root_sidecar_trimmed,
+        orphan_split_offset: plan.header.orphan_split_offset,
+        published_max_block_id: watermark,
+    };
+    trie_sql::write_squash_level(&tx, &level_row)?;
+    trie_sql::clear_promotion_state(&tx)?;
+    tx.commit().map_err(Error::SQLError)?;
+    Ok(())
 }
 
 // ===========================================================================
@@ -836,240 +1252,6 @@ pub(crate) fn merge_catchup_into_plan(
     }
     merged.sort_by_key(|e| (e.hot_file_seq, e.file_offset));
     merged
-}
-
-/// Apply the swap phase: pwrite rewrites to hot files, fsync, run the SQL transaction, refresh
-/// squash meta, remove plan file.
-#[allow(clippy::too_many_arguments)] // 8 args: each captures a distinct piece of swap-phase context; bundling would obscure the call site
-fn apply_swap_phase<T: MarfTrieId + Send + Sync>(
-    marf: &mut MARF<T>,
-    plan: &SquashPlan,
-    plan_path: &Path,
-    cold_blob_offset: u64,
-    cold_blob_length: u64,
-    next_level_id: u32,
-    orphan_split_offset: u32,
-    sidecar_published: bool,
-) -> Result<(), Error> {
-    // ── Catch-up scan (B5d-fu.1) ───────────────────────────────────
-    //
-    // Walk hot rows committed AFTER `plan.header.tip_at_scan_start` and emit rewrite entries for
-    // any in-range backptrs they captured. Under B5d's `thread::scope` dispatch, the coordinator is
-    // blocked on the worker's join, so the SQL filter `block_id > tip_at_scan_start` returns no
-    // rows — but exercising the path here keeps fu.2's detached-spawn change a pure dispatch swap.
-    //
-    // Crash safety: if the catch-up scan emits new entries, we re-write the plan file atomically
-    // with the merged rewrite list *before* applying any pwrites. Recovery (which reloads the plan
-    // from disk and replays idempotently) sees the augmented list, so any catch-up rewrite that was
-    // applied pre-crash is replayable by witness. Without the plan re-write, a crash mid-pwrites
-    // would lose unrecorded catch-up entries on recovery.
-    let in_range_block_ids: HashSet<u32> =
-        plan.in_range_blocks.iter().map(|b| b.block_id).collect();
-    let catchup_extras = {
-        let conn = marf.sqlite_conn();
-        let new_descendants = enumerate_hot_descendants_above_block_id(
-            conn,
-            plan.header.max_height,
-            plan.header.tip_at_scan_start,
-        )?;
-        let reverse_set = build_translation_reverse_set(&plan.translation_map);
-        let hot_files = marf
-            .storage
-            .blobs
-            .as_ref()
-            .and_then(|b| b.hot_files())
-            .ok_or_else(|| {
-                Error::CorruptionError(
-                    "swap phase: hot tier must be attached for catch-up scan".into(),
-                )
-            })?;
-        let mut extras: Vec<RewriteEntry> = Vec::new();
-        for desc in &new_descendants {
-            scan_catchup_descendant(
-                hot_files,
-                desc,
-                &in_range_block_ids,
-                &plan.translation_map,
-                &reverse_set,
-                &mut extras,
-            )?;
-        }
-        extras
-    };
-
-    // Merge background-phase + catch-up entries. De-dupes on `(seq, file_offset)`; sorts for
-    // sequential I/O per file.
-    let effective_rewrites = if catchup_extras.is_empty() {
-        plan.rewrite_plan.clone()
-    } else {
-        let merged = merge_catchup_into_plan(&plan.rewrite_plan, catchup_extras);
-        // Persist the augmented plan atomically before any pwrite, so crash recovery has the full
-        // witness list. The header is unchanged — only `rewrite_plan` grew.
-        let augmented = SquashPlan {
-            header: plan.header.clone(),
-            in_range_blocks: plan.in_range_blocks.clone(),
-            translation_map: plan.translation_map.clone(),
-            rewrite_plan: merged.clone(),
-        };
-        crate::chainstate::stacks::index::squash_plan::write_plan_file_atomic(
-            plan_path, &augmented,
-        )?;
-        merged
-    };
-
-    // ── Quiesce + apply rewrites + fsync per touched hot file ──
-    //
-    // Reader-fence protocol (per `.docs/squashing-v1.5-phase-b.md` §6.1.1): for each hot file the
-    // rewrite plan touches, set `mutate_pending = true` and wait for live readers (any
-    // `HotFileReadGuard` on this file) to drain before issuing any `pwrite`. Readers arriving while
-    // the flag is set back off until it clears (see `HotFileReadGuard::try_from_fence`).
-    //
-    // Quiesce timeout: 5s. The expected wait is single-digit milliseconds — the rewrite plan is
-    // bounded by the squash range size, and individual reads are bounded by the read-path's own
-    // latency. A timeout signals a stuck reader (likely a bug in a read path that fails to drop its
-    // guard, or a deadlock). On timeout we abort the swap with `InProgressError`, leaving the plan
-    // file durable for the next RW open's recovery path to retry.
-    let touched_seqs: HashSet<u32> = effective_rewrites.iter().map(|e| e.hot_file_seq).collect();
-    const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    {
-        {
-            let hot_files = marf
-                .storage
-                .blobs
-                .as_mut()
-                .and_then(|b| b.hot_files_mut())
-                .ok_or_else(|| {
-                    Error::CorruptionError(
-                        "swap phase: hot tier must be attached for rewrite apply".into(),
-                    )
-                })?;
-
-            // Set `mutate_pending` on every touched file BEFORE waiting on any. Setting them all
-            // up front prevents new readers from arriving on file B while we're draining file A.
-            for seq in &touched_seqs {
-                hot_files.set_mutate_pending(*seq, true)?;
-            }
-        }
-
-        // Hold the reader fence across BOTH phases of publication: once descendant ptr rewrites
-        // become durable, readers must stay blocked until the SQL transaction redirects in-range
-        // rows into the same post-promotion address space.
-        let rewrite_result = {
-            let hot_files = marf
-                .storage
-                .blobs
-                .as_mut()
-                .and_then(|b| b.hot_files_mut())
-                .ok_or_else(|| {
-                    Error::CorruptionError(
-                        "swap phase: hot tier must be attached for rewrite apply".into(),
-                    )
-                })?;
-
-            (|| -> Result<(), Error> {
-                for seq in &touched_seqs {
-                    hot_files.wait_for_quiesce(*seq, QUIESCE_TIMEOUT)?;
-                }
-                for entry in &effective_rewrites {
-                    hot_files.pwrite_ptr_field(
-                        entry.hot_file_seq,
-                        entry.file_offset,
-                        entry.post_bytes,
-                    )?;
-                }
-                for seq in &touched_seqs {
-                    hot_files.fsync_seq(*seq)?;
-                }
-                Ok(())
-            })()
-        };
-
-        #[cfg(test)]
-        if rewrite_result.is_ok() {
-            test_hooks::maybe_pause_after_rewrite_before_sql(plan_path);
-        }
-
-        let sql_result = if rewrite_result.is_ok() {
-            (|| -> Result<(), Error> {
-                let storage = marf.storage_backend_mut();
-                let tx = storage.sqlite_tx()?;
-                redirect_in_range_blocks_to_cold::<T>(
-                    &tx,
-                    &plan.in_range_blocks,
-                    cold_blob_offset,
-                    cold_blob_length,
-                )?;
-                // Compute the post-publish watermark inside the same SQL transaction (Fix #4 from
-                // B5a Codex review). The legacy path uses
-                // `current_published_max_block_id(&tx)` for this exact purpose: the per-MARF
-                // "bytes since last squash" counter treats `block_id > watermark` as the
-                // post-publish open suffix. Using the in-range max here would cause the counter to
-                // over-count every descendant hot block as new unsquashed work immediately after
-                // promotion — a regression the cadence policy would notice.
-                let watermark = trie_sql::current_published_max_block_id(&tx)?;
-                let level_row = SquashLevelRow {
-                    level_id: next_level_id,
-                    min_height: plan.header.min_height,
-                    max_height: plan.header.max_height,
-                    blob_offset: cold_blob_offset,
-                    blob_length: cold_blob_length,
-                    reads_redirected: true,
-                    root_sidecar_present: sidecar_published,
-                    root_sidecar_trimmed: false,
-                    orphan_split_offset,
-                    published_max_block_id: watermark,
-                };
-                trie_sql::write_squash_level(&tx, &level_row)?;
-                trie_sql::clear_promotion_state(&tx)?;
-                tx.commit()?;
-                Ok(())
-            })()
-        } else {
-            Ok(())
-        };
-
-        let hot_files = marf
-            .storage
-            .blobs
-            .as_mut()
-            .and_then(|b| b.hot_files_mut())
-            .ok_or_else(|| {
-                Error::CorruptionError(
-                    "swap phase: hot tier must be attached while clearing rewrite fence".into(),
-                )
-            })?;
-
-        // Always clear `mutate_pending` — whether the rewrite phase or SQL publish failed. If we
-        // leave it set on error, readers would block on the next promotion attempt.
-        for seq in &touched_seqs {
-            // Best-effort: a failure here would leave the fence stuck, but the alternative (panic)
-            // is worse. Log + move on.
-            if let Err(e) = hot_files.set_mutate_pending(*seq, false) {
-                warn!(
-                    "swap phase: failed to clear mutate_pending on seq={seq}: {e} \
-                     (readers may block on next promotion until process restart)",
-                );
-            }
-        }
-
-        rewrite_result?;
-        sql_result?;
-    }
-
-    #[cfg(test)]
-    test_hooks::maybe_pause_after_sql_commit_before_refresh(plan_path);
-
-    // ── Refresh in-memory squash meta + cold mmap on this handle ──
-    marf.refresh_after_squash()?;
-
-    // ── Remove plan file (best-effort) ────────────────────────────
-    if let Err(e) = std::fs::remove_file(plan_path) {
-        warn!(
-            "B5a swap: failed to remove plan file {plan_path:?}: {e} \
-             (will be retried on next open)",
-        );
-    }
-    Ok(())
 }
 
 /// Redirect every row in `in_range_blocks` to point at `(offset, length)` in the cold blob,
@@ -1525,6 +1707,96 @@ pub(crate) mod test_hooks {
         let plan_parent = plan_path.parent();
         let target_parent = barrier.target_path.parent();
         if plan_parent != target_parent {
+            return;
+        }
+        barrier.reached.store(true, Ordering::SeqCst);
+        while !barrier.released.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Per-test pause barrier for the prepare phase's post-enumerate window — the wall-clock
+    /// spot where the buggy ordering captured `tip_at_scan_start`. Wired into
+    /// `prepare_promotion` via [`maybe_pause_after_descendant_enumerate`]: AFTER
+    /// `enumerate_hot_descendants` returns and the initial descendant scan has run, prepare
+    /// checks for an active barrier whose target path matches the worker's `db_path`; if
+    /// matched, prepare signals `reached` and parks until the test calls `release()`.
+    ///
+    /// Lets a test inject a concurrent commit (via a peer MARF handle) at exactly the spot
+    /// where the watermark-vs-enumerate race lived. Under the corrected ordering, the
+    /// watermark was already captured BEFORE enumerate, so a commit landing in this barrier
+    /// has `block_id > tip_at_scan_start` — the initial scan misses it (committed after
+    /// enumerate ran), but the catch-up filter `> watermark` at publish time covers it.
+    /// Under the (hypothetical) regression where watermark capture moved back here, the
+    /// watermark would equal the new commit's block_id and catch-up would miss it too —
+    /// exactly the mainnet level-8 race.
+    pub struct AfterDescendantEnumerateBarrier {
+        target_path: PathBuf,
+        reached: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl AfterDescendantEnumerateBarrier {
+        pub fn wait_until_reached(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if self.reached.load(Ordering::SeqCst) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        }
+
+        pub fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            let mut slot = ACTIVE_AFTER_DESCENDANT_ENUMERATE_BARRIER.lock();
+            let still_ours = slot
+                .as_ref()
+                .map(|active| active.target_path == self.target_path)
+                .unwrap_or(false);
+            if still_ours {
+                *slot = None;
+            }
+        }
+    }
+
+    static ACTIVE_AFTER_DESCENDANT_ENUMERATE_BARRIER: Mutex<
+        Option<Arc<AfterDescendantEnumerateBarrier>>,
+    > = Mutex::new(None);
+
+    /// Arm a prepare-phase barrier targeted at `db_path`. The next `prepare_promotion` call
+    /// against a MARF whose db_path matches will pause between watermark snapshot and
+    /// descendant enumerate.
+    ///
+    /// Panics if another barrier of this kind is already armed.
+    pub fn arm_after_descendant_enumerate_barrier(
+        db_path: impl Into<PathBuf>,
+    ) -> Arc<AfterDescendantEnumerateBarrier> {
+        let barrier = Arc::new(AfterDescendantEnumerateBarrier {
+            target_path: db_path.into(),
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        let mut slot = ACTIVE_AFTER_DESCENDANT_ENUMERATE_BARRIER.lock();
+        assert!(
+            slot.is_none(),
+            "post-watermark-pre-enumerate barrier already armed by another test \
+             (must release first)"
+        );
+        *slot = Some(Arc::clone(&barrier));
+        barrier
+    }
+
+    /// Called by `prepare_promotion` after `tip_at_scan_start` is captured and before
+    /// `enumerate_hot_descendants` runs. If an active barrier matches `db_path`, signals
+    /// `reached` and parks until released.
+    pub(crate) fn maybe_pause_after_descendant_enumerate(db_path: &str) {
+        let barrier = ACTIVE_AFTER_DESCENDANT_ENUMERATE_BARRIER.lock().clone();
+        let Some(barrier) = barrier else {
+            return;
+        };
+        if barrier.target_path != Path::new(db_path) {
             return;
         }
         barrier.reached.store(true, Ordering::SeqCst);

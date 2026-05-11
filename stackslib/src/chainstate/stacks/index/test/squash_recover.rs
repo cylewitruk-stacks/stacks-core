@@ -281,11 +281,12 @@ fn recovery_no_plans_is_a_noop() {
         &db_path,
         &mut hot_files,
         /* readonly */ false,
+        None,
     )
     .unwrap();
-    assert_eq!(stats.plans_discovered, 0);
-    assert_eq!(stats.plans_committed, 0);
-    assert_eq!(stats.plans_abandoned, 0);
+    assert_eq!(stats.plans_discovered(), 0);
+    assert_eq!(stats.plans_committed(), 0);
+    assert_eq!(stats.plans_abandoned(), 0);
     assert_eq!(stats.rewrites_applied, 0);
     assert_eq!(stats.rewrites_skipped, 0);
 }
@@ -307,12 +308,17 @@ fn recovery_clears_stale_promotion_lock_when_no_plan_present() {
     let pre = trie_sql::read_marf_state(&conn).unwrap();
     assert_eq!(pre.promotion_in_progress, Some(42));
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(stats.plans_discovered, 0);
-    assert_eq!(stats.plans_committed, 0);
-    assert_eq!(stats.plans_abandoned, 0);
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.plans_discovered(), 0);
+    assert_eq!(stats.plans_committed(), 0);
+    assert_eq!(stats.plans_abandoned(), 0);
 
     // Critical: the stale lock must be cleared so the next cadence tick
     // can spawn a fresh promotion.
@@ -334,9 +340,10 @@ fn recovery_readonly_does_not_clear_stale_promotion_lock() {
         &db_path,
         &mut hot_files,
         /* readonly */ true,
+        None,
     )
     .unwrap();
-    assert_eq!(stats.plans_discovered, 0);
+    assert_eq!(stats.plans_discovered(), 0);
 
     // Lock must still be set — readonly never mutates.
     let post = trie_sql::read_marf_state(&conn).unwrap();
@@ -354,13 +361,18 @@ fn recovery_commits_clean_plan_and_publishes_level_row() {
     let (plan, plan_path, _cold_blob_path, _sidecar_path) =
         build_committable_plan_setup(&db_path, &conn, &mut hot_files, 7);
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
 
-    assert_eq!(stats.plans_discovered, 1);
-    assert_eq!(stats.plans_committed, 1);
-    assert_eq!(stats.plans_abandoned, 0);
+    assert_eq!(stats.plans_discovered(), 1);
+    assert_eq!(stats.plans_committed(), 1);
+    assert_eq!(stats.plans_abandoned(), 0);
     assert_eq!(stats.rewrites_applied, 2);
     assert_eq!(stats.rewrites_skipped, 0);
 
@@ -419,14 +431,24 @@ fn recovery_re_run_after_commit_is_a_noop() {
     let (db_path, mut conn) = fresh_v5_db("recovery_re_run_after_commit");
     let mut hot_files = open_hot_files(&db_path, &conn);
     let _setup = build_committable_plan_setup(&db_path, &conn, &mut hot_files, 1);
-    let _first =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    let second =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(second.plans_discovered, 0);
-    assert_eq!(second.plans_committed, 0);
+    let _first = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    let second = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(second.plans_discovered(), 0);
+    assert_eq!(second.plans_committed(), 0);
 }
 
 // ===========================================================================
@@ -451,10 +473,15 @@ fn recovery_skips_already_applied_rewrites() {
     // Plan file is still present (the unlink hadn't happened yet).
     assert!(plan_path.exists());
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(stats.plans_committed, 1);
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.plans_committed(), 1);
     assert_eq!(stats.rewrites_applied, 0, "no fresh writes");
     assert_eq!(
         stats.rewrites_skipped, 2,
@@ -483,10 +510,15 @@ fn recovery_handles_partially_applied_rewrites() {
         .pwrite_ptr_field(first.hot_file_seq, first.file_offset, first.post_bytes)
         .unwrap();
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(stats.plans_committed, 1);
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.plans_committed(), 1);
     assert_eq!(stats.rewrites_applied, 1, "one fresh write");
     assert_eq!(stats.rewrites_skipped, 1, "one was already applied");
     assert!(!plan_path.exists());
@@ -516,11 +548,16 @@ fn recovery_abandons_plan_on_cold_blob_hash_mismatch() {
         f.write_at(&bad, plan.header.cold_blob_offset + 5).unwrap();
     }
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(stats.plans_committed, 0);
-    assert_eq!(stats.plans_abandoned, 1);
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.plans_committed(), 0);
+    assert_eq!(stats.plans_abandoned(), 1);
 
     // No level row published; plan file removed; in-flight state cleared.
     assert!(!plan_path.exists());
@@ -557,10 +594,15 @@ fn recovery_abandons_plan_when_cold_blob_too_short() {
         .unwrap();
     f.set_len(plan.header.cold_blob_offset).unwrap();
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(stats.plans_abandoned, 1);
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.plans_abandoned(), 1);
     assert!(!plan_path.exists());
     assert_promotion_state_cleared(&conn);
 }
@@ -578,10 +620,15 @@ fn recovery_abandons_plan_when_cold_blob_missing() {
 
     fs::remove_file(&cold_blob_path).unwrap();
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(stats.plans_abandoned, 1);
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.plans_abandoned(), 1);
     assert!(!plan_path.exists());
 }
 
@@ -598,10 +645,15 @@ fn recovery_abandons_plan_when_sidecar_missing() {
 
     fs::remove_file(&sidecar_path).unwrap();
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
-    assert_eq!(stats.plans_abandoned, 1);
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.plans_abandoned(), 1);
     assert!(!plan_path.exists());
 }
 
@@ -617,9 +669,14 @@ fn recovery_fails_on_undecodable_plan_file() {
     let plan_path = PathBuf::from(plan_file_path(&db_path, 99));
     fs::write(&plan_path, b"garbage that is not a valid plan").unwrap();
 
-    let err =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .expect_err("should fail to decode");
+    let err = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .expect_err("should fail to decode");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("failed to decode plan file"),
@@ -649,9 +706,14 @@ fn recovery_fails_on_corrupt_witness_bytes() {
         )
         .unwrap();
 
-    let err =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .expect_err("should fail on witness mismatch");
+    let err = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .expect_err("should fail on witness mismatch");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("neither pre nor post bytes"),
@@ -675,6 +737,7 @@ fn recovery_readonly_fails_hard_on_pending_plan() {
         &db_path,
         &mut hot_files,
         /* readonly */ true,
+        None,
     )
     .expect_err("readonly with pending plan must fail hard");
     let msg = format!("{err:?}");
@@ -695,9 +758,10 @@ fn recovery_readonly_succeeds_when_no_plans() {
         &db_path,
         &mut hot_files,
         /* readonly */ true,
+        None,
     )
     .unwrap();
-    assert_eq!(stats.plans_discovered, 0);
+    assert_eq!(stats.plans_discovered(), 0);
     assert_eq!(stats.cold_tail_truncated_bytes, 0);
 }
 
@@ -722,9 +786,14 @@ fn recovery_truncates_uncommitted_cold_tail() {
         "pre-recovery cold blob should be 1024 bytes",
     );
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
     assert_eq!(stats.cold_tail_truncated_bytes, 1024);
     assert_eq!(
         std::fs::metadata(&cold_blob_path).unwrap().len(),
@@ -750,9 +819,179 @@ fn recovery_does_not_truncate_when_within_committed_extent() {
     )
     .unwrap();
 
-    let stats =
-        recover_pending_promotions::<BlockHeaderHash>(&mut conn, &db_path, &mut hot_files, false)
-            .unwrap();
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        false,
+        None,
+    )
+    .unwrap();
     assert_eq!(stats.cold_tail_truncated_bytes, 0);
     assert_eq!(std::fs::metadata(&cold_blob_path).unwrap().len(), 1024);
+}
+
+// ===========================================================================
+// PR 2: canonical-validated drain — stale plan gets discarded instead of
+// published when the live canonical chain has shifted from what the plan
+// recorded.
+// ===========================================================================
+
+/// Mock [`CanonicalView`] backed by a fixed `height -> hash` map. Lets the test inject any
+/// canonical-vs-recorded relationship without needing a real headers DB or sortdb.
+struct MockCanonicalView {
+    map: std::collections::HashMap<u32, [u8; 32]>,
+}
+
+impl crate::chainstate::stacks::index::squash_recover::CanonicalView for MockCanonicalView {
+    fn canonical_at_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<[u8; 32]>, crate::chainstate::stacks::index::Error> {
+        Ok(self.map.get(&height).copied())
+    }
+}
+
+#[test]
+fn recovery_canonical_match_publishes_plan() {
+    // Sanity check: when the canonical view agrees with every recorded `in_range_blocks` entry,
+    // the plan is published just as it would be under TrustPlan. Same plan setup, different
+    // policy — and the verdict is the same.
+    let (db_path, mut conn) = fresh_v5_db("recovery_canonical_match_publishes_plan");
+    let mut hot_files = open_hot_files(&db_path, &conn);
+    let (plan, _, _, _) = build_committable_plan_setup(&db_path, &conn, &mut hot_files, 7);
+
+    // build_committable_plan_setup uses min_height=0, max_height=1, with
+    // in_range_blocks[0] = [0xaa; 32] and [1] = [0xbb; 32].
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, [0xaa; 32]);
+    map.insert(1u32, [0xbb; 32]);
+    let view = MockCanonicalView { map };
+
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        /* readonly */ false,
+        Some(&view),
+    )
+    .unwrap();
+
+    assert_eq!(stats.plans_discovered(), 1);
+    assert_eq!(
+        stats.plans_committed(),
+        1,
+        "matching canonical should publish"
+    );
+    assert_eq!(stats.plans_discarded_stale(), 0);
+    assert_eq!(stats.plans_abandoned(), 0);
+    assert!(stats.stale_discards().next().is_none());
+
+    // Level row was published.
+    let levels = trie_sql::read_squash_levels(&conn).unwrap();
+    assert_eq!(levels.len(), 1);
+    assert_eq!(levels[0].level_id, plan.header.level_id);
+}
+
+#[test]
+fn recovery_canonical_mismatch_discards_stale_plan() {
+    // Substantive PR 2 regression: when the canonical view reports a different hash than what
+    // the plan recorded at some height in `[min_height..=max_height]`, the plan is **discarded**
+    // (not published). This is exactly the production fix for the level-7 detached-worker
+    // stale-tip bug — the worker's snapshot can go stale between scan-start and publish, and
+    // canonical-validated drain catches it before the level row hits `marf_squash_levels`.
+    let (db_path, mut conn) = fresh_v5_db("recovery_canonical_mismatch_discards_stale_plan");
+    let mut hot_files = open_hot_files(&db_path, &conn);
+    let (plan, _plan_path, _cold_path, _sidecar_path) =
+        build_committable_plan_setup(&db_path, &conn, &mut hot_files, 7);
+
+    // Inject divergence at height 1: plan recorded [0xbb; 32], view reports [0xcc; 32].
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, [0xaa; 32]); // matches plan at height 0
+    map.insert(1u32, [0xcc; 32]); // DIVERGES from plan's [0xbb; 32]
+    let view = MockCanonicalView { map };
+
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        /* readonly */ false,
+        Some(&view),
+    )
+    .unwrap();
+
+    assert_eq!(stats.plans_discovered(), 1);
+    assert_eq!(
+        stats.plans_committed(),
+        0,
+        "stale plan must NOT publish under Canonical policy"
+    );
+    assert_eq!(stats.plans_discarded_stale(), 1);
+    assert_eq!(stats.plans_abandoned(), 0);
+
+    // Stale-discard record carries the diagnostic detail callers need to surface as
+    // `DrainOutcome::DiscardedStale`.
+    let stale: Vec<&crate::chainstate::stacks::index::squash_recover::DrainOutcome> =
+        stats.stale_discards().collect();
+    assert_eq!(stale.len(), 1);
+    match stale[0] {
+        crate::chainstate::stacks::index::squash_recover::DrainOutcome::DiscardedStale {
+            level_id,
+            diverging_height,
+            recorded_hash,
+            canonical_hash,
+        } => {
+            assert_eq!(*level_id, plan.header.level_id);
+            assert_eq!(*diverging_height, 1);
+            assert_eq!(*recorded_hash, [0xbb; 32]);
+            assert_eq!(*canonical_hash, Some([0xcc; 32]));
+        }
+        other => panic!("expected DiscardedStale, got {other:?}"),
+    }
+
+    // Level row was NOT published.
+    let levels = trie_sql::read_squash_levels(&conn).unwrap();
+    assert_eq!(
+        levels.len(),
+        0,
+        "marf_squash_levels must remain empty when the only plan was discarded"
+    );
+
+    // Plan file removed and promotion lock cleared — same as the abandon path's terminal state.
+    let plans =
+        crate::chainstate::stacks::index::squash_plan::discover_pending_plans(&db_path).unwrap();
+    assert!(plans.is_empty(), "stale plan file must be removed");
+    assert_promotion_state_cleared(&conn);
+}
+
+#[test]
+fn recovery_canonical_unmapped_height_is_skipped_not_discarded() {
+    // Truncated-ancestry case: the canonical view returns `None` for a height covered by the
+    // plan. Per the three-state predicate, unmapped heights are treated as "skip", not as
+    // non-canonical. Plan still publishes because no mismatch was detected.
+    let (db_path, mut conn) = fresh_v5_db("recovery_canonical_unmapped_height_is_skipped");
+    let mut hot_files = open_hot_files(&db_path, &conn);
+    let _ = build_committable_plan_setup(&db_path, &conn, &mut hot_files, 7);
+
+    let mut map = std::collections::HashMap::new();
+    // Only height 0 in the view; height 1 unmapped.
+    map.insert(0u32, [0xaa; 32]);
+    let view = MockCanonicalView { map };
+
+    let stats = recover_pending_promotions::<BlockHeaderHash>(
+        &mut conn,
+        &db_path,
+        &mut hot_files,
+        /* readonly */ false,
+        Some(&view),
+    )
+    .unwrap();
+
+    assert_eq!(
+        stats.plans_committed(),
+        1,
+        "unmapped heights must skip, not discard"
+    );
+    assert_eq!(stats.plans_discarded_stale(), 0);
+    assert!(stats.stale_discards().next().is_none());
 }
