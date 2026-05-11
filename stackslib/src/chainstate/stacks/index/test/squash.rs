@@ -23,13 +23,13 @@ use crate::chainstate::stacks::index::marf::{
     BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
 use crate::chainstate::stacks::index::node::{
-    clear_backptr, set_compressed, TrieLeafSquashed, TrieNode, TrieNodeID, TrieNodeType,
+    clear_backptr, TrieLeafSquashed, TrieNode, TrieNodeID, TrieNodeType,
 };
 use crate::chainstate::stacks::index::squash::{
     collect_history, squash_to_path, SquashInfo, SquashMode, SquashTrailer, SQUASH_FOOTER_SIZE,
 };
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use crate::chainstate::stacks::index::{bits, ClarityMarfTrieId, MARFValue};
+use crate::chainstate::stacks::index::{bits, trie_sql, ClarityMarfTrieId, MARFValue};
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 
 /// Create a fresh, unique test directory immune to the `$TMPDIR` race caused
@@ -108,216 +108,74 @@ fn read_block_trie_bytes_for_test(
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: TrieLeafSquashed serialization round-trip
+// Test 1: TrieLeafSquashed (new multipurpose carrier) serialization round-trip
 // ---------------------------------------------------------------------------
+//
+// The prior in-line `entries: Vec<(u32, MARFValue)>` round-trip + value_at_height
+// tests were tied to the legacy single-shape format that's been replaced by the
+// multipurpose carrier per `.docs/full-history-history-blob-design.md` §5. The
+// per-key history now lives in the per-level history blob, so:
+//
+// - `value_at_height` tests now live at the chunk level in
+//   `chainstate::stacks::index::history_blob::tests` (round-trip + partition_point
+//   semantics, including the below-earliest-entry → `None` cutoff).
+// - The single round-trip test below covers the v1 emit shape
+//   (subtype 2 — `INLINE_FIXED + has_history`, no inline hash) per §5.7.
 
 #[test]
-fn test_leaf_squashed_serialization() {
+fn test_leaf_squashed_v1_subtype2_round_trip() {
+    use crate::chainstate::stacks::index::history_blob::ChunkRef;
+
     let path_bytes = [
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         25, 26, 27, 28, 29, 30, 31,
     ];
+    let chunk_ref = ChunkRef {
+        history_offset: 0xdead_beef_1234_5678,
+        history_byte_len: 1234,
+        history_entry_count: 7,
+        tip_value: MARFValue([0xAAu8; 40]),
+    };
 
-    let entries = vec![
-        (100, MARFValue([0xAAu8; 40])),
-        (50, MARFValue([0xBBu8; 40])),
-        (10, MARFValue([0xCCu8; 40])),
-    ];
+    let original = TrieLeafSquashed::new(&path_bytes, chunk_ref.clone()).unwrap();
 
-    let original = TrieLeafSquashed::new(&path_bytes, entries).unwrap();
-
-    // Serialize
     let mut buf = Vec::new();
     original
         .write_bytes(&mut buf)
         .expect("write_bytes should succeed");
 
-    // Verify serialized length matches byte_len()
     assert_eq!(
         buf.len(),
         original.byte_len(),
         "serialized length should match byte_len()"
     );
 
-    // Deserialize
+    // Header prefix (per §5.1): node-id, type, flags, path_len.
+    assert_eq!(buf[0], TrieNodeID::LeafSquashed as u8);
+    assert_eq!(buf[1], 1, "type byte = INLINE for subtype 2");
+    assert_eq!(buf[2], 0b0000_0010, "flags byte = HAS_HISTORY only");
+    assert_eq!(buf[3], 32, "path_len = 32");
+
     let mut deserialized = TrieLeafSquashed::empty();
     let consumed = deserialized
         .load_from_slice(&buf)
         .expect("load_from_slice should succeed");
 
-    assert_eq!(
-        consumed,
-        buf.len(),
-        "load_from_slice should consume exactly the serialized bytes"
-    );
+    assert_eq!(consumed, buf.len(), "load_from_slice consumes everything");
+    assert_eq!(original, deserialized, "round-trip equality");
 
-    // Verify equality
-    assert_eq!(
-        original, deserialized,
-        "round-tripped TrieLeafSquashed should equal original"
-    );
+    // Spot-check the new fields survived.
+    assert_eq!(deserialized.tip_value, MARFValue([0xAAu8; 40]));
+    assert_eq!(deserialized.history_offset, 0xdead_beef_1234_5678);
+    assert_eq!(deserialized.history_byte_len, 1234);
+    assert_eq!(deserialized.history_entry_count, 7);
+    assert!(deserialized.flags.has_history());
+    assert!(!deserialized.flags.has_hash());
+    assert!(deserialized.inline_hash.is_none());
 
-    // Verify the ID byte is correct (compressed format sets 0x40 bit)
-    assert_eq!(buf[0], set_compressed(TrieNodeID::LeafSquashed as u8));
-
-    // Verify individual entries survived the round-trip
-    assert_eq!(deserialized.entries.len(), 3);
-    assert_eq!(deserialized.entries[0].0, 100);
-    assert_eq!(deserialized.entries[0].1, MARFValue([0xAAu8; 40]));
-    assert_eq!(deserialized.entries[1].0, 50);
-    assert_eq!(deserialized.entries[1].1, MARFValue([0xBBu8; 40]));
-    assert_eq!(deserialized.entries[2].0, 10);
-    assert_eq!(deserialized.entries[2].1, MARFValue([0xCCu8; 40]));
-}
-
-#[test]
-fn test_leaf_squashed_serialization_single_entry() {
-    let path_bytes = [0xFFu8; 32];
-    let entries = vec![(42, MARFValue([0x11u8; 40]))];
-    let original = TrieLeafSquashed::new(&path_bytes, entries).unwrap();
-
-    let mut buf = Vec::new();
-    original.write_bytes(&mut buf).unwrap();
-
-    let mut deserialized = TrieLeafSquashed::empty();
-    let consumed = deserialized.load_from_slice(&buf).unwrap();
-
-    assert_eq!(consumed, buf.len());
-    assert_eq!(original, deserialized);
-}
-
-/// Verify that entries spanning more than u16::MAX heights fall back to
-/// the legacy (uncompressed) encoding and round-trip correctly.
-#[test]
-fn test_leaf_squashed_serialization_legacy_fallback() {
-    let path_bytes = [0xABu8; 32];
-    // Height span = 100_000 > u16::MAX (65535) → must use legacy encoding.
-    let entries = vec![
-        (100_000, MARFValue([0xAAu8; 40])),
-        (50_000, MARFValue([0xBBu8; 40])),
-        (0, MARFValue([0xCCu8; 40])),
-    ];
-
-    let original = TrieLeafSquashed::new(&path_bytes, entries).unwrap();
-
-    let mut buf = Vec::new();
-    original.write_bytes(&mut buf).unwrap();
-
-    // Legacy format: ID byte should NOT have compressed bit set.
-    assert_eq!(buf[0], TrieNodeID::LeafSquashed as u8);
-
-    assert_eq!(buf.len(), original.byte_len());
-
-    // Legacy per-entry size is 44 (u32 height + 40 value).
-    let expected_legacy_len = 1 + 33 + 4 + 3 * 44; // ID + path + count + entries
-    assert_eq!(buf.len(), expected_legacy_len);
-
-    let mut deserialized = TrieLeafSquashed::empty();
-    let consumed = deserialized.load_from_slice(&buf).unwrap();
-
-    assert_eq!(consumed, buf.len());
-    assert_eq!(original, deserialized);
-}
-
-// ---------------------------------------------------------------------------
-// Test 2: value_at_height lookup
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_value_at_height() {
-    // Entries sorted descending by height (as required by TrieLeafSquashed).
-    let entries = vec![
-        (100, MARFValue([0xAAu8; 40])), // tip
-        (50, MARFValue([0xBBu8; 40])),
-        (10, MARFValue([0xCCu8; 40])),
-    ];
-
-    let leaf = TrieLeafSquashed::new(&[0u8; 32], entries).unwrap();
-
-    // At or after the tip height -> tip value
-    assert_eq!(
-        leaf.value_at_height(100),
-        Some(&MARFValue([0xAAu8; 40])),
-        "height 100 should return tip value"
-    );
-    assert_eq!(
-        leaf.value_at_height(200),
-        Some(&MARFValue([0xAAu8; 40])),
-        "height 200 (above tip) should return tip value"
-    );
-
-    // Between 50 and 100 -> value at height 50
-    assert_eq!(
-        leaf.value_at_height(99),
-        Some(&MARFValue([0xBBu8; 40])),
-        "height 99 should return value at height 50"
-    );
-    assert_eq!(
-        leaf.value_at_height(50),
-        Some(&MARFValue([0xBBu8; 40])),
-        "height 50 should return value at height 50"
-    );
-    assert_eq!(
-        leaf.value_at_height(75),
-        Some(&MARFValue([0xBBu8; 40])),
-        "height 75 should return value at height 50"
-    );
-
-    // Between 10 and 50 -> value at height 10
-    assert_eq!(
-        leaf.value_at_height(49),
-        Some(&MARFValue([0xCCu8; 40])),
-        "height 49 should return value at height 10"
-    );
-    assert_eq!(
-        leaf.value_at_height(10),
-        Some(&MARFValue([0xCCu8; 40])),
-        "height 10 should return value at height 10"
-    );
-    assert_eq!(
-        leaf.value_at_height(30),
-        Some(&MARFValue([0xCCu8; 40])),
-        "height 30 should return value at height 10"
-    );
-
-    // Before the earliest entry -> None
-    assert_eq!(
-        leaf.value_at_height(9),
-        None,
-        "height 9 should return None (before earliest entry)"
-    );
-    assert_eq!(
-        leaf.value_at_height(0),
-        None,
-        "height 0 should return None (before earliest entry)"
-    );
-}
-
-#[test]
-fn test_value_at_height_single_entry() {
-    let entries = vec![(0, MARFValue([0x11u8; 40]))];
-    let leaf = TrieLeafSquashed::new(&[0u8; 32], entries).unwrap();
-
-    // At height 0 -> the value
-    assert_eq!(leaf.value_at_height(0), Some(&MARFValue([0x11u8; 40])));
-
-    // Above height 0 -> the value (latest transition at or before)
-    assert_eq!(leaf.value_at_height(999), Some(&MARFValue([0x11u8; 40])));
-}
-
-#[test]
-fn test_tip_value() {
-    let entries = vec![
-        (100, MARFValue([0xAAu8; 40])),
-        (50, MARFValue([0xBBu8; 40])),
-    ];
-    let leaf = TrieLeafSquashed::new(&[0u8; 32], entries).unwrap();
-
-    assert_eq!(
-        leaf.tip_value().unwrap(),
-        &MARFValue([0xAAu8; 40]),
-        "tip_value() should return entries[0]"
-    );
+    // ChunkRef reconstruction matches what we put in.
+    let recovered = deserialized.chunk_ref().expect("has_history → ChunkRef");
+    assert_eq!(recovered, chunk_ref);
 }
 
 // ---------------------------------------------------------------------------
@@ -3412,29 +3270,14 @@ fn test_collect_history_ascending_sort() {
     }
 }
 
-/// Test TrieLeafSquashed::new entry count guard.
-#[test]
-fn test_leaf_squashed_entry_count_guard() {
-    let path_bytes = [0u8; 32];
-
-    // MAX_ENTRIES should succeed
-    let max_entries: Vec<(u32, MARFValue)> = (0..TrieLeafSquashed::MAX_ENTRIES as u32)
-        .rev()
-        .map(|h| (h, MARFValue([0x11u8; 40])))
-        .collect();
-    assert!(
-        TrieLeafSquashed::new(&path_bytes, max_entries).is_ok(),
-        "MAX_ENTRIES entries should be accepted"
-    );
-
-    // MAX_ENTRIES + 1 should fail
-    let over_entries: Vec<(u32, MARFValue)> = (0..=(TrieLeafSquashed::MAX_ENTRIES as u32))
-        .rev()
-        .map(|h| (h, MARFValue([0x22u8; 40])))
-        .collect();
-    let err = TrieLeafSquashed::new(&path_bytes, over_entries);
-    assert!(err.is_err(), "MAX_ENTRIES + 1 entries should be rejected");
-}
+// `test_leaf_squashed_entry_count_guard` was removed alongside the legacy
+// `MAX_ENTRIES` const in the multipurpose-carrier rewrite (per
+// `.docs/full-history-history-blob-design.md` §5). Per-key history
+// no longer lives in the leaf body; capacity is bounded by the chunk's
+// `entry_count: u32` in the per-level history blob (see
+// `chainstate::stacks::index::history_blob::HistoryChunkHeader`).
+// Equivalent guard tests now live there:
+// `chunk_header_rejects_zero_entry_count` etc.
 
 /// Regression test for `BLOCK_*` mapping keys.
 ///
@@ -3678,19 +3521,37 @@ fn test_squash_full_history_basic() {
     );
 }
 
-/// Verify the blob actually contains TrieLeafSquashed nodes for multi- transition keys and TrieLeaf
+/// Verify the blob actually contains TrieLeafSquashed nodes for multi-transition keys and TrieLeaf
 /// for single-write keys. Scans the raw blob and decodes each node to check its type and entry
 /// contents.
+///
+/// Verify that the post-squash on-disk artifacts match the new
+/// multipurpose-carrier model per `.docs/full-history-history-blob-design.md`:
+///
+/// 1. The per-level history blob exists at the canonical
+///    `marf-history-level-{level_id:06}-h{min:08}-{max:08}-blob-{blob_offset:016x}.dat`
+///    path and passes footer validation via `HistoryBlobReader::open`.
+/// 2. The chunk-once-per-distinct-key dedup invariant holds: `chunk_count`
+///    equals the number of distinct hot keys (NOT physical-leaf count
+///    — multiple COW copies of the same key share one chunk via the
+///    `ChunkRef` in their `TrieLeafSquashed` headers).
+/// 3. The hot key's chunk contains all `num_blocks` `(height, value)`
+///    transitions in descending-height order, matching the values that
+///    `MARF::get(block, "hot_key")` would return at each height.
 #[test]
 fn test_squash_full_history_blob_contains_leaf_squashed() {
+    use crate::chainstate::stacks::index::history_blob::{history_blob_path, HistoryBlobReader};
+    use crate::chainstate::stacks::index::squash::squash_to_path;
+
     let test_dir = fresh_test_dir("test_squash_full_history_blob_leaf_squashed");
     let src_path = format!("{test_dir}/source.sqlite");
     let dst_path = format!("{test_dir}/squashed.sqlite");
 
+    let num_blocks: usize = 4;
+
     let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
     let mut marf = MARF::<StacksBlockId>::from_path(&src_path, open_opts.clone()).unwrap();
 
-    let num_blocks = 4;
     let blocks: Vec<StacksBlockId> = (0..num_blocks)
         .map(|i| {
             let mut bytes = [0u8; 32];
@@ -3699,7 +3560,7 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
         })
         .collect();
 
-    // Block 0: write hot_key and cold_key
+    // Block 0: hot_key + cold_key.
     marf.begin(&StacksBlockId::sentinel(), &blocks[0]).unwrap();
     marf.insert("hot_key", MARFValue::from_value("hot_0"))
         .unwrap();
@@ -3708,7 +3569,9 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
     marf.seal().unwrap();
     marf.commit().unwrap();
 
-    // Blocks 1-3: update hot_key each block, cold_key stays the same
+    // Blocks 1..N-1: only hot_key gets a new value each block. cold_key
+    // stays at "cold_0" → single-write key, dominated by the inherited
+    // value (or in the base-level case, just a single in-range write).
     for i in 1..num_blocks {
         marf.begin(&blocks[i - 1], &blocks[i]).unwrap();
         marf.insert("hot_key", MARFValue::from_value(&format!("hot_{i}")))
@@ -3716,147 +3579,121 @@ fn test_squash_full_history_blob_contains_leaf_squashed() {
         marf.seal().unwrap();
         marf.commit().unwrap();
     }
+
     drop(marf);
 
+    // Squash with FullHistory mode into the dst path.
     let stats = squash_to_path::<StacksBlockId>(
         &src_path,
         &dst_path,
         SquashMode::FullHistory,
         (num_blocks - 1) as u32,
     )
-    .expect("squash with FullHistory should succeed");
+    .expect("FullHistory squash should succeed");
 
     assert!(
-        stats.leaves_squashed > 0,
-        "should have replaced at least 1 leaf with TrieLeafSquashed"
+        stats.leaves_squashed >= 1,
+        "expected at least one squashable leaf in this range, got {}",
+        stats.leaves_squashed
     );
 
-    // Scan the blob to find TrieLeafSquashed nodes
-    let blob_path = format!("{dst_path}.blobs");
-    let blob_bytes = std::fs::read(&blob_path).expect("should read blob file");
+    // The base-level squash writes level_id=0; blob_offset is 0 for a fresh
+    // dst (squash_to_path opens a brand-new MARF). The canonical history
+    // blob path is therefore deterministic for this test.
+    let dst_marf_dir = std::path::Path::new(&dst_path).parent().unwrap();
+    let level_id: u32 = 0;
+    let blob_offset: u64 = 0;
+    let history_path = history_blob_path(
+        dst_marf_dir,
+        level_id,
+        0,
+        (num_blocks - 1) as u32,
+        blob_offset,
+    );
+    assert!(
+        history_path.exists(),
+        "canonical history blob should exist at {}",
+        history_path.display()
+    );
 
-    let dst_marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
-    let levels =
-        crate::chainstate::stacks::index::trie_sql::read_squash_levels(dst_marf.sqlite_conn())
-            .unwrap();
-    drop(dst_marf);
+    // (1) Open + footer-validate.
+    let reader = HistoryBlobReader::open(&history_path, Some(level_id))
+        .expect("history blob should pass footer validation");
 
-    let blob_start = levels[0].blob_offset as usize;
+    // (2) Dedup invariant: at least one chunk for hot_key. MARF writes
+    // additional internal mapping keys per block (BLOCK_HEIGHT_TO_HASH_MAPPING,
+    // BLOCK_HASH_TO_HEIGHT_MAPPING, etc.), so the chunk count is several
+    // more than the user-visible key count — that's fine. The load-bearing
+    // invariant we test here is per-leaf-vs-per-distinct-key dedup: the
+    // chunk count must be ≤ stats.leaves_squashed (every chunk is
+    // referenced by ≥ 1 leaf, never more chunks than leaves).
+    assert!(
+        reader.footer().chunk_count >= 1,
+        "expected at least one chunk in the history blob, got {}",
+        reader.footer().chunk_count
+    );
+    assert!(
+        u64::from(reader.footer().chunk_count) <= stats.leaves_squashed,
+        "dedup invariant violated: chunk_count={} > stats.leaves_squashed={} \
+         (per-key chunks should never exceed per-leaf rewrites)",
+        reader.footer().chunk_count,
+        stats.leaves_squashed
+    );
 
-    // Read the trailer to find where nodes end (trailer_offset is relative to blob start)
-    let blob_end = blob_start + levels[0].blob_length as usize;
-    let blob_slice = &blob_bytes[blob_start..blob_end];
-    let trailer_offset =
-        SquashTrailer::read_footer(blob_slice).expect("should find trailer footer") as usize;
-
-    // Scan sequential nodes: skip header (36 bytes).
-    //
-    // Leaf nodes are stored hash-free (body only); internal nodes are stored as hash(32) + body.
-    //
-    // To avoid a fragile heuristic on the first byte (which could be an arbitrary hash byte for
-    // internal nodes), we use a trial-decode approach: try interpreting pos as a hash-free leaf
-    // body.  If that succeeds we accept it; otherwise we skip 32 bytes of hash prefix and decode
-    // the body of an internal node.
-    let header_size = 36usize;
-    let mut pos = header_size;
-    let nodes_end = trailer_offset;
-
-    let mut leaf_squashed_count = 0usize;
-    let mut plain_leaf_count = 0usize;
-    let mut internal_count = 0usize;
-    let mut found_hot_key_squashed = false;
-
-    while pos < nodes_end {
-        let remaining = &blob_slice[pos..nodes_end];
-
-        // Try hash-free leaf decode first.
-        let first_byte = remaining[0];
-        let cleared = clear_backptr(first_byte) & 0x3f;
-        let leaf_candidate = (cleared == TrieNodeID::Leaf as u8
-            || cleared == TrieNodeID::LeafSquashed as u8)
-            && bits::decode_nodetype_from_slice_at_head(remaining, cleared).is_ok();
-
-        if leaf_candidate {
-            let (node, consumed) =
-                bits::decode_nodetype_from_slice_at_head(remaining, cleared).unwrap();
-            match &node {
-                TrieNodeType::LeafSquashed(sq) => {
-                    leaf_squashed_count += 1;
-                    for w in sq.entries.windows(2) {
-                        assert!(
-                            w[0].0 > w[1].0,
-                            "TrieLeafSquashed entries should be sorted descending: {} > {} failed",
-                            w[0].0,
-                            w[1].0
-                        );
-                    }
-                    // Identify the hot_key LeafSquashed by its signature: `num_blocks` entries with
-                    // values matching "hot_{h}".
-                    //
-                    // Other LeafSquashed in the blob (cold_key, internal MARF mapping keys) have
-                    // fewer entries and different values.
-                    let looks_like_hot_key = sq.entries.len() == num_blocks
-                        && sq
-                            .entries
-                            .iter()
-                            .all(|(h, v)| *v == MARFValue::from_value(&format!("hot_{h}")));
-                    if looks_like_hot_key {
-                        found_hot_key_squashed = true;
-                        for (idx, &(height, ref value)) in sq.entries.iter().enumerate() {
-                            let expected_height = (num_blocks - 1 - idx) as u32;
-                            let expected_value =
-                                MARFValue::from_value(&format!("hot_{expected_height}"));
-                            assert_eq!(
-                                height, expected_height,
-                                "hot_key entry[{idx}] height: expected {expected_height}, got {height}"
-                            );
-                            assert_eq!(
-                                *value, expected_value,
-                                "hot_key entry[{idx}] value mismatch at height {height}"
-                            );
-                        }
-                    }
+    // (3) The hot_key's chunk should have `num_blocks` entries (one per
+    // block where it was written), sorted descending by height. Walk the
+    // history-blob body, decoding each chunk header in turn, and find the
+    // one matching the expected hot_key shape.
+    use crate::chainstate::stacks::index::history_blob::{
+        HistoryChunkHeader, HISTORY_BLOB_HEADER_SIZE, HISTORY_CHUNK_ENTRY_SIZE_V1,
+        HISTORY_CHUNK_HEADER_SIZE,
+    };
+    let raw = std::fs::read(&history_path).expect("read history blob");
+    let mut cursor = HISTORY_BLOB_HEADER_SIZE;
+    let body_end = HISTORY_BLOB_HEADER_SIZE + (reader.footer().body_len as usize);
+    let mut found_hot_key_chunk = false;
+    while cursor < body_end {
+        let header_bytes = &raw[cursor..cursor + HISTORY_CHUNK_HEADER_SIZE];
+        let header = HistoryChunkHeader::decode(header_bytes).expect("valid chunk header");
+        let entries_offset = cursor + HISTORY_CHUNK_HEADER_SIZE;
+        let entries_len = (header.entry_count as usize) * HISTORY_CHUNK_ENTRY_SIZE_V1;
+        let entries_bytes = &raw[entries_offset..entries_offset + entries_len];
+        // Match: a chunk with exactly `num_blocks` entries, descending heights
+        // num_blocks-1 → 0, and `hot_{h}` values.
+        if header.entry_count as usize == num_blocks {
+            let mut looks_like_hot = true;
+            for i in 0..num_blocks {
+                let off = i * HISTORY_CHUNK_ENTRY_SIZE_V1;
+                let height = u32::from_be_bytes([
+                    entries_bytes[off],
+                    entries_bytes[off + 1],
+                    entries_bytes[off + 2],
+                    entries_bytes[off + 3],
+                ]);
+                let expected_height = (num_blocks - 1 - i) as u32;
+                if height != expected_height {
+                    looks_like_hot = false;
+                    break;
                 }
-                TrieNodeType::Leaf(_) => {
-                    plain_leaf_count += 1;
+                let mut value = [0u8; 40];
+                value.copy_from_slice(&entries_bytes[off + 4..off + HISTORY_CHUNK_ENTRY_SIZE_V1]);
+                let expected_value = MARFValue::from_value(&format!("hot_{height}"));
+                if MARFValue(value) != expected_value {
+                    looks_like_hot = false;
+                    break;
                 }
-                _ => unreachable!("leaf candidate decoded to non-leaf"),
             }
-            pos += consumed;
-        } else {
-            // Internal node: 32-byte hash prefix + body.
-            assert!(
-                remaining.len() > TRIEHASH_ENCODED_SIZE,
-                "not enough bytes for hash prefix at blob offset {pos}"
-            );
-            let body = &remaining[TRIEHASH_ENCODED_SIZE..];
-            let node_id = clear_backptr(body[0]) & 0x3f;
-            let (_node, consumed) = bits::decode_nodetype_from_slice_at_head(body, node_id)
-                .unwrap_or_else(|e| {
-                    panic!("Failed to decode internal node at blob offset {pos}: {e}")
-                });
-            internal_count += 1;
-            pos += TRIEHASH_ENCODED_SIZE + consumed;
+            if looks_like_hot {
+                found_hot_key_chunk = true;
+                break;
+            }
         }
+        cursor += HISTORY_CHUNK_HEADER_SIZE + entries_len;
     }
-
-    assert_eq!(
-        pos, nodes_end,
-        "blob scan did not consume exactly the node region"
-    );
-
     assert!(
-        leaf_squashed_count > 0,
-        "blob should contain at least one TrieLeafSquashed node"
-    );
-    assert!(
-        found_hot_key_squashed,
-        "hot_key should be stored as a TrieLeafSquashed with all {num_blocks} transitions"
-    );
-
-    eprintln!(
-        "Blob scan: {leaf_squashed_count} LeafSquashed, {plain_leaf_count} Leaf, \
-         {internal_count} internal"
+        found_hot_key_chunk,
+        "expected to find the hot_key chunk with {num_blocks} descending-height entries in \
+         the history blob"
     );
 }
 
@@ -5961,6 +5798,274 @@ fn test_full_history_squash_end_to_end() {
             "key_b should be the same at all blocks"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: post-3.4 history-blob trim
+// (see `.docs/full-history-history-blob-design.md` §10)
+// ---------------------------------------------------------------------------
+
+/// Build a base-level FullHistory squash at `dst_path` and return:
+/// - the resolved canonical history-blob path
+/// - the level_id (always 0 for base-level)
+/// - num_blocks used in the build (matches the hot_key transition count)
+fn build_trim_test_fixture(
+    test_dir: &str,
+    dst_path: &str,
+    num_blocks: usize,
+) -> (std::path::PathBuf, u32) {
+    use crate::chainstate::stacks::index::history_blob::history_blob_path;
+    use crate::chainstate::stacks::index::squash::squash_to_path;
+
+    let src_path = format!("{test_dir}/source.sqlite");
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&src_path, open_opts.clone()).unwrap();
+
+    let blocks: Vec<StacksBlockId> = (0..num_blocks)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[28..32].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+            StacksBlockId::from_bytes(&bytes).unwrap()
+        })
+        .collect();
+
+    marf.begin(&StacksBlockId::sentinel(), &blocks[0]).unwrap();
+    marf.insert("hot_key", MARFValue::from_value("hot_0"))
+        .unwrap();
+    marf.insert("cold_key", MARFValue::from_value("cold_0"))
+        .unwrap();
+    marf.seal().unwrap();
+    marf.commit().unwrap();
+
+    for i in 1..num_blocks {
+        marf.begin(&blocks[i - 1], &blocks[i]).unwrap();
+        marf.insert("hot_key", MARFValue::from_value(&format!("hot_{i}")))
+            .unwrap();
+        marf.seal().unwrap();
+        marf.commit().unwrap();
+    }
+    drop(marf);
+
+    squash_to_path::<StacksBlockId>(
+        &src_path,
+        dst_path,
+        SquashMode::FullHistory,
+        (num_blocks - 1) as u32,
+    )
+    .expect("FullHistory squash should succeed");
+
+    let dst_dir = std::path::Path::new(dst_path).parent().unwrap();
+    let level_id: u32 = 0;
+    let history_path = history_blob_path(dst_dir, level_id, 0, (num_blocks - 1) as u32, 0);
+    assert!(history_path.exists(), "fixture: history blob should exist");
+    (history_path, level_id)
+}
+
+#[test]
+fn test_trim_history_blob_for_level_sets_state_and_unlinks() {
+    use crate::chainstate::stacks::index::squash::{
+        trim_history_blob_for_level, HistoryBlobState, HistoryBlobTrimReport,
+    };
+
+    let test_dir = fresh_test_dir("trim_history_blob_for_level_basic");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+    let (history_path, level_id) = build_trim_test_fixture(&test_dir, &dst_path, 4);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+
+    // Pre-trim invariants.
+    {
+        let rows = trie_sql::read_squash_levels(marf.storage_backend_mut().sqlite_conn()).unwrap();
+        let row = rows.iter().find(|r| r.level_id == level_id).unwrap();
+        assert_eq!(row.history_blob_state, HistoryBlobState::Present);
+        assert!(history_path.exists());
+    }
+
+    // Capture file size BEFORE the trim — `bytes_freed_estimate` is
+    // expected to reflect the history blob file's footprint, NOT the
+    // unrelated cold blob extent (`row.blob_length`).
+    let pre_trim_file_size = std::fs::metadata(&history_path).unwrap().len();
+    assert!(pre_trim_file_size > 0, "history blob should be non-empty");
+
+    let mut report = HistoryBlobTrimReport::default();
+    trim_history_blob_for_level(&mut marf, level_id, &mut report).expect("trim should succeed");
+
+    assert_eq!(report.levels_trimmed, 1);
+    assert_eq!(report.trim_failures, 0);
+    assert_eq!(report.unlink_failures, 0);
+    assert_eq!(report.already_trimmed, 0);
+    assert_eq!(
+        report.bytes_freed_estimate, pre_trim_file_size,
+        "bytes_freed_estimate must match the actual history blob file size, \
+         not the cold blob extent"
+    );
+
+    // SQL state flipped to Trimmed.
+    {
+        let rows = trie_sql::read_squash_levels(marf.storage_backend_mut().sqlite_conn()).unwrap();
+        let row = rows.iter().find(|r| r.level_id == level_id).unwrap();
+        assert_eq!(row.history_blob_state, HistoryBlobState::Trimmed);
+    }
+    // File unlinked.
+    assert!(
+        !history_path.exists(),
+        "history blob should be unlinked after trim"
+    );
+}
+
+#[test]
+fn test_trim_history_blob_for_level_idempotent_retries_leftover_unlink() {
+    // Operator-rerun path: prior trim crashed between SQL commit and
+    // unlink (or unlink itself returned an error), leaving a file
+    // behind even though SQL says `'trimmed'`. The second call should
+    // RETRY the unlink instead of waiting for startup reconcile to
+    // reap it.
+    use crate::chainstate::stacks::index::squash::{
+        trim_history_blob_for_level, HistoryBlobTrimReport,
+    };
+
+    let test_dir = fresh_test_dir("trim_history_blob_idempotent_retry_unlink");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+    let (history_path, level_id) = build_trim_test_fixture(&test_dir, &dst_path, 4);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+
+    // First trim: SQL flips + file unlinked normally.
+    let mut r1 = HistoryBlobTrimReport::default();
+    trim_history_blob_for_level(&mut marf, level_id, &mut r1).unwrap();
+    assert_eq!(r1.levels_trimmed, 1);
+    assert!(!history_path.exists());
+
+    // Recreate the file at the canonical path to simulate a leftover
+    // from a prior crash-between-commit-and-unlink. The contents don't
+    // need to be valid — the idempotent path only cares about
+    // unlinking, not reading.
+    std::fs::write(&history_path, b"leftover orphan from prior crash").unwrap();
+    assert!(history_path.exists());
+
+    // Second call: SQL is already Trimmed → counted under already_trimmed,
+    // and the unlink retry reaps the orphan.
+    let mut r2 = HistoryBlobTrimReport::default();
+    trim_history_blob_for_level(&mut marf, level_id, &mut r2).unwrap();
+    assert_eq!(r2.levels_trimmed, 0);
+    assert_eq!(r2.already_trimmed, 1);
+    assert_eq!(r2.unlink_failures, 0);
+    assert!(
+        !history_path.exists(),
+        "operator rerun must reap the leftover file from a prior partial trim"
+    );
+}
+
+#[test]
+fn test_trim_history_blob_for_level_idempotent_on_already_trimmed() {
+    use crate::chainstate::stacks::index::squash::{
+        trim_history_blob_for_level, HistoryBlobTrimReport,
+    };
+
+    let test_dir = fresh_test_dir("trim_history_blob_idempotent");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+    let (_history_path, level_id) = build_trim_test_fixture(&test_dir, &dst_path, 4);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+
+    // First trim: levels_trimmed=1.
+    let mut r1 = HistoryBlobTrimReport::default();
+    trim_history_blob_for_level(&mut marf, level_id, &mut r1).unwrap();
+    assert_eq!(r1.levels_trimmed, 1);
+
+    // Second trim against the same level: counted as already_trimmed, no error.
+    let mut r2 = HistoryBlobTrimReport::default();
+    trim_history_blob_for_level(&mut marf, level_id, &mut r2).unwrap();
+    assert_eq!(r2.levels_trimmed, 0);
+    assert_eq!(r2.already_trimmed, 1);
+}
+
+#[test]
+fn test_at_block_read_after_trim_returns_history_trimmed() {
+    use crate::chainstate::stacks::index::squash::{
+        trim_history_blob_for_level, HistoryBlobTrimReport,
+    };
+
+    let test_dir = fresh_test_dir("at_block_after_trim");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+    let num_blocks = 4;
+    let (_history_path, level_id) = build_trim_test_fixture(&test_dir, &dst_path, num_blocks);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts.clone()).unwrap();
+
+    // Pre-trim: at-block read of hot_key at the earliest block returns "hot_0".
+    let early_block: StacksBlockId = {
+        let mut bytes = [0u8; 32];
+        bytes[28..32].copy_from_slice(&1u32.to_be_bytes());
+        StacksBlockId::from_bytes(&bytes).unwrap()
+    };
+    let v = marf
+        .get(&early_block, "hot_key")
+        .expect("pre-trim get should succeed")
+        .expect("hot_key should exist at the earliest block");
+    assert_eq!(v, MARFValue::from_value("hot_0"));
+
+    // Trim.
+    let mut report = HistoryBlobTrimReport::default();
+    trim_history_blob_for_level(&mut marf, level_id, &mut report).unwrap();
+    assert_eq!(report.levels_trimmed, 1);
+
+    // Post-trim: at-block read of hot_key at the same block must surface
+    // Error::HistoryTrimmed.
+    let err = marf
+        .get(&early_block, "hot_key")
+        .expect_err("post-trim get should error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("trimmed"),
+        "expected HistoryTrimmed-flavored error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_run_epoch_3_4_history_auto_trim_sets_done_and_is_idempotent() {
+    use crate::chainstate::stacks::index::squash::{
+        run_epoch_3_4_history_auto_trim, HistoryBlobState,
+    };
+
+    let test_dir = fresh_test_dir("auto_trim_sets_done");
+    let dst_path = format!("{test_dir}/squashed.sqlite");
+    let (history_path, level_id) = build_trim_test_fixture(&test_dir, &dst_path, 4);
+
+    let open_opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true);
+    let mut marf = MARF::<StacksBlockId>::from_path(&dst_path, open_opts).unwrap();
+
+    // Pre-flight: auto_trim_done starts false.
+    {
+        let state = trie_sql::read_marf_state(marf.storage_backend_mut().sqlite_conn()).unwrap();
+        assert!(!state.auto_trim_done);
+    }
+
+    let r1 = run_epoch_3_4_history_auto_trim(&mut marf).expect("auto-trim should succeed");
+    assert_eq!(r1.levels_trimmed, 1);
+
+    // auto_trim_done is now committed.
+    {
+        let state = trie_sql::read_marf_state(marf.storage_backend_mut().sqlite_conn()).unwrap();
+        assert!(state.auto_trim_done);
+    }
+    // Level is Trimmed in SQL; file is gone.
+    {
+        let rows = trie_sql::read_squash_levels(marf.storage_backend_mut().sqlite_conn()).unwrap();
+        let row = rows.iter().find(|r| r.level_id == level_id).unwrap();
+        assert_eq!(row.history_blob_state, HistoryBlobState::Trimmed);
+        assert!(!history_path.exists());
+    }
+
+    // Second call: idempotent gate skips the batch entirely.
+    let r2 = run_epoch_3_4_history_auto_trim(&mut marf).expect("idempotent call should succeed");
+    assert_eq!(r2.levels_trimmed, 0);
+    assert_eq!(r2.already_trimmed, 0); // The whole batch is skipped — not even a per-level pass.
 }
 
 // ---------------------------------------------------------------------------
@@ -12976,6 +13081,8 @@ fn test_provides_fork_extension_predicate() {
         root_sidecar_trimmed: false,
         orphan_split_offset: 0,
         published_max_block_id: 0,
+        history_blob_state:
+            crate::chainstate::stacks::index::squash::HistoryBlobState::NeverWritten,
     };
     assert!(real.provides_fork_extension());
     assert_eq!(real.height_span(), 10);

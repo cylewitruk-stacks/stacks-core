@@ -19,14 +19,23 @@ mod types;
 mod util;
 
 use clap::Parser;
-use cli::Cli;
+use cli::{Cli, Command};
 
 use crate::cli::CliCtx;
 
 fn main() {
     let cli = Cli::parse();
 
-    let ctx = CliCtx::new(&cli.db);
+    // `trim-history` is the only subcommand that mutates the DB and
+    // opens its own writable [`MARF`] handle internally. Skip the
+    // read-only [`CliCtx`] so we don't hold a stale `Connection`
+    // against the path while the MARF's writable open path runs
+    // recovery and the SQL trim flip.
+    if let Command::TrimHistory(args) = cli.command {
+        cli::trim_history_exec(&cli.db, args);
+        return;
+    }
 
+    let ctx = CliCtx::new(&cli.db);
     cli.exec(&ctx);
 }

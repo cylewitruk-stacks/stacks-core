@@ -188,16 +188,15 @@ impl MarfReadState {
             }
             TrieNodeID::LeafSquashed => {
                 let n = self.leaf_squashed.as_ref().unwrap();
-                // tip_value() is infallible here: entries were validated
-                // non-empty at construction and deserialization. The trait
-                // signature (`fn get_ref -> TrieNodeRef`) does not permit
-                // error propagation, so we expect.
                 TrieNodeRef::LeafSquashed(TrieLeafSquashedRef {
                     path: n.path.as_slice(),
-                    tip_value: n
-                        .tip_value()
-                        .expect("BUG: LeafSquashed invariant violated: entries is empty"),
-                    entries: &n.entries,
+                    tip_value: &n.tip_value,
+                    leaf_type: n.leaf_type,
+                    flags: n.flags,
+                    inline_hash: n.inline_hash.as_ref(),
+                    history_offset: n.history_offset,
+                    history_byte_len: n.history_byte_len,
+                    history_entry_count: n.history_entry_count,
                 })
             }
         }
@@ -464,10 +463,9 @@ impl MarfReadState {
     }
 
     pub fn decode_leaf_squashed_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        let node = self.leaf_squashed.get_or_insert_with(|| TrieLeafSquashed {
-            path: Default::default(),
-            entries: Vec::new(),
-        });
+        let node = self
+            .leaf_squashed
+            .get_or_insert_with(TrieLeafSquashed::empty);
         let consumed = node.load_from_slice(bytes)?;
         self.owned = None;
         self.current_id = Some(TrieNodeID::LeafSquashed);

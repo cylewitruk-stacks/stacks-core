@@ -305,7 +305,7 @@ fn recover_one_plan<T: MarfTrieId>(
             "recovery: abandoning plan {plan_path:?} (cold-blob region mismatch); \
              will clear promotion state and remove plan file"
         );
-        abandon_plan(db, plan_path)?;
+        abandon_plan(db, plan_path, Some(&plan))?;
         stats.outcomes.push(DrainOutcome::Abandoned { level_id });
         return Ok(());
     }
@@ -317,7 +317,7 @@ fn recover_one_plan<T: MarfTrieId>(
             "recovery: abandoning plan {plan_path:?} (sidecar mismatch); \
              will clear promotion state and remove plan file"
         );
-        abandon_plan(db, plan_path)?;
+        abandon_plan(db, plan_path, Some(&plan))?;
         stats.outcomes.push(DrainOutcome::Abandoned { level_id });
         return Ok(());
     }
@@ -349,7 +349,7 @@ fn recover_one_plan<T: MarfTrieId>(
                     canonical_hash.map(|h| stacks_common::util::hash::to_hex(&h)),
                 );
             }
-            abandon_plan(db, plan_path)?;
+            abandon_plan(db, plan_path, Some(&plan))?;
             stats.outcomes.push(outcome);
             return Ok(());
         }
@@ -579,10 +579,51 @@ fn truncate_cold_tail(db: &Connection, db_path: &str, readonly: bool) -> Result<
     Ok(truncated)
 }
 
-/// Abandon a plan: clear the in-flight promotion state in `marf_state` and remove the plan file.
-/// Used when cold-blob or sidecar verification fails (the merger never reached durable state, so
-/// the plan can never replay).
-fn abandon_plan(db: &mut Connection, plan_path: &Path) -> Result<(), Error> {
+/// Abandon a plan: clear the in-flight promotion state in `marf_state`,
+/// unlink any staged history blob tmp file the plan owned, and remove
+/// the plan file. Used when cold-blob or sidecar verification fails (the
+/// merger never reached durable state, so the plan can never replay).
+///
+/// History blob cleanup: if the plan declared
+/// `history_blob_state == Present`, the tmp file at
+/// `header.history_blob_tmp_path` was kept alive by a `forget()` on the
+/// staged guard at prepare time. Abandoning means that tmp file will
+/// never be renamed to canonical — unlink it now so it doesn't leak.
+/// `None` for the plan means we couldn't decode it (already corrupt);
+/// the tmp file (if any) lives at an unknown path and gets reaped on
+/// next-process-startup via the open-time `reconcile_history_blobs`
+/// sweep (`.docs/full-history-history-blob-design.md` §9.4).
+fn abandon_plan(
+    db: &mut Connection,
+    plan_path: &Path,
+    plan: Option<&crate::chainstate::stacks::index::squash_plan::SquashPlan>,
+) -> Result<(), Error> {
+    use crate::chainstate::stacks::index::squash::HistoryBlobState;
+
+    if let Some(plan) = plan {
+        if plan.header.history_blob_state == HistoryBlobState::Present
+            && !plan.header.history_blob_tmp_path.is_empty()
+        {
+            let tmp = Path::new(&plan.header.history_blob_tmp_path);
+            match fs::remove_file(tmp) {
+                Ok(()) => {
+                    debug!("recovery: abandoned plan's staged history blob unlinked: {tmp:?}",);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone — either the plan never had a real
+                    // staged file, or some other recovery path cleaned
+                    // it. Either way, no work to do.
+                }
+                Err(e) => {
+                    warn!(
+                        "recovery: failed to unlink abandoned plan's history blob tmp {tmp:?}: {e} \
+                         (file will be reaped by next-boot reconcile_history_blobs)"
+                    );
+                }
+            }
+        }
+    }
+
     trie_sql::clear_promotion_state(db)?;
     if let Err(e) = fs::remove_file(plan_path) {
         warn!(

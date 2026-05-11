@@ -127,7 +127,17 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
     -- of 'bytes since last squash' at startup (see
     -- .docs/adaptive-squash-cadence.md §3.2.1). Existing rows get 0; the next
     -- successful squash writes a real publish-time watermark.
-    published_max_block_id INTEGER NOT NULL DEFAULT 0
+    published_max_block_id INTEGER NOT NULL DEFAULT 0,
+    -- Per-level FullHistory history-blob state. See
+    -- .docs/full-history-history-blob-design.md §10.1 for the value semantics:
+    --   'never_written' — TipOnly-mode level; no history blob file on disk
+    --   'present'       — FullHistory level with a valid history blob file
+    --   'trimmed'       — operator (or auto-trim §10.3) has unlinked the file;
+    --                     at-block reads return Error::HistoryTrimmed
+    -- The DEFAULT 'never_written' is correct for any row that doesn't
+    -- explicitly set the column at insert time (TipOnly publish path).
+    history_blob_state TEXT NOT NULL DEFAULT 'never_written'
+        CHECK (history_blob_state IN ('never_written', 'present', 'trimmed'))
 );
 
 ALTER TABLE marf_data ADD COLUMN storage_kind INTEGER NOT NULL DEFAULT 0;
@@ -149,7 +159,13 @@ CREATE TABLE IF NOT EXISTS marf_state (
     -- 'next cold append offset' computation is
     -- (committed level extents' end) + (this reservation when non-NULL).
     promotion_reserved_offset   INTEGER          DEFAULT NULL,
-    promotion_reserved_length   INTEGER          DEFAULT NULL
+    promotion_reserved_length   INTEGER          DEFAULT NULL,
+    -- One-shot gate for the post-epoch-3.4 history-blob auto-trim
+    -- (.docs/full-history-history-blob-design.md §10.3). Default 0
+    -- (false). Set to 1 (true) by the chains-coordinator after the
+    -- auto-trim batch completes; subsequent boots skip the trigger
+    -- check on seeing 1.
+    auto_trim_done              INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO marf_state (id) VALUES (1);
 
@@ -1099,8 +1115,15 @@ pub fn clear_tables(tx: &Transaction) -> Result<(), Error> {
 
 // --- Squash level registry ---
 
-use crate::chainstate::stacks::index::squash::SquashLevelRow;
+use crate::chainstate::stacks::index::squash::{HistoryBlobState, SquashLevelRow};
 
+// IMPORTANT: keep this DDL in sync with the v3 schema at
+// `SQL_MARF_DATA_TABLE_SCHEMA_3` above (specifically the `marf_squash_levels`
+// CREATE TABLE block). Both are the same table; this one is the
+// belt-and-suspenders/test-helper path used by `create_squash_levels_table`,
+// while the v3 DDL is what fresh chainstates open against. A drift between
+// the two will silently produce a table missing the new column on any
+// codepath that touches this DDL but not the v3 DDL.
 static SQL_SQUASH_LEVELS_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS marf_squash_levels (
     level_id INTEGER PRIMARY KEY,
@@ -1121,7 +1144,12 @@ CREATE TABLE IF NOT EXISTS marf_squash_levels (
     -- the conservative one-time over-count that levels predating this
     -- column produce on first read post-migration; cleared on the next
     -- successful squash.
-    published_max_block_id INTEGER NOT NULL DEFAULT 0
+    published_max_block_id INTEGER NOT NULL DEFAULT 0,
+    -- Per-level FullHistory history-blob state. Mirrors the v3 schema
+    -- column for the multipurpose `TrieLeafSquashed` carrier — see
+    -- .docs/full-history-history-blob-design.md §10.1.
+    history_blob_state TEXT NOT NULL DEFAULT 'never_written'
+        CHECK (history_blob_state IN ('never_written', 'present', 'trimmed'))
 );
 ";
 
@@ -1218,8 +1246,8 @@ pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(),
         "INSERT OR REPLACE INTO marf_squash_levels \
          (level_id, min_height, max_height, blob_offset, blob_length, \
           reads_redirected, root_sidecar_present, root_sidecar_trimmed, \
-          orphan_split_offset, published_max_block_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          orphan_split_offset, published_max_block_id, history_blob_state) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             row.level_id,
             row.min_height,
@@ -1231,7 +1259,24 @@ pub fn write_squash_level(conn: &Connection, row: &SquashLevelRow) -> Result<(),
             row.root_sidecar_trimmed as i64,
             row.orphan_split_offset as i64,
             row.published_max_block_id as i64,
+            row.history_blob_state.as_sql_str(),
         ],
+    )?;
+    Ok(())
+}
+
+/// Update `history_blob_state` for an existing level. Used by the trim
+/// flow (§10.2) — SQL update goes first, then the file unlink, so a crash
+/// between steps leaves a sane state (recovery's `'trimmed'` branch
+/// handles the leftover file). Idempotent.
+pub fn set_history_blob_state(
+    conn: &Connection,
+    level_id: u32,
+    state: HistoryBlobState,
+) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE marf_squash_levels SET history_blob_state = ?1 WHERE level_id = ?2",
+        params![state.as_sql_str(), level_id],
     )?;
     Ok(())
 }
@@ -1320,12 +1365,18 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
          COALESCE(root_sidecar_present, 0) AS root_sidecar_present, \
          COALESCE(root_sidecar_trimmed, 0) AS root_sidecar_trimmed, \
          COALESCE(orphan_split_offset, 0) AS orphan_split_offset, \
-         COALESCE(published_max_block_id, 0) AS published_max_block_id \
+         COALESCE(published_max_block_id, 0) AS published_max_block_id, \
+         COALESCE(history_blob_state, 'never_written') AS history_blob_state \
          FROM marf_squash_levels ORDER BY min_height ASC",
     )?;
-    let rows = stmt
-        .query_map(NO_PARAMS, |row| {
-            Ok(SquashLevelRow {
+    let mut rows = Vec::new();
+    let mapped = stmt.query_map(NO_PARAMS, |row| {
+        // Read history_blob_state as a text column and decode below; the
+        // closure cannot propagate `Error` directly, so we keep the value
+        // as a `String` and decode in the outer collect loop.
+        let history_blob_state_str: String = row.get("history_blob_state")?;
+        Ok((
+            SquashLevelRow {
                 level_id: row.get::<_, u32>("level_id")?,
                 min_height: row.get::<_, u32>("min_height")?,
                 max_height: row.get::<_, u32>("max_height")?,
@@ -1336,9 +1387,17 @@ pub fn read_squash_levels(conn: &Connection) -> Result<Vec<SquashLevelRow>, Erro
                 root_sidecar_trimmed: row.get::<_, i64>("root_sidecar_trimmed")? != 0,
                 orphan_split_offset: row.get::<_, i64>("orphan_split_offset")? as u32,
                 published_max_block_id: row.get::<_, i64>("published_max_block_id")? as u32,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+                // Filled in below after decoding `history_blob_state_str`.
+                history_blob_state: HistoryBlobState::NeverWritten,
+            },
+            history_blob_state_str,
+        ))
+    })?;
+    for entry in mapped {
+        let (mut row, state_str) = entry?;
+        row.history_blob_state = HistoryBlobState::from_sql_str(&state_str)?;
+        rows.push(row);
+    }
     Ok(rows)
 }
 
@@ -1493,6 +1552,13 @@ pub struct MarfState {
     /// Phase B: cold-blob extent length reserved by an in-flight promotion. Phase A always reads
     /// `None`.
     pub promotion_reserved_length: Option<u64>,
+    /// One-shot gate for the post-epoch-3.4 history-blob auto-trim per
+    /// `.docs/full-history-history-blob-design.md` §10.3. `false` (the
+    /// default) when the boundary hasn't been crossed yet; `true` after
+    /// the chains-coordinator's auto-trim batch has completed (step 5 of
+    /// the §10.3 batch flow — committed LAST so a mid-batch crash leaves
+    /// `false` and the next boot resumes).
+    pub auto_trim_done: bool,
 }
 
 /// Read the MARF state singleton.
@@ -1506,7 +1572,8 @@ pub fn read_marf_state(conn: &Connection) -> Result<MarfState, Error> {
         .query_row(
             "SELECT active_hot_seq, horizon_burn_blocks, \
                     promotion_in_progress, \
-                    promotion_reserved_offset, promotion_reserved_length \
+                    promotion_reserved_offset, promotion_reserved_length, \
+                    COALESCE(auto_trim_done, 0) AS auto_trim_done \
              FROM marf_state WHERE id = 1",
             NO_PARAMS,
             |row| {
@@ -1522,6 +1589,7 @@ pub fn read_marf_state(conn: &Connection) -> Result<MarfState, Error> {
                     promotion_reserved_length: row
                         .get::<_, Option<i64>>("promotion_reserved_length")?
                         .map(|v| v as u64),
+                    auto_trim_done: row.get::<_, i64>("auto_trim_done")? != 0,
                 })
             },
         )
@@ -1531,6 +1599,21 @@ pub fn read_marf_state(conn: &Connection) -> Result<MarfState, Error> {
             "marf_state singleton row missing — chainstate may be on a pre-v5 schema".into(),
         )
     })
+}
+
+/// Set `marf_state.auto_trim_done` to the given value. Used by the
+/// chains-coordinator's epoch-3.4 auto-trim hook (§10.3 of the design
+/// doc) to commit the one-shot gate AFTER the trim batch completes —
+/// step 5 of the §10.3 batch flow. Committing this last is load-bearing
+/// for crash-safety: a mid-batch crash leaves `false`, the next boot's
+/// trigger check re-evaluates conditions and resumes the trim against
+/// any remaining `'present'` levels.
+pub fn set_auto_trim_done(conn: &Connection, done: bool) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE marf_state SET auto_trim_done = ?1 WHERE id = 1",
+        params![done as i64],
+    )?;
+    Ok(())
 }
 
 /// Set the active hot-file sequence number. Used by the hot-file rotation path when the active file

@@ -1672,15 +1672,41 @@ impl<T: MarfTrieId> MARF<T> {
         // must not be carried forward into per-block blobs. If the copied
         // child was reached inside a reclaimed FullHistory squash, preserve
         // the value at the opened snapshot height, not the merged squash tip.
+        //
+        // Resolution policy (per `.docs/full-history-history-blob-design.md` §8.2):
+        // - At-height read (`squash_opened_height = Some(h)`): consult the
+        //   per-level history blob via `chunk.value_at_height(h)`.
+        // - Tip flatten (`squash_opened_height = None`): use `leaf.tip_value`
+        //   directly — no history-blob I/O, per the tip-read short-circuit.
         if let TrieNodeType::LeafSquashed(ref sq) = child_node {
             let value = match storage.squash_opened_height() {
-                Some(height) => sq.value_at_height(height).cloned().ok_or_else(|| {
-                    Error::CorruptionError(format!(
-                        "LeafSquashed COW copy could not resolve value at opened \
-                         squash height {height} for path {}",
-                        crate::util::hash::to_hex(sq.path.as_slice())
-                    ))
-                })?,
+                Some(height) => {
+                    // sq.has_history() must be true here in v1 — the only emit
+                    // shape is subtype 2 (`INLINE_FIXED + has_history`). A
+                    // squashed leaf without has_history would mean an unimplemented
+                    // subtype slipped through; treat as corruption.
+                    if !sq.has_history() {
+                        return Err(Error::CorruptionError(format!(
+                            "LeafSquashed COW copy at squash_opened_height={height} \
+                             but leaf has no has_history flag set (path {})",
+                            crate::util::hash::to_hex(sq.path.as_slice()),
+                        )));
+                    }
+                    let value_opt = storage.squashed_leaf_value_at_height(
+                        sq.history_offset,
+                        sq.history_byte_len,
+                        sq.history_entry_count,
+                        height,
+                    )?;
+                    value_opt.ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "LeafSquashed COW copy could not resolve value at opened \
+                             squash height {height} for path {} (chunk has no entry at \
+                             or below this height)",
+                            crate::util::hash::to_hex(sq.path.as_slice())
+                        ))
+                    })?
+                }
                 None => sq.tip_value()?.clone(),
             };
             child_node = TrieNodeType::Leaf(TrieLeaf {
@@ -2152,32 +2178,47 @@ impl<T: MarfTrieId> MARF<T> {
                                         .into(),
                                 )
                             })?;
-                            let value = sq.value_at_height(height).cloned().ok_or_else(|| {
-                                // `debug!` (not `warn!`): None here is an explicit signal
-                                // to the caller that the key didn't exist at the requested
-                                // snapshot height — semantically valid (e.g. for a key
-                                // first written above `height`). For unexpected cases (the
-                                // genesis-sync seal panic), this debug line provides the
-                                // entries vector + resolved height, queryable with
-                                // `STACKS_LOG_DEBUG=1` if a regression resurfaces.
-                                let entry_heights: Vec<u32> =
-                                    sq.entries.iter().map(|(h, _)| *h).collect();
-                                debug!(
-                                    "MARF::walk LeafSquashed value_at_height returned None: \
-                                     user_block_hash={user_block_hash}, user_block_id={user_block_id:?}, \
-                                     eager_user_height={eager_user_height:?}, \
-                                     resolved_height={height}, \
-                                     leaf_path={}, entries_heights={entry_heights:?}",
-                                    crate::util::hash::to_hex(&path)
-                                );
-                                Error::NotFoundError
-                            })?;
+                            // Snapshot the chunk-ref fields before we drop `read_session`
+                            // (which is borrowing `storage` mutably). The actual blob
+                            // lookup goes through storage immutably after the session ends.
+                            if !sq.has_history() {
+                                return Err(Error::CorruptionError(format!(
+                                    "MARF::walk: LeafSquashed at-block read at \
+                                     resolved_height={height} but leaf has no has_history \
+                                     flag set (user_block_hash={user_block_hash}, leaf_path={})",
+                                    crate::util::hash::to_hex(&path),
+                                )));
+                            }
+                            let history_offset = sq.history_offset;
+                            let history_byte_len = sq.history_byte_len;
+                            let history_entry_count = sq.history_entry_count;
+                            drop(read_session);
+                            // Resolve via the per-level history blob (per design
+                            // doc §8.2). `None` here means the key didn't exist
+                            // at this height — the at-block contract treats that
+                            // as `NotFoundError` (semantically valid, e.g. for a
+                            // key first written above `height`).
+                            let value = storage
+                                .squashed_leaf_value_at_height(
+                                    history_offset,
+                                    history_byte_len,
+                                    history_entry_count,
+                                    height,
+                                )?
+                                .ok_or_else(|| {
+                                    if marf_squash_trace_enabled_for_height(Some(height)) {
+                                        debug!(
+                                            "MARF::walk LeafSquashed value_at_height returned None: \
+                                             user_block_hash={user_block_hash}, \
+                                             user_block_id={user_block_id:?}, \
+                                             eager_user_height={eager_user_height:?}, \
+                                             resolved_height={height}, leaf_path={}",
+                                            crate::util::hash::to_hex(&path)
+                                        );
+                                    }
+                                    Error::NotFoundError
+                                })?;
                             if marf_squash_trace_enabled_for_height(Some(height)) {
-                                let entries: Vec<String> = sq
-                                    .entries
-                                    .iter()
-                                    .map(|(h, v)| format!("{h}={}", v.to_hex()))
-                                    .collect();
                                 info!(
                                     "MARF_SQUASH_TRACE leaf_squashed historical";
                                     "user_block_hash" => %user_block_hash,
@@ -2186,8 +2227,9 @@ impl<T: MarfTrieId> MARF<T> {
                                     "resolved_height" => height,
                                     "leaf_path" => %crate::util::hash::to_hex(&path),
                                     "leaf_ptr" => ?leaf_node_ptr,
-                                    "entry_count" => sq.entries.len(),
-                                    "entries" => %entries.join(","),
+                                    "history_offset" => history_offset,
+                                    "history_byte_len" => history_byte_len,
+                                    "history_entry_count" => history_entry_count,
                                     "value_hash" => %value.to_hex()
                                 );
                             }
@@ -2996,6 +3038,21 @@ impl<T: MarfTrieId> MARF<T> {
     /// external squash modified the underlying storage.
     pub fn refresh_after_squash(&mut self) -> Result<(), Error> {
         self.storage.refresh_after_squash()
+    }
+
+    /// Run a SQL mutation INSIDE the squash-publish quiesce window, then
+    /// republish [`crate::chainstate::stacks::index::storage::SquashMeta`].
+    /// See [`crate::chainstate::stacks::index::storage::TrieFileStorage::refresh_after_squash_with_sql_mutation`]
+    /// for the full ordering guarantees. Use this whenever a SQL flip must
+    /// be atomic with the meta refresh — e.g. flipping
+    /// `marf_squash_levels.history_blob_state` to `'trimmed'` before any
+    /// unlink.
+    pub fn refresh_after_squash_with_sql_mutation<F>(&mut self, mutation: F) -> Result<(), Error>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<(), Error>,
+    {
+        self.storage
+            .refresh_after_squash_with_sql_mutation(mutation)
     }
 
     /// Lightweight peer-style sync for the writer that just published a

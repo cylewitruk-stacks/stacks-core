@@ -36,7 +36,7 @@ use crate::chainstate::stacks::index::node::{
 };
 use crate::chainstate::stacks::index::profile::TrieBenchmark;
 use crate::chainstate::stacks::index::scratch::MarfReadState;
-use crate::chainstate::stacks::index::squash::SquashTrailer;
+use crate::chainstate::stacks::index::squash::{HistoryBlobState, SquashTrailer};
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
     bits, marf_squash_trace_enabled_for_height, trie_sql, BlockMap, ClarityMarfTrieId, Error,
@@ -1799,6 +1799,39 @@ pub struct SquashMeta {
     /// outcome). Retained on the struct so reading code stays unchanged
     /// across the deletion.
     pub ambiguous_block_ids: HashSet<u32>,
+    /// Per-level FullHistory history-blob state, parallel to `levels`. Mirrors
+    /// `marf_squash_levels.history_blob_state` per
+    /// `.docs/full-history-history-blob-design.md` §10.1. Consulted by the
+    /// at-block read path (§8.2) to decide whether to open/consult the
+    /// per-level history blob.
+    pub level_history_blob_state: Vec<HistoryBlobState>,
+    /// Per-level min_height, parallel to `levels`. Mirrors
+    /// `marf_squash_levels.min_height`. Used by [`Self::history_blob_reader`]
+    /// to derive the canonical history-blob filename for lazy opens
+    /// (which depends on min_height, max_height, and blob_offset).
+    pub level_min_heights: Vec<u32>,
+    /// Per-level max_height, parallel to `levels`. Mirrors
+    /// `marf_squash_levels.max_height`. See `level_min_heights`.
+    pub level_max_heights: Vec<u32>,
+    /// Per-level lazy cache of `Arc<HistoryBlobReader>`. Populated on
+    /// first at-block read against a level whose state is `Present`.
+    /// Wrapped in `Mutex` so the at-block read path (which takes
+    /// `&SquashMeta` through the `Arc`) can lazily mutate the cache
+    /// without contending on the global `meta: RwLock<Arc<SquashMeta>>`
+    /// snapshot lock.
+    ///
+    /// Lifecycle (per design doc §8.3): the reader is opened once at
+    /// MARF level-load time AND validates the file's footer at open
+    /// (per §9.4 step 4). It stays alive for the lifetime of this
+    /// `SquashMeta` instance — `build_squash_meta_from_sql` rebuilds
+    /// the whole `SquashMeta` on every publish, which is the natural
+    /// invalidation point for the cache.
+    pub history_blob_readers: std::sync::Mutex<
+        HashMap<
+            usize,
+            std::sync::Arc<crate::chainstate::stacks::index::history_blob::HistoryBlobReader>,
+        >,
+    >,
 }
 
 impl SquashMeta {
@@ -1814,6 +1847,109 @@ impl SquashMeta {
             level_block_id_to_height: Vec::new(),
             level_reads_redirected: Vec::new(),
             ambiguous_block_ids: HashSet::new(),
+            level_history_blob_state: Vec::new(),
+            level_min_heights: Vec::new(),
+            level_max_heights: Vec::new(),
+            history_blob_readers: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve the per-level history blob reader for `level_idx`, lazily
+    /// opening + footer-validating the file on first use. Three outcomes
+    /// per design doc §8.2 / §10.1:
+    ///
+    /// * `Ok(None)` — `NeverWritten` (TipOnly-mode level, or FullHistory
+    ///   with no squashable leaves). At-block reads should not reach this
+    ///   path with a `has_history` leaf; if they do, that's a corruption
+    ///   between the SQL row and the on-disk leaf.
+    /// * `Err(Error::HistoryTrimmed { level_id })` — `Trimmed`. The file
+    ///   has been unlinked; at-block reads on this level fail by design.
+    /// * `Ok(Some(reader))` — `Present`. The reader is opened once and
+    ///   shared across all callers for the lifetime of this `SquashMeta`.
+    pub fn history_blob_reader(
+        &self,
+        marf_dir: &std::path::Path,
+        level_idx: usize,
+    ) -> Result<
+        Option<std::sync::Arc<crate::chainstate::stacks::index::history_blob::HistoryBlobReader>>,
+        Error,
+    > {
+        let state = self
+            .level_history_blob_state
+            .get(level_idx)
+            .copied()
+            .ok_or_else(|| {
+                Error::CorruptionError(format!(
+                    "SquashMeta::history_blob_reader: level_idx {level_idx} out of range \
+                         ({} levels)",
+                    self.level_history_blob_state.len()
+                ))
+            })?;
+
+        match state {
+            HistoryBlobState::NeverWritten => Ok(None),
+            HistoryBlobState::Trimmed => {
+                let level_id = self
+                    .levels
+                    .get(level_idx)
+                    .map(|t| t.info.level_id)
+                    .unwrap_or(u32::MAX);
+                Err(Error::HistoryTrimmed { level_id })
+            }
+            HistoryBlobState::Present => {
+                // Fast path: cache hit.
+                {
+                    let cache = self.history_blob_readers.lock().map_err(|_| {
+                        Error::CorruptionError("history_blob_readers cache poisoned".into())
+                    })?;
+                    if let Some(existing) = cache.get(&level_idx) {
+                        return Ok(Some(existing.clone()));
+                    }
+                }
+                // Slow path: open + validate. Computed outside the lock so
+                // we don't hold it across the file-open.
+                let trailer = self.levels.get(level_idx).ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "SquashMeta::history_blob_reader: levels[{level_idx}] missing"
+                    ))
+                })?;
+                let blob_offset = *self.level_blob_offsets.get(level_idx).ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "SquashMeta::history_blob_reader: level_blob_offsets[{level_idx}] missing"
+                    ))
+                })?;
+                let min_h = *self.level_min_heights.get(level_idx).ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "SquashMeta::history_blob_reader: level_min_heights[{level_idx}] missing"
+                    ))
+                })?;
+                let max_h = *self.level_max_heights.get(level_idx).ok_or_else(|| {
+                    Error::CorruptionError(format!(
+                        "SquashMeta::history_blob_reader: level_max_heights[{level_idx}] missing"
+                    ))
+                })?;
+                let path = crate::chainstate::stacks::index::history_blob::history_blob_path(
+                    marf_dir,
+                    trailer.info.level_id,
+                    min_h,
+                    max_h,
+                    blob_offset,
+                );
+                let reader =
+                    crate::chainstate::stacks::index::history_blob::HistoryBlobReader::open(
+                        &path,
+                        Some(trailer.info.level_id),
+                    )?;
+                let arc = std::sync::Arc::new(reader);
+                // Re-acquire the lock to insert. Another thread may have
+                // raced us to open the same level; if so, return their
+                // reader (deterministic — both are valid views of the
+                // same immutable file) and let ours drop.
+                let mut cache = self.history_blob_readers.lock().map_err(|_| {
+                    Error::CorruptionError("history_blob_readers cache poisoned".into())
+                })?;
+                Ok(Some(cache.entry(level_idx).or_insert(arc).clone()))
+            }
         }
     }
 }
@@ -2371,6 +2507,9 @@ pub(crate) fn build_squash_meta_from_sql(
     let mut level_blob_offsets = Vec::with_capacity(total_levels);
     let mut level_block_id_to_height: Vec<HashMap<u32, u32>> = Vec::with_capacity(total_levels);
     let mut level_reads_redirected = Vec::with_capacity(total_levels);
+    let mut level_history_blob_state = Vec::with_capacity(total_levels);
+    let mut level_min_heights = Vec::with_capacity(total_levels);
+    let mut level_max_heights = Vec::with_capacity(total_levels);
 
     for row in &squash_level_rows {
         let trailer_opt = if row.blob_length == 0 {
@@ -2409,6 +2548,9 @@ pub(crate) fn build_squash_meta_from_sql(
         level_blob_offsets.push(row.blob_offset);
         level_block_id_to_height.push(per_level_block_ids);
         level_reads_redirected.push(row.reads_redirected);
+        level_history_blob_state.push(row.history_blob_state);
+        level_min_heights.push(row.min_height);
+        level_max_heights.push(row.max_height);
     }
 
     Ok(SquashMeta {
@@ -2422,6 +2564,10 @@ pub(crate) fn build_squash_meta_from_sql(
         level_block_id_to_height,
         level_reads_redirected,
         ambiguous_block_ids: HashSet::new(),
+        level_history_blob_state,
+        level_min_heights,
+        level_max_heights,
+        history_blob_readers: std::sync::Mutex::new(HashMap::new()),
     })
 }
 
@@ -3952,11 +4098,11 @@ fn trace_leaf_at_squash_read<T: MarfTrieId>(
             let Ok(Some(sq)) = node.as_leaf_squashed_ref() else {
                 return;
             };
-            let entries: Vec<String> = sq
-                .entries
-                .iter()
-                .map(|(h, v)| format!("{h}={}", v.to_hex()))
-                .collect();
+            // The new multipurpose carrier holds only a chunk-blob
+            // reference; historical entries live in the per-level history
+            // blob and are not loaded for this trace line. We log the
+            // leaf header (type + flags + tip + chunk pointer) instead of
+            // the entries themselves.
             info!(
                 "MARF_SQUASH_TRACE leaf_node_at_squash_read";
                 "kind" => "leaf_squashed",
@@ -3968,8 +4114,12 @@ fn trace_leaf_at_squash_read<T: MarfTrieId>(
                 "level_idx" => ?squash_opened_level_idx,
                 "ptr" => ?ptr,
                 "leaf_path" => %to_hex(sq.path),
-                "entry_count" => sq.entries.len(),
-                "entries" => %entries.join(",")
+                "leaf_type" => ?sq.leaf_type,
+                "flags" => format!("0x{:02x}", sq.flags.bits()),
+                "tip_value" => %sq.tip_value.to_hex(),
+                "history_offset" => sq.history_offset,
+                "history_byte_len" => sq.history_byte_len,
+                "history_entry_count" => sq.history_entry_count
             );
         }
         _ => {}
@@ -4492,6 +4642,76 @@ impl<T: MarfTrieId, Db: Deref<Target = Connection>> TrieReadStorage<T>
         self.data.squash_opened_height
     }
 
+    fn squash_opened_level_idx(&self) -> Option<usize> {
+        self.data.squash_opened_level_idx
+    }
+
+    fn squashed_leaf_value_at_height(
+        &self,
+        history_offset: u64,
+        history_byte_len: u32,
+        history_entry_count: u32,
+        height: u32,
+    ) -> Result<Option<MARFValue>, Error> {
+        // Concurrency / generation gate (mirrors the cold-blob read pattern
+        // in `read_trie_item_borrowed`'s mmap fast path):
+        //
+        // 1. Acquire a `BlobReadGuard` to bump `active_reads` for the
+        //    duration of this read. Phase 4 trim respects the same
+        //    counter — it can't unlink the history blob while reads are
+        //    in flight. On POSIX an unlinked mmap region survives until
+        //    the last reference drops, but Windows doesn't allow unlink-
+        //    while-open without special flags, so the guard is necessary
+        //    for cross-platform correctness.
+        // 2. Re-check `squash_state_fresh`: a publish or trim between
+        //    this handle's last sync and now would install a new
+        //    `SquashMeta` whose `level_history_blob_state[level_idx]`
+        //    may differ from our cached snapshot. Without this check,
+        //    we could read from a stale `Arc<HistoryBlobReader>` that
+        //    happens to still be alive (POSIX) and serve data that
+        //    `'trimmed'` semantics promise to surface as
+        //    `HistoryTrimmed`. Bubble `RetryAfterSquash` so the
+        //    top-level wrapper resyncs and the retry returns the
+        //    correct error.
+        let _guard = self
+            .data
+            .shared_squash
+            .try_acquire_blob_read()
+            .ok_or(Error::RetryAfterSquash)?;
+        if !self
+            .data
+            .shared_squash
+            .squash_state_fresh(self.data.seen_squash_generation)
+        {
+            return Err(Error::RetryAfterSquash);
+        }
+
+        let level_idx = self.data.squash_opened_level_idx.ok_or_else(|| {
+            Error::CorruptionError(
+                "squashed_leaf_value_at_height: hit LeafSquashed without an opened squash level"
+                    .into(),
+            )
+        })?;
+        // marf_dir = parent of the sqlite path.
+        let marf_dir = std::path::Path::new(&self.db_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let reader_opt = self
+            .data
+            .squash_meta
+            .history_blob_reader(&marf_dir, level_idx)?;
+        let reader = reader_opt.ok_or_else(|| {
+            Error::CorruptionError(format!(
+                "squashed_leaf_value_at_height: level_idx={level_idx} has history_blob_state \
+                 = NeverWritten but a TrieLeafSquashed with has_history was decoded here \
+                 (corruption between SQL row and on-disk leaf)"
+            ))
+        })?;
+        let chunk = reader.read_chunk(history_offset, history_byte_len, history_entry_count)?;
+        Ok(chunk.value_at_height(height))
+    }
+
     #[cfg(test)]
     fn bump_squashed_tip_fallback_count(&self) {
         let c = &self.data.squashed_tip_fallback_count;
@@ -4849,6 +5069,68 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             &mut self.cache,
             &self.db,
         )
+    }
+
+    /// Run an arbitrary SQL mutation INSIDE the shared squash-publish quiesce
+    /// window, then republish [`SquashMeta`] atomically so that the new SQL
+    /// state and the new in-memory snapshot become visible to all handles at
+    /// the same generation bump.
+    ///
+    /// This is the correct path for any post-squash SQL flip that affects the
+    /// read path's behavior (e.g. `marf_squash_levels.history_blob_state`
+    /// going from `'present'` to `'trimmed'`): the alternative — SQL UPDATE
+    /// outside the quiesce window, then a separate
+    /// [`Self::refresh_after_squash`] — leaves a window where existing handles
+    /// can still pass the generation-freshness check, observe SQL as
+    /// `Trimmed` via a fresh read, but read the cached `Present`
+    /// [`SquashMeta`] and serve bytes from a file that's about to be
+    /// unlinked.
+    ///
+    /// Ordering inside `publish_squash`:
+    ///
+    /// 1. `truncate_pending = true` — new readers back off.
+    /// 2. Drain in-flight readers (`active_reads == 0`).
+    /// 3. **Run `mutation(&Connection)`** — pre-arm; failures here are safely
+    ///    surfaced to the caller without risk to other handles.
+    /// 4. `guard.arm()` — SQL change is durable from here on.
+    /// 5. `remap_and_invalidate` (when external blobs are present).
+    /// 6. `build_squash_meta_from_sql` — reflects the post-mutation SQL state.
+    /// 7. Install new `Arc<SquashMeta>`, bump generation, clear
+    ///    `truncate_pending`.
+    ///
+    /// A failure at step 5 or 6 aborts the process — once the mutation
+    /// committed, recovering would mean serving the old `SquashMeta` against
+    /// the new SQL state (the inverse of the bug we're guarding against).
+    pub fn refresh_after_squash_with_sql_mutation<F>(&mut self, mutation: F) -> Result<(), Error>
+    where
+        F: FnOnce(&Connection) -> Result<(), Error>,
+    {
+        let TrieFileStorage { db, blobs, .. } = self;
+        let db: &Connection = db;
+        let blobs: &mut Option<TrieFile> = blobs;
+
+        let rebuild = |guard: &PublishMutationGuard| -> Result<SquashMeta, Error> {
+            mutation(db)?;
+            guard.arm();
+            if let Some(b) = blobs.as_mut() {
+                b.remap_and_invalidate()?;
+            }
+            build_squash_meta_from_sql(db, blobs.as_ref())
+        };
+
+        self.data.shared_squash.publish_squash(rebuild)?;
+
+        self.data.squash_meta = self.data.shared_squash.snapshot();
+        self.data.seen_squash_generation = self.data.shared_squash.generation();
+        self.data.external_bytes_since_last_squash =
+            trie_sql::current_external_bytes_since_last_squash(&self.db)?;
+
+        self.cache = BlockCache::new("noop");
+        self.data.set_block(T::sentinel(), None);
+        self.data.trie_ancestor_hash_bytes_cache = None;
+        self.data.resolved_snapshot_context.set(None);
+
+        Ok(())
     }
 
     /// Reload squash level metadata and remap the blob file after an external
@@ -5282,6 +5564,65 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                             report.tmp_orphans_deleted, report.dat_orphans_deleted, report.dat_kept,
                         );
                     }
+
+                    // Reconcile the per-level history blob files against SQL
+                    // `marf_squash_levels.history_blob_state` per
+                    // `.docs/full-history-history-blob-design.md` §9.4 step 4.
+                    // Pattern mirrors the root sidecar reconcile above:
+                    //   - `'never_written'` row: defensive unlink of any
+                    //      canonical history blob file
+                    //   - `'present'` row: file MUST exist + pass footer
+                    //      validation, else CorruptionError
+                    //   - `'trimmed'` row: file MUST be absent; leftover
+                    //      gets unlinked (handles §10.2 crash window
+                    //      between SQL commit and unlink)
+                    //   - tmp `.history-tmp-*.dat` files: unlinked as
+                    //      crashed-writer orphans
+                    use crate::chainstate::stacks::index::history_blob::{
+                        reconcile_history_blobs, ExpectedHistoryBlob,
+                    };
+                    let marf_dir = db_path_for_reconcile
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let expected_hb: Vec<ExpectedHistoryBlob> = meta
+                        .levels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let blob_offset = *meta.level_blob_offsets.get(i).ok_or_else(|| {
+                                Error::corruption(&format!(
+                                    "SquashMeta.level_blob_offsets missing entry for \
+                                         level_idx={i}"
+                                ))
+                            })?;
+                            let state = *meta.level_history_blob_state.get(i).ok_or_else(|| {
+                                Error::corruption(&format!(
+                                    "SquashMeta.level_history_blob_state missing entry \
+                                         for level_idx={i}"
+                                ))
+                            })?;
+                            use crate::chainstate::stacks::index::squash::HistoryBlobState;
+                            Ok::<ExpectedHistoryBlob, Error>(ExpectedHistoryBlob {
+                                level_id: t.info.level_id,
+                                min_height: t.info.min_height,
+                                max_height: t.info.max_height,
+                                blob_offset,
+                                present: matches!(state, HistoryBlobState::Present),
+                                trimmed: matches!(state, HistoryBlobState::Trimmed),
+                            })
+                        })
+                        .collect::<Result<_, Error>>()?;
+                    let hb_report = reconcile_history_blobs(&marf_dir, &expected_hb)?;
+                    if hb_report.tmp_orphans_deleted > 0 || hb_report.dat_orphans_deleted > 0 {
+                        info!(
+                            "MARF history blob reconcile: tmp_orphans_deleted={}, \
+                             dat_orphans_deleted={}, dat_kept={}",
+                            hb_report.tmp_orphans_deleted,
+                            hb_report.dat_orphans_deleted,
+                            hb_report.dat_kept,
+                        );
+                    }
                 }
 
                 Ok(meta)
@@ -5452,6 +5793,57 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                     "MARF squash sidecar reconcile (post-drain): tmp_orphans_deleted={}, \
                      dat_orphans_deleted={}, dat_kept={}",
                     report.tmp_orphans_deleted, report.dat_orphans_deleted, report.dat_kept,
+                );
+            }
+
+            // Mirror the post-drain history-blob reconcile that the
+            // normal open path runs alongside the sidecar reconcile.
+            // Without this, deferred recovery would leave `present`
+            // history blobs unvalidated and `trimmed`/orphan files
+            // unswept until the next ordinary open. Same dispatch
+            // (per design doc §9.4 step 4): present → footer-validate,
+            // trimmed → unlink leftover, never_written → defensive unlink.
+            use crate::chainstate::stacks::index::history_blob::{
+                reconcile_history_blobs, ExpectedHistoryBlob,
+            };
+            use crate::chainstate::stacks::index::squash::HistoryBlobState;
+            let marf_dir = db_path_for_reconcile
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let expected_hb: Vec<ExpectedHistoryBlob> = meta
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let blob_offset = *meta.level_blob_offsets.get(i).ok_or_else(|| {
+                        Error::corruption(&format!(
+                            "SquashMeta.level_blob_offsets missing entry for level_idx={i}"
+                        ))
+                    })?;
+                    let state = *meta.level_history_blob_state.get(i).ok_or_else(|| {
+                        Error::corruption(&format!(
+                            "SquashMeta.level_history_blob_state missing entry for level_idx={i}"
+                        ))
+                    })?;
+                    Ok::<ExpectedHistoryBlob, Error>(ExpectedHistoryBlob {
+                        level_id: t.info.level_id,
+                        min_height: t.info.min_height,
+                        max_height: t.info.max_height,
+                        blob_offset,
+                        present: matches!(state, HistoryBlobState::Present),
+                        trimmed: matches!(state, HistoryBlobState::Trimmed),
+                    })
+                })
+                .collect::<Result<_, Error>>()?;
+            let hb_report = reconcile_history_blobs(&marf_dir, &expected_hb)?;
+            if hb_report.tmp_orphans_deleted > 0 || hb_report.dat_orphans_deleted > 0 {
+                info!(
+                    "MARF history blob reconcile (post-drain): tmp_orphans_deleted={}, \
+                     dat_orphans_deleted={}, dat_kept={}",
+                    hb_report.tmp_orphans_deleted,
+                    hb_report.dat_orphans_deleted,
+                    hb_report.dat_kept,
                 );
             }
         }

@@ -18,12 +18,13 @@ use std::io::{Read, Write};
 use std::{error, fmt};
 
 use crate::chainstate::stacks::index::bits::{self, SPARSE_PTR_BITMAP_MARKER};
+use crate::chainstate::stacks::index::history_blob::ChunkRef;
 use crate::chainstate::stacks::index::{
     BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodePath, ReadNodeBacking,
-    ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf,
+    ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf, MARF_VALUE_ENCODED_SIZE,
 };
 use crate::codec::{read_next, write_next, Error as codec_error, StacksMessageCodec};
-use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE};
+use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE};
 use crate::util::hash::to_hex;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +86,220 @@ pub fn clear_backptr(id: u8) -> u8 {
 pub fn is_leaf_type(id: u8) -> bool {
     let cleared = id & 0x3f;
     cleared == TrieNodeID::Leaf as u8 || cleared == TrieNodeID::LeafSquashed as u8
+}
+
+// ---------------------------------------------------------------------------
+// Multipurpose `TrieLeafSquashed` carrier — type + flags discriminator
+// ---------------------------------------------------------------------------
+//
+// Per `.docs/full-history-history-blob-design.md` §5, the on-disk
+// `TrieLeafSquashed` format (node-id 7) is a multipurpose carrier with an
+// internal `(type, flags)` discriminator. v1 only emits one shape
+// (subtype 2: `INLINE` + `has_history`); subtypes 3-5 are format-reserved
+// for the variable-length-Clarity-value work landing later (§5.7).
+//
+// Plain `TrieLeaf` (id 1) is untouched — it stays the hot-path leaf for
+// the simple case (no history, fixed-size MARFValue). The multipurpose
+// carrier only appears for cases that need at least one of: external
+// history reference, external value reference, variable-length value.
+
+/// Where the leaf's tip value lives. `INLINE` keeps the value in the leaf
+/// body (either fixed 40B `MARFValue` or — when `LeafFlags::variable_length_inline`
+/// is set — a `(len, bytes)` pair). `EXTERNAL` puts the value in a separate
+/// per-level "values payload blob" file referenced by `(offset, len)` from
+/// the leaf header.
+///
+/// Reserved values (`0` and `3..=255`) surface as `Error::CorruptionError`
+/// on decode (see `validate_leaf_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LeafType {
+    /// Tip value carried inline in the leaf body. v1's only emit subtype
+    /// (subtype 2) uses this with fixed-size `MARFValue` payload.
+    Inline = 1,
+    /// Tip value lives in an external "values payload blob" file (subtypes
+    /// 3 / 4 — variable-length Clarity values, deferred per §5.7).
+    External = 2,
+}
+
+impl LeafType {
+    /// Decode + validate a `type` byte. Returns `CorruptionError` for any
+    /// value not in `{1, 2}`. `0` is explicitly reserved as an
+    /// invalid/uninitialized sentinel for corruption detection.
+    pub fn from_u8(b: u8) -> Result<Self, Error> {
+        match b {
+            1 => Ok(LeafType::Inline),
+            2 => Ok(LeafType::External),
+            other => Err(Error::CorruptionError(format!(
+                "TrieLeafSquashed: invalid type byte 0x{:02x} (expected 1=INLINE or 2=EXTERNAL)",
+                other
+            ))),
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Flag bit positions within the `LeafFlags` byte. Bits 3-7 are reserved
+/// and must be zero on decode (rejected as corruption to prevent silent
+/// format extension via flipped reserved bits — future format changes go
+/// through versioning, not by claiming reserved bits).
+pub mod leaf_flag {
+    /// Bit 0: a 32-byte hash follows the leaf header (per-block-mode
+    /// reads carry the hash inline; squash-mode emit typically omits it).
+    pub const HAS_HASH: u8 = 0b0000_0001;
+    /// Bit 1: a `(history_offset: u64, history_byte_len: u32,
+    /// history_entry_count: u32)` triple follows in the header pointing
+    /// to a chunk in the per-level history blob.
+    pub const HAS_HISTORY: u8 = 0b0000_0010;
+    /// Bit 2: when `LeafType::Inline`, the inline tip value is variable-length
+    /// (`tip_value_len: u32` in the header, `tip_value_len` bytes in the body).
+    /// When `LeafType::External`, this bit MUST be 0 (rejected as corruption
+    /// otherwise — strict per §5.2 type/flag coherence).
+    pub const VARIABLE_LENGTH_INLINE: u8 = 0b0000_0100;
+
+    /// Mask of all bits used by v1. Any other bit set on decode is corruption.
+    pub const VALID_MASK: u8 = HAS_HASH | HAS_HISTORY | VARIABLE_LENGTH_INLINE;
+}
+
+/// Decoded view of the `flags` byte in a multipurpose `TrieLeafSquashed`
+/// header. Construct via `LeafFlags::from_u8` (which validates reserved
+/// bits) or by combining the constants in [`leaf_flag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeafFlags(u8);
+
+impl LeafFlags {
+    /// Construct from a raw flags byte without validation. Use
+    /// [`Self::from_u8`] when decoding from disk to surface
+    /// corruption on reserved-bit violations.
+    pub const fn new(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// Decode + validate a `flags` byte. Surfaces `CorruptionError` if any
+    /// reserved bit (3-7) is set.
+    pub fn from_u8(b: u8) -> Result<Self, Error> {
+        if b & !leaf_flag::VALID_MASK != 0 {
+            return Err(Error::CorruptionError(format!(
+                "TrieLeafSquashed: reserved flag bits set in 0x{:02x} (valid mask 0x{:02x})",
+                b,
+                leaf_flag::VALID_MASK
+            )));
+        }
+        Ok(Self(b))
+    }
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub fn has_hash(self) -> bool {
+        self.0 & leaf_flag::HAS_HASH != 0
+    }
+
+    pub fn has_history(self) -> bool {
+        self.0 & leaf_flag::HAS_HISTORY != 0
+    }
+
+    pub fn variable_length_inline(self) -> bool {
+        self.0 & leaf_flag::VARIABLE_LENGTH_INLINE != 0
+    }
+
+    /// Cross-check `(type, flags)` coherence per §5.2. Currently enforces:
+    ///
+    /// - `External` MUST NOT set `VARIABLE_LENGTH_INLINE` (the flag is
+    ///   meaningless for external values, which are always variable-length;
+    ///   strict rejection beats silent masking).
+    pub fn validate_against_type(self, t: LeafType) -> Result<(), Error> {
+        if matches!(t, LeafType::External) && self.variable_length_inline() {
+            return Err(Error::CorruptionError(
+                "TrieLeafSquashed: EXTERNAL + variable_length_inline is invalid \
+                 (flag is meaningless for EXTERNAL — must be 0)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod leaf_type_flag_tests {
+    use super::*;
+
+    #[test]
+    fn leaf_type_round_trip() {
+        assert_eq!(LeafType::from_u8(1).unwrap(), LeafType::Inline);
+        assert_eq!(LeafType::from_u8(2).unwrap(), LeafType::External);
+        assert_eq!(LeafType::Inline.as_u8(), 1);
+        assert_eq!(LeafType::External.as_u8(), 2);
+    }
+
+    #[test]
+    fn leaf_type_rejects_invalid_values() {
+        for b in [0u8, 3, 4, 0xff] {
+            let err = LeafType::from_u8(b).unwrap_err();
+            assert!(matches!(err, Error::CorruptionError(_)));
+        }
+    }
+
+    #[test]
+    fn leaf_flags_accepts_valid_combinations() {
+        let f = LeafFlags::from_u8(0).unwrap();
+        assert!(!f.has_hash());
+        assert!(!f.has_history());
+        assert!(!f.variable_length_inline());
+
+        let f = LeafFlags::from_u8(leaf_flag::HAS_HISTORY).unwrap();
+        assert!(!f.has_hash());
+        assert!(f.has_history());
+
+        let f = LeafFlags::from_u8(leaf_flag::HAS_HASH | leaf_flag::HAS_HISTORY).unwrap();
+        assert!(f.has_hash());
+        assert!(f.has_history());
+
+        let all = LeafFlags::from_u8(leaf_flag::VALID_MASK).unwrap();
+        assert!(all.has_hash());
+        assert!(all.has_history());
+        assert!(all.variable_length_inline());
+    }
+
+    #[test]
+    fn leaf_flags_rejects_reserved_bits() {
+        for reserved_bit in [
+            0b0000_1000u8,
+            0b0001_0000,
+            0b0010_0000,
+            0b0100_0000,
+            0b1000_0000,
+        ] {
+            let err = LeafFlags::from_u8(reserved_bit).unwrap_err();
+            assert!(
+                matches!(err, Error::CorruptionError(_)),
+                "bit 0x{reserved_bit:02x} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn external_with_variable_length_inline_is_corruption() {
+        let f = LeafFlags::from_u8(leaf_flag::VARIABLE_LENGTH_INLINE).unwrap();
+        let err = f.validate_against_type(LeafType::External).unwrap_err();
+        assert!(matches!(err, Error::CorruptionError(_)));
+    }
+
+    #[test]
+    fn external_without_variable_length_inline_is_ok() {
+        let f = LeafFlags::from_u8(leaf_flag::HAS_HISTORY).unwrap();
+        f.validate_against_type(LeafType::External).unwrap();
+    }
+
+    #[test]
+    fn inline_with_variable_length_inline_is_ok() {
+        let f = LeafFlags::from_u8(leaf_flag::VARIABLE_LENGTH_INLINE).unwrap();
+        f.validate_against_type(LeafType::Inline).unwrap();
+    }
 }
 
 /// Is this node compressed?
@@ -2362,76 +2577,118 @@ impl TrieNode for TrieLeaf {
     }
 }
 
-/// A squashed leaf node that carries the value-transition history for a key
-/// within a squash level's block range. Used in `FullHistory` squash mode.
+/// Multipurpose "special-leaf" carrier at on-disk node-id `7`. Per
+/// `.docs/full-history-history-blob-design.md` §5, the in-memory layout
+/// mirrors the on-disk header (§5.1): tip value inline, optional hash,
+/// optional history-blob reference, type/flags discriminator.
 ///
-/// `entries[0]` is the tip (most recent value). For incremental levels,
-/// `entries[last]` may be a synthetic baseline entry carrying the value
-/// inherited from the prior level.
-#[derive(Debug, Clone)]
+/// **Name is historical** — once subtypes 3/4/5 land for variable-length
+/// values this carrier represents non-history shapes too. The struct keeps
+/// its name to avoid renaming churn across the codebase per §0 + §5.0.
+///
+/// v1 only emits **subtype 2** (`INLINE_FIXED + has_history`); subtypes
+/// 3/5 (variable inline) and 3/4 (external) are format-reserved per §5.7
+/// and rejected by both encoder and decoder until variable-length-value
+/// work lands.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrieLeafSquashed {
     pub path: NodePath,
-    /// Value transitions sorted descending by height.
-    pub entries: Vec<(u32, MARFValue)>,
-}
-
-impl PartialEq for TrieLeafSquashed {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.entries == other.entries
-    }
+    /// Tip-era value. For subtype 2 this is the value at the highest
+    /// height in the chunk (= `chunk[0].value`); the §5.2 invariant
+    /// `tip_value == chunk[0].value` keeps tip reads off the history
+    /// blob.
+    pub tip_value: MARFValue,
+    /// Discriminator + modifier flags per §5.1. v1 always emits with
+    /// `leaf_type = Inline` + `flags.has_history()`.
+    pub leaf_type: LeafType,
+    pub flags: LeafFlags,
+    /// 32-byte hash, present iff `flags.has_hash()`. Per §5.2 hash pin,
+    /// this is computed exactly as `bits::get_leaf_hash(&TrieLeaf{path,
+    /// data: tip_value})` so that proofs.rs / marf.rs hashing sites
+    /// keep working unchanged. v1 squash-mode emit doesn't set has_hash.
+    pub inline_hash: Option<TrieHash>,
+    /// `(history_offset, history_byte_len, history_entry_count)` triple
+    /// pointing into the per-level history blob. Present iff
+    /// `flags.has_history()`. The §5.2 history invariant holds: when
+    /// set, `history_entry_count >= 1` and the chunk contains every
+    /// in-range transition for this key.
+    pub history_offset: u64,
+    pub history_byte_len: u32,
+    pub history_entry_count: u32,
 }
 
 impl TrieLeafSquashed {
-    /// Maximum number of entries per leaf. This matches the non-mmap
-    /// read ceiling in `bits::get_node_body_max_byte_len`.
-    pub const MAX_ENTRIES: usize = 65_536;
+    /// MARF path bound — bounded ≤ 32 (nibble-pair representation per §5.1).
+    pub const MAX_PATH_LEN: u8 = 32;
 
-    pub fn new(path: &[u8], entries: Vec<(u32, MARFValue)>) -> Result<Self, Error> {
-        if entries.is_empty() {
+    /// Construct a v1 subtype-2 leaf (`INLINE_FIXED + has_history`, no inline hash).
+    /// This is the only emit shape v1 produces (§5.7).
+    pub fn new(path: &[u8], chunk_ref: ChunkRef) -> Result<Self, Error> {
+        Self::new_subtype_2(path, chunk_ref, None)
+    }
+
+    /// Construct a subtype-2 leaf with an optional inline hash (used by
+    /// per-block-mode encoding paths that keep hashes inline).
+    pub fn new_subtype_2(
+        path: &[u8],
+        chunk_ref: ChunkRef,
+        inline_hash: Option<TrieHash>,
+    ) -> Result<Self, Error> {
+        if chunk_ref.history_entry_count == 0 {
             return Err(Error::CorruptionError(
-                "TrieLeafSquashed must have at least one entry".into(),
+                "TrieLeafSquashed: ChunkRef.history_entry_count == 0 violates the §5.2 \
+                 has_history invariant"
+                    .into(),
             ));
         }
-        if entries.len() > Self::MAX_ENTRIES {
-            return Err(Error::CorruptionError(format!(
-                "TrieLeafSquashed: {} entries exceeds maximum {}",
-                entries.len(),
-                Self::MAX_ENTRIES
-            )));
-        }
-        if !entries.is_sorted_by(|a, b| a.0 >= b.0) {
-            return Err(Error::CorruptionError(
-                "TrieLeafSquashed: entries must be sorted descending by height".into(),
-            ));
+        let path = NodePath::from_slice(path).ok_or_else(|| {
+            Error::CorruptionError("TrieLeafSquashed: node path exceeds 32 bytes".into())
+        })?;
+        let mut flags_bits = leaf_flag::HAS_HISTORY;
+        if inline_hash.is_some() {
+            flags_bits |= leaf_flag::HAS_HASH;
         }
         Ok(Self {
-            path: NodePath::from_slice(path).ok_or_else(|| {
-                Error::CorruptionError("TrieLeafSquashed: node path exceeds 32 bytes".into())
-            })?,
-            entries,
+            path,
+            tip_value: chunk_ref.tip_value,
+            leaf_type: LeafType::Inline,
+            flags: LeafFlags::new(flags_bits),
+            inline_hash,
+            history_offset: chunk_ref.history_offset,
+            history_byte_len: chunk_ref.history_byte_len,
+            history_entry_count: chunk_ref.history_entry_count,
         })
     }
 
-    /// The most recent value (always `entries[0]`).
+    /// Tip value (always present in v1 since `leaf_type == Inline`).
     ///
-    /// Returns `CorruptionError` if `entries` is empty, which would
-    /// indicate a construction or deserialization bug.
+    /// Returns `Result` for compatibility with existing call sites; in v1
+    /// this never errors — every emit is subtype 2 with the tip value
+    /// inline. When subtypes 3/4 land (external tip), this signature
+    /// will need to either fetch from the values blob or be split.
     pub fn tip_value(&self) -> Result<&MARFValue, Error> {
-        Ok(&self
-            .entries
-            .first()
-            .ok_or_else(|| {
-                Error::CorruptionError("BUG: TrieLeafSquashed must have at least one entry".into())
-            })?
-            .1)
+        Ok(&self.tip_value)
     }
 
-    /// Point-in-time lookup. Returns the value from the most recent
-    /// transition at or before `height`, or `None` if the key did not
-    /// exist at that height.
-    pub fn value_at_height(&self, height: u32) -> Option<&MARFValue> {
-        let idx = self.entries.partition_point(|(h, _)| *h > height);
-        self.entries.get(idx).map(|(_, v)| v)
+    /// Whether this leaf references a chunk in the per-level history
+    /// blob (i.e., `flags.has_history()`).
+    pub fn has_history(&self) -> bool {
+        self.flags.has_history()
+    }
+
+    /// Reconstruct the [`ChunkRef`] from the leaf's header fields. Useful
+    /// when handing the leaf off to the read-path's history-blob fetcher.
+    /// Only meaningful when `has_history()` — otherwise returns `None`.
+    pub fn chunk_ref(&self) -> Option<ChunkRef> {
+        if !self.has_history() {
+            return None;
+        }
+        Some(ChunkRef {
+            history_offset: self.history_offset,
+            history_byte_len: self.history_byte_len,
+            history_entry_count: self.history_entry_count,
+            tip_value: self.tip_value.clone(),
+        })
     }
 }
 
@@ -2441,9 +2698,20 @@ impl TrieNode for TrieLeafSquashed {
     }
 
     fn empty() -> Self {
+        // Synthetic placeholder for in-place decode targets (load_from_slice
+        // overwrites every field). Subtype-2 shape with a zero ChunkRef +
+        // zero tip_value. Per §5.2, history_entry_count==0 with has_history
+        // would be invalid, so we leave has_history clear here — the placeholder
+        // is never emitted, only used as a load_from_slice target.
         Self {
             path: NodePath::default(),
-            entries: vec![(0, MARFValue([0u8; 40]))],
+            tip_value: MARFValue([0u8; 40]),
+            leaf_type: LeafType::Inline,
+            flags: LeafFlags::new(0),
+            inline_hash: None,
+            history_offset: 0,
+            history_byte_len: 0,
+            history_entry_count: 0,
         }
     }
 
@@ -2452,149 +2720,246 @@ impl TrieNode for TrieLeafSquashed {
     }
 
     fn write_bytes<W: Write>(&self, w: &mut W) -> Result<(), Error> {
-        let (first_height, base_height) = match (self.entries.first(), self.entries.last()) {
-            (Some(&(f, _)), Some(&(l, _))) => (f, l),
-            _ => return Err(Error::corruption("BUG: TrieLeafSquashed has no entries")),
-        };
-        let max_delta = first_height.saturating_sub(base_height);
-
-        if max_delta <= u16::MAX as u32 {
-            // Compressed: [ID|0x40][path][base_height(4)][count(4)][u16+value...]
-            w.write_all(&[set_compressed(self.id())])?;
-            bits::write_path_to_bytes(&self.path, w)?;
-            w.write_all(&base_height.to_be_bytes())?;
-            let count = u32::try_from(self.entries.len()).map_err(|_| Error::OverflowError)?;
-            w.write_all(&count.to_be_bytes())?;
-            for (height, value) in &self.entries {
-                let rel = (height - base_height) as u16;
-                w.write_all(&rel.to_be_bytes())?;
-                w.write_all(&value.0)?;
-            }
-        } else {
-            // Legacy: [ID][path][count(4)][u32+value...]
-            w.write_all(&[self.id()])?;
-            bits::write_path_to_bytes(&self.path, w)?;
-            let count = u32::try_from(self.entries.len()).map_err(|_| Error::OverflowError)?;
-            w.write_all(&count.to_be_bytes())?;
-            for (height, value) in &self.entries {
-                w.write_all(&height.to_be_bytes())?;
-                w.write_all(&value.0)?;
-            }
+        // §5.7 emit-scope assertion: v1 only emits INLINE_FIXED (subtype 2).
+        // Defense in depth — encoder rejects the unimplemented shapes so a
+        // future patch that flips the policy does so explicitly.
+        if self.leaf_type != LeafType::Inline {
+            return Err(Error::NotSupportedError(format!(
+                "TrieLeafSquashed: emit of leaf_type {:?} is forbidden in v1 (§5.7)",
+                self.leaf_type
+            )));
         }
+        if self.flags.variable_length_inline() {
+            return Err(Error::NotSupportedError(
+                "TrieLeafSquashed: emit of INLINE_VARIABLE (subtype 5) is forbidden in v1 (§5.7)"
+                    .into(),
+            ));
+        }
+        // Cross-check type/flag coherence (§5.2). Should always pass when
+        // emitting subtype 2, but flag any drift early.
+        self.flags.validate_against_type(self.leaf_type)?;
+
+        // Path length fits in u8 by construction (`NodePath::from_slice`
+        // rejects > 32 bytes), but assert here so a corrupted in-memory
+        // node doesn't silently truncate.
+        let path_bytes = self.path.as_slice();
+        let path_len = u8::try_from(path_bytes.len()).map_err(|_| {
+            Error::CorruptionError(format!(
+                "TrieLeafSquashed: path_len {} exceeds u8",
+                path_bytes.len()
+            ))
+        })?;
+        if path_len > Self::MAX_PATH_LEN {
+            return Err(Error::CorruptionError(format!(
+                "TrieLeafSquashed: path_len {path_len} exceeds {}",
+                Self::MAX_PATH_LEN
+            )));
+        }
+
+        // Header fixed prefix: node-id, type, flags, path_len.
+        w.write_all(&[self.id()])?;
+        w.write_all(&[self.leaf_type.as_u8()])?;
+        w.write_all(&[self.flags.bits()])?;
+        w.write_all(&[path_len])?;
+
+        // Conditional fixed-width header fields (presence per flags + type).
+        if self.flags.has_hash() {
+            let hash = self.inline_hash.as_ref().ok_or_else(|| {
+                Error::CorruptionError(
+                    "TrieLeafSquashed: has_hash flag set but inline_hash is None".into(),
+                )
+            })?;
+            w.write_all(hash.as_bytes())?;
+        }
+        if self.flags.has_history() {
+            if self.history_entry_count == 0 {
+                return Err(Error::CorruptionError(
+                    "TrieLeafSquashed: has_history set but history_entry_count == 0 \
+                     (violates §5.2 invariant)"
+                        .into(),
+                ));
+            }
+            w.write_all(&self.history_offset.to_be_bytes())?;
+            w.write_all(&self.history_byte_len.to_be_bytes())?;
+            w.write_all(&self.history_entry_count.to_be_bytes())?;
+        }
+        // No type-dependent sizing field for INLINE_FIXED (tip is fixed 40B).
+        // EXTERNAL would emit (tip_offset: u64, tip_len: u32) here; INLINE_VARIABLE
+        // would emit (tip_value_len: u32). Both rejected above.
+
+        // Body: path bytes, then tip_value.
+        w.write_all(path_bytes)?;
+        w.write_all(&self.tip_value.0)?;
         Ok(())
     }
 
     fn write_bytes_compressed<W: Write>(&self, w: &mut W) -> Result<(), Error> {
+        // The new format has no compressed/uncompressed dichotomy — the
+        // inline-history compressed encoding from the prior format is
+        // gone. Both methods produce the same bytes.
         self.write_bytes(w)
     }
 
     fn byte_len(&self) -> usize {
-        let base_height = self.entries.last().map_or(0, |(h, _)| *h);
-        let max_delta = self
-            .entries
-            .first()
-            .map_or(0, |(h, _)| *h)
-            .saturating_sub(base_height);
-        if max_delta <= u16::MAX as u32 {
-            // Compressed: 1 + path + 4 (base_height) + 4 (count) + entries * 42
-            1 + bits::get_path_byte_len(&self.path) + 4 + 4 + self.entries.len() * 42
-        } else {
-            // Legacy: 1 + path + 4 (count) + entries * 44
-            1 + bits::get_path_byte_len(&self.path) + 4 + self.entries.len() * 44
+        let path_len = self.path.as_slice().len();
+        // Fixed prefix: id + type + flags + path_len.
+        let mut total = 4;
+        if self.flags.has_hash() {
+            total += TRIEHASH_ENCODED_SIZE;
         }
+        if self.flags.has_history() {
+            // history_offset(8) + history_byte_len(4) + history_entry_count(4)
+            total += 16;
+        }
+        // Type-dependent sizing fields:
+        match (self.leaf_type, self.flags.variable_length_inline()) {
+            (LeafType::Inline, false) => {}         // no header sizing field
+            (LeafType::Inline, true) => total += 4, // tip_value_len: u32
+            (LeafType::External, _) => total += 12, // tip_offset(8) + tip_len(4)
+        }
+        // Body: path bytes + (for INLINE) tip value.
+        total += path_len;
+        match (self.leaf_type, self.flags.variable_length_inline()) {
+            (LeafType::Inline, false) => total += MARF_VALUE_ENCODED_SIZE as usize,
+            // INLINE_VARIABLE / EXTERNAL: caller-dependent body size; v1
+            // doesn't emit these so byte_len() doesn't see them in practice.
+            // Return the fixed-prefix size only — callers that emit these
+            // subtypes will need to extend byte_len.
+            _ => {}
+        }
+        total
     }
 
     fn byte_len_compressed(&self) -> usize {
         self.byte_len()
     }
 
+    #[allow(clippy::indexing_slicing)] // hist_bytes is `.get(cursor..cursor + 16).ok_or(...)?` so length == 16
     fn load_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        let id = *bytes
-            .first()
-            .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing node ID byte".into()))?;
-
+        // ── header fixed prefix ──
+        let id = *bytes.first().ok_or_else(|| {
+            Error::CorruptionError("TrieLeafSquashed: missing node ID byte".into())
+        })?;
         if clear_ctrl_bits(id) != TrieNodeID::LeafSquashed as u8 {
             return Err(Error::CorruptionError(format!(
-                "LeafSquashed: bad ID 0x{:02x}",
+                "TrieLeafSquashed: bad ID 0x{:02x}",
                 id
             )));
         }
+        // The new format does NOT use the compressed bit (0x40) — that was the
+        // height-delta encoding for the prior inline format and is gone. Reject
+        // if we see it set, since it would indicate either old-format bytes or
+        // a bit-flip.
+        if id & 0x40 != 0 {
+            return Err(Error::CorruptionError(format!(
+                "TrieLeafSquashed: compressed bit (0x40) is set on id 0x{id:02x} — the \
+                 new format does not use it; bytes are likely from the prior format"
+            )));
+        }
+        let type_byte = *bytes
+            .get(1)
+            .ok_or_else(|| Error::CorruptionError("TrieLeafSquashed: missing type byte".into()))?;
+        let leaf_type = LeafType::from_u8(type_byte)?;
+        let flags_byte = *bytes
+            .get(2)
+            .ok_or_else(|| Error::CorruptionError("TrieLeafSquashed: missing flags byte".into()))?;
+        let flags = LeafFlags::from_u8(flags_byte)?;
+        flags.validate_against_type(leaf_type)?;
+        let path_len = *bytes.get(3).ok_or_else(|| {
+            Error::CorruptionError("TrieLeafSquashed: missing path_len byte".into())
+        })?;
+        if path_len > Self::MAX_PATH_LEN {
+            return Err(Error::CorruptionError(format!(
+                "TrieLeafSquashed: path_len {path_len} exceeds {}",
+                Self::MAX_PATH_LEN
+            )));
+        }
 
-        let compressed = is_compressed(id);
-
-        let remaining = bytes
-            .get(1..)
-            .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing path bytes".into()))?;
-        let path_consumed = bits::path_from_bytes_slice_into(remaining, &mut self.path)?;
-
-        let mut cursor = 1 + path_consumed;
-
-        // Compressed format has a base_height field before the entry count.
-        let base_height = if compressed {
-            let end = cursor + 4;
-            let b = bytes.get(cursor..end).ok_or_else(|| {
-                Error::CorruptionError("LeafSquashed: missing base_height".into())
+        // ── conditional fixed-width header fields ──
+        let mut cursor = 4usize;
+        let inline_hash = if flags.has_hash() {
+            let end = cursor + TRIEHASH_ENCODED_SIZE;
+            let hash_bytes = bytes.get(cursor..end).ok_or_else(|| {
+                Error::CorruptionError("TrieLeafSquashed: header truncated at inline hash".into())
             })?;
             cursor = end;
-            u32::from_be_bytes(b.try_into().map_err(|_| {
-                Error::CorruptionError("LeafSquashed: base_height not 4 bytes".into())
-            })?)
+            let mut h = [0u8; TRIEHASH_ENCODED_SIZE];
+            h.copy_from_slice(hash_bytes);
+            Some(TrieHash(h))
         } else {
-            0 // unused for legacy format
+            None
         };
 
-        let count_end = cursor + 4;
-        let count_bytes = bytes
-            .get(cursor..count_end)
-            .ok_or_else(|| Error::CorruptionError("LeafSquashed: missing entry count".into()))?;
-        let entry_count = u32::from_be_bytes(count_bytes.try_into().map_err(|_| {
-            Error::CorruptionError("LeafSquashed: entry count slice is not 4 bytes".into())
-        })?) as usize;
-        cursor = count_end;
+        let (history_offset, history_byte_len, history_entry_count) = if flags.has_history() {
+            let end = cursor + 16;
+            let hist_bytes = bytes.get(cursor..end).ok_or_else(|| {
+                Error::CorruptionError(
+                    "TrieLeafSquashed: header truncated at history reference".into(),
+                )
+            })?;
+            cursor = end;
+            let mut off = [0u8; 8];
+            off.copy_from_slice(&hist_bytes[0..8]);
+            let mut blen = [0u8; 4];
+            blen.copy_from_slice(&hist_bytes[8..12]);
+            let mut count = [0u8; 4];
+            count.copy_from_slice(&hist_bytes[12..16]);
+            let count = u32::from_be_bytes(count);
+            if count == 0 {
+                return Err(Error::CorruptionError(
+                    "TrieLeafSquashed: has_history set but decoded entry_count == 0 \
+                     (violates §5.2 invariant)"
+                        .into(),
+                ));
+            }
+            (u64::from_be_bytes(off), u32::from_be_bytes(blen), count)
+        } else {
+            (0, 0, 0)
+        };
 
-        if entry_count == 0 {
+        // ── §5.7 v1-policy rejection of subtypes 3/4/5 ──
+        // The format-aware decode above succeeded; now reject what v1
+        // doesn't yet implement (§5.7 decoder enforcement).
+        if matches!(leaf_type, LeafType::External) {
             return Err(Error::CorruptionError(
-                "LeafSquashed: entry count is zero".into(),
+                "TrieLeafSquashed: EXTERNAL leaf seen but subtypes 3/4 are not implemented \
+                 in v1 (§5.7) — likely an encoder bug or wrong-format bytes"
+                    .into(),
+            ));
+        }
+        if flags.variable_length_inline() {
+            return Err(Error::CorruptionError(
+                "TrieLeafSquashed: INLINE_VARIABLE leaf seen but subtype 5 is not implemented \
+                 in v1 (§5.7) — likely an encoder bug or wrong-format bytes"
+                    .into(),
             ));
         }
 
-        self.entries.clear();
-        self.entries.reserve(entry_count);
+        // ── body: path bytes + (INLINE_FIXED) 40B tip value ──
+        let path_end = cursor + path_len as usize;
+        let path_bytes = bytes.get(cursor..path_end).ok_or_else(|| {
+            Error::CorruptionError("TrieLeafSquashed: body truncated at path".into())
+        })?;
+        self.path = NodePath::from_slice(path_bytes).ok_or_else(|| {
+            Error::CorruptionError("TrieLeafSquashed: decoded path exceeds 32 bytes".into())
+        })?;
+        cursor = path_end;
 
-        if compressed {
-            // Per-entry: [u16 relative_height][MARFValue(40)] = 42 bytes
-            for _ in 0..entry_count {
-                let entry_end = cursor + 42;
-                let entry_bytes = bytes
-                    .get(cursor..entry_end)
-                    .ok_or_else(|| Error::corruption("LeafSquashed: truncated entry"))?;
-                let (rel_bytes, value_bytes) = entry_bytes
-                    .split_first_chunk::<2>()
-                    .ok_or_else(|| Error::corruption("LeafSquashed: bad rel height"))?;
-                let rel = u16::from_be_bytes(*rel_bytes);
-                let height = base_height + u32::from(rel);
-                let mut value = MARFValue([0u8; 40]);
-                value.0.copy_from_slice(value_bytes);
-                self.entries.push((height, value));
-                cursor = entry_end;
-            }
-        } else {
-            // Legacy: per-entry [u32 height][MARFValue(40)] = 44 bytes
-            for _ in 0..entry_count {
-                let entry_end = cursor + 44;
-                let entry_bytes = bytes
-                    .get(cursor..entry_end)
-                    .ok_or_else(|| Error::corruption("LeafSquashed: truncated entry"))?;
-                let (height_bytes, value_bytes) = entry_bytes
-                    .split_first_chunk::<4>()
-                    .ok_or_else(|| Error::corruption("LeafSquashed: bad height"))?;
-                let height = u32::from_be_bytes(*height_bytes);
-                let mut value = MARFValue([0u8; 40]);
-                value.0.copy_from_slice(value_bytes);
-                self.entries.push((height, value));
-                cursor = entry_end;
-            }
-        }
+        let tip_end = cursor + MARF_VALUE_ENCODED_SIZE as usize;
+        let tip_bytes = bytes.get(cursor..tip_end).ok_or_else(|| {
+            Error::CorruptionError("TrieLeafSquashed: body truncated at tip_value".into())
+        })?;
+        let mut tip_arr = [0u8; MARF_VALUE_ENCODED_SIZE as usize];
+        tip_arr.copy_from_slice(tip_bytes);
+        self.tip_value = MARFValue(tip_arr);
+        cursor = tip_end;
+
+        self.leaf_type = leaf_type;
+        self.flags = flags;
+        self.inline_hash = inline_hash;
+        self.history_offset = history_offset;
+        self.history_byte_len = history_byte_len;
+        self.history_entry_count = history_entry_count;
 
         Ok(cursor)
     }
@@ -2648,22 +3013,44 @@ pub struct TrieLeafRef<'a> {
     pub data: &'a MARFValue,
 }
 
-/// Borrowed view of a `TrieLeafSquashed`. Carries a reference to the
-/// full entries list so that `to_owned_node()` can round-trip without
-/// losing history.
+/// Borrowed view of a `TrieLeafSquashed`. Mirrors the multipurpose
+/// carrier's header layout per §5.1 — historical reads need to fetch
+/// from the per-level history blob via `(history_offset, history_byte_len,
+/// history_entry_count)`, not from any inline entries (the new format
+/// has none).
 #[derive(Debug, Clone, Copy)]
 pub struct TrieLeafSquashedRef<'a> {
     pub path: &'a [u8],
     pub tip_value: &'a MARFValue,
-    pub entries: &'a [(u32, MARFValue)],
+    pub leaf_type: LeafType,
+    pub flags: LeafFlags,
+    /// Inline hash, present iff `flags.has_hash()`.
+    pub inline_hash: Option<&'a TrieHash>,
+    /// History-blob reference. Fields are meaningful iff
+    /// `flags.has_history()` (otherwise all zero).
+    pub history_offset: u64,
+    pub history_byte_len: u32,
+    pub history_entry_count: u32,
 }
 
 impl<'a> TrieLeafSquashedRef<'a> {
-    /// Point-in-time lookup on the borrowed entries slice.
-    /// Same semantics as `TrieLeafSquashed::value_at_height`.
-    pub fn value_at_height(&self, height: u32) -> Option<&MARFValue> {
-        let idx = self.entries.partition_point(|(h, _)| *h > height);
-        self.entries.get(idx).map(|(_, v)| v)
+    /// Whether this leaf has an associated history-blob chunk.
+    pub fn has_history(&self) -> bool {
+        self.flags.has_history()
+    }
+
+    /// Reconstruct an owned [`ChunkRef`] from the borrowed header fields.
+    /// Returns `None` when the leaf has no history.
+    pub fn chunk_ref(&self) -> Option<ChunkRef> {
+        if !self.has_history() {
+            return None;
+        }
+        Some(ChunkRef {
+            history_offset: self.history_offset,
+            history_byte_len: self.history_byte_len,
+            history_entry_count: self.history_entry_count,
+            tip_value: self.tip_value.clone(),
+        })
     }
 }
 
@@ -2839,7 +3226,13 @@ impl<'a> TrieNodeRef<'a> {
             }),
             Self::LeafSquashed(sq) => TrieNodeType::LeafSquashed(TrieLeafSquashed {
                 path: NodePath::from_slice(sq.path).expect("node path exceeds 32 bytes"),
-                entries: sq.entries.to_vec(),
+                tip_value: sq.tip_value.clone(),
+                leaf_type: sq.leaf_type,
+                flags: sq.flags,
+                inline_hash: sq.inline_hash.cloned(),
+                history_offset: sq.history_offset,
+                history_byte_len: sq.history_byte_len,
+                history_entry_count: sq.history_entry_count,
             }),
         }
     }
@@ -2891,13 +3284,13 @@ impl<'a> From<&'a TrieNodeType> for TrieNodeRef<'a> {
             }),
             TrieNodeType::LeafSquashed(data) => Self::LeafSquashed(TrieLeafSquashedRef {
                 path: data.path.as_slice(),
-                // Infallible: entries validated non-empty at construction
-                // and deserialization. The From trait does not permit error
-                // propagation.
-                tip_value: data
-                    .tip_value()
-                    .expect("BUG: LeafSquashed invariant violated: entries is empty"),
-                entries: &data.entries,
+                tip_value: &data.tip_value,
+                leaf_type: data.leaf_type,
+                flags: data.flags,
+                inline_hash: data.inline_hash.as_ref(),
+                history_offset: data.history_offset,
+                history_byte_len: data.history_byte_len,
+                history_entry_count: data.history_entry_count,
             }),
         }
     }

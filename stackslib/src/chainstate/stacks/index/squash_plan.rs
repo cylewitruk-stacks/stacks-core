@@ -59,6 +59,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha512_256};
 use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 
+use crate::chainstate::stacks::index::squash::HistoryBlobState;
 use crate::chainstate::stacks::index::Error;
 
 /// Magic bytes identifying a squash promotion plan file. Cheap structural
@@ -67,7 +68,14 @@ pub const PLAN_MAGIC: &[u8; 4] = b"SQPL";
 
 /// Current on-disk format version. Bump on any breaking change to the
 /// layout; readers refuse versions they don't know.
-pub const PLAN_FORMAT_VERSION: u32 = 1;
+///
+/// Version history:
+/// - v1: Phase B horizon-gated promotion. No FullHistory support.
+/// - v2: Adds `history_blob_state` + `history_blob_tmp_path` to the
+///   header so FullHistory promotion can hand off a staged history
+///   blob from worker to coordinator/recovery (per Phase 5.A of
+///   `.docs/full-history-history-blob-design.md`).
+pub const PLAN_FORMAT_VERSION: u32 = 2;
 
 /// File-name suffix template. The discoverer matches files of the form
 /// `<db>.squash_pending.{level_id:08}.plan`.
@@ -166,6 +174,41 @@ pub struct PlanHeader {
     /// `MAX(block_id) FROM marf_data WHERE unconfirmed = 0` snapshotted
     /// at publish time. Backs the per-MARF squash-work counter.
     pub published_max_block_id: u32,
+
+    // ── FullHistory history-blob handoff (plan format v2) ──────────
+    //
+    // The next two fields together carry a staged history blob from
+    // the worker's prepare phase to the coordinator's publish phase
+    // (or to recovery on a crash in between). They are the durable
+    // analog of the legacy synchronous path's in-process
+    // `MergeOutputs.history_blob: Option<StagedHistoryBlob>` field.
+    //
+    // Lifecycle:
+    // 1. **Prepare** (worker): if `prepare_merge_outputs` returned
+    //    a staged history blob, capture its tmp path here and set
+    //    `history_blob_state = Present`. The worker MUST then call
+    //    `forget()` on the staged guard so RAII drop doesn't unlink
+    //    the tmp file — the plan file is now the durable owner.
+    // 2. **Publish** (coordinator OR recovery): if state is
+    //    `Present`, rename the tmp file to its canonical history-
+    //    blob path (`history_blob_path(...)`) BEFORE the SQL commit,
+    //    parent-dir-fsync, then commit the SQL row with
+    //    `history_blob_state = Present`. If state is
+    //    `NeverWritten`, no file work; commit with `NeverWritten`.
+    //    `Trimmed` should never appear in a plan header — the trim
+    //    flow runs only against already-published levels.
+    /// State the published `marf_squash_levels.history_blob_state`
+    /// column should land at. `NeverWritten` for TipOnly mode and for
+    /// FullHistory levels with no emitted leaves; `Present` for
+    /// FullHistory levels with a real history blob.
+    pub history_blob_state: HistoryBlobState,
+    /// Absolute path to the staged history blob tmp file when
+    /// `history_blob_state == Present`. Empty string when state is
+    /// `NeverWritten`. The publish/recovery step renames this to the
+    /// canonical history-blob path; idempotent on re-runs (source
+    /// already renamed → canonical already exists is treated as
+    /// success).
+    pub history_blob_tmp_path: String,
 }
 
 /// One entry in the in-range canonical block list.
@@ -311,6 +354,9 @@ impl SquashPlan {
         write_u8(w, self.header.root_sidecar_trimmed as u8)?;
         write_u32(w, self.header.orphan_split_offset)?;
         write_u32(w, self.header.published_max_block_id)?;
+        // v2: FullHistory history-blob handoff.
+        write_u8(w, self.header.history_blob_state.as_u8())?;
+        write_varbytes(w, self.header.history_blob_tmp_path.as_bytes())?;
 
         // In-range blocks
         write_u32(
@@ -399,6 +445,44 @@ impl SquashPlan {
         let root_sidecar_trimmed = read_bool(r)?;
         let orphan_split_offset = read_u32(r)?;
         let published_max_block_id = read_u32(r)?;
+        // v2: FullHistory history-blob handoff.
+        let history_blob_state = {
+            let mut buf = [0u8; 1];
+            r.read_exact(&mut buf).map_err(Error::IOError)?;
+            HistoryBlobState::from_u8(buf[0])?
+        };
+        let history_blob_tmp_path_bytes = read_varbytes(r)?;
+        let history_blob_tmp_path =
+            String::from_utf8(history_blob_tmp_path_bytes).map_err(|e| {
+                Error::CorruptionError(format!(
+                    "squash_plan: history_blob_tmp_path is not valid UTF-8: {e}"
+                ))
+            })?;
+        // Cross-field invariant: Present requires a non-empty path;
+        // NeverWritten requires an empty path. Mismatch signals
+        // corruption (or an encoder bug).
+        match history_blob_state {
+            HistoryBlobState::Present if history_blob_tmp_path.is_empty() => {
+                return Err(Error::CorruptionError(
+                    "squash_plan: history_blob_state=Present but history_blob_tmp_path is empty"
+                        .into(),
+                ));
+            }
+            HistoryBlobState::NeverWritten if !history_blob_tmp_path.is_empty() => {
+                return Err(Error::CorruptionError(
+                    "squash_plan: history_blob_state=NeverWritten but history_blob_tmp_path is non-empty"
+                        .into(),
+                ));
+            }
+            HistoryBlobState::Trimmed => {
+                return Err(Error::CorruptionError(
+                    "squash_plan: history_blob_state=Trimmed is not valid in a plan header \
+                     (trim runs only against published levels)"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
         let header = PlanHeader {
             level_id,
             min_height,
@@ -414,6 +498,8 @@ impl SquashPlan {
             root_sidecar_trimmed,
             orphan_split_offset,
             published_max_block_id,
+            history_blob_state,
+            history_blob_tmp_path,
         };
 
         // In-range blocks
@@ -822,6 +908,8 @@ mod tests {
                 root_sidecar_trimmed: false,
                 orphan_split_offset: 0xc0de,
                 published_max_block_id: 1010,
+                history_blob_state: HistoryBlobState::NeverWritten,
+                history_blob_tmp_path: String::new(),
             },
             in_range_blocks: vec![
                 InRangeBlock {
@@ -986,6 +1074,89 @@ mod tests {
         assert_eq!(m.lookup(2, 100), None);
         assert_eq!(m.lookup(99, 0), None);
         assert_eq!(m.entry_count(), 3);
+    }
+
+    #[test]
+    fn round_trip_with_history_blob_present_state() {
+        // v2 plan format carrying a FullHistory handoff: state=Present
+        // with a non-empty tmp path. Exercises the new fields end-to-end.
+        let mut plan = make_plan();
+        plan.header.history_blob_state = HistoryBlobState::Present;
+        plan.header.history_blob_tmp_path =
+            "/tmp/marf-history-level-000042-h0000000a-0000003f.history-tmp-1234".to_string();
+
+        let mut buf = Vec::new();
+        plan.encode(&mut buf).unwrap();
+        let decoded = SquashPlan::decode(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(plan, decoded);
+        assert_eq!(decoded.header.history_blob_state, HistoryBlobState::Present);
+        assert_eq!(
+            decoded.header.history_blob_tmp_path,
+            "/tmp/marf-history-level-000042-h0000000a-0000003f.history-tmp-1234"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_present_state_with_empty_tmp_path() {
+        // The decoder enforces the cross-field invariant: state=Present
+        // requires a non-empty tmp path. The encoder doesn't enforce
+        // (it writes whatever the struct holds), so an in-memory plan
+        // with the invalid combo round-trips through encode to produce
+        // a valid-by-body-hash but invariant-violating buffer.
+        let mut plan = make_plan();
+        plan.header.history_blob_state = HistoryBlobState::Present;
+        plan.header.history_blob_tmp_path = String::new();
+
+        let mut buf = Vec::new();
+        plan.encode(&mut buf).unwrap();
+
+        let err = SquashPlan::decode(&mut std::io::Cursor::new(&buf))
+            .expect_err("must reject Present+empty");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("history_blob_state=Present but history_blob_tmp_path is empty"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    #[test]
+    fn decode_rejects_never_written_state_with_non_empty_tmp_path() {
+        // The inverse cross-field invariant: NeverWritten requires an
+        // empty tmp path.
+        let mut plan = make_plan();
+        plan.header.history_blob_state = HistoryBlobState::NeverWritten;
+        plan.header.history_blob_tmp_path = "/some/stale/path".to_string();
+
+        let mut buf = Vec::new();
+        plan.encode(&mut buf).unwrap();
+
+        let err = SquashPlan::decode(&mut std::io::Cursor::new(&buf))
+            .expect_err("must reject NeverWritten+non-empty");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("history_blob_state=NeverWritten but history_blob_tmp_path is non-empty"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    #[test]
+    fn decode_rejects_trimmed_state_in_plan_header() {
+        // Trimmed is not a valid state for a plan header — the trim
+        // flow runs against published levels, never against plans.
+        let mut plan = make_plan();
+        plan.header.history_blob_state = HistoryBlobState::Trimmed;
+        plan.header.history_blob_tmp_path = String::new();
+
+        let mut buf = Vec::new();
+        plan.encode(&mut buf).unwrap();
+
+        let err = SquashPlan::decode(&mut std::io::Cursor::new(&buf))
+            .expect_err("must reject Trimmed in plan");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("history_blob_state=Trimmed is not valid in a plan header"),
+            "unexpected error: {msg}",
+        );
     }
 
     #[test]

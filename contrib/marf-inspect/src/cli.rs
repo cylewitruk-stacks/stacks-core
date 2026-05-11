@@ -4,6 +4,7 @@ mod manifest;
 mod node;
 mod plan;
 mod trie;
+mod trim_history;
 mod walk;
 
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ pub use node::NodeArgs;
 pub use plan::PlanArgs;
 use rusqlite::{Connection, OpenFlags};
 pub use trie::TrieArgs;
+pub use trim_history::{TrimHistoryArgs, exec as trim_history_exec};
 pub use walk::WalkArgs;
 
 #[derive(Parser)]
@@ -52,6 +54,17 @@ pub enum Command {
 
     /// List squash levels with their on-disk trailer metadata (mode, root hashes counts, etc.).
     Levels(LevelsArgs),
+
+    /// **DESTRUCTIVE** — trim per-level FullHistory history blobs. Use
+    /// `--level <ID>` for a single level or `--all` for every level
+    /// whose `history_blob_state` is currently `'present'`. SQL is
+    /// flipped to `'trimmed'` inside the squash-publish quiesce
+    /// window; the on-disk file is then best-effort unlinked. After
+    /// trimming, at-block reads against the level return
+    /// `Error::HistoryTrimmed`. Idempotent: rerunning on
+    /// already-trimmed levels reaps any leftover file from a prior
+    /// partial trim.
+    TrimHistory(TrimHistoryArgs),
 }
 
 pub struct CliCtx {
@@ -111,6 +124,10 @@ impl Cli {
             Command::Manifest(args) => manifest::exec(ctx, args),
             Command::Walk(args) => walk::exec(ctx, args),
             Command::Levels(args) => levels::exec(ctx, args),
+            // `trim-history` writes to the DB and is dispatched
+            // against the path rather than the read-only `ctx.db`
+            // connection. Other subcommands stay read-only.
+            Command::TrimHistory(args) => trim_history::exec(ctx.db_path(), args),
         }
     }
 }

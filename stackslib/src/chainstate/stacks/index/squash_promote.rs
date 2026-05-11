@@ -359,7 +359,7 @@ pub(crate) fn prepare_promotion<T: MarfTrieId + Send + Sync>(
     // ── Background phase: merge prep ──────────────────────────────
     let mut stats = SquashStats::default();
     let mut timings = PhaseTimings::default();
-    let prepared = prepare_merge_outputs(
+    let mut prepared = prepare_merge_outputs(
         marf,
         mode,
         min_height,
@@ -508,6 +508,48 @@ pub(crate) fn prepare_promotion<T: MarfTrieId + Send + Sync>(
         (rel.to_string_lossy().into_owned(), hash)
     };
 
+    // ── Background phase: capture the FullHistory handoff ─────────
+    //
+    // Per Phase 5.A: a FullHistory squash produces a `StagedHistoryBlob`
+    // tmp file via `prepare_merge_outputs`. Persist its path into the
+    // plan header so the coordinator's publish step (or recovery on
+    // crash) can rename it to canonical.
+    //
+    // **Ownership handoff timing is load-bearing.** Take the staged
+    // guard into a local `Option<StagedHistoryBlob>` here but do NOT
+    // call `forget()` yet — only after `write_plan_file_atomic`
+    // succeeds. If any fallible step between here and plan-file fsync
+    // fails (encoder, fsync, rename, parent-dir fsync), the local
+    // guard's RAII Drop unlinks the tmp file when this function
+    // returns, so we never strand a multi-GB FullHistory tmp blob
+    // without a durable plan to own it.
+    let history_blob_state = prepared.merge.history_blob_state;
+    let mut staged_history_blob = prepared.merge.history_blob.take();
+    let history_blob_tmp_path = match &staged_history_blob {
+        Some(staged) => staged.tmp_path().to_string_lossy().into_owned(),
+        None => String::new(),
+    };
+    // Cross-field sanity: encoder enforces this same invariant via
+    // `decode`'s round-trip check, but failing fast here gives a
+    // clearer error than a later decode failure.
+    match (history_blob_state, history_blob_tmp_path.is_empty()) {
+        (crate::chainstate::stacks::index::squash::HistoryBlobState::Present, true) => {
+            return Err(Error::CorruptionError(
+                "prepare_promotion: history_blob_state=Present but \
+                 prepare_merge_outputs returned no staged history blob"
+                    .into(),
+            ));
+        }
+        (crate::chainstate::stacks::index::squash::HistoryBlobState::NeverWritten, false) => {
+            return Err(Error::CorruptionError(
+                "prepare_promotion: history_blob_state=NeverWritten but a staged history blob \
+                 was emitted (inconsistency in prepare_merge_outputs)"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+
     // ── Background phase: stage the plan file ─────────────────────
     let plan = SquashPlan {
         header: PlanHeader {
@@ -532,13 +574,28 @@ pub(crate) fn prepare_promotion<T: MarfTrieId + Send + Sync>(
                 .map(|b| b.block_id)
                 .max()
                 .unwrap_or(0),
+            history_blob_state,
+            history_blob_tmp_path,
         },
         in_range_blocks: in_range_blocks.clone(),
         translation_map: prepared.merge.translation_map.clone(),
         rewrite_plan: rewrite_plan.clone(),
     };
     let plan_path = PathBuf::from(plan_file_path(&marf_path, prepared.next_level_id));
+    // `write_plan_file_atomic` does: encode → tempfile fsync → rename
+    // → parent dir fsync. If ANY of those steps fails, the early
+    // return below drops `staged_history_blob` and RAII unlinks the
+    // tmp file — no leak.
     write_plan_file_atomic(&plan_path, &plan)?;
+
+    // Plan file is now durable. Transfer ownership of the tmp file
+    // from the in-process guard to the on-disk plan file. From this
+    // point on, the publish step (or recovery's `recover_one_plan`,
+    // or abandonment's `abandon_plan`) is responsible for the tmp
+    // file's lifecycle.
+    if let Some(staged) = staged_history_blob.take() {
+        staged.forget();
+    }
 
     let translation_entries = prepared.merge.translation_map.entry_count();
     let next_level_id = prepared.next_level_id;
@@ -625,10 +682,41 @@ pub fn apply_prepared_plan<T: MarfTrieId + Send + Sync>(
                     canonical_hash.map(|h| stacks_common::util::hash::to_hex(&h)),
                 );
             }
-            // Same cleanup as recovery's `abandon_plan`: clear the in-flight promotion lock and
-            // remove the plan file. Doesn't truncate the cold blob's reserved-but-unpublished
-            // region — the next promotion's reserved offset is derived from the top committed
-            // level (not file EOF), so the orphan bytes are safely overwritten.
+            // Same cleanup as recovery's `abandon_plan`: clear the in-flight promotion lock,
+            // unlink the plan-owned staged history blob (if any), and remove the plan file.
+            // Doesn't truncate the cold blob's reserved-but-unpublished region — the next
+            // promotion's reserved offset is derived from the top committed level (not file
+            // EOF), so the orphan bytes are safely overwritten.
+            //
+            // History blob cleanup mirrors `abandon_plan` in squash_recover.rs: a plan that
+            // declared `history_blob_state == Present` owns the tmp file at
+            // `header.history_blob_tmp_path` (RAII guard was released after plan-file fsync).
+            // Discarding the plan without unlinking would orphan a multi-GB FullHistory tmp blob
+            // until the next-boot reconcile sweep — exactly the leak Codex flagged for this
+            // path.
+            use crate::chainstate::stacks::index::squash::HistoryBlobState;
+            if plan.header.history_blob_state == HistoryBlobState::Present
+                && !plan.header.history_blob_tmp_path.is_empty()
+            {
+                let tmp = Path::new(&plan.header.history_blob_tmp_path);
+                match std::fs::remove_file(tmp) {
+                    Ok(()) => {
+                        debug!(
+                            "promotion publish: discarded plan's staged history blob unlinked: {tmp:?}",
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Already gone — fine.
+                    }
+                    Err(e) => {
+                        warn!(
+                            "promotion publish: failed to unlink discarded plan's history blob \
+                             tmp {tmp:?}: {e} (file will be reaped by next-boot \
+                             reconcile_history_blobs)"
+                        );
+                    }
+                }
+            }
             trie_sql::clear_promotion_state(marf.sqlite_conn())?;
             if let Err(e) = std::fs::remove_file(&prepared.plan_path) {
                 let plan_path_disp = prepared.plan_path.display();
@@ -820,7 +908,7 @@ pub(crate) fn publish_prepared_inner<T: MarfTrieId>(
         }
 
         let sql_result = if rewrite_result.is_ok() {
-            publish_level_sql::<T>(db, plan)
+            publish_level_sql::<T>(db, plan, marf_dir_from_plan_path(plan_path))
         } else {
             Ok(())
         };
@@ -841,7 +929,7 @@ pub(crate) fn publish_prepared_inner<T: MarfTrieId>(
     } else {
         // No touched seqs (empty rewrite plan, or all entries already applied). Still publish
         // the level row + redirect + clear lock.
-        publish_level_sql::<T>(db, plan)?;
+        publish_level_sql::<T>(db, plan, marf_dir_from_plan_path(plan_path))?;
     }
 
     #[cfg(test)]
@@ -859,14 +947,124 @@ pub(crate) fn publish_prepared_inner<T: MarfTrieId>(
     Ok((rewrites_applied, rewrites_skipped))
 }
 
+/// Recover the MARF dir from a plan-file path. Plan files live at
+/// `<marf_dir>/<db_basename>.squash_pending.{level_id:08}.plan`, so the
+/// parent of the plan file IS the MARF dir. Falls back to "." if the
+/// plan path is somehow bare (defensive; should be impossible for any
+/// plan produced via `write_plan_file_atomic`).
+fn marf_dir_from_plan_path(plan_path: &Path) -> &Path {
+    plan_path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+/// Rename the staged history blob (recorded in the plan header) to its
+/// canonical path, parent-dir-fsync, and return. Idempotent under
+/// retry / recovery:
+///
+/// - **source present + canonical absent** → fresh rename.
+/// - **source absent + canonical present** → already renamed (no-op success).
+/// - **source absent + canonical absent** → corruption; surface as
+///   `CorruptionError`. The plan declares `Present`, but neither the
+///   staged tmp file nor the canonical file exists — the staged tmp
+///   was lost (operator deletion, filesystem corruption). The caller's
+///   recovery path will abandon the plan.
+/// - **source present + canonical present** → defensive cleanup of the
+///   source (stale duplicate from a partial prior rename), then ok.
+///
+/// `marf_dir` is the directory containing the MARF sqlite — i.e. the
+/// parent of the plan file. Caller is responsible for passing this in.
+///
+/// No-op when `plan.header.history_blob_state == NeverWritten`.
+fn rename_history_blob_to_canonical(plan: &SquashPlan, marf_dir: &Path) -> Result<(), Error> {
+    use crate::chainstate::stacks::index::history_blob::history_blob_path;
+    use crate::chainstate::stacks::index::squash::HistoryBlobState;
+
+    if plan.header.history_blob_state != HistoryBlobState::Present {
+        return Ok(());
+    }
+
+    if plan.header.history_blob_tmp_path.is_empty() {
+        return Err(Error::CorruptionError(
+            "rename_history_blob_to_canonical: state=Present but tmp_path is empty \
+             (plan format invariant violation; should have been caught at decode)"
+                .into(),
+        ));
+    }
+
+    let tmp_path = Path::new(&plan.header.history_blob_tmp_path);
+    let canonical = history_blob_path(
+        marf_dir,
+        plan.header.level_id,
+        plan.header.min_height,
+        plan.header.max_height,
+        plan.header.cold_blob_offset,
+    );
+
+    let tmp_exists = tmp_path.exists();
+    let canonical_exists = canonical.exists();
+
+    match (tmp_exists, canonical_exists) {
+        (false, false) => Err(Error::CorruptionError(format!(
+            "rename_history_blob_to_canonical: plan declares state=Present for level_id={} \
+             but neither tmp ({:?}) nor canonical ({:?}) history blob exists \
+             (staged blob was lost — abandoning required)",
+            plan.header.level_id, tmp_path, canonical,
+        ))),
+        (false, true) => {
+            debug!(
+                "rename_history_blob_to_canonical: already renamed for level_id={} \
+                 (tmp absent, canonical present at {:?})",
+                plan.header.level_id, canonical,
+            );
+            Ok(())
+        }
+        (true, true) => {
+            // Defensive: a partial-rename race shouldn't be possible
+            // since rename(2) is atomic, but a stray duplicate from an
+            // out-of-process operator action is best cleaned up.
+            warn!(
+                "rename_history_blob_to_canonical: both tmp ({:?}) and canonical ({:?}) \
+                 exist for level_id={}; canonical wins, unlinking duplicate tmp",
+                tmp_path, canonical, plan.header.level_id,
+            );
+            let _ = std::fs::remove_file(tmp_path);
+            Ok(())
+        }
+        (true, false) => {
+            std::fs::rename(tmp_path, &canonical).map_err(Error::IOError)?;
+            if let Ok(dir_handle) = std::fs::File::open(marf_dir) {
+                let _ = dir_handle.sync_all();
+            }
+            debug!(
+                "rename_history_blob_to_canonical: level_id={} renamed {:?} → {:?}",
+                plan.header.level_id, tmp_path, canonical,
+            );
+            Ok(())
+        }
+    }
+}
+
 /// SQL transaction step shared by [`publish_prepared_inner`]'s two callers (runtime publish via
 /// `apply_prepared_plan`, and recovery via `recover_one_plan`). Redirects the in-range
 /// `marf_data` rows to the cold blob, writes the level row, and clears the in-flight promotion
 /// lock — all inside one transaction so the publish lands atomically.
+///
+/// **History blob rename ordering**: before opening the SQL
+/// transaction, renames the staged history blob to its canonical path
+/// (if `plan.header.history_blob_state == Present`). Order mirrors the
+/// legacy synchronous publish path
+/// ([`crate::chainstate::stacks::index::squash::publish_squashed_blob`]):
+/// rename + parent-dir fsync → THEN SQL commit. A crash between rename
+/// and SQL commit leaves the canonical file on disk + plan still on
+/// disk + SQL row not written; the next-boot recovery's idempotent
+/// rename (source missing + canonical present → ok) re-runs the SQL
+/// commit cleanly.
 fn publish_level_sql<T: MarfTrieId>(
     db: &mut rusqlite::Connection,
     plan: &SquashPlan,
+    marf_dir: &Path,
 ) -> Result<(), Error> {
+    rename_history_blob_to_canonical(plan, marf_dir)?;
+
     let tx = db.transaction().map_err(Error::SQLError)?;
     redirect_in_range_blocks_to_cold::<T>(
         &tx,
@@ -891,6 +1089,12 @@ fn publish_level_sql<T: MarfTrieId>(
         root_sidecar_trimmed: plan.header.root_sidecar_trimmed,
         orphan_split_offset: plan.header.orphan_split_offset,
         published_max_block_id: watermark,
+        // Plan format v2 carries FullHistory state through the plan
+        // file; `rename_history_blob_to_canonical` above has already
+        // moved the staged tmp file to canonical (or confirmed
+        // already-renamed via idempotent path). Commit the state
+        // straight from the plan header.
+        history_blob_state: plan.header.history_blob_state,
     };
     trie_sql::write_squash_level(&tx, &level_row)?;
     trie_sql::clear_promotion_state(&tx)?;

@@ -770,6 +770,237 @@ impl<
     /// next reward cycle's burnchain blocks.  Subsequent calls to this function will terminate
     /// with Some(pox-anchor-block-hash) until the reward cycle info is processed in the sortition
     /// DB.
+    /// Epoch 3.4 one-shot history-blob auto-trim hook (see
+    /// [`.docs/full-history-history-blob-design.md`](../../../../../.docs/full-history-history-blob-design.md) §10.3).
+    ///
+    /// Called per-Stacks-block in
+    /// [`Self::handle_new_nakamoto_stacks_block`] AFTER
+    /// [`StacksChainState::maybe_squash`] so the latter has had a
+    /// chance to reap pending promotion workers and publish any
+    /// pre-epoch-3.4 `FullHistory` levels before we evaluate the
+    /// "no future history blobs can be written" predicate. Running
+    /// before `maybe_squash` would miss in-flight workers and could
+    /// permanently strand levels they're about to publish.
+    ///
+    /// Operates on **both** the headers MARF
+    /// ([`StacksChainState::state_index`]) and the Clarity MARF —
+    /// both can carry FullHistory squash levels and each has its
+    /// own `marf_state.auto_trim_done` flag. The in-memory cache
+    /// (`self.history_auto_trim_decided`) is set only when both
+    /// MARFs are confirmed done (or both are explicitly opted out
+    /// via `SquashMode::FullHistory`).
+    ///
+    /// Per-MARF gating predicate:
+    ///
+    /// 1. **Operator opt-out**: configured `SquashMode::FullHistory`
+    ///    short-circuits — treated as permanently done.
+    /// 2. **Persistent gate**: `marf_state.auto_trim_done == true`
+    ///    means a prior process completed the trim; no work.
+    /// 3. **No in-flight promotion**: `headers_promotion_handle` /
+    ///    `clarity_promotion_handle` must be `None`. An in-flight
+    ///    worker might be about to publish a new FullHistory level,
+    ///    so we wait for the next tick's reap.
+    /// 4. **Future-range safety**: the MARF's next-to-squash Stacks
+    ///    block (the `max_height + 1` of its latest published
+    ///    squash level, or `0` if no levels exist) must have burn
+    ///    height >= epoch-3.4 activation. Computed inline via
+    ///    [`MARF::latest_squash_level_range`] +
+    ///    [`StacksChainState::burn_height_for_stacks_height`]. This
+    ///    is what prevents a future `effective_squash_mode` upgrade
+    ///    from publishing a fresh `'present'` history blob after
+    ///    we've already trimmed.
+    ///
+    /// After a successful pass, the persistent gate is re-read from
+    /// each MARF. The in-memory cache flips to `true` only when both
+    /// gates are committed. A `trim_failures > 0` outcome leaves the
+    /// gate `false` (per library §10.3) and the cache `false`, so
+    /// the next block's tick retries — this preserves the design's
+    /// "next boot resumes" semantics within a single long-running
+    /// process.
+    fn maybe_run_epoch_3_4_history_auto_trim(&mut self) -> Result<(), Error> {
+        use crate::chainstate::stacks::index::marf::MarfConnection;
+        use crate::chainstate::stacks::index::squash::{
+            run_epoch_3_4_history_auto_trim, HistoryBlobTrimReport, SquashMode,
+        };
+        use crate::chainstate::stacks::index::trie_sql;
+
+        if self.history_auto_trim_decided {
+            return Ok(());
+        }
+
+        // (1) Operator opt-out — configured FullHistory means no
+        // trim ever, on either MARF. Cache permanently.
+        let configured = self.chain_state_db.configured_squash_mode();
+        if configured == SquashMode::FullHistory {
+            self.history_auto_trim_decided = true;
+            debug!("MARF history auto-trim: skipped — operator configured SquashMode::FullHistory");
+            return Ok(());
+        }
+
+        // (2) Resolve epoch-3.4 activation height. `None` means the
+        // sortdb's epochs table doesn't define 3.4 (early chain, test
+        // config). Defer without caching — production runs will
+        // resolve a stable value once the chain has populated.
+        let Some(activation_height) =
+            StacksChainState::resolve_epoch34_burn_height(self.sortition_db.conn())
+        else {
+            debug!("MARF history auto-trim: epoch 3.4 not yet defined in sortdb; deferring");
+            return Ok(());
+        };
+
+        // (3) Per-MARF state snapshot — persistent gate, in-flight
+        // worker, and future-range safety predicate. The
+        // future-range predicate is what addresses Codex's
+        // finding #2: a TipOnly-configured operator with pending
+        // pre-3.4 ranges to squash would otherwise trim now and
+        // strand whatever those squashes later publish as
+        // FullHistory.
+        let headers_done = trie_sql::read_marf_state(self.chain_state_db.state_index.sqlite_conn())
+            .map_err(ChainstateError::from)?
+            .auto_trim_done;
+        let clarity_done = self
+            .chain_state_db
+            .clarity_state
+            .with_marf(|m| trie_sql::read_marf_state(m.sqlite_conn()))
+            .map_err(ChainstateError::from)?
+            .auto_trim_done;
+
+        if headers_done && clarity_done {
+            self.history_auto_trim_decided = true;
+            debug!(
+                "MARF history auto-trim: skipped — both headers + clarity \
+                 marf_state.auto_trim_done already true"
+            );
+            return Ok(());
+        }
+
+        let headers_handle_busy = self.chain_state_db.headers_promotion_handle.is_some();
+        let clarity_handle_busy = self.chain_state_db.clarity_promotion_handle.is_some();
+
+        // Compute the next-to-squash Stacks height per-MARF upfront,
+        // BEFORE we need both the chainstate headers `&Connection`
+        // and the `&mut` borrow on `clarity_state` simultaneously.
+        // `latest_squash_level_range().max_height + 1` is the next
+        // range's min_height; `None` (no levels yet) defaults to
+        // Stacks height 0. Both MARFs use the chainstate headers
+        // `block_headers` table to map Stacks height → burn height.
+        let headers_next_min = self
+            .chain_state_db
+            .state_index
+            .latest_squash_level_range()
+            .map(|r| r.max_height + 1)
+            .unwrap_or(0);
+        let clarity_next_min = self.chain_state_db.clarity_state.with_marf(|m| {
+            m.latest_squash_level_range()
+                .map(|r| r.max_height + 1)
+                .unwrap_or(0)
+        });
+
+        let headers_burn = StacksChainState::burn_height_for_stacks_height(
+            self.chain_state_db.db(),
+            headers_next_min,
+        );
+        let clarity_burn = StacksChainState::burn_height_for_stacks_height(
+            self.chain_state_db.db(),
+            clarity_next_min,
+        );
+
+        // Per-MARF future-range safety. `None` from the burn-height
+        // lookup means the next-to-squash Stacks block isn't in
+        // `block_headers` yet — defer this MARF (the next block's
+        // tick re-evaluates after catch-up).
+        let headers_safe = !headers_done
+            && !headers_handle_busy
+            && headers_burn
+                .map(|h| h >= activation_height)
+                .unwrap_or(false);
+        let clarity_safe = !clarity_done
+            && !clarity_handle_busy
+            && clarity_burn
+                .map(|h| h >= activation_height)
+                .unwrap_or(false);
+
+        if !headers_safe && !clarity_safe {
+            debug!(
+                "MARF history auto-trim: deferring";
+                "headers_done" => headers_done,
+                "clarity_done" => clarity_done,
+                "headers_handle_busy" => headers_handle_busy,
+                "clarity_handle_busy" => clarity_handle_busy,
+                "epoch_3_4_activation_height" => activation_height,
+            );
+            return Ok(());
+        }
+
+        // (4) Run the trim helper on each safe + not-yet-done MARF.
+        // Failures inside the helper are absorbed into the report's
+        // `trim_failures` counter; we re-read the persistent gate
+        // below to determine whether to flip the in-memory cache.
+        let mut headers_report: Option<HistoryBlobTrimReport> = None;
+        if headers_safe {
+            let report = run_epoch_3_4_history_auto_trim(&mut self.chain_state_db.state_index)
+                .map_err(ChainstateError::from)?;
+            info!(
+                "MARF history auto-trim invoked (headers)";
+                "levels_trimmed" => report.levels_trimmed,
+                "already_trimmed" => report.already_trimmed,
+                "trim_failures" => report.trim_failures,
+                "unlink_failures" => report.unlink_failures,
+                "bytes_freed_estimate" => report.bytes_freed_estimate,
+                "epoch_3_4_activation_height" => activation_height,
+            );
+            headers_report = Some(report);
+        }
+        let mut clarity_report: Option<HistoryBlobTrimReport> = None;
+        if clarity_safe {
+            let report = self
+                .chain_state_db
+                .clarity_state
+                .with_marf(|m| run_epoch_3_4_history_auto_trim(m))
+                .map_err(ChainstateError::from)?;
+            info!(
+                "MARF history auto-trim invoked (clarity)";
+                "levels_trimmed" => report.levels_trimmed,
+                "already_trimmed" => report.already_trimmed,
+                "trim_failures" => report.trim_failures,
+                "unlink_failures" => report.unlink_failures,
+                "bytes_freed_estimate" => report.bytes_freed_estimate,
+                "epoch_3_4_activation_height" => activation_height,
+            );
+            clarity_report = Some(report);
+        }
+
+        // (5) Re-read both persistent gates. Cache the in-memory
+        // decision only when both are committed. If `trim_failures
+        // > 0` on either MARF, the library left the gate `false`
+        // intentionally — the next block's tick will retry. We
+        // suppress the cache flip in that case so the retry
+        // happens.
+        let headers_done_after =
+            trie_sql::read_marf_state(self.chain_state_db.state_index.sqlite_conn())
+                .map_err(ChainstateError::from)?
+                .auto_trim_done;
+        let clarity_done_after = self
+            .chain_state_db
+            .clarity_state
+            .with_marf(|m| trie_sql::read_marf_state(m.sqlite_conn()))
+            .map_err(ChainstateError::from)?
+            .auto_trim_done;
+        if headers_done_after && clarity_done_after {
+            self.history_auto_trim_decided = true;
+        } else {
+            warn!(
+                "MARF history auto-trim: persistent gate NOT fully committed; \
+                 next block will retry";
+                "headers_done_after" => headers_done_after,
+                "clarity_done_after" => clarity_done_after,
+                "headers_trim_failures" => headers_report.map(|r| r.trim_failures),
+                "clarity_trim_failures" => clarity_report.map(|r| r.trim_failures),
+            );
+        }
+        Ok(())
+    }
+
     pub fn handle_new_nakamoto_stacks_block(&mut self) -> Result<Option<BlockHeaderHash>, Error> {
         debug!("Handle new Nakamoto block");
         let canonical_sortition_tip = self.canonical_sortition_tip.clone().ok_or_else(|| {
@@ -835,14 +1066,28 @@ impl<
             // promotion (Phase B) makes divergence unreachable on hot-tier MARFs by
             // design.
             {
-                let chainstate = &mut self.chain_state_db;
                 let new_tip = block_receipt.header.index_block_hash();
-                chainstate.assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
-                chainstate.maybe_squash(
+                self.chain_state_db
+                    .assert_squash_consistency(&new_tip, self.sortition_db.conn())?;
+
+                self.chain_state_db.maybe_squash(
                     block_receipt.header.stacks_block_height,
                     new_tip,
                     &self.sortition_db,
                 );
+
+                // Epoch 3.4 one-shot history-blob auto-trim, AFTER
+                // `maybe_squash`. The ordering is load-bearing:
+                // `maybe_squash` reaps any pending promotion worker
+                // and publishes its level before the trim runs, so
+                // we don't strand a `'present'` history blob that
+                // the worker was about to commit. The hook is
+                // further gated by per-MARF predicates (configured
+                // SquashMode, persistent gate, no in-flight worker,
+                // next-to-squash burn height >= epoch-3.4
+                // activation). Cheap when already-decided or
+                // pre-activation.
+                self.maybe_run_epoch_3_4_history_auto_trim()?;
             }
 
             let block_hash = block_receipt.header.anchored_header.block_hash();

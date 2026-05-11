@@ -152,10 +152,20 @@ pub fn get_node_body_max_byte_len(node_id: u8) -> Result<usize, Error> {
         TrieNodeID::Node48 => get_ptrs_byte_len(&[TriePtr::default(); 48]) + 256 + path_max_len,
         TrieNodeID::Node256 => get_ptrs_byte_len(&[TriePtr::default(); 256]) + path_max_len,
         TrieNodeID::Patch => 1 + patch_ptr_max_len + 1 + 256 * patch_ptr_max_len,
-        // LeafSquashed is variable-length; use a generous upper bound.
-        // Legacy format (wider spans): 1 + path + 4 (count) + 65536 * 44
-        // This covers both compressed and legacy encodings.
-        TrieNodeID::LeafSquashed => 1 + path_max_len + 4 + 65536 * 44,
+        // LeafSquashed (multipurpose carrier per `.docs/full-history-history-blob-design.md` §5.1).
+        // The new format has a fixed-bounded body — no inline transitions —
+        // so the upper bound is tiny. v1 emits subtype 2 (INLINE_FIXED +
+        // has_history); the only emit shape with the maximum-overhead header
+        // is INLINE_FIXED + has_history + has_hash. Worst case:
+        //   node-id(1) + type(1) + flags(1) + path_len(1)        = 4
+        //   + hash(32)                                            = 36
+        //   + history_offset(8) + byte_len(4) + entry_count(4)    = 52
+        //   + path (bounded ≤ 32B per MARF nibble-pair)           = ≤84
+        //   + tip_value (40B fixed for INLINE_FIXED)              = ≤124
+        // The non-mmap slow-path read buffer was previously sized for the
+        // legacy ~2.8 MB inline-history bound; the new format uses ≤124 B,
+        // a ~22000× shrink in the slow-path buffer alloc.
+        TrieNodeID::LeafSquashed => 4 + 32 + 16 + path_max_len + 40,
         TrieNodeID::Empty => {
             return Err(Error::CorruptionError(format!(
                 "Unsupported node ID for node-body read: {:x}",

@@ -262,6 +262,27 @@ pub struct ChainsCoordinator<
     pub refresh_stacker_db: Arc<AtomicBool>,
     /// whether or not the canonical tip is now a Nakamoto header
     pub in_nakamoto_epoch: bool,
+    /// One-shot in-memory cache for the post-epoch-3.4 history-blob auto-trim
+    /// hook. Flips to `true` only when **both** of the headers and Clarity
+    /// MARFs are confirmed done — either because their persistent
+    /// [`crate::chainstate::stacks::index::trie_sql::MarfState::auto_trim_done`]
+    /// flags were already committed (prior process completed the trim), or
+    /// because the hook just ran the library helper on each safe MARF and
+    /// both `auto_trim_done` re-reads came back `true`. Also flips to `true`
+    /// on the global operator opt-out path (configured
+    /// `SquashMode::FullHistory`). After the flip, subsequent ticks
+    /// short-circuit without touching SQL.
+    ///
+    /// Stays `false` while any per-MARF gate is still open: pre-epoch-3.4,
+    /// pending promotion handles, future ranges that would still resolve to
+    /// `FullHistory`, or `trim_failures > 0` on the most recent pass (per
+    /// `.docs/full-history-history-blob-design.md` §10.3). The hook is then
+    /// re-evaluated on every subsequent block.
+    ///
+    /// Re-set to `false` on every process restart by the struct
+    /// initializer — the persistent `marf_state.auto_trim_done` flags on
+    /// each MARF are the durable source of truth.
+    pub history_auto_trim_decided: bool,
 }
 
 #[derive(Debug)]
@@ -565,6 +586,7 @@ impl<
             burnchain_indexer,
             refresh_stacker_db: comms.refresh_stacker_db.clone(),
             in_nakamoto_epoch: false,
+            history_auto_trim_decided: false,
         };
 
         loop {
@@ -730,6 +752,7 @@ impl<T: BlockEventDispatcher, U: RewardSetProvider, B: BurnchainHeaderReader>
             burnchain_indexer,
             refresh_stacker_db: Arc::new(AtomicBool::new(false)),
             in_nakamoto_epoch: false,
+            history_auto_trim_decided: false,
         }
     }
 }

@@ -91,6 +91,114 @@ fn read_storage_kind(db: &Connection, bhh: &BlockHeaderHash) -> i64 {
     .unwrap()
 }
 
+/// Phase 5.A — `run_horizon_gated_promotion` accepts `SquashMode::FullHistory`
+/// and publishes a level whose `history_blob_state = Present`. Closes the
+/// genesis-sync gap (Codex review): the pre-Phase-5 path hard-rejected
+/// FullHistory with `NotSupportedError`, which left pre-epoch-3.4 ranges
+/// permanently unsquashed during catch-up.
+///
+/// Asserts:
+/// 1. The promotion succeeds (no NotSupportedError).
+/// 2. The published level row's `history_blob_state` is `'present'`.
+/// 3. The canonical history blob file
+///    (`history_blob_path(...)`) exists on disk after the promotion.
+/// 4. The staged tmp file is gone (renamed, not orphaned).
+/// 5. At-block reads against the squashed level still return the
+///    historically-correct values (the load-bearing correctness check —
+///    proves the history blob was emitted with the right chunks AND
+///    the read path resolves through it).
+#[test]
+fn phase_5a_horizon_gated_promotion_supports_full_history_mode() {
+    use crate::chainstate::stacks::index::history_blob::history_blob_path;
+    use crate::chainstate::stacks::index::squash::HistoryBlobState;
+
+    let (mut marf, db_path) =
+        open_hot_tier_marf("phase_5a_horizon_gated_promotion_supports_full_history_mode");
+
+    // Build a chain. We'll use FullHistory mode and promote
+    // [b1..=b3] (heights 0..=2), leaving b4..b6 as hot descendants.
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+    let b4 = extend_with_block(&mut marf, &b3, 4);
+    let b5 = extend_with_block(&mut marf, &b4, 5);
+    let _b6 = extend_with_block(&mut marf, &b5, 6);
+
+    // Pre-promotion: snapshot the value of `k_1` at b1 — this is the
+    // historical value that must remain readable through the history
+    // blob after promotion.
+    let pre_v_at_b1 = marf.get(&b1, "k_1").unwrap();
+    assert_eq!(pre_v_at_b1, Some(MARFValue::from_value("v_1")));
+
+    let stats = run_horizon_gated_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::FullHistory,
+        /* min_height */ 0,
+        /* max_height */ 2,
+        Some(b3.clone()),
+    )
+    .expect("FullHistory promotion must succeed");
+
+    assert!(stats.cold_blob_bytes_written > 0);
+
+    // Published level row carries `history_blob_state = Present`.
+    let levels = trie_sql::read_squash_levels(marf.sqlite_conn()).unwrap();
+    assert_eq!(levels.len(), 1);
+    let level = &levels[0];
+    assert_eq!(
+        level.history_blob_state,
+        HistoryBlobState::Present,
+        "FullHistory promotion must commit history_blob_state=Present"
+    );
+
+    // Canonical history blob file exists.
+    let marf_dir = std::path::Path::new(&db_path).parent().unwrap();
+    let canonical = history_blob_path(
+        marf_dir,
+        level.level_id,
+        level.min_height,
+        level.max_height,
+        level.blob_offset,
+    );
+    assert!(
+        canonical.exists(),
+        "canonical history blob file must exist at {canonical:?} after FullHistory promotion"
+    );
+
+    // No leftover staged tmp files in the MARF dir (the rename
+    // consumed it; nothing should be left under `.history-tmp-*`).
+    for entry in std::fs::read_dir(marf_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.contains(".history-tmp-"),
+            "staged history blob tmp file leaked: {name}",
+        );
+    }
+
+    // Plan file gone, promotion lock cleared.
+    let plan_path = plan_file_path(&db_path, level.level_id);
+    assert!(!std::path::Path::new(&plan_path).exists());
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert_eq!(state.promotion_in_progress, None);
+
+    // Load-bearing correctness: tip read works via the leaf's
+    // `tip_value`; descendant reads work via the rewritten backptrs;
+    // historical at-block reads against the squashed level use the
+    // history blob.
+    for byte in 1..=6u8 {
+        let key = format!("k_{byte}");
+        let expected = MARFValue::from_value(&format!("v_{byte}"));
+        let got = marf.get(&block_hash(byte), &key).unwrap();
+        assert_eq!(
+            got,
+            Some(expected),
+            "post-promotion read of {key} returned wrong value"
+        );
+    }
+}
+
 #[test]
 fn b5a_horizon_gated_promotion_publishes_level_and_rewrites_descendants() {
     let (mut marf, db_path) =
@@ -2666,6 +2774,168 @@ fn coordinator_discards_stale_plan_on_canonical_divergence() {
         state.promotion_in_progress.is_none(),
         "abandon must clear promotion_in_progress"
     );
+}
+
+/// Phase 5.A regression (Codex finding #1): if `write_plan_file_atomic`
+/// fails AFTER `prepare_merge_outputs` returned a `StagedHistoryBlob`,
+/// the staged tmp file MUST be unlinked by the RAII guard's Drop —
+/// pre-fix, `staged.forget()` was called before `write_plan_file_atomic`
+/// returned, so a failure left a multi-GB FullHistory tmp blob without
+/// any durable plan to own it.
+///
+/// We force the write to fail by pre-creating a DIRECTORY at the
+/// tempfile path that `write_plan_file_atomic` opens for the body
+/// write (`<plan_path>.tmp`). `OpenOptions::write/create/truncate` on
+/// a directory errors with EISDIR, so the write fails. The
+/// `.plan.tmp` suffix is explicitly skipped by `discover_pending_plans`,
+/// so the pre-prep guard doesn't false-fire on this fixture.
+#[test]
+fn prepare_promotion_unlinks_staged_blob_on_plan_write_failure() {
+    use crate::chainstate::stacks::index::squash_plan::plan_file_path;
+    use crate::chainstate::stacks::index::squash_promote::prepare_promotion;
+
+    let (mut marf, db_path) =
+        open_hot_tier_marf("prepare_promotion_unlinks_staged_blob_on_plan_write_failure");
+
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+
+    // The next squash level for a fresh MARF is id=0. Block the
+    // tempfile path that `write_plan_file_atomic` will try to open
+    // for the encoded body. The `.plan.tmp` suffix isn't picked up by
+    // `discover_pending_plans` (which only matches `.plan`), so the
+    // pre-prep guard at the top of `prepare_promotion` doesn't fire
+    // on our fixture.
+    let plan_path = plan_file_path(&db_path, /* level_id */ 0);
+    let tmp_path = format!("{plan_path}.tmp");
+    std::fs::create_dir(&tmp_path).unwrap();
+
+    let marf_dir = std::path::Path::new(&db_path)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let err = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::FullHistory,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .expect_err("plan tempfile open must fail with directory in the way");
+
+    // Sanity: the failure is an I/O error from the tempfile open.
+    assert!(
+        matches!(err, crate::chainstate::stacks::index::Error::IOError(_)),
+        "expected Error::IOError from plan tempfile open, got {err:?}",
+    );
+
+    // Critical assertion: NO `.history-tmp-*` files remain in the marf
+    // directory. Pre-fix, the FullHistory staged blob's tmp file would
+    // be orphaned here because `staged.forget()` had already disabled
+    // RAII unlink. Post-fix, the local `Option<StagedHistoryBlob>`'s
+    // Drop runs on the early-return path and unlinks the tmp file.
+    let mut leaked = Vec::new();
+    for entry in std::fs::read_dir(&marf_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".history-tmp-") {
+            leaked.push(name);
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "FullHistory staged tmp blob leaked after plan-write failure: {leaked:?}",
+    );
+}
+
+/// Phase 5.A regression (Codex finding #2): when a FullHistory plan is
+/// discarded mid-flight under `DrainPolicy::Canonical(view)`, the
+/// plan-owned staged history blob tmp file MUST be unlinked alongside
+/// the plan file. Pre-fix, the discard path removed the plan file but
+/// left the multi-GB FullHistory tmp blob on disk until the next-boot
+/// `reconcile_history_blobs` sweep — exactly the leak Codex flagged.
+#[test]
+fn coordinator_discards_full_history_plan_unlinks_staged_history_blob() {
+    use crate::chainstate::stacks::index::squash_plan::read_plan_file;
+    use crate::chainstate::stacks::index::squash_promote::{
+        apply_prepared_plan, prepare_promotion,
+    };
+    use crate::chainstate::stacks::index::squash_recover::{DrainOutcome, DrainPolicy};
+
+    let (mut marf, _db_path) =
+        open_hot_tier_marf("coordinator_discards_full_history_plan_unlinks_staged_history_blob");
+
+    let sentinel = BlockHeaderHash::sentinel();
+    let b1 = extend_with_block(&mut marf, &sentinel, 1);
+    let b2 = extend_with_block(&mut marf, &b1, 2);
+    let b3 = extend_with_block(&mut marf, &b2, 3);
+    let _b4 = extend_with_block(&mut marf, &b3, 4);
+
+    // Prepare a FullHistory promotion. After this returns, the staged
+    // tmp file lives at `plan.header.history_blob_tmp_path` (with
+    // RAII guard released — plan file is now the durable owner).
+    let prepared = prepare_promotion::<BlockHeaderHash>(
+        &mut marf,
+        SquashMode::FullHistory,
+        0,
+        2,
+        Some(b3.clone()),
+    )
+    .unwrap();
+
+    let plan = read_plan_file(&prepared.plan_path).unwrap();
+    assert_eq!(
+        plan.header.history_blob_state,
+        crate::chainstate::stacks::index::squash::HistoryBlobState::Present,
+        "FullHistory prepare must produce a Present plan"
+    );
+    let tmp_path = plan.header.history_blob_tmp_path.clone();
+    assert!(
+        !tmp_path.is_empty(),
+        "Present plan must record a non-empty tmp path"
+    );
+    let tmp_path_buf = std::path::PathBuf::from(&tmp_path);
+    assert!(
+        tmp_path_buf.exists(),
+        "tmp history blob must exist after prepare: {tmp_path}"
+    );
+
+    // Construct a view that diverges from the plan to force the
+    // discard branch in `apply_prepared_plan`.
+    let recorded_at_h1 = plan.in_range_blocks[1].block_hash;
+    let mut map = std::collections::HashMap::new();
+    map.insert(0u32, plan.in_range_blocks[0].block_hash);
+    let mut sibling = recorded_at_h1;
+    sibling[0] ^= 0xff;
+    map.insert(1u32, sibling);
+    map.insert(2u32, plan.in_range_blocks[2].block_hash);
+    let view = MockCanonicalView { map };
+
+    let outcome =
+        apply_prepared_plan::<BlockHeaderHash>(&mut marf, &prepared, DrainPolicy::Canonical(&view))
+            .expect("publish must Ok-return the DiscardedStale outcome");
+    assert!(
+        matches!(outcome, DrainOutcome::DiscardedStale { .. }),
+        "expected DiscardedStale, got {outcome:?}"
+    );
+
+    // Both the plan file AND the staged history blob tmp file must be
+    // gone. The pre-fix bug left the tmp file dangling.
+    assert!(
+        !prepared.plan_path.exists(),
+        "discarded plan file must be removed"
+    );
+    assert!(
+        !tmp_path_buf.exists(),
+        "discarded plan's staged history blob tmp file MUST be unlinked: {tmp_path}"
+    );
+
+    // Lock cleared (sanity).
+    let state = trie_sql::read_marf_state(marf.sqlite_conn()).unwrap();
+    assert!(state.promotion_in_progress.is_none());
 }
 
 /// Integration-style: simulate the runtime canonical shift. Worker captures a canonical_tip,

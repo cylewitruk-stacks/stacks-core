@@ -36,6 +36,7 @@ pub mod bits;
 pub mod byte_scanner;
 pub mod cache;
 pub mod file;
+pub mod history_blob;
 pub mod hot_file;
 pub mod hot_reclaim;
 pub mod marf;
@@ -514,6 +515,18 @@ pub enum Error {
     Patch(Option<TrieHash>, TrieNodePatch),
     NodeTooDeep,
     NotSupportedError(String),
+    /// Returned by the at-block read path when a `TrieLeafSquashed` in a
+    /// `Trimmed` squash level is encountered. The history blob has been
+    /// unlinked (operator-driven §10.2 trim, or epoch-3.4 auto-trim per
+    /// §10.3 of `.docs/full-history-history-blob-design.md`), so the
+    /// chunk that would resolve the historical value at this height no
+    /// longer exists. Tip reads against the same level still succeed
+    /// because `tip_value` lives in the leaf body, not the chunk.
+    /// Callers that issue `at-block` post-3.4 against a trimmed level
+    /// have a bug — Clarity post-3.4 doesn't issue these queries.
+    HistoryTrimmed {
+        level_id: u32,
+    },
     /// Internal retry sentinel. Emitted by read-path helpers when a concurrent squash writer
     /// on another handle has entered (or completed) its mutation window between the current
     /// handle's last state sync and this read. The bounded retry wrappers at the public read
@@ -978,6 +991,41 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
         None
     }
 
+    /// The index into `squash_meta.levels` of the currently-opened block's
+    /// squash level, when applicable. Returns `None` for committed
+    /// non-squash blocks. Required by the at-block read path to resolve
+    /// `TrieLeafSquashed` value-at-height lookups against the level's
+    /// history blob (per `.docs/full-history-history-blob-design.md` §8.2).
+    fn squash_opened_level_idx(&self) -> Option<usize> {
+        None
+    }
+
+    /// Resolve a `TrieLeafSquashed`'s value at a specific height via the
+    /// per-level history blob reader. Default impl returns
+    /// `NotSupportedError` — backends without a squash concept don't
+    /// implement this. The real implementation lives on
+    /// `TrieStorageConnection` in `storage.rs`.
+    ///
+    /// On success returns `Ok(Some(value))` when the key had a transition
+    /// at or before `height`, or `Ok(None)` when the key didn't yet exist
+    /// at `height` (i.e. the query is below the chunk's earliest entry —
+    /// either before the first in-range write or below the synthetic
+    /// `(min_height - 1, baseline)` entry for inherited keys).
+    ///
+    /// Returns `Err(Error::HistoryTrimmed)` when the level's history blob
+    /// has been unlinked (operator-driven or epoch-3.4 auto-trim).
+    fn squashed_leaf_value_at_height(
+        &self,
+        _history_offset: u64,
+        _history_byte_len: u32,
+        _history_entry_count: u32,
+        _height: u32,
+    ) -> Result<Option<MARFValue>, Error> {
+        Err(Error::NotSupportedError(
+            "squashed_leaf_value_at_height: backend has no squash concept".into(),
+        ))
+    }
+
     /// Resolve the snapshot height for `LeafSquashed` reads on a *specific* block, independent of
     /// the currently-open `cur_block` (which the marf walk mutates during backptr resolution).
     ///
@@ -1308,16 +1356,26 @@ impl<'a> ReadTrieNode<'a> {
             ReadNodeBacking::PersistedBytes(node) => match self.decoded_from_bytes(node)? {
                 TrieNodeType::LeafSquashed(sq) => Ok(Some(TrieLeafSquashedRef {
                     path: sq.path.as_slice(),
-                    tip_value: sq.tip_value()?,
-                    entries: &sq.entries,
+                    tip_value: &sq.tip_value,
+                    leaf_type: sq.leaf_type,
+                    flags: sq.flags,
+                    inline_hash: sq.inline_hash.as_ref(),
+                    history_offset: sq.history_offset,
+                    history_byte_len: sq.history_byte_len,
+                    history_entry_count: sq.history_entry_count,
                 })),
                 _ => Ok(None),
             },
             ReadNodeBacking::Owned(TrieNodeType::LeafSquashed(sq)) => {
                 Ok(Some(TrieLeafSquashedRef {
                     path: sq.path.as_slice(),
-                    tip_value: sq.tip_value()?,
-                    entries: &sq.entries,
+                    tip_value: &sq.tip_value,
+                    leaf_type: sq.leaf_type,
+                    flags: sq.flags,
+                    inline_hash: sq.inline_hash.as_ref(),
+                    history_offset: sq.history_offset,
+                    history_byte_len: sq.history_byte_len,
+                    history_entry_count: sq.history_entry_count,
                 }))
             }
             _ => Ok(None),
@@ -1453,6 +1511,11 @@ impl fmt::Display for Error {
             }
             Error::NodeTooDeep => write!(f, "Node is too deeply buried under patches"),
             Error::NotSupportedError(ref s) => write!(f, "Operation not supported: {s}"),
+            Error::HistoryTrimmed { level_id } => write!(
+                f,
+                "FullHistory history blob trimmed for squash level {level_id}; \
+                 at-block reads on this level are no longer available"
+            ),
             Error::RetryAfterSquash => {
                 debug_assert!(
                     false,

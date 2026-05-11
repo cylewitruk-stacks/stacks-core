@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::chainstate::stacks::index::history_blob::ChunkRef;
 use crate::chainstate::stacks::index::marf::{
     MARFOpenOpts, MarfConnection, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
@@ -471,6 +472,85 @@ fn read_u32_be(bytes: &[u8], pos: &mut usize) -> Result<u32, Error> {
     })?))
 }
 
+/// Per-level FullHistory history-blob lifecycle state. Mirrors the
+/// `history_blob_state` SQL column on `marf_squash_levels` per §10.1 of
+/// `.docs/full-history-history-blob-design.md`.
+///
+/// Two read-time consumers care about this:
+/// 1. The recovery sweep (`§9.4`) — accepts/rejects the on-disk history blob
+///    based on the row's state (`Present` requires a footer-validated file;
+///    `Trimmed` requires no file; `NeverWritten` ignores any orphan).
+/// 2. The at-block read path (Phase 3 §8.2) — short-circuits to
+///    `Error::HistoryTrimmed` when the level is `Trimmed`.
+///
+/// `NeverWritten` is the default at INSERT time for TipOnly-mode squash
+/// levels (no carrier emitted, no history blob file). `Present` is set
+/// explicitly by the publish path for FullHistory levels with a valid
+/// history blob. `Trimmed` is set by the trim flow (§10.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryBlobState {
+    /// No history blob file on disk for this level. Applies to TipOnly-mode
+    /// levels and to FullHistory levels where no leaves were promoted (rare).
+    NeverWritten,
+    /// History blob file exists at the canonical path and passed footer
+    /// validation at MARF open. The level was emitted with subtype-2
+    /// `TrieLeafSquashed` carriers per §5.7.
+    Present,
+    /// Operator (or epoch-3.4 auto-trim, §10.3) ran the trim flow. The
+    /// history blob file has been unlinked. `at-block` reads against this
+    /// level surface `Error::HistoryTrimmed`.
+    Trimmed,
+}
+
+impl HistoryBlobState {
+    /// SQL column representation (matches the v3 `CHECK` constraint values).
+    pub fn as_sql_str(self) -> &'static str {
+        match self {
+            HistoryBlobState::NeverWritten => "never_written",
+            HistoryBlobState::Present => "present",
+            HistoryBlobState::Trimmed => "trimmed",
+        }
+    }
+
+    /// Decode from the SQL column. `Err` on any value not in the v3 CHECK set.
+    pub fn from_sql_str(s: &str) -> Result<Self, Error> {
+        match s {
+            "never_written" => Ok(HistoryBlobState::NeverWritten),
+            "present" => Ok(HistoryBlobState::Present),
+            "trimmed" => Ok(HistoryBlobState::Trimmed),
+            other => Err(Error::CorruptionError(format!(
+                "marf_squash_levels.history_blob_state: invalid value {other:?} \
+                 (expected 'never_written' | 'present' | 'trimmed')"
+            ))),
+        }
+    }
+
+    /// 1-byte plan-file encoding (used by `SquashPlan`'s on-disk
+    /// `PlanHeader.history_blob_state` field). Distinct from the SQL
+    /// string representation so the plan format stays compact.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            HistoryBlobState::NeverWritten => 0,
+            HistoryBlobState::Present => 1,
+            HistoryBlobState::Trimmed => 2,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`]. Surfaces `CorruptionError` on any
+    /// unrecognized tag.
+    pub fn from_u8(b: u8) -> Result<Self, Error> {
+        match b {
+            0 => Ok(HistoryBlobState::NeverWritten),
+            1 => Ok(HistoryBlobState::Present),
+            2 => Ok(HistoryBlobState::Trimmed),
+            other => Err(Error::CorruptionError(format!(
+                "HistoryBlobState: invalid tag byte 0x{other:02x} \
+                 (expected 0=NeverWritten | 1=Present | 2=Trimmed)"
+            ))),
+        }
+    }
+}
+
 /// Row data for the `marf_squash_levels` SQL table.
 #[derive(Debug, Clone)]
 pub struct SquashLevelRow {
@@ -512,6 +592,12 @@ pub struct SquashLevelRow {
     /// produce on first read post-migration; cleared on the next successful
     /// squash, which writes a real watermark and resets the counter.
     pub published_max_block_id: u32,
+    /// FullHistory history-blob lifecycle state per §10.1 of the design doc.
+    /// `NeverWritten` for TipOnly levels (no carrier emitted); `Present`
+    /// for FullHistory levels with a footer-validated history blob file
+    /// at the canonical path; `Trimmed` once the trim flow has unlinked
+    /// the file (Phase 4).
+    pub history_blob_state: HistoryBlobState,
 }
 
 impl SquashLevelRow {
@@ -895,10 +981,20 @@ fn is_marf_internal_key(key_hash: &TrieHash) -> bool {
 ///
 /// Extracted as a helper so it can be called from both the serial fallback and the parallel
 /// `thread::scope` workers in `squash_level_incremental` Step 2.5.
-fn build_squashed_leaf_bytes(
-    raw: &[u8],
-    transitions: &[(u32, MARFValue)],
-) -> Result<Vec<u8>, Error> {
+/// Build new leaf bytes for a squashable leaf, in the v1 multipurpose
+/// `TrieLeafSquashed` format (subtype 2 — see
+/// `.docs/full-history-history-blob-design.md` §5.7). The new format
+/// references a chunk in the per-level history blob via `ChunkRef`
+/// rather than carrying inline transitions.
+///
+/// **Phase 2 work-in-progress note:** the chunk-emit pipeline that
+/// builds `key_to_chunk_ref` and calls this helper is not yet wired —
+/// `build_squashed_leaf_bytes` is currently unreachable from the squash
+/// pipeline (the callers still in this module call this on the prior
+/// `transitions` shape and have been stubbed to surface a clear error).
+/// The new signature documents the intended Phase 2 contract.
+#[allow(dead_code)] // wired in Phase 2
+fn build_squashed_leaf_bytes(raw: &[u8], chunk_ref: &ChunkRef) -> Result<Vec<u8>, Error> {
     let node_id_byte = *raw.first().ok_or_else(|| {
         Error::CorruptionError("Empty node body during FullHistory leaf replace".into())
     })?;
@@ -906,12 +1002,7 @@ fn build_squashed_leaf_bytes(
     let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(raw, node_id)?;
     let path_slice = existing_node.path_bytes();
 
-    // `transitions` from `collect_history` is ascending by height; `TrieLeafSquashed` wants
-    // descending so `value_at_height`'s `partition_point(|h| *h > query)` works.
-    let mut entries: Vec<(u32, MARFValue)> = transitions.to_vec();
-    entries.reverse();
-
-    let squashed = TrieLeafSquashed::new(path_slice, entries)?;
+    let squashed = TrieLeafSquashed::new(path_slice, chunk_ref.clone())?;
     let squashed_node = TrieNodeType::LeafSquashed(squashed);
     let mut new_buf = Vec::with_capacity(squashed_node.byte_len() + 1);
     squashed_node.write_bytes(&mut new_buf)?;
@@ -1001,13 +1092,30 @@ where
             })?);
             let leaf_value: Option<MARFValue> = match node {
                 TrieNodeType::Leaf(ref leaf) => Some(leaf.data.clone()),
-                // Resolve the squashed leaf at the *current walk height*, not at the leaf's tip.
-                // The leaf may have been built by a prior squash anchored to a different canonical
-                // chain whose tip transition is not the value at `height` on *this* canonical
-                // chain. `value_at_height` returns the most recent transition with `h <= height`,
-                // or `None` if the key did not exist at `height` (in which case there is no local
-                // leaf to record).
-                TrieNodeType::LeafSquashed(ref sq) => sq.value_at_height(height).cloned(),
+                // Resolve the squashed leaf at the *current walk height* via
+                // the per-level history blob reader. Per design doc §8.2:
+                // `value_at_height` returns the most recent transition with
+                // `h <= height`, or `None` if the key did not exist at
+                // `height` (in which case there is no local leaf to record).
+                //
+                // This branch only fires when the squash range overlaps a
+                // previously-squashed FullHistory level; in the common case
+                // of squashing a range of per-block blobs, leaves are plain
+                // `TrieLeaf` and this arm is not exercised.
+                TrieNodeType::LeafSquashed(ref sq) => {
+                    if !sq.has_history() {
+                        return Err(Error::CorruptionError(format!(
+                            "walk_local_leaves: LeafSquashed at height={height} has no \
+                             has_history flag set"
+                        )));
+                    }
+                    conn.squashed_leaf_value_at_height(
+                        sq.history_offset,
+                        sq.history_byte_len,
+                        sq.history_entry_count,
+                        height,
+                    )?
+                }
                 _ => unreachable!("is_leaf() returned true for non-leaf"),
             };
             if let Some(value) = leaf_value {
@@ -1655,7 +1763,20 @@ pub fn squash_level<T: MarfTrieId>(
     // updated node sizes are naturally picked up by offset computation. Leaf hashes are unchanged:
     // TrieLeafSquashed hashes the same way as TrieLeaf (only the tip value is covered by the hash).
     // ---------------------------------------------------------------
-    if mode == SquashMode::FullHistory {
+    // Base-level FullHistory: emit one history-blob chunk per distinct
+    // squashable key (Phase A.6) and rewrite leaves to subtype-2
+    // `TrieLeafSquashed` referencing those chunks. Mirror of the incremental
+    // path in `replace_leaves_full_history`; simpler because base-level
+    // squashes have no inheritance (no baseline lookup) and no descendants.
+    //
+    // Returns `Some(StagedHistoryBlob)` if any chunks were emitted; the
+    // rename to the canonical `marf-history-level-{...}-blob-{blob_offset:016x}.dat`
+    // path happens at publish time (§9.2 step 2) once `dst_blob_offset` is
+    // known. The RAII guard unlinks the tmp file on drop if we error out
+    // between finalize and rename.
+    let history_blob_staged: Option<
+        crate::chainstate::stacks::index::history_blob::StagedHistoryBlob,
+    > = if mode == SquashMode::FullHistory {
         let block_hashes_typed: Vec<T> = block_hashes_raw
             .iter()
             .map(|bhh| T::from_bytes(*bhh))
@@ -1663,57 +1784,116 @@ pub fn squash_level<T: MarfTrieId>(
 
         let history = collect_history(&mut src_marf, &block_hashes_typed, min_height, max_height)?;
 
+        // Pre-filter the squashable set serially: collected leaves whose key
+        // has a non-empty history list. (Base-level → no `dominated_single_keys`
+        // optimization; every key with at least one in-range write is squashable.)
         let node_count_before = node_store.len();
-        for i in 0..node_count_before {
-            if !collected[i].is_leaf {
-                continue;
+        let squashable: Vec<(usize, TrieHash)> = (0..node_count_before)
+            .filter_map(|i| {
+                if !collected[i].is_leaf {
+                    return None;
+                }
+                let key_hash = leaf_key_hashes[i].as_ref()?;
+                let transitions = history.get(key_hash)?;
+                if transitions.is_empty() {
+                    return None;
+                }
+                Some((i, *key_hash))
+            })
+            .collect();
+
+        if squashable.is_empty() {
+            // Nothing to promote — no history blob, no rewrites.
+            None
+        } else {
+            // Phase A.6: chunk emission (one chunk per distinct key).
+            let dst_marf_dir = std::path::Path::new(dst_path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            // `level_id` for base-level squash is always 0.
+            let history_blob_tmp =
+                crate::chainstate::stacks::index::history_blob::history_blob_tmp_path(
+                    &dst_marf_dir,
+                    0,
+                );
+            let mut history_blob_writer =
+                crate::chainstate::stacks::index::history_blob::HistoryBlobWriter::create_at(
+                    history_blob_tmp.clone(),
+                    0,
+                )?;
+
+            // Capacity uses `history.len()` rather than `squashable.len()` —
+            // see the matching comment in the incremental path above.
+            let mut key_to_chunk_ref: HashMap<
+                TrieHash,
+                crate::chainstate::stacks::index::history_blob::ChunkRef,
+            > = HashMap::with_capacity(history.len());
+            for (_, key_hash) in &squashable {
+                if key_to_chunk_ref.contains_key(key_hash) {
+                    continue;
+                }
+                let entries_asc = history.get(key_hash).ok_or_else(|| {
+                    Error::CorruptionError(
+                        "base-level Phase A.6: key_hash in squashable missing from history map"
+                            .into(),
+                    )
+                })?;
+                // §7.3: chunk entries sorted descending by height.
+                let mut chunk_entries: Vec<(u32, MARFValue)> = entries_asc.clone();
+                chunk_entries.reverse();
+                let (history_offset, history_byte_len) =
+                    history_blob_writer.append_chunk(&chunk_entries)?;
+                let tip_value = chunk_entries[0].1.clone();
+                let history_entry_count =
+                    u32::try_from(chunk_entries.len()).map_err(|_| Error::OverflowError)?;
+                let chunk_ref = crate::chainstate::stacks::index::history_blob::ChunkRef {
+                    history_offset,
+                    history_byte_len,
+                    history_entry_count,
+                    tip_value,
+                };
+                key_to_chunk_ref.insert(*key_hash, chunk_ref);
             }
-            let key_hash = match &leaf_key_hashes[i] {
-                Some(kh) => kh,
-                None => continue,
-            };
-            // Base-level squash: no inheritance from prior levels, so every in-range write needs a
-            // height-tagged entry so that reads at heights below the first write return None via
-            // `value_at_height`. Keys not in `history` are internal MARF keys and stay plain.
-            let transitions = match history.get(key_hash) {
-                Some(t) if !t.is_empty() => t,
-                _ => continue,
-            };
+            history_blob_writer.finalize()?; // footer + fsync, file stays at tmp path
+            drop(history); // §7.4 lifecycle: history map is no longer needed
 
-            // Read the existing serialized leaf to get its path bytes.
-            // Leaf bytes in node_store are hash-free: [body] only.
-            let raw = node_store.read_node_bytes(i)?;
+            // Phase B: rewrite each squashable leaf as subtype-2 TrieLeafSquashed
+            // referencing its key's chunk via ChunkRef. Serial loop — base-level
+            // squash doesn't yet use the streaming-channel parallelism that
+            // `replace_leaves_full_history` does; the legacy path is dominated
+            // by single-threaded I/O regardless.
+            for (i, key_hash) in &squashable {
+                let chunk_ref = key_to_chunk_ref.get(key_hash).ok_or_else(|| {
+                    Error::CorruptionError(
+                        "base-level Phase B: key_hash missing from key_to_chunk_ref \
+                         between A.6 and B"
+                            .into(),
+                    )
+                })?;
+                let raw = node_store.read_node_bytes(*i)?;
+                let new_buf = build_squashed_leaf_bytes(&raw, chunk_ref)?;
+                node_store.update(*i, &new_buf)?;
+                stats.leaves_squashed += 1;
+            }
+            node_store.flush()?;
 
-            // Decode the leaf to get its path (NodePath)
-            let node_id_byte = *raw.first().ok_or_else(|| {
-                Error::CorruptionError("Empty node body during FullHistory leaf replace".into())
-            })?;
-            let node_id = clear_backptr(node_id_byte) & 0x3f;
-            let (existing_node, _) = bits::decode_nodetype_from_slice_at_head(&raw, node_id)?;
-            let path_slice = existing_node.path_bytes();
-
-            // Build the TrieLeafSquashed: entries must be sorted descending by height
-            let mut entries: Vec<(u32, MARFValue)> = transitions.clone();
-            entries.reverse(); // history map is ascending; TrieLeafSquashed wants descending
-
-            let squashed = TrieLeafSquashed::new(path_slice, entries)?;
-
-            // Re-serialize without hash prefix (leaf hashes are omitted in squash blobs)
-            let squashed_node = TrieNodeType::LeafSquashed(squashed);
-            let mut new_buf = Vec::with_capacity(squashed_node.byte_len() + 1);
-            squashed_node.write_bytes(&mut new_buf)?;
-
-            node_store.update(i, &new_buf)?;
-            stats.leaves_squashed += 1;
+            info!(
+                "Base-level FullHistory: emitted {} chunks, rewrote {} leaves; \
+                 history blob staged at {}",
+                key_to_chunk_ref.len(),
+                stats.leaves_squashed,
+                history_blob_tmp.display(),
+            );
+            Some(
+                crate::chainstate::stacks::index::history_blob::StagedHistoryBlob::new(
+                    history_blob_tmp,
+                ),
+            )
         }
-
-        node_store.flush()?;
-
-        info!(
-            "FullHistory: replaced {} leaves with TrieLeafSquashed",
-            stats.leaves_squashed
-        );
-    }
+    } else {
+        None
+    };
 
     // ---------------------------------------------------------------
     // Step 4: Compute sequential byte offsets and remap pointers
@@ -1889,6 +2069,43 @@ pub fn squash_level<T: MarfTrieId>(
         storage.get_blob_append_offset()?
     };
 
+    // §9.2 step 2: rename the staged history blob (already finalized at its
+    // tmp path during Phase A.6 above) to its canonical
+    // `marf-history-level-000000-...-blob-{dst_blob_offset:016x}.dat` path now
+    // that `dst_blob_offset` is known. Best-effort parent-dir fsync after
+    // rename mirrors `write_squash_root_sidecar` — durability of the rename
+    // before SQL marks `history_blob_state = Present`. No-op overall when no
+    // history blob was emitted.
+    let dst_marf_dir = std::path::Path::new(dst_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let history_blob_state = if let Some(staged) = history_blob_staged {
+        let canonical = crate::chainstate::stacks::index::history_blob::history_blob_path(
+            &dst_marf_dir,
+            0, // base-level squash → level_id always 0
+            min_height,
+            max_height,
+            dst_blob_offset,
+        );
+        // Rename failure drops `staged` here → tmp file unlinked.
+        std::fs::rename(staged.tmp_path(), &canonical).map_err(Error::IOError)?;
+        if let Ok(dir_handle) = std::fs::File::open(&dst_marf_dir) {
+            let _ = dir_handle.sync_all();
+        }
+        debug!(
+            "Base-level history blob renamed: {} → {}",
+            staged.tmp_path().display(),
+            canonical.display()
+        );
+        // Success: consume the guard so its Drop doesn't try to unlink
+        // a file that has just been renamed.
+        staged.forget();
+        HistoryBlobState::Present
+    } else {
+        HistoryBlobState::NeverWritten
+    };
+
     // Publish the per-height root sidecar AFTER opening dst_marf so the dst's startup reconcile
     // (running on an empty SQL state) doesn't see the just-written sidecar as an orphan and delete
     // it. The dir is keyed off dst_path so each MARF's sidecars are isolated from peer MARFs
@@ -2004,6 +2221,11 @@ pub fn squash_level<T: MarfTrieId>(
             // 0 means "no orphans, route all reads to merged blob".
             orphan_split_offset: 0,
             published_max_block_id: watermark,
+            // Determined above by the chunk-emit step: `Present` if a history
+            // blob was staged + renamed for this FullHistory level, else
+            // `NeverWritten` (TipOnly mode, or FullHistory with no squashable
+            // leaves).
+            history_blob_state,
         };
         trie_sql::write_squash_level(storage.sqlite_conn(), &row)?;
 
@@ -2274,22 +2496,25 @@ fn extend_squash_dfs_with_canonical_roots<T: MarfTrieId>(
 
             let (resolved_ptr, node_block_id) = if ptr.is_backptr() {
                 let back_block_id = ptr.back_block();
+                // Resolve the back-block hash up front. Mirror's the
+                // main DFS's hoisted-insert pattern (above): the rehash
+                // pass needs `block_id → block_hash` for ANY preserved
+                // backptr child, regardless of whether the orphan walk
+                // proceeds into the subtree (intra-level branch) or
+                // skips it (cross-level branch). Inserting in only the
+                // cross-level branch — as the prior code did — would
+                // miss intra-level non-canonical block_ids that the
+                // canonical per-height seed in `collect_per_height_metadata`
+                // doesn't cover.
+                let back_block_hash = conn.get_block_from_local_id(back_block_id)?;
+                if let Some(map) = block_id_to_hash.as_deref_mut() {
+                    map.entry(back_block_id)
+                        .or_insert_with(|| back_block_hash.clone());
+                }
                 if !intra_level_block_ids.contains(&back_block_id) {
-                    // Cross-level: don't inline the target subtree, but record the back_block's
-                    // hash so the downstream rehash pass can resolve `block_hash(back_block)` for
-                    // the backptr child-hash. The tip-DFS does the same for cross-level backptrs it
-                    // encounters; if the orphan walk discovered this back_block first (e.g. because
-                    // the tip never traverses this particular cross-level edge), the rehash would
-                    // otherwise fail with "Missing block hash for backptr target block_id ...".
-                    if let Some(map) = block_id_to_hash.as_deref_mut() {
-                        if !map.contains_key(&back_block_id) {
-                            let back_block_hash = conn.get_block_from_local_id(back_block_id)?;
-                            map.insert(back_block_id, back_block_hash);
-                        }
-                    }
+                    // Cross-level: hash recorded above; skip the subtree.
                     continue;
                 }
-                let back_block_hash = conn.get_block_from_local_id(back_block_id)?;
                 conn.open_block_known_id(&back_block_hash, back_block_id)?;
                 let resolved = ptr.from_backptr();
                 (resolved, back_block_id)
@@ -2734,6 +2959,375 @@ pub(crate) fn trim_aged_root_sidecars<T: MarfTrieId>(
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// Post-3.4 history-blob trim — `.docs/full-history-history-blob-design.md` §10
+// ---------------------------------------------------------------------------
+
+/// Outcome of a history-blob trim pass. Mirrors `TrimReport` for root
+/// sidecars; the counters distinguish "SQL flipped successfully" from
+/// "file unlink failed" because the SQL flag is the load-bearing source
+/// of truth (per §10.2 ordering: SQL first, then unlink — a crash between
+/// steps leaves SQL says `'trimmed'` + file leftover, which §9.4 recovery
+/// cleans up on next open).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HistoryBlobTrimReport {
+    /// Levels whose `history_blob_state` SQL column was successfully
+    /// flipped to `'trimmed'`. A level is "trimmed" the moment this
+    /// commits; the subsequent file unlink is best-effort disk hygiene.
+    pub levels_trimmed: u64,
+    /// Levels whose SQL UPDATE failed. The trim doesn't advance — file
+    /// is untouched, level stays trim-eligible, retried on next pass.
+    pub trim_failures: u64,
+    /// Levels whose SQL flag was set but whose history blob file unlink
+    /// returned an error. Disk leakage only: SQL says `'trimmed'` so the
+    /// read path correctly surfaces `Error::HistoryTrimmed`, and
+    /// startup `reconcile_history_blobs` cleans up the orphan on next
+    /// open.
+    pub unlink_failures: u64,
+    /// Levels skipped because the SQL column was already `'trimmed'`
+    /// from a prior pass (idempotent).
+    pub already_trimmed: u64,
+    /// Total bytes freed by successful unlinks (sum of `blob_length`
+    /// across trimmed levels). Best-effort approximation — the actual
+    /// disk freed includes filesystem overhead and any non-history
+    /// content that shared inode pages.
+    pub bytes_freed_estimate: u64,
+}
+
+/// Trim a single FullHistory squash level's history blob.
+///
+/// The atomic guarantee per §10.2 is that no live handle ever observes
+/// `(history_blob_state = 'trimmed', file present + still readable
+/// through a cached SquashMeta)`. We get there by performing the SQL
+/// flip INSIDE the [`SquashMeta`] publish quiesce window, not before it:
+/// new readers back off, in-flight readers drain, the UPDATE commits,
+/// the new meta (reflecting `'trimmed'`) is installed, and the
+/// generation bumps — all atomically from any concurrent handle's POV.
+///
+/// 1. **Publish-window SQL flip** —
+///    [`MARF::refresh_after_squash_with_sql_mutation`] enters
+///    [`SharedStorageState::publish_squash`], drains in-flight readers,
+///    runs [`trie_sql::set_history_blob_state`], arms the mutation
+///    guard, rebuilds `SquashMeta` from the new SQL state, and bumps
+///    the shared generation. Failure of the SQL update is pre-arm and
+///    surfaced as `trim_failures`; failure after arming aborts the
+///    process (the alternative would be serving a stale `Present` meta
+///    against a `Trimmed` SQL row).
+/// 2. **Best-effort unlink** — outside the quiesce. SQL is already the
+///    source of truth, so no read is consulting the file by this
+///    point. ENOENT is harmless (prior crashed trim); other errors are
+///    logged at `warn!` level and counted under `unlink_failures`;
+///    startup `reconcile_history_blobs` reaps the orphan.
+///
+/// **Idempotent**: a level whose SQL state is already `'trimmed'` is
+/// not re-flipped, but the unlink is RETRIED — a prior trim may have
+/// crashed between SQL commit and unlink, and the operator rerun is
+/// the natural place to clean that up (instead of waiting for the next
+/// process restart's reconcile pass). **Not epoch-gated** at the
+/// library level — callers (the §10.2 operator subcommand, the §10.3
+/// auto-trim hook) enforce their own epoch eligibility check before
+/// invoking this.
+pub fn trim_history_blob_for_level<T: MarfTrieId>(
+    marf: &mut MARF<T>,
+    level_id: u32,
+    report: &mut HistoryBlobTrimReport,
+) -> Result<(), Error> {
+    let storage = marf.storage_backend_mut();
+    let levels = trie_sql::read_squash_levels(storage.sqlite_conn())?;
+    let Some(row) = levels.iter().find(|r| r.level_id == level_id) else {
+        return Err(Error::CorruptionError(format!(
+            "trim_history_blob_for_level: level_id={level_id} not found in marf_squash_levels"
+        )));
+    };
+
+    let level_min_height = row.min_height;
+    let level_max_height = row.max_height;
+    let level_blob_offset = row.blob_offset;
+    let prior_state = row.history_blob_state;
+    let db_path = marf.get_db_path().to_string();
+
+    if matches!(prior_state, HistoryBlobState::NeverWritten) {
+        // Defensive: there's no file to trim. Don't change SQL —
+        // `'never_written'` correctly reflects the absence. Surface
+        // a clear error so a buggy caller's `--all` loop doesn't
+        // silently miss this.
+        return Err(Error::CorruptionError(format!(
+            "trim_history_blob_for_level: level_id={level_id} has history_blob_state \
+             = 'never_written' — nothing to trim"
+        )));
+    }
+
+    let marf_dir = std::path::Path::new(&db_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let path = crate::chainstate::stacks::index::history_blob::history_blob_path(
+        &marf_dir,
+        level_id,
+        level_min_height,
+        level_max_height,
+        level_blob_offset,
+    );
+
+    if matches!(prior_state, HistoryBlobState::Present) {
+        // Snapshot the on-disk size BEFORE the flip so the bytes-freed
+        // estimate reflects the history blob's own footprint rather
+        // than the cold squash blob extent (`row.blob_length`, which
+        // is unrelated to the per-level history file). ENOENT is fine
+        // — counts as zero; the SQL flip still proceeds.
+        let pre_flip_size: u64 = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        // Phase 1: SQL flip inside the publish_squash quiesce. The
+        // mutation is pre-arm — failures here surface cleanly as
+        // `trim_failures` with the file untouched.
+        let mutation_result = marf.refresh_after_squash_with_sql_mutation(|conn| {
+            trie_sql::set_history_blob_state(conn, level_id, HistoryBlobState::Trimmed)
+        });
+        if let Err(e) = mutation_result {
+            warn!(
+                "trim_history_blob_for_level: in-quiesce SQL flag update failed for \
+                 level_id={level_id}: {e:?}. File left in place; will retry on next trim pass."
+            );
+            report.trim_failures += 1;
+            return Ok(());
+        }
+        report.levels_trimmed += 1;
+        report.bytes_freed_estimate = report.bytes_freed_estimate.saturating_add(pre_flip_size);
+    } else {
+        // SQL already says `'trimmed'`. Don't re-flip / re-publish (no
+        // observable change), but DO retry the unlink — a prior trim
+        // may have crashed between SQL commit and unlink, and the
+        // operator rerun is the cheap place to reap it without waiting
+        // for the next process restart.
+        report.already_trimmed += 1;
+    }
+
+    // Phase 2: unlink. SQL is the source of truth; no live reader can
+    // be holding this file via the new `SquashMeta`.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            info!(
+                "trim_history_blob_for_level: deleted history blob {} (level_id={level_id})",
+                path.display(),
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                "trim_history_blob_for_level: history blob {} already absent for \
+                 level_id={level_id} (prior crash mid-trim?)",
+                path.display(),
+            );
+        }
+        Err(e) => {
+            warn!(
+                "trim_history_blob_for_level: file unlink failed for {} \
+                 (level_id={level_id}): {e}. SQL flag is set, so the read path is \
+                 correct; startup reconcile_history_blobs will clean up the orphan.",
+                path.display(),
+            );
+            report.unlink_failures += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The epoch-3.4 auto-trim batch, callable by the chains-coordinator
+/// from its boundary-crossing trigger per §10.3 of the design doc.
+///
+/// Performs the §10.3 batch flow in the exact ordering the design
+/// requires for opt-out-on-restart semantics:
+///
+/// 1. Re-check that the one-shot gate is still `false` (idempotent
+///    against concurrent ticks).
+/// 2. Emit the `STARTING` WARN with the level count and estimated
+///    bytes-to-reclaim — visible at the default log level so operators
+///    can't miss the destructive nature.
+/// 3. Loop [`trim_history_blob_for_level`] over every `'present'`
+///    level. Each per-level trim is independently transactional; a
+///    mid-loop crash leaves trimmed levels durably trimmed and the
+///    remaining `'present'` levels will be re-evaluated on next boot.
+/// 4. Emit the `COMPLETE` WARN with the final report counters.
+/// 5. **Commit `marf_state.auto_trim_done = true` ONLY IF
+///    `trim_failures == 0`**. This is the load-bearing ordering for
+///    the operator opt-out window: a restart BEFORE this commit lands
+///    re-evaluates the trigger condition (`!auto_trim_done && burn_height
+///    >= activation`) and, if the operator set the override config, the
+///    trigger skips. A restart AFTER this commit observes
+///    `auto_trim_done = true` and the auto-trim never re-fires. The
+///    `trim_failures > 0` gate is what keeps the "next boot resumes
+///    remaining present levels" story honest for non-crash SQL
+///    failures — without it, a transient sqlite error would leave the
+///    level `'present'` AND `auto_trim_done = true`, and the level
+///    would never be retried. `unlink_failures` does NOT block the
+///    gate: SQL is already `'trimmed'` for those levels, so the read
+///    path is correct and startup reconcile reaps the orphans.
+///
+/// **Skips entirely** when `marf_state.auto_trim_done` is already true.
+/// The chains-coordinator should still call this on every tick — the
+/// idempotent gate keeps it cheap.
+pub fn run_epoch_3_4_history_auto_trim<T: MarfTrieId>(
+    marf: &mut MARF<T>,
+) -> Result<HistoryBlobTrimReport, Error> {
+    // (1) Idempotent gate.
+    let state = trie_sql::read_marf_state(marf.storage_backend_mut().sqlite_conn())?;
+    if state.auto_trim_done {
+        return Ok(HistoryBlobTrimReport::default());
+    }
+
+    // Snapshot the pre-trim level set for the STARTING log. Read-only so
+    // it's fine to do before phase 3 (trim) mutates SQL.
+    let levels = trie_sql::read_squash_levels(marf.storage_backend_mut().sqlite_conn())?;
+    let db_path = marf.get_db_path().to_string();
+    let marf_dir = std::path::Path::new(&db_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let present_rows: Vec<&SquashLevelRow> = levels
+        .iter()
+        .filter(|r| matches!(r.history_blob_state, HistoryBlobState::Present))
+        .collect();
+    let present_count = present_rows.len();
+    // Estimate bytes-to-reclaim from the per-level history blob file
+    // sizes — `row.blob_length` is the cold squash blob extent, which is
+    // unrelated to the per-level history file size and would make the
+    // operator-facing log misleading by orders of magnitude. ENOENT on
+    // any individual file is a no-op for the sum (covers pre-flip crash
+    // residue).
+    let estimated_bytes: u64 = present_rows
+        .iter()
+        .map(|r| {
+            let p = crate::chainstate::stacks::index::history_blob::history_blob_path(
+                &marf_dir,
+                r.level_id,
+                r.min_height,
+                r.max_height,
+                r.blob_offset,
+            );
+            std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
+        })
+        .sum();
+
+    if present_count == 0 {
+        // No work to do. Commit the gate so we don't re-run on every tick.
+        trie_sql::set_auto_trim_done(marf.storage_backend_mut().sqlite_conn(), true)?;
+        info!(
+            "MARF history auto-trim SKIPPED — no 'present' levels to trim; \
+             marf_state.auto_trim_done = true."
+        );
+        return Ok(HistoryBlobTrimReport::default());
+    }
+
+    // (2) STARTING — WARN-level so it's visible at default log filters.
+    // Per §10.3: the wording is honest about the timing (the boundary has
+    // already been crossed and the trim has begun) and points operators at
+    // the override config + the stop-now-to-preserve-remaining mechanic.
+    //
+    // The opt-out is `marf_full_history = true` in TOML, which routes
+    // through `MARFOpenOpts.squash_mode = SquashMode::FullHistory` and
+    // causes the coordinator's auto-trim hook to skip permanently. There
+    // is no separate `auto_trim_*` config field — the squash mode IS
+    // the opt-out lever.
+    warn!(
+        "MARF history auto-trim STARTING — {present_count} levels eligible, \
+         ~{} GB to be reclaimed. This is DESTRUCTIVE: trimmed history cannot \
+         be reconstructed without a resync. Once complete, at-block reads on \
+         these levels will return HistoryTrimmed. To preserve any remaining \
+         levels, stop the node (Ctrl-C / systemctl stop) and restart with \
+         `marf_full_history = true` set in the node TOML (this routes the \
+         configured SquashMode to FullHistory, which the coordinator's \
+         post-3.4 auto-trim hook treats as a permanent operator opt-out). \
+         Levels already trimmed at the time of stop cannot be recovered; \
+         stopping early prevents the rest. The marf_state.auto_trim_done \
+         flag is committed only after this batch completes, so a restart \
+         with the override re-evaluates the trigger and skips it.",
+        estimated_bytes / (1u64 << 30).max(1),
+    );
+
+    // (3) Per-level trim loop. Failures inside `trim_history_blob_for_level`
+    // are recorded in the report and don't abort the loop — the policy is
+    // "trim as much as possible; the next boot's resumption picks up the rest."
+    let mut report = HistoryBlobTrimReport::default();
+    let present_level_ids: Vec<u32> = present_rows.iter().map(|r| r.level_id).collect();
+    drop(present_rows);
+    drop(levels);
+    for level_id in present_level_ids {
+        let before = report.levels_trimmed;
+        trim_history_blob_for_level(marf, level_id, &mut report)?;
+        if report.levels_trimmed > before {
+            info!(
+                "MARF history auto-trim progress: trimmed level {level_id}, \
+                 ~{} MB freed",
+                report.bytes_freed_estimate / (1u64 << 20).max(1),
+            );
+        }
+    }
+
+    // (4) COMPLETE — WARN-level so the destructive completion is visible.
+    warn!(
+        "MARF history auto-trim COMPLETE — {} levels trimmed, total ~{} GB \
+         reclaimed. {} trim failures, {} unlink failures (orphans will be \
+         reaped by next-boot reconcile_history_blobs).",
+        report.levels_trimmed,
+        report.bytes_freed_estimate / (1u64 << 30).max(1),
+        report.trim_failures,
+        report.unlink_failures,
+    );
+
+    // (5) Commit the one-shot gate LAST — and ONLY if every per-level
+    // SQL flip succeeded. A non-zero `trim_failures` means some level
+    // is still `'present'` in SQL; setting `auto_trim_done = true`
+    // would strand it. `unlink_failures` is fine: SQL says `'trimmed'`
+    // for those, so reconcile reaps them on next boot. A mid-loop
+    // crash leaves the gate `false` (we never reach this line),
+    // ensuring the resumption on the next boot picks up the rest.
+    if report.trim_failures == 0 {
+        trie_sql::set_auto_trim_done(marf.storage_backend_mut().sqlite_conn(), true)?;
+    } else {
+        warn!(
+            "MARF history auto-trim: marf_state.auto_trim_done LEFT FALSE because \
+             {} levels' SQL flip failed; next boot will re-evaluate and retry the \
+             remaining 'present' levels.",
+            report.trim_failures,
+        );
+    }
+    Ok(report)
+}
+
+/// Trim every FullHistory squash level whose history blob is currently
+/// `'present'`. Used by:
+///
+/// - The §10.2 operator-driven `stacks-inspect marf trim-history --all`
+///   subcommand.
+/// - The §10.3 epoch-3.4 chains-coordinator auto-trim hook (which also
+///   wraps this with the conspicuous WARN start/complete logging + the
+///   `marf_state.auto_trim_done` one-shot gate commit).
+///
+/// Each per-level trim is independently transactional: a mid-batch crash
+/// leaves any already-trimmed levels durably trimmed; the resumption on
+/// next boot finds the remaining `'present'` levels and continues.
+pub fn trim_history_blobs_for_all_present<T: MarfTrieId>(
+    marf: &mut MARF<T>,
+) -> Result<HistoryBlobTrimReport, Error> {
+    let mut report = HistoryBlobTrimReport::default();
+
+    // Snapshot the level_ids upfront — `trim_history_blob_for_level`
+    // mutates SQL + republishes SquashMeta on each call, so re-reading
+    // the level set inside the loop would interleave with our own
+    // mutations. The snapshot is stable since this function holds the
+    // write path for the duration (no concurrent publish).
+    let storage = marf.storage_backend_mut();
+    let level_ids: Vec<u32> = trie_sql::read_squash_levels(storage.sqlite_conn())?
+        .into_iter()
+        .filter(|r| matches!(r.history_blob_state, HistoryBlobState::Present))
+        .map(|r| r.level_id)
+        .collect();
+
+    for level_id in level_ids {
+        trim_history_blob_for_level(marf, level_id, &mut report)?;
+    }
+    Ok(report)
+}
+
 /// A dummy `BlockMap` for squash blob hash computation.
 ///
 /// All backpointers are resolved before hash recomputation, so no block hash lookups should occur.
@@ -2917,6 +3511,10 @@ pub(crate) struct PhaseTimings {
     collect_history_ms: u128,
     baseline_ms: u128,
     baseline_keys: usize,
+    /// Phase A.6 chunk emission (FullHistory only): walking distinct keys,
+    /// appending one chunk per key to the per-level history blob writer at
+    /// a tmp path, finalizing footer + fsync. See design doc §7.3.
+    chunk_emit_ms: u128,
     leaf_replace_ms: u128,
     leaf_replace_flush_ms: u128,
     remap_ms: u128,
@@ -2934,13 +3532,14 @@ impl std::fmt::Display for PhaseTimings {
         write!(
             f,
             "dfs={}, collect_history={}, baseline={}({} keys), \
-             leaf_replace={}, leaf_replace_flush={}, \
+             chunk_emit={}, leaf_replace={}, leaf_replace_flush={}, \
              remap={}, publish_overhead={}, prune={}, \
              blob_write={}, finish_blob={}, sql_updates={}, build_meta={}, total={}",
             self.dfs_ms,
             self.collect_history_ms,
             self.baseline_ms,
             self.baseline_keys,
+            self.chunk_emit_ms,
             self.leaf_replace_ms,
             self.leaf_replace_flush_ms,
             self.remap_ms,
@@ -3193,6 +3792,7 @@ fn append_offset_from_top_prior(existing_levels: &[SquashLevelRow]) -> u64 {
 /// inside the same SQL transaction that registers the level, so any rename-but-no-SQL crash leaves
 /// an orphan sidecar that startup reconciliation can delete. `root_sidecar_trimmed` is always
 /// `false` at publish time — the trim policy mutates it later.
+#[allow(clippy::too_many_arguments)] // 10 distinct fields, none of which group cleanly
 fn build_published_level_row(
     next_level_id: u32,
     min_height: u32,
@@ -3203,6 +3803,7 @@ fn build_published_level_row(
     sidecar_published: bool,
     orphan_split_offset: u32,
     published_max_block_id: u32,
+    history_blob_state: HistoryBlobState,
 ) -> SquashLevelRow {
     SquashLevelRow {
         level_id: next_level_id,
@@ -3215,6 +3816,7 @@ fn build_published_level_row(
         root_sidecar_trimmed: false,
         orphan_split_offset,
         published_max_block_id,
+        history_blob_state,
     }
 }
 
@@ -3564,6 +4166,22 @@ fn dfs_collect_for_squash<T: MarfTrieId + Send + Sync>(
             let (resolved_ptr, node_block_id) = if ptr.is_backptr() {
                 let back_block_id = ptr.back_block();
                 let back_block_hash = conn.get_block_from_local_id(back_block_id)?;
+                // Record `back_block_id → back_block_hash` for the downstream rehash pass
+                // UNCONDITIONALLY — every preserved backptr child in the merged blob needs
+                // its target's block_hash to compute the parent's consensus hash (per
+                // `child_hashes` lookup at the top of this function). The branches below
+                // cover cross-level, in-other-squash-level, stub-range, and intra-range
+                // targets; only some of them populate the map. `collect_per_height_metadata`
+                // seeds canonical per-height block_ids, but non-canonical block_ids that
+                // happen to be valid local MARF block_ids (forks within the squash range,
+                // peer hot-tier rows encountered during horizon-gated promotion) would slip
+                // through and surface later as "Missing block hash for backptr target
+                // block_id X during rehash". Hoisting the insert here covers all branches
+                // with one line. `or_insert_with` is idempotent — no overwrite when a
+                // canonical-seed entry already exists.
+                block_id_to_hash
+                    .entry(back_block_id)
+                    .or_insert_with(|| back_block_hash.clone());
                 let bhh_key = bhh_to_key(&back_block_hash);
 
                 match squash_index.get(&bhh_key) {
@@ -4145,6 +4763,25 @@ pub(crate) struct MergeOutputs {
     /// `dead_code` until then.
     #[allow(dead_code)]
     pub(crate) translation_map: crate::chainstate::stacks::index::squash_plan::TranslationMap,
+    /// FullHistory history-blob lifecycle state for the level being published.
+    /// Set to `Present` by the chunk-emit step (Phase A.6) when a history blob
+    /// was emitted for this level; otherwise `NeverWritten` (TipOnly mode, or
+    /// FullHistory with no squashable leaves). Flows into the
+    /// `marf_squash_levels.history_blob_state` SQL column at publish time.
+    pub(crate) history_blob_state: HistoryBlobState,
+    /// RAII handle to the staged history-blob tmp file, awaiting rename
+    /// to the canonical `marf-history-level-...-blob-{blob_offset:016x}.dat`
+    /// path once `blob_offset` is known at publish time. `Some(_)` iff
+    /// `history_blob_state == Present`.
+    ///
+    /// **RAII guarantee**: dropping a `Some(_)` without calling
+    /// `forget()` unlinks the tmp file. The publish path calls
+    /// `forget()` only after a successful rename + parent-dir fsync,
+    /// so any earlier error in the prep / publish pipeline (descendant
+    /// scan, sidecar emit, SQL error, etc.) cleans up the tmp file
+    /// instead of leaking it until startup recovery.
+    pub(crate) history_blob:
+        Option<crate::chainstate::stacks::index::history_blob::StagedHistoryBlob>,
 }
 
 /// Stage a pending copy of the active canonical sidecar at a unique pending path so the
@@ -4203,8 +4840,24 @@ fn publish_squashed_blob<T: MarfTrieId + Send + Sync>(
     let tip_reachable_count = merge.tip_reachable_count;
     let orphan_split_offset = merge.orphan_split_offset;
     let sidecar_published = merge.sidecar_published;
+    let history_blob_state = merge.history_blob_state;
+    // Take ownership of the staged history blob guard. Mutable so the
+    // closure can `take()` it on the rename success path and call
+    // `forget()`; on any error path before that point the guard drops
+    // and unlinks the tmp file. No orphan tmp file lingers regardless
+    // of where in the closure we exit.
+    let mut history_blob_staged = merge.history_blob.take();
     let node_store = &merge.node_store;
     let trailer = &merge.trailer;
+
+    // The marf directory parent — used to build the canonical history-blob
+    // filename via `history_blob_path` once `blob_offset` is computed inside
+    // the publish closure. Captured as an owned PathBuf so the closure
+    // doesn't have to re-borrow `marf` for path derivation.
+    let marf_dir: PathBuf = std::path::Path::new(marf.get_db_path())
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     let t_publish_call = Instant::now();
     // Capture `closure_start` inside the closure to separate publish_squash's own overhead (lock
     // acquisition + quiesce wait) from the closure's work.
@@ -4238,6 +4891,52 @@ fn publish_squashed_blob<T: MarfTrieId + Send + Sync>(
         } else {
             (storage.get_blob_append_offset()?, None)
         };
+
+        // ── §9.2 step 2: rename the staged history blob (already finalized
+        // at its tmp path during Phase A.6 — footer-validated, fsync'd) to
+        // its canonical `marf-history-level-{...}-blob-{blob_offset:016x}.dat`
+        // path now that `blob_offset` is known. This must happen BEFORE the
+        // cold blob bytes are written, because the cold blob's leaves
+        // reference history blob offsets — the file must be discoverable at
+        // its canonical path before any reader could find a leaf pointing
+        // into it (§9.2 step 2 rationale). Rename failure aborts cleanly:
+        // no cold blob bytes have been written yet, no SQL row inserted.
+        //
+        // Best-effort parent-directory fsync after rename matches the
+        // root-sidecar pattern in `write_squash_root_sidecar`: not
+        // load-bearing for content correctness, but matters across
+        // power-loss between rename and SQL commit. Without it, the
+        // SQL row could land at `history_blob_state = 'present'` while
+        // the rename hasn't reached disk, and recovery would surface
+        // `CorruptionError` ("present row but file missing"). Best-effort
+        // because directory fsync is a platform-conditional no-op.
+        //
+        // No-op overall when there's no history blob (TipOnly, or
+        // FullHistory with no squashable leaves).
+        if let Some(staged) = history_blob_staged.take() {
+            let canonical = crate::chainstate::stacks::index::history_blob::history_blob_path(
+                &marf_dir,
+                next_level_id,
+                min_height,
+                max_height,
+                blob_offset,
+            );
+            // If the rename fails, `staged` drops here → tmp file unlinked
+            // → no leak. The `?` on the error preserves the original IO
+            // error for the caller.
+            std::fs::rename(staged.tmp_path(), &canonical).map_err(Error::IOError)?;
+            if let Ok(dir_handle) = std::fs::File::open(&marf_dir) {
+                let _ = dir_handle.sync_all();
+            }
+            debug!(
+                "History blob renamed to canonical path: {} → {}",
+                staged.tmp_path().display(),
+                canonical.display()
+            );
+            // Success: consume the guard so its Drop doesn't try to unlink
+            // a file that has just been renamed to the canonical path.
+            staged.forget();
+        }
 
         // ── Mutation phase begins. From here on, every operation is irreversible:
         //    * `prune_orphaned_external_refs` zeroes `external_offset`/`length` on non-canonical
@@ -4361,6 +5060,7 @@ fn publish_squashed_blob<T: MarfTrieId + Send + Sync>(
             sidecar_published,
             orphan_split_offset,
             watermark,
+            history_blob_state,
         );
 
         trie_sql::write_squash_level(&tx, &row)?;
@@ -4394,22 +5094,37 @@ fn publish_squashed_blob<T: MarfTrieId + Send + Sync>(
 /// in-range transition history into a `TrieLeafSquashed` whose embedded transitions cover the full
 /// `[min_height, max_height]` range.
 ///
-/// Pipeline:
-/// 1. **Collect transitions** ([`collect_history_parallel`]): the per-key in-range transition
-///    history, sorted by height.
-/// 2. **Baseline lookup** (when `min_height > 0`): for any key whose earliest transition is *after*
-///    `min_height`, the key was inherited from a prior level. Walk the prior level's tip trie (at
-///    `min_height - 1`) to fetch the inherited value and inject a synthetic `(min_height - 1,
-///    value)` entry. Keys whose single in-range write is byte-identical to the inherited value go
-///    into `dominated_single_keys` and stay as plain `TrieLeaf` — reading the same value at every
-///    range height is correct without promotion.
-/// 3. **Leaf rewrite**: for every promotable leaf, decode the bytes, construct the
-///    `TrieLeafSquashed`, and write it back via `node_store.update` (Phase A parallelizes the
-///    decode/build/serialize; Phase B applies the writes serially because `NodeStore::update` takes
-///    `&mut self`).
+/// Pipeline (post-Phase-2 multipurpose carrier):
 ///
-/// Updates `stats.leaves_squashed` and the `collect_history_ms`, `baseline_ms`, `baseline_keys`,
-/// `leaf_replace_ms`, and `leaf_replace_flush_ms` fields of `timings`.
+/// 1. **A — collect transitions** ([`collect_history_parallel`]): per-key
+///    in-range transition history, sorted ascending by height.
+/// 2. **A.5 — baseline lookup** (when `min_height > 0`): inject synthetic
+///    `(min_height - 1, baseline_value)` entries for keys inherited from
+///    prior levels. Keys whose single in-range write is byte-identical to
+///    the inherited value go into `dominated_single_keys` and stay as
+///    plain `TrieLeaf`.
+/// 3. **A.6 — chunk emission** (NEW per design doc §7.3): walk distinct
+///    keys with at least one squashable physical leaf, sort their entries
+///    descending by height, append one chunk per key into a per-level
+///    history blob at a tmp path, build `key_to_chunk_ref:
+///    HashMap<TrieHash, ChunkRef>`. The history map is dropped at the end
+///    of A.6; everything Phase B needs is in `key_to_chunk_ref`.
+/// 4. **B — leaf rewrite**: for every promotable physical leaf, look up
+///    its `ChunkRef` and emit a subtype-2 `TrieLeafSquashed` body via
+///    `build_squashed_leaf_bytes`. Streamed via the existing channel pattern:
+///    parallel workers produce, main thread drains and applies
+///    `node_store.update`.
+///
+/// Returns the tmp path of the finalized history blob (footer-validated,
+/// fsync'd) when at least one chunk was emitted, or `None` when there were
+/// no squashable leaves (e.g. trivial squash range with only single-write
+/// keys all in `dominated_single_keys`). The caller renames the tmp path
+/// to the canonical `marf-history-level-...-blob-{blob_offset:016x}.dat`
+/// once `blob_offset` is known at publish time per §9.2.
+///
+/// Updates `stats.leaves_squashed` and the `collect_history_ms`, `baseline_ms`,
+/// `baseline_keys`, `leaf_replace_ms`, and `leaf_replace_flush_ms` fields of
+/// `timings`.
 fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
     marf: &mut MARF<T>,
     tip_block: &T,
@@ -4421,7 +5136,7 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
     leaf_key_hashes: &[Option<TrieHash>],
     stats: &mut SquashStats,
     timings: &mut PhaseTimings,
-) -> Result<(), Error> {
+) -> Result<Option<crate::chainstate::stacks::index::history_blob::StagedHistoryBlob>, Error> {
     let block_hashes_typed: Vec<T> = block_hashes_raw
         .iter()
         .map(|bhh| T::from_bytes(*bhh))
@@ -4715,24 +5430,137 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
         .map(|i| node_store.file_offset(i))
         .collect();
 
+    // Empty-squashable shortcut: nothing to promote → no history blob to emit,
+    // no Phase B work to do. The caller's MergeOutputs gets `history_blob_state =
+    // NeverWritten` and `history_blob_tmp_path = None`.
+    if squashable.is_empty() {
+        timings.leaf_replace_ms = t_leaf_replace.elapsed().as_millis();
+        let t_replace_flush = Instant::now();
+        node_store.flush()?;
+        timings.leaf_replace_flush_ms = t_replace_flush.elapsed().as_millis();
+        info!(
+            "Incremental FullHistory: no squashable leaves, history blob skipped \
+             (level publishes with history_blob_state=never_written)"
+        );
+        return Ok(None);
+    }
+
+    // ── Phase A.6: chunk emission (per design doc §7.3) ───────────────
+    //
+    // Walk distinct keys with at least one squashable physical leaf,
+    // append one chunk per key to a HistoryBlobWriter at a tmp path,
+    // and build `key_to_chunk_ref` for Phase B. Drop the in-memory
+    // `history` map at the end of this block: every byte Phase B needs
+    // is in `key_to_chunk_ref` (per §7.4 lifecycle).
+    let t_chunk_emit = Instant::now();
+    let marf_dir = std::path::Path::new(marf.get_db_path())
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // The level_id baked into the history blob header is the SAME level_id
+    // the caller will write to `marf_squash_levels` at publish time. We
+    // re-derive it here from the existing levels — it must match the
+    // `next_level_id` the publish path picks (validated by `validate_squash_target`).
+    let next_level_id = {
+        let existing_levels = trie_sql::read_squash_levels(marf.sqlite_conn())?;
+        validate_squash_target(&existing_levels, min_height)?
+    };
+    let history_blob_tmp = crate::chainstate::stacks::index::history_blob::history_blob_tmp_path(
+        &marf_dir,
+        next_level_id,
+    );
+    let mut history_blob_writer =
+        crate::chainstate::stacks::index::history_blob::HistoryBlobWriter::create_at(
+            history_blob_tmp.clone(),
+            next_level_id,
+        )?;
+
+    // Build `key_to_chunk_ref` — distinct keys only, one chunk per key.
+    // The same physical leaf may appear in `squashable` multiple times under
+    // a single TrieHash (cross-block COW copies via `promote_leaf_to_node4` —
+    // §1.1 of the design doc shows this drives the inline-rewrite amplification
+    // we're eliminating). Walk distinct keys; emit each chunk once.
+    //
+    // Map capacity uses `history.len()` (the count of all distinct keys with
+    // any in-range write) as the upper bound on `key_to_chunk_ref.len()`. The
+    // actual distinct-squashable-key count is ≤ `history.len()` (after
+    // dominated-single filtering, which removes some keys entirely). This is
+    // a tighter upper bound than `squashable.len()` (the per-physical-leaf
+    // count), which the rewrite-amplification analysis (§1.1) showed is
+    // ~2× larger than the per-distinct-key count on the worst real workload.
+    let mut key_to_chunk_ref: HashMap<
+        TrieHash,
+        crate::chainstate::stacks::index::history_blob::ChunkRef,
+    > = HashMap::with_capacity(history.len());
+
+    for (_, key_hash) in &squashable {
+        if key_to_chunk_ref.contains_key(key_hash) {
+            continue;
+        }
+        let entries_asc = history.get(key_hash).ok_or_else(|| {
+            Error::CorruptionError(
+                "Phase A.6: key_hash in squashable missing from history map".into(),
+            )
+        })?;
+        // §7.3: chunk entries sorted descending by height (matches
+        // `value_at_height`'s partition_point semantics). The history
+        // map stores entries ascending; clone + reverse here.
+        let mut chunk_entries: Vec<(u32, MARFValue)> = entries_asc.clone();
+        chunk_entries.reverse();
+        let (history_offset, history_byte_len) =
+            history_blob_writer.append_chunk(&chunk_entries)?;
+        // §5.2 invariant: tip_value == chunk[0].value (descending → highest
+        // height first). Capture from the freshly-sorted chunk.
+        let tip_value = chunk_entries[0].1.clone();
+        let history_entry_count =
+            u32::try_from(chunk_entries.len()).map_err(|_| Error::OverflowError)?;
+        let chunk_ref = crate::chainstate::stacks::index::history_blob::ChunkRef {
+            history_offset,
+            history_byte_len,
+            history_entry_count,
+            tip_value,
+        };
+        key_to_chunk_ref.insert(*key_hash, chunk_ref);
+    }
+
+    history_blob_writer.finalize()?; // footer + fsync, file stays at tmp path
+    timings.chunk_emit_ms = t_chunk_emit.elapsed().as_millis();
+
+    // §7.4 lifecycle: drop the in-memory history map immediately. Phase B
+    // only needs `key_to_chunk_ref` from here on.
+    drop(history);
+
+    info!(
+        "Phase A.6 chunk emission: {} distinct keys → {} chunks at {}",
+        key_to_chunk_ref.len(),
+        key_to_chunk_ref.len(),
+        history_blob_tmp.display(),
+    );
+
+    // ── Phase B: streaming leaf rewrite using ChunkRef lookups ──────────
+    //
+    // The streaming-channel shape from the prior implementation is preserved.
+    // The only change: workers look up `ChunkRef` from `key_to_chunk_ref`
+    // instead of `Vec<(u32, MARFValue)>` from `history`, and call
+    // `build_squashed_leaf_bytes(raw, &ChunkRef)` to emit subtype-2
+    // `TrieLeafSquashed` bytes per §5.7.
     if leaf_n_workers <= 1 {
-        // Serial fallback: stream directly without spawning. Used when (a) the squashable count is
-        // small enough that thread setup would dominate, or (b) only one core is available. Same
-        // streaming shape as the parallel path — no staged Vec.
+        // Serial fallback: stream directly without spawning. Same shape as the
+        // parallel path — no staged Vec.
         for (i, key_hash) in &squashable {
-            let transitions = history.get(key_hash).ok_or_else(|| {
+            let chunk_ref = key_to_chunk_ref.get(key_hash).ok_or_else(|| {
                 Error::CorruptionError(
-                    "key_hash disappeared from history between pre-filter and apply".into(),
+                    "Phase B: key_hash missing from key_to_chunk_ref between A.6 and B".into(),
                 )
             })?;
             let raw = node_store.read_node_bytes(*i)?;
-            let new_buf = build_squashed_leaf_bytes(&raw, transitions)?;
+            let new_buf = build_squashed_leaf_bytes(&raw, chunk_ref)?;
             node_store.update(*i, &new_buf)?;
             stats.leaves_squashed += 1;
         }
     } else {
         let chunk_size = squashable.len().div_ceil(leaf_n_workers).max(1);
-        let history_ref = &history;
+        let key_to_chunk_ref_ref = &key_to_chunk_ref;
         let squashable_ref: &[(usize, TrieHash)] = &squashable;
         let file_offsets_ref: &[(u64, u32)] = &file_offsets;
         let temp_path_ref: &Path = &temp_path;
@@ -4751,21 +5579,22 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
                     s.spawn(move || {
                         for (i, key_hash) in chunk {
                             let result: Result<(usize, Vec<u8>), Error> = (|| {
-                                let transitions = history_ref.get(key_hash).ok_or_else(|| {
-                                    Error::CorruptionError(
-                                        "key_hash disappeared from history \
-                                             between pre-filter and apply"
-                                            .into(),
-                                    )
-                                })?;
+                                let chunk_ref =
+                                    key_to_chunk_ref_ref.get(key_hash).ok_or_else(|| {
+                                        Error::CorruptionError(
+                                            "Phase B: key_hash missing from \
+                                             key_to_chunk_ref between A.6 and B"
+                                                .into(),
+                                        )
+                                    })?;
                                 let (offset, len) = file_offsets_ref[*i];
                                 let raw = read_node_bytes_at(temp_path_ref, offset, len)?;
-                                let new_buf = build_squashed_leaf_bytes(&raw, transitions)?;
+                                let new_buf = build_squashed_leaf_bytes(&raw, chunk_ref)?;
                                 Ok((*i, new_buf))
                             })(
                             );
-                            // Receiver dropped (main bailed on an earlier error) — exit cleanly so
-                            // we don't block the scope on an unreceived send.
+                            // Receiver dropped (main bailed on an earlier error) — exit cleanly
+                            // so we don't block the scope on an unreceived send.
                             if tx.send(result).is_err() {
                                 return;
                             }
@@ -4827,11 +5656,15 @@ fn replace_leaves_full_history<T: MarfTrieId + Send + Sync>(
     timings.leaf_replace_flush_ms = t_replace_flush.elapsed().as_millis();
 
     info!(
-        "Incremental FullHistory: replaced {} leaves with TrieLeafSquashed",
-        stats.leaves_squashed
+        "Incremental FullHistory: replaced {} leaves with TrieLeafSquashed (subtype 2); \
+         history blob staged at {}",
+        stats.leaves_squashed,
+        history_blob_tmp.display(),
     );
 
-    Ok(())
+    Ok(Some(
+        crate::chainstate::stacks::index::history_blob::StagedHistoryBlob::new(history_blob_tmp),
+    ))
 }
 
 /// Path-based wrapper around the live-handle [`MARF::squash`] method. Opens its own `MARF<T>` from
@@ -4999,7 +5832,23 @@ pub(crate) fn prepare_merge_outputs<T: MarfTrieId + Send + Sync>(
     // ---------------------------------------------------------------
     // Step 2.5: FullHistory leaf replacement
     // ---------------------------------------------------------------
-    if full_history {
+    //
+    // FullHistory mode (per design doc §7) runs three sub-phases:
+    //  - A: collect_history_parallel (in-memory transition map)
+    //  - A.5: baseline lookup (synthetic min_height-1 entries for inherited keys)
+    //  - A.6: chunk emission (one chunk per distinct key → tmp history blob)
+    //  - B: leaf rewrite (each squashable leaf → subtype-2 TrieLeafSquashed
+    //       referencing its key's chunk via ChunkRef)
+    //
+    // The returned `Option<PathBuf>` is the tmp path of the staged history
+    // blob (footer-validated, fsync'd). The publish path renames it to
+    // the canonical `marf-history-level-{...}-blob-{blob_offset:016x}.dat`
+    // once `blob_offset` is reserved (§9.2 step 2). `None` means there were
+    // no squashable leaves (e.g. trivial range with all dominated-single
+    // keys); the level publishes with `history_blob_state = NeverWritten`.
+    let history_blob_staged: Option<
+        crate::chainstate::stacks::index::history_blob::StagedHistoryBlob,
+    > = if full_history {
         replace_leaves_full_history(
             &mut *marf,
             &tip_block,
@@ -5011,8 +5860,15 @@ pub(crate) fn prepare_merge_outputs<T: MarfTrieId + Send + Sync>(
             &leaf_key_hashes,
             stats,
             timings,
-        )?;
-    }
+        )?
+    } else {
+        None
+    };
+    let history_blob_state = if history_blob_staged.is_some() {
+        HistoryBlobState::Present
+    } else {
+        HistoryBlobState::NeverWritten
+    };
 
     // Mark the boundary between FullHistory leaf replacement and Step 3+4 (pointer remap + offset
     // compute) so we can attribute time to the structural prep that runs before publish_squash.
@@ -5184,6 +6040,8 @@ pub(crate) fn prepare_merge_outputs<T: MarfTrieId + Send + Sync>(
         orphan_split_offset,
         sidecar_published,
         translation_map,
+        history_blob_state,
+        history_blob: history_blob_staged,
     };
 
     // Annotate the dfs_ms timing now that the prep is complete.
@@ -5327,6 +6185,9 @@ pub fn create_stub_level<T: MarfTrieId>(
             // Stub levels have no nodes and therefore no orphans.
             orphan_split_offset: 0,
             published_max_block_id: watermark,
+            // Stub levels have no FullHistory artifacts — no carrier emitted,
+            // no history blob written.
+            history_blob_state: HistoryBlobState::NeverWritten,
         };
         trie_sql::write_squash_level(storage.sqlite_conn(), &row)?;
         offset
@@ -5536,6 +6397,7 @@ mod tests {
             root_sidecar_trimmed: false,
             orphan_split_offset: 0,
             published_max_block_id: 0,
+            history_blob_state: HistoryBlobState::NeverWritten,
         }
     }
 
@@ -5688,6 +6550,7 @@ mod tests {
             collect_history_ms: 2,
             baseline_ms: 3,
             baseline_keys: 4,
+            chunk_emit_ms: 15,
             leaf_replace_ms: 5,
             leaf_replace_flush_ms: 6,
             remap_ms: 7,
@@ -5703,6 +6566,7 @@ mod tests {
         assert!(s.contains("dfs=1,"), "missing dfs in: {s}");
         assert!(s.contains("collect_history=2,"));
         assert!(s.contains("baseline=3(4 keys),"));
+        assert!(s.contains("chunk_emit=15,"), "missing chunk_emit in: {s}");
         assert!(s.contains("leaf_replace=5,"));
         assert!(s.contains("leaf_replace_flush=6,"));
         assert!(s.contains("remap=7,"));
@@ -5893,6 +6757,7 @@ mod tests {
                 root_sidecar_trimmed: false,
                 orphan_split_offset: 0,
                 published_max_block_id: 0,
+                history_blob_state: HistoryBlobState::NeverWritten,
             },
             SquashLevelRow {
                 level_id: 1,
@@ -5905,6 +6770,7 @@ mod tests {
                 root_sidecar_trimmed: false,
                 orphan_split_offset: 0,
                 published_max_block_id: 0,
+                history_blob_state: HistoryBlobState::NeverWritten,
             },
         ];
         // Top prior is level_id=1 ending at offset 1500.
@@ -5913,7 +6779,18 @@ mod tests {
 
     #[test]
     fn build_published_level_row_records_reclaim_and_sidecar() {
-        let row = build_published_level_row(7, 100, 199, 4096, 16384, true, true, 12345, 4321);
+        let row = build_published_level_row(
+            7,
+            100,
+            199,
+            4096,
+            16384,
+            true,
+            true,
+            12345,
+            4321,
+            HistoryBlobState::Present,
+        );
         assert_eq!(row.level_id, 7);
         assert_eq!(row.min_height, 100);
         assert_eq!(row.max_height, 199);
@@ -5925,15 +6802,28 @@ mod tests {
         assert!(!row.root_sidecar_trimmed);
         assert_eq!(row.orphan_split_offset, 12345);
         assert_eq!(row.published_max_block_id, 4321);
+        assert_eq!(row.history_blob_state, HistoryBlobState::Present);
     }
 
     #[test]
     fn build_published_level_row_no_reclaim_no_sidecar() {
-        let row = build_published_level_row(0, 0, 0, 0, 0, false, false, 0, 0);
+        let row = build_published_level_row(
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+            false,
+            0,
+            0,
+            HistoryBlobState::NeverWritten,
+        );
         assert!(!row.reads_redirected);
         assert!(!row.root_sidecar_present);
         assert!(!row.root_sidecar_trimmed);
         assert_eq!(row.published_max_block_id, 0);
+        assert_eq!(row.history_blob_state, HistoryBlobState::NeverWritten);
     }
 
     #[test]

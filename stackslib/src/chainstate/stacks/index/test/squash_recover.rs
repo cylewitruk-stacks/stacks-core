@@ -224,6 +224,9 @@ fn build_committable_plan_setup(
             root_sidecar_trimmed: false,
             orphan_split_offset: 0,
             published_max_block_id: block_id_b,
+            history_blob_state:
+                crate::chainstate::stacks::index::squash::HistoryBlobState::NeverWritten,
+            history_blob_tmp_path: String::new(),
         },
         in_range_blocks: vec![
             InRangeBlock {
