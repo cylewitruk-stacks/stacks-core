@@ -60,7 +60,7 @@ use crate::net::http::{
     HttpResponsePreamble,
 };
 use crate::net::httpcore::RPCRequestHandler;
-use crate::net::{Error as NetError, StacksNodeState};
+use crate::net::{rpc_services, Error as NetError, StacksNodeState};
 use crate::util_lib::db::Error as db_error;
 
 /// Test flag to stall block validation per endpoint with a matching passphrase
@@ -347,7 +347,7 @@ pub fn is_event_pox_addr_valid(is_mainnet: bool, event: &StacksTransactionEvent)
 }
 
 impl NakamotoBlockProposal {
-    fn spawn_validation_thread(
+    pub(crate) fn spawn_validation_thread(
         self,
         sortdb: SortitionDB,
         mut chainstate: StacksChainState,
@@ -1232,77 +1232,56 @@ impl RPCRequestHandler for RPCBlockProposalRequestHandler {
         );
 
         let res = node.with_node_state(|network, sortdb, chainstate, _mempool, rpc_args| {
-            if network.is_proposal_thread_running() {
-                return Err((
-                    TOO_MANY_REQUESTS_STATUS,
-                    NetError::SendError("Proposal currently being evaluated".into()),
-                ));
-            }
-
-            if block_proposal
-                .block
-                .header
-                .timestamp
-                .saturating_add(network.get_connection_opts().block_proposal_max_age_secs)
-                < get_epoch_time_secs()
-            {
-                return Err((
-                    422,
-                    NetError::SendError("Block proposal is too old to process.".into()),
-                ));
-            }
-
-            let (chainstate, _) = chainstate.reopen().map_err(|e| (400, NetError::from(e)))?;
-            let sortdb = sortdb.reopen().map_err(|e| (400, NetError::from(e)))?;
-            let receiver = rpc_args
-                .event_observer
-                .and_then(|observer| observer.get_proposal_callback_receiver())
-                .ok_or_else(|| {
-                    (
-                        400,
-                        NetError::SendError(
-                            "No `observer` registered for receiving proposal callbacks".into(),
-                        ),
-                    )
-                })?;
-            let thread_info = block_proposal
-                .spawn_validation_thread(
-                    sortdb,
-                    chainstate,
-                    receiver,
-                    network.get_connection_opts(),
-                )
-                .map_err(|_e| {
-                    (
-                        TOO_MANY_REQUESTS_STATUS,
-                        NetError::SendError(
-                            "IO error while spawning proposal callback thread".into(),
-                        ),
-                    )
-                })?;
-            network.set_proposal_thread(thread_info);
-            Ok(())
+            rpc_services::start_block_proposal_validation(
+                network,
+                sortdb,
+                chainstate,
+                rpc_args,
+                block_proposal,
+            )
         });
 
         match res {
-            Ok(_) => {
+            Ok(rpc_services::BlockProposalAccepted) => {
                 let preamble = HttpResponsePreamble::accepted_json(&preamble);
-                let body = HttpResponseContents::try_from_json(&serde_json::json!({
-                    "result": "Accepted",
-                    "message": "Block proposal is processing, result will be returned via the event observer"
-                }))?;
+                let response = accepted_block_proposal_response();
+                let body = HttpResponseContents::try_from_json(&response)?;
                 Ok((preamble, body))
             }
-            Err((code, err)) => {
-                let preamble = HttpResponsePreamble::error_json(code, http_reason(code));
+            Err(err) => {
+                let status_code = block_proposal_error_status(&err);
+                let preamble =
+                    HttpResponsePreamble::error_json(status_code, http_reason(status_code));
                 let body = HttpResponseContents::try_from_json(&serde_json::json!({
                     "result": "Error",
-                    "message": format!("Could not process block proposal request: {err}")
+                    "message": block_proposal_error_message(&err)
                 }))?;
                 Ok((preamble, body))
             }
         }
     }
+}
+
+fn accepted_block_proposal_response() -> BlockProposalResponse {
+    BlockProposalResponse {
+        result: BlockProposalResult::Accepted,
+        message: "Block proposal is processing, result will be returned via the event observer"
+            .to_string(),
+    }
+}
+
+fn block_proposal_error_status(error: &rpc_services::BlockProposalError) -> u16 {
+    match error {
+        rpc_services::BlockProposalError::AlreadyValidating
+        | rpc_services::BlockProposalError::SpawnFailed => TOO_MANY_REQUESTS_STATUS,
+        rpc_services::BlockProposalError::TooOld => 422,
+        rpc_services::BlockProposalError::Reopen(_)
+        | rpc_services::BlockProposalError::NoObserver => 400,
+    }
+}
+
+fn block_proposal_error_message(error: &rpc_services::BlockProposalError) -> String {
+    format!("Could not process block proposal request: {error}")
 }
 
 /// Decode the HTTP response
@@ -1314,5 +1293,40 @@ impl HttpResponse for RPCBlockProposalRequestHandler {
     ) -> Result<HttpResponsePayload, Error> {
         let response: BlockProposalResponse = parse_json(preamble, body)?;
         HttpResponsePayload::try_from_json(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::net::api::postblock_proposal::{
+        block_proposal_error_message, block_proposal_error_status, TOO_MANY_REQUESTS_STATUS,
+    };
+    use crate::net::rpc_services::BlockProposalError;
+
+    #[test]
+    fn block_proposal_error_mapping_preserves_legacy_status_and_message() {
+        let already_validating = BlockProposalError::AlreadyValidating;
+        assert_eq!(
+            block_proposal_error_status(&already_validating),
+            TOO_MANY_REQUESTS_STATUS
+        );
+        assert_eq!(
+            block_proposal_error_message(&already_validating),
+            "Could not process block proposal request: Proposal currently being evaluated"
+        );
+
+        let too_old = BlockProposalError::TooOld;
+        assert_eq!(block_proposal_error_status(&too_old), 422);
+        assert_eq!(
+            block_proposal_error_message(&too_old),
+            "Could not process block proposal request: Block proposal is too old to process."
+        );
+
+        let no_observer = BlockProposalError::NoObserver;
+        assert_eq!(block_proposal_error_status(&no_observer), 400);
+        assert_eq!(
+            block_proposal_error_message(&no_observer),
+            "Could not process block proposal request: No `observer` registered for receiving proposal callbacks"
+        );
     }
 }

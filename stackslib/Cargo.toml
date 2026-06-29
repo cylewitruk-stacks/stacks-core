@@ -76,6 +76,7 @@ insta = { version = "1.37.0", features = ["ron"] }
 
 [features]
 default = []
+axum-rpc = []
 profile-sqlite = []
 disable-costs = []
 developer-mode = ["clarity/developer-mode"]

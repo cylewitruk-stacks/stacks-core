@@ -106,12 +106,50 @@ impl MarfedKV {
         Ok(marf)
     }
 
+    fn setup_db_readonly(
+        path_str: &str,
+        marf_opts: Option<MARFOpenOpts>,
+    ) -> Result<MARF<StacksBlockId>, VmExecutionError> {
+        let mut path = PathBuf::from(path_str);
+        path.push("marf.sqlite");
+        let marf_path = path
+            .to_str()
+            .ok_or_else(|| VmInternalError::BadFileName)?
+            .to_string();
+
+        let mut marf_opts = marf_opts.unwrap_or(MARFOpenOpts::default());
+        marf_opts.external_blobs = true;
+
+        test_override_marf_compression(&mut marf_opts);
+
+        MARF::from_path_readonly(&marf_path, marf_opts)
+            .map_err(|err| VmInternalError::MarfFailure(err.to_string()).into())
+    }
+
     pub fn open(
         path_str: &str,
         miner_tip: Option<&StacksBlockId>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<MarfedKV, VmExecutionError> {
         let marf = MarfedKV::setup_db(path_str, false, marf_opts)?;
+        let chain_tip = match miner_tip {
+            Some(miner_tip) => miner_tip.clone(),
+            None => StacksBlockId::sentinel(),
+        };
+
+        Ok(MarfedKV {
+            marf,
+            chain_tip,
+            ephemeral_marf: None,
+        })
+    }
+
+    pub fn open_readonly(
+        path_str: &str,
+        miner_tip: Option<&StacksBlockId>,
+        marf_opts: Option<MARFOpenOpts>,
+    ) -> Result<MarfedKV, VmExecutionError> {
+        let marf = MarfedKV::setup_db_readonly(path_str, marf_opts)?;
         let chain_tip = match miner_tip {
             Some(miner_tip) => miner_tip.clone(),
             None => StacksBlockId::sentinel(),

@@ -11,6 +11,7 @@ members = [
     "libstackerdb",
     "libsigner",
     "stacks-signer",
+    "stacks-rpc",
     "stacks-node",
     "stacks-profiler",
     "stacks-profiler-macros",

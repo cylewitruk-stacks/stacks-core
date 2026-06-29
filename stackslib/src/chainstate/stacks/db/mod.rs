@@ -1234,6 +1234,24 @@ impl StacksChainState {
         }
     }
 
+    fn open_db_readonly(
+        mainnet: bool,
+        chain_id: u32,
+        index_path: &str,
+        marf_opts: Option<MARFOpenOpts>,
+    ) -> Result<MARF<StacksBlockId>, Error> {
+        if fs::metadata(index_path).is_err() {
+            return Err(Error::DBError(db_error::NoDBError));
+        }
+
+        let marf = StacksChainState::open_index_readonly(index_path, marf_opts)?;
+        if Self::need_schema_migrations(marf.sqlite_conn(), mainnet, chain_id)? {
+            return Err(Error::DBError(db_error::OldSchema(0)));
+        }
+
+        Ok(marf)
+    }
+
     #[cfg(test)]
     pub fn open_db_without_migrations(
         mainnet: bool,
@@ -1280,6 +1298,22 @@ impl StacksChainState {
         open_opts.external_blobs = true;
         test_override_marf_compression(&mut open_opts);
         let marf = MARF::from_path(marf_path, open_opts).map_err(db_error::IndexError)?;
+        Ok(marf)
+    }
+
+    /// Open the chainstate MARF index database in read-only mode.
+    ///
+    /// Similar to [`open_index()`](Self::open_index), this function opens the SQLite-based MARF
+    /// index at `marf_path` in read-only mode.
+    pub fn open_index_readonly(
+        marf_path: &str,
+        marf_opts: Option<MARFOpenOpts>,
+    ) -> Result<MARF<StacksBlockId>, db_error> {
+        test_debug!("Open read-only MARF index at {}", marf_path);
+        let mut open_opts = marf_opts.unwrap_or(MARFOpenOpts::default());
+        open_opts.external_blobs = true;
+        test_override_marf_compression(&mut open_opts);
+        let marf = MARF::from_path_readonly(marf_path, open_opts).map_err(db_error::IndexError)?;
         Ok(marf)
     }
 
@@ -1832,7 +1866,18 @@ impl StacksChainState {
         path_str: &str,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
-        StacksChainState::open_and_exec(mainnet, chain_id, path_str, None, marf_opts)
+        StacksChainState::open_with_mode(mainnet, chain_id, path_str, None, marf_opts, false)
+    }
+
+    pub fn open_readonly(
+        mainnet: bool,
+        chain_id: u32,
+        path_str: &str,
+        marf_opts: Option<MARFOpenOpts>,
+    ) -> Result<StacksChainState, Error> {
+        let (chainstate, _) =
+            StacksChainState::open_with_mode(mainnet, chain_id, path_str, None, marf_opts, true)?;
+        Ok(chainstate)
     }
 
     /// Re-open the chainstate -- i.e. to get a new handle to it using an existing chain state's
@@ -1911,7 +1956,22 @@ impl StacksChainState {
         boot_data: Option<&mut ChainStateBootData>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
-        StacksChainState::make_chainstate_dirs(path_str)?;
+        StacksChainState::open_with_mode(mainnet, chain_id, path_str, boot_data, marf_opts, false)
+    }
+
+    fn open_with_mode(
+        mainnet: bool,
+        chain_id: u32,
+        path_str: &str,
+        boot_data: Option<&mut ChainStateBootData>,
+        marf_opts: Option<MARFOpenOpts>,
+        readonly: bool,
+    ) -> Result<(StacksChainState, Vec<StacksTransactionReceipt>), Error> {
+        if readonly {
+            fs::metadata(path_str).map_err(|_| Error::DBError(db_error::NoDBError))?;
+        } else {
+            StacksChainState::make_chainstate_dirs(path_str)?;
+        }
         let path = PathBuf::from(path_str);
         let blocks_path = StacksChainState::blocks_path(path.clone());
         let blocks_path_root = blocks_path
@@ -1941,22 +2001,41 @@ impl StacksChainState {
 
         let nakamoto_staging_blocks_path =
             StacksChainState::static_get_nakamoto_staging_blocks_path(path)?;
-        let nakamoto_staging_blocks_conn =
-            StacksChainState::open_nakamoto_staging_blocks(&nakamoto_staging_blocks_path, true)?;
+        let nakamoto_staging_blocks_conn = StacksChainState::open_nakamoto_staging_blocks(
+            &nakamoto_staging_blocks_path,
+            !readonly,
+        )?;
 
         let init_required = fs::metadata(&clarity_state_index_marf).is_err();
 
-        let state_index =
-            StacksChainState::open_db(mainnet, chain_id, &header_index_root, marf_opts.clone())?;
+        let state_index = if readonly {
+            StacksChainState::open_db_readonly(
+                mainnet,
+                chain_id,
+                &header_index_root,
+                marf_opts.clone(),
+            )?
+        } else {
+            StacksChainState::open_db(mainnet, chain_id, &header_index_root, marf_opts.clone())?
+        };
 
-        let vm_state = MarfedKV::open(
-            &clarity_state_index_root,
-            Some(&StacksBlockHeader::make_index_block_hash(
-                &MINER_BLOCK_CONSENSUS_HASH,
-                &MINER_BLOCK_HEADER_HASH,
-            )),
-            marf_opts.clone(),
-        )
+        let miner_tip = StacksBlockHeader::make_index_block_hash(
+            &MINER_BLOCK_CONSENSUS_HASH,
+            &MINER_BLOCK_HEADER_HASH,
+        );
+        let vm_state = if readonly {
+            MarfedKV::open_readonly(
+                &clarity_state_index_root,
+                Some(&miner_tip),
+                marf_opts.clone(),
+            )
+        } else {
+            MarfedKV::open(
+                &clarity_state_index_root,
+                Some(&miner_tip),
+                marf_opts.clone(),
+            )
+        }
         .map_err(|e| Error::ClarityError(e.into()))?;
 
         let clarity_state = ClarityInstance::new(mainnet, chain_id, vm_state);
@@ -3008,6 +3087,42 @@ pub mod test {
                 StacksChainState::get_contract(&mut conn, &boot_contract_id).unwrap();
             assert!(contract_res.is_some());
         }
+    }
+
+    #[test]
+    fn test_open_readonly_chainstate() {
+        let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
+        let mut readonly_chainstate = StacksChainState::open_readonly(
+            false,
+            0x80000000,
+            &chainstate.root_path,
+            chainstate.marf_opts.clone(),
+        )
+        .unwrap();
+
+        let genesis_tip = StacksBlockHeader::make_index_block_hash(
+            &FIRST_BURNCHAIN_CONSENSUS_HASH,
+            &FIRST_STACKS_BLOCK_HASH,
+        );
+        let boot_contract_id = QualifiedContractIdentifier::new(
+            boot_code_test_addr().into(),
+            ContractName::try_from("pox".to_string()).unwrap(),
+        );
+        let contract_res = readonly_chainstate
+            .with_read_only_clarity_tx(&TEST_BURN_STATE_DB, &genesis_tip, |conn| {
+                StacksChainState::get_contract(conn, &boot_contract_id).unwrap()
+            })
+            .expect("read-only chainstate should open the genesis tip");
+        assert!(contract_res.is_some());
+
+        let readonly_tx = readonly_chainstate.db_tx_begin().unwrap();
+        assert!(readonly_tx
+            .execute(
+                "CREATE TABLE stacks_rpc_readonly_test (id INTEGER)",
+                NO_PARAMS
+            )
+            .is_err());
+        assert!(chainstate.db_tx_begin().is_ok());
     }
 
     #[test]

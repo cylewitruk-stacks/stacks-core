@@ -5043,7 +5043,26 @@ impl StacksNode {
             .expect("FATAL: failed to start relayer thread");
 
         let p2p_event_dispatcher = runloop.get_event_dispatcher();
+        #[cfg(feature = "axum-rpc")]
+        let axum_rpc_server = config.node.axum_rpc_bind_addr().and_then(|bind_addr| {
+            match stacks_rpc::prepare_axum_rpc_server(crate::make_axum_rpc_config(
+                &config, bind_addr,
+            )) {
+                Ok((server, receivers)) => {
+                    p2p_net.install_axum_rpc_receivers(receivers);
+                    Some(server)
+                }
+                Err(e) => {
+                    warn!("Failed to prepare experimental Axum RPC server: {e:?}");
+                    None
+                }
+            }
+        });
         let p2p_thread = PeerThread::new(runloop, p2p_net);
+        #[cfg(feature = "axum-rpc")]
+        if let Some(server) = axum_rpc_server {
+            server.spawn();
+        }
         let p2p_thread_handle = thread::Builder::new()
             .stack_size(BLOCK_PROCESSOR_STACK_SIZE)
             .name(format!(

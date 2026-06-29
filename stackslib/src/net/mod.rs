@@ -102,6 +102,9 @@ pub mod poll;
 pub mod prune;
 pub mod relay;
 pub mod rpc;
+#[cfg(feature = "axum-rpc")]
+pub mod rpc_domains;
+pub mod rpc_services;
 pub mod server;
 pub mod stackerdb;
 pub mod unsolicited;

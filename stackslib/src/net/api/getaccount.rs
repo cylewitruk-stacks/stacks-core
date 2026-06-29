@@ -14,8 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use clarity::vm::clarity::ClarityConnection;
-use clarity::vm::database::{ClarityDatabase, STXBalance};
 use clarity::vm::representations::PRINCIPAL_DATA_REGEX_STRING;
 use clarity::vm::types::PrincipalData;
 use regex::{Captures, Regex};
@@ -23,12 +21,14 @@ use stacks_common::types::net::PeerHost;
 use stacks_common::util::hash::to_hex;
 
 use crate::net::http::{
-    parse_json, Error, HttpNotFound, HttpRequest, HttpRequestContents, HttpRequestPreamble,
-    HttpResponse, HttpResponseContents, HttpResponsePayload, HttpResponsePreamble,
+    parse_json, Error, HttpBadRequest, HttpNotFound, HttpRequest, HttpRequestContents,
+    HttpRequestPreamble, HttpResponse, HttpResponseContents, HttpResponsePayload,
+    HttpResponsePreamble, HttpServerError,
 };
 use crate::net::httpcore::{
     HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttpRequest, StacksHttpResponse,
 };
+use crate::net::rpc_services::{self, AccountView, ProofBytes, RpcServiceError};
 use crate::net::{Error as NetError, StacksNodeState, TipRequest};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +43,31 @@ pub struct AccountEntryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub nonce_proof: Option<String>,
+}
+
+impl From<AccountView> for AccountEntryResponse {
+    fn from(account: AccountView) -> Self {
+        Self {
+            balance: hex_u128(account.balance),
+            locked: hex_u128(account.locked),
+            unlock_height: account.unlock_height,
+            nonce: account.nonce,
+            balance_proof: legacy_proof(account.balance_proof),
+            nonce_proof: legacy_proof(account.nonce_proof),
+        }
+    }
+}
+
+fn hex_u128(value: u128) -> String {
+    format!("0x{}", to_hex(&value.to_be_bytes()))
+}
+
+fn legacy_proof(proof: ProofBytes) -> Option<String> {
+    match proof {
+        ProofBytes::NotRequested => None,
+        ProofBytes::Missing => Some(String::new()),
+        ProofBytes::Present(bytes) => Some(format!("0x{}", to_hex(&bytes))),
+    }
 }
 
 #[derive(Clone)]
@@ -117,105 +142,34 @@ impl RPCRequestHandler for RPCGetAccountRequestHandler {
         contents: HttpRequestContents,
         node: &mut StacksNodeState,
     ) -> Result<(HttpResponsePreamble, HttpResponseContents), NetError> {
-        let tip = match node.load_stacks_chain_tip(&preamble, &contents) {
-            Ok(tip) => tip,
-            Err(error_resp) => {
-                return error_resp.try_into_contents().map_err(NetError::from);
-            }
-        };
+        let tip_req = contents.tip_request();
         let account = self
             .account
             .take()
             .ok_or(NetError::SendError("Missing `account`".into()))?;
         let with_proof = contents.get_with_proof();
-
-        let account_opt_res =
+        let account_res =
             node.with_node_state(|_network, sortdb, chainstate, _mempool, _rpc_args| {
-                chainstate.maybe_read_only_clarity_tx(
-                    &sortdb.index_handle_at_block(chainstate, &tip)?,
-                    &tip,
-                    |clarity_tx| {
-                        clarity_tx.with_clarity_db_readonly(|clarity_db| {
-                            let key = ClarityDatabase::make_key_for_account_balance(&account);
-                            let burn_block_height =
-                                clarity_db.get_current_burnchain_block_height().ok()? as u64;
-                            let v1_unlock_height = clarity_db.get_v1_unlock_height();
-                            let v2_unlock_height = clarity_db.get_v2_unlock_height().ok()?;
-                            let v3_unlock_height = clarity_db.get_v3_unlock_height().ok()?;
-                            let (balance, balance_proof) = if with_proof {
-                                clarity_db
-                                    .get_data_with_proof::<STXBalance>(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|(a, b)| (a, Some(format!("0x{}", to_hex(&b)))))
-                                    .unwrap_or_else(|| (STXBalance::zero(), Some("".into())))
-                            } else {
-                                clarity_db
-                                    .get_data::<STXBalance>(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|a| (a, None))
-                                    .unwrap_or_else(|| (STXBalance::zero(), None))
-                            };
-
-                            let key = ClarityDatabase::make_key_for_account_nonce(&account);
-                            let (nonce, nonce_proof) = if with_proof {
-                                clarity_db
-                                    .get_data_with_proof(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|(a, b)| (a, Some(format!("0x{}", to_hex(&b)))))
-                                    .unwrap_or_else(|| (0, Some("".into())))
-                            } else {
-                                clarity_db
-                                    .get_data(&key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|a| (a, None))
-                                    .unwrap_or_else(|| (0, None))
-                            };
-
-                            let unlocked = balance
-                                .get_available_balance_at_burn_block(
-                                    burn_block_height,
-                                    v1_unlock_height,
-                                    v2_unlock_height,
-                                    v3_unlock_height,
-                                )
-                                .ok()?;
-
-                            let (locked, unlock_height) = balance.get_locked_balance_at_burn_block(
-                                burn_block_height,
-                                v1_unlock_height,
-                                v2_unlock_height,
-                                v3_unlock_height,
-                            );
-
-                            let balance = format!("0x{}", to_hex(&unlocked.to_be_bytes()));
-                            let locked = format!("0x{}", to_hex(&locked.to_be_bytes()));
-
-                            Some(AccountEntryResponse {
-                                balance,
-                                locked,
-                                unlock_height,
-                                nonce,
-                                balance_proof,
-                                nonce_proof,
-                            })
-                        })
-                    },
-                )
+                rpc_services::get_account(sortdb, chainstate, &account, &tip_req, with_proof)
             });
 
-        let account = if let Ok(Some(account)) = account_opt_res {
-            account
-        } else {
-            return StacksHttpResponse::new_error(
-                &preamble,
-                &HttpNotFound::new(format!("Chain tip '{}' not found", &tip)),
-            )
-            .try_into_contents()
-            .map_err(NetError::from);
+        let account = match account_res {
+            Ok(account) => AccountEntryResponse::from(account),
+            Err(RpcServiceError::BadRequest(msg)) => {
+                return StacksHttpResponse::new_error(&preamble, &HttpBadRequest::new(msg))
+                    .try_into_contents()
+                    .map_err(NetError::from);
+            }
+            Err(RpcServiceError::NotFound(msg)) => {
+                return StacksHttpResponse::new_error(&preamble, &HttpNotFound::new(msg))
+                    .try_into_contents()
+                    .map_err(NetError::from);
+            }
+            Err(RpcServiceError::Internal(msg)) => {
+                return StacksHttpResponse::new_error(&preamble, &HttpServerError::new(msg))
+                    .try_into_contents()
+                    .map_err(NetError::from);
+            }
         };
 
         let preamble = HttpResponsePreamble::ok_json(&preamble);
@@ -263,5 +217,28 @@ impl StacksHttpResponse {
         let resp: AccountEntryResponse = serde_json::from_value(contents_json)
             .map_err(|_e| NetError::DeserializeError("Failed to load from JSON".to_string()))?;
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccountEntryResponse;
+    use crate::net::rpc_services::{AccountView, ProofBytes};
+
+    #[test]
+    fn account_view_preserves_legacy_missing_proof_shape() {
+        let response = AccountEntryResponse::from(AccountView {
+            balance: 42,
+            locked: 0,
+            unlock_height: 0,
+            nonce: 3,
+            balance_proof: ProofBytes::Missing,
+            nonce_proof: ProofBytes::Present(vec![0xab, 0xcd]),
+        });
+
+        assert_eq!(response.balance, "0x0000000000000000000000000000002a");
+        assert_eq!(response.locked, "0x00000000000000000000000000000000");
+        assert_eq!(response.balance_proof, Some(String::new()));
+        assert_eq!(response.nonce_proof, Some("0xabcd".to_string()));
     }
 }
