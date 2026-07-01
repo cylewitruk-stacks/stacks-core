@@ -19,7 +19,7 @@ use clarity::vm::contexts::{ExecutionState, GlobalContext};
 use clarity::vm::costs::cost_functions::ClarityCostFunction;
 use clarity::vm::costs::runtime_cost;
 use clarity::vm::database::{ClarityDatabase, STXBalance};
-use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
+use clarity::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::events::{STXEventType, STXLockEventData, StacksTransactionEvent};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use clarity::vm::Value;
@@ -400,6 +400,17 @@ pub fn handle_contract_call(
         // Update the asset map to reflect the delegation
         match (sender_opt, args.first()) {
             (Some(sender), Some(Value::UInt(amount))) => {
+                // Reject any transaction that would overwrite an
+                // existing asset-map stacking entry for `sender`.
+                if global_context
+                    .get_readonly_asset_map()?
+                    .get_stacking(sender)
+                    .is_some()
+                {
+                    return Err(VmExecutionError::from(
+                        RuntimeCheckErrorKind::PoxStxAssetMapOverwrite,
+                    ));
+                }
                 global_context.log_stacking(sender, *amount)?;
             }
             _ => {
@@ -440,7 +451,7 @@ mod tests {
     use clarity::vm::database::MemoryBackingStore;
     use clarity::vm::errors::{RuntimeError, VmExecutionError};
     use clarity::vm::types::{StandardPrincipalData, TupleData};
-    use clarity::vm::Value;
+    use clarity::vm::{ClarityName, Value};
 
     use crate::pox_4::{handle_contract_call, POX_4_NAME};
 
@@ -492,9 +503,18 @@ mod tests {
         // (stacker, lock-amount, unlock-height) tuple
         let stack_stx_response = Value::okay(Value::Tuple(
             TupleData::from_data(vec![
-                ("stacker".into(), Value::Principal(stacker.clone())),
-                ("lock-amount".into(), Value::UInt(100_000_000)), // trying to lock 100 more STX
-                ("unlock-burn-height".into(), Value::UInt(15_000)),
+                (
+                    ClarityName::from_literal("stacker"),
+                    Value::Principal(stacker.clone()),
+                ),
+                (
+                    ClarityName::from_literal("lock-amount"),
+                    Value::UInt(100_000_000),
+                ), // trying to lock 100 more STX
+                (
+                    ClarityName::from_literal("unlock-burn-height"),
+                    Value::UInt(15_000),
+                ),
             ])
             .unwrap(),
         ))

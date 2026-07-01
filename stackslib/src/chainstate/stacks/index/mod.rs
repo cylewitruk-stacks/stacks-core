@@ -32,6 +32,7 @@ use crate::chainstate::stacks::index::storage::TrieStorageConnection;
 use crate::util_lib::db::Error as db_error;
 
 pub mod bits;
+pub mod blob_layout;
 pub mod cache;
 pub mod file;
 pub mod marf;
@@ -39,6 +40,7 @@ pub mod node;
 pub mod profile;
 pub mod proofs;
 pub mod scratch;
+pub mod squash;
 pub mod storage;
 pub mod trie;
 pub mod trie_sql;
@@ -219,6 +221,17 @@ pub trait MarfTrieId:
 {
 }
 
+/// One confirmed `marf_data` row, as loaded by
+/// [`trie_sql::bulk_read_block_entries`].
+#[derive(Debug, Clone)]
+pub struct MarfDataEntry<T> {
+    /// SQLite rowid of the block in `marf_data`.
+    pub block_id: u32,
+    pub block_hash: T,
+    /// Byte offset of the block's trie blob in external `.blobs` storage.
+    pub external_offset: u64,
+}
+
 pub const SENTINEL_ARRAY: [u8; 32] = [255u8; 32];
 
 macro_rules! impl_clarity_marf_trie_id {
@@ -396,6 +409,21 @@ pub enum Error {
     OverflowError,
     Patch(Option<TrieHash>, TrieNodePatch),
     NodeTooDeep,
+    /// Read at a block strictly below the squash height of a squashed MARF.
+    /// The squashed MARF only retains the canonical state at H, so per-block
+    /// historical reads in `0..H` cannot be served.
+    HistoricalReadInSquashedRange {
+        block_height: u32,
+        squash_height: u32,
+    },
+    /// Operation is not supported on a squashed MARF (e.g. proof generation).
+    UnsupportedOnSquashedMarf(&'static str),
+    /// Operation requires a different `TrieFile` backing. Carries the
+    /// operation name.
+    UnsupportedTrieFileType(&'static str),
+    /// A destination path required to be empty already exists. Carries the
+    /// offending path.
+    DestinationExists(String),
 }
 
 /// A borrowed slice of serialized trie node bytes (e.g. from an mmap'd blob).
@@ -596,6 +624,8 @@ pub trait NodeDecodeScratch {
 
     /// Get a borrowed reference to the currently-decoded node.
     fn get_ref(&self) -> TrieNodeRef<'_>;
+    /// Get transient metadata for the currently-decoded node, if any.
+    fn transient_meta(&self) -> Option<TrieNodeTransientMeta>;
     /// Get the decoded patch node.
     fn patch(&self) -> &TrieNodePatch;
     /// Take ownership of the decoded patch node, leaving the slot empty. Avoids cloning when the
@@ -715,6 +745,36 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
 
     /// Read the node type ID and hash at `ptr`, without decoding the full node.
     fn read_node_type_id(&mut self, ptr: &TriePtr) -> Result<(TrieNodeID, TrieHash), Error>;
+
+    /// Returns true when this storage represents a squashed MARF.
+    fn is_squashed(&self) -> bool {
+        false
+    }
+
+    /// MARF height at the squash boundary, if this storage is squashed.
+    fn squash_height(&self) -> Option<u32> {
+        None
+    }
+
+    /// Read a historical MARF root hash from squashed side-table metadata.
+    fn squashed_block_root_hash_by_height(&self, _height: u32) -> Result<Option<TrieHash>, Error> {
+        Ok(None)
+    }
+
+    /// Read a historical block height from squashed side-table metadata.
+    fn squashed_block_height(&self, _block_hash: &T) -> Result<Option<u32>, Error> {
+        Ok(None)
+    }
+
+    /// Read a historical block hash from squashed side-table metadata.
+    fn squashed_block_hash_by_height(&self, _height: u32) -> Result<Option<T>, Error> {
+        Ok(None)
+    }
+
+    /// Reject trie traversal below a squashed MARF's retained boundary.
+    fn check_historical_read_allowed(&self, _block_hash: &T) -> Result<(), Error> {
+        Ok(())
+    }
 
     /// Cache the ancestor hashes for a block (used during proof generation).
     fn set_cached_ancestor_hashes_bytes(&mut self, bhh: &T, bytes: Vec<TrieHash>);
@@ -1128,6 +1188,26 @@ impl fmt::Display for Error {
                 write!(f, "Read patch node instead of expected node: {p:?}")
             }
             Error::NodeTooDeep => write!(f, "Node is too deeply buried under patches"),
+            Error::HistoricalReadInSquashedRange {
+                block_height,
+                squash_height,
+            } => write!(
+                f,
+                "Historical read at height {block_height} below squash height {squash_height} \
+                 is not supported on a squashed MARF"
+            ),
+            Error::UnsupportedOnSquashedMarf(op) => {
+                write!(f, "Operation `{op}` is not supported on a squashed MARF")
+            }
+            Error::UnsupportedTrieFileType(op) => {
+                write!(
+                    f,
+                    "Operation `{op}` is not supported by this TrieFile backing"
+                )
+            }
+            Error::DestinationExists(ref p) => {
+                write!(f, "Destination path already exists: {p}")
+            }
         }
     }
 }

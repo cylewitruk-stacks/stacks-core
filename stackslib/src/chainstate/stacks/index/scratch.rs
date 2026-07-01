@@ -16,7 +16,7 @@
 
 use crate::chainstate::stacks::index::node::{
     ParkedNodeHandle, TrieLeafRef, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
-    TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeType, TriePtr,
+    TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::{
     Error, NodeDecodeScratch, NodeParking, NodePatching, TrieLeaf, TrieNodeArena,
@@ -179,6 +179,54 @@ impl MarfReadState {
             TrieNodeID::Patch => {
                 unreachable!("BUG: patch nodes are never stored in decode scratch")
             }
+        }
+    }
+
+    pub fn transient_meta(&self) -> Option<TrieNodeTransientMeta> {
+        match self.current_id? {
+            TrieNodeID::Node4 => {
+                let n = self.node4.as_ref().expect("BUG: decode scratch lost node4");
+                Some(TrieNodeTransientMeta {
+                    cowptr: n.cowptr,
+                    patch_depth: n.patch_depth,
+                    last_patch_source: n.last_patch_source,
+                })
+            }
+            TrieNodeID::Node16 => {
+                let n = self
+                    .node16
+                    .as_ref()
+                    .expect("BUG: decode scratch lost node16");
+                Some(TrieNodeTransientMeta {
+                    cowptr: n.cowptr,
+                    patch_depth: n.patch_depth,
+                    last_patch_source: n.last_patch_source,
+                })
+            }
+            TrieNodeID::Node48 => {
+                let n = self
+                    .node48
+                    .as_ref()
+                    .expect("BUG: decode scratch lost node48");
+                Some(TrieNodeTransientMeta {
+                    cowptr: n.cowptr,
+                    patch_depth: n.patch_depth,
+                    last_patch_source: n.last_patch_source,
+                })
+            }
+            TrieNodeID::Node256 => {
+                let n = self
+                    .node256
+                    .as_ref()
+                    .expect("BUG: decode scratch lost node256");
+                Some(TrieNodeTransientMeta {
+                    cowptr: n.cowptr,
+                    patch_depth: n.patch_depth,
+                    last_patch_source: n.last_patch_source,
+                })
+            }
+            TrieNodeID::Leaf | TrieNodeID::Patch => None,
+            TrieNodeID::Empty => self.owned.as_ref().map(TrieNodeTransientMeta::from_node),
         }
     }
 
@@ -484,6 +532,10 @@ impl NodeDecodeScratch for MarfReadState {
 
     fn get_ref(&self) -> TrieNodeRef<'_> {
         MarfReadState::get_ref(self)
+    }
+
+    fn transient_meta(&self) -> Option<TrieNodeTransientMeta> {
+        MarfReadState::transient_meta(self)
     }
 
     fn patch(&self) -> &TrieNodePatch {

@@ -92,7 +92,8 @@ use stacks::net::api::postblock_proposal::{
     BlockValidateReject, BlockValidateResponse, NakamotoBlockProposal, ValidateRejectCode,
 };
 use stacks::types::chainstate::{ConsensusHash, StacksBlockId};
-use stacks::util::hash::hex_bytes;
+use stacks::types::{MinerDiagnosticData, MiningReason};
+use stacks::util::hash::{hex_bytes, MerkleTree};
 use stacks::util_lib::boot::boot_code_id;
 use stacks::util_lib::signed_structured_data::pox4::{
     make_pox_4_signer_key_signature, Pox4SignatureTopic,
@@ -509,7 +510,7 @@ pub fn blind_signer_multinode(
 pub fn get_latest_block_proposal(
     conf: &Config,
     sortdb: &SortitionDB,
-) -> Result<(NakamotoBlock, StacksPublicKey), String> {
+) -> Result<(NakamotoBlock, StacksPublicKey, Option<MinerDiagnosticData>), String> {
     let tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn()).unwrap();
     let (stackerdb_conf, miner_info) =
         NakamotoChainState::make_miners_stackerdb_config(sortdb, &tip)
@@ -529,38 +530,48 @@ pub fn get_latest_block_proposal(
         .enumerate()
         .zip(miner_ranges)
         .filter_map(|((miner_ix, (miner_addr, _)), miner_slot_id)| {
-            let proposed_block = {
+            let (proposed_block, miner_diagnostic_data) = {
                 let message: SignerMessageV0 =
                     miners_stackerdb.get_latest(miner_slot_id.start).ok()??;
                 let SignerMessageV0::BlockProposal(block_proposal) = message else {
                     warn!("Expected a block proposal. Got {message:?}");
                     return None;
                 };
-                block_proposal.block
+                (
+                    block_proposal.block,
+                    block_proposal.block_proposal_data.miner_diagnostic_data,
+                )
             };
-            Some((proposed_block, miner_addr, miner_ix == latest_miner))
+            Some((
+                proposed_block,
+                miner_addr,
+                miner_ix == latest_miner,
+                miner_diagnostic_data,
+            ))
         })
         .collect();
 
-    proposed_blocks.sort_by(|(block_a, _, is_latest_a), (block_b, _, is_latest_b)| {
-        let res = block_a
-            .header
-            .chain_length
-            .cmp(&block_b.header.chain_length);
-        if res != std::cmp::Ordering::Equal {
-            return res;
-        }
-        // the heights are tied, tie break with the latest miner
-        if *is_latest_a {
-            return std::cmp::Ordering::Greater;
-        }
-        if *is_latest_b {
-            return std::cmp::Ordering::Less;
-        }
-        std::cmp::Ordering::Equal
-    });
+    proposed_blocks.sort_by(
+        |(block_a, _, is_latest_a, _), (block_b, _, is_latest_b, _)| {
+            let res = block_a
+                .header
+                .chain_length
+                .cmp(&block_b.header.chain_length);
+            if res != std::cmp::Ordering::Equal {
+                return res;
+            }
+            // the heights are tied, tie break with the latest miner
+            if *is_latest_a {
+                return std::cmp::Ordering::Greater;
+            }
+            if *is_latest_b {
+                return std::cmp::Ordering::Less;
+            }
+            std::cmp::Ordering::Equal
+        },
+    );
 
-    for (b, _, is_latest) in proposed_blocks.iter() {
+    for (b, _, is_latest, _) in proposed_blocks.iter() {
         info!("Consider block";
             "signer_signature_hash" => %b.header.signer_signature_hash(),
             "is_latest_sortition" => is_latest,
@@ -568,11 +579,11 @@ pub fn get_latest_block_proposal(
         );
     }
 
-    let Some((proposed_block, miner_addr, _)) = proposed_blocks.pop() else {
+    let Some((proposed_block, miner_addr, _, miner_diagnostic_data)) = proposed_blocks.pop() else {
         return Err("No block proposals found".into());
     };
 
-    let pubkey = StacksPublicKey::recover_to_pubkey(
+    let pubkey = StacksPublicKey::recover_to_pubkey_without_validating_low_s(
         proposed_block.header.miner_signature_hash().as_bytes(),
         &proposed_block.header.miner_signature,
     )
@@ -586,7 +597,7 @@ pub fn get_latest_block_proposal(
         ));
     }
 
-    Ok((proposed_block, pubkey))
+    Ok((proposed_block, pubkey, miner_diagnostic_data))
 }
 
 pub fn read_and_sign_block_proposal(
@@ -767,6 +778,10 @@ where
     Ok(())
 }
 
+/// Wait until check returns Ok(true), if check ever returns an Err(), this
+///  method will immediately return that Err().
+///
+/// After timeout_seconds have passed, this function returns `Err("Timed out")`
 pub fn wait_for<F>(timeout_secs: u64, mut check: F) -> Result<(), String>
 where
     F: FnMut() -> Result<bool, String>,
@@ -3413,6 +3428,31 @@ fn block_proposal_api_endpoint() {
             HTTP_UNPROCESSABLE,
             None,
         ),
+        (
+            "High-S signature",
+            {
+                let mut p = proposal.clone();
+                p.block.txs[0] = p.block.txs[0].with_negated_s_in_signature();
+                // tweaking the signature changes the transaction id (which is
+                // the main problem with high-S signatures), so we need to update
+                // the transaction merkle root
+                let txid_vecs: Vec<_> = p
+                    .block
+                    .txs
+                    .iter()
+                    .map(|tx| tx.txid().as_bytes().to_vec())
+                    .collect();
+
+                let merkle_tree = MerkleTree::<Sha512Trunc256Sum>::new(&txid_vecs);
+                let tx_merkle_root = merkle_tree.root();
+
+                p.block.header.tx_merkle_root = tx_merkle_root;
+
+                sign(&p)
+            },
+            HTTP_ACCEPTED,
+            Some(Err(ValidateRejectCode::BadTransaction)),
+        ),
     ];
 
     // Build HTTP client
@@ -3487,7 +3527,9 @@ fn block_proposal_api_endpoint() {
 
     let expected_proposal_responses: Vec<_> = test_cases
         .iter()
-        .filter_map(|(_, _, _, expected_response)| expected_response.as_ref())
+        .filter_map(|(name, _, _, expected_response)| {
+            expected_response.as_ref().map(|resp| (name, resp))
+        })
         .collect();
 
     let mut proposal_responses = test_observer::get_proposal_responses();
@@ -3502,11 +3544,11 @@ fn block_proposal_api_endpoint() {
         proposal_responses = test_observer::get_proposal_responses();
     }
 
-    for (expected_response, response) in expected_proposal_responses
+    for ((test_case_name, expected_response), response) in expected_proposal_responses
         .iter()
         .zip(proposal_responses.iter())
     {
-        info!("Received response {response:?}, expecting {expected_response:?}");
+        info!("Received response {response:?} for test case \"{test_case_name}\", expecting {expected_response:?}");
         match expected_response {
             Ok(_) => {
                 assert!(matches!(response, BlockValidateResponse::Ok(_)));
@@ -3611,10 +3653,10 @@ fn miner_writes_proposed_block_to_stackerdb() {
     next_block_and_mine_commit(&mut btc_regtest_controller, 60, &naka_conf, &counters).unwrap();
 
     let sortdb = naka_conf.get_burnchain().open_sortition_db(true).unwrap();
+    let burn_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn());
 
-    let proposed_block = get_latest_block_proposal(&naka_conf, &sortdb)
-        .expect("Expected to find a proposed block in the StackerDB")
-        .0;
+    let (proposed_block, _, miner_diagnostic_data) = get_latest_block_proposal(&naka_conf, &sortdb)
+        .expect("Expected to find a proposed block in the StackerDB");
     let proposed_block_hash = format!("0x{}", proposed_block.header.block_hash());
 
     let mut proposed_zero_block = proposed_block.clone();
@@ -3654,6 +3696,19 @@ fn miner_writes_proposed_block_to_stackerdb() {
         format!("0x{}", observed_block.block_hash),
         proposed_zero_block_hash,
         "Observed miner hash should match the proposed block read from StackerDB (after zeroing signatures)"
+    );
+
+    let miner_diagnostic_data = miner_diagnostic_data
+        .expect("miner should have attached diagnostics data to block proposal");
+
+    assert_eq!(
+        miner_diagnostic_data.mining_reason,
+        MiningReason::BlockFound,
+    );
+
+    assert_eq!(
+        miner_diagnostic_data.burnchain_tip_height,
+        burn_tip.unwrap().block_height,
     );
 }
 
@@ -8464,7 +8519,7 @@ fn check_block_info() {
     let last_stacks_block_height = info.stacks_tip_height as u128;
     let last_stacks_tip = StacksBlockId::new(&info.stacks_tip_consensus_hash, &info.stacks_tip);
     let last_tenure_height: u128 =
-        NakamotoChainState::get_coinbase_height(&mut chainstate.index_conn(), &last_stacks_tip)
+        NakamotoChainState::get_coinbase_height_at(&mut chainstate.index_conn(), &last_stacks_tip)
             .unwrap()
             .unwrap()
             .into();
@@ -8487,7 +8542,7 @@ fn check_block_info() {
     let cur_stacks_block_height = info.stacks_tip_height as u128;
     let cur_stacks_tip = StacksBlockId::new(&info.stacks_tip_consensus_hash, &info.stacks_tip);
     let cur_tenure_height: u128 =
-        NakamotoChainState::get_coinbase_height(&mut chainstate.index_conn(), &cur_stacks_tip)
+        NakamotoChainState::get_coinbase_height_at(&mut chainstate.index_conn(), &cur_stacks_tip)
             .unwrap()
             .unwrap()
             .into();
@@ -8595,11 +8650,13 @@ fn check_block_info() {
     let info = get_chain_info(&naka_conf);
     let interim_stacks_block_height = info.stacks_tip_height as u128;
     let interim_stacks_tip = StacksBlockId::new(&info.stacks_tip_consensus_hash, &info.stacks_tip);
-    let interim_tenure_height: u128 =
-        NakamotoChainState::get_coinbase_height(&mut chainstate.index_conn(), &interim_stacks_tip)
-            .unwrap()
-            .unwrap()
-            .into();
+    let interim_tenure_height: u128 = NakamotoChainState::get_coinbase_height_at(
+        &mut chainstate.index_conn(),
+        &interim_stacks_tip,
+    )
+    .unwrap()
+    .unwrap()
+    .into();
     let interim_tenure_start_block_id = NakamotoChainState::get_tenure_start_block_header(
         &mut chainstate.index_conn(),
         &interim_stacks_tip,
@@ -9110,7 +9167,7 @@ fn check_block_info_rewards() {
     let last_nakamoto_block = last_stacks_block_height;
     let last_stacks_tip = StacksBlockId::new(&info.stacks_tip_consensus_hash, &info.stacks_tip);
     let last_nakamoto_block_tenure_height: u128 =
-        NakamotoChainState::get_coinbase_height(&mut chainstate.index_conn(), &last_stacks_tip)
+        NakamotoChainState::get_coinbase_height_at(&mut chainstate.index_conn(), &last_stacks_tip)
             .unwrap()
             .unwrap()
             .into();
@@ -9130,7 +9187,7 @@ fn check_block_info_rewards() {
 
     let last_stacks_tip = StacksBlockId::new(&info.stacks_tip_consensus_hash, &info.stacks_tip);
     let last_tenure_height: u128 =
-        NakamotoChainState::get_coinbase_height(&mut chainstate.index_conn(), &last_stacks_tip)
+        NakamotoChainState::get_coinbase_height_at(&mut chainstate.index_conn(), &last_stacks_tip)
             .unwrap()
             .unwrap()
             .into();
@@ -11738,6 +11795,109 @@ fn mine_invalid_principal_from_consensus_buff() {
     run_loop_thread.join().unwrap();
 }
 
+/// Test that mempool stop reasons are being correctly reported to Prometheus.
+///
+/// The test boots into epoch 3, mines a block to ensure the miner is running, then waits for the
+/// mempool to be drained.
+#[test]
+#[ignore]
+#[cfg(feature = "monitoring_prom")]
+fn miner_stop_reason_reported_to_prometheus() {
+    if env::var("BITCOIND_TEST") != Ok("1".into()) {
+        return;
+    }
+
+    let (mut conf, _miner_account) = naka_neon_integration_conf(None);
+
+    // Setup Prometheus so we can check miner stop reason metrics
+    let prom_bind = format!("127.0.0.1:{}", gen_random_port());
+    conf.node.prometheus_bind = Some(prom_bind.clone());
+
+    let stacker_sk = setup_stacker(&mut conf);
+    let signer_sk = Secp256k1PrivateKey::random();
+    let signer_addr = tests::to_addr(&signer_sk);
+    conf.add_initial_balance(
+        PrincipalData::from(signer_addr.clone()).to_string(),
+        100_000,
+    );
+
+    test_observer::spawn();
+    test_observer::register(&mut conf, &[EventKeyType::AnyEvent]);
+
+    let mut btcd_controller = BitcoinCoreController::from_stx_config(&conf);
+    btcd_controller
+        .start_bitcoind()
+        .expect("Failed starting bitcoind");
+    let mut btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
+    btc_regtest_controller.bootstrap_chain(201);
+
+    let mut run_loop = boot_nakamoto::BootRunLoop::new(conf.clone()).unwrap();
+    let run_loop_stopper = run_loop.get_termination_switch();
+    let Counters {
+        blocks_processed,
+        naka_submitted_commits: commits_submitted,
+        ..
+    } = run_loop.counters();
+    let counters = run_loop.counters();
+    let coord_channel = run_loop.coordinator_channels();
+
+    let run_loop_thread = thread::spawn(move || run_loop.start(None, 0));
+    let mut signers = TestSigners::new(vec![signer_sk.clone()]);
+    wait_for_runloop(&blocks_processed);
+    boot_to_epoch_3(
+        &conf,
+        &blocks_processed,
+        &[stacker_sk.clone()],
+        &[signer_sk.clone()],
+        &mut Some(&mut signers),
+        &mut btc_regtest_controller,
+    );
+
+    info!("------------------------- Reached Epoch 3.0 -------------------------");
+    blind_signer(&conf, &signers, &counters);
+    wait_for_first_naka_block_commit(60, &commits_submitted);
+
+    next_block_and_process_new_stacks_block(&mut btc_regtest_controller, 60, &coord_channel)
+        .expect("failed to mine block");
+
+    // --- Wait for prometheus to report no_transactions ---
+    // The mempool is now empty, so the miner's next iteration should stop with
+    // NoMoreCandidates, which report_to_monitoring() maps to no_transactions.
+    // The miner continuously retries, so we just poll the metric.
+    let prom_http_origin = format!("http://{prom_bind}");
+    let client = reqwest::blocking::Client::new();
+    let parse_metric = |reason: &str| -> u64 {
+        let res = client
+            .get(&prom_http_origin)
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        let re = regex::Regex::new(&format!(
+            r#"stacks_node_miner_stop_reason_total\{{reason="{reason}"\}} (\d+)"#
+        ))
+        .unwrap();
+        re.captures(&res)
+            .and_then(|caps| caps.get(1))
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+
+    let no_tx_count_before = parse_metric("no_transactions");
+
+    wait_for(10, || {
+        Ok(parse_metric("no_transactions") > no_tx_count_before)
+    })
+    .expect("Expected no_transactions metric to increment after mempool drained");
+
+    coord_channel
+        .lock()
+        .expect("Mutex poisoned")
+        .stop_chains_coordinator();
+    run_loop_stopper.store(false, Ordering::SeqCst);
+    run_loop_thread.join().unwrap();
+}
+
 /// Test hot-reloading of miner config
 #[test]
 #[ignore]
@@ -11994,19 +12154,21 @@ fn rbf_on_config_change() {
     })
     .expect("Failed to wait for last commit");
 
-    let commits_before = counters.naka_submitted_commits.get();
-
     let commit_amount_before = counters.naka_submitted_commit_last_commit_amount.get();
 
     info!("---- Updating config ----");
 
     update_config(155000, 57);
 
+    // Wait until a commit reflecting the *new* config is observed. We can't
+    // simply wait for the commit count to increase: the miner submits RBF
+    // commits every initiative, so an old-config commit submitted between the
+    // snapshot above and the config reload would satisfy a count-based wait
+    // while still carrying the old commit amount, flaking the assertions below.
     wait_for(30, || {
-        let commit_count = &counters.naka_submitted_commits.get();
-        Ok(*commit_count > commits_before)
+        Ok(counters.naka_submitted_commit_last_commit_amount.get() == 155000)
     })
-    .expect("Expected new commit after config change");
+    .expect("Expected a commit with the updated burn fee cap after config change");
 
     let commit_amount_after = counters.naka_submitted_commit_last_commit_amount.get();
     assert_eq!(commit_amount_after, 155000);
@@ -15898,8 +16060,8 @@ fn check_sip040_post_conditions() {
         PostConditionPrincipal::Origin,
         AssetInfo {
             contract_address: sender_addr.clone(),
-            contract_name: ContractName::from(contract_name),
-            asset_name: ClarityName::from("asset"),
+            contract_name: ContractName::from_literal(contract_name),
+            asset_name: ClarityName::from_literal("asset"),
         },
         Value::UInt(1),
         NonfungibleConditionCode::MaybeSent,
@@ -16839,8 +17001,11 @@ fn check_with_stacking_allowances_stack_stx() {
         "pox-4",
         "allow-contract-caller",
         &[
-            QualifiedContractIdentifier::new(sender_addr.clone().into(), contract_name.into())
-                .into(),
+            QualifiedContractIdentifier::new(
+                sender_addr.clone().into(),
+                ContractName::from_literal(contract_name),
+            )
+            .into(),
             Value::none(),
         ],
     );
@@ -16905,8 +17070,11 @@ fn check_with_stacking_allowances_stack_stx() {
         "pox-4",
         "allow-contract-caller",
         &[
-            QualifiedContractIdentifier::new(sender_addr.clone().into(), contract_name.into())
-                .into(),
+            QualifiedContractIdentifier::new(
+                sender_addr.clone().into(),
+                ContractName::from_literal(contract_name),
+            )
+            .into(),
             Value::none(),
         ],
     );
@@ -16998,8 +17166,11 @@ fn check_with_stacking_allowances_stack_stx() {
         "pox-4",
         "allow-contract-caller",
         &[
-            QualifiedContractIdentifier::new(sender_addr.clone().into(), contract_name.into())
-                .into(),
+            QualifiedContractIdentifier::new(
+                sender_addr.clone().into(),
+                ContractName::from_literal(contract_name),
+            )
+            .into(),
             Value::none(),
         ],
     );
@@ -17516,7 +17687,7 @@ fn check_restrict_assets_rollback() {
             call_fee,
             chain_id,
             sender_addr,
-            contract_name,
+            contract_name.try_into().unwrap(),
             function_name,
             function_args,
         );
@@ -17945,7 +18116,7 @@ fn check_as_contract_rollback() {
     let contract_name = "test-contract";
     let contract_addr = PrincipalData::Contract(QualifiedContractIdentifier {
         issuer: sender_addr.clone().into(),
-        name: contract_name.into(),
+        name: ContractName::from_literal(contract_name),
     });
     let deploy_fee = 4000;
     let call_fee = 400;
@@ -18221,7 +18392,7 @@ fn check_as_contract_rollback() {
     ) -> (Value, u128, u128) {
         let contract_addr = PrincipalData::Contract(QualifiedContractIdentifier {
             issuer: sender_addr.clone().into(),
-            name: contract_name.into(),
+            name: contract_name.try_into().unwrap(),
         });
         let contract_balance = get_account(http_origin, &contract_addr).balance;
         let recipient_balance = get_account(http_origin, recipient).balance;
@@ -18975,7 +19146,7 @@ fn smaller_tenure_size_for_miner_on_two_tenures() {
             0,
             deploy_fee,
             naka_conf.burnchain.chain_id,
-            &contract_name,
+            contract_name.as_str(),
             &contract,
         );
 

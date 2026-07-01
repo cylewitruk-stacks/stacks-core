@@ -143,6 +143,149 @@ fn trie_node_patch_deserialize_ok_with_ptr_diffs_len_1() {
     assert_eq!(expected, patch_node);
 }
 
+#[test]
+fn trie_node_patch_u64_ptr_roundtrip_ok() {
+    let patch_node = TrieNodePatch {
+        ptr: TriePtr::new(1, 10, u64::from(u32::MAX) + 7),
+        ptr_diff: vec![TriePtr::new(1, 20, u64::from(u32::MAX) + 11)],
+    };
+
+    let mut buffer = Cursor::new(Vec::new());
+    patch_node
+        .consensus_serialize(&mut buffer)
+        .expect("u64 ptr serialization should be ok");
+
+    let decoded = TrieNodePatch::consensus_deserialize(&mut Cursor::new(buffer.into_inner()))
+        .expect("u64 ptr deserialization should be ok");
+    assert_eq!(patch_node, decoded);
+}
+
+#[test]
+fn trie_node_patch_apply_node4_preserves_inline_payload_pointer_identity() {
+    let mut old_node = TrieNode4::new(&[]);
+    let mut inline_with_payload = TriePtr::new(TrieNodeID::Node16 as u8, 0x10, 1234);
+    inline_with_payload.back_block = 55;
+    assert!(old_node.insert(&inline_with_payload));
+
+    let patch = TrieNodePatch {
+        ptr: TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 1, 7),
+        ptr_diff: vec![TriePtr::new(TrieNodeID::Node16 as u8, 0x20, 2345)],
+    };
+
+    let mut patched = old_node;
+    assert!(
+        patch.apply_to(&mut patched, 8, 99),
+        "patch application should succeed"
+    );
+    let patched_ptr = patched
+        .walk(0x10)
+        .expect("inline child with payload should still exist");
+    assert!(is_backptr(patched_ptr.id()));
+    assert_eq!(patched_ptr.back_block(), 55);
+}
+
+#[test]
+fn trie_node_patch_u64_ptr_serialize_fails_with_ptr_diffs_len_0() {
+    let patch_node = TrieNodePatch {
+        ptr: TriePtr::new(TrieNodeID::Node4 as u8, 1, 77),
+        ptr_diff: vec![],
+    };
+    let mut buffer = Cursor::new(Vec::new());
+    let error = patch_node
+        .consensus_serialize(&mut buffer)
+        .expect_err("u64 ptr serialization should fail");
+    assert!(
+        matches!(&error, codec_error::SerializeError(msg) if msg.contains("len 0")),
+        "instead got: {error}"
+    );
+}
+
+#[test]
+fn trie_node_patch_u64_ptr_serialize_fails_with_ptr_diffs_len_257() {
+    let patch_node = TrieNodePatch {
+        ptr: TriePtr::new(TrieNodeID::Node4 as u8, 1, 77),
+        ptr_diff: vec![TriePtr::new(TrieNodeID::Node4 as u8, 2, 88); 257],
+    };
+    let mut buffer = Cursor::new(Vec::new());
+    let error = patch_node
+        .consensus_serialize(&mut buffer)
+        .expect_err("u64 ptr serialization should fail");
+    assert!(
+        matches!(&error, codec_error::SerializeError(msg) if msg.contains("len 257")),
+        "instead got: {error}"
+    );
+}
+
+#[test]
+fn trie_node_patch_u64_ptr_deserialize_fails_on_truncated_payload() {
+    let patch_node = TrieNodePatch {
+        ptr: TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x01, u64::from(u32::MAX) + 2, 5),
+        ptr_diff: vec![
+            TriePtr::new(TrieNodeID::Node16 as u8, 0x02, u64::from(u32::MAX) + 3),
+            TriePtr::new_backptr(TrieNodeID::Node16 as u8, 0x03, u64::from(u32::MAX) + 4, 7),
+        ],
+    };
+
+    let mut buffer = Cursor::new(Vec::new());
+    patch_node
+        .consensus_serialize(&mut buffer)
+        .expect("u64 ptr serialization should be ok");
+    let mut payload = buffer.into_inner();
+    payload.pop();
+
+    let error = TrieNodePatch::consensus_deserialize(&mut Cursor::new(payload))
+        .expect_err("u64 ptr deserialization should fail on truncated payload");
+    assert!(
+        error.to_string().contains("fill whole buffer"),
+        "instead got: {error}"
+    );
+}
+
+#[test]
+fn trie_node_patch_u64_ptr_deserialize_fails_on_malformed_payload() {
+    let patch_node = TrieNodePatch {
+        ptr: TriePtr::new(TrieNodeID::Node4 as u8, 1, 2),
+        ptr_diff: vec![TriePtr::new(TrieNodeID::Node16 as u8, 2, 3)],
+    };
+    let mut buffer = Cursor::new(Vec::new());
+    patch_node
+        .consensus_serialize(&mut buffer)
+        .expect("u64 ptr serialization should be ok");
+    let mut payload = buffer.into_inner();
+
+    // Corrupt the patch node marker.
+    payload[0] = TrieNodeID::Leaf as u8;
+
+    let error = TrieNodePatch::consensus_deserialize(&mut Cursor::new(payload))
+        .expect_err("u64 ptr deserialization should fail on malformed payload");
+    assert!(
+        error
+            .to_string()
+            .contains("Did not read a TrieNodeID::Patch"),
+        "instead got: {error}"
+    );
+}
+
+#[test]
+fn trie_node_patch_u64_ptr_roundtrip_mixed_backptrs() {
+    let patch_node = TrieNodePatch {
+        ptr: TriePtr::new_backptr(TrieNodeID::Node16 as u8, 0x10, u64::from(u32::MAX) + 55, 42),
+        ptr_diff: vec![
+            TriePtr::new(TrieNodeID::Node4 as u8, 0x11, u64::from(u32::MAX) + 56),
+            TriePtr::new_backptr(TrieNodeID::Node48 as u8, 0x12, u64::from(u32::MAX) + 57, 43),
+            TriePtr::new(TrieNodeID::Node256 as u8, 0x13, 19),
+        ],
+    };
+
+    let mut buffer = Cursor::new(Vec::new());
+    patch_node
+        .consensus_serialize(&mut buffer)
+        .expect("u64 ptr mixed serialization should be ok");
+    let decoded = TrieNodePatch::consensus_deserialize(&mut Cursor::new(buffer.into_inner()))
+        .expect("u64 ptr mixed deserialization should be ok");
+    assert_eq!(patch_node, decoded);
+}
+
 /// [`TrieNodePatch::make_ptr_diff`] in the following scenario:
 ///
 /// ## Input
@@ -500,8 +643,8 @@ fn trie_node_patch_make_ptr_diff_all_in_one() {
 /// repeatedly, causing the same trie paths to be COW'd across consecutive blocks and building patch
 /// chains up to `MAX_PATCH_DEPTH`.
 ///
-/// NOTE: this test is written to be portable across branches to be able to compare results and
-/// asserts against a known baseline (at commit 39976ac7e795b84b992e0dea5594bda493a77369). It
+/// NOTE: this test is written to be portable across branches to compare root hashes, and pins this
+/// branch's blob-size baseline for its widened pointer / inline back-block byte layout. It
 /// explicitly uses disk-backed storage to be able to use e.g. `marf-inspect` on the resulting
 /// MARFs.
 #[rstest]
@@ -518,19 +661,20 @@ fn test_marf_compression_reduces_blob_size(
     let num_keys: usize = 128;
     let num_blocks: usize = 16;
 
-    // Per-block blob lengths and root hashes locked in from upstream/develop.
+    // Per-block blob lengths and root hashes locked in for this branch's
+    // widened pointer / inline back-block byte layout.
     // Any on-disk format regression or change to the compression algorithm will break these.
-    const EXPECTED_BLOB_TOTAL_UNC: u64 = 294_221;
-    const EXPECTED_BLOB_TOTAL_COM: u64 = 256_340;
+    const EXPECTED_BLOB_TOTAL_UNC: u64 = 301_285;
+    const EXPECTED_BLOB_TOTAL_COM: u64 = 263_404;
     #[rustfmt::skip]
     const EXPECTED_UNC_BLOB_LENS: [u64; 16] = [
-        17_895, 18_177, 18_251, 18_324, 18_324, 18_397, 18_397, 18_397,
-        18_398, 18_470, 18_470, 18_544, 18_544, 18_544, 18_544, 18_545,
+        18_327, 18_613, 18_691, 18_764, 18_764, 18_837, 18_837, 18_837,
+        18_842, 18_914, 18_914, 18_988, 18_988, 18_988, 18_988, 18_993,
     ];
     #[rustfmt::skip]
     const EXPECTED_COM_BLOB_LENS: [u64; 16] = [
-        15_480, 15_889, 15_939, 15_988, 15_996, 15_940, 16_057, 16_047,
-        16_048, 16_086, 16_078, 16_147, 16_145, 16_145, 16_146, 16_209,
+        15_912, 16_325, 16_379, 16_428, 16_436, 16_380, 16_497, 16_487,
+        16_492, 16_530, 16_522, 16_591, 16_589, 16_589, 16_590, 16_657,
     ];
     #[rustfmt::skip]
     const EXPECTED_ROOT_HASHES: [&str; 16] = [
@@ -666,7 +810,7 @@ fn test_marf_compression_reduces_blob_size(
         "Root hash mismatch between compressed and uncompressed runs"
     );
 
-    // Lock in exact per-block blob sizes and root hashes against the upstream/develop baseline.
+    // Lock in exact per-block blob sizes and root hashes against this branch's baseline.
     // Changes to the on-disk encoding, patch algorithm, or hash computation will fail here.
     assert_eq!(
         uncompressed_size, EXPECTED_BLOB_TOTAL_UNC,

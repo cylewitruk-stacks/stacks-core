@@ -194,15 +194,19 @@ impl Trie {
         cur_leaf_path: &[u8],
         value: &mut TrieLeaf,
     ) -> Result<TriePtr, Error> {
+        let leaf_ptr = cursor.ptr();
+        if leaf_ptr.id() != TrieNodeID::Leaf as u8 {
+            return Err(Error::CorruptionError(format!("Not a leaf: {leaf_ptr:?}")));
+        }
+
         value.path = NodePath::from_slice(cur_leaf_path)
             .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
 
         let leaf_hash = bits::get_leaf_hash(value);
 
-        let leaf_ptr = cursor.ptr();
-        storage.write_node(leaf_ptr.ptr(), value, leaf_hash)?;
+        storage.write_node(leaf_ptr.try_ptr_into_u32()?, value, leaf_hash)?;
 
-        trace!("replace_leaf: wrote {:?} at {:?}", &value, &cursor.ptr());
+        trace!("replace_leaf: wrote {value:?} at {leaf_ptr:?}");
         Ok(cursor.ptr())
     }
 
@@ -226,7 +230,7 @@ impl Trie {
             .ok_or_else(|| Error::CorruptionError("Node path exceeds 32 bytes".into()))?;
 
         let leaf_hash = bits::get_leaf_hash(value);
-        let leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, chr, ptr);
+        let leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, chr, ptr.into());
         storage.write_node(ptr, value, leaf_hash)?;
 
         trace!("append_leaf: append {:?} at {:?}", value, &leaf_ptr);
@@ -304,10 +308,14 @@ impl Trie {
         let cur_leaf_hash = bits::get_leaf_hash(cur_leaf_data);
 
         // NOTE: this is safe since the current leaf's byte representation has gotten shorter
-        storage.write_node(cur_leaf_ptr.ptr(), cur_leaf_data, cur_leaf_hash)?;
+        storage.write_node(
+            cur_leaf_ptr.try_ptr_into_u32()?,
+            cur_leaf_data,
+            cur_leaf_hash,
+        )?;
 
-        // append the new leaf and the end of the file.
-        let new_leaf_disk_ptr = storage.last_ptr()?;
+        // append the new leaf at the end of the trie.
+        let new_leaf_array_ptr = storage.last_ptr()?;
         let new_leaf_chr = cursor.path[cursor.tell()]; // NOTE: this is safe because !cursor.eop()
         new_leaf_data.path = NodePath::from_slice(
             &cursor.path[std::cmp::min(cursor.tell() + 1, cursor.path.len())..],
@@ -316,9 +324,13 @@ impl Trie {
         let new_leaf_hash = bits::get_leaf_hash(new_leaf_data);
 
         // put new leaf at the end of this Trie
-        let new_leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, new_leaf_chr, new_leaf_disk_ptr);
+        let new_leaf_ptr = TriePtr::new(
+            TrieNodeID::Leaf as u8,
+            new_leaf_chr,
+            new_leaf_array_ptr.into(),
+        );
 
-        storage.write_node(new_leaf_disk_ptr, new_leaf_data, new_leaf_hash)?;
+        storage.write_node(new_leaf_array_ptr, new_leaf_data, new_leaf_hash)?;
 
         // append the Node4 that points to both of them, and put it after the new leaf
         let mut node4_data = TrieNode4::new(&node4_path);
@@ -340,10 +352,10 @@ impl Trie {
         let node4 = TrieNodeType::Node4(node4_data);
 
         // append the node4 to the end of the trie
-        let node4_disk_ptr = storage.last_ptr()?;
+        let node4_array_ptr = storage.last_ptr()?;
 
-        let ret = TriePtr::new(TrieNodeID::Node4 as u8, node4_chr, node4_disk_ptr);
-        storage.write_nodetype(node4_disk_ptr, &node4, node4_hash)?;
+        let ret = TriePtr::new(TrieNodeID::Node4 as u8, node4_chr, node4_array_ptr.into());
+        storage.write_nodetype(node4_array_ptr, &node4, node4_hash)?;
 
         // update cursor to point to this node4 as the last-node-visited, and set the newly-created
         // ptr as the last ptr traversed (so the cursor still points to this leaf, but accurately
@@ -429,7 +441,7 @@ impl Trie {
 
         let new_node_hash = get_nodetype_hash(storage, node)?;
 
-        storage.write_nodetype(cursor.ptr().ptr(), node, new_node_hash)?;
+        storage.write_nodetype(cursor.ptr().try_ptr_into_u32()?, node, new_node_hash)?;
 
         Ok(Some(cursor.ptr()))
     }
@@ -475,10 +487,10 @@ impl Trie {
         let new_node_hash = get_nodetype_hash(storage, &new_node)?;
 
         // append this leaf to the Trie
-        let new_node_disk_ptr = storage.last_ptr()?;
+        let new_node_array_ptr = storage.last_ptr()?;
 
-        let ret = TriePtr::new(new_node.id(), node_ptr.chr(), new_node_disk_ptr);
-        storage.write_nodetype(new_node_disk_ptr, &new_node, new_node_hash)?;
+        let ret = TriePtr::new(new_node.id(), node_ptr.chr(), new_node_array_ptr.into());
+        storage.write_nodetype(new_node_array_ptr, &new_node, new_node_hash)?;
 
         // update the cursor so its path of nodes and ptrs accurately reflects that we would have
         // visited this leaf on its path.
@@ -557,16 +569,16 @@ impl Trie {
         let leaf_chr = cursor.path[cursor.tell()];
         let leaf_disk_ptr = storage.last_ptr()?;
         let leaf_hash = bits::get_leaf_hash(leaf);
-        let leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, leaf_chr, leaf_disk_ptr);
+        let leaf_ptr = TriePtr::new(TrieNodeID::Leaf as u8, leaf_chr, leaf_disk_ptr.into());
         storage.write_node(leaf_disk_ptr, leaf, leaf_hash)?;
 
         // update current node (node-X) and make a new path and ptr for it
         let cur_node_cur_ptr = cursor.ptr();
-        let new_cur_node_disk_ptr = storage.last_ptr()?;
+        let new_cur_node_array_ptr = storage.last_ptr()?;
         let new_cur_node_ptr = TriePtr::new(
             cur_node_cur_ptr.id(),
             new_cur_node_chr,
-            new_cur_node_disk_ptr,
+            new_cur_node_array_ptr.into(),
         );
 
         node.set_path(new_cur_node_path);
@@ -602,10 +614,14 @@ impl Trie {
         };
 
         // store node4 where node-X used to be
-        storage.write_nodetype(cur_node_cur_ptr.ptr(), &new_node, new_node_hash)?;
+        storage.write_nodetype(
+            cur_node_cur_ptr.try_ptr_into_u32()?,
+            &new_node,
+            new_node_hash,
+        )?;
 
         // store node-X at the end
-        storage.write_nodetype(new_cur_node_disk_ptr, node, new_cur_node_hash)?;
+        storage.write_nodetype(new_cur_node_array_ptr, node, new_cur_node_hash)?;
 
         let ret = TriePtr::new(
             new_node_id as u8,
@@ -759,11 +775,9 @@ impl Trie {
             };
             if cursor.eonp(&node) {
                 trace!(
-                    "eop = {}, eonp = {}, c = {:?}, node = {:?}",
+                    "eop = {}, eonp = {}, c = {cursor:?}, node = {node:?}",
                     cursor.eop(),
                     cursor.eonp(&node),
-                    cursor,
-                    &node
                 );
                 Trie::insert_leaf(storage, cursor, value, &mut node)
             } else {
@@ -816,19 +830,34 @@ impl Trie {
 
         let mut log_depth = 0;
         while log_depth < 32 && (1u32 << log_depth) <= cur_block_height {
+            let ancestor_height = cur_block_height - (1u32 << log_depth);
             let prev_block_header = read_ctx
-                .get_block_at_height(cur_block_height - (1u32 << log_depth), &cur_block_header)?
+                .get_block_at_height(ancestor_height, &cur_block_header)?
                 .ok_or_else(|| {
                     Error::CorruptionError(format!(
                         "Could not obtain block hash at block height {}",
-                        cur_block_height - (1u32 << log_depth)
+                        ancestor_height
                     ))
                 })?;
 
-            read_ctx.storage().open_block(&prev_block_header)?;
-
-            let root_ptr = read_ctx.storage().root_trieptr();
-            let ancestor_hash = read_ctx.storage().read_node_hash(&root_ptr)?;
+            let ancestor_hash = if read_ctx
+                .storage()
+                .squash_height()
+                .is_some_and(|h| ancestor_height <= h)
+            {
+                read_ctx
+                    .storage()
+                    .squashed_block_root_hash_by_height(ancestor_height)?
+                    .ok_or_else(|| {
+                        Error::CorruptionError(format!(
+                            "Could not obtain squashed root hash at height {ancestor_height}"
+                        ))
+                    })?
+            } else {
+                read_ctx.storage().open_block(&prev_block_header)?;
+                let root_ptr = read_ctx.storage().root_trieptr();
+                read_ctx.storage().read_node_hash(&root_ptr)?
+            };
 
             trace!(
                 "Include root hash {} from block {} in ancestor #{}",
@@ -919,10 +948,10 @@ impl Trie {
         }
     }
 
-    /// Unwind a TrieCursor to update the Merkle root of the trie.
+    /// Unwind a [`TrieCursor`] to update the Merkle root of the trie.
     ///
-    /// The root hashes of each trie form a Merkle skip-list -- the hash of Trie i is calculated
-    /// from the hash of its children, plus the hash Tries i-1, i-2, i-4, i-8, ..., i-2**j, ...
+    /// The root hashes of each trie form a Merkle skip-list -- the hash of trie `i` is calculated
+    /// from the hash of its children, plus the hash tries `i-1`, `i-2`, `i-4`, `i-8`, ..., `i-2**j`, ...
     ///
     /// This is required for Merkle proofs to work (specifically, the shunt proofs).
     fn recalculate_root_hash<
@@ -953,11 +982,12 @@ impl Trie {
                 ));
             }
 
-            // O(1) swap from TrieRAM — avoids the heap allocation of into_owned_node().
-            let (node, _cur_hash) = storage.take_ram_node(child_ptr.ptr())?;
+            // O(1) swap from TrieRAM - avoids the heap allocation of into_owned_node().
+            let child_index = child_ptr.try_ptr_into_u32()?;
+            let (node, cur_hash) = storage.take_ram_node(child_index)?;
 
             if !node.is_node256() {
-                storage.restore_ram_node(child_ptr.ptr(), node, _cur_hash)?;
+                storage.restore_ram_node(child_index, node, cur_hash)?;
                 return Err(Error::CorruptionError(
                     "Only ptr was not a node256".to_string(),
                 ));
@@ -966,7 +996,7 @@ impl Trie {
             let my_hash = get_nodetype_hash(storage, &node)?;
 
             // Restore before ancestor hash lookup (which traverses the trie).
-            storage.restore_ram_node(child_ptr.ptr(), node, my_hash)?;
+            storage.restore_ram_node(child_index, node, my_hash)?;
 
             let h = if update_skiplist {
                 trace!("Update root skiplist");
@@ -982,7 +1012,7 @@ impl Trie {
                 let _ = Trie::get_trie_root_ancestor_hashes_bytes(storage, &node_hash)
                     .map(|_hs| {
                         storage.clear_cached_ancestor_hashes_bytes();
-                        trace!("update_root_hash: Updated {node_debug} with {child_ptr:?} from {_cur_hash} to {node_hash} + {:?} = {h} (fixed root)", &_hs.get(1..));
+                        trace!("update_root_hash: Updated {node_debug} with {child_ptr:?} from {cur_hash} to {node_hash} + {:?} = {h} (fixed root)", &_hs.get(1..));
                     });
             }
 
@@ -990,19 +1020,23 @@ impl Trie {
 
             // Update the final hash if it differs from my_hash (skiplist case).
             if h != my_hash {
-                let (node, _) = storage.take_ram_node(child_ptr.ptr())?;
-                storage.restore_ram_node(child_ptr.ptr(), node, h)?;
+                let (node, _) = storage.take_ram_node(child_index)?;
+                storage.restore_ram_node(child_index, node, h)?;
             }
         } else {
             while let Some(ptr) = ptrs.pop() {
                 if is_backptr(ptr.id()) {
+                    // This node was not altered, but instead queued to the cursor as part of walking a
+                    // backptr skiplist. Do nothing.
                     continue;
                 }
 
-                // O(1) swap from TrieRAM — avoids the heap allocation of into_owned_node().
-                let (mut node, _cur_hash) = storage.take_ram_node(ptr.ptr())?;
+                // O(1) swap from TrieRAM - avoids the heap allocation of into_owned_node().
+                let ptr_index = ptr.try_ptr_into_u32()?;
+                let (mut node, cur_hash) = storage.take_ram_node(ptr_index)?;
                 assert!(!node.is_leaf());
 
+                // This child_ptr MUST be in the node.
                 let updated = node.replace(&child_ptr);
                 if !updated {
                     trace!("FAILED TO UPDATE {node:?} WITH {child_ptr:?}: {cursor:?}");
@@ -1013,12 +1047,12 @@ impl Trie {
                 let content_hash = get_nodetype_hash(storage, &node)?;
 
                 if !is_root_node256 {
-                    trace!("update_root_hash: Updated node with {child_ptr:?} from {_cur_hash:?} to {content_hash:?}");
-                    storage.restore_ram_node(ptr.ptr(), node, content_hash)?;
+                    trace!("update_root_hash: Updated node with {child_ptr:?} from {cur_hash:?} to {content_hash:?}");
+                    storage.restore_ram_node(ptr_index, node, content_hash)?;
                 } else {
                     // Root Node256: restore with temp hash so ancestor traversal works,
                     // then compute final hash and fix up.
-                    storage.restore_ram_node(ptr.ptr(), node, TrieHash([0; 32]))?;
+                    storage.restore_ram_node(ptr_index, node, TrieHash([0; 32]))?;
 
                     let h = if update_skiplist {
                         Trie::get_trie_root_hash(
@@ -1035,21 +1069,22 @@ impl Trie {
                         let _ = Trie::get_trie_root_ancestor_hashes_bytes(storage, &content_hash)
                                     .map(|_hs| {
                                         storage.clear_cached_ancestor_hashes_bytes();
-                                        trace!("update_root_hash: Updated node with {child_ptr:?} from {_cur_hash:?} to {content_hash:?} + {:?} = {h:?}", &_hs.get(1..));
+                                        trace!("update_root_hash: Updated node with {child_ptr:?} from {cur_hash:?} to {content_hash:?} + {:?} = {h:?}", &_hs.get(1..));
                                     });
                     }
 
                     debug!("Next root hash is {h} (update_skiplist={update_skiplist})");
 
-                    let (node, _) = storage.take_ram_node(ptr.ptr())?;
-                    storage.restore_ram_node(ptr.ptr(), node, h)?;
+                    let (node, _) = storage.take_ram_node(ptr_index)?;
+                    storage.restore_ram_node(ptr_index, node, h)?;
                 }
 
                 child_ptr = ptr;
                 child_ptr.id = clear_backptr(child_ptr.id);
             }
         }
-        // must be at the root
+
+        // Must be at the root
         assert_eq!(child_ptr, storage.root_trieptr());
         Ok(())
     }
