@@ -834,7 +834,7 @@ impl FromRow<NakamotoBlockHeader> for NakamotoBlockHeader {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NakamotoBlock {
     pub header: NakamotoBlockHeader,
-    pub(crate) txs: Vec<StacksTransaction>,
+    pub txs: Vec<StacksTransaction>,
 }
 
 impl NakamotoBlock {
