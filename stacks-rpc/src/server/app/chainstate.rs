@@ -122,6 +122,8 @@ impl ChainstateReadExecutor for PooledChainstateReads {
     ) -> Result<AccountView, ApiError> {
         let mut handles = self.checkout()?;
         let ChainstateReadHandles { chainstate, sortdb } = &mut *handles;
+        // Read-only pooled handles do not maintain unconfirmed state; `tip=latest`
+        // falls back to the canonical anchored tip in rpc_services when none exists.
         rpc_services::get_account(sortdb, chainstate, &principal, &tip, with_proof)
             .map_err(ApiError::from)
     }

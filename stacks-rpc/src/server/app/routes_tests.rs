@@ -3,14 +3,13 @@ use std::thread;
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use axum::Router;
 use clarity::vm::types::PrincipalData;
 use stacks::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};
 use stacks::net::api::getinfo::RPCPeerInfoData;
 use stacks::net::api::postblock_proposal::NakamotoBlockProposal;
 use stacks::net::httpcore::TipRequest;
-use stacks::net::rpc_domains::{
-    domain_channels, BlockProposalQuery, PeerQuery, RpcDomainReceivers,
-};
+use stacks::net::rpc_bridge::{rpc_bridge, BlockProposalQuery, RpcEndpoints, RpcNodeHandle};
 use stacks::net::rpc_services::{
     AccountView, BlockProposalAccepted, BlockProposalError, ProofBytes,
 };
@@ -19,10 +18,9 @@ use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlo
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::Sha256Sum;
 
-use crate::chainstate_read::{ChainstateReadExecutor, ChainstateReadService};
+use super::super::chainstate::{ChainstateReadExecutor, ChainstateReadService};
+use super::*;
 use crate::error::{ApiError, ApiErrorCode};
-use crate::routes::parse_proof;
-use crate::server::spawn_axum_rpc_server;
 
 fn sample_info() -> RPCPeerInfoData {
     RPCPeerInfoData {
@@ -91,18 +89,35 @@ fn wait_get(client: &reqwest::blocking::Client, url: &str) -> reqwest::blocking:
     client.get(url).send().unwrap()
 }
 
-fn spawn_test_domains(receivers: RpcDomainReceivers) {
-    let RpcDomainReceivers {
-        peer,
+fn spawn_test_router(addr: SocketAddr, router: Router) -> std::io::Result<thread::JoinHandle<()>> {
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    Ok(thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, router).await.unwrap();
+        });
+    }))
+}
+
+fn spawn_axum_rpc_server(
+    bind_addr: SocketAddr,
+    node: RpcNodeHandle,
+    chainstate_reads: ChainstateReadService,
+    auth_token: Option<String>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    spawn_test_router(bind_addr, router(node, chainstate_reads, auth_token))
+}
+
+fn spawn_test_node(node: &RpcNodeHandle, endpoints: RpcEndpoints) {
+    node.peer_info.publish(sample_info());
+
+    let RpcEndpoints {
+        peer_info: _,
         block_proposal,
         mempool: _,
-    } = receivers;
-
-    thread::spawn(move || {
-        if let Ok(PeerQuery::GetInfo { reply }) = peer.recv_timeout(Duration::from_secs(5)) {
-            let _ = reply.try_send(Ok(sample_info()));
-        }
-    });
+    } = endpoints;
 
     thread::spawn(move || {
         if let Ok(BlockProposalQuery::Validate { proposal, reply }) =
@@ -114,12 +129,12 @@ fn spawn_test_domains(receivers: RpcDomainReceivers) {
     });
 }
 
-fn spawn_block_proposal_rejection_domain(receivers: RpcDomainReceivers, error: BlockProposalError) {
-    let RpcDomainReceivers {
-        peer: _,
+fn spawn_block_proposal_rejection_endpoint(endpoints: RpcEndpoints, error: BlockProposalError) {
+    let RpcEndpoints {
+        peer_info: _,
         block_proposal,
         mempool: _,
-    } = receivers;
+    } = endpoints;
 
     thread::spawn(move || {
         if let Ok(BlockProposalQuery::Validate { reply, .. }) =
@@ -138,6 +153,7 @@ fn mock_chainstate_reads_with_tip(expected_tip: Option<TipRequest>) -> Chainstat
     ChainstateReadService::test_from_executor(MockChainstateReads {
         expected_tip,
         saturated: false,
+        delay: None,
     })
 }
 
@@ -145,12 +161,22 @@ fn saturated_chainstate_reads() -> ChainstateReadService {
     ChainstateReadService::test_from_executor(MockChainstateReads {
         expected_tip: None,
         saturated: true,
+        delay: None,
+    })
+}
+
+fn slow_chainstate_reads(delay: Duration) -> ChainstateReadService {
+    ChainstateReadService::test_from_executor(MockChainstateReads {
+        expected_tip: None,
+        saturated: false,
+        delay: Some(delay),
     })
 }
 
 struct MockChainstateReads {
     expected_tip: Option<TipRequest>,
     saturated: bool,
+    delay: Option<Duration>,
 }
 
 impl ChainstateReadExecutor for MockChainstateReads {
@@ -160,6 +186,9 @@ impl ChainstateReadExecutor for MockChainstateReads {
         tip: TipRequest,
         _with_proof: bool,
     ) -> Result<AccountView, ApiError> {
+        if let Some(delay) = self.delay {
+            thread::sleep(delay);
+        }
         if self.saturated {
             return Err(ApiError::unavailable(
                 ApiErrorCode::ReadQueueFull,
@@ -197,17 +226,13 @@ fn rejects_bad_principal() {
 }
 
 #[test]
-fn serves_info_through_peer_channel_and_account_through_read_service() {
-    let (channels, receivers) = domain_channels();
-    spawn_test_domains(receivers);
+fn serves_info_through_snapshot_and_account_through_read_service() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
     let addr = free_addr();
-    let _server = spawn_axum_rpc_server(
-        addr,
-        channels,
-        mock_chainstate_reads(),
-        Some("password".into()),
-    )
-    .unwrap();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
     let client = reqwest::blocking::Client::new();
 
     let info_url = format!("http://{addr}/rpc/v1/info");
@@ -223,7 +248,7 @@ fn serves_info_through_peer_channel_and_account_through_read_service() {
     let account_response = wait_get(&client, &account_url);
     assert_eq!(account_response.status().as_u16(), StatusCode::OK.as_u16());
     let account: serde_json::Value = account_response.json().unwrap();
-    assert_eq!(account["balance"], "0x0000000000000000000000000000002a");
+    assert_eq!(account["balance"], "42");
     assert_eq!(account["nonce"], 3);
     assert!(account.get("proofs").is_none());
 
@@ -237,13 +262,32 @@ fn serves_info_through_peer_channel_and_account_through_read_service() {
 }
 
 #[test]
+fn info_without_peer_snapshot_returns_503() {
+    let (node, _endpoints) = rpc_bridge();
+    let addr = free_addr();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
+    let client = reqwest::blocking::Client::new();
+
+    let info_url = format!("http://{addr}/rpc/v1/info");
+    let response = wait_get(&client, &info_url);
+    assert_eq!(
+        response.status().as_u16(),
+        StatusCode::SERVICE_UNAVAILABLE.as_u16()
+    );
+    let body: serde_json::Value = response.json().unwrap();
+    assert_eq!(body["error"]["code"], "peer_info_unavailable");
+}
+
+#[test]
 fn account_latest_tip_uses_chainstate_read_service() {
-    let (channels, receivers) = domain_channels();
-    spawn_test_domains(receivers);
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
     let addr = free_addr();
     let _server = spawn_axum_rpc_server(
         addr,
-        channels,
+        node,
         mock_chainstate_reads_with_tip(Some(TipRequest::UseLatestUnconfirmedTip)),
         Some("password".into()),
     )
@@ -256,17 +300,36 @@ fn account_latest_tip_uses_chainstate_read_service() {
     let account_response = wait_get(&client, &account_url);
     assert_eq!(account_response.status().as_u16(), StatusCode::OK.as_u16());
     let account: serde_json::Value = account_response.json().unwrap();
-    assert_eq!(account["balance"], "0x0000000000000000000000000000002a");
+    assert_eq!(account["balance"], "42");
+}
+
+#[test]
+fn account_invalid_tip_returns_400() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
+    let addr = free_addr();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
+    let client = reqwest::blocking::Client::new();
+
+    let account_url = format!(
+        "http://{addr}/rpc/v1/accounts/ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R?tip=not-a-tip"
+    );
+    let response = wait_get(&client, &account_url);
+    assert_eq!(response.status().as_u16(), StatusCode::BAD_REQUEST.as_u16());
+    let body: serde_json::Value = response.json().unwrap();
+    assert_eq!(body["error"]["code"], "invalid_tip");
 }
 
 #[test]
 fn saturated_chainstate_read_queue_returns_503() {
-    let (channels, receivers) = domain_channels();
-    spawn_test_domains(receivers);
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
     let addr = free_addr();
     let _server = spawn_axum_rpc_server(
         addr,
-        channels,
+        node,
         saturated_chainstate_reads(),
         Some("password".into()),
     )
@@ -285,17 +348,66 @@ fn saturated_chainstate_read_queue_returns_503() {
 }
 
 #[test]
-fn rejects_block_proposal_without_auth() {
-    let (channels, receivers) = domain_channels();
-    spawn_test_domains(receivers);
+fn block_stream_limit_returns_503() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
     let addr = free_addr();
-    let _server = spawn_axum_rpc_server(
+    let _server = spawn_test_router(
         addr,
-        channels,
-        mock_chainstate_reads(),
-        Some("password".into()),
+        router_with_block_stream_limit(node, mock_chainstate_reads(), Some("password".into()), 0),
     )
     .unwrap();
+    let client = reqwest::blocking::Client::new();
+
+    let block_id = "00".repeat(32);
+    let response = wait_get(&client, &format!("http://{addr}/rpc/v1/blocks/{block_id}"));
+    assert_eq!(
+        response.status().as_u16(),
+        StatusCode::SERVICE_UNAVAILABLE.as_u16()
+    );
+    let body: serde_json::Value = response.json().unwrap();
+    assert_eq!(body["error"]["code"], "block_stream_queue_full");
+}
+
+#[test]
+fn request_timeout_layer_returns_json_error() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
+    let addr = free_addr();
+    let _server = spawn_test_router(
+        addr,
+        router_with_limits(
+            node,
+            slow_chainstate_reads(Duration::from_millis(100)),
+            Some("password".into()),
+            RouterLimits {
+                request_timeout: Duration::from_millis(10),
+                ..RouterLimits::default()
+            },
+        ),
+    )
+    .unwrap();
+    let client = reqwest::blocking::Client::new();
+
+    let account_url =
+        format!("http://{addr}/rpc/v1/accounts/ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R");
+    let response = wait_get(&client, &account_url);
+    assert_eq!(
+        response.status().as_u16(),
+        StatusCode::SERVICE_UNAVAILABLE.as_u16()
+    );
+    let body: serde_json::Value = response.json().unwrap();
+    assert_eq!(body["error"]["code"], "request_timeout");
+}
+
+#[test]
+fn rejects_block_proposal_without_auth() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
+    let addr = free_addr();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
     let client = reqwest::blocking::Client::new();
 
     let response = client
@@ -310,22 +422,40 @@ fn rejects_block_proposal_without_auth() {
 }
 
 #[test]
-fn rejects_oversized_block_proposal() {
-    let (channels, receivers) = domain_channels();
-    spawn_test_domains(receivers);
+fn rejects_block_proposal_without_bearer_auth_scheme() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
     let addr = free_addr();
-    let _server = spawn_axum_rpc_server(
-        addr,
-        channels,
-        mock_chainstate_reads(),
-        Some("password".into()),
-    )
-    .unwrap();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
     let client = reqwest::blocking::Client::new();
 
     let response = client
         .post(format!("http://{addr}/rpc/v1/block-proposals"))
         .header("authorization", "password")
+        .json(&sample_block_proposal())
+        .send()
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        StatusCode::UNAUTHORIZED.as_u16()
+    );
+}
+
+#[test]
+fn rejects_oversized_block_proposal() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
+    let addr = free_addr();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
+    let client = reqwest::blocking::Client::new();
+
+    let response = client
+        .post(format!("http://{addr}/rpc/v1/block-proposals"))
+        .header("authorization", "Bearer password")
         .header("content-type", "application/json")
         .body(vec![0u8; MAX_PAYLOAD_LEN as usize + 1])
         .send()
@@ -340,22 +470,18 @@ fn rejects_oversized_block_proposal() {
 }
 
 #[test]
-fn serves_block_proposal_through_domain_channel() {
-    let (channels, receivers) = domain_channels();
-    spawn_test_domains(receivers);
+fn serves_block_proposal_through_rpc_bridge() {
+    let (node, endpoints) = rpc_bridge();
+    spawn_test_node(&node, endpoints);
     let addr = free_addr();
-    let _server = spawn_axum_rpc_server(
-        addr,
-        channels,
-        mock_chainstate_reads(),
-        Some("password".into()),
-    )
-    .unwrap();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
     let client = reqwest::blocking::Client::new();
 
     let response = client
         .post(format!("http://{addr}/rpc/v1/block-proposals"))
-        .header("authorization", "password")
+        .header("authorization", "Bearer password")
         .json(&sample_block_proposal())
         .send()
         .unwrap();
@@ -370,21 +496,17 @@ fn serves_block_proposal_through_domain_channel() {
 
 #[test]
 fn block_proposal_rejection_uses_new_api_error_framing() {
-    let (channels, receivers) = domain_channels();
-    spawn_block_proposal_rejection_domain(receivers, BlockProposalError::AlreadyValidating);
+    let (node, endpoints) = rpc_bridge();
+    spawn_block_proposal_rejection_endpoint(endpoints, BlockProposalError::AlreadyValidating);
     let addr = free_addr();
-    let _server = spawn_axum_rpc_server(
-        addr,
-        channels,
-        mock_chainstate_reads(),
-        Some("password".into()),
-    )
-    .unwrap();
+    let _server =
+        spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+            .unwrap();
     let client = reqwest::blocking::Client::new();
 
     let response = client
         .post(format!("http://{addr}/rpc/v1/block-proposals"))
-        .header("authorization", "password")
+        .header("authorization", "Bearer password")
         .json(&sample_block_proposal())
         .send()
         .unwrap();

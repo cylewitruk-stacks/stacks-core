@@ -28,6 +28,7 @@ extern crate slog;
 
 pub use stacks_common::util;
 use stacks_common::util::hash::hex_bytes;
+use stacks_rpc::config::{AxumRpcConfig, ChainstateReadSpec};
 
 pub mod monitoring;
 
@@ -45,8 +46,9 @@ pub mod syncctl;
 pub mod tenure;
 
 use std::collections::HashMap;
-#[cfg(feature = "axum-rpc")]
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::{env, panic, process};
 
 use backtrace::Backtrace;
@@ -73,13 +75,17 @@ pub use self::tenure::Tenure;
 use crate::neon_node::{BlockMinerThread, TipCandidate};
 use crate::run_loop::boot_nakamoto;
 
-#[cfg(feature = "axum-rpc")]
-pub fn make_axum_rpc_config(config: &Config, bind_addr: SocketAddr) -> stacks_rpc::AxumRpcConfig {
+pub fn make_axum_rpc_config(
+    config: &Config,
+    bind_addr: SocketAddr,
+    shutdown_signal: Option<Arc<AtomicBool>>,
+) -> AxumRpcConfig {
     let burnchain = config.get_burnchain();
-    stacks_rpc::AxumRpcConfig {
+    AxumRpcConfig {
         bind_addr,
         auth_token: config.connection_options.auth_token.clone(),
-        chainstate_read: stacks_rpc::ChainstateReadSpec {
+        shutdown_signal,
+        chainstate_read: ChainstateReadSpec {
             mainnet: config.is_mainnet(),
             chain_id: config.burnchain.chain_id,
             chainstate_path: config.get_chainstate_path_str(),

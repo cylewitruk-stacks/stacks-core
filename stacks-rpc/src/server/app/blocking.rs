@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::error::{ApiError, ApiErrorCode};
 
-pub const DOMAIN_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const DOMAIN_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn recv_reply<T, E>(rx: Receiver<Result<T, E>>) -> Result<T, ApiError>
 where

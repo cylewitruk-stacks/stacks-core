@@ -535,17 +535,16 @@ impl Node {
             epochs,
         );
 
-        #[cfg(feature = "axum-rpc")]
         let mut p2p_net = p2p_net;
 
-        #[cfg(feature = "axum-rpc")]
         let axum_rpc_server = self.config.node.axum_rpc_bind_addr().and_then(|bind_addr| {
             match stacks_rpc::prepare_axum_rpc_server(crate::make_axum_rpc_config(
                 &self.config,
                 bind_addr,
+                None,
             )) {
-                Ok((server, receivers)) => {
-                    p2p_net.install_axum_rpc_receivers(receivers);
+                Ok((server, endpoints)) => {
+                    p2p_net.install_rpc_endpoints(endpoints);
                     Some(server)
                 }
                 Err(e) => {
@@ -571,9 +570,10 @@ impl Node {
             self.config.clone(),
         );
 
-        #[cfg(feature = "axum-rpc")]
         if let Some(server) = axum_rpc_server {
-            server.spawn();
+            if let Err(e) = server.spawn() {
+                error!("Failed to spawn experimental Axum RPC server: {e}");
+            }
         }
 
         info!("Start HTTP server on: {}", &self.config.node.rpc_bind);

@@ -2002,14 +2002,17 @@ impl StacksChainState {
             .ok_or_else(|| Error::DBError(db_error::ParseError))?
             .to_string();
 
+        let init_required = fs::metadata(&clarity_state_index_marf).is_err();
+        if readonly && init_required {
+            return Err(Error::DBError(db_error::NoDBError));
+        }
+
         let nakamoto_staging_blocks_path =
             StacksChainState::static_get_nakamoto_staging_blocks_path(path)?;
         let nakamoto_staging_blocks_conn = StacksChainState::open_nakamoto_staging_blocks(
             &nakamoto_staging_blocks_path,
             !readonly,
         )?;
-
-        let init_required = fs::metadata(&clarity_state_index_marf).is_err();
 
         let state_index = if readonly {
             StacksChainState::open_db_readonly(
@@ -3126,6 +3129,22 @@ pub mod test {
             )
             .is_err());
         assert!(chainstate.db_tx_begin().is_ok());
+    }
+
+    #[test]
+    fn test_open_readonly_chainstate_without_initialized_clarity_marf() {
+        let path = chainstate_path(function_name!());
+        if fs::metadata(&path).is_ok() {
+            fs::remove_dir_all(&path).unwrap();
+        };
+        StacksChainState::make_chainstate_dirs(&path).unwrap();
+
+        let err = match StacksChainState::open_readonly(false, 0x80000000, &path, None) {
+            Ok(_) => panic!("read-only open should not initialize a missing clarity MARF"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::DBError(db_error::NoDBError)));
     }
 
     #[test]

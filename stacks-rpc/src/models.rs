@@ -88,23 +88,28 @@ pub struct AccountResponse {
 
 #[derive(Debug, Serialize)]
 pub struct AccountProofs {
-    pub balance: String,
-    pub nonce: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<Option<String>>,
 }
 
 impl From<AccountView> for AccountResponse {
     fn from(account: AccountView) -> Self {
-        let proofs = match (account.balance_proof, account.nonce_proof) {
-            (ProofBytes::Present(balance), ProofBytes::Present(nonce)) => Some(AccountProofs {
-                balance: hex_bytes(&balance),
-                nonce: hex_bytes(&nonce),
-            }),
-            _ => None,
+        let balance_proof = account_proof(account.balance_proof);
+        let nonce_proof = account_proof(account.nonce_proof);
+        let proofs = if balance_proof.is_some() || nonce_proof.is_some() {
+            Some(AccountProofs {
+                balance: balance_proof,
+                nonce: nonce_proof,
+            })
+        } else {
+            None
         };
 
         Self {
-            balance: hex_u128(account.balance),
-            locked: hex_u128(account.locked),
+            balance: account.balance.to_string(),
+            locked: account.locked.to_string(),
             unlock_height: account.unlock_height,
             nonce: account.nonce,
             proofs,
@@ -112,8 +117,35 @@ impl From<AccountView> for AccountResponse {
     }
 }
 
-fn hex_u128(value: u128) -> String {
-    format!("0x{}", to_hex(&value.to_be_bytes()))
+#[cfg(test)]
+mod tests {
+    use stacks::net::rpc_services::{AccountView, ProofBytes};
+
+    use super::AccountResponse;
+
+    #[test]
+    fn account_response_preserves_independent_proofs() {
+        let response = AccountResponse::from(AccountView {
+            balance: 42,
+            locked: 0,
+            unlock_height: 0,
+            nonce: 3,
+            balance_proof: ProofBytes::Present(vec![0xab, 0xcd]),
+            nonce_proof: ProofBytes::Missing,
+        });
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["proofs"]["balance"], "0xabcd");
+        assert!(value["proofs"]["nonce"].is_null());
+    }
+}
+
+fn account_proof(proof: ProofBytes) -> Option<Option<String>> {
+    match proof {
+        ProofBytes::NotRequested => None,
+        ProofBytes::Missing => Some(None),
+        ProofBytes::Present(bytes) => Some(Some(hex_bytes(&bytes))),
+    }
 }
 
 fn hex_bytes(value: &[u8]) -> String {

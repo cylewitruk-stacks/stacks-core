@@ -29,16 +29,21 @@ pub enum ApiErrorCode {
     DomainQueueDisconnected,
     ReadQueueFull,
     ReadQueueDisconnected,
+    BlockStreamQueueFull,
+    PeerInfoUnavailable,
+    RequestTimeout,
     BlockProposalAuthNotConfigured,
     Unauthorized,
     MissingContentType,
     InvalidContentType,
     BodyTooLarge,
+    BodyReadFailed,
     EmptyBody,
     InvalidJson,
     ShadowBlock,
     InvalidPrincipal,
     InvalidBlockId,
+    InvalidTip,
 }
 
 #[derive(Debug)]

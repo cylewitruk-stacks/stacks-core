@@ -289,17 +289,17 @@ pub struct NakamotoBlockStreamDescriptor {
 }
 
 impl NakamotoBlockStreamDescriptor {
-    #[cfg(test)]
-    fn hint_chunk_size(&self) -> usize {
-        32
-    }
-
     #[cfg(not(test))]
-    fn hint_chunk_size(&self) -> usize {
-        4096
-    }
+    const CHUNK_SIZE: usize = 64 * 1024;
 
-    pub fn generate_next_chunk(&mut self) -> RpcServiceResult<Vec<u8>> {
+    #[cfg(test)]
+    const CHUNK_SIZE: usize = 32;
+
+    pub fn generate_next_chunks(&mut self, max_bytes: usize) -> RpcServiceResult<Vec<Vec<u8>>> {
+        if max_bytes == 0 {
+            return Ok(vec![]);
+        }
+
         let mut blob_fd = self
             .staging_db_conn
             .open_nakamoto_block(self.rowid, false)
@@ -309,13 +309,24 @@ impl NakamotoBlockStreamDescriptor {
             .seek(SeekFrom::Start(self.offset))
             .map_err(|e| RpcServiceError::internal("Failed to seek Nakamoto block", e))?;
 
-        let mut buf = vec![0u8; self.hint_chunk_size()];
-        let num_read = blob_fd
-            .read(&mut buf)
-            .map_err(|e| RpcServiceError::internal("Failed to read Nakamoto block", e))?;
-        buf.truncate(num_read);
-        self.offset += num_read as u64;
-        Ok(buf)
+        let mut chunks = vec![];
+        let mut remaining = max_bytes;
+
+        while remaining > 0 {
+            let mut buf = vec![0u8; Self::CHUNK_SIZE.min(remaining)];
+            let num_read = blob_fd
+                .read(&mut buf)
+                .map_err(|e| RpcServiceError::internal("Failed to read Nakamoto block", e))?;
+            if num_read == 0 {
+                break;
+            }
+            buf.truncate(num_read);
+            self.offset += num_read as u64;
+            remaining -= num_read;
+            chunks.push(buf);
+        }
+
+        Ok(chunks)
     }
 }
 
@@ -352,4 +363,84 @@ pub fn get_nakamoto_block_stream(
         rowid,
         offset: 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rusqlite::params;
+    use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash};
+
+    use super::*;
+
+    fn unique_staging_db_path(test_name: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let dir = "/tmp/stacks-node-tests/rpc-services";
+        fs::create_dir_all(dir).unwrap();
+        format!("{dir}/{test_name}-{nanos}.sqlite")
+    }
+
+    #[test]
+    fn nakamoto_block_stream_batches_chunks_from_one_offset() {
+        let path = unique_staging_db_path("nakamoto-block-stream-batch");
+        let conn = StacksChainState::open_nakamoto_staging_blocks(&path, true).unwrap();
+        let block_id = StacksBlockId([1; 32]);
+        let data: Vec<u8> = (0..95).collect();
+
+        conn.execute(
+            "INSERT INTO nakamoto_staging_blocks (
+                block_hash,
+                consensus_hash,
+                parent_block_id,
+                is_tenure_start,
+                burn_attachable,
+                orphaned,
+                processed,
+                height,
+                index_block_hash,
+                processed_time,
+                obtain_method,
+                signing_weight,
+                data
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                &BlockHeaderHash([2; 32]),
+                &ConsensusHash([3; 20]),
+                &StacksBlockId([4; 32]),
+                0,
+                1,
+                0,
+                0,
+                1,
+                &block_id,
+                0,
+                "Pushed",
+                0,
+                &data,
+            ],
+        )
+        .unwrap();
+
+        let rowid = conn.last_insert_rowid();
+        let mut descriptor = NakamotoBlockStreamDescriptor {
+            block_id,
+            staging_db_conn: conn,
+            rowid,
+            offset: 0,
+        };
+
+        let first_batch = descriptor.generate_next_chunks(70).unwrap();
+        assert_eq!(first_batch.len(), 3);
+        assert_eq!(first_batch.concat(), data[..70]);
+
+        let second_batch = descriptor.generate_next_chunks(70).unwrap();
+        assert_eq!(second_batch.concat(), data[70..]);
+
+        assert!(descriptor.generate_next_chunks(70).unwrap().is_empty());
+    }
 }

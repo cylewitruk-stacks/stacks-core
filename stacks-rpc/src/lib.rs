@@ -8,23 +8,9 @@
 #[macro_use]
 extern crate stacks_common;
 
-mod blocking;
-mod chainstate_read;
-mod config;
-mod error;
-mod extractors;
-mod models;
-mod routes;
+pub mod config;
+pub mod error;
+pub mod models;
 mod server;
-mod state;
 
-pub use config::{AxumRpcConfig, ChainstateReadSpec};
-pub use error::{ApiErrorCode, ErrorBody, ErrorResponse};
-pub use models::{
-    AccountProofs, AccountResponse, BlockProposalStatus, BlockProposalSubmitResponse,
-    BurnBlockInfo, InfoResponse, StacksTipInfo,
-};
 pub use server::{prepare_axum_rpc_server, PreparedAxumRpcServer};
-
-#[cfg(test)]
-mod tests;

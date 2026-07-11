@@ -56,17 +56,13 @@ use crate::net::mempool::MempoolSync;
 use crate::net::neighbors::*;
 use crate::net::poll::{NetworkPollState, NetworkState};
 use crate::net::relay::{RelayerStats, *};
-#[cfg(feature = "axum-rpc")]
-use crate::net::rpc_domains::{BlockProposalQuery, PeerQuery, RpcDomainReceivers};
-#[cfg(feature = "axum-rpc")]
-use crate::net::rpc_services;
+use crate::net::rpc_bridge::{BlockProposalQuery, RpcEndpoints};
 use crate::net::server::*;
 use crate::net::stackerdb::{StackerDBConfig, StackerDBSync, StackerDBTx, StackerDBs};
-use crate::net::{Error as net_error, Neighbor, NeighborKey, *};
+use crate::net::{rpc_services, Error as net_error, Neighbor, NeighborKey, *};
 use crate::util_lib::db::{DBConn, DBTx, Error as db_error};
 
-#[cfg(feature = "axum-rpc")]
-const AXUM_RPC_DOMAIN_DRAIN_LIMIT: usize = 32;
+const AXUM_RPC_BRIDGE_DRAIN_LIMIT: usize = 32;
 
 /// inter-thread request to send a p2p message from another thread in this program.
 #[derive(Debug)]
@@ -641,9 +637,8 @@ pub struct PeerNetwork {
     /// via RPC responses
     pub highest_stacks_neighbor: Option<(SocketAddr, u64)>,
 
-    /// Experimental Axum RPC domain receivers.
-    #[cfg(feature = "axum-rpc")]
-    axum_rpc_receivers: Option<RpcDomainReceivers>,
+    /// Experimental Axum RPC endpoints owned by the P2P thread.
+    rpc_endpoints: Option<RpcEndpoints>,
 }
 
 impl PeerNetwork {
@@ -803,8 +798,7 @@ impl PeerNetwork {
 
             highest_stacks_neighbor: None,
 
-            #[cfg(feature = "axum-rpc")]
-            axum_rpc_receivers: None,
+            rpc_endpoints: None,
         };
 
         network.init_block_downloader();
@@ -817,12 +811,10 @@ impl PeerNetwork {
         self.block_proposal_thread = Some(thread);
     }
 
-    #[cfg(feature = "axum-rpc")]
-    pub fn install_axum_rpc_receivers(&mut self, receivers: RpcDomainReceivers) {
-        self.axum_rpc_receivers = Some(receivers);
+    pub fn install_rpc_endpoints(&mut self, endpoints: RpcEndpoints) {
+        self.rpc_endpoints = Some(endpoints);
     }
 
-    #[cfg(feature = "axum-rpc")]
     fn drain_axum_rpc_requests(
         &mut self,
         sortdb: &SortitionDB,
@@ -831,35 +823,25 @@ impl PeerNetwork {
         handler_args: &RPCHandlerArgs,
         ibd: bool,
     ) {
-        let Some(receivers) = self.axum_rpc_receivers.take() else {
+        let Some(endpoints) = self.rpc_endpoints.take() else {
             return;
         };
 
-        let mut remaining = AXUM_RPC_DOMAIN_DRAIN_LIMIT;
+        endpoints.peer_info.publish(rpc_services::get_peer_info(
+            self,
+            chainstate,
+            handler_args.exit_at_block_height,
+            &handler_args.genesis_chainstate_hash,
+            ibd,
+        ));
+
+        let mut remaining = AXUM_RPC_BRIDGE_DRAIN_LIMIT;
 
         while remaining > 0 {
             let mut made_progress = false;
 
             if remaining > 0 {
-                match receivers.peer.try_recv() {
-                    Ok(PeerQuery::GetInfo { reply }) => {
-                        remaining -= 1;
-                        made_progress = true;
-                        let result = Ok(rpc_services::get_peer_info(
-                            self,
-                            chainstate,
-                            handler_args.exit_at_block_height,
-                            &handler_args.genesis_chainstate_hash,
-                            ibd,
-                        ));
-                        let _ = reply.try_send(result);
-                    }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
-                }
-            }
-
-            if remaining > 0 {
-                match receivers.block_proposal.try_recv() {
+                match endpoints.block_proposal.try_recv() {
                     Ok(BlockProposalQuery::Validate { proposal, reply }) => {
                         remaining -= 1;
                         made_progress = true;
@@ -881,7 +863,7 @@ impl PeerNetwork {
             }
         }
 
-        self.axum_rpc_receivers = Some(receivers);
+        self.rpc_endpoints = Some(endpoints);
     }
 
     pub fn is_proposal_thread_running(&mut self) -> bool {
@@ -5592,7 +5574,6 @@ impl PeerNetwork {
         self.refresh_sortition_view(sortdb)
             .expect("FATAL: failed to refresh sortition view from sortition DB");
 
-        #[cfg(feature = "axum-rpc")]
         self.drain_axum_rpc_requests(sortdb, chainstate, mempool, handler_args, ibd);
 
         // This operation needs to be performed before any early return:
