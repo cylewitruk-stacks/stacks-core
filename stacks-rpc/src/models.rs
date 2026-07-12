@@ -1,7 +1,20 @@
-use serde::Serialize;
+use clarity::vm::analysis::contract_interface_builder::ContractInterface;
+use serde::{Deserialize, Serialize};
+use stacks::chainstate::nakamoto::NakamotoBlockHeader;
+use stacks::chainstate::stacks::boot::RewardSet;
+use stacks::chainstate::stacks::db::{ExtendedStacksHeader, StacksBlockHeaderTypes};
+use stacks::chainstate::stacks::StacksBlockHeader;
+use stacks::net::api::get_tenures_fork_info::TenureForkingInfo;
 use stacks::net::api::getinfo::{RPCLastPoxAnchorData, RPCPeerInfoData};
-use stacks::net::rpc_services::{AccountView, BlockProposalAccepted, ProofBytes};
-use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
+use stacks::net::api::getsortition::SortitionInfo;
+use stacks::net::api::gettenureblocks::RPCTenureBlock;
+use stacks::net::rpc_services::{
+    AccountView, BlockProposalAccepted, ClarityValueView, ConfirmedTransactionView,
+    ContractSourceView, ProofBytes, TenureBlocksPage, TenureTipView,
+};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksBlockId,
+};
 use stacks_common::types::StacksPublicKeyBuffer;
 use stacks_common::util::hash::{to_hex, Hash160, Sha256Sum};
 
@@ -96,8 +109,8 @@ pub struct AccountProofs {
 
 impl From<AccountView> for AccountResponse {
     fn from(account: AccountView) -> Self {
-        let balance_proof = account_proof(account.balance_proof);
-        let nonce_proof = account_proof(account.nonce_proof);
+        let balance_proof = proof_response(account.balance_proof);
+        let nonce_proof = proof_response(account.nonce_proof);
         let proofs = if balance_proof.is_some() || nonce_proof.is_some() {
             Some(AccountProofs {
                 balance: balance_proof,
@@ -119,9 +132,12 @@ impl From<AccountView> for AccountResponse {
 
 #[cfg(test)]
 mod tests {
-    use stacks::net::rpc_services::{AccountView, ProofBytes};
+    use stacks::chainstate::nakamoto::NakamotoBlockHeader;
+    use stacks::chainstate::stacks::db::StacksBlockHeaderTypes;
+    use stacks::net::rpc_services::{AccountView, ProofBytes, TenureTipView};
+    use stacks_common::types::chainstate::ConsensusHash;
 
-    use super::AccountResponse;
+    use super::{AccountResponse, TenureTipResponse};
 
     #[test]
     fn account_response_preserves_independent_proofs() {
@@ -138,13 +154,201 @@ mod tests {
         assert_eq!(value["proofs"]["balance"], "0xabcd");
         assert!(value["proofs"]["nonce"].is_null());
     }
+
+    #[test]
+    fn tenure_tip_response_does_not_expose_rust_enum_tags() {
+        let response = TenureTipResponse::from(TenureTipView {
+            header: StacksBlockHeaderTypes::Nakamoto(NakamotoBlockHeader::empty()),
+            burn_view: Some(ConsensusHash([1; 20])),
+        });
+        let value = serde_json::to_value(response).unwrap();
+
+        assert_eq!(value["header_type"], "nakamoto");
+        assert!(value.get("header").is_none());
+        assert!(value.get("Nakamoto").is_none());
+        assert!(value.get("version").is_some());
+    }
 }
 
-fn account_proof(proof: ProofBytes) -> Option<Option<String>> {
+fn proof_response(proof: ProofBytes) -> Option<Option<String>> {
     match proof {
         ProofBytes::NotRequested => None,
         ProofBytes::Missing => Some(None),
         ProofBytes::Present(bytes) => Some(Some(hex_bytes(&bytes))),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContractSourceResponse {
+    pub source: String,
+    pub publish_height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Option<String>>,
+}
+
+impl From<ContractSourceView> for ContractSourceResponse {
+    fn from(source: ContractSourceView) -> Self {
+        Self {
+            source: source.source,
+            publish_height: source.publish_height,
+            proof: proof_response(source.proof),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContractInterfaceResponse {
+    pub interface: ContractInterface,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClarityValueResponse {
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Option<String>>,
+}
+
+impl From<ClarityValueView> for ClarityValueResponse {
+    fn from(value: ClarityValueView) -> Self {
+        Self {
+            value: value.value,
+            proof: proof_response(value.proof),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TraitImplementationResponse {
+    pub implemented: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClarityMetadataResponse {
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadOnlyCallRequest {
+    pub sender: String,
+    #[serde(default)]
+    pub sponsor: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadOnlyCallResponse {
+    pub result: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfirmedTransactionResponse {
+    pub block_id: StacksBlockId,
+    pub transaction: String,
+    pub result: String,
+    pub block_height: Option<u64>,
+    pub canonical: bool,
+}
+
+impl From<ConfirmedTransactionView> for ConfirmedTransactionResponse {
+    fn from(transaction: ConfirmedTransactionView) -> Self {
+        Self {
+            block_id: transaction.block_id,
+            transaction: transaction.transaction,
+            result: transaction.result,
+            block_height: transaction.block_height,
+            canonical: transaction.canonical,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SignerActivityResponse {
+    pub blocks_signed: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StackerSetResponse {
+    pub reward_cycle: u64,
+    pub reward_set: RewardSet,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SortitionsResponse {
+    pub sortitions: Vec<SortitionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeadersResponse {
+    pub headers: Vec<ExtendedStacksHeader>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TenureForkInfoResponse {
+    pub tenures: Vec<TenureForkingInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TenureTipResponse {
+    pub header_type: BlockHeaderType,
+    #[serde(flatten)]
+    pub header: BlockHeaderResponse,
+    pub burn_view: Option<ConsensusHash>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockHeaderType {
+    Epoch2,
+    Nakamoto,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum BlockHeaderResponse {
+    Epoch2(StacksBlockHeader),
+    Nakamoto(NakamotoBlockHeader),
+}
+
+impl From<TenureTipView> for TenureTipResponse {
+    fn from(tip: TenureTipView) -> Self {
+        let (header_type, header) = match tip.header {
+            StacksBlockHeaderTypes::Epoch2(header) => {
+                (BlockHeaderType::Epoch2, BlockHeaderResponse::Epoch2(header))
+            }
+            StacksBlockHeaderTypes::Nakamoto(header) => (
+                BlockHeaderType::Nakamoto,
+                BlockHeaderResponse::Nakamoto(header),
+            ),
+        };
+        Self {
+            header_type,
+            header,
+            burn_view: tip.burn_view,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TenureBlocksPageResponse {
+    pub consensus_hash: ConsensusHash,
+    pub last_sortition_consensus_hash: ConsensusHash,
+    pub burn_block_height: u64,
+    pub burn_block_hash: BurnchainHeaderHash,
+    pub blocks: Vec<RPCTenureBlock>,
+    pub next_cursor: Option<StacksBlockId>,
+}
+
+impl From<TenureBlocksPage> for TenureBlocksPageResponse {
+    fn from(page: TenureBlocksPage) -> Self {
+        Self {
+            consensus_hash: page.consensus_hash,
+            last_sortition_consensus_hash: page.last_sortition_consensus_hash,
+            burn_block_height: page.burn_block_height,
+            burn_block_hash: page.burn_block_hash,
+            blocks: page.blocks,
+            next_cursor: page.next_cursor,
+        }
     }
 }
 

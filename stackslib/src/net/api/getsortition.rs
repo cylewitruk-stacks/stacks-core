@@ -147,7 +147,7 @@ impl GetSortitionHandler {
         }
     }
 
-    fn get_sortition_info(
+    pub fn get_sortition_info(
         sortition_sn: BlockSnapshot,
         sortdb: &SortitionDB,
         chainstate: &mut StacksChainState,

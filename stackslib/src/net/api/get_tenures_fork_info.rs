@@ -137,7 +137,7 @@ impl HttpRequest for GetTenuresForkInfo {
 }
 
 impl TenureForkingInfo {
-    fn from_snapshot(
+    pub fn from_snapshot(
         sn: &BlockSnapshot,
         sortdb: &SortitionDB,
         chainstate: &StacksChainState,

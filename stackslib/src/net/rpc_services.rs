@@ -5,20 +5,42 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::time::Duration;
 
+use clarity::util::secp256k1::Secp256k1PublicKey;
+use clarity::vm::analysis::contract_interface_builder::ContractInterface;
+use clarity::vm::analysis::RuntimeCheckErrorKind;
 use clarity::vm::clarity::ClarityConnection;
-use clarity::vm::database::{ClarityDatabase, STXBalance};
-use clarity::vm::types::PrincipalData;
+use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
+use clarity::vm::database::clarity_store::{make_contract_hash_key, ContractCommitment};
+use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
+use clarity::vm::errors::ClarityEvalError;
+use clarity::vm::errors::VmExecutionError::{self, RuntimeCheck};
+use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TraitIdentifier};
+use clarity::vm::{ClarityName, SymbolicExpression, Value};
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::Sha256Sum;
 
+use crate::burnchains::{Burnchain, Txid};
 use crate::chainstate::burn::db::sortdb::SortitionDB;
-use crate::chainstate::nakamoto::{NakamotoChainState, NakamotoStagingBlocksConn};
-use crate::chainstate::stacks::db::StacksChainState;
+use crate::chainstate::burn::BlockSnapshot;
+use crate::chainstate::coordinator::Error as CoordinatorError;
+use crate::chainstate::nakamoto::miner::make_mem_abort_callback;
+use crate::chainstate::nakamoto::{NakamotoChainState, NakamotoStagingBlocksConn, StacksDBIndexed};
+use crate::chainstate::stacks::boot::RewardSet;
+use crate::chainstate::stacks::db::{
+    ExtendedStacksHeader, StacksBlockHeaderTypes, StacksChainState,
+};
 use crate::chainstate::stacks::Error as ChainError;
+use crate::net::api::get_tenures_fork_info::TenureForkingInfo;
 use crate::net::api::getinfo::RPCPeerInfoData;
+use crate::net::api::getpoxinfo::RPCPoxInfoData;
+use crate::net::api::getsortition::{GetSortitionHandler, SortitionInfo};
+use crate::net::api::getstackers::{GetStackersErrors, GetStackersResponse};
+use crate::net::api::gettenureblocks::RPCTenureBlock;
 use crate::net::api::postblock_proposal::NakamotoBlockProposal;
 use crate::net::p2p::PeerNetwork;
 use crate::net::{Error as NetError, RPCHandlerArgs, TipRequest};
@@ -53,6 +75,68 @@ pub struct AccountView {
     pub nonce: u64,
     pub balance_proof: ProofBytes,
     pub nonce_proof: ProofBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractSourceView {
+    pub source: String,
+    pub publish_height: u32,
+    pub proof: ProofBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClarityValueView {
+    pub value: String,
+    pub proof: ProofBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedTransactionView {
+    pub block_id: StacksBlockId,
+    pub transaction: String,
+    pub result: String,
+    pub block_height: Option<u64>,
+    pub canonical: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TenureTipView {
+    pub header: StacksBlockHeaderTypes,
+    pub burn_view: Option<stacks_common::types::chainstate::ConsensusHash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortitionQuery {
+    ConsensusHash(stacks_common::types::chainstate::ConsensusHash),
+    BurnBlockHash(stacks_common::types::chainstate::BurnchainHeaderHash),
+    BurnBlockHeight(u64),
+    Latest,
+    LatestAndLast,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOnlyCallView {
+    Success(String),
+    NotReadOnly,
+    ExecutionTimedOut,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenureSelector {
+    ConsensusHash(stacks_common::types::chainstate::ConsensusHash),
+    BurnBlockHash(stacks_common::types::chainstate::BurnchainHeaderHash),
+    BurnBlockHeight(u64),
+}
+
+#[derive(Debug, Clone)]
+pub struct TenureBlocksPage {
+    pub consensus_hash: stacks_common::types::chainstate::ConsensusHash,
+    pub last_sortition_consensus_hash: stacks_common::types::chainstate::ConsensusHash,
+    pub burn_block_height: u64,
+    pub burn_block_hash: stacks_common::types::chainstate::BurnchainHeaderHash,
+    pub blocks: Vec<RPCTenureBlock>,
+    pub next_cursor: Option<StacksBlockId>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +365,327 @@ pub fn get_account(
     }
 }
 
+pub fn get_contract_source(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    tip_req: &TipRequest,
+    with_proof: bool,
+) -> RpcServiceResult<ContractSourceView> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let result = chainstate.maybe_read_only_clarity_tx(
+        &sortdb
+            .index_handle_at_block(chainstate, &tip)
+            .map_err(|e| RpcServiceError::internal("Failed to open sortition index", e))?,
+        &tip,
+        |clarity_tx| {
+            clarity_tx.with_clarity_db_readonly(|db| {
+                let source = db.get_contract_src(contract)?;
+                let key = make_contract_hash_key(contract);
+                let (commitment, proof) = if with_proof {
+                    db.get_data_with_proof::<ContractCommitment>(&key)
+                        .ok()
+                        .flatten()
+                        .map(|(commitment, proof)| (commitment, ProofBytes::Present(proof)))?
+                } else {
+                    db.get_data::<ContractCommitment>(&key)
+                        .ok()
+                        .flatten()
+                        .map(|commitment| (commitment, ProofBytes::NotRequested))?
+                };
+                Some(ContractSourceView {
+                    source,
+                    publish_height: commitment.block_height,
+                    proof,
+                })
+            })
+        },
+    );
+    required_clarity_result(result, &tip, "Contract source not found", "contract source")
+}
+
+pub fn get_contract_interface(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<ContractInterface> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let result = chainstate.maybe_read_only_clarity_tx(
+        &sortdb
+            .index_handle_at_block(chainstate, &tip)
+            .map_err(|e| RpcServiceError::internal("Failed to open sortition index", e))?,
+        &tip,
+        |clarity_tx| {
+            let epoch = clarity_tx.get_epoch();
+            clarity_tx.with_analysis_db_readonly(|db| {
+                db.load_contract(contract, &epoch)
+                    .ok()?
+                    .and_then(|analysis| analysis.contract_interface)
+            })
+        },
+    );
+    required_clarity_result(
+        result,
+        &tip,
+        "Contract interface not found",
+        "contract interface",
+    )
+}
+
+pub fn get_data_var(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    name: &ClarityName,
+    tip_req: &TipRequest,
+    with_proof: bool,
+) -> RpcServiceResult<ClarityValueView> {
+    let key = ClarityDatabase::make_key_for_trip(contract, StoreType::Variable, name);
+    get_clarity_db_value(
+        sortdb,
+        chainstate,
+        &key,
+        tip_req,
+        with_proof,
+        "Data variable",
+    )
+}
+
+pub fn get_map_entry(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    map: &ClarityName,
+    key_value: &Value,
+    tip_req: &TipRequest,
+    with_proof: bool,
+) -> RpcServiceResult<ClarityValueView> {
+    let key = ClarityDatabase::make_key_for_data_map_entry(contract, map, key_value)
+        .map_err(|e| RpcServiceError::BadRequest(format!("Invalid map key: {e:?}")))?;
+    let none = Value::none()
+        .serialize_to_hex()
+        .map_err(|e| RpcServiceError::internal("Failed to serialize Clarity none value", e))?;
+    get_optional_clarity_db_value(
+        sortdb,
+        chainstate,
+        &key,
+        tip_req,
+        with_proof,
+        format!("0x{none}"),
+    )
+}
+
+pub fn get_constant(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    name: &ClarityName,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<ClarityValueView> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let result = chainstate.maybe_read_only_clarity_tx(
+        &sortdb
+            .index_handle_at_block(chainstate, &tip)
+            .map_err(|e| RpcServiceError::internal("Failed to open sortition index", e))?,
+        &tip,
+        |clarity_tx| {
+            clarity_tx.with_clarity_db_readonly(|db| {
+                let contract = db.get_contract(contract).ok()?;
+                let value = contract.lookup_variable(name.as_str())?;
+                let value = value.serialize_to_hex().ok()?;
+                Some(ClarityValueView {
+                    value: format!("0x{value}"),
+                    proof: ProofBytes::NotRequested,
+                })
+            })
+        },
+    );
+    required_clarity_result(result, &tip, "Constant not found", "constant")
+}
+
+pub fn is_trait_implemented(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    trait_contract: QualifiedContractIdentifier,
+    trait_name: ClarityName,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<bool> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let trait_id = TraitIdentifier::new(trait_contract.issuer, trait_contract.name, trait_name);
+    let result = chainstate.maybe_read_only_clarity_tx(
+        &sortdb
+            .index_handle_at_block(chainstate, &tip)
+            .map_err(|e| RpcServiceError::internal("Failed to open sortition index", e))?,
+        &tip,
+        |clarity_tx| {
+            clarity_tx.with_clarity_db_readonly(|db| {
+                let analysis = db.load_contract_analysis(contract).ok().flatten()?;
+                if analysis.implemented_traits.contains(&trait_id) {
+                    return Some(true);
+                }
+                let defining_contract = db
+                    .load_contract_analysis(&trait_id.contract_identifier)
+                    .ok()
+                    .flatten()?;
+                let definition = defining_contract.get_defined_trait(&trait_id.name)?;
+                Some(
+                    analysis
+                        .check_trait_compliance(
+                            &db.get_clarity_epoch_version().ok()?,
+                            &trait_id,
+                            definition,
+                        )
+                        .is_ok(),
+                )
+            })
+        },
+    );
+    required_clarity_result(
+        result,
+        &tip,
+        "Contract analysis or trait definition not found",
+        "trait implementation",
+    )
+}
+
+pub fn get_clarity_metadata(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    key: &str,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<String> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let result = chainstate.maybe_read_only_clarity_tx(
+        &sortdb
+            .index_handle_at_block(chainstate, &tip)
+            .map_err(|e| RpcServiceError::internal("Failed to open sortition index", e))?,
+        &tip,
+        |clarity_tx| {
+            clarity_tx
+                .with_clarity_db_readonly(|db| db.store.get_metadata(contract, key).ok().flatten())
+        },
+    );
+    required_clarity_result(
+        result,
+        &tip,
+        "Contract metadata not found",
+        "contract metadata",
+    )
+}
+
+fn get_clarity_db_value(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    key: &str,
+    tip_req: &TipRequest,
+    with_proof: bool,
+    resource: &str,
+) -> RpcServiceResult<ClarityValueView> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let result = read_clarity_db_value(sortdb, chainstate, key, &tip, with_proof, None);
+    required_clarity_result(
+        result,
+        &tip,
+        &format!("{resource} not found"),
+        &resource.to_lowercase(),
+    )
+}
+
+fn get_optional_clarity_db_value(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    key: &str,
+    tip_req: &TipRequest,
+    with_proof: bool,
+    missing_value: String,
+) -> RpcServiceResult<ClarityValueView> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    match read_clarity_db_value(
+        sortdb,
+        chainstate,
+        key,
+        &tip,
+        with_proof,
+        Some(missing_value),
+    ) {
+        Ok(Some(Some(value))) => Ok(value),
+        Ok(Some(None)) => unreachable!("map reads always provide a missing value"),
+        Ok(None) => Err(RpcServiceError::NotFound(format!(
+            "Chain tip '{tip}' not found"
+        ))),
+        Err(e) => Err(RpcServiceError::internal("Failed to read map entry", e)),
+    }
+}
+
+fn read_clarity_db_value(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    key: &str,
+    tip: &StacksBlockId,
+    with_proof: bool,
+    missing_value: Option<String>,
+) -> Result<Option<Option<ClarityValueView>>, ChainError> {
+    chainstate.maybe_read_only_clarity_tx(
+        &sortdb.index_handle_at_block(chainstate, tip)?,
+        tip,
+        |clarity_tx| {
+            clarity_tx.with_clarity_db_readonly(|db| {
+                if with_proof {
+                    db.get_data_with_proof::<String>(key)
+                        .ok()
+                        .flatten()
+                        .map(|(value, proof)| ClarityValueView {
+                            value: format!("0x{value}"),
+                            proof: ProofBytes::Present(proof),
+                        })
+                        .or_else(|| {
+                            missing_value.clone().map(|value| ClarityValueView {
+                                value,
+                                proof: ProofBytes::Missing,
+                            })
+                        })
+                } else {
+                    db.get_data::<String>(key)
+                        .ok()
+                        .flatten()
+                        .map(|value| ClarityValueView {
+                            value: format!("0x{value}"),
+                            proof: ProofBytes::NotRequested,
+                        })
+                        .or_else(|| {
+                            missing_value.clone().map(|value| ClarityValueView {
+                                value,
+                                proof: ProofBytes::NotRequested,
+                            })
+                        })
+                }
+            })
+        },
+    )
+}
+
+fn required_clarity_result<T>(
+    result: Result<Option<Option<T>>, ChainError>,
+    tip: &StacksBlockId,
+    missing_message: &str,
+    operation: &str,
+) -> RpcServiceResult<T> {
+    match result {
+        Ok(Some(Some(value))) => Ok(value),
+        Ok(Some(None)) => Err(RpcServiceError::NotFound(missing_message.to_string())),
+        Ok(None) => Err(RpcServiceError::NotFound(format!(
+            "Chain tip '{tip}' not found"
+        ))),
+        Err(e) => Err(RpcServiceError::internal(
+            &format!("Failed to read {operation}"),
+            e,
+        )),
+    }
+}
+
 pub struct NakamotoBlockStreamDescriptor {
     pub block_id: StacksBlockId,
     staging_db_conn: NakamotoStagingBlocksConn,
@@ -365,6 +770,480 @@ pub fn get_nakamoto_block_stream(
     })
 }
 
+pub fn get_nakamoto_block_stream_by_height(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    height: u64,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<NakamotoBlockStreamDescriptor> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let block_id = chainstate
+        .index_conn()
+        .get_ancestor_block_hash(height, &tip)
+        .map_err(|e| RpcServiceError::internal("Failed to query block height", e))?
+        .ok_or_else(|| RpcServiceError::NotFound(format!("No block at height {height}")))?;
+    get_nakamoto_block_stream(chainstate, block_id)
+}
+
+pub fn get_confirmed_transaction(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    txid: &Txid,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<ConfirmedTransactionView> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let (block_id, transaction, result) =
+        NakamotoChainState::get_tx_info_from_txid(chainstate.index_conn().conn(), txid)
+            .map_err(|e| RpcServiceError::internal("Failed to query transaction", e))?
+            .ok_or_else(|| RpcServiceError::NotFound(format!("No confirmed transaction {txid}")))?;
+    let block_height = chainstate
+        .index_conn()
+        .get_ancestor_block_height(&block_id, &tip)
+        .map_err(|e| RpcServiceError::internal("Failed to query transaction block height", e))?;
+
+    Ok(ConfirmedTransactionView {
+        block_id,
+        transaction,
+        result,
+        canonical: block_height.is_some(),
+        block_height,
+    })
+}
+
+pub fn get_signer_block_count(
+    chainstate: &StacksChainState,
+    signer: &Secp256k1PublicKey,
+    reward_cycle: u64,
+) -> RpcServiceResult<u64> {
+    NakamotoChainState::get_signer_block_count(&chainstate.index_conn(), signer, reward_cycle)
+        .map_err(|e| RpcServiceError::NotFound(format!("Signer activity not found: {e}")))
+}
+
+pub fn get_tenure_tip(
+    sortdb: &SortitionDB,
+    chainstate: &StacksChainState,
+    consensus_hash: &stacks_common::types::chainstate::ConsensusHash,
+) -> RpcServiceResult<TenureTipView> {
+    let header = NakamotoChainState::find_highest_known_block_header_in_tenure(
+        chainstate,
+        sortdb,
+        consensus_hash,
+    )
+    .map_err(|e| RpcServiceError::internal("Failed to query tenure tip", e))?
+    .ok_or_else(|| RpcServiceError::NotFound(format!("No blocks in tenure {consensus_hash}")))?;
+    Ok(TenureTipView {
+        header: header.anchored_header,
+        burn_view: header.burn_view,
+    })
+}
+
+pub fn get_pox_info(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    burnchain: &Burnchain,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<RPCPoxInfoData> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    RPCPoxInfoData::from_db(sortdb, chainstate, &tip, burnchain, &BTreeMap::new())
+        .map_err(|e| RpcServiceError::internal("Failed to load PoX information", e))
+}
+
+pub fn get_stacker_set(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    burnchain: &Burnchain,
+    reward_cycle: u64,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<RewardSet> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    GetStackersResponse::load(sortdb, chainstate, &tip, burnchain, reward_cycle)
+        .map(|response| response.stacker_set)
+        .map_err(map_stacker_set_error)
+}
+
+fn map_stacker_set_error(error: GetStackersErrors) -> RpcServiceError {
+    match &error {
+        GetStackersErrors::NotAvailableYet(
+            CoordinatorError::NotPrepareEndBlock
+            | CoordinatorError::NotInPreparePhase
+            | CoordinatorError::PoXNotProcessedYet,
+        )
+        | GetStackersErrors::Other(_) => RpcServiceError::BadRequest(error.to_string()),
+        GetStackersErrors::NotAvailableYet(_) => {
+            RpcServiceError::Internal(format!("Failed to load stacker set: {error}"))
+        }
+    }
+}
+
+pub fn get_sortitions(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    query: &SortitionQuery,
+) -> RpcServiceResult<Vec<SortitionInfo>> {
+    let tip = load_canonical_chain_tip(sortdb, chainstate)?;
+    let burn_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn())
+        .map_err(|e| RpcServiceError::internal("Failed to load canonical burn tip", e))?;
+    let snapshot = match query {
+        SortitionQuery::Latest => Some(burn_tip.clone()),
+        SortitionQuery::ConsensusHash(consensus_hash) => {
+            SortitionDB::get_block_snapshot_consensus(sortdb.conn(), consensus_hash)
+                .map_err(|e| RpcServiceError::internal("Failed to query sortition", e))?
+        }
+        SortitionQuery::BurnBlockHash(burn_hash) => sortdb
+            .index_handle_at_tip()
+            .get_block_snapshot(burn_hash)
+            .map_err(|e| RpcServiceError::internal("Failed to query sortition", e))?,
+        SortitionQuery::BurnBlockHeight(height) => sortdb
+            .index_handle_at_tip()
+            .get_block_snapshot_by_height(*height)
+            .map_err(|e| RpcServiceError::internal("Failed to query sortition", e))?,
+        SortitionQuery::LatestAndLast => {
+            if burn_tip.sortition {
+                Some(burn_tip.clone())
+            } else {
+                Some(
+                    sortdb
+                        .index_handle_at_tip()
+                        .get_last_snapshot_with_sortition(burn_tip.block_height)
+                        .map_err(|e| {
+                            RpcServiceError::internal("Failed to query latest sortition", e)
+                        })?,
+                )
+            }
+        }
+    }
+    .ok_or_else(|| RpcServiceError::NotFound(format!("Sortition not found: {query:?}")))?;
+
+    let first = GetSortitionHandler::get_sortition_info(snapshot, sortdb, chainstate, &tip)
+        .map_err(|e| RpcServiceError::internal("Failed to load sortition details", e))?;
+    let last_sortition = first.last_sortition_ch.clone();
+    let mut result = vec![first];
+    if matches!(query, SortitionQuery::LatestAndLast) {
+        if let Some(last_sortition) = last_sortition {
+            let snapshot =
+                SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &last_sortition)
+                    .map_err(|e| RpcServiceError::internal("Failed to query last sortition", e))?
+                    .ok_or_else(|| {
+                        RpcServiceError::NotFound(format!(
+                            "Last sortition {last_sortition} not found"
+                        ))
+                    })?;
+            result.push(
+                GetSortitionHandler::get_sortition_info(snapshot, sortdb, chainstate, &tip)
+                    .map_err(|e| {
+                        RpcServiceError::internal("Failed to load last sortition details", e)
+                    })?,
+            );
+        }
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_read_only(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    contract: &QualifiedContractIdentifier,
+    function: &ClarityName,
+    sender: PrincipalData,
+    sponsor: Option<PrincipalData>,
+    arguments: Vec<Value>,
+    tip_req: &TipRequest,
+    mut cost_limit: ExecutionCost,
+    max_execution_time: Duration,
+    max_memory_bytes: u64,
+) -> RpcServiceResult<ReadOnlyCallView> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let args: Vec<_> = arguments
+        .into_iter()
+        .map(SymbolicExpression::atom_value)
+        .collect();
+    let mainnet = chainstate.mainnet;
+    let chain_id = chainstate.chain_id;
+    cost_limit.write_length = 0;
+    cost_limit.write_count = 0;
+
+    let result = chainstate.maybe_read_only_clarity_tx(
+        &sortdb
+            .index_handle_at_block(chainstate, &tip)
+            .map_err(|e| RpcServiceError::internal("Failed to open sortition index", e))?,
+        &tip,
+        |clarity_tx| {
+            let epoch = clarity_tx.get_epoch();
+            let cost_track = clarity_tx
+                .with_clarity_db_readonly(|db| {
+                    LimitedCostTracker::new_mid_block(mainnet, chain_id, cost_limit, db, epoch)
+                })
+                .map_err(VmExecutionError::from)?;
+            clarity_tx.with_readonly_clarity_env(
+                mainnet,
+                chain_id,
+                sender,
+                sponsor,
+                cost_track,
+                |exec_state, invoke_ctx| {
+                    exec_state
+                        .global_context
+                        .set_abort_callback(make_mem_abort_callback(max_memory_bytes));
+                    exec_state
+                        .global_context
+                        .set_max_execution_time(max_execution_time);
+                    // Deliberately allow any public function, not only `define-read-only`
+                    // functions. The zero write budget still rejects state changes, while this
+                    // permits read-only execution paths that use `contract-call?`.
+                    exec_state
+                        .execute_contract(invoke_ctx, contract, function.as_str(), &args, false)
+                        .map_err(ClarityEvalError::from)
+                },
+            )
+        },
+    );
+
+    match result {
+        Ok(Some(Ok(value))) => value
+            .serialize_to_hex()
+            .map(|value| ReadOnlyCallView::Success(format!("0x{value}")))
+            .map_err(|e| RpcServiceError::internal("Failed to serialize call result", e)),
+        Ok(Some(Err(ClarityEvalError::Vm(RuntimeCheck(
+            RuntimeCheckErrorKind::CostBalanceExceeded(actual, _),
+        )))))
+            if actual.write_count > 0 =>
+        {
+            Ok(ReadOnlyCallView::NotReadOnly)
+        }
+        Ok(Some(Err(ClarityEvalError::Vm(RuntimeCheck(
+            RuntimeCheckErrorKind::ExecutionTimeExpired,
+        ))))) => Ok(ReadOnlyCallView::ExecutionTimedOut),
+        Ok(Some(Err(e))) => Ok(ReadOnlyCallView::Failed(e.to_string())),
+        Ok(None) => Err(RpcServiceError::NotFound(format!(
+            "Chain tip '{tip}' not found"
+        ))),
+        Err(e) => Err(RpcServiceError::internal(
+            "Failed to execute read-only call",
+            e,
+        )),
+    }
+}
+
+pub fn get_headers(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    quantity: u32,
+    tip_req: &TipRequest,
+) -> RpcServiceResult<Vec<ExtendedStacksHeader>> {
+    let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
+    let header = StacksChainState::load_staging_block_info(chainstate.db(), &tip)
+        .map_err(|e| RpcServiceError::internal("Failed to query header tip", e))?
+        .ok_or_else(|| RpcServiceError::NotFound(format!("No header for tip {tip}")))?;
+    let quantity = quantity.min(header.height as u32);
+    let db = chainstate
+        .reopen_db()
+        .map_err(|e| RpcServiceError::internal("Failed to open header database", e))?;
+    let mut block_id = tip;
+    let mut headers = Vec::with_capacity(quantity as usize);
+    for _ in 0..quantity {
+        match StacksChainState::read_extended_header(&db, &chainstate.blocks_path, &block_id) {
+            Ok(header) => {
+                block_id = header.parent_block_id.clone();
+                headers.push(header);
+            }
+            Err(ChainError::DBError(crate::util_lib::db::Error::NotFoundError)) => break,
+            Err(e) => return Err(RpcServiceError::internal("Failed to read header", e)),
+        }
+    }
+    Ok(headers)
+}
+
+pub fn get_tenure_blocks_page(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    selector: &TenureSelector,
+    cursor: Option<StacksBlockId>,
+    limit: usize,
+) -> RpcServiceResult<TenureBlocksPage> {
+    let tip = load_canonical_chain_tip(sortdb, chainstate)?;
+    let snapshot = get_tenure_snapshot(sortdb, selector)?;
+    let last_sortition_consensus_hash = get_prior_sortition(sortdb, chainstate, &snapshot, &tip)?;
+    let highest = match selector {
+        TenureSelector::ConsensusHash(consensus_hash) => {
+            NakamotoChainState::find_highest_known_block_header_in_tenure(
+                chainstate,
+                sortdb,
+                consensus_hash,
+            )
+        }
+        TenureSelector::BurnBlockHash(hash) => {
+            NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_hash(
+                chainstate, sortdb, hash,
+            )
+        }
+        TenureSelector::BurnBlockHeight(height) => {
+            NakamotoChainState::find_highest_known_block_header_in_tenure_by_block_height(
+                chainstate, sortdb, *height,
+            )
+        }
+    }
+    .map_err(|e| RpcServiceError::internal("Failed to query tenure blocks", e))?;
+
+    let had_cursor = cursor.is_some();
+    let mut next_block_id = match cursor {
+        Some(cursor) => Some(cursor),
+        None => highest.map(|header| header.index_block_hash()),
+    };
+    let mut blocks = Vec::with_capacity(limit);
+    while blocks.len() < limit {
+        let Some(block_id) = next_block_id.take() else {
+            break;
+        };
+        let Some(header) = NakamotoChainState::get_block_header(chainstate.db(), &block_id)
+            .map_err(|e| RpcServiceError::internal("Failed to read tenure block header", e))?
+        else {
+            return Err(RpcServiceError::NotFound(format!(
+                "Tenure block cursor {block_id} not found"
+            )));
+        };
+        if header.consensus_hash != snapshot.consensus_hash {
+            if blocks.is_empty() && had_cursor {
+                return Err(RpcServiceError::BadRequest(
+                    "Tenure cursor does not belong to the requested tenure".into(),
+                ));
+            }
+            break;
+        }
+        let parent_block_id = match &header.anchored_header {
+            StacksBlockHeaderTypes::Nakamoto(nakamoto) => nakamoto.parent_block_id.clone(),
+            StacksBlockHeaderTypes::Epoch2(epoch2) => {
+                StacksBlockId::new(&header.consensus_hash, &epoch2.parent_block)
+            }
+        };
+        blocks.push(RPCTenureBlock {
+            block_id: header.index_block_hash(),
+            header_type: header.header_type_name().into(),
+            block_hash: header.anchored_header.block_hash(),
+            parent_block_id: parent_block_id.clone(),
+            height: header.stacks_block_height,
+        });
+        next_block_id = Some(parent_block_id);
+    }
+
+    let next_cursor = if let Some(next) = next_block_id {
+        NakamotoChainState::get_block_header(chainstate.db(), &next)
+            .map_err(|e| RpcServiceError::internal("Failed to query tenure page cursor", e))?
+            .filter(|header| header.consensus_hash == snapshot.consensus_hash)
+            .map(|_| next)
+    } else {
+        None
+    };
+
+    Ok(TenureBlocksPage {
+        consensus_hash: snapshot.consensus_hash,
+        last_sortition_consensus_hash,
+        burn_block_height: snapshot.block_height,
+        burn_block_hash: snapshot.burn_header_hash,
+        blocks,
+        next_cursor,
+    })
+}
+
+pub fn get_tenure_fork_info(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    start: &stacks_common::types::chainstate::ConsensusHash,
+    end: &stacks_common::types::chainstate::ConsensusHash,
+) -> RpcServiceResult<Vec<TenureForkingInfo>> {
+    const DEPTH_LIMIT: usize = 10;
+    let tip = load_canonical_chain_tip(sortdb, chainstate)?;
+    let end_snapshot = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), end)
+        .map_err(|e| RpcServiceError::internal("Failed to query end tenure", e))?
+        .ok_or_else(|| RpcServiceError::NotFound(format!("Tenure {end} not found")))?;
+    let height_bound = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), start)
+        .map_err(|e| RpcServiceError::internal("Failed to query start tenure", e))?
+        .ok_or_else(|| RpcServiceError::NotFound(format!("Tenure {start} not found")))?
+        .block_height;
+    let mut cursor = end_snapshot;
+    let mut result = vec![];
+    let mut depth = 0;
+    loop {
+        if cursor.sortition
+            || chainstate
+                .nakamoto_blocks_db()
+                .is_shadow_tenure(&cursor.consensus_hash)
+                .map_err(|e| RpcServiceError::internal("Failed to query shadow tenure", e))?
+        {
+            result.push(
+                TenureForkingInfo::from_snapshot(&cursor, sortdb, chainstate, &tip)
+                    .map_err(|e| RpcServiceError::internal("Failed to load tenure fork info", e))?,
+            );
+        }
+        if cursor.consensus_hash == *start || depth >= DEPTH_LIMIT {
+            break;
+        }
+        if height_bound >= cursor.block_height {
+            return Err(RpcServiceError::BadRequest(
+                "Tenures are not in the same sortition fork".into(),
+            ));
+        }
+        cursor = SortitionDB::get_block_snapshot(sortdb.conn(), &cursor.parent_sortition_id)
+            .map_err(|e| RpcServiceError::internal("Failed to walk tenure fork", e))?
+            .ok_or_else(|| RpcServiceError::NotFound("Parent tenure not found".into()))?;
+        if cursor.sortition {
+            depth += 1;
+        }
+    }
+    Ok(result)
+}
+
+fn get_tenure_snapshot(
+    sortdb: &SortitionDB,
+    selector: &TenureSelector,
+) -> RpcServiceResult<BlockSnapshot> {
+    let snapshot = match selector {
+        TenureSelector::ConsensusHash(consensus_hash) => {
+            SortitionDB::get_block_snapshot_consensus(sortdb.conn(), consensus_hash)
+                .map_err(|e| RpcServiceError::internal("Failed to query tenure", e))?
+        }
+        TenureSelector::BurnBlockHash(hash) => {
+            let handle = sortdb.index_handle_at_tip();
+            let sortition_id = handle
+                .get_sortition_id_for_bhh(hash)
+                .map_err(|e| RpcServiceError::internal("Failed to query burn block", e))?
+                .ok_or_else(|| RpcServiceError::NotFound(format!("Burn block {hash} not found")))?;
+            SortitionDB::get_block_snapshot(handle.conn(), &sortition_id)
+                .map_err(|e| RpcServiceError::internal("Failed to query tenure snapshot", e))?
+        }
+        TenureSelector::BurnBlockHeight(height) => sortdb
+            .index_handle_at_tip()
+            .get_block_snapshot_by_height(*height)
+            .map_err(|e| RpcServiceError::internal("Failed to query burn height", e))?,
+    };
+    snapshot.ok_or_else(|| RpcServiceError::NotFound(format!("Tenure not found: {selector:?}")))
+}
+
+fn get_prior_sortition(
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    snapshot: &BlockSnapshot,
+    tip: &StacksBlockId,
+) -> RpcServiceResult<stacks_common::types::chainstate::ConsensusHash> {
+    let is_shadow = chainstate
+        .nakamoto_blocks_db()
+        .is_shadow_tenure(&snapshot.consensus_hash)
+        .map_err(|e| RpcServiceError::internal("Failed to query shadow tenure", e))?;
+    if is_shadow {
+        return chainstate
+            .index_conn()
+            .get_parent_tenure_consensus_hash(tip, &snapshot.consensus_hash)
+            .map_err(|e| RpcServiceError::internal("Failed to query parent tenure", e))?
+            .ok_or_else(|| RpcServiceError::NotFound("Parent tenure not found".into()));
+    }
+    sortdb
+        .index_handle_at_ch(&snapshot.consensus_hash)
+        .map_err(|e| RpcServiceError::internal("Failed to open tenure sortition", e))?
+        .get_last_snapshot_with_sortition(snapshot.block_height.saturating_sub(1))
+        .map(|snapshot| snapshot.consensus_hash)
+        .map_err(|e| RpcServiceError::internal("Failed to query prior sortition", e))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -374,6 +1253,22 @@ mod tests {
     use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash};
 
     use super::*;
+
+    #[test]
+    fn stacker_set_errors_distinguish_availability_from_internal_failures() {
+        assert!(matches!(
+            map_stacker_set_error(GetStackersErrors::NotAvailableYet(
+                CoordinatorError::NotInPreparePhase
+            )),
+            RpcServiceError::BadRequest(_)
+        ));
+        assert!(matches!(
+            map_stacker_set_error(GetStackersErrors::NotAvailableYet(
+                CoordinatorError::NoSortitions
+            )),
+            RpcServiceError::Internal(_)
+        ));
+    }
 
     fn unique_staging_db_path(test_name: &str) -> String {
         let nanos = SystemTime::now()

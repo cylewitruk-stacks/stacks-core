@@ -4,6 +4,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use http_body_util::LengthLimitError;
+use serde::de::DeserializeOwned;
 use stacks::net::api::postblock_proposal::NakamotoBlockProposal;
 use stacks_common::codec::MAX_PAYLOAD_LEN;
 use subtle::ConstantTimeEq;
@@ -26,6 +27,30 @@ impl FromRequestParts<AppState> for BlockProposalAuth {
 }
 
 pub struct BlockProposalBody(pub NakamotoBlockProposal);
+
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        axum::Json::<T>::from_request(req, state)
+            .await
+            .map(|axum::Json(value)| Self(value))
+            .map_err(|rejection| {
+                let code = match rejection.status() {
+                    StatusCode::PAYLOAD_TOO_LARGE => ApiErrorCode::BodyTooLarge,
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE => ApiErrorCode::InvalidContentType,
+                    _ => ApiErrorCode::InvalidJson,
+                };
+                ApiError::status(rejection.status(), code, rejection.body_text())
+            })
+    }
+}
 
 impl FromRequest<AppState> for BlockProposalBody {
     type Rejection = ApiError;
