@@ -28,7 +28,9 @@ extern crate slog;
 
 pub use stacks_common::util;
 use stacks_common::util::hash::hex_bytes;
-use stacks_rpc::config::{AxumRpcConfig, ChainstateReadSpec, ReadOnlyCallSpec};
+use stacks_rpc::config::{
+    AxumRpcConfig, ChainstateReadSpec, FeeEstimationSpec, MempoolReadSpec, ReadOnlyCallSpec,
+};
 
 pub mod monitoring;
 
@@ -82,6 +84,19 @@ pub fn make_axum_rpc_config(
     shutdown_signal: Option<Arc<AtomicBool>>,
 ) -> AxumRpcConfig {
     let burnchain = config.get_burnchain();
+    let chainstate_path = config.get_chainstate_path_str();
+    let fee_estimation = match (
+        config.make_cost_estimator(),
+        config.make_fee_estimator(),
+        config.make_cost_metric(),
+    ) {
+        (Some(cost_estimator), Some(fee_estimator), Some(cost_metric)) => Some(FeeEstimationSpec {
+            cost_estimator,
+            fee_estimator,
+            cost_metric,
+        }),
+        _ => None,
+    };
     AxumRpcConfig {
         bind_addr,
         auth_token: config.connection_options.auth_token.clone(),
@@ -89,7 +104,7 @@ pub fn make_axum_rpc_config(
         chainstate_read: ChainstateReadSpec {
             mainnet: config.is_mainnet(),
             chain_id: config.burnchain.chain_id,
-            chainstate_path: config.get_chainstate_path_str(),
+            chainstate_path: chainstate_path.clone(),
             sortition_db_path: config.get_burn_db_file_path(),
             marf_opts: Some(config.node.get_marf_opts()),
             burnchain,
@@ -103,6 +118,8 @@ pub fn make_axum_rpc_config(
                 max_memory_bytes: config.connection_options.read_only_call_max_mem_bytes,
             },
         },
+        mempool_read: MempoolReadSpec { chainstate_path },
+        fee_estimation,
     }
 }
 

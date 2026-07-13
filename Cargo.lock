@@ -4635,6 +4635,7 @@ dependencies = [
  "http-body-util",
  "r2d2",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "slog",

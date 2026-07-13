@@ -2028,6 +2028,47 @@ impl MemPoolDB {
         query_row(conn, "SELECT * FROM mempool WHERE txid = ?1", params![txid])
     }
 
+    /// Return a stable newest-first page for public mempool inspection.
+    /// The cursor identifies the last transaction returned by the previous page.
+    pub fn get_txs_page(
+        conn: &DBConn,
+        cursor: Option<&Txid>,
+        limit: u64,
+    ) -> Result<(Vec<MemPoolTxInfo>, Option<Txid>), db_error> {
+        let fetch_limit = limit.saturating_add(1);
+        let mut transactions = if let Some(cursor) = cursor {
+            let cursor_info = Self::get_tx(conn, cursor)?.ok_or(db_error::NotFoundError)?;
+            query_rows::<MemPoolTxInfo, _>(
+                conn,
+                "SELECT * FROM mempool
+                 WHERE accept_time < ?1 OR (accept_time = ?1 AND txid < ?2)
+                 ORDER BY accept_time DESC, txid DESC
+                 LIMIT ?3",
+                params![
+                    u64_to_sql(cursor_info.metadata.accept_time)?,
+                    cursor,
+                    u64_to_sql(fetch_limit)?,
+                ],
+            )?
+        } else {
+            query_rows::<MemPoolTxInfo, _>(
+                conn,
+                "SELECT * FROM mempool
+                 ORDER BY accept_time DESC, txid DESC
+                 LIMIT ?1",
+                params![u64_to_sql(fetch_limit)?],
+            )?
+        };
+        let has_more = transactions.len() > limit as usize;
+        transactions.truncate(limit as usize);
+        let next_cursor = if has_more {
+            transactions.last().map(|tx| tx.metadata.txid.clone())
+        } else {
+            None
+        };
+        Ok((transactions, next_cursor))
+    }
+
     /// Get all transactions across all tips
     #[cfg(test)]
     pub fn get_all_txs(conn: &DBConn) -> Result<Vec<MemPoolTxInfo>, db_error> {

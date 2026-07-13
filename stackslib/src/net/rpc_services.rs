@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use clarity::util::secp256k1::Secp256k1PublicKey;
@@ -20,9 +21,10 @@ use clarity::vm::errors::ClarityEvalError;
 use clarity::vm::errors::VmExecutionError::{self, RuntimeCheck};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TraitIdentifier};
 use clarity::vm::{ClarityName, SymbolicExpression, Value};
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::codec::StacksMessageCodec;
+use stacks_common::types::chainstate::{StacksAddress, StacksBlockId};
 use stacks_common::util::get_epoch_time_secs;
-use stacks_common::util::hash::Sha256Sum;
+use stacks_common::util::hash::{to_hex, Sha256Sum};
 
 use crate::burnchains::{Burnchain, Txid};
 use crate::chainstate::burn::db::sortdb::SortitionDB;
@@ -34,7 +36,11 @@ use crate::chainstate::stacks::boot::RewardSet;
 use crate::chainstate::stacks::db::{
     ExtendedStacksHeader, StacksBlockHeaderTypes, StacksChainState,
 };
-use crate::chainstate::stacks::Error as ChainError;
+use crate::chainstate::stacks::{Error as ChainError, StacksTransaction, TransactionPayload};
+use crate::core::mempool::MemPoolDB;
+use crate::core::StacksEpoch;
+use crate::cost_estimates::metrics::CostMetric;
+use crate::cost_estimates::{CostEstimator, EstimatorError, FeeEstimator};
 use crate::net::api::get_tenures_fork_info::TenureForkingInfo;
 use crate::net::api::getinfo::RPCPeerInfoData;
 use crate::net::api::getpoxinfo::RPCPoxInfoData;
@@ -43,7 +49,8 @@ use crate::net::api::getstackers::{GetStackersErrors, GetStackersResponse};
 use crate::net::api::gettenureblocks::RPCTenureBlock;
 use crate::net::api::postblock_proposal::NakamotoBlockProposal;
 use crate::net::p2p::PeerNetwork;
-use crate::net::{Error as NetError, RPCHandlerArgs, TipRequest};
+use crate::net::relay::Relayer;
+use crate::net::{Attachment, Error as NetError, RPCHandlerArgs, TipRequest};
 
 #[derive(Debug)]
 pub enum RpcServiceError {
@@ -99,6 +106,29 @@ pub struct ConfirmedTransactionView {
     pub canonical: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MempoolTransactionView {
+    pub txid: Txid,
+    pub transaction: String,
+    pub fee: u64,
+    pub length: u64,
+    pub accepted_at: u64,
+    pub coinbase_height: u64,
+    pub tenure_consensus_hash: stacks_common::types::chainstate::ConsensusHash,
+    pub tenure_block_hash: stacks_common::types::chainstate::BlockHeaderHash,
+    pub origin_address: StacksAddress,
+    pub origin_nonce: u64,
+    pub sponsor_address: StacksAddress,
+    pub sponsor_nonce: u64,
+    pub time_estimate_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MempoolTransactionsPage {
+    pub transactions: Vec<MempoolTransactionView>,
+    pub next_cursor: Option<Txid>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TenureTipView {
     pub header: StacksBlockHeaderTypes,
@@ -141,6 +171,126 @@ pub struct TenureBlocksPage {
 
 #[derive(Debug, Clone)]
 pub struct BlockProposalAccepted;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionSubmission {
+    pub txid: Txid,
+    pub status: TransactionSubmissionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeeEstimateView {
+    pub estimated_cost: ExecutionCost,
+    pub estimated_cost_scalar: u64,
+    pub estimations: Vec<FeeEstimateTier>,
+    pub cost_scalar_change_by_byte: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeeEstimateTier {
+    pub fee_rate: f64,
+    pub fee: u64,
+}
+
+#[derive(Debug)]
+pub enum FeeEstimationError {
+    NoEstimate(String),
+    Internal(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeStateSnapshot {
+    pub observed_at: u64,
+    pub peer_info: RPCPeerInfoData,
+    pub health: NodeHealthView,
+    pub current_tenure: Option<CurrentTenureView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeHealthView {
+    pub difference_from_max_peer: u64,
+    pub max_peer_height: u64,
+    pub max_peer_address: Option<SocketAddr>,
+    pub node_tip_height: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTenureView {
+    pub consensus_hash: stacks_common::types::chainstate::ConsensusHash,
+    pub tenure_start_block_id: StacksBlockId,
+    pub parent_consensus_hash: stacks_common::types::chainstate::ConsensusHash,
+    pub parent_tenure_start_block_id: StacksBlockId,
+    pub tip_block_id: StacksBlockId,
+    pub tip_height: u64,
+    pub reward_cycle: u64,
+}
+
+pub fn estimate_transaction_fee(
+    cost_estimator: &dyn CostEstimator,
+    fee_estimator: &dyn FeeEstimator,
+    metric: &dyn CostMetric,
+    payload: &TransactionPayload,
+    estimated_len: u64,
+    epoch: &StacksEpoch,
+) -> Result<FeeEstimateView, FeeEstimationError> {
+    use crate::chainstate::stacks::db::blocks::MINIMUM_TX_FEE_RATE_PER_BYTE;
+
+    let estimated_cost = cost_estimator
+        .estimate_cost(payload, &epoch.epoch_id)
+        .map_err(map_estimator_error)?;
+    let scalar = metric.from_cost_and_len(&estimated_cost, &epoch.block_limit, estimated_len);
+    let rates = fee_estimator
+        .get_rate_estimates()
+        .map_err(map_estimator_error)?
+        .to_vec();
+    let minimum_fee = estimated_len.saturating_mul(MINIMUM_TX_FEE_RATE_PER_BYTE);
+    let estimations = rates
+        .into_iter()
+        .map(|fee_rate| FeeEstimateTier {
+            fee_rate,
+            fee: ((fee_rate * scalar as f64) as u64).max(minimum_fee),
+        })
+        .collect();
+
+    Ok(FeeEstimateView {
+        estimated_cost,
+        estimated_cost_scalar: scalar,
+        estimations,
+        cost_scalar_change_by_byte: metric.change_per_byte(),
+    })
+}
+
+fn map_estimator_error(error: EstimatorError) -> FeeEstimationError {
+    match error {
+        EstimatorError::NoEstimateAvailable => FeeEstimationError::NoEstimate(error.to_string()),
+        EstimatorError::SqliteError(_) => {
+            FeeEstimationError::Internal(format!("Fee estimator database failed: {error}"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionSubmissionStatus {
+    Accepted,
+    AlreadyKnown,
+}
+
+#[derive(Debug, Clone)]
+pub enum TransactionSubmissionError {
+    Problematic,
+    Rejected(serde_json::Value),
+    Internal(String),
+}
+
+impl std::fmt::Display for TransactionSubmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Problematic => f.write_str("Transaction failed static problematic checks"),
+            Self::Rejected(error) => write!(f, "Transaction rejected by mempool: {error}"),
+            Self::Internal(message) => f.write_str(message),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum BlockProposalError {
@@ -185,6 +335,56 @@ pub fn get_peer_info(
     )
 }
 
+pub fn get_node_state_snapshot(
+    network: &PeerNetwork,
+    chainstate: &StacksChainState,
+    exit_at_block_height: Option<u64>,
+    genesis_chainstate_hash: &Sha256Sum,
+    ibd: bool,
+) -> NodeStateSnapshot {
+    let (max_peer_address, max_peer_height) = network
+        .highest_stacks_neighbor
+        .map(|(address, height)| (Some(address), height))
+        .unwrap_or((None, 0));
+    let node_tip_height = network.stacks_tip.height;
+    let current_tenure = network
+        .burnchain
+        .block_height_to_reward_cycle(network.burnchain_tip.block_height)
+        .map(|reward_cycle| CurrentTenureView {
+            consensus_hash: network.stacks_tip.consensus_hash.clone(),
+            tenure_start_block_id: network.tenure_start_block_id.clone(),
+            parent_consensus_hash: network.parent_stacks_tip.consensus_hash.clone(),
+            parent_tenure_start_block_id: StacksBlockId::new(
+                &network.parent_stacks_tip.consensus_hash,
+                &network.parent_stacks_tip.block_hash,
+            ),
+            tip_block_id: StacksBlockId::new(
+                &network.stacks_tip.consensus_hash,
+                &network.stacks_tip.block_hash,
+            ),
+            tip_height: node_tip_height,
+            reward_cycle,
+        });
+
+    NodeStateSnapshot {
+        observed_at: get_epoch_time_secs(),
+        peer_info: get_peer_info(
+            network,
+            chainstate,
+            exit_at_block_height,
+            genesis_chainstate_hash,
+            ibd,
+        ),
+        health: NodeHealthView {
+            difference_from_max_peer: max_peer_height.saturating_sub(node_tip_height),
+            max_peer_height,
+            max_peer_address,
+            node_tip_height,
+        },
+        current_tenure,
+    }
+}
+
 /// Trigger block proposal validation.
 ///
 /// The RPC service only starts validation. The eventual validation result is delivered through the
@@ -226,6 +426,84 @@ pub fn start_block_proposal_validation(
         .map_err(|_e| BlockProposalError::SpawnFailed)?;
     network.set_proposal_thread(thread_info);
     Ok(BlockProposalAccepted)
+}
+
+pub fn submit_transaction(
+    network: &mut PeerNetwork,
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    mempool: &mut MemPoolDB,
+    rpc_args: &RPCHandlerArgs,
+    transaction: &StacksTransaction,
+    attachment: Option<&Attachment>,
+) -> Result<TransactionSubmission, TransactionSubmissionError> {
+    let txid = transaction.txid();
+    if mempool.has_tx(&txid) {
+        return Ok(TransactionSubmission {
+            txid,
+            status: TransactionSubmissionStatus::AlreadyKnown,
+        });
+    }
+
+    let burn_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn()).map_err(|e| {
+        TransactionSubmissionError::Internal(format!("Failed to load canonical burn tip: {e}"))
+    })?;
+    let epoch = SortitionDB::get_stacks_epoch(sortdb.conn(), burn_tip.block_height)
+        .map_err(|e| {
+            TransactionSubmissionError::Internal(format!("Failed to load Stacks epoch: {e}"))
+        })?
+        .ok_or_else(|| {
+            TransactionSubmissionError::Internal(
+                "No Stacks epoch for canonical burn tip".to_string(),
+            )
+        })?;
+
+    if Relayer::do_static_problematic_checks()
+        && Relayer::static_check_problematic_relayed_tx(
+            chainstate.mainnet,
+            epoch.epoch_id,
+            transaction,
+        )
+        .is_err()
+    {
+        return Err(TransactionSubmissionError::Problematic);
+    }
+
+    mempool
+        .submit(
+            chainstate,
+            sortdb,
+            &network.stacks_tip.consensus_hash,
+            &network.stacks_tip.block_hash,
+            transaction,
+            rpc_args.event_observer.as_deref(),
+            &epoch.block_limit,
+            &epoch.epoch_id,
+        )
+        .map_err(|error| TransactionSubmissionError::Rejected(error.into_json(&txid)))?;
+
+    if let (Some(attachment), TransactionPayload::ContractCall(contract_call)) =
+        (attachment, &transaction.payload)
+    {
+        if network
+            .get_atlasdb()
+            .should_keep_attachment(&contract_call.to_clarity_contract_id(), attachment)
+        {
+            network
+                .get_atlasdb_mut()
+                .insert_uninstantiated_attachment(attachment)
+                .map_err(|e| {
+                    TransactionSubmissionError::Internal(format!(
+                        "Failed to store contract-call attachment: {e:?}"
+                    ))
+                })?;
+        }
+    }
+
+    Ok(TransactionSubmission {
+        txid,
+        status: TransactionSubmissionStatus::Accepted,
+    })
 }
 
 pub fn load_stacks_chain_tip(
@@ -808,6 +1086,58 @@ pub fn get_confirmed_transaction(
         canonical: block_height.is_some(),
         block_height,
     })
+}
+
+pub fn get_mempool_transaction(
+    conn: &crate::util_lib::db::DBConn,
+    txid: &Txid,
+) -> RpcServiceResult<MempoolTransactionView> {
+    MemPoolDB::get_tx(conn, txid)
+        .map_err(|e| RpcServiceError::internal("Failed to query mempool transaction", e))?
+        .map(MempoolTransactionView::from)
+        .ok_or_else(|| RpcServiceError::NotFound(format!("No mempool transaction {txid}")))
+}
+
+pub fn get_mempool_transactions_page(
+    conn: &crate::util_lib::db::DBConn,
+    cursor: Option<&Txid>,
+    limit: u64,
+) -> RpcServiceResult<MempoolTransactionsPage> {
+    let (transactions, next_cursor) =
+        MemPoolDB::get_txs_page(conn, cursor, limit).map_err(|e| {
+            if matches!(e, crate::util_lib::db::Error::NotFoundError) && cursor.is_some() {
+                RpcServiceError::BadRequest("Mempool cursor does not exist".to_string())
+            } else {
+                RpcServiceError::internal("Failed to query mempool transactions", e)
+            }
+        })?;
+    Ok(MempoolTransactionsPage {
+        transactions: transactions
+            .into_iter()
+            .map(MempoolTransactionView::from)
+            .collect(),
+        next_cursor,
+    })
+}
+
+impl From<crate::core::mempool::MemPoolTxInfo> for MempoolTransactionView {
+    fn from(info: crate::core::mempool::MemPoolTxInfo) -> Self {
+        Self {
+            txid: info.metadata.txid,
+            transaction: format!("0x{}", to_hex(&info.tx.serialize_to_vec())),
+            fee: info.metadata.tx_fee,
+            length: info.metadata.len,
+            accepted_at: info.metadata.accept_time,
+            coinbase_height: info.metadata.coinbase_height,
+            tenure_consensus_hash: info.metadata.tenure_consensus_hash,
+            tenure_block_hash: info.metadata.tenure_block_header_hash,
+            origin_address: info.metadata.origin_address,
+            origin_nonce: info.metadata.origin_nonce,
+            sponsor_address: info.metadata.sponsor_address,
+            sponsor_nonce: info.metadata.sponsor_nonce,
+            time_estimate_ms: info.metadata.time_estimate_ms,
+        }
+    }
 }
 
 pub fn get_signer_block_count(

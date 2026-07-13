@@ -33,7 +33,12 @@ pub fn prepare_axum_rpc_server(
     config: AxumRpcConfig,
 ) -> RpcServiceResult<(PreparedAxumRpcServer, RpcEndpoints)> {
     let (node, endpoints) = rpc_bridge();
-    let app = app::RpcApplication::open(config.chainstate_read, config.auth_token)?;
+    let app = app::RpcApplication::open(
+        config.chainstate_read,
+        config.mempool_read,
+        config.fee_estimation,
+        config.auth_token,
+    )?;
     Ok((
         PreparedAxumRpcServer {
             bind_addr: config.bind_addr,

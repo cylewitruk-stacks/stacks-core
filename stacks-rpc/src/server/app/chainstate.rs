@@ -11,6 +11,7 @@ use stacks::burnchains::Txid;
 use stacks::chainstate::burn::db::sortdb::SortitionDB;
 use stacks::chainstate::stacks::boot::RewardSet;
 use stacks::chainstate::stacks::db::{ExtendedStacksHeader, StacksChainState};
+use stacks::core::StacksEpoch;
 use stacks::net::api::get_tenures_fork_info::TenureForkingInfo;
 use stacks::net::api::getpoxinfo::RPCPoxInfoData;
 use stacks::net::api::getsortition::SortitionInfo;
@@ -22,12 +23,11 @@ use stacks::net::rpc_services::{
 };
 use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
 
+use super::read_pool::{
+    build_eager_pool, DEFAULT_READ_POOL_SIZE, READ_POOL_CHECKOUT_TIMEOUT, READ_POOL_STARTUP_TIMEOUT,
+};
 use crate::config::{ChainstateReadSpec, ReadOnlyCallSpec};
 use crate::error::{ApiError, ApiErrorCode};
-
-const DEFAULT_READ_POOL_SIZE: u32 = 4;
-const READ_POOL_CHECKOUT_TIMEOUT: Duration = Duration::from_millis(100);
-const READ_POOL_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ChainstateReadService {
@@ -155,6 +155,8 @@ pub trait ChainstateReadExecutor: Send + Sync {
         start: ConsensusHash,
         end: ConsensusHash,
     ) -> Result<Vec<TenureForkingInfo>, ApiError>;
+
+    fn get_current_epoch(&self) -> Result<StacksEpoch, ApiError>;
 }
 
 struct PooledChainstateReads {
@@ -216,7 +218,7 @@ impl ChainstateReadService {
         ))
     }
 
-    fn from_executor(
+    pub fn from_executor(
         executor: impl ChainstateReadExecutor + 'static,
         maximum_call_argument_bytes: u32,
         txindex: bool,
@@ -226,18 +228,6 @@ impl ChainstateReadService {
             maximum_call_argument_bytes,
             txindex,
         }
-    }
-
-    #[cfg(test)]
-    pub fn test_from_executor(executor: impl ChainstateReadExecutor + 'static) -> Self {
-        Self::from_executor(executor, u32::MAX, true)
-    }
-
-    #[cfg(test)]
-    pub fn test_from_executor_without_txindex(
-        executor: impl ChainstateReadExecutor + 'static,
-    ) -> Self {
-        Self::from_executor(executor, u32::MAX, false)
     }
 
     pub fn get_account(
@@ -416,6 +406,10 @@ impl ChainstateReadService {
         end: ConsensusHash,
     ) -> Result<Vec<TenureForkingInfo>, ApiError> {
         self.executor.get_tenure_fork_info(start, end)
+    }
+
+    pub fn get_current_epoch(&self) -> Result<StacksEpoch, ApiError> {
+        self.executor.get_current_epoch()
     }
 }
 
@@ -653,6 +647,30 @@ impl ChainstateReadExecutor for PooledChainstateReads {
         let ChainstateReadHandles { chainstate, sortdb } = &mut *handles;
         rpc_services::get_tenure_fork_info(sortdb, chainstate, &start, &end).map_err(ApiError::from)
     }
+
+    fn get_current_epoch(&self) -> Result<StacksEpoch, ApiError> {
+        let handles = self.checkout()?;
+        let tip =
+            SortitionDB::get_canonical_burn_chain_tip(handles.sortdb.conn()).map_err(|e| {
+                ApiError::from(RpcServiceError::internal(
+                    "Failed to load canonical burnchain tip",
+                    e,
+                ))
+            })?;
+        SortitionDB::get_stacks_epoch(handles.sortdb.conn(), tip.block_height)
+            .map_err(|e| {
+                ApiError::from(RpcServiceError::internal(
+                    "Failed to load current Stacks epoch",
+                    e,
+                ))
+            })?
+            .ok_or_else(|| {
+                ApiError::internal(
+                    ApiErrorCode::InternalError,
+                    "Current Stacks epoch is unavailable",
+                )
+            })
+    }
 }
 
 impl PooledChainstateReads {
@@ -700,24 +718,6 @@ impl fmt::Display for ChainstateReadOpenError {
 
 impl std::error::Error for ChainstateReadOpenError {}
 
-fn build_eager_pool<M>(
-    manager: M,
-    pool_size: u32,
-    startup_timeout: Duration,
-) -> Result<Pool<M>, r2d2::Error>
-where
-    M: ManageConnection,
-{
-    Pool::builder()
-        .max_size(pool_size)
-        .min_idle(Some(pool_size))
-        .connection_timeout(startup_timeout)
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .test_on_check_out(false)
-        .build(manager)
-}
-
 fn open_chainstate_read_handles(
     spec: &ChainstateReadSpec,
 ) -> RpcServiceResult<ChainstateReadHandles> {
@@ -746,7 +746,8 @@ mod tests {
 
     use r2d2::ManageConnection;
 
-    use super::{build_eager_pool, READ_POOL_CHECKOUT_TIMEOUT, READ_POOL_STARTUP_TIMEOUT};
+    use super::{READ_POOL_CHECKOUT_TIMEOUT, READ_POOL_STARTUP_TIMEOUT};
+    use crate::server::app::read_pool::build_eager_pool;
 
     #[test]
     fn startup_timeout_is_distinct_from_checkout_timeout() {

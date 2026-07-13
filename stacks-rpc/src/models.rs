@@ -1,16 +1,19 @@
 use clarity::vm::analysis::contract_interface_builder::ContractInterface;
 use serde::{Deserialize, Serialize};
+use stacks::burnchains::Txid;
 use stacks::chainstate::nakamoto::NakamotoBlockHeader;
 use stacks::chainstate::stacks::boot::RewardSet;
 use stacks::chainstate::stacks::db::{ExtendedStacksHeader, StacksBlockHeaderTypes};
 use stacks::chainstate::stacks::StacksBlockHeader;
 use stacks::net::api::get_tenures_fork_info::TenureForkingInfo;
-use stacks::net::api::getinfo::{RPCLastPoxAnchorData, RPCPeerInfoData};
+use stacks::net::api::getinfo::RPCLastPoxAnchorData;
 use stacks::net::api::getsortition::SortitionInfo;
 use stacks::net::api::gettenureblocks::RPCTenureBlock;
 use stacks::net::rpc_services::{
     AccountView, BlockProposalAccepted, ClarityValueView, ConfirmedTransactionView,
-    ContractSourceView, ProofBytes, TenureBlocksPage, TenureTipView,
+    ContractSourceView, CurrentTenureView, FeeEstimateView, MempoolTransactionView,
+    MempoolTransactionsPage, NodeHealthView, NodeStateSnapshot, ProofBytes, TenureBlocksPage,
+    TenureTipView, TransactionSubmission, TransactionSubmissionStatus,
 };
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksBlockId,
@@ -20,6 +23,7 @@ use stacks_common::util::hash::{to_hex, Hash160, Sha256Sum};
 
 #[derive(Debug, Serialize)]
 pub struct InfoResponse {
+    pub observed_at: u64,
     pub peer_version: u32,
     pub server_version: String,
     pub network_id: u32,
@@ -57,9 +61,11 @@ pub struct StacksTipInfo {
     pub tenure_height: u64,
 }
 
-impl From<RPCPeerInfoData> for InfoResponse {
-    fn from(info: RPCPeerInfoData) -> Self {
+impl From<NodeStateSnapshot> for InfoResponse {
+    fn from(snapshot: NodeStateSnapshot) -> Self {
+        let info = snapshot.peer_info;
         Self {
+            observed_at: snapshot.observed_at,
             peer_version: info.peer_version,
             server_version: info.server_version,
             network_id: info.network_id,
@@ -85,6 +91,54 @@ impl From<RPCPeerInfoData> for InfoResponse {
             node_public_key_hash: info.node_public_key_hash,
             last_pox_anchor: info.last_pox_anchor,
             stackerdbs: info.stackerdbs,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub observed_at: u64,
+    pub difference_from_max_peer: u64,
+    pub max_peer_height: u64,
+    pub max_peer_address: Option<String>,
+    pub node_tip_height: u64,
+}
+
+impl HealthResponse {
+    pub fn from_snapshot(observed_at: u64, health: NodeHealthView) -> Self {
+        Self {
+            observed_at,
+            difference_from_max_peer: health.difference_from_max_peer,
+            max_peer_height: health.max_peer_height,
+            max_peer_address: health.max_peer_address.map(|address| address.to_string()),
+            node_tip_height: health.node_tip_height,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CurrentTenureResponse {
+    pub observed_at: u64,
+    pub consensus_hash: ConsensusHash,
+    pub tenure_start_block_id: StacksBlockId,
+    pub parent_consensus_hash: ConsensusHash,
+    pub parent_tenure_start_block_id: StacksBlockId,
+    pub tip_block_id: StacksBlockId,
+    pub tip_height: u64,
+    pub reward_cycle: u64,
+}
+
+impl CurrentTenureResponse {
+    pub fn from_snapshot(observed_at: u64, tenure: CurrentTenureView) -> Self {
+        Self {
+            observed_at,
+            consensus_hash: tenure.consensus_hash,
+            tenure_start_block_id: tenure.tenure_start_block_id,
+            parent_consensus_hash: tenure.parent_consensus_hash,
+            parent_tenure_start_block_id: tenure.parent_tenure_start_block_id,
+            tip_block_id: tenure.tip_block_id,
+            tip_height: tenure.tip_height,
+            reward_cycle: tenure.reward_cycle,
         }
     }
 }
@@ -248,6 +302,133 @@ pub struct ConfirmedTransactionResponse {
     pub result: String,
     pub block_height: Option<u64>,
     pub canonical: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionSubmitRequest {
+    pub transaction: String,
+    #[serde(default)]
+    pub attachment: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransactionSubmitResponse {
+    pub txid: Txid,
+    pub status: TransactionSubmitStatus,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeeEstimateRequest {
+    pub transaction_payload: String,
+    #[serde(default)]
+    pub estimated_length: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeeEstimateResponse {
+    pub estimated_cost: clarity::vm::costs::ExecutionCost,
+    pub estimated_cost_scalar: u64,
+    pub estimations: Vec<FeeEstimateTierResponse>,
+    pub cost_scalar_change_by_byte: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeeEstimateTierResponse {
+    pub fee_rate: f64,
+    pub fee: u64,
+}
+
+impl From<FeeEstimateView> for FeeEstimateResponse {
+    fn from(estimate: FeeEstimateView) -> Self {
+        Self {
+            estimated_cost: estimate.estimated_cost,
+            estimated_cost_scalar: estimate.estimated_cost_scalar,
+            estimations: estimate
+                .estimations
+                .into_iter()
+                .map(|tier| FeeEstimateTierResponse {
+                    fee_rate: tier.fee_rate,
+                    fee: tier.fee,
+                })
+                .collect(),
+            cost_scalar_change_by_byte: estimate.cost_scalar_change_by_byte,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct MempoolTransactionResponse {
+    pub txid: Txid,
+    pub transaction: String,
+    pub fee: u64,
+    pub length: u64,
+    pub accepted_at: u64,
+    pub coinbase_height: u64,
+    pub tenure_consensus_hash: ConsensusHash,
+    pub tenure_block_hash: BlockHeaderHash,
+    pub origin_address: String,
+    pub origin_nonce: u64,
+    pub sponsor_address: String,
+    pub sponsor_nonce: u64,
+    pub time_estimate_ms: Option<u64>,
+}
+
+impl From<MempoolTransactionView> for MempoolTransactionResponse {
+    fn from(transaction: MempoolTransactionView) -> Self {
+        Self {
+            txid: transaction.txid,
+            transaction: transaction.transaction,
+            fee: transaction.fee,
+            length: transaction.length,
+            accepted_at: transaction.accepted_at,
+            coinbase_height: transaction.coinbase_height,
+            tenure_consensus_hash: transaction.tenure_consensus_hash,
+            tenure_block_hash: transaction.tenure_block_hash,
+            origin_address: transaction.origin_address.to_string(),
+            origin_nonce: transaction.origin_nonce,
+            sponsor_address: transaction.sponsor_address.to_string(),
+            sponsor_nonce: transaction.sponsor_nonce,
+            time_estimate_ms: transaction.time_estimate_ms,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct MempoolTransactionsPageResponse {
+    pub transactions: Vec<MempoolTransactionResponse>,
+    pub next_cursor: Option<Txid>,
+}
+
+impl From<MempoolTransactionsPage> for MempoolTransactionsPageResponse {
+    fn from(page: MempoolTransactionsPage) -> Self {
+        Self {
+            transactions: page
+                .transactions
+                .into_iter()
+                .map(MempoolTransactionResponse::from)
+                .collect(),
+            next_cursor: page.next_cursor,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionSubmitStatus {
+    Accepted,
+    AlreadyKnown,
+}
+
+impl From<TransactionSubmission> for TransactionSubmitResponse {
+    fn from(submission: TransactionSubmission) -> Self {
+        Self {
+            txid: submission.txid,
+            status: match submission.status {
+                TransactionSubmissionStatus::Accepted => TransactionSubmitStatus::Accepted,
+                TransactionSubmissionStatus::AlreadyKnown => TransactionSubmitStatus::AlreadyKnown,
+            },
+        }
+    }
 }
 
 impl From<ConfirmedTransactionView> for ConfirmedTransactionResponse {

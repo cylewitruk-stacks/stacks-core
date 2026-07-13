@@ -2,7 +2,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
-use stacks::net::rpc_services::{BlockProposalError, RpcServiceError};
+use stacks::net::rpc_services::{
+    BlockProposalError, FeeEstimationError, RpcServiceError, TransactionSubmissionError,
+};
 
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
@@ -13,6 +15,8 @@ pub struct ErrorResponse {
 pub struct ErrorBody {
     pub code: ApiErrorCode,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,8 +33,10 @@ pub enum ApiErrorCode {
     DomainQueueDisconnected,
     ReadQueueFull,
     ReadQueueDisconnected,
+    MempoolUnavailable,
     BlockStreamQueueFull,
-    PeerInfoUnavailable,
+    NodeSnapshotUnavailable,
+    CurrentTenureUnavailable,
     RequestTimeout,
     BlockProposalAuthNotConfigured,
     Unauthorized,
@@ -52,7 +58,14 @@ pub enum ApiErrorCode {
     InvalidBlockId,
     InvalidBlockHeight,
     InvalidTransactionId,
+    InvalidTransaction,
+    InvalidAttachment,
     TransactionIndexDisabled,
+    TransactionProblematic,
+    TransactionRejected,
+    FeeEstimationDisabled,
+    FeeEstimateUnavailable,
+    InvalidTransactionPayload,
     InvalidSignerPublicKey,
     InvalidRewardCycle,
     InvalidConsensusHash,
@@ -85,6 +98,12 @@ pub enum ApiError {
         code: ApiErrorCode,
         message: String,
     },
+    StatusWithDetails {
+        status: StatusCode,
+        code: ApiErrorCode,
+        message: String,
+        details: serde_json::Value,
+    },
 }
 
 impl From<RpcServiceError> for ApiError {
@@ -104,6 +123,42 @@ impl From<BlockProposalError> for ApiError {
             ApiErrorCode::BlockProposalRejected,
             error.to_string(),
         )
+    }
+}
+
+impl From<TransactionSubmissionError> for ApiError {
+    fn from(error: TransactionSubmissionError) -> Self {
+        match error {
+            TransactionSubmissionError::Problematic => Self::status(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiErrorCode::TransactionProblematic,
+                "Transaction failed static problematic checks",
+            ),
+            TransactionSubmissionError::Rejected(details) => Self::status_with_details(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiErrorCode::TransactionRejected,
+                "Transaction was rejected by the mempool",
+                details,
+            ),
+            TransactionSubmissionError::Internal(message) => {
+                Self::internal(ApiErrorCode::InternalError, message)
+            }
+        }
+    }
+}
+
+impl From<FeeEstimationError> for ApiError {
+    fn from(error: FeeEstimationError) -> Self {
+        match error {
+            FeeEstimationError::NoEstimate(message) => Self::status(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiErrorCode::FeeEstimateUnavailable,
+                message,
+            ),
+            FeeEstimationError::Internal(message) => {
+                Self::internal(ApiErrorCode::InternalError, message)
+            }
+        }
     }
 }
 
@@ -143,6 +198,20 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub fn status_with_details(
+        status: StatusCode,
+        code: ApiErrorCode,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self::StatusWithDetails {
+            status,
+            code,
+            message: message.into(),
+            details,
+        }
+    }
 }
 
 fn block_proposal_error_status(error: &BlockProposalError) -> StatusCode {
@@ -157,21 +226,35 @@ fn block_proposal_error_status(error: &BlockProposalError) -> StatusCode {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, code, message) = match self {
-            Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message),
-            Self::NotFound { code, message } => (StatusCode::NOT_FOUND, code, message),
-            Self::Unavailable { code, message } => (StatusCode::SERVICE_UNAVAILABLE, code, message),
-            Self::Internal { code, message } => (StatusCode::INTERNAL_SERVER_ERROR, code, message),
+        let (status, code, message, details) = match self {
+            Self::BadRequest { code, message } => (StatusCode::BAD_REQUEST, code, message, None),
+            Self::NotFound { code, message } => (StatusCode::NOT_FOUND, code, message, None),
+            Self::Unavailable { code, message } => {
+                (StatusCode::SERVICE_UNAVAILABLE, code, message, None)
+            }
+            Self::Internal { code, message } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, code, message, None)
+            }
             Self::Status {
                 status,
                 code,
                 message,
-            } => (status, code, message),
+            } => (status, code, message, None),
+            Self::StatusWithDetails {
+                status,
+                code,
+                message,
+                details,
+            } => (status, code, message, Some(details)),
         };
         (
             status,
             Json(ErrorResponse {
-                error: ErrorBody { code, message },
+                error: ErrorBody {
+                    code,
+                    message,
+                    details,
+                },
             }),
         )
             .into_response()

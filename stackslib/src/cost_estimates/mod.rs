@@ -35,7 +35,7 @@ use crate::core::StacksEpochId;
 ///  payload. `FeeRateEstimator` implementations estimate the network's current fee rate.
 ///  Clients interested in determining the fee to be paid for a transaction must used both
 ///  whereas miners only need to use a `CostEstimator`
-pub trait FeeEstimator {
+pub trait FeeEstimator: Send {
     /// This method is invoked by the `stacks-node` to update the fee estimator with a new
     ///  block receipt.
     fn notify_block(

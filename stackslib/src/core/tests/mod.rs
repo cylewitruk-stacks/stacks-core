@@ -78,6 +78,93 @@ fn mempool_db_init() {
     let _mempool = MemPoolDB::open_test(false, 0x80000000, &chainstate_path).unwrap();
 }
 
+#[test]
+fn mempool_keyset_pages_are_stable_across_equal_timestamps() {
+    let _chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
+    let chainstate_path = chainstate_path(function_name!());
+    let mut mempool = MemPoolDB::open_test(false, 0x80000000, &chainstate_path).unwrap();
+    let sender_key = StacksPrivateKey::from_hex(SK_1).unwrap();
+    let sender_address = to_addr(&sender_key);
+    let recipient = PrincipalData::from(StacksAddress::burn_address(false));
+    let timestamps = [30_u64, 30, 20, 20, 10];
+    let mut expected = Vec::with_capacity(timestamps.len());
+
+    let mempool_tx = mempool.tx_begin().unwrap();
+    for (nonce, accept_time) in timestamps.into_iter().enumerate() {
+        let serialized = make_stacks_transfer_serialized(
+            &sender_key,
+            nonce as u64,
+            180 + nonce as u64,
+            0x80000000,
+            &recipient,
+            1,
+        );
+        let transaction =
+            StacksTransaction::consensus_deserialize(&mut serialized.as_slice()).unwrap();
+        let txid = transaction.txid();
+        insert_tx_in_mempool(
+            &mempool_tx,
+            serialized,
+            &sender_address,
+            nonce as u64,
+            180 + nonce as u64,
+            &ConsensusHash([2; 20]),
+            &FIRST_STACKS_BLOCK_HASH,
+            10,
+        );
+        mempool_tx
+            .execute(
+                "UPDATE mempool SET accept_time = ?1 WHERE txid = ?2",
+                params![accept_time, txid],
+            )
+            .unwrap();
+        expected.push((accept_time, txid));
+    }
+    mempool_tx.commit().unwrap();
+
+    expected.sort_by(|(time_a, txid_a), (time_b, txid_b)| {
+        time_b.cmp(time_a).then_with(|| txid_b.0.cmp(&txid_a.0))
+    });
+    let expected_txids: Vec<_> = expected.into_iter().map(|(_, txid)| txid).collect();
+
+    let (first, first_cursor) = MemPoolDB::get_txs_page(mempool.conn(), None, 2).unwrap();
+    let first_cursor = first_cursor.expect("first page should have a continuation");
+    assert_eq!(
+        first
+            .iter()
+            .map(|tx| tx.metadata.txid.clone())
+            .collect::<Vec<_>>(),
+        expected_txids[..2]
+    );
+
+    let (second, second_cursor) =
+        MemPoolDB::get_txs_page(mempool.conn(), Some(&first_cursor), 2).unwrap();
+    let second_cursor = second_cursor.expect("second page should have a continuation");
+    assert_eq!(
+        second
+            .iter()
+            .map(|tx| tx.metadata.txid.clone())
+            .collect::<Vec<_>>(),
+        expected_txids[2..4]
+    );
+
+    let (third, third_cursor) =
+        MemPoolDB::get_txs_page(mempool.conn(), Some(&second_cursor), 2).unwrap();
+    assert_eq!(
+        third
+            .iter()
+            .map(|tx| tx.metadata.txid.clone())
+            .collect::<Vec<_>>(),
+        expected_txids[4..]
+    );
+    assert!(third_cursor.is_none());
+
+    assert!(matches!(
+        MemPoolDB::get_txs_page(mempool.conn(), Some(&Txid([0xff; 32])), 2),
+        Err(crate::util_lib::db::Error::NotFoundError)
+    ));
+}
+
 pub fn make_block(
     chainstate: &mut StacksChainState,
     block_consensus: ConsensusHash,
