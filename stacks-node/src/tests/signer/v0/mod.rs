@@ -96,13 +96,13 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use super::SignerTest;
 use crate::event_dispatcher::TEST_SKIP_BLOCK_ANNOUNCEMENT;
-use crate::nakamoto_node::miner::{
+use crate::node::test_support::nakamoto::miner::{
     fault_injection_stall_miner, fault_injection_try_stall_miner, fault_injection_unstall_miner,
     TEST_BROADCAST_PROPOSAL_STALL, TEST_MINE_SKIP,
 };
-use crate::nakamoto_node::stackerdb_listener::TEST_IGNORE_SIGNERS;
-use crate::neon::{Counters, RunLoopCounter};
-use crate::run_loop::boot_nakamoto;
+use crate::node::test_support::nakamoto::signer::listener::TEST_IGNORE_SIGNERS;
+use crate::node::test_support::{nakamoto, Counters, RunLoopCounter};
+use crate::node::NodeRunner;
 use crate::tests::nakamoto_integrations::{
     boot_to_epoch_25, boot_to_epoch_3_reward_set, next_block_and,
     next_block_and_process_new_stacks_block, setup_epoch_3_reward_set, wait_for,
@@ -116,7 +116,7 @@ use crate::tests::neon_integrations::{
 use crate::tests::signer::commands::*;
 use crate::tests::signer::SpawnedSignerTrait;
 use crate::tests::{self, gen_random_port};
-use crate::{nakamoto_node, BitcoinRegtestController, BurnchainController, Config, Keychain};
+use crate::{BitcoinRegtestController, BurnchainController, Config, Keychain};
 
 pub mod capitulate_parent_tenure_view;
 pub mod epoch_4_0_multi_miner_distribution;
@@ -603,7 +603,7 @@ fn contract_source_exists(http_origin: &str, addr: &StacksAddress, contract_name
 /// [`SignerTest::boot_to_epoch_4_with_pox5_lockups`] and by the pox-5
 /// regtest lifecycle tests in `nakamoto_integrations`. `validate-stake!` is a no-op;
 /// `register-self` forwards a signer-key grant + `register-signer` call to pox-5 under `as-contract?`.
-pub(crate) fn pox5_signer_manager_source() -> &'static str {
+pub fn pox5_signer_manager_source() -> &'static str {
     r#"
 (impl-trait 'ST000000000000000000002AMW42H.pox-5.signer-manager-trait)
 (use-trait signer-manager-trait 'ST000000000000000000002AMW42H.pox-5.signer-manager-trait)
@@ -660,7 +660,7 @@ pub(crate) fn pox5_signer_manager_source() -> &'static str {
 /// Source for the sBTC token stub that `boot_to_epoch_4` publishes. Provides
 /// `get-balance` so pox-5's read-only checker accepts the substituted token
 /// contract on Epoch 4.0 initialization.
-pub(crate) fn sbtc_token_stub_source() -> &'static str {
+pub fn sbtc_token_stub_source() -> &'static str {
     r#"
 (define-fungible-token sbtc-token)
 
@@ -685,7 +685,7 @@ pub(crate) fn sbtc_token_stub_source() -> &'static str {
 /// Exposes `get-current-aggregate-pubkey`, returning the supplied compressed
 /// secp256k1 pubkey. Signer-set computation reads this to derive the
 /// per-cycle sBTC waterfall recipient.
-pub(crate) fn sbtc_registry_stub_source(pubkey: &[u8; 33]) -> String {
+pub fn sbtc_registry_stub_source(pubkey: &[u8; 33]) -> String {
     format!(
         r#"
 (define-read-only (get-current-aggregate-pubkey) 0x{})
@@ -1181,7 +1181,7 @@ impl MultipleMinerTest {
             conf.burnchain.peer_version,
         );
 
-        let mut run_loop_2 = boot_nakamoto::BootRunLoop::new(conf_node_2.clone()).unwrap();
+        let mut run_loop_2 = NodeRunner::new(conf_node_2.clone()).unwrap();
         let rl2_stopper = run_loop_2.get_termination_switch();
         let rl2_coord_channels = run_loop_2.coordinator_channels();
         let rl2_counters = run_loop_2.counters();
@@ -2127,12 +2127,20 @@ impl MultipleMinerTest {
                 .naka_submitted_commit_last_burn_height
                 .load(Ordering::SeqCst)
                 >= target_burn_height
-                && m1.naka_submitted_commit_last_parent_tenure_id.get() == target_consensus_hash;
+                && m1
+                    .naka_submitted_commit_last_parent_tenure_id
+                    .get_opt()
+                    .as_ref()
+                    == Some(&target_consensus_hash);
             let m2_committed = m2
                 .naka_submitted_commit_last_burn_height
                 .load(Ordering::SeqCst)
                 >= target_burn_height
-                && m2.naka_submitted_commit_last_parent_tenure_id.get() == target_consensus_hash;
+                && m2
+                    .naka_submitted_commit_last_parent_tenure_id
+                    .get_opt()
+                    .as_ref()
+                    == Some(&target_consensus_hash);
             Ok(m1_committed && m2_committed)
         })?;
 
@@ -2820,7 +2828,7 @@ fn miner_gather_signatures() {
 
     // Disable p2p broadcast of the nakamoto blocks, so that we rely
     //  on the signer's using StackerDB to get pushed blocks
-    nakamoto_node::miner::TEST_P2P_BROADCAST_SKIP.set(true);
+    nakamoto::miner::TEST_P2P_BROADCAST_SKIP.set(true);
 
     info!("------------------------- Test Setup -------------------------");
     let num_signers = 5;
@@ -4454,7 +4462,7 @@ fn duplicate_signers() {
 
     // Disable p2p broadcast of the nakamoto blocks, so that we rely
     //  on the signer's using StackerDB to get pushed blocks
-    nakamoto_node::miner::TEST_P2P_BROADCAST_SKIP.set(true);
+    nakamoto::miner::TEST_P2P_BROADCAST_SKIP.set(true);
 
     info!("------------------------- Test Setup -------------------------");
     let num_signers = 5;

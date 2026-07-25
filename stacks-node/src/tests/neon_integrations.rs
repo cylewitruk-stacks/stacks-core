@@ -103,13 +103,13 @@ use tokio::net::{TcpListener, TcpStream};
 use super::{ADDR_4, SK_1, SK_2, SK_3};
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
 use crate::burnchains::bitcoin_regtest_controller::{self, UTXO};
-use crate::neon_node::RelayerThread;
+use crate::node::test_support::{epoch2 as neon, load_activated_vrf_key, RunLoopCounter};
 use crate::operations::BurnchainOpSigner;
 use crate::stacks_common::types::PrivateKey;
 use crate::syncctl::PoxSyncWatchdogComms;
 use crate::tests::gen_random_port;
 use crate::tests::nakamoto_integrations::{get_key_for_cycle, wait_for};
-use crate::{neon, BitcoinRegtestController, BurnchainController, Config, ConfigFile, Keychain};
+use crate::{BitcoinRegtestController, BurnchainController, Config, ConfigFile, Keychain};
 
 fn inner_neon_integration_test_conf(seed: Option<Vec<u8>>) -> (Config, StacksAddress) {
     let mut conf = super::new_test_conf();
@@ -1236,7 +1236,7 @@ fn bitcoind_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -1344,7 +1344,7 @@ fn confirm_unparsed_ongoing_ops() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -1425,7 +1425,7 @@ fn most_recent_utxo_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -1690,7 +1690,7 @@ fn deep_contract() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let _client = reqwest::blocking::Client::new();
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -1800,7 +1800,7 @@ fn liquid_ustx_integration() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let _client = reqwest::blocking::Client::new();
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -1931,7 +1931,7 @@ fn lockup_integration() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let _client = reqwest::blocking::Client::new();
 
@@ -2046,7 +2046,7 @@ fn stx_transfer_btc_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -2317,7 +2317,7 @@ fn stx_delegate_btc_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -2602,7 +2602,7 @@ fn stack_stx_burn_op_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3001,7 +3001,7 @@ fn vote_for_aggregate_key_burn_op_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3224,7 +3224,7 @@ fn bitcoind_resubmission_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3342,7 +3342,7 @@ fn bitcoind_forking_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3449,7 +3449,7 @@ fn download_err_in_btc_reorg() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let counters = run_loop.get_counters();
 
@@ -3572,7 +3572,7 @@ fn should_fix_2771() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3682,7 +3682,7 @@ fn filter_low_fee_tx_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3771,7 +3771,7 @@ fn filter_long_runtime_tx_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3876,7 +3876,7 @@ fn miner_submit_twice() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -3985,7 +3985,7 @@ fn size_check_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -4110,7 +4110,7 @@ fn block_replay_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let client = reqwest::blocking::Client::new();
 
@@ -4258,7 +4258,7 @@ fn cost_voting_integration() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -4608,7 +4608,7 @@ fn mining_events_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -4897,7 +4897,7 @@ fn setup_block_limit_test(strategy: MemPoolWalkStrategy) -> (Vec<serde_json::Val
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -5180,7 +5180,7 @@ fn block_large_tx_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -5326,7 +5326,7 @@ fn pox_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -5820,7 +5820,7 @@ fn atlas_integration_test() {
 
         eprintln!("Chain bootstrapped...");
 
-        let mut run_loop = neon::RunLoop::new(conf_bootstrap_node.clone());
+        let mut run_loop = neon::Driver::new(conf_bootstrap_node.clone());
         let blocks_processed = run_loop.get_blocks_processed_arc();
         let client = reqwest::blocking::Client::new();
         let channel = run_loop.get_coordinator_channel().unwrap();
@@ -6105,7 +6105,7 @@ fn atlas_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf_follower_node.clone());
+    let mut run_loop = neon::Driver::new(conf_follower_node.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let client = reqwest::blocking::Client::new();
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -6360,7 +6360,7 @@ fn antientropy_integration_test() {
 
         eprintln!("Chain bootstrapped...");
 
-        let mut run_loop = neon::RunLoop::new(conf_bootstrap_node_threaded.clone());
+        let mut run_loop = neon::Driver::new(conf_bootstrap_node_threaded.clone());
         let blocks_processed = run_loop.get_blocks_processed_arc();
         let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -6421,7 +6421,7 @@ fn antientropy_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf_follower_node.clone());
+    let mut run_loop = neon::Driver::new(conf_follower_node.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -6597,7 +6597,7 @@ fn atlas_stress_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf_bootstrap_node.clone());
+    let mut run_loop = neon::Driver::new(conf_bootstrap_node.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let client = reqwest::blocking::Client::new();
 
@@ -7301,7 +7301,7 @@ fn fuzzed_median_fee_rate_estimation_test(window_size: u64, expected_final_value
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -7481,7 +7481,7 @@ fn use_latest_tip_integration_test() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     thread::spawn(move || run_loop.start(None, 0));
@@ -7712,7 +7712,7 @@ fn test_flash_block_skip_tenure() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let missed_tenures = run_loop.get_missed_tenures_arc();
 
@@ -7774,7 +7774,7 @@ fn test_chainwork_first_intervals() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -7801,7 +7801,7 @@ fn test_chainwork_partial_interval() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -7942,7 +7942,7 @@ fn test_problematic_txs_are_not_stored() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -8002,7 +8002,7 @@ fn spawn_follower_node(
     initial_conf: &Config,
 ) -> (
     Config,
-    neon::RunLoopCounter,
+    RunLoopCounter,
     PoxSyncWatchdogComms,
     CoordinatorChannels,
 ) {
@@ -8030,7 +8030,7 @@ fn spawn_follower_node(
 
     conf.connection_options.inv_sync_interval = 3;
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
     let pox_sync = run_loop.get_pox_sync_comms();
@@ -8161,7 +8161,7 @@ fn test_problematic_blocks_are_not_mined() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -8393,7 +8393,7 @@ fn push_boot_receipts() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf);
+    let mut run_loop = neon::Driver::new(conf);
     let _chainstate = run_loop.boot_chainstate(&burnchain_config);
 
     // verify that the event observer got its boot receipts
@@ -8438,7 +8438,7 @@ fn run_with_custom_wallet() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     thread::spawn(move || run_loop.start(None, 0));
@@ -8732,7 +8732,7 @@ fn test_competing_miners_build_on_same_chain(
     eprintln!("Chain bootstrapped...");
 
     for (i, burnchain_config) in burnchain_configs.into_iter().enumerate() {
-        let mut run_loop = neon::RunLoop::new(confs[i].clone());
+        let mut run_loop = neon::Driver::new(confs[i].clone());
         let blocks_processed_arc = run_loop.get_blocks_processed_arc();
 
         blocks_processed.push(blocks_processed_arc);
@@ -8900,7 +8900,7 @@ fn min_txs() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let _client = reqwest::blocking::Client::new();
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -8946,7 +8946,7 @@ fn min_txs() {
         }
     }
 
-    let saved_vrf_key = RelayerThread::load_saved_vrf_key(path);
+    let saved_vrf_key = load_activated_vrf_key(path);
     assert!(saved_vrf_key.is_some());
 
     test_observer::clear();
@@ -9004,7 +9004,7 @@ fn filter_txs_by_type() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let _client = reqwest::blocking::Client::new();
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -9059,7 +9059,7 @@ fn filter_txs_by_type() {
         }
     }
 
-    let saved_vrf_key = RelayerThread::load_saved_vrf_key(path);
+    let saved_vrf_key = load_activated_vrf_key(path);
     assert!(saved_vrf_key.is_some());
 
     test_observer::clear();
@@ -9114,7 +9114,7 @@ fn filter_txs_by_origin() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let _client = reqwest::blocking::Client::new();
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -9207,7 +9207,7 @@ fn bitcoin_reorg_flap() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -9364,7 +9364,7 @@ fn bitcoin_reorg_flap_with_follower() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut miner_run_loop = neon::RunLoop::new(conf.clone());
+    let mut miner_run_loop = neon::Driver::new(conf.clone());
     let run_loop_stopper = miner_run_loop.get_termination_switch();
     let miner_blocks_processed = miner_run_loop.get_blocks_processed_arc();
     let miner_channel = miner_run_loop.get_coordinator_channel().unwrap();
@@ -9401,7 +9401,7 @@ fn bitcoin_reorg_flap_with_follower() {
         PEER_VERSION_TESTNET,
     );
 
-    let mut follower_run_loop = neon::RunLoop::new(follower_conf.clone());
+    let mut follower_run_loop = neon::Driver::new(follower_conf.clone());
     let follower_run_loop_stopper = follower_run_loop.get_termination_switch();
     let follower_blocks_processed = follower_run_loop.get_blocks_processed_arc();
     let follower_channel = follower_run_loop.get_coordinator_channel().unwrap();
@@ -9546,7 +9546,7 @@ fn mock_miner_replay() {
 
     info!("Chain bootstrapped...");
 
-    let mut miner_run_loop = neon::RunLoop::new(conf.clone());
+    let mut miner_run_loop = neon::Driver::new(conf.clone());
     let miner_blocks_processed = miner_run_loop.get_blocks_processed_arc();
     let miner_channel = miner_run_loop.get_coordinator_channel().unwrap();
 
@@ -9582,7 +9582,7 @@ fn mock_miner_replay() {
         PEER_VERSION_TESTNET,
     );
 
-    let mut follower_run_loop = neon::RunLoop::new(follower_conf.clone());
+    let mut follower_run_loop = neon::Driver::new(follower_conf.clone());
     let follower_blocks_processed = follower_run_loop.get_blocks_processed_arc();
     let follower_channel = follower_run_loop.get_coordinator_channel().unwrap();
 

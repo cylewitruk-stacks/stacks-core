@@ -17,9 +17,9 @@ use stacks_common::types::chainstate::VRFSeed;
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::vrf::VRFProof;
 
-/// Only used by the Helium (Mocknet) node
 use super::node::ChainTip;
-use super::{BurnchainTip, Config};
+/// Only used by the Helium (Mocknet) node
+use crate::{BurnchainTip, Config};
 
 pub struct TenureArtifacts {
     pub anchored_block: StacksBlock,

@@ -58,7 +58,7 @@ use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, VRFSeed};
 use stacks_common::util::hash::{hex_bytes, to_hex, Sha256Sum};
 
 use super::{new_test_conf, ADDR_4, SK_1, SK_2, SK_3};
-use crate::helium::RunLoop;
+use crate::node::SimulatorDriver as Driver;
 
 const OTHER_CONTRACT: &str = "
   (define-data-var x uint u0)
@@ -207,7 +207,7 @@ fn integration_test_get_info() {
     let num_rounds = 5;
 
     let rpc_bind = conf.node.rpc_bind.clone();
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     {
         let mut http_opt = HTTP_BINDING.lock().unwrap();
@@ -1122,7 +1122,7 @@ fn contract_stx_transfer() {
 
     let num_rounds = 5;
 
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     run_loop
         .callbacks
@@ -1478,7 +1478,7 @@ fn mine_transactions_out_of_order() {
     conf.add_initial_balance(addr.to_string(), 100000);
 
     let num_rounds = 5;
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     run_loop
         .callbacks
@@ -1650,7 +1650,7 @@ fn mine_contract_twice() {
 
     let num_rounds = 3;
 
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     run_loop
         .callbacks
@@ -1742,7 +1742,7 @@ fn bad_contract_tx_rollback() {
 
     let num_rounds = 4;
 
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     run_loop
         .callbacks
@@ -2088,7 +2088,7 @@ fn block_limit_runtime_test() {
     }
 
     let num_rounds = 6;
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     run_loop
         .callbacks
@@ -2219,7 +2219,7 @@ fn mempool_errors() {
         http_opt.replace(format!("http://{rpc_bind}"));
     }
 
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     run_loop
         .callbacks

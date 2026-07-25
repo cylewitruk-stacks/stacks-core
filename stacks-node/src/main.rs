@@ -29,20 +29,15 @@ extern crate slog;
 pub use stacks_common::util;
 use stacks_common::util::hash::hex_bytes;
 
-pub mod monitoring;
+mod monitoring;
 
-pub mod burnchains;
-pub mod event_dispatcher;
-pub mod genesis_data;
-pub mod globals;
-pub mod keychain;
-pub mod nakamoto_node;
-pub mod neon_node;
-pub mod node;
-pub mod operations;
-pub mod run_loop;
-pub mod syncctl;
-pub mod tenure;
+mod burnchains;
+mod event_dispatcher;
+mod genesis_data;
+mod keychain;
+mod node;
+mod operations;
+mod syncctl;
 
 use std::collections::HashMap;
 use std::{env, panic, process};
@@ -65,11 +60,7 @@ pub use self::burnchains::{
 };
 pub use self::event_dispatcher::EventDispatcher;
 pub use self::keychain::Keychain;
-pub use self::node::{ChainTip, Node};
-pub use self::run_loop::{helium, neon};
-pub use self::tenure::Tenure;
-use crate::neon_node::{BlockMinerThread, TipCandidate};
-use crate::run_loop::boot_nakamoto;
+use crate::node::{BlockMinerThread, NodeRunner, RuntimePlan, SimulatorDriver, TipCandidate};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_arch = "arm")))]
 #[global_allocator]
@@ -465,31 +456,26 @@ fn main() {
 
     send_pending_event_payloads(&conf);
 
-    let num_round: u64 = 0; // Infinite number of rounds
-
-    if conf.burnchain.mode == "helium" || conf.burnchain.mode == "mocknet" {
-        let mut run_loop = helium::RunLoop::new(conf);
-        if let Err(e) = run_loop.start(num_round) {
-            warn!("Helium runloop exited: {e}");
-        }
-    } else if conf.burnchain.mode == "neon"
-        || conf.burnchain.mode == "nakamoto-neon"
-        || conf.burnchain.mode == "xenon"
-        || conf.burnchain.mode == "krypton"
-        || conf.burnchain.mode == "mainnet"
-    {
-        if conf.miner.max_assembly_mem_bytes > 0
-            || conf.connection_options.block_proposal_max_tx_mem_bytes > 0
-            || conf.connection_options.read_only_call_max_mem_bytes > 0
-        {
-            if !tracking_allocator_installed() {
-                panic!("Tracking allocator must be installed to set a memory limit");
+    match RuntimePlan::for_mode(&conf.burnchain.mode) {
+        Ok(RuntimePlan::LegacySimulator) => {
+            let mut driver = SimulatorDriver::new(conf);
+            if let Err(e) = driver.start(0) {
+                warn!("Legacy simulator driver exited: {e}");
             }
         }
-        let mut run_loop = boot_nakamoto::BootRunLoop::new(conf).unwrap();
-        run_loop.start(None, 0);
-    } else {
-        println!("Burnchain mode '{}' not supported", conf.burnchain.mode);
+        Ok(RuntimePlan::EpochAware) => {
+            if conf.miner.max_assembly_mem_bytes > 0
+                || conf.connection_options.block_proposal_max_tx_mem_bytes > 0
+                || conf.connection_options.read_only_call_max_mem_bytes > 0
+            {
+                if !tracking_allocator_installed() {
+                    panic!("Tracking allocator must be installed to set a memory limit");
+                }
+            }
+            let mut node_runner = NodeRunner::new(conf).unwrap();
+            node_runner.start(None, 0);
+        }
+        Err(error) => println!("{error}"),
     }
 }
 

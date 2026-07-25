@@ -52,14 +52,14 @@ use stacks_common::util::sleep_ms;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
 use crate::burnchains::bitcoin_regtest_controller::UTXO;
-use crate::neon::RunLoopCounter;
+use crate::node::test_support::{epoch2 as neon, RunLoopCounter};
 use crate::operations::BurnchainOpSigner;
 use crate::stacks_common::address::AddressHashMode;
 use crate::stacks_common::types::Address;
 use crate::stacks_common::util::hash::{bytes_to_hex, hex_bytes};
 use crate::tests::neon_integrations::*;
 use crate::tests::*;
-use crate::{neon, BitcoinRegtestController, BurnchainController, Keychain};
+use crate::{BitcoinRegtestController, BurnchainController, Keychain};
 
 const MINER_BURN_PUBLIC_KEY: &str =
     "03dc62fe0b8964d01fc9ca9a5eec0e22e557a12cc656919e648f04e0b26fea5faa";
@@ -178,7 +178,7 @@ fn advance_to_2_1(
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -641,7 +641,7 @@ fn transition_fixes_bitcoin_rigidity() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -1543,7 +1543,7 @@ fn transition_removes_pox_sunset() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
     let thread_burnchain = burnchain_config.clone();
@@ -1809,7 +1809,7 @@ fn transition_empty_blocks() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -2171,7 +2171,7 @@ fn test_sortition_divergence_pre_21() {
     eprintln!("Chain bootstrapped...");
 
     for (i, burnchain_config) in burnchain_configs.into_iter().enumerate() {
-        let mut run_loop = neon::RunLoop::new(confs[i].clone());
+        let mut run_loop = neon::Driver::new(confs[i].clone());
         let blocks_processed_arc = run_loop.get_blocks_processed_arc();
         let channel = run_loop.get_coordinator_channel().unwrap();
         let this_miner_status = run_loop.get_miner_status();
@@ -2513,7 +2513,7 @@ fn trait_invocation_cross_epoch() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
     let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -2778,7 +2778,7 @@ fn test_v1_unlock_height_with_current_stackers() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let runloop_burnchain = burnchain_config.clone();
 
     let blocks_processed = run_loop.get_blocks_processed_arc();
@@ -3038,7 +3038,7 @@ fn test_v1_unlock_height_with_delay_and_current_stackers() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let runloop_burnchain = burnchain_config.clone();
 
     let blocks_processed = run_loop.get_blocks_processed_arc();

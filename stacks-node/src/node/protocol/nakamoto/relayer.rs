@@ -14,15 +14,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 use core::fmt;
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::LazyLock;
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use std::{fs, thread};
 
 use rand::{thread_rng, Rng};
 use stacks::burnchains::{Burnchain, Txid};
@@ -60,17 +59,16 @@ use stacks_common::util::hash::Hash160;
 use stacks_common::util::tests::TestFlag;
 use stacks_common::util::vrf::VRFPublicKey;
 
-use super::miner::MinerReason;
+use super::driver::Globals;
+use super::miner::{BlockMinerThread, MinerDirective, MinerReason};
 use super::{
     Config, Error as NakamotoNodeError, EventDispatcher, Keychain, BLOCK_PROCESSOR_STACK_SIZE,
 };
 use crate::burnchains::BurnchainController;
-use crate::nakamoto_node::miner::{BlockMinerThread, MinerDirective};
-use crate::neon_node::{
-    fault_injection_skip_mining, open_chainstate_with_faults, LeaderKeyRegistrationState,
-};
-use crate::run_loop::nakamoto::{Globals, RunLoop};
-use crate::run_loop::RegisteredKey;
+use crate::node::chainstate;
+use crate::node::context::SpawnContext;
+use crate::node::leader_key::{load_activated_vrf_key, LeaderKeyRegistrationState, RegisteredKey};
+use crate::node::protocol::fault_injection::fault_injection_skip_mining;
 use crate::BitcoinRegtestController;
 
 #[cfg(test)]
@@ -98,7 +96,7 @@ pub enum RelayerDirective {
     /// Either a new burn block has been processed (without a miner active yet) or a
     ///  nakamoto tenure's first block has been processed, so the relayer should issue
     ///  a block commit
-    IssueBlockCommit(ConsensusHash, BlockHeaderHash),
+    IssueBlockCommit,
     /// Try to register a VRF public key
     RegisterKey(BlockSnapshot),
     /// Stop the relayer thread
@@ -110,7 +108,7 @@ impl fmt::Display for RelayerDirective {
         match self {
             RelayerDirective::HandleNetResult(_) => write!(f, "HandleNetResult"),
             RelayerDirective::ProcessedBurnBlock(_, _, _) => write!(f, "ProcessedBurnBlock"),
-            RelayerDirective::IssueBlockCommit(_, _) => write!(f, "IssueBlockCommit"),
+            RelayerDirective::IssueBlockCommit => write!(f, "IssueBlockCommit"),
             RelayerDirective::RegisterKey(_) => write!(f, "RegisterKey"),
             RelayerDirective::Exit => write!(f, "Exit"),
         }
@@ -124,13 +122,8 @@ pub struct LastCommit {
     block_commit: LeaderBlockCommitOp,
     /// the sortition tip at the time the block-commit was sent
     burn_tip: BlockSnapshot,
-    /// the stacks tip at the time the block-commit was sent
-    stacks_tip: StacksBlockId,
     /// the tenure consensus hash for the tip's tenure
     tenure_consensus_hash: ConsensusHash,
-    /// the start-block hash of the tip's tenure
-    #[allow(dead_code)]
-    start_block_hash: BlockHeaderHash,
     /// What is the epoch in which this was sent?
     epoch_id: StacksEpochId,
     /// commit txid (to be filled in on submission)
@@ -220,17 +213,13 @@ impl LastCommit {
     pub fn new(
         commit: LeaderBlockCommitOp,
         burn_tip: BlockSnapshot,
-        stacks_tip: StacksBlockId,
         tenure_consensus_hash: ConsensusHash,
-        start_block_hash: BlockHeaderHash,
         epoch_id: StacksEpochId,
     ) -> Self {
         Self {
             block_commit: commit,
             burn_tip,
-            stacks_tip,
             tenure_consensus_hash,
-            start_block_hash,
             epoch_id,
             txid: None,
         }
@@ -239,16 +228,6 @@ impl LastCommit {
     /// Get the commit
     pub fn get_block_commit(&self) -> &LeaderBlockCommitOp {
         &self.block_commit
-    }
-
-    /// What's the parent tenure's tenure-start block hash?
-    pub fn parent_tenure_id(&self) -> StacksBlockId {
-        StacksBlockId(self.block_commit.block_header_hash.0)
-    }
-
-    /// What's the stacks tip at the time of commit?
-    pub fn get_stacks_tip(&self) -> &StacksBlockId {
-        &self.stacks_tip
     }
 
     /// What's the burn tip at the time of commit?
@@ -380,12 +359,14 @@ impl TenureExtendTime {
         self.time.elapsed() > self.timeout
     }
 
-    // Amount of time elapsed since we decided to tenure-extend
+    /// Amount of time elapsed since we decided to tenure-extend.
+    #[cfg(any(test, feature = "testing"))]
     pub fn elapsed(&self) -> Duration {
         self.time.elapsed()
     }
 
-    // The timeout specified when we decided to tenure-extend
+    /// The timeout specified when we decided to tenure-extend.
+    #[cfg(any(test, feature = "testing"))]
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
@@ -410,7 +391,7 @@ impl TenureExtendTime {
 /// * if mining, runs the miner and broadcasts blocks (via a subordinate MinerThread)
 pub struct RelayerThread {
     /// Node config
-    pub(crate) config: Config,
+    pub config: Config,
     /// Handle to the sortition DB
     sortdb: SortitionDB,
     /// Handle to the chainstate DB
@@ -418,17 +399,17 @@ pub struct RelayerThread {
     /// Handle to the mempool DB
     mempool: MemPoolDB,
     /// Handle to global state and inter-thread communication channels
-    pub(crate) globals: Globals,
+    pub globals: Globals,
     /// Authoritative copy of the keychain state
-    pub(crate) keychain: Keychain,
+    pub keychain: Keychain,
     /// Burnchian configuration
-    pub(crate) burnchain: Burnchain,
+    pub burnchain: Burnchain,
     /// height of last VRF key registration request
     last_vrf_key_burn_height: Option<u64>,
     /// client to the burnchain (used only for sending block-commits)
-    pub(crate) bitcoin_controller: BitcoinRegtestController,
+    pub bitcoin_controller: BitcoinRegtestController,
     /// client to the event dispatcher
-    pub(crate) event_dispatcher: EventDispatcher,
+    pub event_dispatcher: EventDispatcher,
     /// copy of the local peer state
     local_peer: LocalPeer,
     /// last observed burnchain block height from the p2p thread (obtained from network results)
@@ -474,28 +455,29 @@ pub struct RelayerThread {
 
 impl RelayerThread {
     /// Instantiate relayer thread.
-    /// Uses `runloop` to obtain globals, config, and `is_miner`` status
+    /// Uses the runtime-established spawn context as its authoritative node configuration.
     pub fn new(
-        runloop: &RunLoop,
+        context: &SpawnContext<RelayerDirective>,
         local_peer: LocalPeer,
         relayer: Relayer,
         keychain: Keychain,
     ) -> RelayerThread {
-        let config = runloop.config().clone();
-        let globals = runloop.get_globals();
+        let config = context.config().clone();
+        let globals = context.shared();
         let burn_db_path = config.get_burn_db_file_path();
-        let is_miner = runloop.is_miner();
+        let is_miner = context.is_miner();
+        let burnchain = context.burnchain().clone();
 
         let sortdb = SortitionDB::open(
             &burn_db_path,
             true,
-            runloop.get_burnchain().pox_constants,
+            burnchain.pox_constants.clone(),
             Some(config.node.get_marf_opts()),
         )
         .expect("FATAL: failed to open burnchain DB");
 
         let chainstate =
-            open_chainstate_with_faults(&config).expect("FATAL: failed to open chainstate DB");
+            chainstate::open_chainstate(&config).expect("FATAL: failed to open chainstate DB");
 
         let mempool = config
             .connect_mempool_db()
@@ -512,10 +494,10 @@ impl RelayerThread {
             mempool,
             globals,
             keychain,
-            burnchain: runloop.get_burnchain(),
+            burnchain,
             last_vrf_key_burn_height: None,
             bitcoin_controller,
-            event_dispatcher: runloop.get_event_dispatcher(),
+            event_dispatcher: context.events(),
             local_peer,
 
             last_network_block_height: 0,
@@ -1065,7 +1047,7 @@ impl RelayerThread {
     /// Returns None if we fail somehow.
     ///
     /// TODO: unit test
-    pub(crate) fn make_block_commit(
+    pub fn make_block_commit(
         &mut self,
         tip_block_ch: &ConsensusHash,
         tip_block_bh: &BlockHeaderHash,
@@ -1280,11 +1262,7 @@ impl RelayerThread {
         Ok(LastCommit::new(
             commit,
             sort_tip,
-            stacks_tip,
             highest_tenure_start_block_header.consensus_hash,
-            highest_tenure_start_block_header
-                .anchored_header
-                .block_hash(),
             target_epoch.epoch_id,
         ))
     }
@@ -1904,10 +1882,7 @@ impl RelayerThread {
                 "miner_spend_changed" => %burnchain_config_changed,
                 "miner_config_changed" => %miner_config_changed,
             );
-            return Ok(Some(RelayerDirective::IssueBlockCommit(
-                stacks_tip_ch,
-                stacks_tip_bh,
-            )));
+            return Ok(Some(RelayerDirective::IssueBlockCommit));
         }
 
         if !burnchain_changed && !highest_tenure_changed {
@@ -1917,10 +1892,7 @@ impl RelayerThread {
 
         if highest_tenure_changed {
             // highest-tenure view changed, so we need to send (or RBF) a commit
-            return Ok(Some(RelayerDirective::IssueBlockCommit(
-                stacks_tip_ch,
-                stacks_tip_bh,
-            )));
+            return Ok(Some(RelayerDirective::IssueBlockCommit));
         }
 
         debug!("Relayer: burnchain view changed, but highest tenure did not");
@@ -1952,10 +1924,7 @@ impl RelayerThread {
                 })?
                 .is_none();
             if no_sortitions_after_last_tenure {
-                return Ok(Some(RelayerDirective::IssueBlockCommit(
-                    stacks_tip_ch,
-                    stacks_tip_bh,
-                )));
+                return Ok(Some(RelayerDirective::IssueBlockCommit));
             }
         }
 
@@ -1963,10 +1932,7 @@ impl RelayerThread {
             &sort_tip.consensus_hash,
             &self.config.miner.block_commit_delay,
         ) {
-            return Ok(Some(RelayerDirective::IssueBlockCommit(
-                stacks_tip_ch,
-                stacks_tip_bh,
-            )));
+            return Ok(Some(RelayerDirective::IssueBlockCommit));
         } else {
             if let Some(deadline) = self
                 .new_tenure_timeout
@@ -2179,25 +2145,8 @@ impl RelayerThread {
     }
 
     /// Try loading up a saved VRF key
-    pub(crate) fn load_saved_vrf_key(path: &str, pubkey_hash: &Hash160) -> Option<RegisteredKey> {
-        let mut f = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Could not open {path}: {e:?}");
-                return None;
-            }
-        };
-        let mut registered_key_bytes = vec![];
-        if let Err(e) = f.read_to_end(&mut registered_key_bytes) {
-            warn!("Failed to read registered key bytes from {path}: {e:?}");
-            return None;
-        }
-
-        let Ok(registered_key) = serde_json::from_slice::<RegisteredKey>(&registered_key_bytes)
-        else {
-            warn!("Did not load registered key from {path}: could not decode JSON");
-            return None;
-        };
+    fn load_saved_vrf_key(path: &str, pubkey_hash: &Hash160) -> Option<RegisteredKey> {
+        let registered_key = load_activated_vrf_key(path)?;
 
         // Check that the loaded key's memo matches the current miner's key
         if registered_key.memo != pubkey_hash.as_ref() {
@@ -2260,7 +2209,7 @@ impl RelayerThread {
                 )
             }
             // These are triggered by the relayer waking up, seeing a new consensus hash *or* a new first tenure block
-            RelayerDirective::IssueBlockCommit(..) => {
+            RelayerDirective::IssueBlockCommit => {
                 if !self.is_miner {
                     return true;
                 }
@@ -2321,9 +2270,6 @@ impl RelayerThread {
 
 #[cfg(test)]
 pub mod test {
-    use std::fs::File;
-    use std::io::Write;
-    use std::path::Path;
     use std::time::Duration;
     use std::u64;
 
@@ -2334,64 +2280,17 @@ pub mod test {
     use stacks::util::hash::Hash160;
     use stacks::util::secp256k1::Secp256k1PublicKey;
     use stacks::util::vrf::VRFPublicKey;
+    use tempfile::tempdir;
 
     use super::{BurnBlockCommitTimer, RelayerThread};
-    use crate::nakamoto_node::save_activated_vrf_key;
-    use crate::run_loop::RegisteredKey;
+    use crate::node::leader_key::{save_activated_vrf_key, RegisteredKey};
     use crate::Keychain;
 
     #[test]
-    fn load_nonexistent_vrf_key() {
-        let keychain = Keychain::default(vec![0u8; 32]);
-        let pk = Secp256k1PublicKey::from_private(keychain.get_nakamoto_sk());
-        let pubkey_hash = Hash160::from_node_public_key(&pk);
-
-        let path = "/tmp/does_not_exist.json";
-        _ = std::fs::remove_file(path);
-
-        let res = RelayerThread::load_saved_vrf_key(path, &pubkey_hash);
-        assert!(res.is_none());
-    }
-
-    #[test]
-    fn load_empty_vrf_key() {
-        let keychain = Keychain::default(vec![0u8; 32]);
-        let pk = Secp256k1PublicKey::from_private(keychain.get_nakamoto_sk());
-        let pubkey_hash = Hash160::from_node_public_key(&pk);
-
-        let path = "/tmp/empty.json";
-        File::create(path).expect("Failed to create test file");
-        assert!(Path::new(path).exists());
-
-        let res = RelayerThread::load_saved_vrf_key(path, &pubkey_hash);
-        assert!(res.is_none());
-
-        std::fs::remove_file(path).expect("Failed to delete test file");
-    }
-
-    #[test]
-    fn load_bad_vrf_key() {
-        let keychain = Keychain::default(vec![0u8; 32]);
-        let pk = Secp256k1PublicKey::from_private(keychain.get_nakamoto_sk());
-        let pubkey_hash = Hash160::from_node_public_key(&pk);
-
-        let path = "/tmp/invalid_saved_key.json";
-        let json_content = r#"{ "hello": "world" }"#;
-
-        // Write the JSON content to the file
-        let mut file = File::create(path).expect("Failed to create test file");
-        file.write_all(json_content.as_bytes())
-            .expect("Failed to write to test file");
-        assert!(Path::new(path).exists());
-
-        let res = RelayerThread::load_saved_vrf_key(path, &pubkey_hash);
-        assert!(res.is_none());
-
-        std::fs::remove_file(path).expect("Failed to delete test file");
-    }
-
-    #[test]
     fn save_load_vrf_key() {
+        let directory = tempdir().expect("Failed to create temporary directory");
+        let path = directory.path().join("vrf_key.json");
+        let path = path.to_str().unwrap();
         let keychain = Keychain::default(vec![0u8; 32]);
         let pk = Secp256k1PublicKey::from_private(keychain.get_nakamoto_sk());
         let pubkey_hash = Hash160::from_node_public_key(&pk);
@@ -2405,17 +2304,17 @@ pub mod test {
             .unwrap(),
             memo: pubkey_hash.as_ref().to_vec(),
         };
-        let path = "/tmp/vrf_key.json";
         save_activated_vrf_key(path, &key);
 
         let res = RelayerThread::load_saved_vrf_key(path, &pubkey_hash);
         assert!(res.is_some());
-
-        std::fs::remove_file(path).expect("Failed to delete test file");
     }
 
     #[test]
     fn invalid_saved_memo() {
+        let directory = tempdir().expect("Failed to create temporary directory");
+        let path = directory.path().join("vrf_key.json");
+        let path = path.to_str().unwrap();
         let keychain = Keychain::default(vec![0u8; 32]);
         let pk = Secp256k1PublicKey::from_private(keychain.get_nakamoto_sk());
         let pubkey_hash = Hash160::from_node_public_key(&pk);
@@ -2429,7 +2328,6 @@ pub mod test {
             .unwrap(),
             memo: pubkey_hash.as_ref().to_vec(),
         };
-        let path = "/tmp/vrf_key.json";
         save_activated_vrf_key(path, &key);
 
         let keychain = Keychain::default(vec![1u8; 32]);
@@ -2438,8 +2336,6 @@ pub mod test {
 
         let res = RelayerThread::load_saved_vrf_key(path, &pubkey_hash);
         assert!(res.is_none());
-
-        std::fs::remove_file(path).expect("Failed to delete test file");
     }
 
     #[test]

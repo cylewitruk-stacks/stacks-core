@@ -43,7 +43,7 @@ use stacks::util::secp256k1::MessageSignature;
 #[cfg(test)]
 use stacks_common::util::tests::TestFlag;
 
-use super::Error as NakamotoNodeError;
+use super::super::Error as NakamotoNodeError;
 use crate::event_dispatcher::StackerDBChannel;
 use crate::Config;
 
@@ -81,7 +81,7 @@ pub struct BlockStatus {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TimestampInfo {
+pub struct TimestampInfo {
     pub timestamp: u64,
     pub weight: u32,
 }
@@ -100,27 +100,27 @@ pub struct StackerDBListener {
     /// The signer set for this tenure (0 or 1)
     signer_set: u32,
     /// The total weight of all signers
-    pub(crate) total_weight: u32,
+    pub total_weight: u32,
     /// The weight threshold for block approval
-    pub(crate) weight_threshold: u32,
+    pub weight_threshold: u32,
     /// The signer entries for this tenure (keyed by slot_id)
     signer_entries: HashMap<u32, NakamotoSignerEntry>,
     /// Tracks signatures for blocks
     ///   - key: Sha512Trunc256Sum (signer signature hash)
     ///   - value: BlockStatus
-    pub(crate) blocks: Arc<(Mutex<HashMap<Sha512Trunc256Sum, BlockStatus>>, Condvar)>,
+    pub blocks: Arc<(Mutex<HashMap<Sha512Trunc256Sum, BlockStatus>>, Condvar)>,
     /// Tracks the timestamps from signers to decide when they should be
     /// willing to accept time-based tenure extensions
     ///  - key: StacksPublicKey
     ///  - value: TimestampInfo
-    pub(crate) signer_idle_timestamps: Arc<Mutex<HashMap<StacksPublicKey, TimestampInfo>>>,
+    pub signer_idle_timestamps: Arc<Mutex<HashMap<StacksPublicKey, TimestampInfo>>>,
     /// Tracks the timestamps from signers to decide when they should be
     /// willing to accept time-based read-count extensions
     ///  - key: StacksPublicKey
     ///  - value: TimestampInfo
-    pub(crate) signer_read_count_timestamps: Arc<Mutex<HashMap<StacksPublicKey, TimestampInfo>>>,
+    pub signer_read_count_timestamps: Arc<Mutex<HashMap<StacksPublicKey, TimestampInfo>>>,
     /// Tracks the signer's global state machine through signer state machine update messages
-    pub(crate) global_state_evaluator: Arc<Mutex<GlobalStateEvaluator>>,
+    pub global_state_evaluator: Arc<Mutex<GlobalStateEvaluator>>,
     /// Wehther we are operating on mainnet
     is_mainnet: bool,
 }

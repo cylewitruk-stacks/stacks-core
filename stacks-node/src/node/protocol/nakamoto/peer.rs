@@ -31,10 +31,10 @@ use stacks::net::p2p::PeerNetwork;
 use stacks::net::RPCHandlerArgs;
 use stacks_common::util::hash::Sha256Sum;
 
+use super::driver::Globals;
+use super::relayer::RelayerDirective;
 use crate::burnchains::make_bitcoin_indexer;
-use crate::nakamoto_node::relayer::RelayerDirective;
-use crate::neon_node::open_chainstate_with_faults;
-use crate::run_loop::nakamoto::{Globals, RunLoop};
+use crate::node::chainstate;
 use crate::{Config, EventDispatcher};
 
 /// Thread that runs the network state machine, handling both p2p and http requests.
@@ -141,16 +141,7 @@ impl PeerThread {
     /// Binds the addresses in the config (which may panic if the port is blocked).
     /// This is so the node will crash "early" before any new threads start if there's going to be
     /// a bind error anyway.
-    pub fn new(runloop: &RunLoop, net: PeerNetwork) -> PeerThread {
-        Self::new_all(
-            runloop.get_globals(),
-            runloop.config(),
-            runloop.get_burnchain().pox_constants,
-            net,
-        )
-    }
-
-    fn new_all(
+    pub fn new(
         globals: Globals,
         config: &Config,
         pox_constants: PoxConstants,
@@ -171,7 +162,7 @@ impl PeerThread {
         .expect("FATAL: could not open sortition DB");
 
         let chainstate =
-            open_chainstate_with_faults(&config).expect("FATAL: could not open chainstate DB");
+            chainstate::open_chainstate(&config).expect("FATAL: could not open chainstate DB");
 
         let p2p_sock: SocketAddr = config
             .node
@@ -230,7 +221,7 @@ impl PeerThread {
     /// Run one pass of the p2p/http state machine
     /// Return true if we should continue running passes; false if not
     #[allow(clippy::borrowed_box)]
-    pub(crate) fn run_one_pass<B: BurnchainHeaderReader>(
+    pub fn run_one_pass<B: BurnchainHeaderReader>(
         &mut self,
         indexer: &B,
         dns_client_opt: Option<&mut DNSClient>,

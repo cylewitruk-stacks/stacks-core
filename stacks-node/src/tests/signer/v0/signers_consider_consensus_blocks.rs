@@ -30,7 +30,7 @@ use stacks_signer::v0::SpawnedSigner;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::nakamoto_node::stackerdb_listener::TEST_IGNORE_SIGNERS;
+use crate::node::test_support::nakamoto::signer::listener::TEST_IGNORE_SIGNERS;
 use crate::tests::nakamoto_integrations::wait_for;
 use crate::tests::neon_integrations::{submit_tx, test_observer};
 use crate::tests::signer::v0::{

@@ -25,7 +25,7 @@
 ///
 ///
 ///                           |------------------|
-///                           |  RunLoop thread  |   [1,7]
+///                           | Epoch 2 driver   |   [1,7]
 ///                           |   .----------.   |--------------------------------------.
 ///                           |   .StacksNode.   |                                      |
 ///                           |---.----------.---|                                      |
@@ -64,8 +64,9 @@
 ///
 /// When the node is running, there are 4-5 active threads at once. They are:
 ///
-/// * **RunLoop Thread**:
-///     This is the main thread, whose code body lives in `src/run_loop/neon.rs`.
+/// * **Epoch 2 driver thread**:
+///     This is the main thread, whose code body lives in
+///     `src/node/protocol/epoch2/driver.rs`.
 ///     This thread is responsible for:
 ///       * Bootup
 ///       * Running the burnchain indexer
@@ -124,8 +125,8 @@
 ///     microblocks, and handles PoX reorgs should they occur (this mainly happens in boot-up). It,
 ///     like the Relayer thread, is a very I/O-heavy thread, and it will hold a write-lock on the
 ///     chainstate DBs while it works. Its actions are controlled by a CoordinatorComms structure in
-///     the Globals shared state, which the Relayer thread and RunLoop thread both drive (the former
-///     drives Stacks blocks processing, the latter sortitions).
+///     the shared node state, which the Relayer and Epoch 2 driver threads both drive (the former
+///     drives Stacks block processing, the latter sortitions).
 ///     This thread is responsible for:
 ///       * Responding to requests from other threads to process sortitions
 ///       * Responding to requests from other threads to process Stacks blocks and microblocks
@@ -141,28 +142,29 @@
 ///       * The global shutdown flag that, when set, causes all threads to terminate
 ///       * Sender channel endpoints that can be shared between threads
 ///       * Metrics about the node's behavior (e.g. number of blocks processed, etc.)
-///
-/// This file may be refactored in the future into a full-fledged module.
 use std::cmp;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{ErrorKind, Read, Write};
+use std::io::ErrorKind;
+#[cfg(test)]
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fs, mem, thread};
 
 use clarity::boot_util::boot_code_id;
 use clarity::vm::costs::ExecutionCost;
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use clarity::vm::types::PrincipalData;
 use libsigner::v0::messages::{
     MessageSlotID, MinerSlotID, MockBlock, MockProposal, MockSignature, PeerInfo, SignerMessage,
 };
 use libsigner::{SignerSession, StackerDBSession};
 use stacks::burnchains::bitcoin::address::{BitcoinAddress, LegacyBitcoinAddressType};
 use stacks::burnchains::db::BurnchainHeaderReader;
-use stacks::burnchains::{Burnchain, BurnchainSigner, PoxConstants, Txid};
+use stacks::burnchains::{Burnchain, PoxConstants, Txid};
 use stacks::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};
 use stacks::chainstate::burn::operations::leader_block_commit::{
     RewardSetInfo, BURN_BLOCK_MINED_AT_MODULUS,
@@ -189,44 +191,43 @@ use stacks::chainstate::stacks::{
 use stacks::config::chain_data::MinerStats;
 use stacks::config::NodeConfig;
 use stacks::core::mempool::MemPoolDB;
-use stacks::core::{EpochList, FIRST_BURNCHAIN_CONSENSUS_HASH, STACKS_EPOCH_3_0_MARKER};
+use stacks::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, STACKS_EPOCH_3_0_MARKER};
 use stacks::cost_estimates::metrics::{CostMetric, UnitMetric};
 use stacks::cost_estimates::{CostEstimator, FeeEstimator, UnitEstimator};
-use stacks::monitoring::{increment_stx_blocks_mined_counter, update_active_miners_count_gauge};
-use stacks::net::atlas::{AtlasConfig, AtlasDB};
-use stacks::net::db::{LocalPeer, PeerDB};
+use stacks::monitoring::increment_stx_blocks_mined_counter;
+use stacks::net::db::LocalPeer;
 use stacks::net::dns::{DNSClient, DNSResolver};
 use stacks::net::p2p::PeerNetwork;
 use stacks::net::relay::Relayer;
-use stacks::net::stackerdb::{StackerDBConfig, StackerDBSync, StackerDBs, MINER_SLOT_COUNT};
-use stacks::net::{
-    Error as NetError, NetworkResult, PeerNetworkComms, RPCHandlerArgs, ServiceFlags,
-};
-use stacks::util_lib::strings::{UrlString, VecDisplay};
-use stacks::{monitoring, version_string};
+use stacks::net::stackerdb::{StackerDBs, MINER_SLOT_COUNT};
+use stacks::net::{Error as NetError, NetworkResult, RPCHandlerArgs};
+use stacks::version_string;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockId,
-    StacksPrivateKey, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockId, TrieHash,
+    VRFSeed,
 };
-use stacks_common::types::net::PeerAddress;
 use stacks_common::types::{PublicKey, StacksEpochId};
 use stacks_common::util::hash::{to_hex, Hash160, Sha256Sum};
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 use stacks_common::util::vrf::{VRFProof, VRFPublicKey};
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
 
-use super::{BurnchainController, Config, EventDispatcher, Keychain};
 use crate::burnchains::bitcoin_regtest_controller::{
     burnchain_params_from_config, BitcoinRegtestController, OngoingBlockCommit,
 };
 use crate::burnchains::{make_bitcoin_indexer, Error as BurnchainControllerError};
-use crate::globals::{NeonGlobals as Globals, RelayerDirective};
-use crate::nakamoto_node::miner_db::MinerDB;
-use crate::nakamoto_node::signer_coordinator::SignerCoordinator;
-use crate::run_loop::neon::RunLoop;
-use crate::run_loop::RegisteredKey;
-use crate::ChainTip;
+use crate::node::chainstate;
+use crate::node::context::SpawnContext;
+use crate::node::leader_key::{load_activated_vrf_key, LeaderKeyRegistrationState, RegisteredKey};
+use crate::node::network::NodeNetwork;
+use crate::node::protocol::fault_injection::{
+    fault_injection_long_tenure, fault_injection_skip_mining,
+};
+use crate::node::protocol::nakamoto::signer::coordinator::SignerCoordinator;
+use crate::node::protocol::nakamoto::signer::miner_db::MinerDB;
+use crate::node::runtime::{BurnBlockObservation, Globals, WorkerHandles};
+use crate::{BurnchainController, Config, EventDispatcher, Keychain};
 
 pub const RELAYER_MAX_BUFFER: usize = 100;
 const VRF_MOCK_MINER_KEY: u64 = 1;
@@ -235,9 +236,26 @@ pub const BLOCK_PROCESSOR_STACK_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
 type MinedBlocks = HashMap<BlockHeaderHash, (AssembledAnchorBlock, Secp256k1PrivateKey)>;
 
+pub type NeonGlobals = Globals<RelayerDirective>;
+
+/// Command types for the relayer thread, issued to it by other threads
+#[allow(clippy::large_enum_variant)]
+pub enum RelayerDirective {
+    /// Handle some new data that arrived on the network (such as blocks, transactions, and
+    HandleNetResult(NetworkResult),
+    /// Announce a new sortition.  Process and broadcast the block if we won.
+    ProcessTenure(ConsensusHash, BurnchainHeaderHash, BlockHeaderHash),
+    /// Try to mine a block
+    RunTenure(RegisteredKey, BlockSnapshot, u128), // (vrf key, chain tip, time of issuance in ms)
+    /// Try to register a VRF public key
+    RegisterKey(BlockSnapshot),
+    /// Stop the relayer thread
+    Exit,
+}
+
 /// Result of running the miner thread.  It could produce a Stacks block or a microblock.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum MinerThreadResult {
+pub enum MinerThreadResult {
     Block(
         AssembledAnchorBlock,
         Secp256k1PrivateKey,
@@ -286,81 +304,11 @@ impl MinerTip {
 /// This struct is used to set up the node proper and launch the p2p thread and relayer thread.
 /// It is further used by the main thread to communicate with these two threads.
 pub struct StacksNode {
-    /// Atlas network configuration
-    pub atlas_config: AtlasConfig,
     /// Global inter-thread communication handle
-    pub globals: Globals,
+    pub globals: NeonGlobals,
     /// True if we're a miner
     is_miner: bool,
-    /// handle to the p2p thread
-    pub p2p_thread_handle: JoinHandle<Option<PeerNetwork>>,
-    /// handle to the relayer thread
-    pub relayer_thread_handle: JoinHandle<()>,
-}
-
-/// Fault injection logic to artificially increase the length of a tenure.
-/// Only used in testing
-#[cfg(test)]
-pub(crate) fn fault_injection_long_tenure() {
-    // simulated slow block
-    let Ok(tenure_str) = std::env::var("STX_TEST_SLOW_TENURE") else {
-        return;
-    };
-    let Ok(tenure_time) = tenure_str.parse::<u64>() else {
-        error!("Parse error for STX_TEST_SLOW_TENURE");
-        panic!();
-    };
-    info!("Fault injection: sleeping for {tenure_time} milliseconds to simulate a long tenure");
-    stacks_common::util::sleep_ms(tenure_time);
-}
-
-#[cfg(not(test))]
-pub(crate) fn fault_injection_long_tenure() {}
-
-/// Fault injection to skip mining in this bitcoin block height
-/// Only used in testing
-#[cfg(test)]
-pub(crate) fn fault_injection_skip_mining(rpc_bind: &str, target_burn_height: u64) -> bool {
-    let Ok(disable_heights) = std::env::var("STACKS_DISABLE_MINER") else {
-        return false;
-    };
-    let disable_schedule: serde_json::Value = serde_json::from_str(&disable_heights).unwrap();
-    let disable_schedule = disable_schedule.as_array().unwrap();
-    for disabled in disable_schedule {
-        let target_miner_rpc_bind = disabled.get("rpc_bind").unwrap().as_str().unwrap();
-        if target_miner_rpc_bind != rpc_bind {
-            continue;
-        }
-        let target_block_heights = disabled.get("blocks").unwrap().as_array().unwrap();
-        for target_block_value in target_block_heights {
-            let target_block = u64::try_from(target_block_value.as_i64().unwrap()).unwrap();
-            if target_block == target_burn_height {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-#[cfg(not(test))]
-pub(crate) fn fault_injection_skip_mining(_rpc_bind: &str, _target_burn_height: u64) -> bool {
-    false
-}
-
-/// Open the chainstate, and inject faults from the config file
-pub(crate) fn open_chainstate_with_faults(
-    config: &Config,
-) -> Result<StacksChainState, ChainstateError> {
-    let stacks_chainstate_path = config.get_chainstate_path_str();
-    let (mut chainstate, _) = StacksChainState::open(
-        config.is_mainnet(),
-        config.burnchain.chain_id,
-        &stacks_chainstate_path,
-        Some(config.node.get_marf_opts()),
-    )?;
-
-    chainstate.fault_injection.hide_blocks = config.node.fault_injection_hide_blocks;
-    Ok(chainstate)
+    workers: WorkerHandles<Option<PeerNetwork>>,
 }
 
 /// Types of errors that can arise during mining
@@ -393,29 +341,6 @@ struct ParentStacksBlockInfo {
     coinbase_nonce: u64,
 }
 
-#[derive(Clone, Default)]
-pub enum LeaderKeyRegistrationState {
-    /// Not started yet
-    #[default]
-    Inactive,
-    /// Waiting for burnchain confirmation
-    /// `u64` is the target block height in which we intend this key to land
-    /// `txid` is the burnchain transaction ID
-    Pending(u64, Txid),
-    /// Ready to go!
-    Active(RegisteredKey),
-}
-
-impl LeaderKeyRegistrationState {
-    pub fn get_active(&self) -> Option<RegisteredKey> {
-        if let Self::Active(registered_key) = self {
-            Some(registered_key.clone())
-        } else {
-            None
-        }
-    }
-}
-
 /// Relayer thread
 /// * accepts network results and stores blocks and microblocks
 /// * forwards new blocks, microblocks, and transactions to the p2p thread
@@ -431,7 +356,9 @@ pub struct RelayerThread {
     /// Handle to the mempool DB (optional so we can take/replace it)
     mempool: Option<MemPoolDB>,
     /// Handle to global state and inter-thread communication channels
-    globals: Globals,
+    globals: NeonGlobals,
+    /// Epoch 2 mining caches shared by successive block-miner threads
+    mining_state: Epoch2MiningState,
     /// Authoritative copy of the keychain state
     keychain: Keychain,
     /// Burnchian configuration
@@ -490,11 +417,13 @@ pub struct RelayerThread {
     last_attempt_failed: bool,
 }
 
-pub(crate) struct BlockMinerThread {
+pub struct BlockMinerThread {
     /// node config struct
     config: Config,
     /// handle to global state
-    globals: Globals,
+    globals: NeonGlobals,
+    /// Epoch 2 mining caches shared by successive block-miner threads
+    mining_state: Epoch2MiningState,
     /// copy of the node's keychain
     keychain: Keychain,
     /// burnchain configuration
@@ -518,7 +447,7 @@ pub(crate) struct BlockMinerThread {
 /// State representing the microblock miner.
 struct MicroblockMinerThread {
     /// handle to global state
-    globals: Globals,
+    globals: NeonGlobals,
     /// handle to chainstate DB (optional so we can take/replace it)
     chainstate: Option<StacksChainState>,
     /// handle to sortition DB (optional so we can take/replace it)
@@ -587,7 +516,7 @@ impl MicroblockMinerThread {
         })
         .ok()?;
 
-        let mut chainstate = open_chainstate_with_faults(&config)
+        let mut chainstate = chainstate::open_chainstate(&config)
             .map_err(|e| {
                 error!(
                     "Relayer: Could not open chainstate '{stacks_chainstate_path}' ({e:?}); skipping microblock tenure"
@@ -976,6 +905,74 @@ impl TipCandidate {
     }
 }
 
+/// Mining-policy caches whose meaning and lifetime are specific to Epoch 2.
+#[derive(Clone, Default)]
+struct Epoch2MiningState {
+    /// Estimated winning probability at given Bitcoin block heights.
+    estimated_winning_probs: Arc<Mutex<HashMap<u64, f64>>>,
+    /// Previously selected best tips, indexed by Stacks height.
+    previous_best_tips: Arc<Mutex<BTreeMap<u64, TipCandidate>>>,
+}
+
+impl Epoch2MiningState {
+    /// Record an estimated winning probability.
+    fn add_estimated_win_prob(&self, burn_height: u64, win_prob: f64) {
+        match self.estimated_winning_probs.lock() {
+            Ok(mut probs) => {
+                probs.insert(burn_height, win_prob);
+            }
+            Err(_e) => {
+                error!("FATAL: failed to lock estimated_winning_probs");
+                panic!();
+            }
+        }
+    }
+
+    /// Get the estimated winning probability, if available.
+    fn get_estimated_win_prob(&self, burn_height: u64) -> Option<f64> {
+        match self.estimated_winning_probs.lock() {
+            Ok(probs) => probs.get(&burn_height).cloned(),
+            Err(_e) => {
+                error!("FATAL: failed to lock estimated_winning_probs");
+                panic!();
+            }
+        }
+    }
+
+    /// Record a best tip and evict entries older than the configured reorg depth.
+    fn add_best_tip(&self, stacks_height: u64, tip_candidate: TipCandidate, max_depth: u64) {
+        match self.previous_best_tips.lock() {
+            Ok(mut tips) => {
+                tips.insert(stacks_height, tip_candidate);
+                let mut stale = vec![];
+                for (prev_height, _) in tips.iter() {
+                    if *prev_height + max_depth < stacks_height {
+                        stale.push(*prev_height);
+                    }
+                }
+                for height in stale.into_iter() {
+                    tips.remove(&height);
+                }
+            }
+            Err(_e) => {
+                error!("FATAL: failed to lock previous_best_tips");
+                panic!();
+            }
+        }
+    }
+
+    /// Get a best tip selected at a previous height.
+    fn get_best_tip(&self, stacks_height: u64) -> Option<TipCandidate> {
+        match self.previous_best_tips.lock() {
+            Ok(tips) => tips.get(&stacks_height).cloned(),
+            Err(_e) => {
+                error!("FATAL: failed to lock previous_best_tips");
+                panic!();
+            }
+        }
+    }
+}
+
 impl BlockMinerThread {
     /// Instantiate the miner thread from its parent RelayerThread
     pub fn from_relayer_thread(
@@ -986,6 +983,7 @@ impl BlockMinerThread {
         BlockMinerThread {
             config: rt.config.clone(),
             globals: rt.globals.clone(),
+            mining_state: rt.mining_state.clone(),
             keychain: rt.keychain.clone(),
             burnchain: rt.burnchain.clone(),
             last_mined_blocks: rt.last_mined_blocks.clone(),
@@ -1118,7 +1116,7 @@ impl BlockMinerThread {
     }
 
     /// Is a given Stacks staging block on the canonical burnchain fork?
-    pub(crate) fn is_on_canonical_burnchain_fork(
+    pub fn is_on_canonical_burnchain_fork(
         candidate_ch: &ConsensusHash,
         candidate_bh: &BlockHeaderHash,
         sortdb_tip_handle: &SortitionHandleConn,
@@ -1166,7 +1164,7 @@ impl BlockMinerThread {
     /// but greater than or equal to this end height minus `max_depth`.
     /// Returns the list of all Stacks blocks up to max_depth blocks beneath it.
     /// The blocks will be sorted first by stacks height, and then by burnchain height
-    pub(crate) fn load_candidate_tips(
+    pub fn load_candidate_tips(
         burn_db: &mut SortitionDB,
         chain_state: &mut StacksChainState,
         max_depth: u64,
@@ -1254,9 +1252,7 @@ impl BlockMinerThread {
     /// Put all tip candidates in order by stacks height, breaking ties with burnchain height.
     /// Also, count up the number of earliersiblings each tip has -- i.e. the number of stacks
     /// blocks that have the same height, but a later burnchain sortition.
-    pub(crate) fn sort_and_populate_candidates(
-        mut candidates: Vec<TipCandidate>,
-    ) -> Vec<TipCandidate> {
+    pub fn sort_and_populate_candidates(mut candidates: Vec<TipCandidate>) -> Vec<TipCandidate> {
         if candidates.is_empty() {
             return candidates;
         }
@@ -1302,8 +1298,8 @@ impl BlockMinerThread {
     /// The tip with the lowest score is composed of blocks that collectively made the fewest
     /// orphans, and is thus the "nicest" chain with the least orphaning.  This is the tip that is
     /// selected.
-    pub fn pick_best_tip(
-        globals: &Globals,
+    fn pick_best_tip(
+        mining_state: &Epoch2MiningState,
         config: &Config,
         burn_db: &mut SortitionDB,
         chain_state: &mut StacksChainState,
@@ -1320,7 +1316,7 @@ impl BlockMinerThread {
         let mut previous_best_tips = HashMap::new();
         let sortdb_tip_handle = burn_db.index_handle_at_tip();
         for tip in stacks_tips.iter() {
-            let Some(prev_best_tip) = globals.get_best_tip(tip.stacks_height) else {
+            let Some(prev_best_tip) = mining_state.get_best_tip(tip.stacks_height) else {
                 continue;
             };
             if !Self::is_on_canonical_burnchain_fork(
@@ -1335,7 +1331,7 @@ impl BlockMinerThread {
 
         let best_tip_opt = Self::inner_pick_best_tip(stacks_tips, previous_best_tips);
         if let Some(best_tip) = best_tip_opt.as_ref() {
-            globals.add_best_tip(best_tip.stacks_height, best_tip.clone(), max_depth);
+            mining_state.add_best_tip(best_tip.stacks_height, best_tip.clone(), max_depth);
         } else {
             // no best-tip found; revert to old tie-breaker logic
             debug!("No best-tips found; using old tie-breaking logic");
@@ -1362,7 +1358,7 @@ impl BlockMinerThread {
     /// now-orphaned previously-chosen best-tip.  If there are multiple best-tips that conflict in
     /// `previosu_best_tips`, then only the highest one which the leaf could confirm will be
     /// considered (since the node updates its understanding of the best-tip on each RunTenure).
-    pub(crate) fn inner_pick_best_tip(
+    pub fn inner_pick_best_tip(
         stacks_tips: Vec<TipCandidate>,
         previous_best_tips: HashMap<u64, TipCandidate>,
     ) -> Option<TipCandidate> {
@@ -1533,7 +1529,7 @@ impl BlockMinerThread {
             .expect("FATAL: could not query chain tip")
         {
             let best_stacks_tip =
-                Self::pick_best_tip(&self.globals, &self.config, burn_db, chain_state, None)
+                Self::pick_best_tip(&self.mining_state, &self.config, burn_db, chain_state, None)
                     .expect("FATAL: no best chain tip");
             let miner_address = self
                 .keychain
@@ -1567,15 +1563,16 @@ impl BlockMinerThread {
             debug!("No Stacks chain tip known, will return a genesis block");
             let burnchain_params = burnchain_params_from_config(&self.config.burnchain);
 
-            let chain_tip = ChainTip::genesis(
+            let stacks_parent_header = StacksHeaderInfo::genesis(
+                TrieHash([0u8; 32]),
                 &burnchain_params.first_block_hash,
-                burnchain_params.first_block_height,
+                burnchain_params.first_block_height as u32,
                 burnchain_params.first_block_timestamp.into(),
             );
 
             (
                 Some(ParentStacksBlockInfo {
-                    stacks_parent_header: chain_tip.metadata,
+                    stacks_parent_header,
                     parent_consensus_hash: FIRST_BURNCHAIN_CONSENSUS_HASH,
                     parent_block_burn_height: 0,
                     parent_block_total_burn: 0,
@@ -2125,11 +2122,14 @@ impl BlockMinerThread {
             self.globals.get_start_mining_height(),
             None,
             |block_height| {
-                self.globals
+                self.mining_state
                     .get_estimated_win_prob(block_height)
                     .unwrap_or(0.0)
             },
-            |block_height, win_prob| self.globals.add_estimated_win_prob(block_height, win_prob),
+            |block_height, win_prob| {
+                self.mining_state
+                    .add_estimated_win_prob(block_height, win_prob)
+            },
         );
         if burn_fee_cap == 0 {
             warn!("Calculated burn_fee_cap is 0; will not mine");
@@ -2478,7 +2478,7 @@ impl BlockMinerThread {
         .expect("FATAL: could not open sortition DB");
 
         let mut chain_state =
-            open_chainstate_with_faults(&self.config).expect("FATAL: could not open chainstate DB");
+            chainstate::open_chainstate(&self.config).expect("FATAL: could not open chainstate DB");
 
         let mut mem_pool = MemPoolDB::open(
             self.config.is_mainnet(),
@@ -2672,7 +2672,7 @@ impl BlockMinerThread {
             .expect("FATAL: failed to query sortition DB for canonical burn chain tip");
 
         if let Some(stacks_tip) = Self::pick_best_tip(
-            &self.globals,
+            &self.mining_state,
             &self.config,
             &mut burn_db,
             &mut chain_state,
@@ -2816,10 +2816,15 @@ impl BlockMinerThread {
 }
 
 impl RelayerThread {
-    /// Instantiate off of a StacksNode, a runloop, and a relayer.
-    pub fn new(runloop: &RunLoop, local_peer: LocalPeer, relayer: Relayer) -> RelayerThread {
-        let config = runloop.config().clone();
-        let globals = runloop.get_globals();
+    /// Instantiate the Epoch 2 relayer from runtime-owned node resources.
+    pub fn new(
+        config: Config,
+        globals: NeonGlobals,
+        burnchain: Burnchain,
+        event_dispatcher: EventDispatcher,
+        local_peer: LocalPeer,
+        relayer: Relayer,
+    ) -> RelayerThread {
         let burn_db_path = config.get_burn_db_file_path();
         let stacks_chainstate_path = config.get_chainstate_path_str();
         let is_mainnet = config.is_mainnet();
@@ -2828,13 +2833,13 @@ impl RelayerThread {
         let sortdb = SortitionDB::open(
             &burn_db_path,
             true,
-            runloop.get_burnchain().pox_constants,
+            burnchain.pox_constants.clone(),
             Some(config.node.get_marf_opts()),
         )
         .expect("FATAL: failed to open burnchain DB");
 
         let chainstate =
-            open_chainstate_with_faults(&config).expect("FATAL: failed to open chainstate DB");
+            chainstate::open_chainstate(&config).expect("FATAL: failed to open chainstate DB");
 
         let cost_estimator = config
             .make_cost_estimator()
@@ -2856,17 +2861,18 @@ impl RelayerThread {
         let bitcoin_controller = BitcoinRegtestController::new_dummy(config.clone());
 
         RelayerThread {
-            config: config.clone(),
+            config,
             sortdb: Some(sortdb),
             chainstate: Some(chainstate),
             mempool: Some(mempool),
             globals,
+            mining_state: Epoch2MiningState::default(),
             keychain,
-            burnchain: runloop.get_burnchain(),
+            burnchain,
             last_vrf_key_burn_height: 0,
             last_mined_blocks: MinedBlocks::new(),
             bitcoin_controller,
-            event_dispatcher: runloop.get_event_dispatcher(),
+            event_dispatcher,
             local_peer,
 
             last_tenure_issue_time: 0,
@@ -3093,6 +3099,7 @@ impl RelayerThread {
             );
             #[cfg(any(test, feature = "testing"))]
             {
+                use std::io::Write;
                 use std::path::Path;
                 if let Ok(path) = std::env::var("STACKS_BAD_BLOCKS_DIR") {
                     // record this block somewhere
@@ -3522,7 +3529,7 @@ impl RelayerThread {
     /// cost since we won't be mining it anymore.
     fn setup_microblock_mining_state(&mut self, new_miner_tip: Option<MinerTip>) {
         // update state
-        let my_miner_tip = std::mem::take(&mut self.miner_tip);
+        let my_miner_tip = mem::take(&mut self.miner_tip);
         let best_tip = Self::pick_higher_tip(my_miner_tip.clone(), new_miner_tip.clone());
         if best_tip == new_miner_tip && best_tip != my_miner_tip {
             // tip has changed
@@ -4113,25 +4120,8 @@ impl RelayerThread {
     }
 
     /// Try loading up a saved VRF key
-    pub(crate) fn load_saved_vrf_key(path: &str) -> Option<RegisteredKey> {
-        let mut f = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Could not open {path}: {e:?}");
-                return None;
-            }
-        };
-        let mut registered_key_bytes = vec![];
-        if let Err(e) = f.read_to_end(&mut registered_key_bytes) {
-            warn!("Failed to read registered key bytes from {path}: {e:?}");
-            return None;
-        }
-
-        let Ok(registered_key) = serde_json::from_slice(&registered_key_bytes) else {
-            warn!("Did not load registered key from {path}: could not decode JSON");
-            return None;
-        };
-
+    fn load_saved_vrf_key(path: &str) -> Option<RegisteredKey> {
+        let registered_key = load_activated_vrf_key(path)?;
         info!("Loaded registered key from {path}");
         Some(registered_key)
     }
@@ -4185,10 +4175,6 @@ impl RelayerThread {
                     issue_timestamp_ms,
                 );
                 debug!("Relayer: directive Ran tenure");
-                true
-            }
-            RelayerDirective::NakamotoTenureStartProcessed(_, _) => {
-                warn!("Relayer: Nakamoto tenure start notification received while still operating 2.x neon node");
                 true
             }
             RelayerDirective::Exit => false,
@@ -4329,7 +4315,7 @@ pub struct PeerThread {
     /// instance of the peer network. Made optional in order to trick the borrow checker.
     net: Option<PeerNetwork>,
     /// handle to global inter-thread comms
-    globals: Globals,
+    globals: NeonGlobals,
     /// how long to wait for network messages on each poll, in millis
     poll_timeout: u64,
     /// handle to the sortition DB (optional so we can take/replace it)
@@ -4381,17 +4367,8 @@ impl PeerThread {
     /// Binds the addresses in the config (which may panic if the port is blocked).
     /// This is so the node will crash "early" before any new threads start if there's going to be
     /// a bind error anyway.
-    pub fn new(runloop: &RunLoop, net: PeerNetwork) -> PeerThread {
-        Self::new_all(
-            runloop.get_globals(),
-            runloop.config(),
-            runloop.get_burnchain().pox_constants,
-            net,
-        )
-    }
-
-    pub fn new_all(
-        globals: Globals,
+    pub fn new(
+        globals: NeonGlobals,
         config: &Config,
         pox_constants: PoxConstants,
         mut net: PeerNetwork,
@@ -4409,7 +4386,7 @@ impl PeerThread {
         .expect("FATAL: could not open sortition DB");
 
         let chainstate =
-            open_chainstate_with_faults(&config).expect("FATAL: could not open chainstate DB");
+            chainstate::open_chainstate(&config).expect("FATAL: could not open chainstate DB");
 
         let p2p_sock: SocketAddr = config
             .node
@@ -4631,240 +4608,6 @@ impl PeerThread {
 }
 
 impl StacksNode {
-    /// Create a StacksPrivateKey from a given seed buffer
-    pub fn make_node_private_key_from_seed(seed: &[u8]) -> StacksPrivateKey {
-        let node_privkey = {
-            let mut re_hashed_seed = seed.to_vec();
-            let my_private_key = loop {
-                match Secp256k1PrivateKey::from_slice(&re_hashed_seed[..]) {
-                    Ok(sk) => break sk,
-                    Err(_) => {
-                        re_hashed_seed = Sha256Sum::from_data(&re_hashed_seed[..])
-                            .as_bytes()
-                            .to_vec()
-                    }
-                }
-            };
-            my_private_key
-        };
-        node_privkey
-    }
-
-    /// Set up the mempool DB by making sure it exists.
-    /// Panics on failure.
-    fn setup_mempool_db(config: &Config) -> MemPoolDB {
-        // force early mempool instantiation
-        let cost_estimator = config
-            .make_cost_estimator()
-            .unwrap_or_else(|| Box::new(UnitEstimator));
-        let metric = config
-            .make_cost_metric()
-            .unwrap_or_else(|| Box::new(UnitMetric));
-
-        MemPoolDB::open(
-            config.is_mainnet(),
-            config.burnchain.chain_id,
-            &config.get_chainstate_path_str(),
-            cost_estimator,
-            metric,
-        )
-        .expect("BUG: failed to instantiate mempool")
-    }
-
-    /// Set up the Peer DB and update any soft state from the config file. This includes:
-    ///   * Blacklisted/whitelisted nodes
-    ///   * Node keys
-    ///   * Bootstrap nodes
-    ///
-    /// Returns the instantiated `PeerDB`.
-    ///
-    /// Panics on failure.
-    fn setup_peer_db(
-        config: &Config,
-        burnchain: &Burnchain,
-        stackerdb_contract_ids: &[QualifiedContractIdentifier],
-    ) -> PeerDB {
-        let data_url = UrlString::try_from(config.node.data_url.to_string()).unwrap();
-        let initial_neighbors = config.node.bootstrap_node.clone();
-        if !initial_neighbors.is_empty() {
-            info!(
-                "Will bootstrap from peers {}",
-                VecDisplay(&initial_neighbors)
-            );
-        } else {
-            warn!("Without a peer to bootstrap from, the node will start mining a new chain");
-        }
-
-        let p2p_sock: SocketAddr = config
-            .node
-            .p2p_bind
-            .parse()
-            .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.p2p_bind));
-        let p2p_addr: SocketAddr = config
-            .node
-            .p2p_address
-            .parse()
-            .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.p2p_address));
-        let node_privkey = Secp256k1PrivateKey::from_seed(&config.node.local_peer_seed);
-
-        let mut peerdb = PeerDB::connect(
-            &config.get_peer_db_file_path(),
-            true,
-            config.burnchain.chain_id,
-            burnchain.network_id,
-            Some(node_privkey),
-            config.connection_options.private_key_lifetime,
-            PeerAddress::from_socketaddr(&p2p_addr),
-            p2p_sock.port(),
-            data_url,
-            &[],
-            Some(&initial_neighbors),
-            stackerdb_contract_ids,
-        )
-        .map_err(|e| {
-            eprintln!("Failed to open {}: {e:?}", &config.get_peer_db_file_path());
-            panic!();
-        })
-        .unwrap();
-
-        // allow all bootstrap nodes
-        {
-            let tx = peerdb.tx_begin().unwrap();
-            for initial_neighbor in initial_neighbors.iter() {
-                // update peer in case public key changed
-                PeerDB::update_peer(&tx, initial_neighbor).unwrap();
-                PeerDB::set_allow_peer(
-                    &tx,
-                    initial_neighbor.addr.network_id,
-                    &initial_neighbor.addr.addrbytes,
-                    initial_neighbor.addr.port,
-                    -1,
-                )
-                .unwrap();
-            }
-            tx.commit().unwrap();
-        }
-
-        if !config.node.deny_nodes.is_empty() {
-            warn!("Will ignore nodes {:?}", &config.node.deny_nodes);
-        }
-
-        // deny all config-denied peers
-        {
-            let tx = peerdb.tx_begin().unwrap();
-            for denied in config.node.deny_nodes.iter() {
-                PeerDB::set_deny_peer(
-                    &tx,
-                    denied.addr.network_id,
-                    &denied.addr.addrbytes,
-                    denied.addr.port,
-                    get_epoch_time_secs() + 24 * 365 * 3600,
-                )
-                .unwrap();
-            }
-            tx.commit().unwrap();
-        }
-
-        // update services to indicate we can support mempool sync and stackerdb
-        {
-            let tx = peerdb.tx_begin().unwrap();
-            PeerDB::set_local_services(
-                &tx,
-                (ServiceFlags::RPC as u16)
-                    | (ServiceFlags::RELAY as u16)
-                    | (ServiceFlags::STACKERDB as u16),
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
-
-        peerdb
-    }
-
-    /// Set up the PeerNetwork, but do not bind it.
-    pub(crate) fn setup_peer_network(
-        config: &Config,
-        atlas_config: &AtlasConfig,
-        burnchain: Burnchain,
-    ) -> PeerNetwork {
-        let sortdb = SortitionDB::open(
-            &config.get_burn_db_file_path(),
-            true,
-            burnchain.pox_constants.clone(),
-            Some(config.node.get_marf_opts()),
-        )
-        .expect("Error while instantiating sor/tition db");
-
-        let epochs_vec = SortitionDB::get_stacks_epochs(sortdb.conn())
-            .expect("Error while loading stacks epochs");
-        let epochs = EpochList::new(&epochs_vec);
-
-        let view = {
-            let sortition_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn())
-                .expect("Failed to get sortition tip");
-            SortitionDB::get_burnchain_view(&sortdb.index_conn(), &burnchain, &sortition_tip)
-                .unwrap()
-        };
-
-        let atlasdb =
-            AtlasDB::connect(atlas_config.clone(), &config.get_atlas_db_file_path(), true).unwrap();
-
-        let mut chainstate =
-            open_chainstate_with_faults(config).expect("FATAL: could not open chainstate DB");
-
-        let mut stackerdb_machines = HashMap::new();
-        let mut stackerdbs = StackerDBs::connect(&config.get_stacker_db_file_path(), true).unwrap();
-
-        let mut stackerdb_configs = HashMap::new();
-        for contract in config.node.stacker_dbs.iter() {
-            stackerdb_configs.insert(contract.clone(), StackerDBConfig::noop());
-        }
-        let stackerdb_configs = stackerdbs
-            .create_or_reconfigure_stackerdbs(
-                &mut chainstate,
-                &sortdb,
-                stackerdb_configs,
-                &config.connection_options,
-            )
-            .unwrap();
-
-        let stackerdb_contract_ids: Vec<QualifiedContractIdentifier> =
-            stackerdb_configs.keys().cloned().collect();
-        for (contract_id, stackerdb_config) in stackerdb_configs {
-            let stackerdbs = StackerDBs::connect(&config.get_stacker_db_file_path(), true).unwrap();
-            let stacker_db_sync = StackerDBSync::new(
-                contract_id.clone(),
-                &stackerdb_config,
-                PeerNetworkComms::new(),
-                stackerdbs,
-            );
-            stackerdb_machines.insert(contract_id, (stackerdb_config, stacker_db_sync));
-        }
-        let peerdb = Self::setup_peer_db(config, &burnchain, &stackerdb_contract_ids);
-        let burnchain_db = burnchain
-            .open_burnchain_db(false)
-            .expect("Failed to open burnchain DB");
-
-        let local_peer = match PeerDB::get_local_peer(peerdb.conn()) {
-            Ok(local_peer) => local_peer,
-            _ => panic!("Unable to retrieve local peer"),
-        };
-
-        PeerNetwork::new(
-            peerdb,
-            atlasdb,
-            stackerdbs,
-            burnchain_db,
-            local_peer,
-            config.burnchain.peer_version,
-            burnchain,
-            view,
-            config.connection_options.clone(),
-            stackerdb_machines,
-            epochs,
-        )
-    }
-
     /// Main loop of the relayer.
     /// Runs in a separate thread.
     /// Continuously receives
@@ -4960,50 +4703,19 @@ impl StacksNode {
         p2p_thread.net
     }
 
-    /// This function sets the global var `GLOBAL_BURNCHAIN_SIGNER`.
-    ///
-    /// This variable is used for prometheus monitoring (which only
-    /// runs when the feature flag `monitoring_prom` is activated).
-    /// The address is set using the single-signature BTC address
-    /// associated with `keychain`'s public key. This address always
-    /// assumes Epoch-2.1 rules for the miner address: if the
-    /// node is configured for segwit, then the miner address generated
-    /// is a segwit address, otherwise it is a p2pkh.
-    ///
-    fn set_monitoring_miner_address(keychain: &Keychain, relayer_thread: &RelayerThread) {
-        let public_key = keychain.get_pub_key();
-        let miner_addr = relayer_thread
-            .bitcoin_controller
-            .get_miner_address(StacksEpochId::Epoch21, &public_key);
-        let miner_addr_str = miner_addr.to_string();
-        let _ = monitoring::set_burnchain_signer(BurnchainSigner(miner_addr_str)).map_err(|e| {
-            warn!("Failed to set global burnchain signer: {e:?}");
-            e
-        });
-    }
-
     pub fn spawn(
-        runloop: &RunLoop,
-        globals: Globals,
+        context: SpawnContext<RelayerDirective>,
         // relay receiver endpoint for the p2p thread, so the relayer can feed it data to push
         relay_recv: Receiver<RelayerDirective>,
     ) -> StacksNode {
-        let config = runloop.config().clone();
-        let is_miner = runloop.is_miner();
-        let burnchain = runloop.get_burnchain();
-        let atlas_config = config.atlas.clone();
+        let (config, burnchain, globals, event_dispatcher, is_miner) = context.into_parts();
         let keychain = Keychain::default(config.node.seed.clone());
 
-        let _ = Self::setup_mempool_db(&config);
-
-        let mut p2p_net = Self::setup_peer_network(&config, &atlas_config, burnchain);
-
-        let stackerdbs = StackerDBs::connect(&config.get_stacker_db_file_path(), true)
-            .expect("FATAL: failed to connect to stacker DB");
-
-        let relayer = Relayer::from_p2p(&mut p2p_net, stackerdbs);
-
-        let local_peer = p2p_net.local_peer.clone();
+        let _ = config
+            .connect_mempool_db()
+            .expect("BUG: failed to instantiate mempool");
+        let (p2p_net, local_peer, relayer) =
+            NodeNetwork::prepare(&config, burnchain.clone(), None).into_parts();
 
         let NodeConfig {
             mock_mining, miner, ..
@@ -5029,9 +4741,16 @@ impl StacksNode {
         };
         globals.set_initial_leader_key_registration_state(leader_key_registration_state);
 
-        let relayer_thread = RelayerThread::new(runloop, local_peer.clone(), relayer);
+        let relayer_thread = RelayerThread::new(
+            config.clone(),
+            globals.clone(),
+            burnchain.clone(),
+            event_dispatcher.clone(),
+            local_peer.clone(),
+            relayer,
+        );
 
-        StacksNode::set_monitoring_miner_address(&keychain, &relayer_thread);
+        crate::monitoring::set_burnchain_signer(&keychain, &relayer_thread.bitcoin_controller);
 
         let relayer_thread_handle = thread::Builder::new()
             .name(format!("relayer-{}", &local_peer.data_url))
@@ -5042,8 +4761,8 @@ impl StacksNode {
             })
             .expect("FATAL: failed to start relayer thread");
 
-        let p2p_event_dispatcher = runloop.get_event_dispatcher();
-        let p2p_thread = PeerThread::new(runloop, p2p_net);
+        let p2p_thread =
+            PeerThread::new(globals.clone(), &config, burnchain.pox_constants, p2p_net);
         let p2p_thread_handle = thread::Builder::new()
             .stack_size(BLOCK_PROCESSOR_STACK_SIZE)
             .name(format!(
@@ -5052,7 +4771,7 @@ impl StacksNode {
             ))
             .spawn(move || {
                 debug!("p2p thread ID is {:?}", thread::current().id());
-                Self::p2p_main(p2p_thread, p2p_event_dispatcher)
+                Self::p2p_main(p2p_thread, event_dispatcher)
             })
             .expect("FATAL: failed to start p2p thread");
 
@@ -5060,11 +4779,9 @@ impl StacksNode {
         info!("Start P2P server on: {}", &config.node.p2p_bind);
 
         StacksNode {
-            atlas_config,
             globals,
             is_miner,
-            p2p_thread_handle,
-            relayer_thread_handle,
+            workers: WorkerHandles::new(relayer_thread_handle, p2p_thread_handle),
         }
     }
 
@@ -5170,90 +4887,17 @@ impl StacksNode {
         sort_id: &SortitionId,
         ibd: bool,
     ) -> Option<BlockSnapshot> {
-        let mut last_sortitioned_block = None;
-
-        let ic = sortdb.index_conn();
-
-        let block_snapshot = SortitionDB::get_block_snapshot(&ic, sort_id)
-            .expect("Failed to obtain block snapshot for processed burn block.")
-            .expect("Failed to obtain block snapshot for processed burn block.");
-        let block_height = block_snapshot.block_height;
-
-        let block_commits =
-            SortitionDB::get_block_commits_by_block(&ic, &block_snapshot.sortition_id)
-                .expect("Unexpected SortitionDB error fetching block commits");
-
-        let num_block_commits = block_commits.len();
-
-        update_active_miners_count_gauge(block_commits.len() as i64);
-
-        for op in block_commits.into_iter() {
-            if op.txid == block_snapshot.winning_block_txid {
-                info!(
-                    "Received burnchain block #{block_height} including block_commit_op (winning) - {} ({})",
-                    op.apparent_sender, &op.block_header_hash
-                );
-                last_sortitioned_block = Some((block_snapshot.clone(), op.vtxindex));
-            } else if self.is_miner {
-                info!(
-                    "Received burnchain block #{block_height} including block_commit_op - {} ({})",
-                    op.apparent_sender, &op.block_header_hash
-                );
-            }
-        }
-
-        let key_registers =
-            SortitionDB::get_leader_keys_by_block(&ic, &block_snapshot.sortition_id)
-                .expect("Unexpected SortitionDB error fetching key registers");
-
-        self.globals.set_last_sortition(block_snapshot);
-        let ret = last_sortitioned_block.map(|x| x.0);
-
-        let num_key_registers = key_registers.len();
-        debug!(
-            "Processed burnchain state at height {block_height}: {num_key_registers} leader keys, {num_block_commits} block-commits (ibd = {ibd})"
-        );
-
-        // save the registered VRF key
-        let activated_key_opt = self
-            .globals
-            .try_activate_leader_key_registration(block_height, key_registers);
-
-        let Some(activated_key) = activated_key_opt else {
-            return ret;
-        };
-
-        let Some(path) = config.miner.activated_vrf_key_path.as_ref() else {
-            return ret;
-        };
-
-        info!("Activated VRF key; saving to {path}");
-
-        let Ok(key_json) = serde_json::to_string(&activated_key) else {
-            warn!("Failed to serialize VRF key");
-            return ret;
-        };
-
-        let mut f = match fs::File::create(path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Failed to create {path}: {e:?}");
-                return ret;
-            }
-        };
-
-        if let Err(e) = f.write_all(key_json.as_bytes()) {
-            warn!("Failed to write activated VRF key to {path}: {e:?}");
-            return ret;
-        }
-
-        info!("Saved activated VRF key to {path}");
-        ret
+        let mut observation = BurnBlockObservation::load(sortdb, sort_id, self.is_miner);
+        self.globals
+            .set_last_sortition(observation.snapshot().clone());
+        let winning_snapshot = observation.winning_snapshot();
+        observation.log_processed(ibd);
+        observation.activate_leader_key(&self.globals, config);
+        winning_snapshot
     }
 
     /// Join all inner threads
     pub fn join(self) -> Option<PeerNetwork> {
-        self.relayer_thread_handle.join().unwrap();
-        self.p2p_thread_handle.join().unwrap()
+        self.workers.join()
     }
 }

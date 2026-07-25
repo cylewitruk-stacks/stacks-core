@@ -40,9 +40,10 @@ use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, VRF
 use stacks_common::util::hash::hex_bytes;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
+use crate::node::test_support::epoch2 as neon;
 use crate::tests::neon_integrations::*;
 use crate::tests::{run_until_burnchain_height, select_transactions_where};
-use crate::{neon, BitcoinRegtestController, BurnchainController, Keychain};
+use crate::{BitcoinRegtestController, BurnchainController, Keychain};
 
 #[test]
 #[ignore]
@@ -148,7 +149,7 @@ fn test_exact_block_costs() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -382,7 +383,7 @@ fn test_dynamic_db_method_costs() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -546,7 +547,7 @@ fn transition_empty_blocks() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
@@ -812,7 +813,7 @@ fn test_cost_limit_switch_version205() {
 
     btc_regtest_controller.bootstrap_chain(200);
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();

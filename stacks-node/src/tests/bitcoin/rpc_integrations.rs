@@ -31,9 +31,7 @@ use stacks::core::BITCOIN_REGTEST_FIRST_BLOCK_HASH;
 use stacks::types::chainstate::BurnchainHeaderHash;
 
 use crate::burnchains::rpc::bitcoin_rpc_client::test_utils::AddressType;
-use crate::burnchains::rpc::bitcoin_rpc_client::{
-    BitcoinRpcClientError, ImportDescriptorsRequest, Timestamp,
-};
+use crate::burnchains::rpc::bitcoin_rpc_client::{BitcoinRpcClientError, ImportDescriptorsRequest};
 use crate::burnchains::rpc::rpc_transport::RpcError;
 
 mod utils {
@@ -598,7 +596,7 @@ fn test_import_descriptor_ok() {
 
     let desc_req = ImportDescriptorsRequest {
         descriptor: format!("addr({address})#{checksum}"),
-        timestamp: Timestamp::Time(0),
+        timestamp: 0,
         internal: Some(true),
     };
 
@@ -630,7 +628,7 @@ fn test_import_descriptor_twice_ok() {
 
     let desc_req = ImportDescriptorsRequest {
         descriptor: format!("addr({address})#{checksum}"),
-        timestamp: Timestamp::Time(0),
+        timestamp: 0,
         internal: Some(true),
     };
 

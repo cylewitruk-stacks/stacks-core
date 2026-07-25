@@ -36,9 +36,9 @@ use stacks_common::types::chainstate::BlockHeaderHash;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{hex_bytes, to_hex};
 
-use super::neon_node::{BlockMinerThread, TipCandidate};
+use super::node::{BlockMinerThread, TipCandidate};
 use super::Config;
-use crate::helium::RunLoop;
+use crate::node::SimulatorDriver as Driver;
 use crate::tests::neon_integrations::{get_chain_info, next_block_and_wait};
 use crate::BitcoinRegtestController;
 
@@ -265,7 +265,7 @@ fn should_succeed_mining_valid_txs() {
     );
 
     let num_rounds = 6;
-    let mut run_loop = RunLoop::new(conf.clone());
+    let mut run_loop = Driver::new(conf.clone());
 
     // Use tenure's hook for submitting transactions
     run_loop.callbacks.on_new_tenure(|round, _burnchain_tip, chain_tip, tenure| {
@@ -541,7 +541,7 @@ fn should_succeed_handling_malformed_and_valid_txs() {
     conf.add_initial_balance(to_addr(&contract_sk).to_string(), 10000);
 
     let num_rounds = 4;
-    let mut run_loop = RunLoop::new(conf);
+    let mut run_loop = Driver::new(conf);
 
     // Use tenure's hook for submitting transactions
     run_loop.callbacks.on_new_tenure(|round, _burnchain_tip, chain_tip, tenure| {

@@ -22,7 +22,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::nakamoto_node::miner::TEST_BROADCAST_PROPOSAL_STALL;
+use crate::node::test_support::nakamoto::miner::TEST_BROADCAST_PROPOSAL_STALL;
 use crate::tests::nakamoto_integrations::wait_for;
 use crate::tests::signer::v0::{
     get_stackerdb_signer_messages, wait_for_block_pre_commits_from_signers,

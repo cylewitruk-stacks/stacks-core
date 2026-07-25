@@ -20,8 +20,7 @@ use stacks::config::Config;
 use stacks::types::chainstate::StacksPublicKey;
 use stacks::util_lib::db::{sqlite_open, tx_begin_immediate, Error as DBError};
 
-/// Structure for storing **non-confidential** miner information
-///  which can be reused between restarts
+/// Signer-owned storage for **non-confidential** miner information that survives restarts.
 pub struct MinerDB {
     db: Connection,
 }

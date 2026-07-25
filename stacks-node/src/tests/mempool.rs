@@ -44,7 +44,7 @@ use stacks_common::util::hash::*;
 use stacks_common::util::secp256k1::*;
 
 use super::{SK_1, SK_2};
-use crate::helium::RunLoop;
+use crate::node::SimulatorDriver as Driver;
 use crate::Keychain;
 
 const FOO_CONTRACT: &str = "(define-public (foo) (ok 1))
@@ -114,7 +114,7 @@ fn mempool_setup_chainstate() {
 
     let num_rounds = 4;
 
-    let mut run_loop = RunLoop::new(conf.clone());
+    let mut run_loop = Driver::new(conf.clone());
 
     run_loop
         .callbacks

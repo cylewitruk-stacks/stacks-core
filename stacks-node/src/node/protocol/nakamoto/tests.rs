@@ -15,7 +15,7 @@
 
 use stacks::types::chainstate::{StacksPrivateKey, StacksPublicKey};
 
-use super::miner_db::MinerDB;
+use super::signer::miner_db::MinerDB;
 
 #[test]
 fn miner_db_units() {

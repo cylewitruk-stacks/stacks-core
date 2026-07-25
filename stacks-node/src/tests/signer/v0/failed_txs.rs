@@ -32,7 +32,7 @@ use stacks_signer::v0::SpawnedSigner;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::nakamoto_node::miner::TEST_MINE_SKIP;
+use crate::node::test_support::nakamoto::miner::TEST_MINE_SKIP;
 use crate::tests::nakamoto_integrations::wait_for;
 use crate::tests::neon_integrations::submit_tx_fallible;
 use crate::tests::signer::v0::{

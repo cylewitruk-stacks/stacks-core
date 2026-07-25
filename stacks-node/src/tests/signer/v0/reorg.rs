@@ -45,13 +45,13 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use super::{SignerTest, *};
 use crate::event_dispatcher::MinedNakamotoBlockEvent;
-use crate::nakamoto_node::miner::{
+use crate::node::test_support::nakamoto::miner::{
     fault_injection_stall_miner, fault_injection_unstall_miner, TEST_BLOCK_ANNOUNCE_STALL,
     TEST_BROADCAST_PROPOSAL_STALL, TEST_MINER_BROADCASTING_BLOCK, TEST_MINE_SKIP,
     TEST_P2P_BROADCAST_STALL,
 };
-use crate::neon::Counters;
-use crate::run_loop::boot_nakamoto;
+use crate::node::test_support::Counters;
+use crate::node::NodeRunner;
 use crate::tests::nakamoto_integrations::{next_block_and, next_block_and_controller, wait_for};
 use crate::tests::neon_integrations::{
     get_account, get_chain_info, get_chain_info_opt, get_sortition_info, submit_tx, test_observer,
@@ -2313,7 +2313,7 @@ fn partial_tenure_fork() {
 
     let http_origin = format!("http://{}", &conf.node.rpc_bind);
 
-    let mut run_loop_2 = boot_nakamoto::BootRunLoop::new(conf_node_2.clone()).unwrap();
+    let mut run_loop_2 = NodeRunner::new(conf_node_2.clone()).unwrap();
     let rl2_coord_channels = run_loop_2.coordinator_channels();
     let run_loop_stopper_2 = run_loop_2.get_termination_switch();
     let Counters {
@@ -3231,8 +3231,9 @@ fn bitcoin_reorg_extended_tenure() {
     wait_for(60, || {
         Ok(rl1_counters
             .naka_submitted_commit_last_parent_tenure_id
-            .get()
-            == info.stacks_tip_consensus_hash)
+            .get_opt()
+            .as_ref()
+            == Some(&info.stacks_tip_consensus_hash))
     })
     .expect("Timed out waiting for commits from Miner 1 for Tenure 1 of the test");
 
@@ -4169,7 +4170,7 @@ fn revalidate_unknown_parent() {
 
     let http_origin = format!("http://{}", &conf.node.rpc_bind);
 
-    let mut run_loop_2 = boot_nakamoto::BootRunLoop::new(conf_node_2.clone()).unwrap();
+    let mut run_loop_2 = NodeRunner::new(conf_node_2.clone()).unwrap();
     let rl2_coord_channels = run_loop_2.coordinator_channels();
     let run_loop_stopper_2 = run_loop_2.get_termination_switch();
     let Counters {

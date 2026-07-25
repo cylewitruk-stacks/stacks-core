@@ -8,7 +8,7 @@ use stacks::config::Config as NeonConfig;
 use stacks::types::chainstate::StacksPublicKey;
 use stacks::util::hash::Hash160;
 
-use crate::neon::Counters;
+use crate::node::test_support::Counters;
 use crate::stacks_common::types::PublicKey;
 use crate::tests::signer::v0::{get_nakamoto_headers, MultipleMinerTest};
 

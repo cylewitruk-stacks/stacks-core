@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::thread::JoinHandle;
-use std::{env, thread, time};
+use std::{thread, time};
 
 use rand::RngCore;
 use stacks::burnchains::bitcoin::BitcoinNetworkType;
@@ -33,12 +33,11 @@ use stacks::chainstate::burn::operations::{
 use stacks::chainstate::burn::ConsensusHash;
 use stacks::chainstate::stacks::address::PoxAddress;
 use stacks::chainstate::stacks::db::{
-    ChainStateBootData, ChainstateAccountBalance, ChainstateAccountLockup, ChainstateBNSName,
-    ChainstateBNSNamespace, ClarityTx, StacksChainState, StacksEpochReceipt, StacksHeaderInfo,
+    ChainStateBootData, ClarityTx, StacksChainState, StacksEpochReceipt, StacksHeaderInfo,
 };
-use stacks::chainstate::stacks::events::{
-    StacksTransactionEvent, StacksTransactionReceipt, TransactionOrigin,
-};
+#[cfg(test)]
+use stacks::chainstate::stacks::events::StacksTransactionReceipt;
+use stacks::chainstate::stacks::events::{StacksTransactionEvent, TransactionOrigin};
 use stacks::chainstate::stacks::{
     CoinbasePayload, StacksBlock, StacksMicroblock, StacksTransaction, StacksTransactionSigner,
     TransactionAnchorMode, TransactionPayload, TransactionVersion,
@@ -60,16 +59,20 @@ use stacks_common::util::hash::Sha256Sum;
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 use stacks_common::util::vrf::VRFPublicKey;
 
-use super::{BurnchainController, BurnchainTip, Config, EventDispatcher, Keychain, Tenure};
+use super::tenure::Tenure;
 use crate::burnchains::make_bitcoin_indexer;
 use crate::genesis_data::USE_TEST_GENESIS_CHAINSTATE;
-use crate::run_loop;
-use crate::run_loop::RegisteredKey;
+use crate::node::genesis::{
+    announce_boot_receipts, attach_genesis_data_sources, use_test_genesis_chainstate,
+};
+use crate::node::leader_key::RegisteredKey;
+use crate::{BurnchainController, BurnchainTip, Config, EventDispatcher, Keychain};
 
 #[derive(Debug, Clone)]
 pub struct ChainTip {
     pub metadata: StacksHeaderInfo,
     pub block: StacksBlock,
+    #[cfg(test)]
     pub receipts: Vec<StacksTransactionReceipt>,
 }
 
@@ -87,13 +90,14 @@ impl ChainTip {
                 first_burnchain_block_timestamp,
             ),
             block: StacksBlock::genesis_block(),
+            #[cfg(test)]
             receipts: vec![],
         }
     }
 }
 
-/// Node is a structure modelising an active node working on the stacks chain.
-pub struct Node {
+/// Historical single-process node used only by the Helium and Mocknet simulator runtime.
+pub struct LegacyNode {
     pub chain_state: StacksChainState,
     pub config: Config,
     active_registered_key: Option<RegisteredKey>,
@@ -106,64 +110,6 @@ pub struct Node {
     nonce: u64,
     leader_key_registers: HashSet<Txid>,
     block_commits: HashSet<Txid>,
-}
-
-pub fn get_account_lockups(
-    use_test_chainstate_data: bool,
-) -> Box<dyn Iterator<Item = ChainstateAccountLockup>> {
-    Box::new(
-        stx_genesis::GenesisData::new(use_test_chainstate_data)
-            .read_lockups()
-            .map(|item| ChainstateAccountLockup {
-                address: item.address,
-                amount: item.amount,
-                block_height: item.block_height,
-            }),
-    )
-}
-
-pub fn get_account_balances(
-    use_test_chainstate_data: bool,
-) -> Box<dyn Iterator<Item = ChainstateAccountBalance>> {
-    Box::new(
-        stx_genesis::GenesisData::new(use_test_chainstate_data)
-            .read_balances()
-            .map(|item| ChainstateAccountBalance {
-                address: item.address,
-                amount: item.amount,
-            }),
-    )
-}
-
-pub fn get_namespaces(
-    use_test_chainstate_data: bool,
-) -> Box<dyn Iterator<Item = ChainstateBNSNamespace>> {
-    Box::new(
-        stx_genesis::GenesisData::new(use_test_chainstate_data)
-            .read_namespaces()
-            .map(|item| ChainstateBNSNamespace {
-                namespace_id: item.namespace_id,
-                importer: item.importer,
-                buckets: item.buckets,
-                base: item.base as u64,
-                coeff: item.coeff as u64,
-                nonalpha_discount: item.nonalpha_discount as u64,
-                no_vowel_discount: item.no_vowel_discount as u64,
-                lifetime: item.lifetime as u64,
-            }),
-    )
-}
-
-pub fn get_names(use_test_chainstate_data: bool) -> Box<dyn Iterator<Item = ChainstateBNSName>> {
-    Box::new(
-        stx_genesis::GenesisData::new(use_test_chainstate_data)
-            .read_names()
-            .map(|item| ChainstateBNSName {
-                fully_qualified_name: item.fully_qualified_name,
-                owner: item.owner,
-                zonefile_hash: item.zonefile_hash,
-            }),
-    )
 }
 
 // This function is called for helium and mocknet.
@@ -277,19 +223,7 @@ fn spawn_peer(
     server_thread
 }
 
-// Check if the small test genesis chainstate data should be used.
-// First check env var, then config file, then use default.
-pub fn use_test_genesis_chainstate(config: &Config) -> bool {
-    if env::var("BLOCKSTACK_USE_TEST_GENESIS_CHAINSTATE") == Ok("1".to_string()) {
-        true
-    } else if let Some(use_test_genesis_chainstate) = config.node.use_test_genesis_chainstate {
-        use_test_genesis_chainstate
-    } else {
-        USE_TEST_GENESIS_CHAINSTATE
-    }
-}
-
-impl Node {
+impl LegacyNode {
     /// Instantiate and initialize a new node, given a config
     pub fn new(config: Config, boot_block_exec: Box<dyn FnOnce(&mut ClarityTx)>) -> Self {
         let use_test_genesis_data = if config.burnchain.mode == "mocknet" {
@@ -318,17 +252,12 @@ impl Node {
             first_burnchain_block_timestamp: 0,
             pox_constants,
             post_flight_callback: Some(boot_block_exec),
-            get_bulk_initial_lockups: Some(Box::new(move || {
-                get_account_lockups(use_test_genesis_data)
-            })),
-            get_bulk_initial_balances: Some(Box::new(move || {
-                get_account_balances(use_test_genesis_data)
-            })),
-            get_bulk_initial_namespaces: Some(Box::new(move || {
-                get_namespaces(use_test_genesis_data)
-            })),
-            get_bulk_initial_names: Some(Box::new(move || get_names(use_test_genesis_data))),
+            get_bulk_initial_lockups: None,
+            get_bulk_initial_balances: None,
+            get_bulk_initial_namespaces: None,
+            get_bulk_initial_names: None,
         };
+        attach_genesis_data_sources(&mut boot_data, use_test_genesis_data);
 
         let chain_state_result = StacksChainState::open_and_exec(
             config.is_mainnet(),
@@ -359,14 +288,7 @@ impl Node {
         )
         .expect("FATAL: failed to initiate mempool");
 
-        let mut event_dispatcher = EventDispatcher::new_with_custom_queue_size(
-            config.get_working_dir(),
-            config.node.effective_event_dispatcher_queue_size(),
-        );
-
-        for observer in &config.events_observers {
-            event_dispatcher.register_observer(observer);
-        }
+        let event_dispatcher = EventDispatcher::from_config(&config);
 
         let burnchain_config = config.get_burnchain();
 
@@ -378,8 +300,8 @@ impl Node {
         )
         .expect("FATAL: failed to connect to burnchain DB");
 
-        run_loop::announce_boot_receipts(
-            &mut event_dispatcher,
+        announce_boot_receipts(
+            &event_dispatcher,
             &chain_state,
             &burnchain_config.pox_constants,
             &receipts,
@@ -937,6 +859,7 @@ impl Node {
         }
 
         // Handle events
+        #[cfg(test)]
         let receipts = processed_block.tx_receipts;
         let metadata = processed_block.header;
         let block: StacksBlock = {
@@ -952,6 +875,7 @@ impl Node {
         let chain_tip = ChainTip {
             metadata,
             block,
+            #[cfg(test)]
             receipts,
         };
         self.chain_tip = Some(chain_tip.clone());

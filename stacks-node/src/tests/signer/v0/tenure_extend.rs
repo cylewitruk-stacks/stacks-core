@@ -50,12 +50,12 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use super::{SignerTest, *};
 use crate::clarity::vm::clarity::ClarityConnection;
-use crate::nakamoto_node::miner::{
+use crate::node::test_support::nakamoto::miner::{
     fault_injection_stall_miner, fault_injection_unstall_miner, TEST_BROADCAST_PROPOSAL_STALL,
 };
-use crate::nakamoto_node::relayer::TEST_MINER_COMMIT_TIP;
-use crate::nakamoto_node::stackerdb_listener::TEST_IGNORE_SIGNERS;
-use crate::neon::Counters;
+use crate::node::test_support::nakamoto::relayer::TEST_MINER_COMMIT_TIP;
+use crate::node::test_support::nakamoto::signer::listener::TEST_IGNORE_SIGNERS;
+use crate::node::test_support::Counters;
 use crate::tests::nakamoto_integrations::{next_block_and, wait_for};
 use crate::tests::neon_integrations::{
     get_account, get_chain_info, submit_tx, submit_tx_fallible, test_observer,

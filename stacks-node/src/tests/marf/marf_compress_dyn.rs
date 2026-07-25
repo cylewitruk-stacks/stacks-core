@@ -29,7 +29,9 @@ pub mod utils {
     use stacks::types::chainstate::{StacksAddress, StacksPrivateKey};
     use stacks_signer::v0::SpawnedSigner;
 
-    use crate::nakamoto_node::miner::{fault_injection_stall_miner, fault_injection_unstall_miner};
+    use crate::node::test_support::nakamoto::miner::{
+        fault_injection_stall_miner, fault_injection_unstall_miner,
+    };
     use crate::tests::nakamoto_integrations::wait_for;
     use crate::tests::neon_integrations::{get_account, test_observer};
     use crate::tests::signer::SignerTest;

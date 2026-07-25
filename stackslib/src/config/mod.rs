@@ -863,21 +863,10 @@ impl Config {
             None => default_burnchain_config,
         };
 
-        let supported_modes = [
-            "mocknet",
-            "helium",
-            "neon",
-            "argon",
-            "krypton",
-            "xenon",
-            "mainnet",
-            "nakamoto-neon",
-        ];
-
-        if !supported_modes.contains(&burnchain.mode.as_str()) {
+        if !BurnchainConfig::SUPPORTED_MODES.contains(&burnchain.mode.as_str()) {
             return Err(format!(
                 "Setting burnchain.network not supported (should be: {})",
-                supported_modes.join(", ")
+                BurnchainConfig::SUPPORTED_MODES.join(", ")
             ));
         }
 
@@ -1683,6 +1672,17 @@ pub struct BurnchainConfig {
 }
 
 impl BurnchainConfig {
+    pub const SUPPORTED_MODES: &'static [&'static str] = &[
+        "mocknet",
+        "helium",
+        "neon",
+        "argon",
+        "krypton",
+        "xenon",
+        "mainnet",
+        "nakamoto-neon",
+    ];
+
     fn default() -> BurnchainConfig {
         BurnchainConfig {
             chain: "bitcoin".to_string(),

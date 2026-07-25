@@ -25,9 +25,10 @@ use stacks::core::{self, EpochList, STACKS_EPOCH_MAX};
 use stacks_common::util::sleep_ms;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
+use crate::node::test_support::epoch2 as neon;
 use crate::tests::neon_integrations::*;
 use crate::tests::*;
-use crate::{neon, BitcoinRegtestController, BurnchainController};
+use crate::{BitcoinRegtestController, BurnchainController};
 
 #[test]
 #[ignore]
@@ -155,7 +156,7 @@ fn trait_invocation_behavior() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let runloop_burnchain = burnchain_config;
 
     let blocks_processed = run_loop.get_blocks_processed_arc();

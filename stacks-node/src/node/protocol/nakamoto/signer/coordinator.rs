@@ -39,12 +39,11 @@ use stacks::util::hash::Sha512Trunc256Sum;
 use stacks::util::secp256k1::MessageSignature;
 use stacks::util_lib::boot::boot_code_id;
 
+use super::super::Error as NakamotoNodeError;
+use super::listener::{StackerDBListener, StackerDBListenerComms, EVENT_RECEIVER_POLL};
 use super::miner_db::MinerDB;
-use super::stackerdb_listener::StackerDBListenerComms;
-use super::Error as NakamotoNodeError;
 use crate::event_dispatcher::StackerDBChannel;
-use crate::nakamoto_node::stackerdb_listener::{StackerDBListener, EVENT_RECEIVER_POLL};
-use crate::neon::Counters;
+use crate::node::runtime::Counters;
 use crate::Config;
 
 /// The state of the signer database listener, used by the miner thread to

@@ -63,14 +63,16 @@ use stacks_common::util::vrf::VRFProof;
 #[cfg(test)]
 use tempfile::tempdir;
 
-use super::miner_db::MinerDB;
+use super::driver::Globals;
 use super::relayer::{MinerStopHandle, RelayerThread};
-use super::{Config, Error as NakamotoNodeError, EventDispatcher, Keychain};
-use crate::nakamoto_node::signer_coordinator::SignerCoordinator;
-use crate::nakamoto_node::VRF_MOCK_MINER_KEY;
-use crate::neon_node;
-use crate::run_loop::nakamoto::Globals;
-use crate::run_loop::RegisteredKey;
+use super::signer::coordinator::SignerCoordinator;
+use super::signer::miner_db::MinerDB;
+use super::{Config, Error as NakamotoNodeError, EventDispatcher, Keychain, VRF_MOCK_MINER_KEY};
+use crate::node::chainstate;
+#[cfg(test)]
+use crate::node::leader_key::LeaderKeyRegistrationState;
+use crate::node::leader_key::RegisteredKey;
+use crate::node::protocol::fault_injection::fault_injection_long_tenure;
 
 #[cfg(test)]
 #[derive(Default, Clone, PartialEq)]
@@ -613,12 +615,11 @@ impl BlockMinerThread {
         reward_set: &RewardSet,
     ) -> Result<(), NakamotoNodeError> {
         Self::fault_injection_miner_stall();
-        let mut chain_state =
-            neon_node::open_chainstate_with_faults(&self.config).map_err(|e| {
-                NakamotoNodeError::SigningCoordinatorFailure(format!(
-                    "Failed to open chainstate DB. Cannot mine! {e:?}"
-                ))
-            })?;
+        let mut chain_state = chainstate::open_chainstate(&self.config).map_err(|e| {
+            NakamotoNodeError::SigningCoordinatorFailure(format!(
+                "Failed to open chainstate DB. Cannot mine! {e:?}"
+            ))
+        })?;
         // Late block tenures are initiated only to issue the BlockFound
         //  tenure change tx (because they can be immediately extended to
         //  the next burn view). This checks whether or not we're in such a
@@ -989,12 +990,11 @@ impl BlockMinerThread {
             return Ok(Vec::new());
         }
 
-        let mut chain_state =
-            neon_node::open_chainstate_with_faults(&self.config).map_err(|e| {
-                NakamotoNodeError::SigningCoordinatorFailure(format!(
-                    "Failed to open chainstate DB. Cannot mine! {e:?}"
-                ))
-            })?;
+        let mut chain_state = chainstate::open_chainstate(&self.config).map_err(|e| {
+            NakamotoNodeError::SigningCoordinatorFailure(format!(
+                "Failed to open chainstate DB. Cannot mine! {e:?}"
+            ))
+        })?;
 
         let burn_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn()).map_err(|e| {
             NakamotoNodeError::SigningCoordinatorFailure(format!(
@@ -1044,12 +1044,11 @@ impl BlockMinerThread {
             ))
         })?;
 
-        let mut chain_state =
-            neon_node::open_chainstate_with_faults(&self.config).map_err(|e| {
-                NakamotoNodeError::SigningCoordinatorFailure(format!(
-                    "Failed to open chainstate DB. Cannot mine! {e:?}"
-                ))
-            })?;
+        let mut chain_state = chainstate::open_chainstate(&self.config).map_err(|e| {
+            NakamotoNodeError::SigningCoordinatorFailure(format!(
+                "Failed to open chainstate DB. Cannot mine! {e:?}"
+            ))
+        })?;
 
         let burn_election_height = self.burn_election_block.block_height;
 
@@ -1189,8 +1188,8 @@ impl BlockMinerThread {
             ));
         };
 
-        let mut chain_state = neon_node::open_chainstate_with_faults(&self.config)
-            .expect("FATAL: could not open chainstate DB");
+        let mut chain_state =
+            chainstate::open_chainstate(&self.config).expect("FATAL: could not open chainstate DB");
         let sort_db = SortitionDB::open(
             &self.config.get_burn_db_file_path(),
             true,
@@ -1497,8 +1496,8 @@ impl BlockMinerThread {
     /// Check that the provided block is not mined too quickly after the parent block.
     /// This is to ensure that the signers do not reject the block due to the block being mined within the same second as the parent block.
     fn validate_timestamp(&self, x: &NakamotoBlock) -> Result<bool, NakamotoNodeError> {
-        let chain_state = neon_node::open_chainstate_with_faults(&self.config)
-            .expect("FATAL: could not open chainstate DB");
+        let chain_state =
+            chainstate::open_chainstate(&self.config).expect("FATAL: could not open chainstate DB");
         let stacks_parent_header =
             NakamotoChainState::get_block_header(chain_state.db(), &x.header.parent_block_id)
                 .map_err(|e| {
@@ -1542,14 +1541,14 @@ impl BlockMinerThread {
         )
         .expect("FATAL: could not open sortition DB");
 
-        let mut chain_state = neon_node::open_chainstate_with_faults(&self.config)
-            .expect("FATAL: could not open chainstate DB");
+        let mut chain_state =
+            chainstate::open_chainstate(&self.config).expect("FATAL: could not open chainstate DB");
 
         self.check_burn_tip_changed(&burn_db)?;
         if Self::fault_injection_block_mining_skip() {
             return Err(ChainstateError::MinerAborted.into());
         }
-        neon_node::fault_injection_long_tenure();
+        fault_injection_long_tenure();
 
         let mut mem_pool = self
             .config
@@ -2171,11 +2170,11 @@ fn should_read_count_extend_units() {
                 stacks::chainstate::stacks::miner::MinerStatus::make_ready(10),
             )),
             relay_sender,
-            crate::neon::Counters::new(),
+            crate::node::runtime::Counters::new(),
             crate::syncctl::PoxSyncWatchdogComms::new(Arc::new(AtomicBool::new(true))),
             Arc::new(AtomicBool::new(true)),
             0,
-            neon_node::LeaderKeyRegistrationState::Inactive,
+            LeaderKeyRegistrationState::Inactive,
         ),
         keychain: Keychain::default(vec![]),
         burnchain: Burnchain::regtest("/dev/null"),

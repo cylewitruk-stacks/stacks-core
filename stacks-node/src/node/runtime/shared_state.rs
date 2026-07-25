@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -11,33 +10,10 @@ use stacks::chainstate::stacks::db::unconfirmed::UnconfirmedTxMap;
 use stacks::chainstate::stacks::db::StacksChainState;
 use stacks::chainstate::stacks::miner::MinerStatus;
 use stacks::config::{BurnchainConfig, MinerConfig};
-use stacks::net::NetworkResult;
-use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, ConsensusHash};
 
-use crate::neon::Counters;
-use crate::neon_node::LeaderKeyRegistrationState;
-use crate::run_loop::RegisteredKey;
+use crate::node::leader_key::{LeaderKeyRegistrationState, RegisteredKey};
+use crate::node::runtime::Counters;
 use crate::syncctl::PoxSyncWatchdogComms;
-use crate::TipCandidate;
-
-pub type NeonGlobals = Globals<RelayerDirective>;
-
-/// Command types for the relayer thread, issued to it by other threads
-#[allow(clippy::large_enum_variant)]
-pub enum RelayerDirective {
-    /// Handle some new data that arrived on the network (such as blocks, transactions, and
-    HandleNetResult(NetworkResult),
-    /// Announce a new sortition.  Process and broadcast the block if we won.
-    ProcessTenure(ConsensusHash, BurnchainHeaderHash, BlockHeaderHash),
-    /// Try to mine a block
-    RunTenure(RegisteredKey, BlockSnapshot, u128), // (vrf key, chain tip, time of issuance in ms)
-    /// A nakamoto tenure's first block has been processed.
-    NakamotoTenureStartProcessed(ConsensusHash, BlockHeaderHash),
-    /// Try to register a VRF public key
-    RegisterKey(BlockSnapshot),
-    /// Stop the relayer thread
-    Exit,
-}
 
 /// Inter-thread communication structure, shared between threads. This
 /// is generic over the relayer communication channel: nakamoto and
@@ -48,7 +24,7 @@ pub struct Globals<T> {
     /// Status of the miner
     miner_status: Arc<Mutex<MinerStatus>>,
     /// Communication link to the coordinator thread
-    pub(crate) coord_comms: CoordinatorChannels,
+    pub coord_comms: CoordinatorChannels,
     /// Unconfirmed transactions (shared between the relayer and p2p threads)
     unconfirmed_txs: Arc<Mutex<UnconfirmedTxMap>>,
     /// Writer endpoint to the relayer thread
@@ -69,11 +45,6 @@ pub struct Globals<T> {
     last_miner_spend_amount: Arc<Mutex<Option<u64>>>,
     /// burnchain height at which we start mining
     start_mining_height: Arc<Mutex<u64>>,
-    /// estimated winning probability at given bitcoin block heights
-    estimated_winning_probs: Arc<Mutex<HashMap<u64, f64>>>,
-    /// previously-selected best tips
-    /// maps stacks height to tip candidate
-    previous_best_tips: Arc<Mutex<BTreeMap<u64, TipCandidate>>>,
     /// Initiative flag.
     /// Raised when the main loop should wake up and do something.
     initiative: Arc<Mutex<Option<String>>>,
@@ -98,8 +69,6 @@ impl<T> Clone for Globals<T> {
             last_burnchain_config: self.last_burnchain_config.clone(),
             last_miner_spend_amount: self.last_miner_spend_amount.clone(),
             start_mining_height: self.start_mining_height.clone(),
-            estimated_winning_probs: self.estimated_winning_probs.clone(),
-            previous_best_tips: self.previous_best_tips.clone(),
             initiative: self.initiative.clone(),
         }
     }
@@ -131,8 +100,6 @@ impl<T> Globals<T> {
             last_burnchain_config: Arc::new(Mutex::new(None)),
             last_miner_spend_amount: Arc::new(Mutex::new(None)),
             start_mining_height: Arc::new(Mutex::new(start_mining_height)),
-            estimated_winning_probs: Arc::new(Mutex::new(HashMap::new())),
-            previous_best_tips: Arc::new(Mutex::new(BTreeMap::new())),
             initiative: Arc::new(Mutex::new(None)),
         }
     }
@@ -180,11 +147,6 @@ impl<T> Globals<T> {
             .lock()
             .expect("FATAL: mutex poisoned")
             .remove_blocked()
-    }
-
-    /// Get the main thread's counters
-    pub fn get_counters(&self) -> Counters {
-        self.counters.clone()
     }
 
     /// Called by the relayer to pass unconfirmed txs to the p2p thread, so the p2p thread doesn't
@@ -236,7 +198,7 @@ impl<T> Globals<T> {
     }
 
     /// Get the current leader key registration state.
-    /// Called from the runloop thread and relayer thread.
+    /// Called from the protocol driver and relayer threads.
     pub fn get_leader_key_registration_state(&self) -> LeaderKeyRegistrationState {
         let key_state = self
             .leader_key_registration_state
@@ -250,7 +212,7 @@ impl<T> Globals<T> {
     }
 
     /// Set the initial leader key registration state.
-    /// Called from the runloop thread when booting up.
+    /// Called from the protocol driver while booting.
     pub fn set_initial_leader_key_registration_state(&self, new_state: LeaderKeyRegistrationState) {
         let mut key_state = self
             .leader_key_registration_state
@@ -278,7 +240,7 @@ impl<T> Globals<T> {
 
     /// Advance the leader key registration state to active, given the VRF key registration ops
     /// we've discovered in a given snapshot.
-    /// The runloop thread calls this whenever it processes a sortition.
+    /// The protocol driver calls this whenever it processes a sortition.
     pub fn try_activate_leader_key_registration(
         &self,
         burn_block_height: u64,
@@ -381,17 +343,6 @@ impl<T> Globals<T> {
         }
     }
 
-    /// Get the last miner spend amount
-    pub fn get_last_miner_spend_amount(&self) -> Option<u64> {
-        match self.last_miner_spend_amount.lock() {
-            Ok(last_miner_spend_amount) => *last_miner_spend_amount,
-            Err(_e) => {
-                error!("FATAL; failed to lock last miner spend amount");
-                panic!();
-            }
-        }
-    }
-
     /// Set the last miner spend amount
     pub fn set_last_miner_spend_amount(&self, spend_amount: u64) {
         match self.last_miner_spend_amount.lock() {
@@ -425,63 +376,6 @@ impl<T> Globals<T> {
             }
             Err(_e) => {
                 error!("FATAL: failed to lock start_mining_height");
-                panic!();
-            }
-        }
-    }
-
-    /// Record an estimated winning probability
-    pub fn add_estimated_win_prob(&self, burn_height: u64, win_prob: f64) {
-        match self.estimated_winning_probs.lock() {
-            Ok(mut probs) => {
-                probs.insert(burn_height, win_prob);
-            }
-            Err(_e) => {
-                error!("FATAL: failed to lock estimated_winning_probs");
-                panic!();
-            }
-        }
-    }
-
-    /// Get the estimated winning probability, if we have one
-    pub fn get_estimated_win_prob(&self, burn_height: u64) -> Option<f64> {
-        match self.estimated_winning_probs.lock() {
-            Ok(probs) => probs.get(&burn_height).cloned(),
-            Err(_e) => {
-                error!("FATAL: failed to lock estimated_winning_probs");
-                panic!();
-            }
-        }
-    }
-
-    /// Record a best-tip
-    pub fn add_best_tip(&self, stacks_height: u64, tip_candidate: TipCandidate, max_depth: u64) {
-        match self.previous_best_tips.lock() {
-            Ok(mut tips) => {
-                tips.insert(stacks_height, tip_candidate);
-                let mut stale = vec![];
-                for (prev_height, _) in tips.iter() {
-                    if *prev_height + max_depth < stacks_height {
-                        stale.push(*prev_height);
-                    }
-                }
-                for height in stale.into_iter() {
-                    tips.remove(&height);
-                }
-            }
-            Err(_e) => {
-                error!("FATAL: failed to lock previous_best_tips");
-                panic!();
-            }
-        }
-    }
-
-    /// Get a best-tip at a previous height
-    pub fn get_best_tip(&self, stacks_height: u64) -> Option<TipCandidate> {
-        match self.previous_best_tips.lock() {
-            Ok(tips) => tips.get(&stacks_height).cloned(),
-            Err(_e) => {
-                error!("FATAL: failed to lock previous_best_tips");
                 panic!();
             }
         }

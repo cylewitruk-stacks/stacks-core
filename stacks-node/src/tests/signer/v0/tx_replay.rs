@@ -33,7 +33,9 @@ use stacks_signer::v0::signer_state::TEST_IGNORE_BITCOIN_FORK_PUBKEYS;
 use stacks_signer::v0::SpawnedSigner;
 
 use super::{SignerTest, *};
-use crate::nakamoto_node::miner::{fault_injection_stall_miner, fault_injection_unstall_miner};
+use crate::node::test_support::nakamoto::miner::{
+    fault_injection_stall_miner, fault_injection_unstall_miner,
+};
 use crate::operations::BurnchainOpSigner;
 use crate::tests::nakamoto_integrations::{next_block_and, wait_for};
 use crate::tests::neon_integrations::{

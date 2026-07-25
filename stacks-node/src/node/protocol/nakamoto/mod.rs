@@ -14,39 +14,32 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::mpsc::Receiver;
-use std::thread::JoinHandle;
-use std::{fs, thread};
+use std::thread;
 
-use stacks::burnchains::{BurnchainSigner, Txid};
+use stacks::burnchains::Txid;
 use stacks::chainstate::burn::db::sortdb::SortitionDB;
 use stacks::chainstate::burn::BlockSnapshot;
 use stacks::chainstate::stacks::Error as ChainstateError;
 use stacks::libstackerdb::StackerDBChunkAckData;
-use stacks::monitoring;
-use stacks::monitoring::update_active_miners_count_gauge;
-use stacks::net::atlas::AtlasConfig;
-use stacks::net::relay::Relayer;
-use stacks::net::stackerdb::StackerDBs;
+use stacks::net::p2p::PeerNetwork;
 use stacks::net::Error as NetError;
 use stacks::util_lib::db::Error as DBError;
 use stacks_common::types::chainstate::SortitionId;
-use stacks_common::types::StacksEpochId;
 
-use super::{Config, EventDispatcher, Keychain};
+use self::driver::Globals;
 use crate::burnchains::Error as BurnchainsError;
-use crate::neon_node::{LeaderKeyRegistrationState, StacksNode as NeonNode};
-use crate::run_loop::boot_nakamoto::Neon2NakaData;
-use crate::run_loop::nakamoto::{Globals, RunLoop};
-use crate::run_loop::RegisteredKey;
+use crate::node::context::SpawnContext;
+use crate::node::leader_key::{LeaderKeyRegistrationState, RegisteredKey};
+use crate::node::network::NodeNetwork;
+use crate::node::runtime::{BurnBlockObservation, WorkerHandles};
+use crate::{Config, EventDispatcher, Keychain};
 
+pub mod driver;
 pub mod miner;
-pub mod miner_db;
 pub mod peer;
 pub mod relayer;
-pub mod signer_coordinator;
-pub mod stackerdb_listener;
+pub mod signer;
 
 #[cfg(test)]
 mod tests;
@@ -59,22 +52,34 @@ const VRF_MOCK_MINER_KEY: u64 = 1;
 
 pub const BLOCK_PROCESSOR_STACK_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
-pub type BlockCommits = HashSet<Txid>;
+/// Nakamoto node state inherited from an Epoch 2 driver, or empty for direct startup.
+#[derive(Default)]
+pub struct NodeStartup {
+    leader_key_registration_state: LeaderKeyRegistrationState,
+    peer_network: Option<PeerNetwork>,
+}
+
+impl NodeStartup {
+    pub fn inherited(
+        leader_key_registration_state: LeaderKeyRegistrationState,
+        peer_network: Option<PeerNetwork>,
+    ) -> Self {
+        Self {
+            leader_key_registration_state,
+            peer_network,
+        }
+    }
+}
 
 /// Node implementation for both miners and followers.
 /// This struct is used to set up the node proper and launch the p2p thread and relayer thread.
 /// It is further used by the main thread to communicate with these two threads.
 pub struct StacksNode {
-    /// Atlas network configuration
-    pub atlas_config: AtlasConfig,
     /// Global inter-thread communication handle
     pub globals: Globals,
     /// True if we're a miner
     is_miner: bool,
-    /// handle to the p2p thread
-    pub p2p_thread_handle: JoinHandle<()>,
-    /// handle to the relayer thread
-    pub relayer_thread_handle: JoinHandle<()>,
+    workers: WorkerHandles<()>,
 }
 
 /// Types of errors that can arise during Nakamoto StacksNode operation
@@ -156,39 +161,16 @@ pub enum Error {
 }
 
 impl StacksNode {
-    /// This function sets the global var `GLOBAL_BURNCHAIN_SIGNER`.
-    ///
-    /// This variable is used for prometheus monitoring (which only
-    /// runs when the feature flag `monitoring_prom` is activated).
-    /// The address is set using the single-signature BTC address
-    /// associated with `keychain`'s public key. This address always
-    /// assumes Epoch-2.1 rules for the miner address: if the
-    /// node is configured for segwit, then the miner address generated
-    /// is a segwit address, otherwise it is a p2pkh.
-    ///
-    fn set_monitoring_miner_address(keychain: &Keychain, relayer_thread: &RelayerThread) {
-        let public_key = keychain.get_pub_key();
-        let miner_addr = relayer_thread
-            .bitcoin_controller
-            .get_miner_address(StacksEpochId::Epoch21, &public_key);
-        let miner_addr_str = miner_addr.to_string();
-        let _ = monitoring::set_burnchain_signer(BurnchainSigner(miner_addr_str)).map_err(|e| {
-            warn!("Failed to set global burnchain signer: {e:?}");
-            e
-        });
-    }
-
     pub fn spawn(
-        runloop: &RunLoop,
-        globals: Globals,
+        context: SpawnContext<RelayerDirective>,
         // relay receiver endpoint for the p2p thread, so the relayer can feed it data to push
         relay_recv: Receiver<RelayerDirective>,
-        data_from_neon: Option<Neon2NakaData>,
+        startup: NodeStartup,
     ) -> StacksNode {
-        let config = runloop.config().clone();
-        let is_miner = runloop.is_miner();
-        let burnchain = runloop.get_burnchain();
-        let atlas_config = config.atlas.clone();
+        let config = context.config().clone();
+        let globals = context.shared();
+        let is_miner = context.is_miner();
+        let burnchain = context.burnchain().clone();
         let mut keychain = Keychain::default(config.node.seed.clone());
         if let Some(mining_key) = config.miner.mining_key.clone() {
             keychain.set_nakamoto_sk(mining_key);
@@ -198,18 +180,13 @@ impl StacksNode {
             .connect_mempool_db()
             .expect("FATAL: database failure opening mempool");
 
-        let data_from_neon = data_from_neon.unwrap_or_default();
+        let NodeStartup {
+            leader_key_registration_state,
+            peer_network,
+        } = startup;
 
-        let mut p2p_net = data_from_neon
-            .peer_network
-            .unwrap_or_else(|| NeonNode::setup_peer_network(&config, &atlas_config, burnchain));
-
-        let stackerdbs = StackerDBs::connect(&config.get_stacker_db_file_path(), true)
-            .expect("FATAL: failed to connect to stacker DB");
-
-        let relayer = Relayer::from_p2p(&mut p2p_net, stackerdbs);
-
-        let local_peer = p2p_net.local_peer.clone();
+        let (p2p_net, local_peer, relayer) =
+            NodeNetwork::prepare(&config, burnchain.clone(), peer_network).into_parts();
 
         // setup initial key registration
         let leader_key_registration_state = if config.get_node_config(false).mock_mining {
@@ -223,11 +200,11 @@ impl StacksNode {
                 memo: keychain.get_nakamoto_pkh().as_bytes().to_vec(),
             })
         } else {
-            match &data_from_neon.leader_key_registration_state {
+            match &leader_key_registration_state {
                 LeaderKeyRegistrationState::Active(registered_key) => {
                     let pubkey_hash = keychain.get_nakamoto_pkh();
                     if pubkey_hash.as_ref() == registered_key.memo {
-                        data_from_neon.leader_key_registration_state
+                        leader_key_registration_state
                     } else {
                         LeaderKeyRegistrationState::Inactive
                     }
@@ -239,9 +216,9 @@ impl StacksNode {
         globals.set_initial_leader_key_registration_state(leader_key_registration_state);
 
         let relayer_thread =
-            RelayerThread::new(runloop, local_peer.clone(), relayer, keychain.clone());
+            RelayerThread::new(&context, local_peer.clone(), relayer, keychain.clone());
 
-        StacksNode::set_monitoring_miner_address(&keychain, &relayer_thread);
+        crate::monitoring::set_burnchain_signer(&keychain, &relayer_thread.bitcoin_controller);
 
         let relayer_thread_name = format!("relayer:{}", local_peer.port);
         let relayer_thread_handle = thread::Builder::new()
@@ -263,8 +240,9 @@ impl StacksNode {
             .unwrap_or_else(|| panic!("Failed to parse socket: {}", &config.node.rpc_bind))
             .port();
 
-        let p2p_event_dispatcher = runloop.get_event_dispatcher();
-        let p2p_thread = PeerThread::new(runloop, p2p_net);
+        let p2p_event_dispatcher = context.events();
+        let p2p_thread =
+            PeerThread::new(globals.clone(), &config, burnchain.pox_constants, p2p_net);
         let p2p_thread_handle = thread::Builder::new()
             .stack_size(BLOCK_PROCESSOR_STACK_SIZE)
             .name(format!("p2p:({p2p_port},{rpc_port})"))
@@ -277,11 +255,9 @@ impl StacksNode {
         info!("Start P2P server on: {}", &config.node.p2p_bind);
 
         StacksNode {
-            atlas_config,
             globals,
             is_miner,
-            p2p_thread_handle,
-            relayer_thread_handle,
+            workers: WorkerHandles::new(relayer_thread_handle, p2p_thread_handle),
         }
     }
 
@@ -304,7 +280,7 @@ impl StacksNode {
             "sortition_id" => %snapshot.sortition_id
         );
 
-        // unlike in neon_node, the nakamoto node should *always* notify the relayer of
+        // Unlike the Epoch 2 node, the Nakamoto node should *always* notify the relayer of
         //  a new burnchain block
 
         self.globals
@@ -330,94 +306,18 @@ impl StacksNode {
         sort_id: &SortitionId,
         ibd: bool,
     ) -> Result<(), Error> {
-        let ic = sortdb.index_conn();
-
-        let block_snapshot = SortitionDB::get_block_snapshot(&ic, sort_id)
-            .expect("Failed to obtain block snapshot for processed burn block.")
-            .expect("Failed to obtain block snapshot for processed burn block.");
-        let block_height = block_snapshot.block_height;
-
-        let block_commits =
-            SortitionDB::get_block_commits_by_block(&ic, &block_snapshot.sortition_id)
-                .expect("Unexpected SortitionDB error fetching block commits");
-
-        let num_block_commits = block_commits.len();
-
-        update_active_miners_count_gauge(block_commits.len() as i64);
-
-        for op in block_commits.into_iter() {
-            if op.txid == block_snapshot.winning_block_txid {
-                info!(
-                    "Received burnchain block #{block_height} including block_commit_op (winning) - {} ({})",
-                    op.apparent_sender, &op.block_header_hash
-                );
-            } else if self.is_miner {
-                info!(
-                    "Received burnchain block #{block_height} including block_commit_op - {} ({})",
-                    op.apparent_sender, &op.block_header_hash
-                );
-            }
-        }
-
-        let key_registers =
-            SortitionDB::get_leader_keys_by_block(&ic, &block_snapshot.sortition_id)
-                .expect("Unexpected SortitionDB error fetching key registers");
-
-        let num_key_registers = key_registers.len();
-
-        let activated_key_opt = self
-            .globals
-            .try_activate_leader_key_registration(block_height, key_registers);
-
-        // save the registered VRF key
-        if let (Some(activated_key), Some(path)) = (
-            activated_key_opt,
-            config.miner.activated_vrf_key_path.as_ref(),
-        ) {
-            save_activated_vrf_key(path, &activated_key);
-        }
-
-        debug!(
-            "Processed burnchain state";
-            "burn_height" => block_height,
-            "leader_keys_count" => num_key_registers,
-            "block_commits_count" => num_block_commits,
-            "in_initial_block_download?" => ibd,
-        );
-
-        self.globals.set_last_sortition(block_snapshot.clone());
+        let mut observation = BurnBlockObservation::load(sortdb, sort_id, self.is_miner);
+        observation.log_processed(ibd);
+        observation.activate_leader_key(&self.globals, config);
+        self.globals
+            .set_last_sortition(observation.snapshot().clone());
 
         // notify the relayer thread of the new sortition state
-        self.relayer_burnchain_notify(block_snapshot)
+        self.relayer_burnchain_notify(observation.into_snapshot())
     }
 
     /// Join all inner threads
     pub fn join(self) {
-        self.relayer_thread_handle.join().unwrap();
-        self.p2p_thread_handle.join().unwrap();
+        self.workers.join();
     }
-}
-
-pub(crate) fn save_activated_vrf_key(path: &str, activated_key: &RegisteredKey) {
-    info!("Activated VRF key; saving to {path}");
-
-    let Ok(key_json) = serde_json::to_string(&activated_key) else {
-        warn!("Failed to serialize VRF key");
-        return;
-    };
-
-    let mut f = match fs::File::create(path) {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("Failed to create {path}: {e:?}");
-            return;
-        }
-    };
-
-    if let Err(e) = f.write_all(key_json.as_bytes()) {
-        warn!("Failed to write activated VRF key to {path}: {e:?}");
-        return;
-    }
-
-    info!("Saved activated VRF key to {path}");
 }

@@ -1,42 +1,40 @@
 use stacks::chainstate::stacks::db::ClarityTx;
 use stacks_common::types::chainstate::BurnchainHeaderHash;
 
-use super::RunLoopCallbacks;
+use super::callbacks::DriverCallbacks;
+use super::node::{ChainTip, LegacyNode};
 use crate::burnchains::Error as BurnchainControllerError;
-use crate::{
-    BitcoinRegtestController, BurnchainController, ChainTip, Config, MocknetController, Node,
-};
+use crate::{BitcoinRegtestController, BurnchainController, Config, MocknetController};
 
-/// RunLoop is coordinating a simulated burnchain and some simulated nodes
-/// taking turns in producing blocks.
-pub struct RunLoop {
+/// Coordinates a simulated burnchain and node, taking turns producing blocks and tenures.
+pub struct Driver {
     config: Config,
-    pub node: Node,
-    pub callbacks: RunLoopCallbacks,
+    pub node: LegacyNode,
+    pub callbacks: DriverCallbacks,
 }
 
-impl RunLoop {
+impl Driver {
     pub fn new(config: Config) -> Self {
-        RunLoop::new_with_boot_exec(config, Box::new(|_| {}))
+        Driver::new_with_boot_exec(config, Box::new(|_| {}))
     }
 
-    /// Sets up a runloop and node, given a config.
+    /// Sets up the simulator driver and node from a configuration.
     pub fn new_with_boot_exec(config: Config, boot_exec: Box<dyn FnOnce(&mut ClarityTx)>) -> Self {
         // Apply config-driven process-wide state before any chainstate is opened.
-        // Helium opens chainstate inside `Node::new`, so this must run first.
+        // The legacy simulator opens chainstate inside `LegacyNode::new`, so this must run first.
         config.apply_runtime_state();
 
         // Build node based on config
-        let node = Node::new(config.clone(), boot_exec);
+        let node = LegacyNode::new(config.clone(), boot_exec);
 
         Self {
             config,
             node,
-            callbacks: RunLoopCallbacks::new(),
+            callbacks: DriverCallbacks::new(),
         }
     }
 
-    /// Starts the testnet runloop.
+    /// Starts the simulator driver.
     ///
     /// This function will block by looping infinitely.
     /// It will start the burnchain (separate thread), set-up a channel in
@@ -49,8 +47,6 @@ impl RunLoop {
             "mocknet" => MocknetController::generic(self.config.clone()),
             _ => unreachable!(),
         };
-
-        self.callbacks.invoke_burn_chain_initialized(&mut burnchain);
 
         let (initial_state, _) = burnchain.start(None)?;
 
@@ -150,7 +146,7 @@ impl RunLoop {
             leader_tenure = self.node.initiate_new_tenure();
         }
 
-        // Start the runloop
+        // Start alternating burnchain rounds and node tenures.
         round_index = 1;
         loop {
             if expected_num_rounds == round_index {

@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use stacks::burnchains::bitcoin::address::{
-    BitcoinAddress, LegacyBitcoinAddress, LegacyBitcoinAddressType, SegwitBitcoinAddress,
+    legacy_address_type_to_version_byte, BitcoinAddress, LegacyBitcoinAddress,
+    LegacyBitcoinAddressType, SegwitBitcoinAddress,
 };
 use stacks::burnchains::bitcoin::indexer::{
     BitcoinIndexer, BitcoinIndexerConfig, BitcoinIndexerRuntime,
@@ -70,7 +71,7 @@ use super::super::Config;
 use super::{BurnchainController, BurnchainTip, Error as BurnchainControllerError};
 use crate::burnchains::rpc::bitcoin_rpc_client::{
     BitcoinRpcClient, BitcoinRpcClientError, BitcoinRpcClientResult, ImportDescriptorsRequest,
-    Timestamp,
+    ListUnspentResponse,
 };
 
 /// The number of bitcoin blocks that can have
@@ -78,6 +79,34 @@ use crate::burnchains::rpc::bitcoin_rpc_client::{
 ///  the cache is force-reset.
 const UTXO_CACHE_STALENESS_LIMIT: u64 = 6;
 const DUST_UTXO_LIMIT: u64 = 5500;
+
+fn utxo_matches_requested_address(
+    utxo: &ListUnspentResponse,
+    requested_address: &BitcoinAddress,
+) -> bool {
+    // Base58 uses the same version bytes for testnet and regtest, so parsing a legacy regtest
+    // address necessarily tags it as testnet. Compare its encoded version and payload instead of
+    // the ambiguous in-memory network tag. Segwit addresses retain distinct network HRPs.
+    let matches = match (&utxo.address, requested_address) {
+        (BitcoinAddress::Legacy(returned), BitcoinAddress::Legacy(requested)) => {
+            returned.bytes == requested.bytes
+                && legacy_address_type_to_version_byte(returned.addrtype, returned.network_id)
+                    == legacy_address_type_to_version_byte(requested.addrtype, requested.network_id)
+        }
+        _ => &utxo.address == requested_address,
+    };
+    if matches {
+        return true;
+    }
+
+    warn!("Bitcoin Core returned a UTXO for an unexpected address";
+        "requested_address" => %requested_address,
+        "returned_address" => %utxo.address,
+        "txid" => %utxo.txid,
+        "vout" => utxo.vout,
+    );
+    false
+}
 
 #[cfg(test)]
 // Used to inject invalid block commits during testing.
@@ -1611,7 +1640,7 @@ impl BitcoinRegtestController {
         res
     }
 
-    pub(crate) fn get_miner_address(
+    pub fn get_miner_address(
         &self,
         epoch_id: StacksEpochId,
         public_key: &Secp256k1PublicKey,
@@ -2269,7 +2298,7 @@ impl BitcoinRegtestController {
 
             let descr_req = ImportDescriptorsRequest {
                 descriptor: format!("addr({address})#{}", info.checksum),
-                timestamp: Timestamp::Time(0),
+                timestamp: 0,
                 internal: Some(true),
             };
 
@@ -2357,6 +2386,7 @@ impl BitcoinRegtestController {
 
         let utxos = unspents
             .into_iter()
+            .filter(|utxo| utxo_matches_requested_address(utxo, address))
             .filter(|each| !txids_to_exclude.contains(&each.txid))
             .filter(|each| each.amount >= minimum_sum_amount)
             .map(|each| UTXO {
@@ -2814,6 +2844,57 @@ mod tests {
             config.node.working_dir = format!("/tmp/follower");
             config
         }
+    }
+
+    #[test]
+    fn utxo_address_must_match_request() {
+        let requested_address = utils::to_address_legacy(&utils::create_miner1_pubkey());
+        let other_address = utils::to_address_legacy(&utils::create_miner2_pubkey());
+        let response = |address| ListUnspentResponse {
+            txid: Txid([0; 32]),
+            vout: 0,
+            address,
+            script_pub_key: Script::new(),
+            amount: 1,
+            confirmations: 1,
+        };
+
+        assert!(utxo_matches_requested_address(
+            &response(requested_address.clone()),
+            &requested_address
+        ));
+        assert!(!utxo_matches_requested_address(
+            &response(other_address),
+            &requested_address
+        ));
+        let mut same_payload_mainnet = requested_address.clone();
+        let BitcoinAddress::Legacy(mainnet_address) = &mut same_payload_mainnet else {
+            unreachable!("test address is legacy")
+        };
+        mainnet_address.network_id = BitcoinNetworkType::Mainnet;
+        assert!(!utxo_matches_requested_address(
+            &response(same_payload_mainnet),
+            &requested_address
+        ));
+
+        // Bitcoin Core returns addresses as strings. Base58 cannot distinguish testnet from
+        // regtest, so deserialization tags this legacy address as testnet even though the request
+        // was built for regtest. They still identify the same Bitcoin destination.
+        let parsed_response: ListUnspentResponse = serde_json::from_value(serde_json::json!({
+            "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+            "vout": 0,
+            "address": requested_address.to_string(),
+            "scriptPubKey": "",
+            "amount": 1,
+            "confirmations": 1
+        }))
+        .expect("valid listunspent response");
+
+        assert_ne!(parsed_response.address, requested_address);
+        assert!(utxo_matches_requested_address(
+            &parsed_response,
+            &requested_address
+        ));
     }
 
     #[test]

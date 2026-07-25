@@ -48,14 +48,7 @@ impl PoxSyncWatchdogComms {
         }
     }
 
-    pub fn get_p2p_state_passes(&self) -> u64 {
-        self.p2p_state_passes.load(Ordering::SeqCst)
-    }
-
-    pub fn get_inv_sync_passes(&self) -> u64 {
-        self.inv_sync_passes.load(Ordering::SeqCst)
-    }
-
+    #[cfg(test)]
     pub fn get_download_passes(&self) -> u64 {
         self.download_passes.load(Ordering::SeqCst)
     }
@@ -122,10 +115,6 @@ impl PoxSyncWatchdog {
             steady_state_burnchain_sync_interval: burnchain_poll_time,
             relayer_comms: watchdog_comms,
         })
-    }
-
-    pub fn make_comms_handle(&self) -> PoxSyncWatchdogComms {
-        self.relayer_comms.clone()
     }
 
     /// Are we in the initial burnchain block download? i.e. is the burn tip snapshot far enough away
