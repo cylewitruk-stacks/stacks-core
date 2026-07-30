@@ -5,12 +5,10 @@ mod leader_key;
 mod network;
 mod protocol;
 mod runtime;
-mod simulator;
 mod supervisor;
 
 pub use protocol::epoch2::node::{BlockMinerThread, TipCandidate};
-pub use simulator::driver::Driver as SimulatorDriver;
-pub use supervisor::{NodeRunner, RuntimePlan};
+pub use supervisor::NodeRunner;
 
 #[cfg(test)]
 pub mod test_support {

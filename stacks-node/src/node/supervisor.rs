@@ -24,7 +24,6 @@ use std::{fs, thread};
 use stacks::burnchains::Burnchain;
 use stacks::chainstate::burn::db::sortdb::SortitionDB;
 use stacks::chainstate::coordinator::comm::CoordinatorChannels;
-use stacks::config::BurnchainConfig;
 use stacks::net::p2p::PeerNetwork;
 use stacks_common::types::StacksEpochId;
 
@@ -35,30 +34,6 @@ use crate::node::protocol::nakamoto::driver::Driver as NakamotoDriver;
 use crate::node::runtime::Counters;
 use crate::node::runtime::RuntimeContinuity;
 use crate::Config;
-
-/// Selects the runtime architecture independently of a mode's network and burnchain profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimePlan {
-    /// The deterministic local simulator used by the historical Helium and Mocknet modes.
-    LegacySimulator,
-    /// The production-style runtime that follows configured epochs from Neon into Nakamoto.
-    EpochAware,
-}
-
-impl RuntimePlan {
-    pub fn for_mode(mode: &str) -> Result<Self, String> {
-        // Keep the executable's historical behavior: Argon is accepted by the shared config
-        // parser for library/test consumers, but has never selected a stacks-node run loop.
-        if mode == "argon" || !BurnchainConfig::SUPPORTED_MODES.contains(&mode) {
-            return Err(format!("Burnchain mode '{mode}' not supported"));
-        }
-
-        match mode {
-            "helium" | "mocknet" => Ok(Self::LegacySimulator),
-            _ => Ok(Self::EpochAware),
-        }
-    }
-}
 
 /// Runtime and protocol resources transferred atomically from Epoch 2 to Nakamoto.
 struct Epoch2Handoff {
@@ -102,6 +77,7 @@ enum ProtocolExit {
 
 impl NodeRunner {
     pub fn new(config: Config) -> Result<Self, String> {
+        Self::validate_mode(&config.burnchain.mode)?;
         let (coordinator_channels, active_protocol) =
             if !Self::reached_epoch_30_transition(&config)? {
                 let epoch2 = Epoch2Driver::new(config.clone());
@@ -122,6 +98,15 @@ impl NodeRunner {
             active_protocol,
             coordinator_channels: Arc::new(Mutex::new(coordinator_channels)),
         })
+    }
+
+    pub fn validate_mode(mode: &str) -> Result<(), String> {
+        // Preserve the executable's historical carve-out: shared configuration
+        // accepts Argon for library consumers, but stacks-node has never run it.
+        if mode == "argon" || !stacks::config::BurnchainConfig::SUPPORTED_MODES.contains(&mode) {
+            return Err(format!("Burnchain mode '{mode}' not supported"));
+        }
+        Ok(())
     }
 
     /// Gets the coordinator channels through the stable supervisor handle.
@@ -315,7 +300,7 @@ impl NodeRunner {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use super::{Epoch2Driver, Epoch2Handoff, RuntimePlan};
+    use super::{Epoch2Driver, Epoch2Handoff, NodeRunner};
     use crate::Config;
 
     #[test]
@@ -330,19 +315,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_plan_is_independent_of_network_profile() {
-        for mode in ["helium", "mocknet"] {
-            assert_eq!(
-                RuntimePlan::for_mode(mode),
-                Ok(RuntimePlan::LegacySimulator)
-            );
-        }
-
+    fn node_runner_accepts_supported_modes_except_argon() {
         for mode in ["neon", "krypton", "xenon", "mainnet", "nakamoto-neon"] {
-            assert_eq!(RuntimePlan::for_mode(mode), Ok(RuntimePlan::EpochAware));
+            assert_eq!(NodeRunner::validate_mode(mode), Ok(()));
         }
 
-        assert!(RuntimePlan::for_mode("argon").is_err());
-        assert!(RuntimePlan::for_mode("unknown").is_err());
+        assert!(NodeRunner::validate_mode("argon").is_err());
+        assert!(NodeRunner::validate_mode("unknown").is_err());
     }
 }

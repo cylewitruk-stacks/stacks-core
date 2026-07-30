@@ -216,7 +216,7 @@ use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
 use crate::burnchains::bitcoin_regtest_controller::{
     burnchain_params_from_config, BitcoinRegtestController, OngoingBlockCommit,
 };
-use crate::burnchains::{make_bitcoin_indexer, Error as BurnchainControllerError};
+use crate::burnchains::{make_bitcoin_indexer, Error as ControllerError};
 use crate::node::chainstate;
 use crate::node::context::SpawnContext;
 use crate::node::leader_key::{load_activated_vrf_key, LeaderKeyRegistrationState, RegisteredKey};
@@ -227,7 +227,7 @@ use crate::node::protocol::fault_injection::{
 use crate::node::protocol::nakamoto::signer::coordinator::SignerCoordinator;
 use crate::node::protocol::nakamoto::signer::miner_db::MinerDB;
 use crate::node::runtime::{BurnBlockObservation, Globals, WorkerHandles};
-use crate::{BurnchainController, Config, EventDispatcher, Keychain};
+use crate::{Config, EventDispatcher, Keychain};
 
 pub const RELAYER_MAX_BUFFER: usize = 100;
 const VRF_MOCK_MINER_KEY: u64 = 1;
@@ -2762,7 +2762,7 @@ impl BlockMinerThread {
                 debug!("Relayer: Mock-mining enabled; not sending Bitcoin transaction");
                 self.failed_to_submit_last_attempt = true;
             }
-            Err(BurnchainControllerError::IdenticalOperation) => {
+            Err(ControllerError::IdenticalOperation) => {
                 info!("Relayer: Block-commit already submitted");
                 self.failed_to_submit_last_attempt = true;
                 return None;

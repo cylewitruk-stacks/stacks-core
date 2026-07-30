@@ -39,7 +39,7 @@ use crate::node::runtime::{Counters, RunLoopCounter};
 use crate::syncctl::PoxSyncWatchdog;
 #[cfg(test)]
 use crate::syncctl::PoxSyncWatchdogComms;
-use crate::{BurnchainController, Config};
+use crate::Config;
 
 /// Protocol resources recovered after a clean Epoch 2 worker shutdown.
 #[derive(Default)]

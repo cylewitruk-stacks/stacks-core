@@ -28,7 +28,7 @@ use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
 use crate::node::test_support::epoch2 as neon;
 use crate::tests::neon_integrations::*;
 use crate::tests::*;
-use crate::{BitcoinRegtestController, BurnchainController};
+use crate::BitcoinRegtestController;
 
 #[test]
 #[ignore]

@@ -43,7 +43,7 @@ use crate::tests::neon_integrations::{
     get_account, get_chain_info, get_pox_info, neon_integration_test_conf, next_block_and_wait,
     submit_tx, test_observer, wait_for_runloop,
 };
-use crate::{BitcoinRegtestController, BurnchainController};
+use crate::BitcoinRegtestController;
 
 #[cfg(test)]
 pub fn get_reward_set_entries_at_block(

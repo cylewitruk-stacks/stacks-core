@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use stacks::burnchains::{Burnchain, Error as burnchain_error};
+use stacks::burnchains::{Burnchain, Error as BurnchainError};
 use stacks_common::util::{get_epoch_time_secs, sleep_ms};
 
 use crate::burnchains::BurnchainTip;
@@ -57,12 +57,12 @@ impl PoxSyncWatchdogComms {
         self.last_ibd.load(Ordering::SeqCst)
     }
 
-    fn interruptable_sleep(&self, secs: u64) -> Result<(), burnchain_error> {
+    fn interruptable_sleep(&self, secs: u64) -> Result<(), BurnchainError> {
         let deadline = secs + get_epoch_time_secs();
         while get_epoch_time_secs() < deadline {
             sleep_ms(1000);
             if !self.should_keep_running() {
-                return Err(burnchain_error::CoordinatorClosed);
+                return Err(BurnchainError::CoordinatorClosed);
             }
         }
         Ok(())
@@ -149,7 +149,7 @@ impl PoxSyncWatchdog {
         burnchain: &Burnchain,
         burnchain_tip: &BurnchainTip, // this is the highest burnchain snapshot we've sync'ed to
         burnchain_height: u64,        // this is the absolute burnchain block height
-    ) -> Result<(bool, u64), burnchain_error> {
+    ) -> Result<(bool, u64), BurnchainError> {
         let burnchain_rc = burnchain
             .block_height_to_reward_cycle(burnchain_height)
             .expect("FATAL: burnchain height is before system start");

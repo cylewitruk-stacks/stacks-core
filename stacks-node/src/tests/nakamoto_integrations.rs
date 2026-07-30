@@ -77,7 +77,7 @@ use stacks::core::test_util::{
     make_contract_publish_versioned, make_stacks_transfer_serialized, make_stacks_transfer_tx,
 };
 use stacks::core::{
-    EpochList, StacksEpoch, StacksEpochId, BLOCK_LIMIT_MAINNET_10, HELIUM_BLOCK_LIMIT_20,
+    EpochList, StacksEpoch, StacksEpochId, BLOCK_LIMIT_MAINNET_10, BLOCK_LIMIT_REGTEST_20,
     PEER_VERSION_EPOCH_1_0, PEER_VERSION_EPOCH_2_0, PEER_VERSION_EPOCH_2_05,
     PEER_VERSION_EPOCH_2_1, PEER_VERSION_EPOCH_2_2, PEER_VERSION_EPOCH_2_3, PEER_VERSION_EPOCH_2_4,
     PEER_VERSION_EPOCH_2_5, PEER_VERSION_EPOCH_3_0, PEER_VERSION_EPOCH_3_1, PEER_VERSION_EPOCH_3_2,
@@ -138,7 +138,7 @@ use crate::tests::neon_integrations::{
 use crate::tests::signer::v0::{sbtc_registry_stub_source, sbtc_token_stub_source};
 use crate::tests::signer::SignerTest;
 use crate::tests::{gen_random_port, get_chain_info, make_contract_publish, to_addr};
-use crate::{tests, BitcoinRegtestController, BurnchainController, Config, ConfigFile, Keychain};
+use crate::{tests, BitcoinRegtestController, Config, ConfigFile, Keychain};
 
 pub static POX_DEFAULT_STACKER_BALANCE: u64 = 100_000_000_000_000;
 pub static POX_DEFAULT_STACKER_STX_AMT: u128 = 99_000_000_000_000;
@@ -163,84 +163,84 @@ lazy_static! {
             epoch_id: StacksEpochId::Epoch20,
             start_height: 0,
             end_height: 1,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_2_0
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch2_05,
             start_height: 1,
             end_height: 2,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_2_05
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch21,
             start_height: 2,
             end_height: 3,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_2_1
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch22,
             start_height: 3,
             end_height: 4,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_2_2
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch23,
             start_height: 4,
             end_height: 5,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_2_3
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch24,
             start_height: 5,
             end_height: 201,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_2_4
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch25,
             start_height: 201,
             end_height: 231,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_2_5
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch30,
             start_height: 231,
             end_height: 241,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_3_0
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch31,
             start_height: 241,
             end_height: 251,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_3_1
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch32,
             start_height: 251,
             end_height: 252,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_3_2
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch33,
             start_height: 252,
             end_height: 253,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_3_3
         },
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch34,
             start_height: 253,
             end_height: 1_002,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_3_4
         },
         // Epoch 4.0 is pushed out by default so the typical signer integration
@@ -257,7 +257,7 @@ lazy_static! {
             epoch_id: StacksEpochId::Epoch40,
             start_height: 1_002,
             end_height: STACKS_EPOCH_MAX,
-            block_limit: HELIUM_BLOCK_LIMIT_20,
+            block_limit: BLOCK_LIMIT_REGTEST_20,
             network_epoch: PEER_VERSION_EPOCH_3_4
         },
     ];
@@ -15205,9 +15205,9 @@ fn contract_limit_percentage_mempool_strategy_high_limit() {
     let small_proportion: usize = 5;
     let large_proportion: usize = 22;
     let small_contract =
-        make_big_read_count_contract(HELIUM_BLOCK_LIMIT_20, small_proportion as u64);
+        make_big_read_count_contract(BLOCK_LIMIT_REGTEST_20, small_proportion as u64);
     let large_contract =
-        make_big_read_count_contract(HELIUM_BLOCK_LIMIT_20, large_proportion as u64);
+        make_big_read_count_contract(BLOCK_LIMIT_REGTEST_20, large_proportion as u64);
     let expected_big = 100 / large_proportion;
     let expected_small = (100 - large_proportion * expected_big) / small_proportion;
 
@@ -15541,9 +15541,9 @@ fn contract_limit_percentage_mempool_strategy_low_limit() {
     let small_proportion: usize = 5;
     let large_proportion: usize = 22;
     let small_contract =
-        make_big_read_count_contract(HELIUM_BLOCK_LIMIT_20, small_proportion as u64);
+        make_big_read_count_contract(BLOCK_LIMIT_REGTEST_20, small_proportion as u64);
     let large_contract =
-        make_big_read_count_contract(HELIUM_BLOCK_LIMIT_20, large_proportion as u64);
+        make_big_read_count_contract(BLOCK_LIMIT_REGTEST_20, large_proportion as u64);
     let expected_big = 100 / large_proportion;
 
     let call_large = |sender_sk: &_, sender_nonces: &mut _| {

@@ -27,9 +27,7 @@ use stacks::util_lib::db::Error as DatabaseError;
 use stacks_common::deps_common::ctrlc as termination;
 use stacks_common::deps_common::ctrlc::SignalId;
 
-use crate::burnchains::{
-    make_bitcoin_indexer, BitcoinRegtestController, BurnchainController, Error as ControllerError,
-};
+use crate::burnchains::{make_bitcoin_indexer, BitcoinRegtestController, Error as ControllerError};
 use crate::monitoring::{start_serving_monitoring_metrics, MonitoringError};
 use crate::node::context::SpawnContext;
 use crate::node::genesis::{

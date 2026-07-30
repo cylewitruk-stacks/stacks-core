@@ -7,7 +7,7 @@
                 {
                     "name": "name",
                     "description": "Human-readable name for the node. Primarily used for identification in testing\nenvironments (e.g., deriving log file names, temporary directory names).",
-                    "default_value": "`\"helium-node\"`",
+                    "default_value": "`\"stacks-node\"`",
                     "notes": null,
                     "deprecated": null,
                     "toml_example": null,

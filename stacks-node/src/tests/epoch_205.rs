@@ -43,7 +43,7 @@ use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
 use crate::node::test_support::epoch2 as neon;
 use crate::tests::neon_integrations::*;
 use crate::tests::{run_until_burnchain_height, select_transactions_where};
-use crate::{BitcoinRegtestController, BurnchainController, Keychain};
+use crate::{BitcoinRegtestController, Keychain};
 
 #[test]
 #[ignore]

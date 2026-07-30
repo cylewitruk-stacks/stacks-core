@@ -32,7 +32,7 @@ use crate::node::runtime::Counters;
 use crate::node::runtime::{
     BurnchainSyncCursor, EpochRuntime, EpochStartup, Globals as GenericGlobals, RuntimeContinuity,
 };
-use crate::{BurnchainController, Config};
+use crate::Config;
 
 pub type Globals = GenericGlobals<super::relayer::RelayerDirective>;
 

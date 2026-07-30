@@ -1,0 +1,1 @@
+Node configuration files must now set `burnchain.mode` explicitly, including when loaded by tools such as `stacks-inspect` and `marf-squash`.

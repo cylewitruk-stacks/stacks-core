@@ -22,7 +22,7 @@ use crate::stacks_common::types::Address;
 use crate::stacks_common::util::hash::bytes_to_hex;
 use crate::tests::neon_integrations::*;
 use crate::tests::*;
-use crate::{BitcoinRegtestController, BurnchainController};
+use crate::BitcoinRegtestController;
 
 #[test]
 #[ignore]

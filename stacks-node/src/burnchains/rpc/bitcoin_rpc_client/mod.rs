@@ -251,9 +251,11 @@ pub struct ImportDescriptorsErrorMessage {
 }
 
 /// Response for `generatetoaddress` rpc, mainly used as deserialization wrapper for `BurnchainHeaderHash`
+#[cfg(test)]
 struct GenerateToAddressResponse(pub Vec<BurnchainHeaderHash>);
 
 /// Deserializes a JSON string array into a vec of [`BurnchainHeaderHash`] and wrap it into [`GenerateToAddressResponse`]
+#[cfg(test)]
 impl<'de> Deserialize<'de> for GenerateToAddressResponse {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -522,6 +524,7 @@ impl BitcoinRpcClient {
     ///
     /// # Notes
     /// Typically used on `regtest` or test networks.
+    #[cfg(test)]
     pub fn generate_to_address(
         &self,
         num_blocks: u64,

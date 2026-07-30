@@ -64,7 +64,6 @@ use super::miner::{BlockMinerThread, MinerDirective, MinerReason};
 use super::{
     Config, Error as NakamotoNodeError, EventDispatcher, Keychain, BLOCK_PROCESSOR_STACK_SIZE,
 };
-use crate::burnchains::BurnchainController;
 use crate::node::chainstate;
 use crate::node::context::SpawnContext;
 use crate::node::leader_key::{load_activated_vrf_key, LeaderKeyRegistrationState, RegisteredKey};
