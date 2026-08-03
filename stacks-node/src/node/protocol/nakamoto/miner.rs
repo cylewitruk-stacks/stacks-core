@@ -65,13 +65,12 @@ use tempfile::tempdir;
 
 use super::driver::Globals;
 use super::relayer::{MinerStopHandle, RelayerThread};
-use super::signer::coordinator::SignerCoordinator;
-use super::signer::miner_db::MinerDB;
-use super::{Config, Error as NakamotoNodeError, EventDispatcher, Keychain, VRF_MOCK_MINER_KEY};
+use super::signer::{MinerDB, SignerCoordinator};
+use super::{Config, Error as NakamotoNodeError, EventDispatcher, Keychain};
 use crate::node::chainstate;
 #[cfg(test)]
 use crate::node::leader_key::LeaderKeyRegistrationState;
-use crate::node::leader_key::RegisteredKey;
+use crate::node::leader_key::{generate_vrf_proof, RegisteredKey};
 use crate::node::protocol::fault_injection::fault_injection_long_tenure;
 
 #[cfg(test)]
@@ -1434,40 +1433,14 @@ impl BlockMinerThread {
     /// Returns Some(proof) if we could make the proof
     /// Return None if we could not make the proof
     fn make_vrf_proof(&mut self) -> Option<VRFProof> {
-        // if we're a mock miner, then make sure that the keychain has a keypair for the mocked VRF
-        // key
-        let vrf_proof = if self.config.get_node_config(false).mock_mining {
-            self.keychain.generate_proof(
-                VRF_MOCK_MINER_KEY,
-                self.burn_election_block.sortition_hash.as_bytes(),
-            )
-        } else {
-            self.keychain.generate_proof(
-                self.registered_key.target_block_height,
-                self.burn_election_block.sortition_hash.as_bytes(),
-            )
-        };
-
-        let Some(vrf_proof) = vrf_proof else {
-            error!(
-                "Unable to generate VRF proof, will be unable to mine";
-                "burn_block_sortition_hash" => %self.burn_election_block.sortition_hash,
-                "burn_block_block_height" => %self.burn_block.block_height,
-                "burn_block_hash" => %self.burn_block.burn_header_hash,
-                "vrf_pubkey" => &self.registered_key.vrf_public_key.to_hex()
-            );
-            return None;
-        };
-
-        debug!(
-            "Generated VRF Proof: {} over {} ({},{}) with key {}",
-            vrf_proof.to_hex(),
+        generate_vrf_proof(
+            &mut self.keychain,
+            self.config.get_node_config(false).mock_mining,
+            &self.registered_key,
             &self.burn_election_block.sortition_hash,
-            &self.burn_block.block_height,
+            self.burn_block.block_height,
             &self.burn_block.burn_header_hash,
-            &self.registered_key.vrf_public_key.to_hex()
-        );
-        Some(vrf_proof)
+        )
     }
 
     fn validate_timestamp_info(

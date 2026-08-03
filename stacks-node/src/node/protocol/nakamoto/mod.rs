@@ -13,6 +13,115 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+//! Nakamoto node runtime and protocol actors.
+//!
+//! This module coordinates the node processes used after the Nakamoto
+//! activation. The underlying network, chainstate, coordinator, and runtime
+//! services are shared with Epoch 2, but the actors here implement a different
+//! scheduling and mining model:
+//!
+//! ```text
+//! System schematic.
+//! Legend:
+//!    |------|    Thread
+//!    /------\    Shared memory
+//!    @------@    Database
+//!    .------.    Code module
+//!
+//!
+//!                                 |------------------|
+//!                                 | Nakamoto driver  |
+//!                                 |   .----------.   |
+//!                                 |   .StacksNode.   |
+//!                                 |---.----------.---|
+//!                           [1]      |     |     |      [2]
+//!             .----------------------*     |     *------------------------------.
+//!             |                       [1,3]|                                    |
+//!             V                            V                                    V
+//!     |---------------|    [4]     |----------------|     [5]      |--------------------------|
+//!     |   P2P thread  | ---------> | Relayer thread | -----------> | ChainsCoordinator thread |
+//!     |---------------|            |----------------|              |--------------------------|
+//!             |                            |     |                              |
+//!         [6] |                        [7] |     | [10]                         | [8]
+//!             |                 /-------------\  |                              |
+//!             |                 /   Globals   \  |                              |
+//!             |                 /-------------\  |                              |
+//!             |                        |   ^ [7] *----------------------.       |
+//!             V                  [1,9] V   |                            V       V
+//!     @--------------@             |---------------------|         @------------------@
+//!     @  Mempool DB  @ <---[11]--- |    Miner thread     | -[12]-> @  Chainstate DBs  @
+//!     @--------------@             | .-----------------. |         @------------------@
+//!                                  | .SignerCoordinator. |
+//!                                  |-.-----------------.-|
+//!                                        |   |
+//!                                   [13] |   | [1]
+//!             .--------------------------'   |
+//!             V                              V
+//!     @---------------@            |--------------------|
+//!     @   StackerDB   @ ---[14]--> | StackerDB listener |
+//!     @---------------@            |--------------------|
+//!
+//! [1]  Spawns
+//! [2]  Signals new burn and Stacks blocks
+//! [3]  Raises relayer initiatives
+//! [4]  Forwards the coalesced network result
+//! [5]  Requests block processing
+//! [6]  Stores unconfirmed transactions
+//! [7]  Shares runtime state, counters, and miner status
+//! [8]  Updates canonical chainstate
+//! [9]  Starts and stops tenure mining
+//! [10] Stores preprocessed blocks
+//! [11] Reads candidate transactions
+//! [12] Stores the mined block
+//! [13] Publishes block proposals
+//! [14] Delivers signer chunk events
+//! ```
+//!
+//! ## Runtime actors
+//!
+//! - The [`Driver`] synchronizes the burnchain, signals the chains coordinator
+//!   about new burn and Stacks blocks, and raises relayer initiatives once
+//!   synchronized.
+//! - `PeerThread` runs the P2P and RPC state machines, refreshes StackerDB
+//!   configuration, coalesces pending network results, and wakes the relayer
+//!   when work is available.
+//! - `RelayerThread` is the Nakamoto control plane. It preprocesses and stores
+//!   network-received blocks through its own chainstate handle, processes
+//!   sortition directives, periodically evaluates initiatives and deadlines,
+//!   submits burnchain commits, extends tenures, and starts or stops the miner.
+//! - `BlockMinerThread` builds and stores tenure blocks. Its
+//!   [`SignerCoordinator`] publishes each proposal to StackerDB directly and
+//!   owns a listener thread that consumes the signers' chunk events.
+//! - The shared chains coordinator remains responsible for processing
+//!   sortitions and Stacks blocks and for updating canonical chainstate.
+//!
+//! ## Startup and protocol handoff
+//!
+//! Nakamoto can start directly or inherit [`NodeStartup`] from the Epoch 2
+//! driver. An inherited startup carries the active leader-key registration and
+//! the existing `PeerNetwork`, including any already-bound sockets. Fresh
+//! networks bind strictly; inherited networks bind only when the sockets have
+//! not already been acquired. Shared runtime continuity is reactivated by the
+//! supervisor before the inherited driver starts.
+//!
+//! ## Deliberate differences from Epoch 2
+//!
+//! These actors intentionally do not implement a common protocol-actor trait
+//! with their Epoch 2 counterparts:
+//!
+//! - the relayer wakes on timeouts to evaluate initiatives, commit deadlines,
+//!   and tenure extensions instead of blocking solely on directives;
+//! - the peer coalesces network results into one retained pending directive,
+//!   whereas Epoch 2 uses `VecDeque`-backed queued buffering; both retain work
+//!   under channel backpressure;
+//! - mining is tenure-based and signer-mediated, with no microblock miner;
+//! - signer communication and StackerDB refresh are Nakamoto-specific;
+//! - miner and relayer state is retained across multiple blocks in a tenure.
+//!
+//! Shared mechanics live in the parent node modules; sequencing and
+//! protocol-specific state transitions remain visible here.
+
 use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -31,15 +140,30 @@ use self::driver::Globals;
 use crate::burnchains::Error as BurnchainsError;
 use crate::node::context::SpawnContext;
 use crate::node::leader_key::{LeaderKeyRegistrationState, RegisteredKey};
-use crate::node::network::NodeNetwork;
+use crate::node::network::{NodeNetwork, PeerNetworkOrigin};
 use crate::node::runtime::{BurnBlockObservation, WorkerHandles};
 use crate::{Config, EventDispatcher, Keychain};
 
-pub mod driver;
-pub mod miner;
-pub mod peer;
-pub mod relayer;
-pub mod signer;
+mod driver;
+mod miner;
+mod peer;
+mod relayer;
+mod signer;
+
+pub use driver::Driver;
+pub use signer::{MinerDB, SignerCoordinator};
+
+#[cfg(test)]
+pub mod test_support {
+    pub use super::miner::{
+        fault_injection_stall_miner, fault_injection_try_stall_miner,
+        fault_injection_unstall_miner, TEST_BLOCK_ANNOUNCE_STALL, TEST_BROADCAST_PROPOSAL_STALL,
+        TEST_MINER_BROADCASTING_BLOCK, TEST_MINE_SKIP, TEST_P2P_BROADCAST_SKIP,
+        TEST_P2P_BROADCAST_STALL,
+    };
+    pub use super::relayer::{TEST_MINER_COMMIT_TIP, TEST_MINER_THREAD_STALL};
+    pub use super::signer::TEST_IGNORE_SIGNERS;
+}
 
 #[cfg(test)]
 mod tests;
@@ -48,7 +172,6 @@ use self::peer::PeerThread;
 use self::relayer::{RelayerDirective, RelayerThread};
 
 pub const RELAYER_MAX_BUFFER: usize = 1;
-const VRF_MOCK_MINER_KEY: u64 = 1;
 
 pub const BLOCK_PROCESSOR_STACK_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
@@ -184,6 +307,11 @@ impl StacksNode {
             leader_key_registration_state,
             peer_network,
         } = startup;
+        let peer_network_origin = if peer_network.is_some() {
+            PeerNetworkOrigin::Inherited
+        } else {
+            PeerNetworkOrigin::Fresh
+        };
 
         let (p2p_net, local_peer, relayer) =
             NodeNetwork::prepare(&config, burnchain.clone(), peer_network).into_parts();
@@ -191,14 +319,10 @@ impl StacksNode {
         // setup initial key registration
         let leader_key_registration_state = if config.get_node_config(false).mock_mining {
             // mock mining, pretend to have a registered key
-            let (vrf_public_key, _) = keychain.make_vrf_keypair(VRF_MOCK_MINER_KEY);
-            LeaderKeyRegistrationState::Active(RegisteredKey {
-                target_block_height: VRF_MOCK_MINER_KEY,
-                block_height: 1,
-                op_vtxindex: 1,
-                vrf_public_key,
-                memo: keychain.get_nakamoto_pkh().as_bytes().to_vec(),
-            })
+            LeaderKeyRegistrationState::Active(RegisteredKey::for_mock_mining(
+                &keychain,
+                keychain.get_nakamoto_pkh().as_bytes().to_vec(),
+            ))
         } else {
             match &leader_key_registration_state {
                 LeaderKeyRegistrationState::Active(registered_key) => {
@@ -241,8 +365,13 @@ impl StacksNode {
             .port();
 
         let p2p_event_dispatcher = context.events();
-        let p2p_thread =
-            PeerThread::new(globals.clone(), &config, burnchain.pox_constants, p2p_net);
+        let p2p_thread = PeerThread::new(
+            globals.clone(),
+            &config,
+            burnchain.pox_constants,
+            p2p_net,
+            peer_network_origin,
+        );
         let p2p_thread_handle = thread::Builder::new()
             .stack_size(BLOCK_PROCESSOR_STACK_SIZE)
             .name(format!("p2p:({p2p_port},{rpc_port})"))

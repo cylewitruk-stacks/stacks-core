@@ -53,6 +53,16 @@ impl PoxSyncWatchdogComms {
         self.download_passes.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub fn get_p2p_state_passes(&self) -> u64 {
+        self.p2p_state_passes.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn get_inv_sync_passes(&self) -> u64 {
+        self.inv_sync_passes.load(Ordering::SeqCst)
+    }
+
     pub fn get_ibd(&self) -> bool {
         self.last_ibd.load(Ordering::SeqCst)
     }

@@ -29,9 +29,7 @@ use stacks::chainstate::burn::db::sortdb::{FindIter, SortitionDB};
 use stacks::chainstate::burn::operations::leader_block_commit::{
     RewardSetInfo, BURN_BLOCK_MINED_AT_MODULUS,
 };
-use stacks::chainstate::burn::operations::{
-    BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-};
+use stacks::chainstate::burn::operations::{BlockstackOperationType, LeaderBlockCommitOp};
 use stacks::chainstate::burn::{BlockSnapshot, ConsensusHash};
 use stacks::chainstate::nakamoto::coordinator::get_nakamoto_next_recipients;
 use stacks::chainstate::nakamoto::{NakamotoBlockHeader, NakamotoChainState};
@@ -57,7 +55,6 @@ use stacks_common::util::get_epoch_time_ms;
 use stacks_common::util::hash::Hash160;
 #[cfg(test)]
 use stacks_common::util::tests::TestFlag;
-use stacks_common::util::vrf::VRFPublicKey;
 
 use super::driver::Globals;
 use super::miner::{BlockMinerThread, MinerDirective, MinerReason};
@@ -66,8 +63,11 @@ use super::{
 };
 use crate::node::chainstate;
 use crate::node::context::SpawnContext;
-use crate::node::leader_key::{load_activated_vrf_key, LeaderKeyRegistrationState, RegisteredKey};
+use crate::node::leader_key::{
+    load_activated_vrf_key, make_leader_key_register_op, LeaderKeyRegistrationState, RegisteredKey,
+};
 use crate::node::protocol::fault_injection::fault_injection_skip_mining;
+use crate::node::runtime::DownloadReadiness;
 use crate::BitcoinRegtestController;
 
 #[cfg(test)]
@@ -411,24 +411,8 @@ pub struct RelayerThread {
     pub event_dispatcher: EventDispatcher,
     /// copy of the local peer state
     local_peer: LocalPeer,
-    /// last observed burnchain block height from the p2p thread (obtained from network results)
-    last_network_block_height: u64,
-    /// time at which we observed a change in the network block height (epoch time in millis)
-    last_network_block_height_ts: u128,
-    /// last observed number of downloader state-machine passes from the p2p thread (obtained from
-    /// network results)
-    last_network_download_passes: u64,
-    /// last observed number of inventory state-machine passes from the p2p thread (obtained from
-    /// network results)
-    last_network_inv_passes: u64,
-    /// minimum number of downloader state-machine passes that must take place before mining (this
-    /// is used to ensure that the p2p thread attempts to download new Stacks block data before
-    /// this thread tries to mine a block)
-    min_network_download_passes: u64,
-    /// minimum number of inventory state-machine passes that must take place before mining (this
-    /// is used to ensure that the p2p thread attempts to download new Stacks block data before
-    /// this thread tries to mine a block)
-    min_network_inv_passes: u64,
+    /// Network-download progress that gates mining after a burnchain advance.
+    download_readiness: DownloadReadiness,
 
     /// Inner relayer instance for forwarding broadcasted data back to the p2p thread for dispatch
     /// to neighbors
@@ -499,12 +483,7 @@ impl RelayerThread {
             event_dispatcher: context.events(),
             local_peer,
 
-            last_network_block_height: 0,
-            last_network_block_height_ts: 0,
-            last_network_download_passes: 0,
-            min_network_download_passes: 0,
-            last_network_inv_passes: 0,
-            min_network_inv_passes: 0,
+            download_readiness: DownloadReadiness::default(),
 
             relayer,
 
@@ -526,12 +505,11 @@ impl RelayerThread {
     /// have we waited for the right conditions under which to start mining a block off of our
     /// chain tip?
     fn has_waited_for_latest_blocks(&self) -> bool {
-        // a network download pass took place
-        self.min_network_download_passes <= self.last_network_download_passes
-        // we waited long enough for a download pass, but timed out waiting
-        || self.last_network_block_height_ts + (self.config.node.wait_time_for_blocks as u128) < get_epoch_time_ms()
-        // we're not supposed to wait at all
-        || !self.config.miner.wait_for_block_download
+        self.download_readiness.permits_mining(
+            self.config.miner.wait_for_block_download,
+            self.config.node.wait_time_for_blocks,
+            get_epoch_time_ms(),
+        )
     }
 
     /// Handle a NetworkResult from the p2p/http state machine.  Usually this is the act of
@@ -544,12 +522,12 @@ impl RelayerThread {
             net_result.burn_height
         );
 
-        if self.last_network_block_height != net_result.burn_height {
+        if self.download_readiness.observe_burn_height(
+            net_result.burn_height,
+            net_result.num_download_passes,
+            get_epoch_time_ms(),
+        ) {
             // burnchain advanced; disable mining until we also do a download pass.
-            self.last_network_block_height = net_result.burn_height;
-            self.min_network_download_passes = net_result.num_download_passes + 1;
-            self.min_network_inv_passes = net_result.num_inv_sync_passes + 1;
-            self.last_network_block_height_ts = get_epoch_time_ms();
         }
 
         let net_receipts = self
@@ -588,8 +566,8 @@ impl RelayerThread {
 
         // resume mining if we blocked it, and if we've done the requisite download
         // passes
-        self.last_network_download_passes = net_result.num_download_passes;
-        self.last_network_inv_passes = net_result.num_inv_sync_passes;
+        self.download_readiness
+            .record_completed_passes(net_result.num_download_passes);
         if self.has_waited_for_latest_blocks() {
             debug!("Relayer: did a download pass, so unblocking mining");
             signal_mining_ready(self.globals.get_miner_status());
@@ -984,23 +962,6 @@ impl RelayerThread {
         directive_opt
     }
 
-    /// Constructs and returns a LeaderKeyRegisterOp out of the provided params
-    fn make_key_register_op(
-        vrf_public_key: VRFPublicKey,
-        consensus_hash: &ConsensusHash,
-        miner_pkh: &Hash160,
-    ) -> BlockstackOperationType {
-        BlockstackOperationType::LeaderKeyRegister(LeaderKeyRegisterOp {
-            public_key: vrf_public_key,
-            memo: miner_pkh.as_bytes().to_vec(),
-            consensus_hash: consensus_hash.clone(),
-            vtxindex: 0,
-            txid: Txid([0u8; 32]),
-            block_height: 0,
-            burn_header_hash: BurnchainHeaderHash::zero(),
-        })
-    }
-
     /// Create and broadcast a VRF public key registration transaction.
     /// Returns true if we succeed in doing so; false if not.
     pub fn rotate_vrf_and_register(&mut self, burn_block: &BlockSnapshot) {
@@ -1023,7 +984,11 @@ impl RelayerThread {
             "miner_pkh" => miner_pkh.to_hex(),
         );
 
-        let op = Self::make_key_register_op(vrf_pk, burnchain_tip_consensus_hash, &miner_pkh);
+        let op = make_leader_key_register_op(
+            vrf_pk,
+            burnchain_tip_consensus_hash.clone(),
+            miner_pkh.as_bytes().to_vec(),
+        );
 
         let mut op_signer = self.keychain.generate_op_signer();
         if let Ok(txid) = self

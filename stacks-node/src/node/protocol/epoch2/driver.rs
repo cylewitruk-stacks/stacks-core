@@ -29,9 +29,7 @@ use stacks::chainstate::stacks::miner::MinerStatus;
 use stacks::chainstate::stacks::miner::{signal_mining_blocked, signal_mining_ready};
 use stacks::net::p2p::PeerNetwork;
 
-use super::node::{
-    NeonGlobals as Globals, StacksNode, BLOCK_PROCESSOR_STACK_SIZE, RELAYER_MAX_BUFFER,
-};
+use super::{NeonGlobals as Globals, StacksNode, BLOCK_PROCESSOR_STACK_SIZE, RELAYER_MAX_BUFFER};
 use crate::node::leader_key::LeaderKeyRegistrationState;
 use crate::node::runtime::{BurnchainSyncCursor, EpochRuntime, EpochStartup, RuntimeContinuity};
 #[cfg(test)]

@@ -28,8 +28,8 @@ use stacks::net::p2p::PeerNetwork;
 use stacks_common::types::StacksEpochId;
 
 use crate::node::leader_key::LeaderKeyRegistrationState;
-use crate::node::protocol::epoch2::driver::{Driver as Epoch2Driver, Epoch2Shutdown};
-use crate::node::protocol::nakamoto::driver::Driver as NakamotoDriver;
+use crate::node::protocol::epoch2::{Driver as Epoch2Driver, Epoch2Shutdown};
+use crate::node::protocol::nakamoto::Driver as NakamotoDriver;
 #[cfg(test)]
 use crate::node::runtime::Counters;
 use crate::node::runtime::RuntimeContinuity;

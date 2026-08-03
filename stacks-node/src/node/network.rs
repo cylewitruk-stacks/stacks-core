@@ -8,24 +8,274 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 use clarity::vm::types::QualifiedContractIdentifier;
-use stacks::burnchains::Burnchain;
+use stacks::burnchains::bitcoin::indexer::BitcoinIndexer;
+use stacks::burnchains::{Burnchain, PoxConstants};
 use stacks::chainstate::burn::db::sortdb::SortitionDB;
+use stacks::chainstate::stacks::db::StacksChainState;
+use stacks::core::mempool::MemPoolDB;
 use stacks::core::EpochList;
+use stacks::cost_estimates::metrics::{CostMetric, UnitMetric};
+use stacks::cost_estimates::{CostEstimator, FeeEstimator, UnitEstimator};
 use stacks::net::atlas::{AtlasConfig, AtlasDB};
 use stacks::net::db::{LocalPeer, PeerDB};
+use stacks::net::dns::{DNSClient, DNSResolver};
 use stacks::net::p2p::PeerNetwork;
 use stacks::net::relay::Relayer;
 use stacks::net::stackerdb::{StackerDBConfig, StackerDBSync, StackerDBs};
-use stacks::net::{PeerNetworkComms, ServiceFlags};
+use stacks::net::{NetworkResult, PeerNetworkComms, ServiceFlags};
 use stacks::util_lib::strings::{UrlString, VecDisplay};
 use stacks_common::types::net::PeerAddress;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 
+use crate::burnchains::make_bitcoin_indexer;
 use crate::node::chainstate::open_chainstate;
+use crate::syncctl::PoxSyncWatchdogComms;
 use crate::Config;
+
+/// Changes observed during a pass through the peer network state machines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerProgressUpdate {
+    burn_height_changed: bool,
+    inventory_advanced: bool,
+    downloader_advanced: bool,
+}
+
+impl PeerProgressUpdate {
+    pub fn burn_height_changed(self) -> bool {
+        self.burn_height_changed
+    }
+
+    pub fn inventory_advanced(self) -> bool {
+        self.inventory_advanced
+    }
+
+    pub fn downloader_advanced(self) -> bool {
+        self.downloader_advanced
+    }
+}
+
+/// Progress shared by the Epoch 2 and Nakamoto peer workers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerProgress {
+    p2p_state_machine_passes: u64,
+    inventory_sync_passes: u64,
+    download_passes: u64,
+    burn_height: u64,
+}
+
+/// Whether a peer network is being bound for the first time or inherited
+/// across the Epoch 2-to-Nakamoto handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerNetworkOrigin {
+    /// A newly constructed, necessarily unbound network. Binding is strict so
+    /// an ownership violation fails during startup instead of being hidden.
+    Fresh,
+    /// A network transferred across a protocol handoff which may already own
+    /// its configured sockets.
+    Inherited,
+}
+
+/// Databases and network state owned by a protocol peer worker.
+pub struct PeerRuntimeResources {
+    network: PeerNetwork,
+    sortition_db: SortitionDB,
+    chainstate: StacksChainState,
+    mempool: MemPoolDB,
+    poll_timeout_ms: u64,
+}
+
+impl PeerRuntimeResources {
+    pub fn open(
+        config: &Config,
+        pox_constants: PoxConstants,
+        mut network: PeerNetwork,
+        origin: PeerNetworkOrigin,
+    ) -> Self {
+        let mempool = config
+            .connect_mempool_db()
+            .expect("FATAL: database failure opening mempool");
+        let sortition_db = SortitionDB::open(
+            &config.get_burn_db_file_path(),
+            false,
+            pox_constants,
+            Some(config.node.get_marf_opts()),
+        )
+        .expect("FATAL: could not open sortition DB");
+        let chainstate = open_chainstate(config).expect("FATAL: could not open chainstate DB");
+
+        let p2p_socket: SocketAddr = config
+            .node
+            .p2p_bind
+            .parse()
+            .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.p2p_bind));
+        let rpc_socket = config
+            .node
+            .rpc_bind
+            .parse()
+            .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.rpc_bind));
+
+        match origin {
+            PeerNetworkOrigin::Fresh => network
+                .bind(&p2p_socket, &rpc_socket)
+                .expect("BUG: PeerNetwork could not bind or is already bound"),
+            PeerNetworkOrigin::Inherited => {
+                let did_bind = network
+                    .try_bind(&p2p_socket, &rpc_socket)
+                    .expect("BUG: PeerNetwork could not bind");
+                if !did_bind {
+                    info!("`PeerNetwork::bind()` skipped, already bound");
+                }
+            }
+        }
+
+        Self {
+            network,
+            sortition_db,
+            chainstate,
+            mempool,
+            poll_timeout_ms: config.get_poll_time(),
+        }
+    }
+
+    pub fn network(&self) -> &PeerNetwork {
+        &self.network
+    }
+
+    pub fn poll_timeout_ms(&self) -> u64 {
+        self.poll_timeout_ms
+    }
+
+    pub fn with_chainstate<R>(
+        &mut self,
+        operation: impl FnOnce(&SortitionDB, &mut StacksChainState, &mut MemPoolDB) -> R,
+    ) -> R {
+        operation(&self.sortition_db, &mut self.chainstate, &mut self.mempool)
+    }
+
+    pub fn with_network_state<R>(
+        &mut self,
+        operation: impl FnOnce(
+            &mut PeerNetwork,
+            &SortitionDB,
+            &mut StacksChainState,
+            &mut MemPoolDB,
+        ) -> R,
+    ) -> R {
+        operation(
+            &mut self.network,
+            &self.sortition_db,
+            &mut self.chainstate,
+            &mut self.mempool,
+        )
+    }
+
+    pub fn into_network(self) -> PeerNetwork {
+        self.network
+    }
+}
+
+/// Run the era-neutral setup and polling lifecycle around a protocol peer pass.
+pub fn run_peer_network_loop(
+    config: &Config,
+    should_keep_running: Arc<AtomicBool>,
+    mut run_one_pass: impl FnMut(
+        &BitcoinIndexer,
+        Option<&mut DNSClient>,
+        &dyn CostEstimator,
+        &dyn CostMetric,
+        Option<&dyn FeeEstimator>,
+    ) -> bool,
+) {
+    let (mut dns_resolver, mut dns_client) = DNSResolver::new(10);
+    thread::Builder::new()
+        .name("dns-resolver".to_string())
+        .spawn(move || {
+            debug!("DNS resolver thread ID is {:?}", thread::current().id());
+            dns_resolver.thread_main();
+        })
+        .expect("FATAL: failed to start DNS resolver thread");
+
+    // These services must be instantiated in the peer thread because they
+    // cannot safely be transferred from the spawning thread.
+    let fee_estimator = config.make_fee_estimator();
+    let cost_estimator = config
+        .make_cost_estimator()
+        .unwrap_or_else(|| Box::new(UnitEstimator));
+    let cost_metric = config
+        .make_cost_metric()
+        .unwrap_or_else(|| Box::new(UnitMetric));
+    let indexer = make_bitcoin_indexer(config, Some(should_keep_running.clone()));
+
+    while should_keep_running.load(Ordering::SeqCst)
+        && run_one_pass(
+            &indexer,
+            Some(&mut dns_client),
+            cost_estimator.as_ref(),
+            cost_metric.as_ref(),
+            fee_estimator.as_deref(),
+        )
+    {}
+}
+
+impl PeerProgress {
+    /// Record a network result and notify the synchronization watchdog about
+    /// newly completed state-machine passes.
+    pub fn observe(
+        &mut self,
+        result: &NetworkResult,
+        sync_comms: &mut PoxSyncWatchdogComms,
+    ) -> PeerProgressUpdate {
+        self.observe_counts(
+            result.num_state_machine_passes,
+            result.num_inv_sync_passes,
+            result.num_download_passes,
+            result.burn_height,
+            sync_comms,
+        )
+    }
+
+    fn observe_counts(
+        &mut self,
+        p2p_state_machine_passes: u64,
+        inventory_sync_passes: u64,
+        download_passes: u64,
+        burn_height: u64,
+        sync_comms: &mut PoxSyncWatchdogComms,
+    ) -> PeerProgressUpdate {
+        let p2p_advanced = self.p2p_state_machine_passes < p2p_state_machine_passes;
+        if p2p_advanced {
+            sync_comms.notify_p2p_state_pass();
+            self.p2p_state_machine_passes = p2p_state_machine_passes;
+        }
+
+        let inventory_advanced = self.inventory_sync_passes < inventory_sync_passes;
+        if inventory_advanced {
+            sync_comms.notify_inv_sync_pass();
+            self.inventory_sync_passes = inventory_sync_passes;
+        }
+
+        let downloader_advanced = self.download_passes < download_passes;
+        if downloader_advanced {
+            sync_comms.notify_download_pass();
+            self.download_passes = download_passes;
+        }
+
+        let burn_height_changed = self.burn_height != burn_height;
+        self.burn_height = burn_height;
+
+        PeerProgressUpdate {
+            burn_height_changed,
+            inventory_advanced,
+            downloader_advanced,
+        }
+    }
+}
 
 /// Era-independent network components needed to construct peer and relayer workers.
 pub struct NodeNetwork {
@@ -256,5 +506,62 @@ impl<'a> PeerNetworkBuilder<'a> {
             tx.commit().unwrap();
         }
         peerdb
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use super::PeerProgress;
+    use crate::syncctl::PoxSyncWatchdogComms;
+
+    fn sync_comms() -> PoxSyncWatchdogComms {
+        PoxSyncWatchdogComms::new(Arc::new(AtomicBool::new(true)))
+    }
+
+    #[test]
+    fn peer_progress_notifies_each_new_pass_once() {
+        let mut progress = PeerProgress::default();
+        let mut sync_comms = sync_comms();
+
+        let update = progress.observe_counts(1, 2, 3, 100, &mut sync_comms);
+        assert!(update.inventory_advanced());
+        assert!(update.downloader_advanced());
+        assert!(update.burn_height_changed());
+        assert_eq!(sync_comms.get_p2p_state_passes(), 1);
+        assert_eq!(sync_comms.get_inv_sync_passes(), 1);
+        assert_eq!(sync_comms.get_download_passes(), 1);
+
+        let update = progress.observe_counts(1, 2, 3, 100, &mut sync_comms);
+        assert!(!update.inventory_advanced());
+        assert!(!update.downloader_advanced());
+        assert!(!update.burn_height_changed());
+        assert_eq!(sync_comms.get_p2p_state_passes(), 1);
+        assert_eq!(sync_comms.get_inv_sync_passes(), 1);
+        assert_eq!(sync_comms.get_download_passes(), 1);
+    }
+
+    #[test]
+    fn peer_progress_reports_independent_edges() {
+        let mut progress = PeerProgress::default();
+        let mut sync_comms = sync_comms();
+        progress.observe_counts(1, 1, 1, 100, &mut sync_comms);
+
+        let inventory = progress.observe_counts(1, 2, 1, 100, &mut sync_comms);
+        assert!(inventory.inventory_advanced());
+        assert!(!inventory.downloader_advanced());
+        assert!(!inventory.burn_height_changed());
+
+        let downloader = progress.observe_counts(1, 2, 2, 100, &mut sync_comms);
+        assert!(!downloader.inventory_advanced());
+        assert!(downloader.downloader_advanced());
+        assert!(!downloader.burn_height_changed());
+
+        let burn_height = progress.observe_counts(1, 2, 2, 101, &mut sync_comms);
+        assert!(!burn_height.inventory_advanced());
+        assert!(!burn_height.downloader_advanced());
+        assert!(burn_height.burn_height_changed());
     }
 }

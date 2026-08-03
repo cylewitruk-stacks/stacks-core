@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use stacks::burnchains::Txid;
 use stacks::chainstate::burn::operations::LeaderKeyRegisterOp;
@@ -8,7 +10,7 @@ use stacks::chainstate::burn::BlockSnapshot;
 use stacks::chainstate::coordinator::comm::CoordinatorChannels;
 use stacks::chainstate::stacks::db::unconfirmed::UnconfirmedTxMap;
 use stacks::chainstate::stacks::db::StacksChainState;
-use stacks::chainstate::stacks::miner::MinerStatus;
+use stacks::chainstate::stacks::miner::{signal_mining_blocked, MinerStatus};
 use stacks::config::{BurnchainConfig, MinerConfig};
 
 use crate::node::leader_key::{LeaderKeyRegistrationState, RegisteredKey};
@@ -184,6 +186,25 @@ impl<T> Globals<T> {
     #[cfg_attr(test, mutants::skip)]
     pub fn signal_stop(&self) {
         self.should_keep_running.store(false, Ordering::SeqCst);
+    }
+
+    /// Stop peer-dependent workers and reliably deliver the relayer's exit
+    /// directive after peer polling has ended.
+    pub fn shutdown_peer_worker(&self, mut exit_directive: T) {
+        signal_mining_blocked(self.get_miner_status());
+        self.signal_stop();
+
+        loop {
+            match self.relay_send.try_send(exit_directive) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => break,
+                Err(TrySendError::Full(directive)) => {
+                    exit_directive = directive;
+                    warn!("Failed to direct relayer thread to exit, sleeping and trying again");
+                    thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+        info!("P2P thread exit!");
     }
 
     /// Should we keep running?
