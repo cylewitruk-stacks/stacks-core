@@ -494,9 +494,10 @@ impl EpochRuntime {
 
         let keychain = Keychain::default(self.config().node.seed.clone());
         let mut op_signer = keychain.generate_op_signer();
-        if let Err(e) = burnchain.create_wallet_if_dne() {
-            warn!("Error when creating wallet: {e:?}");
-        }
+
+        // A miner cannot operate without its configured wallet. Retry here
+        // because bitcoind may still be starting up.
+        burnchain.ensure_miner_wallet_loaded();
 
         let mut address_epochs = vec![StacksEpochId::Epoch2_05];
         if self.config().miner.segwit {

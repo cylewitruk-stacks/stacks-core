@@ -57,7 +57,7 @@ mod utils {
         config.burnchain.username = Some(String::from("user"));
         config.burnchain.password = Some(String::from("12345"));
         config.burnchain.peer_host = String::from("127.0.0.1");
-        config.burnchain.wallet_name = "my_wallet".to_string();
+        config.burnchain.wallet_name = Some("my_wallet".to_string());
         config.burnchain.rpc_port = 10000;
         config.burnchain.timeout = 300;
         config
@@ -263,6 +263,75 @@ fn test_create_wallet_ok() {
     client
         .create_wallet("testwallet", Some(true))
         .expect("create wallet should be ok!");
+}
+
+#[test]
+fn test_load_wallet_ok() {
+    let expected_request = json!({
+        "jsonrpc": "2.0",
+        "id": "stacks",
+        "method": "loadwallet",
+        "params": ["testwallet"]
+    });
+
+    let mock_response = json!({
+        "id": "stacks",
+        "result": {
+            "name": "testwallet",
+            "warning": null
+        },
+        "error": null
+    });
+
+    let mut server: mockito::ServerGuard = mockito::Server::new();
+    let _m = server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::PartialJson(expected_request.clone()))
+        .with_status(200)
+        .with_header("Content-Type", "application/json")
+        .with_body(mock_response.to_string())
+        .create();
+
+    let client = utils::setup_client(&server);
+    client
+        .load_wallet("testwallet")
+        .expect("load wallet should be ok!");
+}
+
+#[test]
+fn test_list_wallet_dir_ok() {
+    let expected_request = json!({
+        "jsonrpc": "2.0",
+        "id": "stacks",
+        "method": "listwalletdir",
+        "params": []
+    });
+
+    let mock_response = json!({
+        "id": "stacks",
+        "result": {
+            "wallets": [
+                { "name": "wallet1" },
+                { "name": "wallet2" }
+            ]
+        },
+        "error": null
+    });
+
+    let mut server: mockito::ServerGuard = mockito::Server::new();
+    let _m = server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::PartialJson(expected_request.clone()))
+        .with_status(200)
+        .with_header("Content-Type", "application/json")
+        .with_body(mock_response.to_string())
+        .create();
+
+    let client = utils::setup_client(&server);
+    let wallets = client
+        .list_wallet_dir()
+        .expect("list wallet dir should be ok!");
+    assert_eq!(vec!["wallet1".to_owned(), "wallet2".to_owned()], wallets);
 }
 
 #[test]
@@ -682,6 +751,7 @@ fn test_send_raw_transaction_ok_with_custom_params() {
 fn test_get_descriptor_info_ok() {
     let descriptor = format!("addr(bc1_address)");
     let expected_checksum = "mychecksum";
+    let expected_descriptor = format!("{descriptor}#{expected_checksum}");
 
     let expected_request = json!({
         "jsonrpc": "2.0",
@@ -693,6 +763,7 @@ fn test_get_descriptor_info_ok() {
     let mock_response = json!({
         "id": "stacks",
         "result": {
+            "descriptor": expected_descriptor,
             "checksum": expected_checksum
         },
         "error": null,
@@ -711,13 +782,13 @@ fn test_get_descriptor_info_ok() {
     let info = client
         .get_descriptor_info(&descriptor)
         .expect("Should work!");
+    assert_eq!(expected_descriptor, info.descriptor);
     assert_eq!(expected_checksum, info.checksum);
 }
 
 #[test]
 fn test_import_descriptors_ok() {
     let descriptor = "addr(1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa)#checksum";
-    let timestamp = 0;
     let internal = true;
 
     let expected_request = json!({
@@ -728,7 +799,7 @@ fn test_import_descriptors_ok() {
             [
                 {
                     "desc": descriptor,
-                    "timestamp": 0,
+                    "timestamp": "now",
                     "internal": true
                 }
             ]
@@ -757,7 +828,7 @@ fn test_import_descriptors_ok() {
 
     let desc_req = ImportDescriptorsRequest {
         descriptor: descriptor.to_string(),
-        timestamp,
+        timestamp: Timestamp::Now,
         internal: Some(internal),
     };
     let result = client
@@ -793,7 +864,7 @@ fn test_import_descriptors_fails_when_bitcoin_core_rejects_descriptor() {
     let client = utils::setup_client(&server);
     let request = ImportDescriptorsRequest {
         descriptor: "invalid#descriptor".into(),
-        timestamp: 0,
+        timestamp: Timestamp::Time(0),
         internal: None,
     };
 
@@ -825,7 +896,7 @@ fn test_import_descriptors_rejects_incomplete_result_set() {
     let client = utils::setup_client(&server);
     let request = ImportDescriptorsRequest {
         descriptor: "addr(example)#checksum".into(),
-        timestamp: 0,
+        timestamp: Timestamp::Time(0),
         internal: None,
     };
 

@@ -68,7 +68,33 @@ pub struct GetTransactionResponse {
 /// Additional fields can be added in the future as needed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DescriptorInfoResponse {
+    /// The canonical descriptor, exercised by the bitcoind compatibility tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub descriptor: String,
     pub checksum: String,
+}
+
+/// Starting point for the scan performed by Bitcoin Core when importing a
+/// descriptor.
+#[derive(Debug, Clone)]
+pub enum Timestamp {
+    /// Track transactions from the current blockchain time onward.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Now,
+    /// Scan from this Unix timestamp, in seconds.
+    Time(u64),
+}
+
+impl serde::Serialize for Timestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match *self {
+            Self::Now => serializer.serialize_str("now"),
+            Self::Time(timestamp) => serializer.serialize_u64(timestamp),
+        }
+    }
 }
 
 /// Represents a single descriptor import request for use with the `importdescriptors` RPC method.
@@ -85,7 +111,7 @@ pub struct ImportDescriptorsRequest {
     #[serde(rename = "desc")]
     pub descriptor: String,
     /// Specifies when the wallet should begin tracking addresses from this descriptor.
-    pub timestamp: u64,
+    pub timestamp: Timestamp,
     /// Optional flag indicating whether the descriptor is used for change addresses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub internal: Option<bool>,
@@ -250,6 +276,24 @@ pub struct ImportDescriptorsErrorMessage {
     pub message: String,
 }
 
+/// Response for the `listwalletdir` RPC call.
+///
+/// # Notes
+/// This struct supports a subset of available fields to match current usage.
+/// Additional fields can be added in the future as needed.
+#[derive(Debug, Clone, Deserialize)]
+struct ListWalletDirResponse {
+    /// The wallets present in the wallet directory.
+    wallets: Vec<WalletDirEntry>,
+}
+
+/// A single wallet entry returned by the `listwalletdir` RPC call.
+#[derive(Debug, Clone, Deserialize)]
+struct WalletDirEntry {
+    /// The wallet name.
+    name: String,
+}
+
 /// Response for `generatetoaddress` rpc, mainly used as deserialization wrapper for `BurnchainHeaderHash`
 #[cfg(test)]
 struct GenerateToAddressResponse(pub Vec<BurnchainHeaderHash>);
@@ -406,37 +450,20 @@ impl BitcoinRpcClient {
         format!("wallet/{wallet}")
     }
 
-    /// Creates and loads a new wallet into the Bitcoin Core node.
-    ///
-    /// Wallet is stored in the `-walletdir` specified in the Bitcoin Core configuration (or the default data directory if not set).
+    /// Loads an existing wallet from the Bitcoin Core wallet directory.
     ///
     /// # Arguments
-    /// * `wallet_name` - Name of the wallet to create.
-    /// * `disable_private_keys` - If `Some(true)`, the wallet will not be able to hold private keys.
-    ///   If `None`, this defaults to `false`, allowing private key import/use.
+    /// * `wallet_name` - Name of the wallet to load.
     ///
     /// # Returns
-    /// Returns `Ok(())` if the wallet is created successfully.
+    /// Returns `Ok(())` if the wallet is loaded successfully.
     ///
     /// # Availability
     /// - **Since**: Bitcoin Core **v0.17.0**.
-    ///
-    /// # Notes
-    /// This method supports a subset of available RPC arguments to match current usage.
-    /// Additional parameters can be added in the future as needed.
-    pub fn create_wallet(
-        &self,
-        wallet_name: &str,
-        disable_private_keys: Option<bool>,
-    ) -> BitcoinRpcClientResult<()> {
-        let disable_private_keys = disable_private_keys.unwrap_or(false);
-
-        self.endpoint.send::<Value>(
-            &self.client_id,
-            None,
-            "createwallet",
-            vec![wallet_name.into(), disable_private_keys.into()],
-        )?;
+    pub fn load_wallet(&self, wallet_name: &str) -> BitcoinRpcClientResult<()> {
+        let params = vec![wallet_name.into()];
+        self.endpoint
+            .send::<Value>(&self.client_id, None, "loadwallet", params)?;
         Ok(())
     }
 
@@ -451,6 +478,21 @@ impl BitcoinRpcClient {
         Ok(self
             .endpoint
             .send(&self.client_id, None, "listwallets", vec![])?)
+    }
+
+    /// Returns the names of the wallets in the Bitcoin Core wallet directory,
+    /// whether they are loaded or not.
+    ///
+    /// # Returns
+    /// A vector of wallet names as strings.
+    ///
+    /// # Availability
+    /// - **Since**: Bitcoin Core **v0.18.0**.
+    pub fn list_wallet_dir(&self) -> BitcoinRpcClientResult<Vec<String>> {
+        let response: ListWalletDirResponse =
+            self.endpoint
+                .send(&self.client_id, None, "listwalletdir", vec![])?;
+        Ok(response.wallets.into_iter().map(|w| w.name).collect())
     }
 
     /// Retrieve a list of unspent transaction outputs (UTXOs) that meet the specified criteria.
