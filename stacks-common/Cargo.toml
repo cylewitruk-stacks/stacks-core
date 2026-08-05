@@ -78,6 +78,7 @@ sha2 = { version = "0.10" }
 [dev-dependencies]
 proptest = "1.6.0"
 pinny = { workspace = true }
+stacks-protocol = { workspace = true, features = ["testing"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 winapi = { version = "0.3", features = ["fileapi", "processenv", "winnt"] }
