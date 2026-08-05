@@ -5594,7 +5594,7 @@ mod tests {
 
     /// There are three different ways to start a node with a default config:
     ///
-    /// - via `stacks-node mainnet`
+    /// - via `stacks-node start --mainnet`
     /// - via `stacks-node start --config for/bar/baz.toml`, where the config
     ///   file is largely empty
     /// - same as the previous, but the config file also contains empty [sections]
@@ -5614,7 +5614,7 @@ mod tests {
         let seed = "d6f382770fde6b5563afadab79d1a7aa548e15dd2a171152131765df605ab035";
         let local_peer_seed = "9daf9eb08d7fff77ef22a9155fa2a9695ba33f1c9aacdc45e28f54138179e7d5";
 
-        // Create the default mainnet config, as happens when you run `stacks-node mainnet`
+        // Create the default mainnet config, as happens when you run `stacks-node start --mainnet`
         let mut default_file = ConfigFile::mainnet();
         let Some(node) = default_file.node.as_mut() else {
             panic!("node section must exist");

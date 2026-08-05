@@ -1,0 +1,3 @@
+`stacks-node` argument parsing has moved to `clap`. Unknown or misspelled arguments and missing required arguments are now rejected with a usage message and a non-zero exit code, where previously unknown arguments were silently ignored and a missing `--config` panicked and forced a core dump. `--help` and `--version` are now available on the binary and on every subcommand, and the help text is generated from the commands themselves rather than maintained by hand.
+Every `stacks-node` subcommand that accepts `--config` now also accepts the short form `-c`.
+`stacks-node` invoked with no arguments, or with an unrecognized subcommand, now exits with status 2 instead of 0. An unsupported `burnchain.mode` now exits with status 1 instead of 0.
