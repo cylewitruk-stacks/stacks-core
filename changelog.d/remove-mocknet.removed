@@ -1,0 +1,1 @@
+Removed the unsupported Mocknet node mode and its in-process burnchain controller.

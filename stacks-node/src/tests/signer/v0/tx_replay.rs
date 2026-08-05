@@ -24,7 +24,7 @@ use stacks::chainstate::burn::operations::{BlockstackOperationType, PreStxOp, Tr
 use stacks::chainstate::stacks::miner::TEST_EXCLUDE_REPLAY_TXS;
 use stacks::chainstate::stacks::{TenureChangeCause, TenureChangePayload, TransactionPayload};
 use stacks::core::test_util::make_big_read_count_contract;
-use stacks::core::{StacksEpochId, HELIUM_BLOCK_LIMIT_20};
+use stacks::core::{StacksEpochId, BLOCK_LIMIT_REGTEST_20};
 use stacks::net::api::gettransaction::TransactionResponse;
 use stacks::net::api::postblock_proposal::{ValidateRejectCode, TEST_REJECT_REPLAY_TXS};
 use stacks::types::chainstate::{BurnchainHeaderHash, StacksPublicKey};
@@ -33,14 +33,16 @@ use stacks_signer::v0::signer_state::TEST_IGNORE_BITCOIN_FORK_PUBKEYS;
 use stacks_signer::v0::SpawnedSigner;
 
 use super::{SignerTest, *};
-use crate::nakamoto_node::miner::{fault_injection_stall_miner, fault_injection_unstall_miner};
+use crate::node::test_support::nakamoto::miner::{
+    fault_injection_stall_miner, fault_injection_unstall_miner,
+};
 use crate::operations::BurnchainOpSigner;
 use crate::tests::nakamoto_integrations::{next_block_and, wait_for};
 use crate::tests::neon_integrations::{
     get_account, get_chain_info, test_observer, wait_for_tenure_change_tx,
 };
 use crate::tests::{self};
-use crate::{BitcoinRegtestController, BurnchainController, Keychain};
+use crate::{BitcoinRegtestController, Keychain};
 #[test]
 #[ignore]
 /// Trigger a Bitcoin fork and ensure that the signer
@@ -1975,7 +1977,7 @@ fn tx_replay_with_fork_middle_replay_while_tenure_extending() {
 
     info!("---- Deploying big contract ----");
     // First, just deploy the contract in its own tenure
-    let contract_code = make_big_read_count_contract(HELIUM_BLOCK_LIMIT_20, 50);
+    let contract_code = make_big_read_count_contract(BLOCK_LIMIT_REGTEST_20, 50);
     let (_deploy_txid, deploy_nonce) = signer_test
         .submit_contract_deploy(
             &sender_sk,
@@ -2150,7 +2152,7 @@ fn tx_replay_with_fork_middle_replay_while_tenure_extending_and_new_tx_submitted
 
     info!("---- Deploying big contract ----");
     // First, just deploy the contract in its own tenure
-    let contract_code = make_big_read_count_contract(HELIUM_BLOCK_LIMIT_20, 50);
+    let contract_code = make_big_read_count_contract(BLOCK_LIMIT_REGTEST_20, 50);
     let (_deploy_txid, deploy_nonce) = signer_test
         .submit_contract_deploy(
             &sender1_sk,
@@ -2330,7 +2332,7 @@ fn tx_replay_budget_exceeded_tenure_extend() {
     info!("---- Deploying big contract ----");
 
     // First, just deploy the contract in its own tenure
-    let contract_code = make_big_read_count_contract(HELIUM_BLOCK_LIMIT_20, 50);
+    let contract_code = make_big_read_count_contract(BLOCK_LIMIT_REGTEST_20, 50);
 
     let (_deploy_txid, deploy_nonce) = signer_test
         .submit_contract_deploy(&sender_sk, 1000000, contract_code.as_str(), "big-contract")

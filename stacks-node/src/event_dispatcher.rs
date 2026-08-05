@@ -66,13 +66,13 @@ mod worker;
 use db::EventDispatcherDbConnection;
 use payloads::*;
 pub use payloads::{
-    MinedBlockEvent, MinedMicroblockEvent, MinedNakamotoBlockEvent, NakamotoSignerEntryPayload,
-    RewardSetEventPayload, TransactionEventPayload,
+    MinedBlockEvent, MinedMicroblockEvent, MinedNakamotoBlockEvent, TransactionEventPayload,
 };
 pub use stacker_db::StackerDBChannel;
 
 use crate::event_dispatcher::db::PendingPayload;
 use crate::event_dispatcher::worker::{EventDispatcherResult, EventDispatcherWorker};
+use crate::Config;
 
 #[cfg(test)]
 mod tests;
@@ -388,6 +388,18 @@ impl BlockEventDispatcher for EventDispatcher {
 }
 
 impl EventDispatcher {
+    /// Build the dispatcher and register every observer in the node configuration.
+    pub fn from_config(config: &Config) -> Self {
+        let mut dispatcher = Self::new_with_custom_queue_size(
+            config.get_working_dir(),
+            config.node.effective_event_dispatcher_queue_size(),
+        );
+        for observer in &config.events_observers {
+            dispatcher.register_observer(observer);
+        }
+        dispatcher
+    }
+
     /// The default behavior is to create a non-blocking dispatcher with a
     /// queue size of 1,000. Note however that the default *node* configuration
     /// is to always block (i.e. an effective queue size of 0).

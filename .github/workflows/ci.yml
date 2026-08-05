@@ -184,7 +184,7 @@ jobs:
       - setup-env
       - check-test-caches
     uses: ./.github/workflows/_check-cargo-hack.yml
-  
+
   ############################################################################
   ### Constant Check (stacks-inspect)
   ############################################################################

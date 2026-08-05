@@ -117,7 +117,9 @@ pub type RpcResult<T> = Result<T, RpcError>;
 /// Represents supported authentication mechanisms for RPC requests.
 #[derive(Debug, Clone)]
 pub enum RpcAuth {
-    /// No authentication is applied.
+    /// No authentication is applied. Production nodes require credentials, but the transport also
+    /// supports unauthenticated Bitcoin Core instances and mock servers used by integration tests.
+    #[cfg(test)]
     None,
     /// HTTP Basic authentication using a username and password.
     Basic { username: String, password: String },
@@ -244,6 +246,7 @@ impl RpcTransport {
     /// Build auth header if needed
     fn auth_header(&self) -> Option<String> {
         match &self.auth {
+            #[cfg(test)]
             RpcAuth::None => None,
             RpcAuth::Basic { username, password } => {
                 let credentials = format!("{}:{}", username, password);

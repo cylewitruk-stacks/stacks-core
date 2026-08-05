@@ -25,7 +25,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use super::SignerTest;
-use crate::nakamoto_node::stackerdb_listener::TEST_IGNORE_SIGNERS;
+use crate::node::test_support::nakamoto::signer::listener::TEST_IGNORE_SIGNERS;
 use crate::tests::signer::v0::{
     wait_for_block_acceptance_from_signers, wait_for_block_pre_commits_from_signers,
     wait_for_block_proposal, wait_for_block_pushed_and_tip,

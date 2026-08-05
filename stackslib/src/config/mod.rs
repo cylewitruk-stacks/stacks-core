@@ -155,7 +155,7 @@ pub const DEFAULT_PROPOSAL_MEMORY_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GB
 /// Default maximum heap allocation for a single read-only RPC call before it is aborted.
 pub const DEFAULT_READ_ONLY_CALL_MAX_MEM_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB
 
-static HELIUM_DEFAULT_CONNECTION_OPTIONS: LazyLock<ConnectionOptions> =
+static DEFAULT_CONNECTION_OPTIONS: LazyLock<ConnectionOptions> =
     LazyLock::new(|| ConnectionOptions {
         inbox_maxlen: 100,
         outbox_maxlen: 100,
@@ -323,94 +323,6 @@ impl ConfigFile {
             burnchain: Some(burnchain),
             node: Some(node),
             ustx_balance: None,
-            ..ConfigFile::default()
-        }
-    }
-
-    pub fn helium() -> ConfigFile {
-        // ## Settings for local testnet, relying on a local bitcoind server
-        // ## running with the following bitcoin.conf:
-        // ##
-        // ##    chain=regtest
-        // ##    disablewallet=0
-        // ##    txindex=1
-        // ##    server=1
-        // ##    rpcuser=helium
-        // ##    rpcpassword=helium
-        // ##
-        let burnchain = BurnchainConfigFile {
-            mode: Some("helium".to_string()),
-            commit_anchor_block_within: Some(10_000),
-            rpc_port: Some(18443),
-            peer_port: Some(18444),
-            peer_host: Some("0.0.0.0".to_string()),
-            username: Some("helium".to_string()),
-            password: Some("helium".to_string()),
-            local_mining_public_key: Some("04ee0b1602eb18fef7986887a7e8769a30c9df981d33c8380d255edef003abdcd243a0eb74afdf6740e6c423e62aec631519a24cf5b1d62bf8a3e06ddc695dcb77".to_string()),
-            ..BurnchainConfigFile::default()
-        };
-
-        let node = NodeConfigFile {
-            miner: Some(false),
-            stacker: Some(false),
-            ..NodeConfigFile::default()
-        };
-
-        ConfigFile {
-            burnchain: Some(burnchain),
-            node: Some(node),
-            ..ConfigFile::default()
-        }
-    }
-
-    pub fn mocknet() -> ConfigFile {
-        let burnchain = BurnchainConfigFile {
-            mode: Some("mocknet".to_string()),
-            commit_anchor_block_within: Some(10_000),
-            ..BurnchainConfigFile::default()
-        };
-
-        let node = NodeConfigFile {
-            miner: Some(false),
-            stacker: Some(false),
-            ..NodeConfigFile::default()
-        };
-
-        let balances = vec![
-            InitialBalanceFile {
-                // "mnemonic": "point approve language letter cargo rough similar wrap focus edge polar task olympic tobacco cinnamon drop lawn boring sort trade senior screen tiger climb",
-                // "privateKey": "539e35c740079b79f931036651ad01f76d8fe1496dbd840ba9e62c7e7b355db001",
-                // "btcAddress": "n1htkoYKuLXzPbkn9avC2DJxt7X85qVNCK",
-                address: "ST3EQ88S02BXXD0T5ZVT3KW947CRMQ1C6DMQY8H19".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                // "mnemonic": "laugh capital express view pull vehicle cluster embark service clerk roast glance lumber glove purity project layer lyrics limb junior reduce apple method pear",
-                // "privateKey": "075754fb099a55e351fe87c68a73951836343865cd52c78ae4c0f6f48e234f3601",
-                // "btcAddress": "n2ZGZ7Zau2Ca8CLHGh11YRnLw93b4ufsDR",
-                address: "ST3KCNDSWZSFZCC6BE4VA9AXWXC9KEB16FBTRK36T".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                // "mnemonic": "level garlic bean design maximum inhale daring alert case worry gift frequent floor utility crowd twenty burger place time fashion slow produce column prepare",
-                // "privateKey": "374b6734eaff979818c5f1367331c685459b03b1a2053310906d1408dc928a0001",
-                // "btcAddress": "mhY4cbHAFoXNYvXdt82yobvVuvR6PHeghf",
-                address: "STB2BWB0K5XZGS3FXVTG3TKS46CQVV66NAK3YVN8".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                // "mnemonic": "drop guess similar uphold alarm remove fossil riot leaf badge lobster ability mesh parent lawn today student olympic model assault syrup end scorpion lab",
-                // "privateKey": "26f235698d02803955b7418842affbee600fc308936a7ca48bf5778d1ceef9df01",
-                // "btcAddress": "mkEDDqbELrKYGUmUbTAyQnmBAEz4V1MAro",
-                address: "STSTW15D618BSZQB85R058DS46THH86YQQY6XCB7".to_string(),
-                amount: 10000000000000000,
-            },
-        ];
-
-        ConfigFile {
-            burnchain: Some(burnchain),
-            node: Some(node),
-            ustx_balance: Some(balances),
             ..ConfigFile::default()
         }
     }
@@ -712,7 +624,6 @@ impl Config {
     #[cfg_attr(test, mutants::skip)]
     fn make_epochs(
         conf_epochs: &[StacksEpochConfigFile],
-        burn_mode: &str,
         bitcoin_network: BitcoinNetworkType,
         pox_2_activation: Option<u32>,
     ) -> Result<EpochList<ExecutionCost>, String> {
@@ -824,12 +735,6 @@ impl Config {
                 .map_err(|_| "End height must be a non-negative integer")?;
         }
 
-        if burn_mode == "mocknet" {
-            for epoch in out_epochs.iter_mut() {
-                epoch.block_limit = ExecutionCost::max_value();
-            }
-        }
-
         if let Some(pox_2_activation) = pox_2_activation {
             let last_epoch = out_epochs
                 .iter()
@@ -914,33 +819,23 @@ impl Config {
             ..
         } = default;
 
+        if config_file
+            .burnchain
+            .as_ref()
+            .and_then(|burnchain| burnchain.mode.as_ref())
+            .is_none()
+        {
+            return Err(format!(
+                "Setting burnchain.mode is required (one of: {})",
+                BurnchainConfig::SUPPORTED_MODES.join(", ")
+            ));
+        }
+
         // First parse the burnchain config
         let burnchain = match config_file.burnchain {
             Some(burnchain) => burnchain.into_config_default(default_burnchain_config)?,
             None => default_burnchain_config,
         };
-
-        let supported_modes = [
-            "mocknet",
-            "helium",
-            "neon",
-            "argon",
-            "krypton",
-            "xenon",
-            "mainnet",
-            "nakamoto-neon",
-        ];
-
-        if !supported_modes.contains(&burnchain.mode.as_str()) {
-            return Err(format!(
-                "Setting burnchain.network not supported (should be: {})",
-                supported_modes.join(", ")
-            ));
-        }
-
-        if burnchain.mode == "helium" && burnchain.local_mining_public_key.is_none() {
-            return Err("Config is missing the setting `burnchain.local_mining_public_key` (mandatory for helium)".into());
-        }
 
         let is_mainnet = burnchain.mode == "mainnet";
 
@@ -1086,7 +981,7 @@ impl Config {
 
         let connection_options = match config_file.connection_options {
             Some(opts) => opts.into_config(is_mainnet)?,
-            None => HELIUM_DEFAULT_CONNECTION_OPTIONS.clone(),
+            None => DEFAULT_CONNECTION_OPTIONS.clone(),
         };
 
         let estimation = match config_file.fee_estimation {
@@ -1355,7 +1250,7 @@ impl std::default::Default for Config {
         let node = NodeConfig::default();
         let burnchain = BurnchainConfig::default();
 
-        let connection_options = HELIUM_DEFAULT_CONNECTION_OPTIONS.clone();
+        let connection_options = DEFAULT_CONNECTION_OPTIONS.clone();
         let estimation = FeeEstimationConfig::default();
         let mainnet = burnchain.mode == "mainnet";
 
@@ -1388,14 +1283,16 @@ pub struct BurnchainConfig {
     /// Supported values:
     /// - `"mainnet"`: mainnet
     /// - `"xenon"`: testnet
-    /// - `"mocknet"`: regtest
-    /// - `"helium"`: regtest
     /// - `"neon"`: regtest
     /// - `"argon"`: regtest
     /// - `"krypton"`: regtest
     /// - `"nakamoto-neon"`: regtest
     /// ---
-    /// @default: `"mocknet"`
+    /// @required: true
+    /// @notes:
+    ///   - Configuration files must set this field explicitly.
+    ///   - [`BurnchainConfig::default()`] uses `"neon"` only for programmatic
+    ///     construction.
     pub mode: String,
     /// The network-specific identifier used in P2P communication and database initialization.
     /// ---
@@ -1506,7 +1403,7 @@ pub struct BurnchainConfig {
     /// public key.
     ///
     /// It is primarily used in modes that rely on a controlled Bitcoin regtest
-    /// backend (e.g., "helium", "mocknet", "neon") where the Stacks node itself
+    /// backend (e.g., `"neon"`) where the Stacks node itself
     /// needs to instruct the Bitcoin node to generate blocks.
     ///
     /// The key is used to derive the Bitcoin address that receives the coinbase
@@ -1514,7 +1411,7 @@ pub struct BurnchainConfig {
     /// ---
     /// @default: `None`
     /// @notes:
-    ///   - Mandatory if [`BurnchainConfig::mode`] is "helium".
+    ///   - Used only by controlled Bitcoin regtest configurations.
     ///   - This is intended strictly for testing purposes.
     pub local_mining_public_key: Option<String>,
     /// Optional bitcoin block height at which the Stacks node process should
@@ -1751,10 +1648,19 @@ pub struct BurnchainConfig {
 }
 
 impl BurnchainConfig {
+    pub const SUPPORTED_MODES: &'static [&'static str] = &[
+        "neon",
+        "argon",
+        "krypton",
+        "xenon",
+        "mainnet",
+        "nakamoto-neon",
+    ];
+
     fn default() -> BurnchainConfig {
         BurnchainConfig {
             chain: "bitcoin".to_string(),
-            mode: "mocknet".to_string(),
+            mode: "neon".to_string(),
             chain_id: CHAIN_ID_TESTNET,
             peer_version: PEER_VERSION_TESTNET,
             burn_fee_cap: 20000,
@@ -1814,7 +1720,7 @@ impl BurnchainConfig {
         match self.mode.as_str() {
             "mainnet" => ("mainnet".to_string(), BitcoinNetworkType::Mainnet),
             "xenon" => ("testnet".to_string(), BitcoinNetworkType::Testnet),
-            "helium" | "neon" | "argon" | "krypton" | "mocknet" | "nakamoto-neon" => {
+            "neon" | "argon" | "krypton" | "nakamoto-neon" => {
                 ("regtest".to_string(), BitcoinNetworkType::Regtest)
             }
             other => panic!("Invalid stacks-node mode: {other}"),
@@ -1901,6 +1807,12 @@ impl BurnchainConfigFile {
         }
 
         let mode = self.mode.unwrap_or(default_burnchain_config.mode);
+        if !BurnchainConfig::SUPPORTED_MODES.contains(&mode.as_str()) {
+            return Err(format!(
+                "Setting burnchain.mode = \"{mode}\" not supported (should be: {})",
+                BurnchainConfig::SUPPORTED_MODES.join(", ")
+            ));
+        }
         let is_mainnet = mode == "mainnet";
         if is_mainnet {
             // check magic bytes and set if not defined
@@ -2058,7 +1970,6 @@ impl BurnchainConfigFile {
         if let Some(ref conf_epochs) = self.epochs {
             config.epochs = Some(Config::make_epochs(
                 conf_epochs,
-                &config.mode,
                 config.get_bitcoin_network().1,
                 self.pox_2_activation,
             )?);
@@ -2073,7 +1984,7 @@ pub struct NodeConfig {
     /// Human-readable name for the node. Primarily used for identification in testing
     /// environments (e.g., deriving log file names, temporary directory names).
     /// ---
-    /// @default: `"helium-node"`
+    /// @default: `"stacks-node"`
     pub name: String,
     /// The node's Bitcoin wallet private key, provided as a hex string in the config file.
     /// Used to initialize the node's keychain for signing operations.
@@ -2589,7 +2500,7 @@ impl Default for NodeConfig {
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
 
-        let name = "helium-node";
+        let name = "stacks-node";
         NodeConfig {
             name: name.to_string(),
             seed: seed.to_vec(),
@@ -3941,9 +3852,7 @@ impl ConnectionOptionsFile {
                     .map_err(|e| format!("Invalid connection_option.public_ip_address: {e}"))
             })
             .transpose()?;
-        let mut read_only_call_limit = HELIUM_DEFAULT_CONNECTION_OPTIONS
-            .read_only_call_limit
-            .clone();
+        let mut read_only_call_limit = DEFAULT_CONNECTION_OPTIONS.read_only_call_limit.clone();
         if let Some(x) = self.read_only_call_limit_write_length {
             read_only_call_limit.write_length = x;
         }
@@ -3964,80 +3873,80 @@ impl ConnectionOptionsFile {
             read_only_call_limit,
             inbox_maxlen: self
                 .inbox_maxlen
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.inbox_maxlen),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.inbox_maxlen),
             outbox_maxlen: self
                 .outbox_maxlen
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.outbox_maxlen),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.outbox_maxlen),
             timeout: self
                 .timeout
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.timeout),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.timeout),
             idle_timeout: self
                 .idle_timeout
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.idle_timeout),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.idle_timeout),
             heartbeat: self
                 .heartbeat
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.heartbeat),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.heartbeat),
             private_key_lifetime: self
                 .private_key_lifetime
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.private_key_lifetime),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.private_key_lifetime),
             num_neighbors: self
                 .num_neighbors
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.num_neighbors),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.num_neighbors),
             num_clients: self
                 .num_clients
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.num_clients),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.num_clients),
             soft_num_neighbors: self
                 .soft_num_neighbors
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_num_neighbors),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.soft_num_neighbors),
             soft_num_clients: self
                 .soft_num_clients
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_num_clients),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.soft_num_clients),
             max_neighbors_per_host: self
                 .max_neighbors_per_host
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_neighbors_per_host),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.max_neighbors_per_host),
             max_clients_per_host: self
                 .max_clients_per_host
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_clients_per_host),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.max_clients_per_host),
             soft_max_neighbors_per_host: self
                 .soft_max_neighbors_per_host
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_max_neighbors_per_host),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.soft_max_neighbors_per_host),
             soft_max_neighbors_per_org: self
                 .soft_max_neighbors_per_org
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_max_neighbors_per_org),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.soft_max_neighbors_per_org),
             soft_max_clients_per_host: self
                 .soft_max_clients_per_host
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_max_clients_per_host),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.soft_max_clients_per_host),
             walk_interval: self
                 .walk_interval
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.walk_interval),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.walk_interval),
             walk_seed_probability: self
                 .walk_seed_probability
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.walk_seed_probability),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.walk_seed_probability),
             log_neighbors_freq: self
                 .log_neighbors_freq
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.log_neighbors_freq),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.log_neighbors_freq),
             dns_timeout: self
                 .dns_timeout
                 .map(|dns_timeout| dns_timeout as u128)
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.dns_timeout),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.dns_timeout),
             max_inflight_blocks: self
                 .max_inflight_blocks
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_inflight_blocks),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.max_inflight_blocks),
             max_inflight_attachments: self
                 .max_inflight_attachments
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_inflight_attachments),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.max_inflight_attachments),
             maximum_call_argument_size: self
                 .maximum_call_argument_size
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.maximum_call_argument_size),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.maximum_call_argument_size),
             download_interval: self
                 .download_interval
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.download_interval),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.download_interval),
             inv_sync_interval: self
                 .inv_sync_interval
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.inv_sync_interval),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.inv_sync_interval),
             inv_reward_cycles: self.inv_reward_cycles.unwrap_or_else(|| {
                 if is_mainnet {
-                    HELIUM_DEFAULT_CONNECTION_OPTIONS.inv_reward_cycles
+                    DEFAULT_CONNECTION_OPTIONS.inv_reward_cycles
                 } else {
                     // testnet reward cycles are a bit smaller (and blocks can go by
                     // faster), so make our inventory
@@ -4052,7 +3961,7 @@ impl ConnectionOptionsFile {
             force_disconnect_interval: self.force_disconnect_interval,
             max_http_clients: self
                 .max_http_clients
-                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_http_clients),
+                .unwrap_or_else(|| DEFAULT_CONNECTION_OPTIONS.max_http_clients),
             connect_timeout: self.connect_timeout.unwrap_or(10),
             handshake_timeout: self.handshake_timeout.unwrap_or(default.handshake_timeout),
             max_sockets: self.max_sockets.unwrap_or(800) as usize,
@@ -4957,12 +4866,19 @@ mod tests {
     }
 
     #[test]
+    fn default_node_name_is_stacks_node() {
+        assert_eq!(NodeConfig::default().name, "stacks-node");
+    }
+
+    #[test]
     fn test_config() {
         assert_eq!(
             format!("node.seed should be a hex encoded string"),
             Config::from_config_file(
                 ConfigFile::from_str(
                     r#"
+                    [burnchain]
+                    mode = "krypton"
                     [node]
                     seed = "invalid-hex-value"
                     "#,
@@ -4978,6 +4894,8 @@ mod tests {
             Config::from_config_file(
                 ConfigFile::from_str(
                     r#"
+                    [burnchain]
+                    mode = "krypton"
                     [node]
                     local_peer_seed = "invalid-hex-value"
                     "#,
@@ -4994,6 +4912,7 @@ mod tests {
             ConfigFile::from_str(
                 r#"
                 [burnchain]
+                mode = "krypton"
                 peer_host = "bitcoin2.blockstack.com"
                 "#,
             )
@@ -5006,7 +4925,61 @@ mod tests {
             &actual_err_msg[..expected_err_prefix.len()]
         );
 
-        assert!(Config::from_config_file(ConfigFile::from_str("").unwrap(), false).is_ok());
+        let error = Config::from_config_file(ConfigFile::from_str("").unwrap(), false).unwrap_err();
+        assert!(error.contains("Setting burnchain.mode is required"));
+    }
+
+    #[test]
+    fn test_burnchain_mode_is_required_for_file_backed_config() {
+        for config_toml in [
+            "",
+            r#"
+            [burnchain]
+            peer_host = "localhost"
+            "#,
+        ] {
+            let error = Config::from_config_file(ConfigFile::from_str(config_toml).unwrap(), false)
+                .unwrap_err();
+            assert!(
+                error.contains("Setting burnchain.mode is required"),
+                "unexpected error: {error}"
+            );
+        }
+
+        let config = Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                [burnchain]
+                mode = "krypton"
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("an explicit supported mode should parse");
+        assert_eq!(config.burnchain.mode, "krypton");
+
+        assert_eq!(BurnchainConfig::default().mode, "neon");
+
+        for removed_mode in ["helium", "mocknet"] {
+            let error = Config::from_config_file(
+                ConfigFile::from_str(&format!(
+                    r#"
+                    [burnchain]
+                    mode = "{removed_mode}"
+                    "#
+                ))
+                .unwrap(),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "Setting burnchain.mode = \"{removed_mode}\" not supported"
+                )),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -5018,6 +4991,7 @@ mod tests {
                 miner = true
 
                 [burnchain]
+                mode = "krypton"
                 {wallet_setting}
                 "#
             );
@@ -5037,6 +5011,7 @@ mod tests {
                 miner = true
 
                 [burnchain]
+                mode = "krypton"
                 wallet_name = "miner-wallet"
                 "#,
             )
@@ -5055,6 +5030,9 @@ mod tests {
                 [node]
                 miner = true
                 mock_mining = true
+
+                [burnchain]
+                mode = "krypton"
                 "#,
             )
             .unwrap(),
@@ -5062,8 +5040,17 @@ mod tests {
         )
         .expect("A mock miner does not use wallet RPCs");
 
-        Config::from_config_file(ConfigFile::from_str("").unwrap(), false)
-            .expect("A follower does not need a wallet");
+        Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                [burnchain]
+                mode = "krypton"
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("A follower does not need a wallet");
     }
 
     /// Build a miner config with the given `burnchain.wallet_name`.
@@ -5074,6 +5061,7 @@ mod tests {
             miner = true
 
             [burnchain]
+            mode = "krypton"
             wallet_name = "{wallet_name}"
             "#
         );
@@ -5137,6 +5125,7 @@ mod tests {
         let config = format!(
             r#"
             [burnchain]
+            mode = "krypton"
             wallet_name = "{wallet_name}"
             "#
         );
@@ -5211,6 +5200,8 @@ mod tests {
         assert!(Config::from_config_file(
             ConfigFile::from_str(
                 r#"
+                [burnchain]
+                mode = "krypton"
                 [node]
                 pox_5_bond_admin = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM"
                 pox_5_pause_admin = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM"
@@ -5411,6 +5402,8 @@ mod tests {
         let config = Config::from_config_file(
             ConfigFile::from_str(
                 r#"
+                [burnchain]
+                mode = "krypton"
                 [connection_options]
                 auth_token = "password"
                 "#,
@@ -5498,6 +5491,8 @@ mod tests {
         // Check MARF defaults
         let config = utils::config_from_valid_string(
             r#"
+                [burnchain]
+                mode = "krypton"
                 [node]
                 "#,
         );
@@ -5527,6 +5522,8 @@ mod tests {
         // Check MARF full config
         let config = utils::config_from_valid_string(
             r#"
+                [burnchain]
+                mode = "krypton"
                 [node]
                 marf_cache_strategy = "everything"
                 marf_defer_hashing = false
@@ -5560,7 +5557,12 @@ mod tests {
     #[test]
     fn test_load_push_bandwidth_fields_config() {
         // check defaults for omitted fields
-        let config = utils::config_from_valid_string("");
+        let config = utils::config_from_valid_string(
+            r#"
+            [burnchain]
+            mode = "krypton"
+            "#,
+        );
         assert_eq!(0, config.connection_options.max_transaction_push_bandwidth,);
         assert_eq!(
             MB!(4),
@@ -5574,6 +5576,8 @@ mod tests {
         // Check values for configured fields
         let config = utils::config_from_valid_string(
             r#"
+            [burnchain]
+            mode = "krypton"
             [connection_options]
             max_transaction_push_bandwidth = 10
             max_stackerdb_push_bandwidth = 20
@@ -5590,7 +5594,7 @@ mod tests {
 
     /// There are three different ways to start a node with a default config:
     ///
-    /// - via `stacks-node mainnet`
+    /// - via `stacks-node start --mainnet`
     /// - via `stacks-node start --config for/bar/baz.toml`, where the config
     ///   file is largely empty
     /// - same as the previous, but the config file also contains empty [sections]
@@ -5610,7 +5614,7 @@ mod tests {
         let seed = "d6f382770fde6b5563afadab79d1a7aa548e15dd2a171152131765df605ab035";
         let local_peer_seed = "9daf9eb08d7fff77ef22a9155fa2a9695ba33f1c9aacdc45e28f54138179e7d5";
 
-        // Create the default mainnet config, as happens when you run `stacks-node mainnet`
+        // Create the default mainnet config, as happens when you run `stacks-node start --mainnet`
         let mut default_file = ConfigFile::mainnet();
         let Some(node) = default_file.node.as_mut() else {
             panic!("node section must exist");

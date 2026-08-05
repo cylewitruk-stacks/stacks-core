@@ -4,7 +4,9 @@ use madhouse::{Command, CommandWrapper};
 use proptest::prelude::{prop_oneof, Just, Strategy};
 
 use super::context::{SignerTestContext, SignerTestState};
-use crate::nakamoto_node::miner::{fault_injection_stall_miner, fault_injection_unstall_miner};
+use crate::node::test_support::nakamoto::miner::{
+    fault_injection_stall_miner, fault_injection_unstall_miner,
+};
 
 /// Command to globally pause or resume Stacks block mining within the test environment.
 /// This command is used to simulate network-wide conditions where Stacks block production might halt or resume.

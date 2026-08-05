@@ -13,4 +13,4 @@ RUN cp -R target/release/. /out
 
 FROM debian:bookworm-slim
 COPY --from=build /out/stacks-node /out/stacks-signer /out/stacks-inspect /bin/
-CMD ["stacks-node", "mainnet"]
+CMD ["stacks-node", "start", "--mainnet"]

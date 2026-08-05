@@ -40,10 +40,9 @@ use stacks_common::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
-use crate::burnchains::BurnchainController;
-use crate::neon::Counters;
+use crate::node::test_support::Counters;
+use crate::node::NodeRunner;
 use crate::operations::BurnchainOpSigner;
-use crate::run_loop::boot_nakamoto;
 use crate::tests::nakamoto_integrations::{
     boot_to_epoch_4_0, enable_epoch_4_0, get_tx_result_by_id, get_tx_status_by_id,
     naka_neon_integration_conf, next_block_and_mine_commit,
@@ -126,7 +125,7 @@ fn check_pox_5_stake_lifecycle() {
     let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
     btc_regtest_controller.bootstrap_chain(201);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -475,7 +474,7 @@ fn check_pox_5_register_for_bond_lifecycle() {
     let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
     btc_regtest_controller.bootstrap_chain(201);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -875,7 +874,7 @@ fn check_pox_5_register_for_second_bond_no_downtime() {
     let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
     btc_regtest_controller.bootstrap_chain(201);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -1534,7 +1533,7 @@ fn check_pox_5_register_for_bond_l1_lockup_lifecycle() {
         .expect("send_btc miner → bondholder");
     btc_regtest_controller.build_next_block(1);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -2525,7 +2524,7 @@ fn check_pox_5_register_for_bond_l1_early_unlock_lifecycle() {
         .expect("send_btc miner -> bondholder");
     btc_regtest_controller.build_next_block(1);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -3676,7 +3675,7 @@ fn check_with_stacking_allowances_stake() {
     let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
     btc_regtest_controller.bootstrap_chain(201);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -4162,7 +4161,7 @@ fn check_with_stacking_allowances_register_for_bond() {
     let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
     btc_regtest_controller.bootstrap_chain(201);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -4733,7 +4732,7 @@ fn check_with_pox_allowances() {
     let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
     btc_regtest_controller.bootstrap_chain(201);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..
@@ -5070,7 +5069,7 @@ fn check_transaction_post_conditions() {
     let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
     btc_regtest_controller.bootstrap_chain(201);
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let Counters {
         blocks_processed, ..

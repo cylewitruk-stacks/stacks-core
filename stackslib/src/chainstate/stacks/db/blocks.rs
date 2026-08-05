@@ -6905,6 +6905,8 @@ pub mod test {
     use crate::core::mempool::*;
     use crate::net::test::*;
 
+    mod mempool_admission_tests;
+
     pub fn make_empty_coinbase_block(mblock_key: &StacksPrivateKey) -> StacksBlock {
         let privk = StacksPrivateKey::from_hex(
             "59e4d5e18351d6027a37920efe53c2f1cbadc50dca7d77169b7291dff936ed6d01",

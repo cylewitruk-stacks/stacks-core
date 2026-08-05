@@ -16,4 +16,4 @@ RUN case ${TARGETPLATFORM} in \
 
 FROM alpine
 COPY --from=builder /out/* /bin/
-CMD ["/bin/stacks-node", "mainnet"]
+CMD ["/bin/stacks-node", "start", "--mainnet"]

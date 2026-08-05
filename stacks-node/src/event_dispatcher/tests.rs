@@ -55,6 +55,7 @@ use tiny_http::{Method, Response, Server, StatusCode};
 
 use crate::event_dispatcher::payloads::*;
 use crate::event_dispatcher::*;
+use crate::Config;
 
 #[test]
 fn test_post_condition_aborted_transaction_does_not_emit_events() {
@@ -497,6 +498,28 @@ fn test_new_event_dispatcher_with_db() {
 
     // Verify that the database was initialized
     assert!(expected_db_path.exists(), "Database file was not created");
+}
+
+#[test]
+fn dispatcher_from_config_registers_configured_observers() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::default();
+    config.node.working_dir = dir.path().to_string_lossy().into_owned();
+    config.events_observers.insert(EventObserverConfig {
+        endpoint: "http://example.com".to_string(),
+        events_keys: vec![EventKeyType::AnyEvent],
+        timeout_ms: 1_000,
+        disable_retries: true,
+    });
+
+    let dispatcher = EventDispatcher::from_config(&config);
+
+    assert_eq!(dispatcher.registered_observers.len(), 1);
+    assert!(dispatcher.any_event_observers_lookup.contains(&0));
+    assert_eq!(
+        dispatcher.db_path,
+        dir.path().join("event_observers.sqlite")
+    );
 }
 
 #[test]

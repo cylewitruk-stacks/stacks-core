@@ -73,9 +73,9 @@ use super::neon_integrations::{
     copy_dir_all, get_account, get_sortition_info_ch, submit_tx_fallible, Account,
 };
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
-use crate::nakamoto_node::miner::TEST_MINE_SKIP;
-use crate::neon::Counters;
-use crate::run_loop::boot_nakamoto;
+use crate::node::test_support::nakamoto::miner::TEST_MINE_SKIP;
+use crate::node::test_support::Counters;
+use crate::node::NodeRunner;
 use crate::tests::nakamoto_integrations::{
     naka_neon_integration_conf, next_block_and_wait_for_commits, POX_DEFAULT_STACKER_BALANCE,
 };
@@ -1858,7 +1858,7 @@ fn setup_stx_btc_node<G: FnMut(&mut NeonConfig)>(
         info!("Chain bootstrapped...");
     }
 
-    let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+    let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
     let run_loop_stopper = run_loop.get_termination_switch();
     let counters = run_loop.counters();
     let blocks_processed = counters.blocks_processed.clone();

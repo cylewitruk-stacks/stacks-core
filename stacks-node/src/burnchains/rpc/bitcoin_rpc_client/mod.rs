@@ -68,33 +68,31 @@ pub struct GetTransactionResponse {
 /// Additional fields can be added in the future as needed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DescriptorInfoResponse {
-    /// The descriptor in canonical form, without private keys
+    /// The canonical descriptor, exercised by the bitcoind compatibility tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub descriptor: String,
     pub checksum: String,
 }
 
-/// Represents the `timestamp` parameter accepted by the `importdescriptors` RPC method.
-///
-/// This indicates when the imported descriptor starts being relevant for address tracking.
-/// It affects wallet rescanning behavior.
+/// Starting point for the scan performed by Bitcoin Core when importing a
+/// descriptor.
 #[derive(Debug, Clone)]
 pub enum Timestamp {
-    /// Tells the wallet to start tracking from the current blockchain time
+    /// Track transactions from the current blockchain time onward.
+    #[cfg_attr(not(test), allow(dead_code))]
     Now,
-    /// A Unix timestamp (in seconds) specifying when the wallet should begin scanning.
+    /// Scan from this Unix timestamp, in seconds.
     Time(u64),
 }
 
-/// Serializes [`Timestamp`] to either the string `"now"` or a numeric timestamp,
-/// matching the format expected by Bitcoin Core.
 impl serde::Serialize for Timestamp {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         match *self {
-            Timestamp::Now => serializer.serialize_str("now"),
-            Timestamp::Time(timestamp) => serializer.serialize_u64(timestamp),
+            Self::Now => serializer.serialize_str("now"),
+            Self::Time(timestamp) => serializer.serialize_u64(timestamp),
         }
     }
 }
@@ -297,9 +295,11 @@ struct WalletDirEntry {
 }
 
 /// Response for `generatetoaddress` rpc, mainly used as deserialization wrapper for `BurnchainHeaderHash`
+#[cfg(test)]
 struct GenerateToAddressResponse(pub Vec<BurnchainHeaderHash>);
 
 /// Deserializes a JSON string array into a vec of [`BurnchainHeaderHash`] and wrap it into [`GenerateToAddressResponse`]
+#[cfg(test)]
 impl<'de> Deserialize<'de> for GenerateToAddressResponse {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -376,6 +376,12 @@ pub enum BitcoinRpcClientError {
     // Bitcoin serialization errors
     #[error("Bitcoin Serialization error: {0}")]
     BitcoinSerialization(#[from] bitcoin_serialize_error),
+    /// Bitcoin Core returned a different number of descriptor results than requested.
+    #[error("Expected {expected} descriptor import results, received {actual}")]
+    DescriptorImportResultCount { expected: usize, actual: usize },
+    /// Bitcoin Core accepted the RPC request but rejected an individual descriptor.
+    #[error("Descriptor import at index {index} failed: {message}")]
+    DescriptorImportFailed { index: usize, message: String },
 }
 
 /// Alias for results returned from client operations.
@@ -560,6 +566,7 @@ impl BitcoinRpcClient {
     ///
     /// # Notes
     /// Typically used on `regtest` or test networks.
+    #[cfg(test)]
     pub fn generate_to_address(
         &self,
         num_blocks: u64,
@@ -686,12 +693,37 @@ impl BitcoinRpcClient {
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(self.endpoint.send(
+        let responses: Vec<ImportDescriptorsResponse> = self.endpoint.send(
             &self.client_id,
             Some(&Self::wallet_path(wallet)),
             "importdescriptors",
             vec![descriptor_values.into()],
-        )?)
+        )?;
+
+        if responses.len() != descriptors.len() {
+            return Err(BitcoinRpcClientError::DescriptorImportResultCount {
+                expected: descriptors.len(),
+                actual: responses.len(),
+            });
+        }
+
+        for (index, response) in responses.iter().enumerate() {
+            for warning in &response.warnings {
+                warn!("Bitcoin Core descriptor import warning";
+                    "descriptor_index" => index,
+                    "warning" => warning,
+                );
+            }
+            if !response.success {
+                let message = response.error.as_ref().map_or_else(
+                    || "Bitcoin Core did not provide an error".to_owned(),
+                    |error| format!("{} (code {})", error.message, error.code),
+                );
+                return Err(BitcoinRpcClientError::DescriptorImportFailed { index, message });
+            }
+        }
+
+        Ok(responses)
     }
 
     /// Returns the hash of the block at the given height.

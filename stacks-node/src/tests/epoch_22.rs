@@ -17,11 +17,12 @@ use stacks_common::util::sleep_ms;
 
 use super::neon_integrations::get_account;
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
+use crate::node::test_support::epoch2 as neon;
 use crate::stacks_common::types::Address;
 use crate::stacks_common::util::hash::bytes_to_hex;
 use crate::tests::neon_integrations::*;
 use crate::tests::*;
-use crate::{neon, BitcoinRegtestController, BurnchainController};
+use crate::BitcoinRegtestController;
 
 #[test]
 #[ignore]
@@ -167,7 +168,7 @@ fn disable_pox() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let runloop_burnchain = burnchain_config.clone();
 
     let blocks_processed = run_loop.get_blocks_processed_arc();
@@ -698,7 +699,7 @@ fn pox_2_unlock_all() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let runloop_burnchain = burnchain_config.clone();
 
     let blocks_processed = run_loop.get_blocks_processed_arc();

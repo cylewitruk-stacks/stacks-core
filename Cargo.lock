@@ -3011,12 +3011,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pico-args"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
-
-[[package]]
 name = "pin-project"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4512,6 +4506,7 @@ dependencies = [
  "backtrace",
  "base64 0.12.3",
  "chrono",
+ "clap",
  "clarity 0.0.1",
  "hashbrown 0.15.2",
  "http-types",
@@ -4522,7 +4517,6 @@ dependencies = [
  "madhouse",
  "mockito",
  "mutants",
- "pico-args",
  "pinny",
  "proptest",
  "rand 0.8.5",

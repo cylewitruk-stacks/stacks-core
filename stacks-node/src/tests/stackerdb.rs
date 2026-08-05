@@ -27,12 +27,12 @@ use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
-use crate::burnchains::BurnchainController;
+use crate::node::test_support::epoch2 as neon;
 use crate::tests::neon_integrations::{
     neon_integration_test_conf, next_block_and_wait, submit_tx, test_observer, wait_for_runloop,
 };
 use crate::tests::{make_contract_publish, to_addr};
-use crate::{neon, BitcoinRegtestController};
+use crate::BitcoinRegtestController;
 
 fn post_stackerdb_chunk(
     http_origin: &str,
@@ -177,7 +177,7 @@ fn test_stackerdb_load_store() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     thread::spawn(move || run_loop.start(None, 0));
@@ -314,7 +314,7 @@ fn test_stackerdb_event_observer() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let blocks_processed = run_loop.get_blocks_processed_arc();
 
     thread::spawn(move || run_loop.start(None, 0));

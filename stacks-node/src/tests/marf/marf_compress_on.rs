@@ -26,15 +26,15 @@ pub mod utils {
     use stacks::util::secp256k1::Secp256k1PrivateKey;
 
     use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
-    use crate::neon::Counters;
-    use crate::run_loop::boot_nakamoto;
+    use crate::node::test_support::Counters;
+    use crate::node::NodeRunner;
     use crate::tests::nakamoto_integrations::{
         blind_signer, boot_to_epoch_3, naka_neon_integration_conf, setup_stacker,
         wait_for_first_naka_block_commit,
     };
     use crate::tests::neon_integrations::{test_observer, wait_for_runloop};
     use crate::tests::{self};
-    use crate::{BitcoinRegtestController, BurnchainController};
+    use crate::BitcoinRegtestController;
 
     /// Just boot chain to epoch 3 using marf compress as node configuration
     pub fn boot_chain_with_marf_compress_cfg(compress: bool) {
@@ -64,7 +64,7 @@ pub mod utils {
         let mut btc_regtest_controller = BitcoinRegtestController::new(naka_conf.clone(), None);
         btc_regtest_controller.bootstrap_chain(201);
 
-        let mut run_loop = boot_nakamoto::BootRunLoop::new(naka_conf.clone()).unwrap();
+        let mut run_loop = NodeRunner::new(naka_conf.clone()).unwrap();
         let run_loop_stopper = run_loop.get_termination_switch();
         let Counters {
             blocks_processed,

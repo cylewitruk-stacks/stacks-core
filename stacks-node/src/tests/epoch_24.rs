@@ -37,12 +37,13 @@ use stacks_common::util::secp256k1::Secp256k1PublicKey;
 use stacks_common::util::sleep_ms;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
+use crate::node::test_support::epoch2 as neon;
 use crate::stacks_common::codec::StacksMessageCodec;
 use crate::tests::neon_integrations::{
     get_account, get_chain_info, get_pox_info, neon_integration_test_conf, next_block_and_wait,
     submit_tx, test_observer, wait_for_runloop,
 };
-use crate::{neon, BitcoinRegtestController, BurnchainController};
+use crate::BitcoinRegtestController;
 
 #[cfg(test)]
 pub fn get_reward_set_entries_at_block(
@@ -193,7 +194,7 @@ fn fix_to_pox_contract() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let runloop_burnchain = burnchain_config.clone();
 
     let blocks_processed = run_loop.get_blocks_processed_arc();
@@ -828,7 +829,7 @@ fn verify_auto_unlock_behavior() {
 
     eprintln!("Chain bootstrapped...");
 
-    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let mut run_loop = neon::Driver::new(conf.clone());
     let runloop_burnchain = burnchain_config.clone();
 
     let blocks_processed = run_loop.get_blocks_processed_arc();

@@ -789,7 +789,6 @@ fn test_get_descriptor_info_ok() {
 #[test]
 fn test_import_descriptors_ok() {
     let descriptor = "addr(1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa)#checksum";
-    let timestamp = 0;
     let internal = true;
 
     let expected_request = json!({
@@ -800,7 +799,7 @@ fn test_import_descriptors_ok() {
             [
                 {
                     "desc": descriptor,
-                    "timestamp": 0,
+                    "timestamp": "now",
                     "internal": true
                 }
             ]
@@ -811,7 +810,7 @@ fn test_import_descriptors_ok() {
         "id": "stacks",
         "result": [{
             "success": true,
-            "warnings": []
+            "warnings": ["Descriptor imported with a warning"]
         }],
         "error": null
     });
@@ -829,11 +828,89 @@ fn test_import_descriptors_ok() {
 
     let desc_req = ImportDescriptorsRequest {
         descriptor: descriptor.to_string(),
-        timestamp: Timestamp::Time(timestamp),
+        timestamp: Timestamp::Now,
         internal: Some(internal),
     };
-    let result = client.import_descriptors("my_wallet", &[&desc_req]);
-    assert!(result.is_ok());
+    let result = client
+        .import_descriptors("my_wallet", &[&desc_req])
+        .expect("descriptor import should succeed");
+    assert_eq!(result.len(), 1);
+    assert!(result[0].success);
+    assert_eq!(result[0].warnings, ["Descriptor imported with a warning"]);
+    assert!(result[0].error.is_none());
+}
+
+#[test]
+fn test_import_descriptors_fails_when_bitcoin_core_rejects_descriptor() {
+    let mock_response = json!({
+        "id": "stacks",
+        "result": [{
+            "success": false,
+            "warnings": [],
+            "error": {
+                "code": -5,
+                "message": "Invalid descriptor"
+            }
+        }],
+        "error": null
+    });
+    let mut server = mockito::Server::new();
+    let _mock = server
+        .mock("POST", "/wallet/my_wallet")
+        .with_status(200)
+        .with_header("Content-Type", "application/json")
+        .with_body(mock_response.to_string())
+        .create();
+    let client = utils::setup_client(&server);
+    let request = ImportDescriptorsRequest {
+        descriptor: "invalid#descriptor".into(),
+        timestamp: Timestamp::Time(0),
+        internal: None,
+    };
+
+    let error = client
+        .import_descriptors("my_wallet", &[&request])
+        .expect_err("per-descriptor failure must fail the import");
+
+    assert!(matches!(
+        error,
+        BitcoinRpcClientError::DescriptorImportFailed { index: 0, ref message }
+            if message == "Invalid descriptor (code -5)"
+    ));
+}
+
+#[test]
+fn test_import_descriptors_rejects_incomplete_result_set() {
+    let mock_response = json!({
+        "id": "stacks",
+        "result": [],
+        "error": null
+    });
+    let mut server = mockito::Server::new();
+    let _mock = server
+        .mock("POST", "/wallet/my_wallet")
+        .with_status(200)
+        .with_header("Content-Type", "application/json")
+        .with_body(mock_response.to_string())
+        .create();
+    let client = utils::setup_client(&server);
+    let request = ImportDescriptorsRequest {
+        descriptor: "addr(example)#checksum".into(),
+        timestamp: Timestamp::Time(0),
+        internal: None,
+    };
+
+    let error = client
+        .import_descriptors("my_wallet", &[&request])
+        .expect_err("one result is required for every descriptor");
+
+    assert!(matches!(
+        error,
+        BitcoinRpcClientError::DescriptorImportResultCount {
+            expected: 1,
+            actual: 0
+        }
+    ));
 }
 
 #[test]

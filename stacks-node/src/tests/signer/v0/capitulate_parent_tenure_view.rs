@@ -28,7 +28,7 @@ use stacks_signer::v0::SpawnedSigner;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use super::{SignerTest, *};
-use crate::nakamoto_node::miner::TEST_BLOCK_ANNOUNCE_STALL;
+use crate::node::test_support::nakamoto::miner::TEST_BLOCK_ANNOUNCE_STALL;
 use crate::tests::nakamoto_integrations::wait_for;
 use crate::tests::neon_integrations::{get_chain_info, submit_tx, test_observer};
 

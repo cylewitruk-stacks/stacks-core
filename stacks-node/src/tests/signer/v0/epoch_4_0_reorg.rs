@@ -36,7 +36,9 @@ use stacks::util_lib::boot::boot_code_id;
 use stacks_signer::v0::SpawnedSigner;
 
 use super::{contract_source_exists, SignerTest};
-use crate::nakamoto_node::miner::{fault_injection_stall_miner, fault_injection_unstall_miner};
+use crate::node::test_support::nakamoto::miner::{
+    fault_injection_stall_miner, fault_injection_unstall_miner,
+};
 use crate::tests::nakamoto_integrations::{enable_epoch_4_0, wait_for};
 use crate::tests::neon_integrations::{
     call_read_only, get_account, get_chain_info, get_sortition_info,
