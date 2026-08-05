@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use clarity_types::representations::ClarityName;
 pub use clarity_types::types::FunctionIdentifier;
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use super::ClarityVersion;
 use super::costs::{CostErrors, CostOverflowingMath};

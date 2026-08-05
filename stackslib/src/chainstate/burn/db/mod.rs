@@ -45,7 +45,13 @@ impl_byte_array_from_column!(SortitionHash);
 impl_byte_array_from_column_only!(Sha512Trunc256Sum);
 impl_byte_array_from_column_only!(VRFProof);
 impl_byte_array_from_column_only!(TrieHash);
-impl_byte_array_from_column_only!(MessageSignature);
+
+impl FromColumn<MessageSignature> for MessageSignature {
+    fn from_column(row: &Row, column_name: &str) -> Result<MessageSignature, db_error> {
+        let signature_hex: String = row.get(column_name)?;
+        MessageSignature::from_hex(&signature_hex).map_err(|_| db_error::ParseError)
+    }
+}
 
 impl FromColumn<VRFPublicKey> for VRFPublicKey {
     fn from_column(row: &Row, column_name: &str) -> Result<VRFPublicKey, db_error> {

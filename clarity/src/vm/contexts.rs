@@ -23,8 +23,8 @@ use clarity_types::representations::ClarityName;
 use serde::Serialize;
 use serde_json::json;
 use stacks_common::alloc_tracker::{AllocationCounter, thread_allocated};
-use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use super::EvalHook;
 use crate::vm::ast::ContractAST;

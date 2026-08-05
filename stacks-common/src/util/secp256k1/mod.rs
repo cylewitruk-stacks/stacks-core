@@ -1,33 +1,14 @@
+// TODO: migrate callers to `stacks-crypto` and `stacks-primitives` directly,
+// then remove this compatibility bridge.
 #[cfg(not(target_family = "wasm"))]
-mod native;
-
-#[cfg(not(target_family = "wasm"))]
-pub use self::native::*;
-
-#[cfg(target_family = "wasm")]
-mod wasm;
-
-#[cfg(target_family = "wasm")]
-pub use self::wasm::*;
-
-pub const MESSAGE_SIGNATURE_ENCODED_SIZE: u32 = 65;
-
-pub struct MessageSignature(pub [u8; 65]);
-impl_array_newtype!(MessageSignature, u8, 65);
-impl_array_hexstring_fmt!(MessageSignature);
-impl_byte_array_newtype!(MessageSignature, u8, 65);
-impl_byte_array_serde!(MessageSignature);
-
-pub struct SchnorrSignature(pub [u8; 65]);
-impl_array_newtype!(SchnorrSignature, u8, 65);
-impl_array_hexstring_fmt!(SchnorrSignature);
-impl_byte_array_newtype!(SchnorrSignature, u8, 65);
-impl_byte_array_serde!(SchnorrSignature);
-pub const SCHNORR_SIGNATURE_ENCODED_SIZE: u32 = 65;
-
-impl Default for SchnorrSignature {
-    /// Creates a default Schnorr Signature. Note this is not a valid signature.
-    fn default() -> Self {
-        Self([0u8; 65])
-    }
-}
+pub use stacks_crypto::secp256k1::MessageSignatureSecp256k1;
+#[cfg(not(feature = "wasm-deterministic"))]
+pub use stacks_crypto::secp256k1::{secp256k1_recover, secp256k1_verify};
+pub use stacks_crypto::secp256k1::{
+    Error, Secp256k1PrivateKey, Secp256k1PublicKey, SigningKey, VerifyingKey,
+};
+pub use stacks_primitives::secp256k1::{
+    MessageSignature, SchnorrSignature, Secp256k1PublicKeyBytes,
+    COMPRESSED_PUBLIC_KEY_ENCODED_SIZE, MESSAGE_SIGNATURE_ENCODED_SIZE,
+    SCHNORR_SIGNATURE_ENCODED_SIZE, UNCOMPRESSED_PUBLIC_KEY_ENCODED_SIZE,
+};

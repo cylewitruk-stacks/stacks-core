@@ -54,7 +54,7 @@ use stacks::util_lib::db::Error as DbError;
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, StacksBlockId, StacksPublicKey, VRFSeed,
 };
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ChainEpochRules, StacksEpochId};
 use stacks_common::util::get_epoch_time_ms;
 use stacks_common::util::hash::Hash160;
 #[cfg(test)]

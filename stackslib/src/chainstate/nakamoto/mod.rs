@@ -36,12 +36,13 @@ use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksAddress, StacksBlockId,
     StacksPrivateKey, StacksPublicKey, TrieHash, VRFSeed,
 };
-use stacks_common::types::{PrivateKey, SIP031EmissionInterval, StacksEpochId};
+use stacks_common::types::{ClarityEpochRules, SIP031EmissionInterval, StacksEpochId};
 use stacks_common::util::hash::{to_hex, Hash160, MerkleHashFunc, MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::retry::BoundReader;
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::util::vrf::{VRFProof, VRFPublicKey, VRF};
 use stacks_common::util::{get_epoch_time_secs, sleep_ms};
+use stacks_crypto::secp256k1::SigningKey as _;
 
 use self::signer_set::SignerCalculation;
 use super::burn::db::sortdb::{
@@ -682,7 +683,9 @@ impl FromRow<NakamotoBlockHeader> for NakamotoBlockHeader {
         let state_index_root = row.get("state_index_root")?;
         let timestamp_i64: i64 = row.get("timestamp")?;
         let timestamp = timestamp_i64.try_into().map_err(|_| DBError::ParseError)?;
-        let miner_signature = row.get("miner_signature")?;
+        let miner_signature_hex: String = row.get("miner_signature")?;
+        let miner_signature =
+            MessageSignature::from_hex(&miner_signature_hex).map_err(|_| DBError::ParseError)?;
         let signer_bitvec = row.get("signer_bitvec")?;
         let signer_signature_json: String = row.get("signer_signature")?;
         let signer_signature: Vec<MessageSignature> =
@@ -3312,7 +3315,7 @@ impl NakamotoChainState {
             header.version,
             u64_to_sql(header.chain_length)?,
             u64_to_sql(header.burn_spent)?,
-            header.miner_signature,
+            header.miner_signature.to_hex(),
             signer_signature,
             header.tx_merkle_root,
             header.state_index_root,

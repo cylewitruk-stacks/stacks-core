@@ -31,11 +31,11 @@ use stacks::core::test_util::{make_stacks_transfer_serialized, to_addr};
 use stacks::core::StacksEpochId;
 use stacks::net::relay::fault_injection::set_ignore_block;
 use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
-use stacks::types::PublicKey;
 use stacks::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 use stacks_common::types::chainstate::TrieHash;
 use stacks_common::util::sleep_ms;
+use stacks_crypto::secp256k1::VerifyingKey as _;
 use stacks_signer::v0::tests::{
     TEST_PIN_SUPPORTED_SIGNER_PROTOCOL_VERSION, TEST_REJECT_ALL_BLOCK_PROPOSAL,
     TEST_SIGNERS_SKIP_BLOCK_RESPONSE_BROADCAST, TEST_SKIP_BLOCK_BROADCAST,

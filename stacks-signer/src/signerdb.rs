@@ -2528,11 +2528,11 @@ pub mod tests {
         TransactionVersion,
     };
     use clarity::types::chainstate::{StacksBlockId, StacksPrivateKey, StacksPublicKey};
-    use clarity::types::PrivateKey;
     use clarity::util::hash::Hash160;
     use clarity::util::secp256k1::MessageSignature;
     use libsigner::v0::messages::{StateMachineUpdateContent, StateMachineUpdateMinerState};
     use libsigner::{BlockProposal, BlockProposalData};
+    use stacks_crypto::secp256k1::SigningKey as _;
 
     use super::*;
     use crate::signerdb::NakamotoBlockVote;

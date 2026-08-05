@@ -17,9 +17,9 @@
 use clarity::vm::types::TupleData;
 use clarity::vm::{ClarityName, Value};
 use stacks_common::types::chainstate::StacksPrivateKey;
-use stacks_common::types::PrivateKey;
 use stacks_common::util::hash::Sha256Sum;
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey};
+use stacks_crypto::secp256k1::SigningKey;
 
 use crate::chainstate::stacks::address::PoxAddress;
 
@@ -82,7 +82,7 @@ pub mod pox4 {
 
     use super::{
         make_structured_data_domain, structured_data_message_hash, MessageSignature, PoxAddress,
-        PrivateKey, Sha256Sum, StacksPrivateKey, TupleData, Value,
+        Sha256Sum, SigningKey, StacksPrivateKey, TupleData, Value,
     };
     define_named_enum!(Pox4SignatureTopic {
         StackStx("stack-stx"),

@@ -32,7 +32,7 @@ use crate::chainstate::stacks::index::marf::{MarfConnection, MARF};
 use crate::chainstate::stacks::index::ClarityMarfTrieId;
 use crate::chainstate::stacks::Error as ChainstateError;
 use crate::clarity_vm::special::handle_contract_call_special_cases;
-use crate::core::{StacksEpoch, StacksEpochId};
+use crate::core::{ChainEpochRules, StacksEpoch, StacksEpochId};
 use crate::util_lib::db::{DBConn, Error as DBError, FromColumn, FromRow};
 
 pub mod ephemeral;

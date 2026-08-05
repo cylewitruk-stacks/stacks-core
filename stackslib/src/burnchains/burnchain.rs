@@ -28,6 +28,7 @@ use rand::{thread_rng, RngCore};
 use stacks_common::address::AddressHashMode;
 use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash as BitcoinSha256dHash;
 use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::ChainEpochRules;
 use stacks_common::util::hash::to_hex;
 use stacks_common::util::vrf::VRFPublicKey;
 use stacks_common::util::{get_epoch_time_ms, sleep_ms};

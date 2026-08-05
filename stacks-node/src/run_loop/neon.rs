@@ -41,8 +41,8 @@ use stacks::util::tests::TestFlag;
 use stacks::util_lib::db::Error as db_error;
 use stacks_common::deps_common::ctrlc as termination;
 use stacks_common::deps_common::ctrlc::SignalId;
-use stacks_common::types::PublicKey;
 use stacks_common::util::hash::Hash160;
+use stacks_crypto::secp256k1::VerifyingKey as _;
 use stx_genesis::GenesisData;
 
 use super::RunLoopCallbacks;

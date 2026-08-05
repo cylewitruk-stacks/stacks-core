@@ -33,6 +33,7 @@ use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockId, VRFSeed,
 };
 use stacks_common::util::hash::to_hex;
+use stacks_protocol::epoch::ClarityEpochRules as _;
 
 use super::SIGNERS_MAX_LIST_SIZE;
 use crate::burnchains::PoxConstants;

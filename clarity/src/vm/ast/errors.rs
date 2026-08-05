@@ -17,7 +17,7 @@
 use std::{error, fmt};
 
 use clarity_types::representations::{PreSymbolicExpression, Span};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use crate::vm::ast::parser::v2::lexer::error::LexerError;
 use crate::vm::ast::parser::v2::lexer::token::Token;

@@ -1,0 +1,19 @@
+[package]
+name = "stacks-protocol"
+version = "0.1.0"
+license = "GPL-3.0"
+homepage = "https://github.com/stacks-network/stacks-core"
+repository = "https://github.com/stacks-network/stacks-core"
+description = "Protocol rules and network parameters for the Stacks blockchain"
+keywords = ["stacks", "stx", "blockchain"]
+readme = "README.md"
+edition = "2024"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+stacks-p2p = { workspace = true }
+stacks-primitives = { workspace = true }
+
+[features]
+default = []
+testing = []

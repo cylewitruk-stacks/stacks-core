@@ -64,6 +64,7 @@ pub mod events;
 pub mod index;
 pub mod miner;
 pub mod transaction;
+mod transaction_types;
 
 #[cfg(test)]
 pub mod tests;
@@ -77,7 +78,7 @@ pub use stacks_common::types::chainstate::{StacksPrivateKey, StacksPublicKey};
 pub const STACKS_BLOCK_VERSION: u8 = 7;
 pub const STACKS_BLOCK_VERSION_AST_PRECHECK_SIZE: u8 = 1;
 
-pub use stacks_codec::transaction::{MAX_BLOCK_LEN, MAX_TRANSACTION_LEN};
+pub use transaction_types::{MAX_BLOCK_LEN, MAX_TRANSACTION_LEN};
 
 #[derive(Debug)]
 pub enum Error {
@@ -403,7 +404,7 @@ impl Error {
     }
 }
 
-pub use stacks_codec::transaction::{
+pub use transaction_types::{
     AssetInfo, AssetInfoID, AuthError, CoinbasePayload, FungibleConditionCode, MultisigHashMode,
     MultisigSpendingCondition, NonfungibleConditionCode, OrderIndependentMultisigHashMode,
     OrderIndependentMultisigSpendingCondition, PostConditionPrincipal, PostConditionPrincipalID,

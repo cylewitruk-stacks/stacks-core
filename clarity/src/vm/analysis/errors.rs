@@ -19,7 +19,7 @@ use std::{error, fmt};
 use clarity_types::errors::ClarityTypeError;
 use clarity_types::representations::SymbolicExpression;
 use clarity_types::types::{TraitIdentifier, TupleTypeSignature, TypeSignature};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use crate::vm::costs::{CostErrors, ExecutionCost};
 use crate::vm::diagnostic::{DiagnosableError, Diagnostic};

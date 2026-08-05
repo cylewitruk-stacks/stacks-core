@@ -33,7 +33,7 @@ use crate::chainstate::burn::operations::{
 };
 use crate::chainstate::burn::{Opcodes, SortitionId};
 use crate::chainstate::stacks::address::PoxAddress;
-use crate::core::{marker_for_epoch, StacksEpochId};
+use crate::core::{marker_for_epoch, ChainEpochRules, StacksEpochId};
 
 // return type from parse_data below
 #[derive(Debug)]

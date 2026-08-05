@@ -29,9 +29,9 @@ use stacks_common::codec::{
     read_next, read_next_at_most, write_next, Error as CodecError, StacksMessageCodec,
 };
 use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
-use stacks_common::types::PrivateKey;
 use stacks_common::util::hash::{hex_bytes, to_hex, Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::MessageSignature;
+use stacks_crypto::secp256k1::SigningKey as _;
 
 /// maximum chunk size (16 MB; same as MAX_PAYLOAD_SIZE)
 pub const STACKERDB_MAX_CHUNK_SIZE: u32 = 16 * 1024 * 1024;

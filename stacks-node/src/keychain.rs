@@ -237,7 +237,6 @@ impl Keychain {
 mod tests {
     use std::collections::HashMap;
 
-    use stacks::burnchains::PrivateKey;
     use stacks::chainstate::stacks::{
         StacksPrivateKey, StacksPublicKey, StacksTransaction, StacksTransactionSigner,
         TokenTransferMemo, TransactionAuth, TransactionPayload, TransactionPostConditionMode,
@@ -247,6 +246,7 @@ mod tests {
     use stacks_common::types::chainstate::StacksAddress;
     use stacks_common::util::hash::{Hash160, Sha256Sum};
     use stacks_common::util::vrf::{VRFPrivateKey, VRFProof, VRFPublicKey, VRF};
+    use stacks_crypto::secp256k1::SigningKey as _;
 
     use super::Keychain;
     use crate::operations::BurnchainOpSigner;

@@ -34,8 +34,9 @@ use stacks_common::types::StacksPublicKeyBuffer;
 use stacks_common::util::hash::{to_hex, Hash160};
 use stacks_common::util::retry::BoundReader;
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_crypto::secp256k1::{SigningKey as _, VerifyingKey as _};
 
-use crate::burnchains::{BurnchainView, PrivateKey, PublicKey};
+use crate::burnchains::BurnchainView;
 use crate::chainstate::burn::ConsensusHash;
 use crate::chainstate::nakamoto::NakamotoBlock;
 use crate::chainstate::stacks::{

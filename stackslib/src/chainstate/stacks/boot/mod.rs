@@ -46,7 +46,9 @@ use crate::chainstate::stacks::db::{StacksChainState, StacksDBConn};
 use crate::chainstate::stacks::Error;
 use crate::clarity_vm::clarity::{ClarityConnection, ClarityTransactionConnection};
 use crate::clarity_vm::database::HeadersDBConn;
-use crate::core::{StacksEpochId, CHAIN_ID_MAINNET, POX_MAXIMAL_SCALING, POX_THRESHOLD_STEPS_USTX};
+use crate::core::{
+    ChainEpochRules, StacksEpochId, CHAIN_ID_MAINNET, POX_MAXIMAL_SCALING, POX_THRESHOLD_STEPS_USTX,
+};
 use crate::util_lib::boot;
 
 const BOOT_CODE_POX_BODY: &str = std::include_str!("pox.clar");

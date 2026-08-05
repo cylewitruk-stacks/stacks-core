@@ -15,8 +15,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use super::{
-    set_test_coinbase_schedule, CoinbaseInterval, StacksEpochId, COINBASE_INTERVALS_MAINNET,
-    COINBASE_INTERVALS_TESTNET,
+    get_coinbase_intervals, set_test_coinbase_schedule, CoinbaseInterval, EpochCoinbaseReward,
+    StacksEpochId, COINBASE_INTERVALS_MAINNET, COINBASE_INTERVALS_TESTNET,
 };
 
 #[test]
@@ -286,28 +286,16 @@ fn test_set_coinbase_intervals() {
         },
     ];
 
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(true),
-        *COINBASE_INTERVALS_MAINNET
-    );
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(false),
-        *COINBASE_INTERVALS_TESTNET
-    );
+    assert_eq!(get_coinbase_intervals(true), *COINBASE_INTERVALS_MAINNET);
+    assert_eq!(get_coinbase_intervals(false), *COINBASE_INTERVALS_TESTNET);
 
     set_test_coinbase_schedule(Some(new_sched.clone()));
 
-    assert_eq!(StacksEpochId::get_coinbase_intervals(true), new_sched);
-    assert_eq!(StacksEpochId::get_coinbase_intervals(false), new_sched);
+    assert_eq!(get_coinbase_intervals(true), new_sched);
+    assert_eq!(get_coinbase_intervals(false), new_sched);
 
     set_test_coinbase_schedule(None);
 
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(true),
-        *COINBASE_INTERVALS_MAINNET
-    );
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(false),
-        *COINBASE_INTERVALS_TESTNET
-    );
+    assert_eq!(get_coinbase_intervals(true), *COINBASE_INTERVALS_MAINNET);
+    assert_eq!(get_coinbase_intervals(false), *COINBASE_INTERVALS_TESTNET);
 }

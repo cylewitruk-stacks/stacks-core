@@ -20,6 +20,7 @@ use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value};
 use madhouse::{Command, CommandWrapper};
 use proptest::array::uniform4;
 use proptest::prelude::{any, Just, Strategy};
+use stacks_protocol::epoch::ChainEpochRules as _;
 
 use super::{ok_true, unwrap_block_failure, unwrap_multi_tx_success, unwrap_single_tx_success};
 use crate::chainstate::stacks::{

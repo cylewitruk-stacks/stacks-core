@@ -141,6 +141,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+
+[[package]]
 name = "ascii"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -497,6 +503,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
+name = "base58ck"
+version = "0.1.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec5dc7e09f7bb15f0062da7c03086d6b71a2c84e0af4fccbbc7d8c6559847816"
+dependencies = [
+ "bitcoin_hashes",
+]
+
+[[package]]
 name = "base64"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,6 +542,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
 
 [[package]]
+name = "bech32"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -540,6 +561,44 @@ name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
+name = "bitcoin"
+version = "0.32.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39581299241111285f3268ba75ddf372746fd041620918b145c1af9d75e91b6c"
+dependencies = [
+ "base58ck",
+ "bech32",
+ "bitcoin-io",
+ "bitcoin-units",
+ "bitcoin_hashes",
+ "hex-conservative",
+ "hex_lit",
+ "secp256k1 0.29.1",
+]
+
+[[package]]
+name = "bitcoin-io"
+version = "0.1.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11301df0b06f22dea7bb1916403fdd88a371031e495c49b8f96931b28189e175"
+
+[[package]]
+name = "bitcoin-units"
+version = "0.1.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57bad157b78d0d1b22c4cbb6a35a566211fc4d14866a37f2c780652b50f3b845"
+
+[[package]]
+name = "bitcoin_hashes"
+version = "0.14.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9901a56e133a1fc86eeb1113e2591f45f4682451ca893bff494d2f88918e3f"
+dependencies = [
+ "bitcoin-io",
+ "hex-conservative",
+]
 
 [[package]]
 name = "bitflags"
@@ -822,6 +881,7 @@ dependencies = [
  "serde_stacker",
  "slog",
  "stacks-common 0.0.1",
+ "stacks-crypto",
 ]
 
 [[package]]
@@ -927,6 +987,18 @@ dependencies = [
  "lazy_static",
  "libc",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "const-hex"
+version = "1.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33e2a781ebdf4467d1428dc4593067825fb646f6871475098d8577421af73558"
+dependencies = [
+ "cfg-if 1.0.0",
+ "cpufeatures",
+ "proptest",
+ "serde_core",
 ]
 
 [[package]]
@@ -1314,7 +1386,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1823,6 +1895,21 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hex-conservative"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fda06d18ac606267c40c04e41b9947729bf8b9efe74bd4e82b61a5f26a510b9f"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
+name = "hex_lit"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3011d1213f159867b13cfd6ac92d2cd5f1345762c63be3554e84092d85a50bbd"
 
 [[package]]
 name = "hmac"
@@ -2396,6 +2483,7 @@ dependencies = [
  "sha2 0.10.8",
  "slog",
  "stacks-common 0.0.1",
+ "stacks-crypto",
  "stackslib 0.0.1",
  "thiserror 1.0.65",
  "tiny_http",
@@ -2440,6 +2528,7 @@ dependencies = [
  "serde",
  "sha2 0.10.8",
  "stacks-common 0.0.1",
+ "stacks-crypto",
 ]
 
 [[package]]
@@ -3214,7 +3303,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3707,7 +3796,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3912,8 +4001,18 @@ version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1629c9c557ef9b293568b338dddfc8208c98a18c59d722a9d53f859d9c9b62"
 dependencies = [
- "secp256k1-sys",
+ "secp256k1-sys 0.6.1",
  "serde",
+]
+
+[[package]]
+name = "secp256k1"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
+dependencies = [
+ "bitcoin_hashes",
+ "secp256k1-sys 0.10.1",
 ]
 
 [[package]]
@@ -3921,6 +4020,15 @@ name = "secp256k1-sys"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83080e2c2fc1006e625be82e5d1eb6a43b7fd9578b617fcc55814daf286bba4b"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "secp256k1-sys"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9"
 dependencies = [
  "cc",
 ]
@@ -4333,9 +4441,9 @@ dependencies = [
 name = "stacks-codec"
 version = "0.1.0"
 dependencies = [
- "clarity-types 0.0.1",
  "serde",
- "stacks-common 0.0.1",
+ "stacks-p2p",
+ "stacks-primitives",
 ]
 
 [[package]]
@@ -4348,7 +4456,6 @@ dependencies = [
  "getrandom 0.2.12",
  "hashbrown 0.15.2",
  "lazy_static",
- "libsecp256k1",
  "nix",
  "p256",
  "pinny",
@@ -4356,7 +4463,6 @@ dependencies = [
  "rand 0.8.5",
  "ripemd",
  "rusqlite",
- "secp256k1",
  "serde",
  "serde_derive",
  "serde_json",
@@ -4365,6 +4471,11 @@ dependencies = [
  "slog",
  "slog-json",
  "slog-term",
+ "stacks-codec",
+ "stacks-crypto",
+ "stacks-p2p",
+ "stacks-primitives",
+ "stacks-protocol",
  "thiserror 1.0.65",
  "toml",
  "winapi 0.3.9",
@@ -4386,7 +4497,7 @@ dependencies = [
  "rand 0.8.5",
  "ripemd",
  "rusqlite",
- "secp256k1",
+ "secp256k1 0.24.3",
  "serde",
  "serde_derive",
  "serde_json",
@@ -4397,6 +4508,23 @@ dependencies = [
  "thiserror 1.0.65",
  "toml",
  "winapi 0.3.9",
+]
+
+[[package]]
+name = "stacks-crypto"
+version = "0.1.0"
+dependencies = [
+ "const-hex",
+ "getrandom 0.2.12",
+ "libsecp256k1",
+ "rand 0.8.5",
+ "ripemd",
+ "secp256k1 0.24.3",
+ "serde",
+ "sha2 0.10.8",
+ "sha3",
+ "stacks-macros",
+ "stacks-primitives",
 ]
 
 [[package]]
@@ -4415,6 +4543,14 @@ dependencies = [
  "stacks-common 0.0.1",
  "stackslib 0.0.1",
  "tikv-jemallocator",
+]
+
+[[package]]
+name = "stacks-macros"
+version = "0.1.0"
+dependencies = [
+ "const-hex",
+ "serde",
 ]
 
 [[package]]
@@ -4450,6 +4586,7 @@ dependencies = [
  "slog",
  "stacks-common 0.0.1",
  "stacks-common 0.0.1 (git+https://github.com/stacks-network/stacks-core.git?rev=ecaaf5c4d397a691e5155eef01b59ddfeaba4ddd)",
+ "stacks-crypto",
  "stacks-inspect",
  "stacks-signer 0.0.1",
  "stacks-signer 0.0.1 (git+https://github.com/stacks-network/stacks-core.git?rev=ecaaf5c4d397a691e5155eef01b59ddfeaba4ddd)",
@@ -4467,6 +4604,34 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "warp",
+]
+
+[[package]]
+name = "stacks-p2p"
+version = "0.1.0"
+dependencies = [
+ "const-hex",
+ "serde",
+ "stacks-macros",
+ "stacks-primitives",
+]
+
+[[package]]
+name = "stacks-primitives"
+version = "0.1.0"
+dependencies = [
+ "const-hex",
+ "serde",
+ "stacks-macros",
+]
+
+[[package]]
+name = "stacks-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "stacks-p2p",
+ "stacks-primitives",
 ]
 
 [[package]]
@@ -4492,6 +4657,7 @@ dependencies = [
  "slog-json",
  "slog-term",
  "stacks-common 0.0.1",
+ "stacks-crypto",
  "stackslib 0.0.1",
  "stdext",
  "thiserror 1.0.65",
@@ -4532,12 +4698,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "stacks-transactions"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "clarity-types 0.0.1",
+ "const-hex",
+ "serde",
+ "stacks-codec",
+ "stacks-crypto",
+ "stacks-macros",
+ "stacks-primitives",
+ "stacks-protocol",
+]
+
+[[package]]
 name = "stackslib"
 version = "0.0.1"
 dependencies = [
  "assert-json-diff 1.1.0",
  "chrono",
  "clarity 0.0.1",
+ "clarity-types 0.0.1",
  "ed25519-dalek",
  "insta",
  "lazy_static",
@@ -4569,6 +4751,9 @@ dependencies = [
  "slog",
  "stacks-codec",
  "stacks-common 0.0.1",
+ "stacks-crypto",
+ "stacks-protocol",
+ "stacks-transactions",
  "stdext",
  "stx-genesis",
  "tempfile",
@@ -5170,9 +5355,9 @@ dependencies = [
 
 [[package]]
 name = "typenum"
-version = "1.17.0"
+version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unarray"
@@ -5503,7 +5688,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

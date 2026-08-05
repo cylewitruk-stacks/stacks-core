@@ -14,91 +14,60 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+pub use ::secp256k1::Error;
 use ::secp256k1::ecdsa::{
     RecoverableSignature as LibSecp256k1RecoverableSignature, RecoveryId as LibSecp256k1RecoveryID,
     Signature as LibSecp256k1Signature,
 };
-pub use ::secp256k1::Error;
 use ::secp256k1::{
-    self, constants as LibSecp256k1Constants, Error as LibSecp256k1Error,
-    Message as LibSecp256k1Message, PublicKey as LibSecp256k1PublicKey, Secp256k1,
-    SecretKey as LibSecp256k1PrivateKey,
+    self, Error as LibSecp256k1Error, Message as LibSecp256k1Message, Secp256k1,
+    constants as LibSecp256k1Constants,
 };
-use serde::de::{Deserialize, Error as de_Error};
-use serde::Serialize;
+use serde::Deserialize;
+use serde::de::Error as de_Error;
 
-use super::MessageSignature;
-use crate::types::{PrivateKey, PublicKey};
-use crate::util::hash::{hex_bytes, to_hex, Sha256Sum};
+use super::{
+    MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey, SigningKey, VerifyingKey,
+    message_signature_compact_bytes, message_signature_from_recovery_id_and_compact,
+    private_key_bytes_and_compression,
+};
+use crate::hash::{Sha256Digest, Sha256Sum};
+
+pub(super) type LibSecp256k1PublicKey = ::secp256k1::PublicKey;
+pub(super) type LibSecp256k1PrivateKey = ::secp256k1::SecretKey;
 
 // per-thread Secp256k1 context
-thread_local!(static _secp256k1: Secp256k1<secp256k1::All> = Secp256k1::new());
+thread_local!(static SECP256K1: Secp256k1<secp256k1::All> = Secp256k1::new());
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Hash)]
-pub struct Secp256k1PublicKey {
-    // serde is broken for secp256k1, so do it ourselves
-    #[serde(
-        serialize_with = "secp256k1_pubkey_serialize",
-        deserialize_with = "secp256k1_pubkey_deserialize"
-    )]
-    key: LibSecp256k1PublicKey,
-    compressed: bool,
+fn message_signature_from_secp256k1_recoverable(
+    sig: &LibSecp256k1RecoverableSignature,
+) -> MessageSignature {
+    let (recid, bytes) = sig.serialize_compact();
+    let recovery_id_byte = recid.to_i32() as u8; // recovery ID will be 0, 1, 2, or 3
+    message_signature_from_recovery_id_and_compact(recovery_id_byte, &bytes)
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub struct Secp256k1PrivateKey {
-    // serde is broken for secp256k1, so do it ourselves
-    #[serde(
-        serialize_with = "secp256k1_privkey_serialize",
-        deserialize_with = "secp256k1_privkey_deserialize"
-    )]
-    key: LibSecp256k1PrivateKey,
-    compress_public: bool,
-}
-
-impl MessageSignature {
-    pub fn empty() -> MessageSignature {
-        // NOTE: this cannot be a valid signature
-        MessageSignature([0u8; 65])
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    // test method for generating place-holder data
-    pub fn from_raw(sig: &[u8]) -> MessageSignature {
-        let mut buf = [0u8; 65];
-        if sig.len() < 65 {
-            buf.copy_from_slice(sig);
-        } else {
-            buf.copy_from_slice(&sig[..65]);
+fn message_signature_to_secp256k1_recoverable(
+    sig: &MessageSignature,
+) -> Option<LibSecp256k1RecoverableSignature> {
+    let recid = match LibSecp256k1RecoveryID::from_i32(sig.0[0] as i32) {
+        Ok(rid) => rid,
+        Err(_) => {
+            return None;
         }
-        MessageSignature(buf)
-    }
+    };
+    let sig_bytes = message_signature_compact_bytes(sig);
 
-    pub fn from_secp256k1_recoverable(sig: &LibSecp256k1RecoverableSignature) -> MessageSignature {
-        let (recid, bytes) = sig.serialize_compact();
-        let mut ret_bytes = [0u8; 65];
-        let recovery_id_byte = recid.to_i32() as u8; // recovery ID will be 0, 1, 2, or 3
-        ret_bytes[0] = recovery_id_byte;
-        ret_bytes[1..=64].copy_from_slice(&bytes[..64]);
-        MessageSignature(ret_bytes)
-    }
+    LibSecp256k1RecoverableSignature::from_compact(&sig_bytes, recid).ok()
+}
 
-    pub fn to_secp256k1_recoverable(&self) -> Option<LibSecp256k1RecoverableSignature> {
-        let recid = match LibSecp256k1RecoveryID::from_i32(self.0[0] as i32) {
-            Ok(rid) => rid,
-            Err(_) => {
-                return None;
-            }
-        };
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes[..64].copy_from_slice(&self.0[1..=64]);
+pub trait MessageSignatureSecp256k1 {
+    fn to_secp256k1_recoverable(&self) -> Option<::secp256k1::ecdsa::RecoverableSignature>;
+}
 
-        LibSecp256k1RecoverableSignature::from_compact(&sig_bytes, recid).ok()
-    }
-
-    /// Convert from VRS to RSV
-    pub fn to_rsv(&self) -> Vec<u8> {
-        [&self.0[1..], &self.0[0..1]].concat()
+impl MessageSignatureSecp256k1 for MessageSignature {
+    fn to_secp256k1_recoverable(&self) -> Option<::secp256k1::ecdsa::RecoverableSignature> {
+        message_signature_to_secp256k1_recoverable(self)
     }
 }
 
@@ -115,11 +84,6 @@ impl Secp256k1PublicKey {
         Secp256k1PublicKey::from_private(&Secp256k1PrivateKey::random())
     }
 
-    pub fn from_hex(hex_string: &str) -> Result<Secp256k1PublicKey, &'static str> {
-        let data = hex_bytes(hex_string).map_err(|_e| "Failed to decode hex public key")?;
-        Secp256k1PublicKey::from_slice(&data[..]).map_err(|_e| "Invalid public key hex string")
-    }
-
     pub fn from_slice(data: &[u8]) -> Result<Secp256k1PublicKey, &'static str> {
         match LibSecp256k1PublicKey::from_slice(data) {
             Ok(pubkey_res) => Ok(Secp256k1PublicKey {
@@ -131,7 +95,7 @@ impl Secp256k1PublicKey {
     }
 
     pub fn from_private(privk: &Secp256k1PrivateKey) -> Secp256k1PublicKey {
-        _secp256k1.with(|ctx| {
+        SECP256K1.with(|ctx| {
             let pubk = LibSecp256k1PublicKey::from_secret_key(ctx, &privk.key);
             Secp256k1PublicKey {
                 key: pubk,
@@ -140,20 +104,8 @@ impl Secp256k1PublicKey {
         })
     }
 
-    pub fn to_hex(&self) -> String {
-        to_hex(&self.to_bytes())
-    }
-
     pub fn to_bytes_compressed(&self) -> Vec<u8> {
         self.key.serialize().to_vec()
-    }
-
-    pub fn compressed(&self) -> bool {
-        self.compressed
-    }
-
-    pub fn set_compressed(&mut self, value: bool) {
-        self.compressed = value;
     }
 
     /// recover message and signature to public key (will be compressed)
@@ -161,13 +113,12 @@ impl Secp256k1PublicKey {
         msg: &[u8],
         sig: &MessageSignature,
     ) -> Result<Secp256k1PublicKey, &'static str> {
-        _secp256k1.with(|ctx| {
-            let msg = LibSecp256k1Message::from_slice(msg).map_err(|_e| {
-                "Invalid message: failed to decode data hash: must be a 32-byte hash"
-            })?;
+        SECP256K1.with(|ctx| {
+            let msg = LibSecp256k1Message::from_slice(msg).map_err(
+                |_e| "Invalid message: failed to decode data hash: must be a 32-byte hash",
+            )?;
 
-            let secp256k1_sig = sig
-                .to_secp256k1_recoverable()
+            let secp256k1_sig = message_signature_to_secp256k1_recoverable(sig)
                 .ok_or("Invalid signature: failed to decode recoverable signature")?;
 
             let recovered_pubkey = ctx
@@ -187,14 +138,14 @@ impl Secp256k1PublicKey {
         msg: &LibSecp256k1Message,
         sig: &LibSecp256k1RecoverableSignature,
     ) -> Result<LibSecp256k1PublicKey, &'static str> {
-        _secp256k1.with(|ctx| {
+        SECP256K1.with(|ctx| {
             ctx.recover_ecdsa(msg, sig)
                 .map_err(|_e| "Invalid signature: failed to recover public key")
         })
     }
 }
 
-impl PublicKey for Secp256k1PublicKey {
+impl VerifyingKey for Secp256k1PublicKey {
     fn to_bytes(&self) -> Vec<u8> {
         if self.compressed {
             self.key.serialize().to_vec()
@@ -204,13 +155,12 @@ impl PublicKey for Secp256k1PublicKey {
     }
 
     fn verify(&self, data_hash: &[u8], sig: &MessageSignature) -> Result<bool, &'static str> {
-        _secp256k1.with(|ctx| {
-            let msg = LibSecp256k1Message::from_slice(data_hash).map_err(|_e| {
-                "Invalid message: failed to decode data hash: must be a 32-byte hash"
-            })?;
+        SECP256K1.with(|ctx| {
+            let msg = LibSecp256k1Message::from_slice(data_hash).map_err(
+                |_e| "Invalid message: failed to decode data hash: must be a 32-byte hash",
+            )?;
 
-            let secp256k1_sig = sig
-                .to_secp256k1_recoverable()
+            let secp256k1_sig = message_signature_to_secp256k1_recoverable(sig)
                 .ok_or("Invalid signature: failed to decode recoverable signature")?;
 
             let recovered_pubkey = ctx
@@ -218,7 +168,6 @@ impl PublicKey for Secp256k1PublicKey {
                 .map_err(|_e| "Invalid signature: failed to recover public key")?;
 
             if recovered_pubkey != self.key {
-                test_debug!("{:?} != {:?}", &recovered_pubkey, &self.key);
                 return Ok(false);
             }
 
@@ -284,28 +233,9 @@ impl Secp256k1PrivateKey {
         }
     }
 
-    pub fn from_hex(hex_string: &str) -> Result<Secp256k1PrivateKey, &'static str> {
-        let data = hex_bytes(hex_string).map_err(|_e| "Failed to decode hex private key")?;
-        Secp256k1PrivateKey::from_slice(&data[..]).map_err(|_e| "Invalid private key hex string")
-    }
-
     pub fn from_slice(data: &[u8]) -> Result<Secp256k1PrivateKey, &'static str> {
-        if data.len() < 32 {
-            return Err("Invalid private key: shorter than 32 bytes");
-        }
-        if data.len() > 33 {
-            return Err("Invalid private key: greater than 33 bytes");
-        }
-        let compress_public = if data.len() == 33 {
-            // compressed byte tag?
-            if data[32] != 0x01 {
-                return Err("Invalid private key: invalid compressed byte marker");
-            }
-            true
-        } else {
-            false
-        };
-        match LibSecp256k1PrivateKey::from_slice(&data[0..32]) {
+        let (key_bytes, compress_public) = private_key_bytes_and_compression(data)?;
+        match LibSecp256k1PrivateKey::from_slice(key_bytes) {
             Ok(privkey_res) => Ok(Secp256k1PrivateKey {
                 key: privkey_res,
                 compress_public,
@@ -314,28 +244,12 @@ impl Secp256k1PrivateKey {
         }
     }
 
-    pub fn compress_public(&self) -> bool {
-        self.compress_public
-    }
-
-    pub fn set_compress_public(&mut self, value: bool) {
-        self.compress_public = value;
-    }
-
-    pub fn to_hex(&self) -> String {
-        let mut bytes = self.key[..].to_vec();
-        if self.compress_public {
-            bytes.push(1);
-        }
-        to_hex(&bytes)
-    }
-
     pub fn as_slice(&self) -> &[u8; 32] {
         self.key.as_ref()
     }
 }
 
-impl PrivateKey for Secp256k1PrivateKey {
+impl SigningKey for Secp256k1PrivateKey {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bits = self.key[..].to_vec();
         if self.compress_public {
@@ -345,13 +259,13 @@ impl PrivateKey for Secp256k1PrivateKey {
     }
 
     fn sign(&self, data_hash: &[u8]) -> Result<MessageSignature, &'static str> {
-        _secp256k1.with(|ctx| {
-            let msg = LibSecp256k1Message::from_slice(data_hash).map_err(|_e| {
-                "Invalid message: failed to decode data hash: must be a 32-byte hash"
-            })?;
+        SECP256K1.with(|ctx| {
+            let msg = LibSecp256k1Message::from_slice(data_hash).map_err(
+                |_e| "Invalid message: failed to decode data hash: must be a 32-byte hash",
+            )?;
 
             let sig = ctx.sign_ecdsa_recoverable(&msg, &self.key);
-            Ok(MessageSignature::from_secp256k1_recoverable(&sig))
+            Ok(message_signature_from_secp256k1_recoverable(&sig))
         })
     }
 
@@ -361,47 +275,47 @@ impl PrivateKey for Secp256k1PrivateKey {
         data_hash: &[u8],
         noncedata: &[u8; 32],
     ) -> Result<MessageSignature, &'static str> {
-        _secp256k1.with(|ctx| {
-            let msg = LibSecp256k1Message::from_slice(data_hash).map_err(|_e| {
-                "Invalid message: failed to decode data hash: must be a 32-byte hash"
-            })?;
+        SECP256K1.with(|ctx| {
+            let msg = LibSecp256k1Message::from_slice(data_hash).map_err(
+                |_e| "Invalid message: failed to decode data hash: must be a 32-byte hash",
+            )?;
 
             let sig = ctx.sign_ecdsa_recoverable_with_noncedata(&msg, &self.key, noncedata);
-            Ok(MessageSignature::from_secp256k1_recoverable(&sig))
+            Ok(message_signature_from_secp256k1_recoverable(&sig))
         })
     }
 }
 
-fn secp256k1_pubkey_serialize<S: serde::Serializer>(
+pub(super) fn secp256k1_pubkey_serialize<S: serde::Serializer>(
     pubk: &LibSecp256k1PublicKey,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    let key_hex = to_hex(&pubk.serialize());
+    let key_hex = const_hex::encode(pubk.serialize());
     s.serialize_str(key_hex.as_str())
 }
 
-fn secp256k1_pubkey_deserialize<'de, D: serde::Deserializer<'de>>(
+pub(super) fn secp256k1_pubkey_deserialize<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<LibSecp256k1PublicKey, D::Error> {
     let key_hex = String::deserialize(d)?;
-    let key_bytes = hex_bytes(&key_hex).map_err(de_Error::custom)?;
+    let key_bytes = const_hex::decode(&key_hex).map_err(de_Error::custom)?;
 
     LibSecp256k1PublicKey::from_slice(&key_bytes).map_err(de_Error::custom)
 }
 
-fn secp256k1_privkey_serialize<S: serde::Serializer>(
+pub(super) fn secp256k1_privkey_serialize<S: serde::Serializer>(
     privk: &LibSecp256k1PrivateKey,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    let key_hex = to_hex(&privk[..]);
+    let key_hex = const_hex::encode(&privk[..]);
     s.serialize_str(key_hex.as_str())
 }
 
-fn secp256k1_privkey_deserialize<'de, D: serde::Deserializer<'de>>(
+pub(super) fn secp256k1_privkey_deserialize<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<LibSecp256k1PrivateKey, D::Error> {
     let key_hex = String::deserialize(d)?;
-    let key_bytes = hex_bytes(&key_hex).map_err(de_Error::custom)?;
+    let key_bytes = const_hex::decode(&key_hex).map_err(de_Error::custom)?;
 
     LibSecp256k1PrivateKey::from_slice(&key_bytes[..]).map_err(de_Error::custom)
 }
@@ -410,7 +324,7 @@ pub fn secp256k1_recover(
     message_arr: &[u8],
     serialized_signature_arr: &[u8],
 ) -> Result<[u8; 33], LibSecp256k1Error> {
-    _secp256k1.with(|ctx| {
+    SECP256K1.with(|ctx| {
         let message = LibSecp256k1Message::from_slice(message_arr)?;
 
         let rec_id = LibSecp256k1RecoveryID::from_i32(serialized_signature_arr[64] as i32)?;
@@ -430,7 +344,7 @@ pub fn secp256k1_verify(
     serialized_signature_arr: &[u8],
     pubkey_arr: &[u8],
 ) -> Result<(), LibSecp256k1Error> {
-    _secp256k1.with(|ctx| {
+    SECP256K1.with(|ctx| {
         let message = LibSecp256k1Message::from_slice(message_arr)?;
         let expanded_sig = LibSecp256k1Signature::from_compact(&serialized_signature_arr[..64])?; // ignore 65th byte if present
         let pubkey = LibSecp256k1PublicKey::from_slice(pubkey_arr)?;
@@ -440,12 +354,19 @@ pub fn secp256k1_verify(
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use rand::RngCore as _;
     use secp256k1::{self, PublicKey as LibSecp256k1PublicKey, Secp256k1};
 
     use super::*;
-    use crate::util::get_epoch_time_ms;
-    use crate::util::hash::hex_bytes;
+
+    fn get_epoch_time_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after UNIX_EPOCH")
+            .as_millis()
+    }
 
     struct KeyFixture<I, R> {
         input: I,
@@ -476,12 +397,16 @@ mod tests {
         assert_eq!(comp_value, "01");
         assert_eq!(uncomp, &h_uncomp);
 
-        assert!(Secp256k1PrivateKey::from_hex(&h_comp)
-            .unwrap()
-            .compress_public());
-        assert!(!Secp256k1PrivateKey::from_hex(&h_uncomp)
-            .unwrap()
-            .compress_public());
+        assert!(
+            Secp256k1PrivateKey::from_hex(&h_comp)
+                .unwrap()
+                .compress_public()
+        );
+        assert!(
+            !Secp256k1PrivateKey::from_hex(&h_uncomp)
+                .unwrap()
+                .compress_public()
+        );
 
         assert_eq!(Secp256k1PrivateKey::from_hex(&h_uncomp), Ok(t1.clone()));
 
@@ -516,19 +441,19 @@ mod tests {
 
     #[test]
     fn test_parse_serialize() {
-        let ctx: Secp256k1<secp256k1::All> = Secp256k1::new();
+        let _ctx: Secp256k1<secp256k1::All> = Secp256k1::new();
         let fixtures = vec![
             KeyFixture {
                 input: "0233d78f74de8ef4a1de815b6d5c5c129c073786305c0826c499b1811c9a12cee5",
                 result: Some(Secp256k1PublicKey {
-                    key: LibSecp256k1PublicKey::from_slice(&hex_bytes("0233d78f74de8ef4a1de815b6d5c5c129c073786305c0826c499b1811c9a12cee5").unwrap()[..]).unwrap(),
+                    key: LibSecp256k1PublicKey::from_slice(&const_hex::decode("0233d78f74de8ef4a1de815b6d5c5c129c073786305c0826c499b1811c9a12cee5").unwrap()[..]).unwrap(),
                     compressed: true
                 })
             },
             KeyFixture {
                 input: "044a83ad59dbae1e2335f488dbba5f8604d00f612a43ebaae784b5b7124cc38c3aaf509362787e1a8e25131724d57fec81b87889aabb4edf7bd89f5c4daa4f8aa7",
                 result: Some(Secp256k1PublicKey {
-                    key: LibSecp256k1PublicKey::from_slice(&hex_bytes("044a83ad59dbae1e2335f488dbba5f8604d00f612a43ebaae784b5b7124cc38c3aaf509362787e1a8e25131724d57fec81b87889aabb4edf7bd89f5c4daa4f8aa7").unwrap()[..]).unwrap(),
+                    key: LibSecp256k1PublicKey::from_slice(&const_hex::decode("044a83ad59dbae1e2335f488dbba5f8604d00f612a43ebaae784b5b7124cc38c3aaf509362787e1a8e25131724d57fec81b87889aabb4edf7bd89f5c4daa4f8aa7").unwrap()[..]).unwrap(),
                     compressed: false
                 })
             },
@@ -548,19 +473,22 @@ mod tests {
                 (Ok(key), Some(key_result)) => {
                     assert_eq!(key, key_result);
 
-                    let key_from_slice =
-                        Secp256k1PublicKey::from_slice(&hex_bytes(fixture.input).unwrap()[..])
-                            .unwrap();
+                    let key_from_slice = Secp256k1PublicKey::from_slice(
+                        &const_hex::decode(fixture.input).unwrap()[..],
+                    )
+                    .unwrap();
                     assert_eq!(key_from_slice, key_result);
 
                     let key_bytes = key.to_bytes();
-                    assert_eq!(key_bytes, hex_bytes(fixture.input).unwrap());
+                    assert_eq!(key_bytes, const_hex::decode(fixture.input).unwrap());
                 }
                 (Err(_e), None) => {}
                 (_, _) => {
                     // either got a key when we didn't expect one, or didn't get a key when we did
                     // expect one.
-                    panic!("Unexpected result: we either got a key when we didn't expect one, or didn't get a key when we did expect one.");
+                    panic!(
+                        "Unexpected result: we either got a key when we didn't expect one, or didn't get a key when we did expect one."
+                    );
                 }
             }
         }
@@ -569,67 +497,67 @@ mod tests {
     #[test]
     fn test_verify() {
         let _ctx: Secp256k1<secp256k1::All> = Secp256k1::new();
-        let fixtures : Vec<VerifyFixture<Result<bool, &'static str>>> = vec![
+        let fixtures: Vec<VerifyFixture<Result<bool, &'static str>>> = vec![
             VerifyFixture {
                 public_key: "0385f2e2867524289d6047d0d9c5e764c5d413729fc32291ad2c353fbc396a4219",
                 signature: "00354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6",
-                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",       // sha256 hash of "hello world"
-                result: Ok(true)
+                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", // sha256 hash of "hello world"
+                result: Ok(true),
             },
             VerifyFixture {
                 public_key: "0385f2e2867524289d6047d0d9c5e764c5d413729fc32291ad2c353fbc396a4219",
                 signature: "00354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6",
-                data: "ca3704aa0b06f5954c79ee837faa152d84d6b2d42838f0637a15eda8337dbdce",       // sha256 hash of "nope"
-                result: Ok(false)
+                data: "ca3704aa0b06f5954c79ee837faa152d84d6b2d42838f0637a15eda8337dbdce", // sha256 hash of "nope"
+                result: Ok(false),
             },
             VerifyFixture {
-                public_key: "034c35b09b758678165d6ed84a50b329900c99986cf8e9a358ceae0d03af91f5b6",   // wrong key
+                public_key: "034c35b09b758678165d6ed84a50b329900c99986cf8e9a358ceae0d03af91f5b6", // wrong key
                 signature: "00354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6",
-                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",       // sha256 hash of "hello world"
-                result: Ok(false)
+                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", // sha256 hash of "hello world"
+                result: Ok(false),
             },
             VerifyFixture {
                 public_key: "0385f2e2867524289d6047d0d9c5e764c5d413729fc32291ad2c353fbc396a4219",
-                signature: "00354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe7",  // wrong sig (bad s)
-                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",       // sha256 hash of "hello world"
-                result: Ok(false)
+                signature: "00354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe7", // wrong sig (bad s)
+                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", // sha256 hash of "hello world"
+                result: Ok(false),
             },
             VerifyFixture {
                 public_key: "0385f2e2867524289d6047d0d9c5e764c5d413729fc32291ad2c353fbc396a4219",
-                signature: "00454445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6",  // wrong sig (bad r)
-                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",       // sha256 hash of "hello world"
-                result: Ok(false)
+                signature: "00454445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6", // wrong sig (bad r)
+                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", // sha256 hash of "hello world"
+                result: Ok(false),
             },
             VerifyFixture {
                 public_key: "0385f2e2867524289d6047d0d9c5e764c5d413729fc32291ad2c353fbc396a4219",
-                signature: "01354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6",  // wrong sig (bad recovery)
-                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",       // sha256 hash of "hello world"
-                result: Ok(false)
+                signature: "01354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6", // wrong sig (bad recovery)
+                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", // sha256 hash of "hello world"
+                result: Ok(false),
             },
             VerifyFixture {
                 public_key: "0385f2e2867524289d6047d0d9c5e764c5d413729fc32291ad2c353fbc396a4219",
-                signature: "02354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6",  // wrong sig (bad recovery)
-                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",       // sha256 hash of "hello world"
+                signature: "02354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6", // wrong sig (bad recovery)
+                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", // sha256 hash of "hello world"
                 result: Err("Invalid signature: failed to recover public key"),
             },
             VerifyFixture {
                 public_key: "0385f2e2867524289d6047d0d9c5e764c5d413729fc32291ad2c353fbc396a4219",
-                signature: "03354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6",  // wrong sig (bad recovery)
-                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",       // sha256 hash of "hello world"
+                signature: "03354445a1dc98a1bd27984dbe69979a5cd77886b4d9134af5c40e634d96e1cb445b97de5b632582d31704f86706a780886e6e381bfed65228267358262d203fe6", // wrong sig (bad recovery)
+                data: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9", // sha256 hash of "hello world"
                 result: Err("Invalid signature: failed to recover public key"),
-            }
+            },
         ];
 
         for fixture in fixtures {
             let key = Secp256k1PublicKey::from_hex(fixture.public_key).unwrap();
-            let signature = MessageSignature::from_raw(&hex_bytes(fixture.signature).unwrap());
-            let ver_res = key.verify(&hex_bytes(fixture.data).unwrap(), &signature);
+            let signature =
+                MessageSignature::from_raw(&const_hex::decode(fixture.signature).unwrap());
+            let ver_res = key.verify(&const_hex::decode(fixture.data).unwrap(), &signature);
             match (ver_res, fixture.result) {
                 (Ok(true), Ok(true)) => {}
                 (Ok(false), Ok(false)) => {}
                 (Err(e1), Err(e2)) => assert_eq!(e1, e2),
-                (Err(e1), _) => {
-                    test_debug!("Failed to verify signature: {}", e1);
+                (Err(_e1), _) => {
                     panic!(
                         "failed fixture (verification: {:?}): {:#?}",
                         &ver_res, &fixture
@@ -653,7 +581,7 @@ mod tests {
         let mut runtime_recover = 0;
         let mut rng = rand::thread_rng();
 
-        for i in 0..100 {
+        for _i in 0..100 {
             let privk = Secp256k1PrivateKey::random();
             let pubk = Secp256k1PublicKey::from_private(&privk);
 
@@ -661,36 +589,36 @@ mod tests {
             rng.fill_bytes(&mut msg);
 
             let sign_start = get_epoch_time_ms();
-            for i in 0..1000 {
-                let sig = privk.sign(&msg).unwrap();
+            for _i in 0..1000 {
+                let _sig = privk.sign(&msg).unwrap();
             }
             let sign_end = get_epoch_time_ms();
 
             let sig = privk.sign(&msg).unwrap();
             let secp256k1_msg = LibSecp256k1Message::from_slice(&msg).unwrap();
-            let secp256k1_sig = sig.to_secp256k1_recoverable().unwrap();
+            let secp256k1_sig = message_signature_to_secp256k1_recoverable(&sig).unwrap();
 
             let recovered_pubk =
                 Secp256k1PublicKey::recover_benchmark(&secp256k1_msg, &secp256k1_sig).unwrap();
             assert_eq!(recovered_pubk, pubk.key);
 
             let recover_start = get_epoch_time_ms();
-            for i in 0..1000 {
-                let recovered_pubk =
+            for _i in 0..1000 {
+                let _recovered_pubk =
                     Secp256k1PublicKey::recover_benchmark(&secp256k1_msg, &secp256k1_sig).unwrap();
             }
             let recover_end = get_epoch_time_ms();
 
             let verify_start = get_epoch_time_ms();
-            for i in 0..1000 {
-                let valid = pubk.verify(&msg, &sig).unwrap();
+            for _i in 0..1000 {
+                let _valid = pubk.verify(&msg, &sig).unwrap();
             }
             let verify_end = get_epoch_time_ms();
 
             let valid = pubk.verify(&msg, &sig).unwrap();
             assert!(valid);
 
-            test_debug!(
+            eprintln!(
                 "Runtime: {:?} sign, {:?} recover, {:?} verify",
                 ((sign_end - sign_start) as f64) / 1000.0,
                 ((recover_end - recover_start) as f64) / 1000.0,
@@ -702,7 +630,7 @@ mod tests {
             runtime_recover += recover_end - recover_start;
         }
 
-        test_debug!(
+        eprintln!(
             "Total Runtime: {:?} sign, {:?} verify, {:?} recover, {:?} verify - recover",
             runtime_sign,
             runtime_verify,

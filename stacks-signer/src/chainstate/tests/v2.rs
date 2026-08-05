@@ -30,7 +30,6 @@ use blockstack_lib::chainstate::stacks::{
 use blockstack_lib::core::test_util::make_stacks_transfer_tx;
 use blockstack_lib::net::api::get_tenures_fork_info::TenureForkingInfo;
 use clarity::types::chainstate::{BurnchainHeaderHash, SortitionId, StacksAddress};
-use clarity::types::PrivateKey;
 use clarity::util::secp256k1::Secp256k1PublicKey;
 use clarity::util::vrf::VRFProof;
 use libsigner::v0::messages::RejectReason;
@@ -47,6 +46,7 @@ use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::{function_name, info};
+use stacks_crypto::secp256k1::SigningKey as _;
 
 use crate::chainstate::tests::make_parent_header_meta;
 use crate::chainstate::v2::{GlobalStateView, SortitionState};

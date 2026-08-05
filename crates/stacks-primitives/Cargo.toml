@@ -1,0 +1,22 @@
+[package]
+name = "stacks-primitives"
+version = "0.1.0"
+license = "GPL-3.0"
+homepage = "https://github.com/stacks-network/stacks-core"
+repository = "https://github.com/stacks-network/stacks-core"
+description = "Primitive data types for the Stacks blockchain reference implementation"
+keywords = ["stacks", "stx", "blockchain"]
+readme = "README.md"
+edition = "2024"
+
+[dependencies]
+# Local dependencies
+stacks-macros = { workspace = true }
+
+# Other dependencies
+const-hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default = []
+testing = []

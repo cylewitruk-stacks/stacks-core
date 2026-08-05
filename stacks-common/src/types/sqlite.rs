@@ -22,7 +22,6 @@ use crate::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksBlockId, TrieHash, Txid,
 };
 use crate::util::hash::{Hash160, Sha512Trunc256Sum};
-use crate::util::secp256k1::MessageSignature;
 use crate::util::vrf::VRFProof;
 
 pub const NO_PARAMS: &[&dyn ToSql] = &[];
@@ -59,7 +58,6 @@ impl_byte_array_rusqlite_only!(BurnchainHeaderHash);
 impl_byte_array_rusqlite_only!(VRFProof);
 impl_byte_array_rusqlite_only!(TrieHash);
 impl_byte_array_rusqlite_only!(Sha512Trunc256Sum);
-impl_byte_array_rusqlite_only!(MessageSignature);
 impl_byte_array_rusqlite_only!(SortitionId);
 impl_byte_array_rusqlite_only!(StacksBlockId);
 impl_byte_array_rusqlite_only!(Txid);

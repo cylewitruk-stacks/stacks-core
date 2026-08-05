@@ -23,7 +23,7 @@ pub use clarity_types::types::signatures::{
     AssetIdentifier, BufferLength, CallableSubtype, ListTypeData, SequenceSubtype, StringSubtype,
     StringUTF8Length, TupleTypeSignature, TypeSignature,
 };
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use self::TypeSignature::SequenceType;
 use crate::vm::analysis::errors::{CommonCheckErrorKind, StaticCheckErrorKind};

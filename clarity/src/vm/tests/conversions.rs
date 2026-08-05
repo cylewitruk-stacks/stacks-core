@@ -17,7 +17,7 @@
 use clarity_types::types::MAX_TO_ASCII_BUFFER_LEN;
 use pinny::tag;
 use proptest::prelude::*;
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 use stacks_common::util::hash::to_hex;
 
 pub use crate::vm::analysis::errors::RuntimeCheckErrorKind;

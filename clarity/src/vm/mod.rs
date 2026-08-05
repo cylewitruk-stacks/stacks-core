@@ -52,7 +52,7 @@ pub mod clarity;
 use std::collections::BTreeMap;
 
 pub use clarity_types::max_call_stack_depth_for_epoch;
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use self::analysis::ContractAnalysis;
 use self::ast::ContractAST;

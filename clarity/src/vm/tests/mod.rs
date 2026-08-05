@@ -15,7 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use stacks_common::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 #[cfg(test)]
 use super::ClarityVersion;

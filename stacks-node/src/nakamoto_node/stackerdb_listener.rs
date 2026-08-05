@@ -36,12 +36,12 @@ use stacks::chainstate::stacks::Error as ChainstateError;
 use stacks::codec::StacksMessageCodec;
 use stacks::net::api::postblock_proposal::ValidateRejectCode;
 use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
-use stacks::types::PublicKey;
 use stacks::util::get_epoch_time_secs;
 use stacks::util::hash::{MerkleHashFunc, Sha512Trunc256Sum};
 use stacks::util::secp256k1::MessageSignature;
 #[cfg(test)]
 use stacks_common::util::tests::TestFlag;
+use stacks_crypto::secp256k1::VerifyingKey as _;
 
 use super::Error as NakamotoNodeError;
 use crate::event_dispatcher::StackerDBChannel;

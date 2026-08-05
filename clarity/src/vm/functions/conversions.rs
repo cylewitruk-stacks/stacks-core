@@ -16,6 +16,7 @@
 
 use clarity_types::errors::ClarityTypeError;
 use clarity_types::types::serialization::SerializationError;
+use stacks_common::types::ClarityEpochRules;
 
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;

@@ -14,11 +14,12 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 use pinny::tag;
 use proptest::prelude::*;
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{StacksPrivateKey, StacksPublicKey};
-use stacks_common::types::{PrivateKey, StacksEpochId};
 use stacks_common::util::hash::{Sha256Sum, to_hex};
 use stacks_common::util::secp256k1::MessageSignature as Secp256k1Signature;
 use stacks_common::util::secp256r1::{Secp256r1PrivateKey, Secp256r1PublicKey};
+use stacks_crypto::secp256k1::SigningKey as _;
 
 use crate::vm::errors::{ClarityEvalError, RuntimeCheckErrorKind, VmExecutionError};
 use crate::vm::types::{ResponseData, TypeSignature, Value};

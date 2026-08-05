@@ -12,6 +12,14 @@ extern crate slog;
 #[macro_use]
 extern crate serde_derive;
 
+#[macro_use]
+extern crate stacks_codec;
+
+// TODO: migrate callers to import codec macros from `stacks-codec` directly.
+pub use stacks_codec::{
+    impl_byte_array_message_codec, impl_stacks_message_codec_for_int, BITVEC_LEN,
+};
+
 #[cfg(all(unix, feature = "ctrlc-handler"))]
 extern crate nix;
 
@@ -21,8 +29,12 @@ extern crate winapi;
 #[macro_use]
 pub mod util;
 
-#[macro_use]
 pub mod codec;
+
+pub mod primitives {
+    // TODO: migrate callers to `stacks-primitives` directly, then remove this bridge.
+    pub use stacks_primitives::*;
+}
 
 pub mod types;
 
@@ -71,34 +83,15 @@ pub mod consts {
     ///  to use to participate in DKG and block validation signing.
     pub const SIGNER_SLOTS_PER_USER: u32 = 13;
 
-    /// peer version (big-endian)
-    /// first byte == major network protocol version (currently 0x18)
-    /// second and third bytes are unused
-    /// fourth byte == highest epoch supported by this node
-    pub const PEER_VERSION_MAINNET_MAJOR: u32 = 0x18000000;
-    pub const PEER_VERSION_TESTNET_MAJOR: u32 = 0xfacade00;
-
-    pub const PEER_VERSION_EPOCH_1_0: u8 = 0x00;
-    pub const PEER_VERSION_EPOCH_2_0: u8 = 0x00;
-    pub const PEER_VERSION_EPOCH_2_05: u8 = 0x05;
-    pub const PEER_VERSION_EPOCH_2_1: u8 = 0x06;
-    pub const PEER_VERSION_EPOCH_2_2: u8 = 0x07;
-    pub const PEER_VERSION_EPOCH_2_3: u8 = 0x08;
-    pub const PEER_VERSION_EPOCH_2_4: u8 = 0x09;
-    pub const PEER_VERSION_EPOCH_2_5: u8 = 0x0a;
-    pub const PEER_VERSION_EPOCH_3_0: u8 = 0x0b;
-    pub const PEER_VERSION_EPOCH_3_1: u8 = 0x0c;
-    pub const PEER_VERSION_EPOCH_3_2: u8 = 0x0d;
-    pub const PEER_VERSION_EPOCH_3_3: u8 = 0x0e;
-    pub const PEER_VERSION_EPOCH_3_4: u8 = 0x0f;
-
-    /// this should be updated to the latest network epoch version supported by
-    ///  this node. this will be checked by the `validate_epochs()` method.
-    pub const PEER_NETWORK_EPOCH: u32 = PEER_VERSION_EPOCH_3_4 as u32;
-
-    /// set the fourth byte of the peer version
-    pub const PEER_VERSION_MAINNET: u32 = PEER_VERSION_MAINNET_MAJOR | PEER_NETWORK_EPOCH;
-    pub const PEER_VERSION_TESTNET: u32 = PEER_VERSION_TESTNET_MAJOR | PEER_NETWORK_EPOCH;
+    // TODO: migrate callers to `stacks-p2p` directly, then remove this bridge.
+    pub use stacks_p2p::{
+        PEER_NETWORK_EPOCH, PEER_VERSION_EPOCH_1_0, PEER_VERSION_EPOCH_2_0,
+        PEER_VERSION_EPOCH_2_05, PEER_VERSION_EPOCH_2_1, PEER_VERSION_EPOCH_2_2,
+        PEER_VERSION_EPOCH_2_3, PEER_VERSION_EPOCH_2_4, PEER_VERSION_EPOCH_2_5,
+        PEER_VERSION_EPOCH_3_0, PEER_VERSION_EPOCH_3_1, PEER_VERSION_EPOCH_3_2,
+        PEER_VERSION_EPOCH_3_3, PEER_VERSION_EPOCH_3_4, PEER_VERSION_MAINNET,
+        PEER_VERSION_MAINNET_MAJOR, PEER_VERSION_TESTNET, PEER_VERSION_TESTNET_MAJOR,
+    };
 
     /// network identifiers
     pub const NETWORK_ID_MAINNET: u32 = 0x17000000;

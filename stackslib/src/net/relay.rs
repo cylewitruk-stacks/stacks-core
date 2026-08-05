@@ -25,7 +25,7 @@ use rand::prelude::*;
 use rand::{thread_rng, Rng};
 use stacks_common::codec::MAX_PAYLOAD_LEN;
 use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksBlockId};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ChainEpochRules, ClarityEpochRules, StacksEpochId};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
 

@@ -16,7 +16,7 @@
 #[cfg(any(test, feature = "testing"))]
 use rstest::rstest;
 #[cfg(test)]
-use stacks_common::types::{StacksEpochId, chainstate::BlockHeaderHash};
+use stacks_common::types::{ClarityEpochRules, StacksEpochId, chainstate::BlockHeaderHash};
 #[cfg(test)]
 use stacks_common::util::hash::Sha512Trunc256Sum;
 

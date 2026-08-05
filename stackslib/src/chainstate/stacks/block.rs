@@ -800,11 +800,11 @@ impl StacksMicroblock {
 
 #[cfg(test)]
 mod test {
-    use clarity::types::PublicKey;
     use rstest::rstest;
     use stacks_common::address::*;
     use stacks_common::types::chainstate::StacksAddress;
     use stacks_common::util::hash::*;
+    use stacks_crypto::secp256k1::VerifyingKey as _;
 
     use super::*;
     use crate::burnchains::{BurnchainSigner, Txid};

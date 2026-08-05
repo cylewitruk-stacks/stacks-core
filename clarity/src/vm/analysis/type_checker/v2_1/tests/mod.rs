@@ -19,7 +19,7 @@ use clarity_types::types::SequenceSubtype;
 use rstest::rstest;
 #[cfg(test)]
 use rstest_reuse::{self, *};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use crate::vm::analysis::errors::{StaticCheckError, StaticCheckErrorKind, SyntaxBindingError};
 use crate::vm::analysis::mem_type_check as mem_run_analysis;

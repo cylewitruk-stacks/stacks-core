@@ -31,8 +31,12 @@ prometheus = { version = "0.9", optional = true }
 slog = { version = "2.5.2", features = [ "max_level_trace" ] }
 chrono = { version = "0.4.19", optional = true }
 clarity = { path = "../clarity" }
+clarity-types = { workspace = true }
 stacks-common = { path = "../stacks-common" }
 stacks-codec = { path = "../stacks-codec" }
+stacks-crypto = { workspace = true }
+stacks-protocol = { workspace = true }
+stacks-transactions = { workspace = true, features = ["codec"] }
 pox-locking = { path = "../pox-locking" }
 libstackerdb = { path = "../libstackerdb" }
 siphasher = "0.3.7"
@@ -80,7 +84,7 @@ disable-costs = []
 developer-mode = ["clarity/developer-mode"]
 monitoring_prom = ["prometheus"]
 slog_json = ["stacks-common/slog_json", "clarity/slog_json", "pox-locking/slog_json"]
-testing = ["chrono", "stacks-common/testing", "clarity/testing"]
+testing = ["chrono", "stacks-common/testing", "stacks-transactions/testing", "clarity/testing"]
 profiler = ["perf-event2"]
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]

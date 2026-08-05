@@ -16,15 +16,21 @@
 
 //! Binary consensus serialization codec for the Stacks blockchain.
 //!
-//! The trait, error type, and primitive impls live in `stacks_common::codec`;
-//! this crate re-exports them for callers that want to depend only on the
-//! codec surface, and will host the higher-level codec types (e.g.
-//! `StacksTransaction`) as they are lowered out of `stackslib`.
+//! The trait, error type, and primitive impls live here. `stacks-common`
+//! temporarily re-exports this surface while callers migrate.
 
+#[macro_use]
+pub mod macros;
+
+pub mod address;
+pub mod codec;
+pub mod p2p;
+pub mod primitives;
 pub mod strings;
-pub mod transaction;
 
-pub use stacks_common::codec::*;
-pub use stacks_common::{
-    impl_byte_array_message_codec, impl_stacks_message_codec_for_int, BITVEC_LEN,
-};
+// TODO: Re-enable these modules once their dependencies no longer force
+// `stacks-codec -> stacks-common`, which would cycle with the temporary
+// `stacks-common -> stacks-codec` re-export bridge.
+// pub mod transaction;
+
+pub use codec::*;

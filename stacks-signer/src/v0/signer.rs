@@ -27,7 +27,7 @@ use blockstack_lib::net::api::postblock_proposal::{
 use blockstack_lib::util_lib::db::Error as DBError;
 use clarity::codec::read_next;
 use clarity::types::chainstate::{StacksBlockId, StacksPrivateKey};
-use clarity::types::{PrivateKey, StacksEpochId};
+use clarity::types::StacksEpochId;
 use clarity::util::hash::{MerkleHashFunc, Sha512Trunc256Sum};
 use clarity::util::secp256k1::Secp256k1PublicKey;
 #[cfg(any(test, feature = "testing"))]
@@ -44,6 +44,7 @@ use stacks_common::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::{debug, error, info, warn};
+use stacks_crypto::secp256k1::SigningKey as _;
 
 use super::signer_state::LocalStateMachine;
 use crate::chainstate::v1::{SortitionMinerStatus, SortitionsView};

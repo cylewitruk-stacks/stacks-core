@@ -27,7 +27,7 @@ use stacks_common::types::chainstate::{
     TrieHash, VRFSeed,
 };
 use stacks_common::types::sqlite::NO_PARAMS;
-use stacks_common::types::StacksPublicKeyBuffer;
+use stacks_common::types::{ChainEpochRules, StacksPublicKeyBuffer};
 use stacks_common::util::hash::{hex_bytes, to_hex, Sha512Trunc256Sum};
 use stacks_common::util::vrf::*;
 

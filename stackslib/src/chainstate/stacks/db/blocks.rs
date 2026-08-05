@@ -37,6 +37,7 @@ use stacks_common::bitvec::BitVec;
 use stacks_common::codec::MAX_MESSAGE_LEN;
 use stacks_common::types::chainstate::{BurnchainHeaderHash, SortitionId, StacksBlockId};
 use stacks_common::types::sqlite::NO_PARAMS;
+use stacks_common::types::EpochCoinbaseReward;
 use stacks_common::util::hash::to_hex;
 use stacks_common::util::retry::BoundReader;
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};

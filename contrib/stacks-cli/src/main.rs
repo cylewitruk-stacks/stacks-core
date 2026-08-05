@@ -210,8 +210,8 @@ impl From<NetError> for CliError {
     }
 }
 
-impl From<stacks_codec::transaction::AuthError> for CliError {
-    fn from(value: stacks_codec::transaction::AuthError) -> Self {
+impl From<stackslib::chainstate::stacks::AuthError> for CliError {
+    fn from(value: stackslib::chainstate::stacks::AuthError) -> Self {
         CliError::Message(format!("Stacks AuthError: {value}"))
     }
 }

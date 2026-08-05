@@ -28,6 +28,7 @@ use clarity::vm::types::{
     StacksAddressExtensions as ClarityStacksAddressExt, StandardPrincipalData, TupleData,
     TypeSignature, Value,
 };
+use stacks_common::types::ChainEpochRules;
 
 use crate::chainstate::nakamoto::miner::MinerTenureInfoCause;
 use crate::chainstate::stacks::db::*;

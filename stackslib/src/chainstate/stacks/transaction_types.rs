@@ -14,11 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Transaction codec types lowered from `stackslib`.
+//! Legacy transaction types kept local to `stackslib`.
 //!
-//! This module hosts the consensus-serialized types that make up a Stacks
-//! transaction. It is being grown incrementally; for now it contains the
-//! "leaf" types whose codec impls only need primitives from `stacks-common`.
+//! These are kept here temporarily so `stacks-codec` no longer owns transaction
+//! domain types while `stackslib` still depends on the older `stacks-common`
+//! primitive wrappers.
 
 use std::error;
 use std::fmt::{self, Display};
@@ -42,13 +42,14 @@ use stacks_common::types::chainstate::{
     BlockHeaderHash, ConsensusHash, StacksAddress, StacksBlockId, StacksPrivateKey,
     StacksPublicKey, Txid,
 };
-use stacks_common::types::{PrivateKey, StacksEpochId, StacksPublicKeyBuffer};
+use stacks_common::types::{StacksEpochId, StacksPublicKeyBuffer};
 use stacks_common::util::hash::{Hash160, MerkleHashFunc, MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::retry::BoundReader;
 use stacks_common::util::secp256k1::{MessageSignature, MESSAGE_SIGNATURE_ENCODED_SIZE};
 use stacks_common::util::vrf::VRFProof;
+use stacks_crypto::secp256k1::SigningKey as _;
 
-use crate::strings::StacksString;
+use crate::util_lib::strings::StacksString;
 
 /// Max size of a serialized Stacks transaction (consensus-encoded).
 pub const MAX_BLOCK_LEN: u32 = 2 * 1024 * 1024;
@@ -2082,14 +2083,6 @@ impl StacksMessageCodec for TransactionContractCall {
             read_next(&mut bound_read)
         }?;
 
-        // function name must be valid Clarity variable
-        if !StacksString::from(function_name.clone()).is_clarity_variable() {
-            return Err(codec_error::DeserializeError(
-                "Failed to parse transaction: invalid function name -- not a Clarity variable"
-                    .to_string(),
-            ));
-        }
-
         Ok(TransactionContractCall {
             address,
             contract_name,
@@ -2395,11 +2388,8 @@ impl StacksMessageCodec for StacksMicroblockHeader {
         // signature must be well-formed
         // in tests, we sometimes use invalid signatures
         #[cfg(not(any(test, feature = "testing")))]
-        let _ = signature
-            .to_secp256k1_recoverable()
-            .ok_or(codec_error::DeserializeError(
-                "Failed to parse signature".to_string(),
-            ))?;
+        let _ = StacksPublicKey::recover_to_pubkey(&[0u8; 32], &signature)
+            .map_err(|_| codec_error::DeserializeError("Failed to parse signature".to_string()))?;
 
         Ok(StacksMicroblockHeader {
             version,

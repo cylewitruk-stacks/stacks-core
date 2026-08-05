@@ -54,12 +54,13 @@ use stacks::util::secp256k1::MessageSignature;
 #[cfg(test)]
 use stacks::util::secp256k1::Secp256k1PublicKey;
 use stacks_common::types::chainstate::{StacksAddress, StacksBlockId};
-#[cfg(test)]
-use stacks_common::types::PublicKey;
-use stacks_common::types::{PrivateKey, StacksEpochId};
+use stacks_common::types::StacksEpochId;
 #[cfg(test)]
 use stacks_common::util::tests::TestFlag;
 use stacks_common::util::vrf::VRFProof;
+use stacks_crypto::secp256k1::SigningKey as _;
+#[cfg(test)]
+use stacks_crypto::secp256k1::VerifyingKey as _;
 #[cfg(test)]
 use tempfile::tempdir;
 

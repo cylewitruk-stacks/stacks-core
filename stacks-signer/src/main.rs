@@ -276,8 +276,8 @@ pub mod tests {
     use clarity::vm::{execute_v2, Value};
     use rand::{Rng, RngCore};
     use stacks_common::consts::CHAIN_ID_TESTNET;
-    use stacks_common::types::PublicKey;
     use stacks_common::util::secp256k1::Secp256k1PublicKey;
+    use stacks_crypto::secp256k1::VerifyingKey as _;
     use stacks_signer::cli::{parse_pox_addr, VerifyVoteArgs, Vote, VoteInfo};
 
     use super::{handle_generate_stacking_signature, *};

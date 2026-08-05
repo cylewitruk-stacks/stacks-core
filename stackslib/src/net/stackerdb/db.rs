@@ -260,7 +260,7 @@ impl StackerDBTx<'_> {
                     0,
                     vec![],
                     Sha512Trunc256Sum([0u8; 32]),
-                    MessageSignature::empty(),
+                    MessageSignature::empty().to_hex(),
                 ];
                 stmt.execute(args)?;
 
@@ -339,7 +339,7 @@ impl StackerDBTx<'_> {
                     0,
                     vec![],
                     Sha512Trunc256Sum([0u8; 32]),
-                    MessageSignature::empty(),
+                    MessageSignature::empty().to_hex(),
                 ];
 
                 stmt.execute(args)?;
@@ -384,7 +384,7 @@ impl StackerDBTx<'_> {
         let args = params![
             slot_desc.slot_version,
             Sha512Trunc256Sum::from_data(chunk),
-            slot_desc.signature,
+            slot_desc.signature.to_hex(),
             chunk,
             u64_to_sql(get_epoch_time_secs())?,
             stackerdb_id,

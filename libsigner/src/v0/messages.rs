@@ -40,7 +40,6 @@ use clarity::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use clarity::types::chainstate::{
     BlockHeaderHash, ConsensusHash, StacksPrivateKey, StacksPublicKey,
 };
-use clarity::types::PrivateKey;
 use clarity::util::hash::Sha256Sum;
 use clarity::util::secp256k1::MessageSignature;
 use clarity::vm::types::{QualifiedContractIdentifier, TupleData};
@@ -51,8 +50,8 @@ use stacks_common::codec::{
 };
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum};
+use stacks_crypto::secp256k1::{SigningKey as _, VerifyingKey as _};
 
-use crate::stacks_common::types::PublicKey;
 use crate::v0::signer_state::{ReplayTransactionSet, SignerStateMachine};
 use crate::{
     BlockProposal, MessageSlotID as MessageSlotIDTrait, SignerMessage as SignerMessageTrait,

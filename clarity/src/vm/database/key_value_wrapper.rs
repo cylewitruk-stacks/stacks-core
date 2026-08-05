@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use super::clarity_store::SpecialCaseHandler;
@@ -622,5 +622,15 @@ impl RollbackWrapper<'_> {
             let metadata_key = (contract.clone(), (*key).to_string());
             self.metadata_lookup_map.contains_key(&metadata_key)
         })
+    }
+
+    pub fn has_pending_write_for_key(&self, keys: &[&str]) -> bool {
+        // Retargeted wrappers always read from the backing store, so pending metadata is
+        // irrelevant.
+        if self.is_retargeted() {
+            return false;
+        }
+
+        keys.iter().any(|key| self.lookup_map.contains_key(*key))
     }
 }

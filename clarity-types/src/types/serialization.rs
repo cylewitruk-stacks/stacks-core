@@ -18,7 +18,7 @@ use std::{cmp, error, str};
 
 use lazy_static::lazy_static;
 use stacks_common::codec::{Error as codec_error, StacksMessageCodec};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 use stacks_common::util::hash::{hex_bytes, to_hex};
 use stacks_common::util::retry::BoundReader;
 

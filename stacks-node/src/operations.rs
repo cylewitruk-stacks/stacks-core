@@ -1,6 +1,6 @@
-use stacks::burnchains::PrivateKey;
 use stacks_common::util::hash::hex_bytes;
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_crypto::secp256k1::SigningKey as _;
 
 /// A signer used for burnchain operations, which manages a private key and provides
 /// functionality to derive public keys, sign messages, and export keys in different formats.

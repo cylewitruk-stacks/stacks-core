@@ -17,10 +17,10 @@
 use std::{error, fmt};
 
 use sha2::{Digest, Sha256};
+use stacks_crypto::secp256k1::VerifyingKey;
 
 use crate::deps_common::bitcoin::blockdata::opcodes::All as btc_opcodes;
 use crate::deps_common::bitcoin::blockdata::script::Builder;
-use crate::types::PublicKey;
 use crate::util::hash::Hash160;
 
 pub mod b58;
@@ -148,13 +148,13 @@ impl TryFrom<u8> for AddressHashMode {
 /// Internally, the Stacks blockchain encodes address the same as Bitcoin
 /// single-sig address (p2pkh)
 /// Get back the hash of the address
-pub fn to_bits_p2pkh<K: PublicKey>(pubk: &K) -> Hash160 {
+pub fn to_bits_p2pkh<K: VerifyingKey>(pubk: &K) -> Hash160 {
     Hash160::from_data(&pubk.to_bytes())
 }
 
 /// Internally, the Stacks blockchain encodes address the same as Bitcoin
 /// multi-sig address (p2sh)
-fn to_bits_p2sh<K: PublicKey>(num_sigs: usize, pubkeys: &Vec<K>) -> Hash160 {
+fn to_bits_p2sh<K: VerifyingKey>(num_sigs: usize, pubkeys: &Vec<K>) -> Hash160 {
     let mut bldr = Builder::new();
     bldr = bldr.push_int(num_sigs as i64);
     for pubk in pubkeys {
@@ -169,7 +169,7 @@ fn to_bits_p2sh<K: PublicKey>(num_sigs: usize, pubkeys: &Vec<K>) -> Hash160 {
 
 /// Internally, the Stacks blockchain encodes address the same as Bitcoin
 /// single-sig address over p2sh (p2h-p2wpkh)
-fn to_bits_p2sh_p2wpkh<K: PublicKey>(pubk: &K) -> Hash160 {
+fn to_bits_p2sh_p2wpkh<K: VerifyingKey>(pubk: &K) -> Hash160 {
     let key_hash = Hash160::from_data(&pubk.to_bytes());
 
     let bldr = Builder::new().push_int(0).push_slice(key_hash.as_bytes());
@@ -180,7 +180,7 @@ fn to_bits_p2sh_p2wpkh<K: PublicKey>(pubk: &K) -> Hash160 {
 
 /// Internally, the Stacks blockchain encodes address the same as Bitcoin
 /// multisig address over p2sh (p2sh-p2wsh)
-fn to_bits_p2sh_p2wsh<K: PublicKey>(num_sigs: usize, pubkeys: &Vec<K>) -> Hash160 {
+fn to_bits_p2sh_p2wsh<K: VerifyingKey>(num_sigs: usize, pubkeys: &Vec<K>) -> Hash160 {
     let mut bldr = Builder::new();
     bldr = bldr.push_int(num_sigs as i64);
     for pubk in pubkeys {
@@ -202,7 +202,7 @@ fn to_bits_p2sh_p2wsh<K: PublicKey>(num_sigs: usize, pubkeys: &Vec<K>) -> Hash16
 /// Convert a number of required signatures and a list of public keys into a byte-vec to hash to an
 /// address.  Validity of the hash_flag vis a vis the num_sigs and pubkeys will _NOT_ be checked.
 /// This is a low-level method.  Consider using StacksAdress::from_public_keys() if you can.
-pub fn public_keys_to_address_hash<K: PublicKey>(
+pub fn public_keys_to_address_hash<K: VerifyingKey>(
     hash_flag: &AddressHashMode,
     num_sigs: usize,
     pubkeys: &Vec<K>,

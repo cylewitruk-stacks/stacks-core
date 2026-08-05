@@ -38,6 +38,7 @@ use rstest_reuse::{self, *};
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::StacksEpochId;
+use stacks_protocol::epoch::{ChainEpochRules as _, ClarityEpochRules as _};
 
 use crate::chainstate::stacks::boot::{BOOT_CODE_COSTS_2, BOOT_CODE_COSTS_3, BOOT_CODE_COSTS_4};
 use crate::chainstate::stacks::index::ClarityMarfTrieId;
