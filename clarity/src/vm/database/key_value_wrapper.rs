@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
-use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
 use super::clarity_store::SpecialCaseHandler;
@@ -432,8 +432,7 @@ impl RollbackWrapper<'_> {
         epoch: &StacksEpochId,
     ) -> Result<ValueResult, SerializationError> {
         let serialized_byte_len = value_hex.len() as u64 / 2;
-        let sanitize = epoch.value_sanitizing();
-        let value = Value::try_deserialize_hex(value_hex, expected, sanitize)?;
+        let value = Value::try_deserialize_hex_at_epoch(value_hex, expected, epoch)?;
 
         Ok(ValueResult {
             value,

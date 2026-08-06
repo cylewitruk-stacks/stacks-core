@@ -4,6 +4,7 @@ pub trait ClarityEpochRules {
     fn analysis_memory(self) -> bool;
     fn value_sanitizing(self) -> bool;
     fn sanitize_in_function_invocation(self) -> bool;
+    fn enforces_exact_typed_tuple_field_set(self) -> bool;
     fn supports_specific_budget_extends(self) -> bool;
     fn treats_unexpected_serialization_as_none(self) -> bool;
     fn rejects_supertype_too_large(self) -> bool;
@@ -35,6 +36,10 @@ impl ClarityEpochRules for StacksEpochId {
 
     fn sanitize_in_function_invocation(self) -> bool {
         self >= StacksEpochId::Epoch40
+    }
+
+    fn enforces_exact_typed_tuple_field_set(self) -> bool {
+        self >= StacksEpochId::Epoch41
     }
 
     fn supports_specific_budget_extends(self) -> bool {
