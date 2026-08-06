@@ -65,6 +65,7 @@ pub mod index;
 pub mod miner;
 pub mod sbtc;
 pub mod transaction;
+mod transaction_types;
 
 #[cfg(test)]
 pub mod tests;
@@ -78,7 +79,7 @@ pub use stacks_common::types::chainstate::{StacksPrivateKey, StacksPublicKey};
 pub const STACKS_BLOCK_VERSION: u8 = 7;
 pub const STACKS_BLOCK_VERSION_AST_PRECHECK_SIZE: u8 = 1;
 
-pub use stacks_codec::transaction::{MAX_BLOCK_LEN, MAX_TRANSACTION_LEN};
+pub use transaction_types::{MAX_BLOCK_LEN, MAX_TRANSACTION_LEN, MIN_TRANSACTION_LEN};
 
 #[derive(Debug)]
 pub enum Error {
@@ -414,7 +415,7 @@ impl Error {
     }
 }
 
-pub use stacks_codec::transaction::{
+pub use transaction_types::{
     AssetInfo, AssetInfoID, AuthError, CoinbasePayload, FungibleConditionCode, MultisigHashMode,
     MultisigSpendingCondition, NonfungibleConditionCode, OrderIndependentMultisigHashMode,
     OrderIndependentMultisigSpendingCondition, PostConditionPrincipal, PostConditionPrincipalID,
@@ -505,6 +506,7 @@ pub mod test {
     use stacks_common::bitvec::BitVec;
     use stacks_common::util::get_epoch_time_secs;
     use stacks_common::util::hash::*;
+    use stacks_transactions::StacksMicroblockHeaderExt as _;
 
     use super::*;
     use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};

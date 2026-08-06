@@ -22,6 +22,7 @@ use clarity::types::StacksEpochId;
 use clarity::util::sleep_ms;
 use libsigner::v0::messages::{MessageSlotID, SignerMessage};
 use libsigner::SignerSession;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 use stacks_common::{info, warn};
 
 use crate::cli::MonitorSignersArgs;

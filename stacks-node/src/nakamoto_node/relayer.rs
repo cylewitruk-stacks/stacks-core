@@ -51,14 +51,16 @@ use stacks::net::relay::Relayer;
 use stacks::net::NetworkResult;
 use stacks::util_lib::db::Error as DbError;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, StacksBlockId, StacksPublicKey, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, StacksBlockId,
+    StacksBlockIdDigest as _, StacksPublicKey, VRFSeed, VRFSeedDigest as _,
 };
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ChainEpochRules, StacksEpochId};
 use stacks_common::util::get_epoch_time_ms;
 use stacks_common::util::hash::Hash160;
 #[cfg(test)]
 use stacks_common::util::tests::TestFlag;
 use stacks_common::util::vrf::VRFPublicKey;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use super::miner::MinerReason;
 use super::{
@@ -2334,6 +2336,7 @@ pub mod test {
     use stacks::util::hash::Hash160;
     use stacks::util::secp256k1::Secp256k1PublicKey;
     use stacks::util::vrf::VRFPublicKey;
+    use stacks_crypto::hash::Hash160Digest as _;
 
     use super::{BurnBlockCommitTimer, RelayerThread};
     use crate::nakamoto_node::save_activated_vrf_key;

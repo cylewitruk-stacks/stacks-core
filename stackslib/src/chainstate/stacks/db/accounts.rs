@@ -16,8 +16,11 @@
 
 use clarity::types::chainstate::TenureBlockId;
 use clarity::vm::types::*;
-use rusqlite::{params, Row};
-use stacks_common::types::chainstate::{StacksAddress, StacksBlockId};
+use rusqlite::Row;
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksBlockId, StacksBlockIdDigest as _,
+};
+use stacks_rusqlite::domain_params;
 
 use crate::chainstate::stacks::db::*;
 use crate::chainstate::stacks::{Error, *};
@@ -446,7 +449,7 @@ impl StacksChainState {
             }
         };
 
-        let args = params![
+        let args = domain_params![
             block_reward.address.to_string(),
             block_reward.recipient.to_string(),
             block_reward.block_hash,
@@ -536,7 +539,7 @@ impl StacksChainState {
             child_index_block_hash
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)";
 
-        let args = params![
+        let args = domain_params![
             reward.address.to_string(),
             reward.recipient.to_string(),
             reward.vtxindex,
@@ -645,7 +648,7 @@ impl StacksChainState {
         child_block_id: &TenureBlockId,
     ) -> Result<Vec<MinerReward>, Error> {
         let sql = "SELECT * FROM matured_rewards WHERE parent_index_block_hash = ?1 AND child_index_block_hash = ?2 AND vtxindex = 0";
-        let args = params![parent_block_id.0, child_block_id.0];
+        let args = domain_params![parent_block_id.0, child_block_id.0];
         let ret: Vec<MinerReward> = query_rows(conn, sql, args).map_err(Error::DBError)?;
         Ok(ret)
     }
@@ -711,7 +714,7 @@ impl StacksChainState {
     ) -> Result<Vec<MinerPaymentSchedule>, Error> {
         let qry =
             "SELECT * FROM payments WHERE index_block_hash = ?1 ORDER BY vtxindex ASC".to_string();
-        let args = params![index_block_hash];
+        let args = domain_params![index_block_hash];
         let rows =
             query_rows::<MinerPaymentSchedule, _>(conn, &qry, args).map_err(Error::DBError)?;
         test_debug!("{} rewards in {}", rows.len(), index_block_hash);
@@ -733,7 +736,7 @@ impl StacksChainState {
         };
 
         let qry = "SELECT * FROM payments WHERE block_hash = ?1 AND consensus_hash = ?2 ORDER BY vtxindex ASC".to_string();
-        let args = params![
+        let args = domain_params![
             ancestor_info.anchored_header.block_hash(),
             ancestor_info.consensus_hash,
         ];
@@ -769,7 +772,7 @@ impl StacksChainState {
         let qry =
             "SELECT * FROM payments WHERE consensus_hash = ?1 AND block_hash = ?2 AND miner = 1"
                 .to_string();
-        let args = params![consensus_hash, stacks_block_hash,];
+        let args = domain_params![consensus_hash, stacks_block_hash,];
         let mut rows =
             query_rows::<MinerPaymentSchedule, _>(conn, &qry, args).map_err(Error::DBError)?;
         let len = rows.len();
@@ -1085,7 +1088,6 @@ mod test {
     use stacks_common::util::hash::*;
 
     use super::*;
-    use crate::burnchains::*;
     use crate::chainstate::stacks::db::testing::*;
     use crate::core::StacksEpochId;
 

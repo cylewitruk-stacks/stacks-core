@@ -22,6 +22,7 @@
 
 use clarity::vm::costs::ExecutionCost;
 use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::EpochPeerVersion as _;
 
 use crate::burnchains::{Burnchain, PoxConstants};
 use crate::core::{StacksEpoch, StacksEpochExtension, StacksEpochId, STACKS_EPOCH_MAX};
@@ -56,7 +57,7 @@ fn epoch(epoch_id: StacksEpochId, start_height: u64, end_height: u64) -> StacksE
         start_height,
         end_height,
         block_limit: ExecutionCost::max_value(),
-        network_epoch: StacksEpochId::network_epoch(epoch_id),
+        network_epoch: epoch_id.peer_version(),
     }
 }
 

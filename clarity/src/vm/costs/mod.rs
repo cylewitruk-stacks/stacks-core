@@ -25,7 +25,7 @@ use costs_4::Costs4;
 use costs_5::Costs5;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ChainEpochRules as _, StacksEpochId};
 
 use super::errors::{RuntimeCheckErrorKind, RuntimeError};
 use crate::boot_util::boot_code_id;

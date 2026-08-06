@@ -22,6 +22,8 @@ use clarity::util::vrf::VRFPrivateKey;
 use stacks_common::address::AddressHashMode;
 use stacks_common::codec::{write_next, Error as codec_error, StacksMessageCodec};
 use stacks_common::types::chainstate::BurnchainHeaderHash;
+#[cfg(test)]
+use stacks_common::types::chainstate::BurnchainHeaderHashBitcoinExt as _;
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::vrf::VRFPublicKey;
 
@@ -239,7 +241,7 @@ pub mod tests {
     use clarity::types::chainstate::{BlockHeaderHash, TrieHash};
     use stacks_common::deps_common::bitcoin::blockdata::transaction::Transaction;
     use stacks_common::deps_common::bitcoin::network::serialize::deserialize;
-    use stacks_common::types::chainstate::SortitionId;
+    use stacks_common::types::chainstate::{SortitionId, SortitionIdExt as _};
     use stacks_common::util::get_epoch_time_secs;
     use stacks_common::util::hash::{hex_bytes, to_hex};
 

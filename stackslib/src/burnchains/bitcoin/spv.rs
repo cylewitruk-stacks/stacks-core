@@ -25,10 +25,11 @@ use stacks_common::deps_common::bitcoin::network::encodable::VarInt;
 use stacks_common::deps_common::bitcoin::network::message as btc_message;
 use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
 use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
-use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::chainstate::{BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::uint::Uint256;
+use stacks_rusqlite::domain_params;
 
 use crate::burnchains::bitcoin::indexer::BitcoinIndexer;
 use crate::burnchains::bitcoin::messages::BitcoinMessageHandler;
@@ -693,7 +694,7 @@ impl SpvClient {
         query_row(
             &self.headers_db,
             "SELECT height FROM headers WHERE hash = ?1",
-            &[burn_header_hash],
+            domain_params![burn_header_hash],
         )
         .map_err(|e| e.into())
     }
@@ -754,7 +755,7 @@ impl SpvClient {
         let sql = "INSERT OR REPLACE INTO headers
         (version, prev_blockhash, merkle_root, time, bits, nonce, height, hash)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
-        let args = params![
+        let args = domain_params![
             header.version,
             header.prev_blockhash,
             header.merkle_root,

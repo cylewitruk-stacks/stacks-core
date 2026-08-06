@@ -20,6 +20,7 @@ use p256::ecdsa::{
 };
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{EncodedPoint, PublicKey as P256PublicKey, SecretKey as P256SecretKey};
+use stacks_crypto::hash::Sha256Digest as _;
 use thiserror::Error;
 
 use crate::util::hash::{hex_bytes, to_hex, Sha256Sum};

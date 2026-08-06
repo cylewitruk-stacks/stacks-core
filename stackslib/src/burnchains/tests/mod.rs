@@ -22,7 +22,10 @@ use std::collections::HashMap;
 
 use clarity::types::chainstate::{StacksAddress, TrieHash};
 use stacks_common::address::*;
-use stacks_common::types::chainstate::{BlockHeaderHash, SortitionId, VRFSeed};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHashBitcoinExt as _, SortitionId, SortitionIdExt as _,
+    StacksAddressExtensions as _, TxidBitcoinExt as _, VRFSeed, VRFSeedDigest as _,
+};
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::*;
 use stacks_common::util::vrf::*;

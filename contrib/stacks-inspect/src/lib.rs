@@ -28,11 +28,13 @@ pub use cli::{
 };
 use regex::Regex;
 use rusqlite::OpenFlags;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
+use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, StacksBlockIdDigest as _};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::vrf::VRFProof;
 use stacks_common::{debug, info, warn};
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
+use stacks_rusqlite::SqlValue;
 use stackslib::burnchains::Burnchain;
 use stackslib::chainstate::burn::ConsensusHash;
 use stackslib::chainstate::burn::db::sortdb::{
@@ -247,7 +249,10 @@ fn collect_epoch2_entries(
     while let Some(row) = rows.next().unwrap_or_else(|e| {
         panic!("Failed to read staging block row: {e}");
     }) {
-        let index_block_hash: StacksBlockId = row.get(0).unwrap();
+        let index_block_hash = row
+            .get::<_, SqlValue<StacksBlockId>>(0)
+            .unwrap()
+            .into_inner();
         entries.push(BlockScanEntry {
             index_block_hash,
             source: BlockSource::Epoch2,
@@ -282,7 +287,10 @@ fn collect_nakamoto_entries(
     while let Some(row) = rows.next().unwrap_or_else(|e| {
         panic!("Failed to read Nakamoto staging block row: {e}");
     }) {
-        let index_block_hash: StacksBlockId = row.get(0).unwrap();
+        let index_block_hash = row
+            .get::<_, SqlValue<StacksBlockId>>(0)
+            .unwrap()
+            .into_inner();
         entries.push(BlockScanEntry {
             index_block_hash,
             source: BlockSource::Nakamoto,

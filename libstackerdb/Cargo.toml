@@ -16,6 +16,7 @@ path = "./src/libstackerdb.rs"
 [dependencies]
 serde = "1"
 stacks-common = { path = "../stacks-common" }
+stacks-crypto = { workspace = true }
 clarity = { path = "../clarity" }
 
 [dev-dependencies]

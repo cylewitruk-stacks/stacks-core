@@ -19,6 +19,7 @@ use clarity::vm::types::ResponseData;
 use clarity::vm::{ClarityVersion, Value};
 use madhouse::{Command, CommandWrapper};
 use proptest::prelude::Strategy;
+use stacks_protocol::epoch::ChainEpochRules as _;
 
 use super::{ok_true, unwrap_block_failure, unwrap_single_tx_success};
 use crate::chainstate::tests::consensus::{ConsensusUtils, TestBlock};

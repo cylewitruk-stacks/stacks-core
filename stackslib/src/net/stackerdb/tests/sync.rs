@@ -24,6 +24,7 @@ use stacks_common::types::chainstate::{
 };
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
 
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::net::p2p::PeerNetwork;

@@ -16,7 +16,8 @@
 
 use stacks_common::consts::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, PoxId, SortitionId, StacksBlockId, TrieHash, VRFSeed,
+    BlockHeaderHash, PoxId, SortitionId, SortitionIdExt as _, StacksBlockId,
+    StacksBlockIdDigest as _, TrieHash, VRFSeed, VRFSeedDigest as _,
 };
 use stacks_common::util::uint::{BitArray, Uint256};
 

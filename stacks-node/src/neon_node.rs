@@ -14,6 +14,78 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::{ErrorKind, Read, Write};
+use std::net::SocketAddr;
+use std::sync::mpsc::{Receiver, TrySendError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use std::{cmp, fs, mem, thread};
+
+use clarity::boot_util::boot_code_id;
+use clarity::vm::costs::ExecutionCost;
+use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use libsigner::v0::messages::{
+    MessageSlotID, MinerSlotID, MockBlock, MockProposal, MockSignature, PeerInfo, SignerMessage,
+};
+use libsigner::{SignerSession, StackerDBSession};
+use stacks::burnchains::bitcoin::address::{BitcoinAddress, LegacyBitcoinAddressType};
+use stacks::burnchains::db::BurnchainHeaderReader;
+use stacks::burnchains::{Burnchain, BurnchainSigner, PoxConstants, Txid};
+use stacks::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};
+use stacks::chainstate::burn::operations::leader_block_commit::{
+    RewardSetInfo, BURN_BLOCK_MINED_AT_MODULUS,
+};
+use stacks::chainstate::burn::operations::{
+    BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
+};
+use stacks::chainstate::burn::{BlockSnapshot, ConsensusHash};
+use stacks::chainstate::coordinator::{get_next_recipients, OnChainRewardSetProvider};
+use stacks::chainstate::nakamoto::NakamotoChainState;
+use stacks::chainstate::stacks::address::PoxAddress;
+use stacks::chainstate::stacks::boot::MINERS_NAME;
+use stacks::chainstate::stacks::db::blocks::StagingBlock;
+use stacks::chainstate::stacks::db::{StacksChainState, StacksHeaderInfo, MINER_REWARD_MATURITY};
+use stacks::chainstate::stacks::miner::{
+    signal_mining_blocked, signal_mining_ready, AssembledAnchorBlock, BlockBuilderSettings,
+    StacksMicroblockBuilder,
+};
+use stacks::chainstate::stacks::{
+    CoinbasePayload, Error as ChainstateError, StacksBlock, StacksBlockBuilder, StacksBlockHeader,
+    StacksMicroblock, StacksPublicKey, StacksTransaction, StacksTransactionSigner,
+    TransactionAnchorMode, TransactionPayload, TransactionVersion,
+};
+use stacks::config::chain_data::MinerStats;
+use stacks::config::NodeConfig;
+use stacks::core::mempool::MemPoolDB;
+use stacks::core::{EpochList, FIRST_BURNCHAIN_CONSENSUS_HASH, STACKS_EPOCH_3_0_MARKER};
+use stacks::cost_estimates::metrics::{CostMetric, UnitMetric};
+use stacks::cost_estimates::{CostEstimator, FeeEstimator, UnitEstimator};
+use stacks::monitoring::{increment_stx_blocks_mined_counter, update_active_miners_count_gauge};
+use stacks::net::atlas::{AtlasConfig, AtlasDB};
+use stacks::net::db::{LocalPeer, PeerDB};
+use stacks::net::dns::{DNSClient, DNSResolver};
+use stacks::net::p2p::PeerNetwork;
+use stacks::net::relay::Relayer;
+use stacks::net::stackerdb::{StackerDBConfig, StackerDBSync, StackerDBs, MINER_SLOT_COUNT};
+use stacks::net::{
+    Error as NetError, NetworkResult, PeerNetworkComms, RPCHandlerArgs, ServiceFlags,
+};
+use stacks::util_lib::strings::{UrlString, VecDisplay};
+use stacks::{monitoring, version_string};
+use stacks_common::codec::StacksMessageCodec;
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, SortitionId,
+    StacksAddress, StacksBlockId, StacksBlockIdDigest as _, StacksPrivateKey, VRFSeed,
+    VRFSeedDigest as _,
+};
+use stacks_common::types::net::PeerAddress;
+use stacks_common::types::{ChainEpochRules, StacksEpochId};
+use stacks_common::util::hash::{to_hex, Hash160, Sha256Sum};
+use stacks_common::util::secp256k1::Secp256k1PrivateKey;
+use stacks_common::util::vrf::{VRFProof, VRFPublicKey};
+use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
 /// Main body of code for the Stacks node and miner.
 ///
 /// System schematic.
@@ -143,78 +215,9 @@
 ///       * Metrics about the node's behavior (e.g. number of blocks processed, etc.)
 ///
 /// This file may be refactored in the future into a full-fledged module.
-use std::cmp;
-use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{ErrorKind, Read, Write};
-use std::net::SocketAddr;
-use std::sync::mpsc::{Receiver, TrySendError};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-use std::{fs, mem, thread};
-
-use clarity::boot_util::boot_code_id;
-use clarity::vm::costs::ExecutionCost;
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
-use libsigner::v0::messages::{
-    MessageSlotID, MinerSlotID, MockBlock, MockProposal, MockSignature, PeerInfo, SignerMessage,
-};
-use libsigner::{SignerSession, StackerDBSession};
-use stacks::burnchains::bitcoin::address::{BitcoinAddress, LegacyBitcoinAddressType};
-use stacks::burnchains::db::BurnchainHeaderReader;
-use stacks::burnchains::{Burnchain, BurnchainSigner, PoxConstants, Txid};
-use stacks::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};
-use stacks::chainstate::burn::operations::leader_block_commit::{
-    RewardSetInfo, BURN_BLOCK_MINED_AT_MODULUS,
-};
-use stacks::chainstate::burn::operations::{
-    BlockstackOperationType, LeaderBlockCommitOp, LeaderKeyRegisterOp,
-};
-use stacks::chainstate::burn::{BlockSnapshot, ConsensusHash};
-use stacks::chainstate::coordinator::{get_next_recipients, OnChainRewardSetProvider};
-use stacks::chainstate::nakamoto::NakamotoChainState;
-use stacks::chainstate::stacks::address::PoxAddress;
-use stacks::chainstate::stacks::boot::MINERS_NAME;
-use stacks::chainstate::stacks::db::blocks::StagingBlock;
-use stacks::chainstate::stacks::db::{StacksChainState, StacksHeaderInfo, MINER_REWARD_MATURITY};
-use stacks::chainstate::stacks::miner::{
-    signal_mining_blocked, signal_mining_ready, AssembledAnchorBlock, BlockBuilderSettings,
-    StacksMicroblockBuilder,
-};
-use stacks::chainstate::stacks::{
-    CoinbasePayload, Error as ChainstateError, StacksBlock, StacksBlockBuilder, StacksBlockHeader,
-    StacksMicroblock, StacksPublicKey, StacksTransaction, StacksTransactionSigner,
-    TransactionAnchorMode, TransactionPayload, TransactionVersion,
-};
-use stacks::config::chain_data::MinerStats;
-use stacks::config::NodeConfig;
-use stacks::core::mempool::MemPoolDB;
-use stacks::core::{EpochList, FIRST_BURNCHAIN_CONSENSUS_HASH, STACKS_EPOCH_3_0_MARKER};
-use stacks::cost_estimates::metrics::{CostMetric, UnitMetric};
-use stacks::cost_estimates::{CostEstimator, FeeEstimator, UnitEstimator};
-use stacks::monitoring::{increment_stx_blocks_mined_counter, update_active_miners_count_gauge};
-use stacks::net::atlas::{AtlasConfig, AtlasDB};
-use stacks::net::db::{LocalPeer, PeerDB};
-use stacks::net::dns::{DNSClient, DNSResolver};
-use stacks::net::p2p::PeerNetwork;
-use stacks::net::relay::Relayer;
-use stacks::net::stackerdb::{StackerDBConfig, StackerDBSync, StackerDBs, MINER_SLOT_COUNT};
-use stacks::net::{
-    Error as NetError, NetworkResult, PeerNetworkComms, RPCHandlerArgs, ServiceFlags,
-};
-use stacks::util_lib::strings::{UrlString, VecDisplay};
-use stacks::{monitoring, version_string};
-use stacks_common::codec::StacksMessageCodec;
-use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockId,
-    StacksPrivateKey, VRFSeed,
-};
-use stacks_common::types::net::PeerAddress;
-use stacks_common::types::{PublicKey, StacksEpochId};
-use stacks_common::util::hash::{to_hex, Hash160, Sha256Sum};
-use stacks_common::util::secp256k1::Secp256k1PrivateKey;
-use stacks_common::util::vrf::{VRFProof, VRFPublicKey};
-use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
+use stacks_crypto::hash::Hash160Digest as _;
+use stacks_crypto::hash::Sha256Digest as _;
+use stacks_crypto::secp256k1::VerifyingKey as _;
 
 use super::{BurnchainController, Config, EventDispatcher, Keychain};
 use crate::burnchains::bitcoin_regtest_controller::{

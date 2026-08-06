@@ -28,7 +28,6 @@ use clarity::vm::types::PrincipalData;
 use clarity::vm::{
     execute_with_parameters as execute, ClarityName, ClarityVersion, ContractName, Value,
 };
-use rusqlite::params;
 use serde::Deserialize;
 use serde_json::json;
 use stacks::burnchains::bitcoin::address::{BitcoinAddress, LegacyBitcoinAddressType};
@@ -36,7 +35,7 @@ use stacks::burnchains::bitcoin::spv::SpvClient;
 use stacks::burnchains::bitcoin::BitcoinNetworkType;
 use stacks::burnchains::burnchain::TEST_DOWNLOAD_ERROR_ON_REORG;
 use stacks::burnchains::db::BurnchainDB;
-use stacks::burnchains::{Address, Burnchain, PoxConstants, Txid};
+use stacks::burnchains::{Burnchain, PoxConstants, Txid};
 use stacks::chainstate::burn::db::sortdb::SortitionDB;
 use stacks::chainstate::burn::operations::{
     BlockstackOperationType, DelegateStxOp, PreStxOp, StackStxOp, TransferStxOp,
@@ -90,13 +89,17 @@ use stacks::util_lib::signed_structured_data::pox4::{
 use stacks_common::address::AddressHashMode;
 use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash as _;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, StacksBlockId,
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, StacksAddress,
+    StacksAddressExtensions as _, StacksBlockId, StacksBlockIdDigest as _,
 };
 use stacks_common::types::StacksPublicKeyBuffer;
 use stacks_common::util::hash::{bytes_to_hex, hex_bytes, to_hex, Hash160};
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs, sleep_ms};
+use stacks_crypto::hash::Hash160Digest as _;
+use stacks_crypto::secp256k1::SigningKey as _;
 use stacks_inspect;
+use stacks_rusqlite::domain_params;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -105,7 +108,6 @@ use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
 use crate::burnchains::bitcoin_regtest_controller::{self, UTXO};
 use crate::neon_node::RelayerThread;
 use crate::operations::BurnchainOpSigner;
-use crate::stacks_common::types::PrivateKey;
 use crate::syncctl::PoxSyncWatchdogComms;
 use crate::tests::gen_random_port;
 use crate::tests::nakamoto_integrations::{get_key_for_cycle, wait_for};
@@ -7137,7 +7139,7 @@ fn atlas_stress_integration_test() {
             let indexes = query_rows::<u64, _>(
                 &atlasdb.conn,
                 "SELECT attachment_index FROM attachment_instances WHERE index_block_hash = ?1",
-                &[ibh],
+                domain_params![ibh],
             )
             .unwrap();
             if !indexes.is_empty() {
@@ -7148,7 +7150,7 @@ fn atlas_stress_integration_test() {
                 let mut hashes = query_row_columns::<Hash160, _>(
                     &atlasdb.conn,
                     "SELECT content_hash FROM attachment_instances WHERE index_block_hash = ?1 AND attachment_index = ?2",
-                    params![ibh, u64_to_sql(*index).unwrap()],
+                    domain_params![ibh, u64_to_sql(*index).unwrap()],
                     "content_hash")
                 .unwrap();
                 if !hashes.is_empty() {

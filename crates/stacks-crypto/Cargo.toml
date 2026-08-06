@@ -1,0 +1,40 @@
+[package]
+name = "stacks-crypto"
+version = "0.1.0"
+license = "GPL-3.0"
+homepage = "https://github.com/stacks-network/stacks-core"
+repository = "https://github.com/stacks-network/stacks-core"
+description = "Cryptographic helpers for Stacks blockchain types"
+keywords = ["stacks", "stx", "blockchain", "crypto"]
+readme = "README.md"
+edition = "2024"
+
+[dependencies]
+# Local dependencies
+stacks-macros = { workspace = true }
+stacks-primitives = { workspace = true }
+
+# Other dependencies
+bitcoin = { workspace = true }
+const-hex = { workspace = true }
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["serde"] }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+ripemd = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+secp256k1 = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+libsecp256k1 = { workspace = true }
+
+[features]
+default = ["rand"]
+rand = ["dep:rand"]
+testing = ["rand", "stacks-primitives/testing"]
+wasm-web = ["rand", "getrandom/js", "libsecp256k1/static-context"]
+wasm-deterministic = ["getrandom/custom"]

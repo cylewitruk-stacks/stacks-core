@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_rusqlite::SqlValue;
 use stackslib::chainstate::stacks::index::marf::MARFOpenOpts;
 use stackslib::util_lib::db::sqlite_open;
 
@@ -84,7 +85,10 @@ pub fn derive_expected_epoch2_block_rel_paths(
         )
         .map_err(|e| format!("prepare block_headers query: {e}"))?;
     let rows = stmt
-        .query_map([], |row| row.get::<_, StacksBlockId>(0))
+        .query_map([], |row| {
+            row.get::<_, SqlValue<StacksBlockId>>(0)
+                .map(SqlValue::into_inner)
+        })
         .map_err(|e| format!("query block_headers: {e}"))?;
 
     let mut rel_paths = Vec::new();

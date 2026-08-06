@@ -31,7 +31,6 @@ use lazy_static::lazy_static;
 use pinny::tag;
 use reqwest;
 use serde_json::json;
-use stacks::burnchains::Address;
 use stacks::chainstate::stacks::db::blocks::{MemPoolRejection, MINIMUM_TX_FEE_RATE_PER_BYTE};
 use stacks::chainstate::stacks::db::StacksChainState;
 use stacks::chainstate::stacks::{
@@ -54,8 +53,11 @@ use stacks::net::api::callreadonly::CallReadOnlyRequestBody;
 use stacks::net::api::getaccount::AccountEntryResponse;
 use stacks::net::api::getcontractsrc::ContractSrcResponse;
 use stacks::net::api::getistraitimplemented::GetIsTraitImplementedResponse;
-use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, VRFSeed};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksBlockId, StacksBlockIdDigest as _, VRFSeed, VRFSeedDigest as _,
+};
 use stacks_common::util::hash::{hex_bytes, to_hex, Sha256Sum};
+use stacks_crypto::hash::Sha256Digest as _;
 
 use super::{new_test_conf, ADDR_4, SK_1, SK_2, SK_3};
 use crate::helium::RunLoop;

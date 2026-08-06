@@ -17,8 +17,8 @@
 use clarity_types::ClarityName;
 use clarity_types::types::CallableData;
 use stacks_common::consts::CHAIN_ID_TESTNET;
-use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use crate::vm::callables::DefineType;
 use crate::vm::contexts::{ExecutionState, InvocationContext};

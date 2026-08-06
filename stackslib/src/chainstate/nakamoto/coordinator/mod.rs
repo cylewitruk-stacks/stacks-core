@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use clarity::boot_util::boot_code_id;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksBlockId,
+    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksBlockId, StacksBlockIdDigest as _,
 };
 use stacks_common::types::StacksEpochId;
 

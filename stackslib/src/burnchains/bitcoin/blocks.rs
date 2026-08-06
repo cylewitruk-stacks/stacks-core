@@ -21,7 +21,7 @@ use stacks_common::deps_common::bitcoin::blockdata::transaction::Transaction;
 use stacks_common::deps_common::bitcoin::network::message as btc_message;
 use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
 use stacks_common::deps_common::bitcoin::util::hash::bitcoin_merkle_root;
-use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::chainstate::{BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _};
 use stacks_common::util::hash::to_hex;
 
 use crate::burnchains::bitcoin::address::BitcoinAddress;

@@ -32,12 +32,16 @@ use siphasher::sip::SipHasher; // this is SipHash-2-4
 use stacks_common::codec::{
     read_next, write_next, Error as codec_error, StacksMessageCodec, MAX_MESSAGE_LEN,
 };
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksAddress, StacksBlockId};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, StacksAddress, StacksBlockId, StacksBlockIdDigest as _,
+};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::types::MempoolCollectionBehavior;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{to_hex, Sha512Trunc256Sum};
 use stacks_common::util::retry::{BoundReader, RetryReader};
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
+use stacks_rusqlite::{domain_params, SqlValue};
 
 use crate::burnchains::Txid;
 use crate::chainstate::burn::db::sortdb::SortitionDB;
@@ -638,7 +642,9 @@ impl MemPoolWalkSettings {
 
 impl FromRow<Txid> for Txid {
     fn from_row(row: &Row) -> Result<Txid, db_error> {
-        row.get(0).map_err(db_error::SqliteError)
+        row.get::<_, SqlValue<Txid>>(0)
+            .map(SqlValue::into_inner)
+            .map_err(db_error::SqliteError)
     }
 }
 
@@ -992,7 +998,7 @@ impl<'a> MemPoolTx<'a> {
                 bloom_counter.remove_raw(dbtx, &txid.0)?;
 
                 let sql = "INSERT OR REPLACE INTO removed_txids (txid) VALUES (?1)";
-                let args = params![txid];
+                let args = domain_params![txid];
                 dbtx.execute(sql, args).map_err(db_error::SqliteError)?;
             }
             // help the type inference out
@@ -1054,7 +1060,7 @@ impl<'a> MemPoolTx<'a> {
                         bloom_counter.remove_raw(dbtx, &evict_txid.0)?;
 
                         let sql = "INSERT OR REPLACE INTO removed_txids (txid) VALUES (?1)";
-                        let args = params![evict_txid];
+                        let args = domain_params![evict_txid];
                         dbtx.execute(sql, args).map_err(db_error::SqliteError)?;
 
                         Some(evict_txid)
@@ -1084,7 +1090,7 @@ impl<'a> MemPoolTx<'a> {
         let hashed_txid = Txid(Sha512Trunc256Sum::from_data(&randomized_buff).0);
 
         let sql = "INSERT OR REPLACE INTO randomized_txids (txid,hashed_txid) VALUES (?1,?2)";
-        let args = params![txid, hashed_txid];
+        let args = domain_params![txid, hashed_txid];
 
         self.execute(sql, args).map_err(db_error::SqliteError)?;
 
@@ -1506,7 +1512,7 @@ impl MemPoolDB {
     ) -> Result<Vec<StacksAddress>, db_error> {
         let sql = "SELECT DISTINCT origin_address FROM mempool WHERE height > ?1 AND height <= ?2 AND tx_fee >= ?3
                    ORDER BY tx_fee DESC LIMIT ?4 OFFSET ?5";
-        let args = params![
+        let args = domain_params![
             start_coinbase_height,
             end_coinbase_height,
             u64_to_sql(min_fees)?,
@@ -1556,7 +1562,7 @@ impl MemPoolDB {
 
             sql_tx.execute(
                 "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                params![fee_rate_f64, txid],
+                domain_params![fee_rate_f64, txid],
             )?;
             updated += 1;
         }
@@ -2020,12 +2026,20 @@ impl MemPoolDB {
     }
 
     pub fn db_has_tx(conn: &DBConn, txid: &Txid) -> Result<bool, db_error> {
-        query_row(conn, "SELECT 1 FROM mempool WHERE txid = ?1", params![txid])
-            .map(|row_opt: Option<i64>| row_opt.is_some())
+        query_row(
+            conn,
+            "SELECT 1 FROM mempool WHERE txid = ?1",
+            domain_params![txid],
+        )
+        .map(|row_opt: Option<i64>| row_opt.is_some())
     }
 
     pub fn get_tx(conn: &DBConn, txid: &Txid) -> Result<Option<MemPoolTxInfo>, db_error> {
-        query_row(conn, "SELECT * FROM mempool WHERE txid = ?1", params![txid])
+        query_row(
+            conn,
+            "SELECT * FROM mempool WHERE txid = ?1",
+            domain_params![txid],
+        )
     }
 
     /// Get all transactions across all tips
@@ -2044,7 +2058,7 @@ impl MemPoolDB {
         block_header_hash: &BlockHeaderHash,
     ) -> Result<usize, db_error> {
         let sql = "SELECT * FROM mempool WHERE consensus_hash = ?1 AND block_header_hash = ?2";
-        let args = params![consensus_hash, block_header_hash];
+        let args = domain_params![consensus_hash, block_header_hash];
         let rows = query_rows::<MemPoolTxInfo, _>(conn, sql, args)?;
         Ok(rows.len())
     }
@@ -2059,7 +2073,7 @@ impl MemPoolDB {
         count: u64,
     ) -> Result<Vec<MemPoolTxInfo>, db_error> {
         let sql = "SELECT * FROM mempool WHERE accept_time >= ?1 AND consensus_hash = ?2 AND block_header_hash = ?3 ORDER BY tx_fee DESC LIMIT ?4";
-        let args = params![
+        let args = domain_params![
             u64_to_sql(timestamp)?,
             consensus_hash,
             block_header_hash,
@@ -2260,7 +2274,7 @@ impl MemPoolDB {
             tx)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
 
-        let args = params![
+        let args = domain_params![
             txid,
             origin_address.to_string(),
             u64_to_sql(origin_nonce)?,
@@ -2460,7 +2474,7 @@ impl MemPoolDB {
         mempool_tx
             .execute(
                 "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                params![fee_rate_estimate, txid],
+                domain_params![fee_rate_estimate, txid],
             )
             .map_err(db_error::from)?;
 
@@ -2632,7 +2646,7 @@ impl MemPoolDB {
     pub fn inner_blacklist_txs(tx: &DBTx<'_>, txids: &[Txid], now: u64) -> Result<(), db_error> {
         for txid in txids {
             let sql = "INSERT OR REPLACE INTO tx_blacklist (txid, arrival_time) VALUES (?1, ?2)";
-            let args = params![txid, &u64_to_sql(now)?];
+            let args = domain_params![txid, &u64_to_sql(now)?];
             tx.execute(sql, args)?;
         }
         Ok(())
@@ -2661,7 +2675,10 @@ impl MemPoolDB {
                 params![u64_to_sql(to_delete)?],
             )?;
             for txid in txids.into_iter() {
-                tx.execute("DELETE FROM tx_blacklist WHERE txid = ?1", params![txid])?;
+                tx.execute(
+                    "DELETE FROM tx_blacklist WHERE txid = ?1",
+                    domain_params![txid],
+                )?;
             }
         }
         Ok(())
@@ -2673,7 +2690,7 @@ impl MemPoolDB {
         txid: &Txid,
     ) -> Result<Option<u64>, db_error> {
         let sql = "SELECT arrival_time FROM tx_blacklist WHERE txid = ?1";
-        let args = params![txid];
+        let args = domain_params![txid];
         query_row(conn, sql, args)
     }
 
@@ -2705,7 +2722,7 @@ impl MemPoolDB {
     fn inner_drop_txs(tx: &DBTx<'_>, txids: &[Txid]) -> Result<(), db_error> {
         let sql = "DELETE FROM mempool WHERE txid = ?";
         for txid in txids.iter() {
-            tx.execute(sql, &[txid])?;
+            tx.execute(sql, domain_params![txid])?;
         }
         Ok(())
     }
@@ -2726,7 +2743,7 @@ impl MemPoolDB {
         for (txid, time_estimate_ms) in txs.iter() {
             mempool_tx
                 .tx
-                .execute(sql, params![time_estimate_ms, txid])?;
+                .execute(sql, domain_params![time_estimate_ms, txid])?;
         }
         mempool_tx.commit()?;
 
@@ -2859,7 +2876,7 @@ impl MemPoolDB {
     /// Get the hashed txid for a txid
     pub fn get_randomized_txid(&self, txid: &Txid) -> Result<Option<Txid>, db_error> {
         let sql = "SELECT hashed_txid FROM randomized_txids WHERE txid = ?1 LIMIT 1";
-        let args = params![txid];
+        let args = domain_params![txid];
         query_row(self.conn(), sql, args)
     }
 
@@ -2906,7 +2923,7 @@ impl MemPoolDB {
                         (SELECT 1 FROM removed_txids WHERE txid = mempool.txid) \
                    ORDER BY randomized_txids.hashed_txid ASC LIMIT ?3";
 
-        let args = params![
+        let args = domain_params![
             last_randomized_txid,
             u64_to_sql(coinbase_height.saturating_sub(BLOOM_COUNTER_DEPTH as u64))?,
             u64_to_sql(max_run)?,
@@ -3004,7 +3021,7 @@ pub fn try_flush_considered_txs(
     let db_tx = conn.transaction()?;
 
     for txid in considered_txs {
-        match db_tx.execute(sql, params![txid]) {
+        match db_tx.execute(sql, domain_params![txid]) {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>

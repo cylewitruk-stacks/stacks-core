@@ -18,6 +18,7 @@ use std::io::Write;
 
 use rusqlite::blob::Blob;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Transaction};
+use stacks_rusqlite::{SqlRef, SqlValue};
 
 #[cfg(test)]
 use crate::chainstate::stacks::index::bits::read_hash_bytes;
@@ -406,7 +407,7 @@ pub fn bulk_read_block_entries<T: MarfTrieId>(
     )?;
     let rows = stmt.query_map(NO_PARAMS, |row| {
         let block_id: u32 = row.get(0)?;
-        let block_hash: T = row.get(1)?;
+        let block_hash = row.get::<_, SqlValue<T>>(1)?.into_inner();
         let offset_i64: i64 = row.get(2)?;
         Ok((block_id, block_hash, offset_i64))
     })?;
@@ -531,14 +532,14 @@ pub fn ensure_no_migration_necessary<T: MarfTrieId>(conn: &mut Connection) -> Re
 
 pub fn get_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<u32, Error> {
     conn.prepare_cached("SELECT block_id FROM marf_data WHERE block_hash = ?")?
-        .query_row(&[bhh], |row| row.get("block_id"))
+        .query_row(params![SqlRef::new(bhh)], |row| row.get("block_id"))
         .map_err(|e| e.into())
 }
 
 pub fn get_mined_block_identifier<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<u32, Error> {
     conn.query_row(
         "SELECT block_id FROM mined_blocks WHERE block_hash = ?",
-        &[bhh],
+        params![SqlRef::new(bhh)],
         |row| row.get("block_id"),
     )
     .map_err(|e| e.into())
@@ -549,7 +550,7 @@ pub fn get_confirmed_block_identifier<T: MarfTrieId>(
     bhh: &T,
 ) -> Result<Option<u32>, Error> {
     conn.prepare_cached("SELECT block_id FROM marf_data WHERE block_hash = ? AND unconfirmed = 0")?
-        .query_row(&[bhh], |row| row.get("block_id"))
+        .query_row(params![SqlRef::new(bhh)], |row| row.get("block_id"))
         .optional()
         .map_err(|e| e.into())
 }
@@ -559,7 +560,7 @@ pub fn get_unconfirmed_block_identifier<T: MarfTrieId>(
     bhh: &T,
 ) -> Result<Option<u32>, Error> {
     conn.prepare_cached("SELECT block_id FROM marf_data WHERE block_hash = ? AND unconfirmed = 1")?
-        .query_row(&[bhh], |row| row.get("block_id"))
+        .query_row(params![SqlRef::new(bhh)], |row| row.get("block_id"))
         .optional()
         .map_err(|e| e.into())
 }
@@ -568,7 +569,10 @@ pub fn get_latest_confirmed_block_hash<T: MarfTrieId>(conn: &Connection) -> Resu
     conn.query_row(
         "SELECT block_hash FROM marf_data WHERE unconfirmed = 0 ORDER BY block_id DESC LIMIT 1",
         NO_PARAMS,
-        |row| row.get("block_hash"),
+        |row| {
+            row.get::<_, SqlValue<T>>("block_hash")
+                .map(SqlValue::into_inner)
+        },
     )
     .map_err(|e| e.into())
 }
@@ -576,7 +580,10 @@ pub fn get_latest_confirmed_block_hash<T: MarfTrieId>(conn: &Connection) -> Resu
 pub fn get_block_hash<T: MarfTrieId>(conn: &Connection, local_id: u32) -> Result<T, Error> {
     let result = conn
         .prepare_cached("SELECT block_hash FROM marf_data WHERE block_id = ?")?
-        .query_row(params![local_id], |row| row.get("block_hash"))
+        .query_row(params![local_id], |row| {
+            row.get::<_, SqlValue<T>>("block_hash")
+                .map(SqlValue::into_inner)
+        })
         .optional()?;
     result.ok_or_else(|| {
         error!("Failed to get block header hash of local ID {}", local_id);
@@ -590,7 +597,7 @@ pub fn write_trie_blob<T: MarfTrieId>(
     block_hash: &T,
     data: &[u8],
 ) -> Result<u32, Error> {
-    let args = params![block_hash, data, 0, 0, 0,];
+    let args = params![SqlRef::new(block_hash), data, 0, 0, 0,];
     let mut s =
         conn.prepare("INSERT INTO marf_data (block_hash, data, unconfirmed, external_offset, external_length) VALUES (?, ?, ?, ?, ?)")?;
     let block_id = s
@@ -618,7 +625,7 @@ fn inner_write_external_trie_blob<T: MarfTrieId>(
         // existing entry (i.e. a migration)
         let empty_blob: &[u8] = &[];
         let args = params![
-            block_hash,
+            SqlRef::new(block_hash),
             empty_blob,
             0,
             u64_to_sql(offset)?,
@@ -638,7 +645,7 @@ fn inner_write_external_trie_blob<T: MarfTrieId>(
         // new entry
         let empty_blob: &[u8] = &[];
         let args = params![
-            block_hash,
+            SqlRef::new(block_hash),
             empty_blob,
             0,
             u64_to_sql(offset)?,
@@ -699,7 +706,7 @@ pub fn write_trie_blob_to_mined<T: MarfTrieId>(
             .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
     } else {
         // doesn't exist yet; insert
-        let args = params![block_hash, data];
+        let args = params![SqlRef::new(block_hash), data];
         let mut s = conn.prepare("INSERT INTO mined_blocks (block_hash, data) VALUES (?, ?)")?;
         s.execute(args)
             .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
@@ -732,7 +739,7 @@ pub fn write_trie_blob_to_unconfirmed<T: MarfTrieId>(
             .expect("EXHAUSTION: MARF cannot track more than 2**31 - 1 blocks");
     } else {
         // doesn't exist yet; insert
-        let args = params![block_hash, data, 1];
+        let args = params![SqlRef::new(block_hash), data, 1];
         let mut s =
             conn.prepare("INSERT INTO marf_data (block_hash, data, unconfirmed, external_offset, external_length) VALUES (?, ?, ?, 0, 0)")?;
         s.execute(args)
@@ -781,7 +788,7 @@ pub fn read_all_block_hashes_and_roots<T: MarfTrieId>(
         "SELECT block_hash, data FROM marf_data WHERE unconfirmed = 0 ORDER BY block_hash",
     )?;
     let rows = s.query_and_then(NO_PARAMS, |row| {
-        let block_hash: T = row.get_unwrap("block_hash");
+        let block_hash = row.get_unwrap::<_, SqlValue<T>>("block_hash").into_inner();
         let data = row
             .get_ref("data")?
             .as_blob()
@@ -820,7 +827,7 @@ pub fn read_node_hash_bytes_by_bhh<W: Write, T: MarfTrieId>(
 ) -> Result<(), Error> {
     let row_id: i64 = conn.query_row(
         "SELECT block_id FROM marf_data WHERE block_hash = ?",
-        &[bhh],
+        [SqlRef::new(bhh)],
         |r| r.get("block_id"),
     )?;
     let mut blob = conn.blob_open(DatabaseName::Main, "marf_data", "data", row_id, true)?;
@@ -877,7 +884,7 @@ pub fn get_external_trie_offset_length_by_bhh<T: MarfTrieId>(
     bhh: &T,
 ) -> Result<(u64, u64), Error> {
     let qry = "SELECT external_offset, external_length FROM marf_data WHERE block_hash = ?1";
-    let args = params![bhh];
+    let args = params![SqlRef::new(bhh)];
     let (offset, length): (u64, u64) = query_row(conn, qry, args)?.ok_or(Error::NotFoundError)?;
     Ok((offset, length))
 }
@@ -946,7 +953,7 @@ pub fn get_node_hash_bytes_by_bhh<T: MarfTrieId>(
 ) -> Result<TrieHash, Error> {
     let row_id: i64 = conn.query_row(
         "SELECT block_id FROM marf_data WHERE block_hash = ?",
-        &[bhh],
+        [SqlRef::new(bhh)],
         |r| r.get("block_id"),
     )?;
     let mut blob = conn.blob_open(DatabaseName::Main, "marf_data", "data", row_id, true)?;
@@ -965,7 +972,7 @@ pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(
         let is_bhh_committed = tx
             .query_row(
                 "SELECT 1 FROM marf_data WHERE block_hash = ? LIMIT 1",
-                &[bhh],
+                [SqlRef::new(bhh)],
                 |_row| Ok(()),
             )
             .optional()?
@@ -978,7 +985,7 @@ pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(
     let is_bhh_locked = tx
         .query_row(
             "SELECT 1 FROM block_extension_locks WHERE block_hash = ? LIMIT 1",
-            &[bhh],
+            [SqlRef::new(bhh)],
             |_row| Ok(()),
         )
         .optional()?
@@ -989,7 +996,7 @@ pub fn tx_lock_bhh_for_extension<T: MarfTrieId>(
 
     tx.execute(
         "INSERT INTO block_extension_locks (block_hash) VALUES (?)",
-        &[bhh],
+        [SqlRef::new(bhh)],
     )?;
     Ok(true)
 }
@@ -1024,7 +1031,7 @@ pub fn is_unconfirmed_block(conn: &Connection, block_id: u32) -> Result<bool, Er
 pub fn drop_lock<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Result<(), Error> {
     conn.execute(
         "DELETE FROM block_extension_locks WHERE block_hash = ?",
-        &[bhh],
+        [SqlRef::new(bhh)],
     )?;
     Ok(())
 }
@@ -1033,7 +1040,7 @@ pub fn drop_unconfirmed_trie<T: MarfTrieId>(conn: &Connection, bhh: &T) -> Resul
     debug!("Drop unconfirmed trie sqlite blob {}", bhh);
     conn.execute(
         "DELETE FROM marf_data WHERE block_hash = ? AND unconfirmed = 1",
-        &[bhh],
+        [SqlRef::new(bhh)],
     )?;
     debug!("Dropped unconfirmed trie sqlite blob {}", bhh);
     Ok(())

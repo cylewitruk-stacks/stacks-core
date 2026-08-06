@@ -1,0 +1,19 @@
+[package]
+name = "stacks-p2p"
+version = "0.1.0"
+license = "GPL-3.0"
+homepage = "https://github.com/stacks-network/stacks-core"
+repository = "https://github.com/stacks-network/stacks-core"
+description = "P2P protocol versioning and peer-facing types for the Stacks blockchain"
+keywords = ["stacks", "stx", "blockchain", "p2p"]
+readme = "README.md"
+edition = "2024"
+
+[dependencies]
+stacks-primitives = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+stacks-macros = { workspace = true }
+const-hex = { workspace = true }
+
+[features]
+default = []

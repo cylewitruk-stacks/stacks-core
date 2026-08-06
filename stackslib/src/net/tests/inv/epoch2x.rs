@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 
 use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
+use stacks_common::types::chainstate::BurnchainHeaderHashBitcoinExt as _;
 
 use crate::burnchains::bitcoin::indexer::BitcoinIndexer;
 use crate::burnchains::db::BurnchainHeaderReader;

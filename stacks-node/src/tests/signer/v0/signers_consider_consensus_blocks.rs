@@ -22,6 +22,7 @@ use stacks::chainstate::stacks::TenureChangeCause;
 use stacks::core::test_util::{make_stacks_transfer_serialized, to_addr};
 use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks::util::secp256k1::Secp256k1PrivateKey;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 use stacks_signer::v0::tests::{
     TEST_IGNORE_ALL_BLOCK_PROPOSALS, TEST_REJECT_ALL_BLOCK_PROPOSAL,
     TEST_SIGNERS_INSERT_BLOCK_PROPOSAL_WITHOUT_PROCESSING,

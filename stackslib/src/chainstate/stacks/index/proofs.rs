@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::ops::Deref;
 
 use stacks_common::codec::{read_next, Error as codec_error, StacksMessageCodec};
-use stacks_common::types::chainstate::TrieHash;
+use stacks_common::types::chainstate::{TrieHash, TrieHashDigest as _};
 use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::bits::{

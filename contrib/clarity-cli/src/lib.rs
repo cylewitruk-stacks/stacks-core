@@ -48,6 +48,8 @@ use stacks_common::types::chainstate::{
 };
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum, bytes_to_hex};
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
+use stacks_rusqlite::SqlRef;
 use stackslib::burnchains::{PoxConstants, Txid};
 use stackslib::chainstate::stacks::boot::{
     BOOT_CODE_BNS, BOOT_CODE_COST_VOTING_MAINNET, BOOT_CODE_COST_VOTING_TESTNET, BOOT_CODE_COSTS,
@@ -345,7 +347,10 @@ fn get_cli_block_height(conn: &Connection, block_id: &StacksBlockId) -> Option<u
         conn.prepare("SELECT id FROM cli_chain_tips WHERE block_hash = ?1"),
         "FATAL: could not prepare query",
     );
-    let mut rows = friendly_expect(stmt.query([block_id]), "FATAL: could not fetch rows");
+    let mut rows = friendly_expect(
+        stmt.query([SqlRef::new(block_id)]),
+        "FATAL: could not fetch rows",
+    );
 
     rows.next()
         .expect("FATAL: could not read block hash")
@@ -624,7 +629,7 @@ impl CLIHeadersDB {
         friendly_expect(
             tx.execute(
                 "INSERT INTO cli_chain_tips (block_hash) VALUES (?1)",
-                [&next_block_hash],
+                [SqlRef::new(&next_block_hash)],
             ),
             &format!("FATAL: failed to store next block hash in '{db_path}'"),
         );

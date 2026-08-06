@@ -25,12 +25,13 @@ use mio::{self, net as mio_net};
 use rand::prelude::*;
 use rand::thread_rng;
 use stacks_common::consts::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
-use stacks_common::types::chainstate::{PoxId, SortitionId};
+use stacks_common::types::chainstate::{PoxId, SortitionId, StacksBlockIdDigest as _};
 use stacks_common::types::net::PeerAddress;
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::to_hex;
 use stacks_common::util::secp256k1::Secp256k1PublicKey;
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
+use stacks_crypto::hash::Hash160Digest as _;
 use url;
 
 use crate::burnchains::db::{BurnchainDB, BurnchainHeaderReader};

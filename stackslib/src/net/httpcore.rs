@@ -31,7 +31,6 @@ use stacks_common::types::chainstate::{
     BurnchainHeaderHash, ConsensusHash, StacksAddress, StacksBlockId, StacksPublicKey,
 };
 use stacks_common::types::net::PeerHost;
-use stacks_common::types::Address;
 use stacks_common::util::chunked_encoding::*;
 use stacks_common::util::retry::{BoundReader, RetryReader};
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};

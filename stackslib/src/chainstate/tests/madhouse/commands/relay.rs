@@ -19,6 +19,7 @@ use clarity::vm::ast::stack_depth_checker::StackDepthLimits;
 use clarity::vm::ClarityVersion;
 use madhouse::{Command, CommandWrapper};
 use proptest::prelude::Strategy;
+use stacks_protocol::epoch::ChainEpochRules as _;
 
 use super::unwrap_single_tx_success;
 use crate::chainstate::tests::consensus::{ConsensusUtils, TestBlock};

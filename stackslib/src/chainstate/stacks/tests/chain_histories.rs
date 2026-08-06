@@ -14,12 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-/// This test module is concerned with verifying that the miner can build block histories out of
-/// blocks and microblocks in which either the Stacks or burnchain histories fork (or both), and
-/// that the Stacks chain state can still process all blocks and microblocks on each fork correctly
-/// (even if they arrive out-of-order).  This module differs from the `block_construction` module in that this
-/// module focuses on building and testing chain histories; unlike `block_construction`, this module does not
-/// test anything about block construction from mempool state.
 use std::collections::HashMap;
 
 use clarity::vm::types::*;
@@ -27,6 +21,13 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use stacks_common::address::*;
 use stacks_common::types::chainstate::SortitionId;
+/// This test module is concerned with verifying that the miner can build block histories out of
+/// blocks and microblocks in which either the Stacks or burnchain histories fork (or both), and
+/// that the Stacks chain state can still process all blocks and microblocks on each fork correctly
+/// (even if they arrive out-of-order).  This module differs from the `block_construction` module in that this
+/// module focuses on building and testing chain histories; unlike `block_construction`, this module does not
+/// test anything about block construction from mempool state.
+use stacks_common::types::chainstate::SortitionIdExt as _;
 
 use crate::burnchains::db::BurnchainDB;
 use crate::burnchains::tests::*;

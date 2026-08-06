@@ -16,7 +16,7 @@
 
 use regex::{Captures, Regex};
 use serde_json;
-use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
+use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId, StacksBlockIdDigest as _};
 use stacks_common::types::net::PeerHost;
 
 use crate::net::http::{

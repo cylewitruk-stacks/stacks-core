@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fmt;
 
-use stacks_common::types::chainstate::{ConsensusHash, SortitionId, StacksBlockId};
+use stacks_common::types::chainstate::{
+    ConsensusHash, SortitionId, StacksBlockId, StacksBlockIdDigest as _,
+};
 use stacks_common::util::get_epoch_time_ms;
 
 use crate::burnchains::{BurnchainView, PoxConstants};

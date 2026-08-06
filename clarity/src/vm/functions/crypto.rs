@@ -21,10 +21,15 @@ use stacks_common::address::{
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::util::ed25519::ed25519_verify;
 use stacks_common::util::hash;
-use stacks_common::util::secp256k1::{
+use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
+use stacks_crypto::address::StacksAddressCryptoExt as _;
+use stacks_crypto::hash::{
+    Hash160Digest as _, Keccak256Digest as _, Sha256Digest as _, Sha512SumDigest as _,
+    Sha512Trunc256Digest as _,
+};
+use stacks_crypto::secp256k1::{
     Secp256k1PublicKey, secp256k1_decompress, secp256k1_recover, secp256k1_verify,
 };
-use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
@@ -71,9 +76,9 @@ native_hash_func!(native_keccak256, hash::Keccak256Hash);
 fn pubkey_to_address_v1(pub_key: Secp256k1PublicKey) -> Result<StacksAddress, VmExecutionError> {
     StacksAddress::from_public_keys(
         C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
-        &AddressHashMode::SerializeP2PKH,
+        AddressHashMode::SerializeP2PKH,
         1,
-        &vec![pub_key],
+        &[pub_key],
     )
     .ok_or_else(|| VmInternalError::Expect("Failed to create address from pubkey".into()).into())
 }
@@ -89,13 +94,10 @@ fn pubkey_to_address_v2(
     } else {
         C32_ADDRESS_VERSION_TESTNET_SINGLESIG
     };
-    StacksAddress::from_public_keys(
-        network_byte,
-        &AddressHashMode::SerializeP2PKH,
-        1,
-        &vec![pub_key],
-    )
-    .ok_or_else(|| VmInternalError::Expect("Failed to create address from pubkey".into()).into())
+    StacksAddress::from_public_keys(network_byte, AddressHashMode::SerializeP2PKH, 1, &[pub_key])
+        .ok_or_else(|| {
+            VmInternalError::Expect("Failed to create address from pubkey".into()).into()
+        })
 }
 
 pub fn special_principal_of(

@@ -18,12 +18,12 @@ use std::ops::Bound;
 use std::str::FromStr;
 
 use super::{
-    set_test_coinbase_schedule, CoinbaseInterval, StacksEpochId,
-    BITCOIN_MAINNET_GENESIS_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT,
+    get_coinbase_intervals, set_test_coinbase_schedule, CoinbaseInterval, EpochCoinbaseReward,
+    StacksEpochId, BITCOIN_MAINNET_GENESIS_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT,
     BITCOIN_TESTNET_GENESIS_BURN_HEIGHT, BITCOIN_TESTNET_STACKS_40_BURN_HEIGHT,
     COINBASE_INTERVALS_MAINNET, COINBASE_INTERVALS_TESTNET,
 };
-use crate::types::StacksEpochRangeTestExt as _;
+use crate::types::{ChainEpochRules as _, StacksEpochRangeTestExt as _};
 
 #[test]
 fn test_epoch40_cost_voting_contract_support_gate() {
@@ -392,28 +392,16 @@ fn test_set_coinbase_intervals() {
         },
     ];
 
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(true),
-        *COINBASE_INTERVALS_MAINNET
-    );
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(false),
-        *COINBASE_INTERVALS_TESTNET
-    );
+    assert_eq!(get_coinbase_intervals(true), *COINBASE_INTERVALS_MAINNET);
+    assert_eq!(get_coinbase_intervals(false), *COINBASE_INTERVALS_TESTNET);
 
     set_test_coinbase_schedule(Some(new_sched.clone()));
 
-    assert_eq!(StacksEpochId::get_coinbase_intervals(true), new_sched);
-    assert_eq!(StacksEpochId::get_coinbase_intervals(false), new_sched);
+    assert_eq!(get_coinbase_intervals(true), new_sched);
+    assert_eq!(get_coinbase_intervals(false), new_sched);
 
     set_test_coinbase_schedule(None);
 
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(true),
-        *COINBASE_INTERVALS_MAINNET
-    );
-    assert_eq!(
-        StacksEpochId::get_coinbase_intervals(false),
-        *COINBASE_INTERVALS_TESTNET
-    );
+    assert_eq!(get_coinbase_intervals(true), *COINBASE_INTERVALS_MAINNET);
+    assert_eq!(get_coinbase_intervals(false), *COINBASE_INTERVALS_TESTNET);
 }

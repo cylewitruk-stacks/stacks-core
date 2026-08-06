@@ -17,9 +17,10 @@
 use clarity::vm::types::TupleData;
 use clarity::vm::{ClarityName, Value};
 use stacks_common::types::chainstate::StacksPrivateKey;
-use stacks_common::types::PrivateKey;
 use stacks_common::util::hash::Sha256Sum;
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey};
+use stacks_crypto::hash::Sha256Digest as _;
+use stacks_crypto::secp256k1::SigningKey;
 
 use crate::chainstate::stacks::address::PoxAddress;
 
@@ -35,10 +36,12 @@ pub fn structured_data_hash(value: Value) -> Sha256Sum {
 /// Generate a message hash for signing structured Clarity data.
 /// Reference [SIP018](https://github.com/stacksgov/sips/blob/main/sips/sip-018/sip-018-signed-structured-data.md) for more information.
 pub fn structured_data_message_hash(structured_data: Value, domain: Value) -> Sha256Sum {
+    let domain_hash = structured_data_hash(domain);
+    let data_hash = structured_data_hash(structured_data);
     let message = [
-        STRUCTURED_DATA_PREFIX.as_ref(),
-        structured_data_hash(domain).as_bytes(),
-        structured_data_hash(structured_data).as_bytes(),
+        &STRUCTURED_DATA_PREFIX[..],
+        &domain_hash.as_bytes()[..],
+        &data_hash.as_bytes()[..],
     ]
     .concat();
 
@@ -82,7 +85,7 @@ pub mod pox4 {
 
     use super::{
         make_structured_data_domain, structured_data_message_hash, MessageSignature, PoxAddress,
-        PrivateKey, Sha256Sum, StacksPrivateKey, TupleData, Value,
+        Sha256Sum, SigningKey, StacksPrivateKey, TupleData, Value,
     };
     define_named_enum!(Pox4SignatureTopic {
         StackStx("stack-stx"),
@@ -182,7 +185,7 @@ pub mod pox4 {
         use clarity::vm::ClarityVersion;
         use stacks_common::address::AddressHashMode;
         use stacks_common::consts::CHAIN_ID_TESTNET;
-        use stacks_common::types::chainstate::StacksAddress;
+        use stacks_common::types::chainstate::{StacksAddress, StacksAddressExtensions as _};
         use stacks_common::util::hash::to_hex;
         use stacks_common::util::secp256k1::Secp256k1PublicKey;
 
@@ -423,8 +426,8 @@ pub mod pox5 {
     use clarity::vm::ClarityName;
 
     use super::{
-        make_structured_data_domain, structured_data_message_hash, MessageSignature, PrivateKey,
-        Secp256k1PrivateKey, Sha256Sum, TupleData, Value,
+        make_structured_data_domain, structured_data_message_hash, MessageSignature,
+        Secp256k1PrivateKey, Sha256Sum, SigningKey, TupleData, Value,
     };
 
     pub fn make_pox_5_signed_data_domain(chain_id: u32) -> Value {

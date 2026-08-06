@@ -22,15 +22,16 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, ConsensusHash, StacksAddress, StacksBlockId,
+    BlockHeaderHash, ConsensusHash, StacksAddress, StacksBlockId, StacksBlockIdDigest as _,
 };
 use stacks_common::util::hash::{Hash160, MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_rusqlite::{domain_params, SqlValue};
 use tempfile::tempdir;
 
 use super::super::blocks::{
     assert_source_tables_classified, copy_confirmed_epoch2_microblocks, copy_epoch2_block_files,
-    copy_nakamoto_staging_blocks, nakamoto_copy_specs, NAKAMOTO_STAGING_TABLES,
+    copy_nakamoto_staging_blocks, nakamoto_copy_specs,
 };
 use super::super::common::clone_schemas_from_source;
 use super::{
@@ -161,22 +162,22 @@ fn test_no_unclassified_nakamoto_staging_tables() {
         .expect("fresh production Nakamoto staging schema must be fully classified");
 }
 
-/// Every cloned table (NAKAMOTO_STAGING_TABLES) must have a row-copy spec and vice versa,
-/// else it would be cloned but never populated (present-but-empty).
+/// Copy-spec coverage guard: no duplicate spec tables, and every Nakamoto
+/// staging spec row-copies (none accidentally schema-only). The `known_*` set
+/// derives from the specs, so a dropped spec is caught by the
+/// unclassified-table guard.
 #[test]
-fn test_nakamoto_copy_specs_match_staging_tables() {
-    let spec_tables: Vec<&str> = nakamoto_copy_specs().iter().map(|s| s.table).collect();
-    let spec_set: HashSet<&str> = spec_tables.iter().copied().collect();
+fn test_nakamoto_copy_specs_well_formed() {
+    let tables = nakamoto_copy_specs().table_names();
+    let spec_set: HashSet<&str> = tables.iter().copied().collect();
     assert_eq!(
-        spec_tables.len(),
+        tables.len(),
         spec_set.len(),
         "duplicate table in nakamoto_copy_specs"
     );
-    let staging_set: HashSet<&str> = NAKAMOTO_STAGING_TABLES.iter().copied().collect();
-    assert_eq!(
-        spec_set, staging_set,
-        "every NAKAMOTO_STAGING_TABLES entry must have exactly one copy spec (and vice versa); \
-         a cloned-but-uncopied table would be present-but-empty in the squash"
+    assert!(
+        nakamoto_copy_specs().schema_only().is_empty(),
+        "nakamoto staging has no schema-only tables; every spec must row-copy"
     );
 }
 
@@ -275,7 +276,7 @@ fn insert_staging_microblock(
              (anchored_block_hash, consensus_hash, index_block_hash, microblock_hash, \
               parent_hash, index_microblock_hash, sequence, processed, orphaned) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
+        domain_params![
             anchored_block_hash,
             consensus_hash,
             index_block_hash,
@@ -298,7 +299,7 @@ fn insert_staging_microblock_data(
 ) {
     conn.execute(
         "INSERT INTO staging_microblocks_data (block_hash, block_data) VALUES (?1, ?2)",
-        params![block_hash, block_data],
+        domain_params![block_hash, block_data],
     )
     .unwrap();
 }
@@ -525,7 +526,12 @@ fn test_microblock_stream_copy() {
     let rows: Vec<(u32, BlockHeaderHash)> = dst_conn
         .prepare("SELECT sequence, microblock_hash FROM staging_microblocks ORDER BY sequence")
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, SqlValue<BlockHeaderHash>>(1)?.into_inner(),
+            ))
+        })
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -533,7 +539,7 @@ fn test_microblock_stream_copy() {
     let blob: Vec<u8> = dst_conn
         .query_row(
             "SELECT block_data FROM staging_microblocks_data WHERE block_hash = ?1",
-            params![mblock0_hash],
+            domain_params![mblock0_hash],
             |row| row.get(0),
         )
         .unwrap();
@@ -547,7 +553,7 @@ fn test_microblock_stream_copy() {
         .query_row(
             "SELECT (SELECT COUNT(*) FROM staging_microblocks WHERE microblock_hash = ?1), \
                     (SELECT COUNT(*) FROM staging_microblocks_data WHERE block_hash = ?1)",
-            params![fork_hash],
+            domain_params![fork_hash],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();

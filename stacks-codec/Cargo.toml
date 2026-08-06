@@ -15,16 +15,15 @@ readme = "README.md"
 edition = "2021"
 
 [dependencies]
-stacks-common = { path = "../stacks-common", default-features = false }
-clarity-types = { path = "../clarity-types", default-features = false }
+stacks-p2p = { workspace = true }
+stacks-primitives = { workspace = true }
+stacks-crypto = { workspace = true, default-features = false }
 serde = { workspace = true, features = ["derive"] }
-variant_count = { workspace = true }
 
 [dev-dependencies]
-stacks-common = { path = "../stacks-common", default-features = false, features = ["testing"] }
-clarity-types = { path = "../clarity-types", default-features = false, features = ["testing"] }
+const-hex = { workspace = true }
 
 [features]
 default = []
-testing = ["stacks-common/testing", "clarity-types/testing"]
-wasm-web = ["stacks-common/wasm-web", "clarity-types/wasm-web"]
+testing = ["stacks-primitives/testing"]
+wasm-web = ["stacks-crypto/wasm-web", "stacks-primitives/wasm-web"]

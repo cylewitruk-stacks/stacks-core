@@ -18,7 +18,6 @@ use std::cmp;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use clarity::types::Address;
 use clarity::vm::analysis::RuntimeCheckErrorKind;
 use clarity::vm::clarity::{ClarityError, TransactionConnection};
 use clarity::vm::contexts::ExecutionState;
@@ -50,7 +49,9 @@ use crate::chainstate::stacks::db::{StacksChainState, StacksDBConn};
 use crate::chainstate::stacks::Error;
 use crate::clarity_vm::clarity::{ClarityConnection, ClarityTransactionConnection};
 use crate::clarity_vm::database::HeadersDBConn;
-use crate::core::{StacksEpochId, CHAIN_ID_MAINNET, POX_MAXIMAL_SCALING, POX_THRESHOLD_STEPS_USTX};
+use crate::core::{
+    ChainEpochRules, StacksEpochId, CHAIN_ID_MAINNET, POX_MAXIMAL_SCALING, POX_THRESHOLD_STEPS_USTX,
+};
 use crate::util_lib::boot;
 
 const BOOT_CODE_POX_BODY: &str = std::include_str!("pox.clar");
@@ -1766,11 +1767,14 @@ pub mod test {
 
     use clarity::vm::contracts::Contract;
     use clarity::vm::types::*;
+    use stacks_common::types::chainstate::{
+        StacksAddressExtensions as _, StacksBlockIdDigest as _,
+    };
     use stacks_common::util::secp256k1::Secp256k1PublicKey;
+    use stacks_crypto::hash::Hash160Digest as _;
 
     use self::signers_tests::readonly_call;
     use super::*;
-    use crate::burnchains::Address;
     use crate::chainstate::burn::operations::BlockstackOperationType;
     use crate::chainstate::stacks::db::*;
     use crate::chainstate::stacks::tests::*;

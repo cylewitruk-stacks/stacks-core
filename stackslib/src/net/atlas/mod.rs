@@ -25,6 +25,7 @@ use serde::ser::Serialize;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::{hex_bytes, to_hex, Hash160, MerkleHashFunc};
+use stacks_crypto::hash::Hash160Digest as _;
 
 pub use self::db::AtlasDB;
 pub use self::download::AttachmentsDownloader;

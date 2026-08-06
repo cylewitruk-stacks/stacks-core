@@ -36,7 +36,9 @@ use stacks::core::{
     PEER_VERSION_EPOCH_2_05, PEER_VERSION_EPOCH_2_1, STACKS_EPOCH_MAX,
 };
 use stacks_common::codec::StacksMessageCodec;
-use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, VRFSeed};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, VRFSeed,
+};
 use stacks_common::util::hash::hex_bytes;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;

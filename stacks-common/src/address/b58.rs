@@ -17,7 +17,7 @@
 use std::{fmt, str};
 
 use crate::address::Error;
-use crate::util::hash::DoubleSha256;
+use crate::util::hash::{DoubleSha256, DoubleSha256Digest as _};
 
 static BASE58_CHARS: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -194,9 +194,8 @@ pub fn from_check(data: &str) -> Result<Vec<u8>, Error> {
         return Err(Error::TooShort(ret.len()));
     }
     let ck_start = ret.len() - 4;
-    let expected = DoubleSha256::from_data(&ret[..ck_start])
-        .into_le()
-        .low_u32();
+    let checksum = DoubleSha256::from_data(&ret[..ck_start]);
+    let expected = u32::from_le_bytes(checksum.0[..4].try_into().expect("four-byte checksum"));
 
     let mut actual_buff = [0; 4];
     actual_buff.copy_from_slice(&ret[ck_start..(ck_start + 4)]);

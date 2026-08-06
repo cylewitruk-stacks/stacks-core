@@ -20,6 +20,7 @@ mod test {
     use stacks_common::types::StacksEpochId;
     use stacks_common::util::hash::Hash160;
     use stacks_common::util::secp256k1::MessageSignature;
+    use stacks_crypto::hash::TxidDigest as _;
 
     use crate::burnchains::Txid;
     use crate::chainstate::stacks::{

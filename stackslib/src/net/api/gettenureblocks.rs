@@ -16,7 +16,7 @@ use clarity::types::chainstate::StacksBlockId;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash};
+use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockIdDigest as _};
 use stacks_common::types::net::PeerHost;
 
 use crate::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};

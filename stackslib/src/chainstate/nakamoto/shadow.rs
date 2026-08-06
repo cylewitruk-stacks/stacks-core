@@ -15,7 +15,6 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use clarity::vm::costs::ExecutionCost;
-use rusqlite::params;
 /// Shadow blocks
 ///
 /// In the event of an emergency chain halt, a SIP will be written to declare that a chain halt has
@@ -40,10 +39,13 @@ use rusqlite::params;
 /// Nakamoto chainstate, and Nakamoto miner structures.
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, ConsensusHash, StacksAddress, StacksBlockId, StacksPrivateKey, StacksPublicKey,
+    BlockHeaderHash, ConsensusHash, StacksAddress, StacksAddressExtensions as _, StacksBlockId,
+    StacksBlockIdDigest as _, StacksPrivateKey, StacksPublicKey,
 };
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::vrf::VRFProof;
+use stacks_crypto::hash::Hash160Digest as _;
+use stacks_rusqlite::domain_params;
 
 use super::miner::MinerTenureInfoCause;
 use crate::burnchains::PoxConstants;
@@ -762,7 +764,7 @@ impl NakamotoStagingBlocksConnRef<'_> {
         index_block_hash: &StacksBlockId,
     ) -> Result<bool, ChainstateError> {
         let qry = "SELECT 1 FROM nakamoto_staging_blocks WHERE index_block_hash = ?1 AND obtain_method = ?2";
-        let args = params![
+        let args = domain_params![
             index_block_hash,
             &NakamotoBlockObtainMethod::Shadow.to_string()
         ];
@@ -779,7 +781,7 @@ impl NakamotoStagingBlocksConnRef<'_> {
         consensus_hash: &ConsensusHash,
     ) -> Result<bool, ChainstateError> {
         let qry = "SELECT 1 FROM nakamoto_staging_blocks WHERE consensus_hash = ?1 AND obtain_method = ?2";
-        let args = rusqlite::params![
+        let args = domain_params![
             consensus_hash,
             NakamotoBlockObtainMethod::Shadow.to_string()
         ];
@@ -800,7 +802,7 @@ impl NakamotoStagingBlocksConnRef<'_> {
         ch: &ConsensusHash,
     ) -> Result<Option<NakamotoBlock>, ChainstateError> {
         let qry = "SELECT data FROM nakamoto_staging_blocks WHERE consensus_hash = ?1 AND obtain_method = ?2 ORDER BY height DESC LIMIT 1";
-        let args = params![ch, &NakamotoBlockObtainMethod::Shadow.to_string()];
+        let args = domain_params![ch, &NakamotoBlockObtainMethod::Shadow.to_string()];
         let res: Option<Vec<u8>> = query_row(self, qry, args)?;
         let Some(block_bytes) = res else {
             return Ok(None);
@@ -827,7 +829,7 @@ impl NakamotoStagingBlocksTx<'_> {
 
         // is this block stored already?
         let qry = "SELECT 1 FROM nakamoto_staging_blocks WHERE index_block_hash = ?1";
-        let args = params![block_id];
+        let args = domain_params![block_id];
         let present: Option<i64> = query_row(self, qry, args)?;
         if present.is_some() {
             return Ok(());
@@ -835,7 +837,7 @@ impl NakamotoStagingBlocksTx<'_> {
 
         // this tenure must be empty, or it must be a shadow tenure
         let qry = "SELECT 1 FROM nakamoto_staging_blocks WHERE consensus_hash = ?1";
-        let args = rusqlite::params![&shadow_block.header.consensus_hash];
+        let args = domain_params![&shadow_block.header.consensus_hash];
         let present: Option<u32> = query_row(self, qry, args)?;
         if present.is_some()
             && !self
@@ -849,7 +851,7 @@ impl NakamotoStagingBlocksTx<'_> {
 
         // there must not be a block at this height in this tenure
         let qry = "SELECT 1 FROM nakamoto_staging_blocks WHERE consensus_hash = ?1 AND height = ?2";
-        let args = rusqlite::params![
+        let args = domain_params![
             &shadow_block.header.consensus_hash,
             u64_to_sql(shadow_block.header.chain_length)?
         ];

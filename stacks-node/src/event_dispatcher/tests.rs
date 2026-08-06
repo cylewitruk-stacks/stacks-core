@@ -49,7 +49,10 @@ use stacks::types::net::PeerHost;
 use stacks::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks::util::secp256k1::MessageSignature;
 use stacks_common::bitvec::BitVec;
-use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksBlockId};
+use stacks_common::types::chainstate::{
+    BurnchainHeaderHash, StacksAddressExtensions as _, StacksBlockId,
+};
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 use tempfile::tempdir;
 use tiny_http::{Method, Response, Server, StatusCode};
 

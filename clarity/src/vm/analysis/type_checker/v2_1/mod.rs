@@ -19,7 +19,7 @@ pub mod natives;
 
 use std::collections::BTreeMap;
 
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use self::contexts::ContractContext;
 pub use self::natives::{SimpleNativeFunction, TypedNativeFunction};

@@ -16,15 +16,58 @@
 
 //! Binary consensus serialization codec for the Stacks blockchain.
 //!
-//! The trait, error type, and primitive impls live in `stacks_common::codec`;
-//! this crate re-exports them for callers that want to depend only on the
-//! codec surface, and will host the higher-level codec types (e.g.
-//! `StacksTransaction`) as they are lowered out of `stackslib`.
+//! The trait, error type, and primitive impls live here. `stacks-common`
+//! temporarily re-exports this surface while callers migrate.
 
+#[macro_use]
+pub mod macros;
+
+pub mod address;
+pub mod codec;
+pub mod p2p;
+pub mod primitives;
 pub mod strings;
-pub mod transaction;
 
-pub use stacks_common::codec::*;
-pub use stacks_common::{
-    impl_byte_array_message_codec, impl_stacks_message_codec_for_int, BITVEC_LEN,
-};
+/// Reusable assertions for crates that own consensus codec implementations.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::{fmt, io};
+
+    use crate::{Error, StacksMessageCodec};
+
+    /// Verify an exact byte representation, its round-trip, and rejection of
+    /// the same representation truncated by one byte.
+    pub fn check_codec_and_corruption<T>(value: &T, expected: &[u8])
+    where
+        T: StacksMessageCodec + fmt::Debug + Clone + PartialEq,
+    {
+        let mut encoded = Vec::with_capacity(expected.len());
+        value.consensus_serialize(&mut encoded).unwrap();
+        assert_eq!(encoded, expected);
+
+        let decoded = T::consensus_deserialize(&mut &encoded[..]).unwrap_or_else(|error| {
+            panic!("failed to parse {value:?} from {expected:?}: {error:?}")
+        });
+        assert_eq!(decoded, *value);
+
+        if encoded.is_empty() {
+            return;
+        }
+
+        let truncated = &encoded[..encoded.len() - 1];
+        match T::consensus_deserialize(&mut &truncated[..]) {
+            Ok(decoded) => panic!(
+                "parsed {decoded:?} from truncated bytes {truncated:?}; expected UnexpectedEof"
+            ),
+            Err(Error::ReadError(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(error) => panic!("unexpected error for truncated bytes: {error:?}"),
+        }
+    }
+}
+
+// TODO: Re-enable these modules once their dependencies no longer force
+// `stacks-codec -> stacks-common`, which would cycle with the temporary
+// `stacks-common -> stacks-codec` re-export bridge.
+// pub mod transaction;
+
+pub use codec::*;

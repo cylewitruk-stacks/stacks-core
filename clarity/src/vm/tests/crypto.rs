@@ -16,14 +16,17 @@ use clarity_types::types::MAX_VALUE_SIZE;
 use pinny::tag;
 use proptest::collection::vec;
 use proptest::prelude::*;
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{StacksPrivateKey, StacksPublicKey};
-use stacks_common::types::{PrivateKey, PublicKey, StacksEpochId};
 use stacks_common::util::ed25519::{self, Ed25519PrivateKey, Ed25519PublicKey, MessageSignature};
 use stacks_common::util::hash::{Sha256Sum, hex_bytes, to_hex};
-use stacks_common::util::secp256k1::{
-    MessageSignature as Secp256k1Signature, Secp256k1PrivateKey, Secp256k1PublicKey,
-};
+use stacks_common::util::secp256k1::MessageSignature as Secp256k1Signature;
 use stacks_common::util::secp256r1::{Secp256r1PrivateKey, Secp256r1PublicKey};
+use stacks_crypto::hash::Sha256Digest as _;
+use stacks_crypto::secp256k1::{
+    MessageSignatureCryptoExt as _, Secp256k1PrivateKey, Secp256k1PublicKey, SigningKey as _,
+    VerifyingKey as _,
+};
 
 use crate::vm::errors::{ClarityEvalError, RuntimeCheckErrorKind, VmExecutionError};
 use crate::vm::types::{BuffData, ResponseData, SequenceData, TypeSignature, Value};

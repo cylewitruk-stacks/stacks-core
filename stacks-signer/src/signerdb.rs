@@ -28,12 +28,11 @@ use blockstack_lib::util_lib::db::{
     Error as DBError, FromRow,
 };
 use clarity::types::chainstate::{BurnchainHeaderHash, StacksAddress, StacksPublicKey};
-use clarity::types::Address;
 use libsigner::v0::messages::{RejectReason, RejectReasonPrefix, StateMachineUpdate};
 use libsigner::v0::signer_state::GlobalStateEvaluator;
 use libsigner::BlockProposal;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{params, Connection, Error as SqliteError, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, Error as SqliteError, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use stacks_common::codec::{read_next, write_next, Error as CodecError, StacksMessageCodec};
 use stacks_common::types::chainstate::ConsensusHash;
@@ -43,6 +42,7 @@ use stacks_common::util::secp256k1::MessageSignature;
 #[cfg(test)]
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 use stacks_common::{debug, define_u8_enum, error, warn};
+use stacks_rusqlite::{domain_params as params, SqlValue};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 /// A vote across the signer set for a block
@@ -88,10 +88,10 @@ pub struct BurnBlockInfo {
 
 impl FromRow<BurnBlockInfo> for BurnBlockInfo {
     fn from_row(row: &rusqlite::Row) -> Result<Self, DBError> {
-        let block_hash: BurnchainHeaderHash = row.get(0)?;
+        let block_hash = row.get::<_, SqlValue<BurnchainHeaderHash>>(0)?.into_inner();
         let block_height: u64 = row.get(1)?;
-        let consensus_hash: ConsensusHash = row.get(2)?;
-        let parent_burn_block_hash: BurnchainHeaderHash = row.get(3)?;
+        let consensus_hash = row.get::<_, SqlValue<ConsensusHash>>(2)?.into_inner();
+        let parent_burn_block_hash = row.get::<_, SqlValue<BurnchainHeaderHash>>(3)?.into_inner();
         Ok(BurnBlockInfo {
             block_hash,
             block_height,
@@ -1449,7 +1449,7 @@ impl SignerDb {
     /// Return whether there was an approved/signed block in a tenure (identified by its consensus hash)
     pub fn has_approved_block_in_tenure(&self, tenure: &ConsensusHash) -> Result<bool, DBError> {
         let query = "SELECT 1 FROM blocks WHERE consensus_hash = ? AND (signed_self IS NOT NULL OR signed_group IS NOT NULL OR approved_time IS NOT NULL) LIMIT 1;";
-        let result: Option<u64> = query_row(&self.db, query, [tenure])?;
+        let result: Option<u64> = query_row(&self.db, query, params![tenure])?;
 
         Ok(result.is_some())
     }
@@ -1460,7 +1460,7 @@ impl SignerDb {
         tenure: &ConsensusHash,
     ) -> Result<Option<BlockInfo>, DBError> {
         let query = "SELECT block_info FROM blocks WHERE consensus_hash = ? AND (signed_self IS NOT NULL OR signed_group IS NOT NULL OR approved_time IS NOT NULL) ORDER BY stacks_height ASC LIMIT 1";
-        let result: Option<String> = query_row(&self.db, query, [tenure])?;
+        let result: Option<String> = query_row(&self.db, query, params![tenure])?;
 
         try_deserialize(result)
     }
@@ -1576,7 +1576,8 @@ impl SignerDb {
         burn_hash: &BurnchainHeaderHash,
     ) -> Result<Option<u64>, DBError> {
         let query = "SELECT received_time FROM burn_blocks WHERE block_hash = ? LIMIT 1";
-        let Some(receive_time_i64) = query_row::<i64, _>(&self.db, query, &[burn_hash])? else {
+        let Some(receive_time_i64) = query_row::<i64, _>(&self.db, query, params![burn_hash])?
+        else {
             return Ok(None);
         };
         let receive_time = u64::try_from(receive_time_i64).map_err(|e| {
@@ -1593,7 +1594,7 @@ impl SignerDb {
         ch: &ConsensusHash,
     ) -> Result<Option<u64>, DBError> {
         let query = "SELECT received_time FROM burn_blocks WHERE consensus_hash = ? LIMIT 1";
-        let Some(receive_time_i64) = query_row::<i64, _>(&self.db, query, &[ch])? else {
+        let Some(receive_time_i64) = query_row::<i64, _>(&self.db, query, params![ch])? else {
             return Ok(None);
         };
         let receive_time = u64::try_from(receive_time_i64).map_err(|e| {
@@ -2079,7 +2080,8 @@ impl SignerDb {
     pub fn get_last_activity_time(&self, tenure: &ConsensusHash) -> Result<Option<u64>, DBError> {
         let query =
             "SELECT last_activity_time FROM tenure_activity WHERE consensus_hash = ? LIMIT 1";
-        let Some(last_activity_time_i64) = query_row::<i64, _>(&self.db, query, &[tenure])? else {
+        let Some(last_activity_time_i64) = query_row::<i64, _>(&self.db, query, params![tenure])?
+        else {
             return Ok(None);
         };
         let last_activity_time = u64::try_from(last_activity_time_i64).map_err(|e| {
@@ -2528,11 +2530,13 @@ pub mod tests {
         TransactionVersion,
     };
     use clarity::types::chainstate::{StacksBlockId, StacksPrivateKey, StacksPublicKey};
-    use clarity::types::PrivateKey;
     use clarity::util::hash::Hash160;
     use clarity::util::secp256k1::MessageSignature;
     use libsigner::v0::messages::{StateMachineUpdateContent, StateMachineUpdateMinerState};
     use libsigner::{BlockProposal, BlockProposalData};
+    use stacks_common::types::chainstate::StacksAddressExtensions as _;
+    use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
+    use stacks_crypto::secp256k1::SigningKey as _;
 
     use super::*;
     use crate::signerdb::NakamotoBlockVote;

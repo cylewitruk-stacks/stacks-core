@@ -189,7 +189,7 @@ impl UrlString {
 
 #[cfg(test)]
 mod test {
-    use clarity::vm::representations::{ContractName, CONTRACT_MAX_NAME_LENGTH};
+    use clarity::vm::representations::{ClarityName, ContractName, CONTRACT_MAX_NAME_LENGTH};
 
     use super::*;
 
@@ -206,6 +206,40 @@ mod test {
         s_payload.extend_from_slice(&s_body);
 
         assert!(ContractName::consensus_deserialize(&mut &s_payload[..]).is_err());
+    }
+
+    #[test]
+    fn stacks_string_clarity_name_compatibility() {
+        let stacks_string = StacksString::try_from_str("foo-bar").unwrap();
+        assert!(ClarityName::try_from(stacks_string.to_string()).is_ok());
+
+        let stacks_string = StacksString::try_from_str("<=").unwrap();
+        let clarity_name = ClarityName::try_from(stacks_string.to_string()).unwrap();
+        let mut bytes = Vec::new();
+        clarity_name.consensus_serialize(&mut bytes).unwrap();
+        assert_eq!(bytes, b"\x02<=");
+    }
+
+    #[test]
+    fn stacks_string_rejects_invalid_clarity_names_at_domain_boundary() {
+        for value in ["not a name", "a.b", "", "1abc"] {
+            let stacks_string = StacksString::try_from_str(value).unwrap();
+            assert!(ClarityName::try_from(stacks_string.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn clarity_name_converts_to_stacks_string_explicitly() {
+        let clarity_name = ClarityName::try_from("hello-world").unwrap();
+        let stacks_string = StacksString::try_from_str(clarity_name.as_str()).unwrap();
+        assert_eq!(stacks_string.to_string(), "hello-world");
+    }
+
+    #[test]
+    fn contract_name_converts_to_stacks_string_explicitly() {
+        let contract_name = ContractName::try_from("hello-world").unwrap();
+        let stacks_string = StacksString::try_from_str(contract_name.as_str()).unwrap();
+        assert_eq!(stacks_string.to_string(), "hello-world");
     }
 
     #[test]

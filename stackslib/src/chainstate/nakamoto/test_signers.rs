@@ -22,6 +22,7 @@ use rand::Rng;
 use stacks_common::address::*;
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::util::hash::Hash160;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use self::boot::RewardSet;
 use crate::burnchains::*;

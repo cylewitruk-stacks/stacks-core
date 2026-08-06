@@ -17,6 +17,8 @@
 use clarity::vm::costs::ExecutionCost;
 use rusqlite::{OptionalExtension, Row};
 use stacks_common::types::chainstate::{StacksBlockId, StacksWorkScore};
+use stacks_rusqlite::{domain_params, SqlRef};
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use crate::chainstate::burn::ConsensusHash;
 use crate::chainstate::stacks::db::*;
@@ -131,17 +133,17 @@ impl StacksChainState {
 
         assert!(block_height < (i64::MAX as u64));
 
-        let args = params![
+        let args = domain_params![
             header.version,
             total_burn_str,
             total_work_str,
-            header.proof,
+            SqlRef::new(&header.proof),
             header.parent_block,
             header.parent_microblock,
             header.parent_microblock_sequence,
-            header.tx_merkle_root,
+            SqlRef::new(&header.tx_merkle_root),
             header.state_index_root,
-            header.microblock_pubkey_hash,
+            SqlRef::new(&header.microblock_pubkey_hash),
             block_hash,
             index_block_hash,
             consensus_hash,
@@ -188,7 +190,7 @@ impl StacksChainState {
         block: &StacksBlockId,
     ) -> Result<Option<ExecutionCost>, Error> {
         let qry = "SELECT cost FROM block_headers WHERE index_block_hash = ?";
-        conn.query_row(qry, &[block], |row| row.get(0))
+        conn.query_row(qry, domain_params![block], |row| row.get(0))
             .optional()
             .map_err(|e| Error::from(db_error::from(e)))
     }
@@ -199,7 +201,7 @@ impl StacksChainState {
         block_hash: &BlockHeaderHash,
     ) -> Result<bool, Error> {
         let sql = "SELECT 1 FROM block_headers WHERE consensus_hash = ?1 AND block_hash = ?2";
-        let args = params![consensus_hash, block_hash];
+        let args = domain_params![consensus_hash, block_hash];
         match conn.query_row(sql, args, |_| Ok(true)) {
             Ok(_) => Ok(true),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
@@ -215,7 +217,7 @@ impl StacksChainState {
         block_hash: &BlockHeaderHash,
     ) -> Result<Option<StacksHeaderInfo>, Error> {
         let sql = "SELECT * FROM block_headers WHERE consensus_hash = ?1 AND block_hash = ?2";
-        let args = params![consensus_hash, block_hash];
+        let args = domain_params![consensus_hash, block_hash];
         query_row_panic(conn, sql, args, || {
             "FATAL: multiple rows for the same block hash".to_string()
         })
@@ -229,7 +231,7 @@ impl StacksChainState {
         index_block_hash: &StacksBlockId,
     ) -> Result<Option<StacksHeaderInfo>, Error> {
         let sql = "SELECT * FROM block_headers WHERE index_block_hash = ?1";
-        query_row_panic(conn, sql, &[&index_block_hash], || {
+        query_row_panic(conn, sql, domain_params![index_block_hash], || {
             "FATAL: multiple rows for the same block hash".to_string()
         })
         .map_err(Error::DBError)
@@ -244,7 +246,7 @@ impl StacksChainState {
         consensus_hash: &ConsensusHash,
     ) -> Result<Option<StacksHeaderInfo>, Error> {
         let sql = "SELECT * FROM block_headers WHERE consensus_hash = ?1";
-        query_row_panic(conn, sql, &[&consensus_hash], || {
+        query_row_panic(conn, sql, domain_params![consensus_hash], || {
             "FATAL: multiple rows for the same consensus hash".to_string()
         })
         .map_err(Error::DBError)
@@ -262,7 +264,7 @@ impl StacksChainState {
             WHERE burn_header_hash = ?1
             ORDER BY block_height DESC
         ";
-        let out = query_rows(conn, sql, &[&burnchain_header_hash])?;
+        let out = query_rows(conn, sql, domain_params![burnchain_header_hash])?;
         if !out.is_empty() {
             return Ok(out);
         }
@@ -347,7 +349,7 @@ impl StacksChainState {
     pub fn get_genesis_header_info(conn: &Connection) -> Result<StacksHeaderInfo, Error> {
         // by construction, only one block can have height 0 in this DB
         let sql = "SELECT * FROM block_headers WHERE consensus_hash = ?1 AND block_height = 0";
-        let args = params![FIRST_BURNCHAIN_CONSENSUS_HASH];
+        let args = domain_params![FIRST_BURNCHAIN_CONSENSUS_HASH];
         let row_opt = query_row(conn, sql, args)?;
         Ok(row_opt.expect("BUG: no genesis header info"))
     }
@@ -358,7 +360,7 @@ impl StacksChainState {
         block_id: &StacksBlockId,
     ) -> Result<Option<StacksBlockId>, Error> {
         let sql = "SELECT parent_block_id FROM block_headers WHERE index_block_hash = ?1 LIMIT 1";
-        let args = params![block_id];
+        let args = domain_params![block_id];
         let mut rows = query_row_columns::<StacksBlockId, _>(conn, sql, args, "parent_block_id")?;
         Ok(rows.pop())
     }
@@ -366,7 +368,7 @@ impl StacksChainState {
     /// Is this block present and processed?
     pub fn has_stacks_block(conn: &Connection, block_id: &StacksBlockId) -> Result<bool, Error> {
         let sql = "SELECT 1 FROM block_headers WHERE index_block_hash = ?1 LIMIT 1";
-        let args = params![block_id];
+        let args = domain_params![block_id];
         Ok(conn
             .query_row(sql, args, |_r| Ok(()))
             .optional()

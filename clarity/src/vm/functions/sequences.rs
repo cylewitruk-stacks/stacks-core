@@ -17,7 +17,7 @@
 use std::cmp;
 
 use clarity_types::types::RetainValuesError;
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules as _, StacksEpochId};
 
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;

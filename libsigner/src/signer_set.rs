@@ -16,7 +16,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use blockstack_lib::chainstate::stacks::boot::NakamotoSignerEntry;
-use stacks_common::types::chainstate::{StacksAddress, StacksPublicKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksPublicKey,
+};
 
 /// A reward set parsed into relevant structures
 #[derive(Debug, Clone)]

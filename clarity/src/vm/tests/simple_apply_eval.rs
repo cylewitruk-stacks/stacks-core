@@ -25,7 +25,9 @@ use stacks_common::address::{
 };
 use stacks_common::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use stacks_common::types::StacksEpochId;
-use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksPrivateKey, StacksPublicKey,
+};
 use stacks_common::util::hash::{hex_bytes, to_hex};
 
 use crate::vm::ast::parse;

@@ -151,10 +151,12 @@ pub(crate) mod tests {
     use rand::{thread_rng, Rng};
     use rand_core::RngCore;
     use stacks_common::types::chainstate::{
-        BlockHeaderHash, ConsensusHash, StacksAddress, StacksPrivateKey, StacksPublicKey,
+        BlockHeaderHash, ConsensusHash, StacksAddress, StacksAddressExtensions as _,
+        StacksPrivateKey, StacksPublicKey,
     };
     use stacks_common::types::{StacksEpochId, StacksPublicKeyBuffer};
     use stacks_common::util::hash::{Hash160, Sha256Sum};
+    use stacks_crypto::hash::{Hash160Digest as _, Sha256Digest as _};
 
     use super::*;
     use crate::config::{

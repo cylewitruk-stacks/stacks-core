@@ -17,7 +17,9 @@ use std::collections::HashSet;
 use std::io::{Cursor, Seek};
 use std::path::PathBuf;
 
-use stacks_common::types::chainstate::{StacksBlockId, TrieHash, TRIEHASH_ENCODED_SIZE};
+use stacks_common::types::chainstate::{
+    StacksBlockId, TrieHash, TrieHashDigest as _, TRIEHASH_ENCODED_SIZE,
+};
 use tempfile::tempdir;
 
 use super::marf::setup_marf;

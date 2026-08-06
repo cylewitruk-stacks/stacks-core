@@ -31,6 +31,7 @@ use serde::Deserialize;
 use stacks_common::codec::{Error as CodecError, StacksMessageCodec, MAX_PAYLOAD_LEN};
 use stacks_common::consts::CHAIN_ID_MAINNET;
 use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
+use stacks_common::types::ChainEpochRules as _;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{hex_bytes, to_hex, Sha512Trunc256Sum};
 #[cfg(any(test, feature = "testing"))]
@@ -47,7 +48,9 @@ use crate::chainstate::stacks::miner::{
     BlockBuilder, BlockLimitFunction, TransactionError, TransactionProblematic,
     TransactionResourceBudgets, TransactionResult, TransactionSkipped,
 };
-use crate::chainstate::stacks::{Error as ChainError, StacksTransaction, TransactionPayload};
+use crate::chainstate::stacks::{
+    Error as ChainError, StacksTransaction, TransactionAuthVerificationMode, TransactionPayload,
+};
 use crate::clarity_vm::clarity::ClarityError;
 use crate::config::DEFAULT_MAX_TENURE_BYTES;
 use crate::core::mempool::ProposalCallbackReceiver;
@@ -784,9 +787,7 @@ impl NakamotoBlockProposal {
                 // and only call `try_mine_tx_with_len` if successful. If consensus forbids it,
                 // we don't have to do this, because `try_mine_tx_with_len` will do it itself.
                 let high_s_check_result = if consensus_allow_high_s_tx_sig {
-                    match tx.verify(
-                        stacks_codec::transaction::TransactionAuthVerificationMode::EnforceLowS,
-                    ) {
+                    match tx.verify(TransactionAuthVerificationMode::EnforceLowS) {
                         Ok(()) => Ok(()),
                         Err(error) => Err(TransactionResult::error(tx, error.into())),
                     }

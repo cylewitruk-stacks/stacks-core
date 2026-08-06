@@ -1,6 +1,7 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
+    "crates/*",
     "stackslib",
     "stacks-common",
     "stacks-codec",
@@ -19,28 +20,63 @@ members = [
     "contrib/stacks-cli",
     "contrib/marf-squash",
 ]
-
 exclude = ["contrib/tools/config-docs-generator"]
 
 [workspace.dependencies]
 # Local dependencies
+clarity-types = { path = "clarity-types" }
+stacks-common = { path = "stacks-common" }
+stacks-codec = { path = "stacks-codec" }
+stacks-crypto = { path = "crates/stacks-crypto", default-features = false }
+stacks-macros = { path = "crates/stacks-macros" }
+stacks-p2p = { path = "crates/stacks-p2p" }
+stacks-primitives = { path = "crates/stacks-primitives" }
+stacks-protocol = { path = "crates/stacks-protocol" }
+stacks-rusqlite = { path = "crates/stacks-rusqlite" }
+stacks-transactions = { path = "crates/stacks-transactions" }
 stacks-profiler = { path = "stacks-profiler" }
 stacks-profiler-macros = { path = "stacks-profiler-macros" }
 
-# Dependencies we want to keep the same between workspace members
+# Internal dependencies
+madhouse = { git = "https://github.com/stacks-network/madhouse-rs.git", rev = "f83f8ea649182c40b9dbd1b90f8de86261b91fe7" } #v0.2.1
+pinny = { git = "https://github.com/stx-labs/pinny-rs.git", rev = "54ba9d533a7b84525a5e65a3eae1a3ae76b9ea49" }             #v0.0.2
+
+# External dependencies
+bitcoin = { version = "0.32.100", default-features = false, features = ["std"] }
+const-hex = { version = "1.19.1" }
 ed25519-dalek = { version = "2.1.1", default-features = false }
+getrandom = { version = "0.2", default-features = false }
 hashbrown = { version = "0.15.2", features = ["serde"] }
 lazy_static = "1.4.0"
-madhouse = { git = "https://github.com/stacks-network/madhouse-rs.git", rev = "f83f8ea649182c40b9dbd1b90f8de86261b91fe7" } #v0.2.1
-pinny = { git = "https://github.com/stx-labs/pinny-rs.git", rev = "54ba9d533a7b84525a5e65a3eae1a3ae76b9ea49" } #v0.0.2
 rand_core = "0.6.4"
 rand = "0.8"
 rand_chacha = "0.3.1"
+ripemd = { version = "0.1.1", default-features = false }
+libsecp256k1 = { version = "0.7.2", default-features = false, features = [
+    "hmac",
+    "lazy-static-context",
+] }
+secp256k1 = { version = "0.24.3", default-features = false, features = [
+    "std",
+    "serde",
+    "recovery",
+] }
 serde = "1"
 serde_derive = "1"
-serde_json = { version = "1.0", features = ["arbitrary_precision", "unbounded_depth"] }
-slog = { version = "2.5.2", features = [ "max_level_trace" ] }
-rusqlite = { version = "0.31.0", features = ["blob", "serde_json", "i128_blob", "bundled", "trace"] }
+serde_json = { version = "1.0", features = [
+    "arbitrary_precision",
+    "unbounded_depth",
+] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+sha3 = { version = "0.10.1", default-features = false }
+slog = { version = "2.5.2", features = ["max_level_trace"] }
+rusqlite = { version = "0.31.0", features = [
+    "blob",
+    "serde_json",
+    "i128_blob",
+    "bundled",
+    "trace",
+] }
 thiserror = "1.0.65"
 tikv-jemallocator = "0.5.4"
 toml = "0.5.6"

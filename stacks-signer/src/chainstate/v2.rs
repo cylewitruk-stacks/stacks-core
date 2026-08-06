@@ -25,6 +25,7 @@ use stacks_common::types::chainstate::ConsensusHash;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::Hash160;
 use stacks_common::{info, warn};
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::chainstate::{ProposalEvalConfig, SignerChainstateError, SortitionData};
 use crate::client::{ClientError, StacksClient};

@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use stacks_crypto::hash::Sha256Digest as _;
 use thiserror::Error;
 
 use crate::util::hash::{hex_bytes, to_hex, Sha256Sum};

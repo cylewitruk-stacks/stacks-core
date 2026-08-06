@@ -21,7 +21,9 @@ use clarity::vm::tests::symbols_from_values;
 use clarity::vm::types::{PrincipalData, StacksAddressExtensions, TupleData};
 use clarity::vm::{ClarityName, ContractName, Value};
 use stacks_common::consts::SIGNER_SLOTS_PER_USER;
-use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, StacksPrivateKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksBlockId, StacksPrivateKey,
+};
 use stacks_common::util::secp256k1::Secp256k1PublicKey;
 
 use super::{RawRewardSetEntry, SIGNERS_PK_LEN};

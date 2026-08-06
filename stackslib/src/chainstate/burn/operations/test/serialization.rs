@@ -1,6 +1,6 @@
 use stacks_common::address::C32_ADDRESS_VERSION_MAINNET_SINGLESIG;
 use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksAddress};
-use stacks_common::types::{Address, StacksPublicKeyBuffer};
+use stacks_common::types::StacksPublicKeyBuffer;
 use stacks_common::util::hash::Hash160;
 
 use crate::burnchains::Txid;

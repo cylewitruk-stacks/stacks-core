@@ -55,7 +55,9 @@ use stacks::net::stackerdb::StackerDBEventDispatcher;
 #[cfg(any(test, feature = "testing"))]
 use stacks::util::tests::TestFlag;
 use stacks_common::bitvec::BitVec;
-use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, StacksBlockId};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, StacksBlockId, StacksBlockIdDigest as _,
+};
 use url::Url;
 
 mod db;

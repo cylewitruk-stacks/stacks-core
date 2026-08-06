@@ -43,19 +43,20 @@ use stacks::core::test_util::make_contract_call;
 use stacks::core::{self, EpochList, BURNCHAIN_TX_SEARCH_WINDOW, STACKS_EPOCH_MAX};
 use stacks::util_lib::boot::boot_code_id;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, StacksBlockId, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, StacksAddress,
+    StacksBlockId, StacksBlockIdDigest as _, VRFSeed,
 };
-use stacks_common::types::PrivateKey;
 use stacks_common::util::hash::{Hash160, Sha256Sum};
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 use stacks_common::util::sleep_ms;
+use stacks_crypto::hash::{Hash160Digest as _, Sha256Digest as _};
+use stacks_crypto::secp256k1::SigningKey as _;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
 use crate::burnchains::bitcoin_regtest_controller::UTXO;
 use crate::neon::RunLoopCounter;
 use crate::operations::BurnchainOpSigner;
 use crate::stacks_common::address::AddressHashMode;
-use crate::stacks_common::types::Address;
 use crate::stacks_common::util::hash::{bytes_to_hex, hex_bytes};
 use crate::tests::neon_integrations::*;
 use crate::tests::*;

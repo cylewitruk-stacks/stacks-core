@@ -23,7 +23,7 @@ use clarity::vm::costs::ExecutionCost;
 use serde::{Deserialize, Serialize};
 use stacks_common::bitvec::BitVec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksBlockId,
+    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksBlockId, StacksBlockIdDigest as _,
 };
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::serde_serializers::prefix_hex;

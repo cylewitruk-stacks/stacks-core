@@ -23,7 +23,6 @@ use blockstack_lib::util_lib::signed_structured_data::{
 use clap::{ArgAction, Parser};
 use clarity::consts::CHAIN_ID_MAINNET;
 use clarity::types::chainstate::StacksPublicKey;
-use clarity::types::{PrivateKey, PublicKey};
 use clarity::util::hash::Sha256Sum;
 use clarity::util::secp256k1::MessageSignature;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TupleData};
@@ -37,6 +36,7 @@ use stacks_common::address::{
 };
 use stacks_common::define_u8_enum;
 use stacks_common::types::chainstate::StacksPrivateKey;
+use stacks_crypto::secp256k1::{SigningKey as _, VerifyingKey as _};
 
 extern crate alloc;
 

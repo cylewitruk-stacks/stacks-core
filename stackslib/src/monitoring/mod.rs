@@ -22,6 +22,7 @@ use clarity::vm::costs::ExecutionCost;
 use rusqlite::{OpenFlags, OptionalExtension};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::uint::{Uint256, Uint512};
+use stacks_rusqlite::domain_params;
 
 use crate::burnchains::{BurnchainSigner, Txid};
 use crate::net::httpcore::StacksHttpRequest;
@@ -224,7 +225,7 @@ fn txid_tracking_db_contains(conn: &DBConn, txid: &Txid) -> Result<bool, Databas
     let contains = conn
         .query_row(
             "SELECT 1 FROM processed_txids WHERE txid = ?",
-            &[txid],
+            domain_params![txid],
             |_row| Ok(true),
         )
         .optional()?

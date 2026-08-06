@@ -18,9 +18,12 @@ use clarity::vm::clarity::ClarityConnection;
 use clarity::vm::representations::*;
 use clarity::vm::{execute, Value};
 use rand::{thread_rng, Rng};
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 use stacks_common::util::hash::*;
 use stacks_common::util::sleep_ms;
 use stacks_common::util::vrf::VRFProof;
+use stacks_crypto::secp256k1::VerifyingKey as _;
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use crate::burnchains::tests::TestMiner;
 use crate::chainstate::burn::db::sortdb::*;
@@ -32,7 +35,6 @@ use crate::chainstate::stacks::*;
 use crate::net::download::BlockDownloader;
 use crate::net::test::*;
 use crate::net::*;
-use crate::stacks_common::types::PublicKey;
 use crate::util_lib::strings::*;
 use crate::util_lib::test::*;
 

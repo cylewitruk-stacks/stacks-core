@@ -50,14 +50,17 @@ use stacks::net::api::postblock_proposal::{
     BlockValidateOk, BlockValidateReject, BlockValidateResponse,
 };
 use stacks::types::chainstate::{StacksAddress, StacksBlockId, StacksPublicKey};
-use stacks::types::PrivateKey;
 use stacks::util::get_epoch_time_secs;
 use stacks::util::hash::MerkleHashFunc;
 use stacks::util::secp256k1::{MessageSignature, Secp256k1PublicKey};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::consts::SIGNER_SLOTS_PER_USER;
+use stacks_common::types::chainstate::{
+    StacksAddressExtensions as _, StacksBlockIdDigest as _, TxidBitcoinExt as _,
+};
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::Sha512Trunc256Sum;
+use stacks_crypto::secp256k1::SigningKey as _;
 use stacks_signer::client::{ClientError, SignerSlotID, StackerDB, StacksClient};
 use stacks_signer::config::{build_signer_config_tomls, GlobalConfig as SignerConfig, Network};
 use stacks_signer::runloop::{SignerResult, State, StateInfo};

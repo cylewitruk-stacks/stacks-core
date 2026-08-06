@@ -34,7 +34,9 @@ use libsigner::v0::signer_state::{
 };
 use serde::{Deserialize, Serialize};
 use stacks_common::codec::Error as CodecError;
-use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
+#[cfg(any(test, feature = "testing"))]
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
+use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId, StacksBlockIdDigest as _};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 #[cfg(any(test, feature = "testing"))]
 use stacks_common::util::secp256k1::Secp256k1PublicKey;

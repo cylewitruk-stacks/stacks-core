@@ -17,6 +17,8 @@
 use std::io::{Read, Write};
 
 use stacks_common::codec::{write_next, Error as codec_error, StacksMessageCodec};
+#[cfg(test)]
+use stacks_common::types::chainstate::BurnchainHeaderHashBitcoinExt as _;
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, StacksBlockId, VRFSeed,
 };
@@ -33,7 +35,7 @@ use crate::chainstate::burn::operations::{
 };
 use crate::chainstate::burn::{Opcodes, SortitionId};
 use crate::chainstate::stacks::address::PoxAddress;
-use crate::core::{marker_for_epoch, StacksEpochId};
+use crate::core::{marker_for_epoch, ChainEpochRules, StacksEpochId};
 
 // return type from parse_data below
 #[derive(Debug)]
@@ -1380,7 +1382,10 @@ mod tests {
     use stacks_common::address::AddressHashMode;
     use stacks_common::deps_common::bitcoin::blockdata::transaction::{Transaction, TxOut};
     use stacks_common::deps_common::bitcoin::network::serialize::{deserialize, serialize_hex};
-    use stacks_common::types::chainstate::{BlockHeaderHash, SortitionId, StacksAddress, VRFSeed};
+    use stacks_common::types::chainstate::{
+        BlockHeaderHash, SortitionId, SortitionIdExt as _, StacksAddress,
+        StacksAddressExtensions as _, VRFSeed,
+    };
     use stacks_common::util::get_epoch_time_secs;
     use stacks_common::util::hash::*;
     use stacks_common::util::vrf::VRFPublicKey;

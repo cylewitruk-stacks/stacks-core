@@ -28,6 +28,7 @@ use stacks_common::bitvec::BitVec;
 use stacks_common::codec::{Error as codec_error, StacksMessageCodec};
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, PoxId, StacksAddress, StacksBlockId,
+    StacksBlockIdDigest as _,
 };
 use stacks_common::types::net::{Error as AddrError, PeerAddress, PeerHost};
 use stacks_common::types::StacksPublicKeyBuffer;
@@ -267,9 +268,9 @@ impl From<libstackerdb_error> for Error {
     }
 }
 
-impl From<stacks_codec::transaction::AuthError> for Error {
-    fn from(e: stacks_codec::transaction::AuthError) -> Self {
-        use stacks_codec::transaction::AuthError;
+impl From<crate::chainstate::stacks::AuthError> for Error {
+    fn from(e: crate::chainstate::stacks::AuthError) -> Self {
+        use crate::chainstate::stacks::AuthError;
         match e {
             AuthError::SigningError(s) => Error::SigningError(s),
             AuthError::VerifyingError(s) => Error::VerifyingError(s),
@@ -2267,6 +2268,7 @@ pub mod test {
     use rand::{self, RngCore};
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
+    use stacks_common::types::chainstate::BurnchainHeaderHashBitcoinExt as _;
     use stacks_common::types::StacksEpochId;
     use stacks_common::util::hash::*;
     use stacks_common::util::secp256k1::*;

@@ -21,7 +21,9 @@ use std::{fs, io};
 use clarity::vm::clarity::ClarityConnection;
 use clarity::vm::types::*;
 use stacks_common::consts::FIRST_BURNCHAIN_CONSENSUS_HASH;
-use stacks_common::types::chainstate::SortitionId;
+use stacks_common::types::chainstate::{
+    BurnchainHeaderHashBitcoinExt as _, SortitionId, SortitionIdExt as _,
+};
 use stacks_common::util::vrf::VRFPublicKey;
 
 use crate::burnchains::tests::*;

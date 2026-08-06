@@ -40,7 +40,7 @@ use serde_json::json;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::consts::CHAIN_ID_MAINNET;
 use stacks_common::types::chainstate::{
-    ConsensusHash, StacksAddress, StacksPrivateKey, StacksPublicKey,
+    ConsensusHash, StacksAddress, StacksAddressExtensions as _, StacksPrivateKey, StacksPublicKey,
 };
 use stacks_common::types::StacksEpochId;
 use stacks_common::{debug, warn};
@@ -742,7 +742,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::thread::spawn;
 
-    use blockstack_lib::burnchains::Address;
     use blockstack_lib::chainstate::nakamoto::NakamotoBlockHeader;
     use blockstack_lib::chainstate::stacks::address::PoxAddress;
     use blockstack_lib::chainstate::stacks::boot::{

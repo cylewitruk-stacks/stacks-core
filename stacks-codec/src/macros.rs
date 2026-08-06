@@ -45,7 +45,6 @@ macro_rules! impl_byte_array_message_codec {
     };
 }
 
-// macro for determining how big an inv bitvec can be, given its bitlen
 #[macro_export]
 macro_rules! BITVEC_LEN {
     ($bitvec:expr) => {

@@ -15,7 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use stacks_common::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 #[cfg(test)]
 use super::ClarityVersion;
@@ -37,6 +37,8 @@ mod datamaps;
 mod defines;
 #[cfg(test)]
 mod epoch_gating;
+#[cfg(test)]
+mod hooks;
 #[cfg(test)]
 mod post_conditions;
 mod principals;

@@ -28,8 +28,9 @@ use stacks_common::util;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{bin_bytes, hex_bytes, to_bin, to_hex, Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
+use stacks_crypto::secp256k1::SigningKey as _;
 
-use crate::burnchains::PrivateKey;
 use crate::chainstate::stacks::{StacksPrivateKey, StacksPublicKey};
 #[cfg(any(test, feature = "testing"))]
 use crate::core::NETWORK_P2P_PORT;

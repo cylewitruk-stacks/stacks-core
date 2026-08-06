@@ -1,0 +1,19 @@
+[package]
+name = "stacks-macros"
+version = "0.1.0"
+license = "GPL-3.0"
+homepage = "https://github.com/stacks-network/stacks-core"
+repository = "https://github.com/stacks-network/stacks-core"
+description = "Generic helper macros used across the Stacks blockchain codebase"
+keywords = ["stacks", "stx", "blockchain", "macros"]
+readme = "README.md"
+edition = "2024"
+
+[dependencies]
+const-hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[features]
+default = []
+rusqlite = []
+testing = []

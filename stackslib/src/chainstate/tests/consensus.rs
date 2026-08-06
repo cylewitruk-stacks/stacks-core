@@ -27,6 +27,10 @@ use clarity::vm::types::{PrincipalData, ResponseData};
 use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value as ClarityValue};
 use serde::{Deserialize, Serialize, Serializer};
 use stacks_common::bitvec::BitVec;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
+use stacks_common::types::EpochPeerVersion;
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
+use stacks_protocol::epoch::ChainEpochRules as _;
 
 use crate::burnchains::tests::TestBurnchainBlock;
 use crate::burnchains::PoxConstants;
@@ -517,7 +521,7 @@ impl ConsensusChain<'_> {
             }
             // Create epoch
             let block_limit = block_limit_for_epoch(*epoch_id);
-            let network_epoch = StacksEpochId::network_epoch(*epoch_id);
+            let network_epoch = epoch_id.peer_version();
             epochs.push(StacksEpoch {
                 epoch_id: *epoch_id,
                 start_height,

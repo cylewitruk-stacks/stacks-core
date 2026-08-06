@@ -28,6 +28,7 @@ use stacks_common::codec::{
 };
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::{to_hex, Sha512Trunc256Sum};
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 
 use crate::util_lib::db::{query_expect_row, DBConn, DBTx, Error as db_error};
 

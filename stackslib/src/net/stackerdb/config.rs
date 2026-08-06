@@ -14,6 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use clarity::vm::analysis::ContractAnalysis;
+use clarity::vm::clarity::ClarityConnection;
+use clarity::vm::database::BurnStateDB;
+use clarity::vm::types::{
+    BufferLength, FunctionType, ListTypeData, PrincipalData, QualifiedContractIdentifier,
+    SequenceSubtype, TupleTypeSignature, TypeSignature, Value as ClarityValue,
+};
+use clarity::vm::ClarityName;
+use lazy_static::lazy_static;
 /// This file implements the interface to the StackerDB smart contract for loading the DB's config.
 /// The smart contract must conform to this trait:
 ///
@@ -36,15 +45,7 @@
 ///         uint))
 /// )
 /// ```
-use clarity::vm::analysis::ContractAnalysis;
-use clarity::vm::clarity::ClarityConnection;
-use clarity::vm::database::BurnStateDB;
-use clarity::vm::types::{
-    BufferLength, FunctionType, ListTypeData, PrincipalData, QualifiedContractIdentifier,
-    SequenceSubtype, TupleTypeSignature, TypeSignature, Value as ClarityValue,
-};
-use clarity::vm::ClarityName;
-use lazy_static::lazy_static;
+use stacks_common::types::chainstate::StacksBlockIdDigest as _;
 use stacks_common::types::chainstate::{StacksAddress, StacksBlockId};
 use stacks_common::types::net::PeerAddress;
 use stacks_common::types::StacksEpochId;

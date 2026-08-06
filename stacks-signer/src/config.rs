@@ -29,8 +29,11 @@ use stacks_common::address::{
     C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
 use stacks_common::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
-use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksPrivateKey, StacksPublicKey,
+};
 use stacks_common::util::hash::Hash160;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::client::SignerSlotID;
 #[cfg(any(test, feature = "testing"))]

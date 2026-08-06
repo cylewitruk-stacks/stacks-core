@@ -18,6 +18,7 @@
 use std::fs;
 
 use clarity::types::chainstate::{BlockHeaderHash, TrieHash};
+use stacks_common::types::chainstate::TrieHashDigest as _;
 use stacks_common::util::get_epoch_time_ms;
 use stacks_common::util::hash::to_hex;
 

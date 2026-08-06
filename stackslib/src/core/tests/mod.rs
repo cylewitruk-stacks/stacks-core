@@ -26,16 +26,17 @@ use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, StacksAddre
 use clarity::vm::{ContractName, Value};
 use rand::prelude::*;
 use rand::thread_rng;
-use rusqlite::params;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, StacksBlockId, StacksWorkScore, TrieHash,
+    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, StacksAddressExtensions as _,
+    StacksBlockId, StacksBlockIdDigest as _, StacksWorkScore, TrieHash,
 };
 use stacks_common::types::{MempoolCollectionBehavior, StacksEpochId};
 use stacks_common::util::hash::{Hash160, *};
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::util::vrf::VRFProof;
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs, sleep_ms};
+use stacks_rusqlite::domain_params;
 
 use super::mempool::MemPoolWalkStrategy;
 use super::MemPoolDB;
@@ -613,7 +614,7 @@ fn test_iterate_candidates_consider_no_estimate_tx_prob() {
             mempool_tx
                 .execute(
                     "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                    params![Some(123.0), txid],
+                    domain_params![Some(123.0), txid],
                 )
                 .unwrap();
         } else {
@@ -621,7 +622,7 @@ fn test_iterate_candidates_consider_no_estimate_tx_prob() {
             mempool_tx
                 .execute(
                     "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                    params![none, txid],
+                    domain_params![none, txid],
                 )
                 .unwrap();
         }
@@ -1154,7 +1155,7 @@ fn test_iterate_candidates_concurrent_write_lock() {
             mempool_tx
                 .execute(
                     "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                    params![Some(123.0), txid],
+                    domain_params![Some(123.0), txid],
                 )
                 .unwrap();
         } else {
@@ -1162,7 +1163,7 @@ fn test_iterate_candidates_concurrent_write_lock() {
             mempool_tx
                 .execute(
                     "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                    params![none, txid],
+                    domain_params![none, txid],
                 )
                 .unwrap();
         }

@@ -17,7 +17,9 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
-use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksPrivateKey, StacksPublicKey,
+};
 
 use super::TestRPC;
 use crate::chainstate::stacks::{

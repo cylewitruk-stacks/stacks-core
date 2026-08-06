@@ -12,7 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-use stacks_common::types::{StacksEpochId, StacksEpochRangeTestExt as _};
+use stacks_common::types::{ClarityEpochRules, StacksEpochId, StacksEpochRangeTestExt as _};
 
 use crate::vm::ClarityVersion;
 

@@ -53,12 +53,17 @@ use stacks::net::p2p::PeerNetwork;
 use stacks::net::stackerdb::StackerDBs;
 use stacks::net::RPCHandlerArgs;
 use stacks::util_lib::strings::UrlString;
-use stacks_common::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, TrieHash, VRFSeed};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, TrieHash, VRFSeed,
+    VRFSeedDigest as _,
+};
 use stacks_common::types::net::PeerAddress;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::Sha256Sum;
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 use stacks_common::util::vrf::VRFPublicKey;
+use stacks_crypto::hash::Sha256Digest as _;
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use super::{BurnchainController, BurnchainTip, Config, EventDispatcher, Keychain, Tenure};
 use crate::burnchains::make_bitcoin_indexer;

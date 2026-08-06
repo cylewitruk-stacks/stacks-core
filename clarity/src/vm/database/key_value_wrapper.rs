@@ -432,8 +432,7 @@ impl RollbackWrapper<'_> {
         epoch: &StacksEpochId,
     ) -> Result<ValueResult, SerializationError> {
         let serialized_byte_len = value_hex.len() as u64 / 2;
-        let sanitize = epoch.value_sanitizing();
-        let value = Value::try_deserialize_hex(value_hex, expected, sanitize)?;
+        let value = Value::try_deserialize_hex_at_epoch(value_hex, expected, epoch)?;
 
         Ok(ValueResult {
             value,
@@ -622,5 +621,15 @@ impl RollbackWrapper<'_> {
             let metadata_key = (contract.clone(), (*key).to_string());
             self.metadata_lookup_map.contains_key(&metadata_key)
         })
+    }
+
+    pub fn has_pending_write_for_key(&self, keys: &[&str]) -> bool {
+        // Retargeted wrappers always read from the backing store, so pending metadata is
+        // irrelevant.
+        if self.is_retargeted() {
+            return false;
+        }
+
+        keys.iter().any(|key| self.lookup_map.contains_key(*key))
     }
 }

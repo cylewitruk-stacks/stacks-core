@@ -29,7 +29,6 @@ path = "./src/libcommon.rs"
 
 [dependencies]
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
-curve25519-dalek = { version = "4.1.3", default-features = false, features = ["serde"] }
 ed25519-dalek = { workspace = true }
 hashbrown = { workspace = true }
 lazy_static = { workspace = true }
@@ -40,13 +39,18 @@ serde_json = { workspace = true }
 sha3 = { version = "0.10.1", default-features = false }
 slog = { workspace = true }
 slog-term = { version = "2.6.0", default-features = false }
+stacks-codec = { workspace = true }
+stacks-crypto = { workspace = true, default-features = false }
+stacks-p2p = { workspace = true }
+stacks-primitives = { workspace = true }
+stacks-protocol = { workspace = true }
 thiserror = { workspace = true }
 
 # RustCrypto elliptic curve crates
 p256 = { version = "0.13", default-features = false, features = ["std", "serde", "ecdsa"] }
 
 # Optional dependencies
-getrandom = { version = "0.2", default-features = false, optional = true }
+getrandom = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 slog-json = { version = "2.3.0", default-features = false, optional = true }
 
@@ -62,11 +66,7 @@ winapi = { version = "0.3", features = [
 ], optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-secp256k1 = { version = "0.24.3", default-features = false, features = ["std","serde", "recovery"] }
 rusqlite = { workspace = true, optional = true }
-
-[target.'cfg(target_family = "wasm")'.dependencies]
-libsecp256k1 = { version = "0.7.2", default-features = false, features = ["hmac", "lazy-static-context"] }
 
 [target.'cfg(all(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"), not(any(target_os="windows"))))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
@@ -77,6 +77,10 @@ sha2 = { version = "0.10" }
 [dev-dependencies]
 proptest = "1.6.0"
 pinny = { workspace = true }
+stacks-codec = { workspace = true, features = ["testing"] }
+stacks-crypto = { workspace = true, features = ["testing"] }
+stacks-primitives = { workspace = true, features = ["testing"] }
+stacks-protocol = { workspace = true, features = ["testing"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 winapi = { version = "0.3", features = ["fileapi", "processenv", "winnt"] }
@@ -94,15 +98,20 @@ slog_json = ["slog-json"]
 rusqlite = ["dep:rusqlite", "rand"]
 # Enables the rand module. This flag must be off on deterministic
 # platforms such as CosmWasm
-rand = ["dep:rand"]
+rand = ["dep:rand", "stacks-crypto/rand"]
 serde = []
-testing = ["rand"]
+testing = [
+    "rand",
+    "stacks-codec/testing",
+    "stacks-crypto/testing",
+    "stacks-protocol/testing",
+]
 bech32_std = []
 bech32_strict = []
 
 # Wasm-specific features for easier configuration
-wasm-web = ["rand", "getrandom/js", "libsecp256k1/static-context", "chrono/wasmbind"]
-wasm-deterministic = ["getrandom/custom"]
+wasm-web = ["rand", "getrandom/js", "stacks-crypto/wasm-web", "chrono/wasmbind"]
+wasm-deterministic = ["getrandom/custom", "stacks-crypto/wasm-deterministic"]
 
 [package.metadata.pinny]
 allowed = ["t_prop"]

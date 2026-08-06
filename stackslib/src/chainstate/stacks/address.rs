@@ -19,7 +19,9 @@ use clarity::vm::ClarityName;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use stacks_common::address::{b58, AddressHashMode};
 use stacks_common::deps_common::bitcoin::blockdata::transaction::TxOut;
-use stacks_common::types::chainstate::StacksAddress;
+use stacks_common::types::chainstate::{
+    AddressHashModeExtensions as _, StacksAddress, StacksAddressExtensions as _,
+};
 use stacks_common::util::hash::{to_hex, Hash160};
 
 use crate::burnchains::bitcoin::address::{

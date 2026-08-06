@@ -21,6 +21,7 @@ use proptest::{prop_assert_eq, prop_assume};
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::Hash160;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::burnchains::PoxConstants;
 use crate::chainstate::stacks::address::PoxAddress;

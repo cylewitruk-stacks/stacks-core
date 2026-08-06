@@ -51,6 +51,7 @@ pub mod vm;
 
 pub mod boot_util {
 
+    use stacks_common::types::StacksAddressExtensions as _;
     use stacks_common::types::chainstate::StacksAddress;
 
     use crate::vm::representations::ContractName;

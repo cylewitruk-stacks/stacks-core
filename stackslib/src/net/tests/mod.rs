@@ -30,15 +30,13 @@ use clarity::vm::costs::ExecutionCost;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use libstackerdb::StackerDBChunkData;
 use rand::Rng;
-use stacks_codec::transaction::TransactionPayload::SmartContract;
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
 use stacks_common::bitvec::BitVec;
 use stacks_common::types::chainstate::{
-    BurnchainHeaderHash, ConsensusHash, StacksAddress, StacksBlockId, StacksPrivateKey,
-    StacksPublicKey, TrieHash,
+    BurnchainHeaderHash, ConsensusHash, StacksAddress, StacksAddressExtensions as _, StacksBlockId,
+    StacksPrivateKey, StacksPublicKey, TrieHash,
 };
 use stacks_common::types::net::PeerAddress;
-use stacks_common::types::Address;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_common::util::secp256k1::MessageSignature;
 
@@ -58,6 +56,7 @@ use crate::chainstate::stacks::boot::{
 use crate::chainstate::stacks::db::blocks::test::make_empty_coinbase_block;
 use crate::chainstate::stacks::events::TransactionOrigin;
 use crate::chainstate::stacks::test::make_codec_test_microblock;
+use crate::chainstate::stacks::TransactionPayload::SmartContract;
 use crate::chainstate::stacks::{
     StacksTransaction, StacksTransactionSigner, TenureChangeCause, TenureChangePayload,
     TokenTransferMemo, TransactionAnchorMode, TransactionAuth, TransactionContractCall,

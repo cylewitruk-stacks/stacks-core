@@ -34,18 +34,24 @@ pub mod sortdb;
 
 pub type DBConn = Connection;
 
-impl_byte_array_from_column_only!(Txid);
-impl_byte_array_from_column_only!(ConsensusHash);
-impl_byte_array_from_column_only!(Hash160);
-impl_byte_array_from_column_only!(BlockHeaderHash);
-impl_byte_array_from_column_only!(VRFSeed);
+impl_stacks_sql_value_from_column!(Txid);
+impl_stacks_sql_value_from_column!(ConsensusHash);
+impl_stacks_sql_value_from_column!(Hash160);
+impl_stacks_sql_value_from_column!(BlockHeaderHash);
+impl_stacks_sql_value_from_column!(VRFSeed);
 impl_byte_array_from_column!(OpsHash);
-impl_byte_array_from_column_only!(BurnchainHeaderHash);
+impl_stacks_sql_value_from_column!(BurnchainHeaderHash);
 impl_byte_array_from_column!(SortitionHash);
-impl_byte_array_from_column_only!(Sha512Trunc256Sum);
-impl_byte_array_from_column_only!(VRFProof);
-impl_byte_array_from_column_only!(TrieHash);
-impl_byte_array_from_column_only!(MessageSignature);
+impl_stacks_sql_value_from_column!(Sha512Trunc256Sum);
+impl_stacks_sql_value_from_column!(VRFProof);
+impl_stacks_sql_value_from_column!(TrieHash);
+
+impl FromColumn<MessageSignature> for MessageSignature {
+    fn from_column(row: &Row, column_name: &str) -> Result<MessageSignature, db_error> {
+        let signature_hex: String = row.get(column_name)?;
+        MessageSignature::from_hex(&signature_hex).map_err(|_| db_error::ParseError)
+    }
+}
 
 impl FromColumn<VRFPublicKey> for VRFPublicKey {
     fn from_column(row: &Row, column_name: &str) -> Result<VRFPublicKey, db_error> {
@@ -57,15 +63,7 @@ impl FromColumn<VRFPublicKey> for VRFPublicKey {
     }
 }
 
-impl FromColumn<StacksAddress> for StacksAddress {
-    fn from_column(row: &Row, column_name: &str) -> Result<Self, db_error> {
-        let address_str: String = row.get_unwrap(column_name);
-        match Self::from_string(&address_str) {
-            Some(a) => Ok(a),
-            None => Err(db_error::ParseError),
-        }
-    }
-}
+impl_stacks_sql_value_from_column!(StacksAddress);
 
 impl FromColumn<PrincipalData> for PrincipalData {
     fn from_column(row: &Row, column_name: &str) -> Result<Self, db_error> {

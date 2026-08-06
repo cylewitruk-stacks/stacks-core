@@ -64,7 +64,6 @@ use stacks::net::relay::fault_injection::clear_ignore_block;
 use stacks::types::chainstate::{
     BlockHeaderHash, StacksAddress, StacksBlockId, StacksPrivateKey, StacksPublicKey,
 };
-use stacks::types::{PrivateKey, PublicKey};
 use stacks::util::get_epoch_time_secs;
 use stacks::util::hash::{hex_bytes, Hash160, MerkleHashFunc, Sha512Trunc256Sum};
 use stacks::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
@@ -73,7 +72,11 @@ use stacks::util_lib::signed_structured_data::pox4::{
     make_pox_4_signer_key_signature, Pox4SignatureTopic,
 };
 use stacks_common::bitvec::BitVec;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 use stacks_common::util::sleep_ms;
+use stacks_crypto::hash::Hash160Digest as _;
+use stacks_crypto::secp256k1::{SigningKey as _, VerifyingKey as _};
+use stacks_rusqlite::domain_params;
 use stacks_signer::chainstate::v1::SortitionsView;
 use stacks_signer::chainstate::ProposalEvalConfig;
 use stacks_signer::client::StackerDB;
@@ -8108,7 +8111,7 @@ fn verify_mempool_caches() {
     let result = conn
         .query_row(
             "SELECT nonce FROM nonces WHERE address = ?1;",
-            [&sender_addr],
+            domain_params![sender_addr],
             |row| {
                 let nonce: u64 = row.get(0)?;
                 Ok(nonce)
@@ -8140,7 +8143,7 @@ fn verify_mempool_caches() {
     let result = conn
         .query_row(
             "SELECT nonce FROM nonces WHERE address = ?1;",
-            [&sender_addr],
+            domain_params![sender_addr],
             |row| {
                 let nonce: u64 = row.get(0)?;
                 Ok(nonce)

@@ -20,6 +20,7 @@ use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash}
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::db::tx_busy_handler;
 use stacks_common::util::hash::Sha512Trunc256Sum;
+use stacks_rusqlite::SqlRef;
 
 use super::clarity_store::{ContractCommitment, make_contract_hash_key};
 use super::{
@@ -176,7 +177,7 @@ impl SqliteConnection {
         value: &str,
     ) -> Result<(), VmExecutionError> {
         let key = Self::make_metadata_key(contract_id, key);
-        let params = params![bhh, key, value];
+        let params = params![SqlRef::new(bhh), key, value];
 
         if let Err(e) = conn
             .prepare_cached("INSERT INTO metadata_table (blockhash, key, value) VALUES (?, ?, ?)")
@@ -250,7 +251,7 @@ impl SqliteConnection {
         from: &StacksBlockId,
         to: &StacksBlockId,
     ) -> Result<(), VmExecutionError> {
-        let params = params![to, from];
+        let params = params![SqlRef::new(to), SqlRef::new(from)];
         if let Err(e) = conn.execute(
             "UPDATE metadata_table SET blockhash = ? WHERE blockhash = ?",
             params,
@@ -264,7 +265,7 @@ impl SqliteConnection {
     pub fn drop_metadata(conn: &Connection, from: &StacksBlockId) -> Result<(), VmExecutionError> {
         if let Err(e) = conn.execute(
             "DELETE FROM metadata_table WHERE blockhash = ?",
-            params![from],
+            params![SqlRef::new(from)],
         ) {
             error!("Failed to drop metadata from {from}: {e:?}");
             return Err(VmInternalError::DBError(SQL_FAIL_MESSAGE.into()).into());
@@ -279,7 +280,7 @@ impl SqliteConnection {
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
         let key = Self::make_metadata_key(contract_id, key);
-        let params = params![bhh, key];
+        let params = params![SqlRef::new(bhh), key];
 
         match conn
             .prepare_cached("SELECT value FROM metadata_table WHERE blockhash = ? AND key = ?")

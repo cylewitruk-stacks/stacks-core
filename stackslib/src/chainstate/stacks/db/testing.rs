@@ -17,6 +17,8 @@
 
 use std::fs;
 
+use stacks_common::types::chainstate::BurnchainHeaderHashBitcoinExt as _;
+
 use super::*;
 
 /// Builder for a fresh test [`StacksChainState`] created under `test_name`,

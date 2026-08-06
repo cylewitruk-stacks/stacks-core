@@ -16,7 +16,7 @@
 
 use clarity_types::representations::ClarityName;
 use clarity_types::types::TypeSignature;
-use stacks_common::types::StacksEpochId;
+use stacks_common::types::{ClarityEpochRules, StacksEpochId};
 
 use super::{
     StaticCheckError, StaticCheckErrorKind, TypeChecker, check_argument_count,

@@ -28,7 +28,9 @@ use clarity::vm::errors::{IncomparableError, RuntimeError, VmExecutionError, VmI
 use clarity::vm::types::QualifiedContractIdentifier;
 use rusqlite::Connection;
 use stacks_common::codec::StacksMessageCodec;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, StacksBlockId, StacksBlockIdDigest as _, TrieHash,
+};
 
 use crate::chainstate::stacks::index::marf::{
     test_override_marf_compression, MARFOpenOpts, MarfConnection, MarfTransaction, MARF,

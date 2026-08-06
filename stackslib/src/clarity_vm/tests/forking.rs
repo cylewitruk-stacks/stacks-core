@@ -13,6 +13,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 use clarity::vm::analysis::errors::RuntimeCheckErrorKind;
 use clarity::vm::contexts::OwnedEnvironment;
 use clarity::vm::errors::{ClarityEvalError, RuntimeError, VmExecutionError};
@@ -25,6 +26,7 @@ use clarity::vm::version::ClarityVersion;
 use clarity::vm::{ContractContext, ContractName};
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
 use stacks_common::types::StacksEpochId;
+use stacks_protocol::epoch::ClarityEpochRules as _;
 
 use crate::chainstate::stacks::index::ClarityMarfTrieId;
 use crate::clarity_vm::clarity::{ClarityMarfStore, ClarityMarfStoreTransaction};

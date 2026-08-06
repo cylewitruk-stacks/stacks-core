@@ -1,0 +1,38 @@
+[package]
+name = "stacks-transactions"
+version = "0.1.0"
+license = "GPL-3.0"
+homepage = "https://github.com/stacks-network/stacks-core"
+repository = "https://github.com/stacks-network/stacks-core"
+description = "Transaction types and transaction-specific behavior for the Stacks blockchain"
+keywords = ["stacks", "stx", "blockchain", "transactions"]
+readme = "README.md"
+edition = "2024"
+
+[dependencies]
+# Local dependencies
+clarity-types = { workspace = true }
+stacks-codec = { workspace = true, optional = true }
+stacks-crypto = { workspace = true }
+stacks-macros = { workspace = true }
+stacks-primitives = { workspace = true }
+stacks-protocol = { workspace = true }
+
+# Other dependencies
+const-hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+variant_count = { workspace = true }
+
+[dev-dependencies]
+stacks-crypto = { workspace = true, features = ["testing"] }
+
+[features]
+default = []
+codec = ["dep:stacks-codec"]
+testing = [
+    "clarity-types/testing",
+    "codec",
+    "stacks-codec/testing",
+    "stacks-crypto/testing",
+    "stacks-primitives/testing",
+]

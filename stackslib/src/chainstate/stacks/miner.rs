@@ -36,6 +36,8 @@ use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 #[cfg(any(test, feature = "testing"))]
 use stacks_common::util::tests::TestFlag;
 use stacks_common::util::vrf::*;
+use stacks_crypto::hash::Hash160Digest as _;
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use crate::burnchains::{Burnchain, Txid};
 use crate::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};

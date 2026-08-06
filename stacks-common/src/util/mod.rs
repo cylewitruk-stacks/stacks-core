@@ -36,10 +36,11 @@ pub mod vrf;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
+use std::thread;
 use std::time::{self, SystemTime, UNIX_EPOCH};
-use std::{error, fmt, thread};
 
 use hash::hex_bytes;
+pub use stacks_primitives::HexError;
 
 /// Given a relative path inside the Cargo workspace, return the absolute path
 #[cfg(any(test, feature = "testing"))]
@@ -93,36 +94,6 @@ pub fn get_epoch_time_nanos() -> u128 {
 pub fn sleep_ms(millis: u64) {
     let t = time::Duration::from_millis(millis);
     thread::sleep(t);
-}
-
-/// Hex deserialization error
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum HexError {
-    /// Length was not 64 characters
-    BadLength(usize),
-    /// Non-hex character in string
-    BadCharacter(char),
-}
-
-impl fmt::Display for HexError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            HexError::BadLength(n) => write!(f, "bad length {n} for hex string"),
-            HexError::BadCharacter(c) => write!(f, "bad character {c} for hex string"),
-        }
-    }
-}
-
-impl error::Error for HexError {
-    fn cause(&self) -> Option<&dyn error::Error> {
-        None
-    }
-    fn description(&self) -> &str {
-        match *self {
-            HexError::BadLength(_) => "hex string non-64 length",
-            HexError::BadCharacter(_) => "bad hex character",
-        }
-    }
 }
 
 pub trait HexDeser: Sized {

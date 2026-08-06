@@ -20,10 +20,11 @@ use stacks_common::consts::{
 };
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, PoxId, SortitionId, StacksAddress,
-    StacksBlockId, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, PoxId, SortitionId, SortitionIdExt as _,
+    StacksAddress, StacksBlockId, StacksBlockIdDigest as _, VRFSeed,
 };
 use stacks_common::util::hash::Sha512Trunc256Sum;
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 
 use crate::vm::costs::ExecutionCost;
 use crate::vm::database::{BurnStateDB, HeadersDB};

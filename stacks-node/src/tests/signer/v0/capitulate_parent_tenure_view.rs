@@ -19,6 +19,7 @@ use clarity::vm::types::PrincipalData;
 use stacks::core::test_util::make_stacks_transfer_serialized;
 use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks::util::secp256k1::Secp256k1PrivateKey;
+use stacks_common::types::chainstate::{StacksAddressExtensions as _, StacksBlockIdDigest as _};
 use stacks_signer::v0::tests::{
     TEST_REJECT_ALL_BLOCK_PROPOSAL, TEST_SIGNERS_IGNORE_BLOCK_ANNOUNCEMENT,
     TEST_SIGNERS_IGNORE_BLOCK_RESPONSES, TEST_SIGNERS_IGNORE_PRE_COMMITS,

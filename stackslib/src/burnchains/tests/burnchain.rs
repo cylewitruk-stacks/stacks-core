@@ -18,7 +18,8 @@ use rand::rngs::ThreadRng;
 use rand::{thread_rng, RngCore as _};
 use stacks_common::address::AddressHashMode;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, PoxId, SortitionId, TrieHash, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, PoxId, SortitionId,
+    TrieHash, VRFSeed,
 };
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{hex_bytes, to_hex};
