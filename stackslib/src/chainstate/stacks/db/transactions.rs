@@ -30,6 +30,7 @@ use clarity::vm::types::{
     TypeSignature, Value,
 };
 use stacks_common::types::ChainEpochRules;
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use crate::chainstate::nakamoto::miner::MinerTenureInfoCause;
 use crate::chainstate::stacks::db::*;
@@ -2051,7 +2052,7 @@ pub mod test {
     use proptest::prelude::*;
     use rand::Rng;
     use rstest::rstest;
-    use stacks_common::types::chainstate::SortitionId;
+    use stacks_common::types::chainstate::{SortitionId, StacksAddressExtensions as _};
     use stacks_common::util::hash::*;
 
     use super::*;

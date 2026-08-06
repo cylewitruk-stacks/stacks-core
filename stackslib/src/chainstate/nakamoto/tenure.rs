@@ -61,10 +61,13 @@
 use std::ops::DerefMut;
 
 use clarity::vm::types::StacksAddressExtensions;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use stacks_common::consts::{FIRST_BURNCHAIN_CONSENSUS_HASH, MINER_REWARD_MATURITY};
-use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, ConsensusHash, StacksBlockId, StacksBlockIdDigest as _,
+};
 use stacks_common::types::StacksEpochId;
+use stacks_rusqlite::{domain_params, SqlValue};
 
 use crate::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandle, SortitionHandleConn};
 use crate::chainstate::burn::BlockSnapshot;
@@ -251,13 +254,23 @@ impl PartialEq for NakamotoTenureEvent {
 
 impl FromRow<NakamotoTenureEvent> for NakamotoTenureEvent {
     fn from_row(row: &rusqlite::Row) -> Result<NakamotoTenureEvent, DBError> {
-        let tenure_id_consensus_hash = row.get("tenure_id_consensus_hash")?;
-        let prev_tenure_id_consensus_hash = row.get("prev_tenure_id_consensus_hash")?;
-        let burn_view_consensus_hash = row.get("burn_view_consensus_hash")?;
+        let tenure_id_consensus_hash = row
+            .get::<_, SqlValue<ConsensusHash>>("tenure_id_consensus_hash")?
+            .into_inner();
+        let prev_tenure_id_consensus_hash = row
+            .get::<_, SqlValue<ConsensusHash>>("prev_tenure_id_consensus_hash")?
+            .into_inner();
+        let burn_view_consensus_hash = row
+            .get::<_, SqlValue<ConsensusHash>>("burn_view_consensus_hash")?
+            .into_inner();
         let cause_u8: u8 = row.get("cause")?;
         let cause = TenureChangeCause::try_from(cause_u8).map_err(|_| DBError::ParseError)?;
-        let block_hash = row.get("block_hash")?;
-        let block_id = row.get("block_id")?;
+        let block_hash = row
+            .get::<_, SqlValue<BlockHeaderHash>>("block_hash")?
+            .into_inner();
+        let block_id = row
+            .get::<_, SqlValue<StacksBlockId>>("block_id")?
+            .into_inner();
         let coinbase_height_i64: i64 = row.get("coinbase_height")?;
         let coinbase_height =
             u64::try_from(coinbase_height_i64).map_err(|_| DBError::ParseError)?;
@@ -436,7 +449,7 @@ impl NakamotoChainState {
     ) -> Result<(), ChainstateError> {
         // NOTE: this is checked with check_nakamoto_tenure()
         assert_eq!(block_header.consensus_hash, tenure.tenure_consensus_hash);
-        let args = params![
+        let args = domain_params![
             tenure.tenure_consensus_hash,
             tenure.prev_tenure_consensus_hash,
             tenure.burn_view_consensus_hash,
@@ -467,7 +480,7 @@ impl NakamotoChainState {
     ) -> Result<(), ChainstateError> {
         tx.execute(
             "DELETE FROM nakamoto_tenure_events WHERE tenure_id_consensus_hash = ?1",
-            &[ch],
+            domain_params![ch],
         )?;
         Ok(())
     }
@@ -492,7 +505,7 @@ impl NakamotoChainState {
     ) -> Result<u32, ChainstateError> {
         // at least one block in this tenure
         let sql = "SELECT height_in_tenure FROM nakamoto_block_headers WHERE index_block_hash = ?1";
-        let count = match query_int(chainstate_conn, sql, &[block_id]) {
+        let count = match query_int(chainstate_conn, sql, domain_params![block_id]) {
             Ok(count_i64) => {
                 let count: u32 = count_i64
                     .try_into()
@@ -514,7 +527,7 @@ impl NakamotoChainState {
     ) -> Result<Option<NakamotoTenureEvent>, ChainstateError> {
         let sql =
             "SELECT * FROM nakamoto_tenure_events WHERE burn_view_consensus_hash = ?1 AND block_id = ?2";
-        let args = rusqlite::params![tenure_id.burn_view_consensus_hash, tenure_id.block_id];
+        let args = domain_params![tenure_id.burn_view_consensus_hash, tenure_id.block_id];
         Ok(query_row(headers_conn, sql, args)?)
     }
 

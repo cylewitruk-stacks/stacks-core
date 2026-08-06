@@ -28,6 +28,7 @@ use stacks_common::bitvec::BitVec;
 use stacks_common::codec::{Error as codec_error, StacksMessageCodec};
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, PoxId, StacksAddress, StacksBlockId,
+    StacksBlockIdDigest as _,
 };
 use stacks_common::types::net::{Error as AddrError, PeerAddress, PeerHost};
 use stacks_common::types::StacksPublicKeyBuffer;
@@ -2267,6 +2268,7 @@ pub mod test {
     use rand::{self, RngCore};
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
+    use stacks_common::types::chainstate::BurnchainHeaderHashBitcoinExt as _;
     use stacks_common::types::StacksEpochId;
     use stacks_common::util::hash::*;
     use stacks_common::util::secp256k1::*;

@@ -531,14 +531,27 @@ macro_rules! impl_array_hexstring_fmt {
 #[macro_export]
 macro_rules! impl_byte_array_newtype {
     ($thing:ident, $ty:ty, $len:expr) => {
+        $crate::impl_byte_array_newtype!(
+            @impl,
+            $thing,
+            $ty,
+            $len,
+            ::const_hex::FromHexError,
+            ::const_hex::decode_to_array
+        );
+    };
+    ($thing:ident, $ty:ty, $len:expr, $hex_error:ty, $decode_hex:path) => {
+        $crate::impl_byte_array_newtype!(@impl, $thing, $ty, $len, $hex_error, $decode_hex);
+    };
+    (@impl, $thing:ident, $ty:ty, $len:expr, $hex_error:ty, $decode_hex:path) => {
         impl $thing {
             /// An instance of all zeroes.
             pub const ZERO: Self = Self([0; $len]);
 
             #[allow(dead_code)]
             /// Instantiates from a hex string
-            pub fn from_hex(hex_str: &str) -> Result<$thing, ::const_hex::FromHexError> {
-                ::const_hex::decode_to_array(hex_str).map($thing)
+            pub fn from_hex(hex_str: &str) -> Result<$thing, $hex_error> {
+                $decode_hex(hex_str).map($thing)
             }
 
             /// Instantiates from a slice of bytes

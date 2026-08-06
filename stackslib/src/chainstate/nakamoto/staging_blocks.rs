@@ -19,10 +19,11 @@ use std::path::PathBuf;
 use std::{fmt, fs};
 
 use rusqlite::blob::Blob;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::get_epoch_time_secs;
+use stacks_rusqlite::{domain_params, SqlValue};
 
 use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader, NakamotoChainState};
 use crate::chainstate::stacks::db::StacksChainState;
@@ -274,7 +275,7 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         index_block_hash: &StacksBlockId,
     ) -> Result<bool, ChainstateError> {
         let qry = "SELECT 1 FROM nakamoto_staging_blocks WHERE index_block_hash = ?1";
-        let args = params![index_block_hash];
+        let args = domain_params![index_block_hash];
         let res: Option<i64> = query_row(self, qry, args)?;
         Ok(res.is_some())
     }
@@ -290,12 +291,12 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         block_hash: &BlockHeaderHash,
     ) -> Result<Option<(StacksBlockId, bool, bool, u32)>, ChainstateError> {
         let sql = "SELECT index_block_hash,processed,orphaned,signing_weight FROM nakamoto_staging_blocks WHERE consensus_hash = ?1 AND block_hash = ?2 ORDER BY signing_weight DESC, index_block_hash LIMIT 1";
-        let args = params![consensus_hash, block_hash];
+        let args = domain_params![consensus_hash, block_hash];
 
         let mut stmt = self.deref().prepare(sql)?;
         Ok(stmt
             .query_row(args, |row| {
-                let block_id: StacksBlockId = row.get(0)?;
+                let block_id = row.get::<_, SqlValue<StacksBlockId>>(0)?.into_inner();
                 let processed: bool = row.get(1)?;
                 let orphaned: bool = row.get(2)?;
                 let signing_weight: u32 = row.get(3)?;
@@ -311,7 +312,7 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         index_block_hash: &StacksBlockId,
     ) -> Result<Option<i64>, ChainstateError> {
         let sql = "SELECT rowid FROM nakamoto_staging_blocks WHERE index_block_hash = ?1";
-        let args = params![index_block_hash];
+        let args = domain_params![index_block_hash];
         let res: Option<i64> = query_row(self, sql, args)?;
         Ok(res)
     }
@@ -323,13 +324,13 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         index_block_hash: &StacksBlockId,
     ) -> Result<Option<(ConsensusHash, StacksBlockId)>, ChainstateError> {
         let sql = "SELECT consensus_hash,parent_block_id FROM nakamoto_staging_blocks WHERE index_block_hash = ?1";
-        let args = params![index_block_hash];
+        let args = domain_params![index_block_hash];
 
         let mut stmt = self.deref().prepare(sql)?;
         Ok(stmt
             .query_row(args, |row| {
-                let ch: ConsensusHash = row.get(0)?;
-                let parent_id: StacksBlockId = row.get(1)?;
+                let ch = row.get::<_, SqlValue<ConsensusHash>>(0)?.into_inner();
+                let parent_id = row.get::<_, SqlValue<StacksBlockId>>(1)?.into_inner();
 
                 Ok((ch, parent_id))
             })
@@ -346,7 +347,7 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         index_block_hash: &StacksBlockId,
     ) -> Result<Option<(NakamotoBlock, u64)>, ChainstateError> {
         let qry = "SELECT data FROM nakamoto_staging_blocks WHERE index_block_hash = ?1";
-        let args = params![index_block_hash];
+        let args = domain_params![index_block_hash];
         let res: Option<Vec<u8>> = query_row(self, qry, args)?;
         let Some(block_bytes) = res else {
             return Ok(None);
@@ -401,7 +402,7 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         index_block_hash: &StacksBlockId,
     ) -> Result<Option<u64>, ChainstateError> {
         let qry = "SELECT length(data) FROM nakamoto_staging_blocks WHERE index_block_hash = ?1";
-        let args = params![index_block_hash];
+        let args = domain_params![index_block_hash];
         let res = query_row(self, qry, args)?
             .map(|size: i64| u64::try_from(size).expect("FATAL: block size exceeds i64::MAX"));
         Ok(res)
@@ -417,7 +418,7 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         consensus_hash: &ConsensusHash,
     ) -> Result<Vec<NakamotoBlock>, ChainstateError> {
         let qry = "SELECT data FROM nakamoto_staging_blocks WHERE is_tenure_start = 1 AND consensus_hash = ?1";
-        let args = params![consensus_hash];
+        let args = domain_params![consensus_hash];
         let block_data: Vec<Vec<u8>> = query_rows(self, qry, args)?;
         Ok(block_data
             .into_iter()
@@ -441,7 +442,7 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
     ) -> Result<Vec<NakamotoBlock>, ChainstateError> {
         let qry =
             "SELECT data FROM nakamoto_staging_blocks WHERE consensus_hash = ?1 AND processed = 1";
-        let args = params![consensus_hash];
+        let args = domain_params![consensus_hash];
         let block_data: Vec<Vec<u8>> = query_rows(self, qry, args)?;
         Ok(block_data
             .into_iter()
@@ -502,8 +503,12 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
                     let mut qry = stmt.query(NO_PARAMS)?;
                     let mut next_nakamoto_block_id = None;
                     while let Some(row) = qry.next()? {
-                        let index_block_hash : StacksBlockId = row.get(0)?;
-                        let parent_block_id : StacksBlockId = row.get(1)?;
+                        let index_block_hash = row
+                            .get::<_, SqlValue<StacksBlockId>>(0)?
+                            .into_inner();
+                        let parent_block_id = row
+                            .get::<_, SqlValue<StacksBlockId>>(1)?
+                            .into_inner();
 
                         // this naturally will ignore nakamoto blocks whose parent nakamoto blocks
                         // are not yet known -- they won't be epoch2 blocks either!
@@ -535,7 +540,7 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
         consensus_hash: &ConsensusHash,
     ) -> Result<bool, ChainstateError> {
         let sql = "SELECT 1 FROM nakamoto_staging_blocks WHERE consensus_hash = ?1 AND burn_attachable = 1";
-        let args = rusqlite::params![consensus_hash];
+        let args = domain_params![consensus_hash];
         let res: Option<u64> = query_row(self, sql, args)?;
         Ok(res.is_some())
     }
@@ -551,7 +556,7 @@ impl NakamotoStagingBlocksTx<'_> {
                                   WHERE index_block_hash = ?1";
         self.execute(
             clear_staged_block,
-            params![block, u64_to_sql(get_epoch_time_secs())?],
+            domain_params![block, u64_to_sql(get_epoch_time_secs())?],
         )?;
 
         Ok(())
@@ -564,14 +569,14 @@ impl NakamotoStagingBlocksTx<'_> {
         let update_dependents = "UPDATE nakamoto_staging_blocks SET orphaned = 1
                                  WHERE parent_block_id = ?";
 
-        self.execute(update_dependents, &[&block])?;
+        self.execute(update_dependents, domain_params![block])?;
 
         let clear_staged_block =
             "UPDATE nakamoto_staging_blocks SET processed = 1, processed_time = ?2, orphaned = 1
                                   WHERE index_block_hash = ?1";
         self.execute(
             clear_staged_block,
-            params![block, u64_to_sql(get_epoch_time_secs())?],
+            domain_params![block, u64_to_sql(get_epoch_time_secs())?],
         )?;
 
         Ok(())
@@ -585,7 +590,7 @@ impl NakamotoStagingBlocksTx<'_> {
     ) -> Result<(), ChainstateError> {
         let update_dependents = "UPDATE nakamoto_staging_blocks SET burn_attachable = 1
                                  WHERE consensus_hash = ?";
-        self.execute(update_dependents, &[consensus_hash])?;
+        self.execute(update_dependents, domain_params![consensus_hash])?;
 
         Ok(())
     }
@@ -709,7 +714,7 @@ impl NakamotoStagingBlocksTx<'_> {
 
                      data
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
+            domain_params![
                 &block.header.block_hash(),
                 &block.header.consensus_hash,
                 &block.header.parent_block_id,
@@ -740,7 +745,7 @@ impl NakamotoStagingBlocksTx<'_> {
     ) -> Result<bool, ChainstateError> {
         let qry =
             "SELECT 1 FROM nakamoto_staging_blocks WHERE consensus_hash = ?1 AND block_hash = ?2";
-        let args = rusqlite::params![consensus_hash, block_hash];
+        let args = domain_params![consensus_hash, block_hash];
         let present: Option<u32> = query_row(self, qry, args)?;
         Ok(present.is_some())
     }
@@ -775,7 +780,7 @@ impl NakamotoStagingBlocksTx<'_> {
         obtain_method: NakamotoBlockObtainMethod,
     ) -> Result<(), ChainstateError> {
         self.execute("UPDATE nakamoto_staging_blocks SET data = ?1, signing_weight = ?2, obtain_method = ?3 WHERE consensus_hash = ?4 AND block_hash = ?5",
-                    params![
+                    domain_params![
                         &block.serialize_to_vec(),
                         &signing_weight,
                         &obtain_method.to_string(),

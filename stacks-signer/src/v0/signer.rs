@@ -40,7 +40,9 @@ use libsigner::v0::messages::{
 };
 use libsigner::v0::signer_state::GlobalStateEvaluator;
 use libsigner::{BlockProposal, SignerEvent, SignerSession};
-use stacks_common::types::chainstate::{StacksAddress, StacksPublicKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksPublicKey,
+};
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::{debug, error, info, warn};

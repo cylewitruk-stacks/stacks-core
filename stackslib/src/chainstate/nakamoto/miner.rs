@@ -17,7 +17,7 @@
 use clarity::vm::clarity::ClarityError;
 use clarity::vm::costs::ExecutionCost;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksBlockId,
+    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksBlockId, StacksBlockIdDigest as _,
 };
 use stacks_common::util::hash::{MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};

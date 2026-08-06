@@ -37,6 +37,7 @@ use stacks::types::chainstate::StacksPrivateKey;
 use stacks::util::secp256k1::Secp256k1PublicKey;
 use stacks::util_lib::boot::boot_code_id;
 use stacks_common::deps_common::bitcoin::blockdata::transaction::Transaction as BitcoinTransaction;
+use stacks_common::types::chainstate::TxidBitcoinExt as _;
 use stacks_signer::v0::SpawnedSigner;
 
 use super::SignerTest;

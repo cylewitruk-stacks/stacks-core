@@ -21,7 +21,9 @@ use std::thread;
 use clarity::vm::types::PrincipalData;
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
 use stacks_common::codec::{read_next, StacksMessageCodec};
-use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksPrivateKey, StacksPublicKey,
+};
 use stacks_common::types::net::PeerAddress;
 use stacks_common::types::{StacksEpoch, StacksEpochId};
 use stacks_common::util::hash::Hash160;
@@ -48,7 +50,6 @@ use crate::net::{
     GetNakamotoInvData, HandshakeData, NakamotoInvData, NeighborAddress, PeerNetworkComms,
     StacksMessage, StacksMessageType,
 };
-use crate::stacks_common::types::Address;
 
 /// Handshake with and get the reward cycle inventories for a range of reward cycles
 pub fn peer_get_nakamoto_invs<'a>(

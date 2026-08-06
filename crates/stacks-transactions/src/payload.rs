@@ -1,7 +1,10 @@
+use std::fmt;
+
 use clarity_types::representations::{ClarityName, ContractName};
 use clarity_types::types::{PrincipalData, QualifiedContractIdentifier, Value};
 use clarity_types::version::ClarityVersion;
 use serde::{Deserialize, Serialize};
+use stacks_crypto::vrf::VRFProof;
 use stacks_macros::{
     define_u8_enum, impl_array_hexstring_fmt, impl_array_newtype, impl_byte_array_newtype,
     impl_byte_array_serde,
@@ -9,7 +12,6 @@ use stacks_macros::{
 use stacks_primitives::StacksString;
 use stacks_primitives::address::StacksAddress;
 use stacks_primitives::block::StacksMicroblockHeader;
-use stacks_primitives::vrf::VRFProof;
 
 use crate::principal::standard_principal_from_address;
 use crate::tenure::{TenureChangeCause, TenureChangePayload};
@@ -32,14 +34,26 @@ define_u8_enum!(TransactionPayloadID {
 pub struct CoinbasePayload(pub [u8; 32]);
 impl_array_newtype!(CoinbasePayload, u8, 32);
 impl_array_hexstring_fmt!(CoinbasePayload);
-impl_byte_array_newtype!(CoinbasePayload, u8, 32);
+impl_byte_array_newtype!(
+    CoinbasePayload,
+    u8,
+    32,
+    stacks_primitives::HexError,
+    stacks_primitives::hex::decode_array
+);
 impl_byte_array_serde!(CoinbasePayload);
 
 /// Token-transfer memo bytes. This is the same length as in Stacks v1.
 pub struct TokenTransferMemo(pub [u8; 34]);
 impl_array_newtype!(TokenTransferMemo, u8, 34);
 impl_array_hexstring_fmt!(TokenTransferMemo);
-impl_byte_array_newtype!(TokenTransferMemo, u8, 34);
+impl_byte_array_newtype!(
+    TokenTransferMemo,
+    u8,
+    34,
+    stacks_primitives::HexError,
+    stacks_primitives::hex::decode_array
+);
 impl_byte_array_serde!(TokenTransferMemo);
 
 /// A transaction that calls into a smart contract.
@@ -49,6 +63,22 @@ pub struct TransactionContractCall {
     pub contract_name: ContractName,
     pub function_name: ClarityName,
     pub function_args: Vec<Value>,
+}
+
+impl fmt::Display for TransactionContractCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let arguments = self
+            .function_args
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "{}.{}::{}({arguments})",
+            self.address, self.contract_name, self.function_name
+        )
+    }
 }
 
 impl TransactionContractCall {

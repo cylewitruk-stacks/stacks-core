@@ -17,7 +17,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use stacks_common::codec::StacksMessageCodec;
-use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
+use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId, StacksBlockIdDigest as _};
 
 use super::TestRPC;
 use crate::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandle};

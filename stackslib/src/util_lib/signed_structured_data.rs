@@ -19,6 +19,7 @@ use clarity::vm::{ClarityName, Value};
 use stacks_common::types::chainstate::StacksPrivateKey;
 use stacks_common::util::hash::Sha256Sum;
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey};
+use stacks_crypto::hash::Sha256Digest as _;
 use stacks_crypto::secp256k1::SigningKey;
 
 use crate::chainstate::stacks::address::PoxAddress;
@@ -184,7 +185,7 @@ pub mod pox4 {
         use clarity::vm::ClarityVersion;
         use stacks_common::address::AddressHashMode;
         use stacks_common::consts::CHAIN_ID_TESTNET;
-        use stacks_common::types::chainstate::StacksAddress;
+        use stacks_common::types::chainstate::{StacksAddress, StacksAddressExtensions as _};
         use stacks_common::util::hash::to_hex;
         use stacks_common::util::secp256k1::Secp256k1PublicKey;
 

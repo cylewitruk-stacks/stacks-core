@@ -19,6 +19,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use stacks_common::types::chainstate::{BurnchainHeaderHash, SortitionId};
 use stacks_common::types::sqlite::NO_PARAMS;
+use stacks_rusqlite::{domain_params, SqlValue};
 
 use super::common::{
     classify_hint, clone_schemas_from_source, copied_rows, with_offline_write_session,
@@ -52,7 +53,10 @@ pub trait SortitionSnapshotExt {
 impl SortitionSnapshotExt for Connection {
     fn get_all_snapshot_burn_header_hashes(&self) -> Result<Vec<BurnchainHeaderHash>, db_error> {
         let mut stmt = self.prepare("SELECT DISTINCT burn_header_hash FROM snapshots")?;
-        let rows = stmt.query_map(NO_PARAMS, |row| row.get(0))?;
+        let rows = stmt.query_map(NO_PARAMS, |row| {
+            row.get::<_, SqlValue<BurnchainHeaderHash>>(0)
+                .map(SqlValue::into_inner)
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error::from)
     }
 
@@ -61,7 +65,7 @@ impl SortitionSnapshotExt for Connection {
         sortition_id: &SortitionId,
     ) -> Result<Option<String>, db_error> {
         self.prepare_cached("SELECT burn_header_hash FROM snapshots WHERE sortition_id = ?1")?
-            .query_row(params![sortition_id], |row| row.get(0))
+            .query_row(domain_params![sortition_id], |row| row.get(0))
             .optional()
             .map_err(db_error::from)
     }
@@ -291,7 +295,7 @@ fn populate_canonical_sortitions(
     let mut insert =
         session_conn.prepare("INSERT INTO canonical_sortitions (sortition_id) VALUES (?1)")?;
     for (_, sortition_id, _) in &canonical {
-        insert.execute(params![sortition_id])?;
+        insert.execute(domain_params![sortition_id])?;
     }
     drop(insert);
     let mut insert =

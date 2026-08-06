@@ -19,9 +19,12 @@ use std::sync::{LazyLock, RwLock};
 use clarity::vm::events::StacksTransactionEvent;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TupleData};
 use clarity::vm::{ClarityName, SymbolicExpression, Value};
-use stacks_common::types::chainstate::{StacksAddress, StacksBlockId};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksBlockId,
+};
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::{to_hex, Hash160};
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::burnchains::PoxConstants;
 use crate::chainstate::burn::db::sortdb::SortitionDB;

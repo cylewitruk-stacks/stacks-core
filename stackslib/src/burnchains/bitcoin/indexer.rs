@@ -31,7 +31,7 @@ use stacks_common::deps_common::bitcoin::network::serialize::{
     BitcoinHash, Error as btc_serialization_err,
 };
 use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
-use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::chainstate::{BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _};
 use stacks_common::util::get_epoch_time_secs;
 
 use crate::burnchains::bitcoin::blocks::{

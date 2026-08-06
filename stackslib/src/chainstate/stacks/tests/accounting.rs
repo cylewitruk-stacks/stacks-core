@@ -22,6 +22,8 @@ use clarity::vm::clarity::ClarityConnection;
 use clarity::vm::costs::LimitedCostTracker;
 use clarity::vm::types::*;
 use stacks_common::address::*;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::chainstate::burn::db::sortdb::*;
 use crate::chainstate::burn::operations::BlockstackOperationType;

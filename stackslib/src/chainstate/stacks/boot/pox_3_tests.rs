@@ -24,7 +24,6 @@ use clarity::vm::types::{
 };
 use stacks_common::address::AddressHashMode;
 use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksAddress};
-use stacks_common::types::Address;
 
 use super::test::*;
 use crate::burnchains::{Burnchain, PoxConstants};

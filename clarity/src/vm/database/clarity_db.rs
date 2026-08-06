@@ -21,12 +21,13 @@ use stacks_common::consts::{
 };
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksAddress, StacksBlockId,
-    TrieHash, VRFSeed,
+    StacksBlockIdDigest as _, TrieHash, VRFSeed,
 };
 use stacks_common::types::{
     ChainEpochRules, ClarityEpochRules, StacksEpoch as GenericStacksEpoch, StacksEpochId,
 };
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum, to_hex};
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 
 use super::clarity_store::SpecialCaseHandler;
 use super::key_value_wrapper::ValueResult;

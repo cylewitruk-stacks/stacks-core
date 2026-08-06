@@ -25,7 +25,7 @@
 
 use clarity::vm::test_util::{generate_test_burn_state_db, TEST_BURN_STATE_DB, TEST_HEADER_DB};
 use clarity::vm::tests::test_only_mainnet_to_chain_id;
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::chainstate::{StacksBlockId, StacksBlockIdDigest as _};
 use stacks_common::types::StacksEpochId;
 
 use crate::chainstate::stacks::index::ClarityMarfTrieId as _;

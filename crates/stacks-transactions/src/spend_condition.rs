@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
+use stacks_crypto::address::StacksAddressCryptoExt as _;
+use stacks_crypto::secp256k1::Secp256k1PublicKey;
 use stacks_primitives::address::StacksAddress;
 use stacks_primitives::hash::Hash160;
 use stacks_primitives::secp256k1::MessageSignature;
-use stacks_primitives::{AddressHashMode, Secp256k1PublicKeyBytes};
+use stacks_primitives::{AddressHashMode, StacksEpochId};
 use stacks_protocol::{AddressNetwork, Mainnet, Testnet};
 
 use crate::{TransactionAuthField, TransactionPublicKeyEncoding};
@@ -15,6 +17,151 @@ pub enum TransactionSpendingCondition {
 }
 
 impl TransactionSpendingCondition {
+    pub fn new_singlesig_p2pkh(
+        public_key: Secp256k1PublicKey,
+    ) -> Option<TransactionSpendingCondition> {
+        let key_encoding = if public_key.compressed() {
+            TransactionPublicKeyEncoding::Compressed
+        } else {
+            TransactionPublicKeyEncoding::Uncompressed
+        };
+        let signer = StacksAddress::from_public_keys(
+            0,
+            AddressHashMode::SerializeP2PKH,
+            1,
+            std::slice::from_ref(&public_key),
+        )?
+        .destruct()
+        .1;
+
+        Some(Self::Singlesig(SinglesigSpendingCondition {
+            signer,
+            nonce: 0,
+            tx_fee: 0,
+            hash_mode: SinglesigHashMode::P2PKH,
+            key_encoding,
+            signature: MessageSignature::empty(),
+        }))
+    }
+
+    pub fn new_singlesig_p2wpkh(
+        public_key: Secp256k1PublicKey,
+    ) -> Option<TransactionSpendingCondition> {
+        let signer = StacksAddress::from_public_keys(
+            0,
+            AddressHashMode::SerializeP2WPKH,
+            1,
+            std::slice::from_ref(&public_key),
+        )?
+        .destruct()
+        .1;
+
+        Some(Self::Singlesig(SinglesigSpendingCondition {
+            signer,
+            nonce: 0,
+            tx_fee: 0,
+            hash_mode: SinglesigHashMode::P2WPKH,
+            key_encoding: TransactionPublicKeyEncoding::Compressed,
+            signature: MessageSignature::empty(),
+        }))
+    }
+
+    pub fn new_multisig_p2sh(
+        signatures_required: u16,
+        public_keys: Vec<Secp256k1PublicKey>,
+    ) -> Option<TransactionSpendingCondition> {
+        let signer = StacksAddress::from_public_keys(
+            0,
+            AddressHashMode::SerializeP2SH,
+            usize::from(signatures_required),
+            &public_keys,
+        )?
+        .destruct()
+        .1;
+
+        Some(Self::Multisig(MultisigSpendingCondition {
+            signer,
+            nonce: 0,
+            tx_fee: 0,
+            hash_mode: MultisigHashMode::P2SH,
+            fields: vec![],
+            signatures_required,
+        }))
+    }
+
+    pub fn new_multisig_p2wsh(
+        signatures_required: u16,
+        public_keys: Vec<Secp256k1PublicKey>,
+    ) -> Option<TransactionSpendingCondition> {
+        let signer = StacksAddress::from_public_keys(
+            0,
+            AddressHashMode::SerializeP2WSH,
+            usize::from(signatures_required),
+            &public_keys,
+        )?
+        .destruct()
+        .1;
+
+        Some(Self::Multisig(MultisigSpendingCondition {
+            signer,
+            nonce: 0,
+            tx_fee: 0,
+            hash_mode: MultisigHashMode::P2WSH,
+            fields: vec![],
+            signatures_required,
+        }))
+    }
+
+    pub fn new_multisig_order_independent_p2sh(
+        signatures_required: u16,
+        public_keys: Vec<Secp256k1PublicKey>,
+    ) -> Option<TransactionSpendingCondition> {
+        let signer = StacksAddress::from_public_keys(
+            0,
+            AddressHashMode::SerializeP2SH,
+            usize::from(signatures_required),
+            &public_keys,
+        )?
+        .destruct()
+        .1;
+
+        Some(Self::OrderIndependentMultisig(
+            OrderIndependentMultisigSpendingCondition {
+                signer,
+                nonce: 0,
+                tx_fee: 0,
+                hash_mode: OrderIndependentMultisigHashMode::P2SH,
+                fields: vec![],
+                signatures_required,
+            },
+        ))
+    }
+
+    pub fn new_multisig_order_independent_p2wsh(
+        signatures_required: u16,
+        public_keys: Vec<Secp256k1PublicKey>,
+    ) -> Option<TransactionSpendingCondition> {
+        let signer = StacksAddress::from_public_keys(
+            0,
+            AddressHashMode::SerializeP2WSH,
+            usize::from(signatures_required),
+            &public_keys,
+        )?
+        .destruct()
+        .1;
+
+        Some(Self::OrderIndependentMultisig(
+            OrderIndependentMultisigSpendingCondition {
+                signer,
+                nonce: 0,
+                tx_fee: 0,
+                hash_mode: OrderIndependentMultisigHashMode::P2WSH,
+                fields: vec![],
+                signatures_required,
+            },
+        ))
+    }
+
     /// When committing to the fact that a transaction is sponsored, the origin doesn't know
     /// anything else.  Instead, it commits to this sentinel value as its sponsor.
     /// It is intractable to calculate a private key that could generate this.
@@ -180,6 +327,14 @@ impl TransactionSpendingCondition {
             }
         }
     }
+
+    /// Order-independent multisig became valid in epoch 3.0.
+    pub fn is_supported_in_epoch(&self, epoch_id: StacksEpochId) -> bool {
+        match self {
+            Self::Singlesig(_) | Self::Multisig(_) => true,
+            Self::OrderIndependentMultisig(_) => epoch_id >= StacksEpochId::Epoch30,
+        }
+    }
 }
 
 #[repr(u8)]
@@ -238,7 +393,7 @@ impl MultisigSpendingCondition {
             .push(TransactionAuthField::Signature(key_encoding, signature));
     }
 
-    pub fn push_public_key(&mut self, public_key: Secp256k1PublicKeyBytes) {
+    pub fn push_public_key(&mut self, public_key: Secp256k1PublicKey) {
         self.fields
             .push(TransactionAuthField::PublicKey(public_key));
     }
@@ -401,7 +556,7 @@ impl OrderIndependentMultisigSpendingCondition {
             .push(TransactionAuthField::Signature(key_encoding, signature));
     }
 
-    pub fn push_public_key(&mut self, public_key: Secp256k1PublicKeyBytes) {
+    pub fn push_public_key(&mut self, public_key: Secp256k1PublicKey) {
         self.fields
             .push(TransactionAuthField::PublicKey(public_key));
     }

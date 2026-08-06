@@ -14,13 +14,25 @@ pub const UNCOMPRESSED_PUBLIC_KEY_ENCODED_SIZE: usize = 65;
 pub struct CompressedSecp256k1PublicKeyBytes(pub [u8; 33]);
 impl_array_newtype!(CompressedSecp256k1PublicKeyBytes, u8, 33);
 impl_array_hexstring_fmt!(CompressedSecp256k1PublicKeyBytes);
-impl_byte_array_newtype!(CompressedSecp256k1PublicKeyBytes, u8, 33);
+impl_byte_array_newtype!(
+    CompressedSecp256k1PublicKeyBytes,
+    u8,
+    33,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(CompressedSecp256k1PublicKeyBytes);
 
 pub struct MessageSignature(pub [u8; 65]);
 impl_array_newtype!(MessageSignature, u8, 65);
 impl_array_hexstring_fmt!(MessageSignature);
-impl_byte_array_newtype!(MessageSignature, u8, 65);
+impl_byte_array_newtype!(
+    MessageSignature,
+    u8,
+    65,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(MessageSignature);
 
 impl MessageSignature {
@@ -58,7 +70,13 @@ impl MessageSignature {
 pub struct SchnorrSignature(pub [u8; 65]);
 impl_array_newtype!(SchnorrSignature, u8, 65);
 impl_array_hexstring_fmt!(SchnorrSignature);
-impl_byte_array_newtype!(SchnorrSignature, u8, 65);
+impl_byte_array_newtype!(
+    SchnorrSignature,
+    u8,
+    65,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(SchnorrSignature);
 
 impl Default for SchnorrSignature {

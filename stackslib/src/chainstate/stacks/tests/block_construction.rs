@@ -14,12 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-/// This test module is concerned with verifying that the system can build blocks out of
-/// transactions from the mempool under various circumstances.  The tests here focus on testing
-/// block construction from various types of transactions and block availabilities, based on data
-/// available in the mempool.  This differs from the `chain_histories` module in that the `chain_histories` module is
-/// concerned with building out and testing block histories from manually-constructed blocks,
-/// ignoring mempool-level concerns entirely.
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -32,9 +26,19 @@ use mempool::MemPoolWalkStrategy;
 use rand::{thread_rng, Rng};
 use rusqlite::params;
 use stacks_common::address::*;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 use stacks_common::util::hash::MerkleTree;
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 use stacks_common::util::{get_epoch_time_ms, sleep_ms};
+/// This test module is concerned with verifying that the system can build blocks out of
+/// transactions from the mempool under various circumstances.  The tests here focus on testing
+/// block construction from various types of transactions and block availabilities, based on data
+/// available in the mempool.  This differs from the `chain_histories` module in that the `chain_histories` module is
+/// concerned with building out and testing block histories from manually-constructed blocks,
+/// ignoring mempool-level concerns entirely.
+use stacks_crypto::hash::Hash160Digest as _;
+use stacks_rusqlite::domain_params;
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use crate::chainstate::burn::db::sortdb::*;
 use crate::chainstate::burn::operations::{BlockstackOperationType, LeaderBlockCommitOp};
@@ -4850,7 +4854,7 @@ fn paramaterized_mempool_walk_test(
                 mempool_tx
                     .execute(
                         "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                        params![Some(123.0), &txid],
+                        domain_params![Some(123.0), txid],
                     )
                     .unwrap();
             } else {
@@ -4858,7 +4862,7 @@ fn paramaterized_mempool_walk_test(
                 mempool_tx
                     .execute(
                         "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                        params![none, &txid],
+                        domain_params![none, txid],
                     )
                     .unwrap();
             }
@@ -5075,7 +5079,7 @@ fn mempool_walk_test_next_nonce_with_highest_fee_rate_strategy() {
         mempool_tx
             .execute(
                 "UPDATE mempool SET fee_rate = ? WHERE txid = ?",
-                params![Some(fee_rate), &txid],
+                domain_params![Some(fee_rate), txid],
             )
             .unwrap();
 

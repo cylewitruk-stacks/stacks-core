@@ -92,8 +92,7 @@ pub struct TrieLeaf {
 
 pub trait MarfTrieId:
     ClarityMarfTrieId
-    + rusqlite::types::ToSql
-    + rusqlite::types::FromSql
+    + stacks_rusqlite::SqliteScalar
     + stacks_common::codec::StacksMessageCodec
     + std::convert::From<MARFValue>
     + PartialEq

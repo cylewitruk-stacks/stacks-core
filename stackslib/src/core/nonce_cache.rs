@@ -21,6 +21,7 @@ use clarity::util::lru_cache::{FlushError, LruCache};
 use clarity::vm::clarity::ClarityConnection;
 use rand::Rng;
 use rusqlite::params;
+use stacks_rusqlite::domain_params;
 
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::util_lib::db::{query_row, u64_to_sql, DBConn, Error as db_error};
@@ -171,11 +172,11 @@ impl NonceCache {
         let tx = conn.transaction()?;
 
         if let Some((addr, nonce)) = evicted {
-            tx.execute(sql, params![addr, nonce])?;
+            tx.execute(sql, domain_params![addr, nonce])?;
         }
 
         match self.cache.flush(|addr, nonce| {
-            tx.execute(sql, params![addr, nonce])?;
+            tx.execute(sql, domain_params![addr, nonce])?;
             Ok::<(), db_error>(())
         }) {
             Ok(_) => {}
@@ -220,7 +221,6 @@ fn db_get_nonce(conn: &DBConn, address: &StacksAddress) -> Result<Option<u64>, d
 mod tests {
     use clarity::consts::CHAIN_ID_TESTNET;
     use clarity::types::chainstate::StacksBlockId;
-    use clarity::types::Address;
     use clarity::vm::tests::{TEST_BURN_STATE_DB, TEST_HEADER_DB};
 
     use super::*;

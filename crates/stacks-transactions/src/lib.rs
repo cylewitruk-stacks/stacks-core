@@ -15,6 +15,8 @@ pub use auth_field::{
     TransactionAuthField, TransactionAuthFieldID, TransactionAuthFlags,
     TransactionPublicKeyEncoding,
 };
+#[cfg(feature = "codec")]
+pub use codec::StacksMicroblockHeaderExt;
 pub use crypto::{
     AuthError, DeriveSpendingCondition, RecoverAuthFieldPublicKey, TransactionAuthVerificationMode,
     VerifySpendingConditionSignatures, make_sighash_postsign, make_sighash_presign, next_signature,
@@ -35,6 +37,7 @@ pub use spend_condition::{
     TransactionSpendingCondition,
 };
 pub use stacks_primitives::block::{MAX_BLOCK_LEN, StacksMicroblockHeader};
+pub use tenure::{TenureChangeCause, TenureChangeError, TenureChangePayload};
 pub use transaction::{
     MAX_TRANSACTION_LEN, MIN_TRANSACTION_LEN, StacksTransaction, TransactionAnchorMode,
     TransactionPostConditionMode, TransactionVersion,

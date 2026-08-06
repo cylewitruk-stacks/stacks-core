@@ -33,6 +33,7 @@ use stacks::core::StacksEpochId;
 use stacks::net::atlas::{AtlasConfig, AtlasDB, Attachment};
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::{get_epoch_time_secs, sleep_ms};
+use stacks_crypto::hash::Hash160Digest as _;
 use stacks_crypto::secp256k1::VerifyingKey as _;
 use stx_genesis::GenesisData;
 

@@ -30,11 +30,14 @@ use stacks::core::test_util::{make_contract_call, to_addr};
 use stacks::core::{self, EpochList, StacksEpochId};
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
 use stacks_common::consts::STACKS_EPOCH_MAX;
-use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, StacksPrivateKey};
-use stacks_common::types::Address;
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksBlockId, StacksBlockIdDigest as _,
+    StacksPrivateKey,
+};
 use stacks_common::util::hash::{bytes_to_hex, hex_bytes, Hash160};
 use stacks_common::util::secp256k1::Secp256k1PublicKey;
 use stacks_common::util::sleep_ms;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
 use crate::stacks_common::codec::StacksMessageCodec;

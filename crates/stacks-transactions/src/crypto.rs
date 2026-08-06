@@ -1,15 +1,11 @@
 use core::{error, fmt};
 
-use bitcoin::blockdata::opcodes::all as btc_opcodes;
-use bitcoin::blockdata::script::{Builder, PushBytesBuf};
-use stacks_crypto::hash::{Hash160Digest, Sha256Digest, Sha256Sum, TxidDigest};
-use stacks_crypto::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey, SigningKey, VerifyingKey};
+pub use stacks_crypto::address::public_keys_to_address_hash;
+use stacks_crypto::hash::TxidDigest;
+use stacks_crypto::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey, SigningKey};
 use stacks_primitives::address::AddressHashMode;
 use stacks_primitives::hash::{Hash160, Txid};
-use stacks_primitives::secp256k1::{
-    COMPRESSED_PUBLIC_KEY_ENCODED_SIZE, MESSAGE_SIGNATURE_ENCODED_SIZE, MessageSignature,
-    Secp256k1PublicKeyBytes,
-};
+use stacks_primitives::secp256k1::{MESSAGE_SIGNATURE_ENCODED_SIZE, MessageSignature};
 
 use crate::spend_condition::{
     MultisigHashMode, MultisigSpendingCondition, OrderIndependentMultisigHashMode,
@@ -208,7 +204,7 @@ pub trait RecoverAuthFieldPublicKey {
 impl RecoverAuthFieldPublicKey for TransactionAuthField {
     fn recover_public_key(&self, sighash_bytes: &[u8]) -> Result<Secp256k1PublicKey, AuthError> {
         match self {
-            TransactionAuthField::PublicKey(pubk) => decode_public_key(pubk),
+            TransactionAuthField::PublicKey(pubk) => Ok(pubk.clone()),
             TransactionAuthField::Signature(key_fmt, sig) => {
                 let mut pubk = Secp256k1PublicKey::recover_to_pubkey_without_validating_low_s(
                     sighash_bytes,
@@ -327,6 +323,55 @@ pub fn next_verification(
     Ok((pubk, next_sighash))
 }
 
+impl TransactionSpendingCondition {
+    pub fn make_sighash_presign(
+        cur_sighash: &Txid,
+        cond_code: &TransactionAuthFlags,
+        tx_fee: u64,
+        nonce: u64,
+    ) -> Txid {
+        make_sighash_presign(cur_sighash, cond_code, tx_fee, nonce)
+    }
+
+    pub fn make_sighash_postsign(
+        cur_sighash: &Txid,
+        public_key: &Secp256k1PublicKey,
+        signature: &MessageSignature,
+    ) -> Txid {
+        make_sighash_postsign(cur_sighash, public_key, signature)
+    }
+
+    pub fn next_signature(
+        cur_sighash: &Txid,
+        cond_code: &TransactionAuthFlags,
+        tx_fee: u64,
+        nonce: u64,
+        private_key: &Secp256k1PrivateKey,
+    ) -> Result<(MessageSignature, Txid), AuthError> {
+        next_signature(cur_sighash, cond_code, tx_fee, nonce, private_key)
+    }
+
+    pub fn next_verification(
+        cur_sighash: &Txid,
+        cond_code: &TransactionAuthFlags,
+        tx_fee: u64,
+        nonce: u64,
+        key_encoding: &TransactionPublicKeyEncoding,
+        signature: &MessageSignature,
+        mode: TransactionAuthVerificationMode,
+    ) -> Result<(Secp256k1PublicKey, Txid), AuthError> {
+        next_verification(
+            cur_sighash,
+            cond_code,
+            tx_fee,
+            nonce,
+            key_encoding,
+            signature,
+            mode,
+        )
+    }
+}
+
 pub trait VerifySpendingConditionSignatures {
     fn verify_signatures(
         &self,
@@ -405,7 +450,7 @@ fn verify_multisig(
                 if !pubkey.compressed() {
                     have_uncompressed = true;
                 }
-                decode_public_key(pubkey)?
+                pubkey.clone()
             }
             TransactionAuthField::Signature(pubkey_encoding, sigbuf) => {
                 if *pubkey_encoding == TransactionPublicKeyEncoding::Uncompressed {
@@ -468,7 +513,7 @@ fn verify_order_independent_multisig(
                 if !pubkey.compressed() {
                     have_uncompressed = true;
                 }
-                decode_public_key(pubkey)?
+                pubkey.clone()
             }
             TransactionAuthField::Signature(pubkey_encoding, sigbuf) => {
                 if *pubkey_encoding == TransactionPublicKeyEncoding::Uncompressed {
@@ -535,118 +580,6 @@ fn verify_multisig_address(
     }
 
     Ok(())
-}
-
-fn decode_public_key(pubkey: &Secp256k1PublicKeyBytes) -> Result<Secp256k1PublicKey, AuthError> {
-    Secp256k1PublicKey::from_public_key_bytes(pubkey)
-        .map_err(|e| AuthError::VerifyingError(e.to_string()))
-}
-
-pub fn public_keys_to_address_hash<K>(
-    hash_mode: AddressHashMode,
-    signatures_required: usize,
-    pubkeys: &[K],
-) -> Option<Hash160>
-where
-    K: VerifyingKey,
-{
-    if pubkeys.len() < signatures_required {
-        return None;
-    }
-
-    match hash_mode {
-        AddressHashMode::SerializeP2PKH | AddressHashMode::SerializeP2WPKH
-            if (signatures_required != 1 || pubkeys.len() != 1) =>
-        {
-            return None;
-        }
-        _ => {}
-    }
-
-    match hash_mode {
-        AddressHashMode::SerializeP2WPKH | AddressHashMode::SerializeP2WSH => {
-            for pubkey in pubkeys {
-                if !is_compressed_public_key(pubkey) {
-                    return None;
-                }
-            }
-        }
-        _ => {}
-    }
-
-    Some(match hash_mode {
-        AddressHashMode::SerializeP2PKH => to_bits_p2pkh(&pubkeys[0]),
-        AddressHashMode::SerializeP2SH => to_bits_p2sh(signatures_required, pubkeys),
-        AddressHashMode::SerializeP2WPKH => to_bits_p2sh_p2wpkh(&pubkeys[0]),
-        AddressHashMode::SerializeP2WSH => to_bits_p2sh_p2wsh(signatures_required, pubkeys),
-    })
-}
-
-fn is_compressed_public_key<K>(pubkey: &K) -> bool
-where
-    K: VerifyingKey,
-{
-    pubkey.to_bytes().len() == COMPRESSED_PUBLIC_KEY_ENCODED_SIZE
-}
-
-fn to_bits_p2pkh<K>(pubkey: &K) -> Hash160
-where
-    K: VerifyingKey,
-{
-    Hash160::from_data(&pubkey.to_bytes())
-}
-
-fn to_bits_p2sh<K>(signatures_required: usize, pubkeys: &[K]) -> Hash160
-where
-    K: VerifyingKey,
-{
-    let mut bldr = Builder::new();
-    bldr = bldr.push_int(signatures_required as i64);
-    for pubkey in pubkeys {
-        bldr = bldr.push_slice(push_bytes(pubkey.to_bytes()));
-    }
-    bldr = bldr.push_int(pubkeys.len() as i64);
-    bldr = bldr.push_opcode(btc_opcodes::OP_CHECKMULTISIG);
-
-    Hash160::from_data(bldr.into_script().as_bytes())
-}
-
-fn to_bits_p2sh_p2wpkh<K>(pubkey: &K) -> Hash160
-where
-    K: VerifyingKey,
-{
-    let key_hash = Hash160::from_data(&pubkey.to_bytes());
-    let script = Builder::new()
-        .push_int(0)
-        .push_slice(key_hash.as_bytes())
-        .into_script();
-
-    Hash160::from_data(script.as_bytes())
-}
-
-fn to_bits_p2sh_p2wsh<K>(signatures_required: usize, pubkeys: &[K]) -> Hash160
-where
-    K: VerifyingKey,
-{
-    let mut bldr = Builder::new();
-    bldr = bldr.push_int(signatures_required as i64);
-    for pubkey in pubkeys {
-        bldr = bldr.push_slice(push_bytes(pubkey.to_bytes()));
-    }
-    bldr = bldr.push_int(pubkeys.len() as i64);
-    bldr = bldr.push_opcode(btc_opcodes::OP_CHECKMULTISIG);
-
-    let script_hash = Sha256Sum::from_data(bldr.into_script().as_bytes());
-    let witness_script = Builder::new()
-        .push_int(0)
-        .push_slice(script_hash.as_bytes())
-        .into_script();
-
-    Hash160::from_data(witness_script.as_bytes())
-}
-
-fn push_bytes(bytes: Vec<u8>) -> PushBytesBuf {
-    PushBytesBuf::try_from(bytes).expect("public key bytes should fit in a Bitcoin push")
 }
 
 #[cfg(all(test, feature = "testing"))]

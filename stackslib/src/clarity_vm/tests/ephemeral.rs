@@ -23,9 +23,8 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
 use stacks_common::types::chainstate::{
-    StacksAddress, StacksBlockId, StacksPrivateKey, StacksPublicKey,
+    StacksAddress, StacksAddressExtensions as _, StacksBlockId, StacksPrivateKey, StacksPublicKey,
 };
-use stacks_common::types::Address;
 
 use crate::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};
 use crate::chainstate::nakamoto::miner::{MinerTenureInfoCause, NakamotoBlockBuilder};

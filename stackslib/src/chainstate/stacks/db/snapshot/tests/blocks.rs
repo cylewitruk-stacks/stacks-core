@@ -22,10 +22,11 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, ConsensusHash, StacksAddress, StacksBlockId,
+    BlockHeaderHash, ConsensusHash, StacksAddress, StacksBlockId, StacksBlockIdDigest as _,
 };
 use stacks_common::util::hash::{Hash160, MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_rusqlite::{domain_params, SqlValue};
 use tempfile::tempdir;
 
 use super::super::blocks::{
@@ -275,7 +276,7 @@ fn insert_staging_microblock(
              (anchored_block_hash, consensus_hash, index_block_hash, microblock_hash, \
               parent_hash, index_microblock_hash, sequence, processed, orphaned) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
+        domain_params![
             anchored_block_hash,
             consensus_hash,
             index_block_hash,
@@ -298,7 +299,7 @@ fn insert_staging_microblock_data(
 ) {
     conn.execute(
         "INSERT INTO staging_microblocks_data (block_hash, block_data) VALUES (?1, ?2)",
-        params![block_hash, block_data],
+        domain_params![block_hash, block_data],
     )
     .unwrap();
 }
@@ -525,7 +526,12 @@ fn test_microblock_stream_copy() {
     let rows: Vec<(u32, BlockHeaderHash)> = dst_conn
         .prepare("SELECT sequence, microblock_hash FROM staging_microblocks ORDER BY sequence")
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, SqlValue<BlockHeaderHash>>(1)?.into_inner(),
+            ))
+        })
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -533,7 +539,7 @@ fn test_microblock_stream_copy() {
     let blob: Vec<u8> = dst_conn
         .query_row(
             "SELECT block_data FROM staging_microblocks_data WHERE block_hash = ?1",
-            params![mblock0_hash],
+            domain_params![mblock0_hash],
             |row| row.get(0),
         )
         .unwrap();
@@ -547,7 +553,7 @@ fn test_microblock_stream_copy() {
         .query_row(
             "SELECT (SELECT COUNT(*) FROM staging_microblocks WHERE microblock_hash = ?1), \
                     (SELECT COUNT(*) FROM staging_microblocks_data WHERE block_hash = ?1)",
-            params![fork_hash],
+            domain_params![fork_hash],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();

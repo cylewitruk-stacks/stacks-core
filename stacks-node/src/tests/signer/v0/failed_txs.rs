@@ -27,6 +27,7 @@ use stacks::libstackerdb::StackerDBChunkData;
 use stacks::net::api::postblock_proposal::ValidateRejectCode;
 use stacks::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
 use stacks::util::get_epoch_time_secs;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 use stacks_signer::v0::tests::TEST_IGNORE_ALL_BLOCK_PROPOSALS;
 use stacks_signer::v0::SpawnedSigner;
 use tracing_subscriber::prelude::*;

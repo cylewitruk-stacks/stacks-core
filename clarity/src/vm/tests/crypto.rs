@@ -22,6 +22,7 @@ use stacks_common::util::ed25519::{self, Ed25519PrivateKey, Ed25519PublicKey, Me
 use stacks_common::util::hash::{Sha256Sum, hex_bytes, to_hex};
 use stacks_common::util::secp256k1::MessageSignature as Secp256k1Signature;
 use stacks_common::util::secp256r1::{Secp256r1PrivateKey, Secp256r1PublicKey};
+use stacks_crypto::hash::Sha256Digest as _;
 use stacks_crypto::secp256k1::{
     MessageSignatureCryptoExt as _, Secp256k1PrivateKey, Secp256k1PublicKey, SigningKey as _,
     VerifyingKey as _,

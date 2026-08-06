@@ -14,8 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-/// This module defines the methods for reading and inserting into a Trie
 use sha2::Digest;
+/// This module defines the methods for reading and inserting into a Trie
+use stacks_common::types::chainstate::TrieHashDigest as _;
 
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::marf::MARF;

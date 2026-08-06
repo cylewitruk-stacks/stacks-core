@@ -18,7 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use clarity::types::chainstate::{BlockHeaderHash, TrieHash};
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::chainstate::{StacksBlockId, TrieHashDigest as _};
 use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::marf::{

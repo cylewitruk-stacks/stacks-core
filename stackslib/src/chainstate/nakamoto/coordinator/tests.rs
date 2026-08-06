@@ -28,10 +28,12 @@ use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLE
 use stacks_common::bitvec::BitVec;
 use stacks_common::consts::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 use stacks_common::types::chainstate::{
-    BurnchainHeaderHash, StacksAddress, StacksBlockId, StacksPrivateKey, StacksPublicKey,
+    BurnchainHeaderHash, StacksAddress, StacksAddressExtensions as _, StacksBlockId,
+    StacksBlockIdDigest as _, StacksPrivateKey, StacksPublicKey,
 };
-use stacks_common::types::{Address, StacksEpoch, StacksEpochId, StacksPublicKeyBuffer};
+use stacks_common::types::{StacksEpoch, StacksEpochId, StacksPublicKeyBuffer};
 use stacks_common::util::hash::{to_hex, Hash160};
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::burnchains::tests::TestMiner;
 use crate::burnchains::Txid;

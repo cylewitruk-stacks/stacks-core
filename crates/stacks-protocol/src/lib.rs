@@ -1,11 +1,12 @@
 pub mod address;
 pub mod epoch;
 pub mod network;
+pub mod pox;
 
 pub use address::{
     AddressHashModeNetworkExt, AddressNetwork, StacksAddressNetworkExt, StacksNetworkAddress,
-    address_hash_mode_from_version, address_hash_mode_from_version_for_network, burn_address,
-    burn_address_for_network,
+    StacksNetworkAddressError, address_hash_mode_from_version,
+    address_hash_mode_from_version_for_network, burn_address, burn_address_for_network,
 };
 pub use epoch::{
     COINBASE_INTERVALS_MAINNET, COINBASE_INTERVALS_TESTNET, ChainEpochRules, ClarityEpochRules,
@@ -40,3 +41,4 @@ pub use network::{
     EpochScheduleLimits, Mainnet, Regtest, StacksNetwork, Testnet, mainnet_epoch_schedule,
     regtest_epoch_schedule, testnet_epoch_schedule,
 };
+pub use pox::{PoxId, SortitionIdExt};

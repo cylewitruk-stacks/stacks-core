@@ -23,7 +23,7 @@ use std::str::FromStr;
 use clarity::vm::costs::ExecutionCost;
 use lazy_static::lazy_static;
 pub use stacks_common::consts::MICROSTACKS_PER_STACKS;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
+use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, StacksBlockIdDigest as _};
 #[cfg(test)]
 use stacks_common::types::StacksEpochRangeTestExt as _;
 pub use stacks_common::types::{ChainEpochRules, ClarityEpochRules, StacksEpochId};

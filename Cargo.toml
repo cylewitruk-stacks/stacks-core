@@ -32,6 +32,7 @@ stacks-macros = { path = "crates/stacks-macros" }
 stacks-p2p = { path = "crates/stacks-p2p" }
 stacks-primitives = { path = "crates/stacks-primitives" }
 stacks-protocol = { path = "crates/stacks-protocol" }
+stacks-rusqlite = { path = "crates/stacks-rusqlite" }
 stacks-transactions = { path = "crates/stacks-transactions" }
 stacks-profiler = { path = "stacks-profiler" }
 stacks-profiler-macros = { path = "stacks-profiler-macros" }

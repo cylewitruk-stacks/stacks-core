@@ -19,6 +19,8 @@ use rstest::rstest;
 use stacks_common::types::{ClarityEpochRules, StacksEpochId, chainstate::BlockHeaderHash};
 #[cfg(test)]
 use stacks_common::util::hash::Sha512Trunc256Sum;
+#[cfg(test)]
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::tests::{test_clarity_versions, test_epochs};

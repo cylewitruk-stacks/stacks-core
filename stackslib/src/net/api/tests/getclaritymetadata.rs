@@ -16,7 +16,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use clarity::types::chainstate::StacksBlockId;
-use clarity::types::Address;
 use clarity::vm::database::{ClaritySerializable, DataMapMetadata, DataVariableMetadata};
 use clarity::vm::types::{QualifiedContractIdentifier, TypeSignature};
 use stacks_common::types::chainstate::StacksAddress;

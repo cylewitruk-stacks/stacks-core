@@ -31,6 +31,7 @@ use stacks_common::codec::{
 use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
 use stacks_common::util::hash::{hex_bytes, to_hex, Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::MessageSignature;
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
 use stacks_crypto::secp256k1::SigningKey as _;
 
 /// maximum chunk size (16 MB; same as MAX_PAYLOAD_SIZE)

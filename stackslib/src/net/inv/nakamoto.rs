@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use stacks_common::bitvec::BitVec;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
+use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, StacksBlockIdDigest as _};
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
 

@@ -17,6 +17,7 @@
 use std::fs;
 
 use rusqlite::{Connection, OpenFlags};
+use stacks_common::types::chainstate::TrieHashDigest as _;
 
 use super::*;
 use crate::chainstate::stacks::index::file::*;

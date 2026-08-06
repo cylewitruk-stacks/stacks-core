@@ -13,9 +13,10 @@ use stacks::chainstate::stacks::{
     StacksTransaction,
 };
 use stacks::core::mempool::MemPoolDB;
-use stacks_common::types::chainstate::VRFSeed;
+use stacks_common::types::chainstate::{VRFSeed, VRFSeedDigest as _};
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::vrf::VRFProof;
+use stacks_crypto::hash::Hash160Digest as _;
 
 /// Only used by the Helium (Mocknet) node
 use super::node::ChainTip;

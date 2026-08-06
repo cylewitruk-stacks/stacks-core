@@ -32,6 +32,7 @@ use stacks::core::{StacksEpochId, BITCOIN_REGTEST_FIRST_BLOCK_HASH};
 use stacks::types::chainstate::BurnchainHeaderHash;
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::secp256k1::Secp256k1PublicKey;
+use stacks_crypto::hash::Hash160Digest as _;
 use stacks_crypto::secp256k1::VerifyingKey as _;
 use tempfile::TempDir;
 

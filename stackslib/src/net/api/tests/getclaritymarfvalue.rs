@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use clarity::types::chainstate::StacksBlockId;
 use clarity::vm::database::{ClarityDeserializable, STXBalance};
-use stacks_common::types::chainstate::TrieHash;
+use stacks_common::types::chainstate::{TrieHash, TrieHashDigest as _};
 
 use super::test_rpc;
 use crate::net::api::*;

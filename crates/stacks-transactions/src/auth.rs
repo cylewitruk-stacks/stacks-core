@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use stacks_crypto::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_primitives::StacksEpochId;
 use stacks_primitives::hash::Txid;
 
 use crate::spend_condition::TransactionSpendingCondition;
@@ -21,6 +23,74 @@ pub enum TransactionAuthError {
 }
 
 impl TransactionAuth {
+    pub fn from_p2pkh(private_key: &Secp256k1PrivateKey) -> Option<Self> {
+        TransactionSpendingCondition::new_singlesig_p2pkh(Secp256k1PublicKey::from_private(
+            private_key,
+        ))
+        .map(Self::Standard)
+    }
+
+    pub fn from_p2wpkh(private_key: &Secp256k1PrivateKey) -> Option<Self> {
+        TransactionSpendingCondition::new_singlesig_p2wpkh(Secp256k1PublicKey::from_private(
+            private_key,
+        ))
+        .map(Self::Standard)
+    }
+
+    pub fn from_p2sh(
+        private_keys: &[Secp256k1PrivateKey],
+        signatures_required: u16,
+    ) -> Option<Self> {
+        let public_keys = private_keys
+            .iter()
+            .map(Secp256k1PublicKey::from_private)
+            .collect();
+        TransactionSpendingCondition::new_multisig_p2sh(signatures_required, public_keys)
+            .map(Self::Standard)
+    }
+
+    pub fn from_p2wsh(
+        private_keys: &[Secp256k1PrivateKey],
+        signatures_required: u16,
+    ) -> Option<Self> {
+        let public_keys = private_keys
+            .iter()
+            .map(Secp256k1PublicKey::from_private)
+            .collect();
+        TransactionSpendingCondition::new_multisig_p2wsh(signatures_required, public_keys)
+            .map(Self::Standard)
+    }
+
+    pub fn from_order_independent_p2sh(
+        private_keys: &[Secp256k1PrivateKey],
+        signatures_required: u16,
+    ) -> Option<Self> {
+        let public_keys = private_keys
+            .iter()
+            .map(Secp256k1PublicKey::from_private)
+            .collect();
+        TransactionSpendingCondition::new_multisig_order_independent_p2sh(
+            signatures_required,
+            public_keys,
+        )
+        .map(Self::Standard)
+    }
+
+    pub fn from_order_independent_p2wsh(
+        private_keys: &[Secp256k1PrivateKey],
+        signatures_required: u16,
+    ) -> Option<Self> {
+        let public_keys = private_keys
+            .iter()
+            .map(Secp256k1PublicKey::from_private)
+            .collect();
+        TransactionSpendingCondition::new_multisig_order_independent_p2wsh(
+            signatures_required,
+            public_keys,
+        )
+        .map(Self::Standard)
+    }
+
     /// Merge two standard auths into a sponsored auth.
     pub fn into_sponsored(self, sponsor_auth: TransactionAuth) -> Option<TransactionAuth> {
         match (self, sponsor_auth) {
@@ -35,13 +105,13 @@ impl TransactionAuth {
     pub fn set_sponsor(
         &mut self,
         sponsor_spending_cond: TransactionSpendingCondition,
-    ) -> Result<(), TransactionAuthError> {
+    ) -> Result<(), AuthError> {
         match *self {
             TransactionAuth::Sponsored(_, ref mut ssc) => {
                 *ssc = sponsor_spending_cond;
                 Ok(())
             }
-            _ => Err(TransactionAuthError::IncompatibleSpendingCondition),
+            _ => Err(AuthError::IncompatibleSpendingConditionError),
         }
     }
 
@@ -112,9 +182,9 @@ impl TransactionAuth {
         self.sponsor().map(TransactionSpendingCondition::nonce)
     }
 
-    pub fn set_sponsor_nonce(&mut self, n: u64) -> Result<(), TransactionAuthError> {
+    pub fn set_sponsor_nonce(&mut self, n: u64) -> Result<(), AuthError> {
         match self.sponsor_mut() {
-            None => Err(TransactionAuthError::IncompatibleSpendingCondition),
+            None => Err(AuthError::IncompatibleSpendingConditionError),
             Some(s) => {
                 s.set_nonce(n);
                 Ok(())
@@ -168,6 +238,16 @@ impl TransactionAuth {
             TransactionAuth::Sponsored(ref mut origin_condition, ref mut sponsor_condition) => {
                 origin_condition.clear();
                 sponsor_condition.clear();
+            }
+        }
+    }
+
+    /// Whether all spending conditions are available in the given epoch.
+    pub fn is_supported_in_epoch(&self, epoch_id: StacksEpochId) -> bool {
+        match self {
+            Self::Standard(origin) => origin.is_supported_in_epoch(epoch_id),
+            Self::Sponsored(origin, sponsor) => {
+                origin.is_supported_in_epoch(epoch_id) && sponsor.is_supported_in_epoch(epoch_id)
             }
         }
     }

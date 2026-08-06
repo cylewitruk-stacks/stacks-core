@@ -21,6 +21,7 @@ use madhouse::{Command, CommandWrapper};
 use proptest::prelude::{any, Strategy};
 use stacks_common::util::hash::{to_hex, Sha256Sum};
 use stacks_common::util::secp256r1::{Secp256r1PrivateKey, Secp256r1PublicKey};
+use stacks_crypto::hash::Sha256Digest as _;
 
 use super::unwrap_single_tx_success;
 use crate::chainstate::tests::consensus::{

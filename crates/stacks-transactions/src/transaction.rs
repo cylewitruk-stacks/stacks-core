@@ -1,10 +1,11 @@
 use clarity_types::types::PrincipalData;
 use serde::{Deserialize, Serialize};
+use stacks_crypto::vrf::VRFProof;
 use stacks_primitives::address::StacksAddress;
-use stacks_primitives::vrf::VRFProof;
 use stacks_protocol::address::burn_address;
 
-use crate::auth::{TransactionAuth, TransactionAuthError};
+use crate::AuthError;
+use crate::auth::TransactionAuth;
 use crate::payload::{CoinbasePayload, TransactionPayload};
 use crate::post_condition::TransactionPostCondition;
 use crate::principal::principal_from_address;
@@ -122,7 +123,7 @@ impl StacksTransaction {
         self.auth.set_origin_nonce(n);
     }
 
-    pub fn set_sponsor_nonce(&mut self, n: u64) -> Result<(), TransactionAuthError> {
+    pub fn set_sponsor_nonce(&mut self, n: u64) -> Result<(), AuthError> {
         self.auth.set_sponsor_nonce(n)
     }
 

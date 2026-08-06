@@ -506,6 +506,7 @@ pub mod test {
     use stacks_common::bitvec::BitVec;
     use stacks_common::util::get_epoch_time_secs;
     use stacks_common::util::hash::*;
+    use stacks_transactions::StacksMicroblockHeaderExt as _;
 
     use super::*;
     use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};

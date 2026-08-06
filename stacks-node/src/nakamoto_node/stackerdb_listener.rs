@@ -39,6 +39,7 @@ use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks::util::get_epoch_time_secs;
 use stacks::util::hash::{MerkleHashFunc, Sha512Trunc256Sum};
 use stacks::util::secp256k1::MessageSignature;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 #[cfg(test)]
 use stacks_common::util::tests::TestFlag;
 use stacks_crypto::secp256k1::VerifyingKey as _;

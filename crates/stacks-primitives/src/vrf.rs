@@ -2,13 +2,19 @@ use stacks_macros::{
     impl_array_hexstring_fmt, impl_array_newtype, impl_byte_array_newtype, impl_byte_array_serde,
 };
 
-/// Opaque wire-level VRF proof bytes.
+/// The 32-byte seed derived from a validated VRF proof.
 ///
-/// Cryptographic construction and verification live outside `stacks-primitives`.
-pub struct VRFProof(pub [u8; 80]);
-impl_array_newtype!(VRFProof, u8, 80);
-impl_array_hexstring_fmt!(VRFProof);
-impl_byte_array_newtype!(VRFProof, u8, 80);
-impl_byte_array_serde!(VRFProof);
+/// This is an opaque value type. Proof validation and seed derivation belong
+/// to `stacks-crypto`.
+pub struct VRFSeed(pub [u8; 32]);
+impl_array_newtype!(VRFSeed, u8, 32);
+impl_array_hexstring_fmt!(VRFSeed);
+impl_byte_array_newtype!(VRFSeed, u8, 32, crate::HexError, crate::hex::decode_array);
+impl_byte_array_serde!(VRFSeed);
 
-pub const VRF_PROOF_ENCODED_SIZE: u32 = 80;
+pub const VRF_SEED_ENCODED_SIZE: u32 = 32;
+
+impl VRFSeed {
+    /// The genesis VRF seed.
+    pub const INITIAL: Self = Self::ZERO;
+}

@@ -18,7 +18,6 @@ use std::cmp;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use clarity::types::Address;
 use clarity::vm::analysis::RuntimeCheckErrorKind;
 use clarity::vm::clarity::{ClarityError, TransactionConnection};
 use clarity::vm::contexts::ExecutionState;
@@ -1768,11 +1767,14 @@ pub mod test {
 
     use clarity::vm::contracts::Contract;
     use clarity::vm::types::*;
+    use stacks_common::types::chainstate::{
+        StacksAddressExtensions as _, StacksBlockIdDigest as _,
+    };
     use stacks_common::util::secp256k1::Secp256k1PublicKey;
+    use stacks_crypto::hash::Hash160Digest as _;
 
     use self::signers_tests::readonly_call;
     use super::*;
-    use crate::burnchains::Address;
     use crate::chainstate::burn::operations::BlockstackOperationType;
     use crate::chainstate::stacks::db::*;
     use crate::chainstate::stacks::tests::*;

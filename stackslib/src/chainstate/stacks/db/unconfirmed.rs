@@ -21,7 +21,9 @@ use std::collections::HashMap;
 
 use clarity::vm::costs::ExecutionCost;
 use clarity::vm::database::{BurnStateDB, HeadersDB};
-use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksBlockId};
+use stacks_common::types::chainstate::{
+    BurnchainHeaderHash, StacksBlockId, StacksBlockIdDigest as _,
+};
 
 use crate::chainstate::stacks::db::*;
 use crate::chainstate::stacks::index::marf::MARFOpenOpts;
@@ -631,6 +633,8 @@ impl StacksChainState {
 #[cfg(test)]
 mod test {
     use clarity::vm::types::StacksAddressExtensions;
+    use stacks_common::types::chainstate::StacksAddressExtensions as _;
+    use stacks_crypto::hash::Hash160Digest as _;
 
     use super::*;
     use crate::chainstate::stacks::miner::*;

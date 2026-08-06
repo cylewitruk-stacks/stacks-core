@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use clarity::vm::ast::stack_depth_checker::StackDepthLimits;
 use clarity::vm::types::StacksAddressExtensions;
 use rand::thread_rng;
+use stacks_common::types::chainstate::{StacksAddressExtensions as _, StacksBlockIdDigest as _};
 use stacks_common::types::StacksEpochId;
 
 use super::*;

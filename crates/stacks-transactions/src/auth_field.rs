@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use stacks_primitives::secp256k1::{MessageSignature, Secp256k1PublicKeyBytes};
+use stacks_crypto::secp256k1::Secp256k1PublicKey;
+use stacks_primitives::secp256k1::MessageSignature;
 
 #[repr(u8)]
 #[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
@@ -46,7 +47,7 @@ impl TransactionPublicKeyEncoding {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransactionAuthField {
-    PublicKey(Secp256k1PublicKeyBytes),
+    PublicKey(Secp256k1PublicKey),
     Signature(TransactionPublicKeyEncoding, MessageSignature),
 }
 
@@ -59,7 +60,7 @@ impl TransactionAuthField {
         matches!(self, TransactionAuthField::Signature(..))
     }
 
-    pub fn as_public_key(&self) -> Option<Secp256k1PublicKeyBytes> {
+    pub fn as_public_key(&self) -> Option<Secp256k1PublicKey> {
         match *self {
             TransactionAuthField::PublicKey(ref pubk) => Some(pubk.clone()),
             _ => None,

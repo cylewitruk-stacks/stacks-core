@@ -48,6 +48,7 @@ use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::util::serde_serializers::{
     prefix_hex, prefix_hex_codec, prefix_opt_hex, prefix_string_0x,
 };
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MinedBlockEvent {

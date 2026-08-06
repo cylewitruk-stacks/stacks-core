@@ -15,7 +15,10 @@ stacks-macros = { workspace = true }
 stacks-primitives = { workspace = true }
 
 # Other dependencies
+bitcoin = { workspace = true }
 const-hex = { workspace = true }
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["serde"] }
+ed25519-dalek = { workspace = true }
 getrandom = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ripemd = { workspace = true }

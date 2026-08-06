@@ -28,7 +28,6 @@ use rusqlite::{
 use serde_json::Error as serde_error;
 use stacks_common::types::chainstate::{SortitionId, StacksAddress, StacksBlockId, TrieHash};
 use stacks_common::types::sqlite::NO_PARAMS;
-use stacks_common::types::Address;
 use stacks_common::util::db::update_lock_table;
 use stacks_common::util::hash::to_hex;
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
@@ -302,21 +301,24 @@ pub fn opt_u64_to_sql(x: Option<u64>) -> Result<Option<i64>, Error> {
     }
 }
 
-macro_rules! impl_byte_array_from_column_only {
-    ($thing:ident) => {
+/// Implement the application-owned row conversion for a domain value whose
+/// SQLite representation is provided by `stacks-rusqlite`.
+macro_rules! impl_stacks_sql_value_from_column {
+    ($thing:ty) => {
         impl crate::util_lib::db::FromColumn<$thing> for $thing {
             fn from_column(
                 row: &rusqlite::Row,
                 column_name: &str,
             ) -> Result<Self, crate::util_lib::db::Error> {
-                Ok(row.get::<_, Self>(column_name)?)
+                let value: stacks_rusqlite::SqlValue<Self> = row.get(column_name)?;
+                Ok(value.into_inner())
             }
         }
     };
 }
 
-impl_byte_array_from_column_only!(SortitionId);
-impl_byte_array_from_column_only!(StacksBlockId);
+impl_stacks_sql_value_from_column!(SortitionId);
+impl_stacks_sql_value_from_column!(StacksBlockId);
 
 macro_rules! impl_byte_array_from_column {
     ($thing:ident) => {

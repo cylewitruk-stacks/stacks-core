@@ -60,10 +60,15 @@ use stacks_common::deps_common::bitcoin::blockdata::transaction::{
 };
 use stacks_common::deps_common::bitcoin::network::serialize::{serialize, serialize_hex};
 use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
-use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::chainstate::{BurnchainHeaderHash, TxidBitcoinExt as _};
+#[cfg(test)]
+use stacks_common::types::chainstate::{
+    BurnchainHeaderHashBitcoinExt as _, StacksAddressExtensions as _,
+};
 use stacks_common::util::hash::{hex_bytes, Hash160};
 use stacks_common::util::secp256k1::{MessageSignatureSecp256k1, Secp256k1PublicKey};
 use stacks_common::util::sleep_ms;
+use stacks_crypto::hash::Hash160Digest as _;
 use stacks_crypto::secp256k1::VerifyingKey as _;
 
 use super::super::operations::BurnchainOpSigner;

@@ -20,7 +20,6 @@ use clarity::types::chainstate::StacksBlockId;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, StacksAddressExtensions};
 use clarity::vm::ClarityName;
 use stacks_common::types::chainstate::StacksAddress;
-use stacks_common::types::Address;
 
 use super::{test_rpc, test_rpc_with_config};
 use crate::net::api::*;

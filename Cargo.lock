@@ -883,6 +883,7 @@ dependencies = [
  "slog",
  "stacks-common 0.0.1",
  "stacks-crypto",
+ "stacks-rusqlite",
 ]
 
 [[package]]
@@ -919,6 +920,8 @@ dependencies = [
  "serde_json",
  "slog",
  "stacks-common 0.0.1",
+ "stacks-crypto",
+ "stacks-rusqlite",
  "stackslib 0.0.1",
 ]
 
@@ -2652,6 +2655,8 @@ dependencies = [
  "serde",
  "sha2 0.10.8",
  "stacks-common 0.0.1",
+ "stacks-crypto",
+ "stacks-rusqlite",
  "stackslib 0.0.1",
  "tempfile",
  "toml 0.5.11",
@@ -4526,7 +4531,9 @@ dependencies = [
 name = "stacks-codec"
 version = "0.1.0"
 dependencies = [
+ "const-hex",
  "serde",
+ "stacks-crypto",
  "stacks-p2p",
  "stacks-primitives",
 ]
@@ -4536,7 +4543,6 @@ name = "stacks-common"
 version = "0.0.1"
 dependencies = [
  "chrono",
- "curve25519-dalek",
  "ed25519-dalek",
  "getrandom 0.2.12",
  "hashbrown 0.15.2",
@@ -4599,7 +4605,10 @@ dependencies = [
 name = "stacks-crypto"
 version = "0.1.0"
 dependencies = [
+ "bitcoin",
  "const-hex",
+ "curve25519-dalek",
+ "ed25519-dalek",
  "getrandom 0.2.12",
  "libsecp256k1",
  "rand 0.8.5",
@@ -4626,6 +4635,8 @@ dependencies = [
  "serde_json",
  "slog",
  "stacks-common 0.0.1",
+ "stacks-crypto",
+ "stacks-rusqlite",
  "stackslib 0.0.1",
  "tikv-jemallocator",
 ]
@@ -4674,8 +4685,10 @@ dependencies = [
  "stacks-common 0.0.1 (git+https://github.com/stacks-network/stacks-core.git?rev=ecaaf5c4d397a691e5155eef01b59ddfeaba4ddd)",
  "stacks-crypto",
  "stacks-inspect",
+ "stacks-rusqlite",
  "stacks-signer 0.0.1",
  "stacks-signer 0.0.1 (git+https://github.com/stacks-network/stacks-core.git?rev=ecaaf5c4d397a691e5155eef01b59ddfeaba4ddd)",
+ "stacks-transactions",
  "stackslib 0.0.1",
  "stackslib 0.0.1 (git+https://github.com/stacks-network/stacks-core.git?rev=ecaaf5c4d397a691e5155eef01b59ddfeaba4ddd)",
  "stdext",
@@ -4708,6 +4721,7 @@ version = "0.1.0"
 dependencies = [
  "const-hex",
  "serde",
+ "sha2 0.10.8",
  "stacks-macros",
 ]
 
@@ -4737,7 +4751,18 @@ name = "stacks-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "sha2 0.10.8",
+ "stacks-crypto",
  "stacks-p2p",
+ "stacks-primitives",
+]
+
+[[package]]
+name = "stacks-rusqlite"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "stacks-crypto",
  "stacks-primitives",
 ]
 
@@ -4765,6 +4790,7 @@ dependencies = [
  "slog-term",
  "stacks-common 0.0.1",
  "stacks-crypto",
+ "stacks-rusqlite",
  "stackslib 0.0.1",
  "stdext",
  "thiserror 1.0.65",
@@ -4808,7 +4834,6 @@ dependencies = [
 name = "stacks-transactions"
 version = "0.1.0"
 dependencies = [
- "bitcoin",
  "clarity-types 0.0.1",
  "const-hex",
  "serde",
@@ -4862,6 +4887,7 @@ dependencies = [
  "stacks-common 0.0.1",
  "stacks-crypto",
  "stacks-protocol",
+ "stacks-rusqlite",
  "stacks-transactions",
  "stdext",
  "stx-genesis",

@@ -25,9 +25,11 @@ use clarity::vm::types::{
     TupleData, Value,
 };
 use stacks_common::address::AddressHashMode;
-use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksAddress, StacksBlockId};
-use stacks_common::types::Address;
+use stacks_common::types::chainstate::{
+    BurnchainHeaderHash, StacksAddress, StacksBlockId, StacksBlockIdDigest as _,
+};
 use stacks_common::util::hash::hex_bytes;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use super::test::*;
 use super::RawRewardSetEntry;

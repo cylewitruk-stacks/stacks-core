@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use stacks_common::types::chainstate::TrieHashDigest as _;
+
 use super::*;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId, *};
 

@@ -21,9 +21,10 @@ use rusqlite::{params, Connection};
 use stacks_common::address::AddressHashMode;
 use stacks_common::deps_common::bitcoin::blockdata::transaction::Transaction as BtcTx;
 use stacks_common::deps_common::bitcoin::network::serialize::deserialize;
-use stacks_common::types::chainstate::StacksAddress;
+use stacks_common::types::chainstate::{BurnchainHeaderHashBitcoinExt as _, StacksAddress};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::*;
+use stacks_rusqlite::domain_params;
 
 use super::*;
 use crate::burnchains::bitcoin::address::*;
@@ -54,10 +55,8 @@ impl BurnchainDB {
         &self,
         block_hash: &BurnchainHeaderHash,
     ) -> Result<Vec<BlockstackOperationType>, BurnchainError> {
-        use rusqlite::params;
-
         let sql = "SELECT op FROM burnchain_db_block_ops WHERE block_hash = ?1";
-        let args = params![block_hash];
+        let args = domain_params![block_hash];
         let mut ops: Vec<BlockstackOperationType> = query_rows(&self.conn, sql, args)?;
         ops.sort_by_key(|op| op.vtxindex());
         Ok(ops)
@@ -1129,7 +1128,7 @@ fn burnchain_db_migration_v2() -> Result<(), BurnchainError> {
     let sample_txid = "txid1".to_string();
     conn.execute(
             "INSERT INTO burnchain_db_block_headers (block_height, block_hash, parent_block_hash, num_txs, timestamp) VALUES (?, ?, ?, ?, ?)",
-            params![1, &sample_block_hash, &sample_parent_block_hash, 1, 1234567890],
+            domain_params![1, sample_block_hash, sample_parent_block_hash, 1, 1234567890],
         )?;
     conn.execute(
         "INSERT INTO affirmation_maps (weight, affirmation_map) VALUES (?, ?)",
@@ -1137,7 +1136,7 @@ fn burnchain_db_migration_v2() -> Result<(), BurnchainError> {
     )?;
     conn.execute(
             "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, affirmation_id, anchor_block, anchor_block_descendant) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![&sample_block_hash, &sample_txid, 1, 0, 0, None::<i64>, None::<i64>],
+            domain_params![sample_block_hash, sample_txid, 1, 0, 0, None::<i64>, None::<i64>],
         )?;
 
     // Create BurnchainDB using connect to trigger migration code
@@ -1187,7 +1186,7 @@ fn burnchain_db_migration_v2() -> Result<(), BurnchainError> {
     let header: Option<BurnchainBlockHeader> = query_row(
         &db.conn,
         "SELECT * FROM burnchain_db_block_headers WHERE block_hash = ?",
-        params![&sample_block_hash],
+        domain_params![sample_block_hash],
     )?;
     assert!(
         header.is_some(),
@@ -1196,7 +1195,7 @@ fn burnchain_db_migration_v2() -> Result<(), BurnchainError> {
     let metadata: Option<String> = query_row(
         &db.conn,
         "SELECT txid FROM block_commit_metadata WHERE burn_block_hash = ?",
-        params![&sample_block_hash],
+        domain_params![sample_block_hash],
     )?;
     assert_eq!(
         metadata,
@@ -1234,11 +1233,11 @@ fn burnchain_db_migration_v3() -> Result<(), BurnchainError> {
     let sample_txid = "txid1".to_string();
     conn.execute(
             "INSERT INTO burnchain_db_block_headers (block_height, block_hash, parent_block_hash, num_txs, timestamp) VALUES (?, ?, ?, ?, ?)",
-            params![1, &sample_block_hash, &sample_parent_block_hash, 1, 1234567890],
+            domain_params![1, sample_block_hash, sample_parent_block_hash, 1, 1234567890],
         )?;
     conn.execute(
             "INSERT INTO block_commit_metadata (burn_block_hash, txid, block_height, vtxindex, anchor_block, anchor_block_descendant) VALUES (?, ?, ?, ?, ?, ?)",
-            params![&sample_block_hash, &sample_txid, 1, 0, None::<i64>, None::<i64>],
+            domain_params![sample_block_hash, sample_txid, 1, 0, None::<i64>, None::<i64>],
         )?;
 
     // Create BurnchainDB using connect to trigger migration code
@@ -1287,7 +1286,7 @@ fn burnchain_db_migration_v3() -> Result<(), BurnchainError> {
     let header: Option<BurnchainBlockHeader> = query_row(
         &db.conn,
         "SELECT * FROM burnchain_db_block_headers WHERE block_hash = ?",
-        params![&sample_block_hash],
+        domain_params![sample_block_hash],
     )?;
     assert!(
         header.is_some(),
@@ -1296,7 +1295,7 @@ fn burnchain_db_migration_v3() -> Result<(), BurnchainError> {
     let metadata: Option<String> = query_row(
         &db.conn,
         "SELECT txid FROM block_commit_metadata WHERE burn_block_hash = ?",
-        params![&sample_block_hash],
+        domain_params![sample_block_hash],
     )?;
     assert_eq!(
         metadata,

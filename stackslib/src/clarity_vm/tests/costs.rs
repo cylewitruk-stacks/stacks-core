@@ -38,7 +38,7 @@ use clarity::vm::types::{
 };
 use clarity::vm::{ClarityName, ClarityVersion, ContractName};
 use lazy_static::lazy_static;
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::chainstate::{StacksBlockId, StacksBlockIdDigest as _};
 use stacks_common::types::StacksEpochId;
 
 use crate::chainstate::stacks::index::ClarityMarfTrieId;

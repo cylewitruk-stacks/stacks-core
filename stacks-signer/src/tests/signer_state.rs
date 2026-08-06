@@ -37,6 +37,8 @@ use libsigner::v0::signer_state::{
 };
 use stacks_common::bitvec::BitVec;
 use stacks_common::function_name;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::chainstate::{ProposalEvalConfig, SortitionData};
 use crate::client::tests::{build_get_tenure_tip_response, MockServerClient};

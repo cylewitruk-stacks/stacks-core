@@ -23,6 +23,7 @@ use stacks_common::types::chainstate::StacksPublicKey;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::secp256k1::Secp256k1PublicKey;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::net::connection::ConnectionOptions;
 use crate::net::db::LocalPeer;
@@ -1667,7 +1668,7 @@ impl<DB: NeighborWalkDB, NC: NeighborComms> NeighborWalk<DB, NC> {
         naddr: &NeighborAddress,
     ) -> bool {
         let neighbor_pubkey_hash =
-            Hash160::from_node_public_key_buffer(&data.handshake.node_public_key);
+            Hash160::from_public_key_bytes(data.handshake.node_public_key.as_bytes());
         if neighbor_pubkey_hash != naddr.public_key_hash {
             debug!(
                 "Neighbor {:?} had an unexpected pubkey hash: expected {:?} != {:?}",

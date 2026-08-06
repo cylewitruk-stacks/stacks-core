@@ -27,7 +27,9 @@ use clarity::vm::types::{PrincipalData, ResponseData};
 use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value as ClarityValue};
 use serde::{Deserialize, Serialize, Serializer};
 use stacks_common::bitvec::BitVec;
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
 use stacks_common::types::EpochPeerVersion;
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
 use stacks_protocol::epoch::ChainEpochRules as _;
 
 use crate::burnchains::tests::TestBurnchainBlock;

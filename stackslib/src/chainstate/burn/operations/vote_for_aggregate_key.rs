@@ -230,7 +230,7 @@ impl StacksMessageCodec for VoteForAggregateKeyOp {
 #[cfg(test)]
 mod tests {
     use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksAddress};
-    use stacks_common::types::{Address, StacksPublicKeyBuffer};
+    use stacks_common::types::StacksPublicKeyBuffer;
     use stacks_common::util::hash::*;
     use stacks_common::util::secp256k1::Secp256k1PublicKey;
 

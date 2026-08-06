@@ -17,8 +17,9 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_rusqlite::domain_params;
 
 use super::common::{
     classify_hint, clone_schemas_from_source, copied_rows, with_offline_write_session,
@@ -117,7 +118,7 @@ fn populate_canonical_blocks(conn: &Connection) -> Result<StacksBlockId, Error> 
         .map_err(Error::SQLError)?;
     for (_, block_hash, _) in &canonical {
         insert
-            .execute(params![block_hash])
+            .execute(domain_params![block_hash])
             .map_err(Error::SQLError)?;
     }
     drop(insert);
@@ -158,7 +159,7 @@ fn derive_max_reward_cycle(
         .query_row(
             "SELECT burn_header_height FROM src.nakamoto_block_headers \
              WHERE index_block_hash = ?1",
-            params![canonical_tip],
+            domain_params![canonical_tip],
             |row| row.get::<_, i64>(0),
         )
         .optional()

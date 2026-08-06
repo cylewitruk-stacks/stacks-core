@@ -36,11 +36,14 @@ use stacks_common::deps_common::bitcoin::blockdata::block::BlockHeader;
 use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
 use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockId, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, SortitionId,
+    StacksAddress, StacksAddressExtensions as _, StacksBlockId, StacksBlockIdDigest as _, VRFSeed,
+    VRFSeedDigest as _,
 };
 use stacks_common::types::StacksPublicKeyBuffer;
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::vrf::*;
+use stacks_rusqlite::domain_params;
 
 use crate::burnchains::bitcoin::indexer::BitcoinIndexer;
 use crate::burnchains::db::*;
@@ -137,7 +140,7 @@ pub fn produce_burn_block<'a, I: Iterator<Item = &'a mut BurnchainDB>>(
 fn get_burn_distribution(conn: &Connection, sortition: &SortitionId) -> Vec<BurnSamplePoint> {
     conn.query_row(
         "SELECT data FROM snapshot_burn_distributions WHERE sortition_id = ?",
-        &[sortition],
+        domain_params![sortition],
         |row| {
             let data_str: String = row.get_unwrap(0);
             Ok(serde_json::from_str(&data_str).unwrap())

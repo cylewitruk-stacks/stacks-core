@@ -24,21 +24,23 @@ use clarity::vm::{ClarityName, ContractName, Value};
 use libstackerdb::{StackerDBChunkData, STACKERDB_MAX_CHUNK_SIZE};
 use rand::distributions::Standard;
 use rand::{thread_rng, Rng, RngCore};
-use rusqlite::params;
 use stacks_common::address::AddressHashMode;
 use stacks_common::bitvec::BitVec;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksAddress, StacksPrivateKey,
-    StacksPublicKey, StacksWorkScore, TrieHash, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksAddress,
+    StacksAddressExtensions as _, StacksBlockIdDigest as _, StacksPrivateKey, StacksPublicKey,
+    StacksWorkScore, TrieHash, VRFSeed,
 };
-use stacks_common::types::{Address, StacksEpoch, StacksEpochId};
+use stacks_common::types::{StacksEpoch, StacksEpochId};
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{hex_bytes, Hash160, MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PublicKey};
 use stacks_common::util::vrf::{VRFPrivateKey, VRFProof, VRFPublicKey, VRF};
+use stacks_crypto::hash::Hash160Digest as _;
 use stacks_crypto::secp256k1::{MessageSignatureCryptoExt as _, SigningKey as _};
+use stacks_rusqlite::domain_params;
 
 use crate::burnchains::{BurnchainSigner, PoxConstants, Txid};
 use crate::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleTx};
@@ -89,7 +91,8 @@ impl NakamotoStagingBlocksConnRef<'_> {
         let mut cursor = tip.clone();
         let qry = "SELECT data FROM nakamoto_staging_blocks WHERE index_block_hash = ?1";
         loop {
-            let Some(block_data): Option<Vec<u8>> = query_row(self, qry, params![cursor])? else {
+            let Some(block_data): Option<Vec<u8>> = query_row(self, qry, domain_params![cursor])?
+            else {
                 break;
             };
             let block = NakamotoBlock::consensus_deserialize(&mut block_data.as_slice())?;

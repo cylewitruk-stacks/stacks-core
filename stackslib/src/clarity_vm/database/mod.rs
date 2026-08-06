@@ -13,13 +13,13 @@ use clarity::vm::database::{
 };
 use clarity::vm::errors::{RuntimeError, VmExecutionError};
 use clarity::vm::types::{QualifiedContractIdentifier, TupleData};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksAddress, StacksBlockId,
-    TenureBlockId, VRFSeed,
+    TenureBlockId, VRFSeed, VRFSeedDigest as _,
 };
-use stacks_common::types::Address;
 use stacks_common::util::vrf::VRFProof;
+use stacks_rusqlite::domain_params;
 
 use crate::chainstate::burn::db::sortdb::{
     get_ancestor_sort_id, SortitionDB, SortitionHandle, SortitionHandleConn, SortitionHandleTx,
@@ -690,7 +690,7 @@ pub fn get_stacks_header_column_from_table<F, R>(
 where
     F: Fn(&Row) -> R,
 {
-    let args = params![id_bhh];
+    let args = domain_params![id_bhh];
     let table_name = if nakamoto {
         "nakamoto_block_headers"
     } else {
@@ -792,7 +792,7 @@ fn get_miner_column<F, R>(
 where
     F: FnOnce(&Row) -> R,
 {
-    let args = params![id_bhh.0];
+    let args = domain_params![id_bhh.0];
     conn.query_row(
         &format!(
             "SELECT {} FROM payments WHERE index_block_hash = ? AND miner = 1",
@@ -827,7 +827,7 @@ fn get_matured_reward<GTS: GetTenureStartId>(
             "SELECT parent_block_id FROM {table_name} WHERE index_block_hash = ?"
         ))
         .and_then(|mut stmt| {
-            stmt.query_row(params![child_id_bhh.0], |x| {
+            stmt.query_row(domain_params![child_id_bhh.0], |x| {
                 Ok(StacksBlockId::from_column(x, "parent_block_id")
                     .expect("Bad parent_block_id in database"))
             })

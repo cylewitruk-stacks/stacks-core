@@ -38,6 +38,7 @@ use stacks::util_lib::boot::boot_code_id;
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_crypto::hash::Sha256Digest as _;
 use stacks_crypto::secp256k1::MessageSignatureSecp256k1 as _;
 
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;

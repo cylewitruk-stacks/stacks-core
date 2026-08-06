@@ -22,13 +22,16 @@ use stacks_common::codec::{
     MAX_MESSAGE_LEN,
 };
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, StacksBlockId, StacksWorkScore, TrieHash, VRFSeed,
+    BlockHeaderHash, BlockHeaderHashDigest as _, StacksBlockId, StacksBlockIdDigest as _,
+    StacksWorkScore, TrieHash, VRFSeed, VRFSeedDigest as _,
 };
 use stacks_common::util::hash::{MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::retry::BoundReader;
 #[cfg(test)]
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::util::vrf::*;
+use stacks_crypto::hash::Hash160Digest as _;
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use crate::chainstate::burn::operations::*;
 use crate::chainstate::burn::{ConsensusHash, *};
@@ -1469,7 +1472,7 @@ mod test {
         block_header_coinbase.tx_merkle_root = get_tx_root(&txs_coinbase);
 
         let mut block_header_offchain_coinbase = header.clone();
-        block_header_offchain_coinbase.tx_merkle_root = get_tx_root(&txs_coinbase);
+        block_header_offchain_coinbase.tx_merkle_root = get_tx_root(&txs_offchain_coinbase);
 
         let mut block_header_invalid_anchor = header.clone();
         block_header_invalid_anchor.tx_merkle_root = get_tx_root(&txs_bad_anchor);
@@ -1520,11 +1523,13 @@ mod test {
         for (ref block, ref msg) in invalid_blocks.iter() {
             let mut bytes: Vec<u8> = vec![];
             block.consensus_serialize(&mut bytes).unwrap();
-            assert!(StacksMicroblock::consensus_deserialize(&mut &bytes[..])
+            let error = StacksMicroblock::consensus_deserialize(&mut &bytes[..])
                 .unwrap_err()
-                .to_string()
-                .find(msg)
-                .is_some());
+                .to_string();
+            assert!(
+                error.contains(msg),
+                "expected error containing {msg:?}, got {error:?}"
+            );
         }
     }
 

@@ -20,8 +20,9 @@
 use std::collections::HashMap;
 
 use clarity::util::hash::Sha512Trunc256Sum;
-use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::chainstate::{StacksBlockId, TrieHashDigest as _};
 use stacks_common::util::hash::to_hex;
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 
 use crate::chainstate::stacks::index::bits::*;
 use crate::chainstate::stacks::index::marf::*;

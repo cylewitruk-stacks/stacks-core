@@ -1,0 +1,18 @@
+[package]
+name = "stacks-rusqlite"
+version = "0.1.0"
+license = "GPL-3.0"
+homepage = "https://github.com/stacks-network/stacks-core"
+repository = "https://github.com/stacks-network/stacks-core"
+description = "Rusqlite adapters for Stacks domain types"
+keywords = ["stacks", "stx", "blockchain", "sqlite"]
+readme = "README.md"
+edition = "2024"
+
+[dependencies]
+# Local dependencies
+stacks-primitives = { workspace = true }
+stacks-crypto = { workspace = true, default-features = false }
+
+# Other dependencies
+rusqlite = { workspace = true }

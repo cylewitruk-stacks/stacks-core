@@ -39,9 +39,12 @@ use stacks::cost_estimates::metrics::UnitMetric;
 use stacks::cost_estimates::UnitEstimator;
 use stacks::net::Error as NetError;
 use stacks_common::address::AddressHashMode;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksAddress};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, StacksAddress, StacksAddressExtensions as _,
+};
 use stacks_common::util::hash::*;
 use stacks_common::util::secp256k1::*;
+use stacks_transactions::StacksMicroblockHeaderExt as _;
 
 use super::{SK_1, SK_2};
 use crate::helium::RunLoop;

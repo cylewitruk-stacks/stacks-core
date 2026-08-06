@@ -16,13 +16,7 @@
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
-use super::chainstate::{StacksAddress, VRFSeed};
 use crate::deps_common::bitcoin::util::hash::Sha256dHash;
-use crate::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksBlockId, TrieHash, Txid,
-};
-use crate::util::hash::{Hash160, Sha512Trunc256Sum};
-use crate::util::vrf::VRFProof;
 
 pub const NO_PARAMS: &[&dyn ToSql] = &[];
 
@@ -40,24 +34,3 @@ impl ToSql for Sha256dHash {
         Ok(hex_str.into())
     }
 }
-
-impl ToSql for StacksAddress {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        let addr_str = self.to_string();
-        Ok(addr_str.into())
-    }
-}
-
-// Implement rusqlite traits for a bunch of structs that used to be defined
-//  in the chainstate code
-impl_byte_array_rusqlite_only!(ConsensusHash);
-impl_byte_array_rusqlite_only!(Hash160);
-impl_byte_array_rusqlite_only!(BlockHeaderHash);
-impl_byte_array_rusqlite_only!(VRFSeed);
-impl_byte_array_rusqlite_only!(BurnchainHeaderHash);
-impl_byte_array_rusqlite_only!(VRFProof);
-impl_byte_array_rusqlite_only!(TrieHash);
-impl_byte_array_rusqlite_only!(Sha512Trunc256Sum);
-impl_byte_array_rusqlite_only!(SortitionId);
-impl_byte_array_rusqlite_only!(StacksBlockId);
-impl_byte_array_rusqlite_only!(Txid);

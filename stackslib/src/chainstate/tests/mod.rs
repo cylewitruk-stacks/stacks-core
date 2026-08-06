@@ -42,6 +42,9 @@ use clarity::vm::ContractName;
 use rand::{self, thread_rng, Rng};
 use stacks_common::address::*;
 use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
+use stacks_common::types::chainstate::{
+    BurnchainHeaderHashBitcoinExt as _, StacksAddressExtensions as _, StacksBlockIdDigest as _,
+};
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::*;
 use stacks_common::util::vrf::*;

@@ -19,6 +19,7 @@
 use stacks_common::types::chainstate::{
     BlockHeaderHash, ConsensusHash, SortitionId, StacksBlockId,
 };
+use stacks_crypto::block::StacksBlockIdDigest as _;
 use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::burn::BlockSnapshot;
 use stackslib::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};

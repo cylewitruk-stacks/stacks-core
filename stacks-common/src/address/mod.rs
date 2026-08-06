@@ -17,7 +17,9 @@
 use std::{error, fmt};
 
 use sha2::{Digest, Sha256};
+use stacks_crypto::hash::Hash160Digest as _;
 use stacks_crypto::secp256k1::VerifyingKey;
+pub use stacks_primitives::AddressHashMode;
 
 use crate::deps_common::bitcoin::blockdata::opcodes::All as btc_opcodes;
 use crate::deps_common::bitcoin::blockdata::script::Builder;
@@ -88,60 +90,30 @@ impl error::Error for Error {
     }
 }
 
-/// Serialization modes for public keys to addresses.  These apply to Stacks addresses, which
-/// correspond to legacy Bitcoin addresses -- legacy Bitcoin address can be converted directly
-/// into a Stacks address, permitting a Bitcoin address to be represented directly on Stacks.
-/// These *do not apply* to Bitcoin segwit addresses.
-#[repr(u8)]
-#[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Hash, Eq, Copy, Serialize, Deserialize)]
-pub enum AddressHashMode {
-    // We support four different modes due to legacy compatibility with Stacks v1 addresses:
-    SerializeP2PKH = 0x00,  // hash160(public-key), same as bitcoin's p2pkh
-    SerializeP2SH = 0x01,   // hash160(multisig-redeem-script), same as bitcoin's multisig p2sh
-    SerializeP2WPKH = 0x02, // hash160(segwit-program-00(p2pkh)), same as bitcoin's p2sh-p2wpkh
-    SerializeP2WSH = 0x03,  // hash160(segwit-program-00(public-keys)), same as bitcoin's p2sh-p2wsh
+/// Legacy network-agnostic inference. New code should prefer the typed
+/// network helpers in `stacks-protocol`.
+pub fn address_hash_mode_from_version(version: u8) -> AddressHashMode {
+    stacks_protocol::address_hash_mode_from_version(version)
 }
 
-impl AddressHashMode {
-    pub fn to_version_mainnet(&self) -> u8 {
-        match *self {
-            AddressHashMode::SerializeP2PKH => C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
-            _ => C32_ADDRESS_VERSION_MAINNET_MULTISIG,
-        }
-    }
-
-    pub fn to_version_testnet(&self) -> u8 {
-        match *self {
-            AddressHashMode::SerializeP2PKH => C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
-            _ => C32_ADDRESS_VERSION_TESTNET_MULTISIG,
-        }
-    }
-
-    /// WARNING: this does not support segwit-p2sh!
-    pub fn from_version(version: u8) -> AddressHashMode {
-        match version {
-            C32_ADDRESS_VERSION_TESTNET_SINGLESIG | C32_ADDRESS_VERSION_MAINNET_SINGLESIG => {
-                AddressHashMode::SerializeP2PKH
-            }
-            _ => AddressHashMode::SerializeP2SH,
-        }
-    }
+/// Compatibility methods for network policy now owned by `stacks-protocol`.
+pub trait AddressHashModeExtensions {
+    fn to_version_mainnet(&self) -> u8;
+    fn to_version_testnet(&self) -> u8;
+    fn from_version(version: u8) -> Self;
 }
 
-/// Given the u8 of an AddressHashMode, deduce the AddressHashNode
-impl TryFrom<u8> for AddressHashMode {
-    type Error = Error;
+impl AddressHashModeExtensions for AddressHashMode {
+    fn to_version_mainnet(&self) -> u8 {
+        stacks_protocol::AddressHashModeNetworkExt::to_version_mainnet(self)
+    }
 
-    fn try_from(value: u8) -> Result<AddressHashMode, Self::Error> {
-        match value {
-            x if x == AddressHashMode::SerializeP2PKH as u8 => Ok(AddressHashMode::SerializeP2PKH),
-            x if x == AddressHashMode::SerializeP2SH as u8 => Ok(AddressHashMode::SerializeP2SH),
-            x if x == AddressHashMode::SerializeP2WPKH as u8 => {
-                Ok(AddressHashMode::SerializeP2WPKH)
-            }
-            x if x == AddressHashMode::SerializeP2WSH as u8 => Ok(AddressHashMode::SerializeP2WSH),
-            _ => Err(Error::InvalidVersion(value)),
-        }
+    fn to_version_testnet(&self) -> u8 {
+        stacks_protocol::AddressHashModeNetworkExt::to_version_testnet(self)
+    }
+
+    fn from_version(version: u8) -> Self {
+        address_hash_mode_from_version(version)
     }
 }
 

@@ -18,7 +18,8 @@ use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::ContractName;
 use stacks_common::address::AddressHashMode;
 use stacks_common::types::chainstate::{
-    BurnchainHeaderHash, StacksAddress, StacksPrivateKey, StacksPublicKey,
+    BurnchainHeaderHash, StacksAddress, StacksAddressExtensions as _, StacksPrivateKey,
+    StacksPublicKey,
 };
 use stacks_common::types::StacksEpoch;
 use stacks_common::util::hash::Hash160;

@@ -17,9 +17,12 @@ use stacks::core::{
     EpochList, StacksEpoch, StacksEpochId, PEER_VERSION_EPOCH_2_0, PEER_VERSION_EPOCH_2_05,
     PEER_VERSION_EPOCH_2_1, STACKS_EPOCH_MAX,
 };
-use stacks_common::types::chainstate::{BurnchainHeaderHash, PoxId};
+use stacks_common::types::chainstate::{
+    BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, PoxId,
+};
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::Sha256Sum;
+use stacks_crypto::hash::Sha256Digest as _;
 
 use super::super::operations::BurnchainOpSigner;
 use super::super::Config;

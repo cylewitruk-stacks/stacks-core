@@ -20,7 +20,8 @@ use std::thread;
 
 use stacks_common::bitvec::BitVec;
 use stacks_common::types::chainstate::{
-    ConsensusHash, StacksAddress, StacksBlockId, StacksPrivateKey, TrieHash,
+    ConsensusHash, StacksAddress, StacksBlockId, StacksBlockIdDigest as _, StacksPrivateKey,
+    TrieHash,
 };
 use stacks_common::types::net::PeerAddress;
 use stacks_common::types::StacksEpochId;
@@ -51,7 +52,6 @@ use crate::net::tests::inv::nakamoto::{
 };
 use crate::net::tests::{NakamotoBootPlan, TestPeer};
 use crate::net::{Error as NetError, Hash160, NeighborAddress, SortitionDB};
-use crate::stacks_common::types::Address;
 use crate::util_lib::db::Error as DBError;
 
 impl NakamotoTenureDownloadState {

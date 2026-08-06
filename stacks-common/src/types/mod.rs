@@ -14,18 +14,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::cmp::Ordering;
 use std::fmt;
 use std::io::{Read, Write};
 
 #[cfg(feature = "rusqlite")]
 pub mod sqlite;
 
-use crate::address::c32::{c32_address, c32_address_decode};
 use crate::address::{
-    public_keys_to_address_hash, to_bits_p2pkh, AddressHashMode,
-    C32_ADDRESS_VERSION_MAINNET_MULTISIG, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
-    C32_ADDRESS_VERSION_TESTNET_MULTISIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+    AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
 };
 use crate::codec::{read_next, write_next, Error as CodecError, StacksMessageCodec};
 use crate::types::chainstate::{StacksAddress, StacksPublicKey};
@@ -103,109 +99,67 @@ pub use stacks_protocol::network::{
     BITCOIN_TESTNET_STACKS_40_BURN_HEIGHT, BITCOIN_TESTNET_STACKS_41_BURN_HEIGHT,
 };
 
-impl PartialOrd for StacksAddress {
-    fn partial_cmp(&self, other: &StacksAddress) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for StacksAddress {
-    fn cmp(&self, other: &StacksAddress) -> Ordering {
-        match self.version().cmp(&other.version()) {
-            Ordering::Equal => self.bytes().cmp(other.bytes()),
-            inequality => inequality,
-        }
-    }
-}
-
-impl StacksAddress {
-    pub fn is_mainnet(&self) -> bool {
-        match self.version() {
-            C32_ADDRESS_VERSION_MAINNET_MULTISIG | C32_ADDRESS_VERSION_MAINNET_SINGLESIG => true,
-            C32_ADDRESS_VERSION_TESTNET_MULTISIG | C32_ADDRESS_VERSION_TESTNET_SINGLESIG => false,
-            _ => false,
-        }
-    }
-
-    pub fn burn_address(mainnet: bool) -> StacksAddress {
-        Self::new(
-            if mainnet {
-                C32_ADDRESS_VERSION_MAINNET_SINGLESIG
-            } else {
-                C32_ADDRESS_VERSION_TESTNET_SINGLESIG
-            },
-            Hash160([0u8; 20]),
-        )
-        .unwrap_or_else(|_| panic!("FATAL: constant address versions are invalid"))
-        // infallible
-    }
-
+/// Compatibility surface for address behavior whose canonical owners are
+/// `stacks-crypto` (derivation) and `stacks-protocol` (network policy).
+pub trait StacksAddressExtensions {
+    fn is_mainnet(&self) -> bool;
+    fn burn_address(mainnet: bool) -> Self;
     /// Generate an address from a given address hash mode, signature threshold, and list of public
     /// keys.  Only return an address if the combination given is supported.
-    /// The version is may be arbitrary.
-    pub fn from_public_keys(
+    // Preserve the legacy facade signature while callers migrate to
+    // `stacks_crypto::address::StacksAddressCryptoExt`, whose API accepts a
+    // slice. Removing this facade is the appropriate point to drop `&Vec`.
+    #[allow(clippy::ptr_arg)]
+    fn from_public_keys(
         version: u8,
         hash_mode: &AddressHashMode,
         num_sigs: usize,
         pubkeys: &Vec<StacksPublicKey>,
-    ) -> Option<StacksAddress> {
-        // must be sufficient public keys
-        if pubkeys.len() < num_sigs {
-            return None;
-        }
+    ) -> Option<Self>
+    where
+        Self: Sized;
+    fn p2pkh(mainnet: bool, pubkey: &StacksPublicKey) -> Self;
+    fn p2pkh_from_hash(mainnet: bool, hash: Hash160) -> Self;
+}
 
-        // address hash mode must be consistent with the number of keys
-        match *hash_mode {
-            AddressHashMode::SerializeP2PKH | AddressHashMode::SerializeP2WPKH
-                // must be a single public key, and must require one signature
-                if (num_sigs != 1 || pubkeys.len() != 1) => {
-                    return None;
-                }
-            _ => {}
-        }
-
-        // if segwit, then keys must all be compressed
-        match *hash_mode {
-            AddressHashMode::SerializeP2WPKH | AddressHashMode::SerializeP2WSH => {
-                for pubkey in pubkeys {
-                    if !pubkey.compressed() {
-                        return None;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        let hash_bits = public_keys_to_address_hash(hash_mode, num_sigs, pubkeys);
-        StacksAddress::new(version, hash_bits).ok()
+impl StacksAddressExtensions for StacksAddress {
+    fn is_mainnet(&self) -> bool {
+        stacks_protocol::StacksAddressNetworkExt::is_mainnet(self)
     }
 
-    /// Make a P2PKH StacksAddress
-    pub fn p2pkh(mainnet: bool, pubkey: &StacksPublicKey) -> StacksAddress {
-        let bytes = to_bits_p2pkh(pubkey);
-        Self::p2pkh_from_hash(mainnet, bytes)
+    fn burn_address(mainnet: bool) -> Self {
+        stacks_protocol::burn_address(mainnet)
     }
 
-    /// Make a P2PKH StacksAddress
-    pub fn p2pkh_from_hash(mainnet: bool, hash: Hash160) -> StacksAddress {
+    #[allow(clippy::ptr_arg)]
+    fn from_public_keys(
+        version: u8,
+        hash_mode: &AddressHashMode,
+        num_sigs: usize,
+        pubkeys: &Vec<StacksPublicKey>,
+    ) -> Option<Self> {
+        stacks_crypto::address::StacksAddressCryptoExt::from_public_keys(
+            version, *hash_mode, num_sigs, pubkeys,
+        )
+    }
+
+    fn p2pkh(mainnet: bool, pubkey: &StacksPublicKey) -> Self {
+        let hash = stacks_crypto::address::public_keys_to_address_hash(
+            AddressHashMode::SerializeP2PKH,
+            1,
+            std::slice::from_ref(pubkey),
+        )
+        .expect("a single public key is valid P2PKH input");
+        Self::p2pkh_from_hash(mainnet, hash)
+    }
+
+    fn p2pkh_from_hash(mainnet: bool, hash: Hash160) -> Self {
         let version = if mainnet {
             C32_ADDRESS_VERSION_MAINNET_SINGLESIG
         } else {
             C32_ADDRESS_VERSION_TESTNET_SINGLESIG
         };
-        Self::new(version, hash)
-            .unwrap_or_else(|_| panic!("FATAL: constant address versions are invalid"))
-        // infallible
-    }
-}
-
-impl std::fmt::Display for StacksAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // the .unwrap_or_else() should be unreachable since StacksAddress is constructed to only
-        // accept a 5-bit value for its version
-        c32_address(self.version(), self.bytes().as_bytes())
-            .expect("Stacks version is not C32-encodable")
-            .fmt(f)
+        Self::new(version, hash).expect("constant address versions are valid")
     }
 }
 
@@ -215,19 +169,11 @@ impl Address for StacksAddress {
     }
 
     fn from_string(s: &str) -> Option<StacksAddress> {
-        let (version, bytes) = c32_address_decode(s).ok()?;
-
-        if bytes.len() != 20 {
-            return None;
-        }
-
-        let mut hash_bytes = [0u8; 20];
-        hash_bytes.copy_from_slice(&bytes[..]);
-        StacksAddress::new(version, Hash160(hash_bytes)).ok()
+        StacksAddress::from_string(s)
     }
 
     fn is_burn(&self) -> bool {
-        self.bytes() == &Hash160([0u8; 20])
+        StacksAddress::is_burn(self)
     }
 }
 

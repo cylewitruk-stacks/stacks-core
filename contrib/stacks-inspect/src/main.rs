@@ -22,6 +22,7 @@ use clarity::types::StacksEpochId;
 use clarity::types::chainstate::StacksPrivateKey;
 use clarity_cli::{DEFAULT_CLI_EPOCH, read_file_or_stdin, read_file_or_stdin_bytes, vm_execute};
 use stacks_common::alloc_tracker::TrackingAllocator;
+use stacks_common::types::chainstate::StacksBlockIdDigest as _;
 use stacks_inspect::cli::{Cli, Command};
 use stacks_inspect::{
     CommonOpts, command_contract_hash, command_replay_mock_mining, command_try_mine,
@@ -70,9 +71,10 @@ use stacks_common::util::hash::{Hash160, hex_bytes, to_hex};
 use stacks_common::util::retry::LogReader;
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 use stacks_common::util::vrf::VRFProof;
+use stacks_rusqlite::{SqlValue, domain_params};
 use stackslib::burnchains::bitcoin::{BitcoinNetworkType, spv};
 use stackslib::burnchains::db::BurnchainDB;
-use stackslib::burnchains::{Address, Burnchain, PoxConstants};
+use stackslib::burnchains::{Burnchain, PoxConstants};
 use stackslib::chainstate::burn::db::sortdb::{
     SortitionDB, SortitionHandle, get_block_commit_by_txid,
 };
@@ -628,8 +630,13 @@ fn main() {
                 println!("{cur_consensus}, {cur_tip}");
                 let (next_consensus, next_tip) = match conn.query_row(
                     "SELECT parent_consensus_hash, parent_anchored_block_hash FROM staging_blocks WHERE anchored_block_hash = ? AND consensus_hash = ?",
-                    params![cur_tip, cur_consensus],
-                    |row| Ok((row.get_unwrap(0), row.get_unwrap(1))),
+                    domain_params![cur_tip, cur_consensus],
+                    |row| {
+                        Ok((
+                            row.get::<_, SqlValue<ConsensusHash>>(0)?.into_inner(),
+                            row.get::<_, SqlValue<BlockHeaderHash>>(1)?.into_inner(),
+                        ))
+                    },
                 ) {
                     Ok(x) => x,
                     Err(e) => {

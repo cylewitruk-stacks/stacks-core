@@ -20,6 +20,7 @@ use clarity::vm::types::QualifiedContractIdentifier;
 use libstackerdb::{SlotMetadata, StackerDBChunkData};
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_common::util::secp256k1::MessageSignature;
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 
 use super::TestRPC;
 use crate::net::api::*;

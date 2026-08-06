@@ -21,7 +21,9 @@ use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::ContractName;
 use libstackerdb::STACKERDB_MAX_CHUNK_SIZE;
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG};
-use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksAddressExtensions as _, StacksPrivateKey, StacksPublicKey,
+};
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::MessageSignature;
 

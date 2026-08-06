@@ -8,11 +8,13 @@ pub use stacks_primitives::hash::{
 
 mod merkle;
 
-pub use merkle::{MerkleHashFunc, MerkleTree};
+pub use merkle::{MerkleHashFunc, MerklePath, MerklePathOrder, MerklePathPoint, MerkleTree};
 
 pub trait Hash160Digest {
     fn from_sha256(sha256_hash: &[u8; 32]) -> Hash160;
     fn from_data(data: &[u8]) -> Hash160;
+    fn from_node_public_key(pubkey: &crate::secp256k1::Secp256k1PublicKey) -> Hash160;
+    fn from_public_key_bytes(pubkey: &[u8]) -> Hash160;
 }
 
 impl Hash160Digest for Hash160 {
@@ -25,6 +27,14 @@ impl Hash160Digest for Hash160 {
     fn from_data(data: &[u8]) -> Hash160 {
         let sha2_result = Sha256::digest(data);
         Hash160(Ripemd160::digest(sha2_result).into())
+    }
+
+    fn from_node_public_key(pubkey: &crate::secp256k1::Secp256k1PublicKey) -> Hash160 {
+        Self::from_data(&pubkey.to_bytes_compressed())
+    }
+
+    fn from_public_key_bytes(pubkey: &[u8]) -> Hash160 {
+        Self::from_data(pubkey)
     }
 }
 

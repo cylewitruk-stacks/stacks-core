@@ -17,9 +17,13 @@ edition = "2021"
 [dependencies]
 stacks-p2p = { workspace = true }
 stacks-primitives = { workspace = true }
+stacks-crypto = { workspace = true, default-features = false }
 serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+const-hex = { workspace = true }
 
 [features]
 default = []
 testing = ["stacks-primitives/testing"]
-wasm-web = ["stacks-primitives/wasm-web"]
+wasm-web = ["stacks-crypto/wasm-web", "stacks-primitives/wasm-web"]

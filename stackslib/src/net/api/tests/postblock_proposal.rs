@@ -26,7 +26,7 @@ use clarity::types::chainstate::{BlockHeaderHash, StacksBlockId, StacksPrivateKe
 use clarity::vm::costs::ExecutionCost;
 use clarity::vm::types::StandardPrincipalData;
 use postblock_proposal::{NakamotoBlockProposal, ValidateRejectCode};
-use stacks_common::types::chainstate::ConsensusHash;
+use stacks_common::types::chainstate::{ConsensusHash, StacksBlockIdDigest as _};
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::sleep_ms;
 

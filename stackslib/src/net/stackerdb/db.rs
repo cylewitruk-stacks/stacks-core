@@ -24,6 +24,8 @@ use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_common::util::secp256k1::MessageSignature;
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
+use stacks_rusqlite::SqlValue;
 
 use crate::net::stackerdb::{StackerDBConfig, StackerDBTx, StackerDBs, STACKERDB_INV_MAX};
 use crate::net::{Error as net_error, StackerDBChunkData};
@@ -259,7 +261,7 @@ impl StackerDBTx<'_> {
                     NO_VERSION,
                     0,
                     vec![],
-                    Sha512Trunc256Sum([0u8; 32]),
+                    SqlValue::new(Sha512Trunc256Sum([0u8; 32])),
                     MessageSignature::empty().to_hex(),
                 ];
                 stmt.execute(args)?;
@@ -338,7 +340,7 @@ impl StackerDBTx<'_> {
                     NO_VERSION,
                     0,
                     vec![],
-                    Sha512Trunc256Sum([0u8; 32]),
+                    SqlValue::new(Sha512Trunc256Sum([0u8; 32])),
                     MessageSignature::empty().to_hex(),
                 ];
 
@@ -383,7 +385,7 @@ impl StackerDBTx<'_> {
 
         let args = params![
             slot_desc.slot_version,
-            Sha512Trunc256Sum::from_data(chunk),
+            SqlValue::new(Sha512Trunc256Sum::from_data(chunk)),
             slot_desc.signature.to_hex(),
             chunk,
             u64_to_sql(get_epoch_time_secs())?,

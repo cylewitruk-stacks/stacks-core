@@ -37,12 +37,15 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::de::Error as de_Error;
 use serde::Deserialize;
 use stacks_common::codec::{read_next, write_next, StacksMessageCodec};
-use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, TrieHash};
+use stacks_common::types::chainstate::{
+    StacksAddress, StacksBlockId, StacksBlockIdDigest as _, TrieHash,
+};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::{hex_bytes, to_hex};
+use stacks_rusqlite::domain_params;
 
 use crate::burnchains::bitcoin::address::LegacyBitcoinAddress;
-use crate::burnchains::{Address, Burnchain, BurnchainParameters, PoxConstants};
+use crate::burnchains::{Burnchain, BurnchainParameters, PoxConstants};
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::burn::operations::{
     DelegateStxOp, StackStxOp, TransferStxOp, VoteForAggregateKeyOp,
@@ -2731,7 +2734,7 @@ impl StacksChainState {
         index_block_hash: &StacksBlockId,
     ) -> Result<Vec<Txid>, Error> {
         let sql = "SELECT txids FROM burnchain_txids WHERE index_block_hash = ?1";
-        let args = params![index_block_hash];
+        let args = domain_params![index_block_hash];
 
         let txids = conn
             .query_row(sql, args, |r| {
@@ -2815,7 +2818,7 @@ impl StacksChainState {
         let txids_json =
             serde_json::to_string(&txids).expect("FATAL: could not serialize Vec<Txid>");
         let sql = "INSERT INTO burnchain_txids (index_block_hash, txids) VALUES (?1, ?2)";
-        let args = params![index_block_hash, &txids_json];
+        let args = domain_params![index_block_hash, &txids_json];
         tx.execute(sql, args)?;
         Ok(())
     }
@@ -2944,7 +2947,7 @@ impl StacksChainState {
         if applied_epoch_transition {
             debug!("Block {} applied an epoch transition", &index_block_hash);
             let sql = "INSERT INTO epoch_transitions (block_id) VALUES (?)";
-            let args = params![&index_block_hash];
+            let args = domain_params![&index_block_hash];
             headers_tx.deref_mut().execute(sql, args)?;
         }
 
@@ -2962,6 +2965,7 @@ pub mod test {
     use std::env;
 
     use clarity::vm::test_util::TEST_BURN_STATE_DB;
+    use stacks_common::types::chainstate::BurnchainHeaderHashBitcoinExt as _;
     use stx_genesis::GenesisData;
 
     use super::testing::*;
@@ -3316,7 +3320,7 @@ pub mod test {
                 burn_header_hash, burn_header_height, burn_header_timestamp, parent_block_id,
                 cost, block_size, affirmation_weight
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
+            domain_params![
                 1,
                 "1000",
                 "1",
@@ -3391,7 +3395,7 @@ pub mod test {
             .query_row(
                 "SELECT block_hash, consensus_hash, block_size
             FROM block_headers WHERE index_block_hash = ?",
-                params![&sample_index_block_hash],
+                domain_params![sample_index_block_hash],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,

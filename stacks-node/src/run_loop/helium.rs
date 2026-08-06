@@ -1,5 +1,5 @@
 use stacks::chainstate::stacks::db::ClarityTx;
-use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::chainstate::{BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _};
 
 use super::RunLoopCallbacks;
 use crate::burnchains::Error as BurnchainControllerError;

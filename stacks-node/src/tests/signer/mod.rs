@@ -55,6 +55,9 @@ use stacks::util::hash::MerkleHashFunc;
 use stacks::util::secp256k1::{MessageSignature, Secp256k1PublicKey};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::consts::SIGNER_SLOTS_PER_USER;
+use stacks_common::types::chainstate::{
+    StacksAddressExtensions as _, StacksBlockIdDigest as _, TxidBitcoinExt as _,
+};
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_crypto::secp256k1::SigningKey as _;

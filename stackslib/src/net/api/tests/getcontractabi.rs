@@ -19,7 +19,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use clarity::types::chainstate::StacksBlockId;
 use clarity::vm::types::QualifiedContractIdentifier;
 use stacks_common::types::chainstate::StacksAddress;
-use stacks_common::types::Address;
 
 use super::test_rpc;
 use crate::net::api::*;

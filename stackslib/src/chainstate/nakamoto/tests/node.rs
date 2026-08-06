@@ -20,11 +20,15 @@ use clarity::vm::costs::ExecutionCost;
 use clarity::vm::types::*;
 use rusqlite::params;
 use stacks_common::address::*;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksAddress, StacksBlockId, VRFSeed};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, StacksAddress, StacksAddressExtensions as _, StacksBlockId,
+    StacksBlockIdDigest as _, VRFSeed, VRFSeedDigest as _,
+};
 use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey};
 use stacks_common::util::vrf::VRFProof;
+use stacks_crypto::hash::Hash160Digest as _;
 use stacks_crypto::secp256k1::MessageSignatureCryptoExt as _;
 
 use crate::burnchains::bitcoin::indexer::BitcoinIndexer;

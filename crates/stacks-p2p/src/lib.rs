@@ -11,7 +11,13 @@ use stacks_primitives::StacksEpochId;
 pub struct PeerAddress(pub [u8; 16]);
 impl_array_newtype!(PeerAddress, u8, 16);
 impl_array_hexstring_fmt!(PeerAddress);
-impl_byte_array_newtype!(PeerAddress, u8, 16);
+impl_byte_array_newtype!(
+    PeerAddress,
+    u8,
+    16,
+    stacks_primitives::HexError,
+    stacks_primitives::hex::decode_array
+);
 
 impl Serialize for PeerAddress {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {

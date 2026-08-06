@@ -28,7 +28,7 @@ use stacks_common::address::{
 };
 use stacks_common::types::chainstate::StacksAddress;
 #[cfg(any(test, feature = "testing"))]
-use stacks_common::types::chainstate::StacksPrivateKey;
+use stacks_common::types::chainstate::{StacksAddressExtensions as _, StacksPrivateKey};
 use stacks_common::types::{ClarityEpochRules as _, StacksEpochId};
 use stacks_common::util::hash;
 

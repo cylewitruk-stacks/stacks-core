@@ -16,6 +16,8 @@
 
 use std::io::Cursor;
 
+use stacks_common::types::chainstate::TrieHashDigest as _;
+
 use super::*;
 use crate::chainstate::stacks::index::bits::{get_node_byte_len, get_node_max_byte_len};
 use crate::chainstate::stacks::index::*;

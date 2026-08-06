@@ -24,6 +24,8 @@ use clarity::vm::costs::ExecutionCost;
 use clarity::vm::tests::BurnStateDB;
 use clarity::vm::types::PrincipalData;
 use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value};
+use stacks_common::types::chainstate::StacksAddressExtensions as _;
+use stacks_rusqlite::domain_params;
 
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::miner::{BlockBuilderSettings, StacksMicroblockBuilder};
@@ -632,7 +634,7 @@ pub fn insert_tx_in_mempool(
             .expect("Failed to deserialize transaction")
             .txid()
     };
-    let args = rusqlite::params![
+    let args = domain_params![
         txid,
         origin_addr_str,
         origin_nonce,

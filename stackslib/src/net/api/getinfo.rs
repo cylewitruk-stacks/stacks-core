@@ -21,6 +21,7 @@ use stacks_common::types::chainstate::{
 use stacks_common::types::net::PeerHost;
 use stacks_common::types::StacksPublicKeyBuffer;
 use stacks_common::util::hash::{Hash160, Sha256Sum};
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::burnchains::Txid;
 use crate::chainstate::stacks::db::StacksChainState;

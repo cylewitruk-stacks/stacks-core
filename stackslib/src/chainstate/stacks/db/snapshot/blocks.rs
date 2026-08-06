@@ -18,8 +18,11 @@ use std::fs;
 use std::path::Path;
 
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, OpenFlags};
-use stacks_common::types::chainstate::{BlockHeaderHash, ConsensusHash, StacksBlockId};
+use rusqlite::{Connection, OpenFlags};
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, ConsensusHash, StacksBlockId, StacksBlockIdDigest as _,
+};
+use stacks_rusqlite::{domain_params, SqlValue};
 
 use super::common::{
     classify_hint, clone_schemas_from_source, copied_rows, execute_copy_specs,
@@ -104,8 +107,11 @@ fn get_confirmed_microblock_stream(
     )?;
 
     let stream = stmt
-        .query_map(params![parent_ibh, max_seq], |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, BlockHeaderHash>(1)?))
+        .query_map(domain_params![parent_ibh, max_seq], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, SqlValue<BlockHeaderHash>>(1)?.into_inner(),
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -133,9 +139,9 @@ fn derive_confirmed_microblock_set(
     let children: Vec<(ConsensusHash, BlockHeaderHash, BlockHeaderHash, u32)> = stmt
         .query_map([], |row| {
             Ok((
-                row.get::<_, ConsensusHash>(0)?,
-                row.get::<_, BlockHeaderHash>(1)?,
-                row.get::<_, BlockHeaderHash>(2)?,
+                row.get::<_, SqlValue<ConsensusHash>>(0)?.into_inner(),
+                row.get::<_, SqlValue<BlockHeaderHash>>(1)?.into_inner(),
+                row.get::<_, SqlValue<BlockHeaderHash>>(2)?.into_inner(),
                 row.get::<_, u32>(3)?,
             ))
         })?
@@ -203,13 +209,13 @@ fn populate_microblock_temp_tables(
         let mut ins_hash =
             conn.prepare("INSERT INTO temp.selected_microblocks (hash) VALUES (?1)")?;
         for h in selected_hashes {
-            ins_hash.execute(params![h])?;
+            ins_hash.execute(domain_params![h])?;
         }
     }
     {
         let mut ins_parent = conn.prepare("INSERT INTO temp.selected_parents (ibh) VALUES (?1)")?;
         for p in selected_parents {
-            ins_parent.execute(params![p])?;
+            ins_parent.execute(domain_params![p])?;
         }
     }
 
@@ -292,7 +298,10 @@ pub fn copy_epoch2_block_files(
     )?;
 
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, StacksBlockId>(0)?, row.get::<_, u64>(1)?))
+        Ok((
+            row.get::<_, SqlValue<StacksBlockId>>(0)?.into_inner(),
+            row.get::<_, u64>(1)?,
+        ))
     })?;
 
     let mut stats = Epoch2BlockFileCopyStats::default();

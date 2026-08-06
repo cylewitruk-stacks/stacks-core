@@ -26,13 +26,14 @@ use libstackerdb::SlotMetadata;
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksAddress, StacksBlockId,
-    StacksPrivateKey, StacksPublicKey,
+    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, StacksAddress,
+    StacksAddressExtensions as _, StacksBlockId, StacksPrivateKey, StacksPublicKey,
 };
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{to_hex, Hash160, Sha512Trunc256Sum};
 use stacks_common::util::pipe::Pipe;
 use stacks_common::util::serde_serializers::{prefix_hex, prefix_opt_hex};
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
 
 use crate::burnchains::bitcoin::indexer::BitcoinIndexer;
 use crate::burnchains::Txid;

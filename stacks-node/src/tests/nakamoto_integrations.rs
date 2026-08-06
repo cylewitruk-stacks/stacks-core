@@ -104,7 +104,8 @@ use stacks_common::bitvec::BitVec;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::consts::{CHAIN_ID_TESTNET, STACKS_EPOCH_MAX};
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, StacksPrivateKey, StacksPublicKey,
+    BlockHeaderHash, BurnchainHeaderHash, BurnchainHeaderHashBitcoinExt as _, StacksAddress,
+    StacksAddressExtensions as _, StacksBlockIdDigest as _, StacksPrivateKey, StacksPublicKey,
     TrieHash,
 };
 use stacks_common::types::{
@@ -114,6 +115,8 @@ use stacks_common::types::{
 use stacks_common::util::hash::{to_hex, Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey};
 use stacks_common::util::{get_epoch_time_secs, sleep_ms};
+use stacks_crypto::hash::{Hash160Digest as _, Sha512Trunc256Digest as _};
+use stacks_rusqlite::domain_params;
 use stacks_signer::chainstate::v1::SortitionsView;
 use stacks_signer::chainstate::ProposalEvalConfig;
 use stacks_signer::config::DEFAULT_RESET_REPLAY_SET_AFTER_FORK_BLOCKS;
@@ -11038,7 +11041,7 @@ fn sip029_coinbase_change() {
         }
         let coinbase = {
             let sql = "SELECT coinbase FROM payments WHERE consensus_hash = ?1";
-            let args = rusqlite::params![&sn.consensus_hash];
+            let args = domain_params![sn.consensus_hash];
             let Some(coinbase) = chainstate
                 .db()
                 .query_row(sql, args, |r| {

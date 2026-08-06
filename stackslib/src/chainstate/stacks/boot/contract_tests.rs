@@ -31,9 +31,11 @@ use clarity::vm::version::ClarityVersion;
 use lazy_static::lazy_static;
 use stacks_common::address::AddressHashMode;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockId, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksAddressExtensions as _,
+    StacksBlockId, VRFSeed,
 };
 use stacks_common::util::hash::to_hex;
+use stacks_crypto::hash::Hash160Digest as _;
 use stacks_protocol::epoch::ClarityEpochRules as _;
 
 use super::SIGNERS_MAX_LIST_SIZE;

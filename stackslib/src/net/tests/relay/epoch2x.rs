@@ -24,10 +24,12 @@ use pinny::tag;
 use proptest::prelude::*;
 use rand::{thread_rng, Rng};
 use stacks_common::address::AddressHashMode;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
-use stacks_common::types::Address;
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, StacksAddressExtensions as _, StacksBlockId, StacksBlockIdDigest as _,
+};
 use stacks_common::util::hash::{MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::vrf::VRFProof;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use crate::burnchains::tests::TestMiner;
 use crate::chainstate::stacks::db::blocks::{MemPoolRejection, MINIMUM_TX_FEE_RATE_PER_BYTE};

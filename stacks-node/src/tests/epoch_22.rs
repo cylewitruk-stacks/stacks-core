@@ -10,14 +10,14 @@ use stacks::config::{EventKeyType, EventObserverConfig, InitialBalance};
 use stacks::core::test_util::{make_contract_call, make_stacks_transfer_serialized};
 use stacks::core::{self, EpochList, STACKS_EPOCH_MAX};
 use stacks::util_lib::boot::boot_code_id;
-use stacks_common::types::chainstate::{StacksAddress, StacksBlockId};
+use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, StacksBlockIdDigest as _};
 use stacks_common::util::hash::Hash160;
 use stacks_common::util::secp256k1::Secp256k1PublicKey;
 use stacks_common::util::sleep_ms;
+use stacks_crypto::hash::Hash160Digest as _;
 
 use super::neon_integrations::get_account;
 use crate::burnchains::bitcoin::core_controller::BitcoinCoreController;
-use crate::stacks_common::types::Address;
 use crate::stacks_common::util::hash::bytes_to_hex;
 use crate::tests::neon_integrations::*;
 use crate::tests::*;

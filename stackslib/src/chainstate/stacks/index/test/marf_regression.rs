@@ -25,6 +25,7 @@ mod utils {
     use std::time::SystemTime;
 
     use clarity::types::chainstate::{BlockHeaderHash, TrieHash};
+    use stacks_crypto::block::TrieHashDigest as _;
 
     use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
     use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};

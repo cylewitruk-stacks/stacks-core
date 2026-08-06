@@ -12,15 +12,22 @@ pub const MAX_BLOCK_LEN: u32 = 2 * 1024 * 1024;
 pub struct BlockHeaderHash(pub [u8; 32]);
 impl_array_newtype!(BlockHeaderHash, u8, 32);
 impl_array_hexstring_fmt!(BlockHeaderHash);
-impl_byte_array_newtype!(BlockHeaderHash, u8, 32);
+impl_byte_array_newtype!(
+    BlockHeaderHash,
+    u8,
+    32,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(BlockHeaderHash);
 pub const BLOCK_HEADER_HASH_ENCODED_SIZE: usize = 32;
 
 /// Hash of a Trie node.
+#[derive(Default, Copy)]
 pub struct TrieHash(pub [u8; 32]);
 impl_array_newtype!(TrieHash, u8, 32);
 impl_array_hexstring_fmt!(TrieHash);
-impl_byte_array_newtype!(TrieHash, u8, 32);
+impl_byte_array_newtype!(TrieHash, u8, 32, crate::HexError, crate::hex::decode_array);
 impl_byte_array_serde!(TrieHash);
 pub const TRIEHASH_ENCODED_SIZE: usize = 32;
 
@@ -36,20 +43,38 @@ impl TrieHash {
 pub struct BurnchainHeaderHash(pub [u8; 32]);
 impl_array_newtype!(BurnchainHeaderHash, u8, 32);
 impl_array_hexstring_fmt!(BurnchainHeaderHash);
-impl_byte_array_newtype!(BurnchainHeaderHash, u8, 32);
+impl_byte_array_newtype!(
+    BurnchainHeaderHash,
+    u8,
+    32,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(BurnchainHeaderHash);
 
 /// Identifier used to identify sortitions in the SortitionDB.
 pub struct SortitionId(pub [u8; 32]);
 impl_array_newtype!(SortitionId, u8, 32);
 impl_array_hexstring_fmt!(SortitionId);
-impl_byte_array_newtype!(SortitionId, u8, 32);
+impl_byte_array_newtype!(
+    SortitionId,
+    u8,
+    32,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(SortitionId);
 
 pub struct StacksBlockId(pub [u8; 32]);
 impl_array_newtype!(StacksBlockId, u8, 32);
 impl_array_hexstring_fmt!(StacksBlockId);
-impl_byte_array_newtype!(StacksBlockId, u8, 32);
+impl_byte_array_newtype!(
+    StacksBlockId,
+    u8,
+    32,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(StacksBlockId);
 
 /// A newtype for `StacksBlockId` that indicates a block is a tenure-change
@@ -66,7 +91,13 @@ impl From<StacksBlockId> for TenureBlockId {
 pub struct ConsensusHash(pub [u8; 20]);
 impl_array_newtype!(ConsensusHash, u8, 20);
 impl_array_hexstring_fmt!(ConsensusHash);
-impl_byte_array_newtype!(ConsensusHash, u8, 20);
+impl_byte_array_newtype!(
+    ConsensusHash,
+    u8,
+    20,
+    crate::HexError,
+    crate::hex::decode_array
+);
 impl_byte_array_serde!(ConsensusHash);
 pub const CONSENSUS_HASH_ENCODED_SIZE: u32 = 20;
 

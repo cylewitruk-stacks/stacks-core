@@ -19,10 +19,12 @@ stacks-primitives = { workspace = true }
 stacks-protocol = { workspace = true }
 
 # Other dependencies
-bitcoin = { workspace = true }
 const-hex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 variant_count = { workspace = true }
+
+[dev-dependencies]
+stacks-crypto = { workspace = true, features = ["testing"] }
 
 [features]
 default = []
@@ -30,6 +32,7 @@ codec = ["dep:stacks-codec"]
 testing = [
     "clarity-types/testing",
     "codec",
+    "stacks-codec/testing",
     "stacks-crypto/testing",
     "stacks-primitives/testing",
 ]

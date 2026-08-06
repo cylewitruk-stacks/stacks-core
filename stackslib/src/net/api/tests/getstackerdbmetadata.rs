@@ -19,6 +19,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use clarity::vm::types::QualifiedContractIdentifier;
 use stacks_common::util::hash::Sha512Trunc256Sum;
 use stacks_common::util::secp256k1::MessageSignature;
+use stacks_crypto::hash::Sha512Trunc256Digest as _;
 
 use super::test_rpc;
 use crate::net::api::*;
