@@ -20,3 +20,4 @@ serde = { workspace = true, features = ["derive"] }
 [features]
 default = []
 testing = []
+wasm-web = []

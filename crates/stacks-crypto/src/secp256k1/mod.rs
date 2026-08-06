@@ -41,6 +41,44 @@ pub trait SigningKey: Clone + fmt::Debug + serde::Serialize + DeserializeOwned {
     ) -> Result<MessageSignature, &'static str>;
 }
 
+/// Test-only helpers that require knowledge of the secp256k1 scalar field.
+#[cfg(any(test, feature = "testing"))]
+pub trait MessageSignatureCryptoExt {
+    fn with_negated_s(&self) -> Self;
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl MessageSignatureCryptoExt for MessageSignature {
+    fn with_negated_s(&self) -> Self {
+        // secp256k1's group order, encoded big-endian.
+        const ORDER: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+
+        let mut signature = self.clone();
+        let mut borrow = 0u16;
+        for index in (0..32).rev() {
+            let minuend = u16::from(ORDER[index]);
+            let subtrahend = u16::from(self.0[index + 33]) + borrow;
+            if minuend >= subtrahend {
+                signature.0[index + 33] = (minuend - subtrahend) as u8;
+                borrow = 0;
+            } else {
+                signature.0[index + 33] = (minuend + 256 - subtrahend) as u8;
+                borrow = 1;
+            }
+        }
+        assert_eq!(
+            borrow, 0,
+            "signature S scalar must be below the curve order"
+        );
+        signature.0[0] ^= 1;
+        signature
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 #[cfg_attr(not(target_family = "wasm"), derive(Hash))]
 pub struct Secp256k1PublicKey {

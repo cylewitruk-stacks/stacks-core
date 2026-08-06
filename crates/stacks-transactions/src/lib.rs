@@ -16,7 +16,7 @@ pub use auth_field::{
     TransactionPublicKeyEncoding,
 };
 pub use crypto::{
-    AuthError, DeriveSpendingCondition, RecoverAuthFieldPublicKey,
+    AuthError, DeriveSpendingCondition, RecoverAuthFieldPublicKey, TransactionAuthVerificationMode,
     VerifySpendingConditionSignatures, make_sighash_postsign, make_sighash_presign, next_signature,
     next_verification, public_keys_to_address_hash, public_keys_to_signer,
 };
@@ -26,7 +26,7 @@ pub use payload::{
 };
 pub use post_condition::{
     AssetInfo, AssetInfoID, FungibleConditionCode, NonfungibleConditionCode,
-    PostConditionPrincipal, PostConditionPrincipalID, TransactionPostCondition,
+    PostConditionPrincipal, PostConditionPrincipalID, PoxConditionCode, TransactionPostCondition,
 };
 pub use principal::{principal_from_address, standard_principal_from_address};
 pub use spend_condition::{
@@ -36,6 +36,6 @@ pub use spend_condition::{
 };
 pub use stacks_primitives::block::{MAX_BLOCK_LEN, StacksMicroblockHeader};
 pub use transaction::{
-    MAX_TRANSACTION_LEN, StacksTransaction, TransactionAnchorMode, TransactionPostConditionMode,
-    TransactionVersion,
+    MAX_TRANSACTION_LEN, MIN_TRANSACTION_LEN, StacksTransaction, TransactionAnchorMode,
+    TransactionPostConditionMode, TransactionVersion,
 };

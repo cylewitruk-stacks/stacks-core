@@ -42,6 +42,17 @@ impl MessageSignature {
     pub fn to_rsv(&self) -> Vec<u8> {
         [&self.0[1..], &self.0[0..1]].concat()
     }
+
+    /// Convert from RSV (used by Clarity) to VRS (used by Stacks transaction code).
+    pub fn from_rsv(source: &[u8]) -> Option<Self> {
+        if source.len() != 65 {
+            return None;
+        }
+        let mut signature = [0u8; 65];
+        signature[0] = source[64];
+        signature[1..].copy_from_slice(&source[..64]);
+        Some(Self(signature))
+    }
 }
 
 pub struct SchnorrSignature(pub [u8; 65]);

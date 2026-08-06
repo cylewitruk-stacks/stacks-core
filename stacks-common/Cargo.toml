@@ -78,6 +78,8 @@ sha2 = { version = "0.10" }
 [dev-dependencies]
 proptest = "1.6.0"
 pinny = { workspace = true }
+stacks-crypto = { workspace = true, features = ["testing"] }
+stacks-primitives = { workspace = true, features = ["testing"] }
 stacks-protocol = { workspace = true, features = ["testing"] }
 
 [target.'cfg(windows)'.dev-dependencies]
@@ -103,7 +105,7 @@ bech32_std = []
 bech32_strict = []
 
 # Wasm-specific features for easier configuration
-wasm-web = ["rand", "getrandom/js", "stacks-crypto/wasm-web"]
+wasm-web = ["rand", "getrandom/js", "stacks-crypto/wasm-web", "chrono/wasmbind"]
 wasm-deterministic = ["getrandom/custom", "stacks-crypto/wasm-deterministic"]
 
 [package.metadata.pinny]

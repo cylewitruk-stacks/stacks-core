@@ -2,6 +2,7 @@ use clarity_types::representations::{ClarityName, ContractName};
 use clarity_types::types::{PrincipalData, QualifiedContractIdentifier, Value};
 use serde::{Deserialize, Serialize};
 use stacks_primitives::address::StacksAddress;
+use variant_count::VariantCount;
 
 use crate::principal::standard_principal_from_address;
 
@@ -12,6 +13,8 @@ pub enum AssetInfoID {
     STX = 0,
     FungibleAsset = 1,
     NonfungibleAsset = 2,
+    Staking = 3,
+    Pox = 4,
 }
 
 impl AssetInfoID {
@@ -20,13 +23,15 @@ impl AssetInfoID {
             0 => Some(AssetInfoID::STX),
             1 => Some(AssetInfoID::FungibleAsset),
             2 => Some(AssetInfoID::NonfungibleAsset),
+            3 => Some(AssetInfoID::Staking),
+            4 => Some(AssetInfoID::Pox),
             _ => None,
         }
     }
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize, VariantCount)]
 pub enum FungibleConditionCode {
     SentEq = 0x01,
     SentGt = 0x02,
@@ -36,6 +41,14 @@ pub enum FungibleConditionCode {
 }
 
 impl FungibleConditionCode {
+    pub const ALL: &'static [FungibleConditionCode] = &[
+        FungibleConditionCode::SentEq,
+        FungibleConditionCode::SentGt,
+        FungibleConditionCode::SentGe,
+        FungibleConditionCode::SentLt,
+        FungibleConditionCode::SentLe,
+    ];
+
     pub fn from_u8(b: u8) -> Option<FungibleConditionCode> {
         match b {
             0x01 => Some(FungibleConditionCode::SentEq),
@@ -58,6 +71,8 @@ impl FungibleConditionCode {
     }
 }
 
+const _: () = assert!(FungibleConditionCode::ALL.len() == FungibleConditionCode::VARIANT_COUNT);
+
 #[repr(u8)]
 #[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
 pub enum PostConditionPrincipalID {
@@ -75,7 +90,7 @@ pub struct AssetInfo {
 }
 
 #[repr(u8)]
-#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize, VariantCount)]
 pub enum NonfungibleConditionCode {
     Sent = 0x10,
     NotSent = 0x11,
@@ -83,6 +98,12 @@ pub enum NonfungibleConditionCode {
 }
 
 impl NonfungibleConditionCode {
+    pub const ALL: &'static [NonfungibleConditionCode] = &[
+        NonfungibleConditionCode::Sent,
+        NonfungibleConditionCode::NotSent,
+        NonfungibleConditionCode::MaybeSent,
+    ];
+
     pub fn from_u8(b: u8) -> Option<NonfungibleConditionCode> {
         match b {
             0x10 => Some(NonfungibleConditionCode::Sent),
@@ -113,6 +134,45 @@ impl NonfungibleConditionCode {
         }
     }
 }
+
+const _: () =
+    assert!(NonfungibleConditionCode::ALL.len() == NonfungibleConditionCode::VARIANT_COUNT);
+
+/// Condition code for a PoX post-condition.
+#[repr(u8)]
+#[derive(Debug, Clone, PartialEq, Copy, Serialize, Deserialize, VariantCount)]
+pub enum PoxConditionCode {
+    NotPerformed = 0x30,
+    MaybePerformed = 0x31,
+    Performed = 0x32,
+}
+
+impl PoxConditionCode {
+    pub const ALL: &'static [PoxConditionCode] = &[
+        PoxConditionCode::NotPerformed,
+        PoxConditionCode::MaybePerformed,
+        PoxConditionCode::Performed,
+    ];
+
+    pub fn from_u8(b: u8) -> Option<PoxConditionCode> {
+        match b {
+            0x30 => Some(PoxConditionCode::NotPerformed),
+            0x31 => Some(PoxConditionCode::MaybePerformed),
+            0x32 => Some(PoxConditionCode::Performed),
+            _ => None,
+        }
+    }
+
+    pub fn check(&self, performed: bool) -> bool {
+        match self {
+            PoxConditionCode::NotPerformed => !performed,
+            PoxConditionCode::MaybePerformed => true,
+            PoxConditionCode::Performed => performed,
+        }
+    }
+}
+
+const _: () = assert!(PoxConditionCode::ALL.len() == PoxConditionCode::VARIANT_COUNT);
 
 /// Post-condition principal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,4 +223,6 @@ pub enum TransactionPostCondition {
         Value,
         NonfungibleConditionCode,
     ),
+    Staking(PostConditionPrincipal, FungibleConditionCode, u64),
+    Pox(PostConditionPrincipal, PoxConditionCode),
 }

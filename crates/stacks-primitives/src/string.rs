@@ -110,3 +110,32 @@ impl TryFrom<String> for StacksString {
         value.as_str().try_into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StacksString;
+
+    #[test]
+    fn rejects_non_printable_strings() {
+        assert!(StacksString::try_from_str("hello\rworld").is_none());
+        assert!(StacksString::try_from_str("hello\x01world").is_none());
+        assert!(StacksString::try_from_str("hello\x7fworld").is_none());
+        assert!(StacksString::try_from_str("héllo").is_none());
+    }
+
+    #[test]
+    fn accepts_tab_and_newline() {
+        assert!(StacksString::try_from_str("line1\nline2").is_some());
+        assert!(StacksString::try_from_str("col1\tcol2").is_some());
+    }
+
+    #[test]
+    fn printable_ascii_boundaries() {
+        assert!(StacksString::try_from_str(" ").is_some());
+        assert!(StacksString::try_from_str("~").is_some());
+        let below_printable = String::from_utf8(vec![0x1f]).unwrap();
+        assert!(StacksString::from_string(&below_printable).is_none());
+        let delete = String::from_utf8(vec![0x7f]).unwrap();
+        assert!(StacksString::from_string(&delete).is_none());
+    }
+}

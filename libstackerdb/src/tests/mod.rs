@@ -20,6 +20,7 @@ use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLE
 use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::MessageSignature;
+use stacks_crypto::secp256k1::MessageSignatureCryptoExt as _;
 
 use crate::*;
 
@@ -45,6 +46,11 @@ fn test_stackerdb_slot_metadata_sign_verify() {
     let mut slot_metadata = chunk_data.get_slot_metadata();
     slot_metadata.sign(&pk).unwrap();
 
+    assert!(slot_metadata.verify(&addr).unwrap());
+
+    // succeeds with high-S signature (that's not necessarily good, but
+    // since this has always worked, it can't just stop)
+    slot_metadata.signature = slot_metadata.signature.with_negated_s();
     assert!(slot_metadata.verify(&addr).unwrap());
 
     // fails with wrong address

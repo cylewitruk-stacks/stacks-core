@@ -192,45 +192,6 @@ mod test {
     use clarity::vm::representations::{ClarityName, ContractName, CONTRACT_MAX_NAME_LENGTH};
 
     use super::*;
-    use crate::net::codec::test::check_codec_and_corruption;
-
-    #[test]
-    fn tx_stacks_strings_codec() {
-        let s = "hello-world";
-        let stacks_str = StacksString::from_str(s).unwrap();
-        let clarity_str = ClarityName::try_from(s).unwrap();
-        let contract_str = ContractName::try_from(s).unwrap();
-
-        assert_eq!(stacks_str[..], s.as_bytes().to_vec()[..]);
-        let s2 = stacks_str.to_string();
-        assert_eq!(s2, s.to_string());
-
-        // stacks strings have a 4-byte length prefix
-        let mut b = vec![];
-        stacks_str.consensus_serialize(&mut b).unwrap();
-        let mut bytes = vec![0x00, 0x00, 0x00, s.len() as u8];
-        bytes.extend_from_slice(s.as_bytes());
-
-        check_codec_and_corruption::<StacksString>(&stacks_str, &bytes);
-
-        // clarity names and contract names have a 1-byte length prefix
-        let mut clarity_bytes = vec![s.len() as u8];
-        clarity_bytes.extend_from_slice(clarity_str.as_bytes());
-        check_codec_and_corruption::<ClarityName>(&clarity_str, &clarity_bytes);
-
-        let mut contract_bytes = vec![s.len() as u8];
-        contract_bytes.extend_from_slice(contract_str.as_bytes());
-        check_codec_and_corruption::<ContractName>(&contract_str, &contract_bytes);
-    }
-
-    #[test]
-    fn tx_stacks_string_invalid() {
-        let s = "hello\rworld";
-        assert!(StacksString::from_str(s).is_none());
-
-        let s = "hello\x01world";
-        assert!(StacksString::from_str(s).is_none());
-    }
 
     #[test]
     fn test_contract_name_invalid() {
@@ -245,6 +206,40 @@ mod test {
         s_payload.extend_from_slice(&s_body);
 
         assert!(ContractName::consensus_deserialize(&mut &s_payload[..]).is_err());
+    }
+
+    #[test]
+    fn stacks_string_clarity_name_compatibility() {
+        let stacks_string = StacksString::try_from_str("foo-bar").unwrap();
+        assert!(ClarityName::try_from(stacks_string.to_string()).is_ok());
+
+        let stacks_string = StacksString::try_from_str("<=").unwrap();
+        let clarity_name = ClarityName::try_from(stacks_string.to_string()).unwrap();
+        let mut bytes = Vec::new();
+        clarity_name.consensus_serialize(&mut bytes).unwrap();
+        assert_eq!(bytes, b"\x02<=");
+    }
+
+    #[test]
+    fn stacks_string_rejects_invalid_clarity_names_at_domain_boundary() {
+        for value in ["not a name", "a.b", "", "1abc"] {
+            let stacks_string = StacksString::try_from_str(value).unwrap();
+            assert!(ClarityName::try_from(stacks_string.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn clarity_name_converts_to_stacks_string_explicitly() {
+        let clarity_name = ClarityName::try_from("hello-world").unwrap();
+        let stacks_string = StacksString::try_from_str(clarity_name.as_str()).unwrap();
+        assert_eq!(stacks_string.to_string(), "hello-world");
+    }
+
+    #[test]
+    fn contract_name_converts_to_stacks_string_explicitly() {
+        let contract_name = ContractName::try_from("hello-world").unwrap();
+        let stacks_string = StacksString::try_from_str(contract_name.as_str()).unwrap();
+        assert_eq!(stacks_string.to_string(), "hello-world");
     }
 
     #[test]

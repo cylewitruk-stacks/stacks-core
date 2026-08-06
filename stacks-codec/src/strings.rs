@@ -46,3 +46,32 @@ impl StacksMessageCodec for StacksString {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stacks_string_codec() {
+        let value = StacksString::try_from_str("hello-world").unwrap();
+        let expected = b"\0\0\0\x0bhello-world";
+
+        assert_eq!(value.serialize_to_vec(), expected);
+        assert_eq!(
+            StacksString::consensus_deserialize(&mut &expected[..]).unwrap(),
+            value
+        );
+
+        for end in 0..expected.len() {
+            assert!(StacksString::consensus_deserialize(&mut &expected[..end]).is_err());
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_non_printable_bytes() {
+        let bytes = b"\0\0\0\x05a\x01bcd";
+        let err = StacksString::consensus_deserialize(&mut &bytes[..]).unwrap_err();
+        assert!(matches!(err, codec_error::DeserializeError(_)));
+        assert!(err.to_string().contains("non-printable"));
+    }
+}

@@ -178,9 +178,11 @@ pub const PEER_VERSION_EPOCH_3_1: u8 = 0x0c;
 pub const PEER_VERSION_EPOCH_3_2: u8 = 0x0d;
 pub const PEER_VERSION_EPOCH_3_3: u8 = 0x0e;
 pub const PEER_VERSION_EPOCH_3_4: u8 = 0x0f;
+pub const PEER_VERSION_EPOCH_4_0: u8 = 0x10;
+pub const PEER_VERSION_EPOCH_4_1: u8 = 0x11;
 
 /// Latest epoch marker advertised in the P2P peer version.
-pub const PEER_NETWORK_EPOCH: u32 = PEER_VERSION_EPOCH_3_4 as u32;
+pub const PEER_NETWORK_EPOCH: u32 = PEER_VERSION_EPOCH_4_0 as u32;
 
 /// Peer versions advertised on mainnet and testnet-compatible networks.
 pub const PEER_VERSION_MAINNET: u32 = PEER_VERSION_MAINNET_MAJOR | PEER_NETWORK_EPOCH;
@@ -200,6 +202,8 @@ const PEER_VERSION_BY_EPOCH: &[(StacksEpochId, u8)] = &[
     (StacksEpochId::Epoch32, PEER_VERSION_EPOCH_3_2),
     (StacksEpochId::Epoch33, PEER_VERSION_EPOCH_3_3),
     (StacksEpochId::Epoch34, PEER_VERSION_EPOCH_3_4),
+    (StacksEpochId::Epoch40, PEER_VERSION_EPOCH_4_0),
+    (StacksEpochId::Epoch41, PEER_VERSION_EPOCH_4_1),
 ];
 
 pub trait EpochPeerVersion {

@@ -13,6 +13,8 @@ pub use block::{
     StacksMicroblockHeader, StacksWorkScore, TenureBlockId, TrieHash,
 };
 pub use epoch::StacksEpochId;
+#[cfg(any(test, feature = "testing"))]
+pub use epoch::StacksEpochRangeTestExt;
 pub use hash::{
     DoubleSha256, Hash160, Keccak256Hash, Sha256Sum, Sha512Sum, Sha512Trunc256Sum, Txid,
 };

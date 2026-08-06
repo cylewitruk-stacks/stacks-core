@@ -21,4 +21,5 @@ serde = { workspace = true, features = ["derive"] }
 
 [features]
 default = []
-testing = []
+testing = ["stacks-primitives/testing"]
+wasm-web = ["stacks-primitives/wasm-web"]

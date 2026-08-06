@@ -3,13 +3,14 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use stacks_primitives::block::{ConsensusHash, StacksBlockId};
 use stacks_primitives::hash::Hash160;
+use variant_count::VariantCount;
 
 /// Cause of change in mining tenure
 /// Depending on cause, tenure can be ended or extended
 /// NB: `PartialEq` is _not_ implemented for this enum in order to ensure that callers use the
 /// instance methods to ascertain what kind of tenure change this is.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, VariantCount)]
 pub enum TenureChangeCause {
     /// A valid winning block-commit
     BlockFound = 0,
@@ -57,6 +58,16 @@ impl TryFrom<u8> for TenureChangeCause {
 }
 
 impl TenureChangeCause {
+    pub const ALL: &'static [TenureChangeCause] = &[
+        TenureChangeCause::BlockFound,
+        TenureChangeCause::Extended,
+        TenureChangeCause::ExtendedRuntime,
+        TenureChangeCause::ExtendedReadCount,
+        TenureChangeCause::ExtendedReadLength,
+        TenureChangeCause::ExtendedWriteCount,
+        TenureChangeCause::ExtendedWriteLength,
+    ];
+
     /// Does this tenure change cause require a sortition to be valid?
     pub fn expects_sortition(&self) -> bool {
         match self {
@@ -125,6 +136,8 @@ impl TenureChangeCause {
         }
     }
 }
+
+const _: () = assert!(TenureChangeCause::ALL.len() == TenureChangeCause::VARIANT_COUNT);
 
 /// Reasons why a `TenureChange` transaction can be bad
 pub enum TenureChangeError {

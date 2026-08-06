@@ -2,7 +2,7 @@ use stacks_p2p::{
     PEER_VERSION_EPOCH_1_0, PEER_VERSION_EPOCH_2_0, PEER_VERSION_EPOCH_2_1, PEER_VERSION_EPOCH_2_2,
     PEER_VERSION_EPOCH_2_3, PEER_VERSION_EPOCH_2_4, PEER_VERSION_EPOCH_2_05,
     PEER_VERSION_EPOCH_2_5, PEER_VERSION_EPOCH_3_0, PEER_VERSION_EPOCH_3_1, PEER_VERSION_EPOCH_3_2,
-    PEER_VERSION_EPOCH_3_3, PEER_VERSION_EPOCH_3_4,
+    PEER_VERSION_EPOCH_3_3, PEER_VERSION_EPOCH_3_4, PEER_VERSION_EPOCH_4_0, PEER_VERSION_EPOCH_4_1,
 };
 use stacks_primitives::StacksEpochId;
 use stacks_primitives::network::Mainnet;
@@ -21,6 +21,7 @@ impl AddressNetwork for Mainnet {
 
 // TODO: TO BE SET BY STACKS_V1_MINER_THRESHOLD
 pub const BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT: u64 = 666_050;
+pub const BITCOIN_MAINNET_GENESIS_BURN_HEIGHT: u64 = BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT;
 pub const BITCOIN_MAINNET_FIRST_BLOCK_TIMESTAMP: u32 = 1_610_643_248;
 pub const BITCOIN_MAINNET_FIRST_BLOCK_HASH: &str =
     "0000000000000000000ab248c8e35c574514d052a83dbc12669e19bc43df486e";
@@ -45,6 +46,10 @@ pub const BITCOIN_MAINNET_STACKS_32_BURN_HEIGHT: u64 = 907_740;
 pub const BITCOIN_MAINNET_STACKS_33_BURN_HEIGHT: u64 = 923_222;
 /// This is Epoch-3.4, activation timing proposed in SIP-039
 pub const BITCOIN_MAINNET_STACKS_34_BURN_HEIGHT: u64 = 943_333;
+/// This is Epoch-4.0, activation timing proposed in SIP-045.
+pub const BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT: u64 = 960_230;
+/// Epoch 4.1 has no activation height yet.
+pub const BITCOIN_MAINNET_STACKS_41_BURN_HEIGHT: u64 = i64::MAX as u64;
 
 pub fn epoch_schedule<L: Clone>(
     limits: &EpochScheduleLimits<L>,
@@ -138,9 +143,23 @@ pub fn epoch_schedule<L: Clone>(
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch34,
             start_height: BITCOIN_MAINNET_STACKS_34_BURN_HEIGHT,
-            end_height: stacks_epoch_max,
+            end_height: BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT,
             block_limit: limits.mainnet_21.clone(),
             network_epoch: PEER_VERSION_EPOCH_3_4,
+        },
+        StacksEpoch {
+            epoch_id: StacksEpochId::Epoch40,
+            start_height: BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT,
+            end_height: BITCOIN_MAINNET_STACKS_41_BURN_HEIGHT,
+            block_limit: limits.mainnet_40.clone(),
+            network_epoch: PEER_VERSION_EPOCH_4_0,
+        },
+        StacksEpoch {
+            epoch_id: StacksEpochId::Epoch41,
+            start_height: BITCOIN_MAINNET_STACKS_41_BURN_HEIGHT,
+            end_height: stacks_epoch_max,
+            block_limit: limits.mainnet_40.clone(),
+            network_epoch: PEER_VERSION_EPOCH_4_1,
         },
     ])
 }

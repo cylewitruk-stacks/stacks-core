@@ -40,6 +40,13 @@ impl fmt::Display for AuthError {
 
 impl error::Error for AuthError {}
 
+/// Selects whether transaction signature verification enforces normalized low-S signatures.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum TransactionAuthVerificationMode {
+    EnforceLowS,
+    AllowHighS,
+}
+
 pub trait DeriveSpendingCondition {
     fn singlesig_p2pkh(pubkey: Secp256k1PublicKey) -> Option<TransactionSpendingCondition>;
     fn singlesig_p2wpkh(pubkey: Secp256k1PublicKey) -> Option<TransactionSpendingCondition>;
@@ -203,8 +210,11 @@ impl RecoverAuthFieldPublicKey for TransactionAuthField {
         match self {
             TransactionAuthField::PublicKey(pubk) => decode_public_key(pubk),
             TransactionAuthField::Signature(key_fmt, sig) => {
-                let mut pubk = Secp256k1PublicKey::recover_to_pubkey(sighash_bytes, sig)
-                    .map_err(|e| AuthError::VerifyingError(e.to_string()))?;
+                let mut pubk = Secp256k1PublicKey::recover_to_pubkey_without_validating_low_s(
+                    sighash_bytes,
+                    sig,
+                )
+                .map_err(|e| AuthError::VerifyingError(e.to_string()))?;
                 pubk.set_compressed(*key_fmt == TransactionPublicKeyEncoding::Compressed);
                 Ok(pubk)
             }
@@ -291,11 +301,22 @@ pub fn next_verification(
     nonce: u64,
     key_encoding: &TransactionPublicKeyEncoding,
     sig: &MessageSignature,
+    mode: TransactionAuthVerificationMode,
 ) -> Result<(Secp256k1PublicKey, Txid), AuthError> {
     let sighash_presign = make_sighash_presign(cur_sighash, cond_code, tx_fee, nonce);
 
-    let mut pubk = Secp256k1PublicKey::recover_to_pubkey(sighash_presign.as_bytes(), sig)
-        .map_err(|ve| AuthError::VerifyingError(ve.to_string()))?;
+    let pubk = match mode {
+        TransactionAuthVerificationMode::EnforceLowS => {
+            Secp256k1PublicKey::recover_to_pubkey(sighash_presign.as_bytes(), sig)
+        }
+        TransactionAuthVerificationMode::AllowHighS => {
+            Secp256k1PublicKey::recover_to_pubkey_without_validating_low_s(
+                sighash_presign.as_bytes(),
+                sig,
+            )
+        }
+    };
+    let mut pubk = pubk.map_err(|ve| AuthError::VerifyingError(ve.to_string()))?;
 
     match key_encoding {
         TransactionPublicKeyEncoding::Compressed => pubk.set_compressed(true),
@@ -311,6 +332,7 @@ pub trait VerifySpendingConditionSignatures {
         &self,
         initial_sighash: &Txid,
         cond_code: &TransactionAuthFlags,
+        mode: TransactionAuthVerificationMode,
     ) -> Result<Txid, AuthError>;
 }
 
@@ -319,16 +341,17 @@ impl VerifySpendingConditionSignatures for TransactionSpendingCondition {
         &self,
         initial_sighash: &Txid,
         cond_code: &TransactionAuthFlags,
+        mode: TransactionAuthVerificationMode,
     ) -> Result<Txid, AuthError> {
         match self {
             TransactionSpendingCondition::Singlesig(data) => {
-                verify_singlesig(data, initial_sighash, cond_code)
+                verify_singlesig(data, initial_sighash, cond_code, mode)
             }
             TransactionSpendingCondition::Multisig(data) => {
-                verify_multisig(data, initial_sighash, cond_code)
+                verify_multisig(data, initial_sighash, cond_code, mode)
             }
             TransactionSpendingCondition::OrderIndependentMultisig(data) => {
-                verify_order_independent_multisig(data, initial_sighash, cond_code)
+                verify_order_independent_multisig(data, initial_sighash, cond_code, mode)
             }
         }
     }
@@ -338,6 +361,7 @@ fn verify_singlesig(
     condition: &SinglesigSpendingCondition,
     initial_sighash: &Txid,
     cond_code: &TransactionAuthFlags,
+    mode: TransactionAuthVerificationMode,
 ) -> Result<Txid, AuthError> {
     let (pubkey, next_sighash) = next_verification(
         initial_sighash,
@@ -346,6 +370,7 @@ fn verify_singlesig(
         condition.nonce,
         &condition.key_encoding,
         &condition.signature,
+        mode,
     )?;
 
     let signer =
@@ -368,6 +393,7 @@ fn verify_multisig(
     condition: &MultisigSpendingCondition,
     initial_sighash: &Txid,
     cond_code: &TransactionAuthFlags,
+    mode: TransactionAuthVerificationMode,
 ) -> Result<Txid, AuthError> {
     let mut pubkeys = vec![];
     let mut cur_sighash = initial_sighash.clone();
@@ -393,6 +419,7 @@ fn verify_multisig(
                     condition.nonce,
                     pubkey_encoding,
                     sigbuf,
+                    mode,
                 )?;
                 cur_sighash = next_sighash;
                 num_sigs = num_sigs
@@ -430,6 +457,7 @@ fn verify_order_independent_multisig(
     condition: &OrderIndependentMultisigSpendingCondition,
     initial_sighash: &Txid,
     cond_code: &TransactionAuthFlags,
+    mode: TransactionAuthVerificationMode,
 ) -> Result<Txid, AuthError> {
     let mut pubkeys = vec![];
     let mut num_sigs: u16 = 0;
@@ -454,6 +482,7 @@ fn verify_order_independent_multisig(
                     condition.nonce,
                     pubkey_encoding,
                     sigbuf,
+                    mode,
                 )?;
                 num_sigs = num_sigs
                     .checked_add(1)
@@ -526,10 +555,10 @@ where
     }
 
     match hash_mode {
-        AddressHashMode::SerializeP2PKH | AddressHashMode::SerializeP2WPKH => {
-            if signatures_required != 1 || pubkeys.len() != 1 {
-                return None;
-            }
+        AddressHashMode::SerializeP2PKH | AddressHashMode::SerializeP2WPKH
+            if (signatures_required != 1 || pubkeys.len() != 1) =>
+        {
+            return None;
         }
         _ => {}
     }
@@ -618,4 +647,46 @@ where
 
 fn push_bytes(bytes: Vec<u8>) -> PushBytesBuf {
     PushBytesBuf::try_from(bytes).expect("public key bytes should fit in a Bitcoin push")
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use stacks_crypto::secp256k1::MessageSignatureCryptoExt as _;
+
+    use super::*;
+
+    #[test]
+    fn high_s_verification_is_selected_by_mode() {
+        let private_key = Secp256k1PrivateKey::from_seed(&[7; 32]);
+        let initial_sighash = Txid([3; 32]);
+        let auth_flag = TransactionAuthFlags::AuthStandard;
+        let (signature, _) = next_signature(&initial_sighash, &auth_flag, 10, 11, &private_key)
+            .expect("signature generation should succeed");
+        let high_s_signature = signature.with_negated_s();
+
+        assert!(
+            next_verification(
+                &initial_sighash,
+                &auth_flag,
+                10,
+                11,
+                &TransactionPublicKeyEncoding::Compressed,
+                &high_s_signature,
+                TransactionAuthVerificationMode::EnforceLowS,
+            )
+            .is_err()
+        );
+        assert!(
+            next_verification(
+                &initial_sighash,
+                &auth_flag,
+                10,
+                11,
+                &TransactionPublicKeyEncoding::Compressed,
+                &high_s_signature,
+                TransactionAuthVerificationMode::AllowHighS,
+            )
+            .is_ok()
+        );
+    }
 }

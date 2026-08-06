@@ -6,8 +6,10 @@ use stacks_codec::{
     BoundReader, Error as CodecError, MAX_MESSAGE_LEN, StacksMessageCodec,
     impl_byte_array_message_codec, read_next, write_next,
 };
+use stacks_crypto::hash::TxidDigest as _;
 use stacks_crypto::secp256k1::Secp256k1PublicKey;
 use stacks_primitives::block::StacksMicroblockHeader;
+use stacks_primitives::hash::Txid;
 use stacks_primitives::secp256k1::{COMPRESSED_PUBLIC_KEY_ENCODED_SIZE, Secp256k1PublicKeyBytes};
 use stacks_primitives::vrf::VRFProof;
 
@@ -22,7 +24,7 @@ use crate::payload::{
 };
 use crate::post_condition::{
     AssetInfo, AssetInfoID, FungibleConditionCode, NonfungibleConditionCode,
-    PostConditionPrincipal, PostConditionPrincipalID, TransactionPostCondition,
+    PostConditionPrincipal, PostConditionPrincipalID, PoxConditionCode, TransactionPostCondition,
 };
 use crate::spend_condition::{
     MultisigHashMode, MultisigSpendingCondition, OrderIndependentMultisigHashMode,
@@ -34,6 +36,7 @@ use crate::transaction::{
     MAX_TRANSACTION_LEN, StacksTransaction, TransactionAnchorMode, TransactionPostConditionMode,
     TransactionVersion,
 };
+use crate::{AuthError, TransactionAuthVerificationMode};
 
 impl_byte_array_message_codec!(CoinbasePayload, 32);
 impl_byte_array_message_codec!(TokenTransferMemo, 34);
@@ -519,6 +522,17 @@ impl StacksMessageCodec for TransactionPostCondition {
                 write_next(fd, asset_value)?;
                 write_next(fd, &(*condition as u8))
             }
+            TransactionPostCondition::Staking(principal, condition, amount) => {
+                write_next(fd, &(AssetInfoID::Staking as u8))?;
+                write_next(fd, principal)?;
+                write_next(fd, &(*condition as u8))?;
+                write_next(fd, amount)
+            }
+            TransactionPostCondition::Pox(principal, condition) => {
+                write_next(fd, &(AssetInfoID::Pox as u8))?;
+                write_next(fd, principal)?;
+                write_next(fd, &(*condition as u8))
+            }
         }
     }
 
@@ -572,6 +586,30 @@ impl StacksMessageCodec for TransactionPostCondition {
                     asset_value,
                     condition,
                 ))
+            }
+            Some(AssetInfoID::Staking) => {
+                let principal = read_next(fd)?;
+                let condition_u8 = read_next(fd)?;
+                let condition = FungibleConditionCode::from_u8(condition_u8).ok_or_else(|| {
+                    CodecError::DeserializeError(format!(
+                        "Failed to parse staking post-condition: unknown condition code {condition_u8}"
+                    ))
+                })?;
+                Ok(TransactionPostCondition::Staking(
+                    principal,
+                    condition,
+                    read_next(fd)?,
+                ))
+            }
+            Some(AssetInfoID::Pox) => {
+                let principal = read_next(fd)?;
+                let condition_u8 = read_next(fd)?;
+                let condition = PoxConditionCode::from_u8(condition_u8).ok_or_else(|| {
+                    CodecError::DeserializeError(format!(
+                        "Failed to parse PoX post-condition: unknown condition code {condition_u8}"
+                    ))
+                })?;
+                Ok(TransactionPostCondition::Pox(principal, condition))
             }
             None => Err(CodecError::DeserializeError(format!(
                 "Failed to parse post-condition: unknown asset info ID {asset_info_id}"
@@ -733,6 +771,7 @@ fn clarity_version_consensus_serialize<W: Write>(
         ClarityVersion::Clarity3 => write_next(fd, &3u8),
         ClarityVersion::Clarity4 => write_next(fd, &4u8),
         ClarityVersion::Clarity5 => write_next(fd, &5u8),
+        ClarityVersion::Clarity6 => write_next(fd, &6u8),
     }
 }
 
@@ -746,6 +785,7 @@ fn clarity_version_consensus_deserialize<R: Read>(
         3 => Ok(ClarityVersion::Clarity3),
         4 => Ok(ClarityVersion::Clarity4),
         5 => Ok(ClarityVersion::Clarity5),
+        6 => Ok(ClarityVersion::Clarity6),
         _ => Err(CodecError::DeserializeError(format!(
             "Failed to parse clarity version: {version_byte}"
         ))),
@@ -769,6 +809,31 @@ impl StacksMessageCodec for StacksTransaction {
 }
 
 impl StacksTransaction {
+    pub fn txid(&self) -> Txid {
+        let mut bytes = Vec::new();
+        self.consensus_serialize(&mut bytes)
+            .expect("BUG: failed to serialize transaction");
+        Txid::from_stacks_tx(&bytes)
+    }
+
+    pub fn sign_begin(&self) -> Txid {
+        let mut tx = self.clone();
+        tx.auth = tx.auth.into_initial_sighash_auth();
+        tx.txid()
+    }
+
+    pub fn verify_begin(&self) -> Txid {
+        self.sign_begin()
+    }
+
+    pub fn verify(&self, mode: TransactionAuthVerificationMode) -> Result<(), AuthError> {
+        self.auth.verify(&self.verify_begin(), mode)
+    }
+
+    pub fn verify_origin(&self, mode: TransactionAuthVerificationMode) -> Result<Txid, AuthError> {
+        self.auth.verify_origin(&self.verify_begin(), mode)
+    }
+
     pub fn consensus_deserialize_with_len<R: Read>(
         fd: &mut R,
     ) -> Result<(StacksTransaction, u64), CodecError> {
@@ -833,5 +898,49 @@ impl StacksTransaction {
         let mut bytes = Vec::new();
         self.consensus_serialize(&mut bytes)?;
         Ok(bytes.len() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check_roundtrip(post_condition: TransactionPostCondition, expected: &[u8]) {
+        assert_eq!(post_condition.serialize_to_vec(), expected);
+        let mut bytes = expected;
+        assert_eq!(
+            TransactionPostCondition::consensus_deserialize(&mut bytes).unwrap(),
+            post_condition
+        );
+    }
+
+    #[test]
+    fn epoch_40_post_condition_codec() {
+        let mut staking = vec![
+            AssetInfoID::Staking as u8,
+            PostConditionPrincipalID::Origin as u8,
+            FungibleConditionCode::SentEq as u8,
+        ];
+        staking.extend_from_slice(&123_u64.to_be_bytes());
+        check_roundtrip(
+            TransactionPostCondition::Staking(
+                PostConditionPrincipal::Origin,
+                FungibleConditionCode::SentEq,
+                123,
+            ),
+            &staking,
+        );
+
+        check_roundtrip(
+            TransactionPostCondition::Pox(
+                PostConditionPrincipal::Origin,
+                PoxConditionCode::NotPerformed,
+            ),
+            &[
+                AssetInfoID::Pox as u8,
+                PostConditionPrincipalID::Origin as u8,
+                PoxConditionCode::NotPerformed as u8,
+            ],
+        );
     }
 }

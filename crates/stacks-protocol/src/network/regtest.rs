@@ -2,7 +2,7 @@ use stacks_p2p::{
     PEER_VERSION_EPOCH_1_0, PEER_VERSION_EPOCH_2_0, PEER_VERSION_EPOCH_2_1, PEER_VERSION_EPOCH_2_2,
     PEER_VERSION_EPOCH_2_3, PEER_VERSION_EPOCH_2_4, PEER_VERSION_EPOCH_2_05,
     PEER_VERSION_EPOCH_2_5, PEER_VERSION_EPOCH_3_0, PEER_VERSION_EPOCH_3_1, PEER_VERSION_EPOCH_3_2,
-    PEER_VERSION_EPOCH_3_3, PEER_VERSION_EPOCH_3_4,
+    PEER_VERSION_EPOCH_3_3, PEER_VERSION_EPOCH_3_4, PEER_VERSION_EPOCH_4_0, PEER_VERSION_EPOCH_4_1,
 };
 use stacks_primitives::StacksEpochId;
 use stacks_primitives::network::Regtest;
@@ -116,9 +116,23 @@ pub fn epoch_schedule<L: Clone>(
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch34,
             start_height: 11001,
-            end_height: stacks_epoch_max,
+            end_height: 12001,
             block_limit: limits.mainnet_21.clone(),
             network_epoch: PEER_VERSION_EPOCH_3_4,
+        },
+        StacksEpoch {
+            epoch_id: StacksEpochId::Epoch40,
+            start_height: 12001,
+            end_height: 13001,
+            block_limit: limits.mainnet_40.clone(),
+            network_epoch: PEER_VERSION_EPOCH_4_0,
+        },
+        StacksEpoch {
+            epoch_id: StacksEpochId::Epoch41,
+            start_height: 13001,
+            end_height: stacks_epoch_max,
+            block_limit: limits.mainnet_40.clone(),
+            network_epoch: PEER_VERSION_EPOCH_4_1,
         },
     ])
 }

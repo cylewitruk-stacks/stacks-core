@@ -13,6 +13,7 @@ use crate::tenure::TenureChangePayload;
 
 /// Max size of a serialized Stacks transaction.
 pub const MAX_TRANSACTION_LEN: u32 = stacks_primitives::block::MAX_BLOCK_LEN;
+pub const MIN_TRANSACTION_LEN: u32 = 180;
 
 /// Stacks transaction versions.
 #[repr(u8)]
@@ -195,5 +196,80 @@ impl StacksTransaction {
             &self.payload,
             TransactionPayload::TokenTransfer(address, 0, _) if *address == boot_address
         )
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_negated_s_in_signature(&self) -> StacksTransaction {
+        high_s::tx_with_negated_s_in_signature(self)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+mod high_s {
+    use stacks_crypto::secp256k1::MessageSignatureCryptoExt as _;
+
+    use crate::{
+        StacksTransaction, TransactionAuth, TransactionAuthField, TransactionSpendingCondition,
+    };
+
+    fn auth_fields_with_negated_s_signature(
+        fields: Vec<TransactionAuthField>,
+    ) -> Vec<TransactionAuthField> {
+        let mut handled_one = false;
+        let mut result: Vec<_> = fields
+            .iter()
+            .rev()
+            .map(|field| {
+                if handled_one {
+                    return field.clone();
+                }
+                match field {
+                    TransactionAuthField::PublicKey(_) => field.clone(),
+                    TransactionAuthField::Signature(encoding, signature) => {
+                        handled_one = true;
+                        TransactionAuthField::Signature(*encoding, signature.with_negated_s())
+                    }
+                }
+            })
+            .collect();
+        result.reverse();
+        result
+    }
+
+    fn spending_condition_with_negated_s_signature(
+        condition: &TransactionSpendingCondition,
+    ) -> TransactionSpendingCondition {
+        match condition {
+            TransactionSpendingCondition::Singlesig(condition) => {
+                let mut condition = condition.clone();
+                condition.signature = condition.signature.with_negated_s();
+                TransactionSpendingCondition::Singlesig(condition)
+            }
+            TransactionSpendingCondition::Multisig(condition) => {
+                let mut condition = condition.clone();
+                condition.fields = auth_fields_with_negated_s_signature(condition.fields);
+                TransactionSpendingCondition::Multisig(condition)
+            }
+            TransactionSpendingCondition::OrderIndependentMultisig(condition) => {
+                let mut condition = condition.clone();
+                condition.fields = auth_fields_with_negated_s_signature(condition.fields);
+                TransactionSpendingCondition::OrderIndependentMultisig(condition)
+            }
+        }
+    }
+
+    pub fn tx_with_negated_s_in_signature(tx: &StacksTransaction) -> StacksTransaction {
+        let auth = match tx.auth() {
+            TransactionAuth::Standard(condition) => {
+                TransactionAuth::Standard(spending_condition_with_negated_s_signature(condition))
+            }
+            TransactionAuth::Sponsored(origin, sponsor) => TransactionAuth::Sponsored(
+                origin.clone(),
+                spending_condition_with_negated_s_signature(sponsor),
+            ),
+        };
+        let mut result = tx.clone();
+        result.auth = auth;
+        result
     }
 }

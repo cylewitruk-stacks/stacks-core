@@ -72,6 +72,9 @@ impl<L: Clone> EpochList<L> {
         if let Some(index) = StacksEpoch::find_epoch_by_id(&self.0, epoch_id) {
             self.0.truncate(index + 1);
         }
+        if let Some(epoch) = self.0.last_mut() {
+            epoch.end_height = i64::MAX as u64;
+        }
     }
 
     pub fn epoch_id_at_height(&self, height: u64) -> Option<StacksEpochId> {

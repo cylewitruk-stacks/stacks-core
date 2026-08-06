@@ -28,7 +28,7 @@ use stacks_common::util::hash::{to_hex, Hash160};
 
 use super::TestRPC;
 use crate::burnchains::Txid;
-use crate::chainstate::stacks::db::test::{chainstate_path, instantiate_chainstate};
+use crate::chainstate::stacks::db::testing::{chainstate_path, TestChainstateBuilder};
 use crate::chainstate::stacks::{
     StacksTransaction, TokenTransferMemo, TransactionAnchorMode, TransactionAuth,
     TransactionPayload, TransactionPostConditionMode, TransactionVersion,
@@ -119,7 +119,7 @@ fn test_try_make_response() {
 
 #[test]
 fn test_stream_mempool_txs() {
-    let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
+    let mut chainstate = TestChainstateBuilder::new_testnet(function_name!()).build();
     let chainstate_path = chainstate_path(function_name!());
     let mut mempool = MemPoolDB::open_test(false, 0x80000000, &chainstate_path).unwrap();
 
@@ -364,7 +364,7 @@ fn test_decode_tx_stream() {
 
     // valid empty tx stream
     let empty_stream = [0x11u8; 32];
-    let (next_txs, next_page) = decode_tx_stream(&mut empty_stream.as_ref()).unwrap();
+    let (next_txs, next_page) = decode_tx_stream(&mut &empty_stream[..]).unwrap();
     assert!(next_txs.is_empty());
     assert_eq!(next_page, Some(Txid([0x11; 32])));
 
@@ -389,7 +389,7 @@ fn test_decode_tx_stream() {
 
     // garbage tx stream
     let garbage_stream = [0xff; 256];
-    let err = decode_tx_stream(&mut garbage_stream.as_ref());
+    let err = decode_tx_stream(&mut &garbage_stream[..]);
     assert!(
         matches!(err, Err(NetError::ExpectedEndOfStream)),
         "did not fail with correct error"
@@ -397,7 +397,7 @@ fn test_decode_tx_stream() {
 
     // tx stream that is too short
     let short_stream = [0x33u8; 33];
-    let err = decode_tx_stream(&mut short_stream.as_ref());
+    let err = decode_tx_stream(&mut &short_stream[..]);
     assert!(
         matches!(err, Err(NetError::ExpectedEndOfStream)),
         "did not fail with correct error"

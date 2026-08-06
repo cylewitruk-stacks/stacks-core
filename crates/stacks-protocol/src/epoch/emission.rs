@@ -2,6 +2,11 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::network::{
+    BITCOIN_MAINNET_GENESIS_BURN_HEIGHT, BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT,
+    BITCOIN_TESTNET_GENESIS_BURN_HEIGHT, BITCOIN_TESTNET_STACKS_40_BURN_HEIGHT,
+};
+
 pub const MICROSTACKS_PER_STACKS: u32 = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -10,7 +15,7 @@ pub struct CoinbaseInterval {
     pub effective_start_height: u64,
 }
 
-pub static COINBASE_INTERVALS_MAINNET: LazyLock<[CoinbaseInterval; 5]> = LazyLock::new(|| {
+pub static COINBASE_INTERVALS_MAINNET: LazyLock<[CoinbaseInterval; 3]> = LazyLock::new(|| {
     let emissions_schedule = [
         CoinbaseInterval {
             coinbase: 1_000 * u128::from(MICROSTACKS_PER_STACKS),
@@ -21,23 +26,16 @@ pub static COINBASE_INTERVALS_MAINNET: LazyLock<[CoinbaseInterval; 5]> = LazyLoc
             effective_start_height: 278_950,
         },
         CoinbaseInterval {
-            coinbase: 250 * u128::from(MICROSTACKS_PER_STACKS),
-            effective_start_height: 383_950,
-        },
-        CoinbaseInterval {
-            coinbase: 125 * u128::from(MICROSTACKS_PER_STACKS),
-            effective_start_height: 593_950,
-        },
-        CoinbaseInterval {
-            coinbase: (625 * u128::from(MICROSTACKS_PER_STACKS)) / 10,
-            effective_start_height: 803_950,
+            coinbase: 1_000 * u128::from(MICROSTACKS_PER_STACKS),
+            effective_start_height: BITCOIN_MAINNET_STACKS_40_BURN_HEIGHT
+                - BITCOIN_MAINNET_GENESIS_BURN_HEIGHT,
         },
     ];
     assert!(CoinbaseInterval::check_order(&emissions_schedule));
     emissions_schedule
 });
 
-pub static COINBASE_INTERVALS_TESTNET: LazyLock<[CoinbaseInterval; 5]> = LazyLock::new(|| {
+pub static COINBASE_INTERVALS_TESTNET: LazyLock<[CoinbaseInterval; 6]> = LazyLock::new(|| {
     let emissions_schedule = [
         CoinbaseInterval {
             coinbase: 1_000 * u128::from(MICROSTACKS_PER_STACKS),
@@ -58,6 +56,11 @@ pub static COINBASE_INTERVALS_TESTNET: LazyLock<[CoinbaseInterval; 5]> = LazyLoc
         CoinbaseInterval {
             coinbase: (625 * u128::from(MICROSTACKS_PER_STACKS)) / 10,
             effective_start_height: 77_777 * 21,
+        },
+        CoinbaseInterval {
+            coinbase: 1_000 * u128::from(MICROSTACKS_PER_STACKS),
+            effective_start_height: BITCOIN_TESTNET_STACKS_40_BURN_HEIGHT
+                - BITCOIN_TESTNET_GENESIS_BURN_HEIGHT,
         },
     ];
     assert!(CoinbaseInterval::check_order(&emissions_schedule));

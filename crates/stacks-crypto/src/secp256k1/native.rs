@@ -113,6 +113,22 @@ impl Secp256k1PublicKey {
         msg: &[u8],
         sig: &MessageSignature,
     ) -> Result<Secp256k1PublicKey, &'static str> {
+        Self::recover_to_pubkey_possibly_with_low_s_verification(msg, sig, true)
+    }
+
+    /// Recover a public key while preserving the historical acceptance of high-S signatures.
+    pub fn recover_to_pubkey_without_validating_low_s(
+        msg: &[u8],
+        sig: &MessageSignature,
+    ) -> Result<Secp256k1PublicKey, &'static str> {
+        Self::recover_to_pubkey_possibly_with_low_s_verification(msg, sig, false)
+    }
+
+    fn recover_to_pubkey_possibly_with_low_s_verification(
+        msg: &[u8],
+        sig: &MessageSignature,
+        verify_low_s: bool,
+    ) -> Result<Secp256k1PublicKey, &'static str> {
         SECP256K1.with(|ctx| {
             let msg = LibSecp256k1Message::from_slice(msg).map_err(
                 |_e| "Invalid message: failed to decode data hash: must be a 32-byte hash",
@@ -120,6 +136,15 @@ impl Secp256k1PublicKey {
 
             let secp256k1_sig = message_signature_to_secp256k1_recoverable(sig)
                 .ok_or("Invalid signature: failed to decode recoverable signature")?;
+
+            if verify_low_s {
+                let standard = secp256k1_sig.to_standard();
+                let mut normalized = standard;
+                normalized.normalize_s();
+                if normalized != standard {
+                    return Err("Invalid signature: high-S");
+                }
+            }
 
             let recovered_pubkey = ctx
                 .recover_ecdsa(&msg, &secp256k1_sig)
@@ -171,11 +196,9 @@ impl VerifyingKey for Secp256k1PublicKey {
                 return Ok(false);
             }
 
-            // NOTE: libsecp256k1 _should_ ensure that the S is low,
-            // but add this check just to be safe.
+            // libsecp256k1 does not enforce low-S for recoverable signatures.
             let secp256k1_sig_standard = secp256k1_sig.to_standard();
 
-            // must be low-S
             let mut secp256k1_sig_low_s = secp256k1_sig_standard;
             secp256k1_sig_low_s.normalize_s();
             if secp256k1_sig_low_s != secp256k1_sig_standard {
@@ -352,6 +375,11 @@ pub fn secp256k1_verify(
     })
 }
 
+pub fn secp256k1_decompress(compressed_pubkey_arr: &[u8]) -> Result<[u8; 65], LibSecp256k1Error> {
+    let pubkey = LibSecp256k1PublicKey::from_slice(compressed_pubkey_arr)?;
+    Ok(pubkey.serialize_uncompressed())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -360,6 +388,7 @@ mod tests {
     use secp256k1::{self, PublicKey as LibSecp256k1PublicKey, Secp256k1};
 
     use super::*;
+    use crate::secp256k1::MessageSignatureCryptoExt as _;
 
     fn get_epoch_time_ms() -> u128 {
         SystemTime::now()
@@ -637,5 +666,52 @@ mod tests {
             runtime_recover,
             runtime_verify - runtime_recover
         );
+    }
+
+    #[test]
+    fn test_decompress() {
+        let mut sk = Secp256k1PrivateKey::random();
+        sk.set_compress_public(true);
+        let pk = Secp256k1PublicKey::from_private(&sk);
+
+        assert_eq!(pk.to_bytes().len(), 33);
+
+        let decompressed_pk = secp256k1_decompress(&pk.to_bytes()).unwrap();
+        assert_eq!(decompressed_pk.len(), 65);
+
+        sk.set_compress_public(false);
+        let pk_uncompressed = Secp256k1PublicKey::from_private(&sk);
+
+        assert_eq!(pk_uncompressed.to_bytes(), decompressed_pk);
+    }
+
+    #[test]
+    fn test_with_negated_s() {
+        let priv_key = Secp256k1PrivateKey::from_hex(
+            "7b48329a5126dad83fc583c309c2698ae2843acfb9a7023fb081d850386c6950",
+        )
+        .unwrap();
+        let pub_key = Secp256k1PublicKey::from_private(&priv_key);
+        let message =
+            const_hex::decode("77949dd27dabb40847564f40afcde8b91e0f7baf2cc710415a4ac8b777104866")
+                .unwrap();
+        let original_sig = priv_key.sign(&message).unwrap();
+        let high_s_sig = original_sig.with_negated_s();
+
+        assert_ne!(original_sig, high_s_sig);
+        assert_eq!(original_sig, high_s_sig.with_negated_s());
+
+        let (recovered_from_orig, recovered_from_high_s) = SECP256K1.with(|ctx| {
+            let msg = LibSecp256k1Message::from_slice(&message).unwrap();
+            let original = message_signature_to_secp256k1_recoverable(&original_sig).unwrap();
+            let high_s = message_signature_to_secp256k1_recoverable(&high_s_sig).unwrap();
+            (
+                ctx.recover_ecdsa(&msg, &original).unwrap(),
+                ctx.recover_ecdsa(&msg, &high_s).unwrap(),
+            )
+        });
+
+        assert_eq!(recovered_from_orig, recovered_from_high_s);
+        assert_eq!(recovered_from_high_s, pub_key.key);
     }
 }

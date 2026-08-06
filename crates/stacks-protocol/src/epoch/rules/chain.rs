@@ -16,6 +16,7 @@ pub enum MempoolCollectionBehavior {
 
 pub trait ChainEpochRules {
     fn mempool_garbage_behavior(self) -> MempoolCollectionBehavior;
+    fn enforces_strict_signature_order(self) -> bool;
     fn allows_pox_punishment(self) -> bool;
     fn block_commits_to_parent(self) -> bool;
     fn supports_shadow_blocks(self) -> bool;
@@ -29,6 +30,10 @@ pub trait ChainEpochRules {
         first_epoch30_reward_cycle: u64,
     ) -> bool;
     fn supports_sip040_post_conditions(self) -> bool;
+    fn supports_cost_voting_contract(self) -> bool;
+    fn starts_reward_cycle_at_0(self) -> bool;
+    fn supports_staking_post_conditions(self) -> bool;
+    fn allows_tx_signatures_with_high_s(self) -> bool;
 }
 
 impl ChainEpochRules for StacksEpochId {
@@ -38,6 +43,10 @@ impl ChainEpochRules for StacksEpochId {
         } else {
             MempoolCollectionBehavior::ByStacksHeight
         }
+    }
+
+    fn enforces_strict_signature_order(self) -> bool {
+        self >= StacksEpochId::Epoch40
     }
 
     fn allows_pox_punishment(self) -> bool {
@@ -82,5 +91,21 @@ impl ChainEpochRules for StacksEpochId {
 
     fn supports_sip040_post_conditions(self) -> bool {
         self >= StacksEpochId::Epoch34
+    }
+
+    fn supports_cost_voting_contract(self) -> bool {
+        self < StacksEpochId::Epoch40
+    }
+
+    fn starts_reward_cycle_at_0(self) -> bool {
+        self >= StacksEpochId::Epoch40
+    }
+
+    fn supports_staking_post_conditions(self) -> bool {
+        self >= StacksEpochId::Epoch40
+    }
+
+    fn allows_tx_signatures_with_high_s(self) -> bool {
+        self < StacksEpochId::Epoch40
     }
 }

@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
+use stacks_primitives::hash::Txid;
 
 use crate::spend_condition::TransactionSpendingCondition;
+use crate::{
+    AuthError, TransactionAuthFlags, TransactionAuthVerificationMode,
+    VerifySpendingConditionSignatures,
+};
 
 /// Types of transaction authorizations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,6 +133,29 @@ impl TransactionAuth {
         match *self {
             TransactionAuth::Standard(ref s) => s.get_tx_fee(),
             TransactionAuth::Sponsored(_, ref s) => s.get_tx_fee(),
+        }
+    }
+
+    pub fn verify_origin(
+        &self,
+        initial_sighash: &Txid,
+        mode: TransactionAuthVerificationMode,
+    ) -> Result<Txid, AuthError> {
+        self.origin()
+            .verify_signatures(initial_sighash, &TransactionAuthFlags::AuthStandard, mode)
+    }
+
+    pub fn verify(
+        &self,
+        initial_sighash: &Txid,
+        mode: TransactionAuthVerificationMode,
+    ) -> Result<(), AuthError> {
+        let origin_sighash = self.verify_origin(initial_sighash, mode)?;
+        match self {
+            TransactionAuth::Standard(_) => Ok(()),
+            TransactionAuth::Sponsored(_, sponsor) => sponsor
+                .verify_signatures(&origin_sighash, &TransactionAuthFlags::AuthSponsored, mode)
+                .map(|_| ()),
         }
     }
 
