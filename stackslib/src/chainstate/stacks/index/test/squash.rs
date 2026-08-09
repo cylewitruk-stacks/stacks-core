@@ -29,7 +29,7 @@ use crate::chainstate::stacks::index::marf::{
 };
 use crate::chainstate::stacks::index::node::{
     is_u64_ptr, set_backptr, TrieNode as _, TrieNode16, TrieNode256, TrieNode4, TrieNode48,
-    TrieNodeID, TrieNodeType, TriePtr,
+    TrieNodeID, TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::squash::{
     compute_node_hash, deserialize_node, serialize_node, stream_squash_blob, NodeStore,
@@ -966,9 +966,7 @@ fn test_compute_node_hash_matches_bits_get_node_hash() {
             TriePtr::new(TrieNodeID::Leaf as u8, b'c', 300),
             TriePtr::default(),
         ],
-        cowptr: None,
-        patch_depth: 0,
-        last_patch_source: None,
+        meta: TrieNodeTransientMeta::default(),
     };
     let node4_via_bits = get_node_hash(&node4, &child_hashes, &mut ());
     let node4_via_squash = compute_node_hash(&TrieNodeType::Node4(node4), &child_hashes);
@@ -990,9 +988,7 @@ fn make_test_node4(path: &[u8], ptrs: [TriePtr; 4]) -> TrieNodeType {
     TrieNodeType::Node4(TrieNode4 {
         path: NodePath::from_slice(path).unwrap(),
         ptrs,
-        cowptr: None,
-        patch_depth: 0,
-        last_patch_source: None,
+        meta: TrieNodeTransientMeta::default(),
     })
 }
 
@@ -1027,9 +1023,7 @@ fn test_node_store_roundtrip_all_variants() {
     let n16 = TrieNodeType::Node16(TrieNode16 {
         path: NodePath::from_slice(&[6, 7, 8]).unwrap(),
         ptrs: ptrs16,
-        cowptr: None,
-        patch_depth: 0,
-        last_patch_source: None,
+        meta: TrieNodeTransientMeta::default(),
     });
     let n16_hash = TrieHash::from_data(&[3]);
     store.push(&n16, n16_hash, 30).unwrap();
@@ -1043,9 +1037,7 @@ fn test_node_store_roundtrip_all_variants() {
         path: NodePath::from_slice(&[9, 10]).unwrap(),
         indexes: indexes48,
         ptrs: ptrs48,
-        cowptr: None,
-        patch_depth: 0,
-        last_patch_source: None,
+        meta: TrieNodeTransientMeta::default(),
     }));
     let n48_hash = TrieHash::from_data(&[4]);
     store.push(&n48, n48_hash, 40).unwrap();
@@ -1056,9 +1048,7 @@ fn test_node_store_roundtrip_all_variants() {
     let n256 = TrieNodeType::Node256(Box::new(TrieNode256 {
         path: NodePath::from_slice(&[11]).unwrap(),
         ptrs: ptrs256,
-        cowptr: None,
-        patch_depth: 0,
-        last_patch_source: None,
+        meta: TrieNodeTransientMeta::default(),
     }));
     let n256_hash = TrieHash::from_data(&[5]);
     store.push(&n256, n256_hash, 50).unwrap();
@@ -1193,9 +1183,7 @@ fn test_stream_squash_blob_mixed_node_types() {
     let root = TrieNodeType::Node16(TrieNode16 {
         path: NodePath::from_slice(&[0]).unwrap(),
         ptrs: root_ptrs,
-        cowptr: None,
-        patch_depth: 0,
-        last_patch_source: None,
+        meta: TrieNodeTransientMeta::default(),
     });
     store.push(&root, h, 0).unwrap();
 

@@ -13,6 +13,10 @@ pub struct WalkArgs {
     /// Block hash to walk (hex string, 64 chars)
     pub block_hash: String,
 
+    /// Optional parent block hash to inspect for __MARF_BLOCK_HEIGHT_SELF.
+    #[arg(long)]
+    pub parent_block_hash: Option<String>,
+
     /// MARF key to look up (default: __MARF_BLOCK_HEIGHT_SELF)
     #[arg(long, default_value = "__MARF_BLOCK_HEIGHT_SELF")]
     pub key: String,
@@ -21,17 +25,11 @@ pub struct WalkArgs {
 pub fn exec(ctx: &CliCtx, args: WalkArgs) {
     let db_path = ctx.db_path().to_str().expect("DB path must be valid UTF-8");
 
-    let block_hash = {
-        let bytes = hex_bytes(&args.block_hash).unwrap_or_else(|e| {
-            eprintln!("Invalid hex block hash '{}': {e}", args.block_hash);
-            std::process::exit(1);
-        });
-        if bytes.len() != 32 {
-            eprintln!("Block hash must be 32 bytes (64 hex chars)");
-            std::process::exit(1);
-        }
-        StacksBlockId::from_bytes(&bytes).expect("32 bytes should always work")
-    };
+    let block_hash = parse_block_hash(&args.block_hash, "block hash");
+    let parent_block_hash = args
+        .parent_block_hash
+        .as_deref()
+        .map(|hash| parse_block_hash(hash, "parent block hash"));
 
     let key = &args.key;
     let path = TrieHash::from_key(key);
@@ -44,12 +42,38 @@ pub fn exec(ctx: &CliCtx, args: WalkArgs) {
 
     // --- Test with mmap enabled ---
     println!("=== WITH MMAP ===");
-    run_walk(db_path, ctx.blobs_path().is_some(), true, &block_hash, key);
+    run_walk(
+        db_path,
+        ctx.blobs_path().is_some(),
+        true,
+        &block_hash,
+        parent_block_hash.as_ref(),
+        key,
+    );
 
     // --- Test with mmap disabled ---
     println!();
     println!("=== WITHOUT MMAP ===");
-    run_walk(db_path, ctx.blobs_path().is_some(), false, &block_hash, key);
+    run_walk(
+        db_path,
+        ctx.blobs_path().is_some(),
+        false,
+        &block_hash,
+        parent_block_hash.as_ref(),
+        key,
+    );
+}
+
+fn parse_block_hash(hash: &str, label: &str) -> StacksBlockId {
+    let bytes = hex_bytes(hash).unwrap_or_else(|e| {
+        eprintln!("Invalid hex {label} '{hash}': {e}");
+        std::process::exit(1);
+    });
+    if bytes.len() != 32 {
+        eprintln!("{label} must be 32 bytes (64 hex chars)");
+        std::process::exit(1);
+    }
+    StacksBlockId::from_bytes(&bytes).expect("32 bytes should always work")
 }
 
 fn run_walk(
@@ -57,6 +81,7 @@ fn run_walk(
     external_blobs: bool,
     mmap: bool,
     block_hash: &StacksBlockId,
+    parent_block_hash: Option<&StacksBlockId>,
     key: &str,
 ) {
     let marf_opts = MARFOpenOpts {
@@ -95,16 +120,13 @@ fn run_walk(
         Err(e) => println!("  get(\"{key}\"): Err({e:?})"),
     }
 
-    // Step 4: Check parent block
-    let parent_hash = StacksBlockId::from_bytes(
-        &hex_bytes("8b838a4c94912f96eef12c489e2ac1837cd19783b0b849dbc003d2f6eaab92c0").unwrap(),
-    )
-    .unwrap();
-    match MarfConnection::get(&mut marf, &parent_hash, OWN_BLOCK_HEIGHT_KEY) {
-        Ok(Some(val)) => println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Ok(Some({val:?}))"),
-        Ok(None) => {
-            println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Ok(None)  *** PARENT ALSO MISSING ***")
+    if let Some(parent_hash) = parent_block_hash {
+        match MarfConnection::get(&mut marf, parent_hash, OWN_BLOCK_HEIGHT_KEY) {
+            Ok(Some(val)) => println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Ok(Some({val:?}))"),
+            Ok(None) => {
+                println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Ok(None)  *** PARENT ALSO MISSING ***")
+            }
+            Err(e) => println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Err({e:?})"),
         }
-        Err(e) => println!("  Parent {OWN_BLOCK_HEIGHT_KEY}: Err({e:?})"),
     }
 }

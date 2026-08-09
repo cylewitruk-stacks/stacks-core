@@ -49,8 +49,8 @@ pub mod trie_sql;
 pub mod test;
 
 use crate::chainstate::stacks::index::node::{
-    ParkedNodeHandle, TrieLeafRef, TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeTransientMeta,
-    TrieNodeType, TriePtr,
+    clear_backptr, is_backptr, CursorError, ParkedNodeHandle, TrieCursor, TrieLeafRef, TrieNodeID,
+    TrieNodePatch, TrieNodeRef, TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 
 #[derive(Debug)]
@@ -132,8 +132,8 @@ impl NodePath {
     /// The path bytes as a slice.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // `len` is always <= 32: only set by validated paths (try_from_slice, try_set_from_slice,
-        // read_from after bits::path_from_bytes_* validates TRIEHASH_ENCODED_SIZE).
+        // `len` is always <= 32: only set by validated paths (`from_slice`, `set_from_slice`, or
+        // `read_from` after callers validate against `TRIEHASH_ENCODED_SIZE`).
         self.data
             .get(..self.len as usize)
             .expect("BUG: NodePath len invariant violated")
@@ -294,17 +294,6 @@ impl_byte_array_newtype!(MARFValue, u8, 40);
 impl_byte_array_message_codec!(MARFValue, 40);
 pub const MARF_VALUE_ENCODED_SIZE: u32 = 40;
 
-impl From<String> for MARFValue {
-    #[inline]
-    fn from(s: String) -> Self {
-        let mut hasher = TrieHasher::new();
-        hasher.update(s.as_bytes());
-        let tmp = hasher.finalize().into();
-
-        MARFValue::from_value_hash_bytes(&tmp)
-    }
-}
-
 impl From<u32> for MARFValue {
     fn from(value: u32) -> MARFValue {
         let h = value.to_le_bytes();
@@ -407,7 +396,7 @@ pub enum Error {
     RestoreMarfBlockError(Box<Error>),
     NonMatchingForks([u8; 32], [u8; 32]),
     OverflowError,
-    Patch(Option<TrieHash>, TrieNodePatch),
+    Patch(TrieNodePatch),
     NodeTooDeep,
     /// Read at a block strictly below the squash height of a squashed MARF.
     /// The squashed MARF only retains the canonical state at H, so per-block
@@ -518,11 +507,10 @@ pub enum ReadTrieItemKind<'a> {
 }
 
 /// A single item read from trie storage, wrapping either a resolved node or an unresolved patch
-/// along with its hash and compression depth.
+/// along with its hash.
 #[derive(Debug, Clone)]
 pub struct ReadTrieItem<'a> {
     pub hash: Option<TrieHash>,
-    pub patch_depth: usize,
     pub kind: ReadTrieItemKind<'a>,
 }
 
@@ -556,16 +544,15 @@ pub enum ReadNodeBacking<'a> {
 /// and cached in `decoded_bytes` via [`OnceLock`].
 #[derive(Debug, Clone)]
 pub struct ReadTrieNode<'a> {
-    /// The node's Merkle hash, if read. `None` when the caller requested a no-hash read (e.g.
-    /// `read_nodetype_nohash`).
+    /// The node's Merkle hash, if read.
     pub hash: Option<TrieHash>,
     /// Number of patch layers resolved to produce this node (0 if uncompressed).
     pub patch_depth: usize,
     /// The node data — may be decoded, raw bytes, or owned.
     pub backing: ReadNodeBacking<'a>,
     /// Lazily-decoded node for the `PersistedBytes` case. Shared via `Arc` so that `ReadTrieNode`
-    /// remains `Clone` without re-decoding.
-    decoded_bytes: Arc<OnceLock<TrieNodeType>>,
+    /// remains `Clone` without re-decoding. `None` for already-decoded/owned nodes.
+    decoded_bytes: Option<Arc<OnceLock<TrieNodeType>>>,
     /// Transient metadata (cowptr, patch state) from the source `TrieNodeType` that
     /// `TrieNodeRef` cannot carry. Applied by `into_owned_node()` to round-trip
     /// without loss.
@@ -589,22 +576,6 @@ pub enum ReadTrieNodeCursorStep {
     /// re-reading the node there.
     FollowBackptr(TriePtr),
 }
-
-/// Arena for parking decoded nodes so they remain accessible across multiple storage reads within a
-/// single operation.
-pub trait TrieNodeArena {
-    /// Store an owned node in the arena and return a borrowed reference to it.
-    fn park<'a>(&'a mut self, node: TrieNodeType) -> TrieNodeRef<'a>;
-}
-
-/// Transitional marker trait; combines parking and patching capabilities.
-///
-/// TODO: Not the target architecture: will be removed once all call sites declare their own
-/// specific bounds.
-pub trait TrieNodeReadState: NodeParking + NodePatching {}
-
-/// Blanket impl: any type implementing both capability traits satisfies this.
-impl<T: NodeParking + NodePatching> TrieNodeReadState for T {}
 
 /// Reusable byte-buffer and typed-slot decode workspace.
 ///
@@ -632,15 +603,21 @@ pub trait NodeDecodeScratch {
     /// patch will be moved into a collection.
     fn take_patch(&mut self) -> TrieNodePatch;
     /// Take the reusable patch chain buffer (cleared, ready for use).
-    fn take_patch_chain_buf(&mut self) -> Vec<(u32, TriePtr, TrieNodePatch)>;
+    fn take_patch_chain_buf(&mut self) -> Vec<PatchChainEntry>;
     /// Return the patch chain buffer for reuse in subsequent calls.
-    fn restore_patch_chain_buf(&mut self, buf: Vec<(u32, TriePtr, TrieNodePatch)>);
+    fn restore_patch_chain_buf(&mut self, buf: Vec<PatchChainEntry>);
     /// Store an owned node as the current node and return a reference.
     fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_>;
     /// Clear the current decoded node slot.
     fn clear_current_node(&mut self);
-    /// Check whether a node is currently decoded.
-    fn has_current_node(&self) -> bool;
+}
+
+/// One patch encountered while chasing a compressed MARF patch chain.
+#[derive(Debug)]
+pub struct PatchChainEntry {
+    pub block_id: u32,
+    pub ptr: TriePtr,
+    pub patch: TrieNodePatch,
 }
 
 /// Parking capability trait: keep decoded nodes alive across multiple storage reads.
@@ -650,10 +627,8 @@ pub trait NodeDecodeScratch {
 /// accessible. Parking moves a node into stable storage with a handle
 /// for later retrieval.
 ///
-/// Note: `NodeParking` is intentionally independent of `TrieNodeArena`.
-/// `TrieNodeArena::park()` stores into the "current node" slot (ephemeral),
-/// while `NodeParking` methods use a separate parked-node vec (persistent
-/// across reads). These are distinct operations and should not be conflated.
+/// `NodeParking` uses a separate parked-node vec that persists across reads, unlike the scratch
+/// trait's current-node slot.
 pub trait NodeParking: NodeDecodeScratch {
     /// Move the currently-decoded node into parked storage.
     fn park_current_node(&mut self) -> Result<ParkedNodeHandle, Error>;
@@ -674,7 +649,7 @@ pub trait NodePatching: NodeDecodeScratch {
     /// Apply a sequence of patches to the currently-decoded node.
     fn apply_patches_in_place(
         &mut self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
+        patches: &[PatchChainEntry],
         cur_block_id: u32,
     ) -> Result<(), Error>;
 }
@@ -692,8 +667,8 @@ pub trait NodePatching: NodeDecodeScratch {
 /// via [`get_cur_block_and_id()`](Self::get_cur_block_and_id).
 pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     /// Read a node from the currently-open block's trie at the given pointer. The `state` parameter
-    /// provides scratch space for node decoding and patch resolution (see [`TrieNodeReadState`]).
-    fn read_node_with_state<'a, S: TrieNodeReadState>(
+    /// provides scratch space for node decoding, patch resolution, and parking across reads.
+    fn read_node_with_state<'a, S: NodePatching>(
         &'a mut self,
         ptr: &TriePtr,
         state: &'a mut S,
@@ -777,10 +752,10 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     }
 
     /// Cache the ancestor hashes for a block (used during proof generation).
-    fn set_cached_ancestor_hashes_bytes(&mut self, bhh: &T, bytes: Vec<TrieHash>);
+    fn set_cached_ancestor_hashes_bytes(&mut self, bhh: &T, bytes: Arc<[TrieHash]>);
 
     /// Retrieve previously-cached ancestor hashes for a block, if present.
-    fn check_cached_ancestor_hashes_bytes(&mut self, bhh: &T) -> Option<Vec<TrieHash>>;
+    fn check_cached_ancestor_hashes_bytes(&mut self, bhh: &T) -> Option<Arc<[TrieHash]>>;
 
     /// Write the hashes of the children pointed to by `ptrs` into `w`.
     ///
@@ -799,15 +774,14 @@ pub trait TrieReadStorage<T: MarfTrieId>: BlockMap<TrieId = T> {
     fn test_genesis_block(&self) -> Option<T>;
 }
 
-/// Bundles a [`TrieReadStorage`] reference with a [`TrieNodeReadState`] for convenient node
-/// reading.
+/// Bundles a [`TrieReadStorage`] reference with node read scratch for convenient node reading.
 ///
 /// Callers use [`read_node()`](Self::read_node) instead of manually passing state to every
 /// [`read_node_with_state()`](TrieReadStorage::read_node_with_state) call.
 pub struct TrieReadSession<
     'a,
     T: MarfTrieId,
-    S: TrieNodeReadState,
+    S: NodePatching,
     R: TrieReadStorage<T> + ?Sized = TrieStorageConnection<'a, T>,
 > {
     storage: &'a mut R,
@@ -815,7 +789,7 @@ pub struct TrieReadSession<
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>
+impl<'a, T: MarfTrieId, S: NodePatching, R: TrieReadStorage<T> + ?Sized>
     TrieReadSession<'a, T, S, R>
 {
     pub fn new(storage: &'a mut R, state: &'a mut S) -> Self {
@@ -837,6 +811,65 @@ impl<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>
     pub fn read_node<'b>(&'b mut self, ptr: &TriePtr) -> Result<ReadTrieNode<'b>, Error> {
         self.storage.read_node_with_state(ptr, self.state)
     }
+
+    /// Walk the current trie from the root until the path reaches a leaf or crosses a backptr.
+    pub fn walk_to_leaf_or_backptr(
+        &mut self,
+        path: &TrieHash,
+        cursor: &mut TrieCursor<T>,
+    ) -> Result<TrieLeafOrBackptr, Error> {
+        let root_ptr = self.storage.root_trieptr();
+        cursor.reset(path, root_ptr);
+        let mut node_ptr = root_ptr;
+
+        for _ in 0..(cursor.path.len() + 1) {
+            let cur_block = self.storage.get_cur_block();
+            let read = self.read_node(&node_ptr)?;
+            match cursor.walk_read(&read, &cur_block) {
+                Ok(Some(next_ptr)) => {
+                    node_ptr = next_ptr;
+                    continue;
+                }
+                Ok(None) => {
+                    if clear_backptr(cursor.ptr().id()) != TrieNodeID::Leaf as u8 {
+                        return Err(Error::CorruptionError(
+                            "Non-leaf encountered at end of path".to_string(),
+                        ));
+                    }
+
+                    let leaf = read.as_leaf()?.ok_or_else(|| {
+                        Error::CorruptionError("Path reached a non-leaf".to_string())
+                    })?;
+                    return Ok(TrieLeafOrBackptr::Leaf {
+                        ptr: node_ptr,
+                        leaf: TrieLeaf::from_value(leaf.path, leaf.data.clone()),
+                    });
+                }
+                Err(Error::CursorError(CursorError::PathDiverged))
+                | Err(Error::CursorError(CursorError::ChrNotFound)) => {
+                    return Err(Error::NotFoundError);
+                }
+                Err(Error::CursorError(CursorError::BackptrEncountered(ptr))) => {
+                    if !is_backptr(ptr.id()) {
+                        return Err(Error::CorruptionError(format!(
+                            "Failed to walk 0x{:02x} -- got non-backptr",
+                            ptr.chr()
+                        )));
+                    }
+
+                    return Ok(TrieLeafOrBackptr::Backptr(ptr));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(Error::CorruptionError("Trie has a cycle".to_string()))
+    }
+}
+
+pub enum TrieLeafOrBackptr {
+    Leaf { ptr: TriePtr, leaf: TrieLeaf },
+    Backptr(TriePtr),
 }
 
 impl<'a> ReadTrieItem<'a> {
@@ -844,7 +877,6 @@ impl<'a> ReadTrieItem<'a> {
     pub fn from_node(node: ReadTrieNode<'a>) -> Self {
         Self {
             hash: node.hash,
-            patch_depth: node.patch_depth,
             kind: ReadTrieItemKind::Node(node),
         }
     }
@@ -853,21 +885,7 @@ impl<'a> ReadTrieItem<'a> {
     pub fn from_patch(patch: &'a TrieNodePatch, hash: Option<TrieHash>) -> Self {
         Self {
             hash,
-            patch_depth: 0,
             kind: ReadTrieItemKind::Patch(patch),
-        }
-    }
-
-    /// Returns `true` if this item is an unresolved patch.
-    pub fn is_patch(&self) -> bool {
-        matches!(&self.kind, ReadTrieItemKind::Patch(_))
-    }
-
-    /// Borrow the patch, if this item is one.
-    pub fn as_patch(&self) -> Option<&TrieNodePatch> {
-        match &self.kind {
-            ReadTrieItemKind::Node(_) => None,
-            ReadTrieItemKind::Patch(patch) => Some(*patch),
         }
     }
 
@@ -876,18 +894,20 @@ impl<'a> ReadTrieItem<'a> {
     pub fn into_node(self) -> Result<ReadTrieNode<'a>, Error> {
         match self.kind {
             ReadTrieItemKind::Node(node) => Ok(node),
-            ReadTrieItemKind::Patch(patch) => Err(Error::Patch(self.hash, patch.clone())),
+            ReadTrieItemKind::Patch(patch) => Err(Error::Patch(patch.clone())),
         }
     }
 }
 
 impl<'a> ReadTrieNode<'a> {
     fn new(hash: Option<TrieHash>, patch_depth: usize, backing: ReadNodeBacking<'a>) -> Self {
+        let decoded_bytes = matches!(&backing, ReadNodeBacking::PersistedBytes(_))
+            .then(|| Arc::new(OnceLock::new()));
         Self {
             hash,
             patch_depth,
             backing,
-            decoded_bytes: Arc::new(OnceLock::new()),
+            decoded_bytes,
             transient_meta: None,
         }
     }
@@ -982,13 +1002,18 @@ impl<'a> ReadTrieNode<'a> {
     /// Return a reference to the decoded node, decoding from bytes on first call and caching the
     /// result in `decoded_bytes`.
     fn decoded_from_bytes(&self, node: &BytesBacking<'_>) -> Result<&TrieNodeType, Error> {
-        if let Some(decoded) = self.decoded_bytes.get() {
+        let decoded_bytes = self.decoded_bytes.as_ref().ok_or_else(|| {
+            Error::CorruptionError(
+                "Missing decoded-byte cache for byte-backed trie node".to_string(),
+            )
+        })?;
+        if let Some(decoded) = decoded_bytes.get() {
             return Ok(decoded);
         }
 
         let decoded = self.decode_bytes_to_node(node)?;
-        let _ = self.decoded_bytes.set(decoded);
-        self.decoded_bytes.get().ok_or_else(|| {
+        let _ = decoded_bytes.set(decoded);
+        decoded_bytes.get().ok_or_else(|| {
             Error::CorruptionError(format!(
                 "Failed to cache decoded stable byte-backed {:?} node",
                 node.node_type()
@@ -1069,24 +1094,6 @@ impl<'a> ReadTrieNode<'a> {
                 Ok((TrieNodeRef::from(self.decoded_from_bytes(node)?), self.hash))
             }
             ReadNodeBacking::Owned(node) => Ok((TrieNodeRef::from(node), self.hash)),
-        }
-    }
-
-    /// Decode (if needed) and park the node in an arena, returning a stable borrowed reference that
-    /// outlives this `ReadTrieNode`.
-    pub fn park_in<A: TrieNodeArena>(
-        self,
-        arena: &'a mut A,
-    ) -> Result<(TrieNodeRef<'a>, Option<TrieHash>), Error> {
-        match self.backing {
-            ReadNodeBacking::VolatileDecoded(node) => Ok((node, self.hash)),
-            ReadNodeBacking::PersistedDecoded(node) => {
-                Ok((arena.park(node.to_owned_node()), self.hash))
-            }
-            ReadNodeBacking::PersistedBytes(ref node) => {
-                Ok((arena.park(self.decode_bytes_to_node(node)?), self.hash))
-            }
-            ReadNodeBacking::Owned(node) => Ok((arena.park(node), self.hash)),
         }
     }
 
@@ -1184,7 +1191,7 @@ impl fmt::Display for Error {
                 write!(f, "BUG: MARF requested the identifier for a RAM trie")
             }
             Error::OverflowError => write!(f, "Overflow"),
-            Error::Patch(ref _h, ref p) => {
+            Error::Patch(ref p) => {
                 write!(f, "Read patch node instead of expected node: {p:?}")
             }
             Error::NodeTooDeep => write!(f, "Node is too deeply buried under patches"),

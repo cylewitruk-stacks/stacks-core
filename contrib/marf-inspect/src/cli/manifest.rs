@@ -3,10 +3,10 @@ use std::collections::VecDeque;
 use clap::Args;
 use clarity::types::chainstate::TRIEHASH_ENCODED_SIZE;
 use sha2::{Digest as _, Sha256};
+use stackslib::chainstate::stacks::index::blob_layout::ROOT_NODE_OFFSET;
 use stackslib::chainstate::stacks::index::node::{
     TrieNodeID, clear_ctrl_bits, is_backptr, is_compressed,
 };
-use stackslib::chainstate::stacks::index::storage::ROOT_PTR_DISK;
 
 use crate::cli::CliCtx;
 use crate::types::BlobEntry;
@@ -35,7 +35,7 @@ pub fn exec(ctx: &CliCtx, args: ManifestArgs) {
     println!("{}", "-".repeat(95));
 
     let mut frontier: VecDeque<(usize, u8)> = VecDeque::new();
-    frontier.push_back((ROOT_PTR_DISK as usize, TrieNodeID::Node256 as u8));
+    frontier.push_back((ROOT_NODE_OFFSET, TrieNodeID::Node256 as u8));
 
     let mut bfs_index = 0u32;
     let mut total_normal = 0u32;

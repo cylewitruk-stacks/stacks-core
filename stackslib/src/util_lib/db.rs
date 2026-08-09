@@ -33,7 +33,7 @@ use stacks_common::util::db::update_lock_table;
 use stacks_common::util::hash::to_hex;
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 
-use crate::chainstate::stacks::index::marf::{MarfConnection, MarfTransaction, MARF};
+use crate::chainstate::stacks::index::marf::{MarfConnection, MarfCore, MarfTransaction, MARF};
 use crate::chainstate::stacks::index::{Error as MARFError, MARFValue, MarfTrieId};
 
 pub type DBConn = rusqlite::Connection;

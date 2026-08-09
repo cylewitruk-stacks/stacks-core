@@ -14,16 +14,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 
 use rusqlite::blob::Blob;
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Transaction};
 
-use crate::chainstate::stacks::index::node::{TrieNodeID, TriePtr};
 #[cfg(test)]
-use crate::chainstate::stacks::index::storage;
+use crate::chainstate::stacks::index::blob_layout;
+use crate::chainstate::stacks::index::node::{TrieNodeID, TriePtr};
 use crate::chainstate::stacks::index::{
-    bits, trie_sql, Error, MarfDataEntry, MarfTrieId, NodeDecodeScratch, ReadTrieItem, ReadTrieNode,
+    bits, trie_sql, Error, MarfDataEntry, MarfTrieId, NodeDecodeScratch, ReadTrieItem,
 };
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use crate::types::sqlite::NO_PARAMS;
@@ -806,7 +806,7 @@ pub fn read_all_block_hashes_and_roots<T: MarfTrieId>(
             .get_ref("data")?
             .as_blob()
             .expect("DB Corruption: MARF data is non-blob");
-        let start = storage::ROOT_PTR_DISK as usize;
+        let start = blob_layout::ROOT_NODE_OFFSET as usize;
         let trie_hash = TrieHash(bits::read_hash_bytes(&mut &data[start..])?);
         Ok((trie_hash, block_hash))
     })?;
@@ -831,33 +831,6 @@ pub fn read_node_hash_bytes<W: Write>(
     w.write_all(&hash_buff).map_err(|e| e.into())
 }
 
-/// Read a node's hash from a sqlite-stored blob, given its block header hash
-pub fn read_node_hash_bytes_by_bhh<W: Write, T: MarfTrieId>(
-    conn: &Connection,
-    w: &mut W,
-    bhh: &T,
-    ptr: &TriePtr,
-) -> Result<(), Error> {
-    let row_id: i64 = conn.query_row(
-        "SELECT block_id FROM marf_data WHERE block_hash = ?",
-        &[bhh],
-        |r| r.get("block_id"),
-    )?;
-    let mut blob = conn.blob_open(DatabaseName::Main, "marf_data", "data", row_id, true)?;
-    let hash_buff = bits::read_node_hash_bytes(&mut blob, ptr)?;
-    w.write_all(&hash_buff).map_err(|e| e.into())
-}
-
-/// Read a node and its hash from a sqlite-stored trie blob into decode scratch.
-pub fn read_node_type<'a>(
-    conn: &Connection,
-    block_id: u32,
-    ptr: &TriePtr,
-    scratch: &'a mut impl NodeDecodeScratch,
-) -> Result<ReadTrieNode<'a>, Error> {
-    read_trie_item(conn, block_id, ptr, scratch)?.into_node()
-}
-
 pub fn read_trie_item<'a>(
     conn: &Connection,
     block_id: u32,
@@ -872,14 +845,6 @@ pub fn read_trie_item<'a>(
         true,
     )?;
     bits::read_trie_item(&mut blob, ptr, scratch)
-}
-
-pub fn read_trie_blob_bytes(conn: &Connection, block_id: u32) -> Result<Vec<u8>, Error> {
-    let mut blob = open_trie_blob_readonly(conn, block_id)?;
-    let mut trie_blob = Vec::new();
-    blob.read_to_end(&mut trie_blob)
-        .inspect_err(|e| error!("Failed to read sqlite trie blob {block_id}: {e:}"))?;
-    Ok(trie_blob)
 }
 
 /// Get the offset and length of a trie blob in the trie blobs file.

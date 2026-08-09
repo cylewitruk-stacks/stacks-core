@@ -2107,13 +2107,14 @@ pub struct NodeConfig {
     /// ---
     /// @default: `None` (Prometheus server disabled)
     pub prometheus_bind: Option<String>,
-    /// The strategy to use for MARF trie node caching in memory.
-    /// Controls the trade-off between memory usage and performance for state access.
+    /// Legacy strategy knob for MARF caching in memory. Trie-node caching has been removed; this
+    /// now controls only whether legacy strategy values are accepted while block metadata caching
+    /// remains enabled.
     ///
     /// Possible values:
-    /// - `"noop"`: No caching (least memory).
-    /// - `"everything"`: Cache all nodes (most memory, potentially fastest).
-    /// - `"node256"`: Cache only larger `TrieNode256` nodes.
+    /// - `"noop"`: accepted legacy value.
+    /// - `"everything"`: accepted legacy value.
+    /// - `"node256"`: accepted legacy value.
     ///
     /// If the value is `None` or an unrecognized string, it defaults to `"noop"`.
     /// ---

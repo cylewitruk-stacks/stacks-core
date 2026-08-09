@@ -183,8 +183,9 @@ fn marf_read_random_1048576_4096_file_storage() {
         let mut f = f_store.connection();
 
         let cursor = &mut None;
+        let nested_cursor = &mut None;
         let scratch = &mut MarfReadState::new();
-        let mut read_ctx = MarfReadCtx::new(&mut f, cursor, scratch);
+        let mut read_ctx = MarfReadCtx::new(&mut f, cursor, nested_cursor, scratch);
 
         let block_header = BlockHeaderHash::from_bytes(&[
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,

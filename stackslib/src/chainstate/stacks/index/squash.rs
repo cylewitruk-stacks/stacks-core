@@ -28,7 +28,9 @@ use rusqlite::params;
 use stacks_common::types::chainstate::TrieHash;
 
 use crate::chainstate::stacks::index::blob_layout::BlobHeader;
-use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
+use crate::chainstate::stacks::index::marf::{
+    MARFOpenOpts, MarfConnection as _, MarfCore as _, MARF,
+};
 use crate::chainstate::stacks::index::node::{clear_backptr, is_backptr, TrieNodeID, TriePtr};
 use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::storage::{

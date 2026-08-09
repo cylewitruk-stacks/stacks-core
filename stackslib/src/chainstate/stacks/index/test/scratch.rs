@@ -16,10 +16,12 @@
 
 use crate::chainstate::stacks::index::node::{
     TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodePatch,
-    TrieNodeRef, TrieNodeType, TriePtr,
+    TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::scratch::MarfReadState;
-use crate::chainstate::stacks::index::{MARFValue, OwnedNodeBytes, ReadTrieNode, TrieLeaf};
+use crate::chainstate::stacks::index::{
+    MARFValue, NodeDecodeScratch, NodePatching, PatchChainEntry, ReadTrieNode, TrieLeaf,
+};
 use crate::codec::StacksMessageCodec;
 
 fn make_test_nodes() -> Vec<TrieNodeType> {
@@ -46,12 +48,37 @@ fn make_test_nodes() -> Vec<TrieNodeType> {
     ]
 }
 
+fn decode_into_scratch<'a>(
+    scratch: &'a mut MarfReadState,
+    node: &TrieNodeType,
+) -> crate::chainstate::stacks::index::node::TrieNodeRef<'a> {
+    let mut bytes = Vec::new();
+    match node {
+        TrieNodeType::Node4(node) => node.write_bytes(&mut bytes).unwrap(),
+        TrieNodeType::Node16(node) => node.write_bytes(&mut bytes).unwrap(),
+        TrieNodeType::Node48(node) => node.write_bytes(&mut bytes).unwrap(),
+        TrieNodeType::Node256(node) => node.write_bytes(&mut bytes).unwrap(),
+        TrieNodeType::Leaf(node) => node.write_bytes(&mut bytes).unwrap(),
+    }
+    let consumed = scratch.decode_node_from_slice(TrieNodeID::from_u8(node.id()).unwrap(), &bytes);
+    assert_eq!(consumed.unwrap(), bytes.len());
+    scratch.get_ref()
+}
+
+fn owned_from_scratch(scratch: &MarfReadState) -> TrieNodeType {
+    let mut read = ReadTrieNode::from_state_borrowed(scratch.get_ref(), None);
+    if let Some(meta) = scratch.transient_meta() {
+        read = read.with_transient_meta(meta);
+    }
+    read.into_owned_node().unwrap().0
+}
+
 #[test]
-fn trie_node_decode_scratch_store_and_get_ref_per_variant() {
+fn trie_node_decode_scratch_decode_and_get_ref_per_variant() {
     let mut scratch = MarfReadState::new();
 
     for node in make_test_nodes() {
-        let node_ref = scratch.store_from_ref(&node);
+        let node_ref = decode_into_scratch(&mut scratch, &node);
         assert_eq!(node_ref.to_owned_node(), node);
 
         let get_ref = scratch.get_ref();
@@ -70,13 +97,13 @@ fn trie_node_decode_scratch_overwrite_tracks_latest_node() {
         MARFValue::from(9u32),
     ));
 
-    scratch.store_from_ref(&node4);
+    decode_into_scratch(&mut scratch, &node4);
     assert_eq!(scratch.get_ref().to_owned_node(), node4);
 
-    scratch.store_from_ref(&node16);
+    decode_into_scratch(&mut scratch, &node16);
     assert_eq!(scratch.get_ref().to_owned_node(), node16);
 
-    scratch.store_from_ref(&leaf);
+    decode_into_scratch(&mut scratch, &leaf);
     assert_eq!(scratch.get_ref().to_owned_node(), leaf);
 }
 
@@ -86,13 +113,13 @@ fn trie_node_decode_scratch_to_owned_preserves_patch_metadata() {
 
     let mut node4 = TrieNode4::new(&[0x01, 0x02]);
     assert!(node4.insert(&TriePtr::new(TrieNodeID::Leaf as u8, 0x11, 7)));
-    node4.patch_depth = 1;
-    node4.last_patch_source = Some((5, TriePtr::new(TrieNodeID::Node4 as u8, 0x22, 9)));
+    node4.meta.patch_depth = 1;
+    node4.meta.last_patch_source = Some((5, TriePtr::new(TrieNodeID::Node4 as u8, 0x22, 9)));
 
     let node = TrieNodeType::Node4(node4);
-    scratch.store_from_ref(&node);
+    scratch.store(node.clone());
 
-    assert_eq!(scratch.to_owned_node(), node);
+    assert_eq!(owned_from_scratch(&scratch), node);
     assert_ne!(scratch.get_ref().to_owned_node(), node);
 }
 
@@ -104,39 +131,47 @@ fn trie_node_decode_scratch_apply_patches_in_place_matches_owned_path() {
     assert!(node4.insert(&TriePtr::new(TrieNodeID::Leaf as u8, 0x11, 7)));
 
     let patches = vec![
-        (
-            5,
-            TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 9, 4),
-            TrieNodePatch {
+        PatchChainEntry {
+            block_id: 5,
+            ptr: TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 9, 4),
+            patch: TrieNodePatch {
                 ptr: TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 9, 4),
                 ptr_diff: vec![TriePtr::new(TrieNodeID::Leaf as u8, 0x22, 11)],
             },
-        ),
-        (
-            6,
-            TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 9, 5),
-            TrieNodePatch {
+        },
+        PatchChainEntry {
+            block_id: 6,
+            ptr: TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 9, 5),
+            patch: TrieNodePatch {
                 ptr: TriePtr::new_backptr(TrieNodeID::Node4 as u8, 0x00, 9, 5),
                 ptr_diff: vec![TriePtr::new(TrieNodeID::Leaf as u8, 0x33, 12)],
             },
-        ),
+        },
     ];
 
     // Build expected result by applying patches in-place to a clone
     let mut expected_node4 = node4.clone();
-    for (patch_block_id, _, patch) in patches.iter() {
-        assert!(patch.apply_to(&mut expected_node4, *patch_block_id, 6));
+    for entry in patches.iter() {
+        assert!(entry.patch.apply_to(&mut expected_node4, entry.block_id, 6));
     }
-    expected_node4.patch_depth += patches.len();
-    expected_node4.last_patch_source = patches.last().map(|(block_id, ptr, _)| (*block_id, *ptr));
+    expected_node4.meta.patch_depth += patches.len();
+    expected_node4.meta.last_patch_source = patches.last().map(|entry| (entry.block_id, entry.ptr));
     let expected = TrieNodeType::Node4(expected_node4);
 
-    scratch.store_from_ref(&TrieNodeType::Node4(node4));
+    decode_into_scratch(&mut scratch, &TrieNodeType::Node4(node4));
     scratch
         .apply_patches_in_place(&patches, 6)
         .expect("in-place patch application should succeed");
 
-    assert_eq!(scratch.to_owned_node(), expected);
+    assert_eq!(owned_from_scratch(&scratch), expected);
+
+    let recovered_capacity = patches
+        .iter()
+        .map(|entry| entry.patch.ptr_diff.capacity())
+        .max()
+        .unwrap();
+    scratch.restore_patch_chain_buf(patches);
+    assert!(scratch.patch().ptr_diff.capacity() >= recovered_capacity);
 }
 
 #[test]
@@ -167,35 +202,4 @@ fn trie_node_decode_scratch_decode_patch_from_slice_reuses_storage() {
 
     assert_eq!(scratch.patch(), &patch_b);
     assert!(scratch.patch().ptr_diff.capacity() >= first_capacity);
-}
-
-#[test]
-fn read_trie_node_park_in_clones_non_state_borrowed_nodes_into_read_state() {
-    let mut scratch = MarfReadState::new();
-    let node = TrieNodeType::Node4(TrieNode4::new(&[0x01, 0x02, 0x03]));
-
-    let (parked_ref, hash) = ReadTrieNode::from_borrowed(TrieNodeRef::from(&node), None)
-        .park_in(&mut scratch)
-        .expect("park_in should accept borrowed nodes");
-
-    assert_eq!(hash, None);
-    assert_eq!(parked_ref.to_owned_node(), node);
-    assert_eq!(scratch.get_ref().to_owned_node(), node);
-}
-
-#[test]
-fn read_trie_node_park_in_decodes_byte_backed_nodes_into_read_state() {
-    let mut scratch = MarfReadState::new();
-    let node = TrieNodeType::Node4(TrieNode4::new(&[0x0a, 0x0b, 0x0c]));
-    let mut node_bytes = Vec::new();
-    node.write_bytes(&mut node_bytes).unwrap();
-
-    let (parked_ref, hash) =
-        ReadTrieNode::from_owned_bytes(OwnedNodeBytes::new(TrieNodeID::Node4, node_bytes), None)
-            .park_in(&mut scratch)
-            .expect("park_in should decode byte-backed nodes into read state");
-
-    assert_eq!(hash, None);
-    assert_eq!(parked_ref.to_owned_node(), node);
-    assert_eq!(scratch.get_ref().to_owned_node(), node);
 }

@@ -20,9 +20,9 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use sha2::{Digest, Sha512_256 as TrieHasher};
 
 use crate::chainstate::stacks::index::node::{
-    clear_compressed, clear_ctrl_bits, is_backptr, is_compressed, ptrs_fmt, set_backptr,
-    ConsensusSerializable, TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID,
-    TrieNodePatch, TrieNodeType, TriePtr,
+    clear_compressed, clear_ctrl_bits, is_backptr, is_compressed, ptrs_fmt, ConsensusSerializable,
+    TrieNode, TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeID, TrieNodePatch,
+    TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::{
@@ -147,34 +147,14 @@ pub fn get_ptrs_byte_len_compressed(id: u8, ptrs: &[TriePtr]) -> usize {
 
 pub fn get_node_body_max_byte_len(node_id: u8) -> Result<usize, Error> {
     let cleared_node_id = clear_ctrl_bits(node_id);
-    let path_max_len = get_path_byte_len(&[0; TRIEHASH_ENCODED_SIZE]);
-    let widest_ptr = TriePtr::widest_encoded();
-    let patch_ptr_max_len = TriePtr {
-        id: set_backptr(TrieNodeID::Node256 as u8),
-        chr: 0,
-        ptr: widest_ptr.ptr(),
-        back_block: u32::MAX,
-    }
-    .compressed_size();
-
-    let max_len = match TrieNodeID::from_u8(cleared_node_id)
-        .ok_or_else(|| Error::CorruptionError(format!("Bad node ID: {:x}", node_id)))?
-    {
-        TrieNodeID::Leaf => 1 + path_max_len + MARF_VALUE_ENCODED_SIZE as usize,
-        TrieNodeID::Node4 => get_ptrs_byte_len(&[widest_ptr; 4]) + path_max_len,
-        TrieNodeID::Node16 => get_ptrs_byte_len(&[widest_ptr; 16]) + path_max_len,
-        TrieNodeID::Node48 => get_ptrs_byte_len(&[widest_ptr; 48]) + 256 + path_max_len,
-        TrieNodeID::Node256 => get_ptrs_byte_len(&[widest_ptr; 256]) + path_max_len,
-        TrieNodeID::Patch => 1 + patch_ptr_max_len + 1 + 256 * patch_ptr_max_len,
-        TrieNodeID::Empty => {
-            return Err(Error::CorruptionError(format!(
-                "Unsupported node ID for node-body read: {:x}",
-                node_id
-            )))
-        }
-    };
-
-    Ok(max_len)
+    let node_id = TrieNodeID::from_u8(cleared_node_id)
+        .ok_or_else(|| Error::CorruptionError(format!("Bad node ID: {:x}", node_id)))?;
+    node_id.max_body_byte_len().ok_or_else(|| {
+        Error::CorruptionError(format!(
+            "Unsupported node ID for node-body read: {:x}",
+            cleared_node_id
+        ))
+    })
 }
 
 pub fn get_read_node_max_byte_len(node_id: u8) -> Result<usize, Error> {
@@ -205,7 +185,7 @@ fn decode_nodetype_ref_from_slice_at_head(
 
     let node_id = TrieNodeID::from_u8(ptr_id).ok_or_else(|| {
         Error::CorruptionError(format!(
-            "inner_read_nodetype_at_head: Unknown trie node type {ptr_id}"
+            "decode_nodetype_ref_from_slice_at_head: unknown trie node type {ptr_id}"
         ))
     })?;
 
@@ -227,7 +207,7 @@ pub fn decode_nodetype_from_slice_at_head(
 ) -> Result<(TrieNodeType, usize), Error> {
     let node_id = TrieNodeID::from_u8(ptr_id).ok_or_else(|| {
         Error::CorruptionError(format!(
-            "inner_read_nodetype_at_head: Unknown trie node type {}",
+            "decode_nodetype_from_slice_at_head: unknown trie node type {}",
             ptr_id
         ))
     })?;
@@ -240,7 +220,7 @@ pub fn decode_nodetype_from_slice_at_head(
     })?;
 
     if stored_node_id == TrieNodeID::Patch {
-        return Err(Error::Patch(None, TrieNodePatch::from_slice(bytes)?.0));
+        return Err(Error::Patch(TrieNodePatch::from_slice(bytes)?.0));
     }
 
     match node_id {
@@ -265,7 +245,7 @@ pub fn decode_nodetype_from_slice_at_head(
             Ok((TrieNodeType::Leaf(node), consumed))
         }
         TrieNodeID::Empty => Err(Error::CorruptionError(
-            "inner_read_nodetype_at_head: stored empty node type".to_string(),
+            "decode_nodetype_from_slice_at_head: stored empty node type".to_string(),
         )),
         TrieNodeID::Patch => unreachable!("BUG: direct patch nodes are handled before dispatch"),
     }
@@ -275,21 +255,22 @@ fn read_node_bytes_into<R: Read + Seek>(
     r: &mut R,
     bytes: &mut Vec<u8>,
     node_id: u8,
-) -> Result<u64, Error> {
+) -> Result<(u64, usize), Error> {
     let max_len = get_read_node_max_byte_len(node_id)?;
 
     let start_disk_ptr = r
         .stream_position()
         .inspect_err(|e| error!("Failed to ftell the read handle: {e:?}"))?;
 
-    bytes.clear();
-    bytes.resize(max_len, 0);
+    if bytes.len() < max_len {
+        bytes.resize(max_len, 0);
+    }
 
     let mut offset = 0;
     loop {
         let nr = match r.read(
             bytes
-                .get_mut(offset..)
+                .get_mut(offset..max_len)
                 .ok_or_else(|| Error::OverflowError)?,
         ) {
             Ok(nr) => nr,
@@ -311,8 +292,7 @@ fn read_node_bytes_into<R: Read + Seek>(
         }
     }
 
-    bytes.truncate(offset);
-    Ok(start_disk_ptr)
+    Ok((start_disk_ptr, offset))
 }
 
 pub fn parse_hash_from_bytes(bytes: &[u8]) -> Result<(TrieHash, &[u8]), Error> {
@@ -367,7 +347,7 @@ fn read_expected_node_id_from_bytes(expected_node_id: u8, bytes: &[u8]) -> Resul
 
     if nid_node_id == TrieNodeID::Patch {
         let patch = TrieNodePatch::from_slice(bytes).map(|(patch, _)| patch)?;
-        return Err(Error::Patch(None, patch));
+        return Err(Error::Patch(patch));
     }
 
     error!("Bad idbuf: {:x} != {:x}", nid, expected_node_id);
@@ -785,14 +765,6 @@ pub fn read_nodetype<F: Read + Seek>(
     read_trie_item(f, ptr, &mut scratch).and_then(read_item_into_owned_node)
 }
 
-/// Read a node at `ptr`.
-pub fn read_nodetype_nohash<F: Read + Seek>(
-    f: &mut F,
-    ptr: &TriePtr,
-) -> Result<TrieNodeType, Error> {
-    read_nodetype(f, ptr).map(|(node, _)| node)
-}
-
 /// Read a node and hash at the stream's current position.
 pub fn read_nodetype_at_head<F: Read + Seek>(
     f: &mut F,
@@ -800,14 +772,6 @@ pub fn read_nodetype_at_head<F: Read + Seek>(
 ) -> Result<(TrieNodeType, TrieHash), Error> {
     let mut scratch = MarfReadState::new();
     read_trie_item_at_head_ref(f, ptr_id, &mut scratch).and_then(read_item_into_owned_node)
-}
-
-/// Read a node at the stream's current position.
-pub fn read_nodetype_at_head_nohash<F: Read + Seek>(
-    f: &mut F,
-    ptr_id: u8,
-) -> Result<TrieNodeType, Error> {
-    read_nodetype_at_head(f, ptr_id).map(|(node, _)| node)
 }
 
 /// Deserialize a TrieNodeType and optionally its hash from the given Read+Seek object.
@@ -830,16 +794,24 @@ pub fn read_trie_item_at_head_ref<'a, F: Read + Seek>(
     scratch: &'a mut impl NodeDecodeScratch,
 ) -> Result<ReadTrieItem<'a>, Error> {
     let mut node_bytes = scratch.take_node_bytes();
-    let start_disk_ptr = read_node_bytes_into(f, &mut node_bytes, ptr_id)?;
+    let (start_disk_ptr, bytes_read) = read_node_bytes_into(f, &mut node_bytes, ptr_id)?;
 
-    let result = parse_node_from_bytes(f, start_disk_ptr, node_bytes.as_slice(), |bytes| {
-        let (hash, remaining) = parse_hash_from_bytes(bytes)?;
-        let (stored_node_id, consumed) = decode_trie_item_into_scratch(remaining, ptr_id, scratch)?;
-        let total_consumed = TRIEHASH_ENCODED_SIZE
-            .checked_add(consumed)
-            .ok_or(Error::OverflowError)?;
-        Ok(((hash, stored_node_id), total_consumed))
-    });
+    let result = parse_node_from_bytes(
+        f,
+        start_disk_ptr,
+        node_bytes
+            .get(..bytes_read)
+            .ok_or_else(|| Error::OverflowError)?,
+        |bytes| {
+            let (hash, remaining) = parse_hash_from_bytes(bytes)?;
+            let (stored_node_id, consumed) =
+                decode_trie_item_into_scratch(remaining, ptr_id, scratch)?;
+            let total_consumed = TRIEHASH_ENCODED_SIZE
+                .checked_add(consumed)
+                .ok_or(Error::OverflowError)?;
+            Ok(((hash, stored_node_id), total_consumed))
+        },
+    );
 
     scratch.restore_node_bytes(node_bytes);
 
@@ -880,7 +852,7 @@ pub fn get_node_max_byte_len(id: u8, u64_ptr_offsets: bool) -> Result<usize, Err
         _ => {
             return Err(Error::CorruptionError(format!(
                 "get_node_max_byte_len: no node body for id {id:x}"
-            )))
+            )));
         }
     };
     Ok(TRIEHASH_ENCODED_SIZE + body)
@@ -1009,7 +981,7 @@ mod tests {
 
     use super::*;
     use crate::chainstate::stacks::index::node::{
-        set_compressed, TrieLeafRef, TrieNode, TrieNode4, TrieNodeRef,
+        set_backptr, set_compressed, TrieLeafRef, TrieNode, TrieNode4, TrieNodeRef,
     };
     use crate::chainstate::stacks::index::scratch::MarfReadState;
     use crate::chainstate::stacks::index::ReadTrieItemKind;
@@ -1204,6 +1176,44 @@ mod tests {
         assert_eq!(
             clear_ctrl_bits(set_backptr(TrieNodeID::Patch as u8)),
             TrieNodeID::Patch as u8
+        );
+    }
+
+    #[test]
+    fn node_body_max_len_constants_match_runtime_encoding_bounds() {
+        let path_max_len = get_path_byte_len(&[0; TRIEHASH_ENCODED_SIZE]);
+        let widest_ptr = TriePtr::widest_encoded();
+        let patch_ptr_max_len = TriePtr {
+            id: set_backptr(TrieNodeID::Node256 as u8),
+            chr: 0,
+            ptr: widest_ptr.ptr(),
+            back_block: u32::MAX,
+        }
+        .compressed_size();
+
+        assert_eq!(
+            <TrieLeaf as TrieNode>::MAX_BODY_BYTE_LEN,
+            1 + path_max_len + MARF_VALUE_ENCODED_SIZE as usize
+        );
+        assert_eq!(
+            <TrieNode4 as TrieNode>::MAX_BODY_BYTE_LEN,
+            get_ptrs_byte_len(&[widest_ptr; 4]) + path_max_len
+        );
+        assert_eq!(
+            <TrieNode16 as TrieNode>::MAX_BODY_BYTE_LEN,
+            get_ptrs_byte_len(&[widest_ptr; 16]) + path_max_len
+        );
+        assert_eq!(
+            <TrieNode48 as TrieNode>::MAX_BODY_BYTE_LEN,
+            get_ptrs_byte_len(&[widest_ptr; 48]) + 256 + path_max_len
+        );
+        assert_eq!(
+            <TrieNode256 as TrieNode>::MAX_BODY_BYTE_LEN,
+            get_ptrs_byte_len(&[widest_ptr; 256]) + path_max_len
+        );
+        assert_eq!(
+            TrieNodePatch::MAX_BODY_BYTE_LEN,
+            1 + patch_ptr_max_len + 1 + 256 * patch_ptr_max_len
         );
     }
 

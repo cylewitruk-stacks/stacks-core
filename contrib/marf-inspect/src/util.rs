@@ -26,10 +26,16 @@ pub fn read_blob(ctx: &CliCtx, block_id: u32) -> Vec<u8> {
     }
 
     // Fall back to inline blob.
-    trie_sql::read_trie_blob_bytes(ctx.db(), block_id).unwrap_or_else(|e| {
-        eprintln!("Failed to read blob for block {block_id}: {e:?}");
+    let mut blob = trie_sql::open_trie_blob_readonly(ctx.db(), block_id).unwrap_or_else(|e| {
+        eprintln!("Failed to open inline blob for block {block_id}: {e:?}");
         std::process::exit(1);
-    })
+    });
+    let mut trie_blob = Vec::new();
+    blob.read_to_end(&mut trie_blob).unwrap_or_else(|e| {
+        eprintln!("Failed to read inline blob for block {block_id}: {e:?}");
+        std::process::exit(1);
+    });
+    trie_blob
 }
 
 pub fn node_type_name(node: &TrieNodeType) -> &'static str {
@@ -80,7 +86,7 @@ pub fn decode_entry(blob: &[u8], offset: usize, ptr_id: u8) -> Result<BlobEntry,
             node: Box::new(node),
             consumed: TRIEHASH_ENCODED_SIZE + body_consumed,
         }),
-        Err(MarfError::Patch(_, patch)) => {
+        Err(MarfError::Patch(patch)) => {
             let body_consumed = patch.size();
             Ok(BlobEntry::Patch {
                 hash,

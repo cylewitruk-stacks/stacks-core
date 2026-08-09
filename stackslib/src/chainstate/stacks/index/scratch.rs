@@ -19,8 +19,19 @@ use crate::chainstate::stacks::index::node::{
     TrieNodeID, TrieNodePatch, TrieNodeRef, TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::{
-    Error, NodeDecodeScratch, NodeParking, NodePatching, TrieLeaf, TrieNodeArena,
+    Error, NodeDecodeScratch, NodeParking, NodePatching, PatchChainEntry, TrieLeaf,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentSlot {
+    Node4,
+    Node16,
+    Node48,
+    Node256,
+    Leaf,
+    Patch,
+    Owned,
+}
 
 #[derive(Debug, Default)]
 pub struct MarfReadState {
@@ -33,10 +44,10 @@ pub struct MarfReadState {
     node_bytes: Vec<u8>,
     /// Reusable buffer for patch chain accumulation. Taken by `take_patch_chain_buf` and restored
     /// by `restore_patch_chain_buf` to avoid per-read allocation in the patch-chasing loop.
-    patch_chain_buf: Vec<(u32, TriePtr, TrieNodePatch)>,
+    patch_chain_buf: Vec<PatchChainEntry>,
     owned: Option<TrieNodeType>,
     parked: Vec<TrieNodeType>,
-    current_id: Option<TrieNodeID>,
+    current_slot: Option<CurrentSlot>,
 }
 
 impl MarfReadState {
@@ -44,38 +55,58 @@ impl MarfReadState {
         Self::default()
     }
 
-    pub fn take_node_bytes(&mut self) -> Vec<u8> {
+    fn empty_patch() -> TrieNodePatch {
+        TrieNodePatch {
+            ptr: TriePtr::default(),
+            ptr_diff: Vec::new(),
+        }
+    }
+
+    fn take_node_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.node_bytes)
     }
 
-    pub fn take_patch_chain_buf(&mut self) -> Vec<(u32, TriePtr, TrieNodePatch)> {
+    fn take_patch_chain_buf(&mut self) -> Vec<PatchChainEntry> {
         let mut buf = std::mem::take(&mut self.patch_chain_buf);
         buf.clear();
         buf
     }
 
-    pub fn restore_patch_chain_buf(&mut self, buf: Vec<(u32, TriePtr, TrieNodePatch)>) {
+    fn restore_patch_chain_buf(&mut self, mut buf: Vec<PatchChainEntry>) {
+        let current_patch_capacity = self.patch.as_ref().map_or(0, |p| p.ptr_diff.capacity());
+        let reusable_patch_index = buf
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, entry)| entry.patch.ptr_diff.capacity())
+            .and_then(|(index, entry)| {
+                (entry.patch.ptr_diff.capacity() > current_patch_capacity).then_some(index)
+            });
+
+        if let Some(index) = reusable_patch_index {
+            let mut entry = buf.swap_remove(index);
+            entry.patch.ptr = TriePtr::default();
+            entry.patch.ptr_diff.clear();
+            self.patch = Some(entry.patch);
+        }
+
+        buf.clear();
         self.patch_chain_buf = buf;
     }
 
-    pub fn restore_node_bytes(&mut self, node_bytes: Vec<u8>) {
+    fn restore_node_bytes(&mut self, node_bytes: Vec<u8>) {
         self.node_bytes = node_bytes;
     }
 
-    pub fn clear_current_node(&mut self) {
-        self.current_id = None;
+    fn clear_current_node(&mut self) {
+        self.current_slot = None;
         self.owned = None;
     }
 
-    pub fn has_current_node(&self) -> bool {
-        self.current_id.is_some()
-    }
-
-    pub fn clear_parked_nodes(&mut self) {
+    fn clear_parked_nodes(&mut self) {
         self.parked.clear();
     }
 
-    pub fn get_parked_ref(&self, parked_handle: ParkedNodeHandle) -> TrieNodeRef<'_> {
+    fn get_parked_ref(&self, parked_handle: ParkedNodeHandle) -> TrieNodeRef<'_> {
         let node = self
             .parked
             .get(parked_handle.slot())
@@ -83,45 +114,45 @@ impl MarfReadState {
         TrieNodeRef::from(node)
     }
 
-    pub fn park_owned_node(&mut self, node: TrieNodeType) -> ParkedNodeHandle {
+    fn park_owned_node(&mut self, node: TrieNodeType) -> ParkedNodeHandle {
         self.parked.push(node);
         ParkedNodeHandle::new(self.parked.len() - 1)
     }
 
-    pub fn park_current_node(&mut self) -> Result<ParkedNodeHandle, Error> {
-        let node = match self.current_id.take().ok_or_else(|| {
+    fn park_current_node(&mut self) -> Result<ParkedNodeHandle, Error> {
+        let node = match self.current_slot.take().ok_or_else(|| {
             Error::CorruptionError("decode scratch has no current node to park".to_string())
         })? {
-            TrieNodeID::Node4 => TrieNodeType::Node4(
+            CurrentSlot::Node4 => TrieNodeType::Node4(
                 self.node4
                     .take()
                     .expect("BUG: decode scratch lost node4 before parking"),
             ),
-            TrieNodeID::Node16 => TrieNodeType::Node16(
+            CurrentSlot::Node16 => TrieNodeType::Node16(
                 self.node16
                     .take()
                     .expect("BUG: decode scratch lost node16 before parking"),
             ),
-            TrieNodeID::Node48 => TrieNodeType::Node48(Box::new(
+            CurrentSlot::Node48 => TrieNodeType::Node48(Box::new(
                 self.node48
                     .take()
                     .expect("BUG: decode scratch lost node48 before parking"),
             )),
-            TrieNodeID::Node256 => TrieNodeType::Node256(Box::new(
+            CurrentSlot::Node256 => TrieNodeType::Node256(Box::new(
                 self.node256
                     .take()
                     .expect("BUG: decode scratch lost node256 before parking"),
             )),
-            TrieNodeID::Leaf => TrieNodeType::Leaf(
+            CurrentSlot::Leaf => TrieNodeType::Leaf(
                 self.leaf
                     .take()
                     .expect("BUG: decode scratch lost leaf before parking"),
             ),
-            TrieNodeID::Empty => self
+            CurrentSlot::Owned => self
                 .owned
                 .take()
                 .expect("BUG: decode scratch lost owned node before parking"),
-            TrieNodeID::Patch => {
+            CurrentSlot::Patch => {
                 return Err(Error::CorruptionError(
                     "Cannot park patch nodes in decode scratch".to_string(),
                 ));
@@ -131,26 +162,26 @@ impl MarfReadState {
         Ok(self.park_owned_node(node))
     }
 
-    pub fn get_ref(&self) -> TrieNodeRef<'_> {
+    fn get_ref(&self) -> TrieNodeRef<'_> {
         match self
-            .current_id
+            .current_slot
             .expect("BUG: decode scratch has no current node")
         {
-            TrieNodeID::Node4 => {
+            CurrentSlot::Node4 => {
                 let n = self.node4.as_ref().unwrap();
                 TrieNodeRef::Node4 {
                     path: n.path.as_slice(),
                     ptrs: &n.ptrs,
                 }
             }
-            TrieNodeID::Node16 => {
+            CurrentSlot::Node16 => {
                 let n = self.node16.as_ref().unwrap();
                 TrieNodeRef::Node16 {
                     path: n.path.as_slice(),
                     ptrs: &n.ptrs,
                 }
             }
-            TrieNodeID::Node48 => {
+            CurrentSlot::Node48 => {
                 let n = self.node48.as_ref().unwrap();
                 TrieNodeRef::Node48 {
                     path: n.path.as_slice(),
@@ -158,344 +189,194 @@ impl MarfReadState {
                     ptrs: &n.ptrs,
                 }
             }
-            TrieNodeID::Node256 => {
+            CurrentSlot::Node256 => {
                 let n = self.node256.as_ref().unwrap();
                 TrieNodeRef::Node256 {
                     path: n.path.as_slice(),
                     ptrs: &n.ptrs,
                 }
             }
-            TrieNodeID::Leaf => {
+            CurrentSlot::Leaf => {
                 let n = self.leaf.as_ref().unwrap();
                 TrieNodeRef::Leaf(TrieLeafRef {
                     path: n.path.as_slice(),
                     data: &n.data,
                 })
             }
-            TrieNodeID::Empty => {
+            CurrentSlot::Owned => {
                 let n = self.owned.as_ref().unwrap();
                 TrieNodeRef::from(n)
             }
-            TrieNodeID::Patch => {
+            CurrentSlot::Patch => {
                 unreachable!("BUG: patch nodes are never stored in decode scratch")
             }
         }
     }
 
-    pub fn transient_meta(&self) -> Option<TrieNodeTransientMeta> {
-        match self.current_id? {
-            TrieNodeID::Node4 => {
+    fn transient_meta(&self) -> Option<TrieNodeTransientMeta> {
+        match self.current_slot? {
+            CurrentSlot::Node4 => {
                 let n = self.node4.as_ref().expect("BUG: decode scratch lost node4");
-                Some(TrieNodeTransientMeta {
-                    cowptr: n.cowptr,
-                    patch_depth: n.patch_depth,
-                    last_patch_source: n.last_patch_source,
-                })
+                Some(n.meta)
             }
-            TrieNodeID::Node16 => {
+            CurrentSlot::Node16 => {
                 let n = self
                     .node16
                     .as_ref()
                     .expect("BUG: decode scratch lost node16");
-                Some(TrieNodeTransientMeta {
-                    cowptr: n.cowptr,
-                    patch_depth: n.patch_depth,
-                    last_patch_source: n.last_patch_source,
-                })
+                Some(n.meta)
             }
-            TrieNodeID::Node48 => {
+            CurrentSlot::Node48 => {
                 let n = self
                     .node48
                     .as_ref()
                     .expect("BUG: decode scratch lost node48");
-                Some(TrieNodeTransientMeta {
-                    cowptr: n.cowptr,
-                    patch_depth: n.patch_depth,
-                    last_patch_source: n.last_patch_source,
-                })
+                Some(n.meta)
             }
-            TrieNodeID::Node256 => {
+            CurrentSlot::Node256 => {
                 let n = self
                     .node256
                     .as_ref()
                     .expect("BUG: decode scratch lost node256");
-                Some(TrieNodeTransientMeta {
-                    cowptr: n.cowptr,
-                    patch_depth: n.patch_depth,
-                    last_patch_source: n.last_patch_source,
-                })
+                Some(n.meta)
             }
-            TrieNodeID::Leaf | TrieNodeID::Patch => None,
-            TrieNodeID::Empty => self.owned.as_ref().map(TrieNodeTransientMeta::from_node),
+            CurrentSlot::Leaf | CurrentSlot::Patch => None,
+            CurrentSlot::Owned => self.owned.as_ref().map(TrieNodeTransientMeta::from_node),
         }
     }
 
-    pub fn to_owned_node(&self) -> TrieNodeType {
-        match self
-            .current_id
-            .expect("BUG: decode scratch has no current node")
-        {
-            TrieNodeID::Node4 => TrieNodeType::Node4(
-                self.node4
-                    .as_ref()
-                    .expect("BUG: decode scratch lost node4")
-                    .clone(),
-            ),
-            TrieNodeID::Node16 => TrieNodeType::Node16(
-                self.node16
-                    .as_ref()
-                    .expect("BUG: decode scratch lost node16")
-                    .clone(),
-            ),
-            TrieNodeID::Node48 => TrieNodeType::Node48(Box::new(
-                self.node48
-                    .as_ref()
-                    .expect("BUG: decode scratch lost node48")
-                    .clone(),
-            )),
-            TrieNodeID::Node256 => TrieNodeType::Node256(Box::new(
-                self.node256
-                    .as_ref()
-                    .expect("BUG: decode scratch lost node256")
-                    .clone(),
-            )),
-            TrieNodeID::Leaf => TrieNodeType::Leaf(
-                self.leaf
-                    .as_ref()
-                    .expect("BUG: decode scratch lost leaf")
-                    .clone(),
-            ),
-            TrieNodeID::Empty => self
-                .owned
-                .as_ref()
-                .expect("BUG: decode scratch lost owned node")
-                .clone(),
-            TrieNodeID::Patch => {
-                unreachable!("BUG: patch nodes are never stored in decode scratch")
-            }
-        }
-    }
-
-    pub fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
-        self.current_id = Some(TrieNodeID::Empty);
+    fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
+        self.current_slot = Some(CurrentSlot::Owned);
         self.owned = Some(node);
         TrieNodeRef::from(self.owned.as_ref().expect("BUG: decode scratch lost node"))
     }
 
-    pub fn store_from_ref(&mut self, node: &TrieNodeType) -> TrieNodeRef<'_> {
-        match node {
-            TrieNodeType::Node4(n) => self.store_node4(n.clone()),
-            TrieNodeType::Node16(n) => self.store_node16(n.clone()),
-            TrieNodeType::Node48(n) => self.store_node48((**n).clone()),
-            TrieNodeType::Node256(n) => self.store_node256((**n).clone()),
-            TrieNodeType::Leaf(n) => self.store_leaf(n.clone()),
-        }
-    }
-
-    pub fn store_node4(&mut self, node: TrieNode4) -> TrieNodeRef<'_> {
-        self.current_id = Some(TrieNodeID::Node4);
-        self.node4 = Some(node);
-        let n = self.node4.as_ref().expect("BUG: decode scratch lost node4");
-        TrieNodeRef::Node4 {
-            path: n.path.as_slice(),
-            ptrs: &n.ptrs,
-        }
-    }
-
-    pub fn store_node16(&mut self, node: TrieNode16) -> TrieNodeRef<'_> {
-        self.current_id = Some(TrieNodeID::Node16);
-        self.node16 = Some(node);
-        let n = self
-            .node16
-            .as_ref()
-            .expect("BUG: decode scratch lost node16");
-        TrieNodeRef::Node16 {
-            path: n.path.as_slice(),
-            ptrs: &n.ptrs,
-        }
-    }
-
-    pub fn store_node48(&mut self, node: TrieNode48) -> TrieNodeRef<'_> {
-        self.current_id = Some(TrieNodeID::Node48);
-        self.node48 = Some(node);
-        let n = self
-            .node48
-            .as_ref()
-            .expect("BUG: decode scratch lost node48");
-        TrieNodeRef::Node48 {
-            path: n.path.as_slice(),
-            indexes: n.indexes(),
-            ptrs: &n.ptrs,
-        }
-    }
-
-    pub fn store_node256(&mut self, node: TrieNode256) -> TrieNodeRef<'_> {
-        self.current_id = Some(TrieNodeID::Node256);
-        self.node256 = Some(node);
-        let n = self
-            .node256
-            .as_ref()
-            .expect("BUG: decode scratch lost node256");
-        TrieNodeRef::Node256 {
-            path: n.path.as_slice(),
-            ptrs: &n.ptrs,
-        }
-    }
-
-    pub fn store_leaf(&mut self, node: TrieLeaf) -> TrieNodeRef<'_> {
-        self.current_id = Some(TrieNodeID::Leaf);
-        self.leaf = Some(node);
-        let n = self.leaf.as_ref().expect("BUG: decode scratch lost leaf");
-        TrieNodeRef::Leaf(TrieLeafRef {
-            path: n.path.as_slice(),
-            data: &n.data,
-        })
-    }
-
-    pub fn patch(&self) -> &TrieNodePatch {
+    fn patch(&self) -> &TrieNodePatch {
         self.patch
             .as_ref()
             .expect("BUG: decode scratch lost patch node")
     }
 
-    pub fn take_patch(&mut self) -> TrieNodePatch {
+    fn take_patch(&mut self) -> TrieNodePatch {
         self.patch
             .take()
             .expect("BUG: decode scratch lost patch node")
     }
 
-    pub fn apply_patches_in_place(
+    fn apply_patches_in_place(
         &mut self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
+        patches: &[PatchChainEntry],
         cur_block_id: u32,
     ) -> Result<(), Error> {
-        let added_depth = patches.len();
-        let new_source = patches.last().map(|(block_id, ptr, _)| (*block_id, *ptr));
-
         match self
-            .current_id
+            .current_slot
             .expect("BUG: decode scratch has no current node")
         {
-            TrieNodeID::Node4 => {
+            CurrentSlot::Node4 => {
                 let node = self.node4.as_mut().expect("BUG: decode scratch lost node4");
-                for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
-                        return Err(Error::CorruptionError(
-                            "Failed to apply patches to node".to_string(),
-                        ));
-                    }
-                }
-                node.patch_depth += added_depth;
-                node.last_patch_source = new_source.or(node.last_patch_source);
+                Self::apply_patches_to_node(node, patches, cur_block_id)
             }
-            TrieNodeID::Node16 => {
+            CurrentSlot::Node16 => {
                 let node = self
                     .node16
                     .as_mut()
                     .expect("BUG: decode scratch lost node16");
-                for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
-                        return Err(Error::CorruptionError(
-                            "Failed to apply patches to node".to_string(),
-                        ));
-                    }
-                }
-                node.patch_depth += added_depth;
-                node.last_patch_source = new_source.or(node.last_patch_source);
+                Self::apply_patches_to_node(node, patches, cur_block_id)
             }
-            TrieNodeID::Node48 => {
+            CurrentSlot::Node48 => {
                 let node = self
                     .node48
                     .as_mut()
                     .expect("BUG: decode scratch lost node48");
-                for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
-                        return Err(Error::CorruptionError(
-                            "Failed to apply patches to node".to_string(),
-                        ));
-                    }
-                }
-                node.patch_depth += added_depth;
-                node.last_patch_source = new_source.or(node.last_patch_source);
+                Self::apply_patches_to_node(node, patches, cur_block_id)
             }
-            TrieNodeID::Node256 => {
+            CurrentSlot::Node256 => {
                 let node = self
                     .node256
                     .as_mut()
                     .expect("BUG: decode scratch lost node256");
-                for (patch_block_id, _, patch) in patches.iter() {
-                    if !patch.apply_to(node, *patch_block_id, cur_block_id) {
-                        return Err(Error::CorruptionError(
-                            "Failed to apply patches to node".to_string(),
-                        ));
-                    }
-                }
-                node.patch_depth += added_depth;
-                node.last_patch_source = new_source.or(node.last_patch_source);
+                Self::apply_patches_to_node(node, patches, cur_block_id)
             }
-            TrieNodeID::Leaf | TrieNodeID::Empty | TrieNodeID::Patch => {
-                return Err(Error::CorruptionError(
+            CurrentSlot::Leaf | CurrentSlot::Owned | CurrentSlot::Patch => {
+                Err(Error::CorruptionError(
                     "Cannot apply patches to non-intermediate decode scratch node".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn apply_patches_to_node<N: TrieNode + std::fmt::Debug>(
+        node: &mut N,
+        patches: &[PatchChainEntry],
+        cur_block_id: u32,
+    ) -> Result<(), Error> {
+        for entry in patches.iter() {
+            if !entry.patch.apply_to(node, entry.block_id, cur_block_id) {
+                return Err(Error::CorruptionError(
+                    "Failed to apply patches to node".to_string(),
                 ));
             }
         }
-
+        let meta = node
+            .meta_mut()
+            .expect("BUG: branch decode scratch node missing transient metadata");
+        meta.patch_depth += patches.len();
+        meta.last_patch_source = patches
+            .last()
+            .map(|entry| (entry.block_id, entry.ptr))
+            .or(meta.last_patch_source);
         Ok(())
     }
 
-    pub fn decode_node4_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+    fn decode_node4_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.clear_current_node();
         let node = self.node4.get_or_insert_with(TrieNode4::empty);
         let consumed = node.load_from_slice(bytes)?;
-        self.owned = None;
-        self.current_id = Some(TrieNodeID::Node4);
+        self.current_slot = Some(CurrentSlot::Node4);
         Ok(consumed)
     }
 
-    pub fn decode_node16_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+    fn decode_node16_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.clear_current_node();
         let node = self.node16.get_or_insert_with(TrieNode16::empty);
         let consumed = node.load_from_slice(bytes)?;
-        self.owned = None;
-        self.current_id = Some(TrieNodeID::Node16);
+        self.current_slot = Some(CurrentSlot::Node16);
         Ok(consumed)
     }
 
-    pub fn decode_node48_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+    fn decode_node48_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.clear_current_node();
         let node = self.node48.get_or_insert_with(TrieNode48::empty);
         let consumed = node.load_from_slice(bytes)?;
-        self.owned = None;
-        self.current_id = Some(TrieNodeID::Node48);
+        self.current_slot = Some(CurrentSlot::Node48);
         Ok(consumed)
     }
 
-    pub fn decode_node256_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+    fn decode_node256_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.clear_current_node();
         let node = self.node256.get_or_insert_with(TrieNode256::empty);
         let consumed = node.load_from_slice(bytes)?;
-        self.owned = None;
-        self.current_id = Some(TrieNodeID::Node256);
+        self.current_slot = Some(CurrentSlot::Node256);
         Ok(consumed)
     }
 
-    pub fn decode_leaf_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+    fn decode_leaf_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.clear_current_node();
         let node = self.leaf.get_or_insert_with(TrieLeaf::empty);
         let consumed = node.load_from_slice(bytes)?;
-        self.owned = None;
-        self.current_id = Some(TrieNodeID::Leaf);
+        self.current_slot = Some(CurrentSlot::Leaf);
         Ok(consumed)
     }
 
-    pub fn decode_patch_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        let node = self.patch.get_or_insert_with(|| TrieNodePatch {
-            ptr: TriePtr::default(),
-            ptr_diff: Vec::new(),
-        });
+    fn decode_patch_from_slice(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+        self.clear_current_node();
+        let node = self.patch.get_or_insert_with(Self::empty_patch);
         let consumed = node.load_from_slice(bytes)?;
-        self.owned = None;
-        self.current_id = Some(TrieNodeID::Patch);
+        self.current_slot = Some(CurrentSlot::Patch);
         Ok(consumed)
     }
 
-    /// Consolidated decode dispatcher. Routes to the appropriate per-type decode method.
-    pub fn decode_node_from_slice(&mut self, id: TrieNodeID, bytes: &[u8]) -> Result<usize, Error> {
+    fn decode_node_from_slice(&mut self, id: TrieNodeID, bytes: &[u8]) -> Result<usize, Error> {
         match id {
             TrieNodeID::Node4 => self.decode_node4_from_slice(bytes),
             TrieNodeID::Node16 => self.decode_node16_from_slice(bytes),
@@ -508,10 +389,6 @@ impl MarfReadState {
         }
     }
 }
-
-// --- Capability trait implementations ---
-//
-// These implement the NodeDecodeScratch / NodeParking / NodePatching traits.
 
 impl NodeDecodeScratch for MarfReadState {
     fn take_node_bytes(&mut self) -> Vec<u8> {
@@ -546,28 +423,20 @@ impl NodeDecodeScratch for MarfReadState {
         MarfReadState::take_patch(self)
     }
 
-    fn take_patch_chain_buf(&mut self) -> Vec<(u32, TriePtr, TrieNodePatch)> {
+    fn take_patch_chain_buf(&mut self) -> Vec<PatchChainEntry> {
         MarfReadState::take_patch_chain_buf(self)
     }
 
-    fn restore_patch_chain_buf(&mut self, buf: Vec<(u32, TriePtr, TrieNodePatch)>) {
+    fn restore_patch_chain_buf(&mut self, buf: Vec<PatchChainEntry>) {
         MarfReadState::restore_patch_chain_buf(self, buf)
     }
 
-    /// Note: delegates to the inherent `MarfReadState::store()` method.
-    /// When called through `&mut impl NodeDecodeScratch`, Rust dispatches to this trait method.
-    /// When called as `self.store()` inside MarfReadState methods, Rust dispatches to the
-    /// inherent method. Both have identical behavior.
     fn store(&mut self, node: TrieNodeType) -> TrieNodeRef<'_> {
         MarfReadState::store(self, node)
     }
 
     fn clear_current_node(&mut self) {
         MarfReadState::clear_current_node(self)
-    }
-
-    fn has_current_node(&self) -> bool {
-        MarfReadState::has_current_node(self)
     }
 }
 
@@ -592,18 +461,9 @@ impl NodeParking for MarfReadState {
 impl NodePatching for MarfReadState {
     fn apply_patches_in_place(
         &mut self,
-        patches: &[(u32, TriePtr, TrieNodePatch)],
+        patches: &[PatchChainEntry],
         cur_block_id: u32,
     ) -> Result<(), Error> {
         MarfReadState::apply_patches_in_place(self, patches, cur_block_id)
     }
 }
-
-impl TrieNodeArena for MarfReadState {
-    fn park<'a>(&'a mut self, node: TrieNodeType) -> TrieNodeRef<'a> {
-        self.store(node)
-    }
-}
-
-// TrieNodeReadState is now a marker trait with a blanket impl over
-// NodeParking + NodePatching, so MarfReadState satisfies it automatically.

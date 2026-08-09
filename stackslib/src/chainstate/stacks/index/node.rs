@@ -20,10 +20,10 @@ use std::{error, fmt};
 use crate::chainstate::stacks::index::bits::{self, SPARSE_PTR_BITMAP_MARKER};
 use crate::chainstate::stacks::index::{
     BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodePath, ReadNodeBacking,
-    ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf,
+    ReadTrieNode, ReadTrieNodeCursorStep, TrieLeaf, MARF_VALUE_ENCODED_SIZE,
 };
 use crate::codec::{read_next, write_next, Error as codec_error, StacksMessageCodec};
-use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE};
+use crate::types::chainstate::{TrieHash, BLOCK_HEADER_HASH_ENCODED_SIZE, TRIEHASH_ENCODED_SIZE};
 use crate::util::hash::to_hex;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +49,12 @@ impl error::Error for CursorError {
     }
 }
 
+impl From<CursorError> for Error {
+    fn from(e: CursorError) -> Self {
+        Error::CursorError(e)
+    }
+}
+
 // All numeric values of a Trie node when encoded.
 // The low 4 bits encode the base TrieNodeID value (0-6).
 // * the 8th bit (0x80) indicates a back-pointer to be followed
@@ -64,6 +70,23 @@ define_u8_enum!(TrieNodeID {
     Node256 = 5,
     Patch = 6
 });
+
+impl TrieNodeID {
+    /// Maximum serialized body length for this node kind, excluding the leading hash.
+    ///
+    /// Returns `None` for `Empty`, which is a pointer sentinel rather than a serialized node body.
+    pub fn max_body_byte_len(self) -> Option<usize> {
+        match self {
+            TrieNodeID::Empty => None,
+            TrieNodeID::Leaf => Some(<TrieLeaf as TrieNode>::MAX_BODY_BYTE_LEN),
+            TrieNodeID::Node4 => Some(<TrieNode4 as TrieNode>::MAX_BODY_BYTE_LEN),
+            TrieNodeID::Node16 => Some(<TrieNode16 as TrieNode>::MAX_BODY_BYTE_LEN),
+            TrieNodeID::Node48 => Some(<TrieNode48 as TrieNode>::MAX_BODY_BYTE_LEN),
+            TrieNodeID::Node256 => Some(<TrieNode256 as TrieNode>::MAX_BODY_BYTE_LEN),
+            TrieNodeID::Patch => Some(TrieNodePatch::MAX_BODY_BYTE_LEN),
+        }
+    }
+}
 
 /// A node ID encodes a back-pointer if its high bit is set
 pub fn is_backptr(id: u8) -> bool {
@@ -295,8 +318,28 @@ impl fmt::Debug for TrieCowPtr {
     }
 }
 
+/// Transient metadata from an owned branch trie node.
+///
+/// This metadata is not carried by [`TrieNodeRef`], because that type is a lightweight structural
+/// view over path/ptr storage only. Read paths capture it alongside node refs so conversion back
+/// to owned nodes can round-trip without losing COW/patch state.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrieNodeTransientMeta {
+    pub cowptr: Option<TrieCowPtr>,
+    pub patch_depth: usize,
+    pub last_patch_source: Option<(u32, TriePtr)>,
+}
+
+const NODE_PATH_MAX_BYTE_LEN: usize = 1 + TRIEHASH_ENCODED_SIZE;
+const NODE_PTR_ID_BYTE_LEN: usize = 1;
+const NODE48_INDEX_BYTE_LEN: usize = 256;
+const PATCH_DIFF_MAX_PTRS: usize = 256;
+
 /// All Trie nodes implement the following methods:
 pub trait TrieNode {
+    /// Maximum serialized body length for this node type, excluding the leading hash.
+    const MAX_BODY_BYTE_LEN: usize;
+
     /// Node ID for encoding/decoding
     fn id(&self) -> u8;
 
@@ -333,8 +376,18 @@ pub trait TrieNode {
     /// Get a mutable reference to the children of this node.
     fn ptrs_mut(&mut self) -> &mut [TriePtr];
 
+    /// Transient COW/patch metadata for branch nodes.
+    fn meta(&self) -> Option<&TrieNodeTransientMeta>;
+
+    /// Mutable transient COW/patch metadata for branch nodes.
+    fn meta_mut(&mut self) -> Option<&mut TrieNodeTransientMeta>;
+
     /// Reset transient metadata (COW pointer, patch depth, patch source) to defaults.
-    fn reset_transient_meta(&mut self);
+    fn reset_transient_meta(&mut self) {
+        if let Some(meta) = self.meta_mut() {
+            *meta = TrieNodeTransientMeta::default();
+        }
+    }
 
     /// Get a reference to the node's compressed path.
     fn path(&self) -> &NodePath;
@@ -343,10 +396,16 @@ pub trait TrieNode {
     fn as_trie_node_type(&self) -> TrieNodeType;
 
     /// Get the ptr to the node we were copied from (on COW)
-    fn get_cow_ptr(&self) -> Option<&TrieCowPtr>;
+    fn get_cow_ptr(&self) -> Option<&TrieCowPtr> {
+        self.meta().and_then(|meta| meta.cowptr.as_ref())
+    }
 
     /// Set the ptr to the node we were copied from (on COW)
-    fn set_cow_ptr(&mut self, cowptr: TrieCowPtr);
+    fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
+        if let Some(meta) = self.meta_mut() {
+            meta.cowptr = Some(cowptr);
+        }
+    }
 
     /// Encode this node instance into a byte stream and write it to w.
     /// The TriePtrs willl NOT be compressed
@@ -981,12 +1040,15 @@ impl<T: MarfTrieId> TrieCursor<T> {
     /// Callers must push the cursor node and reset `node_path_index` before calling this. This
     /// separation lets callers perform fallible operations (e.g. decoding path bytes) between the
     /// push and the walk, preserving cursor state on decode failure.
-    fn inner_walk(
+    fn inner_walk<E>(
         &mut self,
         node_path: &[u8],
         block_hash: &T,
-        walk_chr: impl FnOnce(u8) -> Result<Option<TriePtr>, CursorError>,
-    ) -> Result<Option<TriePtr>, CursorError> {
+        walk_chr: impl FnOnce(u8) -> Result<Option<TriePtr>, E>,
+    ) -> Result<Option<TriePtr>, E>
+    where
+        E: From<CursorError>,
+    {
         if self.index >= self.path.len() {
             trace!("cursor: out of path");
             return Ok(None);
@@ -1011,7 +1073,7 @@ impl<T: MarfTrieId> TrieCursor<T> {
                 );
 
                 self.last_error = Some(CursorError::PathDiverged);
-                return Err(CursorError::PathDiverged);
+                return Err(CursorError::PathDiverged.into());
             }
 
             self.index += 1;
@@ -1040,7 +1102,7 @@ impl<T: MarfTrieId> TrieCursor<T> {
                     self.index - 1,
                     &path_bytes
                 );
-                Err(CursorError::BackptrEncountered(ptr))
+                Err(CursorError::BackptrEncountered(ptr).into())
             }
             None => {
                 self.last_error = Some(CursorError::ChrNotFound);
@@ -1049,7 +1111,7 @@ impl<T: MarfTrieId> TrieCursor<T> {
                     self.index - 1,
                     &path_bytes
                 );
-                Err(CursorError::ChrNotFound)
+                Err(CursorError::ChrNotFound.into())
             }
         }
     }
@@ -1092,7 +1154,9 @@ impl<T: MarfTrieId> TrieCursor<T> {
         );
         self.nodes.push(cursor_node);
         self.node_path_index = 0;
-        self.inner_walk(node.path_bytes(), block_hash, |chr| Ok(node.walk(chr)))
+        self.inner_walk(node.path_bytes(), block_hash, |chr| {
+            Ok::<_, CursorError>(node.walk(chr))
+        })
     }
 
     /// Walk a persisted [`TrieNodeRef`], recording it as a
@@ -1137,16 +1201,14 @@ impl<T: MarfTrieId> TrieCursor<T> {
             | ReadNodeBacking::PersistedDecoded(node_ref) => self
                 .walk_ref(node_ref, block_hash)
                 .map_err(Error::CursorError),
-            ReadNodeBacking::PersistedBytes(_) => self
-                .walk_borrowed_read(
-                    node,
-                    block_hash,
-                    TrieCursorNode::Handle(CursorNodeHandle::Persisted {
-                        ptr: self.ptr(),
-                        block_hash: block_hash.clone(),
-                    }),
-                )
-                .map_err(Error::CursorError),
+            ReadNodeBacking::PersistedBytes(_) => self.walk_borrowed_read(
+                node,
+                block_hash,
+                TrieCursorNode::Handle(CursorNodeHandle::Persisted {
+                    ptr: self.ptr(),
+                    block_hash: block_hash.clone(),
+                }),
+            ),
             ReadNodeBacking::Owned(node_type) => {
                 self.walk(node_type, block_hash).map_err(Error::CursorError)
             }
@@ -1160,15 +1222,13 @@ impl<T: MarfTrieId> TrieCursor<T> {
         node: &ReadTrieNode<'_>,
         block_hash: &T,
         cursor_node: TrieCursorNode<T>,
-    ) -> Result<Option<TriePtr>, CursorError> {
+    ) -> Result<Option<TriePtr>, Error> {
         assert!(self.last_error.is_none());
         // Push cursor node before fallible path_bytes() to preserve cursor state on decode failure.
         self.nodes.push(cursor_node);
         self.node_path_index = 0;
-        let node_path = node.path_bytes().map_err(|_| CursorError::ChrNotFound)?;
-        self.inner_walk(node_path, block_hash, |chr| {
-            node.walk(chr).map_err(|_| CursorError::ChrNotFound)
-        })
+        let node_path = node.path_bytes()?;
+        self.inner_walk(node_path, block_hash, |chr| node.walk(chr))
     }
 
     /// Like [`walk_ref`](Self::walk_ref), but converts the result into a [`ReadTrieNodeCursorStep`].
@@ -1379,13 +1439,7 @@ impl StacksMessageCodec for TrieLeaf {
 pub struct TrieNode4 {
     pub path: NodePath,
     pub ptrs: [TriePtr; 4],
-    /// If this node was created by copy-on-write, then this points to the node it was copied from.
-    pub cowptr: Option<TrieCowPtr>,
-    /// Number of patches applied to reconstruct this node from the base on-disk node.
-    pub patch_depth: usize,
-    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
-    /// the next amendment patch's COW backpointer.
-    pub last_patch_source: Option<(u32, TriePtr)>,
+    pub meta: TrieNodeTransientMeta,
 }
 
 impl fmt::Debug for TrieNode4 {
@@ -1399,9 +1453,7 @@ impl TrieNode4 {
         TrieNode4 {
             path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             ptrs: [TriePtr::default(); 4],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 }
@@ -1411,13 +1463,7 @@ impl TrieNode4 {
 pub struct TrieNode16 {
     pub path: NodePath,
     pub ptrs: [TriePtr; 16],
-    /// If this node was created by copy-on-write, then this points to the node it was copied from.
-    pub cowptr: Option<TrieCowPtr>,
-    /// Number of patches applied to reconstruct this node from the base on-disk node.
-    pub patch_depth: usize,
-    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
-    /// the next amendment patch's COW backpointer.
-    pub last_patch_source: Option<(u32, TriePtr)>,
+    pub meta: TrieNodeTransientMeta,
 }
 
 impl fmt::Debug for TrieNode16 {
@@ -1431,9 +1477,7 @@ impl TrieNode16 {
         TrieNode16 {
             path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             ptrs: [TriePtr::default(); 16],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -1444,9 +1488,7 @@ impl TrieNode16 {
         TrieNode16 {
             path: node4.path,
             ptrs,
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 }
@@ -1458,13 +1500,7 @@ pub struct TrieNode48 {
     /// If indexes[i] is non-negative, then it is an index into ptrs.
     pub indexes: [i8; 256],
     pub ptrs: [TriePtr; 48],
-    /// If this node was created by copy-on-write, then this points to the node it was copied from.
-    pub cowptr: Option<TrieCowPtr>,
-    /// Number of patches applied to reconstruct this node from the base on-disk node.
-    pub patch_depth: usize,
-    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
-    /// the next amendment patch's COW backpointer.
-    pub last_patch_source: Option<(u32, TriePtr)>,
+    pub meta: TrieNodeTransientMeta,
 }
 
 impl fmt::Debug for TrieNode48 {
@@ -1485,9 +1521,7 @@ impl TrieNode48 {
             path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             indexes: [-1; 256],
             ptrs: [TriePtr::default(); 48],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -1546,9 +1580,7 @@ impl TrieNode48 {
             path: node16.path,
             indexes,
             ptrs,
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 }
@@ -1558,13 +1590,7 @@ impl TrieNode48 {
 pub struct TrieNode256 {
     pub path: NodePath,
     pub ptrs: [TriePtr; 256],
-    /// If this node was created by copy-on-write, then this points to the node it was copied from.
-    pub cowptr: Option<TrieCowPtr>,
-    /// Number of patches applied to reconstruct this node from the base on-disk node.
-    pub patch_depth: usize,
-    /// The (block_id, ptr) of the most recent patch layer. Used by the write path to construct
-    /// the next amendment patch's COW backpointer.
-    pub last_patch_source: Option<(u32, TriePtr)>,
+    pub meta: TrieNodeTransientMeta,
 }
 
 impl fmt::Debug for TrieNode256 {
@@ -1584,9 +1610,7 @@ impl TrieNode256 {
         TrieNode256 {
             path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
             ptrs: [TriePtr::default(); 256],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -1602,9 +1626,7 @@ impl TrieNode256 {
         TrieNode256 {
             path: node4.path,
             ptrs,
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -1621,9 +1643,7 @@ impl TrieNode256 {
         TrieNode256 {
             path: node48.path,
             ptrs,
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 }
@@ -1636,6 +1656,11 @@ pub struct TrieNodePatch {
     pub ptr: TriePtr,
     /// Field of ptrs to insert atop the base node
     pub ptr_diff: Vec<TriePtr>,
+}
+
+impl TrieNodePatch {
+    pub const MAX_BODY_BYTE_LEN: usize =
+        1 + TriePtr::max_encoded_size() + 1 + PATCH_DIFF_MAX_PTRS * TriePtr::max_encoded_size();
 }
 
 impl fmt::Debug for TrieNodePatch {
@@ -2011,7 +2036,7 @@ impl TrieNodePatch {
 
         self.ptr_diff.clear();
         if self.ptr_diff.capacity() < num_ptrs {
-            self.ptr_diff.reserve(num_ptrs - self.ptr_diff.capacity());
+            self.ptr_diff.reserve(num_ptrs);
         }
         for _ in 0..num_ptrs {
             let (ptr, ptr_consumed) =
@@ -2028,15 +2053,6 @@ impl TrieNodePatch {
         Ok(offset)
     }
 
-    /// Load a TrieNodePatch from a Read object
-    /// Returns Ok(Self) on success
-    /// Returns Err(codec_error::*) on failure to decode the bytes
-    /// Returns Err(IOError(..)) on disk I/O failure
-    pub fn from_bytes<R: Read>(f: &mut R) -> Result<Self, Error> {
-        Self::consensus_deserialize(f)
-            .map_err(|e| Error::CorruptionError(format!("Codec error: {e:?}")))
-    }
-
     pub fn from_slice(bytes: &[u8]) -> Result<(Self, usize), Error> {
         let mut patch = Self {
             ptr: TriePtr::default(),
@@ -2048,6 +2064,9 @@ impl TrieNodePatch {
 }
 
 impl TrieNode for TrieNode4 {
+    const MAX_BODY_BYTE_LEN: usize =
+        NODE_PTR_ID_BYTE_LEN + 4 * TriePtr::max_encoded_size() + NODE_PATH_MAX_BYTE_LEN;
+
     fn id(&self) -> u8 {
         TrieNodeID::Node4 as u8
     }
@@ -2056,9 +2075,7 @@ impl TrieNode for TrieNode4 {
         TrieNode4 {
             path: NodePath::default(),
             ptrs: [TriePtr::default(); 4],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -2114,10 +2131,12 @@ impl TrieNode for TrieNode4 {
         &mut self.ptrs
     }
 
-    fn reset_transient_meta(&mut self) {
-        self.cowptr = None;
-        self.patch_depth = 0;
-        self.last_patch_source = None;
+    fn meta(&self) -> Option<&TrieNodeTransientMeta> {
+        Some(&self.meta)
+    }
+
+    fn meta_mut(&mut self) -> Option<&mut TrieNodeTransientMeta> {
+        Some(&mut self.meta)
     }
 
     fn path(&self) -> &NodePath {
@@ -2127,17 +2146,12 @@ impl TrieNode for TrieNode4 {
     fn as_trie_node_type(&self) -> TrieNodeType {
         TrieNodeType::Node4(self.clone())
     }
-
-    fn get_cow_ptr(&self) -> Option<&TrieCowPtr> {
-        self.cowptr.as_ref()
-    }
-
-    fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
-        self.cowptr.replace(cowptr);
-    }
 }
 
 impl TrieNode for TrieNode16 {
+    const MAX_BODY_BYTE_LEN: usize =
+        NODE_PTR_ID_BYTE_LEN + 16 * TriePtr::max_encoded_size() + NODE_PATH_MAX_BYTE_LEN;
+
     fn id(&self) -> u8 {
         TrieNodeID::Node16 as u8
     }
@@ -2146,9 +2160,7 @@ impl TrieNode for TrieNode16 {
         TrieNode16 {
             path: NodePath::default(),
             ptrs: [TriePtr::default(); 16],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -2204,10 +2216,12 @@ impl TrieNode for TrieNode16 {
         &mut self.ptrs
     }
 
-    fn reset_transient_meta(&mut self) {
-        self.cowptr = None;
-        self.patch_depth = 0;
-        self.last_patch_source = None;
+    fn meta(&self) -> Option<&TrieNodeTransientMeta> {
+        Some(&self.meta)
+    }
+
+    fn meta_mut(&mut self) -> Option<&mut TrieNodeTransientMeta> {
+        Some(&mut self.meta)
     }
 
     fn path(&self) -> &NodePath {
@@ -2217,17 +2231,14 @@ impl TrieNode for TrieNode16 {
     fn as_trie_node_type(&self) -> TrieNodeType {
         TrieNodeType::Node16(self.clone())
     }
-
-    fn get_cow_ptr(&self) -> Option<&TrieCowPtr> {
-        self.cowptr.as_ref()
-    }
-
-    fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
-        self.cowptr.replace(cowptr);
-    }
 }
 
 impl TrieNode for TrieNode48 {
+    const MAX_BODY_BYTE_LEN: usize = NODE_PTR_ID_BYTE_LEN
+        + 48 * TriePtr::max_encoded_size()
+        + NODE48_INDEX_BYTE_LEN
+        + NODE_PATH_MAX_BYTE_LEN;
+
     fn id(&self) -> u8 {
         TrieNodeID::Node48 as u8
     }
@@ -2237,9 +2248,7 @@ impl TrieNode for TrieNode48 {
             path: NodePath::default(),
             indexes: [-1; 256],
             ptrs: [TriePtr::default(); 48],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -2350,10 +2359,12 @@ impl TrieNode for TrieNode48 {
         &mut self.ptrs
     }
 
-    fn reset_transient_meta(&mut self) {
-        self.cowptr = None;
-        self.patch_depth = 0;
-        self.last_patch_source = None;
+    fn meta(&self) -> Option<&TrieNodeTransientMeta> {
+        Some(&self.meta)
+    }
+
+    fn meta_mut(&mut self) -> Option<&mut TrieNodeTransientMeta> {
+        Some(&mut self.meta)
     }
 
     fn path(&self) -> &NodePath {
@@ -2363,17 +2374,12 @@ impl TrieNode for TrieNode48 {
     fn as_trie_node_type(&self) -> TrieNodeType {
         TrieNodeType::Node48(Box::new(self.clone()))
     }
-
-    fn get_cow_ptr(&self) -> Option<&TrieCowPtr> {
-        self.cowptr.as_ref()
-    }
-
-    fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
-        self.cowptr.replace(cowptr);
-    }
 }
 
 impl TrieNode for TrieNode256 {
+    const MAX_BODY_BYTE_LEN: usize =
+        NODE_PTR_ID_BYTE_LEN + 256 * TriePtr::max_encoded_size() + NODE_PATH_MAX_BYTE_LEN;
+
     fn id(&self) -> u8 {
         TrieNodeID::Node256 as u8
     }
@@ -2382,9 +2388,7 @@ impl TrieNode for TrieNode256 {
         TrieNode256 {
             path: NodePath::default(),
             ptrs: [TriePtr::default(); 256],
-            cowptr: None,
-            patch_depth: 0,
-            last_patch_source: None,
+            meta: TrieNodeTransientMeta::default(),
         }
     }
 
@@ -2436,10 +2440,12 @@ impl TrieNode for TrieNode256 {
         &mut self.ptrs
     }
 
-    fn reset_transient_meta(&mut self) {
-        self.cowptr = None;
-        self.patch_depth = 0;
-        self.last_patch_source = None;
+    fn meta(&self) -> Option<&TrieNodeTransientMeta> {
+        Some(&self.meta)
+    }
+
+    fn meta_mut(&mut self) -> Option<&mut TrieNodeTransientMeta> {
+        Some(&mut self.meta)
     }
 
     fn path(&self) -> &NodePath {
@@ -2449,17 +2455,11 @@ impl TrieNode for TrieNode256 {
     fn as_trie_node_type(&self) -> TrieNodeType {
         TrieNodeType::Node256(Box::new(self.clone()))
     }
-
-    fn get_cow_ptr(&self) -> Option<&TrieCowPtr> {
-        self.cowptr.as_ref()
-    }
-
-    fn set_cow_ptr(&mut self, cowptr: TrieCowPtr) {
-        self.cowptr.replace(cowptr);
-    }
 }
 
 impl TrieNode for TrieLeaf {
+    const MAX_BODY_BYTE_LEN: usize = 1 + NODE_PATH_MAX_BYTE_LEN + MARF_VALUE_ENCODED_SIZE as usize;
+
     fn id(&self) -> u8 {
         TrieNodeID::Leaf as u8
     }
@@ -2536,8 +2536,12 @@ impl TrieNode for TrieLeaf {
         &mut []
     }
 
-    fn reset_transient_meta(&mut self) {
-        // Leaves have no transient metadata.
+    fn meta(&self) -> Option<&TrieNodeTransientMeta> {
+        None
+    }
+
+    fn meta_mut(&mut self) -> Option<&mut TrieNodeTransientMeta> {
+        None
     }
 
     fn path(&self) -> &NodePath {
@@ -2546,15 +2550,6 @@ impl TrieNode for TrieLeaf {
 
     fn as_trie_node_type(&self) -> TrieNodeType {
         TrieNodeType::Leaf(self.clone())
-    }
-
-    fn get_cow_ptr(&self) -> Option<&TrieCowPtr> {
-        // no-op
-        None
-    }
-
-    fn set_cow_ptr(&mut self, _cowptr: TrieCowPtr) {
-        // no-op
     }
 }
 
@@ -2593,16 +2588,6 @@ pub enum TrieNodeRef<'a> {
         ptrs: &'a [TriePtr; 256],
     },
     Leaf(TrieLeafRef<'a>),
-}
-
-/// Transient metadata from an owned `TrieNodeType` that `TrieNodeRef` does not carry
-/// (because it is a lightweight structural view). Captured alongside a `TrieNodeRef` so
-/// that `to_owned_node()` can round-trip without losing COW/patch state.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TrieNodeTransientMeta {
-    pub cowptr: Option<TrieCowPtr>,
-    pub patch_depth: usize,
-    pub last_patch_source: Option<(u32, TriePtr)>,
 }
 
 impl<'a> TrieNodeRef<'a> {
@@ -2700,16 +2685,12 @@ impl<'a> TrieNodeRef<'a> {
             Self::Node4 { path, ptrs } => TrieNodeType::Node4(TrieNode4 {
                 path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 ptrs: **ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             }),
             Self::Node16 { path, ptrs } => TrieNodeType::Node16(TrieNode16 {
                 path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 ptrs: **ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             }),
             Self::Node48 {
                 path,
@@ -2719,16 +2700,12 @@ impl<'a> TrieNodeRef<'a> {
                 path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 indexes: **indexes,
                 ptrs: **ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             })),
             Self::Node256 { path, ptrs } => TrieNodeType::Node256(Box::new(TrieNode256 {
                 path: NodePath::from_slice(path).expect("node path exceeds 32 bytes"),
                 ptrs: **ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             })),
             Self::Leaf(leaf) => TrieNodeType::Leaf(TrieLeaf {
                 path: NodePath::from_slice(leaf.path).expect("node path exceeds 32 bytes"),
@@ -2741,20 +2718,14 @@ impl<'a> TrieNodeRef<'a> {
 impl TrieNodeTransientMeta {
     /// Extract transient metadata from an owned `TrieNodeType`.
     pub fn from_node(node: &TrieNodeType) -> Self {
-        Self {
-            cowptr: node.get_cow_ptr().copied(),
-            patch_depth: node.patch_depth(),
-            last_patch_source: node.last_patch_source(),
-        }
+        node.transient_meta().unwrap_or_default()
     }
 
     /// Apply this metadata to an owned `TrieNodeType`.
     pub fn apply_to(self, node: &mut TrieNodeType) {
-        if let Some(cowptr) = self.cowptr {
-            node.set_cow_ptr(cowptr);
+        if let Some(meta) = node.transient_meta_mut() {
+            *meta = self;
         }
-        node.set_patch_depth(self.patch_depth);
-        node.set_last_patch_source(self.last_patch_source);
     }
 }
 
@@ -2783,6 +2754,34 @@ impl<'a> From<&'a TrieNodeType> for TrieNodeRef<'a> {
                 data: &data.data,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chainstate::stacks::index::BorrowedNodeBytes;
+    use crate::types::chainstate::BlockHeaderHash;
+
+    #[test]
+    fn byte_backed_walk_propagates_decode_corruption() {
+        let path = TrieHash::from_key("corrupt-node");
+        let root_ptr = TriePtr::new(TrieNodeID::Node4 as u8, 0, 0);
+        let mut cursor = TrieCursor::<BlockHeaderHash>::new(&path, root_ptr);
+        let corrupt_node_bytes = [];
+        let read_node = ReadTrieNode::from_stable_bytes(
+            BorrowedNodeBytes::new(TrieNodeID::Node4, &corrupt_node_bytes),
+            Some(TrieHash([0; 32])),
+        );
+
+        let err = cursor
+            .walk_read(&read_node, &BlockHeaderHash::sentinel())
+            .expect_err("corrupt persisted bytes must not look like a missing child");
+
+        assert!(
+            matches!(err, Error::CorruptionError(_)),
+            "unexpected error: {err:?}"
+        );
     }
 }
 
@@ -2899,43 +2898,38 @@ impl TrieNodeType {
         with_node!(self, ref mut data, data.set_cow_ptr(cowptr))
     }
 
-    pub fn patch_depth(&self) -> usize {
-        match self {
-            TrieNodeType::Node4(ref data) => data.patch_depth,
-            TrieNodeType::Node16(ref data) => data.patch_depth,
-            TrieNodeType::Node48(ref data) => data.patch_depth,
-            TrieNodeType::Node256(ref data) => data.patch_depth,
-            TrieNodeType::Leaf(_) => 0,
+    pub fn clear_cow_ptr(&mut self) {
+        if let Some(meta) = self.transient_meta_mut() {
+            meta.cowptr = None;
         }
+    }
+
+    pub fn patch_depth(&self) -> usize {
+        self.transient_meta().map_or(0, |meta| meta.patch_depth)
     }
 
     pub fn last_patch_source(&self) -> Option<(u32, TriePtr)> {
-        match self {
-            TrieNodeType::Node4(ref data) => data.last_patch_source,
-            TrieNodeType::Node16(ref data) => data.last_patch_source,
-            TrieNodeType::Node48(ref data) => data.last_patch_source,
-            TrieNodeType::Node256(ref data) => data.last_patch_source,
-            TrieNodeType::Leaf(_) => None,
-        }
+        self.transient_meta()
+            .and_then(|meta| meta.last_patch_source)
     }
 
     pub fn set_patch_depth(&mut self, depth: usize) {
-        match self {
-            TrieNodeType::Node4(ref mut data) => data.patch_depth = depth,
-            TrieNodeType::Node16(ref mut data) => data.patch_depth = depth,
-            TrieNodeType::Node48(ref mut data) => data.patch_depth = depth,
-            TrieNodeType::Node256(ref mut data) => data.patch_depth = depth,
-            TrieNodeType::Leaf(_) => {}
+        if let Some(meta) = self.transient_meta_mut() {
+            meta.patch_depth = depth;
         }
     }
 
     pub fn set_last_patch_source(&mut self, source: Option<(u32, TriePtr)>) {
-        match self {
-            TrieNodeType::Node4(ref mut data) => data.last_patch_source = source,
-            TrieNodeType::Node16(ref mut data) => data.last_patch_source = source,
-            TrieNodeType::Node48(ref mut data) => data.last_patch_source = source,
-            TrieNodeType::Node256(ref mut data) => data.last_patch_source = source,
-            TrieNodeType::Leaf(_) => {}
+        if let Some(meta) = self.transient_meta_mut() {
+            meta.last_patch_source = source;
         }
+    }
+
+    pub fn transient_meta(&self) -> Option<TrieNodeTransientMeta> {
+        with_node!(self, ref data, data.meta().copied())
+    }
+
+    pub fn transient_meta_mut(&mut self) -> Option<&mut TrieNodeTransientMeta> {
+        with_node!(self, ref mut data, data.meta_mut())
     }
 }

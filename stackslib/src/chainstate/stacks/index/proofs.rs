@@ -25,14 +25,13 @@ use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::marf::MarfReadCtx;
 use crate::chainstate::stacks::index::node::{
-    clear_backptr, is_backptr, ConsensusSerializable, CursorError, TrieCursor, TrieNodeID,
-    TrieNodeRef, TriePtr,
+    is_backptr, ConsensusSerializable, TrieCursor, TrieNodeID, TrieNodeRef, TriePtr,
 };
 use crate::chainstate::stacks::index::trie::Trie;
 use crate::chainstate::stacks::index::{
-    bits, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, ProofTrieNode, ProofTriePtr,
-    TrieLeaf, TrieMerkleProof, TrieMerkleProofType, TrieNodeReadState, TrieReadSession,
-    TrieReadStorage,
+    bits, BlockMap, ClarityMarfTrieId, Error, MARFValue, MarfTrieId, NodePatching, ProofTrieNode,
+    ProofTriePtr, TrieLeaf, TrieLeafOrBackptr, TrieMerkleProof, TrieMerkleProofType,
+    TrieReadSession, TrieReadStorage,
 };
 
 impl<T: MarfTrieId> ConsensusSerializable<()> for ProofTrieNode<T> {
@@ -389,7 +388,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     /// Given a TriePtr to the _currently-visited_ node and the chr of the _previous_ node, calculate a
     /// Merkle proof node.  Include all the children hashes _except_ for the one that corresponds
     /// to the previous node.
-    fn ptr_to_segment_proof_node<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
+    fn ptr_to_segment_proof_node<S: NodePatching, R: TrieReadStorage<T> + ?Sized>(
         read_session: &mut TrieReadSession<'_, T, S, R>,
         ptr: &TriePtr,
         prev_chr: u8,
@@ -494,7 +493,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     /// Make the initial shunt proof in a MARF merkle proof, for a node that isn't a backptr.
     /// This is a one-item list of a TrieMerkleProofType::Shunt proof entry.
     /// The storage handle must be opened to the block we care about.
-    fn make_initial_shunt_proof<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
+    fn make_initial_shunt_proof<S: NodePatching, R: TrieReadStorage<T> + ?Sized>(
         ctx: &mut MarfReadCtx<'_, T, S, R>,
     ) -> Result<Vec<TrieMerkleProofType<T>>, Error> {
         let backptr_ancestor_hashes = ctx.get_trie_ancestor_hashes_bytes()?;
@@ -524,7 +523,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     ///
     /// All intermediate shunt proofs will contain all ancestor hashes for each node in-between the
     /// backptr and the non-backptr node.  The intermediate root hashes will be calculated by the verifier.
-    fn make_backptr_shunt_proof<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
+    fn make_backptr_shunt_proof<S: NodePatching, R: TrieReadStorage<T> + ?Sized>(
         ctx: &mut MarfReadCtx<'_, T, S, R>,
         backptr: &TriePtr,
     ) -> Result<Vec<TrieMerkleProofType<T>>, Error> {
@@ -599,9 +598,17 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 idx += 1;
             }
             if idx == 0 {
-                panic!("ancestor_height = {}, current_height = {}, but ancestor hash `{}` not found in: [{}]",
-                       ancestor_height, current_height, ancestor_root_hash,
-                       ancestor_hashes.iter().map(|x| format!("{}", x)).collect::<Vec<_>>().join(", "))
+                panic!(
+                    "ancestor_height = {}, current_height = {}, but ancestor hash `{}` not found in: [{}]",
+                    ancestor_height,
+                    current_height,
+                    ancestor_root_hash,
+                    ancestor_hashes
+                        .iter()
+                        .map(|x| format!("{}", x))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
             idx -= 1;
 
@@ -674,7 +681,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                     &ancestor_hashes,
                     &trimmed_ancestor_hashes
                 );
-                trace!("Backptr not found yet.  Shunt to {:?} and walk to {}; Add shunt proof ({}, {:?})", &block_header, ancestor_height, idx, &trimmed_ancestor_hashes);
+                trace!(
+                    "Backptr not found yet.  Shunt to {:?} and walk to {}; Add shunt proof ({}, {:?})",
+                    &block_header, ancestor_height, idx, &trimmed_ancestor_hashes
+                );
             } else {
                 trace!(
                     "Backptr found: trim ancestor hashes at idx={} from {:?} to {:?}",
@@ -682,7 +692,10 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                     &ancestor_hashes,
                     &trimmed_ancestor_hashes
                 );
-                trace!("Backptr found (ancestor_height = {}, header = {:?}).  Intermediate shunt proof is ({}, {:?})", ancestor_height, &block_header, idx, &trimmed_ancestor_hashes);
+                trace!(
+                    "Backptr found (ancestor_height = {}, header = {:?}).  Intermediate shunt proof is ({}, {:?})",
+                    ancestor_height, &block_header, idx, &trimmed_ancestor_hashes
+                );
             };
 
             let shunt_proof_node =
@@ -862,7 +875,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     }
 
     /// Given a list of non-backptr ptrs and a root block header hash, calculate a Merkle proof.
-    fn make_segment_proof<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
+    fn make_segment_proof<S: NodePatching, R: TrieReadStorage<T> + ?Sized>(
         storage: &mut R,
         ptrs: &[TriePtr],
         starting_chr: u8,
@@ -1082,7 +1095,11 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 };
 
                 let Some(path_bytes_prefix) = path_bytes.get(..new_path_bytes.len()) else {
-                    trace!("Segment proof path is {}, which is longer than the previous segment proof length {}", path_bytes.len(), new_path_bytes.len());
+                    trace!(
+                        "Segment proof path is {}, which is longer than the previous segment proof length {}",
+                        path_bytes.len(),
+                        new_path_bytes.len()
+                    );
                     trace!("path_bytes: {:?}", &path_bytes);
                     trace!("new path bytes: {:?}", &new_path_bytes);
                     return false;
@@ -1293,13 +1310,17 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 return false;
             };
 
-            trace!("verify shunt junction proof at {i} next_node_root_hash = {next_node_root_hash:?} penultimate hash = {penultimate_trie_hash:?}: {shunt_proof_junction:?}");
+            trace!(
+                "verify shunt junction proof at {i} next_node_root_hash = {next_node_root_hash:?} penultimate hash = {penultimate_trie_hash:?}: {shunt_proof_junction:?}"
+            );
             let Some(next_trie_hash) = TrieMerkleProof::verify_shunt_proof_junction(
                 &next_node_root_hash,
                 &penultimate_trie_hash,
                 shunt_proof_junction,
             ) else {
-                test_debug!("Unable to verify shunt junction proof at {i} next_node_root_hash = {next_node_root_hash:?} penultimate hash = {penultimate_trie_hash:?}: {shunt_proof_junction:?}");
+                test_debug!(
+                    "Unable to verify shunt junction proof at {i} next_node_root_hash = {next_node_root_hash:?} penultimate hash = {penultimate_trie_hash:?}: {shunt_proof_junction:?}"
+                );
                 return false;
             };
 
@@ -1345,79 +1366,14 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
         TrieMerkleProof::<T>::verify_proof(&self.0, path, marf_value, root_hash, root_to_block)
     }
 
-    /// Walk down the trie pointed to by s until we reach a backptr or a leaf
-    fn inner_walk_to_leaf_or_backptr<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
-        read_session: &mut TrieReadSession<'_, T, S, R>,
-        path: &TrieHash,
-        cursor: &mut TrieCursor<T>,
-    ) -> Result<(TriePtr, Option<MARFValue>), Error> {
-        trace!(
-            "Walk path {path:?} from {:?} to the first backptr",
-            read_session.storage().get_cur_block()
-        );
-
-        let root_ptr = read_session.storage().root_trieptr();
-        let mut node_ptr = root_ptr;
-        cursor.reset(path, root_ptr);
-
-        for _ in 0..(cursor.path.len() + 1) {
-            let cur_block = read_session.storage().get_cur_block();
-            let read = read_session.read_node(&node_ptr)?;
-            match cursor.walk_read(&read, &cur_block) {
-                Ok(Some(next_ptr)) => {
-                    node_ptr = next_ptr;
-                    continue;
-                }
-                Ok(None) => {
-                    trace!("Found leaf {:?}", &read.node_type());
-                    if clear_backptr(cursor.ptr().id()) != TrieNodeID::Leaf as u8 {
-                        return Err(Error::CorruptionError(
-                            "Non-leaf encountered at end of path".to_string(),
-                        ));
-                    }
-
-                    let leaf = read.as_leaf()?.ok_or_else(|| {
-                        Error::CorruptionError("Path reached a non-leaf".to_string())
-                    })?;
-                    return Ok((node_ptr, Some(leaf.data.clone())));
-                }
-                Err(Error::CursorError(CursorError::PathDiverged)) => {
-                    trace!("Path diverged -- we're done.");
-                    return Err(Error::NotFoundError);
-                }
-                Err(Error::CursorError(CursorError::ChrNotFound)) => {
-                    trace!("Failed to walk from {:?}", &read.node_type());
-                    return Err(Error::NotFoundError);
-                }
-                Err(Error::CursorError(CursorError::BackptrEncountered(ptr))) => {
-                    if !is_backptr(ptr.id()) {
-                        return Err(Error::CorruptionError(format!(
-                            "Failed to walk 0x{:02x} -- got non-backptr",
-                            ptr.chr()
-                        )));
-                    }
-
-                    trace!("Found backptr {:?}", &ptr);
-                    return Ok((ptr, None));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        trace!("Trie has a cycle");
-        Err(Error::CorruptionError("Trie has a cycle".to_string()))
-    }
-
     /// Make a merkle proof of inclusion from a path.
     /// If the path doesn't resolve, return an error (NotFoundError)
-    pub fn from_path<S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
+    pub fn from_path<S: NodePatching, R: TrieReadStorage<T> + ?Sized>(
         ctx: &mut MarfReadCtx<'_, T, S, R>,
         path: &TrieHash,
         expected_value: &MARFValue,
         root_block_header: &T,
     ) -> Result<TrieMerkleProof<T>, Error> {
-        let (cur_block_hash, cur_block_id) = ctx.storage().get_cur_block_and_id();
-
         // Squash-aware proofs are not currently supported.
         if ctx.storage().is_squashed() {
             return Err(Error::UnsupportedOnSquashedMarf(
@@ -1425,14 +1381,11 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             ));
         }
 
-        let result = (|| {
-            ctx.with_read_state(|storage, cursor_opt, _decode_scratch| {
-                cursor_opt.get_or_insert_with(|| TrieCursor::new(path, storage.root_trieptr()));
-            });
-
+        ctx.with_restored_block_context(|ctx| {
             let mut segment_proofs = vec![];
             let mut shunt_proofs = vec![];
             let mut block_header = root_block_header.clone();
+            let mut cursor = TrieCursor::new(path, TriePtr::default());
 
             loop {
                 ctx.open_block(&block_header, None)?;
@@ -1442,24 +1395,24 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                     &ctx.storage().get_cur_block(),
                     path
                 );
-                let (backptr, reached_leaf_value) =
-                    ctx.with_read_state(|storage, cursor_opt, decode_scratch| {
-                        let cursor = cursor_opt
-                            .as_mut()
-                            .expect("FATAL: cursor should be initialized before proof walk");
-                        let mut read_session = TrieReadSession::new(storage, decode_scratch);
-                        TrieMerkleProof::inner_walk_to_leaf_or_backptr(
-                            &mut read_session,
-                            path,
-                            cursor,
-                        )
-                    })?;
+                let walk_result = ctx.with_read_state(|storage, _cursor_opt, decode_scratch| {
+                    let mut read_session = TrieReadSession::new(storage, decode_scratch);
+                    trace!(
+                        "Walk path {path:?} from {:?} to the first backptr",
+                        read_session.storage().get_cur_block()
+                    );
+                    read_session.walk_to_leaf_or_backptr(path, &mut cursor)
+                })?;
+                let (backptr, reached_leaf_value) = match walk_result {
+                    TrieLeafOrBackptr::Leaf { ptr, leaf } => (ptr, Some(leaf.data)),
+                    TrieLeafOrBackptr::Backptr(ptr) => {
+                        trace!("Found backptr {:?}", &ptr);
+                        (ptr, None)
+                    }
+                };
 
                 let segment_proof =
-                    ctx.with_read_state(|storage, cursor_opt, decode_scratch| {
-                        let cursor = cursor_opt
-                            .as_ref()
-                            .expect("FATAL: cursor should be initialized before segment proof");
+                    ctx.with_read_state(|storage, _cursor_opt, decode_scratch| {
                         trace!(
                             "Make segment proof at {:?} from {:?}",
                             &storage.get_cur_block(),
@@ -1475,17 +1428,12 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                 segment_proofs.push(segment_proof);
 
                 let cur_block = ctx.storage().get_cur_block();
-                ctx.with_read_state(|_storage, cursor_opt, _decode_scratch| {
-                    let cursor = cursor_opt
-                        .as_ref()
-                        .expect("FATAL: cursor should be initialized before shunt proof");
-                    trace!(
-                        "Make shunt proof {:?} back to the block containing {:?} (cursor ptrs = {:?})",
-                        &cur_block,
-                        &backptr,
-                        &cursor.node_ptrs
-                    );
-                });
+                trace!(
+                    "Make shunt proof {:?} back to the block containing {:?} (cursor ptrs = {:?})",
+                    &cur_block,
+                    &backptr,
+                    &cursor.node_ptrs
+                );
 
                 if is_backptr(backptr.id()) {
                     shunt_proofs.push(TrieMerkleProof::make_backptr_shunt_proof(ctx, &backptr)?);
@@ -1493,14 +1441,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
                     shunt_proofs.push(TrieMerkleProof::make_initial_shunt_proof(ctx)?);
                 }
 
-                let cursor_ptr_id = ctx.with_read_state(|_storage, cursor_opt, _decode_scratch| {
-                    cursor_opt
-                        .as_ref()
-                        .expect("FATAL: cursor should be initialized before leaf check")
-                        .ptr()
-                        .id()
-                });
-                if cursor_ptr_id == TrieNodeID::Leaf as u8 {
+                if cursor.ptr().id() == TrieNodeID::Leaf as u8 {
                     match reached_leaf_value {
                         Some(data) => {
                             if data != *expected_value {
@@ -1558,10 +1499,6 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             }
 
             Ok(TrieMerkleProof(proof))
-        })();
-
-        ctx.open_block(&cur_block_hash, cur_block_id)?;
-
-        result
+        })
     }
 }

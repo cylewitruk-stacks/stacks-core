@@ -33,7 +33,7 @@ use crate::chainstate::stacks::index::storage::testing::MarfTestStorage;
 use crate::chainstate::stacks::index::storage::*;
 use crate::chainstate::stacks::index::trie::*;
 use crate::chainstate::stacks::index::{
-    Error, MARFValue, MarfTrieId, TrieLeaf, TrieNodeReadState, TrieReadSession, TrieReadStorage,
+    Error, MARFValue, MarfTrieId, NodePatching, TrieLeaf, TrieReadSession, TrieReadStorage,
 };
 use crate::chainstate::stacks::{BlockHeaderHash, TrieHash};
 
@@ -83,7 +83,7 @@ impl<T: MarfTrieId> MarfRootTable<T> for ReopenedTrieStorageConnection<'_, T> {
     }
 }
 
-impl<T: MarfTrieId, S: TrieNodeReadState, R> MarfRootTable<T> for MarfReadCtx<'_, T, S, R>
+impl<T: MarfTrieId, S: NodePatching, R> MarfRootTable<T> for MarfReadCtx<'_, T, S, R>
 where
     R: TrieReadStorage<T> + MarfTestStorage<T> + ?Sized,
 {
@@ -265,7 +265,7 @@ fn verify_marf_merkle_proof<C>(
     root_to_block: Option<HashMap<TrieHash, BlockHeaderHash>>,
 ) -> HashMap<TrieHash, BlockHeaderHash>
 where
-    C: MarfInternals<BlockHeaderHash> + MarfRootTable<BlockHeaderHash>,
+    C: MarfCore<BlockHeaderHash> + MarfRootTable<BlockHeaderHash>,
 {
     ctx.open_block(header, None).unwrap();
     let root_hash = ctx

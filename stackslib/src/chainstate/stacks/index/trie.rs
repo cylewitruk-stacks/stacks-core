@@ -16,6 +16,7 @@
 
 /// This module defines the methods for reading and inserting into a Trie
 use std::ops::Deref;
+use std::sync::Arc;
 
 use rusqlite::Connection;
 use sha2::Digest;
@@ -28,8 +29,8 @@ use crate::chainstate::stacks::index::node::{
 use crate::chainstate::stacks::index::scratch::MarfReadState;
 use crate::chainstate::stacks::index::storage::{TrieHashCalculationMode, TrieStorageConnection};
 use crate::chainstate::stacks::index::{
-    bits, Error, MarfTrieId, NodePath, ReadNodeBacking, ReadTrieNode, TrieHasher, TrieLeaf,
-    TrieNodeReadState, TrieReadStorage,
+    bits, Error, MarfTrieId, NodeParking, NodePatching, NodePath, ReadNodeBacking, ReadTrieNode,
+    TrieHasher, TrieLeaf, TrieReadStorage,
 };
 use crate::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 use crate::util::macros::is_trace;
@@ -115,9 +116,9 @@ impl Trie {
     ///
     /// Probe the stored root header first so compatibility checks do not create an escaping borrow,
     /// and then perform a single real read of the root node.
-    pub fn read_root<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T> + ?Sized>(
+    pub fn read_root<'a, T: MarfTrieId, R: TrieReadStorage<T> + ?Sized>(
         storage: &'a mut R,
-        decode_scratch: &'a mut S,
+        decode_scratch: &'a mut impl NodePatching,
     ) -> Result<ReadTrieNode<'a>, Error> {
         let root_ptr = storage.root_trieptr();
         let (stored_id, _root_hash) = storage.read_node_type_id(&root_ptr)?;
@@ -141,11 +142,11 @@ impl Trie {
     ///
     /// Either way, return the node view and the ptr to the node in the block in which it was
     /// found (it will _not_ be a back-pointer).
-    pub fn walk_backptr<'a, T: MarfTrieId, S: TrieNodeReadState, R: TrieReadStorage<T>>(
+    pub fn walk_backptr<'a, T: MarfTrieId, R: TrieReadStorage<T>>(
         storage: &'a mut R,
         ptr: &TriePtr,
         cursor: &mut TrieCursor<T>,
-        decode_scratch: &'a mut S,
+        decode_scratch: &'a mut impl NodePatching,
     ) -> Result<(ReadTrieNode<'a>, TriePtr), Error> {
         let followed_backptr = is_backptr(ptr.id());
         let resolved_ptr = Trie::resolve_backptr(storage, ptr)?;
@@ -650,15 +651,10 @@ impl Trie {
     ///
     /// **Do not** use the returned node for in-place overwrite or flush logic without
     /// first ensuring transient metadata is preserved.
-    fn read_deferred_cursor_node<
-        'a,
-        T: MarfTrieId,
-        S: TrieNodeReadState,
-        Db: Deref<Target = Connection>,
-    >(
+    fn read_deferred_cursor_node<'a, T: MarfTrieId, Db: Deref<Target = Connection>>(
         storage: &'a mut TrieStorageConnection<T, Db>,
         cursor: &TrieCursor<T>,
-        decode_scratch: &'a mut S,
+        decode_scratch: &'a mut (impl NodePatching + NodeParking),
     ) -> Result<ReadTrieNode<'a>, Error> {
         let node_handle = cursor.node_handle().ok_or_else(|| {
             Error::CorruptionError("Cursor is uninitialized or missing survival handle".to_string())
@@ -699,9 +695,11 @@ impl Trie {
             ReadNodeBacking::PersistedDecoded(node) => {
                 DeferredNodeAction::ParkOwned(node.to_owned_node())
             }
-            ReadNodeBacking::PersistedBytes(node) => DeferredNodeAction::ParkOwned(
-                bits::decode_stable_node_bytes(node.bytes(), node.node_type())?,
-            ),
+            ReadNodeBacking::PersistedBytes(node) => {
+                let (node, _consumed) =
+                    bits::decode_nodetype_from_slice_at_head(node.bytes(), node.node_type() as u8)?;
+                DeferredNodeAction::ParkOwned(node)
+            }
             ReadNodeBacking::Owned(node) => DeferredNodeAction::ParkOwned(node),
         };
 
@@ -722,11 +720,11 @@ impl Trie {
 
     /// Add a new value to the Trie at the location pointed at by the cursor.
     /// Returns a ptr to be inserted into the last node visited by the cursor.
-    pub fn add_value<T: MarfTrieId, S: TrieNodeReadState, Db: Deref<Target = Connection>>(
+    pub fn add_value<T: MarfTrieId, Db: Deref<Target = Connection>>(
         storage: &mut TrieStorageConnection<T, Db>,
         cursor: &mut TrieCursor<T>,
         value: &mut TrieLeaf,
-        decode_scratch: &mut S,
+        decode_scratch: &mut (impl NodePatching + NodeParking),
     ) -> Result<TriePtr, Error> {
         enum MutationTarget {
             ReplaceLeaf(NodePath),
@@ -793,16 +791,14 @@ impl Trie {
 
     /// Perform the reads, lookups, etc. for computing the ancestor byte vector.
     /// This method _does not_ restore the previously open block on failure, the caller will do that.
-    fn inner_get_trie_ancestor_hashes_bytes<
-        T: MarfTrieId,
-        S: TrieNodeReadState,
-        R: TrieReadStorage<T> + ?Sized,
-    >(
+    fn inner_get_trie_ancestor_hashes_bytes<T: MarfTrieId, R: TrieReadStorage<T> + ?Sized>(
         storage: &mut R,
         cursor_opt: &mut Option<TrieCursor<T>>,
-        decode_scratch: &mut S,
+        decode_scratch: &mut impl NodePatching,
     ) -> Result<Vec<TrieHash>, Error> {
-        let mut read_ctx = MarfReadCtx::new(storage, cursor_opt, decode_scratch);
+        let mut nested_cursor = None;
+        let mut read_ctx =
+            MarfReadCtx::new(storage, cursor_opt, &mut nested_cursor, decode_scratch);
         let cur_block_header = read_ctx.storage().get_cur_block();
         // definitely enough space for the foreseeable future
         //    ancestor depth _cannot_ exceed 32 -- 2^32 > max size of u32
@@ -876,15 +872,11 @@ impl Trie {
 
     /// Calculate the byte vector of the ancestor root hashes of this trie.
     /// `storage` must point to the block that contains the trie's root.
-    pub fn get_trie_ancestor_hashes_bytes<
-        T: MarfTrieId,
-        S: TrieNodeReadState,
-        R: TrieReadStorage<T> + ?Sized,
-    >(
+    pub fn get_trie_ancestor_hashes_bytes<T: MarfTrieId, R: TrieReadStorage<T> + ?Sized>(
         storage: &mut R,
         cursor_opt: &mut Option<TrieCursor<T>>,
-        decode_scratch: &mut S,
-    ) -> Result<Vec<TrieHash>, Error> {
+        decode_scratch: &mut impl NodePatching,
+    ) -> Result<Arc<[TrieHash]>, Error> {
         let (cur_block_header, cur_block_id) = storage.get_cur_block_and_id();
         if let Some(cached_ancestor_hashes_bytes) =
             storage.check_cached_ancestor_hashes_bytes(&cur_block_header)
@@ -893,8 +885,9 @@ impl Trie {
         } else {
             let result =
                 Trie::inner_get_trie_ancestor_hashes_bytes(storage, cursor_opt, decode_scratch);
+            let result = result.map(Arc::<[TrieHash]>::from);
             if let Ok(ref result) = result {
-                storage.set_cached_ancestor_hashes_bytes(&cur_block_header, result.clone());
+                storage.set_cached_ancestor_hashes_bytes(&cur_block_header, Arc::clone(result));
             }
 
             // restore
@@ -915,9 +908,11 @@ impl Trie {
         );
         let mut cursor = None;
         let mut decode_scratch = MarfReadState::new();
-        let mut ancestor_bytes =
+        let ancestor_hashes =
             Trie::get_trie_ancestor_hashes_bytes(storage, &mut cursor, &mut decode_scratch)?;
+        let mut ancestor_bytes = Vec::with_capacity(ancestor_hashes.len() + 1);
         ancestor_bytes.insert(0, *children_root_hash);
+        ancestor_bytes.extend_from_slice(&ancestor_hashes);
 
         trace!(
             "Trie ancestor bytes for root hash calculation: {:?}",
@@ -930,21 +925,21 @@ impl Trie {
     /// Calculate the root hash of the trie (i.e. the hash for the root node) by including both the
     /// digest of this Trie, as well as a geometric sequence of prior Trie root hashes as far back
     /// as we can go.
-    pub fn get_trie_root_hash<
-        T: MarfTrieId,
-        S: TrieNodeReadState,
-        Db: Deref<Target = Connection>,
-    >(
+    pub fn get_trie_root_hash<T: MarfTrieId, Db: Deref<Target = Connection>>(
         storage: &mut TrieStorageConnection<T, Db>,
         children_root_hash: &TrieHash,
         cursor_opt: &mut Option<TrieCursor<T>>,
-        decode_scratch: &mut S,
+        decode_scratch: &mut impl NodePatching,
     ) -> Result<TrieHash, Error> {
-        let mut hashes = Trie::get_trie_ancestor_hashes_bytes(storage, cursor_opt, decode_scratch)?;
-        hashes.insert(0, *children_root_hash);
-        match hashes.as_slice() {
-            [single_hash] => Ok(*single_hash),
-            multiple_hashes => Ok(TrieHash::from_data_array(multiple_hashes)),
+        let ancestor_hashes =
+            Trie::get_trie_ancestor_hashes_bytes(storage, cursor_opt, decode_scratch)?;
+        if ancestor_hashes.is_empty() {
+            Ok(*children_root_hash)
+        } else {
+            let mut hashes = Vec::with_capacity(ancestor_hashes.len() + 1);
+            hashes.push(*children_root_hash);
+            hashes.extend_from_slice(&ancestor_hashes);
+            Ok(TrieHash::from_data_array(&hashes))
         }
     }
 
@@ -954,16 +949,12 @@ impl Trie {
     /// from the hash of its children, plus the hash tries `i-1`, `i-2`, `i-4`, `i-8`, ..., `i-2**j`, ...
     ///
     /// This is required for Merkle proofs to work (specifically, the shunt proofs).
-    fn recalculate_root_hash<
-        T: MarfTrieId,
-        S: TrieNodeReadState,
-        Db: Deref<Target = Connection>,
-    >(
+    fn recalculate_root_hash<T: MarfTrieId, Db: Deref<Target = Connection>>(
         storage: &mut TrieStorageConnection<T, Db>,
         cursor: &TrieCursor<T>,
         update_skiplist: bool,
         ancestor_cursor: &mut Option<TrieCursor<T>>,
-        decode_scratch: &mut S,
+        decode_scratch: &mut impl NodePatching,
     ) -> Result<(), Error> {
         assert!(!cursor.node_ptrs.is_empty());
 
@@ -993,7 +984,13 @@ impl Trie {
                 ));
             }
 
-            let my_hash = get_nodetype_hash(storage, &node)?;
+            let my_hash = match get_nodetype_hash(storage, &node) {
+                Ok(my_hash) => my_hash,
+                Err(e) => {
+                    storage.restore_ram_node(child_index, node, cur_hash)?;
+                    return Err(e);
+                }
+            };
 
             // Restore before ancestor hash lookup (which traverses the trie).
             storage.restore_ram_node(child_index, node, my_hash)?;
@@ -1040,14 +1037,25 @@ impl Trie {
                 let updated = node.replace(&child_ptr);
                 if !updated {
                     trace!("FAILED TO UPDATE {node:?} WITH {child_ptr:?}: {cursor:?}");
-                    assert!(updated);
+                    storage.restore_ram_node(ptr_index, node, cur_hash)?;
+                    return Err(Error::CorruptionError(
+                        "Failed to update parent node during root hash recalculation".to_string(),
+                    ));
                 }
 
                 let is_root_node256 = node.is_node256() && ptr == storage.root_trieptr();
-                let content_hash = get_nodetype_hash(storage, &node)?;
+                let content_hash = match get_nodetype_hash(storage, &node) {
+                    Ok(content_hash) => content_hash,
+                    Err(e) => {
+                        storage.restore_ram_node(ptr_index, node, cur_hash)?;
+                        return Err(e);
+                    }
+                };
 
                 if !is_root_node256 {
-                    trace!("update_root_hash: Updated node with {child_ptr:?} from {cur_hash:?} to {content_hash:?}");
+                    trace!(
+                        "update_root_hash: Updated node with {child_ptr:?} from {cur_hash:?} to {content_hash:?}"
+                    );
                     storage.restore_ram_node(ptr_index, node, content_hash)?;
                 } else {
                     // Root Node256: restore with temp hash so ancestor traversal works,
@@ -1089,10 +1097,10 @@ impl Trie {
         Ok(())
     }
 
-    pub fn update_root_hash<T: MarfTrieId, S: TrieNodeReadState, Db: Deref<Target = Connection>>(
+    pub fn update_root_hash<T: MarfTrieId, Db: Deref<Target = Connection>>(
         storage: &mut TrieStorageConnection<T, Db>,
         cursor: &TrieCursor<T>,
-        decode_scratch: &mut S,
+        decode_scratch: &mut impl NodePatching,
     ) -> Result<(), Error> {
         let mut ancestor_cursor = None;
         Trie::recalculate_root_hash(
@@ -1104,14 +1112,10 @@ impl Trie {
         )
     }
 
-    pub fn update_root_node_hash<
-        T: MarfTrieId,
-        S: TrieNodeReadState,
-        Db: Deref<Target = Connection>,
-    >(
+    pub fn update_root_node_hash<T: MarfTrieId, Db: Deref<Target = Connection>>(
         storage: &mut TrieStorageConnection<T, Db>,
         cursor: &TrieCursor<T>,
-        decode_scratch: &mut S,
+        decode_scratch: &mut impl NodePatching,
     ) -> Result<(), Error> {
         let mut ancestor_cursor = None;
         Trie::recalculate_root_hash(storage, cursor, false, &mut ancestor_cursor, decode_scratch)

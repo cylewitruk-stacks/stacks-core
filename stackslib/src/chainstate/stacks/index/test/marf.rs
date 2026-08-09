@@ -24,7 +24,7 @@ use stacks_common::util::hash::to_hex;
 
 use super::MarfRootTable;
 use crate::chainstate::stacks::index::marf::{
-    MARFOpenOpts, MarfConnection, MarfCore as _, MarfInternals, BLOCK_HASH_TO_HEIGHT_MAPPING_KEY,
+    MARFOpenOpts, MarfConnection, MarfCore, BLOCK_HASH_TO_HEIGHT_MAPPING_KEY,
     BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
 use crate::chainstate::stacks::index::node::{TrieNodeID, TrieNodeType, TriePtr};
@@ -39,7 +39,7 @@ use crate::chainstate::stacks::index::{
     ClarityMarfTrieId, Error, MARFValue, MarfTrieId, TrieLeaf, TrieReadStorage,
 };
 
-pub trait MarfTestExt<T>: MarfInternals<T> + MarfRootTable<T>
+pub trait MarfTestExt<T>: MarfCore<T> + MarfRootTable<T>
 where
     T: MarfTrieId,
 {
@@ -122,7 +122,7 @@ where
     }
 }
 
-impl<T: MarfTrieId, U: MarfInternals<T> + MarfRootTable<T>> MarfTestExt<T> for U {}
+impl<T: MarfTrieId, U: MarfCore<T> + MarfRootTable<T>> MarfTestExt<T> for U {}
 
 #[test]
 fn marf_insert_different_leaf_same_block_100() {
@@ -1036,11 +1036,11 @@ where
 
         for (i, block) in blocks.iter().enumerate() {
             assert_eq!(
-                MarfConnection::get_block_height(&mut marf, block, &block_header).unwrap(),
+                MarfCore::get_block_height(&mut marf, block, &block_header).unwrap(),
                 Some(i as u32)
             );
             assert_eq!(
-                MarfConnection::get_block_at_height(&mut marf, i as u32, &block_header).unwrap(),
+                MarfCore::get_block_at_height(&mut marf, i as u32, &block_header).unwrap(),
                 Some(block.clone())
             );
         }
@@ -1597,11 +1597,11 @@ fn marf_insert_get_128_fork_256() {
     for (height, fork_row) in fork_headers.iter().enumerate() {
         for block in fork_row.iter() {
             assert_eq!(
-                MarfConnection::get_block_height(&mut m, block, block).unwrap(),
+                MarfCore::get_block_height(&mut m, block, block).unwrap(),
                 Some(height as u32)
             );
             assert_eq!(
-                MarfConnection::get_block_at_height(&mut m, height as u32, block).unwrap(),
+                MarfCore::get_block_at_height(&mut m, height as u32, block).unwrap(),
                 Some(block.clone())
             );
         }
@@ -1796,7 +1796,7 @@ fn marf_insert_flush_to_different_block() {
 
         // get_block_at_height should now always return the correct block_header
         assert_eq!(
-            MarfConnection::get_block_at_height(&mut marf, i as u32, &block_header).unwrap(),
+            MarfCore::get_block_at_height(&mut marf, i as u32, &block_header).unwrap(),
             Some(block.clone())
         );
     }
@@ -2971,7 +2971,7 @@ fn test_block_height_readback_resume_from_disk() {
             initial_blocks.iter().chain(resume_blocks.iter()).collect();
 
         for (i, block) in all_blocks.iter().enumerate() {
-            let height = MarfConnection::get_block_height(&mut marf, block, &tip)
+            let height = MarfCore::get_block_height(&mut marf, block, &tip)
                 .unwrap_or_else(|e| panic!("Writer: block {i} height failed: {e}"));
             assert_eq!(height, Some(i as u32), "Writer: block {i} height mismatch");
         }
@@ -3046,7 +3046,7 @@ fn test_block_height_readback_multi_resume() {
         all_blocks.extend(session_blocks);
 
         for (i, block) in all_blocks.iter().enumerate() {
-            let height = MarfConnection::get_block_height(&mut marf, block, &tip)
+            let height = MarfCore::get_block_height(&mut marf, block, &tip)
                 .unwrap_or_else(|e| panic!("Session {session}: block {i} height failed: {e}"));
             assert_eq!(
                 height,

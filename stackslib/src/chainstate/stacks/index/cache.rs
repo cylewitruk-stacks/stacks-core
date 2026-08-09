@@ -37,7 +37,7 @@ impl<T: MarfTrieId> BlockCache<T> {
             "noop" | "everything" | "node256" => {}
             _ => {
                 error!(
-                    "Unsupported trie node cache strategy '{}'; falling back to block metadata-only caching",
+                    "Unsupported MARF cache strategy '{}'; falling back to block metadata-only caching",
                     strategy
                 );
             }

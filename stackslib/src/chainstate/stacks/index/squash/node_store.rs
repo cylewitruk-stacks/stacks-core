@@ -20,7 +20,7 @@ use stacks_common::types::chainstate::{TrieHash, TRIEHASH_ENCODED_SIZE};
 
 use crate::chainstate::stacks::index::file::read_exact_at;
 use crate::chainstate::stacks::index::node::{
-    TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeType, TriePtr,
+    TrieNode16, TrieNode256, TrieNode4, TrieNode48, TrieNodeTransientMeta, TrieNodeType, TriePtr,
 };
 use crate::chainstate::stacks::index::{Error, MARFValue, NodePath, TrieLeaf};
 
@@ -152,9 +152,7 @@ pub(crate) fn deserialize_node<R: Read>(r: &mut R) -> Result<TrieNodeType, Error
             Ok(TrieNodeType::Node4(TrieNode4 {
                 path,
                 ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             }))
         }
         TAG_NODE16 => {
@@ -165,9 +163,7 @@ pub(crate) fn deserialize_node<R: Read>(r: &mut R) -> Result<TrieNodeType, Error
             Ok(TrieNodeType::Node16(TrieNode16 {
                 path,
                 ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             }))
         }
         TAG_NODE48 => {
@@ -182,9 +178,7 @@ pub(crate) fn deserialize_node<R: Read>(r: &mut R) -> Result<TrieNodeType, Error
                 path,
                 indexes,
                 ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             })))
         }
         TAG_NODE256 => {
@@ -195,9 +189,7 @@ pub(crate) fn deserialize_node<R: Read>(r: &mut R) -> Result<TrieNodeType, Error
             Ok(TrieNodeType::Node256(Box::new(TrieNode256 {
                 path,
                 ptrs,
-                cowptr: None,
-                patch_depth: 0,
-                last_patch_source: None,
+                meta: TrieNodeTransientMeta::default(),
             })))
         }
         _ => Err(Error::CorruptionError(format!(
