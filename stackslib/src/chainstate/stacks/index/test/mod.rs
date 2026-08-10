@@ -527,11 +527,10 @@ pub mod opts {
     pub static OPTS_DEF_EXT_COMP_MMAP: LazyLock<MARFOpenOpts> =
         LazyLock::new(|| OPTS_DEF_EXT_COMP.clone().with_mmap(true));
 
-    /// All combinations: 2 hash modes × 2 external_blobs × 2 compression × 2 mmap = 16 configs.
-    /// The base 8 configs (mmap=false) preserve existing coverage; the mmap=true variants
-    /// exercise the mmap read path for every configuration.
+    /// All meaningful combinations: the 8 base configurations plus the 4 external-blob mmap
+    /// variants. Mmap has no effect without external blob storage, so those duplicates are omitted.
     pub static ALL_OPTS: LazyLock<Vec<MARFOpenOpts>> = LazyLock::new(|| {
-        let base = vec![
+        vec![
             OPTS_IMM.clone(),
             OPTS_IMM_EXT.clone(),
             OPTS_IMM_COMP.clone(),
@@ -540,12 +539,11 @@ pub mod opts {
             OPTS_DEF_EXT.clone(),
             OPTS_DEF_COMP.clone(),
             OPTS_DEF_EXT_COMP.clone(),
-        ];
-        let mut all = base.clone();
-        for opts in &base {
-            all.push(opts.clone().with_mmap(true));
-        }
-        all
+            OPTS_IMM_EXT_MMAP.clone(),
+            OPTS_IMM_EXT_COMP_MMAP.clone(),
+            OPTS_DEF_EXT_MMAP.clone(),
+            OPTS_DEF_EXT_COMP_MMAP.clone(),
+        ]
     });
 
     #[template]
