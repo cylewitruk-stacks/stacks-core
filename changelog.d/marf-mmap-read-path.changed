@@ -1,0 +1,1 @@
+Improve MARF read performance with optional memory-mapped trie blob access and reusable referential read state, controlled by the new `node.marf_mmap` configuration option (enabled by default).
