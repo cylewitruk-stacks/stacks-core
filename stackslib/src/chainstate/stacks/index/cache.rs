@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use crate::chainstate::stacks::index::MarfTrieId;
 
-/// Cache state for block metadata caching.
-pub struct BlockCache<T: MarfTrieId> {
+/// Cache MARF block hash/block ID lookups.
+pub struct BlockHashCache<T: MarfTrieId> {
     /// Mapping between trie blob IDs (i.e. rowids) and the [`MarfTrieId`] of the trie.
     ///
     /// Contents are never evicted; the size of this map grows only at the rate of new Stacks
@@ -31,37 +31,12 @@ pub struct BlockCache<T: MarfTrieId> {
     block_id_cache: HashMap<T, u32>,
 }
 
-impl<T: MarfTrieId> BlockCache<T> {
-    pub fn new(strategy: &str) -> BlockCache<T> {
-        match strategy {
-            "noop" | "everything" | "node256" => {}
-            _ => {
-                error!(
-                    "Unsupported MARF cache strategy '{}'; falling back to block metadata-only caching",
-                    strategy
-                );
-            }
-        }
-
-        BlockCache {
+impl<T: MarfTrieId> BlockHashCache<T> {
+    pub fn new() -> BlockHashCache<T> {
+        BlockHashCache {
             block_hash_cache: HashMap::new(),
             block_id_cache: HashMap::new(),
         }
-    }
-
-    /// Instantiate the default strategy.This still accepts the legacy environment override, but
-    /// node-level caching has been removed.
-    pub fn default() -> BlockCache<T> {
-        if let Ok(strategy) = std::env::var("STACKS_MARF_CACHE_STRATEGY") {
-            BlockCache::new(&strategy)
-        } else {
-            BlockCache::new("noop")
-        }
-    }
-
-    /// Load a block hash provided its ID
-    pub fn load_block_hash(&self, block_id: u32) -> Option<T> {
-        self.block_hash_cache.get(&block_id).cloned()
     }
 
     /// Get cached entry for a block hash, given its ID, or, if not found, use `lookup` to get the

@@ -648,8 +648,8 @@ fn trie_node_patch_make_ptr_diff_all_in_one() {
 /// explicitly uses disk-backed storage to be able to use e.g. `marf-inspect` on the resulting
 /// MARFs.
 #[rstest]
-#[case::immediate(&opts::OPTS_NOOP_IMM_EXT, &opts::OPTS_NOOP_IMM_EXT_COMP)]
-#[case::deferred(&opts::OPTS_NOOP_DEF_EXT, &opts::OPTS_NOOP_DEF_EXT_COMP)]
+#[case::immediate(&opts::OPTS_IMM_EXT, &opts::OPTS_IMM_EXT_COMP)]
+#[case::deferred(&opts::OPTS_DEF_EXT, &opts::OPTS_DEF_EXT_COMP)]
 fn test_marf_compression_reduces_blob_size(
     #[case] uncompressed_opts: &MARFOpenOpts,
     #[case] compressed_opts: &MARFOpenOpts,
@@ -860,8 +860,7 @@ fn make_node_patch_restores_cur_block_during_compressed_flush() {
     fs::create_dir_all(test_dir).unwrap();
     let test_file = format!("{test_dir}/marf.sqlite");
 
-    let opts =
-        MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true).with_compression(true);
+    let opts = MARFOpenOpts::new(TrieHashCalculationMode::Immediate, true).with_compression(true);
     let f = TrieFileStorage::open(&test_file, opts).unwrap();
     let mut marf = MARF::from_storage(f);
 

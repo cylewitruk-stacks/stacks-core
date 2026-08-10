@@ -37,10 +37,10 @@ use crate::chainstate::stacks::index::{
 };
 use crate::chainstate::stacks::{BlockHeaderHash, TrieHash};
 
-pub mod cache;
 pub mod file;
 pub mod marf;
 pub mod marf_perfs;
+pub mod marf_regression;
 pub mod node;
 pub mod node_patch;
 pub mod proofs;
@@ -500,46 +500,46 @@ pub mod opts {
     use crate::chainstate::stacks::index::marf::MARFOpenOpts;
     use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 
-    pub static OPTS_NOOP_IMM: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", false));
-    pub static OPTS_NOOP_IMM_EXT: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Immediate, "noop", true));
-    pub static OPTS_NOOP_IMM_COMP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_IMM.clone().with_compression(true));
-    pub static OPTS_NOOP_IMM_EXT_COMP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_IMM_EXT.clone().with_compression(true));
-    pub static OPTS_NOOP_DEF: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false));
-    pub static OPTS_NOOP_DEF_EXT: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true));
-    pub static OPTS_NOOP_DEF_COMP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_DEF.clone().with_compression(true));
-    pub static OPTS_NOOP_DEF_EXT_COMP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_DEF_EXT.clone().with_compression(true));
+    pub static OPTS_IMM: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Immediate, false));
+    pub static OPTS_IMM_EXT: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Immediate, true));
+    pub static OPTS_IMM_COMP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_IMM.clone().with_compression(true));
+    pub static OPTS_IMM_EXT_COMP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_IMM_EXT.clone().with_compression(true));
+    pub static OPTS_DEF: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Deferred, false));
+    pub static OPTS_DEF_EXT: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| MARFOpenOpts::new(TrieHashCalculationMode::Deferred, true));
+    pub static OPTS_DEF_COMP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_DEF.clone().with_compression(true));
+    pub static OPTS_DEF_EXT_COMP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_DEF_EXT.clone().with_compression(true));
 
     // Mmap variants of the external-blob configs (for rstest parameterized tests).
-    pub static OPTS_NOOP_IMM_EXT_MMAP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_IMM_EXT.clone().with_mmap(true));
-    pub static OPTS_NOOP_DEF_EXT_MMAP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_DEF_EXT.clone().with_mmap(true));
-    pub static OPTS_NOOP_IMM_EXT_COMP_MMAP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_IMM_EXT_COMP.clone().with_mmap(true));
-    pub static OPTS_NOOP_DEF_EXT_COMP_MMAP: LazyLock<MARFOpenOpts> =
-        LazyLock::new(|| OPTS_NOOP_DEF_EXT_COMP.clone().with_mmap(true));
+    pub static OPTS_IMM_EXT_MMAP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_IMM_EXT.clone().with_mmap(true));
+    pub static OPTS_DEF_EXT_MMAP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_DEF_EXT.clone().with_mmap(true));
+    pub static OPTS_IMM_EXT_COMP_MMAP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_IMM_EXT_COMP.clone().with_mmap(true));
+    pub static OPTS_DEF_EXT_COMP_MMAP: LazyLock<MARFOpenOpts> =
+        LazyLock::new(|| OPTS_DEF_EXT_COMP.clone().with_mmap(true));
 
     /// All combinations: 2 hash modes × 2 external_blobs × 2 compression × 2 mmap = 16 configs.
     /// The base 8 configs (mmap=false) preserve existing coverage; the mmap=true variants
     /// exercise the mmap read path for every configuration.
-    pub static ALL_OPTS_NOOP: LazyLock<Vec<MARFOpenOpts>> = LazyLock::new(|| {
+    pub static ALL_OPTS: LazyLock<Vec<MARFOpenOpts>> = LazyLock::new(|| {
         let base = vec![
-            OPTS_NOOP_IMM.clone(),
-            OPTS_NOOP_IMM_EXT.clone(),
-            OPTS_NOOP_IMM_COMP.clone(),
-            OPTS_NOOP_IMM_EXT_COMP.clone(),
-            OPTS_NOOP_DEF.clone(),
-            OPTS_NOOP_DEF_EXT.clone(),
-            OPTS_NOOP_DEF_COMP.clone(),
-            OPTS_NOOP_DEF_EXT_COMP.clone(),
+            OPTS_IMM.clone(),
+            OPTS_IMM_EXT.clone(),
+            OPTS_IMM_COMP.clone(),
+            OPTS_IMM_EXT_COMP.clone(),
+            OPTS_DEF.clone(),
+            OPTS_DEF_EXT.clone(),
+            OPTS_DEF_COMP.clone(),
+            OPTS_DEF_EXT_COMP.clone(),
         ];
         let mut all = base.clone();
         for opts in &base {
@@ -550,13 +550,17 @@ pub mod opts {
 
     #[template]
     #[rstest]
-    #[case::imm(&opts::OPTS_NOOP_IMM)]
-    #[case::imm_ext(&opts::OPTS_NOOP_IMM_EXT)]
-    #[case::imm_comp(&opts::OPTS_NOOP_IMM_COMP)]
-    #[case::imm_ext_comp(&opts::OPTS_NOOP_IMM_EXT_COMP)]
-    #[case::def(&opts::OPTS_NOOP_DEF)]
-    #[case::def_ext(&opts::OPTS_NOOP_DEF_EXT)]
-    #[case::def_comp(&opts::OPTS_NOOP_DEF_COMP)]
-    #[case::def_ext_comp(&opts::OPTS_NOOP_DEF_EXT_COMP)]
-    pub fn tpl_all_opts_noop(#[case] marf_opts: &MARFOpenOpts) {}
+    #[case::imm(&opts::OPTS_IMM)]
+    #[case::imm_ext(&opts::OPTS_IMM_EXT)]
+    #[case::imm_comp(&opts::OPTS_IMM_COMP)]
+    #[case::imm_ext_comp(&opts::OPTS_IMM_EXT_COMP)]
+    #[case::def(&opts::OPTS_DEF)]
+    #[case::def_ext(&opts::OPTS_DEF_EXT)]
+    #[case::def_comp(&opts::OPTS_DEF_COMP)]
+    #[case::def_ext_comp(&opts::OPTS_DEF_EXT_COMP)]
+    #[case::imm_ext_mmap(&opts::OPTS_IMM_EXT_MMAP)]
+    #[case::imm_ext_comp_mmap(&opts::OPTS_IMM_EXT_COMP_MMAP)]
+    #[case::def_ext_mmap(&opts::OPTS_DEF_EXT_MMAP)]
+    #[case::def_ext_comp_mmap(&opts::OPTS_DEF_EXT_COMP_MMAP)]
+    pub fn tpl_all_opts(#[case] marf_opts: &MARFOpenOpts) {}
 }

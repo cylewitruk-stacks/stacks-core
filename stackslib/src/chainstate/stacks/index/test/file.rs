@@ -120,7 +120,7 @@ fn test_migrate_existing_trie_blobs() {
     }
 
     let (data, last_block_header, root_header_map) = {
-        let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", false);
+        let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, false);
 
         let f = TrieFileStorage::open(test_file, marf_opts).unwrap();
         let mut marf = MARF::from_storage(f);
@@ -151,7 +151,7 @@ fn test_migrate_existing_trie_blobs() {
     };
 
     // migrate
-    let mut marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", true);
+    let mut marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, true);
     marf_opts.force_db_migrate = true;
 
     let f = TrieFileStorage::open(test_file, marf_opts).unwrap();
@@ -191,7 +191,7 @@ fn make_test_marf_with_single_block(
     test_file: &str,
     external_blobs: bool,
 ) -> (MARF<BlockHeaderHash>, BlockHeaderHash) {
-    let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, "noop", external_blobs);
+    let marf_opts = MARFOpenOpts::new(TrieHashCalculationMode::Deferred, external_blobs);
     let f = TrieFileStorage::open(test_file, marf_opts).unwrap();
     let mut marf = MARF::from_storage(f);
 

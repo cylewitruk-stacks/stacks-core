@@ -1513,7 +1513,7 @@ pub struct TrieSqlCursor<'a> {
 
 pub struct TrieSqlHashMapCursor<'a, T: MarfTrieId> {
     db: &'a Connection,
-    cache: &'a mut BlockCache<T>,
+    cache: &'a mut BlockHashCache<T>,
     unconfirmed: bool,
 }
 
@@ -1555,7 +1555,7 @@ pub struct TrieStorageConnection<'a, T: MarfTrieId, Db: Deref<Target = Connectio
     db: Db,
     blobs: Option<&'a mut TrieFile>,
     data: &'a mut TrieStorageTransientData<T>,
-    cache: &'a mut BlockCache<T>,
+    cache: &'a mut BlockHashCache<T>,
     bench: &'a mut TrieBenchmark,
     pub hash_calculation_mode: TrieHashCalculationMode,
     compress: bool,
@@ -1644,7 +1644,7 @@ pub struct TrieFileStorage<T: MarfTrieId> {
     db: Connection,
     blobs: Option<TrieFile>,
     data: TrieStorageTransientData<T>,
-    cache: BlockCache<T>,
+    cache: BlockHashCache<T>,
     bench: TrieBenchmark,
     hash_calculation_mode: TrieHashCalculationMode,
     compress: bool,
@@ -1745,7 +1745,7 @@ pub struct ReopenedTrieStorageConnection<'a, T: MarfTrieId> {
     db: &'a Connection,
     blobs: Option<TrieFile>,
     data: TrieStorageTransientData<T>,
-    cache: BlockCache<T>,
+    cache: BlockHashCache<T>,
     bench: TrieBenchmark,
     pub hash_calculation_mode: TrieHashCalculationMode,
     compress: bool,
@@ -1811,12 +1811,12 @@ impl<T: MarfTrieId> ReopenedTrieStorageConnection<'_, T> {
 /// Shared implementation for `TrieReadStorage::open_block`, used by both
 /// `TrieStorageConnection` and `ReopenedTrieStorageConnection`.
 ///
-/// `cache` is required because `get_block_id_caching` accesses `BlockCache<T>`, which lives
+/// `cache` is required because `get_block_id_caching` accesses [`BlockHashCache<T>`], which lives
 /// on the storage struct alongside (not inside) `TrieStorageTransientData`.
 fn open_block_impl<T: MarfTrieId>(
     data: &mut TrieStorageTransientData<T>,
     db: &Connection,
-    cache: &mut BlockCache<T>,
+    cache: &mut BlockHashCache<T>,
     bench: &mut TrieBenchmark,
     bhh: &T,
 ) -> Result<(), Error> {
@@ -1911,7 +1911,7 @@ fn open_block_known_id_impl<T: MarfTrieId>(
 /// borrowing the full storage struct.
 fn get_block_id_caching_impl<T: MarfTrieId>(
     unconfirmed: bool,
-    cache: &mut BlockCache<T>,
+    cache: &mut BlockHashCache<T>,
     db: &Connection,
     block_hash: &T,
 ) -> Result<u32, Error> {
@@ -2350,7 +2350,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             )
         };
         // perf note: should we attempt to clone the cache
-        let cache = BlockCache::default();
+        let cache = BlockHashCache::new();
         let blobs = if self.blobs.is_some() {
             Some(TrieFile::from_db_path(&self.db_path, true, self.mmap)?)
         } else {
@@ -2489,7 +2489,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             blobs.is_some()
         );
 
-        let cache = BlockCache::new(&marf_opts.cache_strategy);
+        let cache = BlockHashCache::new();
 
         let mut ret = TrieFileStorage {
             db_path,
@@ -2531,10 +2531,8 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
 
     pub fn open_unconfirmed(
         db_path: &str,
-        mut marf_opts: MARFOpenOpts,
+        marf_opts: MARFOpenOpts,
     ) -> Result<TrieFileStorage<T>, Error> {
-        // no caching allowed for unconfirmed tries, since they can disappear
-        marf_opts.cache_strategy = "noop".to_string();
         TrieFileStorage::open_opts(db_path, false, true, marf_opts)
     }
 
@@ -2612,7 +2610,7 @@ fn build_readonly_storage<T: MarfTrieId>(
     } else {
         None
     };
-    let cache = BlockCache::default();
+    let cache = BlockHashCache::new();
     Ok(TrieFileStorage {
         db_path: db_path.to_string(),
         db,
