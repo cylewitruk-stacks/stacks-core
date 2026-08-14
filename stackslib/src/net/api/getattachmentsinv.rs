@@ -21,15 +21,14 @@ use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::types::net::PeerHost;
 use url::form_urlencoded;
 
-use crate::net::atlas::{
-    AttachmentPage, GetAttachmentsInvResponse, MAX_ATTACHMENT_INV_PAGES_PER_REQUEST,
-};
+use crate::net::atlas::{GetAttachmentsInvResponse, MAX_ATTACHMENT_INV_PAGES_PER_REQUEST};
 use crate::net::http::{
     parse_json, Error, HttpBadRequest, HttpNotFound, HttpRequest, HttpRequestContents,
     HttpRequestPreamble, HttpResponse, HttpResponseContents, HttpResponsePayload,
     HttpResponsePreamble,
 };
 use crate::net::httpcore::{RPCRequestHandler, StacksHttpRequest, StacksHttpResponse};
+use crate::net::semantic::AttachmentSyncService;
 use crate::net::{Error as NetError, StacksNodeState};
 
 #[derive(Clone)]
@@ -174,38 +173,24 @@ impl RPCRequestHandler for RPCGetAttachmentsInvRequestHandler {
                 .map_err(NetError::from);
         }
 
-        let mut pages = vec![];
-
-        for page_index in page_indexes.iter() {
-            let page_res =
-                node.with_node_state(|network, _sortdb, _chainstate, _mempool, _rpc_args| {
-                    match network
-                        .get_atlasdb()
-                        .get_attachments_available_at_page_index(*page_index, &index_block_hash)
-                    {
-                        Ok(inventory) => Ok(AttachmentPage {
-                            inventory,
-                            index: *page_index,
-                        }),
-                        Err(e) => {
-                            let msg = format!("Unable to read Atlas DB - {}", e);
-                            warn!("{}", msg);
-                            Err(msg)
-                        }
-                    }
-                });
-
-            match page_res {
-                Ok(page) => {
-                    pages.push(page);
-                }
-                Err(msg) => {
-                    return StacksHttpResponse::new_error(&preamble, &HttpNotFound::new(msg))
-                        .try_into_contents()
-                        .map_err(NetError::from);
-                }
+        let pages = node.with_node_state(|network, _sortdb, _chainstate, _mempool, _rpc_args| {
+            AttachmentSyncService::legacy_inventory_pages(
+                network.get_atlasdb(),
+                &index_block_hash,
+                &page_indexes,
+                MAX_ATTACHMENT_INV_PAGES_PER_REQUEST,
+            )
+            .map_err(|error| format!("Unable to read Atlas DB - {error}"))
+        });
+        let pages = match pages {
+            Ok(pages) => pages,
+            Err(msg) => {
+                warn!("{msg}");
+                return StacksHttpResponse::new_error(&preamble, &HttpNotFound::new(msg))
+                    .try_into_contents()
+                    .map_err(NetError::from);
             }
-        }
+        };
 
         let content = GetAttachmentsInvResponse {
             block_id: index_block_hash.clone(),

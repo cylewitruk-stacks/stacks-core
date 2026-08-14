@@ -1625,9 +1625,9 @@ impl ConversationP2P {
             .block_height_to_reward_cycle(base_snapshot.block_height)
             .expect("FATAL: no reward cycle for a valid BlockSnapshot");
         let blocks_inv_data = chainstate
-            .get_blocks_inventory_for_reward_cycle(
+            .get_blocks_inventory_for_burnchain_range(
                 network.get_burnchain(),
-                reward_cycle,
+                base_snapshot.block_height,
                 &block_hashes,
             )
             .map_err(net_error::from)?;
@@ -1637,12 +1637,10 @@ impl ConversationP2P {
             let original_blocks_inv_data: BlocksInvData =
                 chainstate.get_blocks_inventory(&block_hashes)?;
 
-            if original_blocks_inv_data != blocks_inv_data {
-                warn!(
-                    "For reward cycle {}: {:?} != {:?}",
-                    reward_cycle, &original_blocks_inv_data, &blocks_inv_data
-                );
-            }
+            assert_eq!(
+                original_blocks_inv_data, blocks_inv_data,
+                "shared and reference inventory semantics differ for reward cycle {reward_cycle}"
+            );
         }
 
         Ok(StacksMessageType::BlocksInv(blocks_inv_data))

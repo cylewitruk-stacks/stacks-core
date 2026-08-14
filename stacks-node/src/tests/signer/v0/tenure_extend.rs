@@ -56,7 +56,7 @@ use crate::nakamoto_node::miner::{
     fault_injection_stall_miner, fault_injection_unstall_miner, TEST_BROADCAST_PROPOSAL_STALL,
 };
 use crate::nakamoto_node::relayer::TEST_MINER_COMMIT_TIP;
-use crate::nakamoto_node::stackerdb_listener::TEST_IGNORE_SIGNERS;
+use crate::nakamoto_node::signer_message_processor::TEST_IGNORE_SIGNERS;
 use crate::neon::Counters;
 use crate::tests::nakamoto_integrations::{next_block_and, wait_for};
 use crate::tests::neon_integrations::{

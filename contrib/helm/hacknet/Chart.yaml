@@ -1,0 +1,17 @@
+apiVersion: v2
+name: hacknet
+description: A Helm-packaged Kubernetes operator for disposable Stacks adversarial test networks
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/stacks-network/stacks-core
+sources:
+  - https://github.com/stacks-network/stacks-core
+keywords:
+  - stacks
+  - regtest
+  - testing
+  - chaos-engineering
+annotations:
+  artifacthub.io/license: GPL-3.0-only

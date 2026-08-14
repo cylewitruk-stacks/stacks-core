@@ -1,0 +1,1 @@
+Signer database schema 21 removes the legacy `stackerdb_tracking` table. Configuration rollback among the new libp2p/bridge modes remains supported, but an older signer binary cannot open a schema-21 database; binary downgrade requires restoring a pre-upgrade signer database backup. Back up signer state before upgrading when binary downgrade is part of the operator rollback plan.

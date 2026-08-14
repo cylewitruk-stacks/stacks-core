@@ -365,7 +365,10 @@ impl Node {
         );
 
         for observer in &config.events_observers {
-            event_dispatcher.register_observer(observer);
+            event_dispatcher.register_observer_with_proposal_auth(
+                observer,
+                config.connection_options.auth_token.clone(),
+            );
         }
 
         let burnchain_config = config.get_burnchain();

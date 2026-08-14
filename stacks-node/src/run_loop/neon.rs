@@ -335,7 +335,10 @@ impl RunLoop {
             config.node.effective_event_dispatcher_queue_size(),
         );
         for observer in config.events_observers.iter() {
-            event_dispatcher.register_observer(observer);
+            event_dispatcher.register_observer_with_proposal_auth(
+                observer,
+                config.connection_options.auth_token.clone(),
+            );
         }
 
         Self {

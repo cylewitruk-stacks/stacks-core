@@ -1,0 +1,19 @@
+[package]
+name = "stacks-signer-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "GPLv3"
+description = "Quarantined temporary StackerDB compatibility adapter for the native Stacks signer network"
+
+[dependencies]
+clarity = { path = "../clarity" }
+libsigner = { path = "../libsigner" }
+libstackerdb = { path = "../libstackerdb" }
+rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+stacks-common = { path = "../stacks-common" }
+stacks-network-types = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.3"

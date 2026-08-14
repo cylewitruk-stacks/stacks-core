@@ -114,6 +114,9 @@ pub struct Relayer {
     /// Maps to tenure ID and timestamp, so we can garbage-collect.
     /// Timestamp is in milliseconds
     recently_sent_nakamoto_blocks: HashMap<StacksBlockId, (ConsensusHash, u128)>,
+    /// Whether block/transaction application data may leave on the incumbent
+    /// peer transport. Generic StackerDB remains outside this migration switch.
+    legacy_data_relay_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -134,6 +137,13 @@ pub struct RelayerStats {
 
 pub struct ProcessedNetReceipts {
     pub mempool_txs_added: Vec<StacksTransaction>,
+    /// Newly accepted Epoch 2.x blocks, paired with their burn consensus context.
+    pub accepted_epoch2_blocks: Vec<(ConsensusHash, StacksBlock)>,
+    /// Newly accepted confirmed microblock streams, keyed by parent consensus context.
+    pub accepted_confirmed_microblocks: Vec<(ConsensusHash, Vec<StacksMicroblock>)>,
+    /// Newly chainstate-accepted Nakamoto blocks for transport-neutral
+    /// publication by the embedding node.
+    pub accepted_nakamoto_blocks: Vec<NakamotoBlock>,
     pub processed_unconfirmed_state: ProcessedUnconfirmedState,
     pub num_new_blocks: u64,
     pub num_new_confirmed_microblocks: u64,
@@ -578,6 +588,7 @@ impl Relayer {
             connection_opts,
             stacker_dbs,
             recently_sent_nakamoto_blocks: HashMap::new(),
+            legacy_data_relay_enabled: true,
         }
     }
 
@@ -588,6 +599,12 @@ impl Relayer {
 
     pub fn get_p2p_handle(&self) -> NetworkHandle {
         self.p2p.clone()
+    }
+
+    /// Disable incumbent block/transaction propagation while keeping its RPC
+    /// server and generic StackerDB compatibility available.
+    pub fn set_legacy_data_relay_enabled(&mut self, enabled: bool) {
+        self.legacy_data_relay_enabled = enabled;
     }
 
     /// Given Stacks 2.x blocks pushed to us, verify that they correspond to expected block data.
@@ -2247,6 +2264,9 @@ impl Relayer {
         available: BlocksAvailableMap,
         blocks: HashMap<ConsensusHash, StacksBlock>,
     ) -> Result<(), net_error> {
+        if !self.legacy_data_relay_enabled {
+            return Ok(());
+        }
         self.p2p.advertize_blocks(available, blocks)
     }
 
@@ -2255,6 +2275,9 @@ impl Relayer {
         consensus_hash: ConsensusHash,
         block: StacksBlock,
     ) -> Result<(), net_error> {
+        if !self.legacy_data_relay_enabled {
+            return Ok(());
+        }
         let blocks_data = BlocksData {
             blocks: vec![BlocksDatum(consensus_hash, block)],
         };
@@ -2268,6 +2291,9 @@ impl Relayer {
         block_header_hash: &BlockHeaderHash,
         microblock: StacksMicroblock,
     ) -> Result<(), net_error> {
+        if !self.legacy_data_relay_enabled {
+            return Ok(());
+        }
         self.p2p.broadcast_message(
             vec![],
             StacksMessageType::Microblocks(MicroblocksData {
@@ -2547,7 +2573,7 @@ impl Relayer {
         }
 
         // have the p2p thread forward all new unconfirmed microblocks
-        if !new_microblocks.is_empty() {
+        if self.legacy_data_relay_enabled && !new_microblocks.is_empty() {
             debug!(
                 "{:?}: Unconfirmed microblocks: {}",
                 &_local_peer,
@@ -2571,7 +2597,7 @@ impl Relayer {
     #[cfg_attr(test, mutants::skip)]
     /// Process epoch2 block data.
     /// Relays blocks and microblocks as needed
-    /// Returns (num new blocks, num new confirmed microblocks, num new unconfirmed microblocks)
+    /// Returns accepted objects and their summary counts.
     fn process_new_epoch2_blocks(
         &mut self,
         _local_peer: &LocalPeer,
@@ -2580,7 +2606,15 @@ impl Relayer {
         chainstate: &mut StacksChainState,
         ibd: bool,
         coord_comms: Option<&CoordinatorChannels>,
-    ) -> (u64, u64, u64) {
+    ) -> (
+        Vec<(ConsensusHash, StacksBlock)>,
+        Vec<(ConsensusHash, Vec<StacksMicroblock>)>,
+        u64,
+        u64,
+        u64,
+    ) {
+        let mut accepted_blocks = Vec::new();
+        let mut accepted_confirmed_microblocks = Vec::new();
         let mut num_new_blocks = 0;
         let mut num_new_confirmed_microblocks = 0;
         let mut num_new_unconfirmed_microblocks = 0;
@@ -2592,6 +2626,18 @@ impl Relayer {
                 num_new_blocks = new_blocks.len() as u64;
                 num_new_confirmed_microblocks = new_confirmed_microblocks.len() as u64;
                 num_new_unconfirmed_microblocks = new_microblocks.len() as u64;
+                accepted_blocks.extend(
+                    new_blocks
+                        .iter()
+                        .map(|(consensus_hash, block)| (consensus_hash.clone(), block.clone())),
+                );
+                accepted_confirmed_microblocks.extend(
+                    new_confirmed_microblocks
+                        .iter()
+                        .map(|(consensus_hash, (_, stream))| {
+                            (consensus_hash.clone(), stream.clone())
+                        }),
+                );
 
                 // attempt to relay messages (note that this is all best-effort).
                 // punish bad peers
@@ -2622,6 +2668,8 @@ impl Relayer {
             }
         }
         (
+            accepted_blocks,
+            accepted_confirmed_microblocks,
             num_new_blocks,
             num_new_confirmed_microblocks,
             num_new_unconfirmed_microblocks,
@@ -2747,8 +2795,10 @@ impl Relayer {
             let msg = StacksMessageType::NakamotoBlocks(NakamotoBlocksData {
                 blocks: relay_blocks,
             });
-            if let Err(e) = self.p2p.broadcast_message(relayers, msg) {
-                warn!("Failed to broadcast Nakamoto blocks: {:?}", &e);
+            if self.legacy_data_relay_enabled {
+                if let Err(e) = self.p2p.broadcast_message(relayers, msg) {
+                    warn!("Failed to broadcast Nakamoto blocks: {:?}", &e);
+                }
             }
         }
 
@@ -2771,6 +2821,28 @@ impl Relayer {
         ibd: bool,
         coord_comms: Option<&CoordinatorChannels>,
     ) -> u64 {
+        self.process_new_epoch3_blocks_with_objects(
+            local_peer,
+            network_result,
+            burnchain,
+            sortdb,
+            chainstate,
+            ibd,
+            coord_comms,
+        )
+        .0
+    }
+
+    fn process_new_epoch3_blocks_with_objects(
+        &mut self,
+        local_peer: &LocalPeer,
+        network_result: &mut NetworkResult,
+        burnchain: &Burnchain,
+        sortdb: &mut SortitionDB,
+        chainstate: &mut StacksChainState,
+        ibd: bool,
+        coord_comms: Option<&CoordinatorChannels>,
+    ) -> (u64, Vec<NakamotoBlock>) {
         let (accepted_blocks, bad_neighbors) = match Self::process_new_nakamoto_blocks(
             &self.connection_opts,
             network_result,
@@ -2782,7 +2854,7 @@ impl Relayer {
             Ok(x) => x,
             Err(e) => {
                 warn!("Failed to process new Nakamoto blocks: {:?}", &e);
-                return 0;
+                return (0, Vec::new());
             }
         };
 
@@ -2791,6 +2863,10 @@ impl Relayer {
             .fold(0, |acc, accepted| acc + accepted.blocks.len())
             .try_into()
             .unwrap_or(u64::MAX); // don't panic if we somehow receive more than u64::MAX blocks
+        let accepted_objects = accepted_blocks
+            .iter()
+            .flat_map(|batch| batch.blocks.iter().cloned())
+            .collect();
 
         // punish bad peers
         if !bad_neighbors.is_empty() {
@@ -2804,7 +2880,7 @@ impl Relayer {
         if !ibd && !accepted_blocks.is_empty() {
             self.relay_epoch3_blocks(local_peer, sortdb, accepted_blocks);
         }
-        num_new_nakamoto_blocks
+        (num_new_nakamoto_blocks, accepted_objects)
     }
 
     #[cfg_attr(test, mutants::skip)]
@@ -2854,8 +2930,10 @@ impl Relayer {
             debug!("{:?}: Broadcast tx {}", &_local_peer, &tx.txid());
             mempool_txs_added.push(tx.clone());
             let msg = StacksMessageType::Transaction(tx);
-            if let Err(e) = self.p2p.broadcast_message(relayers, msg) {
-                warn!("Failed to broadcast transaction: {:?}", &e);
+            if self.legacy_data_relay_enabled {
+                if let Err(e) = self.p2p.broadcast_message(relayers, msg) {
+                    warn!("Failed to broadcast transaction: {:?}", &e);
+                }
             }
         }
         mempool_txs_added
@@ -2884,26 +2962,32 @@ impl Relayer {
         event_observer: Option<&dyn RelayEventDispatcher>,
     ) -> Result<ProcessedNetReceipts, net_error> {
         // process epoch2 data
-        let (num_new_blocks, num_new_confirmed_microblocks, num_new_unconfirmed_microblocks) = self
-            .process_new_epoch2_blocks(
-                local_peer,
-                network_result,
-                sortdb,
-                chainstate,
-                ibd,
-                coord_comms,
-            );
-
-        // process epoch3 data
-        let num_new_nakamoto_blocks = self.process_new_epoch3_blocks(
+        let (
+            accepted_epoch2_blocks,
+            accepted_confirmed_microblocks,
+            num_new_blocks,
+            num_new_confirmed_microblocks,
+            num_new_unconfirmed_microblocks,
+        ) = self.process_new_epoch2_blocks(
             local_peer,
             network_result,
-            burnchain,
             sortdb,
             chainstate,
             ibd,
             coord_comms,
         );
+
+        // process epoch3 data
+        let (num_new_nakamoto_blocks, accepted_nakamoto_blocks) = self
+            .process_new_epoch3_blocks_with_objects(
+                local_peer,
+                network_result,
+                burnchain,
+                sortdb,
+                chainstate,
+                ibd,
+                coord_comms,
+            );
 
         // process transactions
         let mempool_txs_added = self.process_new_transactions(
@@ -2953,6 +3037,9 @@ impl Relayer {
 
         let receipts = ProcessedNetReceipts {
             mempool_txs_added,
+            accepted_epoch2_blocks,
+            accepted_confirmed_microblocks,
+            accepted_nakamoto_blocks,
             processed_unconfirmed_state,
             num_new_blocks,
             num_new_confirmed_microblocks,

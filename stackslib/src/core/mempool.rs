@@ -2028,6 +2028,44 @@ impl MemPoolDB {
         query_row(conn, "SELECT * FROM mempool WHERE txid = ?1", params![txid])
     }
 
+    /// Return one deterministic, bounded page of transaction IDs.
+    ///
+    /// The cursor is exclusive and the extra row is used only to determine
+    /// whether another page exists.  Keeping this query ID-only prevents a
+    /// remote sync request from causing unbounded transaction decoding or DB
+    /// allocation in the peer thread.
+    pub fn get_txid_page(
+        conn: &DBConn,
+        after: Option<&Txid>,
+        max_items: usize,
+    ) -> Result<(Vec<Txid>, bool), db_error> {
+        if max_items == 0 {
+            return Ok((vec![], false));
+        }
+        let row_limit = u64_to_sql(
+            u64::try_from(max_items)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )?;
+        let mut stmt = match after {
+            Some(_) => {
+                conn.prepare("SELECT txid FROM mempool WHERE txid > ?1 ORDER BY txid ASC LIMIT ?2")?
+            }
+            None => conn.prepare("SELECT txid FROM mempool ORDER BY txid ASC LIMIT ?1")?,
+        };
+        let mut rows = match after {
+            Some(cursor) => stmt.query(params![cursor, row_limit])?,
+            None => stmt.query(params![row_limit])?,
+        };
+        let mut txids = Vec::with_capacity(max_items.saturating_add(1));
+        while let Some(row) = rows.next()? {
+            txids.push(Txid::from_column(row, "txid")?);
+        }
+        let complete = txids.len() <= max_items;
+        txids.truncate(max_items);
+        Ok((txids, complete))
+    }
+
     /// Get all transactions across all tips
     #[cfg(test)]
     pub fn get_all_txs(conn: &DBConn) -> Result<Vec<MemPoolTxInfo>, db_error> {

@@ -1,0 +1,27 @@
+[package]
+name = "stacks-signer-bridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+clarity = { path = "../../clarity" }
+libfuzzer-sys = "0.4"
+libsigner = { path = "../../libsigner" }
+libstackerdb = { path = "../../libstackerdb" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "legacy_translator_decoders"
+path = "fuzz_targets/legacy_translator_decoders.rs"
+test = false
+doc = false
+bench = false

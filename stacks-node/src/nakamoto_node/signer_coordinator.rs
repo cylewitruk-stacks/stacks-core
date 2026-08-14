@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::Included;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 use libsigner::v0::messages::{MinerSlotID, SignerMessage as SignerMessageV0};
 use libsigner::v0::signer_state::SignerStateMachine;
 use libsigner::{BlockProposal, BlockProposalData, SignerSession, StackerDBSession};
+use prost::Message as ProstMessage;
 use stacks::burnchains::Burnchain;
 use stacks::chainstate::burn::db::sortdb::SortitionDB;
 use stacks::chainstate::burn::{BlockSnapshot, ConsensusHash};
@@ -35,15 +37,31 @@ use stacks::libstackerdb::StackerDBChunkData;
 use stacks::net::stackerdb::StackerDBs;
 use stacks::types::chainstate::{StacksBlockId, StacksPrivateKey, StacksPublicKey};
 use stacks::types::MinerDiagnosticData;
-use stacks::util::hash::Sha512Trunc256Sum;
+use stacks::types::PrivateKey;
+use stacks::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks::util::secp256k1::MessageSignature;
 use stacks::util_lib::boot::boot_code_id;
+use stacks_network::{
+    signed_role_directory_record, NetworkHandle, SignerAdmission, SignerNetworkEvent,
+};
+use stacks_network_types::wire::v1::{
+    ProposalManifest, ProposalUnavailable, Role, SignerEnvelope, SignerEnvelopeBody, SignerLane,
+};
+use stacks_network_types::{
+    proposal_content_id, signer_envelope_digest, signer_envelope_id, ContentId, NetworkObject,
+    NetworkScope, ObjectKind, PROPOSAL_MANIFEST_VERSION, SIGNER_ENVELOPE_VERSION,
+};
+use stacks_signer_bridge::{
+    BridgeJournal, LegacyLocator, LegacyWritePipeline, TemporarySignerBridge,
+    TemporarySignerBridgeError,
+};
 
 use super::miner_db::MinerDB;
-use super::stackerdb_listener::StackerDBListenerComms;
+use super::signer_message_processor::{BlockStatus, SignerMessageProcessorComms};
 use super::Error as NakamotoNodeError;
 use crate::event_dispatcher::StackerDBChannel;
-use crate::nakamoto_node::stackerdb_listener::{StackerDBListener, EVENT_RECEIVER_POLL};
+use crate::globals::Libp2pSignerEventRouter;
+use crate::nakamoto_node::signer_message_processor::{SignerMessageProcessor, EVENT_RECEIVER_POLL};
 use crate::neon::Counters;
 use crate::Config;
 
@@ -54,18 +72,18 @@ pub struct SignerCoordinator {
     message_key: StacksPrivateKey,
     /// Is this mainnet?
     is_mainnet: bool,
-    /// The session for writing to the miners contract in the stackerdb
-    miners_session: StackerDBSession,
+    /// Direct legacy `.miners` writer used only by a legacy-only coordinator.
+    miners_session: Option<StackerDBSession>,
     /// The total weight of all signers
     total_weight: u32,
     /// The weight threshold for block approval
     weight_threshold: u32,
-    /// Interface to the StackerDB listener thread's data
-    stackerdb_comms: StackerDBListenerComms,
-    /// Keep running flag for the signer DB listener thread
+    /// Interface to the transport-neutral signer response accumulator.
+    signer_comms: SignerMessageProcessorComms,
+    /// Keep-running flag for the optional legacy signer event source.
     keep_running: Arc<AtomicBool>,
-    /// Handle for the signer DB listener thread
-    listener_thread: Option<JoinHandle<()>>,
+    /// Handle for the optional legacy signer event-source thread.
+    legacy_listener_thread: Option<JoinHandle<()>>,
     /// The current tip when this miner thread was started.
     /// This *should not* be passed into any block building code, as it
     ///  is not necessarily the burn view for the block being constructed.
@@ -74,6 +92,26 @@ pub struct SignerCoordinator {
     burn_tip_at_start: ConsensusHash,
     /// The timeout configuration based on the percentage of rejections
     block_rejection_timeout_steps: BTreeMap<u32, Duration>,
+    /// Producer side of the native libp2p signer network.
+    native_network: Option<NetworkHandle>,
+    /// Rollout gate for locally authored native application messages.
+    native_publish_enabled: bool,
+    /// Stacks application chain/network identifier.
+    chain_id: u32,
+    /// Whether locally authored miner messages are also written to `.miners`.
+    compatibility_stackerdb: bool,
+    /// Restart-safe native miner envelope sequence cursors.
+    native_sequence_db: MinerDB,
+    /// Durable origin-only `.miners` compatibility translator.
+    miner_bridge: Option<TemporarySignerBridge>,
+    /// Complete bounded lifecycle of the legacy HTTP writer.
+    miner_bridge_pipeline: LegacyWritePipeline,
+    /// Continuously drains native signer events into the transport-neutral
+    /// accumulator, including between proposal wait loops.
+    native_listener_thread: Option<JoinHandle<()>>,
+    /// Process-wide native event router and this coordinator's generation.
+    native_signer_router: Libp2pSignerEventRouter,
+    native_signer_registration: Option<u64>,
 }
 
 /// Helper function to build block_rejection_timeout_steps BTreeMap from config.
@@ -104,10 +142,131 @@ fn build_block_rejection_timeout_steps(
     block_rejection_timeout_steps
 }
 
+/// Convert authenticated weighted rejection state into the coordinator's
+/// terminal result without requiring chainstate construction in tests.
+pub(crate) fn signer_rejection_error(
+    block_status: &BlockStatus,
+    total_weight: u32,
+    weight_threshold: u32,
+) -> Option<NakamotoNodeError> {
+    if block_status
+        .total_weight_rejected
+        .saturating_add(weight_threshold)
+        <= total_weight
+    {
+        return None;
+    }
+    let blocking_minority = total_weight.saturating_sub(weight_threshold);
+    let mut temporarily_excluded_txids = HashSet::new();
+    let mut permanently_excluded_txids = HashSet::new();
+    for (txid, info) in &block_status.failed_txids {
+        if info.total_weight > blocking_minority {
+            if info.problematic_weight > blocking_minority {
+                permanently_excluded_txids.insert(txid.clone());
+            } else {
+                temporarily_excluded_txids.insert(txid.clone());
+            }
+        }
+    }
+    Some(NakamotoNodeError::SignersRejected {
+        temporarily_excluded_txids,
+        permanently_excluded_txids,
+    })
+}
+
+fn process_native_signer_event(
+    signer_comms: &SignerMessageProcessorComms,
+    event: SignerNetworkEvent,
+) {
+    let envelope = event.envelope;
+    if matches!(
+        event.admission,
+        SignerAdmission::Duplicate | SignerAdmission::Equivocation
+    ) {
+        return;
+    }
+    let Ok(lane) = SignerLane::try_from(envelope.body.lane) else {
+        warn!("Authenticated native signer response has an unknown lane");
+        return;
+    };
+    let Ok(signer_pubkey) = StacksPublicKey::from_slice(&envelope.body.signer_public_key) else {
+        warn!("Authenticated native response has an invalid signer public key");
+        return;
+    };
+    if lane == SignerLane::ProposalUnavailable {
+        let Ok(unavailable) = ProposalUnavailable::decode(envelope.body.payload.as_slice()) else {
+            warn!("Failed to decode authenticated proposal-unavailable outcome");
+            return;
+        };
+        if stacks_network_types::validate_proposal_unavailable(
+            &unavailable,
+            envelope.body.reward_cycle,
+        )
+        .is_err()
+        {
+            warn!("Rejected malformed authenticated proposal-unavailable outcome");
+            return;
+        }
+        signer_comms.process_authenticated_unavailable(
+            &signer_pubkey,
+            &unavailable,
+            envelope.body.reward_cycle,
+        );
+        return;
+    }
+    let mut payload = envelope.body.payload.as_slice();
+    let Ok(message) = SignerMessageV0::consensus_deserialize(&mut payload) else {
+        warn!("Failed to decode authenticated native signer response");
+        return;
+    };
+    if !payload.is_empty() {
+        warn!("Rejected authenticated native signer response with trailing bytes");
+        return;
+    }
+    let expected_lane = match &message {
+        SignerMessageV0::BlockResponse(_) => SignerLane::BlockResponse,
+        SignerMessageV0::StateMachineUpdate(_) => SignerLane::StateMachineUpdate,
+        _ => {
+            warn!("Rejected native signer message not consumed by the miner");
+            return;
+        }
+    };
+    if lane != expected_lane {
+        warn!("Rejected native signer envelope with mismatched lane and payload";
+            "lane" => ?lane,
+            "expected_lane" => ?expected_lane,
+        );
+        return;
+    }
+    signer_comms.process_authenticated_message(&signer_pubkey, message);
+}
+
+fn run_native_signer_adapter(
+    receiver: Receiver<SignerNetworkEvent>,
+    signer_comms: SignerMessageProcessorComms,
+    keep_running: Arc<AtomicBool>,
+) {
+    info!("Native signer event adapter: starting up");
+    while keep_running.load(std::sync::atomic::Ordering::Relaxed) {
+        match receiver.recv_timeout(EVENT_RECEIVER_POLL) {
+            Ok(event) => process_native_signer_event(&signer_comms, event),
+            Err(error) => match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {}
+                std::sync::mpsc::RecvTimeoutError::Disconnected => break,
+            },
+        }
+    }
+    debug!("Native signer event adapter: shut down");
+}
+
 impl SignerCoordinator {
+    pub(super) fn miner_bridge_enabled(&self) -> bool {
+        self.miner_bridge.is_some()
+    }
+
     /// Create a new `SignerCoordinator` instance.
     /// This will spawn a new thread to listen for messages from the signer DB.
-    pub fn new(
+    pub(crate) fn new(
         stackerdb_channel: Arc<Mutex<StackerDBChannel>>,
         node_keep_running: Arc<AtomicBool>,
         reward_set: &RewardSet,
@@ -116,14 +275,17 @@ impl SignerCoordinator {
         message_key: StacksPrivateKey,
         config: &Config,
         burn_tip_at_start: &ConsensusHash,
+        native_network: Option<NetworkHandle>,
+        native_signer_router: Libp2pSignerEventRouter,
     ) -> Result<Self, ChainstateError> {
         info!("SignerCoordinator: starting up");
         let keep_running = Arc::new(AtomicBool::new(true));
 
-        // Create the stacker DB listener
-        let mut listener = StackerDBListener::new(
+        // Create the transport-neutral signer response processor. Its legacy
+        // event source is absent when compatibility ingress is disabled.
+        let mut processor = SignerMessageProcessor::new(
             stackerdb_channel,
-            node_keep_running,
+            node_keep_running.clone(),
             keep_running.clone(),
             reward_set,
             election_block,
@@ -135,51 +297,344 @@ impl SignerCoordinator {
             .node
             .get_rpc_loopback()
             .ok_or_else(|| ChainstateError::MinerAborted)?;
-        let miners_contract_id = boot_code_id(MINERS_NAME, is_mainnet);
-        let miners_session = StackerDBSession::new(
-            &rpc_socket.to_string(),
-            miners_contract_id,
-            config.miner.stackerdb_timeout,
-        );
+        let miners_session =
+            if native_network.is_none() && config.node.libp2p.signer_bridge.mode.writes_legacy() {
+                Some(StackerDBSession::new(
+                    &rpc_socket.to_string(),
+                    boot_code_id(MINERS_NAME, is_mainnet),
+                    config.miner.stackerdb_timeout,
+                ))
+            } else {
+                None
+            };
+        let native_sequence_db = MinerDB::open_with_config(config).map_err(|error| {
+            error!("Failed to open native miner sequence journal: {error}");
+            ChainstateError::DBError(error)
+        })?;
+        let reward_cycle = burnchain
+            .block_height_to_reward_cycle(election_block.block_height)
+            .expect("signer coordinator starts after the first reward cycle");
+        let mut miner_bridge =
+            if native_network.is_some() && config.node.libp2p.signer_bridge.mode.writes_legacy() {
+                Some(
+                    TemporarySignerBridge::new(
+                        config.node.libp2p.signer_bridge.clone(),
+                        BridgeJournal::open(MinerDB::miner_db_path(config)).map_err(|error| {
+                            ChainstateError::InvalidStacksBlock(format!(
+                                "failed to open miner bridge journal: {error}"
+                            ))
+                        })?,
+                    )
+                    .map_err(|error| {
+                        ChainstateError::InvalidStacksBlock(format!(
+                            "failed to initialize miner bridge: {error}"
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
+        if let Some(bridge) = miner_bridge.as_mut() {
+            bridge
+                .update_cycles(reward_cycle, Some(reward_cycle.saturating_add(1)))
+                .map_err(|error| {
+                    ChainstateError::InvalidStacksBlock(format!(
+                        "failed to initialize miner bridge cycle: {error}"
+                    ))
+                })?;
+        }
+        let miner_bridge_pipeline = if miner_bridge.is_some() {
+            LegacyWritePipeline::spawn(
+                "miner-legacy-bridge",
+                rpc_socket.to_string(),
+                config.miner.stackerdb_timeout,
+                256,
+            )
+            .map_err(|error| {
+                error!("Failed to spawn miner legacy bridge: {error}");
+                ChainstateError::MinerAborted
+            })?
+        } else {
+            LegacyWritePipeline::disabled()
+        };
 
         // build a BTreeMap of the various timeout steps
         let block_rejection_timeout_steps = build_block_rejection_timeout_steps(
-            listener.total_weight,
+            processor.total_weight,
             &config.miner.block_rejection_timeout_steps,
         );
+        if let Some(network) = native_network.as_ref() {
+            network
+                .update_chain_view(election_block.block_height, reward_cycle)
+                .map_err(|error| {
+                    ChainstateError::InvalidStacksBlock(format!(
+                        "failed to update libp2p chain view: {error}"
+                    ))
+                })?;
+            network
+                .retain_signer_cycles(reward_cycle, Some(reward_cycle.saturating_add(1)))
+                .map_err(|error| {
+                    ChainstateError::InvalidStacksBlock(format!(
+                        "failed to retain libp2p signer cycles: {error}"
+                    ))
+                })?;
+            let public_keys = reward_set
+                .signers()
+                .map(|signers| signers.iter().map(|entry| entry.signing_key).collect())
+                .unwrap_or_default();
+            network
+                .update_authorized_signers(reward_cycle, public_keys)
+                .map_err(|error| {
+                    ChainstateError::InvalidStacksBlock(format!(
+                        "failed to update libp2p signer authorization: {error}"
+                    ))
+                })?;
+            let miner_public_key =
+                StacksPublicKey::from_private(&message_key).to_bytes_compressed();
+            let miner_public_key_hash = Hash160::from_data(&miner_public_key);
+            network
+                .update_authorized_miners(
+                    reward_cycle,
+                    vec![(
+                        election_block.consensus_hash.as_bytes().to_vec(),
+                        miner_public_key_hash.0,
+                    )],
+                )
+                .map_err(|error| {
+                    ChainstateError::InvalidStacksBlock(format!(
+                        "failed to update libp2p miner authorization: {error}"
+                    ))
+                })?;
+            let local_peer_id = network.local_peer_id().map_err(|error| {
+                ChainstateError::InvalidStacksBlock(format!(
+                    "failed to resolve local libp2p PeerId: {error}"
+                ))
+            })?;
+            let advertised_addresses = config
+                .node
+                .libp2p
+                .advertise
+                .iter()
+                .map(|address| address.parse())
+                .collect::<Result<Vec<libp2p::Multiaddr>, _>>()
+                .map_err(|error| {
+                    ChainstateError::InvalidStacksBlock(format!(
+                        "invalid libp2p miner advertised address: {error}"
+                    ))
+                })?;
+            let role_record = signed_role_directory_record(
+                NetworkScope::new(config.burnchain.chain_id, config.burnchain.chain_id),
+                local_peer_id,
+                Role::Miner,
+                reward_cycle,
+                election_block.consensus_hash.as_bytes().to_vec(),
+                election_block.block_height,
+                election_block
+                    .block_height
+                    .saturating_add(u64::from(burnchain.pox_constants.reward_cycle_length)),
+                advertised_addresses,
+                &message_key,
+            )
+            .map_err(|error| {
+                ChainstateError::InvalidStacksBlock(format!(
+                    "failed to construct libp2p miner role proof: {error}"
+                ))
+            })?;
+            network
+                .set_local_role_record(Some(role_record))
+                .map_err(|error| {
+                    ChainstateError::InvalidStacksBlock(format!(
+                        "failed to install libp2p miner role proof: {error}"
+                    ))
+                })?;
+        }
 
         let mut sc = Self {
             message_key,
             is_mainnet,
             miners_session,
-            total_weight: listener.total_weight,
-            weight_threshold: listener.weight_threshold,
-            stackerdb_comms: listener.get_comms(),
+            total_weight: processor.total_weight,
+            weight_threshold: processor.weight_threshold,
+            signer_comms: processor.get_comms(),
             keep_running,
-            listener_thread: None,
+            legacy_listener_thread: None,
             burn_tip_at_start: burn_tip_at_start.clone(),
             block_rejection_timeout_steps,
+            native_network,
+            native_publish_enabled: config.node.libp2p.rollout_mode.publishes_application_data(),
+            chain_id: config.burnchain.chain_id,
+            compatibility_stackerdb: config.node.libp2p.signer_bridge.mode.writes_legacy(),
+            native_sequence_db,
+            miner_bridge,
+            miner_bridge_pipeline,
+            native_listener_thread: None,
+            native_signer_router,
+            native_signer_registration: None,
         };
 
-        // Spawn the signer DB listener thread
-        let listener_thread = std::thread::Builder::new()
-            .name(format!(
-                "stackerdb_listener_{}",
-                election_block.block_height
-            ))
-            .spawn(move || {
-                if let Err(e) = listener.run() {
-                    error!("StackerDBListener: exited with error: {e:?}");
-                }
-            })
-            .map_err(|e| {
-                error!("Failed to spawn stackerdb_listener thread: {e:?}");
-                ChainstateError::MinerAborted
-            })?;
+        if sc.native_network.is_some() {
+            let native_signer_comms = processor.get_comms();
+            let native_keep_running = sc.keep_running.clone();
+            let (registration, receiver) = sc.native_signer_router.register();
+            let listener_thread = std::thread::Builder::new()
+                .name(format!(
+                    "native_signer_adapter_{}",
+                    election_block.block_height
+                ))
+                .spawn(move || {
+                    run_native_signer_adapter(receiver, native_signer_comms, native_keep_running);
+                })
+                .map_err(|error| {
+                    error!("Failed to spawn native signer event adapter: {error:?}");
+                    ChainstateError::MinerAborted
+                })?;
+            sc.native_signer_registration = Some(registration);
+            sc.native_listener_thread = Some(listener_thread);
+        }
 
-        sc.listener_thread = Some(listener_thread);
+        if processor.has_legacy_event_source() {
+            let listener_thread = std::thread::Builder::new()
+                .name(format!(
+                    "legacy_signer_adapter_{}",
+                    election_block.block_height
+                ))
+                .spawn(move || {
+                    if let Err(e) = processor.run() {
+                        error!("Legacy signer event adapter exited with error: {e:?}");
+                    }
+                })
+                .map_err(|e| {
+                    error!("Failed to spawn legacy signer event adapter: {e:?}");
+                    ChainstateError::MinerAborted
+                })?;
+            sc.legacy_listener_thread = Some(listener_thread);
+        }
 
         Ok(sc)
+    }
+
+    pub(super) fn publish_native_message(
+        &mut self,
+        message: &SignerMessageV0,
+        reward_cycle: u64,
+        burn_view: &ConsensusHash,
+        lane: SignerLane,
+    ) -> Result<Option<ContentId>, NakamotoNodeError> {
+        if !self.native_publish_enabled {
+            return Ok(None);
+        }
+        let Some(network) = self.native_network.as_ref() else {
+            return Ok(None);
+        };
+        let author = StacksPublicKey::from_private(&self.message_key).to_bytes_compressed();
+        let (sequence, previous) = self
+            .native_sequence_db
+            .get_native_signer_sequence(&author, reward_cycle, lane as i32)
+            .map_err(|error| {
+                NakamotoNodeError::SigningCoordinatorFailure(format!(
+                    "failed to load native miner sequence: {error}"
+                ))
+            })?;
+        let local_peer_id = network.local_peer_id().map_err(|error| {
+            NakamotoNodeError::SigningCoordinatorFailure(format!(
+                "failed to resolve local libp2p PeerId for miner message: {error}"
+            ))
+        })?;
+        let encoded_message = message.serialize_to_vec();
+        let proposal = if lane == SignerLane::BlockProposal {
+            let SignerMessageV0::BlockProposal(proposal) = message else {
+                return Err(NakamotoNodeError::SigningCoordinatorFailure(
+                    "block-proposal lane carried a different signer message".into(),
+                ));
+            };
+            let content_id = proposal_content_id(&encoded_message);
+            let encoded_len = u64::try_from(encoded_message.len()).map_err(|_| {
+                NakamotoNodeError::SigningCoordinatorFailure(
+                    "proposal length does not fit its manifest".into(),
+                )
+            })?;
+            Some((
+                NetworkObject {
+                    kind: ObjectKind::BlockProposal,
+                    content_id,
+                    bytes: encoded_message.clone(),
+                },
+                ProposalManifest {
+                    version: PROPOSAL_MANIFEST_VERSION,
+                    content_id: content_id.as_bytes().to_vec(),
+                    encoded_len,
+                    signer_signature_hash: proposal.block.header.signer_signature_hash().0.to_vec(),
+                    burn_height: proposal.burn_height,
+                    reward_cycle: proposal.reward_cycle,
+                },
+            ))
+        } else {
+            None
+        };
+        let body = SignerEnvelopeBody {
+            version: SIGNER_ENVELOPE_VERSION,
+            chain_id: self.chain_id,
+            network_id: self.chain_id,
+            reward_cycle,
+            lane: lane as i32,
+            sequence,
+            previous_envelope_id: previous
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
+            signer_public_key: author.clone(),
+            transport_peer_id: local_peer_id.to_bytes(),
+            payload: proposal.as_ref().map_or(encoded_message, |_| Vec::new()),
+            burn_view_consensus_hash: burn_view.as_bytes().to_vec(),
+            proposal_manifest: proposal.as_ref().map(|(_, manifest)| manifest.clone()),
+        };
+        let signature = self
+            .message_key
+            .sign(&signer_envelope_digest(&body))
+            .map_err(|error| {
+                NakamotoNodeError::SigningCoordinatorFailure(format!(
+                    "failed to sign native miner envelope: {error}"
+                ))
+            })?;
+        let envelope = SignerEnvelope {
+            body: Some(body),
+            signature: signature.as_bytes().to_vec(),
+        };
+        let envelope_id = signer_envelope_id(&envelope).map_err(|error| {
+            NakamotoNodeError::SigningCoordinatorFailure(format!(
+                "failed to identify native miner envelope: {error}"
+            ))
+        })?;
+        self.native_sequence_db
+            .advance_native_signer_sequence(
+                &author,
+                reward_cycle,
+                lane as i32,
+                sequence.saturating_add(1),
+                &envelope_id,
+            )
+            .map_err(|error| {
+                NakamotoNodeError::SigningCoordinatorFailure(format!(
+                    "failed to persist native miner sequence: {error}"
+                ))
+            })?;
+        let publish_result = if let Some((object, _)) = proposal {
+            network.publish_proposal(object, envelope)
+        } else {
+            network.publish_signer(envelope)
+        };
+        publish_result.map_err(|error| {
+            NakamotoNodeError::SigningCoordinatorFailure(format!(
+                "failed to queue miner message on native libp2p transport: {error}"
+            ))
+        })?;
+        info!(
+            "Queued miner message on native libp2p transport";
+            "reward_cycle" => reward_cycle,
+            "lane" => ?lane,
+            "sequence" => sequence,
+            "envelope_id" => ?envelope_id,
+        );
+        Ok(Some(envelope_id))
     }
 
     /// Send a message over the miners contract using a `StacksPrivateKey`
@@ -230,7 +685,7 @@ impl SignerCoordinator {
             .unwrap_or(0)
             .saturating_add(1);
         let miner_pk = StacksPublicKey::from_private(miner_sk);
-        if let Some(prior_version) = miner_db.get_latest_chunk_version(&miner_pk, slot_id)? {
+        if let Some(prior_version) = miner_db.get_legacy_adapter_version(&miner_pk, slot_id)? {
             if slot_version <= prior_version {
                 slot_version = prior_version.saturating_add(1);
             }
@@ -246,7 +701,7 @@ impl SignerCoordinator {
         match miners_session.put_chunk(&chunk) {
             Ok(ack) => {
                 if ack.accepted {
-                    miner_db.set_latest_chunk_version(&miner_pk, slot_id, slot_version)?;
+                    miner_db.set_legacy_adapter_version(&miner_pk, slot_id, slot_version)?;
                     debug!("Wrote message to stackerdb: {ack:?}");
                     Ok(())
                 } else {
@@ -256,6 +711,99 @@ impl SignerCoordinator {
             Err(e) => Err(NakamotoNodeError::SigningCoordinatorFailure(format!(
                 "{e:?}"
             ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_miner_bridge_message(
+        &mut self,
+        message: &SignerMessageV0,
+        native_envelope_id: Option<ContentId>,
+        reward_cycle: u64,
+        lane: SignerLane,
+        miner_slot_id: MinerSlotID,
+        sortdb: &SortitionDB,
+        tip: &BlockSnapshot,
+        election_sortition: &ConsensusHash,
+        burn_view: &ConsensusHash,
+    ) -> Result<bool, NakamotoNodeError> {
+        self.pump_miner_bridge();
+        let Some(bridge) = self.miner_bridge.as_mut() else {
+            return Ok(false);
+        };
+        let Some(slot_range) = NakamotoChainState::get_miner_slot(sortdb, tip, election_sortition)
+            .map_err(|error| {
+                NakamotoNodeError::SigningCoordinatorFailure(format!(
+                    "failed to read miner slot information: {error:?}"
+                ))
+            })?
+        else {
+            return Err(NakamotoNodeError::SigningCoordinatorFailure(
+                "no slot for miner compatibility message".to_owned(),
+            ));
+        };
+        let slot_id = slot_range
+            .start
+            .saturating_add(u32::from(miner_slot_id.to_u8()));
+        if !slot_range.contains(&slot_id) {
+            return Err(NakamotoNodeError::SigningCoordinatorFailure(
+                "not enough slots for miner compatibility message".to_owned(),
+            ));
+        }
+        let locator = LegacyLocator {
+            contract: boot_code_id(MINERS_NAME, self.is_mainnet).to_string(),
+            reward_cycle,
+            lane,
+            slot_id,
+            author: stacks_signer_bridge::LegacyAuthor::PublicKey(
+                StacksPublicKey::from_private(&self.message_key)
+                    .to_bytes_compressed()
+                    .try_into()
+                    .expect("compressed Stacks public keys are 33 bytes"),
+            ),
+            allow_epoch25: false,
+        };
+        let semantic = libsigner::SignerNetworkMessage {
+            reward_cycle,
+            lane,
+            burn_view_consensus_hash: burn_view.as_bytes().to_vec(),
+            payload: message.serialize_to_vec(),
+        };
+        match bridge.enqueue_origin_egress(
+            &semantic,
+            native_envelope_id,
+            locator,
+            &self.message_key,
+            stacks::util::get_epoch_time_secs(),
+        ) {
+            Ok(_) => {
+                self.pump_miner_bridge();
+                Ok(true)
+            }
+            Err(TemporarySignerBridgeError::QueueFull) => {
+                warn!("Miner compatibility bridge is full; native delivery remains queued");
+                Ok(false)
+            }
+            Err(error) => Err(NakamotoNodeError::SigningCoordinatorFailure(format!(
+                "failed to queue miner compatibility bridge message: {error}"
+            ))),
+        }
+    }
+
+    fn pump_miner_bridge(&mut self) {
+        let Some(bridge) = self.miner_bridge.as_mut() else {
+            return;
+        };
+        for warning in self
+            .miner_bridge_pipeline
+            .pump(
+                bridge,
+                &self.message_key,
+                stacks::util::get_epoch_time_secs(),
+            )
+            .warnings
+        {
+            warn!("Miner compatibility bridge pipeline: {warning}");
         }
     }
 
@@ -285,7 +833,7 @@ impl SignerCoordinator {
         miner_diagnostic_data: MinerDiagnosticData,
     ) -> Result<Vec<MessageSignature>, NakamotoNodeError> {
         // Add this block to the block status map.
-        self.stackerdb_comms.insert_block(&block.header);
+        self.signer_comms.insert_block(&block.header);
 
         let reward_cycle_id = burnchain
             .block_height_to_reward_cycle(election_sortition.block_height)
@@ -299,30 +847,67 @@ impl SignerCoordinator {
         };
 
         let block_proposal_message = SignerMessageV0::BlockProposal(block_proposal);
+        let proposal_id = block.header.signer_signature_hash().to_string();
+        stacks::monitoring::begin_libp2p_signer_round(
+            proposal_id.clone(),
+            block.header.chain_length,
+            self.weight_threshold,
+            self.total_weight,
+        );
 
         loop {
             debug!("Sending block proposal message to signers";
                 "signer_signature_hash" => %block.header.signer_signature_hash(),
             );
-            Self::send_miners_message::<SignerMessageV0>(
-                &self.message_key,
-                sortdb,
-                election_sortition,
-                stackerdbs,
-                block_proposal_message.clone(),
-                MinerSlotID::BlockProposal,
-                self.is_mainnet,
-                &mut self.miners_session,
+            let native_envelope_id = self.publish_native_message(
+                &block_proposal_message,
+                reward_cycle_id,
                 &election_sortition.consensus_hash,
-                miner_db,
+                SignerLane::BlockProposal,
             )?;
+            if self.miner_bridge.is_some() {
+                self.enqueue_miner_bridge_message(
+                    &block_proposal_message,
+                    native_envelope_id,
+                    reward_cycle_id,
+                    SignerLane::BlockProposal,
+                    MinerSlotID::BlockProposal,
+                    sortdb,
+                    election_sortition,
+                    &election_sortition.consensus_hash,
+                    &election_sortition.consensus_hash,
+                )?;
+            } else if self.compatibility_stackerdb {
+                let miners_session = self.miners_session.as_mut().ok_or_else(|| {
+                    NakamotoNodeError::SigningCoordinatorFailure(
+                        "legacy signer publication has no compatibility session".into(),
+                    )
+                })?;
+                Self::send_miners_message::<SignerMessageV0>(
+                    &self.message_key,
+                    sortdb,
+                    election_sortition,
+                    stackerdbs,
+                    block_proposal_message.clone(),
+                    MinerSlotID::BlockProposal,
+                    self.is_mainnet,
+                    miners_session,
+                    &election_sortition.consensus_hash,
+                    miner_db,
+                )?;
+            } else if native_envelope_id.is_none() {
+                return Err(NakamotoNodeError::SigningCoordinatorFailure(
+                    "native signer transport is required when StackerDB compatibility is off"
+                        .into(),
+                ));
+            }
             counters.bump_naka_proposed_blocks();
 
             #[cfg(test)]
             {
                 info!(
-                "SignerCoordinator: sent block proposal to .miners, waiting for test signing channel"
-            );
+                    "SignerCoordinator: sent block proposal to .miners, waiting for test signing channel"
+                );
                 // In test mode, short-circuit waiting for the signers if the TEST_SIGNING
                 //  channel has been created. This allows integration tests for the stacks-node
                 //  independent of the stacks-signer.
@@ -330,6 +915,7 @@ impl SignerCoordinator {
                     crate::tests::nakamoto_integrations::TestSigningChannel::get_signature()
                 {
                     debug!("Short-circuiting waiting for signers, using test signature");
+                    stacks::monitoring::set_libp2p_signer_round_status(&proposal_id, "approved");
                     return Ok(signatures);
                 }
             }
@@ -345,10 +931,22 @@ impl SignerCoordinator {
 
             match res {
                 Err(NakamotoNodeError::SignatureTimeout) => {
+                    stacks::monitoring::set_libp2p_signer_round_status(&proposal_id, "collecting");
                     info!("Block proposal signing process timed out, resending the same proposal");
                     continue;
                 }
-                _ => return res,
+                Ok(signatures) => {
+                    stacks::monitoring::set_libp2p_signer_round_status(&proposal_id, "approved");
+                    return Ok(signatures);
+                }
+                Err(error @ NakamotoNodeError::SignersRejected { .. }) => {
+                    stacks::monitoring::set_libp2p_signer_round_status(&proposal_id, "rejected");
+                    return Err(error);
+                }
+                Err(error) => {
+                    stacks::monitoring::set_libp2p_signer_round_status(&proposal_id, "timed-out");
+                    return Err(error);
+                }
             }
         }
     }
@@ -369,6 +967,10 @@ impl SignerCoordinator {
     ) -> Result<Vec<MessageSignature>, NakamotoNodeError> {
         // the amount of current rejections (used to eventually modify the timeout)
         let mut rejections: u32 = 0;
+        // Unavailability is temporary and never contributes to consensus
+        // rejection weight. Track changes only so the miner can retry the
+        // same proposal as soon as approval quorum is known to be unavailable.
+        let mut unavailable: u32 = 0;
         // default timeout (the 0 entry must be always present)
         let mut rejections_timeout = self
             .block_rejection_timeout_steps
@@ -389,7 +991,7 @@ impl SignerCoordinator {
             // At every iteration wait for the block_status.
             // Exit when the amount of confirmations/rejections reaches the threshold (or until timeout)
             // Based on the amount of rejections, eventually modify the timeout.
-            let block_status = match self.stackerdb_comms.wait_for_block_status(
+            let block_status = match self.signer_comms.wait_for_block_status(
                 block_signer_sighash,
                 EVENT_RECEIVER_POLL,
                 |status| {
@@ -399,6 +1001,10 @@ impl SignerCoordinator {
                     }
                     // number of rejections changed?
                     if status.total_weight_rejected != rejections {
+                        return false;
+                    }
+                    // availability changed?
+                    if status.total_weight_unavailable != unavailable {
                         return false;
                     }
                     // enough signatures?
@@ -444,8 +1050,14 @@ impl SignerCoordinator {
                             "rejections_threshold" => self.total_weight.saturating_sub(self.weight_threshold)
                         );
 
-                        // Reset the rejections in the stackerdb listener
-                        self.stackerdb_comms.reset_rejections(block_signer_sighash);
+                        if unavailable.saturating_add(self.weight_threshold) > self.total_weight {
+                            // A retry may let temporarily unavailable signers
+                            // rejoin. Preserve validity judgments for this
+                            // exact proposal; only liveness state is retryable.
+                            self.signer_comms.reset_unavailable(block_signer_sighash);
+                        } else {
+                            self.signer_comms.reset_rejections(block_signer_sighash);
+                        }
 
                         return Err(NakamotoNodeError::SignatureTimeout);
                     }
@@ -502,10 +1114,18 @@ impl SignerCoordinator {
                 counters.set_miner_current_rejections(rejections);
             }
 
-            if block_status
-                .total_weight_rejected
-                .saturating_add(self.weight_threshold)
-                > self.total_weight
+            if unavailable != block_status.total_weight_unavailable {
+                unavailable = block_status.total_weight_unavailable;
+                info!("Unavailable signer weight updated";
+                    "signer_signature_hash" => %block_signer_sighash,
+                    "unavailable" => unavailable,
+                    "total_weight" => self.total_weight,
+                    "weight_threshold" => self.weight_threshold,
+                );
+            }
+
+            if let Some(rejection_error) =
+                signer_rejection_error(&block_status, self.total_weight, self.weight_threshold)
             {
                 info!(
                     "{}/{} signer weight votes to reject block",
@@ -514,26 +1134,7 @@ impl SignerCoordinator {
                 );
                 counters.bump_naka_rejected_blocks();
 
-                // Only act on failed txids that a blocking minority (>30% weight) agrees on
-                let blocking_minority = self.total_weight.saturating_sub(self.weight_threshold);
-                let mut temporarily_excluded_txids = HashSet::new();
-                let mut permanently_excluded_txids = HashSet::new();
-                for (txid, info) in &block_status.failed_txids {
-                    if info.total_weight > blocking_minority {
-                        // Do not perma ban txids that only a small minority of signers reported as problematic
-                        // But make sure its removed from the next block proposal
-                        if info.problematic_weight > blocking_minority {
-                            permanently_excluded_txids.insert(txid.clone());
-                        } else {
-                            temporarily_excluded_txids.insert(txid.clone());
-                        }
-                    }
-                }
-
-                return Err(NakamotoNodeError::SignersRejected {
-                    temporarily_excluded_txids,
-                    permanently_excluded_txids,
-                });
+                return Err(rejection_error);
             } else if block_status.total_weight_approved >= self.weight_threshold {
                 info!("Received enough signatures, block accepted";
                     "signer_signature_hash" => %block_signer_sighash,
@@ -547,8 +1148,18 @@ impl SignerCoordinator {
                     "rejections_threshold" => self.total_weight.saturating_sub(self.weight_threshold)
                 );
 
-                // Reset the rejections in the stackerdb listener
-                self.stackerdb_comms.reset_rejections(block_signer_sighash);
+                if block_status
+                    .total_weight_unavailable
+                    .saturating_add(self.weight_threshold)
+                    > self.total_weight
+                {
+                    // Do not let an unavailable report create a loop-speed
+                    // retry or erase an honest validity judgment. This branch
+                    // is reached only after the normal escalating deadline.
+                    self.signer_comms.reset_unavailable(block_signer_sighash);
+                } else {
+                    self.signer_comms.reset_rejections(block_signer_sighash);
+                }
 
                 return Err(NakamotoNodeError::SignatureTimeout);
             } else {
@@ -560,20 +1171,20 @@ impl SignerCoordinator {
     /// Get the timestamp at which at least 70% of the signing power should be
     /// willing to accept a time-based tenure extension.
     pub fn get_tenure_extend_timestamp(&self) -> u64 {
-        self.stackerdb_comms
+        self.signer_comms
             .get_tenure_extend_timestamp(self.weight_threshold)
     }
 
     /// Get the timestamp at which at least 70% of the signing power should be
     /// willing to accept a time-based read-count extension.
     pub fn get_read_count_extend_timestamp(&self) -> u64 {
-        self.stackerdb_comms
+        self.signer_comms
             .get_read_count_extend_timestamp(self.weight_threshold)
     }
 
     /// Get the signer global state view if there is one
     pub fn get_signer_global_state(&self) -> Option<SignerStateMachine> {
-        self.stackerdb_comms.get_signer_global_state()
+        self.signer_comms.get_signer_global_state()
     }
 
     /// Check if the tenure needs to change
@@ -590,14 +1201,45 @@ impl SignerCoordinator {
     }
 
     pub fn shutdown(&mut self) {
-        if let Some(listener_thread) = self.listener_thread.take() {
-            info!("SignerCoordinator: shutting down stacker db listener thread");
+        if let Some(registration) = self.native_signer_registration.take() {
+            self.native_signer_router.unregister(registration);
+        }
+        if self.legacy_listener_thread.is_some() || self.native_listener_thread.is_some() {
             self.keep_running
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(listener_thread) = self.native_listener_thread.take() {
+            info!("SignerCoordinator: shutting down native signer adapter thread");
+            if let Err(error) = listener_thread.join() {
+                error!("Failed to join native signer adapter thread: {error:?}");
+            }
+        }
+        if let Some(listener_thread) = self.legacy_listener_thread.take() {
+            info!("SignerCoordinator: shutting down legacy signer adapter thread");
             if let Err(e) = listener_thread.join() {
                 error!("Failed to join signer listener thread: {e:?}");
             }
-            debug!("SignerCoordinator: stacker db listener thread has shut down");
+            debug!("SignerCoordinator: legacy signer adapter thread has shut down");
+        }
+        let Self {
+            miner_bridge,
+            miner_bridge_pipeline,
+            message_key,
+            ..
+        } = self;
+        if let Some(bridge) = miner_bridge.as_mut() {
+            if let Err(error) = miner_bridge_pipeline.shutdown(|pipeline| {
+                for warning in pipeline
+                    .pump(bridge, message_key, stacks::util::get_epoch_time_secs())
+                    .warnings
+                {
+                    warn!("Miner compatibility bridge pipeline: {warning}");
+                }
+            }) {
+                error!("Failed to join miner compatibility bridge: {error:?}");
+            }
+        } else if let Err(error) = miner_bridge_pipeline.shutdown(|_| {}) {
+            error!("Failed to join miner compatibility bridge: {error:?}");
         }
     }
 }

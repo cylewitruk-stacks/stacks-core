@@ -100,7 +100,7 @@ use crate::nakamoto_node::miner::{
     fault_injection_stall_miner, fault_injection_try_stall_miner, fault_injection_unstall_miner,
     TEST_BROADCAST_PROPOSAL_STALL, TEST_MINE_SKIP,
 };
-use crate::nakamoto_node::stackerdb_listener::TEST_IGNORE_SIGNERS;
+use crate::nakamoto_node::signer_message_processor::TEST_IGNORE_SIGNERS;
 use crate::neon::{Counters, RunLoopCounter};
 use crate::run_loop::boot_nakamoto;
 use crate::tests::nakamoto_integrations::{
@@ -5521,10 +5521,10 @@ fn block_commit_delay() {
     signer_test.shutdown();
 }
 
-// Ensures that a signer that successfully submits a block to the node for validation
-// will issue ConnectivityIssues rejections if a block submission times out.
-// Also ensures that no other proposal gets submitted for validation if we
-// are already waiting for a block submission response.
+// Ensures that a signer abstains if its companion validation submission times
+// out. Also ensures that no other proposal is submitted while the first
+// validation obligation is in flight, and that the signer resumes after the
+// companion recovers.
 #[test]
 #[ignore]
 fn block_validation_response_timeout() {
@@ -5631,38 +5631,54 @@ fn block_validation_response_timeout() {
     signer_test.propose_block(block, timeout);
 
     info!("------------------------- Waiting for Timeout -------------------------");
+    let connectivity_rejections_before = get_stackerdb_signer_messages()
+        .into_iter()
+        .filter(|(_, message)| {
+            matches!(
+                message,
+                SignerMessage::BlockResponse(BlockResponse::Rejected(BlockRejection {
+                    reason_code: RejectCode::ConnectivityIssues(_),
+                    ..
+                }))
+            )
+        })
+        .count();
     // Sleep the necessary timeout to make sure the validation times out.
     let elapsed = validation_stall_start.elapsed();
     let wait = timeout.saturating_sub(elapsed);
     info!("Sleeping for {} ms", wait.as_millis());
     std::thread::sleep(timeout.saturating_sub(elapsed));
 
-    info!("------------------------- Wait for Block Rejection Due to Timeout -------------------------");
-    // Verify that the signer that submits the block to the node will issue a ConnectivityIssues rejection
-    wait_for(30, || {
-        for (_chunk, message) in get_stackerdb_signer_messages() {
-            let SignerMessage::BlockResponse(BlockResponse::Rejected(BlockRejection {
-                reason: _reason,
-                reason_code,
-                signer_signature_hash,
-                ..
-            })) = message
-            else {
-                continue;
-            };
-            // We are waiting for the original block proposal which will have a diff signature to our
-            // second proposed block.
-            assert_ne!(
-                signer_signature_hash, block_signer_signature_hash_1,
-                "Received a rejection for the wrong block"
-            );
-            if matches!(reason_code, RejectCode::ConnectivityIssues(_)) {
-                return Ok(true);
+    info!("------------------------- Verify Timeout Abstention -------------------------");
+    // Give the signer event loop a bounded interval to retire the timed-out
+    // obligation. Unavailability must not be published as invalidity.
+    sleep_ms(2_000);
+    let messages = get_stackerdb_signer_messages();
+    let connectivity_rejections_after = messages
+        .iter()
+        .filter(|(_, message)| {
+            matches!(
+                message,
+                SignerMessage::BlockResponse(BlockResponse::Rejected(BlockRejection {
+                    reason_code: RejectCode::ConnectivityIssues(_),
+                    ..
+                }))
+            )
+        })
+        .count();
+    assert_eq!(
+        connectivity_rejections_after, connectivity_rejections_before,
+        "companion timeout must abstain instead of publishing ConnectivityIssues"
+    );
+    assert!(
+        messages.iter().all(|(_, message)| match message {
+            SignerMessage::BlockResponse(response) => {
+                response.get_signer_signature_hash() != &block_signer_signature_hash_1
             }
-        }
-        Ok(false)
-    })
-    .expect("Timed out waiting for block proposal rejections");
+            _ => true,
+        }),
+        "proposal received while validation was in flight must not get a response"
+    );
     // Make sure our chain has still not advanced
     let info_after = get_chain_info(&signer_test.running_nodes.conf);
     assert_eq!(info_before, info_after);

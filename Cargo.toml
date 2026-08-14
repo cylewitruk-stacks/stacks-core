@@ -14,6 +14,9 @@ members = [
     "stacks-node",
     "stacks-profiler",
     "stacks-profiler-macros",
+    "stacks-network-types",
+    "stacks-network",
+    "stacks-signer-bridge",
     "contrib/stacks-inspect",
     "contrib/clarity-cli",
     "contrib/stacks-cli",
@@ -26,6 +29,7 @@ exclude = ["contrib/tools/config-docs-generator"]
 # Local dependencies
 stacks-profiler = { path = "stacks-profiler" }
 stacks-profiler-macros = { path = "stacks-profiler-macros" }
+stacks-network-types = { path = "stacks-network-types" }
 
 # Dependencies we want to keep the same between workspace members
 ed25519-dalek = { version = "2.1.1", default-features = false }
@@ -38,13 +42,56 @@ rand = "0.8"
 rand_chacha = "0.3.1"
 serde = "1"
 serde_derive = "1"
-serde_json = { version = "1.0", features = ["arbitrary_precision", "unbounded_depth"] }
-slog = { version = "2.5.2", features = [ "max_level_trace" ] }
-rusqlite = { version = "0.31.0", features = ["blob", "serde_json", "i128_blob", "bundled", "trace"] }
+serde_json = { version = "1.0", features = [
+    "arbitrary_precision",
+    "unbounded_depth",
+] }
+slog = { version = "2.5.2", features = ["max_level_trace"] }
+rusqlite = { version = "0.31.0", features = [
+    "blob",
+    "serde_json",
+    "i128_blob",
+    "bundled",
+    "trace",
+] }
 thiserror = "1.0.65"
 tikv-jemallocator = "0.5.4"
 toml = "0.5.6"
 variant_count = "1.1"
+async-trait = "0.1.91"
+bytes = "1.12.1"
+futures = "0.3.31"
+hkdf = "0.13.0"
+libp2p = { version = "=0.56.0", default-features = false, features = [
+    "autonat",
+    "dns",
+    "gossipsub",
+    "identify",
+    "kad",
+    "macros",
+    "memory-connection-limits",
+    "metrics",
+    "noise",
+    "ping",
+    "request-response",
+    "secp256k1",
+    "serde",
+    "tcp",
+    "tokio",
+    "yamux",
+] }
+prost = "0.14.4"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing = "0.1.40"
+zeroize = "1.7.0"
 
 # Other dependencies
 libc = { version = "0.2.182", default-features = false }
@@ -52,13 +99,25 @@ rapidhash = { version = "4.3.0", default-features = false, features = ["std"] }
 trybuild = { version = "1.0.116", default-features = false }
 
 # Benchmarking dependencies
-criterion = { version = "0.8.2", default-features = false, features = ["html_reports"] }
+criterion = { version = "0.8.2", default-features = false, features = [
+    "html_reports",
+] }
 
 # Procedural macro dependencies
-syn = { version = "2.0.115", default-features = false, features = ["full", "extra-traits"] }
-quote = { version = "1.0.44", default-features = false, features = ["proc-macro"] }
-proc-macro2 = { version = "1.0.106", default-features = false, features = ["proc-macro", "span-locations"] }
-darling = { version = "0.23.0", default-features = false, features = ["suggestions"] }
+syn = { version = "2.0.115", default-features = false, features = [
+    "full",
+    "extra-traits",
+] }
+quote = { version = "1.0.44", default-features = false, features = [
+    "proc-macro",
+] }
+proc-macro2 = { version = "1.0.106", default-features = false, features = [
+    "proc-macro",
+    "span-locations",
+] }
+darling = { version = "0.23.0", default-features = false, features = [
+    "suggestions",
+] }
 
 # Use a bit more than default optimization for
 # dev builds to speed up test execution
@@ -81,6 +140,15 @@ lto = "fat"
 [profile.release-lite]
 inherits = "release"
 lto = "thin"
+
+# Fast iteration profile for the local libp2p proof of concept. Keep dependency
+# optimization from `dev` so chain execution remains representative, while
+# retaining incremental, multi-codegen-unit builds for the frequently changed
+# node and signer crates. This is intentionally not a production profile.
+[profile.libp2p-poc]
+inherits = "dev"
+debug = "line-tables-only"
+incremental = true
 
 # faster tests for `insta` https://docs.rs/insta/1.43.2/insta/#optional-faster-runs
 [profile.dev.package]

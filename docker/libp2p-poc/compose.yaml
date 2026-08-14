@@ -1,0 +1,151 @@
+name: stacks-libp2p-poc
+
+x-observer-image: &observer-image
+  build:
+    context: ../../contrib/stacks-network-observer
+  image: stacks-network-observer:local
+
+services:
+  bitcoin:
+    image: bitcoin/bitcoin:25.2
+    volumes:
+      - ./bitcoin.conf:/home/bitcoin/.bitcoin/bitcoin.conf
+      - bitcoin-data-v19:/home/bitcoin/.bitcoin/regtest
+    command: ["-nosettings"]
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcconnect=127.0.0.1 -rpcuser=devnet -rpcpassword=devnet -rpcwait getblockchaininfo >/dev/null"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  # This service owns deterministic regtest time and Bitcoin block production.
+  # It creates one watch-only wallet per Stacks miner before Compose is allowed
+  # to start the independently-keyed miner nodes from generated/compose.yaml.
+  bitcoin-miner:
+    image: bitcoin/bitcoin:25.2
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    volumes:
+      - ./bitcoin.conf:/home/bitcoin/.bitcoin/bitcoin.conf
+      - ./mine.sh:/mine.sh:ro
+      - ./canonical-progress.sh:/canonical-progress.sh:ro
+    env_file:
+      - ./generated/topology.env
+    environment:
+      STACKS_RPC_AUTH: "12345"
+      INITIAL_VIEW_CONFIRMATIONS: 3
+      # Ten signers may need one bounded 5-10 second retry after their first
+      # view-mismatch rejection. Twenty seconds lets that retry complete before
+      # a new burn view cancels it while remaining ~30x faster than mainnet.
+      MINE_INTERVAL: ${MINE_INTERVAL:-20}
+      # Bitcoin remains independent of Stacks progress, but a zero-delay
+      # regtest cadence can cross a compact reward-cycle boundary before the
+      # nodes have produced its anchor block. Keep Epoch 3 accelerated at a
+      # fixed, nonzero cadence, then use the normal cadence from Nakamoto on.
+      MINE_FAST_INTERVAL: ${MINE_FAST_INTERVAL:-5}
+      # Height 223 is the first Epoch 3 tenure and must receive the full normal
+      # interval. The accelerated phase therefore ends with height 222.
+      MINE_FAST_UNTIL_HEIGHT: 222
+      MINE_ENTROPY_ENABLED: ${MINE_ENTROPY_ENABLED:-true}
+      MINE_ENTROPY_SEED: ${MINE_ENTROPY_SEED:-4242}
+      MINE_ENTROPY_START_HEIGHT: 245
+      NAKAMOTO_ACTIVATION_HEIGHT: 223
+      EPOCH_4_CONTRACT_GATE_HEIGHT: 244
+      EPOCH_4_CONTRACT_ADDRESS: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H
+      POX5_SIGNER_GATE_HEIGHT: 255
+      READINESS_TIMEOUT: ${READINESS_TIMEOUT:-300}
+      PROGRESS_STALL_AFTER: ${PROGRESS_STALL_AFTER:-90}
+      STACKS_RPC_TIMEOUT: ${STACKS_RPC_TIMEOUT:-2}
+    entrypoint: ["/bin/bash", "/mine.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -r /tmp/libp2p-poc-progress && status=$$(sed -n 's/^status=//p' /tmp/libp2p-poc-progress) && updated=$$(sed -n 's/^updated_at=//p' /tmp/libp2p-poc-progress) && now=$$(date +%s) && { test \"$${status}\" = ready || test \"$${status}\" = live || test \"$${status}\" = stalled; } && test $$((now - updated)) -le 360"]
+      start_period: 30s
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  stacker:
+    build: ./stacker
+    restart: unless-stopped
+    depends_on:
+      miner-1:
+        condition: service_healthy
+    env_file:
+      - ./generated/topology.env
+    environment:
+      STACKS_CORE_RPC_HOST: miner-1
+      STACKS_CORE_RPC_PORT: 20443
+      STACKING_CYCLES: 12
+      POX5_STACKING_CYCLES: 96
+      POX5_RENEWAL_WINDOW_CYCLES: 48
+      STACKING_INTERVAL: 2
+      # These contracts existed during Epoch 3 on the public network. Deploy
+      # them as soon as this compact schedule enters Epoch 3 so confirmation
+      # is an established prerequisite, rather than a race at Epoch 4.
+      EPOCH_4_FIXTURE_DEPLOY_HEIGHT: 223
+
+  observer:
+    <<: *observer-image
+    restart: unless-stopped
+    environment:
+      STACKS_OBSERVER_PROMETHEUS_URL: "http://prometheus:9090"
+      STACKS_OBSERVER_ENROLLMENTS_FILE: "/app/federation/poc-enrollments.json"
+      STACKS_OBSERVER_STACKS_API_URL: "http://miner-1:20443"
+      STACKS_OBSERVER_EXPECTED_BURN_CADENCE_SECONDS: "20"
+      STACKS_OBSERVER_PUBLIC_NETWORK_LABEL: "Stacks regtest"
+      STACKS_OBSERVER_AUTH_MODE: "development-password"
+      STACKS_OBSERVER_ALLOW_INSECURE_DEVELOPMENT_AUTH: "true"
+      STACKS_OBSERVER_DEV_EMAIL: "user@host.com"
+      STACKS_OBSERVER_DEV_PASSWORD_HASH: "scrypt$$v1$$16384$$8$$1$$00112233445566778899aabbccddeeff$$36399bbc41eef2d142e319a445abe043a9a177fa4da34f2d1a0946ec6a01db0c"
+      STACKS_OBSERVER_SESSION_SECURE: "false"
+    depends_on:
+      prometheus:
+        condition: service_started
+      miner-1:
+        condition: service_healthy
+    volumes:
+      - ./generated/poc-enrollments.json:/app/federation/poc-enrollments.json:ro
+    ports:
+      - "127.0.0.1:4319:4319"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  telemetry-collector:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.158.0
+    restart: unless-stopped
+    volumes:
+      - ./generated/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    restart: unless-stopped
+    depends_on:
+      telemetry-collector:
+        condition: service_started
+    volumes:
+      - ../../contrib/stacks-network-observer/federation/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - observer-prometheus-data-v2:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=6h
+      - --storage.tsdb.retention.size=256MB
+      - --web.enable-lifecycle
+
+volumes:
+  bitcoin-data-v19:
+  observer-prometheus-data-v2:

@@ -26,19 +26,9 @@ use stacks_common::types::chainstate::StacksPrivateKey;
 use stacks_common::util::hash::to_hex;
 use stacks_common::{debug, info, warn};
 
-use crate::client::{retry_with_exponential_backoff, ClientError};
+use crate::client::{retry_with_exponential_backoff, ClientError, SignerSlotID};
 use crate::config::{SignerConfig, SignerConfigMode};
 use crate::signerdb::SignerDb;
-
-/// The signer StackerDB slot ID, purposefully wrapped to prevent conflation with SignerID
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord)]
-pub struct SignerSlotID(pub u32);
-
-impl std::fmt::Display for SignerSlotID {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 #[derive(Debug)]
 enum StackerDBMode {
@@ -82,7 +72,7 @@ impl<M: MessageSlotID + 'static> From<&SignerConfig> for StackerDB<M> {
             config.reward_cycle,
             signer_db,
             mode,
-            config.stackerdb_timeout,
+            config.legacy_test_adapter_timeout,
         )
     }
 }
@@ -180,7 +170,7 @@ impl<M: MessageSlotID + 'static> StackerDB<M> {
         loop {
             let slot_version = self
                 .signer_db
-                .get_latest_chunk_version(&signer_pk, slot_id.0)?
+                .get_legacy_test_adapter_version(&signer_pk, slot_id.0)?
                 .map(|x| x.saturating_add(1))
                 .unwrap_or(0);
 
@@ -201,8 +191,11 @@ impl<M: MessageSlotID + 'static> StackerDB<M> {
 
             if chunk_ack.accepted {
                 debug!("Chunk accepted by stackerdb: {chunk_ack:?}");
-                self.signer_db
-                    .set_latest_chunk_version(&signer_pk, slot_id.0, slot_version)?;
+                self.signer_db.set_legacy_test_adapter_version(
+                    &signer_pk,
+                    slot_id.0,
+                    slot_version,
+                )?;
                 return Ok(chunk_ack);
             } else {
                 warn!("Chunk rejected by stackerdb: {chunk_ack:?}");
@@ -212,14 +205,14 @@ impl<M: MessageSlotID + 'static> StackerDB<M> {
                     Some(StackerDBErrorCodes::DataAlreadyExists) => {
                         if let Some(slot_metadata) = chunk_ack.metadata {
                             warn!("Failed to send message to stackerdb due to wrong version number. Attempted {}. Expected {}. Retrying...", slot_version, slot_metadata.slot_version);
-                            self.signer_db.set_latest_chunk_version(
+                            self.signer_db.set_legacy_test_adapter_version(
                                 &signer_pk,
                                 slot_id.0,
                                 slot_metadata.slot_version,
                             )?;
                         } else {
                             warn!("Failed to send message to stackerdb due to wrong version number. Attempted {}. Expected unknown version number. Incrementing and retrying...", slot_version);
-                            self.signer_db.set_latest_chunk_version(
+                            self.signer_db.set_legacy_test_adapter_version(
                                 &signer_pk,
                                 slot_id.0,
                                 slot_version,

@@ -126,6 +126,10 @@ pub struct BitcoinIndexerConfig {
     pub magic_bytes: MagicBytes,
     /// The epochs for this network
     pub epochs: Option<EpochList>,
+    /// Allow an indexed Bitcoin tip outside the normal two-hour wall-clock
+    /// window. This exception is intended only for controlled regtest networks
+    /// whose persisted state may outlive that window.
+    pub allow_stale_bitcoin_tip: bool,
 }
 
 #[derive(Debug)]
@@ -162,6 +166,7 @@ impl BitcoinIndexerConfig {
             first_block,
             magic_bytes: BLOCKSTACK_MAGIC_MAINNET,
             epochs: None,
+            allow_stale_bitcoin_tip: false,
         }
     }
 
@@ -179,6 +184,7 @@ impl BitcoinIndexerConfig {
             first_block: 0,
             magic_bytes: BLOCKSTACK_MAGIC_MAINNET,
             epochs: None,
+            allow_stale_bitcoin_tip: false,
         }
     }
 
@@ -197,6 +203,7 @@ impl BitcoinIndexerConfig {
             first_block: 0,
             magic_bytes: BLOCKSTACK_MAGIC_MAINNET,
             epochs: None,
+            allow_stale_bitcoin_tip: false,
         }
     }
 }
@@ -906,6 +913,9 @@ impl BitcoinIndexer {
     /// Verify that the last block header we have is within 2 hours of now.
     /// Return burnchain_error::TrySyncAgain if not, and delete the offending header
     pub fn check_chain_tip_timestamp(&mut self) -> Result<(), burnchain_error> {
+        if self.config.allow_stale_bitcoin_tip {
+            return Ok(());
+        }
         // if there was no target block height, then verify that the highest header fetched is within
         // 2 hours of now.  Remove headers that don't meet this criterion.
         let highest_header_height = self.get_highest_header_height()?;
@@ -1612,6 +1622,7 @@ mod test {
             first_block: 0,
             magic_bytes: MagicBytes([105, 100]),
             epochs: None,
+            allow_stale_bitcoin_tip: false,
         };
 
         if fs::metadata(&indexer_conf.spv_headers_path).is_ok() {
@@ -3354,7 +3365,8 @@ mod test {
         let total_work_before_idempotent = spv_client.update_chain_work().unwrap();
         assert_eq!(total_work_before, total_work_before_idempotent);
 
-        let config = BitcoinIndexerConfig::test_default(db_path.to_string());
+        let mut config = BitcoinIndexerConfig::test_default(db_path.to_string());
+        config.allow_stale_bitcoin_tip = true;
         let timeout = config.timeout;
         let mut indexer = BitcoinIndexer::new(
             config,
@@ -3495,13 +3507,22 @@ mod test {
         spv_client.test_write_block_headers(0, headers).unwrap();
         assert_eq!(spv_client.get_highest_header_height().unwrap(), 2);
 
-        let config = BitcoinIndexerConfig::test_default(db_path.to_string());
+        let mut config = BitcoinIndexerConfig::test_default(db_path.to_string());
+        config.allow_stale_bitcoin_tip = true;
         let timeout = config.timeout;
         let mut indexer = BitcoinIndexer::new(
             config,
             BitcoinIndexerRuntime::new(BitcoinNetworkType::Regtest, timeout),
             None,
         );
+
+        // A controlled regtest may deliberately resume persisted headers after
+        // the wall-clock freshness window. Disabling the policy must neither
+        // reject nor mutate the stored chain.
+        assert!(indexer.check_chain_tip_timestamp().is_ok());
+        assert_eq!(spv_client.get_highest_header_height().unwrap(), 2);
+
+        indexer.config.allow_stale_bitcoin_tip = false;
 
         if let Err(burnchain_error::TrySyncAgain) = indexer.check_chain_tip_timestamp() {
         } else {

@@ -112,6 +112,8 @@ struct EventObserver {
     /// If true, the stacks-node will not retry if event delivery fails for any reason.
     /// WARNING: This should not be set on observers that require successful delivery of all events.
     disable_retries: bool,
+    /// Shared node/signer credential for policy-affecting proposal callbacks.
+    proposal_response_auth_token: Option<Arc<str>>,
 }
 
 /// Update `serve()` in `neon_integrations.rs` with any new paths that need to be tested
@@ -131,12 +133,24 @@ pub const PATH_PROPOSAL_RESPONSE: &str = "proposal_response";
 static TEST_EVENT_OBSERVER_SKIP_RETRY: LazyLock<TestFlag<bool>> = LazyLock::new(TestFlag::default);
 
 impl EventObserver {
-    fn new(endpoint: String, timeout: Duration, disable_retries: bool) -> Self {
+    fn new(
+        endpoint: String,
+        timeout: Duration,
+        disable_retries: bool,
+        proposal_response_auth_token: Option<Arc<str>>,
+    ) -> Self {
         EventObserver {
             endpoint,
             timeout,
             disable_retries,
+            proposal_response_auth_token,
         }
+    }
+
+    fn authorization_for_path(&self, path: &str) -> Option<Arc<str>> {
+        (path.trim_start_matches('/') == PATH_PROPOSAL_RESPONSE)
+            .then(|| self.proposal_response_auth_token.clone())
+            .flatten()
     }
 }
 
@@ -593,6 +607,11 @@ impl EventDispatcher {
     ) {
         let (dispatch_matrix, events) = self.create_dispatch_matrix_and_event_vector(receipts);
 
+        #[cfg(any(test, feature = "testing"))]
+        if test_skip_block_announcement(block) {
+            return;
+        }
+
         if !dispatch_matrix.is_empty() {
             let mature_rewards_vec = if let Some(rewards_info) = mature_rewards_info {
                 mature_rewards
@@ -616,11 +635,6 @@ impl EventDispatcher {
             };
 
             let mature_rewards = serde_json::Value::Array(mature_rewards_vec);
-
-            #[cfg(any(test, feature = "testing"))]
-            if test_skip_block_announcement(block) {
-                return;
-            }
 
             for (observer_id, filtered_events_ids) in dispatch_matrix.iter().enumerate() {
                 let filtered_events: Vec<_> = filtered_events_ids
@@ -967,15 +981,32 @@ impl EventDispatcher {
     }
 
     pub fn register_observer(&mut self, conf: &EventObserverConfig) {
-        self.register_observer_private(conf);
+        self.register_observer_private(conf, None);
     }
 
-    fn register_observer_private(&mut self, conf: &EventObserverConfig) -> EventObserver {
+    /// Register an observer and authenticate policy-affecting proposal callbacks.
+    ///
+    /// The token is attached only to `/proposal_response`; general observer
+    /// notifications do not expose the node/signer shared credential.
+    pub fn register_observer_with_proposal_auth(
+        &mut self,
+        conf: &EventObserverConfig,
+        auth_token: Option<String>,
+    ) {
+        self.register_observer_private(conf, auth_token.map(Arc::<str>::from));
+    }
+
+    fn register_observer_private(
+        &mut self,
+        conf: &EventObserverConfig,
+        proposal_response_auth_token: Option<Arc<str>>,
+    ) -> EventObserver {
         info!("Registering event observer at: {}", conf.endpoint);
         let event_observer = EventObserver::new(
             conf.endpoint.clone(),
             Duration::from_millis(conf.timeout_ms),
             conf.disable_retries,
+            proposal_response_auth_token,
         );
 
         if conf.disable_retries {
@@ -1118,7 +1149,12 @@ impl EventDispatcher {
             // If the timeout configuration for this observer is different from what it was
             // originally, the updated config wins.
             self.worker
-                .initiate_send(id, observer.disable_retries, Some(observer.timeout))
+                .initiate_send_with_authorization(
+                    id,
+                    observer.disable_retries,
+                    Some(observer.timeout),
+                    observer.authorization_for_path(full_url.path()),
+                )
                 .expect("failed to dispatch pending event payload to worker thread")
                 .wait_until_complete();
         }
@@ -1152,8 +1188,12 @@ impl EventDispatcher {
 
         let id = self.save_to_db(&data);
 
-        self.worker
-            .initiate_send(id, event_observer.disable_retries, None)
+        self.worker.initiate_send_with_authorization(
+            id,
+            event_observer.disable_retries,
+            None,
+            event_observer.authorization_for_path(path),
+        )
     }
 
     /// This fire-and-forget version of `dispatch_to_observer` logs any error from enqueueing the

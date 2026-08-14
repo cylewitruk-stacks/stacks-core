@@ -61,10 +61,17 @@ pub mod actions {
     use crate::monitoring::prometheus::*;
     use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
     use crate::v0::signer_state::LocalStateMachine;
+    use libsigner::v0::signer_state::MinerState;
+    use stacks_network::DeferredMinerAuthorizationSnapshot;
 
     /// Update stacks tip height gauge
     pub fn update_stacks_tip_height(height: i64) {
+        let observed_at = i64::try_from(clarity::util::get_epoch_time_secs()).unwrap_or(i64::MAX);
+        if STACKS_TIP_HEIGHT_GAUGE.get() != height {
+            STACKS_TIP_LAST_CHANGED_TIMESTAMP_GAUGE.set(observed_at);
+        }
         STACKS_TIP_HEIGHT_GAUGE.set(height);
+        STACKS_TIP_LAST_OBSERVED_TIMESTAMP_GAUGE.set(observed_at);
     }
 
     /// Update the current reward cycle
@@ -77,6 +84,13 @@ pub mod actions {
         let label_value = if accepted { "accepted" } else { "rejected" };
         BLOCK_VALIDATION_RESPONSES
             .with_label_values(&[label_value])
+            .inc();
+    }
+
+    /// Record a companion timeout as abstention, never as a rejection.
+    pub fn increment_block_validation_abstentions() {
+        BLOCK_VALIDATION_RESPONSES
+            .with_label_values(&["abstained"])
             .inc();
     }
 
@@ -94,6 +108,11 @@ pub mod actions {
     /// Increment the block pre-commit sent counter
     pub fn increment_block_pre_commits_sent() {
         BLOCK_PRE_COMMITS_SENT.inc();
+    }
+
+    /// Record a bounded signer-policy rejection reason before companion validation.
+    pub fn increment_block_policy_rejection(reason: &str) {
+        POLICY_REJECTIONS.with_label_values(&[reason]).inc();
     }
 
     /// Update the stx balance of the signer
@@ -138,10 +157,173 @@ pub mod actions {
 
     /// Record the current local state machine
     pub fn record_local_state(state: LocalStateMachine) {
-        SIGNER_LOCAL_STATE_MACHINE
+        let blocked_on = match &state {
+            LocalStateMachine::Uninitialized => "local_node_rpc",
+            LocalStateMachine::Pending { .. } => "canonical_view",
+            LocalStateMachine::Initialized(_) => "none",
+        };
+        for reason in ["none", "canonical_view", "local_node_rpc", "other"] {
+            SIGNER_BLOCKED_ON
+                .with_label_values(&["signer_state", reason])
+                .set(i64::from(reason == blocked_on));
+        }
+        let lifecycle = match &state {
+            LocalStateMachine::Uninitialized => "uninitialized",
+            LocalStateMachine::Pending { .. } => "pending",
+            LocalStateMachine::Initialized(_) => "initialized",
+        };
+        for value in ["uninitialized", "pending", "initialized"] {
+            LOCAL_STATE
+                .with_label_values(&[value])
+                .set(i64::from(value == lifecycle));
+        }
+        let state_view = match &state {
+            LocalStateMachine::Initialized(view) => Some(view),
+            LocalStateMachine::Pending { prior, .. } => Some(prior),
+            LocalStateMachine::Uninitialized => None,
+        };
+        let miner_state = match state_view.map(|view| &view.current_miner) {
+            Some(MinerState::ActiveMiner { .. }) => "active_miner",
+            Some(MinerState::NoValidMiner) => "no_valid_miner",
+            None => "unknown",
+        };
+        for value in ["unknown", "no_valid_miner", "active_miner"] {
+            MINER_STATE
+                .with_label_values(&[value])
+                .set(i64::from(value == miner_state));
+        }
+        STATE_BURN_BLOCK_HEIGHT.set(
+            state_view
+                .and_then(|view| i64::try_from(view.burn_block_height).ok())
+                .unwrap_or(0),
+        );
+        ACTIVE_PROTOCOL_VERSION.set(
+            state_view
+                .and_then(|view| i64::try_from(view.active_signer_protocol_version).ok())
+                .unwrap_or(0),
+        );
+        let mut recorded = SIGNER_LOCAL_STATE_MACHINE
             .lock()
-            .expect("Local state machine lock poisoned")
-            .replace(state);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if recorded.as_ref() != Some(&state) {
+            STATE_LAST_CHANGED_TIMESTAMP
+                .set(i64::try_from(clarity::util::get_epoch_time_secs()).unwrap_or(i64::MAX));
+        }
+        recorded.replace(state);
+    }
+
+    /// Publish a bounded native-network snapshot. Transport PeerIds are
+    /// public-key-derived identities rather than endpoints; the central
+    /// observer joins only uniquely enrolled identities.
+    pub fn record_native_network(
+        connected_peer_ids: &[String],
+        connected_rendezvous: usize,
+        signer_public_keys: &[String],
+        deferred: &DeferredMinerAuthorizationSnapshot,
+    ) {
+        NATIVE_CONNECTIONS.set(i64::try_from(connected_peer_ids.len()).unwrap_or(i64::MAX));
+        NATIVE_RENDEZVOUS_CONNECTIONS.set(i64::try_from(connected_rendezvous).unwrap_or(i64::MAX));
+        let current_peers = connected_peer_ids
+            .iter()
+            .filter(|peer_id| valid_transport_peer_id(peer_id))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut previous_peers = PREVIOUS_CONNECTED_PEERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for peer_id in previous_peers.difference(&current_peers) {
+            let _ = CONNECTED_PEERS.remove_label_values(&[peer_id]);
+        }
+        for peer_id in &current_peers {
+            CONNECTED_PEERS.with_label_values(&[peer_id]).set(1);
+        }
+        *previous_peers = current_peers;
+        let current = signer_public_keys
+            .iter()
+            .filter_map(|key| {
+                let parsed =
+                    stacks_common::util::secp256k1::Secp256k1PublicKey::from_hex(key).ok()?;
+                parsed.compressed().then(|| parsed.to_hex())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut previous = PREVIOUS_AUTHENTICATED_SIGNER_LINKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in previous.iter() {
+            AUTHENTICATED_SIGNER_LINKS.with_label_values(&[key]).set(0);
+        }
+        for key in &current {
+            AUTHENTICATED_SIGNER_LINKS.with_label_values(&[key]).set(1);
+        }
+        *previous = current;
+
+        let generation_started =
+            i64::try_from(clarity::util::get_epoch_time_secs()).unwrap_or(i64::MAX);
+        if NATIVE_NETWORK_GENERATION_START_TIMESTAMP.get() == 0 {
+            NATIVE_NETWORK_GENERATION_START_TIMESTAMP.set(generation_started);
+        }
+        let mut prior = PREVIOUS_DEFERRED_MINER_AUTHORIZATIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let delta = |current: u64, previous: u64| {
+            let value = if current >= previous {
+                current - previous
+            } else {
+                current
+            };
+            i64::try_from(value).unwrap_or(i64::MAX)
+        };
+        let admitted_delta = delta(deferred.admitted, prior.admitted);
+        DEFERRED_MINER_AUTHORIZATIONS_ADMITTED.inc_by(admitted_delta);
+        // Admission is the unique, authenticated observe-on-defer boundary.
+        // Count the local abstention here so a companion RPC stall cannot
+        // delay or suppress it by blocking the consensus runloop's queue.
+        BLOCK_VALIDATION_RESPONSES
+            .with_label_values(&["abstained"])
+            .inc_by(admitted_delta);
+        DEFERRED_MINER_AUTHORIZATION_OBSERVATIONS
+            .with_label_values(&["delivered"])
+            .inc_by(delta(
+                deferred.observation_delivered,
+                prior.observation_delivered,
+            ));
+        DEFERRED_MINER_AUTHORIZATION_OBSERVATIONS
+            .with_label_values(&["retry"])
+            .inc_by(delta(
+                deferred.observation_retries,
+                prior.observation_retries,
+            ));
+        for (outcome, current, previous) in [
+            ("released", deferred.released, prior.released),
+            ("expired", deferred.expired, prior.expired),
+            ("unauthorized", deferred.unauthorized, prior.unauthorized),
+            ("redundant", deferred.redundant, prior.redundant),
+            (
+                "binding_failed",
+                deferred.binding_failed,
+                prior.binding_failed,
+            ),
+            ("malformed", deferred.malformed, prior.malformed),
+        ] {
+            DEFERRED_MINER_AUTHORIZATIONS_RESOLVED
+                .with_label_values(&[outcome])
+                .inc_by(delta(current, previous));
+        }
+        DEFERRED_MINER_AUTHORIZATIONS_PENDING
+            .set(i64::try_from(deferred.pending).unwrap_or(i64::MAX));
+        *prior = *deferred;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_miner_authorizations_admitted_for_test() -> i64 {
+        DEFERRED_MINER_AUTHORIZATIONS_ADMITTED.get()
+    }
+
+    fn valid_transport_peer_id(peer_id: &str) -> bool {
+        (32..=128).contains(&peer_id.len())
+            && peer_id
+                .bytes()
+                .all(|byte| matches!(byte, b'1'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z' | b'a'..=b'k' | b'm'..=b'z'))
     }
 
     /// Increment signer agreement state change reason counter
@@ -195,6 +377,7 @@ pub mod actions {
     use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
     use crate::v0::signer_state::LocalStateMachine;
     use crate::GlobalConfig;
+    use stacks_network::DeferredMinerAuthorizationSnapshot;
 
     /// Update stacks tip height gauge
     pub fn update_stacks_tip_height(_height: i64) {}
@@ -205,6 +388,9 @@ pub mod actions {
     /// Increment the block validation responses counter
     pub fn increment_block_validation_responses(_accepted: bool) {}
 
+    /// Record a companion timeout as abstention.
+    pub fn increment_block_validation_abstentions() {}
+
     /// Increment the block responses sent counter
     pub fn increment_block_responses_sent(_accepted: bool) {}
 
@@ -213,6 +399,9 @@ pub mod actions {
 
     /// Increment the block pre-commits sent counter
     pub fn increment_block_pre_commits_sent() {}
+
+    /// Record a bounded signer-policy rejection reason.
+    pub fn increment_block_policy_rejection(_reason: &str) {}
 
     /// Update the stx balance of the signer
     pub fn update_signer_stx_balance(_balance: i64) {}
@@ -244,6 +433,15 @@ pub mod actions {
     /// Record the current local state machine
     pub fn record_local_state(_state: LocalStateMachine) {}
 
+    /// Record a sanitized native-network snapshot.
+    pub fn record_native_network(
+        _connected_peer_ids: &[String],
+        _connected_rendezvous: usize,
+        _signer_public_keys: &[String],
+        _deferred: &DeferredMinerAuthorizationSnapshot,
+    ) {
+    }
+
     /// Increment signer agreement state change reason counter
     pub fn increment_signer_agreement_state_change_reason(
         _reason: SignerAgreementStateChangeReason,
@@ -274,6 +472,12 @@ fn remove_origin_from_path(full_path: &str, origin: &str) -> String {
     full_path.replace(origin, "")
 }
 
+#[cfg(all(test, feature = "monitoring_prom"))]
+use stacks_network::DeferredMinerAuthorizationSnapshot;
+
+#[cfg(all(test, feature = "monitoring_prom"))]
+static MONITORING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_remove_origin_from_path() {
     let full_path = "http://localhost:20443/v2/info";
@@ -285,4 +489,130 @@ fn test_remove_origin_from_path() {
     let origin = "http://localhost:20443";
     let path = remove_origin_from_path(full_path, origin);
     assert_eq!(path, "/v2/info");
+}
+
+#[cfg(feature = "monitoring_prom")]
+#[test]
+fn native_network_metric_exports_an_exact_valid_signer_set() {
+    let _guard = MONITORING_TEST_LOCK.lock().unwrap();
+    let key = "02007311430123d4cad97f4f7e86e023b28143130a18099ecf094d36fef0f6135c".to_owned();
+    let invalid_curve_point = format!("02{}", "00".repeat(32));
+    let peer = "16Uiu2HAmU1MbqEPd87m36aZWn6qKUtPumc2SthnzhF4h2RXz4wTS".to_owned();
+    actions::record_native_network(
+        std::slice::from_ref(&peer),
+        1,
+        &[key.clone(), invalid_curve_point.clone()],
+        &DeferredMinerAuthorizationSnapshot::default(),
+    );
+    assert_eq!(prometheus::NATIVE_CONNECTIONS.get(), 1);
+    assert_eq!(prometheus::NATIVE_RENDEZVOUS_CONNECTIONS.get(), 1);
+    assert_eq!(
+        prometheus::AUTHENTICATED_SIGNER_LINKS
+            .with_label_values(&[&key])
+            .get(),
+        1
+    );
+    assert_eq!(
+        prometheus::AUTHENTICATED_SIGNER_LINKS
+            .with_label_values(&[&invalid_curve_point])
+            .get(),
+        0
+    );
+
+    assert_eq!(
+        prometheus::CONNECTED_PEERS
+            .with_label_values(&[&peer])
+            .get(),
+        1
+    );
+    actions::record_native_network(&[], 0, &[], &DeferredMinerAuthorizationSnapshot::default());
+    assert_eq!(
+        prometheus::AUTHENTICATED_SIGNER_LINKS
+            .with_label_values(&[&key])
+            .get(),
+        0
+    );
+    assert!(prometheus::CONNECTED_PEERS
+        .remove_label_values(&[&peer])
+        .is_err());
+}
+
+#[cfg(feature = "monitoring_prom")]
+#[test]
+fn unchanged_node_tip_refreshes_observation_without_faking_a_chain_change() {
+    prometheus::STACKS_TIP_HEIGHT_GAUGE.set(42);
+    prometheus::STACKS_TIP_LAST_CHANGED_TIMESTAMP_GAUGE.set(123);
+    prometheus::STACKS_TIP_LAST_OBSERVED_TIMESTAMP_GAUGE.set(0);
+
+    actions::update_stacks_tip_height(42);
+
+    assert_eq!(
+        prometheus::STACKS_TIP_LAST_CHANGED_TIMESTAMP_GAUGE.get(),
+        123
+    );
+    assert!(prometheus::STACKS_TIP_LAST_OBSERVED_TIMESTAMP_GAUGE.get() > 0);
+}
+
+#[cfg(feature = "monitoring_prom")]
+#[test]
+fn native_deferral_metrics_mirror_monotonic_conserved_lifecycle() {
+    let _guard = MONITORING_TEST_LOCK.lock().unwrap();
+    *prometheus::PREVIOUS_DEFERRED_MINER_AUTHORIZATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        DeferredMinerAuthorizationSnapshot::default();
+    let admitted_before = prometheus::DEFERRED_MINER_AUTHORIZATIONS_ADMITTED.get();
+    let abstained_before = prometheus::BLOCK_VALIDATION_RESPONSES
+        .with_label_values(&["abstained"])
+        .get();
+    let released_before = prometheus::DEFERRED_MINER_AUTHORIZATIONS_RESOLVED
+        .with_label_values(&["released"])
+        .get();
+    let snapshot = DeferredMinerAuthorizationSnapshot {
+        admitted: 3,
+        observation_delivered: 3,
+        observation_retries: 1,
+        released: 2,
+        expired: 0,
+        unauthorized: 0,
+        redundant: 0,
+        binding_failed: 0,
+        malformed: 0,
+        pending: 1,
+    };
+    assert!(snapshot.is_conserved());
+    actions::record_native_network(&[], 0, &[], &snapshot);
+    assert_eq!(
+        prometheus::DEFERRED_MINER_AUTHORIZATIONS_ADMITTED.get() - admitted_before,
+        3
+    );
+    assert_eq!(
+        prometheus::BLOCK_VALIDATION_RESPONSES
+            .with_label_values(&["abstained"])
+            .get()
+            - abstained_before,
+        3
+    );
+    assert_eq!(
+        prometheus::DEFERRED_MINER_AUTHORIZATIONS_RESOLVED
+            .with_label_values(&["released"])
+            .get()
+            - released_before,
+        2
+    );
+    assert_eq!(prometheus::DEFERRED_MINER_AUTHORIZATIONS_PENDING.get(), 1);
+    actions::record_native_network(&[], 0, &[], &snapshot);
+    assert_eq!(
+        prometheus::DEFERRED_MINER_AUTHORIZATIONS_ADMITTED.get() - admitted_before,
+        3,
+        "re-recording one service snapshot must not double count"
+    );
+    assert_eq!(
+        prometheus::BLOCK_VALIDATION_RESPONSES
+            .with_label_values(&["abstained"])
+            .get()
+            - abstained_before,
+        3,
+        "re-recording one service snapshot must not double count abstentions"
+    );
 }

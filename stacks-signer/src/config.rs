@@ -31,6 +31,7 @@ use stacks_common::address::{
 use stacks_common::consts::{CHAIN_ID_MAINNET, CHAIN_ID_TESTNET};
 use stacks_common::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
 use stacks_common::util::hash::Hash160;
+use stacks_network_types::{BridgeMode, Libp2pLimits, RolloutMode, SignerBridgeConfig};
 
 use crate::client::SignerSlotID;
 #[cfg(any(test, feature = "testing"))]
@@ -204,8 +205,9 @@ pub struct SignerConfig {
     pub reset_replay_set_after_fork_blocks: u64,
     /// Time to wait between updating our local state machine view point and capitulating to other signers miner view
     pub capitulate_miner_view_timeout: Duration,
-    /// The HTTP timeout for read/write operations with StackerDB.
-    pub stackerdb_timeout: Duration,
+    #[cfg(any(test, feature = "testing"))]
+    /// Socket timeout for the test-only incumbent compatibility adapter.
+    pub legacy_test_adapter_timeout: Duration,
     #[cfg(any(test, feature = "testing"))]
     /// Only used for testing purposes to enable overriding the signer version
     pub supported_signer_protocol_version: u64,
@@ -239,6 +241,8 @@ pub struct GlobalConfig {
     pub block_proposal_timeout: Duration,
     /// An optional custom Chain ID
     pub chain_id: Option<u32>,
+    /// Native signer libp2p transport configuration.
+    pub libp2p: SignerLibp2pConfig,
     /// Time to wait for the last block of a tenure to be globally accepted or rejected
     /// before considering a new miner's block at the same height as potentially valid.
     pub tenure_last_block_proposal_timeout: Duration,
@@ -276,6 +280,124 @@ pub struct GlobalConfig {
     pub supported_signer_protocol_version: u64,
 }
 
+/// Native libp2p transport settings for a signer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerLibp2pConfig {
+    /// Enable the native signer transport.
+    pub enabled: bool,
+    /// Staged application ingress/egress policy shared with the node.
+    pub rollout_mode: RolloutMode,
+    /// Multiaddresses on which this signer listens.
+    pub bind: Vec<String>,
+    /// Public/reachable dial hints signed into private role-directory records.
+    /// If empty, `bind` is used (suitable for loopback and memory tests only).
+    pub advertise: Vec<String>,
+    /// Bootstrap multiaddresses ending in `/p2p/<PeerId>`.
+    pub bootstrap_peers: Vec<String>,
+    /// Private rendezvous multiaddresses used for reconnect and role-directory
+    /// queries. Miner authority is derived from canonical sortition proofs.
+    pub rendezvous_peers: Vec<String>,
+    /// Shared connection, stream, byte, validation, and cache bounds.
+    pub limits: Libp2pLimits,
+    /// Shared, validated quarantined signer-bridge policy.
+    pub signer_bridge: SignerBridgeConfig,
+}
+
+impl Default for SignerLibp2pConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rollout_mode: RolloutMode::Off,
+            bind: vec!["/ip4/0.0.0.0/tcp/30445".to_owned()],
+            advertise: Vec::new(),
+            bootstrap_peers: Vec::new(),
+            rendezvous_peers: Vec::new(),
+            limits: Libp2pLimits::default(),
+            signer_bridge: SignerBridgeConfig::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct RawLibp2pConfig {
+    enabled: Option<bool>,
+    rollout_mode: Option<RolloutMode>,
+    bind: Option<Vec<String>>,
+    advertise: Option<Vec<String>>,
+    bootstrap_peers: Option<Vec<String>>,
+    rendezvous_peers: Option<Vec<String>>,
+    limits: Option<Libp2pLimits>,
+    compatibility_stackerdb: Option<bool>,
+    signer_bridge: Option<SignerBridgeConfig>,
+}
+
+impl RawLibp2pConfig {
+    fn parse(self) -> Result<SignerLibp2pConfig, ConfigError> {
+        let default = SignerLibp2pConfig::default();
+        let rollout_mode = match (self.rollout_mode, self.enabled) {
+            (Some(mode), Some(enabled)) if enabled != mode.enabled() => {
+                return Err(ConfigError::BadField(
+                    "libp2p.enabled".to_owned(),
+                    "conflicts with libp2p.rollout_mode".to_owned(),
+                ));
+            }
+            (Some(mode), _) => mode,
+            (None, Some(true)) => RolloutMode::Dual,
+            (None, Some(false)) => RolloutMode::Off,
+            (None, None) => default.rollout_mode,
+        };
+        let enabled = rollout_mode.enabled();
+        let bind = self.bind.unwrap_or(default.bind);
+        let advertise = self.advertise.unwrap_or(default.advertise);
+        let bootstrap_peers = self.bootstrap_peers.unwrap_or(default.bootstrap_peers);
+        let rendezvous_peers = self.rendezvous_peers.unwrap_or(default.rendezvous_peers);
+        let limits = self.limits.unwrap_or(default.limits);
+        limits.validate().map_err(|error| {
+            ConfigError::BadField("libp2p.limits".to_owned(), error.to_string())
+        })?;
+        let mut signer_bridge = self.signer_bridge.unwrap_or(default.signer_bridge);
+        if let Some(enabled) = self.compatibility_stackerdb {
+            signer_bridge.mode = if enabled {
+                BridgeMode::Bidirectional
+            } else {
+                BridgeMode::Off
+            };
+        }
+        signer_bridge.validate().map_err(|error| {
+            ConfigError::BadField("libp2p.signer_bridge".to_owned(), error.to_string())
+        })?;
+        if enabled && bind.is_empty() {
+            return Err(ConfigError::BadField(
+                "libp2p.bind".to_owned(),
+                "must not be empty when libp2p is enabled".to_owned(),
+            ));
+        }
+        if bind
+            .iter()
+            .chain(advertise.iter())
+            .chain(bootstrap_peers.iter())
+            .chain(rendezvous_peers.iter())
+            .any(|address| address.len() > 512)
+        {
+            return Err(ConfigError::BadField(
+                "libp2p".to_owned(),
+                "multiaddresses must not exceed 512 bytes".to_owned(),
+            ));
+        }
+        Ok(SignerLibp2pConfig {
+            enabled,
+            rollout_mode,
+            bind,
+            advertise,
+            bootstrap_peers,
+            rendezvous_peers,
+            limits,
+            signer_bridge,
+        })
+    }
+}
+
 /// Internal struct for loading up the config file.
 ///
 /// This struct represents the TOML configuration file format for the
@@ -311,6 +433,8 @@ struct RawConfigFile {
     /// @notes:
     ///   - Determines address version and transaction version.
     pub network: Network,
+    /// Native signer libp2p transport settings.
+    pub libp2p: Option<RawLibp2pConfig>,
     /// The time to wait for a response from the stacker-db instance.
     /// ---
     /// @default: `5_000`
@@ -523,6 +647,7 @@ impl TryFrom<RawConfigFile> for GlobalConfig {
             StacksAddress::p2pkh_from_hash(raw_data.network.is_mainnet(), signer_hash);
         let event_timeout =
             Duration::from_millis(raw_data.event_timeout_ms.unwrap_or(EVENT_TIMEOUT_MS));
+        let libp2p = raw_data.libp2p.unwrap_or_default().parse()?;
         let first_proposal_burn_block_timing = Duration::from_secs(
             raw_data
                 .first_proposal_burn_block_timing_secs
@@ -634,6 +759,7 @@ impl TryFrom<RawConfigFile> for GlobalConfig {
             first_proposal_burn_block_timing,
             block_proposal_timeout,
             chain_id: raw_data.chain_id,
+            libp2p,
             tenure_last_block_proposal_timeout,
             block_proposal_validation_timeout,
             tenure_idle_timeout,
@@ -823,6 +949,43 @@ chain_id = {chain_id}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn libp2p_rollout_policy_matches_node_semantics() {
+        let base = r#"
+stacks_private_key = "2de4e77aab89c0c2570bb8bb90824f5cf2a5204a975905fee450ff9dad0fcf2801"
+node_host = "localhost:20443"
+endpoint = "localhost:30000"
+network = "testnet"
+auth_password = "abcd"
+db_path = ":memory:"
+"#;
+        for (serialized, expected) in [
+            ("off", RolloutMode::Off),
+            ("observe", RolloutMode::Observe),
+            ("receive", RolloutMode::Receive),
+            ("dual", RolloutMode::Dual),
+            ("libp2p-preferred", RolloutMode::Libp2pPreferred),
+            ("libp2p-only", RolloutMode::Libp2pOnly),
+        ] {
+            let config = GlobalConfig::load_from_str(&format!(
+                "{base}\n[libp2p]\nrollout_mode = \"{serialized}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.libp2p.rollout_mode, expected);
+            assert_eq!(config.libp2p.enabled, expected.enabled());
+        }
+
+        let legacy =
+            GlobalConfig::load_from_str(&format!("{base}\n[libp2p]\nenabled = true\n")).unwrap();
+        assert_eq!(legacy.libp2p.rollout_mode, RolloutMode::Dual);
+
+        let conflict = GlobalConfig::load_from_str(&format!(
+            "{base}\n[libp2p]\nenabled = false\nrollout_mode = \"receive\"\n"
+        ))
+        .unwrap_err();
+        assert!(conflict.to_string().contains("conflicts"));
+    }
 
     #[test]
     fn test_example_confs() {

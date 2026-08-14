@@ -1080,6 +1080,7 @@ fn check_miner_inactivity_timeout() {
     let cur = SortitionInfo {
         burn_block_hash: cur_sortition.burn_block_hash.clone(),
         burn_block_height: burn_height,
+        num_sortitions: 2,
         burn_header_timestamp: cur_sortition.burn_header_timestamp,
         sortition_id: SortitionId([1u8; 32]),
         parent_sortition_id: SortitionId([3u8; 32]),
@@ -1094,6 +1095,7 @@ fn check_miner_inactivity_timeout() {
     let last = SortitionInfo {
         burn_block_hash: last_sortition.burn_block_hash.clone(),
         burn_block_height: 0,
+        num_sortitions: 1,
         burn_header_timestamp: last_sortition.burn_header_timestamp,
         sortition_id: SortitionId([0u8; 32]),
         parent_sortition_id: SortitionId([4u8; 32]),

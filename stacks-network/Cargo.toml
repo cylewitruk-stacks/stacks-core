@@ -1,0 +1,38 @@
+[package]
+name = "stacks-network"
+version = "0.1.0"
+edition = "2021"
+license = "GPLv3"
+description = "Secure libp2p transport and semantic network hub for Stacks"
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+futures-timer = "3.0.3"
+hkdf = { workspace = true }
+libp2p = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
+stacks-common = { path = "../stacks-common" }
+stacks-network-types = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"], optional = true }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false, optional = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+libp2p-swarm-test = "0.6.0"
+serde_json = { workspace = true }
+tempfile = "3.3"
+
+[features]
+test-support = []
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]

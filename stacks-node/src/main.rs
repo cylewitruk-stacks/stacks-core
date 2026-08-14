@@ -296,12 +296,24 @@ fn send_pending_event_payloads(conf: &Config) {
     let mut event_dispatcher =
         EventDispatcher::new_with_custom_queue_size(conf.get_working_dir(), 0);
     for observer in &conf.events_observers {
-        event_dispatcher.register_observer(observer);
+        event_dispatcher.register_observer_with_proposal_auth(
+            observer,
+            conf.connection_options.auth_token.clone(),
+        );
     }
     event_dispatcher.process_pending_payloads();
 }
 
 fn main() {
+    // The incumbent node logs through slog, while the native networking stack
+    // emits structured tracing spans. Install a non-panicking subscriber so
+    // those spans are operationally visible without coupling either logging
+    // implementation to the other. RUST_LOG remains the runtime control.
+    let _observability_guard =
+        stacks_network::install_tracing("stacks-node", "warn,stacks_network=info")
+            .inspect_err(|error| eprintln!("optional tracing initialization failed: {error}"))
+            .ok();
+
     panic::set_hook(Box::new(|panic_info| {
         error!("Process abort due to thread panic: {panic_info}");
         let bt = Backtrace::new();

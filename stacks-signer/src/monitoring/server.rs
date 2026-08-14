@@ -15,7 +15,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clarity::util::hash::to_hex;
 use clarity::util::secp256k1::Secp256k1PublicKey;
@@ -28,6 +29,15 @@ use crate::client::{ClientError, StacksClient};
 use crate::config::{GlobalConfig, Network};
 use crate::monitoring::actions::{update_signer_nonce, update_stacks_tip_height};
 use crate::monitoring::prometheus::gather_metrics_string;
+
+/// Chain height is cheap, operationally important, and changes much more
+/// frequently than reward-set/account metadata. Keep it close to the actor
+/// agent's scrape cadence without multiplying the slower RPC load.
+const NODE_TIP_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const ACCOUNT_METADATA_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Monitoring must continue serving its last known-good snapshot while its
+/// companion is paused or unreachable.
+const MONITORING_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -51,10 +61,9 @@ pub enum MonitoringError {
 pub struct MonitoringServer {
     http_server: HttpServer,
     local_addr: SocketAddr,
-    stacks_client: StacksClient,
-    last_metrics_poll: Instant,
     network: Network,
     public_key: Secp256k1PublicKey,
+    stx_address: String,
     stacks_node_client: reqwest::blocking::Client,
     stacks_node_origin: String,
 }
@@ -63,19 +72,19 @@ impl MonitoringServer {
     pub fn new(
         http_server: HttpServer,
         local_addr: SocketAddr,
-        stacks_client: StacksClient,
         network: Network,
         public_key: Secp256k1PublicKey,
+        stx_address: String,
         stacks_node_origin: String,
+        stacks_node_client: reqwest::blocking::Client,
     ) -> Self {
         Self {
             http_server,
             local_addr,
-            stacks_client,
-            last_metrics_poll: Instant::now(),
             network,
             public_key,
-            stacks_node_client: reqwest::blocking::Client::new(),
+            stx_address,
+            stacks_node_client,
             stacks_node_origin,
         }
     }
@@ -85,23 +94,31 @@ impl MonitoringServer {
         let Some(endpoint) = config.metrics_endpoint else {
             return Err(MonitoringError::EndpointNotConfigured);
         };
-        let stacks_client = StacksClient::from(config);
+        let stacks_client =
+            StacksClient::from(config).with_request_timeout(MONITORING_RPC_REQUEST_TIMEOUT)?;
+        let stacks_node_client = reqwest::blocking::Client::builder()
+            .timeout(MONITORING_RPC_REQUEST_TIMEOUT)
+            .build()
+            .map_err(ClientError::from)?;
         let http_server = HttpServer::http(endpoint).map_err(|_| MonitoringError::AlreadyBound)?;
         let public_key = Secp256k1PublicKey::from_private(&config.stacks_private_key);
+        let stx_address = stacks_client.get_signer_address().to_string();
         let mut server = MonitoringServer::new(
             http_server,
             endpoint,
-            stacks_client,
             config.network.clone(),
             public_key,
+            stx_address,
             format!("http://{}", config.node_host),
+            stacks_node_client,
         );
-        if let Err(e) = server.update_metrics() {
+        if let Err(e) = update_metrics(&stacks_client) {
             warn!(
                 "Monitoring: Error updating metrics when starting server: {:?}",
                 e
             );
         };
+        start_metrics_refresher(stacks_client);
         server.main_loop()
     }
 
@@ -116,9 +133,6 @@ impl MonitoringServer {
     pub fn main_loop(&mut self) -> Result<(), MonitoringError> {
         info!("{}: Starting Prometheus metrics server", self);
         loop {
-            if let Err(err) = self.refresh_metrics() {
-                error!("Monitoring: Error refreshing metrics: {:?}", err);
-            }
             let request = match self.http_server.recv() {
                 Ok(request) => request,
                 Err(err) => {
@@ -170,52 +184,13 @@ impl MonitoringServer {
         }
     }
 
-    /// Check to see if metrics need to be refreshed
-    fn refresh_metrics(&mut self) -> Result<(), MonitoringError> {
-        let now = Instant::now();
-        if now.duration_since(self.last_metrics_poll).as_secs() > 60 {
-            self.last_metrics_poll = now;
-            self.update_metrics()?;
-        }
-        Ok(())
-    }
-
-    /// Update metrics by making RPC calls to the Stacks node
-    fn update_metrics(&self) -> Result<(), MonitoringError> {
-        debug!("{}: Updating metrics", self);
-        let peer_info = self.stacks_client.get_peer_info()?;
-        if let Ok(height) = i64::try_from(peer_info.stacks_tip_height) {
-            update_stacks_tip_height(height);
-        } else {
-            warn!(
-                "Failed to parse stacks tip height: {}",
-                peer_info.stacks_tip_height
-            );
-        }
-        let pox_info = self.stacks_client.get_pox_data()?;
-        if let Ok(reward_cycle) = i64::try_from(pox_info.reward_cycle_id) {
-            update_reward_cycle(reward_cycle);
-        }
-        let signer_stx_addr = self.stacks_client.get_signer_address();
-        let account_entry = self.stacks_client.get_account_entry(signer_stx_addr)?;
-        let balance = i64::from_str_radix(&account_entry.balance[2..], 16).map_err(|e| {
-            MonitoringError::FetchError(ClientError::MalformedClarityValue(format!(
-                "Failed to parse balance: {} with err: {}",
-                &account_entry.balance, e,
-            )))
-        })?;
-        update_signer_nonce(account_entry.nonce);
-        update_signer_stx_balance(balance);
-        Ok(())
-    }
-
     /// Build a JSON response for non-metrics requests
     fn get_info_response(&self) -> String {
         // let public_key = Secp256k1PublicKey::from_private(&self.stacks_client.publ);
         serde_json::to_string(&serde_json::json!({
             "signerPublicKey": to_hex(&self.public_key.to_bytes_compressed()),
             "network": self.network.to_string(),
-            "stxAddress": self.stacks_client.get_signer_address().to_string(),
+            "stxAddress": self.stx_address,
             "version": VERSION_STRING.to_string(),
         }))
         .expect("Failed to serialize JSON")
@@ -243,6 +218,75 @@ impl MonitoringServer {
             }
         }
     }
+}
+
+/// Keep collection isolated from HTTP serving. A stalled companion may delay a
+/// refresh up to the bounded RPC timeout, but it must never delay a federation
+/// scrape of the last known-good process metrics.
+fn start_metrics_refresher(stacks_client: StacksClient) {
+    thread::Builder::new()
+        .name("signer_metrics_refresh".to_owned())
+        .spawn(move || {
+            let mut last_node_tip_poll = Instant::now();
+            let mut last_account_metadata_poll = Instant::now();
+            loop {
+                let now = Instant::now();
+                if now.duration_since(last_node_tip_poll) >= NODE_TIP_POLL_INTERVAL {
+                    last_node_tip_poll = now;
+                    if let Err(error) = update_node_tip(&stacks_client) {
+                        error!("Monitoring: Error refreshing node-tip metrics: {error:?}");
+                    }
+                }
+                if now.duration_since(last_account_metadata_poll) >= ACCOUNT_METADATA_POLL_INTERVAL
+                {
+                    last_account_metadata_poll = now;
+                    if let Err(error) = update_account_metadata(&stacks_client) {
+                        error!("Monitoring: Error refreshing account metrics: {error:?}");
+                    }
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        })
+        .expect("Failed to start signer metrics refresh thread");
+}
+
+/// Populate all companion-derived gauges once before the independent refresher
+/// starts. Errors leave their previous/default value in place.
+fn update_metrics(stacks_client: &StacksClient) -> Result<(), MonitoringError> {
+    debug!("Updating signer companion-derived metrics");
+    update_node_tip(stacks_client)?;
+    update_account_metadata(stacks_client)
+}
+
+fn update_node_tip(stacks_client: &StacksClient) -> Result<(), MonitoringError> {
+    let peer_info = stacks_client.get_peer_info()?;
+    if let Ok(height) = i64::try_from(peer_info.stacks_tip_height) {
+        update_stacks_tip_height(height);
+    } else {
+        warn!(
+            "Failed to parse stacks tip height: {}",
+            peer_info.stacks_tip_height
+        );
+    }
+    Ok(())
+}
+
+fn update_account_metadata(stacks_client: &StacksClient) -> Result<(), MonitoringError> {
+    let pox_info = stacks_client.get_pox_data()?;
+    if let Ok(reward_cycle) = i64::try_from(pox_info.reward_cycle_id) {
+        update_reward_cycle(reward_cycle);
+    }
+    let signer_stx_addr = stacks_client.get_signer_address();
+    let account_entry = stacks_client.get_account_entry(signer_stx_addr)?;
+    let balance = i64::from_str_radix(&account_entry.balance[2..], 16).map_err(|e| {
+        MonitoringError::FetchError(ClientError::MalformedClarityValue(format!(
+            "Failed to parse balance: {} with err: {}",
+            &account_entry.balance, e,
+        )))
+    })?;
+    update_signer_nonce(account_entry.nonce);
+    update_signer_stx_balance(balance);
+    Ok(())
 }
 
 impl std::fmt::Display for MonitoringServer {

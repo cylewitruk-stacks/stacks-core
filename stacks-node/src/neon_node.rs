@@ -156,6 +156,7 @@ use std::{fs, mem, thread};
 use clarity::boot_util::boot_code_id;
 use clarity::vm::costs::ExecutionCost;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use libp2p::PeerId;
 use libsigner::v0::messages::{
     MessageSlotID, MinerSlotID, MockBlock, MockProposal, MockSignature, PeerInfo, SignerMessage,
 };
@@ -198,9 +199,11 @@ use stacks::net::db::{LocalPeer, PeerDB};
 use stacks::net::dns::{DNSClient, DNSResolver};
 use stacks::net::p2p::PeerNetwork;
 use stacks::net::relay::Relayer;
+use stacks::net::semantic::{RelayerIngressAdapter, RelayerIngressOutcome};
 use stacks::net::stackerdb::{StackerDBConfig, StackerDBSync, StackerDBs, MINER_SLOT_COUNT};
 use stacks::net::{
-    Error as NetError, NetworkResult, PeerNetworkComms, RPCHandlerArgs, ServiceFlags,
+    Error as NetError, MicroblocksData, NetworkResult, PeerNetworkComms, RPCHandlerArgs,
+    ServiceFlags,
 };
 use stacks::util_lib::strings::{UrlString, VecDisplay};
 use stacks::{monitoring, version_string};
@@ -215,6 +218,12 @@ use stacks_common::util::hash::{to_hex, Hash160, Sha256Sum};
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 use stacks_common::util::vrf::{VRFProof, VRFPublicKey};
 use stacks_common::util::{get_epoch_time_ms, get_epoch_time_secs};
+use stacks_network::{ObjectNetworkEvent, SyncNetworkEvent};
+use stacks_network_types::wire::v1::{
+    sync_request, sync_response, GetEpoch2Inventory, GetStatus, GetUnconfirmedMicroblocks,
+    MicroblockPage, ObjectType, Status, SyncRequest, SyncResponse, SyncStatus,
+};
+use stacks_network_types::{ContentId, ObjectKind};
 
 use super::{BurnchainController, Config, EventDispatcher, Keychain};
 use crate::burnchains::bitcoin_regtest_controller::{
@@ -230,10 +239,229 @@ use crate::ChainTip;
 
 pub const RELAYER_MAX_BUFFER: usize = 100;
 const VRF_MOCK_MINER_KEY: u64 = 1;
+// An Epoch 2 height can yield both an anchored block and a microblock stream.
+// Keep a page within the default eight-request peer window; the transport's
+// bounded deferred queue absorbs short response-time variance.
+const LIBP2P_EPOCH2_SYNC_PAGE_ITEMS: u32 = 4;
+const LIBP2P_EPOCH2_SYNC_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub const BLOCK_PROCESSOR_STACK_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
 type MinedBlocks = HashMap<BlockHeaderHash, (AssembledAnchorBlock, Secp256k1PrivateKey)>;
+
+#[derive(Clone, Debug)]
+enum PendingEpoch2Sync {
+    Status,
+    Inventory {
+        requested_start: u64,
+        end_height: u64,
+        unconfirmed_parent: Option<Vec<u8>>,
+    },
+    Unconfirmed {
+        parent_block_id: StacksBlockId,
+        requested_sequence: u32,
+    },
+}
+
+fn validate_epoch2_inventory_page(
+    requested_start: u64,
+    end_height: u64,
+    page: &stacks_network_types::wire::v1::InventoryPage,
+) -> Result<(), String> {
+    if page.next_cursor <= requested_start && requested_start < end_height {
+        return Err("Epoch 2 inventory cursor did not advance".to_owned());
+    }
+    if page.next_cursor > end_height {
+        return Err("Epoch 2 inventory cursor exceeded the requested range".to_owned());
+    }
+    let mut expected_height = requested_start;
+    let mut saw_anchor = false;
+    for (index, item) in page.items.iter().enumerate() {
+        if item.index != expected_height {
+            return Err(format!(
+                "Epoch 2 inventory item height {} does not match expected {expected_height}",
+                item.index
+            ));
+        }
+        match ObjectType::try_from(item.kind).ok() {
+            Some(ObjectType::AnchoredBlock) if !saw_anchor => {
+                saw_anchor = true;
+                if (item.available && item.object_id.len() != 32)
+                    || (!item.available && !item.object_id.is_empty())
+                {
+                    return Err("Epoch 2 anchored-block availability/ID mismatch".to_owned());
+                }
+            }
+            Some(ObjectType::Microblock) if saw_anchor && item.available => {
+                if item.object_id.len() != 32 {
+                    return Err("Epoch 2 microblock stream has an invalid ID".to_owned());
+                }
+            }
+            _ => return Err("Epoch 2 inventory item ordering or kind is invalid".to_owned()),
+        }
+        let is_last_for_height = page
+            .items
+            .get(index.saturating_add(1))
+            .is_none_or(|next| next.index != item.index);
+        if is_last_for_height {
+            expected_height = expected_height.saturating_add(1);
+            saw_anchor = false;
+        }
+    }
+    if expected_height != page.next_cursor {
+        return Err("Epoch 2 inventory cursor does not follow its items".to_owned());
+    }
+    Ok(())
+}
+
+fn decode_epoch2_unconfirmed_page(
+    parent: &StacksBlockId,
+    requested_sequence: u32,
+    page: &MicroblockPage,
+) -> Result<Vec<StacksMicroblock>, String> {
+    if page.parent_block_id.as_slice() != parent.as_bytes()
+        || (!page.complete && page.next_sequence <= requested_sequence)
+    {
+        return Err("unconfirmed microblock page did not match its request".to_owned());
+    }
+    let mut expected = requested_sequence;
+    let mut decoded: Vec<StacksMicroblock> = Vec::with_capacity(page.microblocks.len());
+    for bytes in &page.microblocks {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let microblock = StacksMicroblock::consensus_deserialize(&mut cursor)
+            .map_err(|error| format!("invalid unconfirmed microblock: {error}"))?;
+        if cursor.position() != bytes.len() as u64
+            || u32::from(microblock.header.sequence) != expected
+        {
+            return Err("unconfirmed microblock sequence or encoding is invalid".to_owned());
+        }
+        if let Some(previous) = decoded.last() {
+            if microblock.header.prev_block != previous.block_hash() {
+                return Err("unconfirmed microblock page is not contiguous".to_owned());
+            }
+        }
+        expected = expected.saturating_add(1);
+        decoded.push(microblock);
+    }
+    if page.next_sequence != expected {
+        return Err("unconfirmed microblock next sequence is inconsistent".to_owned());
+    }
+    Ok(decoded)
+}
+
+#[cfg(test)]
+mod epoch2_libp2p_inventory_tests {
+    use super::{decode_epoch2_unconfirmed_page, validate_epoch2_inventory_page};
+    use clarity::consts::CHAIN_ID_TESTNET;
+    use clarity::types::chainstate::StacksPrivateKey;
+    use clarity::vm::types::StandardPrincipalData;
+    use stacks::chainstate::stacks::{StacksMicroblock, StacksTransaction};
+    use stacks::core::test_util::make_stacks_transfer_mblock_only;
+    use stacks_common::codec::StacksMessageCodec;
+    use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId};
+    use stacks_network_types::wire::v1::{
+        InventoryItem, InventoryPage, MicroblockPage, ObjectType,
+    };
+
+    fn item(index: u64, kind: ObjectType) -> InventoryItem {
+        InventoryItem {
+            index,
+            object_id: vec![index as u8; 32],
+            available: true,
+            kind: kind as i32,
+        }
+    }
+
+    #[test]
+    fn validates_contiguous_epoch2_inventory_and_rejects_corrupt_progress() {
+        let page = InventoryPage {
+            items: vec![
+                item(10, ObjectType::AnchoredBlock),
+                item(10, ObjectType::Microblock),
+                item(11, ObjectType::AnchoredBlock),
+            ],
+            next_cursor: 12,
+            complete: true,
+        };
+        assert!(validate_epoch2_inventory_page(10, 20, &page).is_ok());
+
+        let mut non_advancing = page.clone();
+        non_advancing.next_cursor = 10;
+        assert!(validate_epoch2_inventory_page(10, 20, &non_advancing).is_err());
+
+        let mut missing_anchor = page.clone();
+        missing_anchor.items.remove(0);
+        assert!(validate_epoch2_inventory_page(10, 20, &missing_anchor).is_err());
+
+        let mut out_of_range = page;
+        out_of_range.next_cursor = 21;
+        assert!(validate_epoch2_inventory_page(10, 20, &out_of_range).is_err());
+    }
+
+    #[test]
+    fn empty_completed_unconfirmed_page_is_bound_to_parent_and_cursor() {
+        let parent = StacksBlockId([7; 32]);
+        let page = MicroblockPage {
+            parent_block_id: parent.as_bytes().to_vec(),
+            microblocks: Vec::new(),
+            next_sequence: 4,
+            complete: true,
+        };
+        assert_eq!(
+            decode_epoch2_unconfirmed_page(&parent, 4, &page).unwrap(),
+            Vec::new(),
+        );
+        let mut wrong = page;
+        wrong.parent_block_id[0] ^= 1;
+        assert!(decode_epoch2_unconfirmed_page(&parent, 4, &wrong).is_err());
+    }
+
+    #[test]
+    fn unconfirmed_pages_require_exact_contiguous_consensus_bytes() {
+        let parent = StacksBlockId([7; 32]);
+        let key = StacksPrivateKey::from_slice(&[1; 32]).unwrap();
+        let transaction_bytes = make_stacks_transfer_mblock_only(
+            &key,
+            0,
+            1,
+            CHAIN_ID_TESTNET,
+            &StandardPrincipalData::transient().into(),
+            1,
+        );
+        let transaction =
+            StacksTransaction::consensus_deserialize(&mut transaction_bytes.as_slice()).unwrap();
+        let first =
+            StacksMicroblock::first_unsigned(&BlockHeaderHash([3; 32]), vec![transaction.clone()]);
+        let second =
+            StacksMicroblock::from_parent_unsigned(&first.header, vec![transaction.clone()])
+                .unwrap();
+        let page = MicroblockPage {
+            parent_block_id: parent.as_bytes().to_vec(),
+            microblocks: vec![first.serialize_to_vec(), second.serialize_to_vec()],
+            next_sequence: 2,
+            complete: false,
+        };
+        assert_eq!(
+            decode_epoch2_unconfirmed_page(&parent, 0, &page)
+                .unwrap()
+                .len(),
+            2,
+        );
+
+        let mut forked = page.clone();
+        let conflicting_parent =
+            StacksMicroblock::first_unsigned(&BlockHeaderHash([4; 32]), vec![transaction.clone()]);
+        let conflicting =
+            StacksMicroblock::from_parent_unsigned(&conflicting_parent.header, vec![transaction])
+                .unwrap();
+        forked.microblocks[1] = conflicting.serialize_to_vec();
+        assert!(decode_epoch2_unconfirmed_page(&parent, 0, &forked).is_err());
+
+        let mut trailing = page;
+        trailing.microblocks[0].push(0);
+        assert!(decode_epoch2_unconfirmed_page(&parent, 0, &trailing).is_err());
+    }
+}
 
 /// Result of running the miner thread.  It could produce a Stacks block or a microblock.
 #[allow(clippy::large_enum_variant)]
@@ -296,6 +524,9 @@ pub struct StacksNode {
     pub p2p_thread_handle: JoinHandle<Option<PeerNetwork>>,
     /// handle to the relayer thread
     pub relayer_thread_handle: JoinHandle<()>,
+    /// Native service is started before Epoch 3 so a genesis-sync node can
+    /// fetch affirmed Epoch 2 anchors without opening the legacy P2P port.
+    pub libp2p_service: Option<stacks_network::NetworkService>,
 }
 
 /// Fault injection logic to artificially increase the length of a tenure.
@@ -2980,6 +3211,8 @@ impl RelayerThread {
             signal_mining_blocked(self.globals.get_miner_status());
         }
 
+        let pending_libp2p_objects = std::mem::take(&mut net_result.libp2p_object_ids);
+        let pending_libp2p_set: HashSet<_> = pending_libp2p_objects.iter().copied().collect();
         let net_receipts = self.with_chainstate(|relayer_thread, sortdb, chainstate, mempool| {
             relayer_thread
                 .relayer
@@ -2996,6 +3229,60 @@ impl RelayerThread {
                 )
                 .expect("BUG: failure processing network results")
         });
+
+        if let Some(network) = self.globals.libp2p_handle() {
+            let publishes_native = self
+                .config
+                .node
+                .libp2p
+                .rollout_mode
+                .publishes_application_data();
+            let mut accepted = HashSet::new();
+            for (consensus_hash, block) in &net_receipts.accepted_epoch2_blocks {
+                let object =
+                    crate::nakamoto_node::libp2p::anchored_block_object(consensus_hash, block);
+                let key = (ObjectKind::AnchoredBlock, object.content_id);
+                accepted.insert(key);
+                if publishes_native || pending_libp2p_set.contains(&key) {
+                    if let Err(error) = network.commit_object(object) {
+                        warn!("Failed to commit accepted native Epoch 2 block: {error}");
+                    }
+                }
+            }
+            for (parent_consensus_hash, stream) in &net_receipts.accepted_confirmed_microblocks {
+                match crate::nakamoto_node::libp2p::microblock_stream_object(
+                    parent_consensus_hash,
+                    stream,
+                ) {
+                    Ok(object) => {
+                        let key = (ObjectKind::Microblock, object.content_id);
+                        accepted.insert(key);
+                        if publishes_native || pending_libp2p_set.contains(&key) {
+                            if let Err(error) = network.commit_object(object) {
+                                warn!(
+                                    "Failed to commit accepted native Epoch 2 microblock stream: {error}"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!("Failed to encode accepted Epoch 2 microblock stream: {error}")
+                    }
+                }
+            }
+            for (kind, content_id) in pending_libp2p_objects {
+                if !accepted.contains(&(kind, content_id)) {
+                    if let Err(error) = network.reject_object(content_id) {
+                        warn!(
+                            "Failed to release rejected native Epoch 2 object reservation";
+                            "kind" => format!("{kind:?}"),
+                            "content_id" => format!("{content_id:?}"),
+                            "error" => error.to_string(),
+                        );
+                    }
+                }
+            }
+        }
 
         if net_receipts.num_new_blocks > 0 || net_receipts.num_new_confirmed_microblocks > 0 {
             // if we received any new block data that could invalidate our view of the chain tip,
@@ -4354,6 +4641,11 @@ pub struct PeerThread {
     num_download_passes: u64,
     /// last burnchain block seen in the PeerNetwork's chain view since the last run
     last_burn_block_height: u64,
+    /// Semantic early-history requests keyed independently of provider
+    /// attempts; `SyncBehaviour` owns hedging and first-valid-wins delivery.
+    libp2p_sync_pending: HashMap<u64, (PendingEpoch2Sync, Instant)>,
+    libp2p_next_sync_correlation: u64,
+    libp2p_next_sync_probe: Instant,
 }
 
 impl PeerThread {
@@ -4411,19 +4703,27 @@ impl PeerThread {
         let chainstate =
             open_chainstate_with_faults(&config).expect("FATAL: could not open chainstate DB");
 
-        let p2p_sock: SocketAddr = config
-            .node
-            .p2p_bind
-            .parse()
-            .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.p2p_bind));
         let rpc_sock = config
             .node
             .rpc_bind
             .parse()
             .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.rpc_bind));
 
-        net.bind(&p2p_sock, &rpc_sock)
-            .expect("BUG: PeerNetwork could not bind or is already bound");
+        if !config.node.libp2p.rollout_mode.legacy_listener_enabled() {
+            info!(
+                "Legacy P2P listener disabled during Epoch 2 libp2p bootstrap";
+                "configured_legacy_bind" => config.node.p2p_bind.clone(),
+            );
+            net.bind_http_only(&rpc_sock)
+                .expect("BUG: PeerNetwork could not bind HTTP or is already bound");
+        } else {
+            let p2p_sock: SocketAddr =
+                config.node.p2p_bind.parse().unwrap_or_else(|_| {
+                    panic!("Failed to parse socket: {}", &config.node.p2p_bind)
+                });
+            net.bind(&p2p_sock, &rpc_sock)
+                .expect("BUG: PeerNetwork could not bind or is already bound");
+        }
 
         let poll_timeout = config.get_poll_time();
 
@@ -4440,6 +4740,9 @@ impl PeerThread {
             num_inv_sync_passes: 0,
             num_download_passes: 0,
             last_burn_block_height: 0,
+            libp2p_sync_pending: HashMap::new(),
+            libp2p_next_sync_correlation: 0,
+            libp2p_next_sync_probe: Instant::now(),
         }
     }
 
@@ -4552,7 +4855,17 @@ impl PeerThread {
         });
 
         match p2p_res {
-            Ok(network_result) => {
+            Ok(mut network_result) => {
+                RelayerIngressAdapter::new(
+                    self.config
+                        .node
+                        .libp2p
+                        .rollout_mode
+                        .legacy_fallback_enabled(),
+                )
+                .prepare_pass(&mut network_result);
+                self.drain_epoch2_libp2p_objects(&mut network_result);
+                self.drain_epoch2_libp2p_sync(&mut network_result);
                 let mut have_update = false;
                 if self.num_p2p_state_machine_passes < network_result.num_state_machine_passes {
                     // p2p state-machine did a full pass. Notify anyone listening.
@@ -4627,6 +4940,679 @@ impl PeerThread {
         }
 
         true
+    }
+
+    /// Feed native historical objects into the incumbent Epoch 2 relayer. The
+    /// relayer remains the only chainstate writer, so both transports share
+    /// exactly the same contextual validation and PoX-anchor rules.
+    fn drain_epoch2_libp2p_objects(&mut self, network_result: &mut NetworkResult) {
+        const MAX_OBJECTS_PER_PASS: usize = 256;
+        if !self
+            .config
+            .node
+            .libp2p
+            .rollout_mode
+            .accepts_application_ingress()
+        {
+            return;
+        }
+        let Some(network) = self.globals.libp2p_handle() else {
+            return;
+        };
+        for _ in 0..MAX_OBJECTS_PER_PASS {
+            let event = match network.try_next_object_event() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!("Failed to poll native Epoch 2 object ingress: {error}");
+                    break;
+                }
+            };
+            match event {
+                ObjectNetworkEvent::Announcement { .. } => {}
+                ObjectNetworkEvent::Request {
+                    source,
+                    response_token,
+                    kind,
+                    id,
+                } => {
+                    let object = self
+                        .load_epoch2_libp2p_object(kind, id)
+                        .map_err(|error| {
+                            warn!(
+                                "Failed to load requested native Epoch 2 object";
+                                "source_peer_id" => source.to_string(),
+                                "error" => %error,
+                            );
+                            error
+                        })
+                        .ok()
+                        .flatten();
+                    if let Err(error) = network.respond_object(response_token, object) {
+                        warn!("Failed to answer native Epoch 2 object request: {error}");
+                    }
+                }
+                ObjectNetworkEvent::Object { source, object, .. } => {
+                    if !matches!(
+                        object.kind,
+                        ObjectKind::AnchoredBlock | ObjectKind::Microblock
+                    ) {
+                        let _ = network.reject_object(object.content_id);
+                        continue;
+                    }
+                    match RelayerIngressAdapter::new(
+                        self.config
+                            .node
+                            .libp2p
+                            .rollout_mode
+                            .legacy_fallback_enabled(),
+                    )
+                    .stage_object(network_result, &object)
+                    {
+                        Ok(RelayerIngressOutcome::Staged) => {}
+                        Ok(RelayerIngressOutcome::Attachment(_)) => {
+                            unreachable!("Epoch 2 object kind checked above")
+                        }
+                        Err(error) => {
+                            let _ = network.reject_object(object.content_id);
+                            warn!(
+                                "Rejected malformed native Epoch 2 application object";
+                                "source_peer_id" => source.to_string(),
+                                "error" => error,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn load_epoch2_libp2p_object(
+        &self,
+        kind: ObjectKind,
+        id: ContentId,
+    ) -> Result<Option<stacks_network_types::NetworkObject>, String> {
+        let chainstate = self
+            .chainstate
+            .as_ref()
+            .ok_or_else(|| "chainstate is temporarily unavailable".to_owned())?;
+        let block_id = StacksBlockId::from_bytes(id.as_bytes())
+            .ok_or_else(|| "content ID is not a Stacks block ID".to_owned())?;
+        match kind {
+            ObjectKind::AnchoredBlock => {
+                let Some(header) =
+                    StacksChainState::get_stacks_block_header_info_by_index_block_hash(
+                        chainstate.db(),
+                        &block_id,
+                    )
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if header.anchored_header.as_stacks_epoch2().is_none() {
+                    return Ok(None);
+                }
+                StacksChainState::load_block(
+                    &chainstate.blocks_path,
+                    &header.consensus_hash,
+                    &header.anchored_header.block_hash(),
+                )
+                .map_err(|error| error.to_string())
+                .map(|block| {
+                    block.map(|block| {
+                        crate::nakamoto_node::libp2p::anchored_block_object(
+                            &header.consensus_hash,
+                            &block,
+                        )
+                    })
+                })
+            }
+            ObjectKind::Microblock => {
+                let Some(info) = StacksChainState::load_staging_microblock_info_indexed(
+                    chainstate.db(),
+                    &block_id,
+                )
+                .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if !info.processed {
+                    return Ok(None);
+                }
+                let Some(stream) = StacksChainState::load_processed_microblock_stream_fork(
+                    chainstate.db(),
+                    &info.consensus_hash,
+                    &info.anchored_block_hash,
+                    &info.microblock_hash,
+                )
+                .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+                crate::nakamoto_node::libp2p::microblock_stream_object(
+                    &info.consensus_hash,
+                    &stream,
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn drain_epoch2_libp2p_sync(&mut self, network_result: &mut NetworkResult) {
+        const MAX_EVENTS_PER_PASS: usize = 64;
+        if !self
+            .config
+            .node
+            .libp2p
+            .rollout_mode
+            .accepts_application_ingress()
+        {
+            return;
+        }
+        let Some(network) = self.globals.libp2p_handle() else {
+            return;
+        };
+        for _ in 0..MAX_EVENTS_PER_PASS {
+            let event = match network.try_next_sync_event() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!("Failed to poll native Epoch 2 sync: {error}");
+                    break;
+                }
+            };
+            match event {
+                SyncNetworkEvent::InboundRequest {
+                    response_token,
+                    request,
+                    ..
+                } => {
+                    let response = match request.request {
+                        Some(sync_request::Request::GetStatus(_)) => SyncResponse {
+                            status: Status::Ok as i32,
+                            response: Some(sync_response::Response::StatusView(SyncStatus {
+                                burn_tip_height: self.get_network().chain_view.burn_block_height,
+                                burn_tip_hash: self
+                                    .get_network()
+                                    .chain_view
+                                    .burn_block_hash
+                                    .as_bytes()
+                                    .to_vec(),
+                                stable_burn_tip_height: self
+                                    .get_network()
+                                    .chain_view
+                                    .burn_stable_block_height,
+                                stable_burn_tip_hash: self
+                                    .get_network()
+                                    .chain_view
+                                    .burn_stable_block_hash
+                                    .as_bytes()
+                                    .to_vec(),
+                                stacks_tip_height: network_result.stacks_tip_height,
+                                stacks_tip_id: network_result.stacks_tip.as_bytes().to_vec(),
+                                current_reward_cycle: self
+                                    .get_network()
+                                    .get_burnchain()
+                                    .block_height_to_reward_cycle(network_result.burn_height)
+                                    .unwrap_or(0),
+                            })),
+                        },
+                        Some(sync_request::Request::GetEpoch2Inventory(request)) => self
+                            .epoch2_libp2p_inventory(request.start_height, request.count, &network),
+                        Some(sync_request::Request::GetUnconfirmedMicroblocks(request)) => self
+                            .epoch2_unconfirmed_microblocks(
+                                &request.parent_block_id,
+                                request.start_sequence,
+                                request.max_items,
+                            ),
+                        _ => SyncResponse {
+                            status: Status::Unsupported as i32,
+                            response: None,
+                        },
+                    };
+                    if let Err(error) = network.respond_sync(response_token, response) {
+                        warn!("Failed to answer native Epoch 2 sync request: {error}");
+                    }
+                }
+                SyncNetworkEvent::Response {
+                    source,
+                    correlation_id: Some(correlation_id),
+                    response,
+                } => {
+                    self.handle_epoch2_libp2p_response(
+                        source,
+                        correlation_id,
+                        response,
+                        network_result,
+                        &network,
+                    );
+                }
+                SyncNetworkEvent::Response { .. } => {}
+                SyncNetworkEvent::OutboundFailure {
+                    peer,
+                    correlation_id: Some(correlation_id),
+                    error,
+                } => {
+                    self.libp2p_sync_pending.remove(&correlation_id);
+                    self.libp2p_next_sync_probe = Instant::now() + Duration::from_secs(2);
+                    warn!(
+                        "Native Epoch 2 sync request failed";
+                        "peer_id" => peer.to_string(),
+                        "error" => error,
+                    );
+                }
+                SyncNetworkEvent::OutboundFailure { .. } => {}
+            }
+        }
+        self.drive_epoch2_libp2p_sync(network_result, &network);
+    }
+
+    fn drive_epoch2_libp2p_sync(
+        &mut self,
+        network_result: &NetworkResult,
+        network: &stacks_network::NetworkHandle,
+    ) {
+        let now = Instant::now();
+        self.libp2p_sync_pending
+            .retain(|_, (_, sent_at)| now.duration_since(*sent_at) < Duration::from_secs(15));
+        if !self.libp2p_sync_pending.is_empty() || now < self.libp2p_next_sync_probe {
+            return;
+        }
+        let diagnostics = network.diagnostics();
+        match serde_json::to_value(&diagnostics) {
+            Ok(snapshot) => stacks::monitoring::set_libp2p_network_diagnostics(snapshot),
+            Err(error) => warn!("Failed to serialize native Epoch 2 diagnostics: {error}"),
+        }
+        let providers = (if diagnostics.preferred_sync_peers.is_empty() {
+            &diagnostics.object_sync_capable_peers
+        } else {
+            &diagnostics.preferred_sync_peers
+        })
+        .iter()
+        .filter_map(|peer| peer.parse::<PeerId>().ok())
+        .collect::<Vec<_>>();
+        let Some(peer) = providers.first().copied() else {
+            self.libp2p_next_sync_probe = now + LIBP2P_EPOCH2_SYNC_PROBE_INTERVAL;
+            return;
+        };
+        self.start_epoch2_libp2p_request(
+            providers,
+            SyncRequest {
+                request: Some(sync_request::Request::GetStatus(GetStatus {})),
+            },
+            PendingEpoch2Sync::Status,
+            network,
+        );
+        self.libp2p_next_sync_probe = now + LIBP2P_EPOCH2_SYNC_PROBE_INTERVAL;
+        debug!(
+            "Probed authenticated native Epoch 2 sync peer";
+            "peer_id" => peer.to_string(),
+            "local_stacks_height" => network_result.stacks_tip_height,
+        );
+    }
+
+    fn handle_epoch2_libp2p_response(
+        &mut self,
+        source: PeerId,
+        correlation_id: u64,
+        response: SyncResponse,
+        network_result: &mut NetworkResult,
+        network: &stacks_network::NetworkHandle,
+    ) {
+        let Some((pending, _)) = self.libp2p_sync_pending.remove(&correlation_id) else {
+            return;
+        };
+        if Status::try_from(response.status).ok() != Some(Status::Ok) {
+            self.libp2p_next_sync_probe = Instant::now() + Duration::from_secs(2);
+            return;
+        }
+        match (pending, response.response) {
+            (PendingEpoch2Sync::Status, Some(sync_response::Response::StatusView(remote))) => {
+                if remote.stacks_tip_height <= network_result.stacks_tip_height {
+                    return;
+                }
+                let start = self.get_network().get_burnchain().first_block_height;
+                let epoch3_start = self.get_network().epochs[StacksEpochId::Epoch30].start_height;
+                let end = epoch3_start.min(remote.burn_tip_height.saturating_add(1));
+                let unconfirmed_parent = (end < epoch3_start).then_some(remote.stacks_tip_id);
+                self.request_epoch2_libp2p_page(source, start, end, unconfirmed_parent, network);
+            }
+            (
+                PendingEpoch2Sync::Inventory {
+                    requested_start,
+                    end_height,
+                    unconfirmed_parent,
+                },
+                Some(sync_response::Response::Inventory(page)),
+            ) => {
+                if let Err(error) =
+                    validate_epoch2_inventory_page(requested_start, end_height, &page)
+                {
+                    let _ = network.report_provider_outcome(
+                        source,
+                        stacks_network::ProviderOutcome::InvalidData,
+                    );
+                    let _ = network.disconnect(source);
+                    self.libp2p_next_sync_probe = Instant::now() + Duration::from_secs(2);
+                    warn!(
+                        "Rejected invalid native Epoch 2 inventory";
+                        "source_peer_id" => source.to_string(),
+                        "error" => error,
+                    );
+                    return;
+                }
+                for item in page.items.iter().filter(|item| item.available) {
+                    let Ok(bytes): Result<[u8; 32], _> = item.object_id.as_slice().try_into()
+                    else {
+                        unreachable!("validated Epoch 2 inventory IDs are exactly 32 bytes");
+                    };
+                    let kind = match ObjectType::try_from(item.kind).ok() {
+                        Some(ObjectType::AnchoredBlock) => ObjectKind::AnchoredBlock,
+                        Some(ObjectType::Microblock) => ObjectKind::Microblock,
+                        _ => unreachable!("validated Epoch 2 inventory has concrete object kinds"),
+                    };
+                    let id = ContentId::from_bytes(bytes);
+                    // Restart/resume is derived from canonical durable state,
+                    // not an auxiliary cursor that can become stale on reorg.
+                    // We still scan bounded inventory pages, but never
+                    // re-download an object already materialized locally.
+                    if self
+                        .load_epoch2_libp2p_object(kind, id)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    if let Err(error) = network.request_object(source, kind, id) {
+                        debug!("Failed to queue native Epoch 2 object fetch: {error}");
+                    }
+                }
+                if page.next_cursor > requested_start && page.next_cursor < end_height {
+                    self.request_epoch2_libp2p_page(
+                        source,
+                        page.next_cursor,
+                        end_height,
+                        unconfirmed_parent,
+                        network,
+                    );
+                } else if let Some(parent) = unconfirmed_parent {
+                    self.request_epoch2_unconfirmed_page(source, &parent, 0, network);
+                }
+            }
+            (
+                PendingEpoch2Sync::Unconfirmed {
+                    parent_block_id,
+                    requested_sequence,
+                },
+                Some(sync_response::Response::UnconfirmedMicroblocks(page)),
+            ) => {
+                match decode_epoch2_unconfirmed_page(&parent_block_id, requested_sequence, &page) {
+                    Ok(microblocks) => {
+                        if !microblocks.is_empty() {
+                            network_result
+                                .pushed_microblocks
+                                .entry(stacks::net::NeighborKey::empty())
+                                .or_default()
+                                .push((
+                                    Vec::new(),
+                                    MicroblocksData {
+                                        index_anchor_block: parent_block_id.clone(),
+                                        microblocks,
+                                    },
+                                ));
+                        }
+                        if !page.complete && page.next_sequence > requested_sequence {
+                            self.request_epoch2_unconfirmed_page(
+                                source,
+                                &page.parent_block_id,
+                                page.next_sequence,
+                                network,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = network.report_provider_outcome(
+                            source,
+                            stacks_network::ProviderOutcome::InvalidData,
+                        );
+                        let _ = network.disconnect(source);
+                        warn!("Rejected invalid unconfirmed microblock page: {error}");
+                    }
+                }
+            }
+            (pending, response) => {
+                let _ = network
+                    .report_provider_outcome(source, stacks_network::ProviderOutcome::InvalidData);
+                let _ = network.disconnect(source);
+                warn!(
+                    "Native Epoch 2 response did not match its request";
+                    "pending" => format!("{pending:?}"),
+                    "response" => format!("{response:?}"),
+                );
+                self.libp2p_next_sync_probe = Instant::now() + Duration::from_secs(2);
+            }
+        }
+    }
+
+    fn request_epoch2_libp2p_page(
+        &mut self,
+        peer: PeerId,
+        start_height: u64,
+        end_height: u64,
+        unconfirmed_parent: Option<Vec<u8>>,
+        network: &stacks_network::NetworkHandle,
+    ) {
+        let count = end_height
+            .saturating_sub(start_height)
+            .min(u64::from(LIBP2P_EPOCH2_SYNC_PAGE_ITEMS)) as u32;
+        if count == 0 {
+            if let Some(parent) = unconfirmed_parent {
+                self.request_epoch2_unconfirmed_page(peer, &parent, 0, network);
+            }
+            return;
+        }
+        let request = SyncRequest {
+            request: Some(sync_request::Request::GetEpoch2Inventory(
+                GetEpoch2Inventory {
+                    start_height,
+                    count,
+                },
+            )),
+        };
+        let diagnostics = network.diagnostics();
+        let mut providers = vec![peer];
+        providers.extend(
+            diagnostics
+                .preferred_sync_peers
+                .iter()
+                .filter_map(|candidate| candidate.parse::<PeerId>().ok())
+                .filter(|candidate| *candidate != peer),
+        );
+        self.start_epoch2_libp2p_request(
+            providers,
+            request,
+            PendingEpoch2Sync::Inventory {
+                requested_start: start_height,
+                end_height,
+                unconfirmed_parent,
+            },
+            network,
+        );
+    }
+
+    fn start_epoch2_libp2p_request(
+        &mut self,
+        providers: Vec<PeerId>,
+        request: SyncRequest,
+        pending: PendingEpoch2Sync,
+        network: &stacks_network::NetworkHandle,
+    ) -> bool {
+        let diagnostics = network.diagnostics();
+        let concurrency = stacks_network::adaptive_sync_concurrency(
+            2,
+            diagnostics
+                .validation_queue_capacity
+                .saturating_sub(diagnostics.validation_queue_depth),
+            diagnostics.validation_queue_depth,
+            diagnostics.validation_queue_capacity,
+        );
+        if concurrency == 0 {
+            return false;
+        }
+        let correlation_id = self.libp2p_next_sync_correlation;
+        self.libp2p_next_sync_correlation = self.libp2p_next_sync_correlation.wrapping_add(1);
+        if network
+            .request_sync_from(
+                correlation_id,
+                providers,
+                request,
+                concurrency,
+                Duration::from_secs(2),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.libp2p_sync_pending
+            .insert(correlation_id, (pending, Instant::now()));
+        true
+    }
+
+    fn request_epoch2_unconfirmed_page(
+        &mut self,
+        peer: PeerId,
+        parent_block_id: &[u8],
+        start_sequence: u32,
+        network: &stacks_network::NetworkHandle,
+    ) {
+        let Some(parent_block_id) = StacksBlockId::from_bytes(parent_block_id) else {
+            return;
+        };
+        let diagnostics = network.diagnostics();
+        let mut providers = vec![peer];
+        providers.extend(
+            diagnostics
+                .preferred_sync_peers
+                .iter()
+                .filter_map(|candidate| candidate.parse::<PeerId>().ok())
+                .filter(|candidate| *candidate != peer),
+        );
+        self.start_epoch2_libp2p_request(
+            providers,
+            SyncRequest {
+                request: Some(sync_request::Request::GetUnconfirmedMicroblocks(
+                    GetUnconfirmedMicroblocks {
+                        parent_block_id: parent_block_id.as_bytes().to_vec(),
+                        start_sequence,
+                        max_items: LIBP2P_EPOCH2_SYNC_PAGE_ITEMS,
+                    },
+                )),
+            },
+            PendingEpoch2Sync::Unconfirmed {
+                parent_block_id,
+                requested_sequence: start_sequence,
+            },
+            network,
+        );
+    }
+
+    fn epoch2_libp2p_inventory(
+        &self,
+        start_height: u64,
+        count: u32,
+        network: &stacks_network::NetworkHandle,
+    ) -> SyncResponse {
+        let result = (|| {
+            let sortdb = self
+                .sortdb
+                .as_ref()
+                .ok_or_else(|| "sortition DB is temporarily unavailable".to_owned())?;
+            let chainstate = self
+                .chainstate
+                .as_ref()
+                .ok_or_else(|| "chainstate is temporarily unavailable".to_owned())?;
+            crate::nakamoto_node::libp2p::epoch2_inventory_page(
+                self.get_network().get_burnchain(),
+                sortdb,
+                chainstate,
+                start_height,
+                count,
+                network,
+            )
+        })();
+        match result {
+            Ok(page) => SyncResponse {
+                status: Status::Ok as i32,
+                response: Some(sync_response::Response::Inventory(page)),
+            },
+            Err(error) => {
+                warn!("Failed to serve native Epoch 2 inventory: {error}");
+                SyncResponse {
+                    status: Status::Busy as i32,
+                    response: None,
+                }
+            }
+        }
+    }
+
+    fn epoch2_unconfirmed_microblocks(
+        &self,
+        parent_block_id: &[u8],
+        start_sequence: u32,
+        max_items: u32,
+    ) -> SyncResponse {
+        let result = (|| -> Result<MicroblockPage, String> {
+            let chainstate = self
+                .chainstate
+                .as_ref()
+                .ok_or_else(|| "chainstate is temporarily unavailable".to_owned())?;
+            let parent = StacksBlockId::from_bytes(parent_block_id)
+                .ok_or_else(|| "invalid unconfirmed microblock parent".to_owned())?;
+            let mut sequence = u16::try_from(start_sequence)
+                .map_err(|_| "unconfirmed microblock sequence is too large".to_owned())?;
+            let mut microblocks = Vec::new();
+            let mut complete = false;
+            for _ in 0..max_items {
+                let Some(microblock) = StacksChainState::load_next_descendant_microblock(
+                    chainstate.db(),
+                    &parent,
+                    sequence,
+                )
+                .map_err(|error| error.to_string())?
+                else {
+                    complete = true;
+                    break;
+                };
+                microblocks.push(microblock.serialize_to_vec());
+                let Some(next) = sequence.checked_add(1) else {
+                    complete = true;
+                    break;
+                };
+                sequence = next;
+            }
+            Ok(MicroblockPage {
+                parent_block_id: parent.as_bytes().to_vec(),
+                next_sequence: start_sequence
+                    .saturating_add(u32::try_from(microblocks.len()).unwrap_or(u32::MAX)),
+                microblocks,
+                complete,
+            })
+        })();
+        match result {
+            Ok(page) => SyncResponse {
+                status: Status::Ok as i32,
+                response: Some(sync_response::Response::UnconfirmedMicroblocks(page)),
+            },
+            Err(error) => {
+                debug!("Unable to serve unconfirmed microblocks: {error}");
+                SyncResponse {
+                    status: Status::Busy as i32,
+                    response: None,
+                }
+            }
+        }
     }
 }
 
@@ -4996,7 +5982,7 @@ impl StacksNode {
 
         let _ = Self::setup_mempool_db(&config);
 
-        let mut p2p_net = Self::setup_peer_network(&config, &atlas_config, burnchain);
+        let mut p2p_net = Self::setup_peer_network(&config, &atlas_config, burnchain.clone());
 
         let stackerdbs = StackerDBs::connect(&config.get_stacker_db_file_path(), true)
             .expect("FATAL: failed to connect to stacker DB");
@@ -5042,6 +6028,16 @@ impl StacksNode {
             })
             .expect("FATAL: failed to start relayer thread");
 
+        let libp2p_service = if config.node.libp2p.enabled {
+            Some(
+                crate::nakamoto_node::libp2p::spawn(&config, &burnchain)
+                    .expect("FATAL: failed to start native Epoch 2 bootstrap network"),
+            )
+        } else {
+            None
+        };
+        globals.set_libp2p_handle(libp2p_service.as_ref().map(|service| service.handle()));
+
         let p2p_event_dispatcher = runloop.get_event_dispatcher();
         let p2p_thread = PeerThread::new(runloop, p2p_net);
         let p2p_thread_handle = thread::Builder::new()
@@ -5057,7 +6053,11 @@ impl StacksNode {
             .expect("FATAL: failed to start p2p thread");
 
         info!("Start HTTP server on: {}", &config.node.rpc_bind);
-        info!("Start P2P server on: {}", &config.node.p2p_bind);
+        if config.node.libp2p.rollout_mode.legacy_listener_enabled() {
+            info!("Start legacy P2P server on: {}", &config.node.p2p_bind);
+        } else {
+            info!("Legacy P2P server is disabled in libp2p-only mode");
+        }
 
         StacksNode {
             atlas_config,
@@ -5065,6 +6065,7 @@ impl StacksNode {
             is_miner,
             p2p_thread_handle,
             relayer_thread_handle,
+            libp2p_service,
         }
     }
 
@@ -5252,8 +6253,15 @@ impl StacksNode {
     }
 
     /// Join all inner threads
-    pub fn join(self) -> Option<PeerNetwork> {
+    pub fn join(mut self) -> Option<PeerNetwork> {
         self.relayer_thread_handle.join().unwrap();
-        self.p2p_thread_handle.join().unwrap()
+        let peer_network = self.p2p_thread_handle.join().unwrap();
+        self.globals.set_libp2p_handle(None);
+        if let Some(service) = self.libp2p_service.take() {
+            service
+                .shutdown()
+                .expect("native Epoch 2 bootstrap network thread panicked");
+        }
+        peer_network
     }
 }

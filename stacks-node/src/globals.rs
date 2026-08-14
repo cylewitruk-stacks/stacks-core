@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use stacks::burnchains::Txid;
@@ -21,6 +21,70 @@ use crate::syncctl::PoxSyncWatchdogComms;
 use crate::TipCandidate;
 
 pub type NeonGlobals = Globals<RelayerDirective>;
+
+const LIBP2P_SIGNER_ROUTER_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct Libp2pSignerRouterState {
+    generation: u64,
+    active: Option<(u64, SyncSender<stacks_network::SignerNetworkEvent>)>,
+}
+
+/// Single process-wide handoff between the native network consumer and the
+/// currently active miner coordinator. The network is drained even when this
+/// node did not win a tenure; only a live coordinator receives semantic work.
+#[derive(Clone, Default)]
+pub(crate) struct Libp2pSignerEventRouter {
+    state: Arc<Mutex<Libp2pSignerRouterState>>,
+}
+
+impl Libp2pSignerEventRouter {
+    pub(crate) fn register(&self) -> (u64, Receiver<stacks_network::SignerNetworkEvent>) {
+        let (sender, receiver) = mpsc::sync_channel(LIBP2P_SIGNER_ROUTER_CAPACITY);
+        let mut state = self
+            .state
+            .lock()
+            .expect("FATAL: libp2p signer router mutex poisoned");
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        state.active = Some((generation, sender));
+        (generation, receiver)
+    }
+
+    pub(crate) fn unregister(&self, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("FATAL: libp2p signer router mutex poisoned");
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| *active == generation)
+        {
+            state.active = None;
+        }
+    }
+
+    pub(crate) fn route(&self, event: stacks_network::SignerNetworkEvent) -> bool {
+        let active = self
+            .state
+            .lock()
+            .expect("FATAL: libp2p signer router mutex poisoned")
+            .active
+            .clone();
+        let Some((generation, sender)) = active else {
+            return true;
+        };
+        match sender.try_send(event) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                self.unregister(generation);
+                true
+            }
+        }
+    }
+}
 
 /// Command types for the relayer thread, issued to it by other threads
 #[allow(clippy::large_enum_variant)]
@@ -77,6 +141,11 @@ pub struct Globals<T> {
     /// Initiative flag.
     /// Raised when the main loop should wake up and do something.
     initiative: Arc<Mutex<Option<String>>>,
+    /// Cloneable producer side of the parallel libp2p service.
+    libp2p_handle: Arc<Mutex<Option<stacks_network::NetworkHandle>>>,
+    /// Routes the single native signer event consumer to the current miner
+    /// coordinator without leaving the network queue ownerless between tenures.
+    libp2p_signer_events: Libp2pSignerEventRouter,
 }
 
 // Need to manually implement Clone, because [derive(Clone)] requires
@@ -101,6 +170,8 @@ impl<T> Clone for Globals<T> {
             estimated_winning_probs: self.estimated_winning_probs.clone(),
             previous_best_tips: self.previous_best_tips.clone(),
             initiative: self.initiative.clone(),
+            libp2p_handle: self.libp2p_handle.clone(),
+            libp2p_signer_events: self.libp2p_signer_events.clone(),
         }
     }
 }
@@ -134,7 +205,29 @@ impl<T> Globals<T> {
             estimated_winning_probs: Arc::new(Mutex::new(HashMap::new())),
             previous_best_tips: Arc::new(Mutex::new(BTreeMap::new())),
             initiative: Arc::new(Mutex::new(None)),
+            libp2p_handle: Arc::new(Mutex::new(None)),
+            libp2p_signer_events: Libp2pSignerEventRouter::default(),
         }
+    }
+
+    /// Install or clear the process-wide libp2p producer handle.
+    pub fn set_libp2p_handle(&self, handle: Option<stacks_network::NetworkHandle>) {
+        *self
+            .libp2p_handle
+            .lock()
+            .expect("FATAL: libp2p handle mutex poisoned") = handle;
+    }
+
+    /// Clone the process-wide libp2p producer handle, when enabled.
+    pub fn libp2p_handle(&self) -> Option<stacks_network::NetworkHandle> {
+        self.libp2p_handle
+            .lock()
+            .expect("FATAL: libp2p handle mutex poisoned")
+            .clone()
+    }
+
+    pub(crate) fn libp2p_signer_events(&self) -> Libp2pSignerEventRouter {
+        self.libp2p_signer_events.clone()
     }
 
     /// Does the inventory sync watcher think we still need to
@@ -509,5 +602,75 @@ impl<T> Globals<T> {
                 panic!();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p::PeerId;
+    use stacks_network::{
+        SignerAdmission, SignerCanonicalAuthorization, SignerNetworkEvent, VerifiedSignerEnvelope,
+    };
+    use stacks_network_types::wire::v1::{SignerEnvelope, SignerEnvelopeBody};
+    use stacks_network_types::ContentId;
+
+    use super::Libp2pSignerEventRouter;
+
+    fn signer_event() -> SignerNetworkEvent {
+        let source = PeerId::random();
+        SignerNetworkEvent {
+            source: source.clone(),
+            provider: source,
+            envelope: VerifiedSignerEnvelope {
+                envelope: SignerEnvelope::default(),
+                body: SignerEnvelopeBody::default(),
+                envelope_id: ContentId::from_bytes([0; 32]),
+            },
+            admission: SignerAdmission::FirstSeen,
+            canonical_authorization: SignerCanonicalAuthorization::Confirmed,
+        }
+    }
+
+    #[test]
+    fn stale_signer_router_registration_cannot_clear_the_current_coordinator() {
+        let router = Libp2pSignerEventRouter::default();
+        let (first, first_receiver) = router.register();
+        let (second, _second_receiver) = router.register();
+
+        assert_ne!(first, second);
+        assert!(matches!(
+            first_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+
+        router.unregister(first);
+        assert_eq!(
+            router
+                .state
+                .lock()
+                .expect("router state")
+                .active
+                .as_ref()
+                .map(|(generation, _)| *generation),
+            Some(second)
+        );
+
+        router.unregister(second);
+        assert!(router.state.lock().expect("router state").active.is_none());
+    }
+
+    #[test]
+    fn signer_router_is_bounded_and_reports_saturation() {
+        let router = Libp2pSignerEventRouter::default();
+        assert!(router.route(signer_event()));
+
+        let (_generation, receiver) = router.register();
+        assert!(router.route(signer_event()));
+        assert!(receiver.try_recv().is_ok());
+
+        for _ in 0..super::LIBP2P_SIGNER_ROUTER_CAPACITY {
+            assert!(router.route(signer_event()));
+        }
+        assert!(!router.route(signer_event()));
     }
 }

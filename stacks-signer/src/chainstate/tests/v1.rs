@@ -761,6 +761,7 @@ fn check_proposal_refresh() {
         SortitionInfo {
             burn_block_hash: last_sortition.burn_block_hash.clone(),
             burn_block_height: 2,
+            num_sortitions: 2,
             sortition_id: SortitionId([2; 32]),
             parent_sortition_id: SortitionId([1; 32]),
             consensus_hash: block.header.consensus_hash.clone(),
@@ -775,6 +776,7 @@ fn check_proposal_refresh() {
         SortitionInfo {
             burn_block_hash: BurnchainHeaderHash([128; 32]),
             burn_block_height: 1,
+            num_sortitions: 1,
             sortition_id: SortitionId([1; 32]),
             parent_sortition_id: SortitionId([0; 32]),
             consensus_hash: view.cur_sortition.data.parent_tenure_id.clone(),

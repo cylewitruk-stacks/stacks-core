@@ -59,6 +59,7 @@ use crate::core::mempool::{
 };
 use crate::core::test_util::{insert_tx_in_mempool, make_stacks_transfer_serialized, to_addr};
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
+use crate::net::semantic::MempoolSyncService;
 use crate::util_lib::bloom::test::setup_bloom_counter;
 use crate::util_lib::bloom::*;
 use crate::util_lib::db::tx_begin_immediate;
@@ -74,6 +75,105 @@ fn mempool_db_init() {
     let _chainstate = TestChainstateBuilder::new_testnet(function_name!()).build();
     let chainstate_path = chainstate_path(function_name!());
     let _mempool = MemPoolDB::open_test(false, 0x80000000, &chainstate_path).unwrap();
+}
+
+#[test]
+fn mempool_txid_pages_are_bounded_and_cursor_stable() {
+    let _chainstate = TestChainstateBuilder::new_testnet(function_name!()).build();
+    let chainstate_path = chainstate_path(function_name!());
+    let mempool = MemPoolDB::open_test(false, 0x80000000, &chainstate_path).unwrap();
+    for byte in [3_u8, 1, 4, 2] {
+        let txid = Txid([byte; 32]);
+        mempool
+            .conn()
+            .execute(
+                "INSERT INTO mempool (
+                    txid, origin_address, origin_nonce, sponsor_address, sponsor_nonce,
+                    tx_fee, length, consensus_hash, block_header_hash, height, accept_time, tx
+                 ) VALUES (?1, ?2, 0, ?3, 0, 1, 1, ?4, ?5, 1, 1, X'00')",
+                params![
+                    txid,
+                    format!("origin-{byte}"),
+                    format!("sponsor-{byte}"),
+                    "00".repeat(20),
+                    "00".repeat(32),
+                ],
+            )
+            .unwrap();
+    }
+
+    let (first, complete) = MemPoolDB::get_txid_page(mempool.conn(), None, 2).unwrap();
+    assert_eq!(first, vec![Txid([1; 32]), Txid([2; 32])]);
+    assert!(!complete);
+
+    let (second, complete) = MemPoolDB::get_txid_page(mempool.conn(), first.last(), 2).unwrap();
+    assert_eq!(second, vec![Txid([3; 32]), Txid([4; 32])]);
+    assert!(complete);
+
+    let (empty, complete) = MemPoolDB::get_txid_page(mempool.conn(), second.last(), 2).unwrap();
+    assert!(empty.is_empty());
+    assert!(complete);
+}
+
+#[test]
+fn mempool_semantic_inventory_matches_database_pages_and_byte_bounds() {
+    let _chainstate = TestChainstateBuilder::new_testnet(function_name!()).build();
+    let chainstate_path = chainstate_path(function_name!());
+    let mut mempool = MemPoolDB::open_test(false, 0x80000000, &chainstate_path).unwrap();
+    let recipient = PrincipalData::from(StacksAddress::burn_address(false));
+    let consensus_hash = ConsensusHash([0x22; 20]);
+    let block_hash = BlockHeaderHash([0x33; 32]);
+    let db_tx = mempool.tx_begin().unwrap();
+    for nonce in 0..5 {
+        let sender = StacksPrivateKey::from_seed(&[nonce as u8 + 1; 32]);
+        let tx_bytes =
+            make_stacks_transfer_serialized(&sender, nonce, 200, 0x80000000, &recipient, 1);
+        let mut cursor = std::io::Cursor::new(&tx_bytes);
+        StacksTransaction::consensus_deserialize(&mut cursor).unwrap();
+        insert_tx_in_mempool(
+            &db_tx,
+            tx_bytes,
+            &to_addr(&sender),
+            nonce,
+            200,
+            &consensus_hash,
+            &block_hash,
+            1,
+        );
+    }
+    db_tx.commit().unwrap();
+    let expected = MemPoolDB::get_txid_page(mempool.conn(), None, 2).unwrap().0;
+
+    // The byte budget, not only max_items, caps the semantic page at two IDs.
+    let first = MempoolSyncService::inventory_page(mempool.conn(), None, 8, 64).unwrap();
+    assert_eq!(
+        first
+            .transactions
+            .iter()
+            .map(|(txid, _)| txid.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(first.next_cursor, Some(expected[1].clone()));
+    assert!(!first.complete);
+
+    let db_page = MemPoolDB::get_txid_page(mempool.conn(), first.next_cursor.as_ref(), 2).unwrap();
+    let second = MempoolSyncService::inventory_page(
+        mempool.conn(),
+        first.next_cursor.as_ref(),
+        2,
+        usize::MAX,
+    )
+    .unwrap();
+    assert_eq!(
+        second
+            .transactions
+            .iter()
+            .map(|(txid, _)| txid.clone())
+            .collect::<Vec<_>>(),
+        db_page.0
+    );
+    assert_eq!(second.complete, db_page.1);
 }
 
 pub fn make_block(

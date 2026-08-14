@@ -16,7 +16,7 @@
 use std::net::SocketAddr;
 use std::sync::mpsc::TrySendError;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use stacks::burnchains::db::BurnchainHeaderReader;
 use stacks::burnchains::PoxConstants;
@@ -36,6 +36,10 @@ use crate::nakamoto_node::relayer::RelayerDirective;
 use crate::neon_node::open_chainstate_with_faults;
 use crate::run_loop::nakamoto::{Globals, RunLoop};
 use crate::{Config, EventDispatcher};
+
+mod libp2p_runtime;
+
+use libp2p_runtime::{Libp2pPeerRuntime, NodeObjectRepository, SyncContext, SyncStores};
 
 /// Thread that runs the network state machine, handling both p2p and http requests.
 pub struct PeerThread {
@@ -67,6 +71,10 @@ pub struct PeerThread {
     num_download_passes: u64,
     /// last burnchain block seen in the PeerNetwork's chain view since the last run
     last_burn_block_height: u64,
+    /// Native-libp2p integration state. The runtime owns its publication,
+    /// ingress, validation, and sync lifecycles independently of incumbent
+    /// `PeerNetwork` scheduling and relayer backpressure.
+    libp2p: Libp2pPeerRuntime,
 }
 
 impl PeerThread {
@@ -173,26 +181,43 @@ impl PeerThread {
         let chainstate =
             open_chainstate_with_faults(&config).expect("FATAL: could not open chainstate DB");
 
-        let p2p_sock: SocketAddr = config
-            .node
-            .p2p_bind
-            .parse()
-            .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.p2p_bind));
         let rpc_sock = config
             .node
             .rpc_bind
             .parse()
             .unwrap_or_else(|_| panic!("Failed to parse socket: {}", &config.node.rpc_bind));
 
-        let did_bind = net
-            .try_bind(&p2p_sock, &rpc_sock)
-            .expect("BUG: PeerNetwork could not bind");
+        let did_bind = if !config.node.libp2p.rollout_mode.legacy_listener_enabled() {
+            info!(
+                "Legacy P2P listener disabled in libp2p-only mode";
+                "configured_legacy_bind" => config.node.p2p_bind.clone(),
+            );
+            net.try_bind_http_only(&rpc_sock)
+                .expect("BUG: PeerNetwork could not bind HTTP")
+        } else {
+            let p2p_sock: SocketAddr =
+                config.node.p2p_bind.parse().unwrap_or_else(|_| {
+                    panic!("Failed to parse socket: {}", &config.node.p2p_bind)
+                });
+            net.try_bind(&p2p_sock, &rpc_sock)
+                .expect("BUG: PeerNetwork could not bind")
+        };
 
         if !did_bind {
             info!("`PeerNetwork::bind()` skipped, already bound");
         }
 
         let poll_timeout = config.get_poll_time();
+        let libp2p = Libp2pPeerRuntime::new(
+            Instant::now(),
+            config
+                .node
+                .libp2p
+                .rollout_mode
+                .accepts_application_ingress(),
+            config.node.libp2p.rollout_mode.legacy_fallback_enabled(),
+            config.node.libp2p.rollout_mode.publishes_application_data(),
+        );
         PeerThread {
             config,
             net,
@@ -206,6 +231,7 @@ impl PeerThread {
             num_inv_sync_passes: 0,
             num_download_passes: 0,
             last_burn_block_height: 0,
+            libp2p,
         }
     }
 
@@ -294,7 +320,41 @@ impl PeerThread {
             )
         };
         match p2p_res {
-            Ok(network_result) => {
+            Ok(mut network_result) => {
+                let native_network = self.globals.libp2p_handle();
+                if let Some(network) = native_network.as_ref() {
+                    self.libp2p.refresh_canonical_view(
+                        Instant::now(),
+                        network_result.burn_height,
+                        self.net.get_burnchain(),
+                        network,
+                        &self.sortdb,
+                        &mut self.chainstate,
+                    );
+                    self.libp2p.refresh_legacy_identity(
+                        self.config.burnchain.chain_id,
+                        network_result.burn_height,
+                        network,
+                        &mut self.net,
+                    );
+                }
+                self.libp2p.prepare_network_result(&mut network_result);
+                if let Some(network) = native_network.as_ref() {
+                    let mut repository =
+                        NodeObjectRepository::new(&mut self.net, &self.chainstate, &self.mempool);
+                    self.libp2p
+                        .drain_objects(network, &mut repository, &mut network_result);
+                    self.libp2p.drain_sync(SyncContext::new(
+                        SyncStores::new(
+                            &mut self.net,
+                            &self.sortdb,
+                            &mut self.chainstate,
+                            &self.mempool,
+                        ),
+                        network,
+                        &network_result,
+                    ));
+                }
                 if self.num_p2p_state_machine_passes < network_result.num_state_machine_passes {
                     // p2p state-machine did a full pass. Notify anyone listening.
                     self.globals.sync_comms.notify_p2p_state_pass();

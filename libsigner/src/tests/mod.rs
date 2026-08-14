@@ -22,12 +22,15 @@ mod signer_state;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::{mem, thread};
 
 use blockstack_lib::chainstate::nakamoto::signer_set::NakamotoSigners;
 use blockstack_lib::chainstate::stacks::events::StackerDBChunksEvent;
+use blockstack_lib::net::api::postblock_proposal::{BlockValidateOk, BlockValidateResponse};
 use clarity::util::hash::Sha512Trunc256Sum;
+use clarity::vm::costs::ExecutionCost;
 use libstackerdb::StackerDBChunkData;
 use stacks_common::codec::{read_next, StacksMessageCodec};
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
@@ -94,7 +97,12 @@ impl<T: SignerEventTrait> SignerRunLoop<Vec<SignerEvent<T>>, T> for SimpleRunLoo
 fn test_simple_signer() {
     // Use a `BlockPreCommit` payload on its matching contract (signers-0-3).
     let contract_id = NakamotoSigners::make_signers_db_contract_id(0, 3, false);
-    let ev = SignerEventReceiver::new(false);
+    let observed_chunks = Arc::new(Mutex::new(Vec::new()));
+    let observer_chunks = observed_chunks.clone();
+    let ev =
+        SignerEventReceiver::new(false).with_stackerdb_event_observer(Arc::new(move |event| {
+            observer_chunks.lock().unwrap().push(event.clone())
+        }));
     let (res_send, _res_recv) = channel();
     let max_events = 5;
     let mut signer = Signer::new(SimpleRunLoop::new(max_events), ev, res_send);
@@ -194,6 +202,7 @@ fn test_simple_signer() {
         }))
     }
     mock_stacks_node.join().unwrap();
+    assert_eq!(*observed_chunks.lock().unwrap(), chunks);
 }
 
 #[test]
@@ -227,4 +236,51 @@ fn test_status_endpoint() {
 
     assert_eq!(sent_events, accepted_events);
     mock_stacks_node.join().unwrap();
+}
+
+#[test]
+fn proposal_response_requires_matching_authorization() {
+    let response = BlockValidateResponse::Ok(BlockValidateOk {
+        signer_signature_hash: Sha512Trunc256Sum([7; 32]),
+        cost: ExecutionCost::ZERO,
+        size: 0,
+        validation_time_ms: 1,
+        replay_tx_hash: None,
+        replay_tx_exhausted: false,
+    });
+    let body = serde_json::to_string(&response).unwrap();
+    let endpoint: SocketAddr = "127.0.0.1:31001".parse().unwrap();
+    let ev = SignerEventReceiver::<SignerMessage>::new(false)
+        .with_proposal_response_auth_token(Arc::<str>::from("companion-secret"));
+    let (res_send, _res_recv) = channel();
+    let mut signer = Signer::new(SimpleRunLoop::new(1), ev, res_send);
+    let running_signer = signer.spawn(endpoint).unwrap();
+
+    let mock_companion = thread::spawn(move || {
+        for (authorization, expected_status) in [
+            (Some("wrong-secret"), "HTTP/1.1 401 Unauthorized\r\n"),
+            (Some("companion-secret"), "HTTP/1.1 200 OK\r\n"),
+        ] {
+            let mut socket = TcpStream::connect(endpoint).unwrap();
+            let authorization = authorization
+                .map(|token| format!("Authorization: {token}\r\n"))
+                .unwrap_or_default();
+            let request = format!(
+                "POST /proposal_response HTTP/1.1\r\nHost: {endpoint}\r\nConnection: close\r\nContent-Type: application/json\r\n{authorization}Content-Length: {}\r\n\r\n{body}",
+                body.len(),
+            );
+            socket.write_all(request.as_bytes()).unwrap();
+            let mut bytes = [0; 128];
+            let read = socket.read(&mut bytes).unwrap();
+            let actual = std::str::from_utf8(&bytes[..read]).unwrap();
+            assert!(actual.starts_with(expected_status), "{actual}");
+        }
+    });
+
+    mock_companion.join().unwrap();
+    let accepted_events = running_signer.stop().unwrap();
+    assert_eq!(
+        accepted_events,
+        vec![SignerEvent::BlockValidationResponse(response)]
+    );
 }

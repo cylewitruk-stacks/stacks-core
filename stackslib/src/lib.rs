@@ -18,6 +18,9 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
+// The Prometheus registry is declared through nested lazy-static macros. Keep
+// enough expansion headroom as the bounded observability contract grows.
+#![recursion_limit = "256"]
 #![cfg_attr(test, allow(unused_variables, unused_assignments))]
 
 #[allow(unused_imports)]

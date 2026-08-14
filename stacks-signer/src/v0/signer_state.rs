@@ -26,8 +26,8 @@ use blockstack_lib::util_lib::db::Error as DBError;
 #[cfg(any(test, feature = "testing"))]
 use clarity::util::tests::TestFlag;
 use libsigner::v0::messages::{
-    MessageSlotID, SignerMessage, StateMachineUpdate as StateMachineUpdateMessage,
-    StateMachineUpdateContent, StateMachineUpdateMinerState,
+    StateMachineUpdate as StateMachineUpdateMessage, StateMachineUpdateContent,
+    StateMachineUpdateMinerState,
 };
 use libsigner::v0::signer_state::{
     GlobalStateEvaluator, MinerState, ReplayTransactionSet, SignerStateMachine,
@@ -44,7 +44,7 @@ use crate::chainstate::v1::{SortitionMinerStatus, SortitionsView};
 use crate::chainstate::{
     ProposalEvalConfig, SignerChainstateError, SortitionData, SortitionState, SortitionStateVersion,
 };
-use crate::client::{ClientError, CurrentAndLastSortition, StackerDB, StacksClient};
+use crate::client::{ClientError, CurrentAndLastSortition, StacksClient};
 use crate::signerdb::{BlockValidatedByReplaySet, SignerDb};
 
 /// This is the latest supported protocol version for this signer binary
@@ -232,27 +232,6 @@ impl LocalStateMachine {
         }
     }
 
-    /// Send the local state machine as a signer update message to stackerdb
-    pub fn send_signer_update_message(
-        &self,
-        stackerdb: &mut StackerDB<MessageSlotID>,
-        version: u64,
-    ) {
-        let update: Result<StateMachineUpdateMessage, _> =
-            self.try_into_update_message_with_version(version);
-        match update {
-            Ok(update) => {
-                debug!("Sending signer update message to stackerdb: {update:?}");
-                if let Err(e) = stackerdb.send_message_with_retry::<SignerMessage>(update.into()) {
-                    warn!("Failed to send signer update to stacker-db: {e:?}",);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to convert local signer state to a signer message: {e:?}");
-            }
-        }
-    }
-
     /// If this local state machine has pending updates, process them
     pub fn handle_pending_update(
         &mut self,
@@ -263,6 +242,23 @@ impl LocalStateMachine {
         eval: &GlobalStateEvaluator,
         local_signer_protocol_version: u64,
     ) -> Result<(), SignerChainstateError> {
+        // Initialization queries several node views which may become coherent
+        // at slightly different times during IBD (notably tenure metadata at
+        // the Epoch 2.x -> Nakamoto boundary). `new()` deliberately leaves the
+        // machine uninitialized on such an error. Retry the same idempotent
+        // initialization here; otherwise an early `NoParentTenureInfo` leaves
+        // this signer unable to publish state until its process is restarted.
+        if matches!(self, LocalStateMachine::Uninitialized) {
+            return self.bitcoin_block_arrival(
+                db,
+                client,
+                proposal_config,
+                None,
+                tx_replay_scope,
+                eval,
+                local_signer_protocol_version,
+            );
+        }
         let LocalStateMachine::Pending { update, .. } = self else {
             return self.check_miner_inactivity(db, client, proposal_config, eval);
         };
@@ -321,7 +317,9 @@ impl LocalStateMachine {
             .and_then(|val| SortitionData::try_from(val).ok())
             .map(|data| SortitionState::new(version, data))
         else {
-            warn!("Signer State: Current miner timed out due to inactivity, but could not find a valid prior miner. Allowing current miner to continue");
+            warn!(
+                "Signer State: Current miner timed out due to inactivity, but could not find a valid prior miner. Allowing current miner to continue"
+            );
             return Ok(());
         };
 
@@ -329,12 +327,16 @@ impl LocalStateMachine {
         // If we already reverted to the last sortition miner, don't time it out as it means we have already timed out the current sorititon miner
         // as there is no other miner available.
         if &sortition_data.consensus_hash == tenure_id {
-            warn!("Signer State: Last sortition miner has timed out, but no prior valid miner. Allowing last sortition miner to continue");
+            warn!(
+                "Signer State: Last sortition miner has timed out, but no prior valid miner. Allowing last sortition miner to continue"
+            );
             return Ok(());
         }
 
         if !last_sortition.is_tenure_valid(db, client, proposal_config, eval)? {
-            warn!("Signer State: Current miner timed out due to inactivity, but prior miner is not valid. Allowing current miner to continue");
+            warn!(
+                "Signer State: Current miner timed out due to inactivity, but prior miner is not valid. Allowing current miner to continue"
+            );
             return Ok(());
         }
         let new_active_tenure_ch = &sortition_data.consensus_hash;
@@ -402,7 +404,7 @@ impl LocalStateMachine {
                 (None, None) => {
                     return Err(SignerChainstateError::NoParentTenureInfo(
                         parent_tenure_id.clone(),
-                    ))
+                    ));
                 }
             };
         Ok((parent_tenure_last_block_height, parent_tenure_last_block))
@@ -693,7 +695,9 @@ impl LocalStateMachine {
                     proposal_config.tenure_last_block_proposal_timeout,
                 )?
             } else {
-                warn!("Signer State: Neither the current nor the prior sortition winner is considered a valid tenure");
+                warn!(
+                    "Signer State: Neither the current nor the prior sortition winner is considered a valid tenure"
+                );
                 MinerState::NoValidMiner
             }
         };
@@ -804,7 +808,9 @@ impl LocalStateMachine {
             .unwrap_or(old_protocol_version);
 
         if active_signer_protocol_version != old_protocol_version {
-            info!("Signer State: Updating active signer protocol version from {old_protocol_version} to {active_signer_protocol_version}");
+            info!(
+                "Signer State: Updating active signer protocol version from {old_protocol_version} to {active_signer_protocol_version}"
+            );
             crate::monitoring::actions::increment_signer_agreement_state_change_reason(
                 crate::monitoring::SignerAgreementStateChangeReason::ProtocolUpgrade,
             );
@@ -849,14 +855,14 @@ impl LocalStateMachine {
         let now = SystemTime::now();
         let current_miner = local_update.content.current_miner();
         let last_approved_block_time = match current_miner {
-            StateMachineUpdateMinerState::ActiveMiner { tenure_id, .. } => {
-                signerdb
-                    .get_last_globally_accepted_approved_time(tenure_id)
-                    .inspect_err(|e| {
-                        warn!("Error retrieving last globally accepted block approved by this signer: {e}");
-                    })
-                    .unwrap_or(None)
-            }
+            StateMachineUpdateMinerState::ActiveMiner { tenure_id, .. } => signerdb
+                .get_last_globally_accepted_approved_time(tenure_id)
+                .inspect_err(|e| {
+                    warn!(
+                        "Error retrieving last globally accepted block approved by this signer: {e}"
+                    );
+                })
+                .unwrap_or(None),
             _ => None,
         };
 
@@ -1082,7 +1088,9 @@ impl LocalStateMachine {
                     );
                 }
                 Err(e) => {
-                    warn!("Signer State: Error retrieving burn block for consensus_hash {tenure_id} from signerdb: {e}");
+                    warn!(
+                        "Signer State: Error retrieving burn block for consensus_hash {tenure_id} from signerdb: {e}"
+                    );
                 }
             }
         }
@@ -1231,7 +1239,9 @@ impl LocalStateMachine {
             &potential_replay_tip,
         )? {
             None => {
-                info!("Detected bitcoin fork occurred in previous reward cycle. Tx replay won't be executed");
+                info!(
+                    "Detected bitcoin fork occurred in previous reward cycle. Tx replay won't be executed"
+                );
                 Ok(None)
             }
             Some(replay_set) => {
@@ -1301,7 +1311,9 @@ impl LocalStateMachine {
                     "tx_replay_scope" => ?scope);
             replay_state = ReplayState::InProgress(ReplayTransactionSet::new(replay_set), scope);
         } else {
-            info!("Tx Replay: replay set will be cleared, because the fork involves the previous reward cycle.");
+            info!(
+                "Tx Replay: replay set will be cleared, because the fork involves the previous reward cycle."
+            );
             replay_state = ReplayState::Unset;
         }
         Ok(Some(replay_state))
@@ -1357,7 +1369,9 @@ impl LocalStateMachine {
         });
 
         if !is_fork_in_current_reward_cycle {
-            info!("Signer State: Detected bitcoin fork occurred in previous reward cycle. Tx replay won't be executed");
+            info!(
+                "Signer State: Detected bitcoin fork occurred in previous reward cycle. Tx replay won't be executed"
+            );
             return Ok(None);
         }
 

@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: stacks-federation
+    static_configs:
+      - targets: [telemetry-collector:9464]
+  - job_name: stacks-federation-pipeline
+    static_configs:
+      - targets: [telemetry-collector:8888]

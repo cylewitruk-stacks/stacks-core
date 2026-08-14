@@ -1,0 +1,54 @@
+Replace the libp2p PoC observer's privileged-RPC polling and custom HMAC batch
+ingestion with independently authenticated per-actor OpenTelemetry metric
+pipelines. Miner, follower, and signer Prometheus surfaces are filtered through
+bounded Collector agents, assigned server-authoritative identities at isolated
+central receivers, stored in Prometheus, and projected into freshness-aware
+dashboard snapshots. Add bounded `blocked_on` and oldest-command-wait metrics;
+federated traces remain structurally disabled pending their privacy audit.
+Enrich the authenticated streams with bounded public signer identity, reward-set
+weight, signer state-machine progress, and endpoint-free corroborated topology
+from a server-owned enrollment registry and public Stacks APIs.
+Split browser access into an explicit public-safe chain/reward-set projection
+and a server-session-protected federation view. Add a PoC-only development
+password provider behind an OIDC-ready principal boundary and reconstruct the
+miner's single bounded latest signer quorum round for enrolled cooperating
+signers without exposing transport identities or endpoints to the client.
+Expose every allowlisted node and signer metric in the authenticated portal,
+aggregate signer latency histograms, derive an explicitly height-only tip
+adoption spread, and separate signer node-tip observation freshness from the
+slower account/PoX monitoring cadence.
+Project the complete enrolled-actor libp2p graph by joining each bounded current
+transport PeerId against a unique server-owned enrollment. Unknown external
+peers remain scalar counts, endpoints remain excluded, stale identity labels
+are removed to bound lifetime cardinality, and raw PeerIds are consumed
+server-side instead of entering the client metric catalogue. Distinguish
+configured signer–companion service bindings from observed connectivity, use
+compact in-node labels, and support actor focus isolation at the 28-actor limit.
+Keep authenticated SSE streams open under normal large-snapshot backpressure by
+coalescing to one latest pending snapshot and resuming on drain, instead of
+mistaking a full response buffer for a disconnected viewer.
+Replace newest-height-as-canonical health with largest same-height cohort
+agreement, leaving newest-height coverage as a separate propagation signal.
+
+For the maximum-scale PoC, use durable status snapshots, coherent
+provider-affine IBD plans, a bounded fair metadata queue, and periodic signer
+replay cursor refresh. The replay refresh repairs simultaneous-startup gaps in
+which an empty early replay and a pre-mesh one-shot state publication otherwise
+prevent signers from negotiating their protocol version, without lowering the
+consensus threshold or relying on startup timing.
+Retry signer local-state initialization after a transiently incomplete
+companion-node tenure view, and publish a bounded ten-second signed state
+heartbeat. Previously, an IBD-time `NoParentTenureInfo` left the signer
+permanently uninitialized until process restart.
+Generate role-specific PoC connection ceilings so the maximum topology remains
+sparse instead of converging into a 28-actor clique: ordinary nodes and signers
+retain bounded rendezvous paths plus a GossipSub mesh, while miner and bootstrap
+ceilings preserve quorum reachability and recovery capacity.
+Keep terminal signer-round telemetry internally consistent with the miner's
+authoritative approval and explicitly zero obsolete per-signer series so a
+federated Prometheus staleness window cannot resurrect an earlier decision.
+Reserve signer connection capacity for configured rendezvous peers before swarm
+startup, require multi-hop GossipSub evidence from at least half of a large
+signer set, and bound verifier log scans. Scale the PoC miner's post-restart
+block-commit delay below the flash-block floor and reject any run where a miner
+falls below Nakamoto's 3-of-6 commitment rule.

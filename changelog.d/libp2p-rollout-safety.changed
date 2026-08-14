@@ -1,0 +1,4 @@
+Reject `libp2p-only` node configurations that explicitly request generic StackerDB replication,
+because generic StackerDB still uses the incumbent peer transport. Native diagnostics now report
+the selected peer-transport mode, legacy-listener and signer-bridge state, generic StackerDB
+replication state, and the signer's continued local-node HTTP/RPC dependency.

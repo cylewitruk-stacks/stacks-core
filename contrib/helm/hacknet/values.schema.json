@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "watchNamespace": {"type": "string"},
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["replicaCount", "image", "developmentSource", "reconcileIntervalSeconds"],
+      "properties": {
+        "replicaCount": {"type": "integer", "const": 1},
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "tag", "pullPolicy"],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "tag": {"type": "string", "minLength": 1},
+            "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+          }
+        },
+        "developmentSource": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "runtimeImage"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "runtimeImage": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["repository", "tag", "pullPolicy"],
+              "properties": {
+                "repository": {"type": "string", "minLength": 1},
+                "tag": {"type": "string", "minLength": 1},
+                "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+              }
+            }
+          }
+        },
+        "imagePullSecrets": {"type": "array", "items": {"type": "object"}},
+        "logLevel": {"enum": ["DEBUG", "INFO", "WARNING", "ERROR"]},
+        "reconcileIntervalSeconds": {"type": "integer", "minimum": 1, "maximum": 300},
+        "resources": {"type": "object"},
+        "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "podLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+        "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+        "tolerations": {"type": "array", "items": {"type": "object"}},
+        "affinity": {"type": "object"},
+        "securityContext": {"type": "object"},
+        "podSecurityContext": {"type": "object"}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations", "tokenExpirationSeconds"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "tokenExpirationSeconds": {"type": "integer", "minimum": 600, "maximum": 86400}
+      }
+    }
+  },
+  "required": ["operator", "serviceAccount", "watchNamespace"]
+}

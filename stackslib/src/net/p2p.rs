@@ -454,6 +454,34 @@ impl From<&DropNeighbor> for DropPeer {
     }
 }
 
+#[derive(Default)]
+struct CrossTransportRelayPolicy {
+    native_coalesced_legacy_keys: HashSet<Hash160>,
+}
+
+impl CrossTransportRelayPolicy {
+    fn replace_native_coalesced(&mut self, public_keys: Vec<[u8; 33]>) {
+        self.native_coalesced_legacy_keys = public_keys
+            .into_iter()
+            .filter_map(|bytes| Secp256k1PublicKey::from_slice(&bytes).ok())
+            .map(|public_key| Hash160::from_node_public_key(&public_key))
+            .collect();
+    }
+
+    fn permits(
+        &self,
+        public_key: Option<&Secp256k1PublicKey>,
+        has_native_equivalent: bool,
+    ) -> bool {
+        !has_native_equivalent
+            || public_key.is_none_or(|public_key| {
+                !self
+                    .native_coalesced_legacy_keys
+                    .contains(&Hash160::from_node_public_key(public_key))
+            })
+    }
+}
+
 pub struct PeerNetwork {
     // constants
     pub peer_version: u32,
@@ -502,13 +530,18 @@ pub struct PeerNetwork {
     // ongoing messages the network is sending via the p2p interface
     pub relay_handles: HashMap<usize, VecDeque<ReplyHandleP2P>>,
     pub relayer_stats: RelayerStats,
+    /// Incumbent public-key hashes independently proven to belong to a live
+    /// native peer. Native-capable application broadcasts skip these legacy
+    /// connections while the proof remains current; generic StackerDB traffic
+    /// never uses this set because it has no native transport.
+    cross_transport_relay: CrossTransportRelayPolicy,
 
     // handles for other threads to send/receive data to peers
     handles: VecDeque<NetworkHandleServer>,
 
     // network I/O
     pub network: Option<NetworkState>,
-    p2p_network_handle: usize,
+    p2p_network_handle: Option<usize>,
     http_network_handle: usize,
 
     // info on the burn chain we're tracking
@@ -636,6 +669,15 @@ pub struct PeerNetwork {
 }
 
 impl PeerNetwork {
+    /// Replace the exact set of live incumbent identities whose redundant
+    /// application broadcast should be served by libp2p. Callers must derive
+    /// this set from independent proofs on both transports. The policy is
+    /// intentionally applied only to payload kinds with a native equivalent.
+    pub fn set_native_relay_exclusions(&mut self, public_keys: Vec<[u8; 33]>) {
+        self.cross_transport_relay
+            .replace_native_coalesced(public_keys);
+    }
+
     pub fn new(
         peerdb: PeerDB,
         atlasdb: AtlasDB,
@@ -711,10 +753,11 @@ impl PeerNetwork {
 
             relay_handles: HashMap::new(),
             relayer_stats: RelayerStats::new(),
+            cross_transport_relay: CrossTransportRelayPolicy::default(),
 
             handles: VecDeque::new(),
             network: None,
-            p2p_network_handle: 0,
+            p2p_network_handle: None,
             http_network_handle: 0,
 
             burnchain,
@@ -864,7 +907,7 @@ impl PeerNetwork {
         );
 
         self.network = Some(net);
-        self.p2p_network_handle = p2p_handle;
+        self.p2p_network_handle = Some(p2p_handle);
         self.http_network_handle = http_handle;
 
         PeerNetwork::with_http(self, |_, ref mut http| {
@@ -878,6 +921,28 @@ impl PeerNetwork {
             port: bound_p2p_addr.port(),
         };
 
+        Ok(())
+    }
+
+    /// Start the incumbent scheduler's HTTP/RPC server without creating a
+    /// legacy P2P listening socket. The scheduler remains the single owner of
+    /// RPC, validation, and chainstate while libp2p owns peer transport.
+    #[cfg_attr(test, mutants::skip)]
+    pub fn bind_http_only(&mut self, http_addr: &SocketAddr) -> Result<(), net_error> {
+        let mut net = NetworkState::new(self.connection_opts.max_sockets)?;
+        let (http_handle, bound_http_addr) = net.bind(http_addr)?;
+
+        debug!(
+            "{:?}: legacy P2P listener disabled, bound HTTP on {:?}",
+            &self.local_peer, bound_http_addr
+        );
+
+        self.network = Some(net);
+        self.p2p_network_handle = None;
+        self.http_network_handle = http_handle;
+        PeerNetwork::with_http(self, |_, ref mut http| {
+            http.set_server_handle(http_handle, bound_http_addr);
+        });
         Ok(())
     }
 
@@ -897,6 +962,20 @@ impl PeerNetwork {
             return Ok(false);
         }
         self.bind(my_addr, http_addr).map(|()| true)
+    }
+
+    /// Call [`Self::bind_http_only`] only if not already bound.
+    pub fn try_bind_http_only(&mut self, http_addr: &SocketAddr) -> Result<bool, net_error> {
+        if self.network.is_some() {
+            return Ok(false);
+        }
+        self.bind_http_only(http_addr).map(|()| true)
+    }
+
+    /// Whether the incumbent P2P TCP server is bound. HTTP-only operation is
+    /// represented explicitly instead of by a hidden loopback listener.
+    pub fn legacy_listener_bound(&self) -> bool {
+        self.p2p_network_handle.is_some()
     }
 
     /// Get bound neighbor key. This is how this PeerNetwork appears to other nodes.
@@ -1408,6 +1487,10 @@ impl PeerNetwork {
             return Ok(event_id);
         }
 
+        // HTTP-only operation has a poller, but no incumbent peer server to
+        // own an outbound socket. Reject before attempting the TCP connect.
+        let p2p_network_handle = self.p2p_network_handle.ok_or(net_error::NotConnected)?;
+
         let next_event_id = match self.network {
             None => {
                 debug!("{:?}: network not connected", &self.local_peer);
@@ -1421,7 +1504,7 @@ impl PeerNetwork {
                 )?;
                 let hint_event_id = network.next_event_id()?;
                 let registered_event_id =
-                    network.register(self.p2p_network_handle, hint_event_id, &sock)?;
+                    network.register(p2p_network_handle, hint_event_id, &sock)?;
 
                 self.connecting.insert(
                     registered_event_id,
@@ -1472,6 +1555,7 @@ impl PeerNetwork {
         &self,
         relay_hints: &[RelayData],
         payload: &R,
+        exclude_native_coalesced: bool,
     ) -> Result<Vec<NeighborKey>, net_error> {
         // coalesce
         let mut outbound_neighbors = vec![];
@@ -1479,6 +1563,12 @@ impl PeerNetwork {
 
         for (_, convo) in self.peers.iter() {
             if !convo.is_authenticated() {
+                continue;
+            }
+            if !self
+                .cross_transport_relay
+                .permits(convo.ref_public_key(), exclude_native_coalesced)
+            {
                 continue;
             }
             let nk = convo.to_neighbor_key();
@@ -1591,7 +1681,8 @@ impl PeerNetwork {
                         // send to each neighbor that needs one
                         let mut all_neighbors = HashSet::new();
                         for BlocksDatum(_, block) in data.blocks.iter() {
-                            let neighbors = self.sample_broadcast_peers(&relay_hints, block)?;
+                            let neighbors =
+                                self.sample_broadcast_peers(&relay_hints, block, true)?;
                             for nk in neighbors.into_iter() {
                                 all_neighbors.insert(nk);
                             }
@@ -1602,7 +1693,8 @@ impl PeerNetwork {
                         // send to each neighbor that needs at least one
                         let mut all_neighbors = HashSet::new();
                         for mblock in data.microblocks.iter() {
-                            let neighbors = self.sample_broadcast_peers(&relay_hints, mblock)?;
+                            let neighbors =
+                                self.sample_broadcast_peers(&relay_hints, mblock, true)?;
                             for nk in neighbors.into_iter() {
                                 all_neighbors.insert(nk);
                             }
@@ -1614,17 +1706,17 @@ impl PeerNetwork {
                         let mut all_neighbors = HashSet::new();
                         for nakamoto_block in data.blocks.iter() {
                             let neighbors =
-                                self.sample_broadcast_peers(&relay_hints, nakamoto_block)?;
+                                self.sample_broadcast_peers(&relay_hints, nakamoto_block, true)?;
 
                             all_neighbors.extend(neighbors);
                         }
                         Ok(all_neighbors.into_iter().collect())
                     }
                     StacksMessageType::StackerDBPushChunk(ref data) => {
-                        Ok(self.sample_broadcast_peers(&relay_hints, data)?)
+                        Ok(self.sample_broadcast_peers(&relay_hints, data, false)?)
                     }
                     StacksMessageType::Transaction(ref data) => {
-                        self.sample_broadcast_peers(&relay_hints, data)
+                        self.sample_broadcast_peers(&relay_hints, data, true)
                     }
                     _ => {
                         // not suitable for broadcast
@@ -2256,22 +2348,23 @@ impl PeerNetwork {
         }
 
         let mut registered = vec![];
+        let Some(p2p_network_handle) = self.p2p_network_handle else {
+            debug!("{:?}: legacy P2P listener is disabled", &self.local_peer);
+            return registered;
+        };
 
         for (hint_event_id, client_sock) in poll_state.new.drain() {
             let event_id = match self.network {
                 Some(ref mut network) => {
                     // add to poller
-                    let event_id = match network.register(
-                        self.p2p_network_handle,
-                        hint_event_id,
-                        &client_sock,
-                    ) {
-                        Ok(event_id) => event_id,
-                        Err(e) => {
-                            warn!("Failed to register {:?}: {:?}", &client_sock, &e);
-                            continue;
-                        }
-                    };
+                    let event_id =
+                        match network.register(p2p_network_handle, hint_event_id, &client_sock) {
+                            Ok(event_id) => event_id,
+                            Err(e) => {
+                                warn!("Failed to register {:?}: {:?}", &client_sock, &e);
+                                continue;
+                            }
+                        };
 
                     // event ID already used?
                     if self.peers.contains_key(&event_id) {
@@ -5467,9 +5560,12 @@ impl PeerNetwork {
             }
         }?;
 
-        let p2p_poll_state = poll_states
-            .remove(&self.p2p_network_handle)
-            .expect("BUG: no poll state for p2p network handle");
+        let p2p_poll_state = match self.p2p_network_handle {
+            Some(handle) => poll_states
+                .remove(&handle)
+                .expect("BUG: no poll state for p2p network handle"),
+            None => NetworkPollState::new(),
+        };
         let http_poll_state = poll_states
             .remove(&self.http_network_handle)
             .expect("BUG: no poll state for http network handle");
@@ -5616,6 +5712,26 @@ mod test {
         neighbor
     }
 
+    #[test]
+    fn cross_transport_relay_policy_only_suppresses_native_equivalent_payloads() {
+        let public_key = make_test_neighbor(20444).public_key;
+        let public_key_bytes: [u8; 33] = public_key
+            .to_bytes_compressed()
+            .try_into()
+            .expect("compressed public key must be 33 bytes");
+        let other_public_key = Secp256k1PublicKey::new();
+        let mut policy = CrossTransportRelayPolicy::default();
+        policy.replace_native_coalesced(vec![public_key_bytes]);
+
+        assert!(!policy.permits(Some(&public_key), true));
+        assert!(policy.permits(Some(&public_key), false));
+        assert!(policy.permits(Some(&other_public_key), true));
+        assert!(policy.permits(None, true));
+
+        policy.replace_native_coalesced(Vec::new());
+        assert!(policy.permits(Some(&public_key), true));
+    }
+
     fn make_test_p2p_network(initial_neighbors: &[Neighbor]) -> PeerNetwork {
         let mut conn_opts = ConnectionOptions::default().with_private_neighbors();
         conn_opts.inbox_maxlen = 5;
@@ -5684,6 +5800,41 @@ mod test {
     }
 
     #[test]
+    fn http_only_bind_has_no_legacy_listener_or_dial_path() {
+        let mut p2p = make_test_p2p_network(&[]);
+        p2p.bind_http_only(&"127.0.0.1:0".parse().unwrap()).unwrap();
+
+        assert!(!p2p.legacy_listener_bound());
+        assert_eq!(p2p.network.as_ref().unwrap().num_events(), 1);
+        let poll_states = p2p.network.as_mut().unwrap().poll(0).unwrap();
+        assert_eq!(poll_states.len(), 1);
+        assert!(poll_states.contains_key(&p2p.http_network_handle));
+
+        // A second bind is a no-op, and the presence of the HTTP poller must
+        // not accidentally enable incumbent outbound dialing.
+        assert!(!p2p
+            .try_bind_http_only(&"127.0.0.1:0".parse().unwrap())
+            .unwrap());
+        let neighbor = make_test_neighbor(1);
+        assert!(matches!(
+            p2p.connect_peer(&neighbor.addr),
+            Err(net_error::NotConnected)
+        ));
+
+        // The rollback shape remains explicit and independently testable:
+        // the normal binder still owns distinct legacy P2P and HTTP servers.
+        let mut dual_stack = make_test_p2p_network(&[]);
+        dual_stack
+            .bind(
+                &"127.0.0.1:0".parse().unwrap(),
+                &"127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+        assert!(dual_stack.legacy_listener_bound());
+        assert_eq!(dual_stack.network.as_ref().unwrap().num_events(), 2);
+    }
+
+    #[test]
     fn test_event_id_no_connecting_leaks() {
         with_timeout(100, || {
             let neighbor = make_test_neighbor(2300);
@@ -5720,7 +5871,9 @@ mod test {
                         Some(ref mut network) => network.poll(100).unwrap(),
                     };
 
-                    let mut p2p_poll_state = poll_states.remove(&p2p.p2p_network_handle).unwrap();
+                    let mut p2p_poll_state = poll_states
+                        .remove(&p2p.p2p_network_handle.expect("test P2P listener"))
+                        .unwrap();
 
                     p2p.process_new_sockets(&mut p2p_poll_state);
                     p2p.process_connecting_sockets(&mut p2p_poll_state);
@@ -5881,7 +6034,9 @@ mod test {
                         Some(ref mut network) => network.poll(100).unwrap(),
                     };
 
-                    let mut p2p_poll_state = poll_state.remove(&p2p.p2p_network_handle).unwrap();
+                    let mut p2p_poll_state = poll_state
+                        .remove(&p2p.p2p_network_handle.expect("test P2P listener"))
+                        .unwrap();
 
                     p2p.process_new_sockets(&mut p2p_poll_state);
                     p2p.process_connecting_sockets(&mut p2p_poll_state);

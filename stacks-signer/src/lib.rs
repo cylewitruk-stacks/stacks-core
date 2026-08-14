@@ -33,6 +33,8 @@ pub mod config;
 pub mod monitor_signers;
 /// The monitoring server for the signer
 pub mod monitoring;
+/// Native signer networking and the temporary legacy compatibility composition.
+pub mod network;
 /// The primary runloop for the signer
 pub mod runloop;
 /// The signer state module
@@ -47,6 +49,7 @@ mod tests;
 
 use std::fmt::{Debug, Display};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 
 use chainstate::v1::SortitionsView;
 use config::GlobalConfig;
@@ -64,6 +67,10 @@ use crate::runloop::RunLoop;
 pub trait Signer<T: SignerEventTrait>: Debug + Display {
     /// Create a new `Signer` instance
     fn new(stacks_client: &StacksClient, signer_config: SignerConfig) -> Self;
+    /// Attach the process-wide signer network after reward-cycle configuration is loaded.
+    ///
+    /// Implementations which do not publish signer messages may retain the default no-op.
+    fn set_signer_network(&mut self, _network: Option<network::SignerNetworkHandle>) {}
     /// Get the reward cycle of the signer
     fn reward_cycle(&self) -> u64;
     /// Process an event
@@ -100,19 +107,29 @@ pub struct SpawnedSigner<S: Signer<T> + Send, T: SignerEventTrait> {
     pub res_recv: Receiver<SignerResult>,
     /// The spawned signer's config
     pub config: GlobalConfig,
+    /// The native libp2p network service, when enabled.
+    libp2p_service: Option<network::SignerNetworkHandle>,
     /// Phantom data for the signer type
     _phantom: std::marker::PhantomData<S>,
 }
 
 impl<S: Signer<T> + Send, T: SignerEventTrait> SpawnedSigner<S, T> {
     /// Stop the signer thread and return the final state
-    pub fn stop(self) -> Option<SignerResult> {
-        self.running_signer.stop()
+    pub fn stop(mut self) -> Option<SignerResult> {
+        let result = self.running_signer.stop();
+        if let Some(service) = self.libp2p_service.take() {
+            service.shutdown().expect("libp2p signer thread panicked");
+        }
+        result
     }
 
     /// Wait for the signer to terminate, and get the final state. WARNING: This will hang forever if the event receiver stop signal was never sent/no error occurred.
-    pub fn join(self) -> Option<SignerResult> {
-        self.running_signer.join()
+    pub fn join(mut self) -> Option<SignerResult> {
+        let result = self.running_signer.join();
+        if let Some(service) = self.libp2p_service.take() {
+            service.shutdown().expect("libp2p signer thread panicked");
+        }
+        result
     }
 }
 
@@ -131,9 +148,26 @@ impl<S: Signer<T> + Send + 'static, T: SignerEventTrait + 'static> SpawnedSigner
             https://docs.stacks.co/guides-and-tutorials/running-a-signer#preflight-setup"
         );
         let (res_send, res_recv) = channel();
-        let ev = SignerEventReceiver::new(config.network.is_mainnet());
         crate::monitoring::actions::start_serving_monitoring_metrics(config.clone()).ok();
-        let runloop = RunLoop::new(config.clone());
+        let libp2p_service = if config.libp2p.enabled
+            || config.libp2p.signer_bridge.mode != stacks_network_types::BridgeMode::Off
+        {
+            Some(network::spawn(&config).expect("Failed to spawn native signer libp2p network"))
+        } else {
+            None
+        };
+        let mut ev = SignerEventReceiver::new(config.network.is_mainnet())
+            .with_proposal_response_auth_token(Arc::<str>::from(config.auth_password.clone()));
+        if config.libp2p.signer_bridge.mode.accepts_ingress() {
+            let network = libp2p_service
+                .as_ref()
+                .cloned()
+                .expect("legacy ingress requires the native signer network");
+            ev = ev.with_stackerdb_event_observer(Arc::new(move |event| {
+                network.ingest_legacy_event(event);
+            }));
+        }
+        let runloop = RunLoop::with_signer_network(config.clone(), libp2p_service.clone());
         let mut signer: RunLoopSigner<S, T> = libsigner::Signer::new(runloop, ev, res_send);
         let running_signer = signer.spawn(endpoint).expect("Failed to spawn signer");
         SpawnedSigner {
@@ -141,6 +175,7 @@ impl<S: Signer<T> + Send + 'static, T: SignerEventTrait + 'static> SpawnedSigner
             res_recv,
             _phantom: std::marker::PhantomData,
             config,
+            libp2p_service,
         }
     }
 }
