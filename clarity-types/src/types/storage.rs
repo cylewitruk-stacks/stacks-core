@@ -23,10 +23,13 @@ use super::{
     TypeSignature, UTF8Data, Value,
 };
 use crate::errors::ClarityTypeError;
-use crate::representations::{CONTRACT_NAME_REGEX, ContractName, MAX_STRING_LEN};
+use crate::representations::{CONTRACT_NAME_REGEX, ClarityName, ContractName, MAX_STRING_LEN};
 
 /// Number of bytes before a packed V1 value body.
 pub const PACKED_VALUE_HEADER_LEN: usize = 4;
+
+/// Version byte for the active value-shape descriptor grammar.
+pub const VALUE_SHAPE_VERSION: u8 = 1;
 
 const OFFSET_WIDTH_U8: u8 = 0;
 const OFFSET_WIDTH_U16: u8 = 1;
@@ -62,6 +65,36 @@ impl<'bytes, 'schema> ValidatedPackedValue<'bytes, 'schema> {
 pub struct PackedValue {
     bytes: Vec<u8>,
     consensus_byte_len: u32,
+}
+
+/// Canonical reconstruction metadata for one active Clarity value shape.
+///
+/// The descriptor contains only information omitted from [`PackedValue`] that
+/// is required to reconstruct consensus bytes without a declared schema.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ValueShape(Vec<u8>);
+
+impl ValueShape {
+    /// Borrow the complete versioned descriptor.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consume this descriptor and return its bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Parse and validate one complete versioned descriptor.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PackedValueError> {
+        if bytes.len() > super::MAX_VALUE_SIZE as usize {
+            return Err(PackedValueError::InvalidRecord(
+                "value shape exceeds maximum size",
+            ));
+        }
+        parse_value_shape(bytes)?;
+        Ok(Self(bytes.to_vec()))
+    }
 }
 
 /// Whether an encoded record is structurally validated before it is returned.
@@ -2648,4 +2681,725 @@ fn decode_canonical_list(
         Value::list_with_type(epoch, values, expected.clone())?,
         checked_logical_add(5, children_len)?,
     ))
+}
+
+const SHAPE_INT: u8 = 0x00;
+const SHAPE_UINT: u8 = 0x01;
+const SHAPE_BOOL: u8 = 0x02;
+const SHAPE_BUFFER: u8 = 0x03;
+const SHAPE_ASCII: u8 = 0x04;
+const SHAPE_UTF8: u8 = 0x05;
+const SHAPE_PRINCIPAL: u8 = 0x06;
+const SHAPE_OPTIONAL_NONE: u8 = 0x07;
+const SHAPE_OPTIONAL_SOME: u8 = 0x08;
+const SHAPE_RESPONSE_OK: u8 = 0x09;
+const SHAPE_RESPONSE_ERR: u8 = 0x0a;
+const SHAPE_RESPONSE_BOTH: u8 = 0x0b;
+const SHAPE_TUPLE: u8 = 0x0c;
+const SHAPE_EMPTY_LIST: u8 = 0x0d;
+const SHAPE_LIST: u8 = 0x0e;
+
+const PREFIX_INT: u8 = 0;
+const PREFIX_UINT: u8 = 1;
+const PREFIX_BUFFER: u8 = 2;
+const PREFIX_BOOL_TRUE: u8 = 3;
+const PREFIX_BOOL_FALSE: u8 = 4;
+const PREFIX_PRINCIPAL_STANDARD: u8 = 5;
+const PREFIX_PRINCIPAL_CONTRACT: u8 = 6;
+const PREFIX_RESPONSE_OK: u8 = 7;
+const PREFIX_RESPONSE_ERR: u8 = 8;
+const PREFIX_OPTIONAL_NONE: u8 = 9;
+const PREFIX_OPTIONAL_SOME: u8 = 10;
+const PREFIX_LIST: u8 = 11;
+const PREFIX_TUPLE: u8 = 12;
+const PREFIX_ASCII: u8 = 13;
+const PREFIX_UTF8: u8 = 14;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActiveShape {
+    Int,
+    UInt,
+    Bool,
+    Buffer,
+    Ascii,
+    Utf8,
+    Principal,
+    Optional(Option<Box<ActiveShape>>),
+    Response {
+        ok: Option<Box<ActiveShape>>,
+        err: Option<Box<ActiveShape>>,
+    },
+    Tuple(Vec<(ClarityName, ActiveShape)>),
+    List(Option<Box<ActiveShape>>),
+}
+
+/// Encode the canonical active-shape descriptor for an admitted value.
+pub fn encode_value_shape(value: &Value) -> Result<ValueShape, PackedValueError> {
+    let shape = ActiveShape::from_value(value)?;
+    let mut bytes = Vec::new();
+    bytes.push(VALUE_SHAPE_VERSION);
+    shape.encode(&mut bytes)?;
+    Ok(ValueShape(bytes))
+}
+
+/// Transcode one exact consensus value into Track C bytes and its descriptor.
+pub fn transcode_consensus_with_shape(
+    consensus: &[u8],
+) -> Result<(PackedValue, ValueShape), PackedValueError> {
+    let value = Value::try_deserialize_slice_exact_untyped(consensus)?;
+    let consensus_byte_len =
+        u32::try_from(consensus.len()).map_err(|_| PackedValueError::SizeOverflow)?;
+    let packed = encode_canonical_packed_admitted(
+        &value,
+        consensus_byte_len,
+        StructuralValidation::Enabled,
+    )?;
+    let shape = encode_value_shape(&value)?;
+    Ok((packed, shape))
+}
+
+/// Reconstruct exact consensus bytes without a declared [`TypeSignature`].
+pub fn reconstruct_consensus(
+    packed: &[u8],
+    descriptor: &[u8],
+) -> Result<Vec<u8>, PackedValueError> {
+    let header = packed
+        .get(..PACKED_VALUE_HEADER_LEN)
+        .ok_or(PackedValueError::InvalidRecord(
+            "truncated canonical header",
+        ))?;
+    let expected_len = read_u32_le(header)?;
+    if expected_len > super::BOUND_VALUE_SERIALIZATION_BYTES {
+        return Err(PackedValueError::InvalidRecord(
+            "reconstructed consensus value exceeds maximum size",
+        ));
+    }
+    let shape = parse_value_shape(descriptor)?;
+    let expected_capacity =
+        usize::try_from(expected_len).map_err(|_| PackedValueError::SizeOverflow)?;
+    let mut consensus = Vec::with_capacity(expected_capacity);
+    reconstruct_body(&packed[PACKED_VALUE_HEADER_LEN..], &shape, &mut consensus)?;
+    if consensus.len() != expected_capacity {
+        return Err(PackedValueError::InvalidRecord(
+            "reconstructed consensus length mismatch",
+        ));
+    }
+    Ok(consensus)
+}
+
+fn parse_value_shape(bytes: &[u8]) -> Result<ActiveShape, PackedValueError> {
+    if bytes.len() > super::MAX_VALUE_SIZE as usize {
+        return Err(PackedValueError::InvalidRecord(
+            "value shape exceeds maximum size",
+        ));
+    }
+    let (&version, body) = bytes
+        .split_first()
+        .ok_or(PackedValueError::InvalidRecord("empty value shape"))?;
+    if version != VALUE_SHAPE_VERSION {
+        return Err(PackedValueError::InvalidRecord(
+            "unsupported value-shape version",
+        ));
+    }
+    let mut cursor = 0usize;
+    let shape = ActiveShape::parse(body, &mut cursor, 0)?;
+    if cursor != body.len() {
+        return Err(PackedValueError::InvalidRecord(
+            "value shape has trailing bytes",
+        ));
+    }
+    Ok(shape)
+}
+
+impl ActiveShape {
+    fn from_value(value: &Value) -> Result<Self, PackedValueError> {
+        match value {
+            Value::Int(_) => Ok(Self::Int),
+            Value::UInt(_) => Ok(Self::UInt),
+            Value::Bool(_) => Ok(Self::Bool),
+            Value::Sequence(SequenceData::Buffer(_)) => Ok(Self::Buffer),
+            Value::Sequence(SequenceData::String(CharType::ASCII(_))) => Ok(Self::Ascii),
+            Value::Sequence(SequenceData::String(CharType::UTF8(_))) => Ok(Self::Utf8),
+            Value::Principal(_) | Value::CallableContract(_) => Ok(Self::Principal),
+            Value::Optional(optional) => Ok(Self::Optional(
+                optional
+                    .data
+                    .as_deref()
+                    .map(Self::from_value)
+                    .transpose()?
+                    .map(Box::new),
+            )),
+            Value::Response(response) => {
+                let child = Box::new(Self::from_value(&response.data)?);
+                if response.committed {
+                    Ok(Self::Response {
+                        ok: Some(child),
+                        err: None,
+                    })
+                } else {
+                    Ok(Self::Response {
+                        ok: None,
+                        err: Some(child),
+                    })
+                }
+            }
+            Value::Tuple(tuple) => tuple
+                .data_map
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), Self::from_value(value)?)))
+                .collect::<Result<Vec<_>, PackedValueError>>()
+                .map(Self::Tuple),
+            Value::Sequence(SequenceData::List(list)) => {
+                let mut merged: Option<Self> = None;
+                for value in &list.data {
+                    let next = Self::from_value(value)?;
+                    merged = Some(match merged {
+                        Some(current) => current.merge(next)?,
+                        None => next,
+                    });
+                }
+                Ok(Self::List(merged.map(Box::new)))
+            }
+        }
+    }
+
+    fn merge(self, other: Self) -> Result<Self, PackedValueError> {
+        match (self, other) {
+            (Self::Int, Self::Int) => Ok(Self::Int),
+            (Self::UInt, Self::UInt) => Ok(Self::UInt),
+            (Self::Bool, Self::Bool) => Ok(Self::Bool),
+            (Self::Buffer, Self::Buffer) => Ok(Self::Buffer),
+            (Self::Ascii, Self::Ascii) => Ok(Self::Ascii),
+            (Self::Utf8, Self::Utf8) => Ok(Self::Utf8),
+            (Self::Principal, Self::Principal) => Ok(Self::Principal),
+            (Self::Optional(left), Self::Optional(right)) => {
+                Ok(Self::Optional(merge_optional_shape(left, right)?))
+            }
+            (
+                Self::Response {
+                    ok: left_ok,
+                    err: left_err,
+                },
+                Self::Response {
+                    ok: right_ok,
+                    err: right_err,
+                },
+            ) => Ok(Self::Response {
+                ok: merge_optional_shape(left_ok, right_ok)?,
+                err: merge_optional_shape(left_err, right_err)?,
+            }),
+            (Self::Tuple(left), Self::Tuple(right)) if left.len() == right.len() => {
+                let mut merged = Vec::with_capacity(left.len());
+                for ((left_name, left_shape), (right_name, right_shape)) in
+                    left.into_iter().zip(right)
+                {
+                    if left_name != right_name {
+                        return Err(incompatible_shape_error());
+                    }
+                    merged.push((left_name, left_shape.merge(right_shape)?));
+                }
+                Ok(Self::Tuple(merged))
+            }
+            (Self::List(left), Self::List(right)) => {
+                Ok(Self::List(merge_optional_shape(left, right)?))
+            }
+            _ => Err(incompatible_shape_error()),
+        }
+    }
+
+    fn encode(&self, output: &mut Vec<u8>) -> Result<(), PackedValueError> {
+        match self {
+            Self::Int => output.push(SHAPE_INT),
+            Self::UInt => output.push(SHAPE_UINT),
+            Self::Bool => output.push(SHAPE_BOOL),
+            Self::Buffer => output.push(SHAPE_BUFFER),
+            Self::Ascii => output.push(SHAPE_ASCII),
+            Self::Utf8 => output.push(SHAPE_UTF8),
+            Self::Principal => output.push(SHAPE_PRINCIPAL),
+            Self::Optional(None) => output.push(SHAPE_OPTIONAL_NONE),
+            Self::Optional(Some(child)) => {
+                output.push(SHAPE_OPTIONAL_SOME);
+                child.encode(output)?;
+            }
+            Self::Response {
+                ok: Some(ok),
+                err: None,
+            } => {
+                output.push(SHAPE_RESPONSE_OK);
+                ok.encode(output)?;
+            }
+            Self::Response {
+                ok: None,
+                err: Some(err),
+            } => {
+                output.push(SHAPE_RESPONSE_ERR);
+                err.encode(output)?;
+            }
+            Self::Response {
+                ok: Some(ok),
+                err: Some(err),
+            } => {
+                output.push(SHAPE_RESPONSE_BOTH);
+                ok.encode(output)?;
+                err.encode(output)?;
+            }
+            Self::Response {
+                ok: None,
+                err: None,
+            } => {
+                return Err(PackedValueError::InvalidRecord(
+                    "response shape has no active branch",
+                ));
+            }
+            Self::Tuple(fields) => {
+                output.push(SHAPE_TUPLE);
+                encode_varuint(fields.len(), output)?;
+                for (name, shape) in fields {
+                    let name = name.as_str().as_bytes();
+                    output.push(
+                        u8::try_from(name.len()).map_err(|_| PackedValueError::SizeOverflow)?,
+                    );
+                    output.extend_from_slice(name);
+                    shape.encode(output)?;
+                }
+            }
+            Self::List(None) => output.push(SHAPE_EMPTY_LIST),
+            Self::List(Some(child)) => {
+                output.push(SHAPE_LIST);
+                child.encode(output)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse(bytes: &[u8], cursor: &mut usize, depth: u8) -> Result<Self, PackedValueError> {
+        if depth > super::MAX_TYPE_DEPTH {
+            return Err(PackedValueError::InvalidRecord(
+                "value shape exceeds maximum depth",
+            ));
+        }
+        let opcode = take_shape_byte(bytes, cursor)?;
+        let child_depth = depth.checked_add(1).ok_or(PackedValueError::SizeOverflow)?;
+        match opcode {
+            SHAPE_INT => Ok(Self::Int),
+            SHAPE_UINT => Ok(Self::UInt),
+            SHAPE_BOOL => Ok(Self::Bool),
+            SHAPE_BUFFER => Ok(Self::Buffer),
+            SHAPE_ASCII => Ok(Self::Ascii),
+            SHAPE_UTF8 => Ok(Self::Utf8),
+            SHAPE_PRINCIPAL => Ok(Self::Principal),
+            SHAPE_OPTIONAL_NONE => Ok(Self::Optional(None)),
+            SHAPE_OPTIONAL_SOME => Ok(Self::Optional(Some(Box::new(Self::parse(
+                bytes,
+                cursor,
+                child_depth,
+            )?)))),
+            SHAPE_RESPONSE_OK => Ok(Self::Response {
+                ok: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
+                err: None,
+            }),
+            SHAPE_RESPONSE_ERR => Ok(Self::Response {
+                ok: None,
+                err: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
+            }),
+            SHAPE_RESPONSE_BOTH => Ok(Self::Response {
+                ok: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
+                err: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
+            }),
+            SHAPE_TUPLE => {
+                let count = decode_varuint(bytes, cursor)?;
+                if count > bytes.len().saturating_sub(*cursor) / 2 {
+                    return Err(PackedValueError::InvalidRecord(
+                        "value-shape tuple field count exceeds descriptor",
+                    ));
+                }
+                let mut fields = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let name_len = usize::from(take_shape_byte(bytes, cursor)?);
+                    let end = cursor
+                        .checked_add(name_len)
+                        .ok_or(PackedValueError::SizeOverflow)?;
+                    let name_bytes =
+                        bytes
+                            .get(*cursor..end)
+                            .ok_or(PackedValueError::InvalidRecord(
+                                "truncated value-shape tuple name",
+                            ))?;
+                    let name = str::from_utf8(name_bytes)
+                        .map_err(|_| PackedValueError::InvalidRecord("invalid tuple name UTF-8"))?;
+                    let name = ClarityName::try_from(name.to_owned())
+                        .map_err(|_| PackedValueError::InvalidRecord("invalid tuple name"))?;
+                    if fields
+                        .last()
+                        .is_some_and(|(previous, _): &(ClarityName, Self)| previous >= &name)
+                    {
+                        return Err(PackedValueError::InvalidRecord(
+                            "tuple shape fields are not canonical",
+                        ));
+                    }
+                    *cursor = end;
+                    let shape = Self::parse(bytes, cursor, child_depth)?;
+                    fields.push((name, shape));
+                }
+                Ok(Self::Tuple(fields))
+            }
+            SHAPE_EMPTY_LIST => Ok(Self::List(None)),
+            SHAPE_LIST => Ok(Self::List(Some(Box::new(Self::parse(
+                bytes,
+                cursor,
+                child_depth,
+            )?)))),
+            _ => Err(PackedValueError::InvalidRecord(
+                "unknown value-shape opcode",
+            )),
+        }
+    }
+
+    fn fixed_width(&self) -> Option<usize> {
+        match self {
+            Self::Bool => Some(1),
+            Self::Tuple(fields) => fields.iter().try_fold(0usize, |total, (_, child)| {
+                total.checked_add(child.fixed_width()?)
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn merge_optional_shape(
+    left: Option<Box<ActiveShape>>,
+    right: Option<Box<ActiveShape>>,
+) -> Result<Option<Box<ActiveShape>>, PackedValueError> {
+    match (left, right) {
+        (None, None) => Ok(None),
+        (Some(shape), None) | (None, Some(shape)) => Ok(Some(shape)),
+        (Some(left), Some(right)) => Ok(Some(Box::new(left.merge(*right)?))),
+    }
+}
+
+fn incompatible_shape_error() -> PackedValueError {
+    PackedValueError::InvalidRecord("incompatible active list element shapes")
+}
+
+fn encode_varuint(mut value: usize, output: &mut Vec<u8>) -> Result<(), PackedValueError> {
+    loop {
+        let mut byte = u8::try_from(value & 0x7f).map_err(|_| PackedValueError::SizeOverflow)?;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn decode_varuint(bytes: &[u8], cursor: &mut usize) -> Result<usize, PackedValueError> {
+    let start = *cursor;
+    let mut value = 0usize;
+    let mut shift = 0u32;
+    loop {
+        let byte = take_shape_byte(bytes, cursor)?;
+        let part = usize::from(byte & 0x7f)
+            .checked_shl(shift)
+            .ok_or(PackedValueError::SizeOverflow)?;
+        value = value
+            .checked_add(part)
+            .ok_or(PackedValueError::SizeOverflow)?;
+        if byte & 0x80 == 0 {
+            let mut canonical = Vec::new();
+            encode_varuint(value, &mut canonical)?;
+            if bytes.get(start..*cursor) != Some(canonical.as_slice()) {
+                return Err(PackedValueError::InvalidRecord(
+                    "non-canonical value-shape varuint",
+                ));
+            }
+            return Ok(value);
+        }
+        shift = shift.checked_add(7).ok_or(PackedValueError::SizeOverflow)?;
+        if shift >= usize::BITS {
+            return Err(PackedValueError::SizeOverflow);
+        }
+    }
+}
+
+fn take_shape_byte(bytes: &[u8], cursor: &mut usize) -> Result<u8, PackedValueError> {
+    let byte = bytes
+        .get(*cursor)
+        .copied()
+        .ok_or(PackedValueError::InvalidRecord("truncated value shape"))?;
+    *cursor = cursor
+        .checked_add(1)
+        .ok_or(PackedValueError::SizeOverflow)?;
+    Ok(byte)
+}
+
+fn reconstruct_body(
+    bytes: &[u8],
+    shape: &ActiveShape,
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    match shape {
+        ActiveShape::Int => {
+            validate_canonical_signed_scalar(bytes)?;
+            output.push(PREFIX_INT);
+            let fill = if bytes[0] & 0x80 == 0 { 0 } else { 0xff };
+            output.resize(output.len() + 16 - bytes.len(), fill);
+            output.extend_from_slice(bytes);
+        }
+        ActiveShape::UInt => {
+            validate_canonical_unsigned_scalar(bytes)?;
+            output.push(PREFIX_UINT);
+            output.resize(output.len() + 16 - bytes.len(), 0);
+            output.extend_from_slice(bytes);
+        }
+        ActiveShape::Bool => match bytes {
+            [0] => output.push(PREFIX_BOOL_FALSE),
+            [1] => output.push(PREFIX_BOOL_TRUE),
+            _ => return Err(PackedValueError::InvalidRecord("invalid boolean")),
+        },
+        ActiveShape::Buffer => reconstruct_sequence(PREFIX_BUFFER, bytes, output)?,
+        ActiveShape::Ascii => {
+            if !bytes.iter().all(valid_ascii_byte) {
+                return Err(PackedValueError::InvalidRecord("invalid ASCII string"));
+            }
+            reconstruct_sequence(PREFIX_ASCII, bytes, output)?;
+        }
+        ActiveShape::Utf8 => {
+            str::from_utf8(bytes)
+                .map_err(|_| PackedValueError::InvalidRecord("invalid UTF-8 string"))?;
+            reconstruct_sequence(PREFIX_UTF8, bytes, output)?;
+        }
+        ActiveShape::Principal => reconstruct_principal(bytes, output)?,
+        ActiveShape::Optional(child_shape) => {
+            let (tag, child) = split_tag(bytes)?;
+            match (tag, child_shape) {
+                (0, _) if child.is_empty() => output.push(PREFIX_OPTIONAL_NONE),
+                (1, Some(shape)) => {
+                    output.push(PREFIX_OPTIONAL_SOME);
+                    reconstruct_body(child, shape, output)?;
+                }
+                _ => {
+                    return Err(PackedValueError::InvalidRecord(
+                        "packed optional disagrees with value shape",
+                    ));
+                }
+            }
+        }
+        ActiveShape::Response { ok, err } => {
+            let (tag, child) = split_tag(bytes)?;
+            let (prefix, shape) = match tag {
+                0 => (PREFIX_RESPONSE_ERR, err.as_deref()),
+                1 => (PREFIX_RESPONSE_OK, ok.as_deref()),
+                _ => return Err(PackedValueError::InvalidRecord("invalid response")),
+            };
+            let shape = shape.ok_or(PackedValueError::InvalidRecord(
+                "response branch is absent from value shape",
+            ))?;
+            output.push(prefix);
+            reconstruct_body(child, shape, output)?;
+        }
+        ActiveShape::Tuple(fields) => reconstruct_tuple(bytes, fields, output)?,
+        ActiveShape::List(element_shape) => {
+            reconstruct_list(bytes, element_shape.as_deref(), output)?
+        }
+    }
+    Ok(())
+}
+
+fn reconstruct_sequence(
+    prefix: u8,
+    bytes: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    output.push(prefix);
+    output.extend_from_slice(
+        &u32::try_from(bytes.len())
+            .map_err(|_| PackedValueError::SizeOverflow)?
+            .to_be_bytes(),
+    );
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn reconstruct_principal(bytes: &[u8], output: &mut Vec<u8>) -> Result<(), PackedValueError> {
+    let (&kind, body) = bytes
+        .split_first()
+        .ok_or(PackedValueError::InvalidRecord("missing principal kind"))?;
+    match kind {
+        0 => {
+            validate_standard_principal(body)?;
+            output.push(PREFIX_PRINCIPAL_STANDARD);
+            output.extend_from_slice(body);
+        }
+        1 => {
+            let name = validate_contract_body(body)?;
+            output.push(PREFIX_PRINCIPAL_CONTRACT);
+            output.extend_from_slice(&body[..21]);
+            output.push(u8::try_from(name.len()).map_err(|_| PackedValueError::SizeOverflow)?);
+            output.extend_from_slice(name.as_bytes());
+        }
+        _ => return Err(PackedValueError::InvalidRecord("invalid principal kind")),
+    }
+    Ok(())
+}
+
+fn reconstruct_tuple(
+    bytes: &[u8],
+    fields: &[(ClarityName, ActiveShape)],
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    output.push(PREFIX_TUPLE);
+    output.extend_from_slice(
+        &u32::try_from(fields.len())
+            .map_err(|_| PackedValueError::SizeOverflow)?
+            .to_be_bytes(),
+    );
+    if fields
+        .iter()
+        .all(|(_, shape)| shape.fixed_width().is_some())
+    {
+        let mut cursor = 0usize;
+        for (name, shape) in fields {
+            let width = shape.fixed_width().ok_or(PackedValueError::InvalidRecord(
+                "fixed value-shape classification changed",
+            ))?;
+            let end = cursor
+                .checked_add(width)
+                .ok_or(PackedValueError::SizeOverflow)?;
+            let child = bytes
+                .get(cursor..end)
+                .ok_or(PackedValueError::InvalidRecord("truncated fixed tuple"))?;
+            reconstruct_tuple_field(name, child, shape, output)?;
+            cursor = end;
+        }
+        if cursor != bytes.len() {
+            return Err(PackedValueError::InvalidRecord(
+                "fixed tuple has trailing bytes",
+            ));
+        }
+    } else {
+        let directory = Directory::parse(bytes, fields.len())?;
+        for (index, (name, shape)) in fields.iter().enumerate() {
+            reconstruct_tuple_field(name, directory.child(index)?, shape, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn reconstruct_tuple_field(
+    name: &ClarityName,
+    bytes: &[u8],
+    shape: &ActiveShape,
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    let name = name.as_str().as_bytes();
+    output.push(u8::try_from(name.len()).map_err(|_| PackedValueError::SizeOverflow)?);
+    output.extend_from_slice(name);
+    reconstruct_body(bytes, shape, output)
+}
+
+fn reconstruct_list(
+    bytes: &[u8],
+    element_shape: Option<&ActiveShape>,
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    let (count, elements) = split_list(bytes)?;
+    output.push(PREFIX_LIST);
+    output.extend_from_slice(
+        &u32::try_from(count)
+            .map_err(|_| PackedValueError::SizeOverflow)?
+            .to_be_bytes(),
+    );
+    if count == 0 {
+        if !elements.is_empty() {
+            return Err(PackedValueError::InvalidRecord(
+                "empty list disagrees with value shape",
+            ));
+        }
+        return Ok(());
+    }
+    let shape = element_shape.ok_or(PackedValueError::InvalidRecord(
+        "non-empty list has no element shape",
+    ))?;
+    match shape {
+        ActiveShape::UInt => reconstruct_unsigned_lane(elements, count, output),
+        ActiveShape::Int => reconstruct_signed_lane(elements, count, output),
+        ActiveShape::Bool => reconstruct_bool_lane(elements, count, output),
+        _ => {
+            if let Some(width) = shape.fixed_width() {
+                let expected_len = count
+                    .checked_mul(width)
+                    .ok_or(PackedValueError::SizeOverflow)?;
+                if elements.len() != expected_len {
+                    return Err(PackedValueError::InvalidRecord(
+                        "fixed list byte length mismatch",
+                    ));
+                }
+                for index in 0..count {
+                    let start = index
+                        .checked_mul(width)
+                        .ok_or(PackedValueError::SizeOverflow)?;
+                    reconstruct_body(&elements[start..start + width], shape, output)?;
+                }
+            } else {
+                let directory = Directory::parse(elements, count)?;
+                for index in 0..count {
+                    reconstruct_body(directory.child(index)?, shape, output)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn reconstruct_unsigned_lane(
+    elements: &[u8],
+    count: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    validate_canonical_unsigned_lane(elements, count)?;
+    let width = lane_width(elements, count)?;
+    for element in elements.chunks_exact(width) {
+        output.push(PREFIX_UINT);
+        output.resize(output.len() + 16 - width, 0);
+        output.extend_from_slice(element);
+    }
+    Ok(())
+}
+
+fn reconstruct_signed_lane(
+    elements: &[u8],
+    count: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    validate_canonical_signed_lane(elements, count)?;
+    let width = lane_width(elements, count)?;
+    for element in elements.chunks_exact(width) {
+        output.push(PREFIX_INT);
+        let fill = if element[0] & 0x80 == 0 { 0 } else { 0xff };
+        output.resize(output.len() + 16 - width, fill);
+        output.extend_from_slice(element);
+    }
+    Ok(())
+}
+
+fn reconstruct_bool_lane(
+    elements: &[u8],
+    count: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), PackedValueError> {
+    validate_bool_lane(elements, count)?;
+    for index in 0..count {
+        let byte = elements
+            .get(index / 8)
+            .ok_or(PackedValueError::InvalidRecord("truncated boolean lane"))?;
+        output.push(if byte & (1 << (index % 8)) == 0 {
+            PREFIX_BOOL_FALSE
+        } else {
+            PREFIX_BOOL_TRUE
+        });
+    }
+    Ok(())
 }

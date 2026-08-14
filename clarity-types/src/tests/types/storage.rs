@@ -13,10 +13,12 @@ use stacks_common::types::StacksEpochId;
 use crate::representations::{ClarityName, ContractName};
 use crate::types::signatures::CallableSubtype;
 use crate::types::storage::{
-    PACKED_VALUE_HEADER_LEN, StructuralValidation, decode_canonical_packed, decode_packed_value,
-    encode_canonical_packed_value, encode_canonical_packed_value_with_consensus_len,
-    encode_packed_value, packed_int_width, packed_uint_width,
-    transcode_consensus_to_canonical_packed, validate_canonical_packed, validate_packed_value,
+    PACKED_VALUE_HEADER_LEN, StructuralValidation, ValueShape, decode_canonical_packed,
+    decode_packed_value, encode_canonical_packed_value,
+    encode_canonical_packed_value_with_consensus_len, encode_packed_value, encode_value_shape,
+    packed_int_width, packed_uint_width, reconstruct_consensus,
+    transcode_consensus_to_canonical_packed, transcode_consensus_with_shape,
+    validate_canonical_packed, validate_packed_value,
 };
 use crate::types::{
     CallableData, ListTypeData, PrincipalData, QualifiedContractIdentifier, SequenceSubtype,
@@ -61,7 +63,59 @@ fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8>
     assert_eq!(decoded.consensus_byte_len, consensus.len() as u32);
     let transcoded = transcode_consensus_to_canonical_packed(&consensus).unwrap();
     assert_eq!(transcoded.as_bytes(), packed.as_bytes());
+    let shape = encode_value_shape(&value).unwrap();
+    assert_eq!(
+        ValueShape::from_bytes(shape.as_bytes()).unwrap().as_bytes(),
+        shape.as_bytes()
+    );
+    assert_eq!(
+        reconstruct_consensus(packed.as_bytes(), shape.as_bytes()).unwrap(),
+        consensus
+    );
+    let (transcoded, transcoded_shape) = transcode_consensus_with_shape(&consensus).unwrap();
+    assert_eq!(transcoded.as_bytes(), packed.as_bytes());
+    assert_eq!(transcoded_shape, shape);
     packed.into_bytes()
+}
+
+#[test]
+fn value_shape_merges_active_list_branches() {
+    let response_type = TypeSignature::new_response(
+        TypeSignature::new_option(TypeSignature::UIntType).unwrap(),
+        TypeSignature::BoolType,
+    )
+    .unwrap();
+    let list_type = ListTypeData::new_list(response_type, 8).unwrap();
+    let value = Value::list_with_type(
+        &EPOCH,
+        vec![
+            Value::okay(Value::none()).unwrap(),
+            Value::okay(Value::some(Value::UInt(17)).unwrap()).unwrap(),
+            Value::error(Value::Bool(true)).unwrap(),
+        ],
+        list_type.clone(),
+    )
+    .unwrap();
+    assert_canonical_round_trip(
+        value,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(list_type)),
+    );
+}
+
+#[test]
+fn value_shape_rejects_noncanonical_and_mismatched_descriptors() {
+    let value = Value::UInt(7);
+    let consensus = value.serialize_to_vec().unwrap();
+    let (packed, shape) = transcode_consensus_with_shape(&consensus).unwrap();
+
+    let mut trailing = shape.as_bytes().to_vec();
+    trailing.push(0);
+    assert!(ValueShape::from_bytes(&trailing).is_err());
+    assert!(reconstruct_consensus(packed.as_bytes(), &[1, 2]).is_err());
+    assert!(reconstruct_consensus(packed.as_bytes(), &[2, 1]).is_err());
+
+    let nonminimal_tuple_count = [1, 0x0c, 0x80, 0x00];
+    assert!(ValueShape::from_bytes(&nonminimal_tuple_count).is_err());
 }
 
 #[test]
@@ -741,6 +795,19 @@ proptest! {
             let decoded = validated.to_owned_value(&EPOCH).unwrap();
             let reencoded = encode_packed_value(&decoded, &expected, &EPOCH).unwrap();
             prop_assert_eq!(reencoded.as_bytes(), bytes.as_slice());
+        }
+    }
+
+    #[test]
+    fn arbitrary_packed_and_shape_bytes_fail_closed(
+        packed in prop::collection::vec(any::<u8>(), 0..512),
+        descriptor in prop::collection::vec(any::<u8>(), 0..256),
+    ) {
+        if let Ok(consensus) = reconstruct_consensus(&packed, &descriptor) {
+            let value = Value::try_deserialize_slice_exact_untyped(&consensus).unwrap();
+            let transcoded = transcode_consensus_to_canonical_packed(&consensus).unwrap();
+            prop_assert_eq!(transcoded.as_bytes(), packed.as_slice());
+            prop_assert_eq!(value.serialize_to_vec().unwrap(), consensus);
         }
     }
 }
