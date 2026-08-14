@@ -1175,8 +1175,21 @@ impl Value {
         expected: &TypeSignature,
         epoch: &StacksEpochId,
     ) -> Result<Value, SerializationError> {
+        Self::try_deserialize_slice_at_epoch(bytes, expected, epoch)
+    }
+
+    /// Epoch-aware typed deserialization from a borrowed byte slice.
+    ///
+    /// This has the same trailing-byte behavior as
+    /// [`Self::try_deserialize_bytes_at_epoch`], but permits callers to decode
+    /// directly from borrowed storage.
+    pub fn try_deserialize_slice_at_epoch(
+        bytes: &[u8],
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Value, SerializationError> {
         Self::deserialize_read_count_with_options(
-            &mut bytes.as_slice(),
+            &mut &*bytes,
             Some(expected),
             epoch.value_sanitizing(),
             TupleFieldsBehavior::from_epoch(epoch),
@@ -1218,9 +1231,19 @@ impl Value {
         expected: &TypeSignature,
         epoch: &StacksEpochId,
     ) -> Result<Value, SerializationError> {
+        Self::try_deserialize_slice_exact_at_epoch(bytes, expected, epoch)
+    }
+
+    /// Epoch-aware typed deserialization from a borrowed byte slice, requiring
+    /// the whole slice to be consumed.
+    pub fn try_deserialize_slice_exact_at_epoch(
+        bytes: &[u8],
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Value, SerializationError> {
         let input_length = bytes.len();
         let (value, read_count) = Value::deserialize_read_count_with_options(
-            &mut bytes.as_slice(),
+            &mut &*bytes,
             Some(expected),
             epoch.value_sanitizing(),
             TupleFieldsBehavior::from_epoch(epoch),

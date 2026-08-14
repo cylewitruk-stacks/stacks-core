@@ -524,6 +524,31 @@ fn try_deserialize_hex_at_epoch_selects_tuple_field_handling(
 }
 
 #[test]
+fn borrowed_slice_deserialization_matches_vec_entry_points() {
+    let value = well_formed_tuple();
+    let expected_type = TypeSignature::type_of(&value).unwrap();
+    let bytes = value.serialize_to_vec().unwrap();
+    let epoch = StacksEpochId::Epoch40;
+
+    assert_eq!(
+        Value::try_deserialize_slice_at_epoch(&bytes, &expected_type, &epoch),
+        Value::try_deserialize_bytes_at_epoch(&bytes, &expected_type, &epoch),
+    );
+    assert_eq!(
+        Value::try_deserialize_slice_exact_at_epoch(&bytes, &expected_type, &epoch),
+        Value::try_deserialize_bytes_exact_at_epoch(&bytes, &expected_type, &epoch),
+    );
+
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(Value::try_deserialize_slice_at_epoch(&trailing, &expected_type, &epoch).is_ok());
+    assert!(matches!(
+        Value::try_deserialize_slice_exact_at_epoch(&trailing, &expected_type, &epoch),
+        Err(SerializationError::LeftoverBytesInDeserialization)
+    ));
+}
+
+#[test]
 fn test_vectors() {
     let tests = [
         ("1010", Err("Bad type prefix".into())),
