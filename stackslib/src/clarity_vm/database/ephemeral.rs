@@ -795,7 +795,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 values.push(marf_value);
             }
             self.ephemeral_marf
-                .insert_batch(&keys, &values)
+                .insert_batch(&keys, values)
                 .map_err(|error| VmInternalError::MarfFailure(error.to_string()))?;
             Ok(())
         })();
@@ -843,7 +843,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 values.push(marf_value);
             }
             self.ephemeral_marf
-                .insert_batch(&keys, &values)
+                .insert_batch(&keys, values)
                 .map_err(|error| VmInternalError::MarfFailure(error.to_string()))?;
             Ok(())
         })();

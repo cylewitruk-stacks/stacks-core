@@ -158,11 +158,10 @@ impl MarfedKV {
 
     // used by benchmarks
     pub fn temporary() -> MarfedKV {
-        use rand::Rng;
         use stacks_common::util::hash::to_hex;
 
         let mut path = PathBuf::from_str("/tmp/stacks-node-tests/unit-tests-marf").unwrap();
-        let random_bytes = rand::thread_rng().gen::<[u8; 32]>();
+        let random_bytes = rand::random::<[u8; 32]>();
         path.push(to_hex(&random_bytes));
 
         debug!(
@@ -1216,7 +1215,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             values.push(marf_value);
         }
         self.marf
-            .insert_batch(&keys, &values)
+            .insert_batch(&keys, values)
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())
     }
 
