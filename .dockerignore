@@ -1,3 +1,7 @@
 Dockerfile*
 target
 .dockerignore
+.git
+docker/libp2p-poc/generated
+contrib/attacknet/generated
+contrib/attacknet/evidence

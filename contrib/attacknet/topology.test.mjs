@@ -33,8 +33,33 @@ test('mainnet profile contains legacy transport and current-main image only', ()
   assert.match(rendered, /\$\{SERVICE:bitcoin\}/);
 });
 
+test('Compose and Kubernetes renderers contain the same workload names', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-parity-'));
+  const {resource} = renderTopology(
+    buildTopology({minerCount: 2, signerCount: 3, followerCount: 2}),
+    output,
+  );
+  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
+  assert.deepEqual(
+    Object.keys(compose.services).sort(),
+    resource.spec.actors.map(actor => actor.name).sort(),
+  );
+});
+
 test('invalid counts fail before rendering', () => {
   assert.throws(() => buildTopology({minerCount: 0}), /minerCount/);
   assert.throws(() => buildTopology({signerCount: 11}), /signerCount/);
   assert.throws(() => buildTopology({followerCount: 6}), /followerCount/);
+});
+
+test('per-actor images express mixed-version and modified builds', () => {
+  const topology = buildTopology({
+    minerCount: 2,
+    signerCount: 2,
+    actorImages: {'miner-2': 'stacks:v4.0.2', 'signer-2': 'stacks:malicious'},
+  });
+  assert.equal(topology.actors.find(actor => actor.name === 'miner-1').image, 'stacks-core-attacknet:main');
+  assert.equal(topology.actors.find(actor => actor.name === 'miner-2').image, 'stacks:v4.0.2');
+  assert.equal(topology.actors.find(actor => actor.name === 'signer-2').image, 'stacks:malicious');
+  assert.throws(() => buildTopology({actorImages: {'signer-9': 'stacks:old'}}), /unknown actor/);
 });

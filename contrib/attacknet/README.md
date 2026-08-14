@@ -16,8 +16,8 @@ burnchain policy, backend adapter, assertions, and evidence capture.
   clock are separate failure domains.
 - Actor counts and inventories come from `manifest.json`; harness scripts do
   not encode a ten-signer assumption.
-- Kubernetes is canonical for adversarial runs. Compose remains a future small
-  smoke adapter, using the same manifest and assertions.
+- Kubernetes is canonical for adversarial runs. Compose is the small smoke
+  adapter; both renderers use the same model, manifest, and assertions.
 - Baseline resources are bounded. Adversarial profiles may opt out, but the
   evidence bundle must capture the admitted Pod spec so LimitRange/Quota
   mutation cannot be mistaken for an unbounded run.
@@ -48,6 +48,26 @@ node contrib/attacknet/topology.mjs \
 
 KUBE_NETWORK=attacknet-stage-1 \
   contrib/attacknet/lifecycle.sh apply contrib/attacknet/generated/stage-1
+```
+
+The same render includes `compose.yaml`, so a local smoke can instead use:
+
+```bash
+ATTACKNET_BACKEND=compose \
+ATTACKNET_COMPOSE=contrib/attacknet/generated/stage-1/compose.yaml \
+  contrib/attacknet/verify.sh \
+  contrib/attacknet/generated/stage-1/manifest.json snapshot
+```
+
+Use repeatable per-actor image overrides for an upgrade matrix or modified
+adversarial binary:
+
+```bash
+node contrib/attacknet/topology.mjs \
+  --miners=3 --signers=10 --followers=5 \
+  --actor-image=miner-3=stacks-core:v4.0.2 \
+  --actor-image=signer-10=stacks-core:malicious \
+  --output=contrib/attacknet/generated/mixed
 ```
 
 The full protocol topology has 28 actors (3 miners, 10 signer/companion pairs,
@@ -82,6 +102,18 @@ Run static and behavioral renderer checks with:
 ```bash
 contrib/attacknet/check.sh
 ```
+
+Run the clean-volume staged capacity preflight with:
+
+```bash
+contrib/attacknet/capacity-preflight.sh
+```
+
+The default stages are `1:1:1`, `2:4:2`, and `3:10:5` (miners, signers,
+followers). Each stage starts from fresh PVCs because increasing the signer
+count changes genesis balances; retaining the earlier chainstate would make the
+capacity comparison invalid. Override `ATTACKNET_CAPACITY_STAGES` for a faster
+smoke or a more gradual profile.
 
 ## Current milestone
 

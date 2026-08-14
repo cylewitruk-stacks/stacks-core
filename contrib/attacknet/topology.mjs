@@ -47,6 +47,18 @@ function option(name, fallback) {
   return process.argv.find(value => value.startsWith(marker))?.slice(marker.length) ?? fallback;
 }
 
+function repeatedMapOption(name) {
+  const marker = `--${name}=`;
+  return Object.fromEntries(process.argv.filter(value => value.startsWith(marker)).map(value => {
+    const pair = value.slice(marker.length);
+    const separator = pair.indexOf('=');
+    if (separator < 1 || separator === pair.length - 1) {
+      throw new Error(`${name} must use actor=image, received ${pair}`);
+    }
+    return [pair.slice(0, separator), pair.slice(separator + 1)];
+  }));
+}
+
 function legacyPublicKey(seedByte) {
   const key = createECDH('secp256k1');
   key.setPrivateKey(Buffer.from(repeated(seedByte), 'hex'));
@@ -192,21 +204,29 @@ function signerActor(index, signer, image) {
   };
 }
 
-export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 1, nodeImage = 'stacks-core-attacknet:main', stackerImage = 'stacks-attacknet-stacker:local'} = {}) {
+export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 1, nodeImage = 'stacks-core-attacknet:main', stackerImage = 'stacks-attacknet-stacker:local', actorImages = {}} = {}) {
   if (minerCount < 1 || minerCount > LIMITS.miners) throw new Error('minerCount out of range');
   if (signerCount < 1 || signerCount > LIMITS.signers) throw new Error('signerCount out of range');
   if (followerCount < 0 || followerCount > LIMITS.followers) throw new Error('followerCount out of range');
   const signers = SIGNERS.slice(0, signerCount);
   const actors = [];
   for (let index = 0; index < minerCount; index += 1) {
-    actors.push(nodeActor({name: `miner-${index + 1}`, role: 'miner', seedByte: MINERS[index][0], miner: true, minerIndex: index, signers, image: nodeImage}));
+    const name = `miner-${index + 1}`;
+    actors.push(nodeActor({name, role: 'miner', seedByte: MINERS[index][0], miner: true, minerIndex: index, signers, image: actorImages[name] ?? nodeImage}));
   }
   for (let index = 1; index <= signerCount; index += 1) {
-    actors.push(nodeActor({name: `signer-node-${index}`, role: 'companion', seedByte: (0x20 + index).toString(16), signerIndex: index, signers, image: nodeImage}));
-    actors.push(signerActor(index, signers[index - 1], nodeImage));
+    const companion = `signer-node-${index}`;
+    const signer = `signer-${index}`;
+    actors.push(nodeActor({name: companion, role: 'companion', seedByte: (0x20 + index).toString(16), signerIndex: index, signers, image: actorImages[companion] ?? nodeImage}));
+    actors.push(signerActor(index, signers[index - 1], actorImages[signer] ?? nodeImage));
   }
   for (let index = 1; index <= followerCount; index += 1) {
-    actors.push(nodeActor({name: `follower-${index}`, role: 'follower', seedByte: (0x30 + index).toString(16), signers, image: nodeImage}));
+    const name = `follower-${index}`;
+    actors.push(nodeActor({name, role: 'follower', seedByte: (0x30 + index).toString(16), signers, image: actorImages[name] ?? nodeImage}));
+  }
+  const knownActors = new Set(actors.map(actor => actor.name));
+  for (const name of Object.keys(actorImages)) {
+    if (!knownActors.has(name)) throw new Error(`actor image override references unknown actor ${name}`);
   }
   return {minerCount, signerCount, followerCount, nodeImage, stackerImage, actors, signers};
 }
@@ -245,6 +265,73 @@ function infrastructureActors(topology, network) {
   ];
 }
 
+function expandCompose(value, network) {
+  if (typeof value === 'string') {
+    return value
+      .replaceAll('${NETWORK}', network)
+      .replaceAll('${NAMESPACE}', 'compose')
+      .replaceAll(/\$\{SERVICE:([a-z][-a-z0-9]*[a-z0-9])\}/g, '$1');
+  }
+  if (Array.isArray(value)) return value.map(item => expandCompose(item, network));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, expandCompose(item, network)]));
+  }
+  return value;
+}
+
+function composeHealthcheck(actor) {
+  if (actor.role === 'burnchain') {
+    return {test: ['CMD', 'bitcoin-cli', '-regtest', '-rpcuser=devnet', '-rpcpassword=devnet', 'getblockchaininfo'], interval: '5s', timeout: '3s', retries: 90};
+  }
+  if (actor.name === 'bitcoin-miner') {
+    return {test: ['CMD-SHELL', 'curl --fail --silent http://127.0.0.1:18500/ >/dev/null'], interval: '3s', timeout: '2s', retries: 90};
+  }
+  if (actor.role === 'signer' || actor.name === 'stacker') {
+    return {test: ['CMD-SHELL', 'test -r /proc/1/status'], interval: '5s', timeout: '2s', retries: 60};
+  }
+  return {test: ['CMD-SHELL', 'curl --fail --silent http://127.0.0.1:20443/v2/info >/dev/null'], interval: '5s', timeout: '3s', retries: 180};
+}
+
+function renderCompose(actors, output, network) {
+  const services = {};
+  const volumes = {};
+  const configsRoot = join(output, 'configs');
+  mkdirSync(configsRoot, {recursive: true});
+  for (const original of actors) {
+    const actor = expandCompose(original, network);
+    const serviceSpec = {
+      image: actor.image,
+      restart: 'unless-stopped',
+      environment: Object.fromEntries((actor.env ?? []).map(item => [item.name, item.value])),
+      healthcheck: composeHealthcheck(actor),
+    };
+    if (actor.command) serviceSpec.entrypoint = actor.command;
+    if (actor.args) serviceSpec.command = actor.args;
+    if (actor.dependencies?.length) {
+      serviceSpec.depends_on = Object.fromEntries(actor.dependencies.map(item => [item.actor, {condition: 'service_started'}]));
+    }
+    const mounts = [];
+    if (actor.config?.files) {
+      const actorDirectory = join(configsRoot, actor.name);
+      mkdirSync(actorDirectory, {recursive: true});
+      for (const [filename, contents] of Object.entries(actor.config.files)) {
+        writeFileSync(join(actorDirectory, filename), expandCompose(contents, network));
+        mounts.push(`./configs/${actor.name}/${filename}:${actor.config.mountPath}/${filename}:ro`);
+      }
+    }
+    if (actor.runtimePolicy) mounts.push(`./policy.env:${actor.runtimePolicy.mountPath}/policy.env:ro`);
+    if (actor.storage?.enabled) {
+      const volume = `${actor.name}-data`;
+      mounts.push(`${volume}:${actor.storage.mountPath}`);
+      volumes[volume] = {};
+    }
+    if (mounts.length) serviceSpec.volumes = mounts;
+    services[actor.name] = serviceSpec;
+  }
+  const compose = {name: network, services, volumes};
+  writeFileSync(join(output, 'compose.yaml'), `${JSON.stringify(compose, null, 2)}\n`);
+}
+
 export function renderTopology(topology, output, {network = 'attacknet', namespace = 'hacknet-system'} = {}) {
   mkdirSync(output, {recursive: true});
   const actors = [...infrastructureActors(topology, network), ...topology.actors];
@@ -271,6 +358,8 @@ export function renderTopology(topology, output, {network = 'attacknet', namespa
   writeFileSync(join(output, 'stacksnetwork.json'), `${JSON.stringify(resource, null, 2)}\n`);
   writeFileSync(join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(join(output, 'burnchain-policy.configmap.json'), `${JSON.stringify(policy, null, 2)}\n`);
+  writeFileSync(join(output, 'policy.env'), policy.data['policy.env']);
+  renderCompose(actors, output, network);
   return {resource, manifest, policy};
 }
 
@@ -281,6 +370,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     followerCount: parseCount('followers', 1, LIMITS.followers),
     nodeImage: option('node-image', 'stacks-core-attacknet:main'),
     stackerImage: option('stacker-image', 'stacks-attacknet-stacker:local'),
+    actorImages: repeatedMapOption('actor-image'),
   });
   const output = resolve(option('output', join(ROOT, 'generated')));
   renderTopology(topology, output, {network: option('network', 'attacknet'), namespace: option('namespace', 'hacknet-system')});
