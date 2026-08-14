@@ -14,6 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 mod serialization;
 mod signatures;
+mod storage;
 
 use rstest::rstest;
 use stacks_common::types::StacksEpochId;

@@ -16,6 +16,7 @@
 
 #[cfg(feature = "rusqlite")]
 use rusqlite::Connection;
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::{Sha512Trunc256Sum, hex_bytes, to_hex};
 
@@ -26,7 +27,40 @@ use crate::vm::database::{
     ClarityDatabase, ClarityDeserializable, ClaritySerializable, NULL_BURN_STATE_DB, NULL_HEADER_DB,
 };
 use crate::vm::errors::{VmExecutionError, VmInternalError};
-use crate::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use crate::vm::types::{PrincipalData, QualifiedContractIdentifier, TypeSignature};
+
+/// Schema and value retained for a typed Clarity value write.
+#[derive(Clone, Debug)]
+pub struct TypedValueData {
+    /// Sanitized runtime value whose consensus bytes equal [`DataStoreEntry::canonical`].
+    pub value: Value,
+    /// Declared schema used to encode and later interpret the physical payload.
+    pub expected: TypeSignature,
+    /// Epoch governing typed deserialization of this value.
+    pub epoch: StacksEpochId,
+    /// Exact consensus serialization, retained so commit-time encoders do not serialize twice.
+    pub consensus: Vec<u8>,
+}
+
+/// One logical key/value edit committed by a backing store.
+#[derive(Clone, Debug)]
+pub struct DataStoreEntry {
+    /// Logical MARF key.
+    pub key: String,
+    /// Exact lowercase canonical string used to derive the MARF value hash.
+    pub canonical: String,
+    /// Typed value metadata when this edit originated from a Clarity `Value` write.
+    pub typed: Option<TypedValueData>,
+}
+
+/// A typed value returned directly by a backing store.
+#[derive(Debug)]
+pub struct TypedValueResult {
+    /// Materialized runtime value.
+    pub value: Value,
+    /// Length of the equivalent consensus serialization.
+    pub serialized_byte_len: u64,
+}
 
 pub struct NullBackingStore {}
 
@@ -51,12 +85,49 @@ pub type SpecialCaseHandler = &'static dyn Fn(
 //    will _panic_. The rationale for this is that under no condition should the interpreter
 //    attempt to continue processing in the event of an unexpected storage error.
 pub trait ClarityBackingStore {
+    /// Whether writes should retain typed values for an alternate physical representation.
+    fn stores_typed_values(&self) -> bool {
+        false
+    }
+
     /// put K-V data into the committed datastore
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError>;
+    /// Commit logical edits while retaining typed values for physical encodings that need them.
+    fn put_all_data_entries(
+        &mut self,
+        entries: Vec<DataStoreEntry>,
+    ) -> Result<(), VmExecutionError> {
+        self.put_all_data(
+            entries
+                .into_iter()
+                .map(|entry| (entry.key, entry.canonical))
+                .collect(),
+        )
+    }
     /// fetch K-V out of the committed datastore
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError>;
     /// fetch Hash(K)-V out of the commmitted datastore
     fn get_data_from_path(&mut self, hash: &TrieHash) -> Result<Option<String>, VmExecutionError>;
+    /// Fetch and decode a declared Clarity value.
+    ///
+    /// Stores with a typed physical representation override this method. The default preserves the
+    /// legacy canonical-string behavior.
+    fn get_typed_value(
+        &mut self,
+        key: &str,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Option<TypedValueResult>, VmExecutionError> {
+        let Some(canonical) = self.get_data(key)? else {
+            return Ok(None);
+        };
+        let value = Value::try_deserialize_hex_at_epoch(&canonical, expected, epoch)
+            .map_err(|error| VmInternalError::DBError(error.to_string()))?;
+        Ok(Some(TypedValueResult {
+            value,
+            serialized_byte_len: canonical.len() as u64 / 2,
+        }))
+    }
     /// fetch K-V out of the committed datastore, along with the byte representation
     ///  of the Merkle proof for that key-value pair
     fn get_data_with_proof(

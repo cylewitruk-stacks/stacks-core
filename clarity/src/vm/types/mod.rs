@@ -25,7 +25,7 @@ pub use clarity_types::types::{
     CallableData, CharType, ContractIdentifier, ListData, MAX_TYPE_DEPTH, MAX_VALUE_SIZE, NONE,
     OptionalData, PrincipalData, QualifiedContractIdentifier, ResponseData, SequenceData,
     SequencedValue, StacksAddressExtensions, TraitIdentifier, TupleData, UTF8Data, Value,
-    WRAPPER_VALUE_SIZE, byte_len_of_serialization,
+    WRAPPER_VALUE_SIZE, byte_len_of_serialization, storage,
 };
 
 pub use self::std_principals::StandardPrincipalData;

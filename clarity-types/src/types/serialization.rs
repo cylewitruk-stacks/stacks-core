@@ -1170,6 +1170,7 @@ impl Value {
     /// Behaves like [`Self::try_deserialize_bytes`], selecting historical
     /// tuple-field handling before Epoch 4.1 and exact field-set enforcement
     /// from Epoch 4.1 onward.
+    #[allow(clippy::ptr_arg)]
     pub fn try_deserialize_bytes_at_epoch(
         bytes: &Vec<u8>,
         expected: &TypeSignature,
@@ -1226,6 +1227,7 @@ impl Value {
     /// requiring the whole buffer to be consumed. Sanitization (Epoch 2.4+) and
     /// strict typed-tuple field enforcement (Epoch 4.1+) are derived from `epoch`
     /// so consensus behavior is gated entirely by the execution epoch.
+    #[allow(clippy::ptr_arg)]
     pub fn try_deserialize_bytes_exact_at_epoch(
         bytes: &Vec<u8>,
         expected: &TypeSignature,
