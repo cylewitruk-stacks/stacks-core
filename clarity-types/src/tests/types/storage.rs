@@ -13,8 +13,10 @@ use stacks_common::types::StacksEpochId;
 use crate::representations::{ClarityName, ContractName};
 use crate::types::signatures::CallableSubtype;
 use crate::types::storage::{
-    PACKED_VALUE_HEADER_LEN, decode_packed_value, encode_packed_value, packed_int_width,
-    packed_uint_width, validate_packed_value,
+    PACKED_VALUE_HEADER_LEN, StructuralValidation, decode_canonical_packed, decode_packed_value,
+    encode_canonical_packed_value, encode_canonical_packed_value_with_consensus_len,
+    encode_packed_value, packed_int_width, packed_uint_width,
+    transcode_consensus_to_canonical_packed, validate_canonical_packed, validate_packed_value,
 };
 use crate::types::{
     CallableData, ListTypeData, PrincipalData, QualifiedContractIdentifier, SequenceSubtype,
@@ -45,6 +47,320 @@ fn assert_round_trip(value: Value, expected: TypeSignature) -> Vec<u8> {
     assert_eq!(decoded.value, value);
     assert_eq!(decoded.value.serialize_to_vec().unwrap(), consensus);
     packed.into_bytes()
+}
+
+fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8> {
+    let consensus = value.serialize_to_vec().unwrap();
+    let packed =
+        encode_canonical_packed_value(&value, &expected, &EPOCH, StructuralValidation::Enabled)
+            .unwrap();
+    validate_canonical_packed(packed.as_bytes(), &expected, &EPOCH).unwrap();
+    let decoded = decode_canonical_packed(packed.as_bytes(), &expected, &EPOCH).unwrap();
+    assert_eq!(decoded.value, value);
+    assert_eq!(decoded.value.serialize_to_vec().unwrap(), consensus);
+    assert_eq!(decoded.consensus_byte_len, consensus.len() as u32);
+    let transcoded = transcode_consensus_to_canonical_packed(&consensus).unwrap();
+    assert_eq!(transcoded.as_bytes(), packed.as_bytes());
+    packed.into_bytes()
+}
+
+#[test]
+fn canonical_round_trips_all_runtime_shapes() {
+    assert_canonical_round_trip(Value::Int(-129), TypeSignature::IntType);
+    assert_canonical_round_trip(Value::UInt(65_536), TypeSignature::UIntType);
+    assert_canonical_round_trip(Value::Bool(true), TypeSignature::BoolType);
+
+    let buffer_type =
+        TypeSignature::SequenceType(SequenceSubtype::BufferType(32u32.try_into().unwrap()));
+    assert_canonical_round_trip(Value::buff_from(vec![1, 2, 3]).unwrap(), buffer_type);
+
+    let optional = TypeSignature::new_option(TypeSignature::UIntType).unwrap();
+    assert_canonical_round_trip(Value::none(), optional.clone());
+    assert_canonical_round_trip(Value::some(Value::UInt(7)).unwrap(), optional);
+
+    let response =
+        TypeSignature::new_response(TypeSignature::BoolType, TypeSignature::UIntType).unwrap();
+    assert_canonical_round_trip(Value::okay(Value::Bool(true)).unwrap(), response.clone());
+    assert_canonical_round_trip(Value::error(Value::UInt(9)).unwrap(), response);
+
+    let tuple = TupleData::from_data(vec![
+        (ClarityName::from_literal("active"), Value::Bool(true)),
+        (ClarityName::from_literal("amount"), Value::UInt(42)),
+    ])
+    .unwrap();
+    let tuple_type = TupleTypeSignature::try_from(vec![
+        (ClarityName::from_literal("active"), TypeSignature::BoolType),
+        (ClarityName::from_literal("amount"), TypeSignature::UIntType),
+    ])
+    .unwrap();
+    assert_canonical_round_trip(Value::Tuple(tuple), TypeSignature::TupleType(tuple_type));
+
+    let list_type = ListTypeData::new_list(TypeSignature::UIntType, 8).unwrap();
+    let list = Value::list_with_type(
+        &EPOCH,
+        vec![Value::UInt(0), Value::UInt(255), Value::UInt(256)],
+        list_type.clone(),
+    )
+    .unwrap();
+    assert_canonical_round_trip(
+        list,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(list_type)),
+    );
+
+    let int_list_type = ListTypeData::new_list(TypeSignature::IntType, 4).unwrap();
+    let int_list = Value::list_with_type(
+        &EPOCH,
+        vec![Value::Int(i128::MIN), Value::Int(0), Value::Int(i128::MAX)],
+        int_list_type.clone(),
+    )
+    .unwrap();
+    assert_canonical_round_trip(
+        int_list,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(int_list_type)),
+    );
+
+    let bool_list_type = ListTypeData::new_list(TypeSignature::BoolType, 9).unwrap();
+    let bool_list = Value::list_with_type(
+        &EPOCH,
+        (0..9).map(|index| Value::Bool(index % 2 == 0)).collect(),
+        bool_list_type.clone(),
+    )
+    .unwrap();
+    assert_canonical_round_trip(
+        bool_list,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(bool_list_type)),
+    );
+
+    let ascii = Value::string_ascii_from_bytes(b"track-c".to_vec()).unwrap();
+    assert_canonical_round_trip(
+        ascii,
+        TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::ASCII(
+            32u32.try_into().unwrap(),
+        ))),
+    );
+    let utf8 = Value::string_utf8_from_bytes("Hej, 世界".as_bytes().to_vec()).unwrap();
+    assert_canonical_round_trip(
+        utf8,
+        TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::UTF8(
+            32u32.try_into().unwrap(),
+        ))),
+    );
+
+    assert_canonical_round_trip(
+        Value::Principal(PrincipalData::Standard(standard_principal(1))),
+        TypeSignature::PrincipalType,
+    );
+    assert_canonical_round_trip(
+        Value::Principal(PrincipalData::Contract(contract(2, "pool"))),
+        TypeSignature::PrincipalType,
+    );
+
+    let trait_id = TraitIdentifier::new(
+        standard_principal(4),
+        ContractName::from_literal("trait-contract"),
+        ClarityName::from_literal("transferable"),
+    );
+    let callable = Value::CallableContract(CallableData {
+        contract_identifier: contract(5, "implementation"),
+        trait_identifier: Some(Box::new(trait_id.clone())),
+    });
+    let callable_bytes = assert_canonical_round_trip(
+        callable.clone(),
+        TypeSignature::CallableType(CallableSubtype::Trait(trait_id.clone())),
+    );
+    assert_eq!(
+        callable_bytes,
+        assert_canonical_round_trip(callable, TypeSignature::TraitReferenceType(trait_id))
+    );
+}
+
+#[test]
+fn canonical_bytes_ignore_bounds_inactive_branches_and_callable_view() {
+    let value = Value::buff_from(vec![1, 2, 3]).unwrap();
+    let short = TypeSignature::SequenceType(SequenceSubtype::BufferType(3u32.try_into().unwrap()));
+    let long =
+        TypeSignature::SequenceType(SequenceSubtype::BufferType(1024u32.try_into().unwrap()));
+    let short_bytes = assert_canonical_round_trip(value.clone(), short);
+    let long_bytes = assert_canonical_round_trip(value, long);
+    assert_eq!(short_bytes, long_bytes);
+
+    let value = Value::okay(Value::Bool(true)).unwrap();
+    let narrow =
+        TypeSignature::new_response(TypeSignature::BoolType, TypeSignature::BoolType).unwrap();
+    let wide = TypeSignature::new_response(
+        TypeSignature::BoolType,
+        TypeSignature::SequenceType(SequenceSubtype::BufferType(1024u32.try_into().unwrap())),
+    )
+    .unwrap();
+    assert_eq!(
+        assert_canonical_round_trip(value.clone(), narrow),
+        assert_canonical_round_trip(value, wide)
+    );
+
+    let contract = contract(9, "canonical-callable");
+    let principal = Value::Principal(PrincipalData::Contract(contract.clone()));
+    let callable = Value::CallableContract(CallableData {
+        contract_identifier: contract.clone(),
+        trait_identifier: None,
+    });
+    let principal_bytes = assert_canonical_round_trip(principal, TypeSignature::PrincipalType);
+    let callable_bytes = assert_canonical_round_trip(
+        callable,
+        TypeSignature::CallableType(CallableSubtype::Principal(contract)),
+    );
+    assert_eq!(principal_bytes, callable_bytes);
+}
+
+#[test]
+fn canonical_empty_lists_and_parent_framing_are_schema_independent() {
+    let bool_list = ListTypeData::new_list(TypeSignature::BoolType, 8).unwrap();
+    let uint_list = ListTypeData::new_list(TypeSignature::UIntType, 1024).unwrap();
+    let bool_value = Value::list_with_type(&EPOCH, vec![], bool_list.clone()).unwrap();
+    let uint_value = Value::list_with_type(&EPOCH, vec![], uint_list.clone()).unwrap();
+    assert_eq!(
+        bool_value.serialize_to_vec().unwrap(),
+        uint_value.serialize_to_vec().unwrap()
+    );
+    assert_eq!(
+        assert_canonical_round_trip(
+            bool_value,
+            TypeSignature::SequenceType(SequenceSubtype::ListType(bool_list)),
+        ),
+        assert_canonical_round_trip(
+            uint_value,
+            TypeSignature::SequenceType(SequenceSubtype::ListType(uint_list)),
+        )
+    );
+
+    let value = Value::Tuple(
+        TupleData::from_data(vec![
+            (
+                ClarityName::from_literal("a"),
+                Value::okay(Value::Bool(true)).unwrap(),
+            ),
+            (ClarityName::from_literal("b"), Value::Bool(true)),
+        ])
+        .unwrap(),
+    );
+    let narrow = TupleTypeSignature::try_from(vec![
+        (
+            ClarityName::from_literal("a"),
+            TypeSignature::new_response(TypeSignature::BoolType, TypeSignature::BoolType).unwrap(),
+        ),
+        (ClarityName::from_literal("b"), TypeSignature::BoolType),
+    ])
+    .unwrap();
+    let wide = TupleTypeSignature::try_from(vec![
+        (
+            ClarityName::from_literal("a"),
+            TypeSignature::new_response(
+                TypeSignature::BoolType,
+                TypeSignature::SequenceType(SequenceSubtype::BufferType(
+                    1024u32.try_into().unwrap(),
+                )),
+            )
+            .unwrap(),
+        ),
+        (ClarityName::from_literal("b"), TypeSignature::BoolType),
+    ])
+    .unwrap();
+    assert_eq!(
+        assert_canonical_round_trip(value.clone(), TypeSignature::TupleType(narrow)),
+        assert_canonical_round_trip(value, TypeSignature::TupleType(wide))
+    );
+}
+
+#[test]
+fn canonical_zero_integers_use_one_byte_scalars_and_lanes() {
+    let uint_zero = assert_canonical_round_trip(Value::UInt(0), TypeSignature::UIntType);
+    assert_eq!(uint_zero, [17, 0, 0, 0, 0]);
+
+    let int_zero = assert_canonical_round_trip(Value::Int(0), TypeSignature::IntType);
+    assert_eq!(int_zero, [17, 0, 0, 0, 0]);
+
+    for (element_type, values) in [
+        (TypeSignature::UIntType, vec![Value::UInt(0); 2]),
+        (TypeSignature::IntType, vec![Value::Int(0); 2]),
+    ] {
+        let list_type = ListTypeData::new_list(element_type, 2).unwrap();
+        let value = Value::list_with_type(&EPOCH, values, list_type.clone()).unwrap();
+        let expected = TypeSignature::SequenceType(SequenceSubtype::ListType(list_type));
+        let packed = assert_canonical_round_trip(value, expected);
+        assert_eq!(packed, [39, 0, 0, 0, 2, 0, 0, 0, 0, 0]);
+    }
+}
+
+#[test]
+fn canonical_decoder_rejects_empty_and_non_minimal_zero_integers() {
+    let empty_scalar = 17u32.to_le_bytes();
+    for expected in [TypeSignature::UIntType, TypeSignature::IntType] {
+        assert!(decode_canonical_packed(&empty_scalar, &expected, &EPOCH).is_err());
+
+        let mut wide_scalar = empty_scalar.to_vec();
+        wide_scalar.extend_from_slice(&[0, 0]);
+        assert!(decode_canonical_packed(&wide_scalar, &expected, &EPOCH).is_err());
+
+        let list_type = ListTypeData::new_list(expected, 2).unwrap();
+        let expected = TypeSignature::SequenceType(SequenceSubtype::ListType(list_type));
+        let mut wide_lane = 39u32.to_le_bytes().to_vec();
+        wide_lane.extend_from_slice(&2u32.to_le_bytes());
+        wide_lane.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(decode_canonical_packed(&wide_lane, &expected, &EPOCH).is_err());
+    }
+}
+
+#[test]
+fn canonical_transcoder_requires_exact_consensus_consumption() {
+    let mut consensus = Value::UInt(1).serialize_to_vec().unwrap();
+    consensus.push(0);
+    assert!(transcode_consensus_to_canonical_packed(&consensus).is_err());
+}
+
+#[test]
+fn canonical_supplied_consensus_length_matches_regular_encoding() {
+    let value = Value::some(Value::UInt(7)).unwrap();
+    let expected = TypeSignature::new_option(TypeSignature::UIntType).unwrap();
+    let consensus_len = value.serialize_to_vec().unwrap().len() as u32;
+    let regular =
+        encode_canonical_packed_value(&value, &expected, &EPOCH, StructuralValidation::Enabled)
+            .unwrap();
+    let supplied = encode_canonical_packed_value_with_consensus_len(
+        &value,
+        &expected,
+        &EPOCH,
+        consensus_len,
+        StructuralValidation::Enabled,
+    )
+    .unwrap();
+    assert_eq!(supplied.as_bytes(), regular.as_bytes());
+
+    assert!(
+        encode_canonical_packed_value_with_consensus_len(
+            &value,
+            &expected,
+            &EPOCH,
+            consensus_len - 1,
+            StructuralValidation::Enabled,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn canonical_decoder_rejects_header_and_body_corruption() {
+    let value = Value::some(Value::UInt(7)).unwrap();
+    let expected = TypeSignature::new_option(TypeSignature::UIntType).unwrap();
+    let packed = assert_canonical_round_trip(value, expected.clone());
+
+    let mut wrong_length = packed.clone();
+    wrong_length[..4].copy_from_slice(&1u32.to_le_bytes());
+    assert!(decode_canonical_packed(&wrong_length, &expected, &EPOCH).is_err());
+
+    let mut invalid_tag = packed.clone();
+    invalid_tag[PACKED_VALUE_HEADER_LEN] = 2;
+    assert!(decode_canonical_packed(&invalid_tag, &expected, &EPOCH).is_err());
+
+    assert!(decode_canonical_packed(&packed[..packed.len() - 1], &expected, &EPOCH).is_err());
 }
 
 #[test]
@@ -351,6 +667,8 @@ proptest! {
     ) {
         assert_round_trip(Value::Int(signed), TypeSignature::IntType);
         assert_round_trip(Value::UInt(unsigned), TypeSignature::UIntType);
+        assert_canonical_round_trip(Value::Int(signed), TypeSignature::IntType);
+        assert_canonical_round_trip(Value::UInt(unsigned), TypeSignature::UIntType);
 
         let signed_type = ListTypeData::new_list(TypeSignature::IntType, 64).unwrap();
         let signed_value = Value::list_with_type(
@@ -359,6 +677,11 @@ proptest! {
             signed_type.clone(),
         ).unwrap();
         assert_round_trip(
+            signed_value.clone(),
+            TypeSignature::SequenceType(SequenceSubtype::ListType(signed_type)),
+        );
+        let signed_type = ListTypeData::new_list(TypeSignature::IntType, 64).unwrap();
+        assert_canonical_round_trip(
             signed_value,
             TypeSignature::SequenceType(SequenceSubtype::ListType(signed_type)),
         );
@@ -370,6 +693,11 @@ proptest! {
             unsigned_type.clone(),
         ).unwrap();
         assert_round_trip(
+            unsigned_value.clone(),
+            TypeSignature::SequenceType(SequenceSubtype::ListType(unsigned_type)),
+        );
+        let unsigned_type = ListTypeData::new_list(TypeSignature::UIntType, 64).unwrap();
+        assert_canonical_round_trip(
             unsigned_value,
             TypeSignature::SequenceType(SequenceSubtype::ListType(unsigned_type)),
         );
@@ -381,6 +709,11 @@ proptest! {
             bool_type.clone(),
         ).unwrap();
         assert_round_trip(
+            bool_value.clone(),
+            TypeSignature::SequenceType(SequenceSubtype::ListType(bool_type)),
+        );
+        let bool_type = ListTypeData::new_list(TypeSignature::BoolType, 128).unwrap();
+        assert_canonical_round_trip(
             bool_value,
             TypeSignature::SequenceType(SequenceSubtype::ListType(bool_type)),
         );

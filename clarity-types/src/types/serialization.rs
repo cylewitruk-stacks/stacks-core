@@ -1266,6 +1266,25 @@ impl Value {
         Value::deserialize_read(&mut bytes.as_slice(), None, false)
     }
 
+    /// Deserialize exactly one self-describing consensus value from a borrowed
+    /// byte slice without applying a declared type.
+    ///
+    /// This is intended for offline physical-storage migration. Consensus VM
+    /// reads must continue using the epoch-aware typed entry points.
+    pub fn try_deserialize_slice_exact_untyped(bytes: &[u8]) -> Result<Value, SerializationError> {
+        let (value, read_count) = Value::deserialize_read_count_with_options(
+            &mut &*bytes,
+            None,
+            false,
+            TupleFieldsBehavior::LEGACY,
+        )?;
+        if read_count != bytes.len() as u64 {
+            Err(SerializationError::LeftoverBytesInDeserialization)
+        } else {
+            Ok(value)
+        }
+    }
+
     /// Try to deserialize a value from a hex string without type information. This *does not*
     /// perform sanitization.
     pub fn try_deserialize_hex_untyped(hex: &str) -> Result<Value, SerializationError> {

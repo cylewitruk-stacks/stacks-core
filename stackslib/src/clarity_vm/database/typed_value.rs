@@ -7,9 +7,8 @@
 
 //! Experimental typed Clarity value side storage used by whole-block comparisons.
 
-use std::env;
-use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{env, mem};
 
 use clarity::vm::database::{TypedValueData, TypedValueResult};
 use clarity::vm::errors::{VmExecutionError, VmInternalError};
@@ -22,6 +21,7 @@ use rusqlite::{params, Connection};
 use stacks_common::types::StacksEpochId;
 
 use crate::chainstate::stacks::index::MARFValue;
+use crate::clarity_vm::database::track_c;
 
 const MODE_ENV: &str = "STACKS_CLARITY_VALUE_STORAGE";
 
@@ -62,6 +62,10 @@ pub enum TypedValueStorageMode {
     ConsensusBytes,
     /// The smaller of raw consensus bytes and packed typed bytes.
     PackedTyped,
+    /// Raw consensus bytes in the production-shaped replacement `data_table`.
+    CanonicalConsensus,
+    /// Canonical Track C packed values in the production-shaped `data_table`.
+    CanonicalPacked,
 }
 
 impl TypedValueStorageMode {
@@ -70,7 +74,9 @@ impl TypedValueStorageMode {
         match env::var(MODE_ENV).as_deref() {
             Ok("integrated-hex") => Ok(Self::IntegratedHex),
             Ok("track-a") => Ok(Self::ConsensusBytes),
+            Ok("track-a-data-table") => Ok(Self::CanonicalConsensus),
             Ok("track-b") => Ok(Self::PackedTyped),
+            Ok("track-c") => Ok(Self::CanonicalPacked),
             Ok("current") | Err(env::VarError::NotPresent) => Ok(Self::Current),
             Ok(value) => {
                 Err(VmInternalError::Expect(format!("invalid {MODE_ENV} value '{value}'")).into())
@@ -84,6 +90,11 @@ impl TypedValueStorageMode {
     /// Whether this arm uses the experimental typed table.
     pub fn is_integrated(self) -> bool {
         self != Self::Current
+    }
+
+    /// Whether this mode replaces the legacy text-keyed `data_table`.
+    pub fn uses_canonical_data_table(self) -> bool {
+        matches!(self, Self::CanonicalConsensus | Self::CanonicalPacked)
     }
 }
 
@@ -115,10 +126,21 @@ pub fn counters() -> TypedValueStorageCounters {
 
 /// Create the experimental table for an integrated arm.
 pub fn initialize(conn: &Connection, mode: TypedValueStorageMode) -> Result<(), VmExecutionError> {
-    if !mode.is_integrated() {
-        return Ok(());
+    match mode {
+        TypedValueStorageMode::CanonicalConsensus => {
+            return track_c::initialize(conn, track_c::ReplacementWritePolicy::ConsensusBytes);
+        }
+        TypedValueStorageMode::CanonicalPacked => {
+            return track_c::initialize(conn, track_c::ReplacementWritePolicy::CanonicalPacked);
+        }
+        TypedValueStorageMode::Current
+        | TypedValueStorageMode::IntegratedHex
+        | TypedValueStorageMode::ConsensusBytes
+        | TypedValueStorageMode::PackedTyped => track_c::reject_if_present(conn)?,
     }
-    conn.execute(CREATE_TABLE_SQL, []).map_err(sql_error)?;
+    if mode.is_integrated() {
+        conn.execute(CREATE_TABLE_SQL, []).map_err(sql_error)?;
+    }
     Ok(())
 }
 
@@ -131,6 +153,22 @@ pub fn put(
     mut typed: TypedValueData,
 ) -> Result<(), VmExecutionError> {
     debug_assert!(mode.is_integrated());
+    if mode.uses_canonical_data_table() {
+        let result = if mode == TypedValueStorageMode::CanonicalPacked {
+            track_c::put_typed(conn, value_hash, canonical, typed)
+        } else {
+            track_c::put_typed_consensus(conn, value_hash, canonical, typed)
+        };
+        if result.is_ok() {
+            WRITES.fetch_add(1, Ordering::Relaxed);
+            if mode == TypedValueStorageMode::CanonicalPacked {
+                PACKED_WRITES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                RAW_WRITES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return result;
+    }
     if !matches_canonical_hex(&typed.consensus, canonical) {
         return Err(VmInternalError::Expect(
             "typed value does not reproduce its canonical MARF payload".into(),
@@ -278,6 +316,13 @@ pub fn get(
     epoch: &StacksEpochId,
 ) -> Result<Option<TypedValueResult>, VmExecutionError> {
     debug_assert!(mode.is_integrated());
+    if mode.uses_canonical_data_table() {
+        let result = track_c::get_typed(conn, value_hash, expected, epoch)?;
+        if result.is_some() {
+            READ_HITS.fetch_add(1, Ordering::Relaxed);
+        }
+        return Ok(result);
+    }
     let mut statement = conn.prepare_cached(GET_SQL).map_err(sql_error)?;
     let mut rows = statement
         .query(params![value_hash.as_bytes()])
@@ -351,6 +396,12 @@ fn encode_payload(
                     bytes: mem::take(&mut typed.consensus),
                 })
             }
+        }
+        TypedValueStorageMode::CanonicalConsensus => {
+            unreachable!("replacement Track A encoding is handled by track_c::put_typed_consensus")
+        }
+        TypedValueStorageMode::CanonicalPacked => {
+            unreachable!("Track C encoding is handled by track_c::put_typed")
         }
     }
 }

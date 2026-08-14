@@ -575,10 +575,10 @@ impl RollbackWrapper<'_> {
         let stored_data = self
             .store
             .get_typed_value(key, expected, epoch)
-            .map_err(|_| {
-                SerializationError::DeserializationFailure(
-                    "ERROR: Clarity backing store failure".into(),
-                )
+            .map_err(|error| {
+                SerializationError::DeserializationFailure(format!(
+                    "ERROR: Clarity backing store failure for key {key}: {error}"
+                ))
             })?;
         Ok(stored_data.map(
             |TypedValueResult {

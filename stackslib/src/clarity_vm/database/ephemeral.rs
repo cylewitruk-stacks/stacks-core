@@ -20,13 +20,16 @@ use clarity::vm::database::sqlite::{
     sqlite_get_contract_hash, sqlite_get_metadata, sqlite_get_metadata_manual,
     sqlite_insert_metadata,
 };
-use clarity::vm::database::{ClarityBackingStore, SpecialCaseHandler, SqliteConnection};
+use clarity::vm::database::{
+    ClarityBackingStore, DataStoreEntry, SpecialCaseHandler, SqliteConnection, TypedValueResult,
+};
 use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
-use clarity::vm::types::QualifiedContractIdentifier;
+use clarity::vm::types::{QualifiedContractIdentifier, TypeSignature};
 use rusqlite::{self, Connection};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
 use stacks_common::types::sqlite::NO_PARAMS;
+use stacks_common::types::StacksEpochId;
 
 use crate::chainstate::stacks::index::marf::{MarfConnection, MarfTransaction, MARF};
 use crate::chainstate::stacks::index::{Error, MARFValue};
@@ -34,6 +37,8 @@ use crate::clarity_vm::clarity::{
     ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
 };
 use crate::clarity_vm::database::marf::ReadOnlyMarfStore;
+use crate::clarity_vm::database::track_c;
+use crate::clarity_vm::database::typed_value::{self, TypedValueStorageMode};
 use crate::clarity_vm::special::handle_contract_call_special_cases;
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 
@@ -55,6 +60,8 @@ pub struct EphemeralMarfStore<'a> {
     ephemeral_marf: MarfTransaction<'a, StacksBlockId>,
     /// Handle to on-disk MARF
     read_only_marf: ReadOnlyMarfStore<'a>,
+    /// Physical value format shared by the RAM and attached stores.
+    value_storage_mode: TypedValueStorageMode,
 }
 
 impl ClarityMarfStore for EphemeralMarfStore<'_> {}
@@ -224,6 +231,7 @@ impl<'a> EphemeralMarfStore<'a> {
         mut read_only_marf: ReadOnlyMarfStore<'a>,
         ephemeral_marf_tx: MarfTransaction<'a, StacksBlockId>,
     ) -> Result<Self, Error> {
+        let value_storage_mode = read_only_marf.value_storage_mode();
         let base_tip_height = read_only_marf.get_current_block_height();
         let ephemeral_tip = ephemeral_marf_tx
             .get_open_chain_tip()
@@ -235,6 +243,7 @@ impl<'a> EphemeralMarfStore<'a> {
             base_tip_height,
             ephemeral_marf: ephemeral_marf_tx,
             read_only_marf,
+            value_storage_mode,
         };
 
         // setup views so that the ephemeral MARF's data and metadata tables show all MARF
@@ -272,7 +281,18 @@ impl<'a> EphemeralMarfStore<'a> {
             NO_PARAMS,
         )
         .expect("FATAL: failed to rename metadata_table to ephemeral_metadata_table");
-        conn.execute("CREATE TEMP VIEW data_table(key, value) AS SELECT * FROM main.ephemeral_data_table UNION SELECT * FROM read_only_marf.data_table", NO_PARAMS)
+        let data_view = if self.value_storage_mode.uses_canonical_data_table() {
+            "CREATE TEMP VIEW data_table(value_hash, record) AS
+             SELECT value_hash, record FROM main.ephemeral_data_table
+             UNION
+             SELECT value_hash, record FROM read_only_marf.data_table"
+        } else {
+            "CREATE TEMP VIEW data_table(key, value) AS
+             SELECT key, value FROM main.ephemeral_data_table
+             UNION
+             SELECT key, value FROM read_only_marf.data_table"
+        };
+        conn.execute(data_view, NO_PARAMS)
             .expect("FATAL: failed to setup temp view data_table on ephemeral MARF DB");
         conn.execute("CREATE TEMP VIEW metadata_table(key, blockhash, value) AS SELECT * FROM main.ephemeral_metadata_table UNION SELECT * FROM read_only_marf.metadata_table", NO_PARAMS)
             .expect("FATAL: failed to setup temp view metadata_table on ephemeral MARF DB");
@@ -371,6 +391,61 @@ impl<'a> EphemeralMarfStore<'a> {
 }
 
 impl ClarityBackingStore for EphemeralMarfStore<'_> {
+    fn stores_typed_values(&self) -> bool {
+        self.value_storage_mode.is_integrated()
+    }
+
+    fn get_typed_value(
+        &mut self,
+        key: &str,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Option<TypedValueResult>, VmExecutionError> {
+        if !self.value_storage_mode.uses_canonical_data_table() {
+            return self
+                .get_data(key)?
+                .map(|canonical| {
+                    let serialized_byte_len = canonical.len() as u64 / 2;
+                    let value = clarity::vm::types::Value::try_deserialize_hex_at_epoch(
+                        &canonical, expected, epoch,
+                    )
+                    .map_err(|error| VmInternalError::DBError(error.to_string()))?;
+                    Ok(TypedValueResult {
+                        value,
+                        serialized_byte_len,
+                    })
+                })
+                .transpose();
+        }
+
+        let mode = self.value_storage_mode;
+        self.get_with_fn(
+            key,
+            |ephemeral_marf, tip, key| {
+                let Some(marf_value) = Self::handle_marf_result(ephemeral_marf.get(tip, key))?
+                else {
+                    return Ok(None);
+                };
+                typed_value::get(
+                    ephemeral_marf.sqlite_conn(),
+                    mode,
+                    &marf_value,
+                    expected,
+                    epoch,
+                )?
+                .map(Some)
+                .ok_or_else(|| {
+                    VmInternalError::Expect(format!(
+                        "ERROR: ephemeral MARF value {} is absent from replacement data_table",
+                        marf_value.to_hex()
+                    ))
+                    .into()
+                })
+            },
+            |read_only_marf, key| read_only_marf.get_typed_value(key, expected, epoch),
+        )
+    }
+
     /// Seek to the given chain tip.  This given tip will become the new tip from which
     /// reads and writes will be indexed.
     ///
@@ -431,22 +506,28 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             "Ephemeral MarfedKV get_data: {key:?} tip={:?}",
             &self.open_tip
         );
+        let mode = self.value_storage_mode;
         self.get_with_fn(
             key,
             |ephemeral_marf, tip, key| {
-                let Some(marf_value) = Self::handle_marf_result(ephemeral_marf.get(tip, key))? else {
-                    return Ok(None)
+                let Some(marf_value) = Self::handle_marf_result(ephemeral_marf.get(tip, key))?
+                else {
+                    return Ok(None);
                 };
-                let side_key = marf_value.to_hex();
-                let data = SqliteConnection::get(ephemeral_marf.sqlite_conn(), &side_key)?
-                    .ok_or_else(|| {
-                        VmInternalError::Expect(format!(
-                            "ERROR: MARF contained value_hash not found in side storage: {side_key}",
-                        ))
-                    })?;
+                let data = if mode.uses_canonical_data_table() {
+                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                } else {
+                    SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
+                }
+                .ok_or_else(|| {
+                    VmInternalError::Expect(format!(
+                        "ERROR: MARF contained value_hash not found in side storage: {}",
+                        marf_value.to_hex()
+                    ))
+                })?;
                 Ok(Some(data))
             },
-            |read_only_marf, key| read_only_marf.get_data(key)
+            |read_only_marf, key| read_only_marf.get_data(key),
         )
     }
 
@@ -460,6 +541,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             hash,
             &self.open_tip
         );
+        let mode = self.value_storage_mode;
         self.get_with_fn(
             hash,
             |ephemeral_marf, tip, hash| {
@@ -468,19 +550,22 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 else {
                     return Ok(None);
                 };
-                let side_key = marf_value.to_hex();
                 trace!(
                     "Ephemeral MarfedKV get side-key for {:?}: {:?}",
                     hash,
-                    &side_key
+                    marf_value
                 );
-                let data = SqliteConnection::get(ephemeral_marf.sqlite_conn(), &side_key)?
-                    .ok_or_else(|| {
-                        VmInternalError::Expect(format!(
+                let data = if mode.uses_canonical_data_table() {
+                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                } else {
+                    SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
+                }
+                .ok_or_else(|| {
+                    VmInternalError::Expect(format!(
                         "ERROR: Ephemeral MARF contained value_hash not found in side storage: {}",
-                        side_key
+                        marf_value.to_hex()
                     ))
-                    })?;
+                })?;
                 Ok(Some(data))
             },
             |read_only_marf, path| read_only_marf.get_data_from_path(path),
@@ -500,6 +585,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             key,
             &self.open_tip
         );
+        let mode = self.value_storage_mode;
         self.get_with_fn(
             key,
             |ephemeral_marf, tip, key| {
@@ -508,14 +594,17 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 else {
                     return Ok(None);
                 };
-                let side_key = marf_value.to_hex();
-                let data = SqliteConnection::get(ephemeral_marf.sqlite_conn(), &side_key)?
-                    .ok_or_else(|| {
-                        VmInternalError::Expect(format!(
-                            "ERROR: MARF contained value_hash not found in side storage: {}",
-                            side_key
-                        ))
-                    })?;
+                let data = if mode.uses_canonical_data_table() {
+                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                } else {
+                    SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
+                }
+                .ok_or_else(|| {
+                    VmInternalError::Expect(format!(
+                        "ERROR: MARF contained value_hash not found in side storage: {}",
+                        marf_value.to_hex()
+                    ))
+                })?;
                 Ok(Some((data, proof.serialize_to_vec())))
             },
             |read_only_marf, key| read_only_marf.get_data_with_proof(key),
@@ -535,6 +624,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             hash,
             &self.open_tip
         );
+        let mode = self.value_storage_mode;
         self.get_with_fn(
             hash,
             |ephemeral_marf, tip, path| {
@@ -543,14 +633,17 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 else {
                     return Ok(None);
                 };
-                let side_key = marf_value.to_hex();
-                let data = SqliteConnection::get(ephemeral_marf.sqlite_conn(), &side_key)?
-                    .ok_or_else(|| {
-                        VmInternalError::Expect(format!(
-                            "ERROR: MARF contained value_hash not found in side storage: {}",
-                            side_key
-                        ))
-                    })?;
+                let data = if mode.uses_canonical_data_table() {
+                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                } else {
+                    SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
+                }
+                .ok_or_else(|| {
+                    VmInternalError::Expect(format!(
+                        "ERROR: MARF contained value_hash not found in side storage: {}",
+                        marf_value.to_hex()
+                    ))
+                })?;
                 Ok(Some((data, proof.serialize_to_vec())))
             },
             |read_only_marf, path| read_only_marf.get_data_with_proof_from_path(path),
@@ -685,35 +778,77 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         // we're only writing, so get rid of the temporary views and restore the data and metadata
         // tables in the ephemeral MARF so this works.
         self.teardown_views();
-        for (key, value) in items.into_iter() {
-            let marf_value = MARFValue::from_value(&value);
-            SqliteConnection::put(
-                self.ephemeral_marf.sqlite_tx(),
-                &marf_value.to_hex(),
-                &value,
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "FATAL: failed to insert side-store data {:?}: {:?}",
-                    &value, &e
-                )
-            });
+        let result = (|| {
+            for (key, value) in items {
+                let marf_value = MARFValue::from_value(&value);
+                if self.value_storage_mode.uses_canonical_data_table() {
+                    track_c::put_generic(self.ephemeral_marf.sqlite_tx(), &marf_value, &value)?;
+                } else {
+                    SqliteConnection::put(
+                        self.ephemeral_marf.sqlite_tx(),
+                        &marf_value.to_hex(),
+                        &value,
+                    )?;
+                }
 
-            keys.push(key);
-            values.push(marf_value);
-        }
-        self.ephemeral_marf
-            .insert_batch(&keys, values)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "FATAL: failed to insert ephemeral MARF key/value pairs: {:?}",
-                    e
-                )
-            });
+                keys.push(key);
+                values.push(marf_value);
+            }
+            self.ephemeral_marf
+                .insert_batch(&keys, &values)
+                .map_err(|error| VmInternalError::MarfFailure(error.to_string()))?;
+            Ok(())
+        })();
 
         // restore unified data and metadata views
         self.setup_views();
-        Ok(())
+        result
+    }
+
+    fn put_all_data_entries(
+        &mut self,
+        entries: Vec<DataStoreEntry>,
+    ) -> Result<(), VmExecutionError> {
+        if !self.value_storage_mode.uses_canonical_data_table() {
+            return self.put_all_data(
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.canonical))
+                    .collect(),
+            );
+        }
+
+        let mut keys = Vec::with_capacity(entries.len());
+        let mut values = Vec::with_capacity(entries.len());
+        self.teardown_views();
+        let result = (|| {
+            for entry in entries {
+                let marf_value = MARFValue::from_value(&entry.canonical);
+                if let Some(typed) = entry.typed {
+                    typed_value::put(
+                        self.ephemeral_marf.sqlite_tx(),
+                        self.value_storage_mode,
+                        &marf_value,
+                        &entry.canonical,
+                        typed,
+                    )?;
+                } else {
+                    track_c::put_generic(
+                        self.ephemeral_marf.sqlite_tx(),
+                        &marf_value,
+                        &entry.canonical,
+                    )?;
+                }
+                keys.push(entry.key);
+                values.push(marf_value);
+            }
+            self.ephemeral_marf
+                .insert_batch(&keys, &values)
+                .map_err(|error| VmInternalError::MarfFailure(error.to_string()))?;
+            Ok(())
+        })();
+        self.setup_views();
+        result
     }
 
     /// Get the hash of a contract and the block it was mined in,
