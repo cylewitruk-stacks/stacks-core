@@ -9,8 +9,7 @@ docker build \
 
 if [[ "${BUILD_STACKS_IMAGE:-0}" == "1" ]]; then
   docker build \
-    --tag stacks-core-libp2p-poc:local \
-    --file "${repo_root}/docker/libp2p-poc/Dockerfile" \
+    --tag stacks-core-attacknet:main \
+    --file "${repo_root}/Dockerfile" \
     "${repo_root}"
 fi
-

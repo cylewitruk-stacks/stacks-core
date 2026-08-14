@@ -31,13 +31,11 @@ cluster-admin access.
 
 ## Current scope
 
-The first version deploys and reconciles actor processes. It does not yet port
-the Docker PoC's complete key generation, watch-only Bitcoin wallet setup,
-stacking bootstrap, observer stack, soak assertions, or chaos campaign ledger.
-`examples/minimal.yaml` is a deployment smoke environment: an advancing Bitcoin
-regtest chain plus a non-mining Stacks follower. The existing
-`docker/libp2p-poc` remains the end-to-end consensus acceptance harness until
-those bootstrap stages are migrated deliberately.
+The operator deploys and reconciles actor processes. The transport-independent
+topology, watch-only Bitcoin wallet setup, stacking bootstrap, runtime adapter,
+and evidence harness live in `contrib/attacknet`. `examples/minimal.yaml` stays
+as a small deployment smoke; generated attacknet resources are the scalable
+current-main system-under-test profile.
 
 The chart requires Kubernetes 1.27 or newer. Hacknet relies on the stable
 StatefulSet PVC retention policy introduced in that release.
@@ -53,7 +51,7 @@ kubectl cluster-info
 ```
 
 From the repository root, build the controller. Set `BUILD_STACKS_IMAGE=1` to
-also build the branch's libp2p PoC node/signer image used by the smoke example.
+also build the current-main node/signer image used by the smoke example.
 
 ```sh
 contrib/helm/hacknet/scripts/build-local.sh
@@ -180,7 +178,7 @@ exports OTLP/HTTP to `telemetry.exporterEndpoint`. The bearer token can come
 from `telemetry.tokenSecretRef`; it is mounted as an environment value without
 the operator reading it.
 
-The PoC's strict metric allowlist and authenticated per-actor enrollment remain
+The federation's strict metric allowlist and authenticated per-actor enrollment remain
 collector/federation responsibilities. The initial sidecar establishes the Pod
 organization and export path without silently duplicating the evolving schema
 inside the operator.
@@ -266,7 +264,7 @@ without cluster resource pressure.
 
 Readiness-gated Services are a deterministic default, not a claim about the
 public network. Withdrawing an endpoint affects discovery and new connections,
-not established libp2p sessions. Future dependency cycles should be detected
+not established application sessions. Future dependency cycles should be detected
 and reported, not prohibited; runtime degradation belongs to explicit process
 or Chaos Mesh controls. TimeChaos scenarios must first inventory which code
 uses wall clock versus monotonic time so the injected fault can affect the

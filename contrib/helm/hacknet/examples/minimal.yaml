@@ -4,7 +4,7 @@ metadata:
   name: minimal
 spec:
   defaults:
-    nodeImage: stacks-core-libp2p-poc:local
+    nodeImage: stacks-core-attacknet:main
     # Docker Desktop kind resolves locally-built images through its internal
     # registry mirror, which requires a pull-capable policy.
     imagePullPolicy: IfNotPresent
@@ -42,7 +42,7 @@ spec:
         size: 2Gi
 
     # A separate helper owns burn-block cadence. It is deliberately a separate
-    # failure domain, just as it is in docker/libp2p-poc.
+    # failure domain from Bitcoin Core and every Stacks actor.
     - name: bitcoin-miner
       role: infrastructure
       image: bitcoin/bitcoin:25.2
@@ -90,9 +90,8 @@ spec:
       storage:
         enabled: false
 
-    # This first smoke resource runs a non-mining Stacks node against the
-    # advancing burnchain. Full miner funding, stacking, and signer enrollment
-    # remain in docker/libp2p-poc until their bootstrap is ported.
+    # This first smoke resource runs current main's production transport, not
+    # the optional libp2p prototype, against the advancing burnchain.
     - name: follower-1
       role: follower
       config:
@@ -114,20 +113,7 @@ spec:
           wait_time_for_microblocks = 0
           mine_microblocks = false
 
-          [node.libp2p]
-          rollout_mode = "libp2p-only"
-          kademlia_server = true
-          bind = ["/ip4/0.0.0.0/tcp/20445"]
-          advertise = ["/dns4/${SERVICE:follower-1}/tcp/20445"]
-          direct_block_push = true
-
-          [node.libp2p.signer_bridge]
-          mode = "off"
-
           [connection_options]
-          disable_block_download = true
-          disable_inbound_handshakes = true
-          disable_inbound_walks = true
           public_ip_address = "127.0.0.1:20444"
           auth_token = "12345"
 

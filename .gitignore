@@ -57,6 +57,7 @@ mutants.out.old/
 **/mutants-*/
 
 node_modules
+docker/libp2p-poc/generated/
 tarpaulin-report.html
 osxcross
 osxcross*.tar.xz

@@ -115,7 +115,6 @@ def role_ports(role: str) -> list[dict[str, Any]]:
         return [
             {"name": "events", "containerPort": 30000},
             {"name": "metrics", "containerPort": 31000},
-            {"name": "libp2p", "containerPort": 30445},
         ]
     if role == "burnchain":
         return [
@@ -126,7 +125,6 @@ def role_ports(role: str) -> list[dict[str, Any]]:
         return [
             {"name": "rpc", "containerPort": 20443},
             {"name": "p2p", "containerPort": 20444},
-            {"name": "libp2p", "containerPort": 20445},
             {"name": "metrics", "containerPort": 20446},
         ]
     return []
