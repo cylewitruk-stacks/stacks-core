@@ -1,0 +1,11 @@
+{
+  "apiVersion": "testing.stacks.org/v1alpha1",
+  "kind": "FaultCampaign",
+  "metadata": {"name": "companion-1-failure"},
+  "spec": {
+    "networkRef": "attacknet",
+    "target": {"actors": ["signer-node-1"]},
+    "fault": {"type": "pod", "action": "pod-failure", "mode": "all", "duration": "30s"},
+    "safety": {"maxUnavailableSignerPercent": 30}
+  }
+}

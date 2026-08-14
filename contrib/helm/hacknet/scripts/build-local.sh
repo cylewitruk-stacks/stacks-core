@@ -10,6 +10,6 @@ docker build \
 if [[ "${BUILD_STACKS_IMAGE:-0}" == "1" ]]; then
   docker build \
     --tag stacks-core-attacknet:main \
-    --file "${repo_root}/Dockerfile" \
+    --file "${repo_root}/contrib/attacknet/Dockerfile" \
     "${repo_root}"
 fi

@@ -132,7 +132,6 @@ spec:
           username = "devnet"
           password = "devnet"
           timeout = 30
-          allow_stale_bitcoin_tip = true
 
           [[burnchain.epochs]]
           epoch_name = "1.0"

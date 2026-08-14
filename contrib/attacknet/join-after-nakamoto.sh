@@ -9,7 +9,7 @@ while true; do
   burn_height="$(sed -n 's/.*"burn_block_height":\([0-9][0-9]*\).*/\1/p' <<<"${response}")"
   if [ -n "${burn_height}" ] && [ "${burn_height}" -ge "${activation_height}" ]; then
     echo "Joining as an additional miner after Nakamoto activation at burn height ${burn_height}"
-    exec stacks-node start --config /etc/stacks/config.toml
+    exec stacks-node start --config "${STACKS_ATTACKNET_CONFIG:-/etc/stacks/config.toml}"
   fi
   sleep 1
 done

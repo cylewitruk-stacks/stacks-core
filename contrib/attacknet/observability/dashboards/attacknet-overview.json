@@ -1,0 +1,183 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Current burn height spread across actor-self-reported node metrics. A value above zero is disagreement, not automatically a defect.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 3}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "max(stacks_node_burn_block_height{attacknet_network=\"$network\"}) - min(stacks_node_burn_block_height{attacknet_network=\"$network\"})", "refId": "A"}],
+      "title": "Burn-height spread",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Current Stacks tip spread across nodes. This remains meaningful even if an adversarial actor lies: drill down to see the outlier and compare orchestrator evidence.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 3}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "max(stacks_node_stacks_tip_height{attacknet_network=\"$network\"}) - min(stacks_node_stacks_tip_height{attacknet_network=\"$network\"})", "refId": "A"}],
+      "title": "Stacks-height spread",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Scrape reachability of node, signer, and orchestrator-observed event endpoints.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 1}, {"color": "green", "value": 2}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(up{attacknet_network=\"$network\"})", "refId": "A"}],
+      "title": "Metric endpoints reachable",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Number of currently active actor-targeted fault series reported by the authenticated event bridge.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(attacknet_fault_active{network=\"$network\"}) or vector(0)", "refId": "A"}],
+      "title": "Active fault targets",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Latest failed orchestrator-observed invariants. Zero is healthy; failures remain visible until the invariant is observed passing again.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "id": 5,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(attacknet_invariant_pass{network=\"$network\"} == 0) or vector(0)", "refId": "A"}],
+      "title": "Failed invariants",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Most recent measured recovery duration for the selected network.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 30}, {"color": "red", "value": 120}]}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "id": 6,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "max(attacknet_recovery_duration_seconds{network=\"$network\"})", "legendFormat": "{{campaign}}", "refId": "A"}],
+      "title": "Last recovery duration",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Self-reported burnchain and Stacks heights by actor. Selecting an actor isolates it without hiding the cohort.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 4},
+      "id": 7,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "stacks_node_burn_block_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "burn {{attacknet_actor}}", "refId": "A"},
+        {"expr": "stacks_node_stacks_tip_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "stacks {{attacknet_actor}}", "refId": "B"}
+      ],
+      "title": "Chain progress and cohort divergence",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Authenticated orchestrator fault state and verification status. Actor metrics cannot write these series.",
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0, "spanNulls": true}, "mappings": [{"options": {"0": {"color": "green", "text": "clear/pass"}, "1": {"color": "orange", "text": "active"}}, "type": "value"}], "min": 0, "max": 1}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 4},
+      "id": 8,
+      "options": {"alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.8, "showValue": "auto", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [
+        {"expr": "attacknet_fault_active{network=\"$network\",actor=~\"$actor\"}", "legendFormat": "fault {{campaign}} / {{actor}}", "refId": "A"},
+        {"expr": "1 - attacknet_invariant_pass{network=\"$network\",actor=~\"$actor\"}", "legendFormat": "failed {{invariant}} / {{actor}}", "refId": "B"}
+      ],
+      "title": "Fault and invariant timeline",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Legacy P2P neighbor gauges from each node. This panel intentionally uses current-main transport metrics and has no libp2p dependency.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 6, "lineWidth": 2, "showPoints": "never", "spanNulls": false}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 13},
+      "id": 9,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "stacks_node_neighbors_inbound{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "in {{attacknet_actor}}", "refId": "A"},
+        {"expr": "stacks_node_neighbors_outbound{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "out {{attacknet_actor}}", "refId": "B"}
+      ],
+      "title": "Legacy P2P connectivity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Signer proposal intake and response outcomes. Policy rejection and validation rejection detail depends on metrics available in the selected image.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 13},
+      "id": 10,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (attacknet_actor) (rate(stacks_signer_block_proposals_received{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "proposal {{attacknet_actor}}", "refId": "A"},
+        {"expr": "sum by (attacknet_actor,response_type) (rate(stacks_signer_block_responses_sent{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "{{response_type}} {{attacknet_actor}}", "refId": "B"}
+      ],
+      "title": "Signer proposal and vote rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Real per-signer response latency dispersion. Empty series mean the selected release does not expose the histogram or no proposals have completed.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 13},
+      "id": 11,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le,attacknet_actor) (rate(stacks_signer_block_response_latencies_histogram_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m])))", "legendFormat": "p95 {{attacknet_actor}}", "refId": "A"}],
+      "title": "Signer response latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Actor-self-reported error and warning rates. A malicious binary can falsify these; use them as evidence, not authority.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "fillOpacity": 30, "lineWidth": 1, "showPoints": "never", "stacking": {"group": "A", "mode": "normal"}}}, "overrides": []},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 21},
+      "id": 12,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "rate(stacks_node_errors_emitted_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m])", "legendFormat": "error {{attacknet_actor}}", "refId": "A"},
+        {"expr": "rate(stacks_node_warning_emitted_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m])", "legendFormat": "warning {{attacknet_actor}}", "refId": "B"}
+      ],
+      "title": "Node warning/error signals (self-reported)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Latest orchestrator-observed invariant state. Use the durable HTML timeline for the complete event payload and replay instruction ID.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 21},
+      "id": 13,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_invariant_pass{network=\"$network\",actor=~\"$actor\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Invariant status",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "network": true, "evidence_source": true}, "renameByName": {"Value": "Passed (1=yes)"}}}],
+      "type": "table"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 41,
+  "tags": ["stacks", "attacknet", "adversarial"],
+  "templating": {
+    "list": [
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(up, attacknet_network)", "includeAll": false, "label": "Network", "name": "network", "options": [], "query": {"query": "label_values(up, attacknet_network)", "refId": "PrometheusVariableQueryEditor-VariableQuery"}, "refresh": 1, "type": "query"},
+      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(up{attacknet_network=\"$network\"}, attacknet_actor)", "includeAll": true, "label": "Actor", "multi": true, "name": "actor", "options": [], "query": {"query": "label_values(up{attacknet_network=\"$network\"}, attacknet_actor)", "refId": "PrometheusVariableQueryEditor-VariableQuery"}, "refresh": 1, "type": "query"}
+    ]
+  },
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Stacks Attacknet: Network, Faults, and Recovery",
+  "uid": "stacks-attacknet-overview",
+  "version": 1
+}

@@ -100,8 +100,8 @@ local_mining_public_key = "${MINERS[minerIndex][1]}"` : '';
 name = "attacknet-${name}"
 rpc_bind = "0.0.0.0:20443"
 p2p_bind = "0.0.0.0:20444"
-data_url = "http://127.0.0.1:20443"
-p2p_address = "${service(name)}:20444"
+data_url = "http://__NODE_IP__:20443"
+p2p_address = "__NODE_IP__:20444"
 prometheus_bind = "0.0.0.0:20446"
 working_dir = "/data/node"
 seed = "${repeated(seedByte)}"
@@ -118,7 +118,8 @@ mine_microblocks = false
 ${bootstrap}
 ${mining}
 [connection_options]
-public_ip_address = "${service(name)}:20444"
+public_ip_address = "__NODE_IP__:20444"
+private_neighbors = true
 auth_token = "12345"
 ${observer}
 [burnchain]
@@ -136,7 +137,6 @@ rpc_ssl = false
 username = "devnet"
 password = "devnet"
 timeout = 30${wallet}
-allow_stale_bitcoin_tip = true
 
 ${epochsAndBalances(signers)}
 `;
@@ -160,20 +160,27 @@ function env(name, value) {
 
 function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex, signers, image}) {
   const delayedMiner = miner && minerIndex > 0;
-  const files = {'config.toml': nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers})};
+  const files = {
+    'config.toml': nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers}),
+    'configure-node.sh': readFileSync(join(ROOT, 'configure-node.sh'), 'utf8'),
+  };
   if (delayedMiner) files['join-after-nakamoto.sh'] = readFileSync(join(ROOT, 'join-after-nakamoto.sh'), 'utf8');
   const dependencies = [{actor: 'bitcoin', port: 18443}, {actor: 'bitcoin-miner', port: 18500}];
   if (name !== 'miner-1') dependencies.push({actor: 'miner-1', port: 20443});
   return {
     name,
     role,
+    activationGate: delayedMiner ? {kind: 'burn-height', height: 223} : undefined,
     image,
     imagePullPolicy: 'IfNotPresent',
     command: delayedMiner
-      ? ['/bin/bash', '/etc/stacks/join-after-nakamoto.sh']
-      : ['stacks-node', 'start', '--config', '/etc/stacks/config.toml'],
+      ? ['/bin/bash', '/etc/stacks/configure-node.sh', '/bin/bash', '/etc/stacks/join-after-nakamoto.sh']
+      : ['/bin/bash', '/etc/stacks/configure-node.sh', 'stacks-node', 'start', '--config', '/tmp/stacks-attacknet-config.toml'],
     config: {files, key: 'config.toml', mountPath: '/etc/stacks'},
-    env: [env('RUST_LOG', 'info')],
+    env: [
+      env('RUST_LOG', 'info'),
+      ...(delayedMiner ? [env('NAKAMOTO_SOURCE_HOST', service('miner-1'))] : []),
+    ],
     dependencies,
     ports: [
       {name: 'rpc', containerPort: 20443},
@@ -194,9 +201,14 @@ function signerActor(index, signer, image) {
     image,
     imagePullPolicy: 'IfNotPresent',
     command: ['stacks-signer', 'run', '--config', '/etc/stacks/signer.toml'],
+    // Companion event delivery must be able to reach the signer before the
+    // companion RPC becomes Ready; otherwise their startup dependencies cycle.
+    // The signer node client retries while its companion finishes booting, so
+    // intentionally do not add a readiness/TCP dependency on the companion.
+    runtimeExposure: 'reachable',
     config: {files: {'signer.toml': signerConfig(index, signer)}, key: 'signer.toml', mountPath: '/etc/stacks'},
     env: [env('RUST_LOG', 'info')],
-    dependencies: [{actor: `signer-node-${index}`, port: 20443}],
+    dependencies: [],
     ports: [{name: 'events', containerPort: 30000}, {name: 'metrics', containerPort: 31000}],
     readinessProbe: {exec: {command: ['test', '-r', '/proc/1/status']}, periodSeconds: 5},
     storage: {enabled: true, size: '512Mi', mountPath: '/data'},
@@ -335,26 +347,38 @@ function renderCompose(actors, output, network) {
 export function renderTopology(topology, output, {network = 'attacknet', namespace = 'hacknet-system'} = {}) {
   mkdirSync(output, {recursive: true});
   const actors = [...infrastructureActors(topology, network), ...topology.actors];
+  // activationGate belongs to the backend-neutral run manifest.  The current
+  // operator does not need it to build the Pod, so do not leak it into the CRD.
+  const resourceActors = actors.map(({activationGate: _activationGate, ...actor}) => actor);
   const resource = {
     apiVersion: 'testing.stacks.org/v1alpha1', kind: 'StacksNetwork',
     metadata: {name: network, namespace, labels: {'testing.stacks.org/profile': 'mainnet-legacy-transport'}},
     spec: {
       defaults: {nodeImage: topology.nodeImage, imagePullPolicy: 'IfNotPresent', storage: {enabled: true, size: '2Gi'}},
-      telemetry: {enabled: false}, actors,
+      telemetry: {enabled: false}, actors: resourceActors,
     },
   };
+  const manifestActor = actor => ({
+    service: actor.name,
+    type: actor.role === 'signer' ? 'signer' : actor.role === 'burnchain' || actor.role === 'infrastructure' ? 'infrastructure' : 'node',
+    role: actor.role,
+    companion: actor.role === 'signer' ? `signer-node-${actor.name.slice('signer-'.length)}` : undefined,
+    signerIndex: actor.role === 'signer'
+      ? Number(actor.name.slice('signer-'.length))
+      : actor.role === 'companion' ? Number(actor.name.slice('signer-node-'.length)) : undefined,
+    signerWeight: ['signer', 'companion'].includes(actor.role)
+      ? ((Number(actor.name.slice(actor.role === 'signer' ? 'signer-'.length : 'signer-node-'.length)) - 1) % 3) + 1
+      : undefined,
+    activationGate: actor.activationGate,
+  });
   const manifest = {
     schemaVersion: 1, profile: 'mainnet-legacy-transport', network, namespace,
     counts: {miners: topology.minerCount, signers: topology.signerCount, followers: topology.followerCount},
     images: {node: topology.nodeImage, stacker: topology.stackerImage},
-    actors: topology.actors.map(actor => ({
-      service: actor.name,
-      type: actor.role === 'signer' ? 'signer' : 'node',
-      role: actor.role,
-      companion: actor.role === 'signer' ? `signer-node-${actor.name.slice('signer-'.length)}` : undefined,
-    })),
+    actors: topology.actors.map(manifestActor),
+    workloads: actors.map(manifestActor),
   };
-  const policy = {apiVersion: 'v1', kind: 'ConfigMap', metadata: {name: `${network}-burnchain-policy`, namespace}, data: {'policy.env': 'GENERATION=1\nMODE=run\nINTERVAL_SECONDS=20\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n'}};
+  const policy = {apiVersion: 'v1', kind: 'ConfigMap', metadata: {name: `${network}-burnchain-policy`, namespace}, data: {'policy.env': 'GENERATION=1\nMODE=pause\nINTERVAL_SECONDS=20\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n'}};
   writeFileSync(join(output, 'stacksnetwork.json'), `${JSON.stringify(resource, null, 2)}\n`);
   writeFileSync(join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(join(output, 'burnchain-policy.configmap.json'), `${JSON.stringify(policy, null, 2)}\n`);

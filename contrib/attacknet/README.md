@@ -29,9 +29,14 @@ burnchain policy, backend adapter, assertions, and evidence capture.
 Build current main's node and signer binaries:
 
 ```bash
-docker build -t stacks-core-attacknet:main .
+docker build -f contrib/attacknet/Dockerfile -t stacks-core-attacknet:main .
 docker build -t stacks-attacknet-stacker:local contrib/attacknet/stacker
 ```
+
+The attacknet image uses upstream's `release-lite` profile and adds only
+`curl`/CA certificates needed by delayed-start and evidence probes. Release
+artifacts retain the repository's fat-LTO profile; iterative experiments do not
+need its single-codegen-unit link cost.
 
 Docker Desktop's kind cluster can use images from its local image store with
 `imagePullPolicy: IfNotPresent`. Other kind installations may need

@@ -249,6 +249,10 @@ spec:
                               type: integer
                               minimum: 1
                               maximum: 65535
+                      runtimeExposure:
+                        type: string
+                        enum: [ready, reachable]
+                        default: ready
                       storage:
                         type: object
                         properties:

@@ -50,6 +50,24 @@ backend_exec() {
   esac
 }
 
+# Bound a remote probe at the backend boundary.  A wedged actor must become an
+# explicit failed observation instead of wedging the verifier or evidence run.
+backend_exec_timeout() {
+  local seconds="$1"
+  local actor="$2"
+  shift 2
+  case "${ATTACKNET_BACKEND}" in
+    compose) timeout --signal=TERM --kill-after=5 "${seconds}" docker compose \
+      -p "${ATTACKNET_PROJECT}" -f "${ATTACKNET_COMPOSE}" exec -T "${actor}" "$@" ;;
+    kubernetes)
+      local pod
+      pod="$(backend_pod "${actor}")" || return
+      timeout --signal=TERM --kill-after=5 "${seconds}" kubectl -n "${KUBE_NAMESPACE}" \
+        exec "${pod}" -c actor -- "$@"
+      ;;
+  esac
+}
+
 # Usage: backend_exec_env ACTOR KEY=VALUE ... -- COMMAND ARG...
 backend_exec_env() {
   local actor="$1"

@@ -188,6 +188,12 @@ inside the operator.
 The controller reports `Pending`, `Progressing`, `Ready`, `Degraded`, or
 `Suspended`, plus each actor's resolved image, resource name, and readiness.
 
+An actor may set `runtimeExposure: reachable` to publish its headless-Service
+endpoint before the pod is Ready. The default, `ready`, keeps bootstrap
+deterministic. This is a discovery control: it affects new DNS lookups, not
+already-established connections, and therefore is not a substitute for a
+runtime fault such as Chaos Mesh network or process disruption.
+
 ```sh
 kubectl get snet -n hacknet-system
 kubectl get snet minimal -n hacknet-system -o jsonpath='{.status.actors}'

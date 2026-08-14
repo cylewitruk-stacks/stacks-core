@@ -264,6 +264,8 @@ def validate_network(network: dict[str, Any]) -> None:
             config_map_name = (runtime_policy.get("configMapRef") or {}).get("name", "")
             if not DNS_LABEL_RE.fullmatch(config_map_name) or len(config_map_name) > 63:
                 raise ValidationError(f"actor {actor_name!r} has invalid runtime policy ConfigMap name")
+        if actor.get("runtimeExposure", "ready") not in {"ready", "reachable"}:
+            raise ValidationError(f"actor {actor_name!r} has invalid runtimeExposure")
         port_names: set[str] = set()
         port_numbers: set[tuple[int, str]] = set()
         for port in actor.get("ports") or role_ports(role):
@@ -428,15 +430,16 @@ def effective_ports(actor: dict[str, Any]) -> list[dict[str, Any]]:
 
 def build_service(context: ActorContext) -> dict[str, Any]:
     ports = effective_ports(context.actor)
+    runtime_exposure = context.actor.get("runtimeExposure", "ready")
     # StatefulSets use a headless governing Service for stable actor identity.
     # Headless Services may validly omit ports, which matters for helper actors
     # such as a burn-block cadence process that never accepts inbound traffic.
     spec: dict[str, Any] = {
         "type": "ClusterIP",
         "clusterIP": "None",
-        # Dependency init containers resolve these Services, so publishing
-        # only Ready endpoints gives dependencies service_healthy semantics.
-        "publishNotReadyAddresses": False,
+        # Runtime endpoint publication is a target-actor property, distinct
+        # from the per-edge dependency gate implemented by init containers.
+        "publishNotReadyAddresses": runtime_exposure == "reachable",
         "selector": {
             NETWORK_LABEL: context.network_name,
             ACTOR_LABEL: context.actor["name"],
@@ -644,10 +647,11 @@ def build_stateful_set(context: ActorContext) -> dict[str, Any]:
         ),
         "securityContext": deep_merge(defaults.get("podSecurityContext"), actor.get("podSecurityContext")),
         "containers": containers,
+        # Keep the empty list explicit: merge-patch retains an omitted field,
+        # which would leave a removed dependency gate in the live Pod template.
+        "initContainers": init_containers,
         "volumes": volumes,
     }
-    if init_containers:
-        pod_spec["initContainers"] = init_containers
     if defaults.get("imagePullSecrets"):
         pod_spec["imagePullSecrets"] = defaults["imagePullSecrets"]
     for field in ("nodeSelector", "affinity", "tolerations", "topologySpreadConstraints"):
@@ -866,8 +870,23 @@ def build_status(network: dict[str, Any], api: Any) -> dict[str, Any]:
     for actor in network["spec"]["actors"]:
         resource_name = stable_name(metadata["name"], actor["name"])
         stateful_set = api.get_stateful_set(metadata["namespace"], resource_name)
-        ready_replicas = int(((stateful_set or {}).get("status") or {}).get("readyReplicas", 0))
-        is_ready = not suspended and ready_replicas >= 1
+        stateful_metadata = (stateful_set or {}).get("metadata") or {}
+        stateful_status = (stateful_set or {}).get("status") or {}
+        stateful_generation = int(stateful_metadata.get("generation", 0))
+        observed_generation = int(stateful_status.get("observedGeneration", 0))
+        ready_replicas = int(stateful_status.get("readyReplicas", 0))
+        updated_replicas = int(stateful_status.get("updatedReplicas", 0))
+        current_revision = stateful_status.get("currentRevision")
+        update_revision = stateful_status.get("updateRevision")
+        rollout_current = (
+            stateful_generation > 0
+            and observed_generation >= stateful_generation
+            and ready_replicas >= 1
+            and updated_replicas >= 1
+            and bool(current_revision)
+            and current_revision == update_revision
+        )
+        is_ready = not suspended and rollout_current
         ready += int(is_ready)
         actor_statuses.append(
             {
@@ -877,6 +896,11 @@ def build_status(network: dict[str, Any], api: Any) -> dict[str, Any]:
                 "image": actor_image(network["spec"], actor),
                 "ready": is_ready,
                 "readyReplicas": ready_replicas,
+                "updatedReplicas": updated_replicas,
+                "generation": stateful_generation,
+                "observedGeneration": observed_generation,
+                "currentRevision": current_revision,
+                "updateRevision": update_revision,
             }
         )
     desired = len(actor_statuses)

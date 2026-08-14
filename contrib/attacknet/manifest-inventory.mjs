@@ -17,6 +17,10 @@ export function inventory(manifest, group) {
       return actors.filter(actor => actor.role === 'miner').map(actor => actor.service);
     case 'followers':
       return actors.filter(actor => actor.role === 'follower').map(actor => actor.service);
+    case 'bootstrap':
+      return actors.filter(actor => actor.activationGate === undefined).map(actor => actor.service);
+    case 'activation-gated':
+      return actors.filter(actor => actor.activationGate !== undefined).map(actor => actor.service);
     default:
       throw new Error(`unknown inventory group: ${group}`);
   }

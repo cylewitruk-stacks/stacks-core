@@ -24,3 +24,14 @@ test('progress requires the configured burn-block delta', () => {
   assert.equal(progress({burnHeight: 20}, {burnHeight: 22}, 2).ok, true);
   assert.equal(progress({burnHeight: 20}, {burnHeight: 21}, 2).ok, false);
 });
+
+test('height cohort can require actual Stacks progress', () => {
+  const samples = [
+    {actor: 'a', info: {burn_block_height: 203, stacks_tip_height: 0, stacks_tip: '00'}},
+    {actor: 'b', info: {burn_block_height: 203, stacks_tip_height: 0, stacks_tip: '00'}},
+  ];
+  assert.equal(heightCohort(samples, 2, 0).ok, true);
+  const result = heightCohort(samples, 2, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.minimumObservedStacksHeight, 0);
+});

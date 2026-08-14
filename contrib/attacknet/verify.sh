@@ -9,6 +9,7 @@ action="${2:-snapshot}"
 backend_require
 evidence_actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" actors)"
 evidence_nodes="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" nodes)"
+probe_timeout="${ATTACKNET_PROBE_TIMEOUT_SECONDS:-10}"
 
 unready="$(backend_unready_actors bitcoin bitcoin-miner stacker ${evidence_actors})"
 if [ -n "${unready}" ]; then
@@ -20,7 +21,7 @@ capture_cohort() {
   local output="$1" actor first=true info
   printf '[' >"${output}"
   for actor in ${evidence_nodes}; do
-    info="$(backend_exec "${actor}" curl --fail --silent http://127.0.0.1:20443/v2/info)"
+    info="$(backend_exec_timeout "${probe_timeout}" "${actor}" curl --fail --silent http://127.0.0.1:20443/v2/info)"
     if [ "${first}" = true ]; then first=false; else printf ',' >>"${output}"; fi
     ACTOR="${actor}" INFO="${info}" node -e '
       process.stdout.write(JSON.stringify({actor: process.env.ACTOR, info: JSON.parse(process.env.INFO)}));
@@ -32,14 +33,15 @@ capture_cohort() {
 temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
 capture_cohort "${temporary}/cohort.json"
-node "${ATTACKNET_DIR}/invariants.mjs" cohort "${temporary}/cohort.json" "${ATTACKNET_HEIGHT_DRIFT_CEILING:-2}"
+node "${ATTACKNET_DIR}/invariants.mjs" cohort "${temporary}/cohort.json" \
+  "${ATTACKNET_HEIGHT_DRIFT_CEILING:-2}" "${ATTACKNET_MINIMUM_STACKS_HEIGHT:-1}"
 
 case "${action}" in
   snapshot) ;;
   progress)
-    start="$(backend_exec bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
+    start="$(backend_exec_timeout "${probe_timeout}" bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
     sleep "${ATTACKNET_PROGRESS_WINDOW_SECONDS:-45}"
-    end="$(backend_exec bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
+    end="$(backend_exec_timeout "${probe_timeout}" bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
     printf '{"start":{"burnHeight":%s},"end":{"burnHeight":%s}}\n' "${start}" "${end}" \
       >"${temporary}/progress.json"
     node "${ATTACKNET_DIR}/invariants.mjs" progress "${temporary}/progress.json" \

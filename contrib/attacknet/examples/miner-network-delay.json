@@ -1,0 +1,17 @@
+{
+  "apiVersion": "testing.stacks.org/v1alpha1",
+  "kind": "FaultCampaign",
+  "metadata": {"name": "miner-2-network-delay"},
+  "spec": {
+    "networkRef": "attacknet",
+    "target": {"actors": ["miner-2"]},
+    "fault": {
+      "type": "network",
+      "action": "delay",
+      "mode": "all",
+      "duration": "45s",
+      "parameters": {"delay": {"latency": "750ms", "correlation": "50", "jitter": "200ms"}}
+    },
+    "safety": {}
+  }
+}

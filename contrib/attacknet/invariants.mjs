@@ -8,7 +8,7 @@ function numeric(value, name) {
   return number;
 }
 
-export function heightCohort(samples, ceiling = 2) {
+export function heightCohort(samples, ceiling = 2, minimumStacksHeight = 0) {
   if (samples.length === 0) throw new Error('height cohort has no node samples');
   const rows = samples.map(sample => ({
     actor: sample.actor,
@@ -20,7 +20,16 @@ export function heightCohort(samples, ceiling = 2) {
   const stacksHeights = rows.map(row => row.stacksHeight);
   const burnDrift = Math.max(...burnHeights) - Math.min(...burnHeights);
   const stacksDrift = Math.max(...stacksHeights) - Math.min(...stacksHeights);
-  return {ok: burnDrift <= ceiling && stacksDrift <= ceiling, ceiling, burnDrift, stacksDrift, rows};
+  const minimumObservedStacksHeight = Math.min(...stacksHeights);
+  return {
+    ok: burnDrift <= ceiling && stacksDrift <= ceiling && minimumObservedStacksHeight >= minimumStacksHeight,
+    ceiling,
+    minimumStacksHeight,
+    minimumObservedStacksHeight,
+    burnDrift,
+    stacksDrift,
+    rows,
+  };
 }
 
 export function progress(start, end, minimumBurnBlocks = 1) {
@@ -31,10 +40,10 @@ export function progress(start, end, minimumBurnBlocks = 1) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const [command, inputPath, rawValue] = process.argv.slice(2);
+  const [command, inputPath, rawValue, rawMinimum] = process.argv.slice(2);
   const input = JSON.parse(readFileSync(inputPath, 'utf8'));
   let result;
-  if (command === 'cohort') result = heightCohort(input, Number(rawValue ?? 2));
+  if (command === 'cohort') result = heightCohort(input, Number(rawValue ?? 2), Number(rawMinimum ?? 0));
   else if (command === 'progress') result = progress(input.start, input.end, Number(rawValue ?? 1));
   else throw new Error('usage: invariants.mjs {cohort|progress} INPUT [LIMIT]');
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

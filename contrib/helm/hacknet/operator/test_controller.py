@@ -104,6 +104,18 @@ class ResourceBuilderTests(unittest.TestCase):
         self.assertFalse(service["spec"]["publishNotReadyAddresses"])
         self.assertNotIn("ports", service["spec"])
 
+    def test_runtime_exposure_can_publish_an_endpoint_before_readiness(self):
+        fixture = network_fixture()
+        fixture["spec"]["actors"][2]["runtimeExposure"] = "reachable"
+        service = controller.build_resources(fixture)["services"][2]
+        self.assertTrue(service["spec"]["publishNotReadyAddresses"])
+
+    def test_removed_dependencies_render_an_explicit_empty_init_container_list(self):
+        fixture = network_fixture()
+        fixture["spec"]["actors"][0]["dependencies"] = []
+        pod_spec = controller.build_resources(fixture)["statefulsets"][0]["spec"]["template"]["spec"]
+        self.assertEqual(pod_spec["initContainers"], [])
+
     def test_actor_workload_has_identity_labels_persistence_and_sidecar(self):
         resources = controller.build_resources(network_fixture())
         miner = resources["statefulsets"][0]
@@ -270,7 +282,15 @@ class FakeApi:
     def get_stateful_set(self, _namespace, name):
         item = copy.deepcopy(self.objects["statefulsets"].get(name))
         if item is not None:
-            item["status"] = {"readyReplicas": 1 if name in self.ready else 0}
+            item["metadata"]["generation"] = 1
+            revision = f"{name}-revision"
+            item["status"] = {
+                "observedGeneration": 1,
+                "readyReplicas": 1 if name in self.ready else 0,
+                "updatedReplicas": 1 if name in self.ready else 0,
+                "currentRevision": revision if name in self.ready else None,
+                "updateRevision": revision,
+            }
         return item
 
     def patch_status(self, _namespace, _name, status):
@@ -323,6 +343,27 @@ class ReconcilerTests(unittest.TestCase):
         }]
         current = controller.condition("Ready", "False", "ActorsNotReady", "0 of 3 actors are ready", previous)
         self.assertEqual(current["lastTransitionTime"], "2026-01-01T00:00:00Z")
+
+    def test_ready_replicas_from_a_previous_revision_do_not_report_ready(self):
+        fixture = network_fixture()
+        api = FakeApi()
+        for resource in controller.build_resources(fixture)["statefulsets"]:
+            api.objects["statefulsets"][resource["metadata"]["name"]] = resource
+        api.ready.update(api.objects["statefulsets"])
+        original = api.get_stateful_set
+
+        def stale_rollout(namespace, name):
+            item = original(namespace, name)
+            item["metadata"]["generation"] = 2
+            item["status"]["observedGeneration"] = 1
+            item["status"]["currentRevision"] = f"{name}-old"
+            item["status"]["updateRevision"] = f"{name}-new"
+            return item
+
+        api.get_stateful_set = stale_rollout
+        status = controller.build_status(fixture, api)
+        self.assertEqual(status["phase"], "Progressing")
+        self.assertEqual(status["readyActors"], 0)
 
 
 class RecordingKubernetesClient(controller.KubernetesClient):
