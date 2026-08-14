@@ -1,0 +1,40 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "hacknet.fullname" . }}
+  namespace: {{ include "hacknet.watchNamespace" . }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["stacksnetworks"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["stacksnetworks/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "hacknet.fullname" . }}
+  namespace: {{ include "hacknet.watchNamespace" . }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hacknet.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "hacknet.fullname" . }}
+

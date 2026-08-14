@@ -1,0 +1,79 @@
+# This example demonstrates the agent-facing topology API. Create the named
+# ConfigMaps/Secrets first; the operator deliberately does not copy or inspect
+# sensitive actor configuration.
+apiVersion: testing.stacks.org/v1alpha1
+kind: StacksNetwork
+metadata:
+  name: mixed-versions
+spec:
+  defaults:
+    nodeImage: stacks-core-main:local
+    signerImage: stacks-core-main:local
+    imagePullPolicy: IfNotPresent
+    storage:
+      enabled: true
+      size: 5Gi
+  telemetry:
+    enabled: true
+    exporterEndpoint: http://telemetry-federation:4318
+    tokenSecretRef:
+      name: hacknet-federation-token
+      key: token
+  actors:
+    - name: miner-current
+      role: miner
+      config:
+        secretRef:
+          name: miner-current-config
+
+    - name: miner-previous
+      role: miner
+      image: stacks-core-4.0.2:local
+      config:
+        secretRef:
+          name: miner-previous-config
+
+    - name: companion-1
+      role: companion
+      config:
+        secretRef:
+          name: companion-1-config
+      dependencies:
+        - actor: miner-current
+          port: 20443
+
+    - name: signer-1
+      role: signer
+      config:
+        secretRef:
+          name: signer-1-config
+      dependencies:
+        - actor: companion-1
+          port: 20443
+
+    - name: companion-old
+      role: companion
+      image: stacks-core-4.0.2:local
+      config:
+        secretRef:
+          name: companion-old-config
+
+    - name: signer-old
+      role: signer
+      image: stacks-core-4.0.2:local
+      config:
+        secretRef:
+          name: signer-old-config
+      dependencies:
+        - actor: companion-old
+          port: 20443
+
+    - name: adversary-1
+      role: adversary
+      image: stacks-core-adversary:double-proposal
+      imagePullPolicy: IfNotPresent
+      config:
+        secretRef:
+          name: adversary-1-config
+      labels:
+        testing.stacks.org/behavior: double-proposal

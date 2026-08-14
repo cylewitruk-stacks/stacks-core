@@ -1,0 +1,12 @@
+{{- if .Values.operator.developmentSource.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hacknet.fullname" . }}-development-source
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+data:
+  controller.py: |-
+    {{- .Files.Get "operator/controller.py" | nindent 4 }}
+{{- end }}

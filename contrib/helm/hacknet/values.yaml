@@ -1,0 +1,59 @@
+nameOverride: ""
+fullnameOverride: ""
+
+operator:
+  replicaCount: 1
+  image:
+    repository: stacks-hacknet-operator
+    tag: dev
+    pullPolicy: IfNotPresent
+  # A Docker Desktop kind cluster may not see images in Docker Engine's local
+  # store, depending on the selected image-store backend. This opt-in smoke
+  # mode mounts the chart's controller source into a public Python runtime,
+  # avoiding an image push. Packaged deployments should leave this disabled.
+  developmentSource:
+    enabled: false
+    runtimeImage:
+      repository: python
+      tag: 3.12-slim
+      pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  logLevel: INFO
+  reconcileIntervalSeconds: 5
+  resources:
+    requests:
+      cpu: 25m
+      memory: 48Mi
+    limits:
+      cpu: 250m
+      memory: 192Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # Kubernetes rotates the projected token before this lifetime elapses. The
+  # minimum is useful for a deterministic local rotation smoke test.
+  tokenExpirationSeconds: 3600
+
+# The first version is intentionally namespace-scoped. Leave empty to watch
+# the Helm release namespace. Cross-namespace operation requires different
+# RBAC and is deliberately not enabled by this chart.
+watchNamespace: ""

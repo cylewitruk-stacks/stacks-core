@@ -1,0 +1,399 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: stacksnetworks.testing.stacks.org
+  labels:
+    app.kubernetes.io/name: hacknet
+spec:
+  group: testing.stacks.org
+  scope: Namespaced
+  names:
+    plural: stacksnetworks
+    singular: stacksnetwork
+    kind: StacksNetwork
+    shortNames: [snet, hacknet]
+    categories: [all]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Ready
+          type: string
+          jsonPath: .status.readySummary
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >-
+            StacksNetwork declares a disposable, non-production Stacks test
+            network. Never place valuable keys or funds in this resource.
+          required: [spec]
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required: [actors]
+              properties:
+                suspended:
+                  type: boolean
+                  default: false
+                  description: Scale every actor to zero without deleting its storage.
+                defaults:
+                  type: object
+                  properties:
+                    nodeImage:
+                      type: string
+                    signerImage:
+                      type: string
+                    burnchainImage:
+                      type: string
+                      default: bitcoin/bitcoin:25.2
+                    imagePullPolicy:
+                      type: string
+                      enum: [Always, IfNotPresent, Never]
+                      default: IfNotPresent
+                    dependencyImage:
+                      type: string
+                      default: busybox:1.36.1
+                    imagePullSecrets:
+                      type: array
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name: {type: string}
+                    storage:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: true
+                        size:
+                          type: string
+                          default: 1Gi
+                        mountPath:
+                          type: string
+                          default: /data
+                        storageClassName:
+                          type: string
+                        accessModes:
+                          type: array
+                          items:
+                            type: string
+                            enum: [ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod]
+                    resources:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    podSecurityContext:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    containerSecurityContext:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    terminationGracePeriodSeconds:
+                      type: integer
+                      minimum: 0
+                      maximum: 3600
+                    nodeSelector:
+                      type: object
+                      additionalProperties: {type: string}
+                    affinity:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    tolerations:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    topologySpreadConstraints:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                telemetry:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    image:
+                      type: string
+                      default: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.158.0
+                    exporterEndpoint:
+                      type: string
+                    imagePullPolicy:
+                      type: string
+                      enum: [Always, IfNotPresent, Never]
+                      default: IfNotPresent
+                    resources:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    tokenSecretRef:
+                      type: object
+                      required: [name, key]
+                      properties:
+                        name:
+                          type: string
+                        key:
+                          type: string
+                actors:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [name]
+                  items:
+                    type: object
+                    required: [name, role]
+                    properties:
+                      name:
+                        type: string
+                        minLength: 1
+                        maxLength: 40
+                        pattern: "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+                      role:
+                        type: string
+                        enum: [burnchain, miner, signer, companion, follower, adversary, infrastructure]
+                      image:
+                        type: string
+                      imagePullPolicy:
+                        type: string
+                        enum: [Always, IfNotPresent, Never]
+                      command:
+                        type: array
+                        items: {type: string}
+                      args:
+                        type: array
+                        items: {type: string}
+                      config:
+                        type: object
+                        properties:
+                          inline:
+                            type: string
+                            maxLength: 524288
+                          files:
+                            type: object
+                            maxProperties: 32
+                            additionalProperties:
+                              type: string
+                              maxLength: 524288
+                          key:
+                            type: string
+                            default: config.toml
+                          mountPath:
+                            type: string
+                            default: /etc/stacks
+                          configMapRef:
+                            type: object
+                            required: [name]
+                            properties:
+                              name: {type: string}
+                          secretRef:
+                            type: object
+                            required: [name]
+                            properties:
+                              name: {type: string}
+                      env:
+                        type: array
+                        items:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                      ports:
+                        type: array
+                        maxItems: 32
+                        x-kubernetes-list-type: map
+                        x-kubernetes-list-map-keys: [name]
+                        items:
+                          type: object
+                          required: [name, containerPort]
+                          properties:
+                            name:
+                              type: string
+                              minLength: 1
+                              maxLength: 15
+                              pattern: "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+                            containerPort:
+                              type: integer
+                              minimum: 1
+                              maximum: 65535
+                            servicePort:
+                              type: integer
+                              minimum: 1
+                              maximum: 65535
+                            protocol:
+                              type: string
+                              enum: [TCP, UDP, SCTP]
+                              default: TCP
+                      dependencies:
+                        type: array
+                        maxItems: 32
+                        items:
+                          type: object
+                          required: [actor, port]
+                          properties:
+                            actor: {type: string}
+                            port:
+                              type: integer
+                              minimum: 1
+                              maximum: 65535
+                      storage:
+                        type: object
+                        properties:
+                          enabled:
+                            type: boolean
+                            default: true
+                          size:
+                            type: string
+                            default: 1Gi
+                          mountPath:
+                            type: string
+                            default: /data
+                          storageClassName:
+                            type: string
+                          accessModes:
+                            type: array
+                            items:
+                              type: string
+                              enum: [ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod]
+                      resources:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      podSecurityContext:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      containerSecurityContext:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      readinessProbe:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      livenessProbe:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      startupProbe:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      workingDir:
+                        type: string
+                      runtimePolicy:
+                        type: object
+                        required: [configMapRef]
+                        properties:
+                          configMapRef:
+                            type: object
+                            required: [name]
+                            properties:
+                              name: {type: string}
+                          mountPath:
+                            type: string
+                            default: /run/hacknet-policy
+                          optional:
+                            type: boolean
+                            default: false
+                      terminationGracePeriodSeconds:
+                        type: integer
+                        minimum: 0
+                        maximum: 3600
+                      nodeSelector:
+                        type: object
+                        additionalProperties: {type: string}
+                      affinity:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      tolerations:
+                        type: array
+                        items:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                      topologySpreadConstraints:
+                        type: array
+                        items:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                      telemetry:
+                        type: object
+                        properties:
+                          enabled: {type: boolean}
+                          image: {type: string}
+                          imagePullPolicy:
+                            type: string
+                            enum: [Always, IfNotPresent, Never]
+                          resources:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          metricsPort:
+                            type: integer
+                            minimum: 1
+                            maximum: 65535
+                          exporterEndpoint: {type: string}
+                          tokenSecretRef:
+                            type: object
+                            required: [name, key]
+                            properties:
+                              name: {type: string}
+                              key: {type: string}
+                      labels:
+                        type: object
+                        additionalProperties: {type: string}
+                      annotations:
+                        type: object
+                        additionalProperties: {type: string}
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                phase:
+                  type: string
+                  enum: [Pending, Progressing, Ready, Degraded, Suspended]
+                desiredActors:
+                  type: integer
+                readyActors:
+                  type: integer
+                readySummary:
+                  type: string
+                actors:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [name]
+                  items:
+                    type: object
+                    required: [name, role, resourceName, ready]
+                    properties:
+                      name: {type: string}
+                      role: {type: string}
+                      resourceName: {type: string}
+                      image: {type: string}
+                      ready: {type: boolean}
+                      readyReplicas: {type: integer}
+                conditions:
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: [type]
+                  items:
+                    type: object
+                    required: [type, status, reason, message, lastTransitionTime]
+                    properties:
+                      type: {type: string}
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      reason: {type: string}
+                      message: {type: string}
+                      lastTransitionTime:
+                        type: string
+                        format: date-time

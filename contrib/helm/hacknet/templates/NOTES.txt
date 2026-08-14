@@ -1,0 +1,22 @@
+The Hacknet operator is installed in namespace {{ .Release.Namespace }} and
+watches StacksNetwork resources in namespace {{ include "hacknet.watchNamespace" . }}.
+
+Build the local controller image before installation when using the default
+image settings:
+
+  docker build -t stacks-hacknet-operator:dev contrib/helm/hacknet/operator
+
+If Docker Desktop kind cannot resolve the local image with the default
+IfNotPresent policy, use the explicit source-mount smoke fallback:
+
+  helm upgrade --install hacknet contrib/helm/hacknet \
+    --namespace {{ .Release.Namespace }} \
+    --set operator.developmentSource.enabled=true
+
+Inspect networks with:
+
+  kubectl get stacksnetworks.testing.stacks.org -n {{ include "hacknet.watchNamespace" . }}
+
+No StacksNetwork is created by the chart. Start with the public-image-only
+examples/operator-smoke.yaml, then examples/minimal.yaml after loading a branch
+Stacks image. Never use valuable keys in this test system.

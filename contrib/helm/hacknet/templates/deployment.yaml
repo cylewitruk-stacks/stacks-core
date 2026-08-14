@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hacknet.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.operator.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "hacknet.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hacknet.selectorLabels" . | nindent 8 }}
+        {{- with .Values.operator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/development-source: {{ ternary ((.Files.Get "operator/controller.py") | sha256sum) "disabled" .Values.operator.developmentSource.enabled | quote }}
+        {{- with .Values.operator.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hacknet.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.operator.podSecurityContext | nindent 8 }}
+      {{- with .Values.operator.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: operator
+          {{- if .Values.operator.developmentSource.enabled }}
+          image: "{{ .Values.operator.developmentSource.runtimeImage.repository }}:{{ .Values.operator.developmentSource.runtimeImage.tag }}"
+          imagePullPolicy: {{ .Values.operator.developmentSource.runtimeImage.pullPolicy }}
+          command: ["python", "/app/controller.py"]
+          {{- else }}
+          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.operator.securityContext | nindent 12 }}
+          env:
+            - name: WATCH_NAMESPACE
+              value: {{ include "hacknet.watchNamespace" . | quote }}
+            - name: RECONCILE_INTERVAL_SECONDS
+              value: {{ .Values.operator.reconcileIntervalSeconds | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.operator.logLevel | quote }}
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- if .Values.operator.developmentSource.enabled }}
+            - name: development-source
+              mountPath: /app/controller.py
+              subPath: controller.py
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: {{ .Values.serviceAccount.tokenExpirationSeconds }}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+        {{- if .Values.operator.developmentSource.enabled }}
+        - name: development-source
+          configMap:
+            name: {{ include "hacknet.fullname" . }}-development-source
+        {{- end }}
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
