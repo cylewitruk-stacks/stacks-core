@@ -2362,7 +2362,9 @@ impl ConversationP2P {
                     }
                 }
             }
-            StacksMessageType::NakamotoBlocks(_) => {
+            StacksMessageType::NakamotoBlocks(ref blocks) => {
+                monitoring::increment_nakamoto_blocks_received_counter(blocks.blocks.len());
+
                 // not handled here, but do some accounting -- we can't receive too many
                 // Nakamoto blocks per second
                 match self.validate_nakamoto_block_push(

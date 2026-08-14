@@ -70,6 +70,12 @@ pub fn increment_stx_blocks_received_counter() {
     prometheus::STX_BLOCKS_RECEIVED_COUNTER.inc();
 }
 
+#[allow(unused_variables)]
+pub fn increment_nakamoto_blocks_received_counter(count: usize) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::NAKAMOTO_BLOCKS_RECEIVED_COUNTER.inc_by(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
 pub fn increment_stx_micro_blocks_received_counter() {
     #[cfg(feature = "monitoring_prom")]
     prometheus::STX_MICRO_BLOCKS_RECEIVED_COUNTER.inc();
