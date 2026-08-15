@@ -98,16 +98,28 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
-      "description": "Self-reported burnchain and Stacks heights by actor. Selecting an actor isolates it without hiding the cohort.",
+      "description": "Self-reported Bitcoin burnchain height by actor. Kept on its own scale because Stacks 3.x blocks advance much faster than burn blocks.",
       "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "short"}, "overrides": []},
-      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 4},
+      "gridPos": {"h": 9, "w": 6, "x": 0, "y": 4},
       "id": 7,
       "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "stacks_node_burn_block_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "burn {{attacknet_actor}}", "refId": "A"},
-        {"expr": "stacks_node_stacks_tip_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "stacks {{attacknet_actor}}", "refId": "B"}
+        {"expr": "stacks_node_burn_block_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "{{attacknet_actor}}", "refId": "A"}
       ],
-      "title": "Chain progress and cohort divergence",
+      "title": "Burn-chain cohort progress",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Self-reported canonical Stacks tip height by actor, independently scaled from the slower Bitcoin burnchain.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 6, "x": 6, "y": 4},
+      "id": 26,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "stacks_node_stacks_tip_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "{{attacknet_actor}}", "refId": "A"}
+      ],
+      "title": "Stacks-chain cohort progress",
       "type": "timeseries"
     },
     {
@@ -312,7 +324,7 @@
       "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
       "targets": [{"expr": "attacknet_run_info{network=\"$network\"}", "format": "table", "instant": true, "refId": "A"}],
       "title": "Attacknet run state and schedule (trusted)",
-      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"attribution": "Attribution", "phase": "Phase", "reason": "Reason", "replay": "Replay", "run": "Run", "schedule_digest": "Schedule digest"}}}],
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"attribution": "Attribution", "minimization": "Minimization", "phase": "Phase", "reason": "Reason", "replay": "Replay", "run": "Run", "schedule_digest": "Schedule digest"}}}],
       "type": "table"
     },
     {
@@ -337,6 +349,18 @@
       "targets": [{"expr": "attacknet_run_budget_usage{network=\"$network\"}", "legendFormat": "{{run}} · {{budget}}", "refId": "A"}],
       "title": "Run budget use (trusted)",
       "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Terminal counterfactual classifications from the run controller. FailureAbsent requires explicit evaluation; missing or ambiguous assertion evidence is Inconclusive. These are empirical fresh-network results and never causal-minimality claims.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 83},
+      "id": 25,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_run_minimization_outcome{network=\"$network\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Fresh-network minimization outcomes (trusted)",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"attempt": "Attempt", "candidate_digest": "Candidate digest", "causal_minimality_claimed": "Causal claim", "evidence_digest": "Evidence digest", "expected_assertion": "Expected assertion", "expected_status": "Expected status", "outcome": "Outcome", "reason": "Reason", "run": "Run"}}}],
+      "type": "table"
     }
   ],
   "refresh": "5s",
@@ -344,9 +368,9 @@
   "tags": ["stacks", "attacknet", "adversarial"],
   "templating": {
     "list": [
-      {"current": {}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(attacknet_actor_info, network)", "includeAll": false, "label": "Network", "name": "network", "options": [], "query": {"query": "label_values(attacknet_actor_info, network)", "refId": "PrometheusVariableQueryEditor-Network"}, "refresh": 1, "type": "query"},
-      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(attacknet_actor_info{network=\"$network\"}, role)", "includeAll": true, "label": "Role", "multi": true, "name": "role", "options": [], "query": {"query": "label_values(attacknet_actor_info{network=\"$network\"}, role)", "refId": "PrometheusVariableQueryEditor-Role"}, "refresh": 1, "type": "query"},
-      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(attacknet_actor_info{network=\"$network\",role=~\"$role\"}, actor)", "includeAll": true, "label": "Actor", "multi": true, "name": "actor", "options": [], "query": {"query": "label_values(attacknet_actor_info{network=\"$network\",role=~\"$role\"}, actor)", "refId": "PrometheusVariableQueryEditor-Actor"}, "refresh": 1, "type": "query"}
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(up{attacknet_network!=\"\"}, attacknet_network)", "includeAll": false, "label": "Network", "name": "network", "options": [], "query": {"query": "label_values(up{attacknet_network!=\"\"}, attacknet_network)", "refId": "PrometheusVariableQueryEditor-Network"}, "refresh": 1, "type": "query"},
+      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(up{attacknet_network=\"$network\",attacknet_role!=\"\"}, attacknet_role)", "includeAll": true, "label": "Role", "multi": true, "name": "role", "options": [], "query": {"query": "label_values(up{attacknet_network=\"$network\",attacknet_role!=\"\"}, attacknet_role)", "refId": "PrometheusVariableQueryEditor-Role"}, "refresh": 1, "type": "query"},
+      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(up{attacknet_network=\"$network\",attacknet_role=~\"$role\",attacknet_actor!=\"\"}, attacknet_actor)", "includeAll": true, "label": "Actor", "multi": true, "name": "actor", "options": [], "query": {"query": "label_values(up{attacknet_network=\"$network\",attacknet_role=~\"$role\",attacknet_actor!=\"\"}, attacknet_actor)", "refId": "PrometheusVariableQueryEditor-Actor"}, "refresh": 1, "type": "query"}
     ]
   },
   "time": {"from": "now-30m", "to": "now"},
