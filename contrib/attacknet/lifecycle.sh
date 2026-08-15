@@ -29,7 +29,8 @@ ledger_append() {
 }
 
 ledger_assertion() {
-  local assertion="$1" status="$2" details="${3:-{}}" payload
+  local assertion="$1" status="$2" details="${3:-}" payload
+  [ -n "${details}" ] || details='{}'
   payload="$(ASSERTION="${assertion}" STATUS="${status}" DETAILS="${details}" node -e '
     console.log(JSON.stringify({
       assertion: process.env.ASSERTION,
@@ -499,10 +500,12 @@ apply_error() {
   exit "${status}"
 }
 
-case "${1:-}" in
-  apply) shift; trap 'apply_error $? ${LINENO}' ERR; apply_network "$@"; trap - ERR ;;
-  wait) wait_ready ;;
-  delete) delete_network ;;
-  capture) shift; capture "$@" ;;
-  *) echo "usage: $0 {apply GENERATED_DIR|wait|delete|capture EVIDENCE_DIR}" >&2; exit 2 ;;
-esac
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    apply) shift; trap 'apply_error $? ${LINENO}' ERR; apply_network "$@"; trap - ERR ;;
+    wait) wait_ready ;;
+    delete) delete_network ;;
+    capture) shift; capture "$@" ;;
+    *) echo "usage: $0 {apply GENERATED_DIR|wait|delete|capture EVIDENCE_DIR}" >&2; exit 2 ;;
+  esac
+fi

@@ -57,7 +57,8 @@ ledger_fault() {
 }
 
 ledger_assertion() {
-  local assertion="$1" status="$2" details="${3:-{}}" payload
+  local assertion="$1" status="$2" details="${3:-}" payload
+  [ -n "${details}" ] || details='{}'
   payload="$(ASSERTION="${assertion}" STATUS="${status}" DETAILS="${details}" node -e '
     console.log(JSON.stringify({assertion:process.env.ASSERTION,status:process.env.STATUS,details:JSON.parse(process.env.DETAILS)}));
   ')"

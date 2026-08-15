@@ -13,6 +13,8 @@ node --test "${ATTACKNET_DIR}"/*.test.mjs
 node --test "${ATTACKNET_DIR}"/observability/*.test.mjs
 bash -n "${ATTACKNET_DIR}"/*.sh
 bash -n "${ATTACKNET_DIR}"/observability/*.sh
+bash -c 'source "$1/lifecycle.sh"; RUN_DESCRIPTOR=""; ledger_assertion regression pass "{\"value\":1}"' \
+  _ "${ATTACKNET_DIR}"
 python3 -m py_compile "${ATTACKNET_DIR}/observability/event_bridge.py"
 python3 -m unittest discover -s "${ATTACKNET_DIR}/observability" -p 'test_*.py'
 
