@@ -1134,12 +1134,51 @@ experiments require the apparatus to fail visibly and converge exactly.
   signer initialized registered for reward cycle 11 on its first process start;
   and its companion subscribed to the legacy `.miners` StackerDB.
 - Protocol result: at burn 223 the miner produced Nakamoto blocks, the signer
-  received/validated/accepted four proposals with zero rejections, and miner,
+  received/validated/accepted proposals with zero rejections, and miner,
   companion, and follower converged on the same burn height, Stacks height, and
-  canonical tip. No actor container restarted during the accepted run.
+  canonical tip. A later backend-neutral progress gate observed burn 232/Stacks
+  31 advance to burn 233/Stacks 32 inside 30 seconds with zero cohort drift and
+  four authenticated conversations per node; the signer had accepted 9/9
+  proposals at the preceding sample. No actor container restarted during the
+  accepted run, including across a Docker Desktop restart.
 - Boundary: this proves the corrected one-miner/one-signer/one-follower staged
   lifecycle and human observability surface. It is not the full 28-actor
   capacity baseline, a fault campaign, or the required 300+ burn-block soak.
+
+## C-002: Medium and full current-main capacity stages passed API-pressure and convergence gates
+
+- Classification: clean capacity and control-plane acceptance evidence
+- Evidence: `contrib/attacknet/evidence/capacity-current-main-20260815T1215Z/`
+  contains requested topology, admitted resources, per-node kubelet storage,
+  operator metrics before/after each stage, every convergence attempt, final
+  invariant result, runtime image identity, and trusted timeline.
+- Medium result: the two-miner/four-signer/two-follower topology reached Ready
+  in 174 seconds and a clean stable progress window on attempt 2. The operator
+  made 3,029 API requests across 28 reconciliations with zero throttles, server
+  errors, or transport failures; mean reconcile duration was 0.434 seconds and
+  maximum was 1.096 seconds.
+- Full result: the three-miner/ten-signer/five-follower topology rendered 31
+  actor workloads, reached Ready in 218 seconds, and passed a clean stable
+  progress window on attempt 5. The operator made 6,826 API requests across 31
+  reconciliations with zero throttles, server errors, or transport failures;
+  mean reconcile duration was 1.080 seconds and maximum was 1.489 seconds.
+  All 31 actors remained Ready with zero restarts and were distributed 16/15
+  across the two worker nodes. The accepted window advanced burn 227 to 228
+  and Stacks 23 to 24 with zero cohort drift, one canonical tip per height, and
+  the required live authenticated-peer coverage.
+- Transient observation: the full topology's first three post-activation
+  samples had incomplete peer coverage and followers up to five Stacks blocks
+  behind. Attempt 4 converged by its ending snapshot, but correctly remained a
+  failed stable-window result because its starting snapshot was unhealthy.
+  Attempt 5 proved both endpoints clean. This is bounded convergence behavior,
+  not silently discarded warm-up evidence.
+- Resource result: before each stage, all three kubelet summaries reported
+  roughly 51.4 GB free on root and image filesystems. No ENOSPC, eviction,
+  restart, or unexplained control-plane pressure occurred.
+- Boundary: this proves a fresh corrected full-topology baseline and API
+  feasibility on the local two-worker kind data plane. It does not yet prove
+  fault recovery, mixed-version compatibility, deliberate worker loss/PVC
+  behavior, or the required 300+ burn-block soak.
 
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
