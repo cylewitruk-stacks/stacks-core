@@ -291,6 +291,52 @@
       ],
       "title": "P2P connectivity distribution (self-reported)",
       "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Orchestrator-observed FaultCampaign phases. A new labelled series is created only when the controller-observed phase changes; Chaos Mesh bookkeeping alone cannot produce Passed.",
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0, "spanNulls": false}, "mappings": [{"options": {"1": {"color": "blue", "text": "observed"}}, "type": "value"}], "max": 1, "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 66},
+      "id": 21,
+      "options": {"alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.65, "showValue": "never", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "attacknet_fault_campaign_info{network=\"$network\",template=\"false\"}", "legendFormat": "{{campaign}} · {{type}} · {{phase}} · {{reason}}", "refId": "A"}],
+      "title": "Fault campaign state (trusted)",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Current sealed AttacknetRun identity, phase, attribution state, and replay status. The schedule digest ties this view to the immutable execution artifact.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 66},
+      "id": 22,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_run_info{network=\"$network\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Attacknet run state and schedule (trusted)",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"attribution": "Attribution", "phase": "Phase", "reason": "Reason", "replay": "Replay", "run": "Run", "schedule_digest": "Schedule digest"}}}],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Trusted effect and recovery outcomes for exact admitted actors. Failed or Inconclusive rows are triage entry points; actor logs cannot create these results.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 9, "w": 16, "x": 0, "y": 74},
+      "id": 23,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_fault_campaign_assertion_outcome{network=\"$network\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Fault effect and recovery assertions (trusted)",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"actor": "Actor", "assertion": "Assertion", "campaign": "Campaign", "outcome": "Outcome"}}}],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Current raw budget use by run. Values have the unit named by each series (counts, seconds, or percent); compare against the admitted AttacknetRun limits in its CR.",
+      "fieldConfig": {"defaults": {"color": {"mode": "continuous-GrYlRd"}, "min": 0}, "overrides": []},
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 74},
+      "id": 24,
+      "options": {"displayMode": "gradient", "minVizHeight": 10, "minVizWidth": 0, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true, "sizing": "auto", "valueMode": "color"},
+      "targets": [{"expr": "attacknet_run_budget_usage{network=\"$network\"}", "legendFormat": "{{run}} · {{budget}}", "refId": "A"}],
+      "title": "Run budget use (trusted)",
+      "type": "bargauge"
     }
   ],
   "refresh": "5s",

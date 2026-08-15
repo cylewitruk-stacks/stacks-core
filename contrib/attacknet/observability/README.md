@@ -6,6 +6,9 @@ version of that instrumentation:
 
 - Prometheus scrapes every rendered Stacks node and signer with stable network,
   actor, and role labels.
+- Prometheus also scrapes the trusted run controller for bounded
+  `FaultCampaign`/`AttacknetRun` phase, exact-target, assertion-outcome,
+  schedule-digest, and budget-use gauges.
 - Grafana Alloy tails each actor container through the Kubernetes logs API and
   sends raw stdout/stderr to a single-binary Loki instance with seven-day
   retention and a dedicated PVC.
@@ -77,6 +80,11 @@ kubectl -n hacknet-system rollout status daemonset/attacknet-attacknet-alloy
 kubectl -n hacknet-system rollout status deployment/attacknet-attacknet-grafana
 ```
 
+The standard Helm release exposes these metrics at `hacknet-run:8080`. If the
+release name or service differs, pass the admitted DNS endpoint explicitly as
+`--run-operator-target=NAME:PORT`; the renderer rejects arbitrary/newline
+targets rather than interpolating them into Prometheus configuration.
+
 The generated file and adjacent `event-token` contain the writer credential and
 are mode `0600`; treat them as runtime artifacts and do not commit them or
 include them in evidence. Supplying `--event-token=...` makes token management
@@ -108,7 +116,8 @@ Grafana provisions two complementary human-diagnostic views:
 - **Network, Faults, and Recovery** is the command center. It shows trusted
   actor inventory/placement/readiness beside self-reported chain cohorts,
   signer participation, legacy P2P connectivity, the network block pipeline,
-  fault/invariant timelines, warning/error rates, and centralized raw logs.
+  fault/invariant timelines, sealed run state and budget use, trusted effect
+  and recovery outcomes, warning/error rates, and centralized raw logs.
   Network, role, and actor variables narrow every relevant panel.
 - **Actor Drill-down** follows one actor through its admitted image and
   Kubernetes node, readiness/restarts, active faults, chain state, P2P/RPC

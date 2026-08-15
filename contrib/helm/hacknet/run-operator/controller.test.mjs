@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import {
   AttacknetRunReconciler, FaultCampaignReconciler, FINALIZER, digest,
-  artifactDigest, decodeSchedule, networkManifest, podEffectResults, stableName,
+  artifactDigest, decodeSchedule, networkManifest, podEffectResults, prometheusMetrics, stableName,
 } from './controller.mjs';
 
 const uid = name => `uid-${name}`;
@@ -417,4 +417,27 @@ test('FaultCampaign finalizer removes an owned fault before permitting deletion'
   assert.equal(await api.get('podchaos', value.metadata.name, {
     group: 'chaos-mesh.org', allow404: true,
   }), null);
+});
+
+test('run-controller metrics expose bounded orchestrator state and assertion outcomes', () => {
+  const value = networkCampaign();
+  value.status = {
+    phase: 'Passed', reason: 'EffectAndRecoveryProven',
+    resolvedTargets: [{actor: 'signer-1', role: 'signer', node: 'worker-1'}],
+    effectResults: [{actor: 'signer-1', assertion: 'NetworkDegraded', outcome: 'Proven'}],
+    recoveryResults: [{actor: 'signer-1', assertion: 'TargetReady', outcome: 'Proven'}],
+  };
+  const run = attacknetRun(campaign({template: true}));
+  run.status = {
+    phase: 'Running', reason: 'CampaignActive', attribution: 'Untriaged',
+    scheduleRef: {digest: `sha256:${'b'.repeat(64)}`}, scheduleSummary: {replay: false},
+    budgetUsage: {campaigns: 1, wallTimeSeconds: 42},
+  };
+  const output = prometheusMetrics([value], [run]);
+  assert.match(output, /attacknet_fault_campaign_info\{[^\n]*phase="Passed"/);
+  assert.match(output, /attacknet_fault_campaign_target_info\{[^\n]*actor="signer-1"/);
+  assert.match(output, /assertion="NetworkDegraded",outcome="Proven"/);
+  assert.match(output, /attacknet_run_info\{[^\n]*phase="Running"[^\n]*schedule_digest="sha256:b{64}"/);
+  assert.match(output, /attacknet_run_budget_usage\{[^\n]*budget="wallTimeSeconds"\} 42/);
+  assert.doesNotMatch(output, /pod_uid/);
 });

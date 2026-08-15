@@ -35,6 +35,8 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
   assert.equal(nodes[1].labels.evidence_source, 'actor_self_reported');
   assert.equal(signers[0].targets[0], 'attacknet-test-signer-1:31000');
   assert.match(prometheus.data['prometheus.yml'], /attacknet-orchestrator-events/);
+  assert.match(prometheus.data['prometheus.yml'], /job_name: attacknet-run-controller/);
+  assert.match(prometheus.data['prometheus.yml'], /targets: \["hacknet-run:8080"\]/);
 
   for (const name of ['events', 'prometheus', 'grafana']) {
     const deployment = resources.get(`Deployment/attacknet-test-attacknet-${name}`);
@@ -53,6 +55,18 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
   const secretConsumers = deployments.filter(deployment =>
     deployment.spec.template.spec.volumes.some(volume => volume.secret?.secretName === secretName));
   assert.deepEqual(secretConsumers.map(deployment => deployment.metadata.name), ['attacknet-test-attacknet-events']);
+});
+
+test('run-controller metrics target is explicit and cannot inject Prometheus config', () => {
+  const rendered = renderObservability(manifest, {
+    eventToken: 'c'.repeat(64), runOperatorTarget: 'custom-run.hacknet-system.svc:8080',
+  });
+  const prometheus = rendered.items.find(item => item.kind === 'ConfigMap'
+    && item.metadata.name === 'attacknet-test-attacknet-prometheus');
+  assert.match(prometheus.data['prometheus.yml'], /custom-run\.hacknet-system\.svc:8080/);
+  assert.throws(() => renderObservability(manifest, {
+    eventToken: 'c'.repeat(64), runOperatorTarget: 'run:8080\n  - job_name: forged',
+  }), /bounded DNS name/);
 });
 
 test('render centralizes actor logs with collector-attached Kubernetes identity and bounded retention', () => {

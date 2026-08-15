@@ -223,6 +223,70 @@ function status(base, phase, reason, extra = {}) {
   };
 }
 
+function metricLabel(value) {
+  return String(value ?? '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/"/g, '\\"');
+}
+
+function metric(name, labels, value = 1) {
+  const encoded = Object.entries(labels).map(([key, item]) => `${key}="${metricLabel(item)}"`).join(',');
+  return `${name}{${encoded}} ${value}`;
+}
+
+export function prometheusMetrics(campaigns, runs) {
+  const lines = [
+    '# HELP attacknet_fault_campaign_info Current orchestrator-observed FaultCampaign state.',
+    '# TYPE attacknet_fault_campaign_info gauge',
+    '# HELP attacknet_fault_campaign_target_info Exact actor targets admitted for a FaultCampaign.',
+    '# TYPE attacknet_fault_campaign_target_info gauge',
+    '# HELP attacknet_fault_campaign_assertion_outcome Trusted effect and recovery assertion outcomes.',
+    '# TYPE attacknet_fault_campaign_assertion_outcome gauge',
+    '# HELP attacknet_run_info Current orchestrator-observed AttacknetRun state.',
+    '# TYPE attacknet_run_info gauge',
+    '# HELP attacknet_run_budget_usage Current AttacknetRun budget consumption.',
+    '# TYPE attacknet_run_budget_usage gauge',
+  ];
+  for (const campaign of campaigns) {
+    const base = {
+      evidence_source: 'orchestrator_observed',
+      network: campaign.spec?.networkRef ?? '', campaign: campaign.metadata?.name ?? '',
+    };
+    lines.push(metric('attacknet_fault_campaign_info', {
+      ...base, type: campaign.spec?.fault?.type ?? '', phase: campaign.status?.phase ?? 'Pending',
+      reason: campaign.status?.reason ?? '', template: campaign.spec?.template === true ? 'true' : 'false',
+    }));
+    for (const target of campaign.status?.resolvedTargets ?? []) {
+      lines.push(metric('attacknet_fault_campaign_target_info', {
+        ...base, actor: target.actor, role: target.role, node: target.node,
+      }));
+    }
+    for (const result of [
+      ...(campaign.status?.effectResults ?? []), ...(campaign.status?.recoveryResults ?? []),
+    ]) {
+      lines.push(metric('attacknet_fault_campaign_assertion_outcome', {
+        ...base, actor: result.actor, assertion: result.assertion, outcome: result.outcome,
+      }));
+    }
+  }
+  for (const run of runs) {
+    const base = {
+      evidence_source: 'orchestrator_observed', network: run.spec?.networkRef ?? '',
+      run: run.metadata?.name ?? '',
+    };
+    lines.push(metric('attacknet_run_info', {
+      ...base, phase: run.status?.phase ?? 'Pending', reason: run.status?.reason ?? '',
+      attribution: run.status?.attribution ?? 'Untriaged',
+      replay: run.status?.scheduleSummary?.replay === true ? 'true' : 'false',
+      schedule_digest: run.status?.scheduleRef?.digest ?? '',
+    }));
+    for (const [budget, value] of Object.entries(run.status?.budgetUsage ?? {})) {
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        lines.push(metric('attacknet_run_budget_usage', {...base, budget}, value));
+      }
+    }
+  }
+  return `${lines.join('\n')}\n`;
+}
+
 export class ApiError extends Error {
   constructor(code, method, path, body = '') {
     super(`Kubernetes API ${method} ${path} returned ${code}: ${body.slice(0, 500)}`);
@@ -944,7 +1008,10 @@ export class RunController {
     this.api = api;
     this.faults = new FaultCampaignReconciler(api);
     this.runs = new AttacknetRunReconciler(api);
+    this.observedCampaigns = [];
+    this.observedRuns = [];
   }
+  metrics() { return prometheusMetrics(this.observedCampaigns, this.observedRuns); }
   async reconcileOnce() {
     let dependencyFailure = null;
     const [campaignList, runList] = await Promise.all([
@@ -952,6 +1019,8 @@ export class RunController {
     ]);
     const campaigns = [...(campaignList.items ?? [])].sort((a, b) =>
       `${a.metadata.creationTimestamp}/${a.metadata.name}`.localeCompare(`${b.metadata.creationTimestamp}/${b.metadata.name}`));
+    this.observedCampaigns = campaigns;
+    this.observedRuns = runList.items ?? [];
     const executions = campaigns.filter(item => item.spec?.template !== true && !TERMINAL_PHASES.has(item.status?.phase));
     const activeName = executions[0]?.metadata.name;
     for (const campaign of campaigns) {
@@ -969,6 +1038,7 @@ export class RunController {
       }
     }
     const refreshed = await this.api.list('faultcampaigns');
+    this.observedCampaigns = refreshed.items ?? [];
     const runs = [...(runList.items ?? [])].sort((a, b) =>
       `${a.metadata.creationTimestamp ?? ''}/${a.metadata.name}`
         .localeCompare(`${b.metadata.creationTimestamp ?? ''}/${b.metadata.name}`));
@@ -999,6 +1069,11 @@ async function main() {
   let lastProgress = Date.now();
   const server = http.createServer((request, response) => {
     const healthy = Date.now() - lastProgress < Math.max(90_000, interval * 4);
+    if (request.url === '/metrics') {
+      response.writeHead(200, {'Content-Type': 'text/plain; version=0.0.4; charset=utf-8'});
+      response.end(controller.metrics());
+      return;
+    }
     const code = request.url === '/healthz' ? (healthy ? 200 : 503)
       : request.url === '/readyz' ? (ready ? 200 : 503) : 404;
     response.writeHead(code, {'Content-Type': 'text/plain'});

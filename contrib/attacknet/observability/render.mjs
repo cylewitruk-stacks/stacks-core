@@ -58,7 +58,7 @@ function actorTargets(manifest) {
   };
 }
 
-function prometheusConfig(manifest) {
+function prometheusConfig(manifest, runOperatorTarget) {
   const bridge = `${stableName(manifest.network, 'attacknet-events')}:9464`;
   return `global:
   scrape_interval: 5s
@@ -97,6 +97,15 @@ scrape_configs:
     sample_limit: 10000
     static_configs:
       - targets: ["${bridge}"]
+        labels:
+          attacknet_network: ${manifest.network}
+          evidence_source: orchestrator_observed
+  - job_name: attacknet-run-controller
+    honor_labels: false
+    scrape_timeout: 3s
+    sample_limit: 10000
+    static_configs:
+      - targets: ["${runOperatorTarget}"]
         labels:
           attacknet_network: ${manifest.network}
           evidence_source: orchestrator_observed
@@ -295,17 +304,21 @@ export function renderObservability(manifest, {
   pythonImage = 'python:3.13-alpine',
   lokiImage = 'grafana/loki:3.5.3',
   alloyImage = 'grafana/alloy:v1.10.0',
+  runOperatorTarget = 'hacknet-run:8080',
 } = {}) {
   const network = manifest.network;
   const namespace = manifest.namespace;
   if (!DNS_LABEL.test(network) || network.length > 63 || !DNS_LABEL.test(namespace) || namespace.length > 63) throw new Error('manifest network and namespace must be DNS labels of at most 63 characters');
+  if (!/^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?:[1-9][0-9]{0,4}$/.test(runOperatorTarget)) {
+    throw new Error('runOperatorTarget must be a bounded DNS name and TCP port');
+  }
   const token = eventToken ?? randomBytes(32).toString('hex');
   if (token.length < 32) throw new Error('eventToken must contain at least 32 characters');
   const targetData = actorTargets(manifest);
   const overview = readFileSync(join(ROOT, 'dashboards', 'attacknet-overview.json'), 'utf8');
   const actorDashboard = readFileSync(join(ROOT, 'dashboards', 'attacknet-actor.json'), 'utf8');
   const eventSource = readFileSync(join(ROOT, 'event_bridge.py'), 'utf8');
-  const promConfig = prometheusConfig(manifest);
+  const promConfig = prometheusConfig(manifest, runOperatorTarget);
   const logsConfig = lokiConfig();
   const collectorConfig = alloyConfig(manifest);
   const nodeTargets = `${JSON.stringify(targetData.nodes, null, 2)}\n`;
@@ -414,6 +427,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     pythonImage: option('python-image', 'python:3.13-alpine'),
     lokiImage: option('loki-image', 'grafana/loki:3.5.3'),
     alloyImage: option('alloy-image', 'grafana/alloy:v1.10.0'),
+    runOperatorTarget: option('run-operator-target', 'hacknet-run:8080'),
   });
   mkdirSync(dirname(output), {recursive: true});
   writeFileSync(output, `${JSON.stringify(resource, null, 2)}\n`, {mode: 0o600});
