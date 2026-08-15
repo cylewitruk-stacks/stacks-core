@@ -7,6 +7,8 @@ EVIDENCE_ROOT="${ATTACKNET_CAPACITY_EVIDENCE:-${ATTACKNET_DIR}/evidence/capacity
 STAGES="${ATTACKNET_CAPACITY_STAGES:-1:1:1 2:4:2 3:10:5}"
 NODE_IMAGE="${ATTACKNET_NODE_IMAGE:-stacks-core-attacknet:main}"
 STACKER_IMAGE="${ATTACKNET_STACKER_IMAGE:-stacks-attacknet-stacker:local}"
+PROBES="${ATTACKNET_PROBES:-true}"
+PROBE_IMAGE="${ATTACKNET_PROBE_IMAGE:-stacks-hacknet-probe:dev}"
 KEEP_LAST="${ATTACKNET_KEEP_LAST:-1}"
 MINIMUM_NODE_AVAILABLE_BYTES="${ATTACKNET_MINIMUM_NODE_AVAILABLE_BYTES:-8589934592}"
 STAGE_CONVERGENCE_TIMEOUT_SECONDS="${ATTACKNET_STAGE_CONVERGENCE_TIMEOUT_SECONDS:-180}"
@@ -70,6 +72,7 @@ for stage in ${STAGES}; do
     --network="${network}" --namespace="${NAMESPACE}" \
     --miners="${miners}" --signers="${signers}" --followers="${followers}" \
     --node-image="${NODE_IMAGE}" --stacker-image="${STACKER_IMAGE}" \
+    --probes="${PROBES}" --probe-image="${PROBE_IMAGE}" \
     --output="${output}/rendered"
 
   capture_operator_metrics "${output}/operator-before.prom"

@@ -2793,6 +2793,92 @@ does pass the controller contract.
   `cleanup.absent=true`, `EffectAndRecoveryProven`, with the same admitted Pod
   UID in both effect and recovery evidence.
 
+## F-112: The capacity profile omitted the trusted active-probe containers
+
+- Classification: attacknet profile and acceptance-evidence gap
+- State: default corrected; clean live full-topology admission proven; fault
+  effect and recovery proof pending
+- Evidence: the corrected three-stage capacity run admitted and converged the
+  complete 31-workload topology, but the retained actor Pods contained only
+  the `actor` container. `capacity-preflight.sh` invoked `topology.mjs`
+  without its opt-in `--probes=true`, even though NetworkChaos, DNSChaos,
+  IOChaos, I/O-pressure, and TimeChaos require the independently controlled
+  active probe for effect and recovery evidence.
+- Impact: PodChaos remained independently provable from Kubernetes Pod state,
+  but a data-plane campaign on the retained stage could only terminate
+  Inconclusive. Hot-adding probes would also roll every actor after the clean
+  capacity baseline, weakening the provenance of a final long soak.
+- Correction and gate: capacity rendering now enables trusted probes by
+  default and accepts explicit `ATTACKNET_PROBES` and
+  `ATTACKNET_PROBE_IMAGE` inputs. The final 300+ block environment must admit
+  the exact probe image from initial Pod creation and prove controlled
+  before/during/after observations; the probe requirement is never weakened
+  to make a campaign pass.
+- Clean proof: `attacknet-final-soak` reached `Ready 31/31` with every actor
+  Pod reporting `2/2` containers from its initial creation. The admitted probe
+  image is `stacks-hacknet-probe:dev`; no actor was rolled or hot-patched to
+  add it. This proves admission and readiness, but not yet the required
+  before/during/after fault effect.
+- Capacity evidence retained separately:
+  `contrib/attacknet/evidence/capacity-current-20260815T2250Z/`.
+
+## F-113: Legacy P2P startup convergence was highly lopsided before becoming dense
+
+- Classification: startup-convergence latency and measurement gap; no
+  permanent node failure established
+- State: reproduced in three fresh full or scaled stages; all recovered
+  without intervention; structured timing and laggard evidence captured
+- Evidence: in the 2-miner/4-signer stage, `signer-node-2` served RPC and was
+  chain-synchronized while `/v2/neighbors` reported zero live inbound and
+  outbound conversations; its three configured bootstrap Services were all
+  TCP-reachable. In the fresh full stage, `signer-node-1` showed the same zero
+  state while every other sampled node already had 11--26 authenticated
+  conversations. Each isolated companion later acquired an authenticated
+  inbound conversation and rapidly converged to the dense cohort. Final full
+  verification showed at least 28 authenticated conversations per node and
+  no unauthenticated conversations.
+- Clean reproduction: in `attacknet-final-soak`, `signer-node-9` remained at
+  zero live inbound and outbound conversations for 595 seconds while serving
+  RPC, staying chain-synchronized at burn height 222 / Stacks height 15, and
+  retaining three reachable bootstrap endpoints. The peer database had
+  already learned and recently contacted a broad frontier, yet `/v2/neighbors`
+  still exposed no active conversation. It recovered at 595 seconds without
+  a restart or configuration change; the post-activation 18-node gate then
+  passed in two seconds.
+- Boundary: configured `bootstrap` and `sample` rows do not prove a live
+  connection; the API currently hard-codes their `authenticated` field to
+  true. Only `inbound` and `outbound` were used by the gate. No Kubernetes
+  DNS, Service endpoint, TCP reachability, process restart, or persistent
+  isolation failure was found.
+- Follow-up: `wait_live_peer_connectivity` now reports the zero-connection
+  actor set every 30 seconds and records convergence duration plus per-actor
+  live counts in the sealed run ledger. Repeat fresh runs before deciding
+  whether this is expected randomized legacy-neighbor walking, an epoch-handoff
+  delay, or a current-node reliability issue. A readiness timeout alone must
+  not erase the distribution.
+- Preserved evidence:
+  `contrib/attacknet/evidence/final-soak-20260815T232258Z/startup-p2p-lag/`.
+
+## F-114: A symlinked CLI fixture could make the peer-gate test pass on empty output
+
+- Classification: attacknet regression-test false-positive
+- State: fixed and covered
+- Evidence: the startup-gate test symlinked `manifest-inventory.mjs` and
+  `invariants.mjs` into its fake harness directory. Node canonicalized
+  `import.meta.url` to the real module while retaining the symlink spelling in
+  `process.argv[1]`, so the modules' CLI-entrypoint checks were false. They
+  emitted nothing and exited zero. The former lifecycle gate trusted the exit
+  status and returned success without parsing the invariant result.
+- Impact: production lifecycle invocations used the real paths and did execute
+  the helpers, but this test could not prove the claimed live-conversation
+  gate. It was another instance of a check that could not fail.
+- Correction: the lifecycle now requires a structured result containing rows
+  and finite authenticated/unauthenticated extrema before recording success.
+  The fixture copies the CLI modules and canonicalizes the macOS temporary
+  directory path, so the actual CLI entry points execute. The test still
+  forces one failed sample and proves a subsequent successful live-peer sample
+  without triggering the lifecycle failure trap.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

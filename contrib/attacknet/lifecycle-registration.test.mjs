@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {chmodSync, existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync} from 'node:fs';
+import {chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import test from 'node:test';
@@ -178,9 +178,17 @@ test('two-phase bootstrap never receives a second generic clock-start command', 
 });
 
 test('startup gates require live conversations and canonical global-state support', () => {
-  const root = mkdtempSync(join(tmpdir(), 'attacknet-protocol-gates-'));
-  symlinkSync(resolve('contrib/attacknet/manifest-inventory.mjs'), join(root, 'manifest-inventory.mjs'));
-  symlinkSync(resolve('contrib/attacknet/invariants.mjs'), join(root, 'invariants.mjs'));
+  // macOS exposes TMPDIR through /var while import.meta resolves /private/var.
+  // Use one canonical path so CLI-entrypoint identity remains true.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'attacknet-protocol-gates-')));
+  // Copy executable modules instead of symlinking them. Node resolves
+  // import.meta.url to the real path while process.argv[1] retains a symlink
+  // path, which suppresses these modules' CLI entry points and can turn an
+  // empty helper result into a false-positive lifecycle test.
+  writeFileSync(join(root, 'manifest-inventory.mjs'),
+    readFileSync(resolve('contrib/attacknet/manifest-inventory.mjs'), 'utf8'));
+  writeFileSync(join(root, 'invariants.mjs'),
+    readFileSync(resolve('contrib/attacknet/invariants.mjs'), 'utf8'));
   const backend = join(root, 'runtime-backend.sh');
   writeFileSync(backend, `#!/bin/sh
 case "$*" in
@@ -209,7 +217,9 @@ esac
     ATTACKNET_DIR="$FAKE_ATTACKNET_DIR"
     NAMESPACE=hacknet-system
     NETWORK=network-a
-    TIMEOUT=2
+    # This test deliberately forces one failed peer sample. Leave enough
+    # wall-clock budget for the structured diagnostic and succeeding sample.
+    TIMEOUT=5
     sleep() { :; }
     node() {
       if [[ "$1" == *invariants.mjs ]] && [ "$2" = peers ] && [ ! -e "$FIRST_SAMPLE" ]; then
@@ -233,7 +243,7 @@ esac
       FALSE_FAILURE: join(root, 'false-lifecycle-failure'),
     },
   });
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
   assert.equal(existsSync(join(root, 'first-sample')), true);
   assert.equal(existsSync(join(root, 'false-lifecycle-failure')), false);
   assert.match(result.stdout, /live authenticated P2P connectivity proven/);

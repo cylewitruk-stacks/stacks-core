@@ -15,6 +15,7 @@ CHAOS_DASHBOARD_LOCAL_ACCESS_ENABLED="${ATTACKNET_CHAOS_DASHBOARD_LOCAL_ACCESS_E
 RUN_DESCRIPTOR=""
 RUN_ID="${ATTACKNET_RUN_ID:-}"
 RUN_SEED="${ATTACKNET_RUN_SEED:-}"
+LIVE_PEER_CONNECTIVITY_RESULT='{}'
 ENVIRONMENT_LOCK="${ATTACKNET_DIR}/environment-lock.sh"
 
 [[ "${NETWORK}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
@@ -263,8 +264,8 @@ wait_nodes_at_burn_height() {
 }
 
 wait_live_peer_connectivity() {
-  local manifest="$1" group="$2" deadline=$((SECONDS + TIMEOUT))
-  local actors actor neighbors first samples result invariant_status
+  local manifest="$1" group="$2" started=${SECONDS} deadline=$((SECONDS + TIMEOUT))
+  local actors actor neighbors first samples result invariant_status elapsed lagging last_report=-30
   actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" "${group}")"
   samples="$(mktemp)"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
@@ -289,11 +290,43 @@ wait_live_peer_connectivity() {
     invariant_status=0
     result="$(trap - ERR; node "${ATTACKNET_DIR}/invariants.mjs" peers "${samples}" 2>/dev/null)" \
       || invariant_status=$?
+    # Treat a malformed or empty helper result as an unsuccessful sample.  The
+    # status alone is not sufficient evidence for the structured ledger, and
+    # accepting it here would either abort while parsing or fabricate a pass.
+    if [ "${invariant_status}" -eq 0 ] && ! RESULT="${result}" node -e '
+      const value=JSON.parse(process.env.RESULT);
+      if (!Array.isArray(value.rows)
+          || !Number.isFinite(value.minimumAuthenticatedConnections)
+          || !Number.isFinite(value.maximumUnauthenticatedConnections)) process.exit(1);
+    ' >/dev/null 2>&1; then
+      invariant_status=1
+    fi
     if [ "${invariant_status}" -eq 0 ]; then
+      elapsed=$((SECONDS - started))
+      LIVE_PEER_CONNECTIVITY_RESULT="$(RESULT="${result}" ELAPSED="${elapsed}" GROUP="${group}" node -e '
+        const value=JSON.parse(process.env.RESULT);
+        process.stdout.write(JSON.stringify({
+          group: process.env.GROUP,
+          convergenceSeconds: Number(process.env.ELAPSED),
+          minimumAuthenticatedConnections: value.minimumAuthenticatedConnections,
+          maximumUnauthenticatedConnections: value.maximumUnauthenticatedConnections,
+          rows: value.rows,
+        }));
+      ')"
       rm -f "${samples}"
-      printf '%s live authenticated P2P connectivity proven for %s nodes\n' \
-        "${group}" "$(wc -w <<<"${actors}" | tr -d ' ')"
+      printf '%s live authenticated P2P connectivity proven for %s nodes in %ss\n' \
+        "${group}" "$(wc -w <<<"${actors}" | tr -d ' ')" "${elapsed}"
       return 0
+    fi
+    elapsed=$((SECONDS - started))
+    if [ $((elapsed - last_report)) -ge 30 ]; then
+      lagging="$(RESULT="${result}" node -e '
+        const value=JSON.parse(process.env.RESULT);
+        process.stdout.write(value.rows.filter(row => row.authenticated === 0).map(row => row.actor).join(",") || "none");
+      ' 2>/dev/null || printf unavailable)"
+      printf '%s waiting for live authenticated P2P; elapsed=%ss lagging=%s\n' \
+        "${group}" "${elapsed}" "${lagging}"
+      last_report=${elapsed}
     fi
     sleep 2
   done
@@ -653,7 +686,7 @@ apply_network() {
   local generated="${1:?generated topology directory required}"
   local manifest="${generated}/manifest.json" final_network="${generated}/stacksnetwork.json"
   local bootstrap_network="${generated}/stacksnetwork.bootstrap.json"
-  local gated desired_interval desired_jitter enrollment_height cutoff_height observer_height registration_height activation_height start_details storage_report pre_activation_stacks_height signer_set_report
+  local gated desired_interval desired_jitter enrollment_height cutoff_height observer_height registration_height activation_height start_details storage_report pre_activation_stacks_height signer_set_report post_activation_peer_result
   if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
     node "${ATTACKNET_DIR}/observability/render.mjs" "${manifest}" \
       --output="${generated}/observability.json" \
@@ -735,6 +768,8 @@ apply_network() {
     wait_signers_registered "${manifest}"
     wait_companion_stackerdb_subscriptions "${manifest}"
     wait_live_peer_connectivity "${manifest}" pre-activation-nodes
+    ledger_assertion pre-activation-live-peer-connectivity pass \
+      "${LIVE_PEER_CONNECTIVITY_RESULT}"
     ledger_assertion signers-registered pass \
       "{\"requestedHeight\":${registration_height},\"observedHeight\":$(clock_status_value bitcoin_height)}"
     ledger_assertion companion-stackerdb-subscriptions pass \
@@ -748,11 +783,16 @@ apply_network() {
     wait_nodes_at_burn_height "${manifest}" nodes "${activation_height}"
     wait_ready
     wait_live_peer_connectivity "${manifest}" nodes
+    post_activation_peer_result="${LIVE_PEER_CONNECTIVITY_RESULT}"
     wait_signer_global_state "${manifest}"
     signer_set_report="$(wait_signer_set_parity "${manifest}")"
     wait_nodes_at_stacks_height "${manifest}" nodes "$((pre_activation_stacks_height + 1))"
     ledger_assertion live-peer-connectivity pass \
-      "{\"observedHeight\":$(clock_status_value bitcoin_height)}"
+      "$(RESULT="${post_activation_peer_result}" HEIGHT="$(clock_status_value bitcoin_height)" node -e '
+        const value=JSON.parse(process.env.RESULT);
+        value.observedHeight=Number(process.env.HEIGHT);
+        process.stdout.write(JSON.stringify(value));
+      ')"
     ledger_assertion signer-global-state pass \
       "{\"threshold\":\"canonical-rounded-up\",\"observedHeight\":$(clock_status_value bitcoin_height)}"
     ledger_assertion signer-set-parity pass "${signer_set_report}"
