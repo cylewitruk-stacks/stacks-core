@@ -1198,6 +1198,37 @@ experiments require the apparatus to fail visibly and converge exactly.
   and proves no generated directory is created. Rejecting all other unknown
   options remains a follow-up hardening item.
 
+## F-063: First-class fault resources bypassed the shared environment mutation lease
+
+- Classification: control-plane serialization and attribution defect
+- State: fixed and regression-tested offline; live controller-owned campaign proof pending
+- Evidence: the host lifecycle and shell campaign runner serialize applies,
+  cadence changes, faults, and teardown through the
+  `attacknet-mutation-lease` ConfigMap. The asynchronous run controller instead
+  serialized only `FaultCampaign` objects against one another with an in-memory
+  oldest-campaign rule. A directly submitted `FaultCampaign` or an
+  `AttacknetRun` child could therefore inject Chaos while a host process was
+  changing cadence, applying a network generation, capturing a supposedly
+  stable assertion window, or tearing the environment down.
+- Risk: two individually valid operations could overlap and produce an
+  unattributable failure, a false recovery, or a replay ledger whose recorded
+  order did not match the mutations actually observed by the network. This is
+  especially dangerous for an agent-driven attacknet because Kubernetes CR
+  submission is asynchronous and human discipline cannot serialize the later
+  controller action.
+- Remediation: every executable campaign now verifies the persistent
+  environment lease, atomically acquires the same namespaced mutation
+  ConfigMap used by the host harness, and binds ownership to the campaign's
+  immutable Kubernetes UID. A foreign holder leaves a pending campaign inert;
+  loss of an owned lease after injection fails closed and removes the owned
+  Chaos resource without deleting the replacement holder's lease; terminal
+  and finalizer cleanup release only an exact UID/token match. The run
+  controller's namespaced Role gained only ConfigMap delete, not broader
+  cluster authority. Regression coverage proves exclusive acquisition,
+  foreign-holder waiting, post-injection lease-loss cleanup, noninterference,
+  and terminal release. A live campaign must still verify the installed RBAC,
+  ConfigMap lifecycle, Chaos effect, and recovery end to end.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

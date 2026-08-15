@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  AttacknetRunReconciler, FaultCampaignReconciler, FINALIZER, digest,
+  AttacknetRunReconciler, FaultCampaignReconciler, RunController, FINALIZER, digest,
   artifactDigest, classifyTerminalAssertion, decodeSchedule, networkManifest, podEffectResults,
   prometheusMetrics, stableName,
 } from './controller.mjs';
@@ -17,6 +17,11 @@ class FakeApi {
   constructor() {
     this.objects = new Map();
     this.pods = [];
+    this.put('configmaps', {
+      apiVersion: 'v1', kind: 'ConfigMap',
+      metadata: {name: 'attacknet-environment-lease', namespace: 'hacknet', uid: uid('environment-lease')},
+      data: {network: 'demo', owner: 'test', purpose: 'test', acquiredAt: '2026-01-01T00:00:00Z'},
+    }, '');
   }
   key(group, plural, name) { return `${group}/${plural}/${name}`; }
   put(plural, value, group = 'testing.stacks.org') {
@@ -181,6 +186,86 @@ test('template campaigns validate without creating a fault', async () => {
   assert.equal(admitted.status.phase, 'Pending');
   assert.equal(admitted.status.reason, 'TemplateReady');
   assert.equal((await api.list('podchaos', {group: 'chaos-mesh.org'})).items.length, 0);
+});
+
+test('an executable campaign exclusively holds and releases the shared mutation lease', async () => {
+  const api = new FakeApi();
+  api.put('stacksnetworks', network());
+  api.pods = [pod('signer-1', 'signer')];
+  const value = campaign();
+  api.put('faultcampaigns', value);
+  const reconciler = new FaultCampaignReconciler(api);
+
+  await reconciler.reconcile(value);
+  let current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Admitted');
+  const lease = await api.get('configmaps', 'attacknet-mutation-lease', {group: ''});
+  assert.deepEqual(lease.data, {
+    network: 'demo', owner: `faultcampaign:${value.metadata.uid}`,
+    purpose: `faultcampaign:${value.metadata.name}`, token: value.metadata.uid,
+    acquiredAt: lease.data.acquiredAt,
+  });
+
+  current.status = {...current.status, phase: 'Passed', reason: 'EffectAndRecoveryProven'};
+  api.put('faultcampaigns', current);
+  await reconciler.reconcile(current);
+  assert.equal(await api.get('configmaps', 'attacknet-mutation-lease', {
+    group: '', allow404: true,
+  }), null);
+});
+
+test('a foreign mutation holder keeps a pending campaign inert', async () => {
+  const api = new FakeApi();
+  api.put('stacksnetworks', network());
+  api.pods = [pod('signer-1', 'signer')];
+  api.put('configmaps', {
+    apiVersion: 'v1', kind: 'ConfigMap',
+    metadata: {name: 'attacknet-mutation-lease', namespace: 'hacknet', uid: uid('foreign-lease')},
+    data: {network: 'demo', owner: 'human:123', purpose: 'lifecycle', token: 'foreign-token'},
+  }, '');
+  const value = campaign();
+  api.put('faultcampaigns', value);
+
+  await new FaultCampaignReconciler(api).reconcile(value);
+  const current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Pending');
+  assert.equal(current.status.reason, 'WaitingForMutationLease');
+  assert.equal((await api.list('podchaos', {group: 'chaos-mesh.org'})).items.length, 0);
+  const lease = await api.get('configmaps', 'attacknet-mutation-lease', {group: ''});
+  assert.equal(lease.data.token, 'foreign-token');
+});
+
+test('losing the mutation lease after injection fails closed and removes only owned Chaos', async () => {
+  const api = new FakeApi();
+  api.put('stacksnetworks', network());
+  api.pods = [pod('signer-1', 'signer')];
+  const value = campaign();
+  api.put('faultcampaigns', value);
+  const reconciler = new FaultCampaignReconciler(api);
+
+  await reconciler.reconcile(value);
+  let current = await api.get('faultcampaigns', value.metadata.name);
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Injecting');
+  assert.ok(await api.get('podchaos', value.metadata.name, {group: 'chaos-mesh.org'}));
+
+  api.put('configmaps', {
+    apiVersion: 'v1', kind: 'ConfigMap',
+    metadata: {name: 'attacknet-mutation-lease', namespace: 'hacknet', uid: uid('replacement-lease')},
+    data: {network: 'demo', owner: 'human:456', purpose: 'teardown', token: 'replacement-token'},
+  }, '');
+  await new RunController(api).reconcileOnce();
+
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Failed');
+  assert.equal(current.status.reason, 'ControllerError');
+  assert.match(current.status.message, /lost its mutation lease/);
+  assert.equal(await api.get('podchaos', value.metadata.name, {
+    group: 'chaos-mesh.org', allow404: true,
+  }), null);
+  const foreign = await api.get('configmaps', 'attacknet-mutation-lease', {group: ''});
+  assert.equal(foreign.data.token, 'replacement-token');
 });
 
 test('Pod effect proof is tied to the immutable admitted UID', () => {

@@ -22,6 +22,8 @@ export const VERSION = 'v1alpha1';
 export const FINALIZER = 'testing.stacks.org/fault-cleanup';
 export const TERMINAL_PHASES = new Set(['Passed', 'Failed', 'Inconclusive']);
 export const MINIMIZATION_OUTCOMES = new Set(['FailureReproduced', 'FailureAbsent', 'Inconclusive']);
+const ENVIRONMENT_LEASE = 'attacknet-environment-lease';
+const MUTATION_LEASE = 'attacknet-mutation-lease';
 const SCHEDULE_FORMAT = 'stacks-attacknet-schedule-configmap/v1';
 const CHAOS_PLURALS = Object.freeze({
   PodChaos: 'podchaos', NetworkChaos: 'networkchaos', DNSChaos: 'dnschaos',
@@ -507,6 +509,44 @@ export class FaultCampaignReconciler {
     return {absent: !remaining, allRecovered};
   }
 
+  leaseOwner(campaign) { return `faultcampaign:${campaign.metadata.uid}`; }
+
+  async holdMutationLease(campaign, network, acquire) {
+    const environment = await this.api.get('configmaps', ENVIRONMENT_LEASE,
+      {group: '', allow404: true});
+    if (environment?.data?.network !== network) {
+      throw new Error(`active environment lease is not ${network}`);
+    }
+    let lease = await this.api.get('configmaps', MUTATION_LEASE, {group: '', allow404: true});
+    const owner = this.leaseOwner(campaign);
+    if (!lease && acquire) {
+      const desired = {
+        apiVersion: 'v1', kind: 'ConfigMap',
+        metadata: {name: MUTATION_LEASE, namespace: campaign.metadata.namespace},
+        data: {
+          network, owner, purpose: `faultcampaign:${campaign.metadata.name}`,
+          token: campaign.metadata.uid, acquiredAt: now(),
+        },
+      };
+      try { lease = await this.api.create('configmaps', desired, {group: ''}); }
+      catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 409) throw error;
+        lease = await this.api.get('configmaps', MUTATION_LEASE, {group: '', allow404: true});
+      }
+    }
+    if (!lease) return false;
+    return lease.data?.network === network && lease.data?.owner === owner
+      && lease.data?.token === campaign.metadata.uid;
+  }
+
+  async releaseMutationLease(campaign) {
+    const lease = await this.api.get('configmaps', MUTATION_LEASE, {group: '', allow404: true});
+    if (!lease) return;
+    if (lease.data?.owner !== this.leaseOwner(campaign)
+        || lease.data?.token !== campaign.metadata.uid) return;
+    await this.api.delete('configmaps', MUTATION_LEASE, {group: '', allow404: true});
+  }
+
   async collectProbePhase(campaign, compiled, network, pods, phase, allInjectedObserved = false) {
     const identity = chaosIdentity(campaign);
     const selectedActors = compiled.evidence.selectedActors;
@@ -538,6 +578,7 @@ export class FaultCampaignReconciler {
     if (!(campaign.metadata.finalizers ?? []).includes(FINALIZER)) return;
     const cleanup = await this.removeChaos(campaign);
     if (!cleanup.absent) return;
+    await this.releaseMutationLease(campaign);
     await this.patchFinalizers(campaign, (campaign.metadata.finalizers ?? []).filter(item => item !== FINALIZER));
   }
 
@@ -555,7 +596,10 @@ export class FaultCampaignReconciler {
       await this.patchFinalizers(campaign, [...(campaign.metadata.finalizers ?? []), FINALIZER]);
       return;
     }
-    if (TERMINAL_PHASES.has(campaign.status?.phase)) return;
+    if (TERMINAL_PHASES.has(campaign.status?.phase)) {
+      await this.releaseMutationLease(campaign);
+      return;
+    }
     if (!serialized && (!campaign.status?.phase || campaign.status.phase === 'Pending')) {
       if (campaign.status?.reason !== 'SerializedBehindActiveFault') {
         await this.patchStatus(campaign, status(campaign.status, 'Pending', 'SerializedBehindActiveFault'));
@@ -572,6 +616,18 @@ export class FaultCampaignReconciler {
     const compiled = compileCampaign(campaignDocument(campaign), manifest);
     const compiledDigest = artifactDigest(compiled.resource);
     const phase = campaign.status?.phase ?? 'Pending';
+    const ownsMutationLease = await this.holdMutationLease(
+      campaign, manifest.network, phase === 'Pending',
+    );
+    if (!ownsMutationLease) {
+      if (phase !== 'Pending') {
+        throw new Error(`FaultCampaign ${campaign.metadata.name} lost its mutation lease`);
+      }
+      if (campaign.status?.reason !== 'WaitingForMutationLease') {
+        await this.patchStatus(campaign, status(campaign.status, 'Pending', 'WaitingForMutationLease'));
+      }
+      return;
+    }
 
     if (phase === 'Pending') {
       const pods = await this.api.list('pods', {group: '', labels: `testing.stacks.org/network=${manifest.network}`});
