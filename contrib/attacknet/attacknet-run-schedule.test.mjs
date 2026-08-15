@@ -7,8 +7,10 @@ import test from 'node:test';
 
 import {
   ATTACKNET_SCHEDULE_SCHEMA,
+  consumeDdminCandidate,
   consumeReplayPlan,
   createDdminPlan,
+  describeDdminCandidate,
   issueDdminAttempt,
   recordDdminOutcome,
   resolveAttacknetSchedule,
@@ -151,6 +153,9 @@ test('schedule validation detects spec, budget, and integrity tampering', () => 
   tampered.budgets.usage.campaigns = 0;
   assert.throws(() => validateResolvedSchedule(tampered), /budget usage mismatch/);
   tampered = structuredClone(schedule);
+  tampered.budgets.headroom.campaigns = 999;
+  assert.throws(() => validateResolvedSchedule(tampered), /budget headroom mismatch/);
+  tampered = structuredClone(schedule);
   tampered.run.seed = 'changed';
   assert.throws(() => validateResolvedSchedule(tampered), /integrity mismatch/);
 });
@@ -244,6 +249,33 @@ test('ddmin is adaptive, counterfactual, and accepts evidence only from unique f
   assert.equal(plan.result.causalMinimalityClaimed, false);
 });
 
+test('ddmin candidate admission permits only source removals on a fresh identical network', () => {
+  const {run, context} = fixture();
+  const source = resolveAttacknetSchedule(run, context);
+  const issued = issueDdminAttempt(createDdminPlan(source, {
+    requireFreshNetwork: true, maxAttempts: 4,
+    expectedFailure: {assertion: 'TargetReady', status: 'Failed'},
+  }));
+  const reduction = describeDdminCandidate(source, issued.attempt.schedule);
+  const fresh = structuredClone(context);
+  fresh.network = {uid: 'network-uid-ddmin-fresh', generation: 1};
+  const admitted = consumeDdminCandidate(reduction, source, fresh);
+  assert.equal(admitted.network.uid, 'network-uid-ddmin-fresh');
+  assert.equal(admitted.replay.sourceScheduleDigest, source.integrity.digest);
+  assert.equal(admitted.replay.candidateScheduleDigest, issued.attempt.schedule.integrity.digest);
+  assert.deepEqual(admitted.actions.map(action => action.instructionId),
+    issued.attempt.schedule.actions.map(action => action.instructionId));
+
+  const reordered = describeDdminCandidate(source, source);
+  reordered.retained.reverse();
+  assert.throws(() => consumeDdminCandidate(reordered, source, fresh), /may not reorder/);
+  const widened = structuredClone(reduction);
+  widened.retained[0].removedTargets = ['not-a-source-target'];
+  assert.throws(() => consumeDdminCandidate(widened, source, fresh), /unknown target/);
+  fresh.network.uid = source.network.uid;
+  assert.throws(() => consumeDdminCandidate(reduction, source, fresh), /fresh network UID/);
+});
+
 test('ddmin records inconclusive counterfactuals without a minimality claim', () => {
   const {run, context} = fixture();
   const schedule = resolveAttacknetSchedule(run, context);
@@ -299,6 +331,13 @@ test('ddmin rejects mismatched counterfactual evidence and source-only schedules
   cadenceOnly.budgets.usage = {
     campaigns: 0, cumulativeFaultSeconds: 0, maximumSignerImpactPercent: 0,
     burnchainFaults: 0, maximumActiveFaults: 0, plannedWallTimeSeconds: 0,
+  };
+  cadenceOnly.budgets.headroom = {
+    campaigns: cadenceOnly.budgets.limits.maxCampaigns,
+    cumulativeFaultSeconds: cadenceOnly.budgets.limits.maxCumulativeFaultSeconds,
+    signerImpactPercent: cadenceOnly.budgets.limits.maxSignerImpactPercent,
+    burnchainFaults: cadenceOnly.budgets.limits.maxBurnchainFaults,
+    wallTimeSeconds: cadenceOnly.budgets.limits.maxWallTimeSeconds,
   };
   const unsigned = structuredClone(cadenceOnly);
   delete unsigned.integrity;

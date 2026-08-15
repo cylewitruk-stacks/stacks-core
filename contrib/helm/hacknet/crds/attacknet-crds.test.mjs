@@ -259,9 +259,37 @@ test('AttacknetRun status accepts serialized controller decisions and budget evi
       wallTimeSeconds: 600, cumulativeFaultSeconds: 45, maximumSignerImpactPercent: 0,
       burnchainFaults: 0, inconclusiveCampaigns: 0, minimizationAttempts: 0,
     },
+    terminalClassification: {
+      attemptId: 'ddmin-001', candidateScheduleDigest: `sha256:${'d'.repeat(64)}`,
+      expectedAssertion: 'TargetReady', expectedStatus: 'Failed',
+      outcome: 'FailureAbsent', reason: 'ExpectedAssertionEvaluatedWithoutExpectedStatus',
+      observationCount: 1,
+      observations: [{child: 'campaign-1', source: 'recovery', outcome: 'Proven', actor: 'miner-2'}],
+      evidenceDigest: `sha256:${'e'.repeat(64)}`,
+      evidenceURI: 'k8s://attacknetruns/ddmin-001/terminal-assertion-evidence',
+      causalMinimalityClaimed: false,
+    },
     attribution: 'NotRequired', evidenceURI: 'file:///evidence/run.json',
   };
   assert.deepEqual(validate(value, schema(runCRD)), []);
+});
+
+test('AttacknetRun minimization attempt has a bounded removal-only admission shape', () => {
+  const value = clone(runExample);
+  value.spec.replay.enabled = false;
+  value.spec.minimization = {
+    enabled: true, strategy: 'DeltaDebug', maxAttempts: 1, requireFreshNetwork: true,
+    sourceRunRef: 'failed-run', sourceScheduleDigest: `sha256:${'a'.repeat(64)}`,
+    attemptId: 'ddmin-001', candidateScheduleDigest: `sha256:${'b'.repeat(64)}`,
+    expectedAssertion: 'TargetReady', expectedStatus: 'Failed',
+    retained: [{instructionId: 'delay-miner-once', removedTargets: [], removedParameters: ['jitter']}],
+  };
+  assert.deepEqual(validate(value, schema(runCRD)), []);
+  assert.equal(schema(runCRD).properties.spec.properties.minimization.properties.retained.maxItems, 256);
+  assert.deepEqual(
+    schema(runCRD).properties.status.properties.terminalClassification.properties.causalMinimalityClaimed.enum,
+    [false],
+  );
 });
 
 test('AttacknetRun schema rejects concurrency and empty seeds', () => {
@@ -286,17 +314,20 @@ test('AttacknetRun uses Kubernetes-compatible pruning and bounded arrays', () =>
   );
 });
 
-test('AttacknetRun CEL rules bind sequence, budgets, replay, and resume', () => {
+test('AttacknetRun CEL rules bind sequence, budgets, replay, resume, and minimization', () => {
   const spec = schema(runCRD).properties.spec;
   const messages = [
     ...(spec['x-kubernetes-validations'] ?? []),
     ...(spec.properties.budgets['x-kubernetes-validations'] ?? []),
     ...(spec.properties.replay['x-kubernetes-validations'] ?? []),
     ...(spec.properties.resume['x-kubernetes-validations'] ?? []),
+    ...(spec.properties.minimization['x-kubernetes-validations'] ?? []),
   ].map(item => item.message).join('\n');
   for (const expected of [
     'ordered sequence exceeds maxCampaigns', 'every sequence campaign must exist',
     'sequence instruction IDs must be unique', 'replay and resume cannot both be enabled',
     'enabled replay requires', 'enabled resume requires',
+    'enabled minimization is one bounded DeltaDebug attempt',
+    'a minimization attempt cannot also be replay or resume',
   ]) assert.match(messages, new RegExp(expected));
 });

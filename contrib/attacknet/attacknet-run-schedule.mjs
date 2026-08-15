@@ -352,7 +352,10 @@ export function validateResolvedSchedule(schedule) {
   });
   const expectedUsage = usageFor(actions);
   if (canonicalJson(expectedUsage) !== canonicalJson(schedule.budgets.usage)) throw new Error('schedule budget usage mismatch');
-  validateBudgetUsage(expectedUsage, schedule.budgets.limits);
+  const expectedBudgets = validateBudgetUsage(expectedUsage, schedule.budgets.limits);
+  if (canonicalJson(expectedBudgets) !== canonicalJson(schedule.budgets)) {
+    throw new Error('schedule budget headroom mismatch');
+  }
   object(schedule.integrity, 'schedule.integrity');
   const unsigned = copy(schedule);
   delete unsigned.integrity;
@@ -589,11 +592,172 @@ function materializeCandidate(plan, removed) {
     action.resolved.campaignSpecDigest = sha256Value(action.resolved.campaignSpec);
   }
   candidate.actions.forEach((action, index) => { action.order = index + 1; });
-  candidate.budgets.usage = usageFor(candidate.actions);
+  candidate.budgets = validateBudgetUsage(usageFor(candidate.actions), candidate.budgets.limits);
   const unsigned = copy(candidate);
   delete unsigned.integrity;
   candidate.integrity = {algorithm: 'sha256', digest: sha256Value(unsigned)};
   return candidate;
+}
+
+function sealCandidate(candidate) {
+  candidate.actions.forEach((action, index) => { action.order = index + 1; });
+  candidate.budgets = validateBudgetUsage(usageFor(candidate.actions), candidate.budgets.limits);
+  const unsigned = copy(candidate);
+  delete unsigned.integrity;
+  candidate.integrity = {algorithm: 'sha256', digest: sha256Value(unsigned)};
+  return candidate;
+}
+
+/**
+ * Describe a candidate exclusively as removals from an immutable source
+ * schedule. The controller accepts this compact description instead of an
+ * arbitrary schedule supplied by the host-side minimizer.
+ */
+export function describeDdminCandidate(sourceSchedule, candidateSchedule) {
+  validateResolvedSchedule(sourceSchedule);
+  validateResolvedSchedule(candidateSchedule);
+  const sourceByInstruction = new Map(sourceSchedule.actions.map(action => [action.instructionId, action]));
+  const retained = [];
+  for (const action of candidateSchedule.actions) {
+    const source = sourceByInstruction.get(action.instructionId);
+    if (!source || source.kind !== 'fault-campaign' || action.kind !== 'fault-campaign') {
+      throw new Error(`ddmin candidate action ${action.instructionId} is not a source fault action`);
+    }
+    const sourceTargets = new Set(source.resolved.targets);
+    if (action.resolved.targets.some(target => !sourceTargets.has(target))) {
+      throw new Error(`ddmin candidate ${action.instructionId} adds a target`);
+    }
+    const sourceKeys = new Set(Object.keys(source.resolved.parameters));
+    if (Object.keys(action.resolved.parameters).some(key => !sourceKeys.has(key))) {
+      throw new Error(`ddmin candidate ${action.instructionId} adds a parameter`);
+    }
+    retained.push({
+      instructionId: action.instructionId,
+      removedTargets: source.resolved.targets.filter(target => !action.resolved.targets.includes(target)),
+      removedParameters: Object.keys(source.resolved.parameters)
+        .filter(key => !(key in action.resolved.parameters)).sort(),
+    });
+  }
+  const reduction = {
+    sourceScheduleDigest: sourceSchedule.integrity.digest,
+    candidateScheduleDigest: candidateSchedule.integrity.digest,
+    retained,
+  };
+  const reconstructed = applyDdminReduction(sourceSchedule, reduction);
+  if (reconstructed.integrity.digest !== candidateSchedule.integrity.digest) {
+    throw new Error('ddmin candidate contains changes other than permitted removals');
+  }
+  return reduction;
+}
+
+function applyDdminReduction(sourceSchedule, reduction) {
+  object(reduction, 'ddmin reduction');
+  if (digest(reduction.sourceScheduleDigest, 'ddmin reduction sourceScheduleDigest')
+      !== sourceSchedule.integrity.digest) {
+    throw new Error('ddmin reduction source schedule digest does not match');
+  }
+  const descriptors = array(reduction.retained, 'ddmin reduction retained', {minimum: 1, maximum: 256});
+  const sourceByInstruction = new Map(sourceSchedule.actions.map(action => [action.instructionId, action]));
+  const sourceOrder = new Map(sourceSchedule.actions.map((action, index) => [action.instructionId, index]));
+  const seen = new Set();
+  let priorSourceOrder = -1;
+  const candidate = copy(sourceSchedule);
+  candidate.actions = descriptors.map((descriptor, index) => {
+    object(descriptor, `ddmin reduction retained[${index}]`);
+    const instructionId = string(descriptor.instructionId, `ddmin reduction retained[${index}].instructionId`);
+    if (seen.has(instructionId)) throw new Error(`duplicate ddmin instruction ${instructionId}`);
+    seen.add(instructionId);
+    const source = sourceByInstruction.get(instructionId);
+    if (!source || source.kind !== 'fault-campaign') {
+      throw new Error(`ddmin reduction references unknown fault action ${instructionId}`);
+    }
+    if (sourceOrder.get(instructionId) <= priorSourceOrder) {
+      throw new Error('ddmin reduction may not reorder source actions');
+    }
+    priorSourceOrder = sourceOrder.get(instructionId);
+    const action = copy(source);
+    const removedTargets = unique(array(descriptor.removedTargets ?? [],
+      `ddmin reduction ${instructionId}.removedTargets`, {maximum: 256}).map(String),
+    `ddmin reduction ${instructionId}.removedTargets`);
+    const sourceTargets = new Set(source.resolved.targets);
+    if (removedTargets.some(target => !sourceTargets.has(target))) {
+      throw new Error(`ddmin reduction ${instructionId} removes an unknown target`);
+    }
+    if (removedTargets.length > 0) {
+      action.resolved.targets = source.resolved.targets.filter(target => !removedTargets.includes(target));
+      if (action.resolved.targets.length === 0) throw new Error(`ddmin reduction ${instructionId} removes every target`);
+      action.resolved.campaignSpec.target = {actors: [...action.resolved.targets], roles: []};
+    }
+    const removedParameters = unique(array(descriptor.removedParameters ?? [],
+      `ddmin reduction ${instructionId}.removedParameters`, {maximum: 256}).map(String),
+    `ddmin reduction ${instructionId}.removedParameters`);
+    const sourceParameters = new Set(Object.keys(source.resolved.parameters));
+    if (removedParameters.some(key => !sourceParameters.has(key))) {
+      throw new Error(`ddmin reduction ${instructionId} removes an unknown parameter`);
+    }
+    if (removedParameters.length > 0) {
+      for (const key of removedParameters) delete action.resolved.parameters[key];
+      action.resolved.campaignSpec.fault.parameters = copy(action.resolved.parameters);
+    }
+    action.resolved.campaignSpecDigest = sha256Value(action.resolved.campaignSpec);
+    return action;
+  });
+  return sealCandidate(candidate);
+}
+
+/**
+ * Validate a host-issued ddmin reduction against the terminal source run and
+ * bind the admitted candidate to a separately identified fresh network.
+ */
+export function consumeDdminCandidate(reduction, sourceSchedule, context) {
+  validateResolvedSchedule(sourceSchedule);
+  object(context, 'context');
+  const candidate = applyDdminReduction(sourceSchedule, reduction);
+  if (candidate.integrity.digest === sourceSchedule.integrity.digest) {
+    throw new Error('ddmin counterfactual must remove at least one campaign, target, or parameter');
+  }
+  if (digest(reduction.candidateScheduleDigest, 'ddmin reduction candidateScheduleDigest')
+      !== candidate.integrity.digest) {
+    throw new Error('ddmin reduction candidate digest does not match permitted source removals');
+  }
+  const manifest = copy(object(context.manifest, 'context.manifest'));
+  const manifestDigest = sha256Value(manifest);
+  if (manifestDigest !== sourceSchedule.network.manifestDigest) {
+    throw new Error('ddmin candidate network manifest differs from the source schedule');
+  }
+  const images = normalizeImages(context.images);
+  if (canonicalJson(images) !== canonicalJson(sourceSchedule.imageConstraints)) {
+    throw new Error('ddmin candidate resolved images differ from the source schedule');
+  }
+  const sources = normalizeSources(context.campaigns);
+  // Removed campaigns remain part of the immutable experimental input set.
+  // Require every source template, not only templates retained by this
+  // counterfactual, so the host cannot combine reduction with source drift.
+  for (const action of sourceSchedule.actions.filter(item => item.kind === 'fault-campaign')) {
+    const source = sources.get(action.source.name);
+    if (!source || source.metadata.uid !== action.source.uid
+        || source.metadata.generation !== action.source.generation
+        || sha256Value(source.spec) !== action.source.specDigest) {
+      throw new Error(`ddmin candidate source ${action.source.name} no longer satisfies immutable constraints`);
+    }
+  }
+  const uid = string(context.network?.uid, 'context.network.uid');
+  if (uid === sourceSchedule.network.uid) throw new Error('ddmin candidate requires a fresh network UID');
+  candidate.network = {
+    name: sourceSchedule.network.name,
+    uid,
+    generation: integer(context.network?.generation, 'context.network.generation', {minimum: 1}),
+    manifestDigest,
+  };
+  candidate.replay = {
+    enabled: true,
+    strategy: 'deterministic-hierarchical-ddmin/v1',
+    sourceScheduleDigest: sourceSchedule.integrity.digest,
+    sourceNetwork: copy(sourceSchedule.network),
+    candidateScheduleDigest: reduction.candidateScheduleDigest,
+    disclosure: 'This is a permitted removal-only counterfactual on a fresh network; it does not establish causal minimality.',
+  };
+  return sealCandidate(candidate);
 }
 
 function advanceDimension(plan) {

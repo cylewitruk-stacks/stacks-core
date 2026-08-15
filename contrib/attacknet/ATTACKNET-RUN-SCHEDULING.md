@@ -106,3 +106,9 @@ one child `FaultCampaign` at a time from
 `action.resolved.campaignSpec`, and verify its source/image constraints and
 schedule digest before creation. Persist the complete schedule, each issued
 ddmin attempt, and each outcome beside the incident evidence bundle.
+
+The bounded host implementation is documented in
+[`DDMIN-EXECUTION.md`](DDMIN-EXECUTION.md). Its CR admission contract sends
+only a removal description and candidate digest; the controller reconstructs
+the candidate from the terminal source schedule. The host does not submit an
+arbitrary schedule and never creates Chaos resources directly.

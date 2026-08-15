@@ -133,13 +133,15 @@
                     "sourceRunRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
                     "descriptorURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
                     "descriptorDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "attemptId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 63},
+                    "expectedStatus": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
                     "requireSameResolvedImages": {"type": "boolean"},
                     "verifyExpectedFailure": {"type": "boolean"}
                   },
                   "x-kubernetes-validations": [{
-                    "rule": "!self.enabled || (has(self.sourceRunRef) && has(self.descriptorURI) && has(self.descriptorDigest))",
-                    "message": "enabled replay requires sourceRunRef, descriptorURI, and descriptorDigest"
+                    "rule": "!self.enabled || (has(self.sourceRunRef) && has(self.descriptorURI) && has(self.descriptorDigest) && has(self.attemptId) && (!self.verifyExpectedFailure || (has(self.expectedAssertion) && has(self.expectedStatus))))",
+                    "message": "enabled replay requires sourceRunRef, descriptorURI, descriptorDigest, attemptId, and an assertion/status when expected-failure verification is enabled"
                   }]
                 },
                 "resume": {
@@ -164,19 +166,43 @@
                     "enabled": {"type": "boolean"},
                     "strategy": {"type": "string", "enum": ["FailurePrefix", "DeltaDebug"]},
                     "maxAttempts": {"type": "integer", "minimum": 0, "maximum": 64},
-                    "requireFreshNetwork": {"type": "boolean", "enum": [true]}
+                    "requireFreshNetwork": {"type": "boolean", "enum": [true]},
+                    "sourceRunRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                    "sourceScheduleDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "attemptId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                    "candidateScheduleDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 63},
+                    "expectedStatus": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
+                    "retained": {
+                      "type": "array", "minItems": 1, "maxItems": 256, "x-kubernetes-list-type": "atomic",
+                      "items": {
+                        "type": "object", "required": ["instructionId", "removedTargets", "removedParameters"],
+                        "properties": {
+                          "instructionId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                          "removedTargets": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"}},
+                          "removedParameters": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+                        }
+                      }
+                    }
                   },
-                  "x-kubernetes-validations": [{
-                    "rule": "self.enabled || self.maxAttempts == 0",
-                    "message": "disabled minimization must use maxAttempts=0"
-                  }]
+                  "x-kubernetes-validations": [
+                    {
+                      "rule": "self.enabled || self.maxAttempts == 0",
+                      "message": "disabled minimization must use maxAttempts=0"
+                    },
+                    {
+                      "rule": "!self.enabled || (self.strategy == 'DeltaDebug' && self.maxAttempts == 1 && has(self.sourceRunRef) && has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.candidateScheduleDigest) && has(self.expectedAssertion) && has(self.expectedStatus) && has(self.retained))",
+                      "message": "enabled minimization is one bounded DeltaDebug attempt and requires immutable source, candidate, expectation, and retained-action fields"
+                    }
+                  ]
                 }
               },
               "x-kubernetes-validations": [
                 {"rule": "self.sequence.size() <= self.budgets.maxCampaigns", "message": "ordered sequence exceeds maxCampaigns budget"},
                 {"rule": "self.sequence.all(step, self.campaignCatalog.exists(campaign, campaign.name == step.campaign))", "message": "every sequence campaign must exist in campaignCatalog"},
                 {"rule": "self.sequence.all(step, self.sequence.filter(other, other.id == step.id).size() == 1)", "message": "sequence instruction IDs must be unique"},
-                {"rule": "!(self.replay.enabled && self.resume.enabled)", "message": "replay and resume cannot both be enabled"}
+                {"rule": "!(self.replay.enabled && self.resume.enabled)", "message": "replay and resume cannot both be enabled"},
+                {"rule": "!(self.minimization.enabled && (self.replay.enabled || self.resume.enabled))", "message": "a minimization attempt cannot also be replay or resume"}
               ]
             },
             "status": {
@@ -251,6 +277,28 @@
                 "replayPlanURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
                 "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
                 "evidenceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                "terminalClassification": {
+                  "type": "object",
+                  "required": ["attemptId", "candidateScheduleDigest", "expectedAssertion", "expectedStatus", "outcome", "reason", "observationCount", "observations", "evidenceDigest", "evidenceURI", "causalMinimalityClaimed"],
+                  "properties": {
+                    "attemptId": {"type": "string", "minLength": 1, "maxLength": 63},
+                    "candidateScheduleDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 63},
+                    "expectedStatus": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
+                    "outcome": {"type": "string", "enum": ["FailureReproduced", "FailureAbsent", "Inconclusive"]},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "observationCount": {"type": "integer", "minimum": 0, "maximum": 25600},
+                    "observations": {"type": "array", "maxItems": 256, "items": {"type": "object", "required": ["child", "source", "outcome"], "properties": {
+                      "child": {"type": "string", "maxLength": 63},
+                      "source": {"type": "string", "enum": ["effect", "recovery"]},
+                      "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
+                      "actor": {"type": "string", "maxLength": 63}
+                    }}},
+                    "evidenceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
+                    "causalMinimalityClaimed": {"type": "boolean", "enum": [false]}
+                  }
+                },
                 "cleanup": {"type": "object", "properties": {"required": {"type": "boolean"}, "completed": {"type": "boolean"}, "completedAt": {"type": "string", "format": "date-time"}, "message": {"type": "string", "maxLength": 2048}}},
                 "conditions": {"type": "array", "maxItems": 16, "x-kubernetes-list-type": "map", "x-kubernetes-list-map-keys": ["type"], "items": {"type": "object", "required": ["type", "status", "reason", "message", "lastTransitionTime"], "properties": {
                   "type": {"type": "string", "maxLength": 128},

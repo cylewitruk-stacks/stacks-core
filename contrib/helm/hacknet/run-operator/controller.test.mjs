@@ -3,8 +3,12 @@ import test from 'node:test';
 
 import {
   AttacknetRunReconciler, FaultCampaignReconciler, FINALIZER, digest,
-  artifactDigest, decodeSchedule, networkManifest, podEffectResults, prometheusMetrics, stableName,
+  artifactDigest, classifyTerminalAssertion, decodeSchedule, networkManifest, podEffectResults,
+  prometheusMetrics, stableName,
 } from './controller.mjs';
+import {
+  createDdminPlan, describeDdminCandidate, issueDdminAttempt,
+} from '../../../attacknet/attacknet-run-schedule.mjs';
 
 const uid = name => `uid-${name}`;
 const clone = value => value === null || value === undefined ? value : structuredClone(value);
@@ -389,6 +393,8 @@ test('replay consumes a sealed source schedule only on a fresh matching network 
     enabled: true, sourceRunRef: original.metadata.name,
     descriptorURI: `k8s://attacknetruns/${original.metadata.name}/resolved-schedule`,
     descriptorDigest: resolvedOriginal.status.scheduleRef.digest,
+    attemptId: 'replay-baseline',
+    expectedAssertion: 'TargetReady', expectedStatus: 'Failed',
     requireSameResolvedImages: true, verifyExpectedFailure: true,
   };
   api.put('attacknetruns', replay);
@@ -400,6 +406,120 @@ test('replay consumes a sealed source schedule only on a fresh matching network 
   assert.equal(replaySchedule.replay.enabled, true);
   assert.equal(replaySchedule.replay.sourceNetwork.uid, firstNetwork.metadata.uid);
   assert.equal(replaySchedule.network.uid, freshNetwork.metadata.uid);
+});
+
+test('ddmin run admits only a removal from a terminal sealed schedule on a fresh network', async () => {
+  const api = new FakeApi();
+  const first = campaign({template: true, effect: false});
+  const second = structuredClone(first);
+  second.metadata.name = 'kill-signer-second-template';
+  second.metadata.uid = uid('second-template');
+  api.put('faultcampaigns', first);
+  api.put('faultcampaigns', second);
+  const originalNetwork = network();
+  api.put('stacksnetworks', originalNetwork);
+  api.pods = networkPods(originalNetwork);
+  const sourceRun = attacknetRun(first);
+  sourceRun.spec.campaignCatalog.push({name: 'kill-second', campaignRef: second.metadata.name});
+  sourceRun.spec.sequence.push({id: 'step-two', campaign: 'kill-second', delayAfterSeconds: 0});
+  sourceRun.spec.budgets.maxCampaigns = 2;
+  api.put('attacknetruns', sourceRun);
+  const reconciler = new AttacknetRunReconciler(api);
+  await reconciler.reconcile(sourceRun, [first, second]);
+  const sealedSourceRun = await api.get('attacknetruns', sourceRun.metadata.name);
+  const sourceConfigMap = await api.get('configmaps', sealedSourceRun.status.scheduleRef.name, {group: ''});
+  const sourceSchedule = decodeSchedule(sourceConfigMap);
+  sealedSourceRun.status.phase = 'Failed';
+  sealedSourceRun.status.reason = 'ExpectedFailure';
+  api.put('attacknetruns', sealedSourceRun);
+
+  const issued = issueDdminAttempt(createDdminPlan(sourceSchedule, {
+    requireFreshNetwork: true, maxAttempts: 2,
+    expectedFailure: {assertion: 'TargetReady', status: 'Failed'},
+  }));
+  const reduction = describeDdminCandidate(sourceSchedule, issued.attempt.schedule);
+  const fresh = network();
+  fresh.metadata.uid = 'uid-demo-ddmin-fresh';
+  fresh.metadata.generation = 1;
+  api.put('stacksnetworks', fresh);
+  api.pods = networkPods(fresh);
+
+  const attempt = attacknetRun(first);
+  attempt.metadata.name = issued.attempt.id;
+  attempt.metadata.uid = uid(issued.attempt.id);
+  attempt.spec = structuredClone(sourceRun.spec);
+  attempt.spec.replay = {enabled: false};
+  attempt.spec.resume = {enabled: false};
+  attempt.spec.minimization = {
+    enabled: true, strategy: 'DeltaDebug', maxAttempts: 1, requireFreshNetwork: true,
+    sourceRunRef: sourceRun.metadata.name,
+    sourceScheduleDigest: reduction.sourceScheduleDigest,
+    candidateScheduleDigest: reduction.candidateScheduleDigest,
+    attemptId: issued.attempt.id,
+    expectedAssertion: 'TargetReady', expectedStatus: 'Failed', retained: reduction.retained,
+  };
+  api.put('attacknetruns', attempt);
+  await reconciler.reconcile(attempt, [first, second]);
+  let current = await api.get('attacknetruns', attempt.metadata.name);
+  assert.equal(current.status.phase, 'Preparing');
+  const admittedConfigMap = await api.get('configmaps', current.status.scheduleRef.name, {group: ''});
+  const admitted = decodeSchedule(admittedConfigMap);
+  assert.equal(admitted.network.uid, fresh.metadata.uid);
+  assert.equal(admitted.actions.length, 1);
+  assert.equal(admitted.replay.candidateScheduleDigest, issued.attempt.schedule.integrity.digest);
+
+  current.status.startedAt = new Date(Date.now() - 2000).toISOString();
+  await reconciler.reconcile(current, [first, second]);
+  current = await api.get('attacknetruns', attempt.metadata.name);
+  assert.equal(current.status.phase, 'Running', JSON.stringify(current.status));
+  const child = await api.get('faultcampaigns', current.status.activeCampaign);
+  child.status = {
+    phase: 'Passed', reason: 'EffectAndRecoveryProven', completedAt: '2026-01-01T00:00:10Z',
+    recoveryResults: [{assertion: 'TargetReady', outcome: 'Failed', actor: 'signer-1'}],
+  };
+  api.put('faultcampaigns', child);
+  await reconciler.reconcile(current, [first, second, child]);
+  current = await api.get('attacknetruns', attempt.metadata.name);
+  assert.equal(current.status.phase, 'Passed');
+  assert.equal(current.status.terminalClassification.outcome, 'FailureReproduced');
+  assert.equal(current.status.terminalClassification.causalMinimalityClaimed, false);
+});
+
+test('terminal assertion classification fails closed on missing or ambiguous evidence', () => {
+  const source = campaign({template: true});
+  const run = attacknetRun(source, {minimization: {
+    enabled: true, attemptId: 'ddmin-001', candidateScheduleDigest: `sha256:${'c'.repeat(64)}`,
+    expectedAssertion: 'TargetReady', expectedStatus: 'Failed',
+  }});
+  const missing = classifyTerminalAssertion(run, [{metadata: {name: 'child', uid: 'uid-child'},
+    status: {phase: 'Failed', reason: 'ControllerError'}}], `sha256:${'d'.repeat(64)}`);
+  assert.equal(missing.outcome, 'Inconclusive');
+  assert.equal(missing.reason, 'ExpectedAssertionNotEvaluated');
+  const absent = classifyTerminalAssertion(run, [{metadata: {name: 'child', uid: 'uid-child'},
+    status: {phase: 'Passed', recoveryResults: [
+      {assertion: 'TargetReady', outcome: 'Proven', actor: 'signer-1'},
+    ]}}], `sha256:${'d'.repeat(64)}`);
+  assert.equal(absent.outcome, 'FailureAbsent');
+
+  const conflicting = classifyTerminalAssertion(run, [{metadata: {name: 'child', uid: 'uid-child'},
+    status: {phase: 'Passed', recoveryResults: [
+      {assertion: 'TargetReady', outcome: 'Failed', actor: 'signer-1'},
+      {assertion: 'TargetReady', outcome: 'Proven', actor: 'signer-2'},
+    ]}}], `sha256:${'d'.repeat(64)}`);
+  assert.equal(conflicting.outcome, 'Inconclusive');
+  assert.equal(conflicting.reason, 'ConflictingExpectedAssertionEvidence');
+
+  const replay = attacknetRun(source, {replay: {
+    enabled: true, verifyExpectedFailure: true, attemptId: 'replay-baseline',
+    descriptorDigest: `sha256:${'f'.repeat(64)}`,
+    expectedAssertion: 'TargetReady', expectedStatus: 'Failed',
+  }});
+  const reproduced = classifyTerminalAssertion(replay, [{metadata: {name: 'child', uid: 'uid-child'},
+    status: {phase: 'Inconclusive', recoveryResults: [
+      {assertion: 'TargetReady', outcome: 'Failed', actor: 'signer-1'},
+    ]}}], `sha256:${'d'.repeat(64)}`);
+  assert.equal(reproduced.attemptId, 'replay-baseline');
+  assert.equal(reproduced.outcome, 'FailureReproduced');
 });
 
 test('FaultCampaign finalizer removes an owned fault before permitting deletion', async () => {
@@ -432,6 +552,12 @@ test('run-controller metrics expose bounded orchestrator state and assertion out
     phase: 'Running', reason: 'CampaignActive', attribution: 'Untriaged',
     scheduleRef: {digest: `sha256:${'b'.repeat(64)}`}, scheduleSummary: {replay: false},
     budgetUsage: {campaigns: 1, wallTimeSeconds: 42},
+    terminalClassification: {
+      attemptId: 'ddmin-001', candidateScheduleDigest: `sha256:${'c'.repeat(64)}`,
+      expectedAssertion: 'TargetReady', expectedStatus: 'Failed', outcome: 'FailureAbsent',
+      reason: 'ExpectedAssertionEvaluatedWithoutExpectedStatus',
+      evidenceDigest: `sha256:${'d'.repeat(64)}`, causalMinimalityClaimed: false,
+    },
   };
   const output = prometheusMetrics([value], [run]);
   assert.match(output, /attacknet_fault_campaign_info\{[^\n]*phase="Passed"/);
@@ -439,5 +565,7 @@ test('run-controller metrics expose bounded orchestrator state and assertion out
   assert.match(output, /assertion="NetworkDegraded",outcome="Proven"/);
   assert.match(output, /attacknet_run_info\{[^\n]*phase="Running"[^\n]*schedule_digest="sha256:b{64}"/);
   assert.match(output, /attacknet_run_budget_usage\{[^\n]*budget="wallTimeSeconds"\} 42/);
+  assert.match(output, /attacknet_run_minimization_outcome\{[^\n]*outcome="FailureAbsent"/);
+  assert.match(output, /causal_minimality_claimed="false"/);
   assert.doesNotMatch(output, /pod_uid/);
 });

@@ -11,7 +11,7 @@ import {compileCampaign} from '../../../attacknet/fault-campaign.mjs';
 import {resolveCampaignTargets} from '../../../attacknet/campaign-targets.mjs';
 import {evaluateFaultEffect} from '../../../attacknet/fault-effect-evidence.mjs';
 import {
-  consumeReplayPlan, resolveAttacknetSchedule, validateResolvedSchedule,
+  consumeDdminCandidate, consumeReplayPlan, resolveAttacknetSchedule, validateResolvedSchedule,
 } from '../../../attacknet/attacknet-run-schedule.mjs';
 import {
   ProbeClient, baselineUsable, buildProbeRequest, controlTarget, probePhase,
@@ -21,6 +21,7 @@ export const GROUP = 'testing.stacks.org';
 export const VERSION = 'v1alpha1';
 export const FINALIZER = 'testing.stacks.org/fault-cleanup';
 export const TERMINAL_PHASES = new Set(['Passed', 'Failed', 'Inconclusive']);
+export const MINIMIZATION_OUTCOMES = new Set(['FailureReproduced', 'FailureAbsent', 'Inconclusive']);
 const SCHEDULE_FORMAT = 'stacks-attacknet-schedule-configmap/v1';
 const CHAOS_PLURALS = Object.freeze({
   PodChaos: 'podchaos', NetworkChaos: 'networkchaos', DNSChaos: 'dnschaos',
@@ -38,6 +39,86 @@ const canonical = value => {
 };
 export const digest = value => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 export const artifactDigest = value => `sha256:${digest(value)}`;
+
+export function classifyTerminalAssertion(run, children, scheduleDigest) {
+  const minimization = run.spec?.minimization;
+  const replay = run.spec?.replay;
+  const expectation = minimization?.enabled === true ? {
+    attemptId: minimization.attemptId,
+    candidateScheduleDigest: minimization.candidateScheduleDigest,
+    expectedAssertion: minimization.expectedAssertion,
+    expectedStatus: minimization.expectedStatus,
+  } : replay?.enabled === true && replay.verifyExpectedFailure === true ? {
+    attemptId: replay.attemptId,
+    candidateScheduleDigest: replay.descriptorDigest,
+    expectedAssertion: replay.expectedAssertion,
+    expectedStatus: replay.expectedStatus,
+  } : null;
+  if (!expectation) return null;
+  const {expectedAssertion, expectedStatus} = expectation;
+  if (!expectedAssertion || !expectedStatus || !scheduleDigest) {
+    throw new Error('minimization assertion classification lacks an immutable expected assertion or schedule');
+  }
+  const evidence = children.map(child => ({
+    name: child.metadata.name,
+    uid: child.metadata.uid,
+    phase: child.status?.phase ?? 'Pending',
+    reason: child.status?.reason ?? '',
+    effectResults: child.status?.effectResults ?? [],
+    recoveryResults: child.status?.recoveryResults ?? [],
+  })).sort((left, right) => left.name.localeCompare(right.name));
+  const observations = evidence.flatMap(child => [
+    ...child.effectResults.map(result => ({child: child.name, source: 'effect', ...result})),
+    ...child.recoveryResults.map(result => ({child: child.name, source: 'recovery', ...result})),
+  ]).filter(result => result.assertion === expectedAssertion);
+  let outcome;
+  let reason;
+  if (observations.length > 256) {
+    outcome = 'Inconclusive';
+    reason = 'AssertionEvidenceLimitExceeded';
+  } else if (observations.length > 0
+      && observations.every(result => result.outcome === expectedStatus)) {
+    outcome = 'FailureReproduced';
+    reason = 'ExpectedAssertionObserved';
+  } else if (observations.some(result => result.outcome === expectedStatus)) {
+    // An assertion name alone does not identify an actor or phase. Conflicting
+    // outcomes therefore cannot truthfully establish that the source failure
+    // reproduced; require the caller to narrow the expected assertion first.
+    outcome = 'Inconclusive';
+    reason = 'ConflictingExpectedAssertionEvidence';
+  } else if (observations.length > 0
+      && observations.every(result => new Set(['Proven', 'Failed']).has(result.outcome))) {
+    outcome = 'FailureAbsent';
+    reason = 'ExpectedAssertionEvaluatedWithoutExpectedStatus';
+  } else {
+    outcome = 'Inconclusive';
+    reason = observations.length === 0 ? 'ExpectedAssertionNotEvaluated' : 'ExpectedAssertionInconclusive';
+  }
+  const evidenceDigest = artifactDigest({
+    runUID: run.metadata.uid,
+    scheduleDigest,
+    attemptId: expectation.attemptId,
+    expectedAssertion,
+    expectedStatus,
+    evidence,
+  });
+  return {
+    attemptId: expectation.attemptId,
+    candidateScheduleDigest: expectation.candidateScheduleDigest,
+    expectedAssertion,
+    expectedStatus,
+    outcome,
+    reason,
+    observationCount: observations.length,
+    observations: observations.slice(0, 256).map(result => ({
+      child: result.child, source: result.source, outcome: result.outcome,
+      ...(result.actor ? {actor: result.actor} : {}),
+    })),
+    evidenceDigest,
+    evidenceURI: `k8s://attacknetruns/${run.metadata.name}/terminal-assertion-evidence`,
+    causalMinimalityClaimed: false,
+  };
+}
 
 export function durationSeconds(value) {
   const match = /^(\d+)(ms|s|m|h)$/.exec(value ?? '');
@@ -244,6 +325,8 @@ export function prometheusMetrics(campaigns, runs) {
     '# TYPE attacknet_run_info gauge',
     '# HELP attacknet_run_budget_usage Current AttacknetRun budget consumption.',
     '# TYPE attacknet_run_budget_usage gauge',
+    '# HELP attacknet_run_minimization_outcome Trusted terminal ddmin counterfactual classification.',
+    '# TYPE attacknet_run_minimization_outcome gauge',
   ];
   for (const campaign of campaigns) {
     const base = {
@@ -276,12 +359,27 @@ export function prometheusMetrics(campaigns, runs) {
       ...base, phase: run.status?.phase ?? 'Pending', reason: run.status?.reason ?? '',
       attribution: run.status?.attribution ?? 'Untriaged',
       replay: run.status?.scheduleSummary?.replay === true ? 'true' : 'false',
+      minimization: run.spec?.minimization?.enabled === true ? 'true' : 'false',
       schedule_digest: run.status?.scheduleRef?.digest ?? '',
     }));
     for (const [budget, value] of Object.entries(run.status?.budgetUsage ?? {})) {
       if (typeof value === 'number' && Number.isFinite(value)) {
         lines.push(metric('attacknet_run_budget_usage', {...base, budget}, value));
       }
+    }
+    const classification = run.status?.terminalClassification;
+    if (classification) {
+      lines.push(metric('attacknet_run_minimization_outcome', {
+        ...base,
+        attempt: classification.attemptId,
+        candidate_digest: classification.candidateScheduleDigest,
+        expected_assertion: classification.expectedAssertion,
+        expected_status: classification.expectedStatus,
+        outcome: classification.outcome,
+        reason: classification.reason,
+        evidence_digest: classification.evidenceDigest,
+        causal_minimality_claimed: 'false',
+      }));
     }
   }
   return `${lines.join('\n')}\n`;
@@ -682,6 +780,10 @@ function runOwner(run) { return ownerReference(run); }
 
 export class AttacknetRunReconciler {
   constructor(api) { this.api = api; }
+  terminalFields(run, children) {
+    const classification = classifyTerminalAssertion(run, children, run.status?.scheduleRef?.digest);
+    return classification ? {terminalClassification: classification} : {};
+  }
   async patchStatus(run, next) {
     next.observedGeneration = run.metadata.generation;
     await this.api.patch('attacknetruns', run.metadata.name,
@@ -759,7 +861,34 @@ export class AttacknetRunReconciler {
       manifest, images, campaigns: sources,
     };
     let schedule;
-    if (run.spec.replay?.enabled === true) {
+    if (run.spec.minimization?.enabled === true) {
+      const minimization = run.spec.minimization;
+      const sourceRun = await this.api.get('attacknetruns', minimization.sourceRunRef);
+      if (!TERMINAL_PHASES.has(sourceRun.status?.phase)) {
+        throw new Error('ddmin source run must be terminal before deriving a counterfactual');
+      }
+      if (!sourceRun.status?.scheduleRef) throw new Error('ddmin source run has no persisted resolved schedule');
+      const sourceSchedule = await this.readSchedule(sourceRun.status.scheduleRef, sourceRun.metadata.uid);
+      if (sourceSchedule.integrity.digest !== minimization.sourceScheduleDigest) {
+        throw new Error('ddmin sourceScheduleDigest does not match the terminal source run');
+      }
+      if (network.metadata.uid === sourceSchedule.network.uid) {
+        throw new Error('ddmin counterfactual requires a fresh network UID');
+      }
+      if (artifactDigest(run.spec.budgets) !== artifactDigest(sourceSchedule.budgets.limits)) {
+        throw new Error('ddmin counterfactual budgets must equal the immutable source budgets');
+      }
+      schedule = consumeDdminCandidate({
+        sourceScheduleDigest: minimization.sourceScheduleDigest,
+        candidateScheduleDigest: minimization.candidateScheduleDigest,
+        retained: minimization.retained,
+      }, sourceSchedule, context);
+      schedule.replay.attemptId = minimization.attemptId;
+      const unsigned = structuredClone(schedule);
+      delete unsigned.integrity;
+      schedule.integrity = {algorithm: 'sha256', digest: artifactDigest(unsigned)};
+      validateResolvedSchedule(schedule);
+    } else if (run.spec.replay?.enabled === true) {
       const sourceRun = await this.api.get('attacknetruns', run.spec.replay.sourceRunRef);
       if (!TERMINAL_PHASES.has(sourceRun.status?.phase)) {
         throw new Error('source replay run must be terminal before its schedule can be replayed');
@@ -793,7 +922,8 @@ export class AttacknetRunReconciler {
     const budgetUsage = {
       campaigns: 0, campaignsStarted: 0, campaignsCompleted: 0, activeFaults: 0,
       wallTimeSeconds: 0, cumulativeFaultSeconds: 0, maximumSignerImpactPercent: 0,
-      burnchainFaults: 0, inconclusiveCampaigns: 0, minimizationAttempts: 0,
+      burnchainFaults: 0, inconclusiveCampaigns: 0,
+      minimizationAttempts: spec.minimization?.enabled === true ? 1 : 0,
       ...(run.status?.budgetUsage ?? {}),
     };
     budgetUsage.wallTimeSeconds = elapsedSeconds(startedAt);
@@ -889,6 +1019,7 @@ export class AttacknetRunReconciler {
       await this.patchStatus(run, status(run.status, paused ? 'Paused' : 'Failed', 'ChildCampaignFailed', {
         activeCampaign: null, decisions, budgetUsage, startedAt,
         ...(paused ? {} : {completedAt: now()}), attribution: 'Untriaged',
+        ...(!paused ? this.terminalFields(run, children) : {}),
       }));
       return;
     }
@@ -899,6 +1030,7 @@ export class AttacknetRunReconciler {
       await this.patchStatus(run, status(run.status, paused ? 'Paused' : 'Inconclusive', 'ChildCampaignInconclusive', {
         activeCampaign: null, decisions, budgetUsage, startedAt,
         ...(paused ? {} : {completedAt: now()}), attribution: 'Untriaged',
+        ...(!paused ? this.terminalFields(run, children) : {}),
       }));
       return;
     }
@@ -906,6 +1038,7 @@ export class AttacknetRunReconciler {
       await this.patchStatus(run, status(run.status, 'Passed', 'StoppedAfterSuccessfulCampaign', {
         activeCampaign: null, decisions, budgetUsage, startedAt, completedAt: now(),
         attribution: 'NotRequired',
+        ...this.terminalFields(run, children),
       }));
       return;
     }
@@ -913,6 +1046,7 @@ export class AttacknetRunReconciler {
       await this.patchStatus(run, status(run.status, 'Passed', 'SequenceCompleted', {
         activeCampaign: null, decisions, budgetUsage, startedAt, completedAt: now(),
         attribution: 'NotRequired',
+        ...this.terminalFields(run, children),
       }));
       return;
     }
