@@ -1,10 +1,21 @@
 import assert from 'node:assert/strict';
-import {mkdtempSync, readFileSync} from 'node:fs';
+import {existsSync, mkdtempSync, readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join, resolve} from 'node:path';
+import {spawnSync} from 'node:child_process';
 import test from 'node:test';
 
 import {buildTopology, renderTopology} from './topology.mjs';
+
+test('--help is read-only and documents trusted probes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'attacknet-topology-help-'));
+  const script = resolve('contrib/attacknet/topology.mjs');
+  const result = spawnSync(process.execPath, [script, '--help'], {cwd: root, encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /--probes=true\|false/);
+  assert.match(result.stdout, /--actor-image=ACTOR=IMAGE/);
+  assert.equal(existsSync(join(root, 'generated')), false);
+});
 
 test('stage topology derives actor inventory from requested counts', () => {
   const topology = buildTopology({minerCount: 2, signerCount: 4, followerCount: 2});

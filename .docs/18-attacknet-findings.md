@@ -1180,6 +1180,24 @@ experiments require the apparatus to fail visibly and converge exactly.
   fault recovery, mixed-version compatibility, deliberate worker loss/PVC
   behavior, or the required 300+ burn-block soak.
 
+## F-062: Asking the topology renderer for help silently rendered a network
+
+- Classification: command-line safety and operator-expectation defect
+- State: fixed and regression-tested
+- Evidence: `node contrib/attacknet/topology.mjs --help` ignored the unknown
+  flag, selected every default, and wrote a seven-workload topology into the
+  default generated directory. This happened during read-only investigation
+  of the trusted-probe option; it did not mutate Kubernetes, but it could
+  overwrite local generated inputs subsequently passed to lifecycle apply.
+- Risk: a user intending only to inspect syntax can alter a replay input or
+  accidentally prepare the wrong topology. Silently accepting arbitrary
+  options also makes misspelled safety/configuration flags appear effective.
+- Remediation: `--help` now exits before topology construction or filesystem
+  writes and documents counts, images, per-actor overrides, probes, namespace,
+  network, and output. Behavioral coverage invokes it from an empty directory
+  and proves no generated directory is created. Rejecting all other unknown
+  options remains a follow-up hardening item.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

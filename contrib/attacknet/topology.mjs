@@ -59,6 +59,25 @@ function repeatedMapOption(name) {
   }));
 }
 
+function usage() {
+  return `usage: topology.mjs [options]
+
+Options:
+  --network=NAME             StacksNetwork name (default: attacknet)
+  --namespace=NAME           Kubernetes namespace (default: hacknet-system)
+  --miners=N                 miner count, 0-${LIMITS.miners} (default: 1)
+  --signers=N                signer/companion pair count, 0-${LIMITS.signers} (default: 1)
+  --followers=N              follower count, 0-${LIMITS.followers} (default: 1)
+  --node-image=IMAGE         default Stacks node/signer image
+  --stacker-image=IMAGE      stacking bootstrap image
+  --actor-image=ACTOR=IMAGE  per-actor image override; repeatable
+  --probes=true|false        add trusted fault-probe sidecars (default: false)
+  --probe-image=IMAGE        trusted fault-probe image
+  --output=DIR               rendered output directory
+  --help                     print this text without rendering
+`;
+}
+
 function legacyPublicKey(seedByte) {
   const key = createECDH('secp256k1');
   key.setPrivateKey(Buffer.from(repeated(seedByte), 'hex'));
@@ -465,6 +484,10 @@ export function renderTopology(topology, output, {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  if (process.argv.includes('--help')) {
+    process.stdout.write(usage());
+    process.exit(0);
+  }
   const topology = buildTopology({
     minerCount: parseCount('miners', 1, LIMITS.miners),
     signerCount: parseCount('signers', 1, LIMITS.signers),
