@@ -127,7 +127,8 @@ contrib/attacknet/evidence-harness.sh evidence/behavior \
 
 One Kubernetes cluster may contain only one active attacknet. Lifecycle apply
 and delete operations hold a persistent environment lease, while cadence
-changes and complete fault campaigns take a short-lived mutation lease. A
+changes, evidence/incident capture, and complete fault campaigns take a
+short-lived mutation lease. A
 blocked writer reports the current owner, purpose, network, and acquisition
 time; read-only Prometheus/Loki/API queries remain concurrent.
 

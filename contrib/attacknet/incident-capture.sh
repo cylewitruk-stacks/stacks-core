@@ -2,6 +2,7 @@
 set -u
 
 ATTACKNET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+original_args=("$@")
 usage() {
   echo "usage: $0 DESTINATION MANIFEST PHASE REASON" >&2
   echo "   or: $0 --destination=PATH --manifest=PATH --phase=NAME --reason=TEXT" >&2
@@ -40,6 +41,18 @@ read -r manifest_network manifest_namespace < <(node -e '
 ' "${manifest}") || exit 2
 namespace="${KUBE_NAMESPACE:-${manifest_namespace}}"
 network="${KUBE_NETWORK:-${manifest_network}}"
+lock_script="${ATTACKNET_DIR}/environment-lock.sh"
+if [ "${ATTACKNET_LOCK_DISABLED:-0}" = 1 ]; then
+  [ "${ATTACKNET_NEGATIVE_CONTROL:-0}" = 1 ] || {
+    echo 'ATTACKNET_LOCK_DISABLED=1 requires ATTACKNET_NEGATIVE_CONTROL=1' >&2
+    exit 2
+  }
+elif [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then
+  exec "${lock_script}" run "${network}" "${ATTACKNET_LOCK_OWNER:-incident:$$}" \
+    incident-capture -- "$0" "${original_args[@]}"
+else
+  "${lock_script}" assert "${network}" "${ATTACKNET_MUTATION_TOKEN}"
+fi
 run_descriptor="$(node "${ATTACKNET_DIR}/run-ledger.mjs" locate \
   "--target=${manifest}" "--namespace=${namespace}" "--network=${network}" 2>/dev/null || true)"
 run_id="${ATTACKNET_RUN_ID:-}"

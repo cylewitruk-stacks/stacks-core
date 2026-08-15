@@ -574,7 +574,15 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       fi
       "${ENVIRONMENT_LOCK}" assert "${NETWORK}" "${ATTACKNET_MUTATION_TOKEN}"
       ;;
-    wait|capture)
+    capture)
+      "${ENVIRONMENT_LOCK}" environment-assert "${NETWORK}"
+      if [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then
+        exec "${ENVIRONMENT_LOCK}" run "${NETWORK}" \
+          "${ATTACKNET_LOCK_OWNER:-lifecycle:$$}" lifecycle-capture -- "$0" "$@"
+      fi
+      "${ENVIRONMENT_LOCK}" assert "${NETWORK}" "${ATTACKNET_MUTATION_TOKEN}"
+      ;;
+    wait)
       "${ENVIRONMENT_LOCK}" environment-assert "${NETWORK}"
       ;;
   esac
