@@ -3,7 +3,32 @@
   "editable": false,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Actor drill-down",
+      "tooltip": "Inspect trusted runtime state, role-specific metrics, faults, and logs for the selected actor",
+      "type": "link",
+      "url": "/d/stacks-attacknet-actor/stacks-attacknet-actor-drill-down"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Explore actor logs",
+      "tooltip": "Open the Loki query workspace for raw actor logs",
+      "type": "link",
+      "url": "/explore"
+    }
+  ],
   "panels": [
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
@@ -131,7 +156,7 @@
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
       "description": "Real per-signer response latency dispersion. Empty series mean the selected release does not expose the histogram or no proposals have completed.",
-      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ms"}, "overrides": []},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "s"}, "overrides": []},
       "gridPos": {"h": 8, "w": 8, "x": 16, "y": 13},
       "id": 11,
       "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
@@ -164,6 +189,108 @@
       "title": "Invariant status",
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "job": true, "instance": true, "network": true, "evidence_source": true}, "renameByName": {"Value": "Passed (1=yes)"}}}],
       "type": "table"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "attacknet-loki"},
+      "description": "Raw stdout/stderr from actor containers. Kubernetes identity labels are collector-attached; every log body is untrusted, adversarial actor-self-reported content and must not be treated as authoritative.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 28},
+      "id": 14,
+      "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "attacknet-loki"}, "editorMode": "code", "expr": "{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "queryType": "range", "refId": "A"}],
+      "title": "Actor logs (untrusted content; Kubernetes-attached identity)",
+      "type": "logs"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Kubernetes-observed actor census. Role, node placement, Pod phase, and admitted image are trusted orchestration metadata. Select an actor variable and follow the Actor drill-down link for detail.",
+      "fieldConfig": {"defaults": {"links": [{"targetBlank": false, "title": "Open actor detail", "url": "/d/stacks-attacknet-actor/stacks-attacknet-actor-drill-down?var-network=$network&var-actor=${__data.fields.actor}&${__url_time_range}"}]}, "overrides": []},
+      "gridPos": {"h": 10, "w": 15, "x": 0, "y": 38},
+      "id": 15,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_actor_info{network=\"$network\",role=~\"$role\",actor=~\"$actor\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Trusted actor inventory and placement",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true, "image_id": true}, "renameByName": {"actor": "Actor", "node": "Kubernetes node", "phase": "Pod phase", "requested_image": "Requested image / version", "role": "Role"}}}],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Latest trusted Kubernetes readiness and restart count for the selected cohort. Restarts are shown numerically; readiness uses green/red state.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 3}]}}, "overrides": [{"matcher": {"id": "byRegexp", "options": "/ready/"}, "properties": [{"id": "mappings", "value": [{"options": {"0": {"color": "red", "text": "NOT READY"}, "1": {"color": "green", "text": "READY"}}, "type": "value"}]}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}]}]},
+      "gridPos": {"h": 10, "w": 9, "x": 15, "y": 38},
+      "id": 16,
+      "options": {"displayMode": "lcd", "minVizHeight": 10, "minVizWidth": 0, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true, "sizing": "auto", "valueMode": "color"},
+      "targets": [
+        {"expr": "attacknet_actor_ready{network=\"$network\",actor=~\"$actor\"} * on(actor) group_left(role) attacknet_actor_info{network=\"$network\",role=~\"$role\"}", "legendFormat": "ready {{actor}}", "refId": "A"},
+        {"expr": "attacknet_actor_restarts{network=\"$network\",actor=~\"$actor\"} * on(actor) group_left(role) attacknet_actor_info{network=\"$network\",role=~\"$role\"}", "legendFormat": "restarts {{actor}}", "refId": "B"}
+      ],
+      "title": "Trusted runtime health by actor",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Current self-reported chain tips by node actor. Sort by either height to identify a lagging cohort; corroborate suspicious actors with trusted readiness and logs.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 48},
+      "id": 17,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [
+        {"expr": "stacks_node_burn_block_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "format": "table", "instant": true, "refId": "A"},
+        {"expr": "stacks_node_stacks_tip_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "format": "table", "instant": true, "refId": "B"}
+      ],
+      "title": "Node chain cohort (actor self-reported)",
+      "transformations": [
+        {"id": "labelsToFields", "options": {"mode": "columns"}},
+        {"id": "merge", "options": {}},
+        {"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "attacknet_network": true}, "renameByName": {"Value #A": "Burn height", "Value #B": "Stacks height", "attacknet_actor": "Actor", "attacknet_role": "Role"}}}
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Runloop initialization and current/next reward-cycle registration for every signer. This is an availability map, not a weighted quorum calculation.",
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0, "spanNulls": false}, "mappings": [{"options": {"0": {"color": "red", "text": "NO"}, "1": {"color": "green", "text": "YES"}}, "type": "value"}], "max": 1, "min": 0}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 48},
+      "id": 18,
+      "options": {"alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.65, "showValue": "never", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [
+        {"expr": "stacks_signer_runloop_ready{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "runloop {{attacknet_actor}}", "refId": "A"},
+        {"expr": "stacks_signer_registered_for_current_reward_cycle{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "current {{attacknet_actor}}", "refId": "B"},
+        {"expr": "stacks_signer_registered_for_next_reward_cycle{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "next {{attacknet_actor}}", "refId": "C"}
+      ],
+      "title": "Signer participation matrix (self-reported)",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Aggregate block-production, receipt, processing, and serving rates. Separation between these curves locates the stage at which network progress stopped.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 57},
+      "id": 19,
+      "options": {"legend": {"calcs": ["sum", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum(rate(stacks_node_btc_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "burn blocks processed", "refId": "A"},
+        {"expr": "sum(rate(stacks_node_stx_blocks_mined_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "Stacks blocks mined", "refId": "B"},
+        {"expr": "sum(rate(stacks_node_stx_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "Stacks blocks received", "refId": "C"},
+        {"expr": "sum(rate(stacks_node_stx_blocks_processed_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "Stacks blocks processed", "refId": "D"},
+        {"expr": "sum(rate(stacks_node_stx_blocks_served_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "Stacks blocks served", "refId": "E"}
+      ],
+      "title": "Network block pipeline (actor self-reported)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Peer counts by actor. Use this distribution to distinguish an isolated node from a network-wide partition. Current-main legacy transport only.",
+      "fieldConfig": {"defaults": {"color": {"mode": "continuous-BlPu"}, "min": 0}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 57},
+      "id": 20,
+      "options": {"displayMode": "gradient", "minVizHeight": 10, "minVizWidth": 0, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true, "sizing": "auto", "valueMode": "color"},
+      "targets": [
+        {"expr": "stacks_node_neighbors_inbound{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "in {{attacknet_actor}}", "refId": "A"},
+        {"expr": "stacks_node_neighbors_outbound{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "out {{attacknet_actor}}", "refId": "B"}
+      ],
+      "title": "P2P connectivity distribution (self-reported)",
+      "type": "bargauge"
     }
   ],
   "refresh": "5s",
@@ -171,8 +298,9 @@
   "tags": ["stacks", "attacknet", "adversarial"],
   "templating": {
     "list": [
-      {"current": {}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(up, attacknet_network)", "includeAll": false, "label": "Network", "name": "network", "options": [], "query": {"query": "label_values(up, attacknet_network)", "refId": "PrometheusVariableQueryEditor-VariableQuery"}, "refresh": 1, "type": "query"},
-      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(up{attacknet_network=\"$network\"}, attacknet_actor)", "includeAll": true, "label": "Actor", "multi": true, "name": "actor", "options": [], "query": {"query": "label_values(up{attacknet_network=\"$network\"}, attacknet_actor)", "refId": "PrometheusVariableQueryEditor-VariableQuery"}, "refresh": 1, "type": "query"}
+      {"current": {}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(attacknet_actor_info, network)", "includeAll": false, "label": "Network", "name": "network", "options": [], "query": {"query": "label_values(attacknet_actor_info, network)", "refId": "PrometheusVariableQueryEditor-Network"}, "refresh": 1, "type": "query"},
+      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(attacknet_actor_info{network=\"$network\"}, role)", "includeAll": true, "label": "Role", "multi": true, "name": "role", "options": [], "query": {"query": "label_values(attacknet_actor_info{network=\"$network\"}, role)", "refId": "PrometheusVariableQueryEditor-Role"}, "refresh": 1, "type": "query"},
+      {"allValue": ".*", "current": {"text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"}, "definition": "label_values(attacknet_actor_info{network=\"$network\",role=~\"$role\"}, actor)", "includeAll": true, "label": "Actor", "multi": true, "name": "actor", "options": [], "query": {"query": "label_values(attacknet_actor_info{network=\"$network\",role=~\"$role\"}, actor)", "refId": "PrometheusVariableQueryEditor-Actor"}, "refresh": 1, "type": "query"}
     ]
   },
   "time": {"from": "now-30m", "to": "now"},

@@ -119,9 +119,29 @@ Capture Kubernetes-admitted resources and runtime evidence:
 ```bash
 contrib/attacknet/lifecycle.sh capture evidence/admitted
 ATTACKNET_BACKEND=kubernetes \
-  contrib/attacknet/evidence-harness.sh evidence/behavior \
+contrib/attacknet/evidence-harness.sh evidence/behavior \
   contrib/attacknet/generated/full/manifest.json 1h
 ```
+
+## Environment serialization
+
+One Kubernetes cluster may contain only one active attacknet. Lifecycle apply
+and delete operations hold a persistent environment lease, while cadence
+changes and complete fault campaigns take a short-lived mutation lease. A
+blocked writer reports the current owner, purpose, network, and acquisition
+time; read-only Prometheus/Loki/API queries remain concurrent.
+
+```bash
+contrib/attacknet/environment-lock.sh status
+```
+
+Do not remove or steal either lease merely because an operation is slow. First
+prove that its owning process is gone and inspect the admitted network. There
+is deliberately no automatic stale-lease takeover: hiding a dead controller or
+wedged Kubernetes garbage collector would invalidate failure attribution. The
+test-only lock bypass requires both `ATTACKNET_LOCK_DISABLED=1` and
+`ATTACKNET_NEGATIVE_CONTROL=1`, and its use must be recorded as a negative
+control rather than baseline evidence.
 
 Run static and behavioral renderer checks with:
 
@@ -143,6 +163,33 @@ smoke or a more gradual profile.
 
 ## Dashboards
 
+Use three separate human views, each with a distinct job:
+
+- **Headlamp** is the preferred cluster-wide Kubernetes resource viewer.
+- **Grafana** explains Stacks actors and network behavior.
+- **Chaos Dashboard** displays and controls Chaos Mesh experiments.
+
+The former upstream Kubernetes Dashboard is deprecated and unmaintained;
+Headlamp is its Kubernetes SIG UI replacement. For a local cluster, install
+Headlamp in-cluster from its official Helm repository and expose it only over a
+loopback port-forward. Do not add it while the storage-capacity preflight is
+failing, and record the admitted chart/image version in run evidence.
+
+```bash
+helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/
+helm repo update
+helm upgrade --install headlamp headlamp/headlamp \
+  --namespace headlamp --create-namespace
+kubectl -n headlamp port-forward service/headlamp 8080:80 \
+  --address=127.0.0.1
+```
+
+Open <http://127.0.0.1:8080>. Headlamp follows Kubernetes authentication and
+RBAC; give it a bounded identity appropriate to the viewer rather than mounting
+any cluster credential into an actor Pod. The Headlamp desktop/Docker Desktop
+extension is an alternative that uses the existing kubeconfig and consumes no
+attacknet cluster storage.
+
 The attacknet observability renderer provisions an anonymous, read-only
 Grafana instance for each network. Forward the retained network locally (the
 default full-topology name is shown):
@@ -154,7 +201,13 @@ kubectl -n hacknet-system port-forward \
 
 Open <http://127.0.0.1:3000>. Actor metrics are self-reported; campaign and
 assertion timeline events are orchestrator-authenticated so a modified actor
-cannot forge its own recovery.
+cannot forge its own recovery. Grafana includes a network command center and a
+single-actor drill-down with role, admitted image/version, Kubernetes placement,
+role-specific metrics, fault context, and centralized logs. These dashboards
+are for human triage; agents should query Prometheus, Loki, and the event journal
+directly and retain the raw responses as canonical evidence. See
+[`observability/README.md`](observability/README.md) for metric coverage and
+trust boundaries.
 
 For a disposable local kind/Docker Desktop cluster, the simplest option is to
 disable Chaos Dashboard authentication and keep it reachable only through a

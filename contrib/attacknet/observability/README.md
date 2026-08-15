@@ -6,6 +6,9 @@ version of that instrumentation:
 
 - Prometheus scrapes every rendered Stacks node and signer with stable network,
   actor, and role labels.
+- Grafana Alloy tails each actor container through the Kubernetes logs API and
+  sends raw stdout/stderr to a single-binary Loki instance with seven-day
+  retention and a dedicated PVC.
 - Grafana is provisioned with a human-facing network/fault/recovery dashboard.
 - An authenticated event bridge durably journals campaign, cadence, invariant,
   actor-state, and recovery observations and projects their bounded state into
@@ -27,6 +30,22 @@ metrics, or serve synthetic values, so these series are evidence but not an
 authority. Scrapes have sample, label, body-size, and timeout limits so a
 malicious metrics endpoint cannot trivially exhaust the monitoring plane, and
 actor-supplied sample timestamps are ignored in favour of scrape time.
+
+Raw log **content** has the same limitation, more strongly: a malicious actor
+controls every byte that it writes to stdout/stderr. Alloy therefore performs
+no JSON, logfmt, or other content-derived label extraction. The immutable
+stream identity is attached from Kubernetes discovery and includes network,
+logical actor, role, namespace, Pod name and UID, node, container, requested
+image, and resolved runtime container ID. Every stream is additionally marked
+`log_content_trust="actor_self_reported_untrusted"` and
+`metadata_trust="kubernetes_collector_attached"`. A log line claiming to be a
+different actor is just untrusted text; it cannot alter those indexed labels.
+
+The exact resolved image digest remains in the orchestrator-observed
+`actor.state` event because Kubernetes service discovery exposes the requested
+container image and runtime container ID, but not the Pod status `imageID` as a
+target label. Correlate `resolved_container_id` in Loki with the admitted Pod
+snapshot/actor-state journal when image provenance matters.
 
 The journal accepts writes only with a 256-bit bearer token. That token is
 mounted only into the trusted event bridge; campaign, cadence, and assertion
@@ -53,6 +72,8 @@ node contrib/attacknet/observability/render.mjs \
 kubectl apply -f contrib/attacknet/generated/full/observability.json
 kubectl -n hacknet-system rollout status deployment/attacknet-attacknet-events
 kubectl -n hacknet-system rollout status deployment/attacknet-attacknet-prometheus
+kubectl -n hacknet-system rollout status statefulset/attacknet-attacknet-loki
+kubectl -n hacknet-system rollout status daemonset/attacknet-attacknet-alloy
 kubectl -n hacknet-system rollout status deployment/attacknet-attacknet-grafana
 ```
 
@@ -63,20 +84,63 @@ external and repeatable. Normal `lifecycle.sh apply` renders and deploys this
 stack by default; set `ATTACKNET_OBSERVABILITY_ENABLED=0` only for a deliberately
 minimal diagnostic run.
 
+Before applying any observability or protocol workload, lifecycle runs
+`storage-preflight.sh`. It records kubelet stats-summary values for the root and
+image filesystem of every node and fails below 2 GiB free by default. This is
+deliberately stronger than the Kubernetes `DiskPressure` condition: the local
+three-node Docker Desktop cluster was observed with `availableBytes=0` on all
+nodes while all three still reported `DiskPressure=False`, allowing Loki,
+Alloy, and even a replacement Grafana Pod to be admitted and crash with
+`ENOSPC`. Tune the floor with `ATTACKNET_OBSERVABILITY_MIN_FREE_BYTES`; disabling
+the check requires both `ATTACKNET_OBSERVABILITY_STORAGE_PREFLIGHT=0` and the
+conspicuous `ATTACKNET_NEGATIVE_CONTROL=1`. The resulting
+`observability-storage-preflight.json` and pass/fail/skipped ledger assertion
+preserve the exact decision as run evidence.
+
 Open the dashboard locally:
 
 ```bash
 kubectl -n hacknet-system port-forward service/attacknet-attacknet-grafana 3000:3000
 ```
 
-The overview shows chain-height cohorts, scrape reachability, legacy P2P
-neighbors, signer proposal/vote rates and p95 response latency, current faults,
-failed invariants, recovery durations, and warning/error rates. Actor filtering
-provides a drilldown without changing the dashboard.
+Grafana provisions two complementary human-diagnostic views:
 
-Prometheus and the event journal use PVCs. Delete their PVCs explicitly when a
-run is meant to start with clean evidence; they are intentionally not owned by
-the `StacksNetwork` CR in this isolated scaffold.
+- **Network, Faults, and Recovery** is the command center. It shows trusted
+  actor inventory/placement/readiness beside self-reported chain cohorts,
+  signer participation, legacy P2P connectivity, the network block pipeline,
+  fault/invariant timelines, warning/error rates, and centralized raw logs.
+  Network, role, and actor variables narrow every relevant panel.
+- **Actor Drill-down** follows one actor through its admitted image and
+  Kubernetes node, readiness/restarts, active faults, chain state, P2P/RPC
+  traffic, block pipeline, node workload, miner state, signer state and
+  latency, and raw logs. Panels that do not apply to the actor's role are
+  intentionally empty instead of fabricating zeroes. Links in both dashboards
+  preserve the selected time range and variables.
+
+The actor dashboard covers every metric family exported by the current-main
+Stacks node and signer monitoring modules. Counters are rendered as rates,
+histograms as quantiles in their native seconds, boolean lifecycle gauges as
+states, cohort values as tables or distributions, and workload snapshots as
+bar gauges. Panels group related families by diagnostic question rather than
+placing one stat tile per metric; this keeps root-cause flow readable. The
+admitted image tag is the best available version identity. Exact image digest
+comes from the trusted actor-state observation. Current main does not export a
+separate build/version information metric.
+
+The **Explore actor logs** links open Grafana Explore for longer LogQL queries.
+The dashboards are optimized for humans. Automated agents should query
+Prometheus, Loki, and the authenticated journal API directly and retain the raw
+results in the evidence bundle; screenshots and reduced Grafana values are not
+canonical evidence.
+
+Prometheus, Loki, and the event journal use PVCs. Loki requests 5 GiB, enforces
+seven-day retention through its singleton compactor, limits ingestion/query
+sizes, and has bounded CPU/memory. Time retention is not a substitute for disk
+monitoring: filesystem Loki cannot evict based on free space, so extremely
+noisy malicious actors can fill the claim before seven days and should make the
+run fail visibly. Delete observability PVCs explicitly when a run is meant to
+start with clean evidence; they are intentionally not owned by the
+`StacksNetwork` CR in this isolated scaffold.
 
 ## Event contract
 
@@ -226,8 +290,24 @@ identity.
 - Dashboard queries tolerate metrics absent from older images by rendering an
   empty panel. Mixed-version evidence must record which image supplied each
   series.
-- Prometheus retention is seven days. Export the timeline, query snapshots, and
-  relevant TSDB data before teardown for longer-lived evidence.
+- Alloy runs as a node-local DaemonSet but uses `loki.source.kubernetes` and a
+  namespace-scoped Role to tail Pod logs through the Kubernetes API. This avoids
+  privileged/root containers and `/var/log/pods` host mounts, works with
+  Docker Desktop kind's nested container runtime, and remains compatible with
+  Restricted Pod Security. The tradeoff is extra API-server/kubelet traffic;
+  discovery is restricted to actor Pods on the collector's own node.
+- Collector positions live in the Alloy Pod's `emptyDir`. Loki normally
+  deduplicates replayed Kubernetes timestamps after a collector restart, but a
+  short gap is still possible if kubelet has already rotated the source log.
+  Incident capture therefore continues to retain bounded `kubectl logs`
+  snapshots alongside centralized Loki evidence.
+- A host-file tailer could reduce API load, but on kind it would require
+  runtime-specific paths inside the Docker-hosted Kubernetes nodes and elevated
+  Pod Security permissions. That is intentionally not the default; add it only
+  as an explicit cluster profile with a live compatibility test.
+- Prometheus and Loki retention are seven days. Export the timeline, query
+  snapshots, raw incident logs, and relevant time-series data before teardown
+  for longer-lived evidence.
 
 ## Tests
 

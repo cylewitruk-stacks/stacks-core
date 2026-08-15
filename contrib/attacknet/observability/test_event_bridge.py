@@ -98,7 +98,20 @@ class BridgeTest(unittest.TestCase):
             self.event(eventId="run", kind="run.started", phase="setup", actor=None, campaign=None, faultType=None, details={"seed": "12" * 32}),
             self.event(eventId="policy", kind="policy.changed", phase="baseline", actor=None, campaign=None, faultType=None, details={"mode": "run", "generation": 7, "intervalSeconds": 20}),
             self.event(eventId="invariant", kind="invariant.observed", phase="verification", actor="signer-1", campaign=None, faultType=None, outcome="pass", details={"name": "height-cohort", "passed": True, "value": 10}),
-            self.event(eventId="actor", kind="actor.state", phase="baseline", actor="signer-1", campaign=None, faultType=None, details={"ready": True, "restarts": 2}),
+            self.event(
+                eventId="actor", kind="actor.state", phase="baseline", actor="signer-1",
+                role="signer", campaign=None, faultType=None,
+                details={
+                    "ready": True, "restarts": 2, "node": "worker-2", "phase": "Running",
+                    "containers": [
+                        {"name": "telemetry", "requestedImage": "collector:1", "imageId": "sha256:sidecar"},
+                        {
+                            "name": "actor", "requestedImage": "stacks-signer:4.0.2",
+                            "imageId": "sha256:resolved", "ready": True, "restarts": 2,
+                        },
+                    ],
+                },
+            ),
             self.event(eventId="clear", kind="fault.cleared", phase="recovering"),
             self.event(eventId="recovery", kind="recovery.complete", phase="verification", actor=None, faultType=None, details={"durationSeconds": 8.5}),
         ]
@@ -110,6 +123,7 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('attacknet_fault_active{actor="miner-1",campaign="delay-miner"', metrics)
         self.assertIn('attacknet_invariant_pass{actor="signer-1",evidence_source="orchestrator_observed",invariant="height-cohort",network="attacknet"} 1', metrics)
         self.assertIn('attacknet_actor_restarts{actor="signer-1",evidence_source="orchestrator_observed",network="attacknet"} 2.0', metrics)
+        self.assertIn('attacknet_actor_info{actor="signer-1",evidence_source="orchestrator_observed",image_id="sha256:resolved",network="attacknet",node="worker-2",phase="Running",requested_image="stacks-signer:4.0.2",role="signer"} 1', metrics)
         self.assertIn('attacknet_recovery_duration_seconds{campaign="delay-miner",evidence_source="orchestrator_observed",network="attacknet"} 8.5', metrics)
         self.assertIn('attacknet_burnchain_policy_info{evidence_source="orchestrator_observed",generation="7",mode="run",network="attacknet"} 1', metrics)
         self.assertIn('attacknet_run_info{evidence_source="orchestrator_observed",network="attacknet",phase="verification",run_id="run-123",seed="' + "12" * 32 + '"} 1', metrics)

@@ -8,7 +8,10 @@ test('Pod admission state becomes trusted actor observations with restart and im
     metadata: {name: 'net-miner-1-0', uid: 'uid-1', labels: {
       'testing.stacks.org/actor': 'miner-1', 'testing.stacks.org/role': 'miner',
     }},
-    spec: {nodeName: 'worker-2'},
+    spec: {nodeName: 'worker-2', containers: [
+      {name: 'actor', image: 'stacks-node:4.0.2'},
+      {name: 'telemetry', image: 'collector:1'},
+    ]},
     status: {
       phase: 'Running', conditions: [{type: 'Ready', status: 'True'}],
       containerStatuses: [
@@ -23,4 +26,5 @@ test('Pod admission state becomes trusted actor observations with restart and im
   assert.equal(states[0].details.restarts, 3);
   assert.equal(states[0].details.node, 'worker-2');
   assert.deepEqual(states[0].details.containers.map(container => container.imageId), ['sha256:abc', 'sha256:def']);
+  assert.deepEqual(states[0].details.containers.map(container => container.requestedImage), ['stacks-node:4.0.2', 'collector:1']);
 });

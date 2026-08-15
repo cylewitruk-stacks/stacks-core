@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {chmodSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
+import {chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -11,7 +11,7 @@ function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'attacknet-observability-integration-'));
   const kubectl = join(directory, 'kubectl.mjs');
   writeFileSync(kubectl, `#!/usr/bin/env node
-import {readFileSync, writeFileSync} from 'node:fs';
+import {existsSync, readFileSync, writeFileSync} from 'node:fs';
 const args=process.argv.slice(2);
 if (args.includes('get') && args.includes('pods')) {
   if (args.at(-1) === 'json' && process.env.FAKE_PODS) process.stdout.write(process.env.FAKE_PODS);
@@ -22,6 +22,10 @@ if (args.includes('get') && args.includes('pods')) {
   else if (name.endsWith('-run-context') && process.env.FAKE_RUN_ID) process.stdout.write(process.env.FAKE_RUN_ID);
   else process.exitCode=1;
 } else if (args.includes('exec') && args.includes('-i')) {
+  if (process.env.FAKE_FAIL_ONCE_FILE && !existsSync(process.env.FAKE_FAIL_ONCE_FILE)) {
+    writeFileSync(process.env.FAKE_FAIL_ONCE_FILE, 'failed-once');
+    process.exit(1);
+  }
   const body=readFileSync(0, 'utf8');
   if (process.env.FAKE_APPEND === '1') {
     const prior=(()=>{try{return readFileSync(process.env.FAKE_EVENT_CAPTURE, 'utf8')}catch{return ''}})();
@@ -75,6 +79,28 @@ test('trusted event writer fixes network and run identity outside caller payload
   assert.doesNotMatch(invocation, /trusted-run|hello/);
 });
 
+test('trusted event writer retries a transient journal transport failure', () => {
+  const {directory, kubectl} = fixture();
+  const capture = join(directory, 'event.json');
+  const argumentsCapture = join(directory, 'args.json');
+  const failedOnce = join(directory, 'failed-once');
+  const result = spawnSync(join(root, 'record-event.sh'), [
+    '--kind=note', '--phase=baseline', '--details={"message":"retried"}',
+  ], {encoding: 'utf8', env: {
+    ...process.env,
+    ATTACKNET_KUBECTL: kubectl,
+    ATTACKNET_RUN_ID: 'retry-run',
+    KUBE_NETWORK: 'retry-network',
+    KUBE_NAMESPACE: 'retry-namespace',
+    FAKE_FAIL_ONCE_FILE: failedOnce,
+    FAKE_EVENT_CAPTURE: capture,
+    FAKE_ARGUMENT_CAPTURE: argumentsCapture,
+  }});
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(existsSync(failedOnce), true);
+  assert.equal(JSON.parse(readFileSync(capture, 'utf8')).details.message, 'retried');
+});
+
 test('trusted event writer resolves the persisted run context without exposing it in arguments', () => {
   const {directory, kubectl} = fixture();
   const capture = join(directory, 'event.json');
@@ -112,6 +138,8 @@ test('Kubernetes export paginates and filters the retained journal by run', () =
     encoding: 'utf8', env: {
       ...process.env,
       ATTACKNET_KUBECTL: kubectl,
+      ATTACKNET_LOCK_DISABLED: '1',
+      ATTACKNET_NEGATIVE_CONTROL: '1',
       ATTACKNET_EVENT_PAGE_LIMIT: '2',
       FAKE_EVENTS: JSON.stringify(events),
       KUBE_NETWORK: 'attacknet',
@@ -153,6 +181,8 @@ test('applied burnchain policy is journaled only after clock acknowledgement', (
     encoding: 'utf8', env: {
       ...process.env,
       ATTACKNET_KUBECTL: kubectl,
+      ATTACKNET_LOCK_DISABLED: '1',
+      ATTACKNET_NEGATIVE_CONTROL: '1',
       ATTACKNET_RUN_ID: 'policy-run',
       FAKE_POLICY: policy,
       FAKE_POLICY_GENERATION: '2',
@@ -178,6 +208,8 @@ test('exact burnchain bursts retain an inter-block bootstrap cadence and end pau
     encoding: 'utf8', env: {
       ...process.env,
       ATTACKNET_KUBECTL: kubectl,
+      ATTACKNET_LOCK_DISABLED: '1',
+      ATTACKNET_NEGATIVE_CONTROL: '1',
       ATTACKNET_RUN_ID: 'burst-run',
       FAKE_POLICY: policy,
       FAKE_POLICY_GENERATION: '5',

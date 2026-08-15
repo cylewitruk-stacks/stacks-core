@@ -26,6 +26,7 @@ export function actorStateEvents(podList) {
         containers: statuses.map(status => ({
           name: status.name,
           ready: status.ready === true,
+          requestedImage: pod.spec?.containers?.find(container => container.name === status.name)?.image ?? 'unknown',
           imageId: status.imageID ?? 'unknown',
           restarts: Number(status.restartCount ?? 0),
         })),

@@ -14,6 +14,18 @@ cp "${manifest}" "${destination}/manifest.json"
 
 namespace="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.namespace)' "${resource}")"
 network="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.labels["testing.stacks.org/network"])' "${resource}")"
+lock_script="${ATTACKNET_DIR}/environment-lock.sh"
+if [ "${ATTACKNET_LOCK_DISABLED:-0}" = 1 ]; then
+  [ "${ATTACKNET_NEGATIVE_CONTROL:-0}" = 1 ] || {
+    echo 'ATTACKNET_LOCK_DISABLED=1 requires ATTACKNET_NEGATIVE_CONTROL=1' >&2
+    exit 2
+  }
+elif [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then
+  exec "${lock_script}" run "${network}" "${ATTACKNET_LOCK_OWNER:-campaign:$$}" \
+    "campaign:$(basename "${campaign}")" -- "$0" "$@"
+else
+  "${lock_script}" assert "${network}" "${ATTACKNET_MUTATION_TOKEN}"
+fi
 resource_kind="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).kind)' "${resource}")"
 kind="$(printf '%s' "${resource_kind}" | tr '[:upper:]' '[:lower:]')"
 name="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.name)' "${resource}")"

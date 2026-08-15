@@ -5,6 +5,19 @@ NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}"
 NETWORK="${KUBE_NETWORK:-attacknet}"
 CONFIG_MAP="${NETWORK}-burnchain-policy"
 kubectl_bin="${ATTACKNET_KUBECTL:-kubectl}"
+lock_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/environment-lock.sh"
+
+if [ "${ATTACKNET_LOCK_DISABLED:-0}" = 1 ]; then
+  [ "${ATTACKNET_NEGATIVE_CONTROL:-0}" = 1 ] || {
+    echo 'ATTACKNET_LOCK_DISABLED=1 requires ATTACKNET_NEGATIVE_CONTROL=1' >&2
+    exit 2
+  }
+elif [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then
+  exec "${lock_script}" run "${NETWORK}" "${ATTACKNET_LOCK_OWNER:-burnchain-policy:$$}" \
+    burnchain-policy -- "$0" "$@"
+else
+  "${lock_script}" assert "${NETWORK}" "${ATTACKNET_MUTATION_TOKEN}"
+fi
 
 current_policy="$(${kubectl_bin} -n "${NAMESPACE}" get configmap "${CONFIG_MAP}" \
   -o jsonpath='{.data.policy\.env}')"

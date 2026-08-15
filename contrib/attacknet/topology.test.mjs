@@ -78,6 +78,16 @@ test('companion waits for the signer event socket without creating a dependency 
   );
 });
 
+test('legacy signer companions subscribe to miner and signer StackerDBs', () => {
+  const actors = buildTopology({signerCount: 2}).actors;
+  for (const companion of actors.filter(actor => actor.role === 'companion')) {
+    assert.match(companion.config.files['config.toml'], /^miner = false$/m);
+    assert.match(companion.config.files['config.toml'], /^stacker = true$/m);
+  }
+  const follower = actors.find(actor => actor.role === 'follower');
+  assert.match(follower.config.files['config.toml'], /^stacker = false$/m);
+});
+
 test('bootstrap suppresses companion observers until signer runloops are initialized', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-observer-bootstrap-'));
   const {resource, bootstrapResource} = renderTopology(buildTopology({signerCount: 2}), output);
@@ -111,7 +121,7 @@ test('manifest exposes deterministic protocol phase barriers', () => {
   assert.deepEqual(manifest.protocol, {
     burnchainBootstrapHeight: 202,
     observerEnableHeight: 220,
-    signerRegistrationHeight: 221,
+    signerRegistrationHeight: 222,
     nakamotoActivationHeight: 223,
     steadyBurnIntervalSeconds: 60,
   });

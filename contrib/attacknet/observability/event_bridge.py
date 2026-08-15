@@ -255,7 +255,21 @@ class Journal:
             elif event["kind"] == "actor.state":
                 ready = 1 if details.get("ready") is True else 0
                 restarts = _finite_number(details.get("restarts"), 0)
-                actor_states[(network, event.get("actor", "unknown"))] = (ready, restarts)
+                containers = details.get("containers") if isinstance(details.get("containers"), list) else []
+                primary = next(
+                    (container for container in containers
+                     if isinstance(container, dict) and container.get("name") == "actor"),
+                    containers[0] if containers and isinstance(containers[0], dict) else {},
+                )
+                actor_states[(network, event.get("actor", "unknown"))] = {
+                    "ready": ready,
+                    "restarts": restarts,
+                    "role": event.get("role", "unknown"),
+                    "node": details.get("node", "unassigned"),
+                    "phase": details.get("phase", "Unknown"),
+                    "requested_image": primary.get("requestedImage", "unknown"),
+                    "image_id": primary.get("imageId", "unknown"),
+                }
             elif event["kind"] == "recovery.complete":
                 recovery[(network, event.get("campaign", ""))] = _finite_number(details.get("durationSeconds"), 0)
 
@@ -286,11 +300,24 @@ class Journal:
             "# TYPE attacknet_actor_ready gauge",
             "# HELP attacknet_actor_restarts Orchestrator-observed container restart count.",
             "# TYPE attacknet_actor_restarts gauge",
+            "# HELP attacknet_actor_info Orchestrator-observed actor identity, placement, and admitted image metadata.",
+            "# TYPE attacknet_actor_info gauge",
         ])
-        for (network, actor), (ready, restarts) in sorted(actor_states.items()):
+        for (network, actor), state in sorted(actor_states.items()):
             labels = _labels(network=network, actor=actor, evidence_source="orchestrator_observed")
-            lines.append(f"attacknet_actor_ready{{{labels}}} {ready}")
-            lines.append(f"attacknet_actor_restarts{{{labels}}} {restarts}")
+            lines.append(f"attacknet_actor_ready{{{labels}}} {state['ready']}")
+            lines.append(f"attacknet_actor_restarts{{{labels}}} {state['restarts']}")
+            info_labels = _labels(
+                network=network,
+                actor=actor,
+                role=state["role"],
+                node=state["node"],
+                phase=state["phase"],
+                requested_image=state["requested_image"],
+                image_id=state["image_id"],
+                evidence_source="orchestrator_observed",
+            )
+            lines.append(f"attacknet_actor_info{{{info_labels}}} 1")
 
         lines.extend(["# HELP attacknet_recovery_duration_seconds Observed time from fault clearance to invariant recovery.", "# TYPE attacknet_recovery_duration_seconds gauge"])
         for (network, campaign), duration in sorted(recovery.items()):

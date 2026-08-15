@@ -9,9 +9,11 @@ AUTO_START_BURNCHAIN="${ATTACKNET_AUTO_START_BURNCHAIN:-1}"
 STARTUP_SETTLE_SECONDS="${ATTACKNET_STARTUP_SETTLE_SECONDS:-5}"
 BOOTSTRAP_INTERVAL_SECONDS="${ATTACKNET_BOOTSTRAP_INTERVAL_SECONDS:-2}"
 OBSERVABILITY_ENABLED="${ATTACKNET_OBSERVABILITY_ENABLED:-1}"
+OBSERVABILITY_STORAGE_PREFLIGHT="${ATTACKNET_OBSERVABILITY_STORAGE_PREFLIGHT:-1}"
 RUN_DESCRIPTOR=""
 RUN_ID="${ATTACKNET_RUN_ID:-}"
 RUN_SEED="${ATTACKNET_RUN_SEED:-}"
+ENVIRONMENT_LOCK="${ATTACKNET_DIR}/environment-lock.sh"
 
 [[ "${NETWORK}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
   echo "invalid Kubernetes network name: ${NETWORK}" >&2
@@ -121,7 +123,7 @@ wait_deleted() {
   local deadline=$((SECONDS + TIMEOUT))
   local remaining
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    remaining="$(kubectl -n "${NAMESPACE}" get pods,pvc,statefulsets,services,configmaps \
+    remaining="$(kubectl -n "${NAMESPACE}" get pods,pvc,deployments,statefulsets,daemonsets,services,configmaps,secrets,serviceaccounts,roles,rolebindings \
       -l "testing.stacks.org/network=${NETWORK}" -o name 2>/dev/null || true)"
     if [ -z "${remaining}" ]; then
       echo "Deleted ${NETWORK} and all labeled children/PVCs"
@@ -271,6 +273,32 @@ wait_signers_registered() {
   return 1
 }
 
+wait_companion_stackerdb_subscriptions() {
+  local manifest="$1" deadline=$((SECONDS + TIMEOUT)) companions companion status missing
+  companions="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" companions)"
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    missing=""
+    for companion in ${companions}; do
+      status="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${companion}" \
+        curl --silent --output /dev/null --write-out '%{http_code}' --max-time 3 \
+        http://127.0.0.1:20443/v2/stackerdb/ST000000000000000000002AMW42H/miners \
+        2>/dev/null || true)"
+      if [ "${status}" != 200 ]; then
+        missing="${missing} ${companion}:${status:-unavailable}"
+      fi
+    done
+    if [ -z "${missing}" ]; then
+      printf 'All %s signer companions subscribe to the legacy .miners StackerDB\n' \
+        "$(wc -w <<<"${companions}" | tr -d ' ')"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "signer companions did not instantiate the .miners StackerDB:${missing}" >&2
+  return 1
+}
+
 burst_to_height() {
   local target="$1" phase="$2" current delta observed
   current="$(clock_status_value bitcoin_height)"
@@ -299,6 +327,12 @@ burst_to_height() {
 
 wait_observability_ready() {
   [ "${OBSERVABILITY_ENABLED}" = 1 ] || return 0
+  kubectl -n "${NAMESPACE}" rollout status statefulset \
+    -l "testing.stacks.org/network=${NETWORK},app.kubernetes.io/name=attacknet-loki" \
+    --timeout="${TIMEOUT}s"
+  kubectl -n "${NAMESPACE}" rollout status daemonset \
+    -l "testing.stacks.org/network=${NETWORK},app.kubernetes.io/name=attacknet-alloy" \
+    --timeout="${TIMEOUT}s"
   kubectl -n "${NAMESPACE}" wait --for=condition=Available deployment \
     -l "testing.stacks.org/network=${NETWORK},app.kubernetes.io/part-of=stacks-attacknet" \
     --timeout="${TIMEOUT}s"
@@ -308,7 +342,7 @@ apply_network() {
   local generated="${1:?generated topology directory required}"
   local manifest="${generated}/manifest.json" final_network="${generated}/stacksnetwork.json"
   local bootstrap_network="${generated}/stacksnetwork.bootstrap.json"
-  local gated desired_interval desired_jitter observer_height registration_height activation_height start_details
+  local gated desired_interval desired_jitter observer_height registration_height activation_height start_details storage_report
   if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
     node "${ATTACKNET_DIR}/observability/render.mjs" "${manifest}" \
       --output="${generated}/observability.json" \
@@ -327,6 +361,24 @@ apply_network() {
   ledger_assertion lifecycle-initialized pass \
     "{\"network\":\"${NETWORK}\",\"namespace\":\"${NAMESPACE}\"}"
   if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
+    if [ "${OBSERVABILITY_STORAGE_PREFLIGHT}" = 1 ]; then
+      if "${ATTACKNET_DIR}/observability/storage-preflight.sh" \
+        "${generated}/observability-storage-preflight.json"; then
+        storage_report="$(jq -c . "${generated}/observability-storage-preflight.json")"
+        ledger_assertion observability-storage-capacity pass "${storage_report}"
+      else
+        storage_report="$(jq -c . "${generated}/observability-storage-preflight.json")"
+        ledger_assertion observability-storage-capacity fail "${storage_report}"
+        return 1
+      fi
+    elif [ "${ATTACKNET_NEGATIVE_CONTROL:-0}" != 1 ]; then
+      echo "disabling the observability storage preflight requires ATTACKNET_NEGATIVE_CONTROL=1" >&2
+      return 2
+    else
+      storage_report='{"schemaVersion":1,"ok":false,"source":"disabled-for-explicit-negative-control"}'
+      printf '%s\n' "${storage_report}" >"${generated}/observability-storage-preflight.json"
+      ledger_assertion observability-storage-capacity skipped "${storage_report}"
+    fi
     kubectl -n "${NAMESPACE}" apply -f "${generated}/observability.json"
     wait_observability_ready
     start_details="$(RUN_SEED="${RUN_SEED}" node -e '
@@ -367,8 +419,11 @@ apply_network() {
     wait_nodes_at_burn_height "${manifest}" pre-activation-nodes "${registration_height}"
     wait_actor_group_ready "${manifest}" bootstrap
     wait_signers_registered "${manifest}"
+    wait_companion_stackerdb_subscriptions "${manifest}"
     ledger_assertion signers-registered pass \
       "{\"requestedHeight\":${registration_height},\"observedHeight\":$(clock_status_value bitcoin_height)}"
+    ledger_assertion companion-stackerdb-subscriptions pass \
+      "{\"contract\":\"ST000000000000000000002AMW42H.miners\",\"observedHeight\":$(clock_status_value bitcoin_height)}"
     [ "${registration_height}" -lt "${activation_height}" ] || {
       echo "signer registration barrier must precede Nakamoto activation" >&2
       return 1
@@ -435,7 +490,7 @@ delete_network() {
   fi
   kubectl -n "${NAMESPACE}" delete stacksnetwork "${NETWORK}" --ignore-not-found --wait=false
   kubectl -n "${NAMESPACE}" delete configmap "${NETWORK}-burnchain-policy" --ignore-not-found
-  kubectl -n "${NAMESPACE}" delete deployments,services,configmaps,secrets,pvc \
+  kubectl -n "${NAMESPACE}" delete deployments,statefulsets,daemonsets,services,configmaps,secrets,pvc,serviceaccounts,roles,rolebindings \
     -l "testing.stacks.org/network=${NETWORK},app.kubernetes.io/part-of=stacks-attacknet" \
     --ignore-not-found --wait=false
   wait_deleted
@@ -497,14 +552,36 @@ apply_error() {
     fi
     echo "Bootstrap failure evidence: ${bundle}" >&2
   fi
+  # A failure before admitting any network-owned object must not reserve the
+  # single-environment lease forever. If anything was admitted, preserve both
+  # the environment and its lease for attribution and incident capture.
+  if ! kubectl -n "${NAMESPACE}" get stacksnetwork "${NETWORK}" >/dev/null 2>&1 \
+    && [ -z "$(kubectl -n "${NAMESPACE}" get pods,pvc,deployments,statefulsets,daemonsets,services,configmaps,secrets,serviceaccounts,roles,rolebindings \
+      -l "testing.stacks.org/network=${NETWORK}" -o name 2>/dev/null)" ]; then
+    "${ENVIRONMENT_LOCK}" release "${NETWORK}" || true
+  fi
   exit "${status}"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  command="${1:-}"
+  case "${command}" in
+    apply|delete)
+      if [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then
+        "${ENVIRONMENT_LOCK}" claim "${NETWORK}" "${ATTACKNET_LOCK_OWNER:-lifecycle:$$}" "lifecycle-${command}"
+        exec "${ENVIRONMENT_LOCK}" run "${NETWORK}" \
+          "${ATTACKNET_LOCK_OWNER:-lifecycle:$$}" "lifecycle-${command}" -- "$0" "$@"
+      fi
+      "${ENVIRONMENT_LOCK}" assert "${NETWORK}" "${ATTACKNET_MUTATION_TOKEN}"
+      ;;
+    wait|capture)
+      "${ENVIRONMENT_LOCK}" environment-assert "${NETWORK}"
+      ;;
+  esac
   case "${1:-}" in
     apply) shift; trap 'apply_error $? ${LINENO}' ERR; apply_network "$@"; trap - ERR ;;
     wait) wait_ready ;;
-    delete) delete_network ;;
+    delete) delete_network; "${ENVIRONMENT_LOCK}" release "${NETWORK}" ;;
     capture) shift; capture "$@" ;;
     *) echo "usage: $0 {apply GENERATED_DIR|wait|delete|capture EVIDENCE_DIR}" >&2; exit 2 ;;
   esac

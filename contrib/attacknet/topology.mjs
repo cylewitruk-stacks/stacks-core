@@ -77,6 +77,11 @@ function epochsAndBalances(signers) {
 }
 
 function nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers}) {
+  // On the current-main legacy transport, `stacker` is also the subscription
+  // switch for the boot `.miners` and signer StackerDB replicas.  A signer
+  // companion is not a miner, but it must set this flag or proposals can only
+  // exist in the winning miner's local database and never reach the signer.
+  const subscribesToSignerStackerDBs = miner || signerIndex !== undefined;
   const bootstrap = name === 'miner-1' ? '' :
     `bootstrap_node = "${legacyPublicKey('11')}@${service('miner-1')}:20444"`;
   const observer = signerIndex === undefined ? '' : `
@@ -107,7 +112,7 @@ working_dir = "/data/node"
 seed = "${repeated(seedByte)}"
 local_peer_seed = "${repeated(seedByte)}"
 miner = ${miner}
-stacker = ${miner}
+stacker = ${subscribesToSignerStackerDBs}
 use_test_genesis_chainstate = true
 pox_5_sbtc_contract = "${CONTRACT_ACCOUNT}.sbtc-token"
 pox_5_sbtc_registry_contract = "${CONTRACT_ACCOUNT}.sbtc-registry"
@@ -411,7 +416,10 @@ export function renderTopology(topology, output, {network = 'attacknet', namespa
     protocol: {
       burnchainBootstrapHeight: 202,
       observerEnableHeight: 220,
-      signerRegistrationHeight: 221,
+      // The stack transactions confirm at 220, and the signer runloops adopt
+      // that reward set on the following burn-block event. Height 222 is the
+      // last deterministic participation barrier before Nakamoto activates.
+      signerRegistrationHeight: 222,
       nakamotoActivationHeight: 223,
       steadyBurnIntervalSeconds: 60,
     },
