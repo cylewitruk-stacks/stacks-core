@@ -123,17 +123,19 @@ wait_ready() {
 
 wait_deleted() {
   local deadline=$((SECONDS + TIMEOUT))
-  local remaining
+  local owner remaining
   while [ "${SECONDS}" -lt "${deadline}" ]; do
+    owner="$(kubectl -n "${NAMESPACE}" get stacksnetwork "${NETWORK}" -o name 2>/dev/null || true)"
     remaining="$(kubectl -n "${NAMESPACE}" get pods,pvc,deployments,statefulsets,daemonsets,services,configmaps,secrets,serviceaccounts,roles,rolebindings \
       -l "testing.stacks.org/network=${NETWORK},!testing.stacks.org/artifact" -o name 2>/dev/null || true)"
-    if [ -z "${remaining}" ]; then
+    if [ -z "${owner}" ] && [ -z "${remaining}" ]; then
       echo "Deleted ${NETWORK} and all labeled children/PVCs"
       return 0
     fi
     sleep 2
   done
   echo "resources survived deletion of ${NETWORK}:" >&2
+  [ -z "${owner}" ] || printf '%s\n' "${owner}" >&2
   printf '%s\n' "${remaining}" >&2
   return 1
 }

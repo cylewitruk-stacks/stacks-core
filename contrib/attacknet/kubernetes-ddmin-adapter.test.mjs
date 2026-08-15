@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
+import {mkdirSync, mkdtempSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import test from 'node:test';
 
 import {
   createDdminPlan, issueDdminAttempt, resolveAttacknetSchedule,
 } from './attacknet-run-schedule.mjs';
+import {evidenceDigestFor} from './ddmin-executor.mjs';
 import {KubernetesDdminAdapter} from './kubernetes-ddmin-adapter.mjs';
 
 const resolvedDigest = `sha256:${'a'.repeat(64)}`;
@@ -130,4 +134,54 @@ test('Kubernetes adapter refuses to overlap even one existing active run', () =>
     generatedDirectory: '/tmp/generated', attacknetDirectory: '/tmp/attacknet',
   }, runner);
   assert.throws(() => adapter.assertExclusive({maxActive: 1}), /second active AttacknetRun/);
+});
+
+test('Kubernetes adapter distinguishes an absent network from an API failure', () => {
+  const config = {
+    namespace: 'hacknet-system', network: 'attacknet', sourceRunRef: 'source-run',
+    generatedDirectory: '/tmp/generated',
+  };
+  const absent = new KubernetesDdminAdapter(config, {run: () => ({
+    status: 1, stdout: '', stderr: 'Error from server (NotFound): stacksnetworks "attacknet" not found',
+  })});
+  assert.equal(absent.networkExists(), false);
+
+  const present = new KubernetesDdminAdapter(config, {run: () => ({
+    status: 0, stdout: 'stacksnetwork.testing.stacks.org/attacknet\n', stderr: '',
+  })});
+  assert.equal(present.networkExists(), true);
+
+  const unavailable = new KubernetesDdminAdapter(config, {run: () => ({
+    status: 1, stdout: '', stderr: 'Unable to connect to the server',
+  })});
+  assert.throws(() => unavailable.networkExists(), /could not determine/);
+});
+
+test('Kubernetes adapter verifies the sealed source evidence before reuse', () => {
+  const {sourceRun, schedule} = fixture();
+  const adapter = new KubernetesDdminAdapter({
+    namespace: 'hacknet-system', network: 'attacknet', sourceRunRef: 'source-run',
+    generatedDirectory: '/tmp/generated',
+  }, {run: () => { throw new Error('Kubernetes must not be contacted'); }});
+  adapter.sourceRun = sourceRun;
+  adapter.sourceSchedule = schedule;
+  const root = mkdtempSync(join(tmpdir(), 'attacknet-source-evidence-'));
+  const directory = join(root, 'source');
+  mkdirSync(directory);
+  const evidencePath = join(directory, 'source-evidence.json');
+  const evidence = {
+    sourceRun, sourceSchedule: schedule,
+    network: {metadata: {name: 'attacknet', uid: schedule.network.uid}},
+    campaigns: {items: []},
+  };
+  writeFileSync(evidencePath, `${JSON.stringify(evidence)}\n`);
+  const receiptPath = join(directory, 'receipt.json');
+  writeFileSync(receiptPath, `${JSON.stringify({
+    schemaVersion: 'stacks-attacknet-source-evidence/v1',
+    digest: evidenceDigestFor(evidence), uri: `file://${evidencePath}`,
+  })}\n`);
+  assert.equal(adapter.verifySourceEvidence(root), evidenceDigestFor(evidence));
+  evidence.network.metadata.uid = 'wrong-source-network';
+  writeFileSync(evidencePath, `${JSON.stringify(evidence)}\n`);
+  assert.throws(() => adapter.verifySourceEvidence(root), /does not match its payload/);
 });

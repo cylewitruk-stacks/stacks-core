@@ -47,6 +47,21 @@ The final ddmin statement is only “one-minimal under the recorded fresh-networ
 counterfactuals.” Neither the schedule library, controller status, executor
 receipt, Prometheus metric, nor Grafana dashboard claims causal minimality.
 
+## LLM-guided, mechanically verified reduction
+
+An agent should not enumerate candidates blindly. It may use source structure,
+the causal event ledger, topology, actor bindings, timestamps, metrics, logs,
+and prior counterfactuals to rank high-information removals and to exclude a
+dimension whose irrelevance is structurally established. Every such decision
+is recorded as a hypothesis with its evidence; it is not promoted to a causal
+fact merely because an LLM considers it obvious.
+
+The trusted boundary remains mechanical: the compiler proves the submitted
+candidate is removal-only, a fresh network executes it, and controller-owned
+assertions classify the outcome. Uncertain dimensions remain in the candidate
+set. This makes the intended process LLM-guided delta debugging rather than
+either exhaustive subset search or intuition-only incident analysis.
+
 ## Running
 
 The source `AttacknetRun` must be terminal and its network must still be
@@ -98,10 +113,20 @@ campaign reason is not silently promoted into trusted failure evidence.
 This is an intentional fail-closed integration boundary, not evidence that
 arbitrary chain-level failures are already minimizable.
 
-## Live-validation boundary
+## Live validation
 
-The executor and controller admission path have offline fake-runner and fake
-API coverage. The live multi-attempt path has not yet been exercised because
-the local kind nodes reported zero available image/root filesystem bytes. A
-live result is not claimed until storage preflight passes and a real terminal
-source failure can be replayed on fresh network UIDs.
+The complete source → fresh baseline replay → removal-only counterfactual path
+has been exercised on the local three-node kind cluster. Source run 5 used an
+irrelevant follower Pod kill followed by an intentionally ineffective TCP
+packet-duplication campaign. Baseline UID
+`909dcff4-ec7a-416a-9575-8ba337d5d6c5` reproduced the trusted
+`NetworkDegraded=Failed` assertion. Candidate UID
+`a6fc4529-8c0b-41de-a9df-1a0ac7b3efc8` removed only the Pod kill and reproduced
+the same assertion. The one-attempt budget then expired, so the result makes no
+minimality claim. Evidence is retained under
+`contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/`.
+
+The live sequence also exposed and closed four harness defects: noncanonical
+image ordering, failure to wait for owner-CR deletion, directory-depth-derived
+source evidence, and redundant teardown of an already-absent network. These are
+recorded as F-103 through F-107 in `.docs/18-attacknet-findings.md`.

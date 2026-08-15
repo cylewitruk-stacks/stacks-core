@@ -293,7 +293,7 @@ export function resolvedNetworkImages(network, pods) {
       resolvedRef,
       resolvedDigest: match[0],
     };
-  });
+  }).sort((left, right) => left.scope.localeCompare(right.scope));
 }
 
 export function encodeSchedule(schedule) {

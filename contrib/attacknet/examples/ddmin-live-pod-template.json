@@ -1,0 +1,40 @@
+{
+  "apiVersion": "testing.stacks.org/v1alpha1",
+  "kind": "FaultCampaign",
+  "metadata": {
+    "name": "ddmin-live-pod-template",
+    "namespace": "hacknet-system"
+  },
+  "spec": {
+    "template": true,
+    "networkRef": "attacknet-ddmin-live",
+    "target": {"actors": ["follower-1"]},
+    "fault": {
+      "type": "pod",
+      "action": "pod-kill",
+      "mode": "one",
+      "duration": "10s",
+      "parameters": {"gracePeriod": 0}
+    },
+    "safety": {
+      "maxUnavailableSignerPercent": 30,
+      "allowQuorumLoss": false,
+      "allowBurnchain": false,
+      "allowExtendedDuration": false,
+      "allowExtremeSeverity": false,
+      "allowMinerMajorityOutage": false,
+      "allowUnenrolledNetworkTargets": false,
+      "maxUnavailableMinerPercent": 50
+    },
+    "effectAssertions": [{
+      "type": "PodRestarted",
+      "actor": "follower-1",
+      "timeoutSeconds": 90
+    }],
+    "recoveryAssertions": [{
+      "type": "TargetReady",
+      "actor": "follower-1",
+      "timeoutSeconds": 300
+    }]
+  }
+}

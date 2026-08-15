@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {createServer} from 'node:net';
+import {setTimeout as delay} from 'node:timers/promises';
 import test from 'node:test';
 
 const script = new URL('./burnchain-clock.sh', import.meta.url).pathname;
@@ -87,6 +88,18 @@ test('the health server consumes requests before a clean HTTP close', async () =
       if (ready.includes('READY\n')) break;
     }
     assert.match(ready, /READY/);
+    let firstResponse;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        firstResponse = await fetch(`http://127.0.0.1:${port}/`, {signal: AbortSignal.timeout(1000)});
+        break;
+      } catch (error) {
+        if (attempt === 49) throw error;
+        await delay(10);
+      }
+    }
+    assert.equal(firstResponse.status, 200);
+    assert.equal(await firstResponse.text(), 'ok\n');
     for (let index = 0; index < 50; index += 1) {
       const response = await fetch(`http://127.0.0.1:${port}/`, {signal: AbortSignal.timeout(1000)});
       assert.equal(response.status, 200);

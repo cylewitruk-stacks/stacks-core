@@ -5,7 +5,7 @@ import {EventEmitter} from 'node:events';
 import {
   AttacknetRunReconciler, FaultCampaignReconciler, RunController, SignerSetClient, FINALIZER, digest,
   artifactDigest, classifyTerminalAssertion, decodeSchedule, networkManifest, podEffectResults,
-  prometheusMetrics, stableName,
+  prometheusMetrics, resolvedNetworkImages, stableName,
 } from './controller.mjs';
 import {
   createDdminPlan, describeDdminCandidate, issueDdminAttempt,
@@ -281,6 +281,16 @@ test('authoritative manifest rejects inconsistent signer ownership and remains c
   assert.throws(() => networkManifest(fixture), /inconsistent authoritative weight/);
   assert.equal(digest({b: 2, a: 1}), digest({a: 1, b: 2}));
   assert.ok(stableName('x'.repeat(63), 'child').length <= 63);
+});
+
+test('admitted image identity is canonical across actor declaration order', () => {
+  const fixture = network();
+  const pods = networkPods(fixture);
+  fixture.spec.actors.reverse();
+  const images = resolvedNetworkImages(fixture, {items: pods});
+  const scopes = images.map(image => image.scope);
+  assert.deepEqual(scopes, [...scopes].sort((left, right) => left.localeCompare(right)));
+  assert.deepEqual(images, resolvedNetworkImages(network(), {items: networkPods()}));
 });
 
 function fakeHttpJson(responses) {

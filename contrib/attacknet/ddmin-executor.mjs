@@ -252,7 +252,7 @@ export async function executeDdmin(options, adapter) {
     let admitted;
     try {
       admitted = validateFreshAdmission(await adapter.recreateNetwork({
-        attempt, contract, attemptDirectory, baselineReplay: true,
+        attempt, contract, attemptDirectory, evidenceDirectory: root, baselineReplay: true,
       }), contract, usedUIDs);
       usedUIDs.add(admitted.uid);
       atomicWrite(join(attemptDirectory, 'admission.json'), admitted);
@@ -326,7 +326,7 @@ export async function executeDdmin(options, adapter) {
     try {
       await adapter.assertExclusive({logicalNetworkName: contract.logicalNetworkName, maxActive: 1});
       admitted = validateFreshAdmission(await adapter.recreateNetwork({
-        attempt, contract, attemptDirectory,
+        attempt, contract, attemptDirectory, evidenceDirectory: root,
       }), contract, usedUIDs);
       usedUIDs.add(admitted.uid);
       atomicWrite(join(attemptDirectory, 'admission.json'), admitted);

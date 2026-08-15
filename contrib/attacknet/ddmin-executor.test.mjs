@@ -51,6 +51,7 @@ class FakeAdapter {
   constructor(outcomes = []) {
     this.outcomes = [...outcomes];
     this.events = [];
+    this.recreationRoots = [];
     this.network = 0;
   }
   async storagePreflight() {
@@ -61,8 +62,9 @@ class FakeAdapter {
     assert.equal(maxActive, 1);
     this.events.push('exclusive');
   }
-  async recreateNetwork({attempt, contract}) {
+  async recreateNetwork({attempt, contract, evidenceDirectory}) {
     this.network += 1;
+    this.recreationRoots.push(evidenceDirectory);
     this.events.push(`recreate:${attempt.id}`);
     return {
       uid: `fresh-${this.network}`, generation: 1, cleanStart: true,
@@ -126,6 +128,7 @@ test('executor serializes fresh counterfactuals and exports durable evidence bef
   const baselineId = result.baselineReplay.id;
   assert.ok(adapter.events.indexOf(`export:${baselineId}`) < adapter.events.indexOf(`delete:${baselineId}`));
   assert.equal(result.attempts.length, 2);
+  assert.deepEqual(adapter.recreationRoots, [root, root, root]);
   assert.notEqual(result.attempts[0].networkUID, result.attempts[1].networkUID);
   for (const attempt of result.attempts) {
     assert.ok(adapter.events.indexOf(`export:${attempt.id}`) < adapter.events.indexOf(`delete:${attempt.id}`));

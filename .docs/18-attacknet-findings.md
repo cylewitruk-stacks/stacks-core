@@ -2477,6 +2477,219 @@ does pass the controller contract.
   failure, actor metrics/logs/APIs, admitted Kubernetes state, targeted
   paginated Loki evidence, storage report, and machine classification.
 
+## F-101: A retained event bridge can reject a newer lifecycle's terminal event contract
+
+- Classification: observability-component rollout compatibility gap
+- State: reproduced at preliminary-run closure; current source accepts and
+  tests the expanded phase/kind contract; fresh joint-image live proof pending
+- Trigger: the lifecycle and record helpers in the worktree were newer than the
+  event-bridge image admitted when the retained run began. Closing the run tried
+  to record teardown actor state and `run.finished` using the current trusted
+  event contract.
+- Result: the active bridge returned HTTP 400 on all three bounded attempts.
+  No terminal event was fabricated. The 196 previously accepted events were
+  exported read-only and an explicit error record was added to the evidence
+  bundle. Chain state and workload readiness were unaffected.
+- Correction and gate: deploy the bridge, lifecycle, and recorder contract from
+  one chart/image revision, publish a bounded contract-version readiness value,
+  and reject lifecycle startup before a run if required kinds/phases are not
+  supported. The final clean run must prove `run.started`, fault/invariant
+  events, teardown actor states, and `run.finished` end-to-end from the same
+  admitted revision. Retaining old components is valuable for mixed-version
+  protocol tests, but the trusted measurement plane itself must not drift
+  accidentally.
+- Evidence: `final-event-write-error.json` and `timeline-final/` in the F-100
+  bundle.
+
+## F-102: A mutable local actor tag can pair an old binary with a newer readiness contract
+
+- Classification: build/admission identity and lifecycle compatibility gap
+- State: reproduced on a fresh seven-workload lifecycle; fail-closed behavior
+  worked, corrective rebuild and fresh replay pending
+- Trigger: after the controllers were rebuilt from the current worktree, a
+  fresh topology still requested the convenience tag
+  `stacks-core-attacknet:main`. The kind nodes resolved that tag to an older
+  actor image whose executable reported source `a7e3e76019d9+`. The current
+  StatefulSet readiness contract requires
+  `stacks_signer_runloop_ready` and
+  `stacks_signer_registered_for_current_reward_cycle`.
+- Result: the signer really initialized and logged that signer 0 was registered
+  for reward cycle 11, but its metrics endpoint exported neither readiness
+  gauge. Kubernetes correctly kept the actor NotReady and the two-phase
+  lifecycle refused to claim completion. Storage, Bitcoin exact-height
+  bootstrap, account locking, companion observer rollout, and the remaining
+  actors were healthy. The wait was stopped after the binary/metric mismatch
+  was proven rather than weakening readiness or waiting out the full deadline.
+- Impact: a mutable local tag is only a transport convenience. Rebuilding a
+  chart/controller without rebuilding every actor can silently admit a binary
+  whose telemetry and readiness contract predates the harness. This can waste a
+  full bootstrap interval and, if probes are permissive, could produce false
+  acceptance evidence. It is the actor-side analogue of F-101.
+- Required correction: rebuild and load the actor image from the exact current
+  source, retain its OCI/runtime identity, and bind that identity to each
+  admitted Pod UID. The default lifecycle should gain a pre-run build-contract
+  receipt or equivalent expected runtime-config check so a mutable tag alone
+  cannot satisfy acceptance. Mixed-version actors remain allowed only when the
+  requested older contract and compatible probes are explicit.
+- Evidence:
+  `contrib/attacknet/evidence/ddmin-live-stale-actor-contract-20260815T2042Z/`.
+  It contains the pre-teardown snapshot, trusted timeline, and aborted run
+  export; actor logs and the live metrics response establish registration
+  versus missing readiness metrics.
+
+## F-103: Fresh-network image identity was hashed in two different actor orders
+
+- Classification: replay/minimization harness correctness defect
+- State: reproduced live; canonical ordering and behavioral regression test
+  implemented; closed by the successful R5 fresh replay and counterfactual
+- Trigger: the first live ddmin baseline recreated the source topology with a
+  new `StacksNetwork` UID and then compared the admitted image set with the
+  sealed source schedule. Every actor retained the same requested reference,
+  runtime `imageID`, and immutable digest.
+- Result: replay paused before creating an `AttacknetRun` with `fresh network
+  changed the admitted images`. The source schedule canonicalized images by
+  actor scope before hashing, while the Kubernetes adapter hashed the same
+  records in `StacksNetwork.spec.actors` declaration order. The two arrays
+  contained identical records but produced different digests. The fresh
+  network was deliberately preserved for triage and no fault was injected.
+- Impact: any non-lexically ordered topology could be misclassified as image
+  drift, making deterministic replay and ddmin unusable despite an unchanged
+  admitted binary set. The fail-closed behavior prevented an invalid causal
+  claim, but the false-positive consumed a full clean bootstrap.
+- Correction and gate: `resolvedNetworkImages()` now returns records sorted by
+  actor scope, matching the persisted schedule's canonical contract. A
+  behavioral test reverses actor declaration order and proves both the ordered
+  result and full record set remain identical. The live source/replay/ddmin
+  sequence must be repeated across fresh network UIDs before this finding is
+  closed.
+- Evidence:
+  `contrib/attacknet/evidence/ddmin-live-20260815T2053Z/ddmin/` contains the
+  preserved-network marker, source receipt, executor error, storage preflight,
+  and execution ledger. The compared source and fresh image records establish
+  that order was the only difference.
+
+## F-104: Teardown could return before the `StacksNetwork` owner was deleted
+
+- Classification: lifecycle delete/recreate race
+- State: reproduced by the first live reduced ddmin attempt; corrected and
+  covered by a behavioral polling test; closed by the R5 consecutive fresh
+  network recreations
+- Trigger: the baseline replay completed and exported its evidence, after which
+  ddmin requested a new clean network for the first removal-only candidate.
+  `lifecycle.sh delete` issued an asynchronous CR deletion and waited for
+  labeled children and PVCs, but it did not include the owner
+  `StacksNetwork` itself in the absence condition.
+- Result: a rapid subsequent `kubectl apply` could successfully update the
+  still-terminating owner. Kubernetes then completed the already-requested
+  deletion. The apply process returned zero, but the adapter's immediate
+  admitted-state read found no `StacksNetwork`; it emitted no fault, classified
+  the attempt Inconclusive, and preserved the evidence directory for triage.
+- Impact: serialized execution alone does not make delete/recreate safe when
+  the API object's deletion is asynchronous. Replay, minimization, or any
+  same-named clean-run loop could lose an entire freshly applied environment
+  at this boundary and spend another bootstrap interval diagnosing a false
+  experiment failure.
+- Correction and gate: `wait_deleted()` now requires both the owner CR and all
+  non-artifact labeled resources to be absent before returning. The regression
+  test makes a fake owner survive the first poll and proves teardown performs a
+  second poll rather than accepting child absence alone. A successful live
+  source replay followed by candidate recreation must prove the corrected
+  boundary.
+- Evidence:
+  `contrib/attacknet/evidence/ddmin-live-r2-20260815T210356Z/ddmin/` seals the
+  successfully reproduced baseline and the subsequent zero-attempt
+  `StacksNetwork NotFound` pause separately.
+
+## F-105: Ddmin inferred two different source-evidence roots from directory depth
+
+- Classification: replay/minimization evidence-path contract defect
+- State: reproduced after the F-104 correction; explicit root contract and
+  regression implemented; closed by the R5 shared source receipt
+- Trigger: the executor stores baseline evidence at
+  `<root>/baseline-replay/` and candidate evidence at
+  `<root>/attempts/<id>/`. The Kubernetes adapter inferred the shared source
+  receipt by applying `dirname()` twice to the attempt directory.
+- Result: baseline captured the source at `<parent-of-root>/source/`, while the
+  candidate searched `<root>/source/`. After the baseline had correctly
+  exported evidence and deleted its fresh network, the candidate treated the
+  missing receipt as a request to recapture source state. That read returned
+  `StacksNetwork NotFound`; no candidate network or fault was created, and the
+  executor paused Inconclusive. The baseline itself again reproduced the exact
+  expected failure on fresh UID `42b5adc9-8d92-4804-90ab-96e2296ca909`.
+- Impact: path-shape inference coupled the adapter to an incidental directory
+  layout and made the first counterfactual impossible even though replay,
+  cleanup, image identity, and owner deletion all worked.
+- Correction and gate: `executeDdmin()` now passes the single resolved evidence
+  root explicitly to every `recreateNetwork()` call. The adapter captures and
+  reads only `<root>/source/receipt.json`. Before reuse it verifies the receipt
+  digest, local URI, source run UID, schedule digest, source network UID, and
+  logical network name; a partial record is never overwritten by recapture. A
+  behavioral executor test proves the baseline and all counterfactual
+  recreations receive the identical root. The full live replay plus reduced
+  attempt then passed in R5.
+- Evidence:
+  `contrib/attacknet/evidence/ddmin-live-r3-20260815T212010Z/ddmin/` contains a
+  reproduced baseline, its fresh UID and classification, followed by the
+  pre-admission candidate error with no injected resource.
+
+## F-106: Candidate recreation redundantly tore down an already-absent network
+
+- Classification: replay/minimization lifecycle idempotency defect
+- State: reproduced after the F-105 correction; fixed with fail-closed network
+  presence detection; closed by the R5 candidate recreation
+- Trigger: after a reproduced baseline, `deleteAttemptNetwork()` had already
+  deleted the replay `AttacknetRun`, exported the network evidence, removed the
+  `StacksNetwork`, waited for its owner and children to disappear, and released
+  both leases. The next candidate's `recreateNetwork()` nevertheless invoked a
+  second full lifecycle deletion before applying the next clean network.
+- Result: the empty teardown located the finalized baseline run ledger and
+  attempted terminal observability export after its event bridge had already
+  been removed. The required export failed, so the lifecycle returned nonzero
+  before candidate apply. The executor paused Inconclusive and injected no
+  candidate fault. Baseline replay again reproduced the expected assertion on
+  fresh UID `774e5815-4ab7-4a3f-a3d5-96ed9d8c9dad`.
+- Impact: a deliberately strict teardown was being asked to finalize the same
+  run twice. Its refusal was correct, but the redundant call prevented all
+  post-baseline counterfactuals.
+- Correction and gate: recreation now queries the owner CR first and runs
+  teardown only when it exists. A genuine NotFound is the only accepted absent
+  result; API unavailability or any other error remains fatal. Unit coverage
+  proves present, absent, and API-error branches. The final live sequence must
+  still demonstrate candidate creation, classification, evidence export, and
+  cleanup.
+- Evidence:
+  `contrib/attacknet/evidence/ddmin-live-r4-20260815T213348Z/ddmin/` seals the
+  reproduced baseline and the failed redundant teardown separately.
+
+## F-107: Fresh replay and one removal-only counterfactual reproduced the same failure
+
+- Classification: positive replay/minimization acceptance evidence
+- State: passed, cleaned up, and integrity-verified
+- Experiment: source run 5 executed an irrelevant one-shot follower Pod kill
+  followed by a TCP packet-duplication NetworkChaos whose trusted
+  `NetworkDegraded` effect assertion deliberately returned `Failed`. The
+  failure is useful as a deterministic negative control: Chaos Mesh reported
+  injection, but TCP absorbed the duplication and the named probes did not
+  report the required protocol-error delta.
+- Baseline replay: a clean network with UID
+  `909dcff4-ec7a-416a-9575-8ba337d5d6c5` admitted the exact sealed source
+  schedule and reproduced `NetworkDegraded=Failed`.
+- Counterfactual: ddmin removed only `irrelevant-pod-kill`, admitted candidate
+  digest
+  `sha256:4799bdf8c0bf6f237819bca8e93dfd9f3eb6416087e6ca08f7d4c66db341f966`
+  on a second clean network UID `a6fc4529-8c0b-41de-a9df-1a0ac7b3efc8`, and
+  reproduced the same trusted assertion. Both runs used the same manifest,
+  admitted image set, source template identities, seed, and source schedule.
+- Interpretation: this proves one useful semantic reduction—the Pod kill was
+  not necessary for the observed failure under this replay. The one-attempt
+  budget then expired, so the executor correctly reports `BudgetExhausted`,
+  `empiricallyReduced=false`, and `causalMinimalityClaimed=false`; it does not
+  claim the remaining campaign is minimal or causal in any broader sense.
+- Cleanup and evidence: both fresh networks exported evidence before deletion;
+  no `StacksNetwork`, environment lease, or mutation lease remained. The
+  execution receipt's canonical SHA-256 integrity verified locally. Bundle:
+  `contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/`.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

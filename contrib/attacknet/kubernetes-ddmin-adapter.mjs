@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import {spawnSync} from 'node:child_process';
-import {mkdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
+import {existsSync, mkdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {gunzipSync} from 'node:zlib';
@@ -97,6 +97,13 @@ export class KubernetesDdminAdapter {
     return JSON.parse(this.kube(args).stdout);
   }
 
+  networkExists() {
+    const result = this.kube(['get', 'stacksnetwork', this.network, '-o', 'name'], {allowFailure: true});
+    if (result.status === 0) return true;
+    if (result.status === 1 && /\bNotFound\b/.test(result.stderr)) return false;
+    throw new Error(`could not determine whether source network exists: ${result.stderr.trim()}`);
+  }
+
   loadSource() {
     const run = this.getJson('attacknetrun', this.sourceRunRef);
     if (!TERMINAL.has(run.status?.phase)) throw new Error('source AttacknetRun must be terminal');
@@ -162,6 +169,27 @@ export class KubernetesDdminAdapter {
     return digest;
   }
 
+  verifySourceEvidence(evidenceDirectory) {
+    if (!this.sourceRun || !this.sourceSchedule) throw new Error('source run was not loaded');
+    const directory = join(evidenceDirectory, 'source');
+    const evidencePath = join(directory, 'source-evidence.json');
+    const receiptPath = join(directory, 'receipt.json');
+    const evidence = JSON.parse(readFileSync(evidencePath, 'utf8'));
+    const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+    if (receipt.schemaVersion !== 'stacks-attacknet-source-evidence/v1'
+        || receipt.uri !== `file://${evidencePath}`
+        || receipt.digest !== evidenceDigestFor(evidence)) {
+      throw new Error('source evidence receipt is missing, moved, or does not match its payload');
+    }
+    if (evidence.sourceRun?.metadata?.uid !== this.sourceRun.metadata.uid
+        || evidence.sourceSchedule?.integrity?.digest !== this.sourceSchedule.integrity.digest
+        || evidence.network?.metadata?.uid !== this.sourceSchedule.network.uid
+        || evidence.network?.metadata?.name !== this.network) {
+      throw new Error('source evidence does not identify the loaded source run, schedule, and network');
+    }
+    return receipt.digest;
+  }
+
   validateRenderedNetwork(contract) {
     const identity = readManifestIdentity(this.generatedDirectory);
     if (identity.network !== this.network || identity.namespace !== this.namespace) {
@@ -183,24 +211,31 @@ export class KubernetesDdminAdapter {
     }
   }
 
-  recreateNetwork({attempt, contract, attemptDirectory}) {
+  recreateNetwork({attempt, contract, attemptDirectory, evidenceDirectory}) {
     if (!this.sourceRun || !this.sourceSchedule) throw new Error('source run was not loaded');
     this.validateRenderedNetwork(contract);
-    const sourceReceipt = join(dirname(dirname(attemptDirectory)), 'source', 'receipt.json');
-    try { readFileSync(sourceReceipt, 'utf8'); } catch {
-      this.captureSourceEvidence(dirname(dirname(attemptDirectory)));
+    const sourceRoot = resolve(string(evidenceDirectory, 'recreateNetwork evidenceDirectory'));
+    const sourceReceipt = join(sourceRoot, 'source', 'receipt.json');
+    const sourceEvidence = join(sourceRoot, 'source', 'source-evidence.json');
+    if (!existsSync(sourceReceipt) && !existsSync(sourceEvidence)) {
+      this.captureSourceEvidence(sourceRoot);
+    } else if (!existsSync(sourceReceipt) || !existsSync(sourceEvidence)) {
+      throw new Error('source evidence is incomplete; refusing to recapture over a partial record');
     }
+    this.verifySourceEvidence(sourceRoot);
     const lifecycle = join(this.attacknetDirectory, 'lifecycle.sh');
     const common = {
       KUBE_NAMESPACE: this.namespace,
       KUBE_NETWORK: this.network,
       ATTACKNET_LOCK_OWNER: `ddmin:${attempt.id}`,
     };
-    this.runner.run(lifecycle, ['delete'], {env: {
-      ...common,
-      ATTACKNET_RUN_FINAL_STATUS: 'aborted',
-      ATTACKNET_RUN_EXPORT_DIR: join(attemptDirectory, 'prior-network-export'),
-    }});
+    if (this.networkExists()) {
+      this.runner.run(lifecycle, ['delete'], {env: {
+        ...common,
+        ATTACKNET_RUN_FINAL_STATUS: 'aborted',
+        ATTACKNET_RUN_EXPORT_DIR: join(attemptDirectory, 'prior-network-export'),
+      }});
+    }
     this.runner.run(lifecycle, ['apply', this.generatedDirectory], {env: {
       ...common,
       ATTACKNET_RUN_ID: `${attempt.id}-network`,

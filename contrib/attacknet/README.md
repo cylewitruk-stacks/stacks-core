@@ -270,6 +270,14 @@ per Stacks node materially increases disk and I/O load, this is a separately
 preflighted topology profile rather than an invisible expansion of the normal
 baseline.
 
+The same correlation must be visible to a human during and after the run: the
+dashboard should render the admitted Bitcoin P2P graph, partition cohorts,
+best-block hash and chainwork per follower, the bound Stacks actor's burn-view
+hash/height, and a common time axis for divergence and convergence. The sealed
+evidence bundle must retain those samples and the exact partition/mining
+schedule, so a Stacks fork can be attributed to the intended burnchain split
+rather than inferred from actor logs.
+
 The local RPC-induced and distributed variants must retain different mechanism
 labels so evidence never equates `invalidateblock` with Bitcoin consensus.
 
@@ -418,9 +426,11 @@ independent recovery proof. Resolved replay requires a fresh network UID with
 the same manifest and images. Live proof now covers Pod failure, NetworkChaos,
 DNSChaos, and the controller-owned arm64 I/O-pressure mechanism on the complete
 topology. A real kind-worker outage carrying 53.33% signer weight also proved
-safe quorum pause and automatic recovery. Remaining live gates are fresh-UID
-replay/minimization, backend-paired assertion negative controls, additional
-version-skew profiles, and the final corrected 300+ burn-block soak.
+safe quorum pause and automatic recovery. Fresh-UID replay/minimization is now
+proven through one removal-only counterfactual with controller-owned
+classification and evidence-before-delete. Remaining live gates are
+backend-paired assertion negative controls, additional version-skew profiles,
+and the final corrected 300+ burn-block soak.
 
 IOChaos has an additional platform gate. Chaos Mesh 2.8.3 bundles an x86-64
 `toda` helper whose source also hard-codes x86-64 ptrace registers and emitted
