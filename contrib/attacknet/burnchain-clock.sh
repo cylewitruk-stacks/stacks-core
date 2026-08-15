@@ -54,11 +54,13 @@ policy_value() {
 }
 
 read_policy() {
+  local current_height
   policy_mode="$(policy_value MODE run)"
   policy_interval="$(policy_value INTERVAL_SECONDS "${DEFAULT_INTERVAL_SECONDS}")"
   policy_jitter="$(policy_value JITTER_SECONDS 0)"
   policy_generation="$(policy_value GENERATION 0)"
   policy_burst="$(policy_value BURST_BLOCKS 0)"
+  policy_burst_target="$(policy_value BURST_TARGET_HEIGHT 0)"
   policy_address_mode="$(policy_value ADDRESS_MODE round-robin)"
   policy_fixed_index="$(policy_value FIXED_ADDRESS_INDEX 0)"
 
@@ -67,15 +69,30 @@ read_policy() {
   [[ "${policy_jitter}" =~ ^[0-9]+$ ]] || policy_jitter=0
   [[ "${policy_generation}" =~ ^[0-9]+$ ]] || policy_generation=0
   [[ "${policy_burst}" =~ ^[0-9]+$ ]] || policy_burst=0
+  [[ "${policy_burst_target}" =~ ^[0-9]+$ ]] || policy_burst_target=0
   [[ "${policy_fixed_index}" =~ ^[0-9]+$ ]] || policy_fixed_index=0
   if [ "${policy_interval}" -gt "${MAX_INTERVAL_SECONDS}" ]; then policy_interval="${MAX_INTERVAL_SECONDS}"; fi
   if [ "${policy_jitter}" -gt "${MAX_INTERVAL_SECONDS}" ]; then policy_jitter="${MAX_INTERVAL_SECONDS}"; fi
   [[ "${policy_address_mode}" =~ ^(round-robin|fixed)$ ]] || policy_address_mode=round-robin
 
   if [ "${policy_generation}" != "${applied_generation}" ]; then
-    burst_remaining="${policy_burst}"
+    if [ "${policy_burst_target}" -gt 0 ]; then
+      current_height="$(btc_until_success getblockcount)" || return 1
+      if [ "${current_height}" -lt "${policy_burst_target}" ]; then
+        burst_remaining=$((policy_burst_target - current_height))
+      else
+        # A burst is a desired target, not an edge-triggered command. Reusing
+        # the same projected generation after a process/Pod restart must not
+        # mine the requested count a second time.
+        burst_remaining=0
+      fi
+    else
+      # Backward-compatible fallback for an older rendered policy. New
+      # orchestrators always publish BURST_TARGET_HEIGHT for exact bursts.
+      burst_remaining="${policy_burst}"
+    fi
     applied_generation="${policy_generation}"
-    log "Applied burnchain policy generation=${policy_generation} mode=${policy_mode} interval=${policy_interval}s jitter=${policy_jitter}s burst=${policy_burst} addressMode=${policy_address_mode}"
+    log "Applied burnchain policy generation=${policy_generation} mode=${policy_mode} interval=${policy_interval}s jitter=${policy_jitter}s burst=${policy_burst} target=${policy_burst_target} remaining=${burst_remaining} addressMode=${policy_address_mode}"
   fi
 }
 

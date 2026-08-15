@@ -5,7 +5,24 @@ NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}"
 NETWORK="${KUBE_NETWORK:-attacknet}"
 CONFIG_MAP="${NETWORK}-burnchain-policy"
 kubectl_bin="${ATTACKNET_KUBECTL:-kubectl}"
+backend="${ATTACKNET_BACKEND:-kubernetes}"
+compose_file="${ATTACKNET_COMPOSE:-}"
+compose_project="${ATTACKNET_PROJECT:-stacks-attacknet}"
+compose_policy="${ATTACKNET_COMPOSE_POLICY:-${compose_file:+$(dirname "${compose_file}")/policy.env}}"
 lock_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/environment-lock.sh"
+
+case "${backend}" in
+  kubernetes|compose) ;;
+  *) echo "unsupported ATTACKNET_BACKEND=${backend}; expected compose or kubernetes" >&2; exit 2 ;;
+esac
+
+if [ "${backend}" = compose ]; then
+  [ -n "${compose_file}" ] && [ -r "${compose_file}" ] && [ -n "${compose_policy}" ] \
+    && [ -r "${compose_policy}" ] || {
+      echo 'Compose policy requires readable ATTACKNET_COMPOSE and ATTACKNET_COMPOSE_POLICY files' >&2
+      exit 2
+    }
+fi
 
 if [ "${ATTACKNET_LOCK_DISABLED:-0}" = 1 ]; then
   [ "${ATTACKNET_NEGATIVE_CONTROL:-0}" = 1 ] || {
@@ -19,8 +36,29 @@ else
   "${lock_script}" assert "${NETWORK}" "${ATTACKNET_MUTATION_TOKEN}"
 fi
 
+if [ "${backend}" = compose ]; then
+  current_policy="$(<"${compose_policy}")"
+else
 current_policy="$(${kubectl_bin} -n "${NAMESPACE}" get configmap "${CONFIG_MAP}" \
-  -o jsonpath='{.data.policy\.env}')"
+    -o jsonpath='{.data.policy\.env}')"
+fi
+
+clock_status_value() {
+  local key="$1" status
+  if [ "${backend}" = compose ]; then
+    status="$(docker compose -p "${compose_project}" -f "${compose_file}" exec -T bitcoin-miner \
+      cat /tmp/hacknet-burnchain-clock.env 2>/dev/null || true)"
+  else
+    local clock_pod
+    clock_pod="$(${kubectl_bin} -n "${NAMESPACE}" get pods \
+      -l "testing.stacks.org/network=${NETWORK},testing.stacks.org/actor=bitcoin-miner" \
+      -o jsonpath='{.items[0].metadata.name}')"
+    status="$(${kubectl_bin} -n "${NAMESPACE}" exec "${clock_pod}" -c actor -- \
+      cat /tmp/hacknet-burnchain-clock.env 2>/dev/null || true)"
+  fi
+  sed -n "s/^${key}=//p" <<<"${status}" | tail -1
+}
+
 value() {
   local key="$1" fallback="$2" result
   result="$(sed -n "s/^${key}=//p" <<<"${current_policy}" | tail -1)"
@@ -34,6 +72,7 @@ mode="$(value MODE run)"
 interval="$(value INTERVAL_SECONDS 60)"
 jitter="$(value JITTER_SECONDS 0)"
 burst=0
+burst_target=0
 address_mode="$(value ADDRESS_MODE round-robin)"
 fixed_index="$(value FIXED_ADDRESS_INDEX 0)"
 
@@ -51,6 +90,12 @@ case "${1:-}" in
     mode=pause
     burst="${2:?burst block count required}"
     interval="${3:-${interval}}"
+    current_height="$(clock_status_value bitcoin_height)"
+    [[ "${current_height}" =~ ^[0-9]+$ ]] || {
+      echo "could not derive the current Bitcoin height for an idempotent burst" >&2
+      exit 1
+    }
+    burst_target=$((current_height + burst))
     ;;
   fixed-address)
     address_mode=fixed
@@ -73,38 +118,52 @@ esac
   exit 2
 }
 
-policy="$(printf 'GENERATION=%s\nMODE=%s\nINTERVAL_SECONDS=%s\nJITTER_SECONDS=%s\nBURST_BLOCKS=%s\nADDRESS_MODE=%s\nFIXED_ADDRESS_INDEX=%s\n' \
-  "${generation}" "${mode}" "${interval}" "${jitter}" "${burst}" "${address_mode}" "${fixed_index}")"
+policy="$(printf 'GENERATION=%s\nMODE=%s\nINTERVAL_SECONDS=%s\nJITTER_SECONDS=%s\nBURST_BLOCKS=%s\nBURST_TARGET_HEIGHT=%s\nADDRESS_MODE=%s\nFIXED_ADDRESS_INDEX=%s\n' \
+  "${generation}" "${mode}" "${interval}" "${jitter}" "${burst}" "${burst_target}" "${address_mode}" "${fixed_index}")"
 patch="$(POLICY="${policy}" node -e 'process.stdout.write(JSON.stringify({data:{"policy.env":process.env.POLICY}}))')"
-${kubectl_bin} -n "${NAMESPACE}" patch configmap "${CONFIG_MAP}" --type=merge -p "${patch}" >/dev/null
-# Changing a Pod annotation asks kubelet to refresh projected volumes promptly;
-# it does not roll or mutate the actor container. Wait for the admitted policy
-# to be visible, then interrupt the current sleep with a no-op signal so the
-# clock applies it immediately.
-pod="$(${kubectl_bin} -n "${NAMESPACE}" get pods \
-  -l "testing.stacks.org/network=${NETWORK},testing.stacks.org/actor=bitcoin-miner" \
-  -o jsonpath='{.items[0].metadata.name}')"
-${kubectl_bin} -n "${NAMESPACE}" annotate pod "${pod}" \
-  "testing.stacks.org/policy-generation=${generation}" --overwrite >/dev/null
-deadline=$((SECONDS + ${BURNCHAIN_POLICY_APPLY_TIMEOUT_SECONDS:-30}))
-while [ "${SECONDS}" -lt "${deadline}" ]; do
-  admitted="$(${kubectl_bin} -n "${NAMESPACE}" exec "${pod}" -c actor -- \
-    sed -n 's/^GENERATION=//p' /run/hacknet-policy/policy.env 2>/dev/null | tail -1 || true)"
-  if [ "${admitted}" = "${generation}" ]; then break; fi
-  sleep 1
-done
-if [ "${admitted:-}" != "${generation}" ]; then
-  echo "policy generation ${generation} was not projected before the deadline" >&2
-  exit 1
+if [ "${backend}" = compose ]; then
+  # Compose bind-mounts this file. Write it fully before signalling PID 1; the
+  # clock reads only after USR2, so it cannot observe a partially-written
+  # generation. An in-place write is intentional: Docker Desktop file bind
+  # mounts follow the inode, while rename-based replacement may not propagate.
+  printf '%s' "${policy}" >"${compose_policy}"
+  docker compose -p "${compose_project}" -f "${compose_file}" kill -s USR2 bitcoin-miner >/dev/null
+else
+  ${kubectl_bin} -n "${NAMESPACE}" patch configmap "${CONFIG_MAP}" --type=merge -p "${patch}" >/dev/null
+  # Changing a Pod annotation asks kubelet to refresh projected volumes promptly;
+  # it does not roll or mutate the actor container. Wait for the admitted policy
+  # to be visible, then interrupt the current sleep with a no-op signal so the
+  # clock applies it immediately.
+  pod="$(${kubectl_bin} -n "${NAMESPACE}" get pods \
+    -l "testing.stacks.org/network=${NETWORK},testing.stacks.org/actor=bitcoin-miner" \
+    -o jsonpath='{.items[0].metadata.name}')"
+  ${kubectl_bin} -n "${NAMESPACE}" annotate pod "${pod}" \
+    "testing.stacks.org/policy-generation=${generation}" --overwrite >/dev/null
+  deadline=$((SECONDS + ${BURNCHAIN_POLICY_APPLY_TIMEOUT_SECONDS:-30}))
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    admitted="$(${kubectl_bin} -n "${NAMESPACE}" exec "${pod}" -c actor -- \
+      sed -n 's/^GENERATION=//p' /run/hacknet-policy/policy.env 2>/dev/null | tail -1 || true)"
+    if [ "${admitted}" = "${generation}" ]; then break; fi
+    sleep 1
+  done
+  if [ "${admitted:-}" != "${generation}" ]; then
+    echo "policy generation ${generation} was not projected before the deadline" >&2
+    exit 1
+  fi
+  ${kubectl_bin} -n "${NAMESPACE}" exec "${pod}" -c actor -- sh -c 'kill -USR2 1'
 fi
-${kubectl_bin} -n "${NAMESPACE}" exec "${pod}" -c actor -- sh -c 'kill -USR2 1'
 # Projection proves what kubelet mounted; this second acknowledgment proves the
 # long-lived clock process has read and applied it.  In pause mode it also
 # establishes the upper bound on any already-in-flight generatetoaddress call.
 deadline=$((SECONDS + ${BURNCHAIN_POLICY_APPLY_TIMEOUT_SECONDS:-30}))
 while [ "${SECONDS}" -lt "${deadline}" ]; do
-  applied="$(${kubectl_bin} -n "${NAMESPACE}" exec "${pod}" -c actor -- \
-    sed -n 's/^policy_generation=//p' /tmp/hacknet-burnchain-clock.env 2>/dev/null | tail -1 || true)"
+  if [ "${backend}" = compose ]; then
+    applied="$(docker compose -p "${compose_project}" -f "${compose_file}" exec -T bitcoin-miner \
+      sed -n 's/^policy_generation=//p' /tmp/hacknet-burnchain-clock.env 2>/dev/null | tail -1 || true)"
+  else
+    applied="$(${kubectl_bin} -n "${NAMESPACE}" exec "${pod}" -c actor -- \
+      sed -n 's/^policy_generation=//p' /tmp/hacknet-burnchain-clock.env 2>/dev/null | tail -1 || true)"
+  fi
   if [ "${applied}" = "${generation}" ]; then break; fi
   sleep 1
 done
@@ -112,21 +171,21 @@ if [ "${applied:-}" != "${generation}" ]; then
   echo "burnchain clock did not acknowledge policy generation ${generation} before the deadline" >&2
   exit 1
 fi
-printf 'Applied %s generation %s: mode=%s interval=%ss jitter=%ss burst=%s address=%s:%s\n' \
+printf 'Applied %s generation %s: mode=%s interval=%ss jitter=%ss burst=%s target=%s address=%s:%s\n' \
   "${CONFIG_MAP}" "${generation}" "${mode}" "${interval}" "${jitter}" "${burst}" \
-  "${address_mode}" "${fixed_index}"
+  "${burst_target}" "${address_mode}" "${fixed_index}"
 
 # This observation is intentionally emitted only after both kubelet projection
 # and the long-lived clock process acknowledge the generation. Actor Pods never
 # receive the journal token; the trusted bridge posts this orchestrator-created
 # record to loopback using its own projected credential.
-if [ "${ATTACKNET_OBSERVABILITY_ENABLED:-1}" = 1 ]; then
+if [ "${backend}" = kubernetes ] && [ "${ATTACKNET_OBSERVABILITY_ENABLED:-1}" = 1 ]; then
   event_args=(--kind=policy.changed "--phase=${ATTACKNET_EVENT_PHASE:-baseline}")
   if [ -n "${ATTACKNET_EVENT_CAMPAIGN:-}" ]; then
     event_args+=("--campaign=${ATTACKNET_EVENT_CAMPAIGN}")
   fi
   details="$(MODE="${mode}" GENERATION="${generation}" INTERVAL="${interval}" \
-    JITTER="${jitter}" BURST="${burst}" ADDRESS_MODE="${address_mode}" \
+    JITTER="${jitter}" BURST="${burst}" BURST_TARGET="${burst_target}" ADDRESS_MODE="${address_mode}" \
     FIXED_INDEX="${fixed_index}" node -e '
       console.log(JSON.stringify({
         mode: process.env.MODE,
@@ -134,6 +193,7 @@ if [ "${ATTACKNET_OBSERVABILITY_ENABLED:-1}" = 1 ]; then
         intervalSeconds: Number(process.env.INTERVAL),
         jitterSeconds: Number(process.env.JITTER),
         burstBlocks: Number(process.env.BURST),
+        burstTargetHeight: Number(process.env.BURST_TARGET),
         addressMode: process.env.ADDRESS_MODE,
         fixedAddressIndex: Number(process.env.FIXED_INDEX),
         applied: true,

@@ -87,7 +87,22 @@ The renderer also emits `compose.bootstrap.yaml`. A Compose runner must follow
 the same two-phase contract—start the bootstrap file, wait for signer runloop
 readiness, then apply `compose.yaml` while preserving node volumes—rather than
 starting the final file cold. The Kubernetes lifecycle is currently the
-canonical automated implementation of this contract.
+canonical automated implementation of this contract. Compose cadence uses the
+same policy script and process-level acknowledgement when its backend settings
+are supplied:
+
+```bash
+KUBE_NETWORK=attacknet-compose-smoke \
+ATTACKNET_BACKEND=compose \
+ATTACKNET_PROJECT=attacknet-compose-smoke \
+ATTACKNET_COMPOSE=contrib/attacknet/generated/stage-1/compose.bootstrap.yaml \
+ATTACKNET_COMPOSE_POLICY=contrib/attacknet/generated/stage-1/policy.env \
+  contrib/attacknet/burnchain-policy.sh burst 6
+```
+
+Bursts are persisted as an absolute Bitcoin target height. Recreating the
+clock resumes only the missing suffix and mines zero blocks when that target
+was already reached; a process restart can never replay a completed burst.
 
 Use repeatable per-actor image overrides for an upgrade matrix or modified
 adversarial binary:
@@ -180,6 +195,12 @@ time; read-only Prometheus/Loki/API queries remain concurrent.
 ```bash
 contrib/attacknet/environment-lock.sh status
 ```
+
+`runtime-backend.sh pause|resume` is a real cgroup freeze only on Compose.
+Kubernetes namespace init cannot be frozen by an in-container SIGSTOP; those
+commands therefore fail closed on Kubernetes. Use a controller-owned bounded
+`FaultCampaign` (`PodChaos` `pod-failure`) and let its finalizer own recovery.
+The shared verifier and evidence collectors remain identical across backends.
 
 Do not remove or steal either lease merely because an operation is slow. First
 prove that its owning process is gone and inspect the admitted network. There

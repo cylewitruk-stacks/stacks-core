@@ -36,7 +36,10 @@ if (args.includes('get') && args.includes('pods')) {
 } else if (args.includes('exec') && args.join(' ').includes('/run/hacknet-policy/policy.env')) {
   process.stdout.write(process.env.FAKE_POLICY_GENERATION ?? '2');
 } else if (args.includes('exec') && args.join(' ').includes('/tmp/hacknet-burnchain-clock.env')) {
-  process.stdout.write(process.env.FAKE_POLICY_GENERATION ?? '2');
+  if (args.includes('cat')) process.stdout.write(
+    'state=paused\\nbitcoin_height='+(process.env.FAKE_CLOCK_HEIGHT ?? '200')
+      +'\\npolicy_generation='+(process.env.FAKE_POLICY_GENERATION ?? '2')+'\\n',
+  ); else process.stdout.write(process.env.FAKE_POLICY_GENERATION ?? '2');
 } else if (args.includes('exec') && args.at(-1) === 'kill -USR2 1') {
   // Successful clock wakeup.
 } else if (args.includes('exec')) {
@@ -176,7 +179,7 @@ test('applied burnchain policy is journaled only after clock acknowledgement', (
   const {directory, kubectl} = fixture();
   const capture = join(directory, 'policy-event.json');
   const argumentsCapture = join(directory, 'args.json');
-  const policy = 'GENERATION=1\nMODE=run\nINTERVAL_SECONDS=20\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
+  const policy = 'GENERATION=1\nMODE=run\nINTERVAL_SECONDS=20\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
   const result = spawnSync(join(root, '..', 'burnchain-policy.sh'), ['pause'], {
     encoding: 'utf8', env: {
       ...process.env,
@@ -195,7 +198,8 @@ test('applied burnchain policy is journaled only after clock acknowledgement', (
   assert.equal(event.kind, 'policy.changed');
   assert.deepEqual(event.details, {
     mode: 'pause', generation: 2, intervalSeconds: 20, jitterSeconds: 0,
-    burstBlocks: 0, addressMode: 'round-robin', fixedAddressIndex: 0, applied: true,
+    burstBlocks: 0, burstTargetHeight: 0,
+    addressMode: 'round-robin', fixedAddressIndex: 0, applied: true,
   });
 });
 
@@ -203,7 +207,7 @@ test('exact burnchain bursts retain an inter-block bootstrap cadence and end pau
   const {directory, kubectl} = fixture();
   const capture = join(directory, 'burst-event.json');
   const argumentsCapture = join(directory, 'args.json');
-  const policy = 'GENERATION=4\nMODE=run\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
+  const policy = 'GENERATION=4\nMODE=run\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
   const result = spawnSync(join(root, '..', 'burnchain-policy.sh'), ['burst', '3', '2'], {
     encoding: 'utf8', env: {
       ...process.env,
@@ -221,7 +225,8 @@ test('exact burnchain bursts retain an inter-block bootstrap cadence and end pau
   const event = JSON.parse(readFileSync(capture, 'utf8'));
   assert.deepEqual(event.details, {
     mode: 'pause', generation: 5, intervalSeconds: 2, jitterSeconds: 0,
-    burstBlocks: 3, addressMode: 'round-robin', fixedAddressIndex: 0, applied: true,
+    burstBlocks: 3, burstTargetHeight: 203,
+    addressMode: 'round-robin', fixedAddressIndex: 0, applied: true,
   });
 });
 

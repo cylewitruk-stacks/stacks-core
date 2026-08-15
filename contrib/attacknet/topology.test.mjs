@@ -224,6 +224,11 @@ test('burnchain cadence is initially paused until the topology is ready', () => 
   renderTopology(buildTopology(), output);
   assert.match(readFileSync(join(output, 'policy.env'), 'utf8'), /^MODE=pause$/m);
   assert.match(readFileSync(join(output, 'policy.env'), 'utf8'), /^INTERVAL_SECONDS=60$/m);
+  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
+  const healthcheck = compose.services['bitcoin-miner'].healthcheck;
+  assert.deepEqual(healthcheck.test.slice(0, 3), ['CMD', 'perl', '-MIO::Socket::INET']);
+  assert.match(healthcheck.test[4], /PeerPort=>18500/);
+  assert.doesNotMatch(healthcheck.test.join(' '), /curl/);
 });
 
 test('manifest exposes deterministic protocol phase barriers', () => {

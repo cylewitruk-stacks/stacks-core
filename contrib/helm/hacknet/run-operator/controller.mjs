@@ -1390,6 +1390,13 @@ export class FaultCampaignReconciler {
       const remaining = await this.api.get(identity.plural, identity.name,
         identityOptions(identity, true));
       if (remaining) return;
+      // The absence check above is the authoritative cleanup barrier. Carry it
+      // into the same status update that may become terminal; otherwise a
+      // truthful but stale cleanup.absent=false can briefly coexist with
+      // phase=Passed until the next reconcile.
+      const completedCleanup = {
+        ...(campaign.status?.cleanup ?? {}), absent: true, observedAt: now(),
+      };
       const pods = await this.api.list('pods', {group: '', labels: `testing.stacks.org/network=${manifest.network}`});
       let recovered;
       try {
@@ -1398,7 +1405,8 @@ export class FaultCampaignReconciler {
         if (elapsedSeconds(campaign.status?.cleanup?.observedAt)
             <= assertionTimeout(campaign.spec.recoveryAssertions, 300)) return;
         await this.patchStatus(campaign, status(campaign.status, 'Failed', 'TargetRecoveryTimeout', {
-          message: String(error.message ?? error).slice(0, 1000), completedAt: now(),
+          message: String(error.message ?? error).slice(0, 1000), cleanup: completedCleanup,
+          completedAt: now(),
         }));
         return;
       }
@@ -1487,7 +1495,7 @@ export class FaultCampaignReconciler {
         // a terminal result.
         await this.patchStatus(campaign, status(campaign.status,
           'Recovering', 'WaitingForRecoveryEvidence', {
-            effectResults, recoveryResults, probeArtifacts,
+            effectResults, recoveryResults, probeArtifacts, cleanup: completedCleanup,
             ...(evidenceError ? {message: evidenceError} : {}),
           }));
         return;
@@ -1497,7 +1505,7 @@ export class FaultCampaignReconciler {
         proven ? 'EffectAndRecoveryProven'
           : evidenceError ? 'ProbeEvidenceInvalid'
             : effectProven ? 'RecoveryNotProven' : 'EffectNotProven', {
-          effectResults, recoveryResults, probeArtifacts,
+          effectResults, recoveryResults, probeArtifacts, cleanup: completedCleanup,
           ...(evidenceError ? {message: evidenceError} : {}),
           completedAt: now(),
         }));

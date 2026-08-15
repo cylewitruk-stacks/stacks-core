@@ -959,6 +959,7 @@ test('pod-failure effect polling survives aggregate network unready and proves r
   current = await api.get('faultcampaigns', value.metadata.name);
   assert.equal(current.status.phase, 'Passed');
   assert.equal(current.status.reason, 'EffectAndRecoveryProven');
+  assert.equal(current.status.cleanup.absent, true);
 });
 
 test('trusted before/during/after probes prove a network effect and its recovery', async () => {

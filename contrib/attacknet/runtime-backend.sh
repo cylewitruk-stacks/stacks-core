@@ -180,9 +180,14 @@ backend_pause() {
   local actor="$1"
   case "${ATTACKNET_BACKEND}" in
     compose) backend_compose pause "${actor}" >/dev/null ;;
-    # SIGSTOP models a frozen process without changing its Pod identity.  It is
-    # a verifier control, not the Attacknet fault API; campaigns use Chaos Mesh.
-    kubernetes) backend_signal "${actor}" STOP >/dev/null ;;
+    # PID 1 is namespace init. Linux accepts the in-namespace kill(2) call but
+    # does not deliver SIGSTOP to namespace init, so this used to return success
+    # while the actor kept running. Kubernetes availability controls must use a
+    # controller-owned FaultCampaign (normally PodChaos pod-failure) instead.
+    kubernetes)
+      echo "Kubernetes pause is not a process primitive; use a controller-owned FaultCampaign for ${actor}" >&2
+      return 2
+      ;;
   esac
 }
 
@@ -190,7 +195,10 @@ backend_resume() {
   local actor="$1"
   case "${ATTACKNET_BACKEND}" in
     compose) backend_compose unpause "${actor}" >/dev/null ;;
-    kubernetes) backend_signal "${actor}" CONT >/dev/null ;;
+    kubernetes)
+      echo "Kubernetes resume is owned by FaultCampaign cleanup; no signal was sent to ${actor}" >&2
+      return 2
+      ;;
   esac
 }
 

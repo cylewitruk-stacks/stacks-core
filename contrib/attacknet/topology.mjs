@@ -399,7 +399,16 @@ function composeHealthcheck(actor) {
     return {test: ['CMD', 'bitcoin-cli', '-regtest', '-rpcuser=devnet', '-rpcpassword=devnet', 'getblockchaininfo'], interval: '5s', timeout: '3s', retries: 90};
   }
   if (actor.name === 'bitcoin-miner') {
-    return {test: ['CMD-SHELL', 'curl --fail --silent http://127.0.0.1:18500/ >/dev/null'], interval: '3s', timeout: '2s', retries: 90};
+    // bitcoin/bitcoin deliberately excludes curl. The clock already requires
+    // Perl for its health listener, so use the same runtime to prove that the
+    // listener is accepting connections without adding another image tool.
+    return {
+      test: [
+        'CMD', 'perl', '-MIO::Socket::INET', '-e',
+        'exit(IO::Socket::INET->new(PeerAddr=>q(127.0.0.1),PeerPort=>18500,Proto=>q(tcp),Timeout=>1)?0:1)',
+      ],
+      interval: '3s', timeout: '2s', retries: 90,
+    };
   }
   if (actor.role === 'signer') {
     return {test: ['CMD-SHELL', "curl --fail --silent http://127.0.0.1:31000/metrics | grep -q '^stacks_signer_runloop_ready 1$'"], interval: '2s', timeout: '2s', retries: 180};
@@ -526,7 +535,7 @@ export function renderTopology(topology, output, {
     actors: topology.actors.map(manifestActor),
     workloads: actors.map(manifestActor),
   };
-  const policy = {apiVersion: 'v1', kind: 'ConfigMap', metadata: {name: `${network}-burnchain-policy`, namespace}, data: {'policy.env': 'GENERATION=1\nMODE=pause\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n'}};
+  const policy = {apiVersion: 'v1', kind: 'ConfigMap', metadata: {name: `${network}-burnchain-policy`, namespace}, data: {'policy.env': 'GENERATION=1\nMODE=pause\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n'}};
   writeFileSync(join(output, 'stacksnetwork.json'), `${JSON.stringify(resource, null, 2)}\n`);
   writeFileSync(join(output, 'stacksnetwork.bootstrap.json'), `${JSON.stringify(bootstrapResource, null, 2)}\n`);
   writeFileSync(join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);

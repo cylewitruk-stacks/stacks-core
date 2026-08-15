@@ -64,6 +64,32 @@ test('the clock remains sourceable so wallet reconciliation is independently tes
   assert.match(result.stdout, /reconcile_inactive_wallet_transactions/);
 });
 
+test('an exact burst target is idempotent across clock restarts', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'burnchain-target-'));
+  const policy = join(directory, 'policy.env');
+  writeFileSync(policy, [
+    'GENERATION=7', 'MODE=pause', 'INTERVAL_SECONDS=2', 'JITTER_SECONDS=0',
+    'BURST_BLOCKS=5', 'BURST_TARGET_HEIGHT=205', 'ADDRESS_MODE=round-robin',
+    'FIXED_ADDRESS_INDEX=0', '',
+  ].join('\n'));
+  const result = spawnSync('bash', ['-c', `
+    export BURNCHAIN_POLICY_FILE="$1"
+    source "$2"
+    btc_until_success() { printf '%s\\n' "$CURRENT_HEIGHT"; }
+    CURRENT_HEIGHT=203
+    applied_generation=''
+    read_policy
+    printf 'before=%s\\n' "$burst_remaining"
+    CURRENT_HEIGHT=205
+    applied_generation=''
+    read_policy
+    printf 'after=%s\\n' "$burst_remaining"
+  `, '_', policy, script], {encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^before=2$/m);
+  assert.match(result.stdout, /^after=0$/m);
+});
+
 test('the health server consumes requests before a clean HTTP close', async () => {
   const reservation = createServer();
   reservation.listen(0, '127.0.0.1');

@@ -2690,6 +2690,109 @@ does pass the controller contract.
   execution receipt's canonical SHA-256 integrity verified locally. Bundle:
   `contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/`.
 
+## F-108: A restarted burnchain clock replayed a completed one-shot burst
+
+- Classification: burnchain-cadence idempotency and lifecycle safety defect
+- State: fixed, regression-tested, and proven by a clean live Compose phase
+  transition
+- Trigger: the Compose bootstrap reached the observer barrier at Bitcoin
+  height 220 using `BURST_BLOCKS=9`. Applying the final Compose phase recreated
+  `bitcoin-miner` while preserving the last policy generation. The new clock
+  process initialized `burst_remaining` from the durable count and mined the
+  same nine blocks again, reaching 229 without an orchestrator request.
+- Impact: any clock Pod/container restart after a completed burst could cross
+  signer enrollment, observer, activation, or hard-fork barriers. The evidence
+  ledger would still describe the requested target while Bitcoin had advanced
+  farther, invalidating the experiment and potentially manufacturing a signer
+  outage. This is a harness defect, not Bitcoin Core behavior.
+- Correction and gate: new burst policies include
+  `BURST_TARGET_HEIGHT=current_height+requested_count`. On every generation
+  application or process restart, the clock derives remaining work as
+  `max(0, target-current)`; an already-reached target therefore mines nothing.
+  Legacy count-only policies remain readable for upgrade compatibility. Unit
+  coverage proves a restart below the target resumes only the remainder and a
+  restart at the target performs zero work. The Compose cadence API now uses
+  the same process-level policy acknowledgment as Kubernetes. A clean phase
+  transition then reached target height 220 under generation 7, recreated both
+  Bitcoin and `bitcoin-miner`, waited 12 seconds, and observed Bitcoin still at
+  exactly 220. The restarted clock reported `state=paused`,
+  `bitcoin_height=220`, and `policy_generation=7`, proving that it recognized
+  the completed target instead of replaying the eight-block request.
+
+## F-109: Compose declared a healthy Bitcoin clock unready because its probe tool was absent
+
+- Classification: backend-parity and readiness-evidence defect
+- State: fixed, regression-tested, and proven by a clean live re-render
+- Evidence: the clock was paused at the requested burn height 223, its status
+  file was fresh, and its dedicated listener was accepting on port 18500, but
+  the shared verifier reported `Unready actors: bitcoin-miner`. Docker recorded
+  63 consecutive healthcheck exits with code 127 and `curl: not found`.
+  `bitcoin/bitcoin:25.2` intentionally contains neither curl nor wget; the
+  rendered Compose healthcheck therefore measured image packaging rather than
+  clock health. Kubernetes uses a TCP socket probe and did not share the bug.
+- Impact: every otherwise-valid Compose assertion was forced to fail, so a
+  paired backend control could falsely appear to show behavioral divergence.
+  Ignoring the actor would have hidden a genuinely failed cadence process as
+  well, so verifier weakening is not an acceptable workaround.
+- Correction and gate: the Compose renderer now executes a direct TCP connect
+  with Perl's `IO::Socket::INET`. Perl is already a runtime dependency of the
+  clock's health listener, so the probe adds no package or shell assumption.
+  Regression coverage inspects the rendered healthcheck and forbids curl. The
+  active small topology was then re-rendered from the corrected source and
+  rolled onto the same persisted chain at burn 223. After two `starting`
+  observations the clock became `healthy`, while Bitcoin remained exactly at
+  223 throughout; no readiness exception or chain advance was hidden.
+
+## F-110: The Kubernetes backend reported a successful pause without stopping the actor
+
+- Classification: deliberate-negative-control truthfulness defect
+- State: fixed, regression-tested, and proven with a controller-owned live
+  negative control
+- Evidence: `runtime-backend.sh pause follower-1` returned success after issuing
+  `kill -STOP 1` through `kubectl exec`, but the follower remained Ready and
+  served every probe for more than 30 seconds. The admitted actor really does
+  run `stacks-node` as PID 1; this was not a wrapper-process mistake. PID 1 is
+  the namespace init process, and Linux does not deliver an in-namespace
+  SIGSTOP to it even though `kill` reports success. A second direct probe
+  observed PID 1 still in sleeping state before and after STOP/CONT.
+- Impact: a paired negative control could claim that Kubernetes tolerated a
+  frozen actor when no fault had occurred. This is the same false-pass class
+  the attacknet is intended to eliminate.
+- Correction and gate: Kubernetes `pause` and `resume` now fail closed with an
+  instruction to use a controller-owned `FaultCampaign`; they never issue the
+  ineffective signal or report success. Compose retains cgroup-level
+  pause/unpause. The Kubernetes half of the parity test uses bounded PodChaos
+  `pod-failure`, requires the shared verifier to name `follower-1` as unready,
+  and requires controller-proven cleanup plus a healthy verifier result. The
+  live campaign proved `PodUnavailable`; the verifier exited 1 with exactly
+  `Unready actors: follower-1`; the same Pod UID recovered; and all nodes then
+  agreed at burn 229 / Stacks height 26 with four authenticated conversations
+  each.
+
+## F-111: A terminal campaign briefly exposed stale cleanup status
+
+- Classification: controller-status atomicity and forensic-evidence defect
+- State: fixed, regression-tested, rolled out, and proven live
+- Evidence: the controller did not enter `Recovering` until it had requested
+  Chaos deletion, and it did not enter `Passed` until a later GET proved the
+  `PodChaos` absent. Nevertheless, the terminal status update copied the older
+  `cleanup.absent=false` field. The next terminal reconcile corrected it five
+  seconds later. A reader in that window—exactly what the parity run captured—
+  saw `phase=Passed`, `EffectAndRecoveryProven`, and `cleanup.absent=false`.
+- Impact: the safety action itself was correct and the Chaos resource was
+  already absent, but an evidence snapshot could not distinguish that from a
+  controller which declared success before cleanup. This undermines incident
+  attribution and automated acceptance gates.
+- Correction and gate: the authoritative absence observation in `Recovering`
+  is now copied into the same status patch that records recovery evidence or a
+  terminal result. Tests require `Passed` and `cleanup.absent=true` in one
+  observed object. After rolling immutable run-controller image
+  `sha256:e0473bd2b44c3eeaf75733b13e76bc10c9ead47869a15cd59c176f1a49d92e1b`,
+  a second live 20-second follower `pod-failure` was polled once per second.
+  Its first terminal observation was simultaneously `phase=Passed`,
+  `cleanup.absent=true`, `EffectAndRecoveryProven`, with the same admitted Pod
+  UID in both effect and recovery evidence.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.
