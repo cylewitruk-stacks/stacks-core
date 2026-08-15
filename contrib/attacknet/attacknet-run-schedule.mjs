@@ -456,9 +456,13 @@ export function consumeReplayPlan(replayPlan, run, context) {
     }
     const sourceScheduleDigest = resolved.integrity.digest;
     const sourceNetwork = copy(resolved.network);
+    const replayNetworkUid = string(context.network?.uid, 'context.network.uid');
+    if (replayNetworkUid === sourceNetwork.uid) {
+      throw new Error('resolved replay requires a fresh network UID');
+    }
     resolved.network = {
       name: resolved.network.name,
-      uid: string(context.network?.uid, 'context.network.uid'),
+      uid: replayNetworkUid,
       generation: integer(context.network?.generation, 'context.network.generation', {minimum: 1}),
       manifestDigest,
     };

@@ -191,6 +191,21 @@
                 "completedAt": {"type": "string", "format": "date-time"},
                 "finishedAt": {"type": "string", "format": "date-time"},
                 "activeCampaign": {"type": "string", "nullable": true, "maxLength": 63},
+                "scheduleRef": {"type": "object", "required": ["name", "uid", "digest", "runGeneration", "runSpecDigest"], "properties": {
+                  "name": {"type": "string", "minLength": 1, "maxLength": 63},
+                  "uid": {"type": "string", "minLength": 1, "maxLength": 128},
+                  "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                  "runGeneration": {"type": "integer", "minimum": 1},
+                  "runSpecDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                }},
+                "scheduleSummary": {"type": "object", "required": ["schemaVersion", "actions", "replay", "networkUid", "networkGeneration", "manifestDigest"], "properties": {
+                  "schemaVersion": {"type": "string", "maxLength": 128},
+                  "actions": {"type": "integer", "minimum": 0, "maximum": 256},
+                  "replay": {"type": "boolean"},
+                  "networkUid": {"type": "string", "minLength": 1, "maxLength": 128},
+                  "networkGeneration": {"type": "integer", "minimum": 1},
+                  "manifestDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                }},
                 "activeChild": {"type": "object", "required": ["instructionId", "name", "uid"], "properties": {
                   "instructionId": {"type": "string", "maxLength": 63},
                   "name": {"type": "string", "maxLength": 63},

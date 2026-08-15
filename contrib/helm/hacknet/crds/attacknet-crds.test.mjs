@@ -229,7 +229,7 @@ test('AttacknetRun is a namespaced status API with a finite referenced catalog',
   assert.equal(spec.properties.campaignCatalog.maxItems, 64);
   assert.equal(spec.properties.sequence.maxItems, 256);
   assert.deepEqual(spec.properties.budgets.properties.maxActiveFaults.enum, [1]);
-  for (const field of ['activeChild', 'resolvedCampaigns', 'decisions', 'budgetUsage', 'attribution', 'evidenceURI']) {
+  for (const field of ['scheduleRef', 'scheduleSummary', 'activeChild', 'resolvedCampaigns', 'decisions', 'budgetUsage', 'attribution', 'evidenceURI']) {
     assert.ok(root.properties.status.properties[field], `missing status.${field}`);
   }
 });
@@ -244,6 +244,15 @@ test('AttacknetRun status accepts serialized controller decisions and budget evi
     observedGeneration: 1, phase: 'Passed', reason: 'SequenceCompleted',
     lastTransitionTime: '2026-08-15T02:10:00Z', startedAt: '2026-08-15T02:00:00Z',
     completedAt: '2026-08-15T02:10:00Z', activeCampaign: null,
+    scheduleRef: {
+      name: 'bounded-miner-delay-resolved-schedule', uid: 'schedule-uid',
+      digest: `sha256:${'a'.repeat(64)}`, runGeneration: 1,
+      runSpecDigest: `sha256:${'c'.repeat(64)}`,
+    },
+    scheduleSummary: {
+      schemaVersion: 'stacks-attacknet-schedule/v1', actions: 1, replay: false,
+      networkUid: 'network-uid', networkGeneration: 1, manifestDigest: `sha256:${'b'.repeat(64)}`,
+    },
     decisions: [{index: 0, execution: 'bounded-miner-delay-1-delay-miner-once', phase: 'Passed', completedAt: '2026-08-15T02:09:00Z', source: 'miner-delay-template'}],
     budgetUsage: {
       campaigns: 1, campaignsStarted: 1, campaignsCompleted: 1, activeFaults: 0,

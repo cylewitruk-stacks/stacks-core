@@ -323,12 +323,16 @@ The operator and current-main topology renderer are functional. Namespaced
 `FaultCampaign` and `AttacknetRun` APIs now provide signer-weight-aware
 admission, exact Ready-Pod identity resolution, one-fault-at-a-time execution,
 aggregate run budgets, finalizer-backed cleanup, and immutable template
-snapshots. A separate restricted run controller owns only these APIs and the
+snapshots. Before the first fault, the run controller seals the complete
+resolved schedule—including admitted image digests and network identity—in an
+owner-bound ConfigMap and executes only those pinned instructions. A separate
+restricted run controller owns only these APIs, schedule artifacts, and the
 five Chaos Mesh resource kinds; the topology operator has no Chaos permission.
 
-`AllInjected` is bookkeeping, not proof. Pod faults can currently be proven
-from admitted Kubernetes Pod UID/readiness/restart state. Network, DNS, I/O,
-and wall-clock campaigns remain `Inconclusive` until their trusted active
-probe evidence is integrated. The next live milestone is therefore a staged
+`AllInjected` is bookkeeping, not proof. Pod faults are proven from admitted
+Kubernetes Pod UID/readiness/restart state. Network, DNS, I/O, and wall-clock
+campaigns require controlled before/during/after active-probe evidence and
+independent recovery proof. Resolved replay requires a fresh network UID with
+the same manifest and images. The next live milestone is a staged
 capacity/parity run and one proof-of-effect/recovery canary for each fault
 family, not merely successful Chaos resource creation.

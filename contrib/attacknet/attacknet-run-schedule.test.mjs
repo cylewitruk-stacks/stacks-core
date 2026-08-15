@@ -186,6 +186,7 @@ test('resolved replay enforces fresh network identity and exact image constraint
   const {run, context} = fixture();
   const schedule = resolveAttacknetSchedule(run, context);
   const plan = {resolvedSchedule: schedule};
+  assert.throws(() => consumeReplayPlan(plan, run, context), /fresh network UID/);
   context.network = {uid: 'fresh-replay-network', generation: 1};
   const replay = consumeReplayPlan(plan, run, context);
   assert.equal(replay.network.uid, 'fresh-replay-network');

@@ -135,12 +135,15 @@ controllers:
 - `FaultCampaign` is either an inert reusable template (`spec.template: true`)
   or one bounded execution with exact admitted Pod identities and a cleanup
   finalizer.
-- `AttacknetRun` snapshots a finite catalog of templates by UID, generation,
-  and SHA-256 digest, then creates at most one owned execution at a time under
-  aggregate wall-time, fault-time, signer-impact, miner, and burnchain budgets.
+- `AttacknetRun` resolves the complete finite catalog before the first fault,
+  pinning template UID/generation/spec, admitted network UID/generation,
+  exact actor image digests, seed decisions, and aggregate budgets in a sealed,
+  gzip-compressed, owner-bound ConfigMap. It then creates at most one owned
+  execution at a time from that immutable schedule.
 
 The run controller has a separate namespaced service account. It can read the
-network and actor Pods, manage only the two run APIs, and create/delete only
+network and actor Pods, create/read its owner-bound schedule ConfigMap, manage
+only the two run APIs, and create/delete only
 `PodChaos`, `NetworkChaos`, `DNSChaos`, `IOChaos`, and `TimeChaos`. Actor Pods
 remain credential-free. Apply the examples after the referenced
 `StacksNetwork` is Ready:
@@ -153,9 +156,17 @@ kubectl get faultcampaigns,attacknetruns -n hacknet-system -w
 
 Chaos Mesh `AllInjected` and `AllRecovered` conditions are retained as context,
 but are not effect evidence. An execution without trusted evidence of the
-requested fault terminates `Inconclusive`, never `Passed`. Pod faults currently
-use Kubernetes-observed UID/readiness/restart evidence. The active-probe path
-for network, DNS, I/O, and time faults is the next implementation increment.
+requested fault terminates `Inconclusive`, never `Passed`. Pod faults use
+Kubernetes-observed UID/readiness/restart evidence. Network, DNS, I/O, and time
+faults require the controlled active probe's before/during/after observations
+to prove both the requested effect and recovery.
+
+Replay reads the source run's sealed schedule through
+`k8s://attacknetruns/NAME/resolved-schedule`, verifies the requested digest,
+requires the same manifest and admitted image digests, and refuses to run on
+the source network UID. The new schedule is rebound only to the separately
+identified fresh network; runtime interleavings remain explicitly
+nondeterministic.
 
 The CR contains global defaults and an explicit actor list. An actor can
 override its image, command, arguments, ports, resources, storage, probes,

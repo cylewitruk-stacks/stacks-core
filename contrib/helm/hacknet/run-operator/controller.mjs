@@ -5,10 +5,14 @@ import {readFile} from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import process from 'node:process';
+import {gunzipSync, gzipSync} from 'node:zlib';
 
 import {compileCampaign} from '../../../attacknet/fault-campaign.mjs';
 import {resolveCampaignTargets} from '../../../attacknet/campaign-targets.mjs';
 import {evaluateFaultEffect} from '../../../attacknet/fault-effect-evidence.mjs';
+import {
+  consumeReplayPlan, resolveAttacknetSchedule, validateResolvedSchedule,
+} from '../../../attacknet/attacknet-run-schedule.mjs';
 import {
   ProbeClient, baselineUsable, buildProbeRequest, controlTarget, probePhase,
 } from './probe-client.mjs';
@@ -17,6 +21,7 @@ export const GROUP = 'testing.stacks.org';
 export const VERSION = 'v1alpha1';
 export const FINALIZER = 'testing.stacks.org/fault-cleanup';
 export const TERMINAL_PHASES = new Set(['Passed', 'Failed', 'Inconclusive']);
+const SCHEDULE_FORMAT = 'stacks-attacknet-schedule-configmap/v1';
 const CHAOS_PLURALS = Object.freeze({
   PodChaos: 'podchaos', NetworkChaos: 'networkchaos', DNSChaos: 'dnschaos',
   IOChaos: 'iochaos', TimeChaos: 'timechaos',
@@ -90,6 +95,54 @@ export function networkManifest(network) {
     };
   });
   return {schemaVersion: 1, network: metadata.name, namespace: metadata.namespace, actors: normalized};
+}
+
+function actorRequestedImage(network, actor) {
+  const image = actor.image ?? network.spec?.defaults?.image;
+  if (typeof image !== 'string' || image.length === 0) {
+    throw new Error(`actor ${actor.name} has no requested image`);
+  }
+  return image;
+}
+
+export function resolvedNetworkImages(network, pods) {
+  const items = pods?.items ?? [];
+  return (network.spec?.actors ?? []).map(actor => {
+    const matches = items.filter(pod => !pod.metadata?.deletionTimestamp
+      && pod.metadata?.labels?.['testing.stacks.org/network'] === network.metadata.name
+      && pod.metadata?.labels?.['testing.stacks.org/actor'] === actor.name);
+    if (matches.length !== 1 || !podReady(matches[0])) {
+      throw new Error(`actor ${actor.name} does not resolve to one Ready admitted Pod`);
+    }
+    const container = matches[0].status?.containerStatuses?.find(item => item.name === 'actor');
+    const resolvedRef = container?.imageID;
+    const match = /sha256:[0-9a-f]{64}/.exec(resolvedRef ?? '');
+    if (!match) throw new Error(`actor ${actor.name} lacks an immutable admitted image digest`);
+    return {
+      scope: actor.name,
+      requestedRef: actorRequestedImage(network, actor),
+      resolvedRef,
+      resolvedDigest: match[0],
+    };
+  });
+}
+
+export function encodeSchedule(schedule) {
+  validateResolvedSchedule(schedule);
+  return gzipSync(Buffer.from(JSON.stringify(schedule))).toString('base64');
+}
+
+export function decodeSchedule(configMap) {
+  if (configMap?.metadata?.annotations?.['testing.stacks.org/schedule-format'] !== SCHEDULE_FORMAT) {
+    throw new Error('schedule ConfigMap has an unsupported format');
+  }
+  const encoded = configMap.binaryData?.['schedule.json.gz'];
+  if (typeof encoded !== 'string' || encoded.length === 0) throw new Error('schedule ConfigMap has no payload');
+  const schedule = JSON.parse(gunzipSync(Buffer.from(encoded, 'base64')).toString('utf8'));
+  validateResolvedSchedule(schedule);
+  const expected = configMap.metadata.annotations['testing.stacks.org/schedule-digest'];
+  if (schedule.integrity.digest !== expected) throw new Error('schedule ConfigMap digest annotation mismatch');
+  return schedule;
 }
 
 function conditionTrue(resource, type) {
@@ -571,11 +624,106 @@ export class AttacknetRunReconciler {
       {metadata: {resourceVersion: run.metadata.resourceVersion}, status: next}, {subresource: 'status'});
   }
 
+  async readSchedule(reference, expectedOwnerUid) {
+    const configMap = await this.api.get('configmaps', reference.name, {group: ''});
+    const owner = configMap.metadata?.ownerReferences?.find(item => item.controller === true);
+    if (!owner || owner.uid !== expectedOwnerUid || configMap.metadata.uid !== reference.uid) {
+      throw new Error('resolved schedule ConfigMap ownership or UID changed');
+    }
+    const schedule = decodeSchedule(configMap);
+    if (schedule.integrity.digest !== reference.digest) throw new Error('resolved schedule reference digest changed');
+    return schedule;
+  }
+
+  async persistSchedule(run, schedule) {
+    const name = stableName(run.metadata.name, 'resolved-schedule');
+    const payload = encodeSchedule(schedule);
+    if (Buffer.byteLength(payload) > 900_000) throw new Error('compressed resolved schedule exceeds 900 KiB');
+    let configMap = await this.api.get('configmaps', name, {group: '', allow404: true});
+    if (!configMap) {
+      configMap = await this.api.create('configmaps', {
+        apiVersion: 'v1', kind: 'ConfigMap',
+        metadata: {
+          name, namespace: run.metadata.namespace, ownerReferences: runOwner(run),
+          labels: {
+            'testing.stacks.org/network': run.spec.networkRef,
+            'testing.stacks.org/run': run.metadata.name,
+            'testing.stacks.org/artifact': 'resolved-schedule',
+          },
+          annotations: {
+            'testing.stacks.org/schedule-format': SCHEDULE_FORMAT,
+            'testing.stacks.org/schedule-digest': schedule.integrity.digest,
+            'testing.stacks.org/run-generation': String(run.metadata.generation),
+            'testing.stacks.org/run-spec-digest': artifactDigest(run.spec),
+          },
+        },
+        binaryData: {'schedule.json.gz': payload},
+      }, {group: ''});
+    }
+    const owner = configMap.metadata?.ownerReferences?.find(item => item.controller === true);
+    if (!owner || owner.uid !== run.metadata.uid) throw new Error(`refusing to adopt ConfigMap ${name}`);
+    if (configMap.metadata.annotations?.['testing.stacks.org/run-generation'] !== String(run.metadata.generation)
+        || configMap.metadata.annotations?.['testing.stacks.org/run-spec-digest'] !== artifactDigest(run.spec)) {
+      throw new Error('an immutable resolved schedule already exists for a different run generation or spec');
+    }
+    const persisted = decodeSchedule(configMap);
+    if (persisted.integrity.digest !== schedule.integrity.digest) {
+      throw new Error('an immutable resolved schedule already exists with different contents');
+    }
+    return {
+      name, uid: configMap.metadata.uid, digest: persisted.integrity.digest,
+      runGeneration: run.metadata.generation, runSpecDigest: artifactDigest(run.spec),
+    };
+  }
+
+  async prepareSchedule(run, network) {
+    const manifest = networkManifest(network);
+    const pods = await this.api.list('pods', {
+      group: '', labels: `testing.stacks.org/network=${manifest.network}`,
+    });
+    const images = resolvedNetworkImages(network, pods);
+    const sources = await Promise.all((run.spec.campaignCatalog ?? []).map(entry =>
+      this.api.get('faultcampaigns', entry.campaignRef)));
+    for (const source of sources) {
+      if (source.spec?.template !== true) throw new Error(`catalog source ${source.metadata.name} is not a template`);
+      if (source.spec.networkRef !== run.spec.networkRef) {
+        throw new Error(`catalog source ${source.metadata.name} targets another network`);
+      }
+    }
+    const context = {
+      network: {uid: network.metadata.uid, generation: network.metadata.generation},
+      manifest, images, campaigns: sources,
+    };
+    let schedule;
+    if (run.spec.replay?.enabled === true) {
+      const sourceRun = await this.api.get('attacknetruns', run.spec.replay.sourceRunRef);
+      if (!TERMINAL_PHASES.has(sourceRun.status?.phase)) {
+        throw new Error('source replay run must be terminal before its schedule can be replayed');
+      }
+      if (!sourceRun.status?.scheduleRef) throw new Error('source replay run has no persisted resolved schedule');
+      const expectedUri = `k8s://attacknetruns/${sourceRun.metadata.name}/resolved-schedule`;
+      if (run.spec.replay.descriptorURI !== expectedUri) {
+        throw new Error(`replay descriptorURI must be ${expectedUri}`);
+      }
+      const sourceSchedule = await this.readSchedule(sourceRun.status.scheduleRef, sourceRun.metadata.uid);
+      if (sourceSchedule.integrity.digest !== run.spec.replay.descriptorDigest) {
+        throw new Error('replay descriptorDigest does not match the source resolved schedule');
+      }
+      schedule = consumeReplayPlan({resolvedSchedule: sourceSchedule}, run, context);
+    } else {
+      schedule = resolveAttacknetSchedule(run, context);
+    }
+    if (schedule.actions.some(action => action.kind !== 'fault-campaign')) {
+      throw new Error('the Kubernetes run controller currently accepts only fault-campaign schedule actions');
+    }
+    const scheduleRef = await this.persistSchedule(run, schedule);
+    return {schedule, scheduleRef};
+  }
+
   async reconcile(run, campaigns) {
     if (run.metadata.deletionTimestamp || TERMINAL_PHASES.has(run.status?.phase)
         || run.status?.phase === 'Paused') return;
     const spec = run.spec ?? {};
-    const sequence = (spec.sequence ?? []).filter(item => item.enabled !== false);
     const decisions = structuredClone(run.status?.decisions ?? []);
     const startedAt = run.status?.startedAt ?? now();
     const budgetUsage = {
@@ -585,6 +733,57 @@ export class AttacknetRunReconciler {
       ...(run.status?.budgetUsage ?? {}),
     };
     budgetUsage.wallTimeSeconds = elapsedSeconds(startedAt);
+
+    const network = await this.api.get('stacksnetworks', spec.networkRef);
+    if (network.status?.phase !== 'Ready') {
+      await this.patchStatus(run, status(run.status, 'Pending', 'NetworkNotReady', {
+        decisions, budgetUsage, startedAt,
+      }));
+      return;
+    }
+    if (!run.status?.scheduleRef) {
+      let prepared;
+      try {
+        prepared = await this.prepareSchedule(run, network);
+      } catch (error) {
+        if (transientError(error)) throw error;
+        await this.patchStatus(run, status(run.status, 'Failed', 'ScheduleAdmissionFailed', {
+          decisions, budgetUsage, startedAt, completedAt: now(), attribution: 'Inconclusive',
+          message: String(error.message ?? error).slice(0, 1000),
+        }));
+        return;
+      }
+      const {schedule, scheduleRef} = prepared;
+      await this.patchStatus(run, status(run.status, 'Preparing', 'ResolvedSchedulePersisted', {
+        decisions, budgetUsage, startedAt, scheduleRef,
+        scheduleSummary: {
+          schemaVersion: schedule.schemaVersion,
+          actions: schedule.actions.length,
+          replay: schedule.replay.enabled,
+          networkUid: schedule.network.uid,
+          networkGeneration: schedule.network.generation,
+          manifestDigest: schedule.network.manifestDigest,
+        },
+      }));
+      return;
+    }
+    const schedule = await this.readSchedule(run.status.scheduleRef, run.metadata.uid);
+    if (run.status.scheduleRef.runGeneration !== run.metadata.generation
+        || run.status.scheduleRef.runSpecDigest !== artifactDigest(run.spec)) {
+      await this.patchStatus(run, status(run.status, 'Failed', 'AdmittedRunChanged', {
+        decisions, budgetUsage, startedAt, completedAt: now(), attribution: 'Inconclusive',
+      }));
+      return;
+    }
+    if (schedule.network.uid !== network.metadata.uid
+        || schedule.network.generation !== network.metadata.generation
+        || schedule.network.name !== spec.networkRef) {
+      await this.patchStatus(run, status(run.status, 'Failed', 'AdmittedNetworkChanged', {
+        decisions, budgetUsage, startedAt, completedAt: now(), attribution: 'Inconclusive',
+      }));
+      return;
+    }
+    const sequence = schedule.actions;
     if (budgetUsage.wallTimeSeconds > spec.budgets.maxWallTimeSeconds) {
       const paused = spec.stopPolicy?.onBudgetExhausted === 'Pause';
       await this.patchStatus(run, status(run.status, paused ? 'Paused' : 'Failed', 'WallTimeBudgetExhausted', {
@@ -668,40 +867,34 @@ export class AttacknetRunReconciler {
     }
 
     const item = sequence[decisions.length];
-    const catalogEntry = (spec.campaignCatalog ?? []).find(entry => entry.name === item.campaign);
-    const sourceName = catalogEntry?.campaignRef;
-    if (!sourceName) throw new Error(`sequence references unknown campaign alias ${item.campaign}`);
-    const source = await this.api.get('faultcampaigns', sourceName);
-    if (source.spec?.template !== true) throw new Error(`catalog source ${sourceName} is not a template`);
-    if (source.spec.networkRef !== spec.networkRef) throw new Error(`catalog source ${sourceName} targets another network`);
-    const sourceDigest = artifactDigest(source.spec);
-    if (catalogEntry.expectedUID && catalogEntry.expectedUID !== source.metadata.uid) {
-      throw new Error(`catalog source ${sourceName} UID does not match expectedUID`);
+    if (elapsedSeconds(startedAt) < item.notBeforeOffsetSeconds) {
+      if (run.status?.reason !== 'ScheduledStartPending') {
+        await this.patchStatus(run, status(run.status, 'Running', 'ScheduledStartPending', {
+          activeCampaign: null, decisions, budgetUsage, startedAt,
+        }));
+      }
+      return;
     }
-    if (catalogEntry.expectedGeneration && catalogEntry.expectedGeneration !== source.metadata.generation) {
-      throw new Error(`catalog source ${sourceName} generation does not match expectedGeneration`);
+    const sourceName = item.source.name;
+    const sourceDigest = item.source.specDigest;
+    const executionName = stableName(run.metadata.name, String(decisions.length + 1), item.instructionId);
+    const resolvedSpec = structuredClone(item.resolved.campaignSpec);
+    if (artifactDigest(resolvedSpec) !== item.resolved.campaignSpecDigest) {
+      throw new Error(`resolved schedule campaign ${item.instructionId} failed its digest check`);
     }
-    if (catalogEntry.expectedSpecDigest && catalogEntry.expectedSpecDigest !== sourceDigest) {
-      throw new Error(`catalog source ${sourceName} digest does not match expectedSpecDigest`);
-    }
-
-    const executionName = stableName(run.metadata.name, String(decisions.length + 1), item.id);
-    const executionSpec = {...structuredClone(source.spec), template: false};
-    const network = await this.api.get('stacksnetworks', spec.networkRef);
+    const executionSpec = {...resolvedSpec, template: false};
     const manifest = networkManifest(network);
     const compiled = compileCampaign({metadata: {name: executionName}, spec: executionSpec}, manifest);
-    const faultSeconds = durationSeconds(compiled.resource.spec.duration);
-    const signerImpact = compiled.evidence.signerImpact.percent;
-    const rolesByActor = new Map(manifest.actors.map(actor => [actor.service, actor.role]));
-    const burnchainFault = compiled.evidence.selectedActors.some(actor => rolesByActor.get(actor) === 'burnchain');
     const nextUsage = {
       ...budgetUsage,
       campaigns: budgetUsage.campaigns + 1,
       campaignsStarted: budgetUsage.campaignsStarted + 1,
       activeFaults: 1,
-      cumulativeFaultSeconds: budgetUsage.cumulativeFaultSeconds + faultSeconds,
-      maximumSignerImpactPercent: Math.max(budgetUsage.maximumSignerImpactPercent, signerImpact),
-      burnchainFaults: budgetUsage.burnchainFaults + (burnchainFault ? 1 : 0),
+      cumulativeFaultSeconds: budgetUsage.cumulativeFaultSeconds + item.budgetCharge.faultSeconds,
+      maximumSignerImpactPercent: Math.max(
+        budgetUsage.maximumSignerImpactPercent, item.budgetCharge.signerImpactPercent,
+      ),
+      burnchainFaults: budgetUsage.burnchainFaults + item.budgetCharge.burnchainFaults,
     };
     const exceeded = nextUsage.campaigns > spec.budgets.maxCampaigns
       || nextUsage.cumulativeFaultSeconds > spec.budgets.maxCumulativeFaultSeconds
@@ -722,10 +915,12 @@ export class AttacknetRunReconciler {
         ownerReferences: runOwner(run),
         labels: {'testing.stacks.org/network': spec.networkRef, 'testing.stacks.org/run': run.metadata.name},
         annotations: {
-          'testing.stacks.org/source-template': source.metadata.name,
-          'testing.stacks.org/source-template-uid': source.metadata.uid,
-          'testing.stacks.org/source-template-generation': String(source.metadata.generation),
+          'testing.stacks.org/source-template': sourceName,
+          'testing.stacks.org/source-template-uid': item.source.uid,
+          'testing.stacks.org/source-template-generation': String(item.source.generation),
           'testing.stacks.org/source-template-digest': sourceDigest,
+          'testing.stacks.org/schedule-digest': schedule.integrity.digest,
+          'testing.stacks.org/instruction-id': item.instructionId,
         },
       },
       spec: executionSpec,
@@ -735,9 +930,9 @@ export class AttacknetRunReconciler {
     await this.patchStatus(run, status(run.status, 'Running', 'CampaignCreated', {
       activeCampaign: executionName, decisions, budgetUsage: nextUsage,
       resolvedCampaigns: [
-        ...(run.status?.resolvedCampaigns ?? []).filter(entry => entry.name !== item.campaign),
-        {name: item.campaign, sourceName, sourceUID: source.metadata.uid,
-          sourceGeneration: source.metadata.generation, specDigest: sourceDigest},
+        ...(run.status?.resolvedCampaigns ?? []).filter(entry => entry.name !== item.campaignAlias),
+        {name: item.campaignAlias, sourceName, sourceUID: item.source.uid,
+          sourceGeneration: item.source.generation, specDigest: sourceDigest},
       ],
       startedAt,
     }));

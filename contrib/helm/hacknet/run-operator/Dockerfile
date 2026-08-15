@@ -11,6 +11,8 @@ COPY contrib/helm/hacknet/run-operator/probe-client.mjs /app/contrib/helm/hackne
 COPY contrib/attacknet/fault-campaign.mjs /app/contrib/attacknet/fault-campaign.mjs
 COPY contrib/attacknet/campaign-targets.mjs /app/contrib/attacknet/campaign-targets.mjs
 COPY contrib/attacknet/fault-effect-evidence.mjs /app/contrib/attacknet/fault-effect-evidence.mjs
+COPY contrib/attacknet/attacknet-run-schedule.mjs /app/contrib/attacknet/attacknet-run-schedule.mjs
+COPY contrib/attacknet/run-descriptor.mjs /app/contrib/attacknet/run-descriptor.mjs
 
 ENV NODE_ENV=production
 USER 65532:65532

@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import {
   AttacknetRunReconciler, FaultCampaignReconciler, FINALIZER, digest,
-  artifactDigest, networkManifest, podEffectResults, stableName,
+  artifactDigest, decodeSchedule, networkManifest, podEffectResults, stableName,
 } from './controller.mjs';
 
 const uid = name => `uid-${name}`;
@@ -59,7 +59,7 @@ function network() {
   return {
     apiVersion: 'testing.stacks.org/v1alpha1', kind: 'StacksNetwork',
     metadata: {name: 'demo', namespace: 'hacknet', uid: uid('demo'), generation: 3, resourceVersion: '1'},
-    spec: {actors: [
+    spec: {defaults: {image: 'stacks:test'}, actors: [
       {name: 'miner-1', role: 'miner', ports: [{name: 'p2p', containerPort: 20444}]},
       {name: 'signer-1', role: 'signer', signerIndex: 1, signerWeight: 1},
       {name: 'signer-node-1', role: 'companion', signerIndex: 1, signerWeight: 1, ports: [{name: 'p2p', containerPort: 20444}]},
@@ -83,11 +83,19 @@ function pod(actor, role) {
     phase: 'Running', conditions: [{type: 'Ready', status: 'True'}],
     podIP: '10.244.1.23',
       containerStatuses: [
-        {name: 'actor', ready: true, image: 'stacks:test', imageID: 'sha256:abc', restartCount: 0},
+        {name: 'actor', ready: true, image: 'stacks:test', imageID: `docker-pullable://stacks@test@sha256:${'a'.repeat(64)}`, restartCount: 0},
         {name: 'attacknet-probe', ready: true, image: 'probe:test', imageID: 'sha256:probe', restartCount: 0},
       ],
     },
   };
+}
+
+function networkPods(value = network()) {
+  return value.spec.actors.map((actor, index) => {
+    const result = pod(actor.name, actor.role);
+    result.status.podIP = `10.244.1.${index + 20}`;
+    return result;
+  });
 }
 
 function campaign({template = false, effect = true} = {}) {
@@ -287,12 +295,18 @@ test('an unready co-located probe cannot supply baseline evidence', async () => 
 test('AttacknetRun snapshots a referenced template into exactly one owned execution', async () => {
   const api = new FakeApi();
   const source = campaign({template: true, effect: false});
-  api.put('stacksnetworks', network());
+  const admitted = network();
+  api.put('stacksnetworks', admitted);
+  api.pods = networkPods(admitted);
   api.put('faultcampaigns', source);
   const run = attacknetRun(source);
   api.put('attacknetruns', run);
   await new AttacknetRunReconciler(api).reconcile(run, [source]);
-  const updated = await api.get('attacknetruns', 'run-a');
+  let updated = await api.get('attacknetruns', 'run-a');
+  assert.equal(updated.status.phase, 'Preparing');
+  assert.match(updated.status.scheduleRef.digest, /^sha256:[0-9a-f]{64}$/);
+  await new AttacknetRunReconciler(api).reconcile(updated, [source]);
+  updated = await api.get('attacknetruns', 'run-a');
   assert.equal(updated.status.phase, 'Running');
   const child = await api.get('faultcampaigns', updated.status.activeCampaign);
   assert.equal(child.spec.template, false);
@@ -306,6 +320,7 @@ test('AttacknetRun refuses a campaign whose resolved signer impact exceeds the a
   const source = campaign({template: true, effect: false});
   const admitted = network();
   api.put('stacksnetworks', admitted);
+  api.pods = networkPods(admitted);
   api.put('faultcampaigns', source);
   const run = attacknetRun(source, {
     budgets: {
@@ -315,10 +330,76 @@ test('AttacknetRun refuses a campaign whose resolved signer impact exceeds the a
   });
   api.put('attacknetruns', run);
   await new AttacknetRunReconciler(api).reconcile(run, [source]);
-  const updated = await api.get('attacknetruns', run.metadata.name);
+  let updated = await api.get('attacknetruns', run.metadata.name);
+  await new AttacknetRunReconciler(api).reconcile(updated, [source]);
+  updated = await api.get('attacknetruns', run.metadata.name);
   assert.equal(updated.status.phase, 'Failed');
-  assert.equal(updated.status.reason, 'CampaignBudgetExhausted');
+  assert.equal(updated.status.reason, 'ScheduleAdmissionFailed');
+  assert.match(updated.status.message, /maximum signer impact percent/);
   assert.equal((await api.list('faultcampaigns')).items.length, 1);
+});
+
+test('a run spec change after schedule sealing fails instead of changing execution', async () => {
+  const api = new FakeApi();
+  const source = campaign({template: true, effect: false});
+  const admitted = network();
+  api.put('stacksnetworks', admitted);
+  api.pods = networkPods(admitted);
+  api.put('faultcampaigns', source);
+  const run = attacknetRun(source);
+  api.put('attacknetruns', run);
+  const reconciler = new AttacknetRunReconciler(api);
+  await reconciler.reconcile(run, [source]);
+  const changed = await api.get('attacknetruns', run.metadata.name);
+  changed.metadata.generation += 1;
+  changed.spec.seed = 'different-seed';
+  api.put('attacknetruns', changed);
+
+  await reconciler.reconcile(changed, [source]);
+  const result = await api.get('attacknetruns', run.metadata.name);
+  assert.equal(result.status.phase, 'Failed');
+  assert.equal(result.status.reason, 'AdmittedRunChanged');
+  assert.equal((await api.list('faultcampaigns')).items.length, 1);
+});
+
+test('replay consumes a sealed source schedule only on a fresh matching network identity', async () => {
+  const api = new FakeApi();
+  const source = campaign({template: true, effect: false});
+  const firstNetwork = network();
+  api.put('stacksnetworks', firstNetwork);
+  api.pods = networkPods(firstNetwork);
+  api.put('faultcampaigns', source);
+  const original = attacknetRun(source);
+  api.put('attacknetruns', original);
+  const reconciler = new AttacknetRunReconciler(api);
+  await reconciler.reconcile(original, [source]);
+  const resolvedOriginal = await api.get('attacknetruns', original.metadata.name);
+  resolvedOriginal.status.phase = 'Failed';
+  resolvedOriginal.status.reason = 'ExpectedFailureForReplay';
+  api.put('attacknetruns', resolvedOriginal);
+
+  const freshNetwork = network();
+  freshNetwork.metadata.uid = 'uid-demo-fresh';
+  api.put('stacksnetworks', freshNetwork);
+  api.pods = networkPods(freshNetwork);
+  const replay = attacknetRun(source);
+  replay.metadata.name = 'run-replay';
+  replay.metadata.uid = uid('run-replay');
+  replay.spec.replay = {
+    enabled: true, sourceRunRef: original.metadata.name,
+    descriptorURI: `k8s://attacknetruns/${original.metadata.name}/resolved-schedule`,
+    descriptorDigest: resolvedOriginal.status.scheduleRef.digest,
+    requireSameResolvedImages: true, verifyExpectedFailure: true,
+  };
+  api.put('attacknetruns', replay);
+  await reconciler.reconcile(replay, [source]);
+  const resolvedReplay = await api.get('attacknetruns', replay.metadata.name);
+  assert.equal(resolvedReplay.status.phase, 'Preparing');
+  const configMap = await api.get('configmaps', resolvedReplay.status.scheduleRef.name, {group: ''});
+  const replaySchedule = decodeSchedule(configMap);
+  assert.equal(replaySchedule.replay.enabled, true);
+  assert.equal(replaySchedule.replay.sourceNetwork.uid, firstNetwork.metadata.uid);
+  assert.equal(replaySchedule.network.uid, freshNetwork.metadata.uid);
 });
 
 test('FaultCampaign finalizer removes an owned fault before permitting deletion', async () => {
