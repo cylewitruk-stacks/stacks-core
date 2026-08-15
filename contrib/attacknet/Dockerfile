@@ -1,7 +1,9 @@
 ARG RUST_IMAGE=1.96.0-bookworm
 ARG CARGO_CHEF_VERSION=0.1.77
+ARG CARGO_CHEF_IMAGE=lukemathwalker/cargo-chef:${CARGO_CHEF_VERSION}-rust-${RUST_IMAGE}
+ARG RUNTIME_IMAGE=debian:bookworm-slim
 
-FROM lukemathwalker/cargo-chef:${CARGO_CHEF_VERSION}-rust-${RUST_IMAGE} AS chef
+FROM ${CARGO_CHEF_IMAGE} AS chef
 
 WORKDIR /src
 
@@ -44,7 +46,7 @@ RUN --mount=type=cache,id=stacks-attacknet-cargo,target=/usr/local/cargo/registr
     && cp /src/target/release-lite/stacks-signer /out/stacks-signer \
     && cp /src/target/release-lite/stacks-inspect /out/stacks-inspect
 
-FROM debian:bookworm-slim
+FROM ${RUNTIME_IMAGE}
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

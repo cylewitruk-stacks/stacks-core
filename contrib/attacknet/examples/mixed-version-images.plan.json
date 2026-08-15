@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "pipelineId": "current-4.0.2-modified",
+  "repository": "../../..",
+  "dockerfile": "../Dockerfile",
+  "imageRepository": "stacks-core-attacknet",
+  "targetPlatform": "linux/arm64",
+  "baseImages": {
+    "cargoChef": "registry.invalid/replace-with-cargo-chef@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "runtime": "registry.invalid/replace-with-debian@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "profiles": [
+    {
+      "id": "current",
+      "source": {"kind": "current"}
+    },
+    {
+      "id": "released-4.0.2",
+      "source": {
+        "kind": "releasedGitRef",
+        "gitRef": "4.0.2",
+        "expectedRevision": "1b57c3fb6709ab927f9179ab6814f874c84f5303"
+      }
+    },
+    {
+      "id": "modified-signer",
+      "source": {
+        "kind": "localModified",
+        "baseRef": "HEAD",
+        "changeId": "adversarial-signer-experiment"
+      }
+    }
+  ]
+}
