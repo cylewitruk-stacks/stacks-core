@@ -695,8 +695,88 @@ def build_resources(network: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     return resources
 
 
+class OperatorMetrics:
+    """Small dependency-free Prometheus registry for control-plane attribution."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.process_start_time = time.time()
+        self.api_requests: dict[tuple[str, str], int] = {}
+        self.api_duration_count = 0
+        self.api_duration_sum = 0.0
+        self.reconciles: dict[str, int] = {}
+        self.reconcile_duration_count = 0
+        self.reconcile_duration_sum = 0.0
+        self.reconcile_duration_max = 0.0
+        self.reconcile_last_duration = 0.0
+        self.reconcile_last_api_requests = 0
+        self.managed_networks = 0
+
+    def api_total(self) -> int:
+        with self.lock:
+            return sum(self.api_requests.values())
+
+    def observe_api(self, method: str, code: str, duration: float) -> None:
+        bounded_code = code if re.fullmatch(r"[1-5][0-9][0-9]", code) else "error"
+        key = (method.upper(), bounded_code)
+        with self.lock:
+            self.api_requests[key] = self.api_requests.get(key, 0) + 1
+            self.api_duration_count += 1
+            self.api_duration_sum += max(0.0, duration)
+
+    def observe_reconcile(self, outcome: str, duration: float, api_requests: int) -> None:
+        with self.lock:
+            self.reconciles[outcome] = self.reconciles.get(outcome, 0) + 1
+            self.reconcile_duration_count += 1
+            self.reconcile_duration_sum += max(0.0, duration)
+            self.reconcile_duration_max = max(self.reconcile_duration_max, duration)
+            self.reconcile_last_duration = max(0.0, duration)
+            self.reconcile_last_api_requests = max(0, api_requests)
+
+    def set_managed_networks(self, count: int) -> None:
+        with self.lock:
+            self.managed_networks = max(0, count)
+
+    def render(self) -> bytes:
+        with self.lock:
+            lines = [
+                "# HELP hacknet_operator_api_requests_total Kubernetes API requests made by the operator.",
+                "# TYPE hacknet_operator_api_requests_total counter",
+            ]
+            for (method, code), count in sorted(self.api_requests.items()):
+                lines.append(f'hacknet_operator_api_requests_total{{method="{method}",code="{code}"}} {count}')
+            lines.extend([
+                "# HELP hacknet_operator_process_start_time_seconds Operator process start time since Unix epoch.",
+                "# TYPE hacknet_operator_process_start_time_seconds gauge",
+                f"hacknet_operator_process_start_time_seconds {self.process_start_time:.6f}",
+                "# TYPE hacknet_operator_api_request_duration_seconds_sum counter",
+                f"hacknet_operator_api_request_duration_seconds_sum {self.api_duration_sum:.9f}",
+                "# TYPE hacknet_operator_api_request_duration_seconds_count counter",
+                f"hacknet_operator_api_request_duration_seconds_count {self.api_duration_count}",
+                "# HELP hacknet_operator_reconciliations_total Completed StacksNetwork reconciliations.",
+                "# TYPE hacknet_operator_reconciliations_total counter",
+            ])
+            for outcome, count in sorted(self.reconciles.items()):
+                lines.append(f'hacknet_operator_reconciliations_total{{outcome="{outcome}"}} {count}')
+            lines.extend([
+                "# TYPE hacknet_operator_reconcile_duration_seconds_sum counter",
+                f"hacknet_operator_reconcile_duration_seconds_sum {self.reconcile_duration_sum:.9f}",
+                "# TYPE hacknet_operator_reconcile_duration_seconds_count counter",
+                f"hacknet_operator_reconcile_duration_seconds_count {self.reconcile_duration_count}",
+                "# TYPE hacknet_operator_reconcile_duration_seconds_max gauge",
+                f"hacknet_operator_reconcile_duration_seconds_max {self.reconcile_duration_max:.9f}",
+                "# TYPE hacknet_operator_reconcile_last_duration_seconds gauge",
+                f"hacknet_operator_reconcile_last_duration_seconds {self.reconcile_last_duration:.9f}",
+                "# TYPE hacknet_operator_reconcile_last_api_requests gauge",
+                f"hacknet_operator_reconcile_last_api_requests {self.reconcile_last_api_requests}",
+                "# TYPE hacknet_operator_managed_networks gauge",
+                f"hacknet_operator_managed_networks {self.managed_networks}",
+            ])
+            return ("\n".join(lines) + "\n").encode()
+
+
 class KubernetesClient:
-    def __init__(self, progress_callback: Any = None) -> None:
+    def __init__(self, progress_callback: Any = None, request_callback: Any = None) -> None:
         host = os.environ.get("KUBERNETES_SERVICE_HOST")
         port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443")
         if not host:
@@ -706,6 +786,7 @@ class KubernetesClient:
         ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
         self.ssl_context = ssl.create_default_context(cafile=ca_path)
         self.progress_callback = progress_callback
+        self.request_callback = request_callback
 
     def _read_token(self) -> str:
         # Projected service-account tokens rotate in place. Reading the small
@@ -729,6 +810,8 @@ class KubernetesClient:
         *,
         content_type: str = "application/json",
     ) -> dict[str, Any] | None:
+        started = time.monotonic()
+        response_code = "error"
         self._mark_progress()
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(
@@ -743,12 +826,17 @@ class KubernetesClient:
         )
         try:
             with urllib.request.urlopen(request, context=self.ssl_context, timeout=30) as response:
+                response_code = str(getattr(response, "status", 200))
                 payload = response.read()
                 return json.loads(payload) if payload else None
         except urllib.error.HTTPError as error:
+            response_code = str(error.code)
             body_text = error.read().decode(errors="replace")
             raise ApiError(error.code, method, path, body_text) from error
         finally:
+            callback = getattr(self, "request_callback", None)
+            if callback is not None:
+                callback(method, response_code, time.monotonic() - started)
             self._mark_progress()
 
     @staticmethod
@@ -946,12 +1034,16 @@ def materially_equal(left: dict[str, Any] | None, right: dict[str, Any]) -> bool
 
 
 class Reconciler:
-    def __init__(self, api: Any):
+    def __init__(self, api: Any, metrics: OperatorMetrics | None = None):
         self.api = api
+        self.metrics = metrics
 
     def reconcile(self, network: dict[str, Any]) -> None:
         metadata = network["metadata"]
         namespace, name = metadata["namespace"], metadata["name"]
+        started = time.monotonic()
+        api_before = self.metrics.api_total() if self.metrics is not None else 0
+        outcome = "ready"
         try:
             resources = build_resources(network)
             for kind in ("configmaps", "services", "statefulsets"):
@@ -963,11 +1055,24 @@ class Reconciler:
                     if existing_name not in desired:
                         self.api.delete_resource(kind, namespace, existing_name)
             status = build_status(network, self.api)
+            outcome = status["phase"].lower()
         except Exception as error:
             logging.exception("failed to reconcile StacksNetwork %s/%s", namespace, name)
             status = degraded_status(network, error)
-        if not materially_equal(network.get("status"), status):
-            self.api.patch_status(namespace, name, status)
+            outcome = "degraded"
+        try:
+            if not materially_equal(network.get("status"), status):
+                self.api.patch_status(namespace, name, status)
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            if self.metrics is not None:
+                self.metrics.observe_reconcile(
+                    outcome,
+                    time.monotonic() - started,
+                    self.metrics.api_total() - api_before,
+                )
 
 
 class HealthState:
@@ -987,8 +1092,17 @@ class HealthState:
 
 class HealthHandler(http.server.BaseHTTPRequestHandler):
     state: HealthState
+    metrics: OperatorMetrics
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if self.path == "/metrics":
+            payload = self.metrics.render()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path == "/healthz" and self.state.is_live():
             self.send_response(200)
         elif self.path == "/readyz" and self.state.ready:
@@ -1001,8 +1115,8 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
         logging.debug("health server: " + format_string, *args)
 
 
-def run_health_server(state: HealthState) -> None:
-    handler = type("BoundHealthHandler", (HealthHandler,), {"state": state})
+def run_health_server(state: HealthState, metrics: OperatorMetrics) -> None:
+    handler = type("BoundHealthHandler", (HealthHandler,), {"state": state, "metrics": metrics})
     server = http.server.ThreadingHTTPServer(("0.0.0.0", 8080), handler)
     server.serve_forever()
 
@@ -1023,20 +1137,22 @@ def main() -> None:
     # during an API-server outage would be an unhelpful restart storm.
     liveness_timeout = max(90.0, interval * 3.0 + 30.0)
     state = HealthState(liveness_timeout)
-    threading.Thread(target=run_health_server, args=(state,), daemon=True).start()
+    metrics = OperatorMetrics()
+    threading.Thread(target=run_health_server, args=(state, metrics), daemon=True).start()
 
     def stop(_signum: int, _frame: Any) -> None:
         state.running = False
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    api = KubernetesClient(progress_callback=state.mark_progress)
-    reconciler = Reconciler(api)
+    api = KubernetesClient(progress_callback=state.mark_progress, request_callback=metrics.observe_api)
+    reconciler = Reconciler(api, metrics)
     logging.info("watching StacksNetwork resources in namespace %s", namespace)
     while state.running:
         state.mark_progress()
         try:
             networks = api.list_networks(namespace)
+            metrics.set_managed_networks(len(networks))
             state.ready = True
             for network in networks:
                 if not (network.get("metadata") or {}).get("deletionTimestamp"):

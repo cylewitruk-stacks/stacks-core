@@ -27,6 +27,15 @@ node "${ATTACKNET_DIR}/node-capacity.mjs" "${MINIMUM_NODE_AVAILABLE_BYTES}" \
 stage_number=0
 stage_total="$(wc -w <<<"${STAGES}" | tr -d ' ')"
 
+capture_operator_metrics() {
+  local output="$1" service
+  service="$(kubectl -n "${NAMESPACE}" get services \
+    -l 'app.kubernetes.io/component=operator' -o json \
+    | jq -er 'if (.items | length) == 1 then .items[0].metadata.name else error("expected exactly one Hacknet operator metrics Service") end')"
+  kubectl get --raw "/api/v1/namespaces/${NAMESPACE}/services/http:${service}:8080/proxy/metrics" \
+    >"${output}"
+}
+
 wait_for_stage_convergence() {
   local network="$1" manifest="$2" output="$3"
   local deadline=$((SECONDS + STAGE_CONVERGENCE_TIMEOUT_SECONDS)) attempt=0
@@ -63,10 +72,16 @@ for stage in ${STAGES}; do
     --node-image="${NODE_IMAGE}" --stacker-image="${STACKER_IMAGE}" \
     --output="${output}/rendered"
 
+  capture_operator_metrics "${output}/operator-before.prom"
+
   start="$(date +%s)"
   KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${network}" \
     "${ATTACKNET_DIR}/lifecycle.sh" apply "${output}/rendered"
   end="$(date +%s)"
+  capture_operator_metrics "${output}/operator-after.prom"
+  node "${ATTACKNET_DIR}/operator-pressure.mjs" \
+    "${output}/operator-before.prom" "${output}/operator-after.prom" \
+    "${output}/operator-pressure.json"
   duration=$((end - start))
   printf '{"stage":%s,"miners":%s,"signers":%s,"followers":%s,"readySeconds":%s}\n' \
     "${stage_number}" "${miners}" "${signers}" "${followers}" "${duration}" \

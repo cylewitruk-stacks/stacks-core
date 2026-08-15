@@ -160,7 +160,30 @@ The default stages are `1:1:1`, `2:4:2`, and `3:10:5` (miners, signers,
 followers). Each stage starts from fresh PVCs because increasing the signer
 count changes genesis balances; retaining the earlier chainstate would make the
 capacity comparison invalid. Override `ATTACKNET_CAPACITY_STAGES` for a faster
-smoke or a more gradual profile.
+smoke or a more gradual profile. Every stage snapshots the operator's
+Prometheus endpoint before and after reconciliation and fails on an operator
+restart, transport error, HTTP 429, or HTTP 5xx. The retained
+`operator-pressure.json` records request counts and API/reconcile latency rather
+than treating eventual Pod readiness as evidence that the control plane was
+healthy.
+
+Run one locally-admitted bounded fault against an active network with:
+
+```bash
+contrib/attacknet/campaign-runner.sh \
+  contrib/attacknet/examples/companion-failure.json \
+  contrib/attacknet/generated/full/manifest.json \
+  evidence/companion-failure
+```
+
+The compiler requires finite typed safety limits, action-specific severity
+bounds, mode-aware signer/miner impact, and explicit opt-ins for quorum loss,
+majority-miner outages, extreme severity, extended duration, burnchain targets,
+or unenrolled network targets. Before injection, the runner resolves each actor
+to exactly one current Ready Pod UID and immutable admitted image identity.
+Clearance is successful only when `AllRecovered`, resource deletion, and
+resource absence are all observed; forced deletion remains a failed campaign
+even when it safely removes the fault.
 
 ## Dashboards
 
@@ -218,10 +241,11 @@ loopback port-forward:
 contrib/attacknet/chaos-dashboard.sh local
 ```
 
-Open <http://127.0.0.1:2333>. This patches the admitted Dashboard Deployment,
-so repeat it after reinstalling or upgrading Chaos Mesh. Restore authenticated
-mode with `contrib/attacknet/chaos-dashboard.sh secure`. Do not use the local
-mode for a shared or remotely reachable cluster.
+Open <http://127.0.0.1:2333>. This updates the Helm release value and rolls out
+the admitted Dashboard Deployment while preserving the installed chart version.
+Restore authenticated mode with
+`contrib/attacknet/chaos-dashboard.sh secure`. Do not use the local mode for a
+shared or remotely reachable cluster.
 
 Authenticated cluster-scoped dashboard access remains available as an
 explicit opt-in because it can create and delete any Chaos Mesh experiment in

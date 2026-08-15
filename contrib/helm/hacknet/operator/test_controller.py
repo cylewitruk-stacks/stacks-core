@@ -333,6 +333,19 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(api.statuses[-1]["phase"], "Degraded")
         self.assertEqual(api.statuses[-1]["conditions"][0]["reason"], "ReconcileFailed")
 
+    def test_status_patch_failure_is_recorded_as_reconcile_error(self):
+        fixture = network_fixture()
+        api = FakeApi()
+        metrics = controller.OperatorMetrics()
+
+        def fail_patch(_namespace, _name, _status):
+            raise controller.ApiError(503, "PATCH", "/status", "unavailable")
+
+        api.patch_status = fail_patch
+        with self.assertRaises(controller.ApiError):
+            controller.Reconciler(api, metrics).reconcile(fixture)
+        self.assertEqual(metrics.reconciles, {"error": 1})
+
     def test_unchanged_condition_preserves_transition_time(self):
         previous = [{
             "type": "Ready",
@@ -527,6 +540,19 @@ class HealthStateTests(unittest.TestCase):
         self.assertTrue(state.is_live())
         state.running = False
         self.assertFalse(state.is_live())
+
+    def test_operator_metrics_bound_api_status_and_report_reconcile_pressure(self):
+        metrics = controller.OperatorMetrics()
+        metrics.observe_api("GET", "200", 0.25)
+        metrics.observe_api("PATCH", "unexpected", 0.50)
+        metrics.observe_reconcile("ready", 0.75, 2)
+        metrics.set_managed_networks(1)
+        rendered = metrics.render().decode()
+        self.assertIn('hacknet_operator_api_requests_total{method="GET",code="200"} 1', rendered)
+        self.assertIn('hacknet_operator_api_requests_total{method="PATCH",code="error"} 1', rendered)
+        self.assertIn('hacknet_operator_reconciliations_total{outcome="ready"} 1', rendered)
+        self.assertIn("hacknet_operator_reconcile_last_api_requests 2", rendered)
+        self.assertIn("hacknet_operator_managed_networks 1", rendered)
 
 
 if __name__ == "__main__":

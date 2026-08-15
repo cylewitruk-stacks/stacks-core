@@ -118,15 +118,21 @@ capture_clocks() {
 }
 
 cleanup() {
-  local actor
-  kubectl -n "${namespace}" delete -f "${resource}" --ignore-not-found --wait=true \
-    >"${destination}/cleanup.log" 2>&1 || true
-  if [ "${injected}" = true ] && [ "${cleared}" = false ]; then
+  local actor status=0 clearance="${destination}/clearance.json"
+  # Preserve the first terminal clearance report. The EXIT/incident traps may
+  # call cleanup again after a successful or forced deletion; rewriting it as
+  # "initially absent" would erase whether AllRecovered was ever observed.
+  [ "${cleared}" = false ] || return 0
+  "${ATTACKNET_DIR}/chaos-resource.sh" "${resource}" "${clearance}" \
+    >"${destination}/cleanup.log" 2>&1 || status=$?
+  if [ "${injected}" = true ] && [ "${cleared}" = false ] \
+    && [ -r "${clearance}" ] && jq -e '.cleared == true' "${clearance}" >/dev/null; then
     for actor in ${selected_actors}; do
       emit_event fault.cleared recovering "${actor}" '{"cleared":true}' || true
     done
     cleared=true
   fi
+  return "${status}"
 }
 
 capture_incident() {
@@ -174,7 +180,7 @@ on_error() {
 }
 
 trap 'on_error ${LINENO}' ERR
-trap cleanup EXIT INT TERM
+trap 'cleanup || true' EXIT INT TERM
 
 if ! ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" snapshot \
@@ -192,6 +198,11 @@ emit_invariant baseline-health true baseline
 KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
   "${ATTACKNET_DIR}/observability/record-verification.sh" \
   "${destination}/before-verification.json" "campaign-${name}-baseline" baseline
+kubectl -n "${namespace}" get pods \
+  -l "testing.stacks.org/network=${network},testing.stacks.org/actor" -o json \
+  >"${destination}/pods-before-injection.json"
+node "${ATTACKNET_DIR}/campaign-targets.mjs" "${manifest}" "${resource}.evidence.json" \
+  "${destination}/pods-before-injection.json" "${destination}/resolved-targets.json"
 ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/runtime-backend.sh" describe >"${destination}/before-runtime.json"
 if [ "${kind}" = timechaos ]; then capture_clocks "${destination}/clocks-before.jsonl"; fi
@@ -219,7 +230,9 @@ kubectl -n "${namespace}" get "${kind}/${name}" -o json >"${destination}/during-
 if [ "${kind}" = timechaos ]; then capture_clocks "${destination}/clocks-during.jsonl"; fi
 sleep "$((duration_seconds + ${ATTACKNET_CHAOS_SETTLE_SECONDS:-5}))"
 kubectl -n "${namespace}" get "${kind}/${name}" -o json >"${destination}/after-duration.json" 2>/dev/null || true
-cleanup
+if ! cleanup; then
+  fail_campaign 'Chaos resource did not report AllRecovered and clear cleanly'
+fi
 ledger_fault reverted
 trap - EXIT INT TERM
 

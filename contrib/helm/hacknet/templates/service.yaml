@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hacknet.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+spec:
+  selector:
+    {{- include "hacknet.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: health
+      protocol: TCP

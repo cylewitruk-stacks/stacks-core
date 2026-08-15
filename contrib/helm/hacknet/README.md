@@ -213,6 +213,12 @@ The controller reads its projected service-account token for every API request,
 so kubelet token rotation does not require a restart. Readiness follows API
 availability. Liveness follows controller-loop progress rather than API success,
 avoiding a Pod restart storm when the Kubernetes API server is unavailable.
+Its Service exposes dependency-free Prometheus metrics on `/metrics`, including
+bounded method/status API-request counters, request latency, reconcile outcome
+and latency, per-reconcile API volume, process start time, and managed-network
+count. Capacity evidence compares snapshots from the same process and fails if
+the controller restarted or observed throttling, server errors, or transport
+failures during a stage.
 
 ## Development checks
 
