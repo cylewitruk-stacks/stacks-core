@@ -467,6 +467,9 @@ delete_network() {
     ' "${RUN_DESCRIPTOR}")
     if [ -z "${final_status}" ]; then
       [ "${descriptor_status}" = running ] && final_status=aborted || final_status="${descriptor_status}"
+    elif [ "${descriptor_status}" != running ] && [ "${final_status}" != "${descriptor_status}" ]; then
+      echo "warning: finalized run status is ${descriptor_status}; ignoring teardown override ${final_status}" >&2
+      final_status="${descriptor_status}"
     fi
     bundle="${ATTACKNET_RUN_EXPORT_DIR:-$(dirname "${RUN_DESCRIPTOR}")/bundle}"
     if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
@@ -481,10 +484,14 @@ delete_network() {
       KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" ATTACKNET_RUN_ID="${RUN_ID}" \
         "${ATTACKNET_DIR}/observability/export-kubernetes-report.sh" "${bundle}/timeline" "${RUN_ID}"
     fi
-    ledger_assertion run-final-status \
-      "$([ "${final_status}" = passed ] && echo pass || { [ "${final_status}" = failed ] && echo fail || echo skipped; })" \
-      "{\"status\":\"${final_status}\"}"
-    node "${ATTACKNET_DIR}/run-ledger.mjs" finalize "${RUN_DESCRIPTOR}" "${final_status}" >/dev/null
+    if [ "${descriptor_status}" = running ]; then
+      ledger_assertion run-final-status \
+        "$([ "${final_status}" = passed ] && echo pass || { [ "${final_status}" = failed ] && echo fail || echo skipped; })" \
+        "{\"status\":\"${final_status}\"}"
+      node "${ATTACKNET_DIR}/run-ledger.mjs" finalize "${RUN_DESCRIPTOR}" "${final_status}" >/dev/null
+    else
+      echo "Run ledger already finalized as ${descriptor_status}; exporting without rewriting it"
+    fi
     ledger_export "${bundle}/descriptor"
     echo "Run evidence exported before teardown: ${bundle}"
   fi
