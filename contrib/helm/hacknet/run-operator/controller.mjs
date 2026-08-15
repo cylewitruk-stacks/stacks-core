@@ -8,6 +8,10 @@ import process from 'node:process';
 
 import {compileCampaign} from '../../../attacknet/fault-campaign.mjs';
 import {resolveCampaignTargets} from '../../../attacknet/campaign-targets.mjs';
+import {evaluateFaultEffect} from '../../../attacknet/fault-effect-evidence.mjs';
+import {
+  ProbeClient, baselineUsable, buildProbeRequest, controlTarget, probePhase,
+} from './probe-client.mjs';
 
 export const GROUP = 'testing.stacks.org';
 export const VERSION = 'v1alpha1';
@@ -96,6 +100,12 @@ function podReady(pod) {
   return pod?.status?.phase === 'Running'
     && (pod.status.conditions ?? []).some(item => item.type === 'Ready' && item.status === 'True')
     && (pod.status.containerStatuses ?? []).some(item => item.name === 'actor' && item.ready === true);
+}
+
+function probeTargetReady(target, pods) {
+  const pod = (pods.items ?? pods).find(item => item.metadata?.uid === target.podUid);
+  const probe = pod?.status?.containerStatuses?.find(item => item.name === 'attacknet-probe');
+  return podReady(pod) && probe?.ready === true && pod.status?.podIP === target.podIP;
 }
 
 function minimumAffected(spec, candidates) {
@@ -255,7 +265,7 @@ function campaignDocument(campaign) {
 }
 
 export class FaultCampaignReconciler {
-  constructor(api) { this.api = api; }
+  constructor(api, probes = new ProbeClient()) { this.api = api; this.probes = probes; }
 
   async patchStatus(campaign, next) {
     next.observedGeneration = campaign.metadata.generation;
@@ -280,6 +290,33 @@ export class FaultCampaignReconciler {
     const remaining = await this.api.get(identity.plural, identity.name,
       {group: 'chaos-mesh.org', version: 'v1alpha1', allow404: true});
     return {absent: !remaining, allRecovered};
+  }
+
+  async collectProbePhase(campaign, compiled, network, pods, phase, allInjectedObserved = false) {
+    const identity = chaosIdentity(campaign);
+    const selectedActors = compiled.evidence.selectedActors;
+    const responses = await Promise.all((campaign.status?.resolvedTargets ?? []).map(async target => {
+      try {
+        if (!probeTargetReady(target, pods)) {
+          throw new Error('exact admitted attacknet-probe container is not Ready at its recorded Pod IP');
+        }
+        const request = buildProbeRequest({
+          kind: identity.kind, campaign, compiledEvidence: compiled.evidence, network, target,
+        });
+        return await this.probes.probe(target, request);
+      } catch (error) {
+        return {actor: target.actor, error: String(error.message ?? error)};
+      }
+    }));
+    if (identity.kind === 'TimeChaos') {
+      try {
+        const control = controlTarget(network, pods, selectedActors);
+        responses.push(await this.probes.probe(control, {kind: 'clock', control: true}));
+      } catch (error) {
+        responses.push({actor: 'independent-control', error: String(error.message ?? error)});
+      }
+    }
+    return probePhase({kind: identity.kind, phase, responses, allInjectedObserved});
   }
 
   async deletion(campaign) {
@@ -324,6 +361,22 @@ export class FaultCampaignReconciler {
     if (phase === 'Pending') {
       const pods = await this.api.list('pods', {group: '', labels: `testing.stacks.org/network=${manifest.network}`});
       const resolved = resolveCampaignTargets(manifest, compiled.evidence, pods);
+      let probeArtifacts = campaign.status?.probeArtifacts ?? {};
+      if (chaosIdentity(campaign).kind !== 'PodChaos') {
+        // The admitted identities must be present on status before the probe
+        // plan can bind observations to exact Pod UIDs. Use a local view for
+        // this pre-admission baseline; no Chaos resource exists yet.
+        const baselineCampaign = {...campaign, status: {...campaign.status, resolvedTargets: resolved.targets}};
+        const before = await this.collectProbePhase(baselineCampaign, compiled, network, pods, 'before');
+        if (!baselineUsable(chaosIdentity(campaign).kind, before, compiled.evidence.selectedActors)) {
+          await this.patchStatus(campaign, status(campaign.status, 'Failed', 'ProbeBaselineUnavailable', {
+            resolvedTargets: resolved.targets,
+            probeArtifacts: {beforeJson: JSON.stringify(before)}, completedAt: now(),
+          }));
+          return;
+        }
+        probeArtifacts = {beforeJson: JSON.stringify(before)};
+      }
       await this.patchStatus(campaign, status(campaign.status, 'Admitted', 'SafetyPolicySatisfied', {
         admission: {
           networkUid: network.metadata.uid, networkGeneration: network.metadata.generation,
@@ -331,6 +384,7 @@ export class FaultCampaignReconciler {
           minerImpact: compiled.evidence.minerImpact,
         },
         resolvedTargets: resolved.targets,
+        probeArtifacts,
       }));
       return;
     }
@@ -365,11 +419,18 @@ export class FaultCampaignReconciler {
       if (!chaos) throw new Error('Chaos resource disappeared before injection was observed');
       if (conditionTrue(chaos, 'AllInjected')) {
         let effectResults = campaign.status?.effectResults ?? [];
+        let probeArtifacts = campaign.status?.probeArtifacts ?? {};
         if (identity.kind === 'PodChaos') {
           const pods = await this.api.list('pods', {
             group: '', labels: `testing.stacks.org/network=${manifest.network}`,
           });
           effectResults = podEffectResults(campaign, pods);
+        } else {
+          const pods = await this.api.list('pods', {
+            group: '', labels: `testing.stacks.org/network=${manifest.network}`,
+          });
+          const during = await this.collectProbePhase(campaign, compiled, network, pods, 'during', true);
+          probeArtifacts = {...probeArtifacts, duringJson: JSON.stringify(during)};
         }
         await this.patchStatus(campaign, status(campaign.status, 'Active', 'AllInjectedObserved', {
           injectedAt: now(), actualInjection: {
@@ -378,6 +439,7 @@ export class FaultCampaignReconciler {
             records: chaos.status?.experiment ?? chaos.status?.instances ?? null,
           },
           effectResults,
+          probeArtifacts,
         }));
       } else if (elapsedSeconds(campaign.status?.chaos?.createdAt) > assertionTimeout(campaign.spec.effectAssertions, 90)) {
         const cleanup = await this.removeChaos(campaign);
@@ -423,25 +485,76 @@ export class FaultCampaignReconciler {
         }));
         return;
       }
+      let probeArtifacts = campaign.status?.probeArtifacts ?? {};
+      let effectResults = campaign.status?.effectResults ?? [];
+      let recoveryResults = recovered.targets.map(target => ({
+        assertion: 'TargetReady', outcome: 'Proven', actor: target.actor,
+        podUid: target.podUid, observedAt: now(),
+      }));
+      let evidenceError = null;
+      if (identity.kind !== 'PodChaos') {
+        const after = await this.collectProbePhase(campaign, compiled, network, pods, 'after');
+        probeArtifacts = {...probeArtifacts, afterJson: JSON.stringify(after)};
+        try {
+          const evaluation = evaluateFaultEffect({
+            campaign: compiled.resource, evidence: compiled.evidence,
+            resolvedTargets: {
+              schemaVersion: 1, network: manifest.network, namespace: manifest.namespace,
+              resolvedAt: campaign.status.admission.admittedAt,
+              targets: campaign.status.resolvedTargets,
+            },
+            before: JSON.parse(probeArtifacts.beforeJson),
+            during: JSON.parse(probeArtifacts.duringJson), after,
+          });
+          const assertion = {
+            NetworkChaos: 'NetworkDegraded', DNSChaos: 'DNSDegraded',
+            IOChaos: 'IODegraded', TimeChaos: 'ClockSkewObserved',
+          }[identity.kind];
+          const title = value => value[0].toUpperCase() + value.slice(1);
+          effectResults = evaluation.evaluations.map(item => ({
+            assertion, outcome: title(item.effect), actor: item.actor,
+            podUid: campaign.status.resolvedTargets.find(target => target.actor === item.actor)?.podUid,
+            observedAt: now(), message: item.reason,
+          }));
+          recoveryResults = evaluation.evaluations.map(item => ({
+            assertion: 'TargetReady', outcome: title(item.recovery), actor: item.actor,
+            podUid: campaign.status.resolvedTargets.find(target => target.actor === item.actor)?.podUid,
+            observedAt: now(), message: item.reason,
+          }));
+        } catch (error) {
+          evidenceError = String(error.message ?? error).slice(0, 1000);
+          effectResults = campaign.status.resolvedTargets.map(target => ({
+            assertion: 'RequestedFaultEffect', outcome: 'Inconclusive', actor: target.actor,
+            podUid: target.podUid, observedAt: now(), message: evidenceError,
+          }));
+          recoveryResults = campaign.status.resolvedTargets.map(target => ({
+            assertion: 'TargetReady', outcome: 'Inconclusive', actor: target.actor,
+            podUid: target.podUid, observedAt: now(), message: evidenceError,
+          }));
+        }
+      }
       const required = campaign.spec.effectAssertions ?? [];
-      const effectResults = campaign.status?.effectResults ?? [];
+      const requiredRecovery = campaign.spec.recoveryAssertions ?? [];
       // User-supplied assertions may add requirements, but omitting them must
       // never turn Chaos Mesh's AllInjected bookkeeping into proof that the
       // requested fault was observable. At least one trusted effect result is
       // required for every execution.
       const minimum = minimumAffected(compiled.resource.spec, campaign.status.resolvedTargets.length);
       const provenResults = effectResults.filter(item => item.outcome === 'Proven');
-      const proven = provenResults.length >= minimum
+      const recoveredResults = recoveryResults.filter(item => item.outcome === 'Proven');
+      const proven = evidenceError === null && provenResults.length >= minimum
+        && recoveredResults.length >= minimum
         && (required.length === 0 || required.every(assertion =>
           provenResults.some(result => result.assertion === assertion.type
+            && (assertion.actor === undefined || result.actor === assertion.actor))))
+        && (requiredRecovery.length === 0 || requiredRecovery.every(assertion =>
+          recoveredResults.some(result => result.assertion === assertion.type
             && (assertion.actor === undefined || result.actor === assertion.actor))));
       await this.patchStatus(campaign, status(campaign.status,
         proven ? 'Passed' : 'Inconclusive',
-        proven ? 'EffectAndRecoveryProven' : 'EffectNotProven', {
-          recoveryResults: recovered.targets.map(target => ({
-            assertion: 'TargetReady', outcome: 'Proven', actor: target.actor,
-            podUid: target.podUid, observedAt: now(),
-          })),
+        proven ? 'EffectAndRecoveryProven' : evidenceError ? 'ProbeEvidenceInvalid' : 'EffectNotProven', {
+          effectResults, recoveryResults, probeArtifacts,
+          ...(evidenceError ? {message: evidenceError} : {}),
           completedAt: now(),
         }));
     }

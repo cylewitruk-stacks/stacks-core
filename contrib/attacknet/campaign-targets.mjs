@@ -32,14 +32,15 @@ export function resolveCampaignTargets(manifest, evidence, podList) {
     if (status.phase !== 'Running' || !ready || !actorStatus?.ready) {
       throw new Error(`selected actor ${actor} is not admitted Running and Ready`);
     }
-    if (!metadata.uid || !metadata.name || !pod.spec?.nodeName) {
-      throw new Error(`selected actor ${actor} lacks Pod uid, name, or node placement`);
+    if (!metadata.uid || !metadata.name || !pod.spec?.nodeName || !status.podIP) {
+      throw new Error(`selected actor ${actor} lacks Pod uid, name, IP, or node placement`);
     }
     return {
       actor,
       role: (metadata.labels ?? {})[ROLE_LABEL] ?? 'unknown',
       pod: metadata.name,
       podUid: metadata.uid,
+      podIP: status.podIP,
       node: pod.spec.nodeName,
       requestedImage: actorStatus.image ?? null,
       resolvedImageId: actorStatus.imageID ?? null,

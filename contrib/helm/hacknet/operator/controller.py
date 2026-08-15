@@ -190,6 +190,21 @@ def telemetry_settings(spec: dict[str, Any], actor: dict[str, Any]) -> dict[str,
     return deep_merge(settings, actor.get("telemetry"))
 
 
+def probe_settings(spec: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the trusted probe independently from actor-controlled runtime data."""
+    defaults = {
+        "enabled": False,
+        "image": "stacks-hacknet-probe:dev",
+        "imagePullPolicy": "IfNotPresent",
+        "resources": {
+            "requests": {"cpu": "5m", "memory": "24Mi"},
+            "limits": {"cpu": "100m", "memory": "64Mi"},
+        },
+    }
+    settings = deep_merge(defaults, spec.get("probe"))
+    return deep_merge(settings, actor.get("probe"))
+
+
 def expand_text(
     value: str,
     *,
@@ -281,6 +296,9 @@ def validate_network(network: dict[str, Any]) -> None:
         telemetry = telemetry_settings(spec, actor)
         if telemetry.get("enabled") and not telemetry.get("exporterEndpoint"):
             raise ValidationError(f"actor {actor_name!r} enables telemetry without exporterEndpoint")
+        probe = probe_settings(spec, actor)
+        if probe.get("enabled") and not probe.get("image"):
+            raise ValidationError(f"actor {actor_name!r} enables the trusted probe without an image")
     for actor in actors:
         for dependency in actor.get("dependencies") or []:
             target = dependency.get("actor")
@@ -529,11 +547,60 @@ def build_telemetry_container(context: ActorContext, telemetry: dict[str, Any]) 
     }
 
 
+def build_probe_container(
+    context: ActorContext,
+    probe: dict[str, Any],
+    storage: dict[str, Any],
+) -> dict[str, Any]:
+    peers = {
+        actor["name"]: {
+            "host": f"{context.services[actor['name']]}.{context.namespace}.svc.cluster.local",
+            "ports": {port["name"]: port["servicePort"] for port in effective_ports(actor)},
+        }
+        for actor in context.spec["actors"]
+    }
+    # The probe receives no Kubernetes token and no actor-provided result
+    # channel. Its peer/port allowlist is generated solely from the admitted
+    # StacksNetwork inventory.
+    return {
+        "name": "attacknet-probe",
+        "image": probe["image"],
+        "imagePullPolicy": probe.get("imagePullPolicy", "IfNotPresent"),
+        "env": [
+            {"name": "PROBE_ACTOR", "value": context.actor["name"]},
+            {"name": "PROBE_PORT", "value": "18080"},
+            {"name": "PROBE_DATA_ROOT", "value": storage["mountPath"]},
+            {"name": "PROBE_DNS_CONTROL", "value": "kubernetes.default.svc.cluster.local"},
+            {"name": "PROBE_PEERS_JSON", "value": json.dumps(peers, sort_keys=True, separators=(",", ":"))},
+        ],
+        "ports": [{"name": "probe", "containerPort": 18080, "protocol": "TCP"}],
+        "readinessProbe": {
+            "httpGet": {"path": "/healthz", "port": "probe"},
+            "periodSeconds": 5,
+            "failureThreshold": 6,
+        },
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"]},
+            "readOnlyRootFilesystem": True,
+            "runAsNonRoot": True,
+            "runAsUser": 65532,
+            "runAsGroup": 65532,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        "resources": probe.get("resources", {}),
+        # Mount the actor volume at the same container-visible path. IOChaos
+        # path matching can then target the probe and actor with one path.
+        "volumeMounts": [{"name": "data", "mountPath": storage["mountPath"]}],
+    }
+
+
 def build_stateful_set(context: ActorContext) -> dict[str, Any]:
     actor = context.actor
     spec = context.spec
     defaults = spec.get("defaults") or {}
     telemetry = telemetry_settings(spec, actor)
+    trusted_probe = probe_settings(spec, actor)
     storage = storage_settings(spec, actor)
     ports = effective_ports(actor)
     command, args = actor_command(actor)
@@ -545,6 +612,7 @@ def build_stateful_set(context: ActorContext) -> dict[str, Any]:
             {
                 "config": config,
                 "telemetry": telemetry if telemetry.get("enabled") else None,
+                "probe": trusted_probe if trusted_probe.get("enabled") else None,
                 "command": command,
                 "args": args,
             },
@@ -616,6 +684,8 @@ def build_stateful_set(context: ActorContext) -> dict[str, Any]:
             volumes.append({"name": "generated-config", "configMap": {"name": context.resource_name}})
         volumes.append({"name": "telemetry-tmp", "emptyDir": {}})
         containers.append(build_telemetry_container(context, telemetry))
+    if trusted_probe.get("enabled"):
+        containers.append(build_probe_container(context, trusted_probe, storage))
     volume_claim_templates: list[dict[str, Any]] = []
     if storage.get("enabled", True):
         claim_spec: dict[str, Any] = {
@@ -639,13 +709,19 @@ def build_stateful_set(context: ActorContext) -> dict[str, Any]:
                 "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}},
             }
         )
+    pod_security_context = deep_merge(defaults.get("podSecurityContext"), actor.get("podSecurityContext"))
+    if trusted_probe.get("enabled") and "fsGroup" not in pod_security_context:
+        # Ensure the non-root probe can create its private directory on a PVC.
+        # This is opt-in with the probe and does not alter baseline actor Pods.
+        pod_security_context["fsGroup"] = 65532
+        pod_security_context["fsGroupChangePolicy"] = "OnRootMismatch"
     pod_spec: dict[str, Any] = {
         "automountServiceAccountToken": False,
         "terminationGracePeriodSeconds": actor.get(
             "terminationGracePeriodSeconds",
             defaults.get("terminationGracePeriodSeconds", 30),
         ),
-        "securityContext": deep_merge(defaults.get("podSecurityContext"), actor.get("podSecurityContext")),
+        "securityContext": pod_security_context,
         "containers": containers,
         # Keep the empty list explicit: merge-patch retains an omitted field,
         # which would leave a removed dependency gate in the live Pod template.

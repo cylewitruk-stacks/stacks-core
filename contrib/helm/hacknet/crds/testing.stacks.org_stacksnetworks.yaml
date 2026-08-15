@@ -149,6 +149,26 @@ spec:
                           type: string
                         key:
                           type: string
+                probe:
+                  type: object
+                  description: >-
+                    Optional trusted active-probe sidecar settings. Disabled by
+                    default. The probe has no Kubernetes credential and is not
+                    published through actor Services.
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    image:
+                      type: string
+                      default: stacks-hacknet-probe:dev
+                    imagePullPolicy:
+                      type: string
+                      enum: [Always, IfNotPresent, Never]
+                      default: IfNotPresent
+                    resources:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                 actors:
                   type: array
                   minItems: 1
@@ -357,6 +377,18 @@ spec:
                             properties:
                               name: {type: string}
                               key: {type: string}
+                      probe:
+                        type: object
+                        description: Per-actor override of the trusted active-probe sidecar.
+                        properties:
+                          enabled: {type: boolean}
+                          image: {type: string}
+                          imagePullPolicy:
+                            type: string
+                            enum: [Always, IfNotPresent, Never]
+                          resources:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
                       labels:
                         type: object
                         additionalProperties: {type: string}

@@ -7,8 +7,10 @@ LABEL org.opencontainers.image.title="Stacks Attacknet run controller" \
 
 WORKDIR /app
 COPY contrib/helm/hacknet/run-operator/controller.mjs /app/contrib/helm/hacknet/run-operator/controller.mjs
+COPY contrib/helm/hacknet/run-operator/probe-client.mjs /app/contrib/helm/hacknet/run-operator/probe-client.mjs
 COPY contrib/attacknet/fault-campaign.mjs /app/contrib/attacknet/fault-campaign.mjs
 COPY contrib/attacknet/campaign-targets.mjs /app/contrib/attacknet/campaign-targets.mjs
+COPY contrib/attacknet/fault-effect-evidence.mjs /app/contrib/attacknet/fault-effect-evidence.mjs
 
 ENV NODE_ENV=production
 USER 65532:65532

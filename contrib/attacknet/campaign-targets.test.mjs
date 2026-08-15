@@ -17,6 +17,7 @@ const pod = ({network = 'attacknet', uid = 'pod-1', ready = true, deleting = fal
   },
   spec: {nodeName: 'worker-1'},
   status: {
+    podIP: '10.244.1.23',
     phase: 'Running',
     conditions: [{type: 'Ready', status: ready ? 'True' : 'False'}],
     containerStatuses: [{name: 'actor', ready, restartCount: 2, image: 'stacks:main', imageID: 'sha256:abc'}],
@@ -26,6 +27,7 @@ const pod = ({network = 'attacknet', uid = 'pod-1', ready = true, deleting = fal
 test('resolves one ready admitted Pod and retains immutable runtime identity', () => {
   const result = resolveCampaignTargets(manifest, evidence, {items: [pod()]});
   assert.equal(result.targets[0].podUid, 'pod-1');
+  assert.equal(result.targets[0].podIP, '10.244.1.23');
   assert.equal(result.targets[0].node, 'worker-1');
   assert.equal(result.targets[0].resolvedImageId, 'sha256:abc');
   assert.equal(result.targets[0].role, 'companion');

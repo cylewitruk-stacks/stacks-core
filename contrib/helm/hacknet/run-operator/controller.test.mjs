@@ -60,9 +60,9 @@ function network() {
     apiVersion: 'testing.stacks.org/v1alpha1', kind: 'StacksNetwork',
     metadata: {name: 'demo', namespace: 'hacknet', uid: uid('demo'), generation: 3, resourceVersion: '1'},
     spec: {actors: [
-      {name: 'miner-1', role: 'miner'},
+      {name: 'miner-1', role: 'miner', ports: [{name: 'p2p', containerPort: 20444}]},
       {name: 'signer-1', role: 'signer', signerIndex: 1, signerWeight: 1},
-      {name: 'signer-node-1', role: 'companion', signerIndex: 1, signerWeight: 1},
+      {name: 'signer-node-1', role: 'companion', signerIndex: 1, signerWeight: 1, ports: [{name: 'p2p', containerPort: 20444}]},
       {name: 'signer-2', role: 'signer', signerIndex: 2, signerWeight: 2},
       {name: 'signer-node-2', role: 'companion', signerIndex: 2, signerWeight: 2},
       {name: 'signer-3', role: 'signer', signerIndex: 3, signerWeight: 3},
@@ -80,8 +80,12 @@ function pod(actor, role) {
     }},
     spec: {nodeName: 'worker-1'},
     status: {
-      phase: 'Running', conditions: [{type: 'Ready', status: 'True'}],
-      containerStatuses: [{name: 'actor', ready: true, image: 'stacks:test', imageID: 'sha256:abc', restartCount: 0}],
+    phase: 'Running', conditions: [{type: 'Ready', status: 'True'}],
+    podIP: '10.244.1.23',
+      containerStatuses: [
+        {name: 'actor', ready: true, image: 'stacks:test', imageID: 'sha256:abc', restartCount: 0},
+        {name: 'attacknet-probe', ready: true, image: 'probe:test', imageID: 'sha256:probe', restartCount: 0},
+      ],
     },
   };
 }
@@ -102,6 +106,21 @@ function campaign({template = false, effect = true} = {}) {
       recoveryAssertions: [{type: 'TargetReady'}],
     },
   };
+}
+
+function networkCampaign() {
+  const value = campaign();
+  value.metadata.name = 'delay-signer';
+  value.metadata.uid = uid('delay-signer');
+  value.spec.fault = {
+    type: 'network', action: 'delay', mode: 'all', duration: '1s',
+    parameters: {
+      delay: {latency: '750ms', correlation: '0', jitter: '0ms'},
+      peerTarget: {actors: ['signer-node-1']},
+    },
+  };
+  value.spec.effectAssertions = [{type: 'NetworkDegraded'}];
+  return value;
 }
 
 function attacknetRun(source, overrides = {}) {
@@ -201,6 +220,68 @@ test('campaign proves admission/injection/recovery but never invents effect evid
   value = await api.get('faultcampaigns', 'kill-signer');
   assert.equal(value.status.phase, 'Inconclusive');
   assert.equal(value.status.reason, 'EffectNotProven');
+});
+
+test('trusted before/during/after probes prove a network effect and its recovery', async () => {
+  const api = new FakeApi();
+  api.put('stacksnetworks', network());
+  api.pods = [pod('signer-1', 'signer')];
+  const value = networkCampaign();
+  api.put('faultcampaigns', value);
+  let calls = 0;
+  const probes = {probe: async (target, request) => {
+    const latency = calls++ === 1 ? 800 : 10;
+    return {observation: {
+      actor: target.actor, probe: 'network', status: 'ok',
+      probeName: `${request.peer}-${request.port}`, peerActor: request.peer,
+      attempts: 5, successes: 5, latencyMsP50: latency, latencyMsP95: latency,
+      protocolErrors: 0, throughputBytesPerSecond: null,
+    }};
+  }};
+  const reconciler = new FaultCampaignReconciler(api, probes);
+
+  let current = await api.get('faultcampaigns', value.metadata.name);
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Admitted');
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  const chaos = await api.get('networkchaos', value.metadata.name, {group: 'chaos-mesh.org'});
+  chaos.status = {conditions: [{type: 'AllInjected', status: 'True'}]};
+  api.put('networkchaos', chaos, 'chaos-mesh.org');
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Active');
+  const recovered = await api.get('networkchaos', value.metadata.name, {group: 'chaos-mesh.org'});
+  recovered.status.conditions.push({type: 'AllRecovered', status: 'True'});
+  api.put('networkchaos', recovered, 'chaos-mesh.org');
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Passed');
+  assert.equal(current.status.effectResults[0].outcome, 'Proven');
+  assert.equal(current.status.recoveryResults[0].outcome, 'Proven');
+});
+
+test('an unready co-located probe cannot supply baseline evidence', async () => {
+  const api = new FakeApi();
+  api.put('stacksnetworks', network());
+  const target = pod('signer-1', 'signer');
+  target.status.containerStatuses.find(item => item.name === 'attacknet-probe').ready = false;
+  // Model the short interval before Kubernetes updates the aggregate Pod Ready
+  // condition. The controller still checks the probe container explicitly.
+  api.pods = [target];
+  const value = networkCampaign();
+  api.put('faultcampaigns', value);
+  let calls = 0;
+  const reconciler = new FaultCampaignReconciler(api, {probe: async () => { calls += 1; }});
+
+  await reconciler.reconcile(await api.get('faultcampaigns', value.metadata.name));
+  const current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Failed');
+  assert.equal(current.status.reason, 'ProbeBaselineUnavailable');
+  assert.equal(calls, 0);
 });
 
 test('AttacknetRun snapshots a referenced template into exactly one owned execution', async () => {

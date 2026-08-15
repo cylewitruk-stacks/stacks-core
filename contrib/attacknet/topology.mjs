@@ -378,7 +378,12 @@ function renderCompose(actors, output, network, filename = 'compose.yaml', confi
   writeFileSync(join(output, filename), `${JSON.stringify(compose, null, 2)}\n`);
 }
 
-export function renderTopology(topology, output, {network = 'attacknet', namespace = 'hacknet-system'} = {}) {
+export function renderTopology(topology, output, {
+  network = 'attacknet',
+  namespace = 'hacknet-system',
+  probes = false,
+  probeImage = 'stacks-hacknet-probe:dev',
+} = {}) {
   mkdirSync(output, {recursive: true});
   const actors = [...infrastructureActors(topology, network), ...topology.actors];
   // activationGate belongs to the backend-neutral run manifest.  The current
@@ -389,7 +394,9 @@ export function renderTopology(topology, output, {network = 'attacknet', namespa
     metadata: {name: network, namespace, labels: {'testing.stacks.org/profile': 'mainnet-legacy-transport'}},
     spec: {
       defaults: {nodeImage: topology.nodeImage, imagePullPolicy: 'IfNotPresent', storage: {enabled: true, size: '2Gi'}},
-      telemetry: {enabled: false}, actors: resourceActors,
+      telemetry: {enabled: false},
+      probe: {enabled: probes, image: probeImage, imagePullPolicy: 'IfNotPresent'},
+      actors: resourceActors,
     },
   };
   // During initial IBD a node emits historical burn-block notifications.  A
@@ -451,6 +458,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     actorImages: repeatedMapOption('actor-image'),
   });
   const output = resolve(option('output', join(ROOT, 'generated')));
-  renderTopology(topology, output, {network: option('network', 'attacknet'), namespace: option('namespace', 'hacknet-system')});
+  const probeEnabled = option('probes', 'false');
+  if (!['true', 'false'].includes(probeEnabled)) throw new Error('probes must be true or false');
+  renderTopology(topology, output, {
+    network: option('network', 'attacknet'),
+    namespace: option('namespace', 'hacknet-system'),
+    probes: probeEnabled === 'true',
+    probeImage: option('probe-image', 'stacks-hacknet-probe:dev'),
+  });
   console.log(`Rendered ${topology.actors.length + 3} workloads to ${output}`);
 }

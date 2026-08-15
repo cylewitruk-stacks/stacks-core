@@ -212,6 +212,37 @@ collector/federation responsibilities. The initial sidecar establishes the Pod
 organization and export path without silently duplicating the evolving schema
 inside the operator.
 
+## Trusted active-probe sidecars
+
+`spec.probe.enabled` is false by default. When enabled, every actor Pod gets a
+credential-free `attacknet-probe` sidecar on Pod port `18080`; that port is
+intentionally absent from the actor's Service. The operator, rather than the
+actor, supplies an allowlist of enrolled actor FQDNs and named service ports.
+The bounded `POST /v1/probe` API can sample TCP reachability/latency, a selected
+DNS name plus a fixed cluster control, confined I/O under a private directory
+on the actor data volume, and wall plus monotonic clocks. `GET /healthz` is the
+only other endpoint. There is no shell or arbitrary hostname/path operation.
+
+The probe mounts the data volume at the actor's configured storage path so an
+IOChaos path can cover both containers. Enabling it adds a default `fsGroup`
+only when the actor did not supply one, allowing the non-root probe to create
+its private directory. Evidence consumers must fetch the response themselves;
+actor logs and actor-provided payloads are not authoritative probe results.
+
+This is process-independent evidence, not a cryptographic process attestation.
+Containers in one Pod share a network namespace, so a deliberately modified
+actor could try to occupy port `18080` while the probe is absent or restarting.
+The run controller therefore admits only an exact Ready Pod UID whose
+`attacknet-probe` container is independently Ready, and a probe outage or
+identity mismatch makes the result inconclusive. A future threat model that
+requires proof against that narrow same-Pod impersonation race must add a
+per-Pod probe signing key (mounted only into the probe) and verify signatures in
+the run controller; the current credential-free contract deliberately does not
+claim that stronger property.
+
+The topology renderer accepts `--probes=true` and `--probe-image=...`. The
+local build helper produces `stacks-hacknet-probe:dev`.
+
 ## Status and suspension
 
 The controller reports `Pending`, `Progressing`, `Ready`, `Degraded`, or

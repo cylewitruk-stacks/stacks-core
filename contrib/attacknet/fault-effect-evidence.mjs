@@ -308,7 +308,7 @@ function normalizeResolvedTargets(value, selectedActors) {
   }
   const targets = resolved.targets.map((target, index) => {
     object(target, `resolvedTargets.targets[${index}]`);
-    exactFields(target, new Set(['actor', 'role', 'pod', 'podUid', 'node', 'requestedImage', 'resolvedImageId', 'restartCount']), `resolvedTargets.targets[${index}]`);
+    exactFields(target, new Set(['actor', 'role', 'pod', 'podUid', 'podIP', 'node', 'requestedImage', 'resolvedImageId', 'restartCount']), `resolvedTargets.targets[${index}]`);
     const actor = string(target.actor, `resolvedTargets.targets[${index}].actor`, 253);
     const restartCount = number(target.restartCount, `resolvedTargets.targets[${index}].restartCount`, {min: 0, max: 1e9, integer: true});
     if (target.requestedImage !== null) string(target.requestedImage, `resolvedTargets.targets[${index}].requestedImage`, 4096);
@@ -318,6 +318,7 @@ function normalizeResolvedTargets(value, selectedActors) {
       role: string(target.role, `resolvedTargets.targets[${index}].role`, 63),
       pod: string(target.pod, `resolvedTargets.targets[${index}].pod`, 253),
       podUid: string(target.podUid, `resolvedTargets.targets[${index}].podUid`, 253),
+      ...(target.podIP === undefined ? {} : {podIP: string(target.podIP, `resolvedTargets.targets[${index}].podIP`, 64)}),
       node: string(target.node, `resolvedTargets.targets[${index}].node`, 253),
       requestedImage: target.requestedImage,
       resolvedImageId: target.resolvedImageId,

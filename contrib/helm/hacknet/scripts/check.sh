@@ -7,7 +7,10 @@ python3 -m py_compile "${chart_dir}/operator/controller.py"
 python3 -m unittest discover -s "${chart_dir}/operator" -p 'test_*.py' -v
 node --check "${chart_dir}/run-operator/controller.mjs"
 node --test "${chart_dir}/run-operator/controller.test.mjs"
+node --test "${chart_dir}/run-operator/probe-client.test.mjs"
 node --test "${chart_dir}/crds/attacknet-crds.test.mjs"
+node --check "${chart_dir}/../../attacknet/probe/probe.mjs"
+node --test "${chart_dir}/../../attacknet/probe/probe.test.mjs"
 
 helm_bin="${HELM_BIN:-helm}"
 if command -v "${helm_bin}" >/dev/null 2>&1; then

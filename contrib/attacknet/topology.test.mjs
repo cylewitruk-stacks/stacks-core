@@ -24,6 +24,20 @@ test('full topology is 28 protocol actors plus three bootstrap workloads', () =>
   assert.deepEqual(manifest.counts, {miners: 3, signers: 10, followers: 5});
 });
 
+test('trusted probes are default-off and explicitly parameterized for Kubernetes', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-probes-'));
+  const disabled = renderTopology(buildTopology(), output).resource;
+  assert.deepEqual(disabled.spec.probe, {
+    enabled: false, image: 'stacks-hacknet-probe:dev', imagePullPolicy: 'IfNotPresent',
+  });
+  const enabled = renderTopology(buildTopology(), output, {
+    probes: true, probeImage: 'registry.local/attacknet-probe:sha-123',
+  }).resource;
+  assert.deepEqual(enabled.spec.probe, {
+    enabled: true, image: 'registry.local/attacknet-probe:sha-123', imagePullPolicy: 'IfNotPresent',
+  });
+});
+
 test('admitted topology carries authoritative signer ownership and weight', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-signer-weights-'));
   const {resource, manifest} = renderTopology(buildTopology({signerCount: 4}), output);
@@ -147,7 +161,11 @@ test('manifest exposes deterministic protocol phase barriers', () => {
   });
 });
 
-test('Compose and Kubernetes renderers contain the same workload names', () => {
+test('Compose and Kubernetes renderers preserve workload identity, commands, dependencies, and config', () => {
+  const composeExpand = value => value
+    .replaceAll('${NETWORK}', 'attacknet')
+    .replaceAll('${NAMESPACE}', 'compose')
+    .replaceAll(/\$\{SERVICE:([a-z][-a-z0-9]*[a-z0-9])\}/g, '$1');
   const output = mkdtempSync(join(tmpdir(), 'attacknet-parity-'));
   const {resource} = renderTopology(
     buildTopology({minerCount: 2, signerCount: 3, followerCount: 2}),
@@ -158,6 +176,32 @@ test('Compose and Kubernetes renderers contain the same workload names', () => {
     Object.keys(compose.services).sort(),
     resource.spec.actors.map(actor => actor.name).sort(),
   );
+  for (const actor of resource.spec.actors) {
+    const service = compose.services[actor.name];
+    assert.equal(service.image, actor.image, `${actor.name} image`);
+    assert.deepEqual(service.entrypoint, actor.command, `${actor.name} command`);
+    assert.deepEqual(service.command, actor.args, `${actor.name} args`);
+    assert.deepEqual(
+      service.environment,
+      Object.fromEntries((actor.env ?? []).map(item => [item.name, composeExpand(item.value)])),
+      `${actor.name} environment`,
+    );
+    assert.deepEqual(
+      Object.keys(service.depends_on ?? {}).sort(),
+      (actor.dependencies ?? []).map(item => item.actor).sort(),
+      `${actor.name} dependencies`,
+    );
+    for (const [filename, source] of Object.entries(actor.config?.files ?? {})) {
+      const mount = service.volumes.find(item => item.includes(`/${actor.name}/${filename}:`));
+      assert.ok(mount, `${actor.name} ${filename} mount`);
+      const rendered = readFileSync(join(output, mount.split(':')[0]), 'utf8');
+      const expected = composeExpand(source);
+      assert.equal(rendered, expected, `${actor.name} ${filename} contents`);
+    }
+    if (actor.storage?.enabled) {
+      assert.ok(service.volumes.includes(`${actor.name}-data:${actor.storage.mountPath}`));
+    }
+  }
 });
 
 test('invalid counts fail before rendering', () => {

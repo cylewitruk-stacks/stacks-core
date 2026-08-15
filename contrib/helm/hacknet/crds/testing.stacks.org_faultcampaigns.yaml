@@ -271,11 +271,12 @@
                   }}
                 }},
                 "resolvedTargetCount": {"type": "integer", "minimum": 0, "maximum": 100},
-                "resolvedTargets": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["actor", "role", "pod", "podUid", "node", "restartCount"], "properties": {
+                "resolvedTargets": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["actor", "role", "pod", "podUid", "podIP", "node", "restartCount"], "properties": {
                   "actor": {"type": "string", "maxLength": 40},
                   "role": {"type": "string", "maxLength": 32},
                   "pod": {"type": "string", "maxLength": 253},
                   "podUid": {"type": "string", "minLength": 1, "maxLength": 128},
+                  "podIP": {"type": "string", "minLength": 2, "maxLength": 64},
                   "node": {"type": "string", "maxLength": 253},
                   "requestedImage": {"type": "string", "nullable": true, "maxLength": 2048},
                   "resolvedImageId": {"type": "string", "nullable": true, "maxLength": 4096},
@@ -293,11 +294,16 @@
                   "chaosResourceVersion": {"type": "string", "maxLength": 128},
                   "records": {"nullable": true, "x-kubernetes-preserve-unknown-fields": true}
                 }},
-                "effectResults": {"type": "array", "maxItems": 16, "items": {"type": "object", "required": ["outcome"], "properties": {
-                  "assertion": {"type": "string", "maxLength": 63}, "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]}, "actor": {"type": "string", "maxLength": 40}, "podUid": {"type": "string", "maxLength": 128}, "observedAt": {"type": "string", "format": "date-time"}, "observedValue": {"type": "number"}, "message": {"type": "string", "maxLength": 2048}
+                "probeArtifacts": {"type": "object", "properties": {
+                  "beforeJson": {"type": "string", "maxLength": 131072},
+                  "duringJson": {"type": "string", "maxLength": 131072},
+                  "afterJson": {"type": "string", "maxLength": 131072}
+                }},
+                "effectResults": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["outcome"], "properties": {
+                  "assertion": {"type": "string", "maxLength": 63}, "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]}, "actor": {"type": "string", "maxLength": 63}, "podUid": {"type": "string", "maxLength": 128}, "observedAt": {"type": "string", "format": "date-time"}, "observedValue": {"type": "number"}, "message": {"type": "string", "maxLength": 2048}
                 }}},
                 "recoveryResults": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["assertion", "outcome", "actor", "podUid", "observedAt"], "properties": {
-                  "assertion": {"type": "string", "maxLength": 63}, "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]}, "actor": {"type": "string", "maxLength": 40}, "podUid": {"type": "string", "maxLength": 128}, "observedAt": {"type": "string", "format": "date-time"}, "observedValue": {"type": "number"}, "message": {"type": "string", "maxLength": 2048}
+                  "assertion": {"type": "string", "maxLength": 63}, "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]}, "actor": {"type": "string", "maxLength": 63}, "podUid": {"type": "string", "maxLength": 128}, "observedAt": {"type": "string", "format": "date-time"}, "observedValue": {"type": "number"}, "message": {"type": "string", "maxLength": 2048}
                 }}},
                 "cleanup": {"type": "object", "required": ["absent", "allRecovered", "observedAt"], "properties": {
                   "absent": {"type": "boolean"}, "allRecovered": {"type": "boolean"}, "observedAt": {"type": "string", "format": "date-time"}

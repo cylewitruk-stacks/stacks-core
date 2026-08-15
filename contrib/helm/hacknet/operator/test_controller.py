@@ -1,4 +1,5 @@
 import copy
+import json
 import pathlib
 import sys
 import tempfile
@@ -136,6 +137,41 @@ class ResourceBuilderTests(unittest.TestCase):
         owner = miner["metadata"]["ownerReferences"][0]
         self.assertTrue(owner["controller"])
         self.assertNotIn("blockOwnerDeletion", owner)
+
+    def test_trusted_probe_is_default_off_and_can_be_enabled_without_service_exposure(self):
+        fixture = network_fixture()
+        disabled = controller.build_resources(fixture)
+        self.assertNotIn(
+            "attacknet-probe",
+            [container["name"] for container in disabled["statefulsets"][0]["spec"]["template"]["spec"]["containers"]],
+        )
+
+        fixture["spec"]["probe"] = {
+            "enabled": True,
+            "image": "stacks-hacknet-probe:test",
+            "imagePullPolicy": "Never",
+        }
+        resources = controller.build_resources(fixture)
+        miner = resources["statefulsets"][0]["spec"]["template"]["spec"]
+        probe = next(item for item in miner["containers"] if item["name"] == "attacknet-probe")
+        self.assertEqual(probe["image"], "stacks-hacknet-probe:test")
+        self.assertEqual(probe["ports"], [{"name": "probe", "containerPort": 18080, "protocol": "TCP"}])
+        self.assertEqual(probe["volumeMounts"], [{"name": "data", "mountPath": "/data"}])
+        self.assertEqual(next(item["value"] for item in probe["env"] if item["name"] == "PROBE_DATA_ROOT"), "/data")
+        peer_map = json.loads(next(item["value"] for item in probe["env"] if item["name"] == "PROBE_PEERS_JSON"))
+        self.assertEqual(peer_map["companion-1"]["host"], "demo-companion-1.hacknet.svc.cluster.local")
+        self.assertEqual(peer_map["companion-1"]["ports"]["rpc"], 20443)
+        self.assertFalse(miner["automountServiceAccountToken"])
+        self.assertEqual(miner["securityContext"]["fsGroup"], 65532)
+        self.assertTrue(probe["securityContext"]["runAsNonRoot"])
+        self.assertNotIn("valueFrom", " ".join(str(item) for item in probe["env"]))
+        # The container port is Pod-local evidence plumbing, never a Service endpoint.
+        miner_service_ports = {item["name"] for item in resources["services"][0]["spec"]["ports"]}
+        self.assertNotIn("probe", miner_service_ports)
+
+        fixture["spec"]["actors"][0]["probe"] = {"enabled": False}
+        overridden = controller.build_resources(fixture)["statefulsets"][0]["spec"]["template"]["spec"]
+        self.assertNotIn("attacknet-probe", [item["name"] for item in overridden["containers"]])
 
     def test_secret_config_is_mounted_without_operator_read_access(self):
         fixture = network_fixture()

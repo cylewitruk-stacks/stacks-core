@@ -96,6 +96,45 @@ node contrib/attacknet/topology.mjs \
   --output=contrib/attacknet/generated/mixed
 ```
 
+For a bounded, reviewable current/old/modified matrix, describe the complete
+actor inventory, profiles, and ordered phases in the
+[`version-matrix.schema.json`](version-matrix.schema.json) format. Compile a
+planning artifact offline with:
+
+```bash
+node contrib/attacknet/version-matrix.mjs \
+  contrib/attacknet/examples/version-matrix.plan.json \
+  --output=contrib/attacknet/generated/version-matrix.json
+```
+
+Each compiled phase contains `actorImages` and the corresponding
+`topologyArguments` (`--actor-image=ACTOR=IMAGE`) accepted by this renderer.
+Source resolution never contacts a registry or remote Git server: `current`
+resolves the local `HEAD` and worktree state, `releasedGitRef` resolves an
+already-present ref to its commit, and `localModified` additionally records a
+change ID, binary-diff/untracked-file state digest, and Dockerfile digest.
+
+Planning mode deliberately permits mutable tags and incomplete build metadata,
+but marks `acceptanceReady: false` and lists every unresolved input. Add
+`--acceptance` for a fail-closed artifact: every actor image must be an OCI
+digest reference; prebuilt images must carry an immutable provenance
+attestation; and locally-built images must name digest-pinned builder and
+runtime images plus cargo-chef recipe, build-invocation, and attestation
+digests/references. The existing attacknet Dockerfile supplies the shared
+`cargo-chef` dependency layer and sets `CARGO_INCREMENTAL=0`; do not fork a
+second build recipe per version. Builds should use isolated BuildKit cache
+namespaces keyed by Rust/Cargo.lock and target platform, then record their
+resulting digest and attestation back into the matrix.
+
+On Apple Silicon, native `linux/arm64` is the default. An amd64-only historical
+image is admissible only when its profile explicitly says
+`execution: emulated` and `executionPlatform: linux/amd64`. This makes the
+performance and timing caveat visible in evidence instead of silently relying
+on Docker Desktop emulation. Compatibility fields and phase hypotheses are
+claims to test, not proof: live image builds, Kubernetes admission, mixed-version
+protocol behavior, and upgrade/missed-upgrade outcomes remain pending until a
+run descriptor captures the admitted image IDs and behavioral assertions.
+
 The full protocol topology has 28 actors (3 miners, 10 signer/companion pairs,
 and 5 followers) plus Bitcoin, the burnchain clock, and the stacker bootstrap:
 

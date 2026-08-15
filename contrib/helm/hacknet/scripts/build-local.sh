@@ -12,6 +12,10 @@ docker build \
   --file "${repo_root}/contrib/helm/hacknet/run-operator/Dockerfile" \
   "${repo_root}"
 
+docker build \
+  --tag stacks-hacknet-probe:dev \
+  "${repo_root}/contrib/attacknet/probe"
+
 if [[ "${BUILD_STACKS_IMAGE:-0}" == "1" ]]; then
   docker build \
     --tag stacks-core-attacknet:main \

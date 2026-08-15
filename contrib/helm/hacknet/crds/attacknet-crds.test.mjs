@@ -162,7 +162,7 @@ test('FaultCampaign status accepts the bounded controller evidence contract', ()
       minerImpact: {totalCount: 3, affectedCount: 1, percent: 33.333},
     },
     resolvedTargets: [{
-      actor: 'miner-2', role: 'miner', pod: 'attacknet-miner-2-0', podUid: 'pod-uid',
+      actor: 'miner-2', role: 'miner', pod: 'attacknet-miner-2-0', podUid: 'pod-uid', podIP: '10.244.1.23',
       node: 'kind-worker', requestedImage: null, resolvedImageId: 'docker://sha256:abc', restartCount: 0,
     }],
     chaos: {kind: 'NetworkChaos', name: 'miner-delay-template', uid: 'chaos-uid', createdAt: '2026-08-15T01:59:05Z'},
