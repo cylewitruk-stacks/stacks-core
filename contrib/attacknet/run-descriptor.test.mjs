@@ -11,6 +11,7 @@ import {
   deriveReplayDescriptor,
   finalizeDescriptor,
   initializeDescriptor,
+  resolveRuntimeInputs,
   seededChoice,
   validateDescriptor,
 } from './run-descriptor.mjs';
@@ -76,6 +77,29 @@ test('the ledger assigns an ordered sequence and rejects backwards occurrence ti
   assert.throws(() => appendEvent(descriptor, {type: 'assertion-result', occurredAt: '2026-08-15T01:00:00Z', payload: {
     assertion: 'late-report', status: 'pass',
   }}), /precedes the prior event/);
+});
+
+test('pre-apply descriptors resolve admitted state and immutable runtime images in a second phase', () => {
+  const {metadata, paths} = fixture();
+  delete metadata.admittedManifestPath;
+  metadata.requestedManifestPath = paths.topology;
+  metadata.images = metadata.images.map(({scope, requestedRef}) => ({scope, requestedRef}));
+  const pending = initializeDescriptor(metadata);
+  assert.equal(pending.inputs.kubernetes.resolution.complete, false);
+  const observedReady = appendEvent(pending, {
+    type: 'assertion-result', occurredAt: '2026-08-15T01:01:00Z',
+    payload: {assertion: 'ready', status: 'pass'},
+  });
+  assert.throws(() => finalizeDescriptor(observedReady, 'passed'), /complete admitted-manifest/);
+  const resolved = resolveRuntimeInputs(pending, {
+    admittedManifestPath: paths.admitted,
+    images: [{
+      scope: 'all-stacks-actors', requestedRef: 'stacks:main',
+      resolvedRef: `stacks@${digest}`, resolvedDigest: digest,
+    }],
+  });
+  assert.equal(resolved.inputs.kubernetes.resolution.complete, true);
+  assert.equal(validateDescriptor(resolved, {verifyFiles: true}), true);
 });
 
 test('finalization enforces assertion outcome and detects descriptor or artifact tampering', () => {

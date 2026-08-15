@@ -58,19 +58,63 @@ test('nodes advertise their runtime container address rather than a DNS socket',
   assert.match(miner.config.files['config.toml'], /data_url = "http:\/\/__NODE_IP__:20443"/);
   assert.match(miner.config.files['config.toml'], /public_ip_address = "__NODE_IP__:20444"/);
   assert.match(miner.config.files['config.toml'], /private_neighbors = true/);
+  assert.match(miner.config.files['config.toml'], /inv_sync_interval = 5/);
+  assert.match(miner.config.files['config.toml'], /download_interval = 1/);
   assert.match(miner.config.files['configure-node.sh'], /hostname -i/);
 });
 
-test('signer starts concurrently with its companion to avoid an event-delivery cycle', () => {
-  const signer = buildTopology().actors.find(actor => actor.name === 'signer-1');
+test('companion waits for the signer event socket without creating a dependency cycle', () => {
+  const actors = buildTopology().actors;
+  const signer = actors.find(actor => actor.name === 'signer-1');
+  const companion = actors.find(actor => actor.name === 'signer-node-1');
   assert.deepEqual(signer.dependencies, []);
+  assert.match(signer.readinessProbe.exec.command[2], /stacks_signer_runloop_ready 1/);
+  assert.match(signer.readinessProbe.exec.command[2],
+    /stacks_signer_registered_for_current_reward_cycle 1/);
   assert.equal(signer.runtimeExposure, 'reachable');
+  assert.deepEqual(
+    companion.dependencies.find(item => item.actor === 'signer-1'),
+    {actor: 'signer-1', port: 30000},
+  );
+});
+
+test('bootstrap suppresses companion observers until signer runloops are initialized', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-observer-bootstrap-'));
+  const {resource, bootstrapResource} = renderTopology(buildTopology({signerCount: 2}), output);
+  for (const name of ['signer-node-1', 'signer-node-2']) {
+    const finalConfig = resource.spec.actors.find(actor => actor.name === name).config.files['config.toml'];
+    const bootstrapConfig = bootstrapResource.spec.actors.find(actor => actor.name === name).config.files['config.toml'];
+    assert.match(finalConfig, /\[\[events_observer\]\]/);
+    assert.doesNotMatch(bootstrapConfig, /\[\[events_observer\]\]/);
+  }
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(output, 'stacksnetwork.bootstrap.json'), 'utf8')),
+    bootstrapResource,
+  );
+  const bootstrapCompose = JSON.parse(readFileSync(join(output, 'compose.bootstrap.yaml'), 'utf8'));
+  assert.doesNotMatch(
+    readFileSync(join(output, bootstrapCompose.services['signer-node-1'].volumes[0].split(':')[0]), 'utf8'),
+    /\[\[events_observer\]\]/,
+  );
 });
 
 test('burnchain cadence is initially paused until the topology is ready', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-paused-clock-'));
   renderTopology(buildTopology(), output);
   assert.match(readFileSync(join(output, 'policy.env'), 'utf8'), /^MODE=pause$/m);
+  assert.match(readFileSync(join(output, 'policy.env'), 'utf8'), /^INTERVAL_SECONDS=60$/m);
+});
+
+test('manifest exposes deterministic protocol phase barriers', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-protocol-phases-'));
+  const {manifest} = renderTopology(buildTopology(), output);
+  assert.deepEqual(manifest.protocol, {
+    burnchainBootstrapHeight: 202,
+    observerEnableHeight: 220,
+    signerRegistrationHeight: 221,
+    nakamotoActivationHeight: 223,
+    steadyBurnIntervalSeconds: 60,
+  });
 });
 
 test('Compose and Kubernetes renderers contain the same workload names', () => {

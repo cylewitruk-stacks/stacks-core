@@ -56,6 +56,7 @@ Create metadata JSON with the fields below, then initialize the ledger:
 
 ```sh
 node contrib/attacknet/run-descriptor.mjs init evidence/run.json --metadata=evidence/run-metadata.json
+node contrib/attacknet/run-descriptor.mjs resolve evidence/run.json --resolution=evidence/resolution.json
 node contrib/attacknet/run-descriptor.mjs append evidence/run.json --event=evidence/next-event.json
 node contrib/attacknet/run-descriptor.mjs finalize evidence/run.json --status=failed
 node contrib/attacknet/run-descriptor.mjs validate evidence/run.json --verify-files
@@ -68,6 +69,14 @@ Events use `fault-decision`, `cadence-transition`, or `assertion-result` as thei
 the contiguous `sequence`. They must be serialized by the run controller and
 supplied in causal order. `recordedAt` defaults to the recorder clock and is kept
 separate from `occurredAt`.
+
+Initialization normally happens before Kubernetes apply. In that mode metadata
+uses `requestedManifestPath`, and image entries contain only `scope` and
+`requestedRef`. After the network is Ready, `resolve` supplies the API-server
+admitted manifest and the `resolvedRef`/`resolvedDigest` observed for every actor
+container. A run cannot finalize as `passed` while this resolution is incomplete;
+failed or aborted bootstrap attempts retain an explicit incomplete-resolution
+record rather than losing their evidence.
 
 `minimize` selects the first failed/errored assertion by default, or the named one
 with `--assertion=ID`. It emits a planned replay containing the original seed and

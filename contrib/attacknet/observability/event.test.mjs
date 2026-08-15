@@ -27,3 +27,12 @@ test('CLI requires identity fields and parses detail JSON', () => {
     '--kind=note', '--network=attacknet', '--run-id=run-1', '--details=[]',
   ]), /JSON object/);
 });
+
+test('oversized composed event IDs are deterministically bounded for idempotency', () => {
+  const oversized = `run-${'r'.repeat(80)}-campaign-${'c'.repeat(80)}-injected`;
+  const first = buildEvent({kind: 'note', network: 'attacknet', runId: 'run-1', eventId: oversized});
+  const second = buildEvent({kind: 'note', network: 'attacknet', runId: 'run-1', eventId: oversized});
+  assert.equal(first.eventId.length, 128);
+  assert.equal(first.eventId, second.eventId);
+  assert.match(first.eventId, /-[0-9a-f]{24}$/);
+});

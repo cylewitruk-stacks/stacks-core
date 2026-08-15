@@ -32,11 +32,15 @@ ALLOWED_KINDS = frozenset(
         "invariant.observed",
         "actor.state",
         "recovery.complete",
+        "incident.opened",
         "note",
     }
 )
 ALLOWED_PHASES = frozenset(
-    {"setup", "baseline", "injecting", "fault-active", "recovering", "verification", "complete"}
+    {
+        "setup", "bootstrap", "baseline", "injecting", "fault-active",
+        "recovering", "verification", "capture", "incident", "teardown", "complete",
+    }
 )
 MAX_BODY_BYTES = 256 * 1024
 MAX_LABEL_LENGTH = 128
@@ -105,9 +109,14 @@ def validate_event(candidate: Any) -> dict[str, Any]:
             raise ValueError("occurredAt must include a timezone")
     kind = event["kind"]
     if kind == "run.started":
-        seed = str(details.get("seed", ""))
-        if not 32 <= len(seed) <= 128 or any(character not in "0123456789abcdefABCDEF" for character in seed):
-            raise ValueError("run.started details.seed must be 32..128 hexadecimal characters")
+        # The canonical run descriptor treats the seed as an opaque string;
+        # decimal, hex, and human-selected reproducibility seeds are all valid.
+        # Keep it bounded because it is projected into attacknet_run_info.
+        _bounded_label(details.get("seed"), "run.started details.seed")
+    if kind == "run.finished":
+        status = details.get("status")
+        if status not in ("passed", "failed", "aborted"):
+            raise ValueError("run.finished details.status must be passed, failed, or aborted")
     if kind == "policy.changed":
         if details.get("mode") not in ("run", "pause"):
             raise ValueError("policy.changed details.mode must be run or pause")
@@ -139,6 +148,10 @@ def validate_event(candidate: Any) -> dict[str, Any]:
             raise ValueError("recovery.complete requires campaign")
         if _finite_number(details.get("durationSeconds"), -1) < 0:
             raise ValueError("recovery.complete details.durationSeconds must be non-negative")
+    if kind == "incident.opened":
+        reason = details.get("reason")
+        if not isinstance(reason, str) or not reason or len(reason) > 2048:
+            raise ValueError("incident.opened details.reason must contain 1..2048 characters")
     return event
 
 

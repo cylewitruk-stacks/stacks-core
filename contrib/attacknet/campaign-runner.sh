@@ -14,7 +14,8 @@ cp "${manifest}" "${destination}/manifest.json"
 
 namespace="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.namespace)' "${resource}")"
 network="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.labels["testing.stacks.org/network"])' "${resource}")"
-kind="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).kind.toLowerCase())' "${resource}")"
+resource_kind="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).kind)' "${resource}")"
+kind="$(printf '%s' "${resource_kind}" | tr '[:upper:]' '[:lower:]')"
 name="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.name)' "${resource}")"
 duration_seconds="$(node -e '
   const fs=require("node:fs");
@@ -24,23 +25,53 @@ duration_seconds="$(node -e '
   console.log(Math.ceil(Number(match[1])*scalar));
 ' "${resource}")"
 selected_actors="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).selectedActors.join(" "))' "${resource}.evidence.json")"
+run_descriptor="$(node "${ATTACKNET_DIR}/run-ledger.mjs" locate \
+  "--target=${manifest}" "--namespace=${namespace}" "--network=${network}" 2>/dev/null || true)"
 run_id="${ATTACKNET_RUN_ID:-}"
+if [ -z "${run_id}" ] && [ -r "${run_descriptor}" ]; then
+  run_id="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).run.id)' "${run_descriptor}")"
+fi
 event_phase=baseline
 injected=false
 cleared=false
 incident_captured=false
 
+ledger_append() {
+  local type="$1" payload="$2"
+  [ -r "${run_descriptor}" ] || return 0
+  node "${ATTACKNET_DIR}/run-ledger.mjs" append "${run_descriptor}" "${type}" "${payload}" >/dev/null
+}
+
+ledger_fault() {
+  local decision="$1" payload
+  payload="$(DECISION="${decision}" CAMPAIGN="${name}" FAULT_KIND="${resource_kind}" \
+    TARGETS="${selected_actors}" RESOURCE="${resource}" node -e '
+      const fs=require("node:fs");
+      console.log(JSON.stringify({
+        campaign:process.env.CAMPAIGN, decision:process.env.DECISION,
+        faultKind:process.env.FAULT_KIND, targets:process.env.TARGETS.split(/\s+/).filter(Boolean),
+        parameters:JSON.parse(fs.readFileSync(process.env.RESOURCE,"utf8")).spec,
+      }));
+    ')"
+  ledger_append fault-decision "${payload}"
+}
+
+ledger_assertion() {
+  local assertion="$1" status="$2" details="${3:-{}}" payload
+  payload="$(ASSERTION="${assertion}" STATUS="${status}" DETAILS="${details}" node -e '
+    console.log(JSON.stringify({assertion:process.env.ASSERTION,status:process.env.STATUS,details:JSON.parse(process.env.DETAILS)}));
+  ')"
+  ledger_append assertion-result "${payload}"
+}
+
 emit_event() {
   local event_kind="$1" phase="$2" actor="$3" details="$4" event_id
   [ -n "${run_id}" ] || return 0
   event_id="${run_id}-${name}-${event_kind//./-}-${actor:-all}"
-  node "${ATTACKNET_DIR}/observability/event.mjs" \
-    "--kind=${event_kind}" "--network=${network}" "--run-id=${run_id}" \
-    "--phase=${phase}" "--event-id=${event_id}" "--campaign=${name}" \
-    "--fault-type=${kind}" "--actor=${actor}" "--details=${details}" \
-    >"${destination}/event.json"
-  KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
-    "${ATTACKNET_DIR}/observability/emit-kubernetes-event.sh" "${destination}/event.json" \
+  KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+    "${ATTACKNET_DIR}/observability/record-event.sh" \
+    "--kind=${event_kind}" "--phase=${phase}" "--event-id=${event_id}" \
+    "--campaign=${name}" "--fault-type=${kind}" "--actor=${actor}" "--details=${details}" \
     >>"${destination}/events-emitted.jsonl"
 }
 
@@ -50,13 +81,12 @@ emit_invariant() {
     console.log(JSON.stringify({name: process.argv[1], passed: process.argv[2] === "true"}));
   ' "${invariant}" "${passed}")"
   if [ -n "${run_id}" ]; then
-    node "${ATTACKNET_DIR}/observability/event.mjs" \
-      --kind=invariant.observed "--network=${network}" "--run-id=${run_id}" \
+    KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+      "${ATTACKNET_DIR}/observability/record-event.sh" \
+      --kind=invariant.observed \
       "--phase=${phase}" "--event-id=${run_id}-${name}-${invariant}-${phase}" \
       "--campaign=${name}" "--outcome=$([ "${passed}" = true ] && echo pass || echo fail)" \
-      "--details=${details}" >"${destination}/event.json"
-    KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
-      "${ATTACKNET_DIR}/observability/emit-kubernetes-event.sh" "${destination}/event.json" \
+      "--details=${details}" \
       >>"${destination}/events-emitted.jsonl"
   fi
 }
@@ -107,6 +137,19 @@ capture_incident() {
 fail_campaign() {
   local reason="$1" status="${2:-1}"
   echo "Campaign failed during ${event_phase}: ${reason}" >&2
+  ledger_assertion "campaign-${name}-${event_phase}" fail \
+    "$(REASON="${reason}" STATUS="${status}" node -e 'console.log(JSON.stringify({reason:process.env.REASON,exitStatus:Number(process.env.STATUS)}))')" || true
+  if [ -r "${run_descriptor}" ]; then
+    node "${ATTACKNET_DIR}/run-ledger.mjs" finalize "${run_descriptor}" failed >/dev/null || true
+    mkdir -p "${destination}/incident"
+    node "${ATTACKNET_DIR}/run-ledger.mjs" export "${run_descriptor}" \
+      "${destination}/incident/run" >/dev/null || true
+    KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+      "${ATTACKNET_DIR}/observability/record-actor-states.sh" incident || true
+    KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+      "${ATTACKNET_DIR}/observability/export-kubernetes-report.sh" \
+      "${destination}/incident/timeline-pre-capture" "${run_id}" >/dev/null || true
+  fi
   capture_incident "${reason}" "${status}"
   exit "${status}"
 }
@@ -123,10 +166,19 @@ trap cleanup EXIT INT TERM
 if ! ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" snapshot \
   >"${destination}/before-verification.json" 2>"${destination}/before-verification.stderr"; then
+  ledger_assertion "campaign-${name}-baseline-health" fail '{"phase":"baseline"}' || true
+  [ ! -s "${destination}/before-verification.json" ] || \
+    KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+      "${ATTACKNET_DIR}/observability/record-verification.sh" \
+      "${destination}/before-verification.json" "campaign-${name}-baseline" baseline || true
   emit_invariant baseline-health false baseline || true
   fail_campaign 'baseline invariant failed before fault injection'
 fi
+ledger_assertion "campaign-${name}-baseline-health" pass '{"phase":"baseline"}'
 emit_invariant baseline-health true baseline
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+  "${ATTACKNET_DIR}/observability/record-verification.sh" \
+  "${destination}/before-verification.json" "campaign-${name}-baseline" baseline
 ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/runtime-backend.sh" describe >"${destination}/before-runtime.json"
 if [ "${kind}" = timechaos ]; then capture_clocks "${destination}/clocks-before.jsonl"; fi
@@ -137,20 +189,25 @@ scheduled_details="$(node -e '
   console.log(JSON.stringify({actors:e.selectedActors,signerImpact:e.signerImpact,safety:e.safety}));
 ' "${resource}.evidence.json")"
 event_phase=injecting
+ledger_fault selected
 emit_event fault.scheduled injecting "" "${scheduled_details}"
 kubectl -n "${namespace}" apply -f "${resource}" >"${destination}/apply.log"
 kubectl -n "${namespace}" wait --for=condition=AllInjected "${kind}/${name}" \
   --timeout="${ATTACKNET_INJECTION_TIMEOUT:-90s}" >"${destination}/injected.log"
 injected=true
+ledger_fault applied
 event_phase=fault-active
 for actor in ${selected_actors}; do
   emit_event fault.injected fault-active "${actor}" '{"injected":true}'
 done
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+  "${ATTACKNET_DIR}/observability/record-actor-states.sh" fault-active
 kubectl -n "${namespace}" get "${kind}/${name}" -o json >"${destination}/during-chaos.json"
 if [ "${kind}" = timechaos ]; then capture_clocks "${destination}/clocks-during.jsonl"; fi
 sleep "$((duration_seconds + ${ATTACKNET_CHAOS_SETTLE_SECONDS:-5}))"
 kubectl -n "${namespace}" get "${kind}/${name}" -o json >"${destination}/after-duration.json" 2>/dev/null || true
 cleanup
+ledger_fault reverted
 trap - EXIT INT TERM
 
 event_phase=recovering
@@ -159,12 +216,23 @@ deadline=$((SECONDS + ${ATTACKNET_RECOVERY_TIMEOUT_SECONDS:-300}))
 until ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" snapshot >"${destination}/after-verification.json" 2>"${destination}/recovery-errors.log"; do
   if [ "${SECONDS}" -ge "${deadline}" ]; then
+    ledger_assertion "campaign-${name}-recovery-health" fail '{"phase":"verification"}' || true
+    [ ! -s "${destination}/after-verification.json" ] || \
+      KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+        "${ATTACKNET_DIR}/observability/record-verification.sh" \
+        "${destination}/after-verification.json" "campaign-${name}-recovery" verification || true
     emit_invariant recovery-health false verification || true
     fail_campaign 'network did not recover before the campaign deadline'
   fi
   sleep 5
 done
+ledger_assertion "campaign-${name}-recovery-health" pass '{"phase":"verification"}'
 emit_invariant recovery-health true verification
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+  "${ATTACKNET_DIR}/observability/record-verification.sh" \
+  "${destination}/after-verification.json" "campaign-${name}-recovery" verification
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+  "${ATTACKNET_DIR}/observability/record-actor-states.sh" verification
 recovery_duration=$(( $(date +%s) - recovery_started ))
 emit_event recovery.complete verification "" "{\"durationSeconds\":${recovery_duration}}"
 if [ "${kind}" = timechaos ]; then capture_clocks "${destination}/clocks-after.jsonl"; fi
@@ -173,10 +241,27 @@ if ! ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${
   ATTACKNET_PROGRESS_WINDOW_SECONDS="${ATTACKNET_POST_CHAOS_PROGRESS_SECONDS:-45}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" progress \
   >"${destination}/post-chaos-progress.json" 2>"${destination}/post-chaos-progress.stderr"; then
+  ledger_assertion "campaign-${name}-post-chaos-progress" fail '{"phase":"verification"}' || true
+  [ ! -s "${destination}/post-chaos-progress.json" ] || \
+    KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+      "${ATTACKNET_DIR}/observability/record-verification.sh" \
+      "${destination}/post-chaos-progress.json" "campaign-${name}-progress" verification || true
   emit_invariant post-chaos-progress false verification || true
   fail_campaign 'post-chaos burnchain and Stacks progress invariant failed'
 fi
+ledger_assertion "campaign-${name}-post-chaos-progress" pass '{"phase":"verification"}'
 emit_invariant post-chaos-progress true verification
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+  "${ATTACKNET_DIR}/observability/record-verification.sh" \
+  "${destination}/post-chaos-progress.json" "campaign-${name}-progress" verification
 ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/runtime-backend.sh" describe >"${destination}/after-runtime.json"
+if [ -r "${run_descriptor}" ]; then
+  node "${ATTACKNET_DIR}/run-ledger.mjs" export "${run_descriptor}" \
+    "${destination}/run" >/dev/null
+fi
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+  "${ATTACKNET_DIR}/observability/export-kubernetes-report.sh" \
+  "${destination}/timeline" "${run_id}" >/dev/null || \
+  echo 'warning: campaign completed but its trusted timeline export failed' >&2
 echo "Campaign evidence: ${destination}"

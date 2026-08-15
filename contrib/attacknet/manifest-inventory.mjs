@@ -4,6 +4,7 @@ import {readFileSync} from 'node:fs';
 
 export function inventory(manifest, group) {
   const actors = manifest.actors ?? [];
+  const workloads = manifest.workloads ?? actors;
   switch (group) {
     case 'actors':
       return actors.map(actor => actor.service);
@@ -17,8 +18,19 @@ export function inventory(manifest, group) {
       return actors.filter(actor => actor.role === 'miner').map(actor => actor.service);
     case 'followers':
       return actors.filter(actor => actor.role === 'follower').map(actor => actor.service);
+    case 'bootstrap-foundation':
+      // These workloads can become Ready before the burnchain advances.  The
+      // cohort deliberately excludes signers (which need PoX/Nakamoto state)
+      // and delayed actors whose activation gate needs later burn heights.
+      return workloads
+        .filter(actor => actor.type !== 'signer' && actor.activationGate === undefined)
+        .map(actor => actor.service);
     case 'bootstrap':
       return actors.filter(actor => actor.activationGate === undefined).map(actor => actor.service);
+    case 'pre-activation-nodes':
+      return actors
+        .filter(actor => actor.type === 'node' && actor.activationGate === undefined)
+        .map(actor => actor.service);
     case 'activation-gated':
       return actors.filter(actor => actor.activationGate !== undefined).map(actor => actor.service);
     default:

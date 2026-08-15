@@ -2,13 +2,53 @@
 set -u
 
 ATTACKNET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-destination="${1:?incident evidence directory required}"
-manifest="${2:?manifest path required}"
-phase="${3:?incident phase required}"
-reason="${4:?incident reason required}"
-namespace="${KUBE_NAMESPACE:-hacknet-system}"
-network="${KUBE_NETWORK:-attacknet}"
-run_id="${ATTACKNET_RUN_ID:-unknown}"
+usage() {
+  echo "usage: $0 DESTINATION MANIFEST PHASE REASON" >&2
+  echo "   or: $0 --destination=PATH --manifest=PATH --phase=NAME --reason=TEXT" >&2
+}
+
+destination= manifest= phase= reason=
+if [[ "${1:-}" == --* ]]; then
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --destination=*) destination="${1#*=}" ;;
+      --manifest=*) manifest="${1#*=}" ;;
+      --phase=*) phase="${1#*=}" ;;
+      --reason=*) reason="${1#*=}" ;;
+      --help) usage; exit 0 ;;
+      *) echo "unknown incident-capture option: $1" >&2; usage; exit 2 ;;
+    esac
+    shift
+  done
+else
+  [ "$#" -eq 4 ] || { usage; exit 2; }
+  destination="$1"
+  manifest="$2"
+  phase="$3"
+  reason="$4"
+fi
+
+[ -n "${destination}" ] && [ -n "${manifest}" ] && [ -n "${phase}" ] && [ -n "${reason}" ] \
+  || { echo 'all incident-capture fields are required' >&2; usage; exit 2; }
+read -r manifest_network manifest_namespace < <(node -e '
+  const fs = require("node:fs");
+  const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  if (!manifest.network || !manifest.namespace) {
+    throw new Error("manifest must define network and namespace");
+  }
+  process.stdout.write(`${manifest.network} ${manifest.namespace}\n`);
+' "${manifest}") || exit 2
+namespace="${KUBE_NAMESPACE:-${manifest_namespace}}"
+network="${KUBE_NETWORK:-${manifest_network}}"
+run_descriptor="$(node "${ATTACKNET_DIR}/run-ledger.mjs" locate \
+  "--target=${manifest}" "--namespace=${namespace}" "--network=${network}" 2>/dev/null || true)"
+run_id="${ATTACKNET_RUN_ID:-}"
+if [ -z "${run_id}" ] && [ -r "${run_descriptor}" ]; then
+  run_id="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).run.id)' "${run_descriptor}")"
+fi
+run_id="${run_id:-unknown}"
+printf 'Capturing incident network=%s namespace=%s phase=%s destination=%s\n' \
+  "${network}" "${namespace}" "${phase}" "${destination}"
 mkdir -p "${destination}"
 
 source "${ATTACKNET_DIR}/runtime-backend.sh"
@@ -26,6 +66,39 @@ capture_error() {
     }));
   ' >>"${errors}"
 }
+
+# Seal and export the causal record before any cleanup or broad evidence probe.
+# A campaign may already have finalized it; direct incident capture must be
+# equally safe and finalize a still-running descriptor as failed.
+if [ -r "${run_descriptor}" ]; then
+  descriptor_status="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).run.status)' "${run_descriptor}")"
+  if [ "${descriptor_status}" = running ]; then
+    incident_assertion="$(REASON="${reason}" PHASE="${phase}" node -e '
+      console.log(JSON.stringify({assertion:`incident-${process.env.PHASE}`,status:"fail",details:{reason:process.env.REASON}}));
+    ')"
+    node "${ATTACKNET_DIR}/run-ledger.mjs" append "${run_descriptor}" assertion-result \
+      "${incident_assertion}" >/dev/null || capture_error run-ledger-append "$?"
+    node "${ATTACKNET_DIR}/run-ledger.mjs" finalize "${run_descriptor}" failed >/dev/null \
+      || capture_error run-ledger-finalize "$?"
+  fi
+  node "${ATTACKNET_DIR}/run-ledger.mjs" export "${run_descriptor}" "${destination}/run" >/dev/null \
+    || capture_error run-ledger-export "$?"
+fi
+if [ "${run_id}" != unknown ]; then
+  incident_details="$(REASON="${reason}" node -e 'console.log(JSON.stringify({reason:process.env.REASON}))')"
+  KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+    "${ATTACKNET_DIR}/observability/record-event.sh" --kind=incident.opened --phase=incident \
+    "--details=${incident_details}" >/dev/null || capture_error incident-event "$?"
+  KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+    "${ATTACKNET_DIR}/observability/record-actor-states.sh" incident \
+    || capture_error incident-actor-states "$?"
+fi
+timeline_run_id="${run_id}"
+[ "${timeline_run_id}" != unknown ] || timeline_run_id=""
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${timeline_run_id}" \
+  "${ATTACKNET_DIR}/observability/export-kubernetes-report.sh" \
+  "${destination}/timeline" "${timeline_run_id}" >/dev/null \
+  || capture_error incident-timeline-export "$?"
 
 SOURCE_REVISION="$(git -C "${ATTACKNET_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)" \
   INCIDENT_PHASE="${phase}" INCIDENT_REASON="${reason}" RUN_ID="${run_id}" \
@@ -77,32 +150,6 @@ for actor in bitcoin bitcoin-miner stacker ${EVIDENCE_ACTORS}; do
   fi
 done
 
-event_pod="$(kubectl -n "${namespace}" get pods \
-  -l "testing.stacks.org/network=${network},app.kubernetes.io/name=attacknet-events" \
-  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-if [ -n "${event_pod}" ]; then
-  if kubectl -n "${namespace}" exec "${event_pod}" -c events -- python3 -c \
-    'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:9464/api/v1/events?after=0&limit=10000", timeout=10).read().decode())' \
-    >"${destination}/trusted-events.json" 2>"${destination}/trusted-events.stderr"; then
-    node -e '
-      const fs = require("node:fs");
-      const page = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      const runId = process.argv[3];
-      for (const event of page.events.filter(event => runId === "unknown" || event.runId === runId)) {
-        process.stdout.write(`${JSON.stringify(event)}\n`);
-      }
-    ' "${destination}/trusted-events.json" "${destination}/trusted-events.jsonl" "${run_id}" \
-      >"${destination}/trusted-events.jsonl"
-    node "${ATTACKNET_DIR}/observability/report.mjs" \
-      "${destination}/trusted-events.jsonl" "${destination}/timeline.html" \
-      || capture_error timeline-report "$?"
-  else
-    capture_error trusted-event-journal "$?"
-  fi
-else
-  capture_error trusted-event-pod-missing 1
-fi
-
 (cd "${destination}" && find . -type f ! -name digests.sha256 -print0 \
   | sort -z | xargs -0 shasum -a 256) >"${destination}/digests.sha256" \
   || capture_error digest-inventory "$?"
@@ -115,6 +162,7 @@ DESTINATION="${destination}" node -e '
     "incident.json", "manifest.json", "actors/runtime.json",
     "kubernetes/stacksnetwork.admitted.json", "kubernetes/pods.admitted.json",
     "burnchain-policy.admitted.json", "chaos-mesh.json", "digests.sha256",
+    "timeline/export.json", "timeline/timeline.jsonl", "timeline/timeline.html",
   ];
   const missing = required.filter(file => !fs.existsSync(path.join(root, file)));
   const captureErrors = fs.readFileSync(path.join(root, "capture-errors.jsonl"), "utf8")

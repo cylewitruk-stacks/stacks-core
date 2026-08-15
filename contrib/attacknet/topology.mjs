@@ -120,6 +120,12 @@ ${mining}
 [connection_options]
 public_ip_address = "__NODE_IP__:20444"
 private_neighbors = true
+# The burnchain is intentionally time-compressed. Keep discovery and block
+# inventory scans proportionally faster than their mainnet defaults while the
+# StackerDB state machine continues to enforce the same authorization rules.
+walk_interval = 5
+inv_sync_interval = 5
+download_interval = 1
 auth_token = "12345"
 ${observer}
 [burnchain]
@@ -167,6 +173,12 @@ function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex
   if (delayedMiner) files['join-after-nakamoto.sh'] = readFileSync(join(ROOT, 'join-after-nakamoto.sh'), 'utf8');
   const dependencies = [{actor: 'bitcoin', port: 18443}, {actor: 'bitcoin-miner', port: 18500}];
   if (name !== 'miner-1') dependencies.push({actor: 'miner-1', port: 20443});
+  // A companion can replay historical burn-block observer events while it
+  // catches up.  Its signer binds the event socket before initializing the
+  // RPC-dependent runloop, so wait for that socket before starting IBD.  The
+  // signer intentionally does not wait for the companion, which keeps this
+  // ordering acyclic.
+  if (role === 'companion') dependencies.push({actor: `signer-${signerIndex}`, port: 30000});
   return {
     name,
     role,
@@ -201,16 +213,24 @@ function signerActor(index, signer, image) {
     image,
     imagePullPolicy: 'IfNotPresent',
     command: ['stacks-signer', 'run', '--config', '/etc/stacks/signer.toml'],
-    // Companion event delivery must be able to reach the signer before the
-    // companion RPC becomes Ready; otherwise their startup dependencies cycle.
-    // The signer node client retries while its companion finishes booting, so
-    // intentionally do not add a readiness/TCP dependency on the companion.
+    // The event receiver binds before the RPC-dependent signer runloop starts.
+    // This readiness check is therefore both meaningful and safe while the
+    // companion waits on it; the signer itself must not wait on the companion.
     runtimeExposure: 'reachable',
     config: {files: {'signer.toml': signerConfig(index, signer)}, key: 'signer.toml', mountPath: '/etc/stacks'},
     env: [env('RUST_LOG', 'info')],
     dependencies: [],
     ports: [{name: 'events', containerPort: 30000}, {name: 'metrics', containerPort: 31000}],
-    readinessProbe: {exec: {command: ['test', '-r', '/proc/1/status']}, periodSeconds: 5},
+    readinessProbe: {
+      exec: {
+        command: [
+          '/bin/sh', '-c',
+          "metrics=$(curl --fail --silent http://127.0.0.1:31000/metrics) && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_runloop_ready 1$' && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_registered_for_current_reward_cycle 1$'",
+        ],
+      },
+      periodSeconds: 2,
+      failureThreshold: 180,
+    },
     storage: {enabled: true, size: '512Mi', mountPath: '/data'},
     resources: {requests: {cpu: '50m', memory: '128Mi'}, limits: {cpu: '2', memory: '2Gi'}},
   };
@@ -298,16 +318,19 @@ function composeHealthcheck(actor) {
   if (actor.name === 'bitcoin-miner') {
     return {test: ['CMD-SHELL', 'curl --fail --silent http://127.0.0.1:18500/ >/dev/null'], interval: '3s', timeout: '2s', retries: 90};
   }
-  if (actor.role === 'signer' || actor.name === 'stacker') {
+  if (actor.role === 'signer') {
+    return {test: ['CMD-SHELL', "curl --fail --silent http://127.0.0.1:31000/metrics | grep -q '^stacks_signer_runloop_ready 1$'"], interval: '2s', timeout: '2s', retries: 180};
+  }
+  if (actor.name === 'stacker') {
     return {test: ['CMD-SHELL', 'test -r /proc/1/status'], interval: '5s', timeout: '2s', retries: 60};
   }
   return {test: ['CMD-SHELL', 'curl --fail --silent http://127.0.0.1:20443/v2/info >/dev/null'], interval: '5s', timeout: '3s', retries: 180};
 }
 
-function renderCompose(actors, output, network) {
+function renderCompose(actors, output, network, filename = 'compose.yaml', configDirectory = 'configs') {
   const services = {};
   const volumes = {};
-  const configsRoot = join(output, 'configs');
+  const configsRoot = join(output, configDirectory);
   mkdirSync(configsRoot, {recursive: true});
   for (const original of actors) {
     const actor = expandCompose(original, network);
@@ -328,7 +351,7 @@ function renderCompose(actors, output, network) {
       mkdirSync(actorDirectory, {recursive: true});
       for (const [filename, contents] of Object.entries(actor.config.files)) {
         writeFileSync(join(actorDirectory, filename), expandCompose(contents, network));
-        mounts.push(`./configs/${actor.name}/${filename}:${actor.config.mountPath}/${filename}:ro`);
+        mounts.push(`./${configDirectory}/${actor.name}/${filename}:${actor.config.mountPath}/${filename}:ro`);
       }
     }
     if (actor.runtimePolicy) mounts.push(`./policy.env:${actor.runtimePolicy.mountPath}/policy.env:ro`);
@@ -341,7 +364,7 @@ function renderCompose(actors, output, network) {
     services[actor.name] = serviceSpec;
   }
   const compose = {name: network, services, volumes};
-  writeFileSync(join(output, 'compose.yaml'), `${JSON.stringify(compose, null, 2)}\n`);
+  writeFileSync(join(output, filename), `${JSON.stringify(compose, null, 2)}\n`);
 }
 
 export function renderTopology(topology, output, {network = 'attacknet', namespace = 'hacknet-system'} = {}) {
@@ -358,6 +381,18 @@ export function renderTopology(topology, output, {network = 'attacknet', namespa
       telemetry: {enabled: false}, actors: resourceActors,
     },
   };
+  // During initial IBD a node emits historical burn-block notifications.  A
+  // signer cannot initialize until its companion RPC is usable, so delivering
+  // those events immediately creates an unavoidable stale in-process backlog.
+  // Bootstrap without companion observers, prove signer runloop initialization,
+  // then roll the companions onto the final observer-enabled configuration.
+  const bootstrapResource = JSON.parse(JSON.stringify(resource));
+  for (const actor of bootstrapResource.spec.actors.filter(actor => actor.role === 'companion')) {
+    actor.config.files['config.toml'] = actor.config.files['config.toml'].replace(
+      /\n\[\[events_observer\]\]\nendpoint = "[^"\n]+"\nevents_keys = \[[^\n]+\]\n/,
+      '\n',
+    );
+  }
   const manifestActor = actor => ({
     service: actor.name,
     type: actor.role === 'signer' ? 'signer' : actor.role === 'burnchain' || actor.role === 'infrastructure' ? 'infrastructure' : 'node',
@@ -373,18 +408,27 @@ export function renderTopology(topology, output, {network = 'attacknet', namespa
   });
   const manifest = {
     schemaVersion: 1, profile: 'mainnet-legacy-transport', network, namespace,
+    protocol: {
+      burnchainBootstrapHeight: 202,
+      observerEnableHeight: 220,
+      signerRegistrationHeight: 221,
+      nakamotoActivationHeight: 223,
+      steadyBurnIntervalSeconds: 60,
+    },
     counts: {miners: topology.minerCount, signers: topology.signerCount, followers: topology.followerCount},
     images: {node: topology.nodeImage, stacker: topology.stackerImage},
     actors: topology.actors.map(manifestActor),
     workloads: actors.map(manifestActor),
   };
-  const policy = {apiVersion: 'v1', kind: 'ConfigMap', metadata: {name: `${network}-burnchain-policy`, namespace}, data: {'policy.env': 'GENERATION=1\nMODE=pause\nINTERVAL_SECONDS=20\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n'}};
+  const policy = {apiVersion: 'v1', kind: 'ConfigMap', metadata: {name: `${network}-burnchain-policy`, namespace}, data: {'policy.env': 'GENERATION=1\nMODE=pause\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n'}};
   writeFileSync(join(output, 'stacksnetwork.json'), `${JSON.stringify(resource, null, 2)}\n`);
+  writeFileSync(join(output, 'stacksnetwork.bootstrap.json'), `${JSON.stringify(bootstrapResource, null, 2)}\n`);
   writeFileSync(join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(join(output, 'burnchain-policy.configmap.json'), `${JSON.stringify(policy, null, 2)}\n`);
   writeFileSync(join(output, 'policy.env'), policy.data['policy.env']);
+  renderCompose(bootstrapResource.spec.actors, output, network, 'compose.bootstrap.yaml', 'configs-bootstrap');
   renderCompose(actors, output, network);
-  return {resource, manifest, policy};
+  return {resource, bootstrapResource, manifest, policy};
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

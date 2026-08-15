@@ -5,3 +5,10 @@ target
 docker/libp2p-poc/generated
 contrib/attacknet/generated
 contrib/attacknet/evidence
+# These trees are not Cargo workspace inputs for the attacknet node/signer
+# image.  Several contain large fuzz corpora or frontend artifacts, and sending
+# them to Docker Desktop consumed over 2 GiB per cold build.
+stacks-signer-bridge
+stacks-network
+contrib/stacks-network-observer
+docker

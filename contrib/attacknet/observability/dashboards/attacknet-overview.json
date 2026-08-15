@@ -87,16 +87,17 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
-      "description": "Authenticated orchestrator fault state and verification status. Actor metrics cannot write these series.",
+      "description": "Authenticated orchestrator fault, verification, and Kubernetes-admitted readiness state. Actor metrics cannot write these series.",
       "fieldConfig": {"defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0, "spanNulls": true}, "mappings": [{"options": {"0": {"color": "green", "text": "clear/pass"}, "1": {"color": "orange", "text": "active"}}, "type": "value"}], "min": 0, "max": 1}, "overrides": []},
       "gridPos": {"h": 9, "w": 12, "x": 12, "y": 4},
       "id": 8,
       "options": {"alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.8, "showValue": "auto", "tooltip": {"mode": "single", "sort": "none"}},
       "targets": [
         {"expr": "attacknet_fault_active{network=\"$network\",actor=~\"$actor\"}", "legendFormat": "fault {{campaign}} / {{actor}}", "refId": "A"},
-        {"expr": "1 - attacknet_invariant_pass{network=\"$network\",actor=~\"$actor\"}", "legendFormat": "failed {{invariant}} / {{actor}}", "refId": "B"}
+        {"expr": "1 - attacknet_invariant_pass{network=\"$network\",actor=~\"$actor\"}", "legendFormat": "failed {{invariant}} / {{actor}}", "refId": "B"},
+        {"expr": "1 - attacknet_actor_ready{network=\"$network\",actor=~\"$actor\"}", "legendFormat": "unready {{actor}}", "refId": "C"}
       ],
-      "title": "Fault and invariant timeline",
+      "title": "Fault, invariant, and runtime timeline",
       "type": "state-timeline"
     },
     {

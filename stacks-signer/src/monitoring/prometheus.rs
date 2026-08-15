@@ -57,6 +57,18 @@ lazy_static! {
         "stacks_signer_current_reward_cycle",
         "The current reward cycle"
     )).unwrap();
+    pub static ref SIGNER_RUNLOOP_READY: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_runloop_ready",
+        "Whether the outer signer runloop has initialized successfully (1) or is still retrying (0)"
+    )).unwrap();
+    pub static ref SIGNER_REGISTERED_CURRENT_REWARD_CYCLE: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_registered_for_current_reward_cycle",
+        "Whether this signer has an active registered signer instance for the current reward cycle"
+    )).unwrap();
+    pub static ref SIGNER_REGISTERED_NEXT_REWARD_CYCLE: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_registered_for_next_reward_cycle",
+        "Whether this signer has an active registered signer instance for the next reward cycle"
+    )).unwrap();
     pub static ref SIGNER_STX_BALANCE: IntGauge = register_int_gauge!(opts!(
         "stacks_signer_stx_balance",
         "The current STX balance of the signer"

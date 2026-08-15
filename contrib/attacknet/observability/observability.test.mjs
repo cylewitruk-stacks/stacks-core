@@ -47,7 +47,12 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
       assert.deepEqual(container.securityContext.capabilities.drop, ['ALL']);
     }
   }
-  assert.equal(resources.get('Secret/attacknet-test-attacknet-event-writer').stringData.token, 'c'.repeat(64));
+  const secretName = 'attacknet-test-attacknet-event-writer';
+  assert.equal(resources.get(`Secret/${secretName}`).stringData.token, 'c'.repeat(64));
+  const deployments = rendered.items.filter(item => item.kind === 'Deployment');
+  const secretConsumers = deployments.filter(deployment =>
+    deployment.spec.template.spec.volumes.some(volume => volume.secret?.secretName === secretName));
+  assert.deepEqual(secretConsumers.map(deployment => deployment.metadata.name), ['attacknet-test-attacknet-events']);
 });
 
 test('render resolves long logical actor names exactly like bounded Kubernetes children', () => {

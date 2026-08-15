@@ -4,13 +4,14 @@ set -euo pipefail
 namespace="${KUBE_NAMESPACE:-hacknet-system}"
 network="${KUBE_NETWORK:-attacknet}"
 event_file="${1:--}"
+kubectl_bin="${ATTACKNET_KUBECTL:-kubectl}"
 
 if [ "${event_file}" != - ] && [ ! -r "${event_file}" ]; then
   echo "event file is not readable: ${event_file}" >&2
   exit 2
 fi
 
-pod="$(kubectl -n "${namespace}" get pods \
+pod="$(${kubectl_bin} -n "${namespace}" get pods \
   -l "testing.stacks.org/network=${network},app.kubernetes.io/name=attacknet-events" \
   --field-selector=status.phase=Running \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
@@ -22,7 +23,7 @@ fi
 # The bearer token never enters an actor Pod, host process arguments, or shell
 # output. The trusted journal reads its projected Secret and posts the
 # orchestrator-supplied event to loopback.
-post=(kubectl -n "${namespace}" exec -i "${pod}" -c events -- python3 -c '
+post=(${kubectl_bin} -n "${namespace}" exec -i "${pod}" -c events -- python3 -c '
 import json, pathlib, sys, urllib.request
 body = sys.stdin.buffer.read()
 json.loads(body)

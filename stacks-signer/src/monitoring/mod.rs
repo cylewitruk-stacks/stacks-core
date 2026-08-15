@@ -72,6 +72,18 @@ pub mod actions {
         CURRENT_REWARD_CYCLE.set(reward_cycle);
     }
 
+    /// Record whether the outer signer runloop has initialized successfully.
+    pub fn update_runloop_ready(ready: bool) {
+        SIGNER_RUNLOOP_READY.set(i64::from(ready));
+    }
+
+    /// Record whether this process can participate in the current and next
+    /// reward cycles. Runloop initialization alone does not imply either.
+    pub fn update_reward_cycle_registration(current: bool, next: bool) {
+        SIGNER_REGISTERED_CURRENT_REWARD_CYCLE.set(i64::from(current));
+        SIGNER_REGISTERED_NEXT_REWARD_CYCLE.set(i64::from(next));
+    }
+
     /// Increment the block validation responses counter
     pub fn increment_block_validation_responses(accepted: bool) {
         let label_value = if accepted { "accepted" } else { "rejected" };
@@ -201,6 +213,12 @@ pub mod actions {
 
     /// Update the current reward cycle
     pub fn update_reward_cycle(_reward_cycle: i64) {}
+
+    /// Record whether the outer signer runloop has initialized successfully.
+    pub fn update_runloop_ready(_ready: bool) {}
+
+    /// No-op reward-cycle registration metrics when Prometheus is disabled.
+    pub fn update_reward_cycle_registration(_current: bool, _next: bool) {}
 
     /// Increment the block validation responses counter
     pub fn increment_block_validation_responses(_accepted: bool) {}

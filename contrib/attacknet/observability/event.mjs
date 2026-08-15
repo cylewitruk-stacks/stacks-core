@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import {createHash} from 'node:crypto';
+
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
   return args.find(argument => argument.startsWith(prefix))?.slice(prefix.length) ?? fallback;
@@ -10,17 +12,25 @@ function required(value, name) {
   return value;
 }
 
+function boundedEventId(value) {
+  if (value === undefined || value === '') return undefined;
+  if (value.length <= 128) return value;
+  const digest = createHash('sha256').update(value).digest('hex').slice(0, 24);
+  return `${value.slice(0, 103)}-${digest}`;
+}
+
 export function buildEvent(values, now = () => new Date().toISOString()) {
+  const normalized = {...values, eventId: boundedEventId(values.eventId)};
   const event = {
-    kind: required(values.kind, 'kind'),
-    network: required(values.network, 'network'),
-    runId: required(values.runId, 'runId'),
-    phase: values.phase ?? 'baseline',
-    occurredAt: values.occurredAt ?? now(),
-    details: values.details ?? {},
+    kind: required(normalized.kind, 'kind'),
+    network: required(normalized.network, 'network'),
+    runId: required(normalized.runId, 'runId'),
+    phase: normalized.phase ?? 'baseline',
+    occurredAt: normalized.occurredAt ?? now(),
+    details: normalized.details ?? {},
   };
   for (const field of ['eventId', 'instructionId', 'campaign', 'actor', 'role', 'faultType', 'outcome']) {
-    if (values[field] !== undefined && values[field] !== '') event[field] = values[field];
+    if (normalized[field] !== undefined && normalized[field] !== '') event[field] = normalized[field];
   }
   return event;
 }

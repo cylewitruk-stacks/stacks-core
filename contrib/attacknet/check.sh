@@ -10,7 +10,11 @@ fi
 REPO_ROOT="$(cd "${ATTACKNET_DIR}/../.." && pwd)"
 
 node --test "${ATTACKNET_DIR}"/*.test.mjs
+node --test "${ATTACKNET_DIR}"/observability/*.test.mjs
 bash -n "${ATTACKNET_DIR}"/*.sh
+bash -n "${ATTACKNET_DIR}"/observability/*.sh
+python3 -m py_compile "${ATTACKNET_DIR}/observability/event_bridge.py"
+python3 -m unittest discover -s "${ATTACKNET_DIR}/observability" -p 'test_*.py'
 
 rendered="$(mktemp -d)"
 trap 'rm -rf "${rendered}"' EXIT

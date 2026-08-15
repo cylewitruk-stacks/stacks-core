@@ -111,13 +111,18 @@ function artifact(path, readFile) {
   return {path: requireString(path, 'artifact path'), digest: sha256File(path, readFile)};
 }
 
-function normalizeImages(images) {
+function normalizeImages(images, {allowUnresolved = false} = {}) {
   const normalized = requireArray(images, 'images').map((image, index) => {
     requireObject(image, `images[${index}]`);
     const scope = requireString(image.scope, `images[${index}].scope`);
     const requestedRef = requireString(image.requestedRef, `images[${index}].requestedRef`);
-    const resolvedRef = requireString(image.resolvedRef, `images[${index}].resolvedRef`);
-    const resolvedDigest = requireString(image.resolvedDigest, `images[${index}].resolvedDigest`);
+    const resolvedRef = image.resolvedRef;
+    const resolvedDigest = image.resolvedDigest;
+    if (allowUnresolved && resolvedRef === undefined && resolvedDigest === undefined) {
+      return {scope, requestedRef};
+    }
+    requireString(resolvedRef, `images[${index}].resolvedRef`);
+    requireString(resolvedDigest, `images[${index}].resolvedDigest`);
     if (!/^sha256:[0-9a-f]{64}$/.test(resolvedDigest)) {
       throw new Error(`images[${index}].resolvedDigest must be a lowercase sha256 digest`);
     }
@@ -131,7 +136,7 @@ function normalizeImages(images) {
     if (scopes.has(image.scope)) throw new Error(`duplicate image scope ${image.scope}`);
     scopes.add(image.scope);
   }
-  if (normalized.length === 0) throw new Error('images must contain at least one resolved image');
+  if (normalized.length === 0) throw new Error('images must contain at least one image');
   return normalized;
 }
 
@@ -177,7 +182,8 @@ export function initializeDescriptor(metadata, options = {}) {
     .map(path => artifact(path, readFile))
     .sort((left, right) => left.path.localeCompare(right.path));
   if (configFiles.length === 0) throw new Error('configPaths must contain at least one rendered configuration');
-  const admittedManifest = artifact(metadata.admittedManifestPath, readFile);
+  const requestedManifestPath = metadata.requestedManifestPath ?? metadata.admittedManifestPath;
+  const requestedManifest = artifact(requestedManifestPath, readFile);
   const createdAt = normalizedTimestamp(metadata.createdAt ?? now(), 'createdAt');
   const descriptor = {
     schemaVersion: RUN_DESCRIPTOR_SCHEMA,
@@ -187,13 +193,50 @@ export function initializeDescriptor(metadata, options = {}) {
     inputs: {
       topology,
       configuration: {files: configFiles, digest: sha256Value(configFiles)},
-      images: normalizeImages(metadata.images),
-      kubernetes: {admittedManifest},
+      images: normalizeImages(metadata.images, {allowUnresolved: true}),
+      kubernetes: {
+        requestedManifest,
+        ...(metadata.admittedManifestPath
+          ? {
+              admittedManifest: artifact(metadata.admittedManifestPath, readFile),
+              resolution: {complete: true, missingImageScopes: []},
+            }
+          : {
+              resolution: {complete: false, missingImageScopes: metadata.images.map(image => image.scope)},
+            }),
+      },
     },
     timeline: [],
     nondeterminism: normalizeNondeterminism(metadata.nondeterminism),
   };
   return seal(descriptor);
+}
+
+export function resolveRuntimeInputs(descriptor, resolution, options = {}) {
+  validateDescriptor(descriptor);
+  if (descriptor.run.status !== 'running') throw new Error(`cannot resolve inputs for a ${descriptor.run.status} run`);
+  requireObject(resolution, 'resolution');
+  const readFile = options.readFile ?? readFileSync;
+  const resolvedByScope = new Map(normalizeImages(resolution.images ?? []).map(image => [image.scope, image]));
+  const images = descriptor.inputs.images.map(image => {
+    const resolved = resolvedByScope.get(image.scope);
+    if (!resolved) return deepCopy(image);
+    if (resolved.requestedRef !== image.requestedRef) {
+      throw new Error(`resolved requestedRef changed for image scope ${image.scope}`);
+    }
+    return resolved;
+  });
+  for (const scope of resolvedByScope.keys()) {
+    if (!descriptor.inputs.images.some(image => image.scope === scope)) {
+      throw new Error(`resolution contains unknown image scope ${scope}`);
+    }
+  }
+  const missingImageScopes = images.filter(image => !image.resolvedDigest).map(image => image.scope);
+  const result = deepCopy(descriptor);
+  result.inputs.images = images;
+  result.inputs.kubernetes.admittedManifest = artifact(resolution.admittedManifestPath, readFile);
+  result.inputs.kubernetes.resolution = {complete: missingImageScopes.length === 0, missingImageScopes};
+  return seal(result);
 }
 
 function normalizeEvent(event, sequence, recordedAt) {
@@ -247,6 +290,9 @@ export function finalizeDescriptor(descriptor, status, options = {}) {
   validateDescriptor(descriptor);
   if (descriptor.run.status !== 'running') throw new Error(`cannot finalize a ${descriptor.run.status} run`);
   if (!new Set(['passed', 'failed', 'aborted']).has(status)) throw new Error('final status must be passed, failed, or aborted');
+  if (status === 'passed' && descriptor.inputs.kubernetes.resolution.complete !== true) {
+    throw new Error('a passed run requires complete admitted-manifest and image resolution');
+  }
   const counts = eventCounts(descriptor.timeline);
   const failed = counts.assertions.fail + counts.assertions.error;
   const evaluated = counts.assertions.pass + failed;
@@ -290,9 +336,24 @@ export function validateDescriptor(descriptor, options = {}) {
   if (configFiles.length === 0) throw new Error('inputs.configuration.files cannot be empty');
   configFiles.forEach((value, index) => validateArtifact(value, `inputs.configuration.files[${index}]`));
   if (descriptor.inputs.configuration.digest !== sha256Value(configFiles)) throw new Error('configuration aggregate digest mismatch');
-  normalizeImages(descriptor.inputs.images);
+  normalizeImages(descriptor.inputs.images, {
+    allowUnresolved: descriptor.run.status !== 'passed' && descriptor.run.status !== 'planned',
+  });
   requireObject(descriptor.inputs.kubernetes, 'inputs.kubernetes');
-  validateArtifact(descriptor.inputs.kubernetes.admittedManifest, 'inputs.kubernetes.admittedManifest');
+  validateArtifact(descriptor.inputs.kubernetes.requestedManifest, 'inputs.kubernetes.requestedManifest');
+  requireObject(descriptor.inputs.kubernetes.resolution, 'inputs.kubernetes.resolution');
+  if (typeof descriptor.inputs.kubernetes.resolution.complete !== 'boolean') {
+    throw new Error('inputs.kubernetes.resolution.complete must be boolean');
+  }
+  requireArray(
+    descriptor.inputs.kubernetes.resolution.missingImageScopes,
+    'inputs.kubernetes.resolution.missingImageScopes',
+  );
+  if (descriptor.inputs.kubernetes.admittedManifest) {
+    validateArtifact(descriptor.inputs.kubernetes.admittedManifest, 'inputs.kubernetes.admittedManifest');
+  } else if (descriptor.inputs.kubernetes.resolution.complete) {
+    throw new Error('complete Kubernetes resolution requires an admitted manifest');
+  }
   normalizeNondeterminism(descriptor.nondeterminism);
   const timeline = requireArray(descriptor.timeline, 'timeline');
   let previousTimestamp = -Infinity;
@@ -304,6 +365,9 @@ export function validateDescriptor(descriptor, options = {}) {
     previousTimestamp = timestamp;
   });
   if (descriptor.run.status === 'planned') {
+    if (descriptor.inputs.kubernetes.resolution.complete !== true) {
+      throw new Error('a replay plan requires completely resolved runtime inputs');
+    }
     requireObject(descriptor.replayPlan, 'replayPlan');
     if (descriptor.timeline.length !== 0) throw new Error('a planned replay cannot contain observed timeline events');
     if (descriptor.replayPlan.strategy !== 'failure-prefix/v1') throw new Error('unsupported replayPlan.strategy');
@@ -352,7 +416,10 @@ export function validateDescriptor(descriptor, options = {}) {
   if (descriptor.integrity.digest !== descriptorDigest(descriptor)) throw new Error('descriptor integrity mismatch');
   if (options.verifyFiles === true) {
     const readFile = options.readFile ?? readFileSync;
-    const artifacts = [descriptor.inputs.topology, ...configFiles, descriptor.inputs.kubernetes.admittedManifest];
+    const artifacts = [descriptor.inputs.topology, ...configFiles, descriptor.inputs.kubernetes.requestedManifest];
+    if (descriptor.inputs.kubernetes.admittedManifest) {
+      artifacts.push(descriptor.inputs.kubernetes.admittedManifest);
+    }
     if (descriptor.source.diff) artifacts.push(descriptor.source.diff);
     for (const item of artifacts) {
       if (sha256File(item.path, readFile) !== item.digest) throw new Error(`artifact digest mismatch: ${item.path}`);
@@ -434,6 +501,20 @@ export function runCli(argv) {
     process.stdout.write(`${descriptor.timeline.at(-1).sequence}\n`);
     return;
   }
+  if (command === 'resolve') {
+    const [path] = args;
+    const resolutionPath = option(args, 'resolution');
+    if (!path || !resolutionPath) {
+      throw new Error('usage: run-descriptor.mjs resolve DESCRIPTOR --resolution=RESOLUTION.json');
+    }
+    const descriptor = resolveRuntimeInputs(
+      readDescriptor(path),
+      JSON.parse(readFileSync(resolutionPath, 'utf8')),
+    );
+    writeDescriptor(path, descriptor);
+    process.stdout.write(`${descriptor.integrity.digest}\n`);
+    return;
+  }
   if (command === 'finalize') {
     const [path] = args;
     const status = option(args, 'status');
@@ -469,7 +550,7 @@ export function runCli(argv) {
     process.stdout.write(`${JSON.stringify(seededChoice(descriptor.randomness.seed, namespace, Number(indexText), choices))}\n`);
     return;
   }
-  throw new Error('commands: init, append, finalize, validate, minimize, choose');
+  throw new Error('commands: init, resolve, append, finalize, validate, minimize, choose');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

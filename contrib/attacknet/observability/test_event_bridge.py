@@ -136,6 +136,46 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(context.exception.code, 400)
         context.exception.close()
 
+    def test_run_seed_matches_the_canonical_opaque_seed_contract(self):
+        event = self.event(
+            eventId="run-decimal-seed",
+            kind="run.started",
+            phase="setup",
+            actor=None,
+            campaign=None,
+            faultType=None,
+            details={"seed": "18446744073709551615"},
+        )
+        status, _, _ = self.request("POST", "/api/v1/events", event)
+        self.assertEqual(status, 201)
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.request("POST", "/api/v1/events", self.event(
+                eventId="run-empty-seed", kind="run.started", phase="setup",
+                actor=None, campaign=None, faultType=None, details={"seed": ""},
+            ))
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_lifecycle_and_incident_events_use_bounded_active_harness_phases(self):
+        lifecycle = self.event(
+            eventId="run-finished", kind="run.finished", phase="teardown",
+            actor=None, campaign=None, faultType=None, outcome="aborted",
+            details={"status": "aborted"},
+        )
+        incident = self.event(
+            eventId="incident", kind="incident.opened", phase="incident",
+            actor=None, campaign=None, faultType=None,
+            details={"reason": "post-chaos progress failed"},
+        )
+        self.assertEqual(self.request("POST", "/api/v1/events", lifecycle)[0], 201)
+        self.assertEqual(self.request("POST", "/api/v1/events", incident)[0], 201)
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.request("POST", "/api/v1/events", self.event(
+                eventId="bad-phase", kind="note", phase="agent-invented", details={},
+            ))
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
     def test_validation_rejects_unbounded_or_unknown_labels(self):
         bad = self.event(kind="totally.unknown")
         with self.assertRaises(urllib.error.HTTPError) as context:

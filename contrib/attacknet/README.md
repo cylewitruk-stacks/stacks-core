@@ -34,9 +34,13 @@ docker build -t stacks-attacknet-stacker:local contrib/attacknet/stacker
 ```
 
 The attacknet image uses upstream's `release-lite` profile and adds only
-`curl`/CA certificates needed by delayed-start and evidence probes. Release
-artifacts retain the repository's fat-LTO profile; iterative experiments do not
-need its single-codegen-unit link cost.
+`curl`/CA certificates needed by delayed-start and evidence probes. It pins
+`cargo-chef` and the Rust toolchain so Cargo metadata changes invalidate a
+separate dependency-cook stage while ordinary source edits reuse the BuildKit
+registry, git, and target caches. Release artifacts retain the repository's
+fat-LTO profile; iterative experiments do not need its single-codegen-unit link
+cost. Record the resolved builder/runtime image digests and recipe digest in
+the run descriptor when comparing builds across machines or CI workers.
 
 Docker Desktop's kind cluster can use images from its local image store with
 `imagePullPolicy: IfNotPresent`. Other kind installations may need
@@ -63,6 +67,23 @@ ATTACKNET_COMPOSE=contrib/attacknet/generated/stage-1/compose.yaml \
   contrib/attacknet/verify.sh \
   contrib/attacknet/generated/stage-1/manifest.json snapshot
 ```
+
+Kubernetes startup is deliberately two-phase. Companion nodes first perform
+IBD from `stacksnetwork.bootstrap.json` without signer event observers. Once
+the pre-activation foundation is Ready, the external clock advances Bitcoin at
+the bootstrap cadence so PoX/Nakamoto state can exist. After
+`stacks_signer_runloop_ready` proves every signer initialized from its live
+companion RPC view, `lifecycle.sh` pauses the clock with a process-level policy
+acknowledgment, applies the final observer-enabled resource, waits for the
+companion rollout, and resumes the requested cadence. This prevents historical
+IBD notifications from being misclassified as live forks without deadlocking
+signer initialization at genesis.
+
+The renderer also emits `compose.bootstrap.yaml`. A Compose runner must follow
+the same two-phase contract—start the bootstrap file, wait for signer runloop
+readiness, then apply `compose.yaml` while preserving node volumes—rather than
+starting the final file cold. The Kubernetes lifecycle is currently the
+canonical automated implementation of this contract.
 
 Use repeatable per-actor image overrides for an upgrade matrix or modified
 adversarial binary:
@@ -119,6 +140,65 @@ followers). Each stage starts from fresh PVCs because increasing the signer
 count changes genesis balances; retaining the earlier chainstate would make the
 capacity comparison invalid. Override `ATTACKNET_CAPACITY_STAGES` for a faster
 smoke or a more gradual profile.
+
+## Dashboards
+
+The attacknet observability renderer provisions an anonymous, read-only
+Grafana instance for each network. Forward the retained network locally (the
+default full-topology name is shown):
+
+```bash
+kubectl -n hacknet-system port-forward \
+  service/attacknet-attacknet-grafana 3000:3000 --address=127.0.0.1
+```
+
+Open <http://127.0.0.1:3000>. Actor metrics are self-reported; campaign and
+assertion timeline events are orchestrator-authenticated so a modified actor
+cannot forge its own recovery.
+
+For a disposable local kind/Docker Desktop cluster, the simplest option is to
+disable Chaos Dashboard authentication and keep it reachable only through a
+loopback port-forward:
+
+```bash
+contrib/attacknet/chaos-dashboard.sh local
+```
+
+Open <http://127.0.0.1:2333>. This patches the admitted Dashboard Deployment,
+so repeat it after reinstalling or upgrading Chaos Mesh. Restore authenticated
+mode with `contrib/attacknet/chaos-dashboard.sh secure`. Do not use the local
+mode for a shared or remotely reachable cluster.
+
+Authenticated cluster-scoped dashboard access remains available as an
+explicit opt-in because it can create and delete any Chaos Mesh experiment in
+the cluster:
+
+```bash
+kubectl apply -f contrib/attacknet/chaos-dashboard-cluster-access.yaml
+kubectl -n chaos-mesh get secret attacknet-chaos-dashboard-token \
+  -o jsonpath='{.data.token}' | base64 --decode
+kubectl -n chaos-mesh port-forward \
+  service/chaos-dashboard 2333:2333 --address=127.0.0.1
+```
+
+Open <http://127.0.0.1:2333>, use any descriptive label in the Name field (it
+is not a Kubernetes object name; for example `local-cluster-manager`), and
+paste the token. The opt-in manifest creates
+a legacy service-account token Secret for local development convenience. It
+does not expire while this cluster and service account exist, but resetting the
+cluster invalidates it. Prefer a bounded projected token when persistence is
+not needed:
+
+```bash
+kubectl -n chaos-mesh create token attacknet-chaos-dashboard --duration=8h
+```
+
+Never mount either credential into an actor Pod. Remove the optional access
+objects with:
+
+```bash
+kubectl delete -f contrib/attacknet/chaos-dashboard-cluster-access.yaml
+```
 
 ## Current milestone
 

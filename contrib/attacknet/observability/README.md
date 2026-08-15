@@ -29,9 +29,10 @@ malicious metrics endpoint cannot trivially exhaust the monitoring plane, and
 actor-supplied sample timestamps are ignored in favour of scrape time.
 
 The journal accepts writes only with a 256-bit bearer token. That token is
-mounted into the event bridge and should be supplied only to the trusted
-campaign runner, cadence controller, and assertion harness; it is never
-mounted into actor Pods. Journal-derived metrics are labelled
+mounted only into the trusted event bridge; campaign, cadence, and assertion
+commands send prepared JSON through `kubectl exec`, and the bridge reads the
+token and posts to its own loopback interface. The credential therefore never
+enters a host process argument, evidence file, or actor Pod. Journal-derived metrics are labelled
 `evidence_source="orchestrator_observed"`. The bridge re-reads its projected
 Secret on every write, so token rotation does not require a restart.
 
@@ -102,7 +103,9 @@ Every event has the following stable envelope:
 `schemaVersion`, `sequence`, and `recordedAt` are assigned by the bridge.
 `eventId` makes retried writes idempotent. Kind and phase are bounded enums and
 all metric-bearing labels are length-limited. Arbitrary detail stays in the
-journal and is never turned into a Prometheus label.
+journal and is never turned into a Prometheus label. Composed event IDs longer
+than the label bound retain a readable prefix plus a deterministic SHA-256
+suffix, preserving idempotency without rejecting legal long campaign names.
 
 Supported kinds are:
 
@@ -112,16 +115,36 @@ Supported kinds are:
 - `invariant.observed`
 - `actor.state`
 - `recovery.complete`
+- `incident.opened`
 - `note`
 
-Emit a prepared JSON event without leaking the token in process arguments:
+Lifecycle phases (`bootstrap`, `capture`, and `teardown`) and campaign phases
+(`injecting`, `fault-active`, `recovering`, `verification`, and `incident`) are
+separate bounded values so the durable timeline shows where an observation was
+made without turning arbitrary strings into metric labels.
+
+For a standalone port-forwarded bridge, emit a prepared JSON event without
+leaking the token in process arguments:
 
 ```bash
 contrib/attacknet/observability/emit-event.sh \
   http://127.0.0.1:9464 /secure/path/event-token event.json
 ```
 
-The intended campaign-runner integration is:
+The active Kubernetes harness uses `record-event.sh`. It fixes network and run
+identity from the trusted orchestration context before processing caller
+fields. `ATTACKNET_RUN_ID` wins when explicitly set; otherwise the helper reads
+`run-id` from the lifecycle-owned `<network>-run-context` ConfigMap. A missing
+identity is an error rather than an unattributed event:
+
+```bash
+KUBE_NETWORK=attacknet \
+  contrib/attacknet/observability/record-event.sh \
+  --kind=note --phase=baseline \
+  '--details={"message":"human annotation"}'
+```
+
+Campaign integration follows these rules:
 
 1. emit `fault.scheduled` after selector compilation, including signer-weight
    impact and the deterministic instruction ID;
@@ -134,11 +157,25 @@ The intended campaign-runner integration is:
 
 The cadence controller emits `policy.changed` after the ConfigMap generation
 is observed by the external Bitcoin clock. Requested policy is insufficient:
-the event must describe applied policy.
+the event describes the applied and process-acknowledged policy. A journal
+failure after the policy mutation warns without encouraging a dangerous retry;
+set `ATTACKNET_EVENT_STRICT=1` when evidence completeness should terminate the
+caller.
+
+`record-verification.sh RESULT SCOPE PHASE` translates backend-neutral
+`verify.sh` JSON into separate bounded observations for burn and Stacks drift,
+canonical-tip agreement, authenticated connectivity, minimum height, and both
+progress dimensions. It deliberately excludes actor rows from Prometheus-bound
+detail while those rows remain in the original evidence file.
+
+`record-actor-states.sh PHASE` reads admitted Pod status with the orchestrator's
+Kubernetes identity and records readiness, restart counts, placement, Pod UID,
+and resolved container image IDs. These observations remain trustworthy even
+when an adversarial actor serves fabricated application metrics.
 
 ## Durable report
 
-With the event service port-forwarded to `9464`:
+With the event service port-forwarded to `9464`, the standalone exporter is:
 
 ```bash
 contrib/attacknet/observability/export-report.sh \
@@ -150,6 +187,20 @@ This paginates the API into `timeline.jsonl`, generates a self-contained
 uses no CDN and inserts event details with `textContent`, so untrusted actor or
 campaign strings cannot inject markup.
 
+The lifecycle and incident paths use the Kubernetes-native equivalent, which
+requires no port-forward and never reads the writer token:
+
+```bash
+KUBE_NETWORK=attacknet \
+  contrib/attacknet/observability/export-kubernetes-report.sh \
+  evidence/run-001/timeline attacknet-run-001
+```
+
+It retains raw API pages, the complete journal JSONL, a run-filtered JSONL,
+HTML/JSON summary, and export metadata. Lifecycle teardown exports this bundle
+before deleting the journal PVC; incident capture does the same while the
+network is deliberately left running.
+
 ## Reproduction and seed
 
 Use the canonical `../run-descriptor.mjs` contract documented in
@@ -159,16 +210,18 @@ digest. The descriptor explicitly discloses distributed nondeterminism and can
 derive an integrity-sealed failure-prefix replay without inventing a second run
 identity.
 
-## Integration limits of this isolated scaffold
+## Integration limits
 
 - Lifecycle renders, applies, and waits for these resources independently of
-  the actor operator.
-- The current campaign runner does not yet emit events. The five integration
-  points above are required before fault/recovery panels can be acceptance
-  evidence rather than empty scaffolding.
-- Kubernetes readiness, restart count, placement, and admitted resource limits
-  must be sampled by a trusted runner and posted as `actor.state`. The bridge
-  intentionally has no service account and cannot inspect the cluster itself.
+  the actor operator. Run identity lives in a control-plane ConfigMap so later
+  orchestration processes share attribution without sharing credentials.
+- Campaign, policy, assertion, recovery, run-boundary, incident, and teardown
+  paths use the trusted writer/export helpers. Event export is evidence; it is
+  not a substitute for the integrity-sealed canonical run descriptor.
+- Kubernetes readiness, restart count, placement, and resolved image state are
+  sampled by the trusted runner as `actor.state`. The bridge intentionally has
+  no service account and cannot inspect the cluster itself; admitted resource
+  limits remain preserved in lifecycle evidence rather than metric labels.
 - Render-time file discovery must be rerun if actors are added or removed.
 - Dashboard queries tolerate metrics absent from older images by rendering an
   empty panel. Mixed-version evidence must record which image supplied each
@@ -180,6 +233,7 @@ identity.
 
 ```bash
 python3 -m unittest discover -s contrib/attacknet/observability -p 'test_*.py'
-node --test contrib/attacknet/observability/observability.test.mjs
+node --test contrib/attacknet/observability/*.test.mjs
 python3 -m py_compile contrib/attacknet/observability/event_bridge.py
+bash -n contrib/attacknet/observability/*.sh
 ```

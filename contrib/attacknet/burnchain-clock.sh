@@ -10,7 +10,7 @@ BTC_CLI=(bitcoin-cli -regtest -rpcconnect="${BITCOIN_RPC_HOST:-bitcoin}" \
   -rpcuser="${BITCOIN_RPC_USER:-devnet}" -rpcpassword="${BITCOIN_RPC_PASSWORD:-devnet}")
 POLICY_FILE="${BURNCHAIN_POLICY_FILE:-/run/hacknet-policy/policy.env}"
 STATUS_FILE="${BURNCHAIN_STATUS_FILE:-/tmp/hacknet-burnchain-clock.env}"
-DEFAULT_INTERVAL_SECONDS="${BURNCHAIN_DEFAULT_INTERVAL_SECONDS:-20}"
+DEFAULT_INTERVAL_SECONDS="${BURNCHAIN_DEFAULT_INTERVAL_SECONDS:-60}"
 MAX_INTERVAL_SECONDS="${BURNCHAIN_MAX_INTERVAL_SECONDS:-3600}"
 running=true
 force_block=false
@@ -24,8 +24,8 @@ log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 write_status() {
   local state="$1" height="${2:-unknown}" detail="${3:-}"
   local tmp="${STATUS_FILE}.tmp"
-  printf 'state=%s\nbitcoin_height=%s\ndetail=%s\nupdated_at=%s\n' \
-    "${state}" "${height}" "${detail}" "$(date +%s)" >"${tmp}"
+  printf 'state=%s\nbitcoin_height=%s\npolicy_generation=%s\ndetail=%s\nupdated_at=%s\n' \
+    "${state}" "${height}" "${applied_generation:-unknown}" "${detail}" "$(date +%s)" >"${tmp}"
   mv "${tmp}" "${STATUS_FILE}"
 }
 
@@ -183,6 +183,15 @@ while [ "${running}" = true ]; do
   force_block=false
   if [ "${burst_remaining}" -gt 0 ]; then
     burst_remaining=$((burst_remaining - 1))
+    # Exact-height bootstrap phases still need wall-clock room for Stacks
+    # transactions, node processing, and signer registration between Bitcoin
+    # blocks. Skip the delay after the final block so the clock acknowledges
+    # the paused barrier promptly.
+    if [ "${burst_remaining}" -gt 0 ]; then
+      delay="${policy_interval}"
+      if [ "${policy_jitter}" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi
+      sleep "${delay}" || true
+    fi
     continue
   fi
   delay="${policy_interval}"

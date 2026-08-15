@@ -72,6 +72,7 @@ evidence_capture_all() {
   local destination="$1"
   local manifest="$2"
   local since="${3:-}"
+  local run_descriptor run_id
   mkdir -p "${destination}"
   evidence_inventory "${manifest}"
   cp "${manifest}" "${destination}/manifest.json"
@@ -81,6 +82,30 @@ evidence_capture_all() {
   evidence_capture_node_info "${destination}/node-info"
   evidence_capture_metrics "${destination}/metrics"
   evidence_capture_logs "${destination}/logs" "${since}"
+  if [ "${ATTACKNET_BACKEND:-compose}" = kubernetes ]; then
+    run_descriptor="$(node "${EVIDENCE_HARNESS_DIR}/run-ledger.mjs" locate \
+      "--target=${manifest}" "--namespace=${KUBE_NAMESPACE:-hacknet-system}" \
+      "--network=${KUBE_NETWORK:-attacknet}" 2>/dev/null || true)"
+    if [ -r "${run_descriptor}" ]; then
+      run_id="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).run.id)' "${run_descriptor}")"
+      node "${EVIDENCE_HARNESS_DIR}/run-ledger.mjs" export "${run_descriptor}" \
+        "${destination}/run" >/dev/null || \
+        printf '{"attacknetCaptureError":true,"probe":"run_ledger_export"}\n' \
+          >"${destination}/run-ledger-error.json"
+      KUBE_NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}" \
+        KUBE_NETWORK="${KUBE_NETWORK:-attacknet}" ATTACKNET_RUN_ID="${run_id}" \
+        "${EVIDENCE_HARNESS_DIR}/observability/record-actor-states.sh" capture || true
+      KUBE_NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}" \
+        KUBE_NETWORK="${KUBE_NETWORK:-attacknet}" ATTACKNET_RUN_ID="${run_id}" \
+        "${EVIDENCE_HARNESS_DIR}/observability/export-kubernetes-report.sh" \
+        "${destination}/timeline" "${run_id}" >/dev/null || \
+        printf '{"attacknetCaptureError":true,"probe":"timeline_export"}\n' \
+          >"${destination}/timeline-export-error.json"
+    else
+      printf '{"attacknetCaptureError":true,"probe":"run_ledger_missing"}\n' \
+        >"${destination}/run-ledger-error.json"
+    fi
+  fi
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
