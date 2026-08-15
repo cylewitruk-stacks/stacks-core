@@ -1229,6 +1229,86 @@ experiments require the apparatus to fail visibly and converge exactly.
   and terminal release. A live campaign must still verify the installed RBAC,
   ConfigMap lifecycle, Chaos effect, and recovery end to end.
 
+## F-064: A fault-induced network outage regressed its campaign to Pending
+
+- Classification: run-controller state-machine liveness defect
+- State: fixed and regression-tested; corrected live rerun pending
+- Evidence: the first controller-owned full-topology campaign injected
+  `PodChaos/pod-failure` into `signer-node-1`. Chaos Mesh reported a successful
+  Apply at `12:49:03Z`, the exact admitted Pod became `Ready=False`, and the
+  aggregate `StacksNetwork` consequently left `Ready`. At `12:49:15Z` the
+  campaign contained an admitted target and live Chaos UID but had regressed
+  from `Active` to `Pending/NetworkNotReady`. After Chaos Mesh successfully
+  recovered the target at `12:49:33Z`, the controller re-entered admission,
+  reused the recovered Chaos object as a new injection, and finally reported
+  `Failed/InjectionTimeout` at `12:51:18Z`.
+- Risk: the expected effect of a valid campaign destroys the controller state
+  needed to observe and clean up that campaign. A run can remain injected,
+  retry a completed fault, emit a false failure, delay the next experiment,
+  and make its forensic timeline disagree with Chaos Mesh's authoritative
+  Apply/Recover record.
+- Remediation: aggregate network readiness now gates only initial admission.
+  Once admitted, a campaign continues against the sealed network UID,
+  generation, compiled digest, target Pod UID, and owned Chaos object even when
+  its requested effect makes actors or the whole network non-Ready. A
+  regression models the network becoming Degraded during an admitted
+  `pod-failure` and proves the campaign advances rather than returning to
+  Pending.
+
+## F-065: AllInjected preceded the observable Pod effect and created a false verdict
+
+- Classification: asynchronous evidence-sampling defect
+- State: fixed and regression-tested; corrected live rerun pending
+- Evidence: the same campaign observed Chaos Mesh `AllInjected=True` and
+  sampled `PodUnavailable=Failed` at `12:49:08Z`. The forensic snapshot seconds
+  later showed the exact admitted Pod UID still present but `Ready=False`,
+  which is precisely the requested and trusted `pod-failure` effect. The early
+  result was never re-evaluated, so the controller's terminal verdict
+  contradicted the later Kubernetes state and Chaos Mesh record.
+- Risk: Kubernetes readiness, restart count, DNS, and network observations are
+  eventually consistent with Chaos controller conditions. Treating the first
+  post-`AllInjected` sample as final can turn a real effect into `Failed` or
+  `Inconclusive`; an agent would then minimize or triage a harness race instead
+  of the network behavior it requested.
+- Remediation: Pod campaigns remain in `Injecting/WaitingForEffectEvidence`
+  after `AllInjected` until the required count of immutable-UID Pod effects is
+  proven or the bounded assertion window ends. The controller retains the
+  first trusted observation, polls again, preserves injection evidence if
+  `AllInjected` later clears, and can proceed directly to recovery when the
+  fault duration ends. Coverage proves an initially Ready Pod produces no
+  verdict, a later `Ready=False` sample proves the effect, and recovery reaches
+  `Passed`.
+
+## F-066: A terminal campaign could release serialization before Chaos deletion settled
+
+- Classification: cleanup and cross-campaign isolation defect
+- State: fixed and regression-tested; corrected live rerun pending
+- Evidence: the failed live campaign recorded
+  `cleanup.absent=false, allRecovered=true`, but its next terminal reconcile
+  released `attacknet-mutation-lease` without rechecking the owned Chaos
+  resource. Kubernetes completed the asynchronous deletion shortly afterward,
+  so this run did not overlap another mutation, but the controller contract
+  permitted that race.
+- Risk: a subsequent campaign or lifecycle mutation could start while the
+  previous Chaos finalizer was still restoring iptables, process, filesystem,
+  or clock state. The next baseline would be contaminated even though the
+  shared lease claimed exclusive ownership.
+- Remediation: terminal reconciliation now repeatedly removes and reads the
+  exact owned Chaos resource, retains the mutation lease while deletion is
+  unsettled, records `cleanup.absent=true` only after a 404, and releases only
+  then. A delayed-deletion test proves the lease survives the first cleanup
+  pass and that neither the resource nor lease remains after confirmed
+  settlement.
+
+The failed live controller run and the network's independent recovery proof
+are retained under
+`contrib/attacknet/evidence/faultcampaign-pod-failure-20260815T124726Z/`.
+Despite the incorrect controller verdict, the full network recovered to one
+canonical cohort and advanced burn `252 -> 253` and Stacks `53 -> 54` during a
+70-second stable window with zero drift and at least 29 live authenticated
+connections per node. This is evidence of Stacks resilience, but it is not an
+accepted `FaultCampaign` proof until the corrected controller rerun passes.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

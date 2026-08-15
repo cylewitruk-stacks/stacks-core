@@ -214,6 +214,48 @@ test('an executable campaign exclusively holds and releases the shared mutation 
   }), null);
 });
 
+test('a terminal campaign retains the mutation lease until owned Chaos is confirmed absent', async () => {
+  const api = new FakeApi();
+  const value = campaign();
+  value.status = {
+    phase: 'Failed', reason: 'InjectionTimeout',
+    cleanup: {absent: false, allRecovered: true, observedAt: '2026-01-01T00:00:00Z'},
+  };
+  api.put('faultcampaigns', value);
+  api.put('configmaps', {
+    apiVersion: 'v1', kind: 'ConfigMap',
+    metadata: {name: 'attacknet-mutation-lease', namespace: 'hacknet', uid: uid('campaign-lease')},
+    data: {
+      network: 'demo', owner: `faultcampaign:${value.metadata.uid}`,
+      purpose: `faultcampaign:${value.metadata.name}`, token: value.metadata.uid,
+    },
+  }, '');
+  api.put('podchaos', {
+    metadata: {name: value.metadata.name, uid: uid('chaos')},
+    status: {conditions: [{type: 'AllRecovered', status: 'True'}]},
+  }, 'chaos-mesh.org');
+  const deleteResource = api.delete.bind(api);
+  let deletionSettled = false;
+  api.delete = async (plural, name, options = {}) => {
+    if (plural === 'podchaos' && !deletionSettled) return {};
+    return deleteResource(plural, name, options);
+  };
+  const reconciler = new FaultCampaignReconciler(api);
+
+  await reconciler.reconcile(value);
+  assert.ok(await api.get('podchaos', value.metadata.name, {group: 'chaos-mesh.org'}));
+  assert.ok(await api.get('configmaps', 'attacknet-mutation-lease', {group: ''}));
+
+  deletionSettled = true;
+  await reconciler.reconcile(await api.get('faultcampaigns', value.metadata.name));
+  const terminal = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(terminal.status.cleanup.absent, true);
+  assert.equal(terminal.status.cleanup.allRecovered, true);
+  assert.equal(await api.get('configmaps', 'attacknet-mutation-lease', {
+    group: '', allow404: true,
+  }), null);
+});
+
 test('a foreign mutation holder keeps a pending campaign inert', async () => {
   const api = new FakeApi();
   api.put('stacksnetworks', network());
@@ -304,9 +346,14 @@ test('campaign proves admission/injection/recovery but never invents effect evid
 
   await reconciler.reconcile(value);
   value = await api.get('faultcampaigns', 'kill-signer');
-  assert.equal(value.status.phase, 'Active');
+  assert.equal(value.status.phase, 'Injecting');
+  assert.equal(value.status.reason, 'WaitingForEffectEvidence');
+  assert.equal(value.status.effectResults[0].outcome, 'Failed');
   const recovered = await api.get('podchaos', 'kill-signer', {group: 'chaos-mesh.org'});
-  recovered.status.conditions.push({type: 'AllRecovered', status: 'True'});
+  recovered.status.conditions = [
+    {type: 'AllInjected', status: 'False'},
+    {type: 'AllRecovered', status: 'True'},
+  ];
   api.put('podchaos', recovered, 'chaos-mesh.org');
 
   await reconciler.reconcile(value);
@@ -317,6 +364,64 @@ test('campaign proves admission/injection/recovery but never invents effect evid
   value = await api.get('faultcampaigns', 'kill-signer');
   assert.equal(value.status.phase, 'Inconclusive');
   assert.equal(value.status.reason, 'EffectNotProven');
+});
+
+test('pod-failure effect polling survives aggregate network unready and proves recovery', async () => {
+  const api = new FakeApi();
+  const admittedNetwork = network();
+  api.put('stacksnetworks', admittedNetwork);
+  const target = pod('signer-1', 'signer');
+  api.pods = [target];
+  const value = campaign();
+  value.spec.fault.action = 'pod-failure';
+  value.spec.effectAssertions = [{type: 'PodUnavailable', actor: 'signer-1'}];
+  api.put('faultcampaigns', value);
+  const reconciler = new FaultCampaignReconciler(api);
+
+  await reconciler.reconcile(value);
+  let current = await api.get('faultcampaigns', value.metadata.name);
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  const chaos = await api.get('podchaos', value.metadata.name, {group: 'chaos-mesh.org'});
+  chaos.status = {conditions: [{type: 'AllInjected', status: 'True'}]};
+  api.put('podchaos', chaos, 'chaos-mesh.org');
+
+  // AllInjected can precede kubelet's Ready=False observation.
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Injecting');
+  assert.equal(current.status.reason, 'WaitingForEffectEvidence');
+
+  // The fault itself makes the aggregate StacksNetwork non-Ready. An admitted
+  // campaign must continue its state machine instead of regressing to Pending.
+  admittedNetwork.status.phase = 'Degraded';
+  api.put('stacksnetworks', admittedNetwork);
+  target.status.conditions.find(item => item.type === 'Ready').status = 'False';
+  target.status.containerStatuses[0].ready = false;
+  api.pods = [target];
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Active');
+  assert.equal(current.status.effectResults[0].outcome, 'Proven');
+
+  const recovered = await api.get('podchaos', value.metadata.name, {group: 'chaos-mesh.org'});
+  recovered.status.conditions = [
+    {type: 'AllInjected', status: 'False'},
+    {type: 'AllRecovered', status: 'True'},
+  ];
+  api.put('podchaos', recovered, 'chaos-mesh.org');
+  admittedNetwork.status.phase = 'Ready';
+  api.put('stacksnetworks', admittedNetwork);
+  target.status.conditions.find(item => item.type === 'Ready').status = 'True';
+  target.status.containerStatuses[0].ready = true;
+  api.pods = [target];
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Recovering');
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Passed');
+  assert.equal(current.status.reason, 'EffectAndRecoveryProven');
 });
 
 test('trusted before/during/after probes prove a network effect and its recovery', async () => {

@@ -597,6 +597,18 @@ export class FaultCampaignReconciler {
       return;
     }
     if (TERMINAL_PHASES.has(campaign.status?.phase)) {
+      const cleanup = await this.removeChaos(campaign);
+      if (!cleanup.absent) return;
+      if (campaign.status?.cleanup?.absent !== true) {
+        await this.patchStatus(campaign, {
+          ...campaign.status,
+          cleanup: {
+            absent: true,
+            allRecovered: campaign.status?.cleanup?.allRecovered ?? cleanup.allRecovered,
+            observedAt: now(),
+          },
+        });
+      }
       await this.releaseMutationLease(campaign);
       return;
     }
@@ -608,14 +620,18 @@ export class FaultCampaignReconciler {
     }
 
     const network = await this.api.get('stacksnetworks', campaign.spec.networkRef);
-    if (network.status?.phase !== 'Ready') {
+    const phase = campaign.status?.phase ?? 'Pending';
+    // A fault is expected to make its target, and therefore possibly the
+    // aggregate StacksNetwork, temporarily non-Ready. Readiness gates admission
+    // only; regressing an admitted execution to Pending loses the state needed
+    // to observe and clean up that very fault.
+    if (phase === 'Pending' && network.status?.phase !== 'Ready') {
       await this.patchStatus(campaign, status(campaign.status, 'Pending', 'NetworkNotReady'));
       return;
     }
     const manifest = networkManifest(network);
     const compiled = compileCampaign(campaignDocument(campaign), manifest);
     const compiledDigest = artifactDigest(compiled.resource);
-    const phase = campaign.status?.phase ?? 'Pending';
     const ownsMutationLease = await this.holdMutationLease(
       campaign, manifest.network, phase === 'Pending',
     );
@@ -688,27 +704,57 @@ export class FaultCampaignReconciler {
       {group: 'chaos-mesh.org', version: 'v1alpha1', allow404: true});
     if (phase === 'Injecting') {
       if (!chaos) throw new Error('Chaos resource disappeared before injection was observed');
-      if (conditionTrue(chaos, 'AllInjected')) {
+      const allInjected = conditionTrue(chaos, 'AllInjected');
+      const injectionObserved = allInjected
+        || campaign.status?.actualInjection?.allInjectedObserved === true;
+      if (injectionObserved) {
         let effectResults = campaign.status?.effectResults ?? [];
         let probeArtifacts = campaign.status?.probeArtifacts ?? {};
+        const injectedAt = campaign.status?.injectedAt ?? now();
+        const actualInjection = {
+          allInjectedObserved: true,
+          chaosResourceVersion: chaos.metadata.resourceVersion,
+          records: chaos.status?.experiment ?? chaos.status?.instances
+            ?? campaign.status?.actualInjection?.records ?? null,
+        };
         if (identity.kind === 'PodChaos') {
           const pods = await this.api.list('pods', {
             group: '', labels: `testing.stacks.org/network=${manifest.network}`,
           });
           effectResults = podEffectResults(campaign, pods);
-        } else {
+          const minimum = minimumAffected(compiled.resource.spec, campaign.status.resolvedTargets.length);
+          if (effectResults.filter(item => item.outcome === 'Proven').length < minimum) {
+            // Chaos Mesh can publish AllInjected before kubelet has propagated
+            // the corresponding Pod readiness/restart observation. Keep the
+            // execution in Injecting and retry the trusted Pod observation;
+            // one early sample must never become the campaign's permanent
+            // verdict.
+            if (!conditionTrue(chaos, 'AllRecovered')
+                && elapsedSeconds(injectedAt) <= assertionTimeout(campaign.spec.effectAssertions, 90)) {
+              await this.patchStatus(campaign, status(campaign.status, 'Injecting', 'WaitingForEffectEvidence', {
+                injectedAt, actualInjection,
+                effectResults,
+              }));
+              return;
+            }
+          }
+        } else if (!conditionTrue(chaos, 'AllRecovered')) {
           const pods = await this.api.list('pods', {
             group: '', labels: `testing.stacks.org/network=${manifest.network}`,
           });
           const during = await this.collectProbePhase(campaign, compiled, network, pods, 'during', true);
           probeArtifacts = {...probeArtifacts, duringJson: JSON.stringify(during)};
         }
+        if (conditionTrue(chaos, 'AllRecovered')) {
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Recovering', 'AllRecoveredObserved', {
+            injectedAt, actualInjection, effectResults, probeArtifacts,
+            cleanup: {...cleanup, observedAt: now()},
+          }));
+          return;
+        }
         await this.patchStatus(campaign, status(campaign.status, 'Active', 'AllInjectedObserved', {
-          injectedAt: now(), actualInjection: {
-            allInjectedObserved: true,
-            chaosResourceVersion: chaos.metadata.resourceVersion,
-            records: chaos.status?.experiment ?? chaos.status?.instances ?? null,
-          },
+          injectedAt, actualInjection,
           effectResults,
           probeArtifacts,
         }));
