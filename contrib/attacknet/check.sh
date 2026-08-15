@@ -2,6 +2,11 @@
 set -euo pipefail
 
 ATTACKNET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if rg -n 'require\(process\.argv' "${ATTACKNET_DIR}" -g '*.sh' -g '*.mjs' -g '*.js'; then
+  echo 'caller-supplied JSON must use fs.readFileSync, not module require()' >&2
+  exit 1
+fi
 REPO_ROOT="$(cd "${ATTACKNET_DIR}/../.." && pwd)"
 
 node --test "${ATTACKNET_DIR}"/*.test.mjs

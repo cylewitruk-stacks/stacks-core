@@ -176,7 +176,7 @@ export function renderObservability(manifest, {eventToken, prometheusImage = 'pr
       'nodes.json': nodeTargets,
       'signers.json': signerTargets,
     }),
-    {apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: {name: names.prometheus, namespace, labels: promLabels}, spec: {accessModes: ['ReadWriteOnce'], resources: {requests: {storage: '10Gi'}}}},
+    {apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: {name: names.prometheus, namespace, labels: promLabels}, spec: {accessModes: ['ReadWriteOnce'], resources: {requests: {storage: '2Gi'}}}},
     {
       apiVersion: 'apps/v1', kind: 'Deployment', metadata: {name: names.prometheus, namespace, labels: promLabels},
       spec: {replicas: 1, selector: {matchLabels: promLabels}, strategy: {type: 'Recreate'}, template: {metadata: {labels: promLabels, annotations: {'testing.stacks.org/config-sha256': digest(promConfig, nodeTargets, signerTargets)}}, spec: {

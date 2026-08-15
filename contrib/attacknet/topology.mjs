@@ -20,7 +20,7 @@ const SIGNERS = Object.freeze([
   ['474747474747474747474747474747474747474747474747474747474747474701', 'ST332XG8HFYG31EBQ2RWZ3R85AQ6VXTGXQHJYH0K5'],
   ['484848484848484848484848484848484848484848484848484848484848484801', 'ST2N5TCTPRMT6EXTFSCPTGBQ0K04B44H79XPH6YXS'],
   ['494949494949494949494949494949494949494949494949494949494949494901', 'ST64T36C5EABZ2T1Y6KWN03RSWAKJK59QHE2D83N'],
-  ['4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a01', 'ST350FBN4H0EKWQCW6BTFK97RGXFS5QJ78E9NST20'],
+  ['4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a01', 'ST3MWT31K0SX74MHJCEWGZY5MR05X61FC5HEVK3W1'],
 ]);
 
 const MINERS = Object.freeze([
@@ -269,7 +269,7 @@ function infrastructureActors(topology, network) {
     },
     {
       name: 'stacker', role: 'infrastructure', image: topology.stackerImage, imagePullPolicy: 'IfNotPresent',
-      env: [env('STACKS_CORE_RPC_HOST', service('miner-1')), env('STACKS_CORE_RPC_PORT', 20443), env('STACKING_KEYS', stackingKeys.join(',')), env('STACKING_CYCLES', 12), env('POX5_STACKING_CYCLES', 96), env('POX5_RENEWAL_WINDOW_CYCLES', 48), env('STACKING_INTERVAL', 2), env('EPOCH_4_FIXTURE_DEPLOY_HEIGHT', 223)],
+      env: [env('STACKS_CORE_RPC_HOST', service('miner-1')), env('STACKS_CORE_RPC_PORT', 20443), env('STACKING_KEYS', stackingKeys.join(',')), env('STACKING_ADDRESSES', topology.signers.map(([, address]) => address).join(',')), env('STACKING_CYCLES', 12), env('POX5_STACKING_CYCLES', 96), env('POX5_RENEWAL_WINDOW_CYCLES', 48), env('STACKING_INTERVAL', 2), env('EPOCH_4_FIXTURE_DEPLOY_HEIGHT', 223)],
       dependencies: [{actor: 'miner-1', port: 20443}],
       readinessProbe: {exec: {command: ['test', '-r', '/proc/1/status']}, periodSeconds: 5},
       storage: {enabled: false}, resources: {requests: {cpu: '50m', memory: '128Mi'}, limits: {cpu: '1', memory: '1Gi'}},

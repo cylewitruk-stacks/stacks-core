@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import {mkdtempSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import test from 'node:test';
 
 import {renderObservability} from './render.mjs';
-import {renderReport} from './report.mjs';
+import {readEvents, renderReport} from './report.mjs';
 
 const manifest = {
   schemaVersion: 1,
@@ -76,4 +79,11 @@ test('standalone report escapes payloads and includes trust-boundary language', 
   assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
   assert.match(html, /orchestrator-observed and bearer-authenticated/);
   assert.match(html, /actor-self-reported/);
+});
+
+test('report reader accepts multi-line JSONL beginning with an object', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'attacknet-report-'));
+  const path = join(directory, 'events.jsonl');
+  writeFileSync(path, '{"sequence":1,"kind":"one"}\n{"sequence":2,"kind":"two"}\n');
+  assert.deepEqual(readEvents(path).map(event => event.kind), ['one', 'two']);
 });

@@ -13,12 +13,12 @@ while true; do
   page=$((page + 1))
   response="${output}/timeline-page-${page}.json"
   curl --fail --silent --show-error "${endpoint%/}/api/v1/events?after=${after}&limit=10000" >"${response}"
-  count="$(node -e 'const p=require(process.argv[1]); console.log(p.events.length)' "${response}")"
+  count="$(node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); console.log(p.events.length)' "${response}")"
   if [ "${count}" -eq 0 ]; then
     break
   fi
-  node -e 'const p=require(process.argv[1]); for (const e of p.events) console.log(JSON.stringify(e))' "${response}" >>"${output}/timeline.jsonl"
-  after="$(node -e 'const p=require(process.argv[1]); console.log(p.events.at(-1).sequence)' "${response}")"
+  node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); for (const e of p.events) console.log(JSON.stringify(e))' "${response}" >>"${output}/timeline.jsonl"
+  after="$(node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); console.log(p.events.at(-1).sequence)' "${response}")"
   if [ "${count}" -lt 10000 ]; then
     break
   fi

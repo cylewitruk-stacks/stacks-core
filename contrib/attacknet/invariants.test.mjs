@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {heightCohort, progress} from './invariants.mjs';
+import {heightCohort, networkCohort, peerConnectivity, progress} from './invariants.mjs';
 
 test('height cohort accepts bounded lag and reports both dimensions', () => {
   const result = heightCohort([
@@ -20,9 +20,31 @@ test('height cohort fails rather than hiding excessive drift', () => {
   ], 2).ok, false);
 });
 
-test('progress requires the configured burn-block delta', () => {
-  assert.equal(progress({burnHeight: 20}, {burnHeight: 22}, 2).ok, true);
-  assert.equal(progress({burnHeight: 20}, {burnHeight: 21}, 2).ok, false);
+const progressSample = height => [{actor: 'miner-1', info: {stacks_tip_height: height}}];
+
+test('progress requires configured burn and Stacks deltas', () => {
+  assert.equal(progress(
+    {burnHeight: 20, cohort: progressSample(5)},
+    {burnHeight: 22, cohort: progressSample(7)},
+    2,
+    2,
+  ).ok, true);
+  assert.equal(progress(
+    {burnHeight: 20, cohort: progressSample(5)},
+    {burnHeight: 21, cohort: progressSample(7)},
+    2,
+    2,
+  ).ok, false);
+});
+
+test('Bitcoin-only movement cannot pass the chain progress invariant', () => {
+  const result = progress(
+    {burnHeight: 230, cohort: progressSample(17)},
+    {burnHeight: 256, cohort: progressSample(17)},
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.burn.delta, 26);
+  assert.equal(result.stacks.delta, 0);
 });
 
 test('height cohort can require actual Stacks progress', () => {
@@ -34,4 +56,47 @@ test('height cohort can require actual Stacks progress', () => {
   const result = heightCohort(samples, 2, 1);
   assert.equal(result.ok, false);
   assert.equal(result.minimumObservedStacksHeight, 0);
+});
+
+test('same-height forks fail even when all height gauges agree', () => {
+  const result = heightCohort([
+    {actor: 'a', info: {burn_block_height: 250, stacks_tip_height: 9, stacks_tip: 'fork-a'}},
+    {actor: 'b', info: {burn_block_height: 250, stacks_tip_height: 9, stacks_tip: 'fork-b'}},
+  ], 0, 1);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.forkedHeights, [{height: 9, tips: ['fork-a', 'fork-b']}]);
+});
+
+test('peer health counts only live authenticated conversations', () => {
+  const healthy = {actor: 'a', neighbors: {
+    bootstrap: [{authenticated: true}], sample: [],
+    inbound: [{authenticated: true}], outbound: [],
+  }};
+  const configuredOnly = {actor: 'b', neighbors: {
+    bootstrap: [{authenticated: true}], sample: [{authenticated: true}], inbound: [], outbound: [],
+  }};
+  assert.equal(peerConnectivity([healthy]).ok, true);
+  const result = peerConnectivity([healthy, configuredOnly]);
+  assert.equal(result.ok, false);
+  assert.equal(result.rows[1].configuredCandidates, 2);
+  assert.equal(result.rows[1].authenticated, 0);
+});
+
+test('a transient unauthenticated handshake is evidence, not a baseline failure', () => {
+  const result = peerConnectivity([{actor: 'a', neighbors: {
+    bootstrap: [], sample: [],
+    inbound: [{authenticated: true}, {authenticated: false}], outbound: [],
+  }}]);
+  assert.equal(result.ok, true);
+  assert.equal(result.minimumAuthenticatedConnections, 1);
+  assert.equal(result.maximumUnauthenticatedConnections, 1);
+});
+
+test('network cohort requires height, tip, and live-peer agreement together', () => {
+  const sample = actor => ({
+    actor,
+    info: {burn_block_height: 250, stacks_tip_height: 9, stacks_tip: 'canonical'},
+    neighbors: {bootstrap: [], sample: [], inbound: [{authenticated: true}], outbound: []},
+  });
+  assert.equal(networkCohort([sample('a'), sample('b')], 0, 1).ok, true);
 });

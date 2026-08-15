@@ -3,14 +3,18 @@
 import {createHash} from 'node:crypto';
 import {readFileSync, writeFileSync} from 'node:fs';
 
-function readEvents(path) {
+export function readEvents(path) {
   const contents = readFileSync(path, 'utf8').trim();
   if (!contents) return [];
-  if (contents.startsWith('{')) {
+  try {
     const parsed = JSON.parse(contents);
     return parsed.events ?? [parsed];
+  } catch (error) {
+    // A JSONL stream naturally starts with "{" too. Fall back only when the
+    // complete document is not JSON, and let a malformed individual line keep
+    // its precise parse failure.
+    return contents.split('\n').filter(Boolean).map(line => JSON.parse(line));
   }
-  return contents.split('\n').filter(Boolean).map(line => JSON.parse(line));
 }
 
 function summarize(events) {

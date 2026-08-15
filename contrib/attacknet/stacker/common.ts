@@ -19,10 +19,24 @@ export function requiredInteger(name: string): number {
 
 const keys = process.env.STACKING_KEYS;
 if (!keys) throw new Error('missing STACKING_KEYS');
+const expectedAddresses = process.env.STACKING_ADDRESSES?.split(',');
+if (!expectedAddresses) throw new Error('missing STACKING_ADDRESSES');
 
-export const accounts = keys.split(',').map((privateKey, index) => {
+const privateKeys = keys.split(',');
+if (privateKeys.length !== expectedAddresses.length) {
+  throw new Error(
+    `STACKING_KEYS has ${privateKeys.length} entries but STACKING_ADDRESSES has ${expectedAddresses.length}`,
+  );
+}
+
+export const accounts = privateKeys.map((privateKey, index) => {
   const publicKey = getPublicKeyFromPrivate(privateKey);
   const address = getAddressFromPrivateKey(privateKey, STACKS_TESTNET);
+  if (address !== expectedAddresses[index]) {
+    throw new Error(
+      `signer ${index} private key derives ${address}, but genesis funds ${expectedAddresses[index]}`,
+    );
+  }
   return {
     index,
     privateKey,

@@ -24,6 +24,22 @@ test('full topology is 28 protocol actors plus three bootstrap workloads', () =>
   assert.deepEqual(manifest.counts, {miners: 3, signers: 10, followers: 5});
 });
 
+test('every stacker key is paired with the same address funded at genesis', () => {
+  const topology = buildTopology({signerCount: 10});
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-address-fixtures-'));
+  const {resource} = renderTopology(topology, output);
+  const stacker = resource.spec.actors.find(actor => actor.name === 'stacker');
+  const expected = stacker.env.find(item => item.name === 'STACKING_ADDRESSES').value.split(',');
+  assert.deepEqual(expected, topology.signers.map(([, address]) => address));
+  // This tenth fixture caused the first full-cluster chain stall. Keep its
+  // independently-derived address explicit so a copied typo cannot regress.
+  assert.equal(expected[9], 'ST3MWT31K0SX74MHJCEWGZY5MR05X61FC5HEVK3W1');
+  for (const actor of topology.actors.filter(actor => actor.role === 'miner')) {
+    const config = actor.config.files['config.toml'];
+    for (const address of expected) assert.match(config, new RegExp(`address = "${address}"`));
+  }
+});
+
 test('mainnet profile contains legacy transport and current-main image only', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-main-profile-'));
   renderTopology(buildTopology(), output);
