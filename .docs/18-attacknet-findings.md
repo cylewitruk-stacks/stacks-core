@@ -1232,7 +1232,7 @@ experiments require the apparatus to fail visibly and converge exactly.
 ## F-064: A fault-induced network outage regressed its campaign to Pending
 
 - Classification: run-controller state-machine liveness defect
-- State: fixed and regression-tested; corrected live rerun pending
+- State: fixed, regression-tested, and proven by corrected live rerun
 - Evidence: the first controller-owned full-topology campaign injected
   `PodChaos/pod-failure` into `signer-node-1`. Chaos Mesh reported a successful
   Apply at `12:49:03Z`, the exact admitted Pod became `Ready=False`, and the
@@ -1258,7 +1258,7 @@ experiments require the apparatus to fail visibly and converge exactly.
 ## F-065: AllInjected preceded the observable Pod effect and created a false verdict
 
 - Classification: asynchronous evidence-sampling defect
-- State: fixed and regression-tested; corrected live rerun pending
+- State: fixed, regression-tested, and proven by corrected live rerun
 - Evidence: the same campaign observed Chaos Mesh `AllInjected=True` and
   sampled `PodUnavailable=Failed` at `12:49:08Z`. The forensic snapshot seconds
   later showed the exact admitted Pod UID still present but `Ready=False`,
@@ -1282,7 +1282,7 @@ experiments require the apparatus to fail visibly and converge exactly.
 ## F-066: A terminal campaign could release serialization before Chaos deletion settled
 
 - Classification: cleanup and cross-campaign isolation defect
-- State: fixed and regression-tested; corrected live rerun pending
+- State: fixed, regression-tested, and proven by corrected live rerun
 - Evidence: the failed live campaign recorded
   `cleanup.absent=false, allRecovered=true`, but its next terminal reconcile
   released `attacknet-mutation-lease` without rechecking the owned Chaos
@@ -1307,7 +1307,1175 @@ Despite the incorrect controller verdict, the full network recovered to one
 canonical cohort and advanced burn `252 -> 253` and Stacks `53 -> 54` during a
 70-second stable window with zero drift and at least 29 live authenticated
 connections per node. This is evidence of Stacks resilience, but it is not an
-accepted `FaultCampaign` proof until the corrected controller rerun passes.
+accepted `FaultCampaign` proof; C-003 records the separate corrected rerun that
+does pass the controller contract.
+
+## C-003: Controller-owned companion outage proved effect, recovery, and serialization
+
+- Classification: clean first-class fault-campaign acceptance evidence
+- Evidence:
+  `contrib/attacknet/evidence/faultcampaign-pod-failure-corrected-20260815T125807Z/`
+  contains the requested resource, clean pre-fault cohort, time-ordered campaign,
+  lease, Chaos, Pod, and network observations, terminal custom-resource status,
+  run-controller metrics/logs, and post-recovery invariant result.
+- Serialization result: before the corrected run, the identical resource was
+  submitted while a host mutation lease remained held for 15 seconds. The
+  controller stayed `Pending/WaitingForMutationLease`, created no Chaos object,
+  and acquired the lease under the immutable campaign UID only after the host
+  released it. During the corrected run the lease remained owned throughout
+  injection and recovery and was absent only after cleanup was confirmed.
+- Effect result: the first post-`AllInjected` observation remained
+  `Injecting/WaitingForEffectEvidence` rather than becoming a verdict. Five
+  seconds later the same admitted Pod UID was `Ready=False`, producing trusted
+  `PodUnavailable=Proven`. The aggregate network simultaneously reported
+  `Progressing 30/31`, while the campaign correctly stayed Active rather than
+  regressing to Pending.
+- Recovery result: Chaos Mesh reported `AllRecovered=True`; the same Pod UID
+  returned Ready; the controller recorded `TargetReady=Proven`,
+  `cleanup.absent=true`, `cleanup.allRecovered=true`, and terminal
+  `Passed/EffectAndRecoveryProven`. All 31 actors returned Ready and the owned
+  Chaos resource and mutation lease were both absent. The subsequent stable
+  window advanced burn `257 -> 259` and the cohort's minimum Stacks height
+  `58 -> 59`; ending drift was one permitted Stacks block with no same-height
+  fork and at least 26 live authenticated connections per node.
+- Boundary: this proves one PodChaos `pod-failure` against a full current-main
+  topology and the corrected first-class controller state machine. Network,
+  DNS, I/O, time, mixed-version, worker/PVC, replay/minimization, and long-soak
+  acceptance remain separate requirements.
+
+## F-067: Non-Pod recovery evidence used a generic assertion name
+
+- Classification: run-controller evidence-contract defect
+- State: fixed and regression-tested; corrected live non-Pod campaigns pending
+- Evidence: the `FaultCampaign` CRD and shipped examples expose the bounded
+  recovery assertions `NetworkRecovered`, `DNSRecovered`, `IORecovered`, and
+  `ClockSkewCleared`. The controller's trusted before/during/after evaluator did
+  compute the corresponding recovery verdict, but labelled every result
+  `TargetReady`. Consequently, a campaign using the documented type-specific
+  assertion could observe a real effect and recovery yet terminate
+  `Inconclusive/EffectNotProven` because its required assertion name could
+  never match. This was found by tracing the complete contract immediately
+  before the first live non-Pod campaign, not by weakening a failed verdict.
+- Correction: recovery results now retain the fault-family-specific assertion
+  name. The reconciliation test uses the documented `NetworkRecovered`
+  requirement and proves both the effect and recovery labels before accepting
+  `Passed/EffectAndRecoveryProven`.
+- Boundary: unit evidence proves the mapping. Each of the four non-Pod fault
+  families still requires live proof of effect and recovery on the probe-enabled
+  network.
+
+## F-068: Probe hardening prevented DNS fault observation
+
+- Classification: data-plane probe/Chaos Mesh compatibility defect
+- State: fixed and regression-tested; corrected live DNS canary pending
+- Evidence: the first controller-owned DNS canary selected both the `actor` and
+  `attacknet-probe` containers in `signer-1`. Chaos Mesh injected and later
+  recovered the actor, but every probe injection attempt failed with
+  `cp: can't create '/etc/resolv.conf.chaos.bak': Read-only file system`.
+  DNSChaos must create this backup beside the container's resolver file. The
+  probe therefore could not observe the same selected-query failure it was
+  intended to prove, even though its pre-fault selected and control queries
+  were both healthy.
+- Correction: the opt-in, credential-free probe keeps a writable container
+  overlay. It remains non-root, drops all capabilities, forbids privilege
+  escalation, uses runtime-default seccomp, and receives no ServiceAccount
+  token. Operator and run-controller filesystems remain read-only. This is a
+  deliberate disposable data-plane exception: preventing the instrument from
+  experiencing a requested fault is not useful hardening.
+- Boundary: this does not yet prove that corrected DNS injection or its active
+  probe succeeds live.
+
+## F-069: Partial Chaos injection waited for a generic timeout
+
+- Classification: run-controller attribution and liveness defect
+- State: fixed and regression-tested; corrected live partial-injection negative control pending
+- Evidence: the same DNS campaign had one successfully injected/recovered
+  container and one repeatedly failed container. Chaos Mesh truthfully reported
+  `AllInjected=False`, `AllRecovered=True`, and retained the actionable daemon
+  error, but the controller remained `Injecting/ChaosResourceCreated` until the
+  90-second assertion deadline and only then returned `Failed/InjectionTimeout`.
+  This held the one-fault mutation lease for roughly a minute after recovery and
+  collapsed a known injection failure into an ambiguous timeout.
+- Correction: `AllRecovered=True` before any `AllInjected=True` observation now
+  terminates immediately as `Failed/InjectionFailed`, retaining the bounded
+  Chaos experiment records and daemon message. Cleanup and lease release remain
+  subject to the existing confirmed-absence gate.
+- Evidence completeness: lifecycle capture now includes all namespaced
+  `FaultCampaign`/`AttacknetRun` resources, all five Chaos families, both shared
+  leases, and separate topology/run-controller logs so this attribution is not
+  lost when a fault resource is removed.
+
+## F-070: A Bitcoin restart left confirmed miner funds hidden behind stale wallet transactions
+
+- Classification: attacknet burnchain-policy restart and wallet-state defect
+- State: root cause proven live; reconciliation and reserve fix regression-tested
+  offline; corrected live restart proof pending
+- Trigger: the full 31-actor topology was healthy through Nakamoto activation.
+  Rolling the actor StatefulSets also restarted the persisted Bitcoin Pod. Its
+  deliberate `persistmempool=0` policy correctly discarded pre-restart block
+  commits, while `walletbroadcast=0` correctly prevented the watch-only miner
+  wallets from republishing them. Miners 2 and 3 then restarted indefinitely
+  with `UTXOs not found` even as the burnchain continued advancing.
+- Evidence: Bitcoin Core's authoritative UTXO set reported miner 2's confirmed
+  change output `61a3339d...17fbf:3` as unspent with 49.99194104 BTC and miner
+  3's `ee2a699f...4ab8d:3` as unspent with 49.99193998 BTC. The mempool contained
+  only miner 1's current commit. Nevertheless, the dedicated watch-only wallets
+  retained two absent, mutually conflicting, zero-confirmation transactions per
+  affected miner with `abandoned=false` and therefore suppressed those
+  confirmed outputs from `listunspent`. This is a wallet/mempool split brain,
+  not missing funding, key mismatch, or chainstate lag.
+- Risk: a normal Bitcoin process restart can permanently remove a subset of
+  otherwise funded miners from an attacknet. The network appears partially
+  healthy and Bitcoin keeps progressing, but the affected Stacks nodes cannot
+  even finish startup. Any restart/chaos evidence after that point is tainted.
+  This particular trigger is caused by the attacknet's explicit mempool policy;
+  it is not asserted as a current-main Stacks consensus defect.
+- Correction: the external burnchain clock now reconciles wallet history
+  against the authoritative mempool before bootstrap and before every mined
+  block. It abandons only deduplicated, unconfirmed send transactions that are
+  absent from the mempool; active, confirmed, received, or already-abandoned
+  transactions are untouched. Reconciliation fails closed and retries instead
+  of mining across ambiguous wallet state. Fresh regtest bootstraps also create
+  four mature coinbase reserve outputs per configured miner rather than making
+  each secondary miner depend on a single spend/change chain. A fake Bitcoin
+  RPC regression proves the exact selection and deduplication contract.
+- Acceptance still required: re-render the corrected clock into the live
+  `StacksNetwork`, observe the stale transactions become abandoned, prove all
+  31 actors return Ready without replacing actor PVCs, then restart Bitcoin
+  again and prove miners remain funded and the chain continues.
+
+## F-071: A hot actor rollout outran signer-state propagation and lost the next PoX anchor
+
+- Classification: attacknet lifecycle defect exposing a transport-independent
+  signer liveness hazard
+- State: root cause bounded by complete incident evidence; topology and startup
+  regression work in progress; clean rerun pending
+- Trigger: all actor StatefulSets were hot-rolled while the external Bitcoin
+  clock continued at the 60-second stress cadence. This bypassed the phased,
+  paused bootstrap path used for a fresh `StacksNetwork` deployment.
+- Evidence: the complete incident bundle is retained at
+  `contrib/attacknet/evidence/reward-cycle-anchor-stall-complete-20260815T142000Z/`.
+  All 18 Stacks nodes agreed on burn height 259, Stacks height 39, canonical
+  tip `19f2d01...12ac5fd`, and PoX consensus `553d9e...14b92`. No Stacks block
+  was produced after the tenure at burn 243. At burn 260 every coordinator
+  reported `No PoX anchor block known yet for cycle 13` / `Missing canonical
+  anchor block`.
+- Signer-state evidence: during the burn-255 proposal window, signers
+  1/2/6/7/9/10 had timely updates from exactly that six-signer cohort, whose
+  authoritative reward-set weight was 14 of 25. Signers 3, 4, 5, and 8 each
+  saw only their own update. Neither the correct 18-of-25 Nakamoto block
+  threshold nor the current global-state evaluator's discrepant 17-of-25
+  rounded-down threshold
+  was reached. Every signer emitted `NoSignerConsensus` as a real rejection,
+  and the miners terminated the proposal as `SignersRejected`.
+- Connectivity evidence: `signer-node-3` still had zero live inbound and
+  outbound conversations at capture. Most other nodes had 29--31 live
+  conversations, and most signers eventually learned nine identities. This
+  proves a persistent isolated companion plus propagation too slow for the
+  proposal window; it does not support the stronger claim that the whole
+  network remained disconnected.
+- Ruled out: `handle_pending_update()` is invoked on every signer event and the
+  lagging local state did eventually catch up. The one-burn companion lag was
+  processing/order pressure, not the separate "never retry pending state"
+  defect. The 60-second burn cadence makes this a deliberate stress case and
+  must not be projected directly onto mainnet frequency.
+- Failure chain: continued burn cadence during rollout left the restored P2P
+  signer-state plane below agreement weight; proposals received only
+  `NoSignerConsensus`; those availability failures were counted as genuine
+  rejection weight (see `.docs/p2p-fixes/01-do-not-count-unavailability-as-invalidity.md`);
+  the prepare phase produced no anchor; the next reward cycle could not start.
+- Required corrections: hot updates must acquire the mutation lease, pause and
+  later restore the external burn policy, and prove live peer connectivity plus
+  signer global-state support before cadence resumes. Node configuration needs
+  multiple deterministic bootstrap peers instead of a single dependency on
+  `miner-1`. The dashboard and lifecycle gate need direct signer-state support
+  metrics rather than inferring this condition from eventual proposal
+  rejections.
+
+## F-072: Global signer-state agreement rounds 70% down while block validation rounds up
+
+- Classification: current-main threshold-consistency and signer-state safety
+  defect; transport-independent
+- State: source-proven on `upstream/main`; targeted fix and mixed-version
+  analysis pending
+- Evidence: `GlobalStateEvaluator::reached_agreement()` in
+  `libsigner/src/v0/signer_state.rs` compares vote weight against
+  `(total_weight * 7) / 10`, using integer floor. In contrast,
+  `NakamotoBlockHeader::compute_voting_weight_threshold()` in
+  `stackslib/src/chainstate/nakamoto/mod.rs` explicitly adds one whenever the
+  division has a remainder.
+- Concrete result: the attacknet's canonical reward set has total weight 25.
+  The signer-state evaluator accepts weight 17 (68%), while a Nakamoto block
+  requires weight 18 (72%). This was not the cause of F-071 because the timely
+  cohort had only weight 14, below both thresholds. A total of 19 provides
+  another useful boundary test: 13 currently passes while 14 is canonical.
+- Risk: protocol-version selection, global burn view, active miner state, and
+  transaction replay-set selection can be derived from less weight than could
+  authorize a block. Different total weights produce different rounding gaps,
+  making comments and tests that describe a 70% threshold false at discrete
+  boundaries. Although chainstate still rejects a block with insufficient
+  signatures, signers can act or capitulate based on a weaker global view,
+  creating liveness and mixed-version divergence risk.
+- Required correction: use one canonical ceiling threshold helper for both
+  block signatures and signer global state, add explicit 19-slot boundary
+  tests (`13` fails, `14` passes), audit the complementary disagreement
+  boundary, and analyze activation/mixed-version behavior before changing the
+  deployed signer state machine.
+
+## F-073: Readiness-gated DNS deadlocked reciprocal bootstrap peers
+
+- Classification: attacknet topology/runtime-exposure defect
+- State: root cause proven live; correction regression-tested offline; clean
+  rerun pending
+- Trigger: the first clean full-topology run after adding three deterministic
+  bootstrap identities per Stacks node configured `miner-1` to bootstrap from
+  followers. Those followers retained the deliberate init dependency on the
+  miner RPC endpoint. The actor Services published only Ready endpoints.
+- Evidence: the failed network remained at `Progressing 2/31`. `miner-1` logged
+  repeated failures resolving
+  `attacknet-baseline-global-state-follower-1:20444`, while `follower-1`'s init
+  container repeatedly logged `bad address` for `miner-1`. Bitcoin and the
+  external burn clock were the only Ready actors. The sealed incident bundle
+  is `contrib/attacknet/evidence/bootstrap-readiness-cycle-20260815T1438Z/`.
+- Root cause: Stacks resolves all configured bootstrap hostnames while parsing
+  node configuration, before `/v2/info` can become Ready. Kubernetes withheld
+  each reciprocal peer's DNS endpoint until readiness, so neither application
+  process could cross the condition required to publish the other endpoint.
+  This is a harness-induced deadlock, not a Stacks P2P failure.
+- Correction: every Stacks node Service now uses the existing
+  `runtimeExposure: reachable` contract. DNS publishes the scheduled Pod before
+  readiness, allowing config parsing and connection attempts, while init
+  dependency gates still require the requested TCP port to accept and Pod
+  readiness still requires the real node RPC endpoint. A topology regression
+  asserts this exposure contract for every node alongside bootstrap diversity.
+- Design lesson: startup dependency checks and runtime endpoint publication are
+  different controls. A bootstrap graph may be cyclic by design; readiness
+  must remain observable without making DNS resolution contingent on the same
+  graph reaching Ready.
+
+## F-074: An expected retry sample falsely finalized the run as failed
+
+- Classification: lifecycle evidence-integrity defect
+- State: fixed and regression-tested; clean rerun pending
+- Trigger: after F-073 was corrected, all 31 actors became Ready at burn 223.
+  The new live-peer barrier sampled the network once before every node had an
+  authenticated inbound or outbound conversation. The invariant command
+  correctly returned nonzero to request another bounded sample.
+- Evidence: lifecycle immediately printed `attacknet apply failed at
+  lifecycle.sh:282` and sealed a bootstrap-failure bundle, then continued and
+  proved live connectivity for all 18 nodes on a later sample. It subsequently
+  proved canonical-threshold global signer state for all ten signers and found
+  the first Nakamoto block, but the already-finalized run descriptor rejected
+  runtime resolution with `cannot resolve inputs for a failed run`.
+- Root cause: lifecycle runs with `set -E`, so its ERR trap is inherited by
+  command substitutions. The intentionally nonzero peer-invariant subprocess
+  invoked the top-level failure trap inside the substitution even though the
+  surrounding wait loop treated that status as a normal retry signal. The
+  apparent failure and later success therefore coexisted in one run.
+- Correction: the expected invariant probe now removes the inherited ERR trap
+  inside its command-substitution boundary and records the exit status
+  explicitly. A regression injects one failed peer sample under the real ERR
+  trap, then proves a later sample succeeds without invoking `apply_error`.
+- Risk: without this distinction, any transient condition at a bounded startup
+  gate can produce a cryptographically sealed false-negative evidence bundle.
+  Continuing after finalization then makes later evidence internally
+  inconsistent even when the system under test is healthy.
+
+## F-075: Declared signer weights understated the canonical reward set
+
+- Classification: attacknet fault-admission safety and evidence-integrity
+  defect
+- State: root cause proven live; static correction and fail-closed runtime
+  parity gate regression-tested and proven on a fresh clean full-topology run;
+  deliberate live mismatch control still pending
+- Trigger: the topology assigned repeating signer weights `1,2,3`, copied from
+  the stacker's `targetSlots` input. `FaultCampaign` and `AttacknetRun` used
+  those values to calculate unavailable signer weight and enforce the 30%
+  quorum-loss boundary.
+- Evidence: the admitted manifest summed the ten signers to 19. On the healthy
+  clean network at burn height 230, `/v3/stacker_set/11` returned the exact ten
+  signing keys with weights `1,3,4,1,3,4,1,3,4,1`, totaling 25; all ten signer
+  metrics independently reported total/known/maximum-view weight 25 and a
+  canonical threshold of 18.
+- Root cause: the stacker locks `1.5 * minimum_threshold * targetSlots` and
+  consensus assigns `floor(stacked_amount / minimum_threshold)` slots. The
+  admitted weights are therefore `floor(1.5 * targetSlots)`, not
+  `targetSlots` itself.
+- Safety impact: a campaign selector could be admitted using understated
+  signer impact. The discrepancy also corrupted the numeric reconstruction of
+  F-071 even though its below-quorum conclusion remained correct. No fault was
+  injected after discovery.
+- Initial correction: topology now derives `1,3,4` in one helper, records each
+  signer's compressed signing public key, and carries the same identity and
+  weight on its signer and companion records. Before steady cadence, lifecycle
+  fetches the current `/v2/pox` cycle and canonical `/v3/stacker_set` and
+  requires an exact key/weight join. Runtime fault admission separately requires
+  exact signer-key identity, overlays the current canonical reward-cycle
+  weights for safety accounting, and pins the resulting canonical manifest.
+  A changed identity or a signer-set change between schedule sealing and child
+  creation fails closed.
+- Fresh acceptance evidence: the misdeclared run was captured and retired,
+  including its actor PVCs. A clean 31-actor recreation named
+  `attacknet-baseline-signer-parity` reached lifecycle readiness at burn 224.
+  Its sealed run timeline records `signer-set-parity=pass` at reward cycle 11:
+  declared count 10, observed count 10, declared weight 25, observed weight
+  25, rounded-up threshold 18, no missing/unexpected/mismatched entries, and
+  signer-set digest
+  `sha256:f1ad977af5e2344a42f6a37362aef065932896844e0e4b16fd7ba4fa2a91b78c`.
+  Signer 1 also recovered from its deliberately early initialization attempt
+  without a container restart once its companion RPC became available.
+- Acceptance evidence still required: show a deliberately modified weight is
+  rejected before any Chaos resource is created. This must not be implemented
+  by mutating the live baseline CR if that mutation would roll actor Pods.
+
+## F-076: Explicit run-operator image packaging omitted a new transitive dependency
+
+- Classification: attacknet controller packaging and deployment-reliability
+  defect
+- State: fixed, regression-tested, rebuilt, and deployment-smoked live
+- Trigger: the run controller began importing the shared signer-set parity
+  verifier. Its Dockerfile copies an explicit allowlist of source modules and
+  did not include the new dependency.
+- Evidence: the first rebuilt image log copied eight existing modules but no
+  `signer-set-parity.mjs`. Starting that image would make Node's module loader
+  fail before the controller could reconcile any resource, despite all host
+  source tests passing.
+- Correction: the verifier is now copied into the image. A packaging test
+  recursively follows every relative `import`/`export` from the controller
+  entry point and requires the complete transitive graph to appear in
+  Dockerfile `COPY` sources. This protects future shared-module additions
+  instead of matching only today's filename.
+- Acceptance evidence: immutable image
+  `stacks-hacknet-run-operator:local-70d9649f5f7a0427` was deployed in Helm
+  revision 14; both the network and run-controller Deployments became
+  Available, and API discovery retained all three attacknet CRDs without a
+  module-loader failure. Runtime schedule admission was subsequently exercised
+  by `baseline-parity-pod-canary-r2`, which sealed a schedule and completed an
+  owned child using the packaged verifier.
+
+## F-077: An active AttacknetRun regressed to Pending when its own fault made the network unready
+
+- Classification: attacknet orchestration truthfulness and lifecycle defect
+- State: reproduced live; fixed, regression-tested, and proven by a corrected
+  live canary
+- Trigger: the first run-controller-driven PodChaos killed
+  `signer-node-1`. The owned child correctly reached `Active` with
+  `PodRestarted=Proven`, while aggregate `StacksNetwork` readiness became
+  temporarily non-Ready as intended.
+- Evidence: during the active fault, parent run
+  `baseline-parity-pod-canary` repeatedly reported
+  `Pending/NetworkNotReady` even though its persisted schedule was sealed and
+  its owned child remained active. The child and Chaos resource did continue
+  reconciling, so this was not a data-plane outage.
+- Root cause: `AttacknetRunReconciler` applied its pre-admission network-ready
+  gate before checking for an already-admitted active child. A fault capable
+  of changing actor readiness therefore made its own parent appear not to
+  have started.
+- Impact: dashboards, budgets, and an external agent could misclassify a
+  running mutation as a preflight wait. A later refactor could also return
+  before cleanup-sensitive logic and turn this status defect into a safety
+  defect.
+- Correction: an owned active child now takes precedence over aggregate
+  readiness and forces `Running/CampaignActive`. A sealed run with no active
+  child waits as `Running/WaitingForNetworkRecovery`; only an unsealed run may
+  report `Pending/NetworkNotReady`. Regression coverage degrades the network
+  while an owned child is active and requires the parent to remain Running.
+- Acceptance evidence: corrected run `baseline-parity-pod-canary-r2` remained
+  `Running/CampaignActive` through injection and effect observation. During
+  the short interval after the child passed but before aggregate readiness
+  recovered, it truthfully reported `Running/WaitingForNetworkRecovery`, then
+  terminated `Passed/StoppedAfterSuccessfulCampaign` with one completed
+  campaign.
+
+## F-078: One-shot PodChaos waited for an impossible AllRecovered transition
+
+- Classification: attacknet cleanup, serialization, and bounded-experiment
+  defect
+- State: reproduced live; restart-safe fix regression-tested and proven by a
+  corrected live canary
+- Trigger: a `PodChaos` `pod-kill` action was declared for 15 seconds. The
+  original Pod UID disappeared and the replacement StatefulSet Pod became
+  Ready, proving both requested effect and system recovery.
+- Evidence: Chaos Mesh retained `AllInjected=True`, `AllRecovered=False`, and
+  `desiredPhase=Run`; the run controller kept the campaign Active for more
+  than five minutes and held the global mutation lease. The first preserved
+  attempt eventually recorded `RecoveryTimeout`, despite
+  `PodRestarted=Proven`, after the corrected controller rollout arrived just
+  beyond its 15-second fault plus 300-second recovery deadline.
+- Root cause: PodKill and ContainerKill are one-shot actions. Chaos Mesh can
+  prove their application but cannot restore the deleted Pod or killed
+  process in the same sense as a reversible network, DNS, I/O, time, or
+  pod-failure mutation. The controller incorrectly treated `AllRecovered` as
+  mandatory for every Chaos family.
+- Impact: a successful one-shot experiment could occupy the sole mutation
+  slot until timeout, falsely fail, and prevent every later campaign from
+  running. Duration did not provide the expected bound.
+- Correction: once Kubernetes-observed immutable Pod UID disappearance or
+  container restart meets the admitted mode's minimum affected count, the
+  controller deletes the one-shot Chaos bookkeeping resource and separately
+  requires the resolved replacement target to become Ready. The same
+  transition is supported from both `Injecting` and `Active`, so a controller
+  restart or rollout cannot strand durable effect evidence.
+- Acceptance evidence: corrected run `baseline-parity-pod-canary-r2` admitted
+  exactly signer weight 1 of canonical total 25 (4%), observed the original
+  Pod UID `e8235295-4891-43fa-b866-f38cc67e7066` disappear, recorded
+  `PodRestarted=Proven`, removed the Chaos resource even though its historical
+  record correctly retained `allRecovered=false`, and proved replacement Pod
+  UID `06a7341c-fb2e-4e9e-ae87-2b06cc83b1f7` Ready. The run completed in 35.7
+  seconds; every one of the 18 Stacks nodes then converged at burn 238, Stacks
+  height 35, tip `9c203b82b430dc8348fb3b7498ebe1c41f81ac4268a71a60c6bf1c351ba56173`,
+  with zero burn/Stacks drift and no unauthenticated live peer conversations.
+
+## F-079: Legitimate reward-cycle weight changes made every later fault schedule inadmissible
+
+- Classification: attacknet fault-admission availability and evidence-integrity
+  defect
+- State: reproduced live; canonical runtime overlay and pre-injection pinning
+  regression-tested and proven by a corrected live NetworkChaos canary
+- Trigger: the first NetworkChaos canary was submitted after the healthy full
+  topology crossed from reward cycle 11 into cycle 12. No signer identity or
+  configured stacked amount changed.
+- Evidence: cycle 11 contained the ten declared signing keys at weights
+  `4,1,4,1,3,3,3,4,1,1`, total 25. Cycle 12 contained the exact same keys at
+  `4,1,4,1,2,2,2,4,1,1`, total 22. The controller rejected the run as
+  `ScheduleAdmissionFailed`; no Chaos resource was created.
+- Root cause: the first runtime parity gate treated topology weights as
+  permanently authoritative. In PoX, signer weight is derived from locked
+  amount relative to the cycle's minimum stacking threshold, so fixed amounts
+  can legitimately map to different integer weights in a later reward cycle.
+  Exact weight parity is appropriate for the lifecycle's known initial
+  enrollment gate, but it is not a valid invariant for a long-running
+  attacknet.
+- Risk: every run submitted after a legitimate weight transition would fail,
+  preventing long soaks and reward-cycle-boundary experiments. Relaxing the
+  entire check would be worse: stale weights could undercharge quorum impact,
+  or a changed signer identity could be mistaken for harmless drift.
+- Correction: runtime resolution now separates identity from weight authority.
+  It requires an exact join of topology signing keys to the current canonical
+  reward set, overlays those observed weights onto both signer and companion
+  actors, and compiles all per-campaign and aggregate safety budgets from that
+  resolved manifest. The immutable schedule pins its digest. Immediately
+  before a child is created, and again before a standalone FaultCampaign is
+  injected, the controller re-resolves the set and refuses any digest change.
+  Admission status records reward cycle, total weight, signer-set digest, and
+  the Stacks RPC actor that supplied the canonical observation.
+- Regression evidence: unit coverage proves weight-only drift is accepted and
+  charged from the observed total, missing/unexpected keys are rejected, the
+  original manifest is not mutated, and a second canonical observation with a
+  changed digest creates neither a child campaign nor a Chaos resource.
+- Live acceptance evidence: `baseline-parity-network-canary-r2` admitted reward
+  cycle 12 at canonical total weight 22 and signer-set digest
+  `sha256:04fee1495a69bbe2dd1a6ce4e2f6e6f012e1ad6f1205891ca75c27a8264d9e98`.
+  It correctly charged zero signer weight and one of three miners for a
+  miner-2-to-signer-node-1 delay. The trusted probe measured p95 latency of
+  7.582 ms before, 1,613.232 ms during the 750 ms bidirectional delay, and
+  2.598 ms after. Both effect and recovery were Proven, the NetworkChaos
+  resource was absent after cleanup, and the parent run passed. The shared
+  verifier then found every one of 18 Stacks nodes at burn 259 / Stacks 61 on
+  tip `49d5da56950693bfbaf67d24f266ba23762355754f2c75799a23a7040d8ac85d`,
+  with zero burn/Stacks drift, 28--34 authenticated live conversations per
+  node, and zero unauthenticated conversations.
+
+## F-080: Recovery status reused the fault-effect explanation
+
+- Classification: attacknet human-observability and evidence-presentation
+  defect
+- State: reproduced live; fixed, regression-tested, and proven by the next
+  live non-Pod canary
+- Trigger: the successful NetworkChaos canary classified both
+  `NetworkDegraded` and `NetworkRecovered` from distinct during/after probe
+  phases, then copied the evaluator's effect reason into both status rows.
+- Evidence: recovery was correctly Proven from the restored 2.598 ms p95, but
+  its message read `named reachability/latency probe observed delay=true`.
+- Impact: the structured outcome and raw phase artifacts were correct, but a
+  dashboard or human reading only the recovery row could reasonably conclude
+  that latency remained injected. This is exactly the kind of ambiguous
+  presentation that slows incident attribution even when underlying evidence
+  is sound.
+- Correction: effect results retain the effect-specific reason. Recovery
+  results now use a recovery-specific evaluator reason when available, or a
+  bounded explicit `trusted after-fault probe classified recovery=<outcome>`
+  message. Regression coverage requires a Proven network recovery message not
+  to contain the earlier `delay=true` effect claim.
+- Live acceptance evidence: `baseline-parity-dns-canary` independently proved
+  the selected companion FQDN resolvable before, failing during DNSChaos, and
+  resolving to the original address afterward, while
+  `kubernetes.default.svc.cluster.local` stayed healthy in all three phases.
+  Its `DNSRecovered=Proven` row now reads
+  `trusted after-fault probe classified recovery=proven`. The canary also
+  crossed into reward cycle 13 and correctly admitted the same signer
+  identities at their new total weight 30, providing a second live proof of
+  F-079's dynamic overlay. Cleanup removed the DNSChaos resource, and all 18
+  nodes subsequently converged at burn 264 / Stacks 65 with zero drift and one
+  common tip.
+
+## F-081: Chaos Mesh's IOChaos helper is x86-only in the arm64 daemon image
+
+- Classification: local-platform capability and fault-cleanup reliability gap
+- State: reproduced and attributed; evidence preserved; zero injection proven;
+  safe manual apparatus abort completed; architecture admission and an exact
+  zero-injection cleanup escape are implemented and regression-tested offline;
+  corrected live admission proof and a distinctly-labelled arm64 I/O-pressure
+  experiment remain pending
+- Trigger: `baseline-parity-io-canary` requested a 500 ms FSYNC delay for 20
+  seconds on `follower-1`, scoped to the probe-only path
+  `/data/.attacknet-probe-follower-1/*`. Safety admission correctly charged
+  zero signer and miner impact at reward cycle 13, canonical signer weight 30.
+- Evidence: the trusted before probe completed five FSYNC operations with p95
+  13.483 ms. Chaos Mesh selected both the actor and probe containers, but every
+  application failed with `toda update RPC failed`; neither container ever
+  exceeded `injectedCount: 0`, and `AllInjected` remained false. All three kind
+  nodes and the target userspace are arm64. The `toda` binary embedded in the
+  Chaos Mesh 2.8.3 arm64 daemon image has ELF machine `0x003e` (x86-64), while
+  the target provides only the arm64 loader. Daemon logs state
+  `rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2`.
+- Native-helper audit: rebuilding the tagged `toda` v0.2.4 source as arm64 is
+  not a packaging fix. Its ptrace implementation explicitly hard-codes x86-64
+  registers and syscall conventions (`rax`, `rdi`, and related registers),
+  and its replacement code emits `.arch x64` machine code through dynasm.
+  The upstream Dockerfile's x86-only download therefore reflects a real
+  implementation limitation, not merely a missing multi-architecture build.
+  A trial native build was stopped once this was established from source.
+- Cleanup finding: after the run controller's bounded injection timeout,
+  Chaos Mesh left the deleting IOChaos object behind its
+  `chaos-mesh/records` finalizer in `Not Injected/Wait`. The attacknet
+  controller correctly retained the global mutation lease while that object
+  remained, preventing overlapping faults, but this would serialize the
+  campaign queue indefinitely. After the complete live evidence bundle proved
+  zero injection, the exact already-deleting object's finalizer was removed as
+  an apparatus abort. The IOChaos object disappeared and the run controller
+  released the lease. No recovery was claimed.
+- Evidence bundle:
+  `contrib/attacknet/evidence/iochaos-arm64-toda-20260815T1617Z/` contains the
+  admitted orchestration, Chaos resources, before probe, cluster runtime, run
+  ledger, and trusted timeline captured before cleanup.
+- Correction: the trusted co-located probe now exposes a bounded system
+  capability observation. Before taking an I/O baseline or creating IOChaos,
+  the run controller compares each exact admitted target Pod's platform and
+  architecture to the chart's explicit helper-support profile (x64-only for
+  the installed Chaos Mesh 2.8.3) and terminates
+  `Failed/FaultCapabilityUnavailable` otherwise. The unsupported evidence is
+  retained in status and no Chaos resource is created. Injection failures now
+  retain the exact Chaos Mesh records and diagnostic message. If an already
+  deleting IOChaos remains behind `chaos-mesh/records` for at least 30 seconds,
+  the controller may remove that one finalizer only when the records exactly
+  cover every admitted Pod/container, all show zero injected and recovered
+  operations, every Apply event failed, and no Apply event succeeded. Cleanup
+  records `method=ZeroInjectionFinalizerAbort` and
+  `zeroInjectionProven=true`; any observed or ambiguous injection preserves the
+  object and the global mutation lease. Regression tests cover the positive
+  and negative boundaries. The namespaced run-controller Role now grants only
+  the additional Chaos-resource `patch` verb needed for this bounded cleanup.
+- Remaining platform boundary: true per-syscall IOChaos on this Apple Silicon
+  cluster requires an x86-64 target actor or a genuinely ported arm64 `toda`;
+  simply recompiling the existing source is invalid. An I/O-pressure fallback
+  may be added as a different fault semantic, but must not be presented as
+  latency/fault injection. The corrected controller must still be rolled out
+  and a live arm64 campaign must prove fail-closed admission before the
+  original run is considered resolved end to end.
+- Corrected live admission evidence: run
+  `baseline-parity-io-capability-r2` resolved exact follower Pod UID
+  `c0410acc-0418-4248-ad91-cbad7bdd9fc5`. Its Ready probe reported
+  `linux/arm64`; the child terminated
+  `Failed/FaultCapabilityUnavailable` with that bounded evidence. It never
+  acquired `status.chaos` or `status.actualInjection`, no IOChaos object
+  existed, terminal cleanup confirmed absence, and the mutation lease was
+  released. The post-canary verifier found all 18 Stacks nodes on one Stacks
+  height/tip (height 105, zero Stacks drift), burn drift one, at least 21
+  authenticated live conversations per node, and zero unauthenticated
+  conversations. The sealed evidence slice is
+  `contrib/attacknet/evidence/iochaos-arm64-capability-20260815T1652Z/`.
+
+## F-082: Selecting two containers in one Pod made TimeChaos partially inject
+
+- Classification: attacknet fault-shape and evidence-integrity defect
+- State: reproduced, attributed, and preserved; compiler/API guard proven;
+  corrected single-container injection/recovery proven live; truthful
+  application-clock observation implemented and proven to reject an
+  ineffective injection; the remaining arm64 platform defect is F-083
+- Trigger: `baseline-parity-time-canary` requested a 30-second negative
+  `CLOCK_REALTIME` offset for 20 seconds in both `follower-1` containers so the
+  Stacks actor would experience the fault and the co-located trusted probe
+  could measure it.
+- Evidence: Chaos Mesh applied and recovered the actor record exactly once.
+  Every probe Apply failed with `duplicate entity`; its injected and recovered
+  counts stayed zero, and `AllInjected` never became true. The controller
+  terminated `Failed/InjectionFailed`, preserved both records and the daemon
+  message, emitted no effect/recovery verdict, removed the recovered TimeChaos
+  resource, and released the mutation lease.
+- Corrected root cause: the shared time-namespace inode was real but was not
+  the injection mechanism. Chaos Mesh 2.8.3 obtains the selected container's
+  PID and ptrace-patches `clock_gettime` and `gettimeofday` in PID 1 and its
+  process group. Its task UID is the TimeChaos UID plus Pod UID, so selecting
+  two containers in one Pod attempts to create the same task entity twice and
+  the second record fails as a duplicate. The official documentation also
+  states that only container PID 1 and its children are affected; a sidecar
+  and even a later `kubectl exec` process are not valid clock witnesses.
+- Admission correction: a TimeChaos campaign may select at most one container
+  per target Pod. Both the local compiler and the FaultCampaign CRD enforce
+  this. A fresh invalid object with actor plus probe was rejected by the API
+  server; the pre-existing invalid template was retained under Kubernetes CRD
+  validation ratcheting and emits an explicit warning rather than being
+  silently rewritten.
+- Second live result: `baseline-parity-time-canary-r2` selected only the actor.
+  Chaos Mesh recorded exactly one successful actor injection, observed
+  `AllInjected`, then exactly one successful recovery and `AllRecovered`.
+  Cleanup was normal and the mutation lease was released. The sidecar clock
+  correctly remained aligned with the control, so the evaluator refused to
+  claim the requested -30-second effect and the run paused
+  `Inconclusive/EffectNotProven`.
+- Evidence correction: every node metrics scrape now samples
+  `stacks_node_process_wall_clock_seconds` inside the Stacks process. The
+  bounded collector will compare that application-process clock with its own
+  monotonic clock and an independent control actor. Evidence explicitly marks
+  the metric content `actor-self-reported` and remains bound to the admitted
+  actor image digest; it is not described as a kernel probe and cannot serve
+  as authoritative evidence for an arbitrary malicious image.
+- Third live result: `baseline-parity-time-canary-r3` used the corrected actor
+  image and process-clock evidence path. Chaos Mesh again recorded one
+  successful actor injection and recovery, but the target's differential
+  `CLOCK_REALTIME` shift was only +0.0303 seconds rather than the requested
+  -30 seconds. The control stayed within 0.001 seconds. The evaluator therefore
+  returned `ClockSkewObserved=Failed`, `ClockSkewCleared=Proven`, and the child
+  and parent remained Inconclusive/Paused. This is positive evidence that the
+  attacknet no longer treats `AllInjected` as proof that TimeChaos had an
+  effect.
+- Post-recovery evidence: all 18 Stacks nodes remained within one burn and one
+  Stacks block, with one tip per observed height, at least 22 authenticated
+  live conversations each, and no unauthenticated connections. The preserved
+  slice is
+  `contrib/attacknet/evidence/timechaos-shared-time-namespace-20260815T1656Z/`.
+
+## F-083: Chaos Mesh 2.8.3 TimeChaos is not effective or fail-safe on this arm64 kind platform
+
+- Classification: local-platform capability, proof-of-effect, and fault-cleanup
+  reliability gap
+- State: reproduced in a Stacks actor and an independent disposable process;
+  network remained healthy; fail-closed architecture admission implemented,
+  regression-tested, deployed, and proven live; a portable automated
+  effect-and-recovery capability canary remains future hardening
+- Stacks-process reproduction: `baseline-parity-time-canary-r3` targeted only
+  the `actor` container in follower-1. The daemon reported `sec:-30`, mask 1,
+  attached to all 14 threads of the correct process PID, and Chaos Mesh set
+  `AllInjected`. The application sampled Rust `SystemTime::now()` from inside
+  that same process on every `/metrics` request. During the fault its
+  target-minus-monotonic, control-normalized shift was +0.030325 seconds, not
+  -30 seconds. Recovery was clean, but there was no effect to recover from.
+- Independent platform reproduction: a disposable Node process on the same
+  worker emitted `Date.now()` and `process.hrtime()` once per second. A
+  12-second single-container TimeChaos selected the exact Pod and invoked the
+  worker2 daemon. The daemon attached to the process and its threads but never
+  reached `finding injected image`, never returned the gRPC call, and never
+  detached. `Selected`, `AllInjected`, and `AllRecovered` all remained false.
+  Deleting the TimeChaos then blocked indefinitely behind
+  `chaos-mesh/records`; the disposable process was ptrace-stopped.
+- Recovery: the disposable Pod was force-deleted after the bounded timeout.
+  Restarting only the worker2 `chaos-daemon` Pod caused the in-flight RPC to
+  fail closed with EOF, allowed the controller to remove the TimeChaos
+  finalizer, and released the attacknet mutation lease. The DaemonSet returned
+  Ready and no Stacks actor or PVC was touched.
+- Root-cause boundary: Stacks uses Rust `SystemTime::now()`, which maps to the
+  requested realtime clock. Chaos Mesh's arm64 fake-clock implementation
+  ptrace-rewrites the target vDSO and carries arm64-specific relocation and
+  syscall code, so this is not the same explicit x86-only helper limitation as
+  F-081. The two live results nevertheless show that successful attachment or
+  `AllInjected` is insufficient on this platform, and one ordinary arm64
+  process shape can wedge the daemon during injection.
+- Required correction: add a cluster capability canary that proves a known
+  process observes the requested realtime offset and subsequent recovery
+  before admitting any TimeChaos campaign. Timeout, no measured effect,
+  incomplete detach, or stuck cleanup must mark TimeChaos unsupported for the
+  cluster and prevent actor-targeted TimeChaos. Preserve daemon/controller
+  logs and exact image/kernel/architecture evidence. Do not replace the proof
+  with `AllInjected`, and do not describe an application-level clock shim as
+  Chaos Mesh TimeChaos.
+- Immediate correction and live acceptance: the run controller now admits
+  TimeChaos only for an explicit platform architecture profile, separate from
+  the IOChaos helper profile. It defaults to x64; extending it is documented as
+  a claim that an effect-and-recovery canary passed. Run
+  `baseline-parity-time-capability-r4` resolved follower-1 Pod UID
+  `09871823-0c51-4ca0-b857-3b6cda1a9142` and image ID
+  `sha256:1b43c28de833f8e8929a0839d2b67dccb1872aa148955ddd76927d9a9151bce5`,
+  then obtained `linux/arm64` from the exact Ready probe. The child terminated
+  `Failed/FaultCapabilityUnavailable` before baseline collection or Chaos
+  creation. No TimeChaos object existed, normal terminal cleanup confirmed
+  absence, and the mutation lease was released. The shared verifier then found
+  all 18 Stacks nodes exactly converged at burn 357 / Stacks 157 on one tip,
+  at least 22 authenticated live connections per node, and zero unauthenticated
+  conversations. This closes the unsafe local path without claiming that x64
+  is proven by this arm64 environment.
+
+## F-084: Local dashboard supervisors ignored termination and accumulated duplicate forwards
+
+- Classification: local operator-experience and harness-reliability defect
+- State: reproduced after Docker Desktop restart; corrected, regression-tested,
+  and repaired live
+- Trigger: Docker Desktop and Kubernetes restarted while localhost access was
+  enabled. Grafana remained reachable, while the newer Grafana supervisor
+  logged a port-3000 bind failure every two seconds. Chaos Dashboard was
+  temporarily unreachable while its Kubernetes stream recovered.
+- Root cause: both shell supervisors installed one trap for `EXIT`, `INT`, and
+  `TERM` whose only action removed the PID file. Receiving `TERM` therefore did
+  not exit the shell or terminate its foreground `kubectl port-forward` child.
+  A subsequent start saw no trustworthy PID record and created another
+  supervisor. At reproduction there were two Grafana supervisors: the older
+  one owned the healthy port while the newer one retried indefinitely. The
+  apparent UI health concealed broken lifecycle ownership.
+- Correction: both supervisors now run `kubectl` as an explicitly tracked
+  child, translate `INT`/`TERM` into process exit, and kill/wait for the child
+  during the `EXIT` cleanup. Grafana now uses the same singleton launchd
+  supervision as Chaos Dashboard on macOS, with absolute script paths and a
+  detached fallback elsewhere. Tests cover loopback forwarding, ambiguity,
+  launchd identity, and signal/child cleanup structure.
+- Live repair evidence: both old launchd jobs and only the exact stale access
+  processes were removed. One new launchd job and one `kubectl` child now exist
+  per dashboard. A subsequent stop/start cycle for each supervisor completed
+  normally and again left exactly one shell/child pair. Both
+  `http://127.0.0.1:3000/` and `http://127.0.0.1:2333/` returned HTTP 200.
+
+## F-085: Storage preflight treated option-shaped arguments as filesystem paths
+
+- Classification: harness usability and diagnostic-quality defect
+- State: reproduced, corrected, and regression-tested offline
+- Trigger: invoking `observability/storage-preflight.sh --help` while checking
+  the live capacity gate. The script treated `--help` as its optional output
+  filename, passed it to `dirname` and `mkdir`, and emitted unrelated filesystem
+  errors before reaching its real check.
+- Impact: this did not mutate Kubernetes or weaken the storage gate, but it made
+  an ordinary operator discovery action look like a storage/filesystem fault.
+  That is especially misleading in a harness whose earlier ENOSPC diagnosis was
+  load-bearing evidence.
+- Correction: the script now has an explicit `[OUTPUT.json]` command contract,
+  returns usage for `-h`/`--help`, rejects unknown options and multiple
+  positional arguments before calling Kubernetes, and has a regression test
+  proving no `dirname`/`mkdir` noise is emitted.
+
+## F-086: Chaos Mesh 2.8.3 StressChaos panics and drops custom stress-ng arguments
+
+- Classification: upstream fault-injector correctness and local-platform
+  capability gap
+- State: reproduced live; attacknet failed closed and recovered without actor
+  mutation; arm64 disk-pressure support remains unproven and must not be
+  advertised through StressChaos
+- Trigger: `baseline-parity-io-pressure-r1` compiled a bounded one-container
+  disk workload for follower-1 as `StressChaos` with
+  `--hdd 2 --hdd-bytes 256M --hdd-write-size 1024K --temp-path /data
+  --metrics-brief`. The exact target record was created, but `Selected` and
+  `AllInjected` remained false.
+- Root cause: Chaos Mesh 2.8.3's official `stresschaos.Impl.Apply` reads
+  `Spec.StressngStressors` only to decide not to normalize the typed CPU/memory
+  stressors, never copies the custom string into `ExecStressRequest`, and then
+  dereferences `Spec.Stressors.MemoryStressor` unconditionally. With the
+  documented custom-stressor-only shape, `Spec.Stressors` is nil and the
+  controller panics at `controllers/chaosimpl/stresschaos/impl.go:84` on every
+  reconciliation. The current upstream source adds a nil check at that line,
+  but still does not pass the custom argument string to the daemon request, so
+  merely adding an empty `stressors` object would avoid the panic while
+  silently injecting no disk workload.
+- Truthful failure evidence: the attacknet child terminated
+  `Failed/InjectionFailed`; the retained record says `Not Injected`,
+  `injectedCount=0`, `recoveredCount=0`, and `AllInjected=false`. No effect or
+  recovery assertion was emitted. Owned-resource cleanup observed the
+  StressChaos absent with `method=Normal`; the mutation lease was released.
+- Network evidence: follower-1 retained the same Pod UID, both containers
+  remained Ready with zero restarts, and the Chaos daemons remained Ready. The
+  shared verifier then found all 18 Stacks nodes exactly converged at burn 385
+  / Stacks 185 on one tip. Minimum authenticated connectivity was 21; one
+  transient unauthenticated conversation on follower-1 remained within the
+  explicitly permitted ceiling.
+- Required correction: keep native IOChaos available only behind its proven
+  architecture capability. Do not use StressChaos custom stressors as an I/O
+  fallback on this release. A local arm64 fallback must be a separately named,
+  bounded, controller-owned disk-pressure mechanism with its own admitted
+  workload identity, resource caps, active proof of effect, strict cleanup,
+  and explicit evidence that it is not Chaos Mesh IOChaos/StressChaos.
+
+## F-087: A stale Ready condition can falsely complete an actor-image rollout
+
+- Classification: harness lifecycle and evidence-integrity defect
+- State: reproduced during the first live missed-upgrade rollout; existing
+  lifecycle gate confirmed correct; reusable admission join added and tested
+- Trigger: follower-5's image was patched while the StacksNetwork still
+  reported `Ready` for the previous generation. An immediate StatefulSet
+  rollout/wait returned success against the old Pod; the operator observed the
+  new generation and terminated that Pod moments later.
+- Impact: a caller that waits only for `status.phase=Ready`, actor counts, or a
+  StatefulSet's currently complete revision can capture the wrong Pod UID and
+  wrong image as rollout evidence. This is a false pass, not merely a slow
+  rollout.
+- Correction: every mutation wait and image-admission join must require
+  `status.observedGeneration == metadata.generation` before accepting Ready.
+  `lifecycle.sh` already enforces this for full-network and bootstrap waits.
+  The new `image-admission-evidence.mjs` independently rejects stale
+  generations and binds the admitted declaration to the replacement Pod UID,
+  Ready actor container, and exact runtime image identity. Its negative test
+  proves stale status cannot pass.
+
+## F-088: Preloading a local kind image does not make its registry digest pullable
+
+- Classification: local-cluster image-distribution ambiguity
+- State: reproduced, attributed, and handled explicitly in the admission
+  contract
+- Trigger: follower-5 was assigned the otherwise correct unqualified digest
+  reference `stacks-core-attacknet@sha256:8b794...` after the image had been
+  imported into each kind node under its content-derived tag.
+- Result: kubelet treated the digest reference as
+  `docker.io/library/stacks-core-attacknet@sha256:...` and entered
+  `ImagePullBackOff`; no such registry object exists. A node-local tag with
+  `IfNotPresent` then admitted immediately.
+- Boundary: an OCI digest reference is the right declaration for a real
+  registry-backed cluster, but local containerd does not infer a second name
+  from matching content. In registry-free kind, the tag is only a transport
+  handle. Acceptance must bind the exact Pod UID and CRI runtime config digest
+  to a sealed build record; a matching tag alone remains insufficient.
+
+## F-089: BuildKit image-index digests and Kubernetes runtime image IDs identify different OCI objects
+
+- Classification: mixed-version evidence-contract defect
+- State: reproduced, corrected, regression-tested, and proven live
+- Trigger: BuildKit reported image/index digest `sha256:8b794...`, while the
+  Ready follower-5 Pod reported `imageID=sha256:42fb1...`. Treating those as
+  directly comparable made a correct rollout appear unauthenticated.
+- Root cause: maximum provenance produces an OCI index. Its arm64 descriptor is
+  platform manifest `sha256:6f83e...`; that manifest names runtime config
+  `sha256:42fb1...`. Containerd correctly reports the config digest through
+  CRI. The outer index additionally carries an attestation manifest and is not
+  the executable config identity.
+- Correction: the build executor now exports the loaded image to a temporary
+  OCI archive, verifies every blob digest, selects exactly one requested
+  platform manifest, verifies its config, and records the complete
+  index/manifest/config chain. The admission join requires the Pod's terminal
+  CRI digest to equal `expectedRuntimeImageID`, plus exact actor, network,
+  observed generation, and Pod UID. Tests prove the two hashes are distinct
+  and that a wrong runtime digest fails closed.
+- Rebuild nuance: a cached rebuild produced a different provenance/index
+  digest (`sha256:73019...`) while retaining the same arm64 manifest
+  `sha256:6f83e...` and runtime config `sha256:42fb1...`. Attestation-envelope
+  nondeterminism must therefore remain visible in each build record, while
+  executable-byte comparison uses the verified config identity.
+
+## F-090: The default progress window was shorter than the configured burn cadence
+
+- Classification: backend-neutral assertion calibration defect
+- State: deliberately reproduced, corrected, and regression-tested
+- Trigger: the shared verifier defaulted to a 45-second observation while the
+  live manifest declares a 60-second steady burn interval. A ten-second
+  negative control and a naturally aligned short run both observed zero burn
+  progress despite a healthy clock and correctly failed; a fixed short default
+  would make ordinary success depend on where the sample lands within a minute.
+- Correction: `progress-window.mjs` now derives the default from
+  `manifest.protocol.steadyBurnIntervalSeconds`, adding a bounded 25% jitter
+  margin with a 15-second floor. The current topology therefore uses 75
+  seconds. Explicit overrides remain bounded and validated. A 75-second live
+  window advanced both burn and Stacks heights by two while the full cohort and
+  peer invariants passed.
+- Evidence: the exact 4.0.2 build/admission join, both current and released
+  executable versions, deliberate short-window failure, successful
+  cadence-aware progress result, and checksums are retained in
+  `contrib/attacknet/evidence/mixed-version-4.0.2-follower5-20260815T1840Z/`.
+
+## F-091: Recovery assertion timeouts were implemented as a single post-fault sample
+
+- Classification: orchestration truthfulness and recovery-classification defect
+- State: reproduced live; corrected and regression-tested; successful arm64
+  I/O-pressure effect, recovery, cleanup, and subsequent network progress
+  proven live
+- Trigger: the first controller-owned I/O-pressure run raised follower-1's
+  FSYNC p95 from 1.009 ms to 2.310 ms. The pressure Pod then completed and was
+  removed, but the first post-fault sample was still 1.721 ms. The campaign
+  immediately terminated `Inconclusive/EffectNotProven` even though its
+  `IOPressureRecovered` assertion declared a 300-second timeout.
+- Root cause: the `Recovering` state used the recovery timeout only while
+  waiting for the target Pod to become Ready. Once Ready, it collected exactly
+  one after-fault probe and made that result terminal. It never polled a failed
+  recovery observation inside the advertised window. The status was also
+  imprecise: `IOPressureObserved` was Proven, while only recovery had failed,
+  yet the reason said `EffectNotProven`.
+- Correction: effect and recovery satisfaction are evaluated independently.
+  A proven effect plus an unproven recovery now remains
+  `Recovering/WaitingForRecoveryEvidence`, preserves each trusted observation,
+  and polls until recovery is proven or its timeout expires. Terminal failure
+  is named `RecoveryNotProven`; an actually unproven effect remains
+  `EffectNotProven`. A regression test forces the first after sample to remain
+  elevated and the second to recover.
+- Live acceptance: `baseline-parity-io-pressure-pod-r3` resolved exact target
+  Pod UID `09871823-0c51-4ca0-b857-3b6cda1a9142`, PVC
+  `data-attacknet-baseline-signer-parity-follower-1-0`, and node
+  `desktop-worker2`. Its chart-owned arm64 pressure Pod UID was
+  `d61a957a-06b1-4638-8504-15b82829e452`, with runtime image ID
+  `sha256:d23fa3d4b688ba61d0dd556a063f59bbbc4bebaf0084add04d418561292cc6b3`.
+  FSYNC p95 met both effect thresholds at 8.177x / +17.433 ms and subsequently
+  fell below both at 0.694x / -0.743 ms. Exact owned-resource absence was
+  confirmed, follower-1 retained the same UID with zero restarts, no named
+  pressure files remained, and PVC free space returned to 40.8 GB.
+- Network acceptance: the cadence-aware post-fault window exited zero and
+  advanced burn 435 -> 436 and Stacks 234 -> 235. All 18 Stacks nodes agreed
+  exactly on burn height, Stacks height, and tip; every node had at least 24
+  authenticated live conversations and no actor exceeded the one permitted
+  unauthenticated conversation. Evidence is retained under
+  `contrib/attacknet/evidence/io-pressure-pod-arm64-20260815T185207Z/`.
+
+## F-092: A planned mid-run topology mutation makes the file-backed run ledger unexportable
+
+- Classification: reproducibility-ledger lifecycle gap
+- State: reproduced during evidence capture; correctly failed closed;
+  immutable initial/admitted input snapshots implemented and regression-tested;
+  explicit admitted mutation events remain to complete replay of phase changes
+- Trigger: the active network's generated `stacksnetwork.json` was changed to
+  place released 4.0.2 on follower-5 after the lifecycle run descriptor had
+  sealed its initial digest. Later I/O-pressure evidence capture asked the run
+  ledger to export the original inputs.
+- Result: export reported `exported artifact digest mismatch` for that source
+  path. Kubernetes admitted state, exact run/campaign CRs, actor metrics/logs,
+  and the trusted timeline were still captured, and the error marker prevents
+  the partial ledger from being mistaken for a reproducible bundle. This is a
+  truthful failure, not corruption evidence.
+- Correction: run initialization now copies topology, requested manifest, and
+  every rendered configuration into content-addressed `initial-inputs` before
+  sealing their descriptor paths. Runtime resolution likewise snapshots the
+  admitted manifest into `runtime-inputs` before updating the descriptor. Tests
+  mutate and replace all original paths after those phases and prove export
+  still verifies only the immutable copies.
+- Remaining gap: each admitted topology/image change must become an ordered
+  ledger action carrying old/new generations, source/spec digests, admitted
+  Pod UIDs, and runtime image IDs. The snapshots make the original run
+  exportable; they do not by themselves replay the later mixed-version phase.
+
+## F-093: Local chart installation does not distribute newly built images to kind nodes
+
+- Classification: local deployment workflow and image-admission usability gap
+- State: repeatedly reproduced; automatic kind-on-Docker loader implemented,
+  regression-tested, integrated before Helm mutation, and proven on all three
+  live nodes
+- Trigger: `build-local.sh` created updated run-controller and I/O-pressure
+  images, and `install-local.sh` assigned content-derived tags, but those tags
+  existed only in Docker Desktop's image store. The three kind nodes use their
+  own containerd stores.
+- Impact: an otherwise valid Helm upgrade can enter `ImagePullBackOff` or reuse
+  an older node-local tag unless the operator manually imports the exact image
+  into every node. The current run was repaired with explicit OCI imports and
+  admitted runtime IDs, but that manual sequence is easy to omit and is not a
+  suitable multi-version attacknet contract.
+- Correction: `load-kind-images.sh` identifies nodes only from server-assigned
+  `kind://docker/.../<node>` provider IDs, verifies matching Docker containers,
+  imports one archive into every node's `k8s.io` containerd namespace, verifies
+  every normalized reference, and emits a machine-readable node/image/host-ID
+  receipt. `install-local.sh` invokes it in auto mode before CRD/Helm mutation;
+  require and explicitly disabled modes are available. Tests cover complete
+  import, non-kind skip/fail behavior, and read-only help/invalid inputs.
+- Live acceptance: the three exact currently admitted chart images were loaded
+  and verified across `desktop-control-plane`, `desktop-worker`, and
+  `desktop-worker2`, producing nine verified joins and no Kubernetes workload
+  mutation. The receipt is retained with the I/O-pressure evidence. Real
+  clusters continue to require immutable registry digests; this local
+  Docker/containerd mechanism is not used by the general operator.
+
+## F-094: kind local-path volumes correctly strand Pods when their node is unavailable
+
+- Classification: multi-node storage behavior and recovery boundary
+- State: deliberate negative control and same-volume recovery proven live;
+  actual worker-process outage and portable-CSI cross-node reattachment remain
+  separate scenarios
+- Setup: follower-2's PVC
+  `data-attacknet-baseline-signer-parity-follower-2-0` was bound to PV
+  `pvc-422bcfc8-2619-42cf-b28a-f53217380643`. The PV's required node affinity
+  named `desktop-worker`; the actor Pod UID was
+  `8b4b3a4c-9222-4721-b0e0-163ec7bf57de`.
+- Negative control: under the shared mutation lease, only
+  `desktop-worker` was cordoned and only follower-2's Pod was deleted. The
+  StatefulSet created replacement UID
+  `3210e50f-b07f-420d-861c-2c77f6a3bc14`, which remained Pending with
+  `PodScheduled=False/Unschedulable`. Scheduler evidence included the volume
+  node-affinity conflict; Kubernetes did not pretend to recover by attaching
+  node-local chainstate to another worker.
+- Recovery: uncordoning the original worker scheduled the replacement there.
+  The PVC UID and PV UID were unchanged, both actor and trusted probe became
+  Ready with zero restarts, and the full cohort converged before the scenario
+  proceeded. The cadence-aware gate then advanced burn 441 -> 442 and Stacks
+  239 -> 240 with zero height drift and one canonical tip. The mutation lease
+  released and the worker remained Ready and schedulable.
+- Boundary: this proves truthful local-path stranding and recovery when the
+  original node returns. It does not prove that a local-path volume can move to
+  another node—it cannot—or that a portable CSI driver reattaches correctly.
+  A real worker outage and a portable-CSI cross-node scenario should be kept as
+  distinct experiments with distinct expected outcomes.
+- Evidence: requested actions, before/stranded/after Pod state, scheduler
+  events, exact PVC/PV identities, chain snapshots, progress result, and
+  checksums are retained at
+  `contrib/attacknet/evidence/pvc-node-affinity-recovery-20260815T190500Z/`.
+
+## F-095: Majority-weight worker loss pauses Stacks quorum and recovers without unsafe progress
+
+- Classification: clean adversarial result plus evidence-schema correction
+- State: real kind worker process stopped and restarted; recovery proven live;
+  exact future outage timing made explicit
+- Setup: `desktop-worker` hosted six active signers carrying 16 of the current
+  reward set's 30 slots (53.33%). The experiment acquired the mutation lease
+  and explicitly set `allowQuorumLoss=true`; it never renormalized signer
+  weights or lowered the 70% threshold.
+- Fault: the exact kind node container was stopped. Kubernetes changed the
+  node to `Ready=Unknown/NodeStatusUnknown` at 19:20:59Z and back to
+  `Ready=True` at 19:21:52Z. Burnchain remained available on the other worker.
+- Consensus result: five-second Prometheus evidence shows all three miners at
+  Stacks height 250 before and throughout the node-unready interval. Their
+  first height-251 samples occurred at 19:22:20Z, after the worker returned.
+  The network therefore paused instead of producing with insufficient signer
+  weight, then resumed automatically. This is a clean safety/liveness result,
+  not a node defect.
+- Recovery: all 31 workloads returned Ready; every network PVC retained its
+  UID; the cadence-aware gate advanced burn 456 -> 458 and Stacks 253 -> 254;
+  the cohort had at most one block of transient drift, no equal-height fork,
+  and live authenticated P2P connectivity recovered.
+- Harness correction: the original result called the configured 50-second
+  post-NotReady hold `downtimeSeconds`, even though Docker had already been
+  stopped while Kubernetes detected the loss. That label understated the
+  total fault window. The runner now records stop-requested, Docker-stopped,
+  NotReady-observed, start-requested, and Ready-observed timestamps and reports
+  the intentional hold separately. The retained run is annotated rather than
+  inventing absent Docker timestamps.
+- Evidence:
+  `contrib/attacknet/evidence/worker-outage-recovery-20260815T192000Z/`.
+
+## F-096: The Bitcoin clock health server could close before reading the kubelet request
+
+- Classification: harness readiness false-negative and HTTP lifecycle defect
+- State: reproduced over the long full-topology run; corrected and
+  regression-tested offline; clean live rollout proof belongs to the next
+  clean run
+- Evidence: the clock mined continuously with zero container restarts, but
+  Kubernetes accumulated 36 intermittent readiness failures over roughly four
+  hours. The kubelet error was
+  `readLoopPeekFailLocked: %!w(<nil>)`; the Pod remained Ready because the
+  threshold intentionally tolerates transient failures. Direct requests from
+  the trusted sidecar succeeded.
+- Root cause: the minimal Perl health server wrote a response and closed the
+  accepted socket without reading the HTTP request. That can race a client's
+  request write and produce a TCP reset/ambiguous close even though the clock
+  process is healthy. This is an apparatus failure, not Bitcoin or Stacks
+  liveness evidence.
+- Correction: consume one complete request header with an 8 KiB bound and a
+  one-second read deadline before returning the fixed response. Incomplete or
+  slow clients are closed without occupying the single-threaded listener
+  indefinitely. A behavioral test performs 50 complete HTTP exchanges and
+  requires every response body and status.
+- Operational note: the current admitted clock uses the prior ConfigMap and is
+  intentionally not hot-rolled during the soak. The next clean lifecycle run
+  must show no recurrence before this is marked live-proven.
+
+## F-097: Expected future reward-set lookup state is emitted as an error storm
+
+- Classification: current-node observability correctness and incident-noise gap
+- State: repeatedly observed on current main; no liveness impact established;
+  implementation site and phase relationship confirmed
+- Trigger: Prometheus/Grafana and operator checks poll `/v2/pox` before the
+  next reward cycle's prepare phase exists in the canonical sortition chain.
+  At burn 471, for example, current cycle 23 was healthy and the API reported
+  four blocks until cycle 24's prepare phase, while each lookup attempted to
+  resolve a prepare-phase ancestor at future height 476.
+- Result: `get_prepare_phase_start_sortition_id_for_reward_cycle` logs
+  `Could not find prepare phase start ancestor while fetching reward set` at
+  error level and returns `NotFound`. Repeated `/v2/pox` clients turn the
+  expected not-yet-available state into multiple error lines roughly every two
+  seconds. Chain height and signer activity continue. A bounded post-boundary
+  sample at burn 476 contained zero matching errors, confirming that the storm
+  is phase-bounded rather than persistent database corruption.
+- Recommended correction: if the computed prepare-phase start exceeds the
+  canonical sortition tip, return an explicit not-ready/absent result without
+  error logging. Preserve error severity for an ancestor that should already
+  exist, and add before/at/after prepare- and reward-boundary tests. Bound or
+  coalesce any remaining endpoint diagnostic.
+- Portability: this behavior predates attacknet and is transport-independent;
+  the accelerated regtest makes its volume conspicuous but does not create the
+  logical future-ancestor condition.
+
+## F-098: A restored peer can amplify stale Nakamoto-inventory send warnings for minutes
+
+- Classification: current-node P2P recovery efficiency and log-amplification
+  finding
+- State: one worker-restart occurrence classified; network recovered; internal
+  ownership/race mechanism needs a focused reproduction before remediation
+- Evidence: after `desktop-worker` returned, miner-2 emitted at least 3,039
+  warnings from 19:22:12Z through the first 19:39 sample for
+  `failed to send GetNakamotoInv ... PeerNotConnected` to stale neighbor
+  identity `8e5553...` at follower-2's unchanged Pod IP `10.244.1.23`. During
+  the same interval `/v2/neighbors` showed a different, live authenticated
+  identity `e13e93...` at that address and the full cohort kept progressing.
+  The old identity repeatedly logs an unauthenticated-timeout drop under a new
+  event ID, then reappears; at 19:41:21Z event 567 dropped and fresh warnings
+  were still arriving. A later bounded sample contained 171 matching warnings
+  in 60 seconds. The final soak capture paginated 6,369 matching Loki entries;
+  its most recent retained warning was at 20:10:58Z, roughly 49 minutes after
+  the worker returned. The condition had therefore still not self-cleared when
+  the run crossed its 300-block boundary, even though protocol progress
+  continued. The local cluster has no Metrics
+  Server, so this run does not quantify its CPU cost. At that rate, the
+  harness's intentionally bounded 20,000-line per-actor incident capture can
+  also lose earlier causal context in under two hours; Loki retention remains
+  the longer forensic source when available.
+- Bounded conclusion: worker/process recovery can leave an inventory peer
+  eligible for repeated send attempts long after a healthy replacement
+  conversation exists. This run proves recovery plus substantial warning
+  amplification; it does not yet prove whether the underlying cause is peer
+  key rotation, duplicate conversation bookkeeping, or a race between
+  `iter_peer_event_ids` and `neighbor_send`.
+- Follow-up: create a focused stable-IP peer-restart test that records both
+  endpoint identities, event IDs, connection registration/removal, inventory
+  map membership, warning count, CPU, and time-to-garbage-collection. A failed
+  send to an already-disconnected inventory peer should be bounded and should
+  promptly evict or suppress that state rather than warning thousands of
+  times. The current run should be observed through its 300-block boundary to
+  determine whether the condition ever clears. Verify the same behavior on a
+  normal VM/TCP network before attributing any rate to kind.
+
+## F-099: Teardown evidence does not yet export the retained Loki log corpus
+
+- Classification: forensic-evidence completeness gap
+- State: confirmed by harness inspection; bounded Kubernetes log snapshots and
+  the trusted event timeline are exported, but the centralized Loki streams are
+  not
+- Impact: Loki is intentionally the longer forensic source when actor output
+  exceeds the 20,000-line `kubectl logs` cap or kubelet rotates a container log.
+  The stale-peer condition in F-098 can fill that bounded snapshot in under two
+  hours. Deleting a network's observability PVC before exporting the relevant
+  Loki range can therefore discard the earliest causal context even though the
+  dashboard displayed it during the run.
+- Required correction: add a paginated, time-bounded Loki exporter that records
+  the exact LogQL selector, start/end nanoseconds, stream labels, per-page
+  cursors, truncation/limit state, Loki build/config identity, and digests. The
+  incident and normal teardown paths must run it before deleting observability
+  storage, fail visibly on an incomplete export, and preserve the PVC for
+  forensic recovery rather than treating an empty/truncated response as
+  success. Keep the existing `kubectl logs` snapshots as an independent source;
+  neither collector is assumed complete by itself.
+
+## F-100: The retained full topology crossed 300 burn blocks and kept progressing
+
+- Classification: preliminary long-run acceptance evidence
+- State: passed and digest-sealed; deliberately not the final corrected soak
+- Evidence: the clean-volume network began at burn 202 and reached burn 502.
+  At that boundary all 18 Stacks nodes reported burn 502, Stacks height 297,
+  zero drift on either height, one common tip, and no same-height fork. A new
+  bounded window then advanced burn 503 to 504 and Stacks 298 to 299 while the
+  full cohort remained in agreement. All 31 declared network workloads and all
+  38 enrolled network/observability Pods were Ready; all 32 PVCs were Bound;
+  every node retained at least 41.6 GB of root/image filesystem headroom.
+- Adversarial coverage retained in the same run: recovered Pod, network, DNS,
+  controller-owned disk-pressure, local-path node-stranding, and real worker
+  outage experiments; the worker carried 53.33% signer weight and produced the
+  expected safe quorum pause before recovery. Follower-5 ran the released 4.0.2
+  image while the remaining actors ran the current branch image.
+- Qualification: this run predates immutable rendered-input snapshots and the
+  Bitcoin clock HTTP correction. The planned follower-5 image mutation causes
+  the old ledger to reject export with an artifact digest mismatch, exactly as
+  it should; the admitted clock was not hot-rolled. F-098 also remained active
+  at the boundary. This evidence therefore validates the retained network and
+  fault recoveries but does not satisfy the active goal's final fresh corrected
+  soak.
+- Bundle:
+  `contrib/attacknet/evidence/full-topology-preliminary-300-20260815T201007Z/`.
+  Its `SHA256SUMS` verifies every retained file, including the explicit ledger
+  failure, actor metrics/logs/APIs, admitted Kubernetes state, targeted
+  paginated Loki evidence, storage report, and machine classification.
 
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean

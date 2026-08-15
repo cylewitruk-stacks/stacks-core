@@ -22,13 +22,17 @@ function targets(items = [target]) {
   };
 }
 
-function phase(name, authority, observations = [], allInjectedObserved = false) {
+function phase(name, authority, observations = [], allInjectedObserved = false,
+  injectionAuthority = 'chaos-mesh-status') {
   return {
     schemaVersion: FAULT_PROBE_SCHEMA, phase: name,
-    source: {trust: 'orchestrator-observed', authority, collector: 'attacknet-probe/v1'},
+    source: {
+      trust: 'orchestrator-observed', authority, collector: 'attacknet-probe/v1',
+      ...(authority === 'application-process-metric' ? {contentTrust: 'actor-self-reported'} : {}),
+    },
     ...(name === 'during' ? {injection: {
       allInjectedObserved,
-      source: {trust: 'orchestrator-observed', authority: 'chaos-mesh-status', collector: 'chaos-controller'},
+      source: {trust: 'orchestrator-observed', authority: injectionAuthority, collector: 'fault-controller'},
     }} : {}),
     observations,
   };
@@ -38,7 +42,7 @@ function evaluate(compiled, before, during, after, options = {}) {
   const resolved = options.targets ?? targets();
   return evaluateFaultEffect({
     campaign: compiled,
-    evidence: {selectedActors: resolved.targets.map(item => item.actor)},
+    evidence: options.evidence ?? {selectedActors: resolved.targets.map(item => item.actor)},
     resolvedTargets: resolved,
     before, during, after,
   });
@@ -159,6 +163,16 @@ function io(values = {}) {
   };
 }
 
+function pressureCampaign(contract) {
+  const compiled = campaign('IOPressurePod', null, {
+    containerNames: ['actor'], workers: 1, bytesMiB: 64, writeSizeKiB: 256,
+  });
+  compiled.metadata.annotations = {
+    'testing.stacks.org/io-pressure-contract': JSON.stringify(contract),
+  };
+  return compiled;
+}
+
 test('I/O proof uses matching operation latency or errno evidence', () => {
   const latency = evaluate(
     campaign('IOChaos', 'latency', {volumePath: '/data', delay: '100ms'}),
@@ -178,18 +192,95 @@ test('I/O proof uses matching operation latency or errno evidence', () => {
   assert.equal(fault.recovery.verdict, 'Proven');
 });
 
+test('disk I/O pressure requires configured latency multiplier and added-ms evidence and proves recovery distinctly', () => {
+  const contract = {
+    semantic: 'disk-io-pressure', severity: 'medium', workers: 1, bytesMiB: 64,
+    writeSizeKiB: 256, tempPath: '/data', minimumLatencyMultiplier: 2,
+    minimumAddedLatencyMs: 5,
+  };
+  const compiled = pressureCampaign(contract);
+  const evidence = {selectedActors: [target.actor], ioPressure: contract};
+  const baseline = io({probeName: 'fsync-pressure.dat', operation: 'FSYNC', latencyMsP50: 2, latencyMsP95: 4});
+  const affected = io({probeName: 'fsync-pressure.dat', operation: 'FSYNC', latencyMsP50: 8, latencyMsP95: 12});
+  const recovered = io({probeName: 'fsync-pressure.dat', operation: 'FSYNC', latencyMsP50: 2, latencyMsP95: 4.5});
+  const result = evaluate(
+    compiled,
+    phase('before', 'active-probe', [baseline]),
+    phase('during', 'active-probe', [affected], true, 'kubernetes-pod-status'),
+    phase('after', 'active-probe', [recovered]),
+    {evidence},
+  );
+  assert.equal(result.verdict, 'Proven');
+  assert.equal(result.recovery.verdict, 'Proven');
+  assert.equal(result.campaign.action, 'disk-pressure');
+  assert.equal(result.evaluations[0].metrics.latencyMultiplier, 3);
+  assert.equal(result.evaluations[0].metrics.addedLatencyMs, 8);
+  assert.match(result.evaluations[0].reason, /both configured/);
+  assert.match(result.evaluations[0].recoveryReason, /returned below both/);
+
+  const allInjectedWithoutEffect = evaluate(
+    compiled,
+    phase('before', 'active-probe', [baseline]),
+    phase('during', 'active-probe', [io({
+      probeName: 'fsync-pressure.dat', operation: 'FSYNC', latencyMsP95: 4.2,
+    })], true, 'kubernetes-pod-status'),
+    phase('after', 'active-probe', [recovered]),
+    {evidence},
+  );
+  assert.equal(allInjectedWithoutEffect.verdict, 'Failed');
+  assert.equal(allInjectedWithoutEffect.injection.allInjectedObserved, true);
+  assert.match(allInjectedWithoutEffect.injection.evidentiaryWeight, /never sufficient/);
+});
+
+test('disk I/O pressure recovery fails while either configured threshold remains exceeded', () => {
+  const contract = {
+    semantic: 'disk-io-pressure', severity: 'low', workers: 1, bytesMiB: 32,
+    writeSizeKiB: 128, tempPath: '/data', minimumLatencyMultiplier: 2,
+    minimumAddedLatencyMs: 5,
+  };
+  const evidence = {selectedActors: [target.actor], ioPressure: contract};
+  const sample = values => io({probeName: 'fsync-pressure.dat', operation: 'FSYNC', ...values});
+  const result = evaluate(
+    pressureCampaign(contract),
+    phase('before', 'active-probe', [sample({latencyMsP95: 4})]),
+    phase('during', 'active-probe', [sample({latencyMsP95: 12})], true, 'kubernetes-pod-status'),
+    phase('after', 'active-probe', [sample({latencyMsP95: 9})]),
+    {evidence},
+  );
+  assert.equal(result.verdict, 'Proven');
+  assert.equal(result.recovery.verdict, 'Failed');
+  assert.match(result.evaluations[0].recoveryReason, /remained at or above/);
+});
+
+test('disk I/O pressure rejects threshold evidence that differs from the compiled resource contract', () => {
+  const contract = {
+    semantic: 'disk-io-pressure', severity: 'low', workers: 1, bytesMiB: 32,
+    writeSizeKiB: 128, tempPath: '/data', minimumLatencyMultiplier: 2,
+    minimumAddedLatencyMs: 5,
+  };
+  assert.throws(() => evaluate(
+    pressureCampaign(contract),
+    phase('before', 'active-probe'), phase('during', 'active-probe', [], true, 'kubernetes-pod-status'),
+    phase('after', 'active-probe'),
+    {evidence: {selectedActors: [target.actor], ioPressure: {...contract, minimumAddedLatencyMs: 6}}},
+  ), /does not match compiler evidence/);
+});
+
 function clock(actor, control, wallEpochSeconds, monotonicSeconds) {
-  return {actor, probe: 'clock', status: 'ok', control, wallEpochSeconds, monotonicSeconds, sampleWindowMs: 20};
+  return {
+    actor, probe: 'clock', status: 'ok', control, wallEpochSeconds, monotonicSeconds,
+    sampleWindowMs: 20, metric: 'stacks_node_process_wall_clock_seconds',
+  };
 }
 
 test('Time proof normalizes target wall-clock shift against monotonic and independent control clocks', () => {
-  const before = phase('before', 'orchestrator-kernel-probe', [
+  const before = phase('before', 'application-process-metric', [
     clock(target.actor, false, 1000, 100), clock('control-1', true, 2000, 500),
   ]);
-  const during = phase('during', 'orchestrator-kernel-probe', [
+  const during = phase('during', 'application-process-metric', [
     clock(target.actor, false, 980, 110), clock('control-1', true, 2010, 510),
   ], true);
-  const after = phase('after', 'orchestrator-kernel-probe', [
+  const after = phase('after', 'application-process-metric', [
     clock(target.actor, false, 1020, 120), clock('control-1', true, 2020, 520),
   ]);
   const result = evaluate(campaign('TimeChaos', null, {timeOffset: '-30s'}), before, during, after);
@@ -199,9 +290,9 @@ test('Time proof normalizes target wall-clock shift against monotonic and indepe
 
   const noControl = evaluate(
     campaign('TimeChaos', null, {timeOffset: '-30s'}),
-    phase('before', 'orchestrator-kernel-probe', [clock(target.actor, false, 1000, 100)]),
-    phase('during', 'orchestrator-kernel-probe', [clock(target.actor, false, 980, 110)], true),
-    phase('after', 'orchestrator-kernel-probe', [clock(target.actor, false, 1020, 120)]),
+    phase('before', 'application-process-metric', [clock(target.actor, false, 1000, 100)]),
+    phase('during', 'application-process-metric', [clock(target.actor, false, 980, 110)], true),
+    phase('after', 'application-process-metric', [clock(target.actor, false, 1020, 120)]),
   );
   assert.equal(noControl.verdict, 'Inconclusive');
 });

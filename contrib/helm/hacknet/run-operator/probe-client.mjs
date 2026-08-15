@@ -2,9 +2,10 @@ import http from 'node:http';
 
 export const PROBE_RESPONSE_SCHEMA = 'stacks-attacknet-probe-response/v1';
 export const PROBE_PORT = 18080;
+export const PROCESS_WALL_CLOCK_METRIC = 'stacks_node_process_wall_clock_seconds';
 
 const KIND_TO_PROBE = Object.freeze({
-  NetworkChaos: 'network', DNSChaos: 'dns', IOChaos: 'io', TimeChaos: 'clock',
+  NetworkChaos: 'network', DNSChaos: 'dns', IOChaos: 'io', IOPressurePod: 'io', TimeChaos: 'clock',
 });
 
 function globMatches(pattern, value) {
@@ -50,7 +51,13 @@ export function buildProbeRequest({kind, campaign, compiledEvidence, network, ta
     const operation = methods.find(method => ['READ', 'WRITE', 'FSYNC'].includes(method)) ?? 'FSYNC';
     return {kind: 'io', operation, attempts: 5, bytes: 4096, file: `${campaign.metadata.name}.dat`};
   }
-  if (kind === 'TimeChaos') return {kind: 'clock', control: false};
+  if (kind === 'IOPressurePod') {
+    return {kind: 'io', operation: 'FSYNC', attempts: 5, bytes: 4096, file: `${campaign.metadata.name}.dat`};
+  }
+  if (kind === 'TimeChaos') return {
+    kind: 'processClock', peer: target.actor, port: 'metrics',
+    metric: PROCESS_WALL_CLOCK_METRIC, control: false,
+  };
   throw new Error(`no active probe contract for ${kind}`);
 }
 
@@ -118,14 +125,21 @@ export class ProbeClient {
 export function probePhase({kind, phase, responses, allInjectedObserved = false}) {
   const probe = KIND_TO_PROBE[kind];
   if (!probe) throw new Error(`unsupported probe phase kind ${kind}`);
-  const authority = kind === 'TimeChaos' ? 'orchestrator-kernel-probe' : 'active-probe';
+  const authority = kind === 'TimeChaos' ? 'application-process-metric' : 'active-probe';
   return {
     schemaVersion: 'stacks-attacknet-fault-probe/v1', phase,
-    source: {trust: 'orchestrator-observed', authority, collector: 'attacknet-probe/v1'},
+    source: {
+      trust: 'orchestrator-observed', authority, collector: 'attacknet-probe/v1',
+      ...(kind === 'TimeChaos' ? {contentTrust: 'actor-self-reported'} : {}),
+    },
     capturedAt: new Date().toISOString(),
     injection: {
       allInjectedObserved,
-      source: {trust: 'orchestrator-observed', authority: 'chaos-mesh-status', collector: 'attacknet-run-operator/v1'},
+      source: {
+        trust: 'orchestrator-observed',
+        authority: kind === 'IOPressurePod' ? 'kubernetes-pod-status' : 'chaos-mesh-status',
+        collector: 'attacknet-run-operator/v1',
+      },
     },
     observations: responses.map(item => item.observation ?? {
       actor: item.actor, probe, status: 'error', error: String(item.error ?? 'probe failed').slice(0, 4096),
@@ -139,7 +153,7 @@ export function baselineUsable(kind, phase, selectedActors) {
   if (observations.length !== selected.size || observations.some(item => item.status !== 'ok')) return false;
   if (kind === 'NetworkChaos') return observations.every(item => item.successes > 0);
   if (kind === 'DNSChaos') return observations.every(item => item.querySucceeded && item.controlSucceeded);
-  if (kind === 'IOChaos') return observations.every(item => item.successes > 0);
+  if (kind === 'IOChaos' || kind === 'IOPressurePod') return observations.every(item => item.successes > 0);
   if (kind === 'TimeChaos') {
     return observations.length === selected.size
       && phase.observations.some(item => item.status === 'ok' && item.control === true && !selected.has(item.actor));

@@ -330,10 +330,39 @@
       "type": "table"
     },
     {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Exact global-state support seen by this signer. Maximum view weight must meet the rounded-up canonical threshold before the attacknet lifecycle permits steady burn cadence. Evaluator-required shows the currently deployed rounded-down behavior for forensic comparison.",
+      "fieldConfig": {"defaults": {"color": {"mode": "continuous-BlPu"}, "min": 0}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 70},
+      "id": 23,
+      "options": {"displayMode": "gradient", "minVizHeight": 10, "minVizWidth": 0, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true, "sizing": "auto", "valueMode": "color"},
+      "targets": [
+        {"expr": "stacks_signer_global_state_available{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "global state available", "refId": "A"},
+        {"expr": "stacks_signer_global_state_known_weight{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "known weight", "refId": "B"},
+        {"expr": "stacks_signer_global_state_maximum_view_weight{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "maximum exact-view weight", "refId": "C"},
+        {"expr": "stacks_signer_global_state_canonical_threshold_weight{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "canonical required", "refId": "D"},
+        {"expr": "stacks_signer_global_state_evaluator_threshold_weight{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "evaluator required", "refId": "E"},
+        {"expr": "stacks_signer_global_state_total_weight{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "total weight", "refId": "F"}
+      ],
+      "title": "Signer global-state weight (self-reported)",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Wall-clock offset sampled inside the Stacks process, compared with Prometheus query time. This actor-self-reported signal is useful for spotting process-visible clock skew; FaultCampaign effect evidence still relies on the independent orchestrator probe rather than trusting this value.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 79},
+      "id": 24,
+      "options": {"legend": {"calcs": ["lastNotNull", "min", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "stacks_node_process_wall_clock_seconds{attacknet_network=\"$network\",attacknet_actor=\"$actor\"} - time()", "legendFormat": "process wall-clock offset", "refId": "A"}],
+      "title": "Process-visible wall-clock offset (self-reported)",
+      "type": "timeseries"
+    },
+    {
       "datasource": {"type": "loki", "uid": "attacknet-loki"},
       "description": "Raw actor stdout/stderr. Kubernetes attaches the stream identity; the body remains fully actor-controlled and untrusted. Use surrounding trusted fault/readiness state to establish causality.",
       "fieldConfig": {"defaults": {}, "overrides": []},
-      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 70},
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 85},
       "id": 16,
       "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
       "targets": [{"datasource": {"type": "loki", "uid": "attacknet-loki"}, "editorMode": "code", "expr": "{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "queryType": "range", "refId": "A"}],

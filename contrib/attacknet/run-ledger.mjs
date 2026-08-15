@@ -76,6 +76,19 @@ function renderedConfigurationFiles(root) {
   });
 }
 
+function snapshotArtifact(path, artifactsDirectory, category) {
+  const absolute = resolve(path);
+  const digest = sha256File(absolute);
+  const snapshotDirectory = join(artifactsDirectory, category);
+  const target = join(snapshotDirectory, `${digest.slice(7, 23)}-${basename(absolute)}`);
+  mkdirSync(snapshotDirectory, {recursive: true});
+  if (!existsSync(target)) copyFileSync(absolute, target);
+  if (sha256File(target) !== digest) {
+    throw new Error(`immutable run artifact snapshot digest mismatch: ${absolute}`);
+  }
+  return target;
+}
+
 function repositoryRoot(attacknetDirectory) {
   return execFileSync('git', ['-C', attacknetDirectory, 'rev-parse', '--show-toplevel'], {encoding: 'utf8'}).trim();
 }
@@ -145,7 +158,12 @@ export function initializeRun(generated, options = {}) {
   const artifacts = join(dirname(descriptorPath), 'run-artifacts');
   mkdirSync(artifacts, {recursive: true});
   const root = repositoryRoot(dirname(new URL(import.meta.url).pathname));
-  const source = sourceState(root, join(artifacts, 'source.patch'));
+  const source = options.source ?? sourceState(root, join(artifacts, 'source.patch'));
+  const topologySnapshot = snapshotArtifact(manifestPath, artifacts, 'initial-inputs');
+  const requestedManifestSnapshot = snapshotArtifact(
+    requestedManifestPath, artifacts, 'initial-inputs');
+  const configurationSnapshots = renderedConfigurationFiles(absoluteGenerated)
+    .map(path => snapshotArtifact(path, artifacts, 'initial-inputs'));
   const metadata = {
     runId,
     seed: String(options.seed ?? process.env.ATTACKNET_RUN_SEED ?? runId),
@@ -154,11 +172,11 @@ export function initializeRun(generated, options = {}) {
     sourceRevision: source.revision,
     sourceDirty: source.dirty,
     ...(source.diffPath ? {sourceDiffPath: source.diffPath} : {}),
-    topologyPath: manifestPath,
+    topologyPath: topologySnapshot,
     // Deliberately exclude observability credentials and run artifacts. They
     // belong in protected evidence, not in the replayable SUT configuration.
-    configPaths: renderedConfigurationFiles(absoluteGenerated),
-    requestedManifestPath,
+    configPaths: configurationSnapshots,
+    requestedManifestPath: requestedManifestSnapshot,
     images: JSON.parse(readFileSync(requestedManifestPath, 'utf8')).spec.actors.map(actor => ({
       scope: actor.name,
       requestedRef: actor.image,
@@ -201,10 +219,20 @@ export function resolveRun(descriptorPath, admittedManifestPath, podsPath) {
   });
   // admittedRef is valuable evidence but is not part of the v1 cryptographic
   // identity tuple; retain it adjacent to the resolution input.
-  const resolutionPath = join(dirname(descriptorPath), 'run-artifacts', 'runtime-resolution.json');
-  writeAtomic(resolutionPath, `${JSON.stringify({admittedManifestPath, images}, null, 2)}\n`);
+  const artifacts = join(dirname(descriptorPath), 'run-artifacts');
+  const admittedManifestSnapshot = snapshotArtifact(
+    admittedManifestPath, artifacts, 'runtime-inputs');
+  const resolutionPath = join(artifacts, 'runtime-resolution.json');
+  writeAtomic(resolutionPath, `${JSON.stringify({
+    observedAdmittedManifestPath: resolve(admittedManifestPath),
+    admittedManifestSnapshot,
+    images,
+  }, null, 2)}\n`);
   const normalizedImages = images.map(({admittedRef: _admittedRef, ...image}) => image);
-  writeDescriptor(descriptorPath, resolveRuntimeInputs(descriptor, {admittedManifestPath, images: normalizedImages}));
+  writeDescriptor(descriptorPath, resolveRuntimeInputs(descriptor, {
+    admittedManifestPath: admittedManifestSnapshot,
+    images: normalizedImages,
+  }));
   return descriptorPath;
 }
 

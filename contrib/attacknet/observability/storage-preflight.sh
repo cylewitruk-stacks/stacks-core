@@ -8,8 +8,18 @@ set -euo pipefail
 
 KUBECTL="${ATTACKNET_KUBECTL:-kubectl}"
 MIN_FREE_BYTES="${ATTACKNET_OBSERVABILITY_MIN_FREE_BYTES:-2147483648}"
-OUTPUT="${1:-}"
 ATTACKNET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  echo "usage: $0 [OUTPUT.json]" >&2
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  -*) usage; echo "unknown option: $1" >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { usage; exit 2; }
+OUTPUT="${1:-}"
 
 [[ "${MIN_FREE_BYTES}" =~ ^[0-9]+$ ]] || {
   echo "ATTACKNET_OBSERVABILITY_MIN_FREE_BYTES must be a non-negative integer" >&2

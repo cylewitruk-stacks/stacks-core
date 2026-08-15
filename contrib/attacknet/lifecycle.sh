@@ -11,6 +11,7 @@ BOOTSTRAP_INTERVAL_SECONDS="${ATTACKNET_BOOTSTRAP_INTERVAL_SECONDS:-2}"
 OBSERVABILITY_ENABLED="${ATTACKNET_OBSERVABILITY_ENABLED:-1}"
 OBSERVABILITY_STORAGE_PREFLIGHT="${ATTACKNET_OBSERVABILITY_STORAGE_PREFLIGHT:-1}"
 LOCAL_ACCESS_ENABLED="${ATTACKNET_LOCAL_ACCESS_ENABLED:-1}"
+CHAOS_DASHBOARD_LOCAL_ACCESS_ENABLED="${ATTACKNET_CHAOS_DASHBOARD_LOCAL_ACCESS_ENABLED:-1}"
 RUN_DESCRIPTOR=""
 RUN_ID="${ATTACKNET_RUN_ID:-}"
 RUN_SEED="${ATTACKNET_RUN_SEED:-}"
@@ -259,6 +260,171 @@ wait_nodes_at_burn_height() {
   return 1
 }
 
+wait_live_peer_connectivity() {
+  local manifest="$1" group="$2" deadline=$((SECONDS + TIMEOUT))
+  local actors actor neighbors first samples result invariant_status
+  actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" "${group}")"
+  samples="$(mktemp)"
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    first=true
+    printf '[' >"${samples}"
+    for actor in ${actors}; do
+      neighbors="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${actor}" \
+        curl --fail --silent --max-time 3 http://127.0.0.1:20443/v2/neighbors 2>/dev/null || true)"
+      if [ "${first}" = true ]; then first=false; else printf ',' >>"${samples}"; fi
+      ACTOR="${actor}" NEIGHBORS="${neighbors}" node -e '
+        let neighbors = {};
+        try { neighbors = JSON.parse(process.env.NEIGHBORS); } catch {}
+        process.stdout.write(JSON.stringify({actor: process.env.ACTOR, neighbors}));
+      ' >>"${samples}"
+    done
+    printf ']\n' >>"${samples}"
+    # A failed sample is the expected retry signal, not a lifecycle failure.
+    # ERR traps are inherited by command substitutions under `set -E`; remove
+    # the trap inside this bounded probe and preserve its status explicitly so
+    # an ordinary not-yet-connected sample cannot seal the run as failed.
+    invariant_status=0
+    result="$(trap - ERR; node "${ATTACKNET_DIR}/invariants.mjs" peers "${samples}" 2>/dev/null)" \
+      || invariant_status=$?
+    if [ "${invariant_status}" -eq 0 ]; then
+      rm -f "${samples}"
+      printf '%s live authenticated P2P connectivity proven for %s nodes\n' \
+        "${group}" "$(wc -w <<<"${actors}" | tr -d ' ')"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "${group} nodes did not establish live authenticated P2P connectivity: ${result:-unavailable}" >&2
+  rm -f "${samples}"
+  return 1
+}
+
+signer_metric_value() {
+  local metrics="$1" name="$2"
+  awk -v metric="${name}" '$1 == metric { print $2; exit }' <<<"${metrics}"
+}
+
+wait_signer_global_state() {
+  local manifest="$1" deadline=$((SECONDS + TIMEOUT)) signers signer metrics
+  local available known maximum canonical missing stable=0
+  signers="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" signers)"
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    missing=""
+    for signer in ${signers}; do
+      metrics="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${signer}" \
+        curl --fail --silent --max-time 3 http://127.0.0.1:31000/metrics 2>/dev/null || true)"
+      available="$(signer_metric_value "${metrics}" stacks_signer_global_state_available)"
+      known="$(signer_metric_value "${metrics}" stacks_signer_global_state_known_weight)"
+      maximum="$(signer_metric_value "${metrics}" stacks_signer_global_state_maximum_view_weight)"
+      canonical="$(signer_metric_value "${metrics}" stacks_signer_global_state_canonical_threshold_weight)"
+      if [ "${available}" != 1 ] || ! [[ "${known}" =~ ^[0-9]+$ ]] \
+        || ! [[ "${maximum}" =~ ^[0-9]+$ ]] || ! [[ "${canonical}" =~ ^[0-9]+$ ]] \
+        || [ "${known:-0}" -lt "${canonical:-1}" ] \
+        || [ "${maximum:-0}" -lt "${canonical:-1}" ]; then
+        missing="${missing} ${signer}:available=${available:-?},known=${known:-?},view=${maximum:-?},required=${canonical:-?}"
+      fi
+    done
+    if [ -z "${missing}" ]; then
+      stable=$((stable + 1))
+      if [ "${stable}" -ge 3 ]; then
+        printf 'All %s signers retained a canonical-threshold global state for three samples\n' \
+          "$(wc -w <<<"${signers}" | tr -d ' ')"
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    sleep 2
+  done
+  echo "signers did not establish canonical-threshold global state:${missing}" >&2
+  return 1
+}
+
+wait_signer_set_parity() {
+  local manifest="$1" deadline=$((SECONDS + TIMEOUT)) pox reward_set cycle
+  local response_file report_file status
+  response_file="$(mktemp)"
+  report_file="$(mktemp)"
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    pox="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+      "${ATTACKNET_DIR}/runtime-backend.sh" exec miner-1 \
+      curl --fail --silent --max-time 3 http://127.0.0.1:20443/v2/pox 2>/dev/null || true)"
+    cycle="$(POX="${pox}" node -e '
+      try {
+        const value = JSON.parse(process.env.POX).current_cycle?.id;
+        if (Number.isSafeInteger(value) && value >= 0) process.stdout.write(String(value));
+      } catch {}
+    ')"
+    if [[ "${cycle}" =~ ^[0-9]+$ ]]; then
+      reward_set="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+        "${ATTACKNET_DIR}/runtime-backend.sh" exec miner-1 \
+        curl --fail --silent --max-time 3 \
+        "http://127.0.0.1:20443/v3/stacker_set/${cycle}" 2>/dev/null || true)"
+      if REWARD_SET="${reward_set}" node -e '
+        try {
+          const parsed = JSON.parse(process.env.REWARD_SET);
+          if (!Array.isArray(parsed.stacker_set?.signers)) process.exit(1);
+        } catch { process.exit(1); }
+      '; then
+        printf '%s\n' "${reward_set}" >"${response_file}"
+        status=0
+        ATTACKNET_REWARD_CYCLE="${cycle}" node "${ATTACKNET_DIR}/signer-set-parity.mjs" \
+          "${manifest}" "${response_file}" "${report_file}" || status=$?
+        if [ "${status}" -eq 0 ]; then
+          jq -c . "${report_file}"
+          rm -f "${response_file}" "${report_file}"
+          return 0
+        fi
+        if [ "${status}" -eq 1 ]; then
+          echo "declared signer ownership is unsafe for fault admission:" >&2
+          jq . "${report_file}" >&2
+          rm -f "${response_file}" "${report_file}"
+          return 1
+        fi
+      fi
+    fi
+    sleep 2
+  done
+  rm -f "${response_file}" "${report_file}"
+  echo "could not prove declared signer weights against the canonical reward set" >&2
+  return 1
+}
+
+minimum_node_stacks_height() {
+  local manifest="$1" group="$2" actors actor info height minimum=""
+  actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" "${group}")"
+  for actor in ${actors}; do
+    info="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+      "${ATTACKNET_DIR}/runtime-backend.sh" exec "${actor}" \
+      curl --fail --silent --max-time 3 http://127.0.0.1:20443/v2/info 2>/dev/null || true)"
+    height="$(INFO="${info}" node -e '
+      try {
+        const value = JSON.parse(process.env.INFO).stacks_tip_height;
+        if (Number.isSafeInteger(value) && value >= 0) process.stdout.write(String(value));
+      } catch {}
+    ')"
+    [[ "${height}" =~ ^[0-9]+$ ]] || return 1
+    if [ -z "${minimum}" ] || [ "${height}" -lt "${minimum}" ]; then minimum="${height}"; fi
+  done
+  printf '%s\n' "${minimum}"
+}
+
+wait_nodes_at_stacks_height() {
+  local manifest="$1" group="$2" target="$3" deadline=$((SECONDS + TIMEOUT)) observed
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    observed="$(minimum_node_stacks_height "${manifest}" "${group}" || true)"
+    if [[ "${observed}" =~ ^[0-9]+$ ]] && [ "${observed}" -ge "${target}" ]; then
+      printf '%s nodes reached Stacks height %s (minimum %s)\n' "${group}" "${target}" "${observed}"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "${group} nodes did not reach Stacks height ${target}; minimum=${observed:-unavailable}" >&2
+  return 1
+}
+
 wait_signers_registered() {
   local manifest="$1" deadline=$((SECONDS + TIMEOUT)) signers signer metrics missing
   signers="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" signers)"
@@ -457,6 +623,10 @@ wait_observability_ready() {
   if [ "${LOCAL_ACCESS_ENABLED}" = 1 ]; then
     KUBE_NAMESPACE="${NAMESPACE}" "${ATTACKNET_DIR}/local-access.sh" start
   fi
+  if [ "${CHAOS_DASHBOARD_LOCAL_ACCESS_ENABLED}" = 1 ] \
+      && kubectl -n chaos-mesh get service/chaos-dashboard >/dev/null 2>&1; then
+    "${ATTACKNET_DIR}/chaos-dashboard.sh" start
+  fi
 }
 
 ensure_burnchain_policy() {
@@ -481,7 +651,7 @@ apply_network() {
   local generated="${1:?generated topology directory required}"
   local manifest="${generated}/manifest.json" final_network="${generated}/stacksnetwork.json"
   local bootstrap_network="${generated}/stacksnetwork.bootstrap.json"
-  local gated desired_interval desired_jitter enrollment_height cutoff_height observer_height registration_height activation_height start_details storage_report
+  local gated desired_interval desired_jitter enrollment_height cutoff_height observer_height registration_height activation_height start_details storage_report pre_activation_stacks_height signer_set_report
   if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
     node "${ATTACKNET_DIR}/observability/render.mjs" "${manifest}" \
       --output="${generated}/observability.json" \
@@ -562,6 +732,7 @@ apply_network() {
     wait_actor_group_ready "${manifest}" bootstrap
     wait_signers_registered "${manifest}"
     wait_companion_stackerdb_subscriptions "${manifest}"
+    wait_live_peer_connectivity "${manifest}" pre-activation-nodes
     ledger_assertion signers-registered pass \
       "{\"requestedHeight\":${registration_height},\"observedHeight\":$(clock_status_value bitcoin_height)}"
     ledger_assertion companion-stackerdb-subscriptions pass \
@@ -570,11 +741,25 @@ apply_network() {
       echo "signer registration barrier must precede Nakamoto activation" >&2
       return 1
     }
+    pre_activation_stacks_height="$(minimum_node_stacks_height "${manifest}" pre-activation-nodes)"
+    burst_to_height "${activation_height}" nakamoto-activation
+    wait_nodes_at_burn_height "${manifest}" nodes "${activation_height}"
+    wait_ready
+    wait_live_peer_connectivity "${manifest}" nodes
+    wait_signer_global_state "${manifest}"
+    signer_set_report="$(wait_signer_set_parity "${manifest}")"
+    wait_nodes_at_stacks_height "${manifest}" nodes "$((pre_activation_stacks_height + 1))"
+    ledger_assertion live-peer-connectivity pass \
+      "{\"observedHeight\":$(clock_status_value bitcoin_height)}"
+    ledger_assertion signer-global-state pass \
+      "{\"threshold\":\"canonical-rounded-up\",\"observedHeight\":$(clock_status_value bitcoin_height)}"
+    ledger_assertion signer-set-parity pass "${signer_set_report}"
+    ledger_assertion first-nakamoto-block pass \
+      "{\"minimumStacksHeight\":$((pre_activation_stacks_height + 1)),\"observedHeight\":$(clock_status_value bitcoin_height)}"
     KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
       "${ATTACKNET_DIR}/burnchain-policy.sh" run "${desired_interval:-60}" "${desired_jitter:-0}"
     ledger_cadence paused "run:${desired_interval:-60}s:jitter-${desired_jitter:-0}s" \
-      nakamoto-activation "${activation_height}" "$(clock_status_value bitcoin_height)"
-    wait_ready
+      steady-state-after-nakamoto-proof "${activation_height}" "$(clock_status_value bitcoin_height)"
   else
     wait_ready
     if [ -f "${bootstrap_network}" ]; then
@@ -662,9 +847,19 @@ capture() {
   kubectl -n "${NAMESPACE}" get pv -o json >"${destination}/persistent-volumes.json"
   kubectl -n "${NAMESPACE}" get events --sort-by=.metadata.creationTimestamp -o json \
     >"${destination}/namespace-events.json"
+  kubectl -n "${NAMESPACE}" get faultcampaigns,attacknetruns -o json \
+    >"${destination}/attacknet-orchestration.json"
+  kubectl -n "${NAMESPACE}" get podchaos,networkchaos,dnschaos,iochaos,timechaos -o json \
+    >"${destination}/chaos-mesh.json"
+  kubectl -n "${NAMESPACE}" get configmaps \
+    attacknet-environment-lease attacknet-mutation-lease --ignore-not-found -o json \
+    >"${destination}/attacknet-leases.json"
   kubectl -n "${NAMESPACE}" logs -l 'app.kubernetes.io/name=hacknet' \
     --all-containers=true --since=1h --timestamps \
     >"${destination}/operator.log"
+  kubectl -n "${NAMESPACE}" logs -l 'app.kubernetes.io/component=run-operator' \
+    --all-containers=true --since=1h --timestamps \
+    >"${destination}/run-operator.log"
   ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
     "${ATTACKNET_DIR}/runtime-backend.sh" describe >"${destination}/runtime.json"
   RUN_DESCRIPTOR="$(locate_ledger || true)"

@@ -11,6 +11,7 @@ const KIND_TO_PROBE = Object.freeze({
   NetworkChaos: 'network',
   DNSChaos: 'dns',
   IOChaos: 'io',
+  IOPressurePod: 'io',
   TimeChaos: 'clock',
 });
 const EXPECTED_AUTHORITY = Object.freeze({
@@ -18,7 +19,8 @@ const EXPECTED_AUTHORITY = Object.freeze({
   NetworkChaos: 'active-probe',
   DNSChaos: 'active-probe',
   IOChaos: 'active-probe',
-  TimeChaos: 'orchestrator-kernel-probe',
+  IOPressurePod: 'active-probe',
+  TimeChaos: 'application-process-metric',
 });
 const PHASES = new Set(['before', 'during', 'after']);
 const POD_PHASES = new Set(['Pending', 'Running', 'Succeeded', 'Failed', 'Unknown']);
@@ -27,6 +29,7 @@ const ACTIONS = Object.freeze({
   NetworkChaos: new Set(['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']),
   DNSChaos: new Set(['error', 'random']),
   IOChaos: new Set(['latency', 'fault', 'attrOverride', 'mistake']),
+  IOPressurePod: new Set(['disk-pressure']),
   TimeChaos: new Set(['time']),
 });
 
@@ -102,7 +105,7 @@ function unsignedDurationSeconds(value, field) {
 
 function normalizeSource(value, field, authority) {
   const source = object(value, field);
-  exactFields(source, new Set(['trust', 'authority', 'collector']), field);
+  exactFields(source, new Set(['trust', 'authority', 'collector', 'contentTrust']), field);
   if (source.trust !== 'orchestrator-observed') {
     throw new Error(`${field}.trust must be orchestrator-observed; actor-supplied evidence is not authoritative`);
   }
@@ -111,17 +114,20 @@ function normalizeSource(value, field, authority) {
     trust: source.trust,
     authority: source.authority,
     collector: string(source.collector, `${field}.collector`, 256),
+    ...(source.contentTrust === undefined ? {} : {
+      contentTrust: string(source.contentTrust, `${field}.contentTrust`, 64),
+    }),
   };
 }
 
-function normalizeInjection(value, field) {
+function normalizeInjection(value, field, expectedAuthority = 'chaos-mesh-status') {
   if (value === undefined) return {allInjectedObserved: false};
   const injection = object(value, field);
   exactFields(injection, new Set(['allInjectedObserved', 'source']), field);
   const source = object(injection.source, `${field}.source`);
   exactFields(source, new Set(['trust', 'authority', 'collector']), `${field}.source`);
-  if (source.trust !== 'orchestrator-observed' || source.authority !== 'chaos-mesh-status') {
-    throw new Error(`${field}.source must be orchestrator-observed chaos-mesh-status`);
+  if (source.trust !== 'orchestrator-observed' || source.authority !== expectedAuthority) {
+    throw new Error(`${field}.source must be orchestrator-observed ${expectedAuthority}`);
   }
   return {
     allInjectedObserved: boolean(injection.allInjectedObserved, `${field}.allInjectedObserved`),
@@ -254,15 +260,19 @@ function normalizeIoObservation(value, field) {
 
 function normalizeClockObservation(value, field) {
   const {observation, actor, status} = normalizeCommonObservation(value, field, 'clock');
-  const allowed = new Set(['actor', 'probe', 'status', 'error', 'control', 'wallEpochSeconds', 'monotonicSeconds', 'sampleWindowMs']);
+  const allowed = new Set(['actor', 'probe', 'status', 'error', 'control', 'wallEpochSeconds', 'monotonicSeconds', 'sampleWindowMs', 'metric']);
   exactFields(observation, allowed, field);
   if (status === 'error') return {actor, probe: 'clock', status, error: observation.error};
+  if (observation.metric !== 'stacks_node_process_wall_clock_seconds') {
+    throw new Error(`${field}.metric must be stacks_node_process_wall_clock_seconds`);
+  }
   return {
     actor, probe: 'clock', status,
     control: boolean(observation.control, `${field}.control`),
     wallEpochSeconds: number(observation.wallEpochSeconds, `${field}.wallEpochSeconds`, {min: 0, max: 1e12}),
     monotonicSeconds: number(observation.monotonicSeconds, `${field}.monotonicSeconds`, {min: 0, max: 1e12}),
     sampleWindowMs: number(observation.sampleWindowMs, `${field}.sampleWindowMs`, {min: 0, max: 5000}),
+    metric: observation.metric,
   };
 }
 
@@ -272,10 +282,17 @@ function normalizePhase(value, expectedPhase, kind) {
   if (phase.schemaVersion !== FAULT_PROBE_SCHEMA) throw new Error(`${expectedPhase}.schemaVersion must be ${FAULT_PROBE_SCHEMA}`);
   if (phase.phase !== expectedPhase || !PHASES.has(phase.phase)) throw new Error(`${expectedPhase}.phase must be ${expectedPhase}`);
   const source = normalizeSource(phase.source, `${expectedPhase}.source`, EXPECTED_AUTHORITY[kind]);
+  if (kind === 'TimeChaos' && source.contentTrust !== 'actor-self-reported') {
+    throw new Error(`${expectedPhase}.source.contentTrust must disclose actor-self-reported time content`);
+  }
+  if (kind !== 'TimeChaos' && source.contentTrust !== undefined) {
+    throw new Error(`${expectedPhase}.source.contentTrust is only valid for TimeChaos`);
+  }
   if (phase.capturedAt !== undefined && !Number.isFinite(Date.parse(phase.capturedAt))) {
     throw new Error(`${expectedPhase}.capturedAt must be RFC 3339 when present`);
   }
-  const injection = normalizeInjection(phase.injection, `${expectedPhase}.injection`);
+  const injection = normalizeInjection(phase.injection, `${expectedPhase}.injection`,
+    kind === 'IOPressurePod' ? 'kubernetes-pod-status' : 'chaos-mesh-status');
   if (!Array.isArray(phase.observations) || phase.observations.length > 10_000) {
     throw new Error(`${expectedPhase}.observations must be an array of at most 10000 entries`);
   }
@@ -284,6 +301,7 @@ function normalizePhase(value, expectedPhase, kind) {
     NetworkChaos: normalizeNetworkObservation,
     DNSChaos: normalizeDnsObservation,
     IOChaos: normalizeIoObservation,
+    IOPressurePod: normalizeIoObservation,
     TimeChaos: normalizeClockObservation,
   }[kind];
   return {
@@ -593,6 +611,100 @@ function ioEvaluation(action, spec, target, before, during, after) {
     : {actor: target.actor, effect: 'failed', recovery: 'inconclusive', reason: 'I/O operation probes did not exhibit the requested effect'};
 }
 
+function normalizeIoPressureContract(value) {
+  const contract = object(value, 'evidence.ioPressure');
+  exactFields(contract, new Set([
+    'semantic', 'severity', 'workers', 'bytesMiB', 'writeSizeKiB', 'tempPath',
+    'minimumLatencyMultiplier', 'minimumAddedLatencyMs',
+  ]), 'evidence.ioPressure');
+  if (contract.semantic !== 'disk-io-pressure') {
+    throw new Error('evidence.ioPressure.semantic must be disk-io-pressure');
+  }
+  if (!new Set(['low', 'medium', 'high']).has(contract.severity)) {
+    throw new Error('evidence.ioPressure.severity must be low, medium, or high');
+  }
+  if (contract.tempPath !== '/data') throw new Error('evidence.ioPressure.tempPath must be /data');
+  return {
+    semantic: contract.semantic,
+    severity: contract.severity,
+    workers: number(contract.workers, 'evidence.ioPressure.workers', {min: 1, max: 4, integer: true}),
+    bytesMiB: number(contract.bytesMiB, 'evidence.ioPressure.bytesMiB', {min: 16, max: 512, integer: true}),
+    writeSizeKiB: number(contract.writeSizeKiB, 'evidence.ioPressure.writeSizeKiB', {min: 4, max: 1024, integer: true}),
+    tempPath: contract.tempPath,
+    minimumLatencyMultiplier: number(contract.minimumLatencyMultiplier,
+      'evidence.ioPressure.minimumLatencyMultiplier', {min: 1.1, max: 20}),
+    minimumAddedLatencyMs: number(contract.minimumAddedLatencyMs,
+      'evidence.ioPressure.minimumAddedLatencyMs', {min: 0.5, max: 5000}),
+  };
+}
+
+function ioPressureEvaluation(target, before, during, after, contract) {
+  const baseline = keyed(before);
+  const active = keyed(during);
+  const recovered = keyed(after);
+  let comparable = 0;
+  let usable = 0;
+  const details = [];
+  for (const [key, first] of baseline) {
+    const second = active.get(key);
+    if (!second || first.operation !== 'FSYNC' || second.operation !== 'FSYNC'
+        || !first.path.startsWith(`${contract.tempPath}/`)
+        || !second.path.startsWith(`${contract.tempPath}/`)) continue;
+    comparable += 1;
+    if (first.successes === 0 || second.successes === 0) continue;
+    usable += 1;
+    const denominator = Math.max(first.latencyMsP95, 0.001);
+    const latencyMultiplier = second.latencyMsP95 / denominator;
+    const addedLatencyMs = second.latencyMsP95 - first.latencyMsP95;
+    const proven = latencyMultiplier >= contract.minimumLatencyMultiplier
+      && addedLatencyMs >= contract.minimumAddedLatencyMs;
+    const metrics = {
+      baselineLatencyMsP95: first.latencyMsP95,
+      duringLatencyMsP95: second.latencyMsP95,
+      latencyMultiplier, addedLatencyMs,
+      minimumLatencyMultiplier: contract.minimumLatencyMultiplier,
+      minimumAddedLatencyMs: contract.minimumAddedLatencyMs,
+    };
+    details.push({key, proven, ...metrics});
+    if (!proven) continue;
+    const final = recovered.get(key);
+    let recovery = 'inconclusive';
+    let recoveryReason = 'trusted after-fault I/O pressure probe is missing';
+    if (final && final.operation === 'FSYNC' && final.path.startsWith(`${contract.tempPath}/`)
+        && final.successes > 0) {
+      const recoveredLatencyMultiplier = final.latencyMsP95 / denominator;
+      const recoveredAddedLatencyMs = final.latencyMsP95 - first.latencyMsP95;
+      const recoveredBelowThreshold = recoveredLatencyMultiplier < contract.minimumLatencyMultiplier
+        && recoveredAddedLatencyMs < contract.minimumAddedLatencyMs;
+      recovery = recoveredBelowThreshold ? 'proven' : 'failed';
+      recoveryReason = recoveredBelowThreshold
+        ? `FSYNC latency returned below both configured disk-pressure effect thresholds: multiplier=${recoveredLatencyMultiplier.toFixed(3)} (<${contract.minimumLatencyMultiplier}), addedMs=${recoveredAddedLatencyMs.toFixed(3)} (<${contract.minimumAddedLatencyMs})`
+        : `FSYNC latency remained at or above a configured disk-pressure effect threshold: multiplier=${recoveredLatencyMultiplier.toFixed(3)}, addedMs=${recoveredAddedLatencyMs.toFixed(3)}`;
+      Object.assign(metrics, {
+        afterLatencyMsP95: final.latencyMsP95,
+        recoveredLatencyMultiplier, recoveredAddedLatencyMs,
+      });
+    }
+    return {
+      actor: target.actor, effect: 'proven', recovery,
+      reason: `FSYNC latency met both configured disk-pressure effect thresholds: multiplier=${latencyMultiplier.toFixed(3)} (>=${contract.minimumLatencyMultiplier}), addedMs=${addedLatencyMs.toFixed(3)} (>=${contract.minimumAddedLatencyMs})`,
+      recoveryReason, metrics,
+    };
+  }
+  return comparable === 0 || usable === 0
+    ? {
+      actor: target.actor, effect: 'inconclusive', recovery: 'inconclusive',
+      reason: comparable === 0
+        ? 'no matching before/during FSYNC pressure probe under /data'
+        : 'FSYNC pressure probe lacked a successful baseline and active sample',
+    }
+    : {
+      actor: target.actor, effect: 'failed', recovery: 'inconclusive',
+      reason: 'FSYNC latency did not meet both configured disk-pressure effect thresholds',
+      metrics: {probes: details},
+    };
+}
+
 function median(values) {
   const sorted = [...values].sort((left, right) => left - right);
   const middle = Math.floor(sorted.length / 2);
@@ -677,13 +789,32 @@ export function evaluateFaultEffect({campaign, evidence, resolvedTargets, before
   object(compiled.metadata, 'campaign.metadata');
   const name = string(compiled.metadata.name, 'campaign.metadata.name', 63);
   const spec = object(compiled.spec, 'campaign.spec');
-  const action = kind === 'TimeChaos' ? 'time' : string(spec.action, 'campaign.spec.action', 64);
+  const action = kind === 'TimeChaos' ? 'time'
+    : kind === 'IOPressurePod' ? 'disk-pressure'
+      : string(spec.action, 'campaign.spec.action', 64);
   if (!ACTIONS[kind].has(action)) throw new Error(`campaign action ${action} is unsupported for ${kind}`);
   const compilerEvidence = object(evidence, 'evidence');
   const selectedActors = stringArray(compilerEvidence.selectedActors, 'evidence.selectedActors');
   if (selectedActors.length === 0) throw new Error('evidence.selectedActors must not be empty');
   const peerSelectedActors = compilerEvidence.peerSelectedActors === undefined
     ? null : new Set(stringArray(compilerEvidence.peerSelectedActors, 'evidence.peerSelectedActors'));
+  const ioPressureContract = kind === 'IOPressurePod'
+    ? normalizeIoPressureContract(compilerEvidence.ioPressure) : null;
+  if (kind === 'IOPressurePod') {
+    const annotation = compiled.metadata.annotations?.['testing.stacks.org/io-pressure-contract'];
+    if (typeof annotation !== 'string') {
+      throw new Error('IOPressurePod is missing its compiled I/O-pressure contract annotation');
+    }
+    let annotatedContract;
+    try {
+      annotatedContract = normalizeIoPressureContract(JSON.parse(annotation));
+    } catch (error) {
+      throw new Error(`IOPressurePod has an invalid compiled I/O-pressure contract annotation: ${error.message}`);
+    }
+    if (JSON.stringify(annotatedContract) !== JSON.stringify(ioPressureContract)) {
+      throw new Error('IOPressurePod compiled I/O-pressure contract does not match compiler evidence');
+    }
+  }
   const targets = normalizeResolvedTargets(resolvedTargets, selectedActors);
   const campaignNetwork = compiled.metadata.labels?.['testing.stacks.org/network'];
   if (compiled.metadata.namespace !== targets.namespace || campaignNetwork !== targets.network) {
@@ -714,6 +845,7 @@ export function evaluateFaultEffect({campaign, evidence, resolvedTargets, before
       NetworkChaos: (target, first, second, third) => networkEvaluation(action, spec, target, first, second, third, peerSelectedActors),
       DNSChaos: (target, first, second, third) => dnsEvaluation(action, spec, target, first, second, third),
       IOChaos: (target, first, second, third) => ioEvaluation(action, spec, target, first, second, third),
+      IOPressurePod: (target, first, second, third) => ioPressureEvaluation(target, first, second, third, ioPressureContract),
     }[kind];
     evaluations = targets.targets.map(target => evaluator(
       target,

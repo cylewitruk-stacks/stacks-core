@@ -31,7 +31,7 @@ function fixture(status = '') {
 function run(item, extra = {}) {
   return spawnSync('bash', [script], {
     encoding: 'utf8',
-    env: {...process.env, PATH: `${item.bin}:/usr/bin:/bin`, ...extra},
+    env: {...process.env, PATH: `${item.bin}:/usr/bin:/bin`, HACKNET_KIND_IMAGE_LOAD: 'disabled', ...extra},
   });
 }
 
@@ -48,8 +48,10 @@ test('installs CRDs before Helm and rolls Pods on exact local image IDs', () => 
   assert.match(calls[upgrade], new RegExp(`runOperator\\.podAnnotations\\.attacknet-build=${digest}`));
   assert.match(calls.join('\n'), /docker image tag stacks-hacknet-operator:dev stacks-hacknet-operator:local-a{16}/);
   assert.match(calls.join('\n'), /docker image tag stacks-hacknet-run-operator:dev stacks-hacknet-run-operator:local-a{16}/);
+  assert.match(calls.join('\n'), /docker image tag stacks-hacknet-io-pressure:dev stacks-hacknet-io-pressure:local-a{16}/);
   assert.match(calls[upgrade], /operator\.image\.tag=local-a{16}/);
   assert.match(calls[upgrade], /runOperator\.image\.tag=local-a{16}/);
+  assert.match(calls[upgrade], /runOperator\.ioPressureImage\.tag=local-a{16}/);
   assert.doesNotMatch(calls[upgrade], /--force-conflicts/);
 });
 
@@ -89,4 +91,12 @@ test('failed releases and managed-field takeover require explicit recovery', () 
   assert.match(readFileSync(allowed.log, 'utf8'), /kubectl apply .*--force-conflicts/);
   assert.match(recovered.stderr, /reclaim conflicting CRD schema fields/);
   assert.match(recovered.stderr, /reclaim conflicting managed fields/);
+});
+
+test('invalid kind image loading mode fails before CRD or Helm mutation', () => {
+  const item = fixture();
+  const result = run(item, {HACKNET_KIND_IMAGE_LOAD: 'sometimes'});
+  assert.equal(result.status, 2);
+  const calls = readFileSync(item.log, 'utf8');
+  assert.doesNotMatch(calls, /kubectl |helm /);
 });

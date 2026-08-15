@@ -114,7 +114,7 @@
       "description": "Self-reported canonical Stacks tip height by actor, independently scaled from the slower Bitcoin burnchain.",
       "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "short"}, "overrides": []},
       "gridPos": {"h": 9, "w": 6, "x": 6, "y": 4},
-      "id": 26,
+      "id": 27,
       "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
         {"expr": "stacks_node_stacks_tip_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "{{attacknet_actor}}", "refId": "A"}
@@ -361,6 +361,24 @@
       "title": "Fresh-network minimization outcomes (trusted)",
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"attempt": "Attempt", "candidate_digest": "Candidate digest", "causal_minimality_claimed": "Causal claim", "evidence_digest": "Evidence digest", "expected_assertion": "Expected assertion", "expected_status": "Expected status", "outcome": "Outcome", "reason": "Reason", "run": "Run"}}}],
       "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Per-signer weight visible to the current global-state evaluator. A healthy baseline has maximum exact-view support at or above the rounded-up canonical threshold on every signer. The separate evaluator threshold exposes the current floor/ceiling protocol inconsistency instead of hiding it.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "min": 0, "unit": "short"}, "overrides": [{"matcher": {"id": "byRegexp", "options": "/available/"}, "properties": [{"id": "custom.axisPlacement", "value": "right"}, {"id": "max", "value": 1}]}]},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 91},
+      "id": 26,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "stacks_signer_global_state_maximum_view_weight{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "view {{attacknet_actor}}", "refId": "A"},
+        {"expr": "stacks_signer_global_state_known_weight{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "known {{attacknet_actor}}", "refId": "B"},
+        {"expr": "stacks_signer_global_state_canonical_threshold_weight{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "canonical required {{attacknet_actor}}", "refId": "C"},
+        {"expr": "stacks_signer_global_state_evaluator_threshold_weight{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "evaluator required {{attacknet_actor}}", "refId": "D"},
+        {"expr": "stacks_signer_global_state_total_weight{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "total {{attacknet_actor}}", "refId": "E"},
+        {"expr": "stacks_signer_global_state_available{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "available {{attacknet_actor}}", "refId": "F"}
+      ],
+      "title": "Signer global-state support (self-reported)",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

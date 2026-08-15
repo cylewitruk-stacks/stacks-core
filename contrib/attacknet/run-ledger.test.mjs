@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   appendRunEvent,
   exportRun,
+  initializeRun,
   resolveRun,
   runContext,
 } from './run-ledger.mjs';
@@ -40,15 +41,45 @@ function fixture() {
   return {root, descriptor, admitted, pods, digest};
 }
 
-test('runtime resolution captures admitted resources and actor image IDs', () => {
+test('runtime resolution snapshots admitted resources and captures actor image IDs', () => {
   const value = fixture();
   resolveRun(value.descriptor, value.admitted, value.pods);
   const descriptor = readDescriptor(value.descriptor);
   assert.equal(descriptor.inputs.kubernetes.resolution.complete, true);
   assert.equal(descriptor.inputs.images[0].resolvedDigest, value.digest);
+  assert.notEqual(descriptor.inputs.kubernetes.admittedManifest.path, value.admitted);
+  writeFileSync(value.admitted, '{"kind":"List","resourceVersion":"mutated"}\n');
+  assert.doesNotThrow(() => exportRun(value.descriptor, join(value.root, 'post-mutation-bundle')));
   const context = runContext(value.descriptor, 'hacknet-system', 'test');
   assert.equal(context.data['run-id'], 'ledger-test');
   assert.equal(context.data['descriptor-digest'], descriptor.integrity.digest);
+});
+
+test('run initialization snapshots mutable rendered inputs before later topology phases', () => {
+  const root = mkdtempSync(join(tmpdir(), 'attacknet-generated-'));
+  const descriptor = join(root, 'runs', 'snapshot-test', 'run.json');
+  const manifest = join(root, 'manifest.json');
+  const requested = join(root, 'stacksnetwork.json');
+  writeFileSync(manifest, JSON.stringify({network: 'snapshot-net', namespace: 'hacknet-system'}));
+  writeFileSync(requested, JSON.stringify({
+    apiVersion: 'testing.stacks.org/v1alpha1', kind: 'StacksNetwork',
+    spec: {actors: [{name: 'follower-1', image: 'stacks:test'}]},
+  }));
+  initializeRun(root, {
+    descriptorPath: descriptor,
+    runId: 'snapshot-test',
+    now: new Date('2026-08-15T00:00:00Z'),
+    source: {revision: 'abcdef1', dirty: false},
+  });
+  const value = readDescriptor(descriptor);
+  assert.notEqual(value.inputs.topology.path, manifest);
+  assert.notEqual(value.inputs.kubernetes.requestedManifest.path, requested);
+  writeFileSync(manifest, JSON.stringify({network: 'changed', namespace: 'hacknet-system'}));
+  writeFileSync(requested, JSON.stringify({kind: 'StacksNetwork', spec: {actors: []}}));
+  const destination = join(root, 'bundle');
+  assert.doesNotThrow(() => exportRun(descriptor, destination));
+  const index = JSON.parse(readFileSync(join(destination, 'artifact-index.json'), 'utf8'));
+  assert.ok(index.every(item => item.missing === false));
 });
 
 test('append is monotonic for a recorder clock that moves backwards', () => {

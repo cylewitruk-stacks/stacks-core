@@ -582,7 +582,13 @@ def build_probe_container(
         "securityContext": {
             "allowPrivilegeEscalation": False,
             "capabilities": {"drop": ["ALL"]},
-            "readOnlyRootFilesystem": True,
+            # DNSChaos must create /etc/resolv.conf.chaos.bak inside the
+            # selected container. The trusted probe is part of the disposable
+            # data plane and must experience the same fault it measures, so it
+            # intentionally keeps a writable overlay while retaining non-root
+            # execution, dropped capabilities, seccomp, and no ServiceAccount
+            # token. Operator/control-plane containers remain read-only.
+            "readOnlyRootFilesystem": False,
             "runAsNonRoot": True,
             "runAsUser": 65532,
             "runAsGroup": 65532,

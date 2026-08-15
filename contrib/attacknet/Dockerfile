@@ -12,6 +12,13 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# Export the exact Cargo Chef recipe as a small, independent evidence target.
+# The mixed-version pipeline retains and hashes this file before it builds the
+# runtime image, so a later admission record can identify dependencies from
+# evidence rather than merely trusting that `cargo chef prepare` ran.
+FROM scratch AS cargo-chef-recipe
+COPY --from=planner /src/recipe.json /recipe.json
+
 FROM chef AS build
 
 ARG STACKS_NODE_VERSION="attacknet-dev"

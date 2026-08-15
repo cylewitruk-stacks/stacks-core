@@ -60,3 +60,14 @@ test('storage preflight fails truthfully when Node DiskPressure could miss zero 
   assert.equal(report.ok, false);
   assert.equal(report.nodes.find(node => node.name === 'worker-2').rootFilesystem.availableBytes, 0);
 });
+
+test('storage preflight handles help and rejects option-shaped output paths before kubectl', () => {
+  const help = spawnSync(join(root, 'storage-preflight.sh'), ['--help'], {encoding: 'utf8'});
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stderr, /usage:/);
+
+  const invalid = spawnSync(join(root, 'storage-preflight.sh'), ['--not-an-output'], {encoding: 'utf8'});
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /unknown option/);
+  assert.doesNotMatch(invalid.stderr, /mkdir:|dirname:/);
+});

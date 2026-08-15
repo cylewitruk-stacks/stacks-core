@@ -53,7 +53,10 @@ For every profile the planner records:
 - digest-pinned cargo-chef and runtime base images;
 - the platform, Cargo profile, features, binaries, and `CARGO_INCREMENTAL=0`;
 - BuildKit's metadata and maximum-mode provenance;
-- the resulting image digest and immutable `repository@sha256:...` reference.
+- the resulting OCI image-index digest and immutable
+  `repository@sha256:...` reference;
+- the selected platform-manifest digest and the runtime config digest that a
+  Kubernetes CRI reports as the container `imageID`.
 
 Absolute repository and Dockerfile paths remain in the plan for local
 forensics, but are excluded from `planDigest`; two hosts with the same source
@@ -73,11 +76,24 @@ maximum-mode provenance and that SBOM generation was requested; it does not
 claim a registry-persisted attestation. A later registry workflow must verify
 its own attached attestations.
 
-The admission join is exact: retain the build record's `imageDigest`, read the
-admitted Pod's UID, declared image, and `status.containerStatuses[].imageID`,
-normalize the image ID to its terminal `sha256:...`, and require equality with
-the build digest. The phase assignment and actor name must refer to that same
-Pod UID. A tag match alone is never sufficient.
+The admission join is exact, but the two relevant digests are not normally
+equal. With BuildKit provenance enabled, `imageDigest` identifies an OCI index
+containing both the platform manifest and an attestation manifest. Kubernetes
+containerd reports the selected platform manifest's **config digest** in
+`status.containerStatuses[].imageID`. The executor exports the locally loaded
+image as an OCI archive and verifies the complete
+`index -> platform manifest -> config` chain. Then
+`image-admission-evidence.mjs` binds that expected config digest to an observed
+StacksNetwork generation, actor declaration, current Ready Pod UID, and CRI
+image ID. A tag match or equality with the outer index digest is never
+sufficient.
+
+For a registry-backed cluster, use the immutable index reference. A local kind
+cluster without a registry cannot pull an unqualified `repository@digest`
+reference merely because the same bytes were preloaded under a tag. In that
+case the declaration uses the content-derived local tag with `IfNotPresent`,
+and acceptance still requires the exact runtime config digest and Pod UID join.
+The tag is transport, not identity.
 
 The existing Dockerfile still defaults to its convenient cargo-chef and Debian
 tags for ordinary development. The attacknet pipeline overrides those `FROM`
@@ -90,25 +106,32 @@ or `localModified` profile intentionally captures all tracked and untracked
 source files in that worktree; sharing a dirty worktree makes both profiles
 represent the same source state.
 
-## Current live-test boundary
+## Live evidence and remaining boundary
 
-As of 2026-08-15, Docker Desktop's three kind nodes report zero available root
-and image-filesystem bytes through kubelet stats despite remaining Ready. The
-attacknet capacity preflight correctly fails closed. No real image build, kind
-load, Pod admission, or mixed-version runtime claim has therefore been made.
+After Docker Desktop storage was repaired on 2026-08-15, the pipeline built
+release `4.0.2` from exact commit
+`1b57c3fb6709ab927f9179ab6814f874c84f5303` for native arm64. The compact
+runtime image is approximately 72 MB. Follower-5 was rolled to that image while
+the other actors remained on the current branch. The observed generation,
+Ready Pod UID, executable version, runtime config digest, full cohort
+convergence, and subsequent burn/Stacks progress are retained in
+`evidence/mixed-version-4.0.2-follower5-20260815T1840Z/`.
 
-Once Docker Desktop storage is repaired, the live gate is:
+The general live gate is:
 
 1. build all requested profiles and retain their BuildKit metadata/build
    records;
 2. load the content tags into the target kind cluster;
 3. create the mixed-version topology using those profile assignments;
 4. capture the admitted Pod UID, declared image, and runtime image ID;
-5. require the runtime image ID digest to equal the build record's immutable
-   image digest and bind that result to the actor and Pod UID;
+5. verify the OCI index/platform/config chain, then require the runtime image
+   ID to equal the build record's expected **runtime config** digest and bind
+   it to the observed generation, actor, and Pod UID;
 6. only then run compatibility, missed-upgrade, and modified-actor assertions.
 
-The unit tests fake all Docker and kind execution. They prove the default path
-runs no executor, source drift aborts before a build, kind loading is opt-in,
-release refs and base images are pinned, BuildKit provenance is mandatory, and
+The unit tests fake all Docker and kind execution and separately exercise the
+OCI identity resolver and admission join. They prove the default path runs no
+executor, source drift aborts before a build, kind loading is opt-in, release
+refs and base images are pinned, BuildKit provenance is mandatory, index and
+runtime config digests remain distinct, stale observed generations fail, and
 no build-only result can claim runtime acceptance.

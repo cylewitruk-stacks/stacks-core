@@ -7,7 +7,9 @@ usage: install-local.sh
 
 Build images first with scripts/build-local.sh. Environment overrides:
   HACKNET_NAMESPACE, HACKNET_RELEASE, HACKNET_OPERATOR_IMAGE,
-  HACKNET_RUN_OPERATOR_IMAGE, HACKNET_FORCE_CRD_CONFLICTS,
+  HACKNET_RUN_OPERATOR_IMAGE, HACKNET_IO_PRESSURE_IMAGE,
+  HACKNET_KIND_IMAGE_LOAD (auto, require, or disabled),
+  HACKNET_FORCE_CRD_CONFLICTS,
   HACKNET_FORCE_CONFLICTS, HACKNET_RECOVER_FAILED_RELEASE.
 EOF
   exit 0
@@ -19,15 +21,26 @@ namespace="${HACKNET_NAMESPACE:-hacknet-system}"
 release="${HACKNET_RELEASE:-hacknet}"
 operator_image="${HACKNET_OPERATOR_IMAGE:-stacks-hacknet-operator:dev}"
 run_operator_image="${HACKNET_RUN_OPERATOR_IMAGE:-stacks-hacknet-run-operator:dev}"
+io_pressure_image="${HACKNET_IO_PRESSURE_IMAGE:-stacks-hacknet-io-pressure:dev}"
+kind_image_load="${HACKNET_KIND_IMAGE_LOAD:-auto}"
+case "${kind_image_load}" in
+  auto|require|disabled) ;;
+  *) echo 'HACKNET_KIND_IMAGE_LOAD must be auto, require, or disabled' >&2; exit 2 ;;
+esac
 
 operator_id="$(docker image inspect --format '{{.Id}}' "${operator_image}")"
 run_operator_id="$(docker image inspect --format '{{.Id}}' "${run_operator_image}")"
+io_pressure_id="$(docker image inspect --format '{{.Id}}' "${io_pressure_image}")"
 [[ "${operator_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
   echo "could not resolve immutable local image ID for ${operator_image}" >&2
   exit 1
 }
 [[ "${run_operator_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
   echo "could not resolve immutable local image ID for ${run_operator_image}" >&2
+  exit 1
+}
+[[ "${io_pressure_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+  echo "could not resolve immutable local image ID for ${io_pressure_image}" >&2
   exit 1
 }
 
@@ -38,14 +51,20 @@ run_operator_id="$(docker image inspect --format '{{.Id}}' "${run_operator_image
   || { echo "operator image must be a locally tagged reference" >&2; exit 2; }
 [[ "${run_operator_image}" != *@* && "${run_operator_image}" == *:* ]] \
   || { echo "run operator image must be a locally tagged reference" >&2; exit 2; }
+[[ "${io_pressure_image}" != *@* && "${io_pressure_image}" == *:* ]] \
+  || { echo "I/O-pressure image must be a locally tagged reference" >&2; exit 2; }
 operator_repository="${operator_image%:*}"
 run_operator_repository="${run_operator_image%:*}"
+io_pressure_repository="${io_pressure_image%:*}"
 operator_tag="local-${operator_id#sha256:}"
 run_operator_tag="local-${run_operator_id#sha256:}"
+io_pressure_tag="local-${io_pressure_id#sha256:}"
 operator_tag="${operator_tag:0:22}"
 run_operator_tag="${run_operator_tag:0:22}"
+io_pressure_tag="${io_pressure_tag:0:22}"
 docker image tag "${operator_image}" "${operator_repository}:${operator_tag}"
 docker image tag "${run_operator_image}" "${run_operator_repository}:${run_operator_tag}"
+docker image tag "${io_pressure_image}" "${io_pressure_repository}:${io_pressure_tag}"
 
 release_status="$(helm status "${release}" -n "${namespace}" -o json 2>/dev/null \
   | jq -r '.info.status // empty' || true)"
@@ -57,6 +76,16 @@ Set HACKNET_RECOVER_FAILED_RELEASE=1 only after the cause and live resources are
 EOF
   exit 1
 fi
+
+case "${kind_image_load}" in
+  auto|require)
+    "${chart_dir}/scripts/load-kind-images.sh" "--mode=${kind_image_load}" \
+      "${operator_repository}:${operator_tag}" \
+      "${run_operator_repository}:${run_operator_tag}" \
+      "${io_pressure_repository}:${io_pressure_tag}"
+    ;;
+  disabled) ;;
+esac
 
 # Helm deliberately does not add or upgrade CRDs from chart crds/ on an
 # existing release. Keep API lifecycle explicit and wait for discovery before
@@ -89,6 +118,8 @@ helm_args=(
   --set-string "operator.image.tag=${operator_tag}"
   --set-string "runOperator.image.repository=${run_operator_repository}"
   --set-string "runOperator.image.tag=${run_operator_tag}"
+  --set-string "runOperator.ioPressureImage.repository=${io_pressure_repository}"
+  --set-string "runOperator.ioPressureImage.tag=${io_pressure_tag}"
 )
 if [ "${HACKNET_FORCE_CONFLICTS:-0}" = 1 ]; then
   echo "WARNING: Helm will explicitly reclaim conflicting managed fields" >&2

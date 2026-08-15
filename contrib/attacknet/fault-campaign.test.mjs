@@ -54,6 +54,88 @@ test('compiles network, DNS, I/O, and explicit clock-source faults', () => {
   }
 });
 
+test('compiles bounded disk I/O pressure to a trusted controller descriptor without accepting execution input', () => {
+  const compiled = compileCampaign(campaign({fault: {
+    type: 'io-pressure', action: 'disk-pressure', mode: 'all', duration: '45s',
+    parameters: {
+      containerNames: ['actor'], severity: 'low', workers: 1, bytesMiB: 32,
+      writeSizeKiB: 256, minimumLatencyMultiplier: 2, minimumAddedLatencyMs: 5,
+    },
+  }}), manifest);
+  assert.equal(compiled.resource.kind, 'IOPressurePod');
+  assert.equal(compiled.resource.apiVersion, 'testing.stacks.org/internal');
+  assert.equal(compiled.resource.spec.action, undefined);
+  assert.deepEqual(Object.keys(compiled.resource.spec).sort(), [
+    'bytesMiB', 'containerNames', 'duration', 'mode', 'selector', 'workers', 'writeSizeKiB',
+  ]);
+  assert.deepEqual(compiled.resource.spec.containerNames, ['actor']);
+  assert.equal(compiled.resource.spec.image, undefined);
+  assert.equal(compiled.resource.spec.command, undefined);
+  assert.equal(compiled.resource.spec.workers, 1);
+  assert.equal(compiled.resource.spec.bytesMiB, 32);
+  assert.equal(compiled.resource.spec.writeSizeKiB, 256);
+  assert.deepEqual(compiled.evidence.ioPressure, {
+    semantic: 'disk-io-pressure', severity: 'low', workers: 1, bytesMiB: 32,
+    writeSizeKiB: 256, tempPath: '/data', minimumLatencyMultiplier: 2,
+    minimumAddedLatencyMs: 5,
+  });
+  assert.equal(
+    JSON.parse(compiled.resource.metadata.annotations['testing.stacks.org/io-pressure-contract']).minimumLatencyMultiplier,
+    2,
+  );
+  assert.throws(() => compileCampaign(campaign({fault: {
+    type: 'io-pressure', action: 'disk-pressure', duration: '30s',
+    parameters: {stressngStressors: '--hdd 8192'},
+  }}), manifest), /unsupported fault.parameters field stressngStressors/);
+  assert.throws(() => compileCampaign(campaign({
+    target: {roles: ['companion']},
+    fault: {
+      type: 'io-pressure', action: 'disk-pressure', mode: 'one', duration: '30s',
+      parameters: {
+        containerNames: ['actor'], severity: 'low', workers: 1, bytesMiB: 32,
+        writeSizeKiB: 256, minimumLatencyMultiplier: 2, minimumAddedLatencyMs: 5,
+      },
+    },
+  }), manifest), /exactly one actor target/);
+});
+
+test('disk I/O pressure caps container count, resources, duration, severity, and evidence thresholds', () => {
+  const base = {
+    containerNames: ['actor'], severity: 'medium', workers: 1, bytesMiB: 64,
+    writeSizeKiB: 256, minimumLatencyMultiplier: 2, minimumAddedLatencyMs: 5,
+  };
+  const fault = parameters => ({
+    type: 'io-pressure', action: 'disk-pressure', duration: '30s',
+    parameters: {...base, ...parameters},
+  });
+  assert.throws(() => compileCampaign(campaign({fault: fault({
+    containerNames: ['actor', 'attacknet-probe'],
+  })}), manifest), /exactly the actor container/);
+  assert.throws(() => compileCampaign(campaign({fault: fault({
+    containerNames: ['attacknet-probe'],
+  })}), manifest), /exactly the actor container/);
+  assert.throws(() => compileCampaign(campaign({fault: fault({workers: 3})}), manifest), /1..2/);
+  assert.throws(() => compileCampaign(campaign({fault: fault({bytesMiB: 512})}), manifest), /16..256/);
+  assert.throws(() => compileCampaign(campaign({fault: fault({writeSizeKiB: 2048})}), manifest), /4..1024/);
+  assert.throws(() => compileCampaign(campaign({fault: fault({minimumLatencyMultiplier: 1})}), manifest), /1.1..20/);
+  assert.throws(() => compileCampaign(campaign({fault: fault({minimumAddedLatencyMs: 0})}), manifest), /0.5..5000/);
+  const missingThreshold = fault({});
+  delete missingThreshold.parameters.minimumAddedLatencyMs;
+  assert.throws(() => compileCampaign(campaign({fault: missingThreshold}), manifest), /requires fault.parameters.minimumAddedLatencyMs/);
+  assert.throws(() => compileCampaign(campaign({fault: {
+    ...fault({severity: 'low'}), duration: '61s',
+  }}), manifest), /low disk-pressure duration must not exceed 60s/);
+  assert.throws(() => compileCampaign(campaign({fault: fault({severity: 'high'})}), manifest), /allowExtremeSeverity/);
+  assert.doesNotThrow(() => compileCampaign(campaign({
+    fault: {...fault({severity: 'high', workers: 4, bytesMiB: 512}), duration: '300s'},
+    safety: {allowExtremeSeverity: true},
+  }), manifest));
+  assert.throws(() => compileCampaign(campaign({
+    fault: {...fault({severity: 'high'}), duration: '301s'},
+    safety: {allowExtremeSeverity: true},
+  }), manifest), /high disk-pressure duration must not exceed 300s/);
+});
+
 test('rejects overlong campaign names and non-positive durations', () => {
   const overlong = campaign();
   overlong.metadata.name = `a${'b'.repeat(63)}`;
@@ -95,6 +177,11 @@ test('validates target and parameter collection types', () => {
   assert.throws(() => compileCampaign(campaign({fault: {
     type: 'time', duration: '30s', parameters: {timeOffset: '-30s', clockIds: ['NOT_A_CLOCK']},
   }}), manifest), /unsupported value/);
+  assert.throws(() => compileCampaign(campaign({fault: {
+    type: 'time', duration: '30s', parameters: {
+      timeOffset: '-30s', containerNames: ['actor', 'attacknet-probe'],
+    },
+  }}), manifest), /at most one container per Pod/);
 });
 
 test('requires action-specific parameters and bounds severity', () => {

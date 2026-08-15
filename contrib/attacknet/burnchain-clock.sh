@@ -6,7 +6,7 @@ set -uo pipefail
 # acceptance assertions belong to observers/policy and can never terminate
 # this process or implicitly stop Bitcoin.
 
-BTC_CLI=(bitcoin-cli -regtest -rpcconnect="${BITCOIN_RPC_HOST:-bitcoin}" \
+BTC_CLI=("${BITCOIN_CLI_BIN:-bitcoin-cli}" -regtest -rpcconnect="${BITCOIN_RPC_HOST:-bitcoin}" \
   -rpcuser="${BITCOIN_RPC_USER:-devnet}" -rpcpassword="${BITCOIN_RPC_PASSWORD:-devnet}")
 POLICY_FILE="${BURNCHAIN_POLICY_FILE:-/run/hacknet-policy/policy.env}"
 STATUS_FILE="${BURNCHAIN_STATUS_FILE:-/tmp/hacknet-burnchain-clock.env}"
@@ -18,6 +18,7 @@ applied_generation=""
 burst_remaining=0
 address_cursor=0
 health_pid=""
+last_bitcoin_uptime=""
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -100,16 +101,78 @@ ensure_wallets() {
   done
 }
 
+# `persistmempool=0` deliberately prevents a pre-restart block commit from
+# being mined after Bitcoin Core comes back.  The watch-only wallets still
+# retain those transactions, however, and Bitcoin Core then hides their
+# confirmed inputs from `listunspent` until the absent transactions are
+# explicitly abandoned.  Reconcile that split brain before every block.  A
+# transaction that is still in the authoritative mempool is never touched.
+wallet_transaction_txids() {
+  local wallet="$1"
+  "${BTC_CLI[@]}" -rpcwallet="${wallet}" listtransactions '*' 5000 0 true |
+    sed -nE 's/^[[:space:]]*"txid": "([0-9a-f]{64})",?$/\1/p' |
+    awk '!seen[$0]++'
+}
+
+reconcile_inactive_wallet_transactions() {
+  local wallet txid txids transaction confirmations
+  for wallet in "${miner_wallets[@]}"; do
+    if ! txids="$(wallet_transaction_txids "${wallet}")"; then
+      log "Could not enumerate inactive transactions in ${wallet}" >&2
+      return 1
+    fi
+    while IFS= read -r txid; do
+      [ -n "${txid}" ] || continue
+      if ! transaction="$("${BTC_CLI[@]}" -rpcwallet="${wallet}" gettransaction "${txid}" true)"; then
+        log "Could not inspect wallet transaction ${txid} in ${wallet}" >&2
+        return 1
+      fi
+      confirmations="$(printf '%s\n' "${transaction}" |
+        sed -nE 's/^[[:space:]]*"confirmations": (-?[0-9]+),?$/\1/p' | head -1)"
+      [ "${confirmations}" = 0 ] || continue
+      printf '%s\n' "${transaction}" | grep -q '"category": "send"' || continue
+      if printf '%s\n' "${transaction}" | grep -q '"abandoned": true'; then
+        continue
+      fi
+      if "${BTC_CLI[@]}" getmempoolentry "${txid}" >/dev/null 2>&1; then
+        continue
+      fi
+      if "${BTC_CLI[@]}" -rpcwallet="${wallet}" abandontransaction "${txid}" >/dev/null 2>&1; then
+        log "Abandoned inactive transaction ${txid} in ${wallet} after mempool reset"
+      else
+        log "Could not abandon inactive transaction ${txid} in ${wallet}" >&2
+        return 1
+      fi
+    done <<<"${txids}"
+  done
+}
+
+reconcile_if_bitcoin_restarted() {
+  local current_uptime
+  current_uptime="$(btc_until_success uptime)" || return 1
+  if [ -z "${last_bitcoin_uptime}" ] || [ "${current_uptime}" -lt "${last_bitcoin_uptime}" ]; then
+    reconcile_inactive_wallet_transactions || return 1
+    log "Reconciled miner wallets against Bitcoin mempool at uptime ${current_uptime}s"
+  fi
+  last_bitcoin_uptime="${current_uptime}"
+}
+
 mine_to_address() {
   local address="$1" wallet="${miner_wallets[0]}"
   btc_until_success -rpcwallet="${wallet}" generatetoaddress 1 "${address}" >/dev/null
 }
 
 bootstrap_regtest() {
-  local height index
+  local height index reserve
   height="$(btc_until_success getblockcount)" || return
   if [ "${height}" -eq 0 ]; then
-    for index in "${!miner_addresses[@]}"; do mine_to_address "${miner_addresses[$index]}"; done
+    reserve="${BURNCHAIN_MINER_RESERVE_OUTPUTS:-4}"
+    [[ "${reserve}" =~ ^[1-9][0-9]*$ ]] || reserve=4
+    for index in "${!miner_addresses[@]}"; do
+      for ((output = 0; output < reserve; output++)); do
+        mine_to_address "${miner_addresses[$index]}"
+      done
+    done
     height="$(btc_until_success getblockcount)" || return
   fi
   while [ "${running}" = true ] && [ "${height}" -lt "${BURNCHAIN_BOOTSTRAP_HEIGHT:-202}" ]; do
@@ -133,9 +196,24 @@ select_address() {
 
 ensure_health_server() {
   if [ -n "${health_pid}" ] && kill -0 "${health_pid}" 2>/dev/null; then return; fi
-  perl -MIO::Socket::INET -e '
+  perl -MIO::Socket::INET -MIO::Select -e '
     my $listener = IO::Socket::INET->new(LocalPort => $ENV{BURNCHAIN_HEALTH_PORT} || 18500, Listen => 16, Reuse => 1) or die $!;
     while (my $client = $listener->accept()) {
+      # Read one bounded HTTP request before closing.  Responding immediately
+      # after accept() can race the kubelet request write and reset the socket,
+      # producing intermittent readLoopPeek failures despite a healthy clock.
+      my $request = "";
+      my $reader = IO::Select->new($client);
+      while (length($request) < 8192 && $request !~ /\r?\n\r?\n/) {
+        last unless $reader->can_read(1);
+        my $count = sysread($client, my $chunk, 1024);
+        last unless defined($count) && $count > 0;
+        $request .= $chunk;
+      }
+      unless ($request =~ /\r?\n\r?\n/) {
+        close $client;
+        next;
+      }
       print $client "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
       close $client;
     }
@@ -146,58 +224,74 @@ ensure_health_server() {
 stop() { running=false; [ -z "${health_pid}" ] || kill "${health_pid}" 2>/dev/null || true; }
 request_block() { force_block=true; }
 wake_for_policy() { :; }
-trap stop TERM INT
-trap request_block USR1
-trap wake_for_policy USR2
+main() {
+  local address delay height
+  trap stop TERM INT
+  trap request_block USR1
+  trap wake_for_policy USR2
 
-IFS=',' read -ra miner_wallets <<<"${MINER_WALLETS:?MINER_WALLETS is required}"
-IFS=',' read -ra miner_addresses <<<"${MINER_BTC_ADDRS:?MINER_BTC_ADDRS is required}"
-if [ "${#miner_wallets[@]}" -eq 0 ] || [ "${#miner_wallets[@]}" -ne "${#miner_addresses[@]}" ]; then
-  log "MINER_WALLETS and MINER_BTC_ADDRS must contain the same non-zero number of entries" >&2
-  while true; do write_status degraded unknown invalid-address-inventory; sleep 60; done
-fi
+  IFS=',' read -ra miner_wallets <<<"${MINER_WALLETS:?MINER_WALLETS is required}"
+  IFS=',' read -ra miner_addresses <<<"${MINER_BTC_ADDRS:?MINER_BTC_ADDRS is required}"
+  if [ "${#miner_wallets[@]}" -eq 0 ] || [ "${#miner_wallets[@]}" -ne "${#miner_addresses[@]}" ]; then
+    log "MINER_WALLETS and MINER_BTC_ADDRS must contain the same non-zero number of entries" >&2
+    while true; do write_status degraded unknown invalid-address-inventory; sleep 60; done
+  fi
 
-write_status starting unknown bitcoin-rpc
-btc_until_success -rpcwait getblockchaininfo >/dev/null || exit 0
-ensure_wallets
-bootstrap_regtest
-ensure_health_server
-
-while [ "${running}" = true ]; do
+  write_status starting unknown bitcoin-rpc
+  btc_until_success -rpcwait getblockchaininfo >/dev/null || return 0
+  ensure_wallets
+  while ! reconcile_if_bitcoin_restarted; do
+    write_status degraded unknown wallet-transaction-reconciliation
+    sleep 2 || true
+  done
+  bootstrap_regtest
   ensure_health_server
-  read_policy
-  height="$(btc_until_success getblockcount)" || break
-  if [ "${policy_mode}" = pause ] && [ "${force_block}" = false ] && [ "${burst_remaining}" -eq 0 ]; then
-    write_status paused "${height}" "policy-generation-${applied_generation}"
-    sleep 1 || true
-    continue
-  fi
 
-  select_address
-  address="${selected_address}"
-  if mine_to_address "${address}"; then
+  while [ "${running}" = true ]; do
+    ensure_health_server
+    read_policy
     height="$(btc_until_success getblockcount)" || break
-    write_status running "${height}" "mined-to-${address}"
-    log "Mined Bitcoin block ${height} to ${address}"
-  fi
-  force_block=false
-  if [ "${burst_remaining}" -gt 0 ]; then
-    burst_remaining=$((burst_remaining - 1))
-    # Exact-height bootstrap phases still need wall-clock room for Stacks
-    # transactions, node processing, and signer registration between Bitcoin
-    # blocks. Skip the delay after the final block so the clock acknowledges
-    # the paused barrier promptly.
-    if [ "${burst_remaining}" -gt 0 ]; then
-      delay="${policy_interval}"
-      if [ "${policy_jitter}" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi
-      sleep "${delay}" || true
+    if [ "${policy_mode}" = pause ] && [ "${force_block}" = false ] && [ "${burst_remaining}" -eq 0 ]; then
+      write_status paused "${height}" "policy-generation-${applied_generation}"
+      sleep 1 || true
+      continue
     fi
-    continue
-  fi
-  delay="${policy_interval}"
-  if [ "${policy_jitter}" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi
-  sleep "${delay}" || true
-done
 
-write_status stopped "${height:-unknown}" terminated
-wait "${health_pid}" 2>/dev/null || true
+    if ! reconcile_if_bitcoin_restarted; then
+      write_status degraded "${height}" wallet-transaction-reconciliation
+      sleep 2 || true
+      continue
+    fi
+    select_address
+    address="${selected_address}"
+    if mine_to_address "${address}"; then
+      height="$(btc_until_success getblockcount)" || break
+      write_status running "${height}" "mined-to-${address}"
+      log "Mined Bitcoin block ${height} to ${address}"
+    fi
+    force_block=false
+    if [ "${burst_remaining}" -gt 0 ]; then
+      burst_remaining=$((burst_remaining - 1))
+      # Exact-height bootstrap phases still need wall-clock room for Stacks
+      # transactions, node processing, and signer registration between Bitcoin
+      # blocks. Skip the delay after the final block so the clock acknowledges
+      # the paused barrier promptly.
+      if [ "${burst_remaining}" -gt 0 ]; then
+        delay="${policy_interval}"
+        if [ "${policy_jitter}" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi
+        sleep "${delay}" || true
+      fi
+      continue
+    fi
+    delay="${policy_interval}"
+    if [ "${policy_jitter}" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi
+    sleep "${delay}" || true
+  done
+
+  write_status stopped "${height:-unknown}" terminated
+  wait "${health_pid}" 2>/dev/null || true
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

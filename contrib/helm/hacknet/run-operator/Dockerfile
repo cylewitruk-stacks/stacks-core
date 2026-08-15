@@ -13,6 +13,7 @@ COPY contrib/attacknet/campaign-targets.mjs /app/contrib/attacknet/campaign-targ
 COPY contrib/attacknet/fault-effect-evidence.mjs /app/contrib/attacknet/fault-effect-evidence.mjs
 COPY contrib/attacknet/attacknet-run-schedule.mjs /app/contrib/attacknet/attacknet-run-schedule.mjs
 COPY contrib/attacknet/run-descriptor.mjs /app/contrib/attacknet/run-descriptor.mjs
+COPY contrib/attacknet/signer-set-parity.mjs /app/contrib/attacknet/signer-set-parity.mjs
 
 ENV NODE_ENV=production
 USER 65532:65532

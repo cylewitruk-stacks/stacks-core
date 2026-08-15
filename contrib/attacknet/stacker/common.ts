@@ -44,8 +44,10 @@ export const accounts = privateKeys.map((privateKey, index) => {
     address,
     poxAddress: publicKeyToBtcAddress(publicKey),
     // Keep a non-uniform quorum without making the highest signer grow with
-    // topology size. At the ten-signer ceiling this yields 19 total slots and
-    // no actor controls more than 3/19 of the weight.
+    // topology size. stacking.ts locks 1.5 times the minimum per target slot,
+    // so consensus floors these multipliers to weights 1, 3, and 4. At the
+    // ten-signer ceiling this yields 25 total weight and no actor controls more
+    // than 4/25.
     targetSlots: (index % 3) + 1,
     client: new StackingClient({ address, network }),
   };

@@ -14,6 +14,7 @@ function load(path) {
 const faultCRD = load(join(here, 'testing.stacks.org_faultcampaigns.yaml'));
 const runCRD = load(join(here, 'testing.stacks.org_attacknetruns.yaml'));
 const faultExample = load(join(chart, 'examples', 'fault-campaign.json'));
+const ioPressureExample = load(join(chart, 'examples', 'fault-campaign-io-pressure.json'));
 const runExample = load(join(chart, 'examples', 'attacknet-run.json'));
 
 function schema(crd) {
@@ -140,6 +141,18 @@ test('FaultCampaign is a namespaced status API with bounded evidence phases', ()
   assert.equal(root.properties.spec.properties.effectAssertions.maxItems, 16);
   assert.deepEqual(root.properties.spec.properties.effectAssertions.items.required, ['type']);
   assert.equal(root.properties.spec.properties.recoveryAssertions.maxItems, 16);
+  assert.ok(root.properties.spec.properties.fault.properties.type.enum.includes('io-pressure'));
+  assert.ok(root.properties.status.properties.chaos.properties.kind.enum.includes('IOPressurePod'));
+  assert.ok(root.properties.spec.properties.effectAssertions.items.properties.type.enum.includes('IOPressureObserved'));
+  assert.ok(root.properties.spec.properties.recoveryAssertions.items.properties.type.enum.includes('IOPressureRecovered'));
+  const pressureParameters = root.properties.spec.properties.fault.properties.parameters.properties;
+  for (const field of [
+    'severity', 'workers', 'bytesMiB', 'writeSizeKiB',
+    'minimumLatencyMultiplier', 'minimumAddedLatencyMs',
+  ]) {
+    assert.equal(pressureParameters[field].default, undefined,
+      `${field} must not default into unrelated fault parameter objects`);
+  }
 });
 
 test('valid FaultCampaign example satisfies the structural OpenAPI subset', () => {
@@ -148,6 +161,18 @@ test('valid FaultCampaign example satisfies the structural OpenAPI subset', () =
   delete withoutAssertions.spec.effectAssertions;
   delete withoutAssertions.spec.recoveryAssertions;
   assert.deepEqual(validate(withoutAssertions, schema(faultCRD)), []);
+});
+
+test('bounded disk I/O-pressure campaign satisfies the structural OpenAPI contract', () => {
+  const value = clone(ioPressureExample);
+  assert.deepEqual(validate(value, schema(faultCRD)), []);
+
+  value.spec.fault.parameters.workers = 5;
+  assert.match(validate(value, schema(faultCRD)).join('\n'), /workers: is above 4/);
+
+  const pressureRule = schema(faultCRD).properties.spec['x-kubernetes-validations']
+    .find(item => item.message === 'disk-pressure must name exactly one actor target');
+  assert.ok(pressureRule, 'disk pressure must not accept a broad role selector');
 });
 
 test('FaultCampaign status accepts the bounded controller evidence contract', () => {
@@ -173,6 +198,26 @@ test('FaultCampaign status accepts the bounded controller evidence contract', ()
     recoveryResults: [{assertion: 'TargetReady', outcome: 'Proven', actor: 'miner-2', podUid: 'pod-uid', observedAt: '2026-08-15T02:00:00Z'}],
     completedAt: '2026-08-15T02:00:00Z', evidenceURI: 'file:///evidence/campaign.json',
   };
+  assert.deepEqual(validate(value, schema(faultCRD)), []);
+
+  value.status.chaos = {
+    kind: 'IOPressurePod', name: 'io-pressure-fault', uid: 'pressure-uid',
+    createdAt: '2026-08-15T01:59:05Z', mechanism: 'controller-owned-io-pressure-pod',
+    resourceDigest: `sha256:${'b'.repeat(64)}`,
+  };
+  value.status.actualInjection = {
+    allInjectedObserved: true, mechanism: 'controller-owned-io-pressure-pod',
+    podUid: 'pressure-uid', image: 'pressure:test',
+    imageID: `containerd://sha256:${'c'.repeat(64)}`, node: 'kind-worker',
+    phase: 'Running', targetActor: 'miner-2', targetPodUid: 'pod-uid',
+    pvcClaim: 'data-miner-2-0', observedAt: '2026-08-15T01:59:06Z',
+  };
+  value.status.capabilityEvidence = [{
+    actor: 'miner-2', podUid: 'pod-uid', source: 'attacknet-run-operator/v1',
+    observedAt: '2026-08-15T01:59:00Z', platform: 'kubernetes-core-pod',
+    architecture: 'native-image', supported: true,
+    reason: 'trusted controller-owned image configured',
+  }];
   assert.deepEqual(validate(value, schema(faultCRD)), []);
 });
 
@@ -213,6 +258,10 @@ test('FaultCampaign CEL rules cover mode, action, parameter, and burnchain const
     'fixed modes require value', 'invalid pod fault action',
     'I/O fault requires parameters.errno', 'burnchain role selection requires allowBurnchain',
     'signer impact above 30 percent', 'faults longer than 10m require allowExtendedDuration',
+    'TimeChaos may select at most one container per Pod',
+    'invalid I/O-pressure fault action', 'I/O pressure requires a structured bounded resource',
+    'disk-pressure must select exactly the actor container', 'disk-pressure duration must not exceed 5m',
+    'high disk-pressure severity requires allowExtremeSeverity',
   ]) assert.match(rules, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.equal(
     spec.properties.fault.properties.parameters.properties.delay['x-kubernetes-preserve-unknown-fields'],

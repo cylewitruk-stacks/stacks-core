@@ -164,6 +164,9 @@ class ResourceBuilderTests(unittest.TestCase):
         self.assertFalse(miner["automountServiceAccountToken"])
         self.assertEqual(miner["securityContext"]["fsGroup"], 65532)
         self.assertTrue(probe["securityContext"]["runAsNonRoot"])
+        self.assertFalse(probe["securityContext"]["readOnlyRootFilesystem"])
+        self.assertFalse(probe["securityContext"]["allowPrivilegeEscalation"])
+        self.assertEqual(probe["securityContext"]["capabilities"], {"drop": ["ALL"]})
         self.assertNotIn("valueFrom", " ".join(str(item) for item in probe["env"]))
         # The container port is Pod-local evidence plumbing, never a Service endpoint.
         miner_service_ports = {item["name"] for item in resources["services"][0]["spec"]["ports"]}

@@ -7,7 +7,7 @@ import test from 'node:test';
 
 import {
   RESPONSE_SCHEMA, clockObservation, createContext, createServer, dispatchProbe,
-  dnsObservation, ioObservation, parsePeerMap,
+  dnsObservation, ioObservation, parsePeerMap, processClockObservation, systemObservation,
 } from './probe.mjs';
 
 function context(overrides = {}) {
@@ -16,7 +16,7 @@ function context(overrides = {}) {
     PROBE_DATA_ROOT: mkdtempSync(join(tmpdir(), 'attacknet-probe-')),
     PROBE_PEERS_JSON: JSON.stringify({
       'miner-1': {host: 'demo-miner-1', ports: {rpc: 20443, p2p: 20444}},
-      'signer-node-1': {host: 'demo-signer-node-1', ports: {rpc: 20443}},
+      'signer-node-1': {host: 'demo-signer-node-1', ports: {rpc: 20443, metrics: 20446}},
     }),
     PROBE_DNS_CONTROL: 'kubernetes.default.svc.cluster.local',
   }, overrides);
@@ -86,6 +86,48 @@ test('clock observation records both wall and monotonic clocks', async () => {
   assert.equal(result.wallEpochSeconds, 1234);
   assert.equal(result.monotonicSeconds, 5.678);
   assert.equal(result.control, true);
+});
+
+test('process clock observation samples only the enrolled node wall-clock metric', async () => {
+  const destinations = [];
+  const httpGet = (destination, callback) => {
+    destinations.push(destination);
+    const outgoing = new EventEmitter();
+    outgoing.destroy = error => outgoing.emit('error', error);
+    queueMicrotask(() => {
+      const response = new EventEmitter();
+      response.statusCode = 200;
+      callback(response);
+      response.emit('data', Buffer.from('# TYPE stacks_node_process_wall_clock_seconds gauge\n'));
+      response.emit('data', Buffer.from('stacks_node_process_wall_clock_seconds 1234.5\n'));
+      response.emit('end');
+    });
+    return outgoing;
+  };
+  const result = await processClockObservation({
+    peer: 'signer-node-1', port: 'metrics',
+    metric: 'stacks_node_process_wall_clock_seconds', control: false,
+  }, context({httpGet, monotonic: () => 5678000000n}));
+  assert.equal(result.wallEpochSeconds, 1234.5);
+  assert.equal(result.monotonicSeconds, 5.678);
+  assert.equal(result.metric, 'stacks_node_process_wall_clock_seconds');
+  assert.deepEqual(destinations, [{host: 'demo-signer-node-1', port: 20446, path: '/metrics', timeout: 2000}]);
+  await assert.rejects(() => processClockObservation({
+    peer: 'signer-node-1', port: 'metrics', metric: 'arbitrary_metric',
+  }, context({httpGet})), /metric must be stacks_node_process_wall_clock_seconds/);
+});
+
+test('system observation exposes the probe runtime architecture without accepting commands', async () => {
+  const ctx = context({platform: 'linux', architecture: 'arm64'});
+  assert.deepEqual(await systemObservation({}, ctx), {
+    actor: 'signer-node-1', probe: 'system', status: 'ok',
+    platform: 'linux', architecture: 'arm64',
+  });
+  const result = await dispatchProbe({kind: 'system'}, ctx);
+  assert.equal(result.kind, 'system');
+  assert.equal(result.observation.architecture, 'arm64');
+  await assert.rejects(() => dispatchProbe({kind: 'system', command: 'uname'}, ctx),
+    /unsupported system field/);
 });
 
 test('response contract wraps evaluator-compatible observations', async () => {

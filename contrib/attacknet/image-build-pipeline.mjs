@@ -12,6 +12,7 @@ import {
   readlinkSync,
   readdirSync,
   realpathSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -147,6 +148,8 @@ function validateDockerfile(contents, path) {
   const checks = [
     [/cargo\s+chef\s+prepare\b/, 'cargo chef prepare'],
     [/cargo\s+chef\s+cook\b/, 'cargo chef cook'],
+    [/FROM\s+scratch\s+AS\s+cargo-chef-recipe\b/i, 'exportable cargo-chef-recipe target'],
+    [/COPY\s+--from=planner\s+\/src\/recipe\.json\s+\/recipe\.json/, 'exact Cargo Chef recipe export'],
     [/CARGO_INCREMENTAL=0/, 'CARGO_INCREMENTAL=0'],
     [/ARG\s+CARGO_CHEF_IMAGE=/, 'CARGO_CHEF_IMAGE build argument'],
     [/FROM\s+\$\{CARGO_CHEF_IMAGE\}/, 'digest-pinnable cargo-chef base'],
@@ -329,11 +332,86 @@ function imageDigestFromMetadata(metadata, profileId) {
   return digest;
 }
 
+function parseJsonBytes(bytes, path) {
+  try { return JSON.parse(Buffer.from(bytes).toString('utf8')); }
+  catch (error) { fail(`${path} is not valid JSON: ${error.message}`); }
+}
+
+function verifiedBlob(readBlob, digest, path) {
+  if (!DIGEST.test(digest ?? '')) fail(`${path} has an invalid digest`);
+  const bytes = Buffer.from(readBlob(digest));
+  if (sha256(bytes) !== digest) fail(`${path} contents do not match ${digest}`);
+  return bytes;
+}
+
+/**
+ * Resolve the identity Kubernetes CRI reports for a single-platform image.
+ *
+ * BuildKit emits an OCI index digest when provenance attestations are enabled,
+ * while containerd reports the selected platform manifest's config digest in
+ * Pod.status.containerStatuses[].imageID.  They are intentionally different
+ * hashes.  This function verifies the complete index -> manifest -> config
+ * chain rather than weakening admission evidence to a mutable tag.
+ */
+export function resolveOciRuntimeIdentity({
+  archiveIndexBytes,
+  readBlob,
+  expectedImageDigest,
+  targetPlatform,
+}) {
+  const [os, architecture] = string(targetPlatform, 'targetPlatform').split('/');
+  if (!os || !architecture) fail(`targetPlatform is invalid: ${targetPlatform}`);
+  const archiveIndex = parseJsonBytes(archiveIndexBytes, 'OCI archive index.json');
+  const roots = Array.isArray(archiveIndex.manifests) ? archiveIndex.manifests : [];
+  const root = roots.find(item => item?.digest === expectedImageDigest);
+  if (!root) fail(`OCI archive does not contain BuildKit image digest ${expectedImageDigest}`);
+  const imageIndexBytes = verifiedBlob(readBlob, root.digest, 'OCI image index');
+  const imageIndex = parseJsonBytes(imageIndexBytes, 'OCI image index');
+  const matches = (Array.isArray(imageIndex.manifests) ? imageIndex.manifests : [])
+    .filter(item => item?.platform?.os === os && item?.platform?.architecture === architecture);
+  if (matches.length !== 1) {
+    fail(`OCI image index must contain exactly one ${targetPlatform} manifest; found ${matches.length}`);
+  }
+  const platformDescriptor = matches[0];
+  const platformManifestBytes = verifiedBlob(readBlob, platformDescriptor.digest, 'OCI platform manifest');
+  const platformManifest = parseJsonBytes(platformManifestBytes, 'OCI platform manifest');
+  const runtimeConfigDigest = platformManifest?.config?.digest;
+  const configBytes = verifiedBlob(readBlob, runtimeConfigDigest, 'OCI runtime config');
+  const config = parseJsonBytes(configBytes, 'OCI runtime config');
+  if (config.os !== os || config.architecture !== architecture) {
+    fail(`OCI runtime config platform ${config.os}/${config.architecture} does not match ${targetPlatform}`);
+  }
+  return {
+    imageIndexDigest: expectedImageDigest,
+    platformManifestDigest: platformDescriptor.digest,
+    runtimeConfigDigest,
+    expectedRuntimeImageID: runtimeConfigDigest,
+    platform: targetPlatform,
+  };
+}
+
+function inspectRuntimeImageIdentity({localRef, imageDigest, targetPlatform, profileId, scratch, runner}) {
+  const archive = join(scratch, `${profileId}.runtime-image.oci.tar`);
+  try {
+    runner('docker', ['image', 'save', '--output', archive, localRef]);
+    const member = name => runner('tar', ['-xOf', archive, name], {encoding: null}).stdout;
+    return resolveOciRuntimeIdentity({
+      archiveIndexBytes: member('index.json'),
+      readBlob: digest => member(`blobs/sha256/${digest.slice('sha256:'.length)}`),
+      expectedImageDigest: imageDigest,
+      targetPlatform,
+    });
+  } finally {
+    rmSync(archive, {force: true});
+  }
+}
+
 export function executeImageBuildPipeline(plan, {
   outputDirectory,
   loadKindCluster = null,
   runner = defaultRunner,
   stager = stageResolvedSource,
+  identityResolver = inspectRuntimeImageIdentity,
   temporaryRoot = null,
 } = {}) {
   if (plan?.schema !== 'stacks-attacknet-image-build-plan/v1') fail('invalid image build plan');
@@ -365,6 +443,25 @@ export function executeImageBuildPipeline(plan, {
     const contextDigest = stagedContextDigest(context);
     const contentDigest = artifactDigest({buildKeyDigest: profile.buildKeyDigest, contextDigest});
     const localRef = `${plan.imageRepository}:content-${tagFragment(contentDigest)}`;
+    const recipeOutput = join(scratch, `${profile.id}-cargo-chef-recipe`);
+    const recipeEvidencePath = join(
+      resolvedOutput, `${profile.id}.${tagFragment(contentDigest)}.cargo-chef-recipe.json`);
+    const recipeArgs = [
+      'buildx', 'build',
+      '--file', stagedDockerfile,
+      '--platform', plan.targetPlatform,
+      '--target', 'cargo-chef-recipe',
+      '--output', `type=local,dest=${recipeOutput}`,
+      '--build-arg', `CARGO_CHEF_IMAGE=${plan.baseImages.cargoChef}`,
+      '--build-arg', `RUNTIME_IMAGE=${plan.baseImages.runtime}`,
+      context,
+    ];
+    runner('docker', recipeArgs, {
+      env: {...process.env, DOCKER_BUILDKIT: '1', CARGO_INCREMENTAL: '0'},
+    });
+    const recipeBytes = readFileSync(join(recipeOutput, 'recipe.json'));
+    writeFileSync(recipeEvidencePath, recipeBytes);
+    const recipeDigest = sha256(recipeBytes);
     const metadataPath = join(resolvedOutput, `${profile.id}.${tagFragment(contentDigest)}.buildkit-metadata.json`);
     // An empty sentinel prevents a successful-but-broken executor from reusing
     // metadata left by an earlier invocation in the same evidence directory.
@@ -388,6 +485,24 @@ export function executeImageBuildPipeline(plan, {
       '--label', `org.stacks.attacknet.source-state=${profile.source.sourceStateDigest}`,
       context,
     ];
+    const buildInvocation = {
+      schema: 'stacks-attacknet-image-build-invocation/v1',
+      buildKeyDigest: profile.buildKeyDigest,
+      stagedContextDigest: contextDigest,
+      dockerfileDigest: plan.dockerfileDigest,
+      targetPlatform: plan.targetPlatform,
+      target: 'runtime',
+      localRef,
+      baseImages: plan.baseImages,
+      cargoIncremental: false,
+      provenanceMode: 'max',
+      sbomRequested: true,
+      labels: {
+        revision: profile.source.revision,
+        sourceState: profile.source.sourceStateDigest,
+      },
+    };
+    const buildInvocationDigest = artifactDigest(buildInvocation);
     runner('docker', args, {
       env: {...process.env, DOCKER_BUILDKIT: '1', BUILDX_METADATA_PROVENANCE: 'max', CARGO_INCREMENTAL: '0'},
     });
@@ -395,6 +510,21 @@ export function executeImageBuildPipeline(plan, {
     const metadata = JSON.parse(metadataBytes.toString('utf8'));
     const imageDigest = imageDigestFromMetadata(metadata, profile.id);
     const immutableRef = `${plan.imageRepository}@${imageDigest}`;
+    const imageIdentity = identityResolver({
+      localRef,
+      imageDigest,
+      targetPlatform: plan.targetPlatform,
+      profileId: profile.id,
+      scratch,
+      runner,
+    });
+    if (imageIdentity?.imageIndexDigest !== imageDigest
+      || imageIdentity?.platform !== plan.targetPlatform
+      || !DIGEST.test(imageIdentity?.platformManifestDigest ?? '')
+      || !DIGEST.test(imageIdentity?.runtimeConfigDigest ?? '')
+      || imageIdentity?.expectedRuntimeImageID !== imageIdentity.runtimeConfigDigest) {
+      fail(`runtime image identity for ${profile.id} is incomplete or inconsistent`);
+    }
     let kindLoaded = false;
     if (loadKindCluster) {
       runner('kind', ['load', 'docker-image', localRef, '--name', loadKindCluster]);
@@ -411,6 +541,15 @@ export function executeImageBuildPipeline(plan, {
       localRef,
       imageDigest,
       immutableRef,
+      imageIdentity,
+      cargoChefRecipe: {
+        path: basename(recipeEvidencePath),
+        digest: recipeDigest,
+      },
+      buildInvocation: {
+        ...buildInvocation,
+        digest: buildInvocationDigest,
+      },
       buildkitMetadata: {
         path: basename(metadataPath),
         digest: sha256(metadataBytes),
@@ -419,10 +558,12 @@ export function executeImageBuildPipeline(plan, {
       },
       kindLoad: kindLoaded ? {cluster: loadKindCluster, localRef} : null,
       acceptanceReady: false,
-      acceptanceImageRef: immutableRef,
+      acceptanceImageRef: kindLoaded ? localRef : immutableRef,
       acceptanceBlockers: [
-        'A Kubernetes admission record must match this immutable image digest.',
-        'The exact admitted Pod UID and runtime imageID must be captured by AttacknetRun evidence.',
+        kindLoaded
+          ? 'The admitted declaration must match this locally loaded content tag; local kind cannot pull the registry-style digest reference.'
+          : 'A Kubernetes admission record must match this immutable image index digest.',
+        'The exact admitted Pod UID and runtime imageID must match imageIdentity.expectedRuntimeImageID.',
       ],
     };
     record.recordDigest = artifactDigest(record);
@@ -454,6 +595,7 @@ export function runImageBuildPipeline(input, options = {}) {
       loadKindCluster: options.loadKindCluster,
       runner: options.runner,
       stager: options.stager,
+      identityResolver: options.identityResolver,
       temporaryRoot: options.temporaryRoot,
     }),
   };

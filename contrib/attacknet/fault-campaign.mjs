@@ -5,12 +5,20 @@ import {readFileSync, writeFileSync} from 'node:fs';
 const NETWORK_LABEL = 'testing.stacks.org/network';
 const ACTOR_LABEL = 'testing.stacks.org/actor';
 const ROLE_LABEL = 'testing.stacks.org/role';
-const TYPES = Object.freeze({pod: 'PodChaos', network: 'NetworkChaos', dns: 'DNSChaos', io: 'IOChaos', time: 'TimeChaos'});
+const TYPES = Object.freeze({
+  pod: 'PodChaos', network: 'NetworkChaos', dns: 'DNSChaos', io: 'IOChaos',
+  // IOPressurePod is an internal, bounded execution descriptor. The run
+  // controller resolves the admitted actor Pod, node and data PVC and creates
+  // a core/v1 Pod from trusted chart configuration. It is deliberately not a
+  // Chaos Mesh StressChaos or IOChaos resource.
+  'io-pressure': 'IOPressurePod', time: 'TimeChaos',
+});
 const ACTIONS = Object.freeze({
   pod: new Set(['pod-kill', 'pod-failure', 'container-kill']),
   network: new Set(['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']),
   dns: new Set(['error', 'random']),
   io: new Set(['latency', 'fault', 'attrOverride', 'mistake']),
+  'io-pressure': new Set(['disk-pressure']),
 });
 const MODES = new Set(['one', 'all', 'fixed', 'fixed-percent', 'random-max-percent']);
 const SAFETY_FIELDS = Object.freeze({
@@ -29,6 +37,12 @@ const IO_METHODS = new Set([
   'MKNOD', 'CHOWN', 'CHMOD', 'UTIMES', 'LINK', 'UNLINK', 'RENAME',
 ]);
 const CLOCK_IDS = new Set(['CLOCK_REALTIME', 'CLOCK_MONOTONIC', 'CLOCK_PROCESS_CPUTIME_ID', 'CLOCK_THREAD_CPUTIME_ID']);
+const IO_PRESSURE_TEMP_PATH = '/data';
+const IO_PRESSURE_SEVERITY = Object.freeze({
+  low: {maximumWorkers: 1, maximumBytesMiB: 64, maximumDurationSeconds: 60},
+  medium: {maximumWorkers: 2, maximumBytesMiB: 256, maximumDurationSeconds: 180},
+  high: {maximumWorkers: 4, maximumBytesMiB: 512, maximumDurationSeconds: 300},
+});
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -355,13 +369,73 @@ function validateIoParameters(action, parameters, safety) {
   }
 }
 
+function validateIoPressureParameters(parameters, safety, seconds) {
+  rejectUnknownFields(parameters, new Set([
+    'containerNames', 'severity', 'workers', 'bytesMiB', 'writeSizeKiB',
+    'minimumLatencyMultiplier', 'minimumAddedLatencyMs',
+  ]), 'fault.parameters');
+  for (const field of [
+    'containerNames', 'severity', 'workers', 'bytesMiB', 'writeSizeKiB',
+    'minimumLatencyMultiplier', 'minimumAddedLatencyMs',
+  ]) {
+    if (parameters[field] === undefined) throw new Error(`disk-pressure requires fault.parameters.${field}`);
+  }
+  const containers = stringArray(parameters.containerNames, 'fault.parameters.containerNames', {required: true});
+  if (containers.length !== 1 || containers[0] !== 'actor') {
+    throw new Error('disk-pressure must select exactly the actor container per Pod');
+  }
+  const severity = parameters.severity;
+  if (typeof severity !== 'string' || !(severity in IO_PRESSURE_SEVERITY)) {
+    throw new Error('fault.parameters.severity must be low, medium, or high');
+  }
+  const limits = IO_PRESSURE_SEVERITY[severity];
+  if (severity === 'high') requireExtreme(true, safety, 'high disk-pressure severity');
+  if (seconds > limits.maximumDurationSeconds) {
+    throw new Error(`${severity} disk-pressure duration must not exceed ${limits.maximumDurationSeconds}s`);
+  }
+  const workers = numericParameter(parameters.workers, 'fault.parameters.workers', {
+    min: 1, max: limits.maximumWorkers, integer: true,
+  });
+  const bytesMiB = numericParameter(parameters.bytesMiB, 'fault.parameters.bytesMiB', {
+    min: 16, max: limits.maximumBytesMiB, integer: true,
+  });
+  const writeSizeKiB = numericParameter(parameters.writeSizeKiB, 'fault.parameters.writeSizeKiB', {
+    min: 4, max: 1024, integer: true,
+  });
+  if (writeSizeKiB > bytesMiB * 1024) {
+    throw new Error('fault.parameters.writeSizeKiB must not exceed bytesMiB');
+  }
+  const minimumLatencyMultiplier = numericParameter(
+    parameters.minimumLatencyMultiplier,
+    'fault.parameters.minimumLatencyMultiplier', {min: 1.1, max: 20},
+  );
+  const minimumAddedLatencyMs = numericParameter(
+    parameters.minimumAddedLatencyMs,
+    'fault.parameters.minimumAddedLatencyMs', {min: 0.5, max: 5000},
+  );
+  return {
+    // Only structured numbers cross the CR boundary. No image, executable,
+    // command, shell fragment, or raw stress arguments are accepted.
+    executionParameters: {containerNames: containers, workers, bytesMiB, writeSizeKiB},
+    evidence: {
+      semantic: 'disk-io-pressure', severity, workers, bytesMiB, writeSizeKiB,
+      tempPath: IO_PRESSURE_TEMP_PATH, minimumLatencyMultiplier, minimumAddedLatencyMs,
+    },
+  };
+}
+
 function validateTimeParameters(parameters, safety) {
   rejectUnknownFields(parameters, new Set(['timeOffset', 'clockIds', 'containerNames']), 'fault.parameters');
   const offset = durationSeconds(parameters.timeOffset, 'fault.parameters.timeOffset', {signed: true});
   if (Math.abs(offset) > 24 * 3600) throw new Error('fault.parameters.timeOffset must not exceed 24h');
   requireExtreme(Math.abs(offset) > 5 * 60, safety, 'fault.parameters.timeOffset beyond 5m');
   if (parameters.clockIds !== undefined) stringArray(parameters.clockIds, 'fault.parameters.clockIds', {required: true, allowed: CLOCK_IDS});
-  if (parameters.containerNames !== undefined) stringArray(parameters.containerNames, 'fault.parameters.containerNames', {required: true});
+  if (parameters.containerNames !== undefined) {
+    const containers = stringArray(parameters.containerNames, 'fault.parameters.containerNames', {required: true});
+    if (containers.length > 1) {
+      throw new Error('TimeChaos may select at most one container per Pod because Pod containers can share one time namespace');
+    }
+  }
 }
 
 export function compileCampaign(campaign, manifest) {
@@ -385,6 +459,9 @@ export function compileCampaign(campaign, manifest) {
   const target = validateTarget(spec.target, 'spec.target');
   const selected = selectedActors(target, actors);
   const mode = normalizedMode(fault.mode ?? 'one', fault.value, selected.length);
+  if (fault.type === 'io-pressure' && (selected.length !== 1 || mode.maximumCount !== 1)) {
+    throw new Error('disk-pressure must resolve to exactly one actor target');
+  }
   const duration = fault.duration ?? '30s';
   const seconds = durationSeconds(duration);
   const safety = validateSafety(spec.safety ?? {});
@@ -411,15 +488,26 @@ export function compileCampaign(campaign, manifest) {
   if (fault.type === 'network') peerSelectedActors = validateNetworkParameters(fault.action, parameters, safety, actors, manifest);
   if (fault.type === 'dns') validateDnsParameters(parameters);
   if (fault.type === 'io') validateIoParameters(fault.action, parameters, safety);
+  const ioPressure = fault.type === 'io-pressure'
+    ? validateIoPressureParameters(parameters, safety, seconds) : null;
   if (fault.type === 'time') validateTimeParameters(parameters, safety);
 
   const chaosSpec = {mode: mode.mode, duration, selector: selector(target, manifest)};
   if (mode.value !== undefined) chaosSpec.value = mode.value;
-  if (fault.type !== 'time') chaosSpec.action = fault.action;
-  Object.assign(chaosSpec, parameters);
+  if (fault.type !== 'time' && fault.type !== 'io-pressure') chaosSpec.action = fault.action;
+  Object.assign(chaosSpec, ioPressure?.executionParameters ?? parameters);
+  const annotations = ioPressure ? {
+    'testing.stacks.org/io-pressure-contract': JSON.stringify(ioPressure.evidence),
+  } : undefined;
   const resource = {
-    apiVersion: 'chaos-mesh.org/v1alpha1', kind: TYPES[fault.type],
-    metadata: {name, namespace: manifest.namespace, labels: {[NETWORK_LABEL]: network, 'testing.stacks.org/campaign': name}},
+    apiVersion: fault.type === 'io-pressure'
+      ? 'testing.stacks.org/internal' : 'chaos-mesh.org/v1alpha1',
+    kind: TYPES[fault.type],
+    metadata: {
+      name, namespace: manifest.namespace,
+      labels: {[NETWORK_LABEL]: network, 'testing.stacks.org/campaign': name},
+      ...(annotations ? {annotations} : {}),
+    },
     spec: chaosSpec,
   };
   return {
@@ -431,6 +519,7 @@ export function compileCampaign(campaign, manifest) {
       minerImpact: miner,
       maximumAffectedActors: mode.maximumCount,
       safety,
+      ...(ioPressure ? {ioPressure: ioPressure.evidence} : {}),
     },
   };
 }

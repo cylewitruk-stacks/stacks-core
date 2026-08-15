@@ -42,9 +42,13 @@ fat-LTO profile; iterative experiments do not need its single-codegen-unit link
 cost. Record the resolved builder/runtime image digests and recipe digest in
 the run descriptor when comparing builds across machines or CI workers.
 
-Docker Desktop's kind cluster can use images from its local image store with
-`imagePullPolicy: IfNotPresent`. Other kind installations may need
-`kind load docker-image` for every node.
+Docker Desktop's Docker image store is not the same as the containerd store in
+each kind node. `contrib/helm/hacknet/scripts/install-local.sh` now detects
+kind-on-Docker, imports its exact content-derived chart image tags into every
+node, and verifies them before Helm runs. For independently-built actor/version
+images, use `scripts/load-kind-images.sh --mode=require --output=receipt.json
+IMAGE...` and retain the receipt beside the build/admission evidence. Real
+clusters should use immutable registry digests rather than this local loader.
 
 ## Render and run
 
@@ -130,10 +134,12 @@ On Apple Silicon, native `linux/arm64` is the default. An amd64-only historical
 image is admissible only when its profile explicitly says
 `execution: emulated` and `executionPlatform: linux/amd64`. This makes the
 performance and timing caveat visible in evidence instead of silently relying
-on Docker Desktop emulation. Compatibility fields and phase hypotheses are
-claims to test, not proof: live image builds, Kubernetes admission, mixed-version
-protocol behavior, and upgrade/missed-upgrade outcomes remain pending until a
-run descriptor captures the admitted image IDs and behavioral assertions.
+on Docker Desktop emulation. Compatibility fields and phase hypotheses remain
+claims to test, not proof. The first live missed-upgrade slice now runs exact
+release 4.0.2 as follower-5 among current actors and binds its BuildKit OCI
+index through the arm64 manifest to the exact CRI config digest and Ready Pod
+UID. Broader rolling-upgrade matrices and deliberately incompatible actors
+still require their own admitted run evidence and behavioral assertions.
 
 The full protocol topology has 28 actors (3 miners, 10 signer/companion pairs,
 and 5 followers) plus Bitcoin, the burnchain clock, and the stacker bootstrap:
@@ -224,6 +230,54 @@ Clearance is successful only when `AllRecovered`, resource deletion, and
 resource absence are all observed; forced deletion remains a failed campaign
 even when it safely removes the fault.
 
+### Burnchain fork campaigns
+
+`BurnchainReorg` is a planned first-class semantic fault, distinct from a
+process or packet-level Chaos Mesh fault. Bitcoin Core regtest exposes
+`invalidateblock` and `reconsiderblock`; a deterministic single-backend
+campaign can therefore record the current branch, invalidate the first block
+of a bounded suffix, mine a longer replacement suffix, and make every Stacks
+actor observe a genuine Bitcoin-chain reorganization.
+
+The campaign must not expose arbitrary Bitcoin RPC. Its admitted contract will
+pin the original tip/hash sequence, fork parent, requested depth, replacement
+block count and recipients, current PoX/epoch phase, exact RPC acknowledgments,
+new canonical sequence, and all Stacks rollback/recovery observations. Safety
+budgets must bound fork depth and duration, prohibit crossing an unspecified
+epoch or reward-cycle boundary, require the environment mutation lease, and
+fail closed if the observed branch differs from the sealed precondition.
+`reconsiderblock` is cleanup of the local invalidity marker, not by itself proof
+that the intended replacement branch remained canonical.
+
+This one-bitcoind scenario exercises Stacks burnchain reorg handling but not a
+Bitcoin network partition. A higher-fidelity topology gives every Stacks node
+its own Bitcoin follower, matching the recommended deployment shape, and joins
+those followers through an explicit regtest Bitcoin P2P graph. Campaigns can
+then partition selected Bitcoin peers, delay or lose Bitcoin propagation, and
+mine bounded competing branches under a seeded work schedule. Honest Stacks
+actors can consequently hold genuinely different burnchain views until the
+Bitcoin graph heals and work selection converges.
+
+That topology needs a first-class Stacks-actor-to-Bitcoin-follower binding and
+per-follower evidence: height, best-block hash, chainwork, chain tips, peer
+graph, header/block receipt timing, and the Stacks node's corresponding burn
+view. Effect assertions must prove the requested split occurred on both layers;
+recovery must prove every Bitcoin follower selected the expected higher-work
+branch and every Stacks actor converged without an unexplained canonical fork.
+The harness must also distinguish an expected bounded split during injection
+from a failed recovery after reconnection. Because one Bitcoin data directory
+per Stacks node materially increases disk and I/O load, this is a separately
+preflighted topology profile rather than an invisible expansion of the normal
+baseline.
+
+The local RPC-induced and distributed variants must retain different mechanism
+labels so evidence never equates `invalidateblock` with Bitcoin consensus.
+
+Flash-block cadence, epoch/reward-boundary placement, actor faults, and version
+skew can later be composed with either variant by `AttacknetRun`. The resolved
+schedule and run ledger must preserve their total order; an adaptive agent may
+choose from bounded templates but never issue an unrecorded Bitcoin RPC.
+
 ## Dashboards
 
 Use three separate human views, each with a distinct job:
@@ -258,7 +312,10 @@ Grafana instance for each network. By default, `lifecycle.sh apply` also starts
 a rediscovering, loopback-only supervisor at <http://127.0.0.1:3000>. The
 supervisor survives a Grafana Pod replacement and follows the sole enrolled
 Grafana Service; it refuses ambiguity if more than one network is active. Its
-state is available through:
+state is available through the following command. On macOS, both the Grafana
+and Chaos Dashboard supervisors are singleton launchd jobs; on other platforms
+they use detached background supervisors. In both cases termination explicitly
+stops the owned `kubectl` child before removing its PID record.
 
 ```bash
 contrib/attacknet/local-access.sh status
@@ -291,8 +348,21 @@ loopback port-forward:
 contrib/attacknet/chaos-dashboard.sh local
 ```
 
-Open <http://127.0.0.1:2333>. This updates the Helm release value and rolls out
-the admitted Dashboard Deployment while preserving the installed chart version.
+Open <http://127.0.0.1:2333>. This updates the Helm release value, rolls out
+the admitted Dashboard Deployment while preserving the installed chart version,
+and starts a rediscovering loopback-only access supervisor. Subsequent
+`lifecycle.sh apply` operations ensure that supervisor is running whenever the
+Chaos Dashboard Service is installed, without changing its authentication mode.
+Inspect or control it with:
+
+```bash
+contrib/attacknet/chaos-dashboard.sh status
+contrib/attacknet/chaos-dashboard.sh start
+contrib/attacknet/chaos-dashboard.sh stop
+```
+
+Set `ATTACKNET_CHAOS_DASHBOARD_LOCAL_ACCESS_ENABLED=0` before lifecycle apply
+to disable that automatic local-access behavior.
 Restore authenticated mode with
 `contrib/attacknet/chaos-dashboard.sh secure`. Do not use the local mode for a
 shared or remotely reachable cluster.
@@ -338,12 +408,56 @@ snapshots. Before the first fault, the run controller seals the complete
 resolved schedule—including admitted image digests and network identity—in an
 owner-bound ConfigMap and executes only those pinned instructions. A separate
 restricted run controller owns only these APIs, schedule artifacts, and the
-five Chaos Mesh resource kinds; the topology operator has no Chaos permission.
+five Chaos Mesh resource kinds plus the separately labelled controller-owned
+I/O-pressure Pod; the topology operator has no fault permission.
 
 `AllInjected` is bookkeeping, not proof. Pod faults are proven from admitted
 Kubernetes Pod UID/readiness/restart state. Network, DNS, I/O, and wall-clock
 campaigns require controlled before/during/after active-probe evidence and
 independent recovery proof. Resolved replay requires a fresh network UID with
-the same manifest and images. The next live milestone is a staged
-capacity/parity run and one proof-of-effect/recovery canary for each fault
-family, not merely successful Chaos resource creation.
+the same manifest and images. Live proof now covers Pod failure, NetworkChaos,
+DNSChaos, and the controller-owned arm64 I/O-pressure mechanism on the complete
+topology. A real kind-worker outage carrying 53.33% signer weight also proved
+safe quorum pause and automatic recovery. Remaining live gates are fresh-UID
+replay/minimization, backend-paired assertion negative controls, additional
+version-skew profiles, and the final corrected 300+ burn-block soak.
+
+IOChaos has an additional platform gate. Chaos Mesh 2.8.3 bundles an x86-64
+`toda` helper whose source also hard-codes x86-64 ptrace registers and emitted
+assembly. The chart therefore defaults
+`runOperator.ioChaosSupportedArchitectures` to `["x64"]`. Before creating an
+IOChaos resource, the controller obtains each exact target Pod's runtime
+architecture from its Ready probe and fails `FaultCapabilityUnavailable` when
+the installed helper profile does not support it. Do not add `arm64` merely to
+bypass this gate; it means a native helper was independently verified. On an
+arm64 cluster, use a separately-labelled I/O-pressure scenario or an admitted
+x86-64 actor rather than claiming per-syscall IOChaos semantics.
+
+The arm64-compatible alternative is explicitly named `io-pressure` with the
+single action `disk-pressure`. It compiles structured worker, byte-count, write
+size, severity, duration, and evidence-threshold fields into an internal
+`IOPressurePod` descriptor. The run controller resolves exactly one admitted
+actor Pod, its node, and its `/data` PVC, then creates a core/v1 Pod using only
+the chart-configured trusted image, fixed entrypoint argument layout, restricted
+non-root context, and severity-specific CPU/memory caps. Callers cannot provide
+an image, command, shell fragment, or raw stress arguments. Its open pressure
+files are unlinked before pressure starts so the campaign cannot strand named
+payloads on the actor volume. The trusted
+FSYNC probe must observe both the configured latency multiplier and added-ms
+threshold before the result can become `IOPressureObserved=Proven`, and both
+must fall below threshold after deletion for
+`IOPressureRecovered=Proven`. Kubernetes-observed pressure-Pod `Running` is
+required as injection evidence but is never substituted for that data-plane
+evidence. Runtime evidence records the pressure Pod UID, admitted image ID,
+node, phase, and claim under
+`mechanism=controller-owned-io-pressure-pod`. See
+`contrib/helm/hacknet/examples/fault-campaign-io-pressure.json`.
+
+TimeChaos is also architecture-gated. On the local arm64 kind cluster, Chaos
+Mesh 2.8.3 reported a successful actor injection without changing the process'
+realtime clock, and a separate Node-process canary wedged the daemon before it
+could detach. The chart therefore defaults
+`runOperator.timeChaosSupportedArchitectures` to `["x64"]`. Extend the list
+only after a known process observes the requested offset and recovery and the
+Chaos resource cleans up normally; `AllInjected` alone is not capability
+evidence.

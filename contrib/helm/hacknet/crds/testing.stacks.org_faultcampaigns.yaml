@@ -77,10 +77,10 @@
                   "type": "object",
                   "required": ["type", "mode", "duration", "parameters"],
                   "properties": {
-                    "type": {"type": "string", "enum": ["pod", "network", "dns", "io", "time"]},
+                    "type": {"type": "string", "enum": ["pod", "network", "dns", "io", "io-pressure", "time"]},
                     "action": {
                       "type": "string",
-                      "enum": ["pod-kill", "pod-failure", "container-kill", "netem", "delay", "loss", "duplicate", "corrupt", "partition", "bandwidth", "error", "random", "latency", "fault", "attrOverride", "mistake"]
+                      "enum": ["pod-kill", "pod-failure", "container-kill", "netem", "delay", "loss", "duplicate", "corrupt", "partition", "bandwidth", "error", "random", "latency", "fault", "attrOverride", "mistake", "disk-pressure"]
                     },
                     "mode": {"type": "string", "enum": ["one", "all", "fixed", "fixed-percent", "random-max-percent"]},
                     "value": {
@@ -189,10 +189,16 @@
                         },
                         "attr": {"type": "object", "minProperties": 1, "maxProperties": 16, "x-kubernetes-preserve-unknown-fields": true},
                         "timeOffset": {"type": "string", "pattern": "^[+-]?[0-9]+(ms|s|m|h)$", "maxLength": 32},
-                        "clockIds": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "string", "enum": ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID"]}
+                        "clockIds": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "string", "enum": ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID"]}},
+                        "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                        "workers": {"type": "integer", "minimum": 1, "maximum": 4},
+                        "bytesMiB": {"type": "integer", "minimum": 16, "maximum": 512},
+                        "writeSizeKiB": {"type": "integer", "minimum": 4, "maximum": 1024},
+                        "minimumLatencyMultiplier": {"type": "number", "minimum": 1.1, "maximum": 20},
+                        "minimumAddedLatencyMs": {"type": "number", "minimum": 0.5, "maximum": 5000}
                       }
                     }
-                  }},
+                  },
                   "x-kubernetes-validations": [
                     {"rule": "self.mode in ['fixed', 'fixed-percent', 'random-max-percent'] ? has(self.value) : !has(self.value)", "message": "fixed modes require value and one/all modes must omit it"},
                     {"rule": "self.type == 'time' ? !has(self.action) : has(self.action)", "message": "time faults omit action; every other fault requires it"},
@@ -200,6 +206,7 @@
                     {"rule": "self.type != 'network' || self.action in ['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']", "message": "invalid network fault action"},
                     {"rule": "self.type != 'dns' || self.action in ['error', 'random']", "message": "invalid DNS fault action"},
                     {"rule": "self.type != 'io' || self.action in ['latency', 'fault', 'attrOverride', 'mistake']", "message": "invalid I/O fault action"},
+                    {"rule": "self.type != 'io-pressure' || self.action == 'disk-pressure'", "message": "invalid I/O-pressure fault action"},
                     {"rule": "self.type != 'network' || !has(self.parameters.target) || !has(self.parameters.peerTarget)", "message": "network faults may use target or peerTarget, not both"},
                     {"rule": "self.type != 'network' || self.action != 'loss' || has(self.parameters.loss)", "message": "network loss requires parameters.loss"},
                     {"rule": "self.type != 'network' || self.action != 'duplicate' || has(self.parameters.duplicate)", "message": "network duplicate requires parameters.duplicate"},
@@ -211,6 +218,7 @@
                     {"rule": "self.type != 'io' || self.action != 'fault' || has(self.parameters.errno)", "message": "I/O fault requires parameters.errno"},
                     {"rule": "self.type != 'io' || self.action != 'mistake' || has(self.parameters.mistake)", "message": "I/O mistake requires parameters.mistake"},
                     {"rule": "self.type != 'io' || self.action != 'attrOverride' || has(self.parameters.attr)", "message": "I/O attrOverride requires parameters.attr"},
+                    {"rule": "self.type != 'io-pressure' || has(self.parameters.severity) && has(self.parameters.workers) && has(self.parameters.bytesMiB) && has(self.parameters.writeSizeKiB) && has(self.parameters.minimumLatencyMultiplier) && has(self.parameters.minimumAddedLatencyMs)", "message": "I/O pressure requires a structured bounded resource and evidence profile"},
                     {"rule": "self.type != 'time' || has(self.parameters.timeOffset)", "message": "time faults require parameters.timeOffset"}
                   ]
                 },
@@ -232,18 +240,26 @@
                   ]
                 },
                 "effectAssertions": {"type": "array", "maxItems": 16, "items": {"type": "object", "required": ["type"], "properties": {
-                  "type": {"type": "string", "enum": ["PodRestarted", "PodUnavailable", "NetworkDegraded", "DNSDegraded", "IODegraded", "ClockSkewObserved"]},
+                  "type": {"type": "string", "enum": ["PodRestarted", "PodUnavailable", "NetworkDegraded", "DNSDegraded", "IODegraded", "IOPressureObserved", "ClockSkewObserved"]},
                   "actor": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"},
                   "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600}
                 }}},
                 "recoveryAssertions": {"type": "array", "maxItems": 16, "items": {"type": "object", "required": ["type"], "properties": {
-                  "type": {"type": "string", "enum": ["TargetReady", "NetworkRecovered", "DNSRecovered", "IORecovered", "ClockSkewCleared", "ChainProgress"]},
+                  "type": {"type": "string", "enum": ["TargetReady", "NetworkRecovered", "DNSRecovered", "IORecovered", "IOPressureRecovered", "ClockSkewCleared", "ChainProgress"]},
                   "actor": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"},
                   "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600}
                 }}}
               },
               "x-kubernetes-validations": [
                 {"rule": "!has(self.target.roles) || !('burnchain' in self.target.roles) || (has(self.safety.allowBurnchain) && self.safety.allowBurnchain)", "message": "burnchain role selection requires allowBurnchain=true"},
+                {"rule": "self.fault.type != 'time' || !has(self.fault.parameters.containerNames) || size(self.fault.parameters.containerNames) <= 1", "message": "TimeChaos may select at most one container per Pod"},
+                {"rule": "self.fault.type != 'io-pressure' || has(self.fault.parameters.containerNames) && size(self.fault.parameters.containerNames) == 1 && self.fault.parameters.containerNames[0] == 'actor'", "message": "disk-pressure must select exactly the actor container per Pod"},
+                {"rule": "self.fault.type != 'io-pressure' || has(self.target.actors) && size(self.target.actors) == 1 && (!has(self.target.roles) || size(self.target.roles) == 0)", "message": "disk-pressure must name exactly one actor target"},
+                {"rule": "self.fault.type != 'io-pressure' || duration(self.fault.duration) <= duration('5m')", "message": "disk-pressure duration must not exceed 5m"},
+                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.writeSizeKiB <= self.fault.parameters.bytesMiB * 1024", "message": "disk-pressure write size must not exceed total bytes"},
+                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.severity != 'low' || self.fault.parameters.workers <= 1 && self.fault.parameters.bytesMiB <= 64 && duration(self.fault.duration) <= duration('60s')", "message": "low disk-pressure exceeds its resource or duration profile"},
+                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.severity != 'medium' || self.fault.parameters.workers <= 2 && self.fault.parameters.bytesMiB <= 256 && duration(self.fault.duration) <= duration('180s')", "message": "medium disk-pressure exceeds its resource or duration profile"},
+                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.severity != 'high' || (has(self.safety.allowExtremeSeverity) && self.safety.allowExtremeSeverity)", "message": "high disk-pressure severity requires allowExtremeSeverity=true"},
                 {"rule": "(has(self.safety.allowExtendedDuration) && self.safety.allowExtendedDuration) || duration(self.fault.duration) <= duration('10m')", "message": "faults longer than 10m require allowExtendedDuration=true"},
                 {"rule": "duration(self.fault.duration) > duration('0s') && duration(self.fault.duration) <= duration('24h')", "message": "fault duration must be greater than zero and at most 24h"},
                 {"rule": "!has(self.fault.parameters.target) && !has(self.fault.parameters.externalTargets) || (has(self.safety.allowUnenrolledNetworkTargets) && self.safety.allowUnenrolledNetworkTargets)", "message": "raw target or externalTargets require allowUnenrolledNetworkTargets=true"}
@@ -263,6 +279,10 @@
                   "networkGeneration": {"type": "integer", "minimum": 1},
                   "compiledDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
                   "admittedAt": {"type": "string", "format": "date-time"},
+                  "signerSetRewardCycle": {"type": "integer", "minimum": 0},
+                  "signerSetTotalWeight": {"type": "integer", "minimum": 1},
+                  "signerSetDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                  "signerSetObservedFrom": {"type": "string", "minLength": 1, "maxLength": 40},
                   "signerImpact": {"type": "object", "required": ["totalWeight", "affectedWeight", "percent"], "properties": {
                     "totalWeight": {"type": "number", "minimum": 0}, "affectedWeight": {"type": "number", "minimum": 0}, "percent": {"type": "number", "minimum": 0, "maximum": 100}
                   }},
@@ -282,17 +302,39 @@
                   "resolvedImageId": {"type": "string", "nullable": true, "maxLength": 4096},
                   "restartCount": {"type": "integer", "minimum": 0, "maximum": 2147483647}
                 }}},
+                "capabilityEvidence": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["actor", "podUid", "source", "observedAt", "platform", "architecture", "supported", "reason"], "properties": {
+                  "actor": {"type": "string", "minLength": 1, "maxLength": 63},
+                  "podUid": {"type": "string", "minLength": 1, "maxLength": 128},
+                  "source": {"type": "string", "enum": ["attacknet-probe/v1", "attacknet-run-operator/v1"]},
+                  "observedAt": {"type": "string", "format": "date-time"},
+                  "platform": {"type": "string", "minLength": 1, "maxLength": 32},
+                  "architecture": {"type": "string", "minLength": 1, "maxLength": 32},
+                  "supported": {"type": "boolean"},
+                  "reason": {"type": "string", "minLength": 1, "maxLength": 1024}
+                }}},
                 "chaos": {"type": "object", "required": ["kind", "name", "uid", "createdAt"], "properties": {
-                  "kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "TimeChaos"]},
+                  "kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos"]},
                   "name": {"type": "string", "maxLength": 63},
                   "uid": {"type": "string", "maxLength": 128},
-                  "createdAt": {"type": "string", "format": "date-time"}
+                  "createdAt": {"type": "string", "format": "date-time"},
+                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod"]},
+                  "resourceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
                 }},
                 "injectedAt": {"type": "string", "format": "date-time"},
                 "actualInjection": {"type": "object", "properties": {
                   "allInjectedObserved": {"type": "boolean"},
                   "chaosResourceVersion": {"type": "string", "maxLength": 128},
-                  "records": {"nullable": true, "x-kubernetes-preserve-unknown-fields": true}
+                  "records": {"nullable": true, "x-kubernetes-preserve-unknown-fields": true},
+                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod"]},
+                  "podUid": {"type": "string", "maxLength": 128},
+                  "image": {"type": "string", "maxLength": 2048},
+                  "imageID": {"type": "string", "maxLength": 4096},
+                  "node": {"type": "string", "maxLength": 253},
+                  "phase": {"type": "string", "enum": ["Pending", "Running", "Succeeded", "Failed", "Unknown"]},
+                  "targetActor": {"type": "string", "maxLength": 63},
+                  "targetPodUid": {"type": "string", "maxLength": 128},
+                  "pvcClaim": {"type": "string", "maxLength": 253},
+                  "observedAt": {"type": "string", "format": "date-time"}
                 }},
                 "probeArtifacts": {"type": "object", "properties": {
                   "beforeJson": {"type": "string", "maxLength": 131072},
@@ -306,7 +348,10 @@
                   "assertion": {"type": "string", "maxLength": 63}, "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]}, "actor": {"type": "string", "maxLength": 63}, "podUid": {"type": "string", "maxLength": 128}, "observedAt": {"type": "string", "format": "date-time"}, "observedValue": {"type": "number"}, "message": {"type": "string", "maxLength": 2048}
                 }}},
                 "cleanup": {"type": "object", "required": ["absent", "allRecovered", "observedAt"], "properties": {
-                  "absent": {"type": "boolean"}, "allRecovered": {"type": "boolean"}, "observedAt": {"type": "string", "format": "date-time"}
+                  "absent": {"type": "boolean"}, "allRecovered": {"type": "boolean"},
+                  "method": {"type": "string", "enum": ["Normal", "ZeroInjectionFinalizerAbort"]},
+                  "zeroInjectionProven": {"type": "boolean"},
+                  "observedAt": {"type": "string", "format": "date-time"}
                 }},
                 "completedAt": {"type": "string", "format": "date-time"},
                 "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},

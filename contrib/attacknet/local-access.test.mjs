@@ -6,6 +6,7 @@ import {spawnSync} from 'node:child_process';
 import test from 'node:test';
 
 const script = resolve('contrib/attacknet/local-access.sh');
+const source = readFileSync(script, 'utf8');
 
 function run(services) {
   const root = mkdtempSync(join(tmpdir(), 'attacknet-access-'));
@@ -37,3 +38,11 @@ test('refuses to choose between two active Grafana Services', () => {
   assert.doesNotMatch(calls, /port-forward/);
 });
 
+test('uses a singleton launchd supervisor on macOS with an absolute script path', () => {
+  assert.match(source, /org\.stacks\.attacknet\.grafana-access/);
+  assert.match(source, /launchctl submit -l/);
+  assert.match(source, /\/bin\/bash "\$\{script_path\}" run/);
+  assert.match(source, /launchctl print "gui\/\$\(id -u\)\/\$\{launchd_label\}"/);
+  assert.match(source, /trap 'exit 143' TERM/);
+  assert.match(source, /kill "\$\{forward_pid\}"/);
+});

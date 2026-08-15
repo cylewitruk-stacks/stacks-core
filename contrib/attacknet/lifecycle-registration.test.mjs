@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {chmodSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
+import {chmodSync, existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import test from 'node:test';
@@ -175,4 +175,120 @@ test('two-phase bootstrap never receives a second generic clock-start command', 
     },
   });
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('startup gates require live conversations and canonical global-state support', () => {
+  const root = mkdtempSync(join(tmpdir(), 'attacknet-protocol-gates-'));
+  symlinkSync(resolve('contrib/attacknet/manifest-inventory.mjs'), join(root, 'manifest-inventory.mjs'));
+  symlinkSync(resolve('contrib/attacknet/invariants.mjs'), join(root, 'invariants.mjs'));
+  const backend = join(root, 'runtime-backend.sh');
+  writeFileSync(backend, `#!/bin/sh
+case "$*" in
+  *'/v2/neighbors'*)
+    printf '%s\n' '{"bootstrap":[],"sample":[],"inbound":[{"authenticated":true}],"outbound":[]}'
+    ;;
+  *'31000/metrics'*)
+    printf '%s\n' 'stacks_signer_global_state_available 1'
+    printf '%s\n' 'stacks_signer_global_state_known_weight 19'
+    printf '%s\n' 'stacks_signer_global_state_maximum_view_weight 19'
+    printf '%s\n' 'stacks_signer_global_state_canonical_threshold_weight 14'
+    ;;
+  *) exit 2 ;;
+esac
+`);
+  chmodSync(backend, 0o755);
+  const manifest = join(root, 'manifest.json');
+  writeFileSync(manifest, `${JSON.stringify({actors: [
+    {service: 'miner-1', type: 'node', role: 'miner'},
+    {service: 'signer-node-1', type: 'node', role: 'companion'},
+    {service: 'signer-1', type: 'signer', role: 'signer'},
+    {service: 'signer-2', type: 'signer', role: 'signer'},
+  ]})}\n`);
+  const result = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    ATTACKNET_DIR="$FAKE_ATTACKNET_DIR"
+    NAMESPACE=hacknet-system
+    NETWORK=network-a
+    TIMEOUT=2
+    sleep() { :; }
+    node() {
+      if [[ "$1" == *invariants.mjs ]] && [ "$2" = peers ] && [ ! -e "$FIRST_SAMPLE" ]; then
+        : >"$FIRST_SAMPLE"
+        return 1
+      fi
+      command node "$@"
+    }
+    apply_error() { : >"$FALSE_FAILURE"; }
+    trap 'apply_error $? \${LINENO}' ERR
+    wait_live_peer_connectivity "$MANIFEST" nodes
+    wait_signer_global_state "$MANIFEST"
+  `], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      LIFECYCLE: lifecycle,
+      FAKE_ATTACKNET_DIR: root,
+      MANIFEST: manifest,
+      FIRST_SAMPLE: join(root, 'first-sample'),
+      FALSE_FAILURE: join(root, 'false-lifecycle-failure'),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(existsSync(join(root, 'first-sample')), true);
+  assert.equal(existsSync(join(root, 'false-lifecycle-failure')), false);
+  assert.match(result.stdout, /live authenticated P2P connectivity proven/);
+  assert.match(result.stdout, /canonical-threshold global state for three samples/);
+});
+
+test('startup proves declared signer identities and weights against the live reward set', () => {
+  const root = mkdtempSync(join(tmpdir(), 'attacknet-signer-parity-'));
+  writeFileSync(join(root, 'signer-set-parity.mjs'),
+    readFileSync(resolve('contrib/attacknet/signer-set-parity.mjs'), 'utf8'));
+  const signerKey = `02${'01'.padStart(64, '0')}`;
+  const backend = join(root, 'runtime-backend.sh');
+  writeFileSync(backend, `#!/bin/sh
+case "$*" in
+  *'/v2/pox'*) printf '%s\n' '{"current_cycle":{"id":11}}' ;;
+  *'/v3/stacker_set/11'*) printf '%s\n' '{"stacker_set":{"signers":[{"signing_key":"${signerKey}","weight":3}]}}' ;;
+  *) exit 2 ;;
+esac
+`);
+  chmodSync(backend, 0o755);
+  const manifest = join(root, 'manifest.json');
+  const actor = {
+    service: 'signer-1', type: 'signer', role: 'signer', signerIndex: 1,
+    signerPublicKey: signerKey, signerWeight: 3,
+  };
+  writeFileSync(manifest, `${JSON.stringify({actors: [actor]})}\n`);
+  const result = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    ATTACKNET_DIR="$FAKE_ATTACKNET_DIR"
+    NAMESPACE=hacknet-system
+    NETWORK=network-a
+    TIMEOUT=2
+    wait_signer_set_parity "$MANIFEST"
+  `], {encoding: 'utf8', env: {
+    ...process.env, LIFECYCLE: lifecycle, FAKE_ATTACKNET_DIR: root, MANIFEST: manifest,
+  }});
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.rewardCycle, 11);
+  assert.equal(report.declaredTotalWeight, 3);
+  assert.equal(report.observedTotalWeight, 3);
+
+  writeFileSync(manifest, `${JSON.stringify({actors: [{...actor, signerWeight: 2}]})}\n`);
+  const mismatch = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    ATTACKNET_DIR="$FAKE_ATTACKNET_DIR"
+    NAMESPACE=hacknet-system
+    NETWORK=network-a
+    TIMEOUT=2
+    wait_signer_set_parity "$MANIFEST"
+  `], {encoding: 'utf8', env: {
+    ...process.env, LIFECYCLE: lifecycle, FAKE_ATTACKNET_DIR: root, MANIFEST: manifest,
+  }});
+  assert.equal(mismatch.status, 1);
+  assert.match(mismatch.stderr, /unsafe for fault admission/);
+  assert.match(mismatch.stderr, /"declared": 2/);
+  assert.match(mismatch.stderr, /"observed": 3/);
 });

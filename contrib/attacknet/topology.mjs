@@ -84,6 +84,15 @@ function legacyPublicKey(seedByte) {
   return key.getPublicKey('hex', 'compressed');
 }
 
+function signerPublicKey(signer) {
+  const key = createECDH('secp256k1');
+  // Stacks private-key strings append one compression byte to the 32-byte
+  // secp256k1 scalar.  The reward-set endpoint publishes the corresponding
+  // compressed public key.
+  key.setPrivateKey(Buffer.from(signer[0].slice(0, 64), 'hex'));
+  return key.getPublicKey('hex', 'compressed');
+}
+
 function epochsAndBalances(signers) {
   const epochs = [
     ['1.0', 0], ['2.0', 0], ['2.05', 203], ['2.1', 204], ['2.2', 206],
@@ -95,14 +104,15 @@ function epochsAndBalances(signers) {
   return [...epochs, ...balances].join('\n\n');
 }
 
-function nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers}) {
+function nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers, bootstrapPeers}) {
   // On the current-main legacy transport, `stacker` is also the subscription
   // switch for the boot `.miners` and signer StackerDB replicas.  A signer
   // companion is not a miner, but it must set this flag or proposals can only
   // exist in the winning miner's local database and never reach the signer.
   const subscribesToSignerStackerDBs = miner || signerIndex !== undefined;
-  const bootstrap = name === 'miner-1' ? '' :
-    `bootstrap_node = "${legacyPublicKey('11')}@${service('miner-1')}:20444"`;
+  const bootstrap = bootstrapPeers.length === 0 ? '' : `bootstrap_node = "${bootstrapPeers
+    .map(peer => `${legacyPublicKey(peer.seedByte)}@${service(peer.name)}:20444`)
+    .join(',')}"`;
   const observer = signerIndex === undefined ? '' : `
 [[events_observer]]
 endpoint = "${service(`signer-${signerIndex}`)}:30000"
@@ -188,10 +198,21 @@ function env(name, value) {
   return {name, value: String(value)};
 }
 
-function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex, signers, image}) {
+function signerConsensusWeight(index) {
+  const targetSlots = ((index - 1) % 3) + 1;
+  // The stacker deliberately locks 1.5 times the reported minimum per target
+  // slot. Consensus assigns floor(amount / minimum) weight, so the admitted
+  // weights are 1, 3, 4—not the input multipliers 1, 2, 3. Keep fault-safety
+  // metadata aligned with the on-chain signer set.
+  return Math.floor(targetSlots * 1.5);
+}
+
+function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex, signers, image, bootstrapPeers}) {
   const delayedMiner = miner && minerIndex > 0;
   const files = {
-    'config.toml': nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers}),
+    'config.toml': nodeConfig({
+      name, seedByte, miner, minerIndex, signerIndex, signers, bootstrapPeers,
+    }),
     'configure-node.sh': readFileSync(join(ROOT, 'configure-node.sh'), 'utf8'),
   };
   if (delayedMiner) files['join-after-nakamoto.sh'] = readFileSync(join(ROOT, 'join-after-nakamoto.sh'), 'utf8');
@@ -208,11 +229,19 @@ function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex
     role,
     ...(signerIndex === undefined ? {} : {
       signerIndex,
-      signerWeight: ((signerIndex - 1) % 3) + 1,
+      signerWeight: signerConsensusWeight(signerIndex),
+      signerPublicKey: signerPublicKey(signers[signerIndex - 1]),
     }),
     activationGate: delayedMiner ? {kind: 'burn-height', height: 223} : undefined,
     image,
     imagePullPolicy: 'IfNotPresent',
+    // Stacks resolves every configured bootstrap hostname before the node RPC
+    // endpoint can become Ready. Publish node endpoints while they are still
+    // starting so reciprocal, diverse bootstrap lists cannot deadlock behind
+    // Kubernetes readiness-gated DNS. This changes discovery only: init
+    // dependency probes still require the requested TCP port to accept, and
+    // Pod readiness continues to reflect /v2/info.
+    runtimeExposure: 'reachable',
     command: delayedMiner
       ? ['/bin/bash', '/etc/stacks/configure-node.sh', '/bin/bash', '/etc/stacks/join-after-nakamoto.sh']
       : ['/bin/bash', '/etc/stacks/configure-node.sh', 'stacks-node', 'start', '--config', '/tmp/stacks-attacknet-config.toml'],
@@ -239,7 +268,8 @@ function signerActor(index, signer, image) {
     name: `signer-${index}`,
     role: 'signer',
     signerIndex: index,
-    signerWeight: ((index - 1) % 3) + 1,
+    signerWeight: signerConsensusWeight(index),
+    signerPublicKey: signerPublicKey(signer),
     image,
     imagePullPolicy: 'IfNotPresent',
     command: ['stacks-signer', 'run', '--config', '/etc/stacks/signer.toml'],
@@ -271,20 +301,43 @@ export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 
   if (signerCount < 1 || signerCount > LIMITS.signers) throw new Error('signerCount out of range');
   if (followerCount < 0 || followerCount > LIMITS.followers) throw new Error('followerCount out of range');
   const signers = SIGNERS.slice(0, signerCount);
+  const nodeIdentities = [
+    ...Array.from({length: minerCount}, (_, index) => ({
+      name: `miner-${index + 1}`, seedByte: MINERS[index][0],
+    })),
+    ...Array.from({length: signerCount}, (_, index) => ({
+      name: `signer-node-${index + 1}`, seedByte: (0x21 + index).toString(16),
+    })),
+    ...Array.from({length: followerCount}, (_, index) => ({
+      name: `follower-${index + 1}`, seedByte: (0x31 + index).toString(16),
+    })),
+  ];
+  // Bootstrap is a recovery mechanism, not an architectural dependency on a
+  // single privileged actor. Prefer the always-on first miner and followers,
+  // then companions and additional miners. Every node receives up to three
+  // distinct, non-self identities from the admitted topology. The list is
+  // deterministic so evidence and replay descriptors remain reproducible.
+  const bootstrapOrder = [
+    nodeIdentities.find(actor => actor.name === 'miner-1'),
+    ...nodeIdentities.filter(actor => actor.name.startsWith('follower-')),
+    ...nodeIdentities.filter(actor => actor.name.startsWith('signer-node-')),
+    ...nodeIdentities.filter(actor => actor.name.startsWith('miner-') && actor.name !== 'miner-1'),
+  ].filter(Boolean);
+  const bootstrapPeersFor = name => bootstrapOrder.filter(actor => actor.name !== name).slice(0, 3);
   const actors = [];
   for (let index = 0; index < minerCount; index += 1) {
     const name = `miner-${index + 1}`;
-    actors.push(nodeActor({name, role: 'miner', seedByte: MINERS[index][0], miner: true, minerIndex: index, signers, image: actorImages[name] ?? nodeImage}));
+    actors.push(nodeActor({name, role: 'miner', seedByte: MINERS[index][0], miner: true, minerIndex: index, signers, image: actorImages[name] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(name)}));
   }
   for (let index = 1; index <= signerCount; index += 1) {
     const companion = `signer-node-${index}`;
     const signer = `signer-${index}`;
-    actors.push(nodeActor({name: companion, role: 'companion', seedByte: (0x20 + index).toString(16), signerIndex: index, signers, image: actorImages[companion] ?? nodeImage}));
+    actors.push(nodeActor({name: companion, role: 'companion', seedByte: (0x20 + index).toString(16), signerIndex: index, signers, image: actorImages[companion] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(companion)}));
     actors.push(signerActor(index, signers[index - 1], actorImages[signer] ?? nodeImage));
   }
   for (let index = 1; index <= followerCount; index += 1) {
     const name = `follower-${index}`;
-    actors.push(nodeActor({name, role: 'follower', seedByte: (0x30 + index).toString(16), signers, image: actorImages[name] ?? nodeImage}));
+    actors.push(nodeActor({name, role: 'follower', seedByte: (0x30 + index).toString(16), signers, image: actorImages[name] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(name)}));
   }
   const knownActors = new Set(actors.map(actor => actor.name));
   for (const name of Object.keys(actorImages)) {
@@ -445,6 +498,7 @@ export function renderTopology(topology, output, {
     companion: actor.role === 'signer' ? `signer-node-${actor.name.slice('signer-'.length)}` : undefined,
     signerIndex: actor.signerIndex,
     signerWeight: actor.signerWeight,
+    signerPublicKey: actor.signerPublicKey,
     stacksAddress: actor.role === 'signer'
       ? topology.signers[actor.signerIndex - 1][1]
       : undefined,

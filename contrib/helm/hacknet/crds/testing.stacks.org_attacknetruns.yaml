@@ -230,7 +230,11 @@
                   "replay": {"type": "boolean"},
                   "networkUid": {"type": "string", "minLength": 1, "maxLength": 128},
                   "networkGeneration": {"type": "integer", "minimum": 1},
-                  "manifestDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                  "manifestDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                  "signerSetRewardCycle": {"type": "integer", "minimum": 0},
+                  "signerSetTotalWeight": {"type": "integer", "minimum": 1},
+                  "signerSetDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                  "signerSetObservedFrom": {"type": "string", "minLength": 1, "maxLength": 40}
                 }},
                 "activeChild": {"type": "object", "required": ["instructionId", "name", "uid"], "properties": {
                   "instructionId": {"type": "string", "maxLength": 63},

@@ -57,6 +57,23 @@ runOperator:
   imagePullSecrets: []
   logLevel: INFO
   reconcileIntervalSeconds: 5
+  # Chaos Mesh v2.8.3 ships an x86-64-only toda helper. IOChaos admission
+  # fails closed for targets on other architectures. Extend this allow-list
+  # only after the installed helper has been verified on that architecture.
+  ioChaosSupportedArchitectures: ["x64"]
+  # TimeChaos 2.8.3 did not shift a Rust process clock on the local arm64 kind
+  # cluster and wedged its daemon on a separate Node-process canary. Extend
+  # this allow-list only after a bounded effect-and-recovery canary succeeds.
+  timeChaosSupportedArchitectures: ["x64"]
+  # Trusted controller-selected workload for bounded data-PVC pressure. A
+  # FaultCampaign cannot override this image, command, arguments, or caps.
+  ioPressureImage:
+    repository: stacks-hacknet-io-pressure
+    tag: dev
+    # Registry deployments should prefer an immutable sha256 digest. When set,
+    # it takes precedence over tag.
+    digest: ""
+    pullPolicy: IfNotPresent
   resources:
     requests:
       cpu: 25m

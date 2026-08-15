@@ -116,10 +116,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const input = JSON.parse(readFileSync(inputPath, 'utf8'));
   let result;
   if (command === 'cohort') result = networkCohort(input, Number(rawValue ?? 2), Number(rawMinimum ?? 0));
+  else if (command === 'peers') result = peerConnectivity(input);
   else if (command === 'progress') {
     result = progress(input.start, input.end, Number(rawValue ?? 1), Number(rawMinimum ?? 1));
   }
-  else throw new Error('usage: invariants.mjs {cohort|progress} INPUT [LIMIT]');
+  else throw new Error('usage: invariants.mjs {cohort|peers|progress} INPUT [LIMIT]');
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (!result.ok) process.exitCode = 1;
 }

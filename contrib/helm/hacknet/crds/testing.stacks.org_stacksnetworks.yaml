@@ -199,6 +199,10 @@ spec:
                         type: number
                         exclusiveMinimum: true
                         minimum: 0
+                      signerPublicKey:
+                        type: string
+                        pattern: "^(02|03)[0-9a-f]{64}$"
+                        description: Compressed secp256k1 signing key expected in the canonical reward set.
                       image:
                         type: string
                       imagePullPolicy:

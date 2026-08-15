@@ -28,6 +28,17 @@ test('plans only enrolled named network and DNS peers', () => {
     kind: 'DNSChaos', campaign: campaign('dns', {patterns: ['attacknet-signer-node-1.hacknet.svc.cluster.local']}),
     compiledEvidence: {}, network, target,
   }), {kind: 'dns', peer: 'signer-node-1'});
+  assert.deepEqual(buildProbeRequest({
+    kind: 'TimeChaos', campaign: campaign('time'), compiledEvidence: {}, network,
+    target: {actor: 'follower-1'},
+  }), {
+    kind: 'processClock', peer: 'follower-1', port: 'metrics',
+    metric: 'stacks_node_process_wall_clock_seconds', control: false,
+  });
+  assert.deepEqual(buildProbeRequest({
+    kind: 'IOPressurePod', campaign: campaign('io-pressure'), compiledEvidence: {}, network,
+    target: {actor: 'follower-1'},
+  }), {kind: 'io', operation: 'FSYNC', attempts: 5, bytes: 4096, file: 'fault-a.dat'});
   assert.throws(() => buildProbeRequest({
     kind: 'DNSChaos', campaign: campaign('dns', {patterns: ['outside.example']}),
     compiledEvidence: {}, network, target,
@@ -51,6 +62,17 @@ test('phase evidence remains inconclusive unless its type-specific baseline is u
   phase.observations[0].successes = 0;
   assert.equal(baselineUsable('NetworkChaos', phase, ['miner-1']), false);
   assert.equal(phase.source.trust, 'orchestrator-observed');
+});
+
+test('controller-owned I/O-pressure Pod uses the existing trusted active I/O probe contract', () => {
+  const response = {observation: {
+    actor: 'miner-1', probe: 'io', status: 'ok', successes: 5,
+  }};
+  const phase = probePhase({kind: 'IOPressurePod', phase: 'before', responses: [response]});
+  assert.equal(phase.source.authority, 'active-probe');
+  assert.equal(phase.observations[0].probe, 'io');
+  assert.equal(baselineUsable('IOPressurePod', phase, ['miner-1']), true);
+  assert.equal(phase.injection.source.authority, 'kubernetes-pod-status');
 });
 
 test('ProbeClient pins response schema, kind, and actor identity', async () => {

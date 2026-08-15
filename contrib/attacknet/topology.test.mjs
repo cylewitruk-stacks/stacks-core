@@ -53,7 +53,7 @@ test('admitted topology carries authoritative signer ownership and weight', () =
   const output = mkdtempSync(join(tmpdir(), 'attacknet-signer-weights-'));
   const {resource, manifest} = renderTopology(buildTopology({signerCount: 4}), output);
   for (const index of [1, 2, 3, 4]) {
-    const weight = ((index - 1) % 3) + 1;
+    const weight = Math.floor((((index - 1) % 3) + 1) * 1.5);
     for (const name of [`signer-${index}`, `signer-node-${index}`]) {
       const admitted = resource.spec.actors.find(actor => actor.name === name);
       const recorded = manifest.actors.find(actor => actor.service === name);
@@ -65,7 +65,21 @@ test('admitted topology carries authoritative signer ownership and weight', () =
         {index: recorded.signerIndex, weight: recorded.signerWeight},
         {index, weight},
       );
+      assert.match(admitted.signerPublicKey, /^(02|03)[0-9a-f]{64}$/);
+      assert.equal(recorded.signerPublicKey, admitted.signerPublicKey);
     }
+  }
+});
+
+test('declared full signer weights match the deterministic PoX reward set', () => {
+  const topology = buildTopology({signerCount: 10});
+  const signers = topology.actors.filter(actor => actor.role === 'signer');
+  assert.deepEqual(signers.map(actor => actor.signerWeight), [1, 3, 4, 1, 3, 4, 1, 3, 4, 1]);
+  assert.equal(signers.reduce((total, actor) => total + actor.signerWeight, 0), 25);
+  assert.equal(new Set(signers.map(actor => actor.signerPublicKey)).size, 10);
+  for (const signer of signers) {
+    const companion = topology.actors.find(actor => actor.name === `signer-node-${signer.signerIndex}`);
+    assert.equal(companion.signerWeight, signer.signerWeight);
   }
 });
 
@@ -106,6 +120,46 @@ test('nodes advertise their runtime container address rather than a DNS socket',
   assert.match(miner.config.files['config.toml'], /inv_sync_interval = 5/);
   assert.match(miner.config.files['config.toml'], /download_interval = 1/);
   assert.match(miner.config.files['configure-node.sh'], /hostname -i/);
+});
+
+test('every node receives deterministic diverse non-self bootstrap identities', () => {
+  const topology = buildTopology({minerCount: 3, signerCount: 10, followerCount: 5});
+  const nodes = topology.actors.filter(actor => actor.role !== 'signer');
+  for (const actor of nodes) {
+    assert.equal(
+      actor.runtimeExposure,
+      'reachable',
+      `${actor.name} must publish a resolvable endpoint before readiness`,
+    );
+    const match = actor.config.files['config.toml'].match(/^bootstrap_node = "([^"]+)"$/m);
+    assert.ok(match, `${actor.name} must have bootstrap peers`);
+    const peers = match[1].split(',');
+    assert.equal(peers.length, 3, `${actor.name} bootstrap count`);
+    assert.equal(new Set(peers).size, peers.length, `${actor.name} bootstrap identities are unique`);
+    assert.equal(
+      peers.some(peer => peer.endsWith(`@\${SERVICE:${actor.name}}:20444`)),
+      false,
+      `${actor.name} must not bootstrap to itself`,
+    );
+  }
+
+  const miner = nodes.find(actor => actor.name === 'miner-1');
+  assert.match(miner.config.files['config.toml'], /\$\{SERVICE:follower-1\}:20444/);
+  assert.match(miner.config.files['config.toml'], /\$\{SERVICE:follower-2\}:20444/);
+  const follower = nodes.find(actor => actor.name === 'follower-1');
+  assert.match(follower.config.files['config.toml'], /\$\{SERVICE:miner-1\}:20444/);
+  assert.match(follower.config.files['config.toml'], /\$\{SERVICE:follower-2\}:20444/);
+});
+
+test('small topology bootstrap adapts without self references', () => {
+  const topology = buildTopology({minerCount: 1, signerCount: 1, followerCount: 0});
+  for (const actor of topology.actors.filter(actor => actor.role !== 'signer')) {
+    const match = actor.config.files['config.toml'].match(/^bootstrap_node = "([^"]+)"$/m);
+    assert.ok(match, `${actor.name} must retain one recovery peer`);
+    const peers = match[1].split(',');
+    assert.equal(peers.length, 1);
+    assert.equal(peers[0].endsWith(`@\${SERVICE:${actor.name}}:20444`), false);
+  }
 });
 
 test('companion waits for the signer event socket without creating a dependency cycle', () => {

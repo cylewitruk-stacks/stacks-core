@@ -14,7 +14,10 @@ import {
   consumeDdminCandidate, consumeReplayPlan, resolveAttacknetSchedule, validateResolvedSchedule,
 } from '../../../attacknet/attacknet-run-schedule.mjs';
 import {
-  ProbeClient, baselineUsable, buildProbeRequest, controlTarget, probePhase,
+  resolveCanonicalSignerSet, verifySignerSetParity,
+} from '../../../attacknet/signer-set-parity.mjs';
+import {
+  PROCESS_WALL_CLOCK_METRIC, ProbeClient, baselineUsable, buildProbeRequest, controlTarget, probePhase,
 } from './probe-client.mjs';
 
 export const GROUP = 'testing.stacks.org';
@@ -29,7 +32,15 @@ const CHAOS_PLURALS = Object.freeze({
   PodChaos: 'podchaos', NetworkChaos: 'networkchaos', DNSChaos: 'dnschaos',
   IOChaos: 'iochaos', TimeChaos: 'timechaos',
 });
+const IO_PRESSURE_MECHANISM = 'controller-owned-io-pressure-pod';
+const IO_PRESSURE_MOUNT = '/data';
+const IO_PRESSURE_RESOURCES = Object.freeze({
+  low: {requests: {cpu: '25m', memory: '24Mi'}, limits: {cpu: '250m', memory: '64Mi'}},
+  medium: {requests: {cpu: '50m', memory: '24Mi'}, limits: {cpu: '500m', memory: '64Mi'}},
+  high: {requests: {cpu: '100m', memory: '24Mi'}, limits: {cpu: '1', memory: '96Mi'}},
+});
 const DURATION_UNITS = Object.freeze({ms: 0.001, s: 1, m: 60, h: 3600});
+const RUNTIME_ARCHITECTURES = new Set(['x64', 'arm64', 'ppc64', 's390x']);
 
 const now = () => new Date().toISOString();
 const canonical = value => {
@@ -159,14 +170,18 @@ export function networkManifest(network) {
     if (actor.signerIndex !== undefined) {
       if (!Number.isInteger(actor.signerIndex) || actor.signerIndex < 1
           || typeof actor.signerWeight !== 'number' || !Number.isFinite(actor.signerWeight)
-          || actor.signerWeight <= 0) {
+          || actor.signerWeight <= 0
+          || !/^(02|03)[0-9a-f]{64}$/.test(actor.signerPublicKey ?? '')) {
         throw new Error(`actor ${actor.name} has invalid authoritative signer ownership`);
       }
       const prior = signerWeights.get(actor.signerIndex);
-      if (prior !== undefined && prior !== actor.signerWeight) {
+      if (prior !== undefined
+          && (prior.weight !== actor.signerWeight || prior.publicKey !== actor.signerPublicKey)) {
         throw new Error(`signer ${actor.signerIndex} has inconsistent authoritative weight`);
       }
-      signerWeights.set(actor.signerIndex, actor.signerWeight);
+      signerWeights.set(actor.signerIndex, {
+        weight: actor.signerWeight, publicKey: actor.signerPublicKey,
+      });
     } else if (actor.signerWeight !== undefined) {
       throw new Error(`actor ${actor.name} has signerWeight without signerIndex`);
     }
@@ -174,10 +189,81 @@ export function networkManifest(network) {
       service: actor.name, role: actor.role,
       ...(actor.signerIndex === undefined ? {} : {
         signerIndex: actor.signerIndex, signerWeight: actor.signerWeight,
+        signerPublicKey: actor.signerPublicKey,
       }),
     };
   });
   return {schemaVersion: 1, network: metadata.name, namespace: metadata.namespace, actors: normalized};
+}
+
+function getJson({hostname, port, path, timeoutMs = 5_000, request = http.request}) {
+  return new Promise((resolve, reject) => {
+    const call = request({hostname, port, path, method: 'GET', timeout: timeoutMs}, response => {
+      const chunks = [];
+      let length = 0;
+      response.on('data', chunk => {
+        length += chunk.length;
+        if (length > 1_048_576) call.destroy(new Error(`response ${path} exceeds 1 MiB`));
+        else chunks.push(chunk);
+      });
+      response.on('end', () => {
+        if ((response.statusCode ?? 0) !== 200) {
+          const error = new Error(`Stacks RPC ${path} returned HTTP ${response.statusCode ?? 0}`);
+          error.code = response.statusCode;
+          reject(error);
+          return;
+        }
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch { reject(new Error(`Stacks RPC ${path} returned invalid JSON`)); }
+      });
+    });
+    call.on('timeout', () => call.destroy(Object.assign(new Error(`Stacks RPC ${path} timed out`), {code: 'ETIMEDOUT'})));
+    call.on('error', reject);
+    call.end();
+  });
+}
+
+export class SignerSetClient {
+  constructor({request = http.request, timeoutMs = 5_000} = {}) {
+    this.request = request;
+    this.timeoutMs = timeoutMs;
+  }
+  async observe(network, pods) {
+    const actors = network.spec?.actors ?? [];
+    const roleOrder = role => ({miner: 0, companion: 1, follower: 2}[role] ?? 9);
+    const nodes = actors.filter(actor => ['miner', 'companion', 'follower'].includes(actor.role))
+      .sort((left, right) => (roleOrder(left.role) - roleOrder(right.role)
+        || left.name.localeCompare(right.name)));
+    const selected = nodes.flatMap(actor => {
+      const rpc = (actor.ports ?? []).find(port => port.name === 'rpc');
+      const pod = (pods.items ?? []).find(item => !item.metadata?.deletionTimestamp
+        && item.metadata?.labels?.['testing.stacks.org/actor'] === actor.name
+        && podReady(item) && item.status?.podIP);
+      return rpc && pod ? [{actor, pod, port: rpc.containerPort ?? rpc.servicePort}] : [];
+    })[0];
+    if (!selected || !Number.isInteger(selected.port)) {
+      throw new Error('no Ready enrolled Stacks RPC endpoint is available for signer-set verification');
+    }
+    const request = this.request;
+    const timeoutMs = this.timeoutMs;
+    const endpoint = {hostname: selected.pod.status.podIP, port: selected.port, timeoutMs, request};
+    const pox = await getJson({...endpoint, path: '/v2/pox'});
+    const rewardCycle = pox.current_cycle?.id;
+    if (!Number.isSafeInteger(rewardCycle) || rewardCycle < 0) {
+      throw new Error('Stacks RPC /v2/pox lacks a current reward cycle');
+    }
+    const rewardSet = await getJson({...endpoint, path: `/v3/stacker_set/${rewardCycle}`});
+    return {rewardCycle, rewardSet, observedFrom: selected.actor.name};
+  }
+  async verify(network, pods, manifest = networkManifest(network)) {
+    const {rewardCycle, rewardSet, observedFrom} = await this.observe(network, pods);
+    return {...verifySignerSetParity(manifest, rewardSet, {rewardCycle}), observedFrom};
+  }
+  async resolve(network, pods, manifest = networkManifest(network)) {
+    const {rewardCycle, rewardSet, observedFrom} = await this.observe(network, pods);
+    const resolved = resolveCanonicalSignerSet(manifest, rewardSet, {rewardCycle});
+    return {...resolved.report, manifest: resolved.manifest, observedFrom};
+  }
 }
 
 function actorRequestedImage(network, actor) {
@@ -230,6 +316,49 @@ export function decodeSchedule(configMap) {
 
 function conditionTrue(resource, type) {
   return (resource?.status?.conditions ?? []).some(item => item.type === type && item.status === 'True');
+}
+
+function injectionFailureMessage(resource) {
+  const records = resource?.status?.experiment?.containerRecords ?? [];
+  const messages = records.flatMap(record => record.events ?? [])
+    .filter(event => event.type === 'Failed')
+    .map(event => String(event.message ?? 'Chaos Mesh injection failed').trim())
+    .filter((message, index, values) => message && values.indexOf(message) === index)
+    .slice(0, 3);
+  return (messages.length ? messages.join('; ') : 'Chaos Mesh recovered before AllInjected became true')
+    .slice(0, 1000);
+}
+
+function actualInjectionEvidence(resource, allInjectedObserved = false) {
+  return {
+    allInjectedObserved,
+    chaosResourceVersion: resource?.metadata?.resourceVersion ?? 'unknown',
+    records: resource?.status?.experiment ?? resource?.status?.instances ?? null,
+  };
+}
+
+function zeroInjectionFinalizerAbortSafe(campaign, resource) {
+  if (campaign.spec?.fault?.type !== 'io'
+      || campaign.status?.phase !== 'Failed'
+      || !['InjectionFailed', 'InjectionTimeout'].includes(campaign.status?.reason)
+      || conditionTrue(resource, 'AllInjected')
+      || elapsedSeconds(resource?.metadata?.deletionTimestamp) < 30) return false;
+  const containers = campaign.spec?.fault?.parameters?.containerNames;
+  const targets = campaign.status?.resolvedTargets;
+  const records = resource?.status?.experiment?.containerRecords;
+  if (!Array.isArray(containers) || containers.length === 0
+      || !Array.isArray(targets) || targets.length === 0
+      || !Array.isArray(records)) return false;
+  const expected = new Set(targets.flatMap(target => containers.map(container =>
+    `${campaign.metadata.namespace}/${target.pod}/${container}`)));
+  if (records.length !== expected.size) return false;
+  return records.every(record => expected.delete(record.id)
+    && record.injectedCount === 0
+    && record.recoveredCount === 0
+    && record.phase === 'Not Injected/Wait'
+    && (record.events ?? []).some(event => event.type === 'Failed' && event.operation === 'Apply')
+    && !(record.events ?? []).some(event => event.type === 'Succeeded'))
+    && expected.size === 0;
 }
 
 function podReady(pod) {
@@ -400,6 +529,23 @@ function transientError(error) {
     .has(error?.code);
 }
 
+function supportedArchitectures(value, environmentName) {
+  const entries = (Array.isArray(value) ? value : String(value).split(','))
+    .map(item => String(item).trim()).filter(Boolean);
+  if (entries.length === 0 || entries.some(item => !RUNTIME_ARCHITECTURES.has(item))) {
+    throw new Error(`${environmentName} must be a non-empty supported architecture list`);
+  }
+  return new Set(entries);
+}
+
+function ioChaosArchitectures(value = process.env.IOCHAOS_SUPPORTED_ARCHITECTURES ?? 'x64') {
+  return supportedArchitectures(value, 'IOCHAOS_SUPPORTED_ARCHITECTURES');
+}
+
+function timeChaosArchitectures(value = process.env.TIMECHAOS_SUPPORTED_ARCHITECTURES ?? 'x64') {
+  return supportedArchitectures(value, 'TIMECHAOS_SUPPORTED_ARCHITECTURES');
+}
+
 export class KubernetesApi {
   constructor({namespace = process.env.WATCH_NAMESPACE, baseUrl, tokenPath, caPath} = {}) {
     this.namespace = namespace;
@@ -472,9 +618,161 @@ export class KubernetesApi {
 
 function chaosIdentity(campaign) {
   const type = campaign.spec?.fault?.type;
-  const kind = {pod: 'PodChaos', network: 'NetworkChaos', dns: 'DNSChaos', io: 'IOChaos', time: 'TimeChaos'}[type];
+  const kind = {
+    pod: 'PodChaos', network: 'NetworkChaos', dns: 'DNSChaos', io: 'IOChaos',
+    'io-pressure': 'IOPressurePod', time: 'TimeChaos',
+  }[type];
   if (!kind) throw new Error(`unsupported fault type ${type}`);
-  return {kind, plural: CHAOS_PLURALS[kind], name: campaign.metadata.name};
+  if (kind === 'IOPressurePod') {
+    return {
+      kind, plural: 'pods', group: '', version: 'v1',
+      name: stableName('io-pressure', campaign.metadata.name),
+    };
+  }
+  return {
+    kind, plural: CHAOS_PLURALS[kind], group: 'chaos-mesh.org',
+    version: 'v1alpha1', name: campaign.metadata.name,
+  };
+}
+
+function identityOptions(identity, allow404 = false) {
+  return {group: identity.group, version: identity.version, allow404};
+}
+
+function ioPressurePodRunning(resource) {
+  const container = resource?.status?.containerStatuses?.find(item => item.name === 'io-pressure');
+  return resource?.status?.phase === 'Running'
+    && container?.state?.running !== undefined
+    && typeof container?.imageID === 'string' && container.imageID.length > 0;
+}
+
+function ioPressureActualInjection(resource, target) {
+  const container = resource.status.containerStatuses.find(item => item.name === 'io-pressure');
+  return {
+    mechanism: IO_PRESSURE_MECHANISM,
+    allInjectedObserved: true,
+    podUid: resource.metadata.uid,
+    image: container.image,
+    imageID: container.imageID,
+    node: resource.spec.nodeName,
+    phase: resource.status.phase,
+    targetActor: target.actor,
+    targetPodUid: target.podUid,
+    pvcClaim: resource.spec.volumes.find(item => item.name === 'actor-data')
+      ?.persistentVolumeClaim?.claimName,
+    observedAt: now(),
+  };
+}
+
+function pressureTargetStorage(campaign, pods) {
+  const [target] = campaign.status?.resolvedTargets ?? [];
+  if (!target || campaign.status.resolvedTargets.length !== 1) {
+    throw new Error('disk-pressure requires exactly one admitted actor target');
+  }
+  const pod = (pods.items ?? []).find(item => item.metadata?.uid === target.podUid);
+  if (!pod || pod.metadata?.deletionTimestamp || pod.spec?.nodeName !== target.node) {
+    throw new Error('the exact admitted disk-pressure target Pod or node changed');
+  }
+  const actor = pod.spec?.containers?.find(item => item.name === 'actor');
+  const mount = actor?.volumeMounts?.find(item => item.mountPath === IO_PRESSURE_MOUNT);
+  const volume = pod.spec?.volumes?.find(item => item.name === mount?.name);
+  const claimName = volume?.persistentVolumeClaim?.claimName;
+  if (typeof claimName !== 'string' || claimName.length === 0) {
+    throw new Error('the admitted actor does not mount a persistent data claim at /data');
+  }
+  return {target, pod, claimName};
+}
+
+function buildIoPressurePod(campaign, compiled, pods, {image, pullPolicy}) {
+  if (typeof image !== 'string' || image.length === 0) {
+    throw new Error('trusted I/O-pressure image is not configured');
+  }
+  const {target, pod, claimName} = pressureTargetStorage(campaign, pods);
+  const contract = compiled.evidence.ioPressure;
+  const duration = Math.ceil(durationSeconds(compiled.resource.spec.duration));
+  const scratch = `${IO_PRESSURE_MOUNT}/.attacknet-io-pressure-${campaign.metadata.uid}`;
+  const fsGroup = Number(pod.spec?.securityContext?.fsGroup ?? 65532);
+  if (!Number.isSafeInteger(fsGroup) || fsGroup <= 0) throw new Error('target Pod fsGroup is not a safe non-root integer');
+  return {
+    apiVersion: 'v1', kind: 'Pod',
+    metadata: {
+      name: chaosIdentity(campaign).name, namespace: campaign.metadata.namespace,
+      ownerReferences: ownerReference(campaign),
+      labels: {
+        'testing.stacks.org/network': campaign.spec.networkRef,
+        'testing.stacks.org/campaign': campaign.metadata.name,
+        'testing.stacks.org/mechanism': IO_PRESSURE_MECHANISM,
+      },
+      annotations: {
+        'testing.stacks.org/io-pressure-contract': JSON.stringify(contract),
+        'testing.stacks.org/target-pod-uid': target.podUid,
+        'testing.stacks.org/target-pvc': claimName,
+      },
+    },
+    spec: {
+      automountServiceAccountToken: false,
+      restartPolicy: 'Never',
+      terminationGracePeriodSeconds: 10,
+      nodeName: target.node,
+      securityContext: {
+        runAsNonRoot: true, fsGroup, fsGroupChangePolicy: 'OnRootMismatch',
+        seccompProfile: {type: 'RuntimeDefault'},
+      },
+      containers: [{
+        name: 'io-pressure', image, imagePullPolicy: pullPolicy,
+        args: [
+          '--duration-seconds', String(duration),
+          '--workers', String(contract.workers),
+          '--bytes-mib', String(contract.bytesMiB),
+          '--write-size-kib', String(contract.writeSizeKiB),
+          '--scratch-path', scratch,
+        ],
+        securityContext: {
+          allowPrivilegeEscalation: false, capabilities: {drop: ['ALL']},
+          readOnlyRootFilesystem: true, runAsNonRoot: true,
+          runAsUser: 65532, runAsGroup: 65532,
+          seccompProfile: {type: 'RuntimeDefault'},
+        },
+        resources: structuredClone(IO_PRESSURE_RESOURCES[contract.severity]),
+        volumeMounts: [{name: 'actor-data', mountPath: IO_PRESSURE_MOUNT}],
+      }],
+      volumes: [{name: 'actor-data', persistentVolumeClaim: {claimName}}],
+    },
+  };
+}
+
+function ioPressurePodContract(resource) {
+  const container = resource?.spec?.containers?.find(item => item.name === 'io-pressure');
+  const volume = resource?.spec?.volumes?.find(item => item.name === 'actor-data');
+  return {
+    ownerUid: resource?.metadata?.ownerReferences?.find(item => item.controller === true)?.uid,
+    labels: {
+      network: resource?.metadata?.labels?.['testing.stacks.org/network'],
+      campaign: resource?.metadata?.labels?.['testing.stacks.org/campaign'],
+      mechanism: resource?.metadata?.labels?.['testing.stacks.org/mechanism'],
+    },
+    annotations: {
+      contract: resource?.metadata?.annotations?.['testing.stacks.org/io-pressure-contract'],
+      targetPodUid: resource?.metadata?.annotations?.['testing.stacks.org/target-pod-uid'],
+      targetPvc: resource?.metadata?.annotations?.['testing.stacks.org/target-pvc'],
+    },
+    pod: {
+      automountServiceAccountToken: resource?.spec?.automountServiceAccountToken,
+      restartPolicy: resource?.spec?.restartPolicy,
+      terminationGracePeriodSeconds: resource?.spec?.terminationGracePeriodSeconds,
+      nodeName: resource?.spec?.nodeName,
+      securityContext: resource?.spec?.securityContext,
+    },
+    container: container ? {
+      image: container.image, imagePullPolicy: container.imagePullPolicy,
+      command: container.command, args: container.args,
+      securityContext: container.securityContext, resources: container.resources,
+      volumeMounts: container.volumeMounts,
+    } : null,
+    volume: volume?.persistentVolumeClaim?.claimName,
+    containerCount: resource?.spec?.containers?.length,
+    volumeCount: resource?.spec?.volumes?.length,
+  };
 }
 
 function campaignDocument(campaign) {
@@ -482,7 +780,21 @@ function campaignDocument(campaign) {
 }
 
 export class FaultCampaignReconciler {
-  constructor(api, probes = new ProbeClient()) { this.api = api; this.probes = probes; }
+  constructor(api, probes = new ProbeClient(), signerSets = new SignerSetClient(), capabilities = {}) {
+    this.api = api;
+    this.probes = probes;
+    this.signerSets = signerSets;
+    this.ioChaosArchitectures = ioChaosArchitectures(capabilities.ioChaosArchitectures);
+    this.timeChaosArchitectures = timeChaosArchitectures(capabilities.timeChaosArchitectures);
+    this.ioPressure = {
+      image: capabilities.ioPressureImage ?? process.env.IO_PRESSURE_IMAGE,
+      pullPolicy: capabilities.ioPressureImagePullPolicy
+        ?? process.env.IO_PRESSURE_IMAGE_PULL_POLICY ?? 'IfNotPresent',
+    };
+    if (!new Set(['Always', 'IfNotPresent', 'Never']).has(this.ioPressure.pullPolicy)) {
+      throw new Error('IO pressure imagePullPolicy must be Always, IfNotPresent, or Never');
+    }
+  }
 
   async patchStatus(campaign, next) {
     next.observedGeneration = campaign.metadata.generation;
@@ -499,14 +811,36 @@ export class FaultCampaignReconciler {
   async removeChaos(campaign) {
     const identity = chaosIdentity(campaign);
     const current = await this.api.get(identity.plural, identity.name,
-      {group: 'chaos-mesh.org', version: 'v1alpha1', allow404: true});
+      identityOptions(identity, true));
     if (!current) return {absent: true, allRecovered: true};
-    const allRecovered = conditionTrue(current, 'AllRecovered');
-    await this.api.delete(identity.plural, identity.name,
-      {group: 'chaos-mesh.org', version: 'v1alpha1'});
-    const remaining = await this.api.get(identity.plural, identity.name,
-      {group: 'chaos-mesh.org', version: 'v1alpha1', allow404: true});
-    return {absent: !remaining, allRecovered};
+    if (identity.kind === 'IOPressurePod'
+        && (current.metadata?.ownerReferences?.find(item => item.controller === true)?.uid
+          !== campaign.metadata.uid
+          || !campaign.status?.chaos?.uid
+          || current.metadata?.uid !== campaign.status.chaos.uid)) {
+      throw new Error(`refusing to delete unowned ${identity.plural}/${identity.name}`);
+    }
+    const allRecovered = identity.kind === 'IOPressurePod'
+      ? current.status?.phase === 'Succeeded' : conditionTrue(current, 'AllRecovered');
+    if (!current.metadata?.deletionTimestamp) {
+      await this.api.delete(identity.plural, identity.name, identityOptions(identity));
+    }
+    let remaining = await this.api.get(identity.plural, identity.name,
+      identityOptions(identity, true));
+    let method = 'Normal';
+    if (identity.kind !== 'IOPressurePod' && remaining && zeroInjectionFinalizerAbortSafe(campaign, remaining)) {
+      const finalizers = (remaining.metadata?.finalizers ?? [])
+        .filter(item => item !== 'chaos-mesh/records');
+      if (finalizers.length !== (remaining.metadata?.finalizers ?? []).length) {
+        await this.api.patch(identity.plural, identity.name, {
+          metadata: {resourceVersion: remaining.metadata.resourceVersion, finalizers},
+        }, identityOptions(identity));
+        method = 'ZeroInjectionFinalizerAbort';
+        remaining = await this.api.get(identity.plural, identity.name,
+          identityOptions(identity, true));
+      }
+    }
+    return {absent: !remaining, allRecovered, method};
   }
 
   leaseOwner(campaign) { return `faultcampaign:${campaign.metadata.uid}`; }
@@ -547,6 +881,58 @@ export class FaultCampaignReconciler {
     await this.api.delete('configmaps', MUTATION_LEASE, {group: '', allow404: true});
   }
 
+  async faultCapabilityEvidence(campaign, pods, targets) {
+    const type = campaign.spec?.fault?.type;
+    if (type === 'io-pressure') {
+      return targets.map(target => ({
+        actor: target.actor, podUid: target.podUid,
+        source: 'attacknet-run-operator/v1', observedAt: now(),
+        platform: 'kubernetes-core-pod', architecture: 'native-image',
+        supported: typeof this.ioPressure.image === 'string' && this.ioPressure.image.length > 0,
+        reason: typeof this.ioPressure.image === 'string' && this.ioPressure.image.length > 0
+          ? `${IO_PRESSURE_MECHANISM} configured with trusted image ${this.ioPressure.image}`
+          : `${IO_PRESSURE_MECHANISM} has no trusted image configured`,
+      }));
+    }
+    if (type !== 'io' && type !== 'time') return [];
+    const kind = type === 'io' ? 'IOChaos' : 'TimeChaos';
+    const architectures = type === 'io'
+      ? this.ioChaosArchitectures : this.timeChaosArchitectures;
+    return Promise.all(targets.map(async target => {
+      const base = {
+        actor: target.actor, podUid: target.podUid,
+        source: 'attacknet-probe/v1', observedAt: now(),
+      };
+      try {
+        if (!probeTargetReady(target, pods)) {
+          throw new Error('exact admitted attacknet-probe container is not Ready');
+        }
+        const response = await this.probes.probe(target, {kind: 'system'});
+        const observation = response.observation;
+        if (observation?.probe !== 'system' || observation?.status !== 'ok'
+            || typeof observation.platform !== 'string'
+            || typeof observation.architecture !== 'string') {
+          throw new Error('system capability observation is malformed');
+        }
+        const supported = observation.platform === 'linux'
+          && architectures.has(observation.architecture);
+        return {
+          ...base, observedAt: response.observedAt ?? base.observedAt,
+          platform: observation.platform, architecture: observation.architecture,
+          supported,
+          reason: supported
+            ? `${kind} platform profile admits ${observation.platform}/${observation.architecture}`
+            : `${kind} platform profile supports ${[...architectures].sort().join(',')}; target reports ${observation.platform}/${observation.architecture}`,
+        };
+      } catch (error) {
+        return {
+          ...base, platform: 'unknown', architecture: 'unknown', supported: false,
+          reason: `${kind} capability could not be established: ${String(error.message ?? error).slice(0, 512)}`,
+        };
+      }
+    }));
+  }
+
   async collectProbePhase(campaign, compiled, network, pods, phase, allInjectedObserved = false) {
     const identity = chaosIdentity(campaign);
     const selectedActors = compiled.evidence.selectedActors;
@@ -566,7 +952,10 @@ export class FaultCampaignReconciler {
     if (identity.kind === 'TimeChaos') {
       try {
         const control = controlTarget(network, pods, selectedActors);
-        responses.push(await this.probes.probe(control, {kind: 'clock', control: true}));
+        responses.push(await this.probes.probe(control, {
+          kind: 'processClock', peer: control.actor, port: 'metrics',
+          metric: PROCESS_WALL_CLOCK_METRIC, control: true,
+        }));
       } catch (error) {
         responses.push({actor: 'independent-control', error: String(error.message ?? error)});
       }
@@ -605,6 +994,9 @@ export class FaultCampaignReconciler {
           cleanup: {
             absent: true,
             allRecovered: campaign.status?.cleanup?.allRecovered ?? cleanup.allRecovered,
+            method: cleanup.method ?? campaign.status?.cleanup?.method ?? 'Normal',
+            zeroInjectionProven: cleanup.method === 'ZeroInjectionFinalizerAbort'
+              || campaign.status?.cleanup?.zeroInjectionProven === true,
             observedAt: now(),
           },
         });
@@ -629,7 +1021,25 @@ export class FaultCampaignReconciler {
       await this.patchStatus(campaign, status(campaign.status, 'Pending', 'NetworkNotReady'));
       return;
     }
-    const manifest = networkManifest(network);
+    const declaredManifest = networkManifest(network);
+    let manifest = declaredManifest;
+    let pods = null;
+    let signerSet = null;
+    if (phase === 'Pending') {
+      pods = await this.api.list('pods', {
+        group: '', labels: `testing.stacks.org/network=${declaredManifest.network}`,
+      });
+      try {
+        signerSet = await this.signerSets.resolve(network, pods, declaredManifest);
+        manifest = signerSet.manifest;
+      } catch (error) {
+        if (transientError(error)) throw error;
+        await this.patchStatus(campaign, status(campaign.status, 'Failed', 'SignerSetAdmissionFailed', {
+          message: String(error.message ?? error).slice(0, 1000), completedAt: now(),
+        }));
+        return;
+      }
+    }
     const compiled = compileCampaign(campaignDocument(campaign), manifest);
     const compiledDigest = artifactDigest(compiled.resource);
     const ownsMutationLease = await this.holdMutationLease(
@@ -646,8 +1056,18 @@ export class FaultCampaignReconciler {
     }
 
     if (phase === 'Pending') {
-      const pods = await this.api.list('pods', {group: '', labels: `testing.stacks.org/network=${manifest.network}`});
       const resolved = resolveCampaignTargets(manifest, compiled.evidence, pods);
+      const capabilityEvidence = await this.faultCapabilityEvidence(campaign, pods, resolved.targets);
+      const unavailable = capabilityEvidence.filter(item => !item.supported);
+      if (unavailable.length > 0) {
+        await this.patchStatus(campaign, status(campaign.status, 'Failed', 'FaultCapabilityUnavailable', {
+          resolvedTargets: resolved.targets,
+          capabilityEvidence,
+          message: unavailable.map(item => `${item.actor}: ${item.reason}`).join('; ').slice(0, 1000),
+          completedAt: now(),
+        }));
+        return;
+      }
       let probeArtifacts = campaign.status?.probeArtifacts ?? {};
       if (chaosIdentity(campaign).kind !== 'PodChaos') {
         // The admitted identities must be present on status before the probe
@@ -669,8 +1089,13 @@ export class FaultCampaignReconciler {
           networkUid: network.metadata.uid, networkGeneration: network.metadata.generation,
           compiledDigest, admittedAt: now(), signerImpact: compiled.evidence.signerImpact,
           minerImpact: compiled.evidence.minerImpact,
+          signerSetRewardCycle: signerSet.rewardCycle,
+          signerSetTotalWeight: signerSet.observedTotalWeight,
+          signerSetDigest: signerSet.signerSetDigest,
+          signerSetObservedFrom: signerSet.observedFrom,
         },
         resolvedTargets: resolved.targets,
+        capabilityEvidence,
         probeArtifacts,
       }));
       return;
@@ -684,26 +1109,129 @@ export class FaultCampaignReconciler {
       return;
     }
 
+    if (phase === 'Admitted') {
+      const currentPods = await this.api.list('pods', {
+        group: '', labels: `testing.stacks.org/network=${declaredManifest.network}`,
+      });
+      let currentSignerSet;
+      try {
+        currentSignerSet = await this.signerSets.resolve(network, currentPods, declaredManifest);
+      } catch (error) {
+        if (transientError(error)) throw error;
+        await this.patchStatus(campaign, status(campaign.status, 'Failed', 'SignerSetChangedBeforeInjection', {
+          message: String(error.message ?? error).slice(0, 1000), completedAt: now(),
+        }));
+        await this.removeChaos(campaign);
+        return;
+      }
+      if (currentSignerSet.signerSetDigest !== campaign.status?.admission?.signerSetDigest) {
+        await this.patchStatus(campaign, status(campaign.status, 'Failed', 'SignerSetChangedBeforeInjection', {
+          message: `canonical signer set changed from ${campaign.status?.admission?.signerSetDigest ?? 'unknown'} to ${currentSignerSet.signerSetDigest}`,
+          completedAt: now(),
+        }));
+        await this.removeChaos(campaign);
+        return;
+      }
+    }
+
     const identity = chaosIdentity(campaign);
     if (phase === 'Admitted') {
-      compiled.resource.metadata.ownerReferences = ownerReference(campaign);
       const existing = await this.api.get(identity.plural, identity.name,
-        {group: 'chaos-mesh.org', version: 'v1alpha1', allow404: true});
+        identityOptions(identity, true));
       if (existing && existing.metadata?.ownerReferences?.[0]?.uid !== campaign.metadata.uid) {
         throw new Error(`refusing to adopt ${identity.plural}/${identity.name}`);
       }
-      const created = existing ?? await this.api.create(identity.plural, compiled.resource,
-        {group: 'chaos-mesh.org', version: 'v1alpha1'});
-      await this.patchStatus(campaign, status(campaign.status, 'Injecting', 'ChaosResourceCreated', {
-        chaos: {kind: identity.kind, name: identity.name, uid: created.metadata.uid, createdAt: now()},
+      let desired = compiled.resource;
+      if (identity.kind === 'IOPressurePod') {
+        const currentPods = await this.api.list('pods', {
+          group: '', labels: `testing.stacks.org/network=${manifest.network}`,
+        });
+        desired = buildIoPressurePod(campaign, compiled, currentPods, this.ioPressure);
+      } else {
+        desired.metadata.ownerReferences = ownerReference(campaign);
+      }
+      if (existing && identity.kind === 'IOPressurePod'
+          && digest(ioPressurePodContract(existing)) !== digest(ioPressurePodContract(desired))) {
+        throw new Error(`refusing to adopt ${identity.plural}/${identity.name} with a different trusted execution contract`);
+      }
+      const created = existing ?? await this.api.create(identity.plural, desired,
+        identityOptions(identity));
+      const pressureDigest = identity.kind === 'IOPressurePod'
+        ? artifactDigest(ioPressurePodContract(created)) : null;
+      if (identity.kind === 'IOPressurePod'
+          && pressureDigest !== artifactDigest(ioPressurePodContract(desired))) {
+        if (!existing && created.metadata?.ownerReferences?.[0]?.uid === campaign.metadata.uid) {
+          await this.api.delete(identity.plural, identity.name, identityOptions(identity));
+        }
+        throw new Error('admission mutated the trusted I/O-pressure Pod execution contract');
+      }
+      await this.patchStatus(campaign, status(campaign.status, 'Injecting',
+        identity.kind === 'IOPressurePod' ? 'PressurePodCreated' : 'ChaosResourceCreated', {
+        chaos: {
+          kind: identity.kind, name: identity.name, uid: created.metadata.uid, createdAt: now(),
+          ...(identity.kind === 'IOPressurePod' ? {
+            mechanism: IO_PRESSURE_MECHANISM,
+            resourceDigest: pressureDigest,
+          } : {}),
+        },
       }));
       return;
     }
 
     const chaos = await this.api.get(identity.plural, identity.name,
-      {group: 'chaos-mesh.org', version: 'v1alpha1', allow404: true});
+      identityOptions(identity, true));
     if (phase === 'Injecting') {
       if (!chaos) throw new Error('Chaos resource disappeared before injection was observed');
+      if (identity.kind === 'IOPressurePod') {
+        if (chaos.metadata?.uid !== campaign.status?.chaos?.uid
+            || chaos.metadata?.ownerReferences?.[0]?.uid !== campaign.metadata.uid
+            || artifactDigest(ioPressurePodContract(chaos)) !== campaign.status?.chaos?.resourceDigest) {
+          throw new Error(`admitted ${identity.kind} identity or ownership changed`);
+        }
+        if (ioPressurePodRunning(chaos)) {
+          const pods = await this.api.list('pods', {
+            group: '', labels: `testing.stacks.org/network=${manifest.network}`,
+          });
+          const during = await this.collectProbePhase(campaign, compiled, network, pods, 'during', true);
+          await this.patchStatus(campaign, status(campaign.status, 'Active', 'PressurePodRunning', {
+            injectedAt: campaign.status?.injectedAt ?? now(),
+            actualInjection: ioPressureActualInjection(chaos, campaign.status.resolvedTargets[0]),
+            effectResults: campaign.status?.effectResults ?? [],
+            probeArtifacts: {...(campaign.status?.probeArtifacts ?? {}), duringJson: JSON.stringify(during)},
+          }));
+          return;
+        }
+        if (['Succeeded', 'Failed'].includes(chaos.status?.phase)) {
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Failed',
+            chaos.status.phase === 'Succeeded' ? 'InjectionNotObserved' : 'InjectionFailed', {
+              actualInjection: {
+                mechanism: IO_PRESSURE_MECHANISM, allInjectedObserved: false,
+                podUid: chaos.metadata.uid, node: chaos.spec?.nodeName,
+                phase: chaos.status.phase, observedAt: now(),
+              },
+              message: chaos.status.phase === 'Succeeded'
+                ? 'I/O-pressure Pod completed before a Running process was observed'
+                : 'I/O-pressure Pod failed before a Running process was observed',
+              cleanup: {...cleanup, observedAt: now()}, completedAt: now(),
+            }));
+          return;
+        }
+        if (elapsedSeconds(campaign.status?.chaos?.createdAt)
+            > assertionTimeout(campaign.spec.effectAssertions, 90)) {
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Failed', 'InjectionTimeout', {
+            actualInjection: {
+              mechanism: IO_PRESSURE_MECHANISM, allInjectedObserved: false,
+              podUid: chaos.metadata.uid, node: chaos.spec?.nodeName,
+              phase: chaos.status?.phase ?? 'Unknown', observedAt: now(),
+            },
+            message: 'I/O-pressure Pod did not reach Running before the effect deadline',
+            cleanup: {...cleanup, observedAt: now()}, completedAt: now(),
+          }));
+        }
+        return;
+      }
       const allInjected = conditionTrue(chaos, 'AllInjected');
       const injectionObserved = allInjected
         || campaign.status?.actualInjection?.allInjectedObserved === true;
@@ -711,12 +1239,7 @@ export class FaultCampaignReconciler {
         let effectResults = campaign.status?.effectResults ?? [];
         let probeArtifacts = campaign.status?.probeArtifacts ?? {};
         const injectedAt = campaign.status?.injectedAt ?? now();
-        const actualInjection = {
-          allInjectedObserved: true,
-          chaosResourceVersion: chaos.metadata.resourceVersion,
-          records: chaos.status?.experiment ?? chaos.status?.instances
-            ?? campaign.status?.actualInjection?.records ?? null,
-        };
+        const actualInjection = actualInjectionEvidence(chaos, true);
         if (identity.kind === 'PodChaos') {
           const pods = await this.api.list('pods', {
             group: '', labels: `testing.stacks.org/network=${manifest.network}`,
@@ -738,6 +1261,22 @@ export class FaultCampaignReconciler {
               return;
             }
           }
+          // PodKill and ContainerKill are one-shot actions. Chaos Mesh records
+          // their application, but there is no process state it can restore;
+          // in particular PodKill can remain AllRecovered=False indefinitely.
+          // Once Kubernetes proves the immutable admitted Pod disappeared or
+          // the admitted container restarted, remove the bookkeeping resource
+          // and independently require the replacement target to become Ready.
+          if (['pod-kill', 'container-kill'].includes(compiled.resource.spec.action)
+              && effectResults.filter(item => item.outcome === 'Proven').length >= minimum) {
+            const cleanup = await this.removeChaos(campaign);
+            await this.patchStatus(campaign, status(campaign.status, 'Recovering',
+              'OneShotEffectObserved', {
+                injectedAt, actualInjection, effectResults, probeArtifacts,
+                cleanup: {...cleanup, observedAt: now()},
+              }));
+            return;
+          }
         } else if (!conditionTrue(chaos, 'AllRecovered')) {
           const pods = await this.api.list('pods', {
             group: '', labels: `testing.stacks.org/network=${manifest.network}`,
@@ -758,9 +1297,24 @@ export class FaultCampaignReconciler {
           effectResults,
           probeArtifacts,
         }));
+      } else if (conditionTrue(chaos, 'AllRecovered')) {
+        // A partially-applied fault can enter AllRecovered without ever
+        // satisfying AllInjected (for example, one selected container rejects
+        // injection). Waiting for the assertion timeout hides the actionable
+        // daemon error and needlessly holds serialization. Preserve the exact
+        // records and fail immediately; this is an apparatus failure, not
+        // evidence that the requested data-plane effect occurred.
+        const cleanup = await this.removeChaos(campaign);
+        await this.patchStatus(campaign, status(campaign.status, 'Failed', 'InjectionFailed', {
+          actualInjection: actualInjectionEvidence(chaos, false),
+          message: injectionFailureMessage(chaos),
+          cleanup: {...cleanup, observedAt: now()}, completedAt: now(),
+        }));
       } else if (elapsedSeconds(campaign.status?.chaos?.createdAt) > assertionTimeout(campaign.spec.effectAssertions, 90)) {
         const cleanup = await this.removeChaos(campaign);
         await this.patchStatus(campaign, status(campaign.status, 'Failed', 'InjectionTimeout', {
+          actualInjection: actualInjectionEvidence(chaos, false),
+          message: injectionFailureMessage(chaos),
           cleanup: {...cleanup, observedAt: now()}, completedAt: now(),
         }));
       }
@@ -769,6 +1323,52 @@ export class FaultCampaignReconciler {
 
     if (phase === 'Active') {
       if (!chaos) throw new Error('Chaos resource disappeared without recovery evidence');
+      if (identity.kind === 'IOPressurePod') {
+        if (ioPressurePodRunning(chaos)) {
+          const deadline = durationSeconds(compiled.resource.spec.duration)
+            + assertionTimeout(campaign.spec.recoveryAssertions, 300);
+          if (elapsedSeconds(campaign.status.injectedAt) <= deadline) return;
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Failed', 'RecoveryTimeout', {
+            message: 'I/O-pressure Pod remained Running beyond its bounded duration and recovery deadline',
+            cleanup: {...cleanup, observedAt: now()}, completedAt: now(),
+          }));
+          return;
+        }
+        if (chaos.status?.phase === 'Succeeded') {
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Recovering', 'PressurePodCompleted', {
+            cleanup: {...cleanup, observedAt: now()},
+          }));
+          return;
+        }
+        if (chaos.status?.phase === 'Failed') {
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Failed', 'PressurePodFailed', {
+            message: 'controller-owned I/O-pressure Pod terminated unsuccessfully',
+            cleanup: {...cleanup, observedAt: now()}, completedAt: now(),
+          }));
+          return;
+        }
+        return;
+      }
+      if (identity.kind === 'PodChaos'
+          && ['pod-kill', 'container-kill'].includes(compiled.resource.spec.action)) {
+        const minimum = minimumAffected(compiled.resource.spec, campaign.status.resolvedTargets.length);
+        const proven = (campaign.status?.effectResults ?? [])
+          .filter(item => item.outcome === 'Proven').length;
+        if (proven >= minimum) {
+          // Re-enter the one-shot cleanup path after a controller restart or
+          // rollout. The durable effect evidence, not the transient prior
+          // phase, is the authority for this transition.
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Recovering',
+            'OneShotEffectObserved', {
+              cleanup: {...cleanup, observedAt: now()},
+            }));
+          return;
+        }
+      }
       if (!conditionTrue(chaos, 'AllRecovered')) {
         const deadline = durationSeconds(compiled.resource.spec.duration)
           + assertionTimeout(campaign.spec.recoveryAssertions, 300);
@@ -788,7 +1388,7 @@ export class FaultCampaignReconciler {
 
     if (phase === 'Recovering') {
       const remaining = await this.api.get(identity.plural, identity.name,
-        {group: 'chaos-mesh.org', version: 'v1alpha1', allow404: true});
+        identityOptions(identity, true));
       if (remaining) return;
       const pods = await this.api.list('pods', {group: '', labels: `testing.stacks.org/network=${manifest.network}`});
       let recovered;
@@ -825,7 +1425,13 @@ export class FaultCampaignReconciler {
           });
           const assertion = {
             NetworkChaos: 'NetworkDegraded', DNSChaos: 'DNSDegraded',
-            IOChaos: 'IODegraded', TimeChaos: 'ClockSkewObserved',
+            IOChaos: 'IODegraded', IOPressurePod: 'IOPressureObserved',
+            TimeChaos: 'ClockSkewObserved',
+          }[identity.kind];
+          const recoveryAssertion = {
+            NetworkChaos: 'NetworkRecovered', DNSChaos: 'DNSRecovered',
+            IOChaos: 'IORecovered', IOPressurePod: 'IOPressureRecovered',
+            TimeChaos: 'ClockSkewCleared',
           }[identity.kind];
           const title = value => value[0].toUpperCase() + value.slice(1);
           effectResults = evaluation.evaluations.map(item => ({
@@ -834,9 +1440,11 @@ export class FaultCampaignReconciler {
             observedAt: now(), message: item.reason,
           }));
           recoveryResults = evaluation.evaluations.map(item => ({
-            assertion: 'TargetReady', outcome: title(item.recovery), actor: item.actor,
+            assertion: recoveryAssertion, outcome: title(item.recovery), actor: item.actor,
             podUid: campaign.status.resolvedTargets.find(target => target.actor === item.actor)?.podUid,
-            observedAt: now(), message: item.reason,
+            observedAt: now(),
+            message: item.recoveryReason
+              ?? `trusted after-fault probe classified recovery=${item.recovery}`,
           }));
         } catch (error) {
           evidenceError = String(error.message ?? error).slice(0, 1000);
@@ -859,17 +1467,36 @@ export class FaultCampaignReconciler {
       const minimum = minimumAffected(compiled.resource.spec, campaign.status.resolvedTargets.length);
       const provenResults = effectResults.filter(item => item.outcome === 'Proven');
       const recoveredResults = recoveryResults.filter(item => item.outcome === 'Proven');
-      const proven = evidenceError === null && provenResults.length >= minimum
-        && recoveredResults.length >= minimum
+      const effectProven = evidenceError === null && provenResults.length >= minimum
         && (required.length === 0 || required.every(assertion =>
           provenResults.some(result => result.assertion === assertion.type
-            && (assertion.actor === undefined || result.actor === assertion.actor))))
+            && (assertion.actor === undefined || result.actor === assertion.actor))));
+      const recoveryProven = evidenceError === null && recoveredResults.length >= minimum
         && (requiredRecovery.length === 0 || requiredRecovery.every(assertion =>
           recoveredResults.some(result => result.assertion === assertion.type
             && (assertion.actor === undefined || result.actor === assertion.actor))));
+      const proven = effectProven && recoveryProven;
+      if (effectProven && !recoveryProven
+          && elapsedSeconds(campaign.status?.cleanup?.observedAt)
+            <= assertionTimeout(campaign.spec.recoveryAssertions, 300)) {
+        // Recovery is a bounded observation window, not a single sample. A
+        // just-completed pressure process can leave the backing filesystem's
+        // latency elevated for a short interval even though the injected Pod
+        // is gone. Preserve the failed sample and poll again until the stated
+        // recovery timeout instead of misclassifying one noisy observation as
+        // a terminal result.
+        await this.patchStatus(campaign, status(campaign.status,
+          'Recovering', 'WaitingForRecoveryEvidence', {
+            effectResults, recoveryResults, probeArtifacts,
+            ...(evidenceError ? {message: evidenceError} : {}),
+          }));
+        return;
+      }
       await this.patchStatus(campaign, status(campaign.status,
         proven ? 'Passed' : 'Inconclusive',
-        proven ? 'EffectAndRecoveryProven' : evidenceError ? 'ProbeEvidenceInvalid' : 'EffectNotProven', {
+        proven ? 'EffectAndRecoveryProven'
+          : evidenceError ? 'ProbeEvidenceInvalid'
+            : effectProven ? 'RecoveryNotProven' : 'EffectNotProven', {
           effectResults, recoveryResults, probeArtifacts,
           ...(evidenceError ? {message: evidenceError} : {}),
           completedAt: now(),
@@ -881,7 +1508,10 @@ export class FaultCampaignReconciler {
 function runOwner(run) { return ownerReference(run); }
 
 export class AttacknetRunReconciler {
-  constructor(api) { this.api = api; }
+  constructor(api, signerSets = new SignerSetClient()) {
+    this.api = api;
+    this.signerSets = signerSets;
+  }
   terminalFields(run, children) {
     const classification = classifyTerminalAssertion(run, children, run.status?.scheduleRef?.digest);
     return classification ? {terminalClassification: classification} : {};
@@ -945,10 +1575,12 @@ export class AttacknetRunReconciler {
   }
 
   async prepareSchedule(run, network) {
-    const manifest = networkManifest(network);
+    const declaredManifest = networkManifest(network);
     const pods = await this.api.list('pods', {
-      group: '', labels: `testing.stacks.org/network=${manifest.network}`,
+      group: '', labels: `testing.stacks.org/network=${declaredManifest.network}`,
     });
+    const signerSet = await this.signerSets.resolve(network, pods, declaredManifest);
+    const manifest = signerSet.manifest;
     const images = resolvedNetworkImages(network, pods);
     const sources = await Promise.all((run.spec.campaignCatalog ?? []).map(entry =>
       this.api.get('faultcampaigns', entry.campaignRef)));
@@ -1012,7 +1644,7 @@ export class AttacknetRunReconciler {
       throw new Error('the Kubernetes run controller currently accepts only fault-campaign schedule actions');
     }
     const scheduleRef = await this.persistSchedule(run, schedule);
-    return {schedule, scheduleRef};
+    return {schedule, scheduleRef, signerSet};
   }
 
   async reconcile(run, campaigns) {
@@ -1031,8 +1663,12 @@ export class AttacknetRunReconciler {
     budgetUsage.wallTimeSeconds = elapsedSeconds(startedAt);
 
     const network = await this.api.get('stacksnetworks', spec.networkRef);
-    if (network.status?.phase !== 'Ready') {
-      await this.patchStatus(run, status(run.status, 'Pending', 'NetworkNotReady', {
+    const owned = item => item.metadata?.ownerReferences?.some(owner => owner.uid === run.metadata.uid);
+    const active = campaigns.find(item => owned(item) && !TERMINAL_PHASES.has(item.status?.phase));
+    if (network.status?.phase !== 'Ready' && !active) {
+      const scheduleSealed = Boolean(run.status?.scheduleRef);
+      await this.patchStatus(run, status(run.status, scheduleSealed ? 'Running' : 'Pending',
+        scheduleSealed ? 'WaitingForNetworkRecovery' : 'NetworkNotReady', {
         decisions, budgetUsage, startedAt,
       }));
       return;
@@ -1049,7 +1685,7 @@ export class AttacknetRunReconciler {
         }));
         return;
       }
-      const {schedule, scheduleRef} = prepared;
+      const {schedule, scheduleRef, signerSet} = prepared;
       await this.patchStatus(run, status(run.status, 'Preparing', 'ResolvedSchedulePersisted', {
         decisions, budgetUsage, startedAt, scheduleRef,
         scheduleSummary: {
@@ -1059,6 +1695,10 @@ export class AttacknetRunReconciler {
           networkUid: schedule.network.uid,
           networkGeneration: schedule.network.generation,
           manifestDigest: schedule.network.manifestDigest,
+          signerSetRewardCycle: signerSet.rewardCycle,
+          signerSetTotalWeight: signerSet.observedTotalWeight,
+          signerSetDigest: signerSet.signerSetDigest,
+          signerSetObservedFrom: signerSet.observedFrom,
         },
       }));
       return;
@@ -1089,10 +1729,10 @@ export class AttacknetRunReconciler {
       return;
     }
 
-    const owned = item => item.metadata?.ownerReferences?.some(owner => owner.uid === run.metadata.uid);
-    const active = campaigns.find(item => owned(item) && !TERMINAL_PHASES.has(item.status?.phase));
     if (active) {
-      if (run.status?.activeCampaign !== active.metadata.name || run.status?.budgetUsage?.activeFaults !== 1) {
+      if (run.status?.phase !== 'Running' || run.status?.reason !== 'CampaignActive'
+          || run.status?.activeCampaign !== active.metadata.name
+          || run.status?.budgetUsage?.activeFaults !== 1) {
         await this.patchStatus(run, status(run.status, 'Running', 'CampaignActive', {
           activeCampaign: active.metadata.name, decisions,
           budgetUsage: {...budgetUsage, activeFaults: 1}, startedAt,
@@ -1183,7 +1823,30 @@ export class AttacknetRunReconciler {
       throw new Error(`resolved schedule campaign ${item.instructionId} failed its digest check`);
     }
     const executionSpec = {...resolvedSpec, template: false};
-    const manifest = networkManifest(network);
+    const declaredManifest = networkManifest(network);
+    let currentSignerSet;
+    try {
+      const pods = await this.api.list('pods', {
+        group: '', labels: `testing.stacks.org/network=${declaredManifest.network}`,
+      });
+      currentSignerSet = await this.signerSets.resolve(network, pods, declaredManifest);
+    } catch (error) {
+      if (transientError(error)) throw error;
+      await this.patchStatus(run, status(run.status, 'Failed', 'SignerSetParityFailed', {
+        activeCampaign: null, decisions, budgetUsage, startedAt, completedAt: now(),
+        attribution: 'Inconclusive', message: String(error.message ?? error).slice(0, 1000),
+      }));
+      return;
+    }
+    if (artifactDigest(currentSignerSet.manifest) !== schedule.network.manifestDigest) {
+      await this.patchStatus(run, status(run.status, 'Failed', 'SignerSetChangedBeforeCampaign', {
+        activeCampaign: null, decisions, budgetUsage, startedAt, completedAt: now(),
+        attribution: 'Inconclusive',
+        message: `canonical signer set changed from ${run.status?.scheduleSummary?.signerSetDigest ?? 'unknown'} to ${currentSignerSet.signerSetDigest}`,
+      }));
+      return;
+    }
+    const manifest = currentSignerSet.manifest;
     const compiled = compileCampaign({metadata: {name: executionName}, spec: executionSpec}, manifest);
     const nextUsage = {
       ...budgetUsage,
@@ -1240,10 +1903,10 @@ export class AttacknetRunReconciler {
 }
 
 export class RunController {
-  constructor(api) {
+  constructor(api, {probes = new ProbeClient(), signerSets = new SignerSetClient()} = {}) {
     this.api = api;
-    this.faults = new FaultCampaignReconciler(api);
-    this.runs = new AttacknetRunReconciler(api);
+    this.faults = new FaultCampaignReconciler(api, probes, signerSets);
+    this.runs = new AttacknetRunReconciler(api, signerSets);
     this.observedCampaigns = [];
     this.observedRuns = [];
   }

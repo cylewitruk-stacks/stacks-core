@@ -58,14 +58,23 @@ contrib/helm/hacknet/scripts/build-local.sh
 BUILD_STACKS_IMAGE=1 contrib/helm/hacknet/scripts/build-local.sh
 ```
 
-With Docker Desktop's containerd image store, kind resolves locally built
-images through its internal registry mirror. Keep the default
-`IfNotPresent` policy: `Never` prevents that mirror lookup and produces
-`ErrImageNeverPull`. Install the normal packaged controller path with:
+Docker Desktop's Docker image store and each kind node's containerd store are
+separate. The installer assigns content-derived tags, detects a
+kind-on-Docker cluster from server-assigned provider IDs, imports all three
+chart images into every node, and verifies the imported references before
+Helm runs. Keep the default `IfNotPresent` policy: `Never` can reject a valid
+local transport path before kubelet resolves it. Install the normal packaged
+controller path with:
 
 ```sh
 contrib/helm/hacknet/scripts/install-local.sh
 ```
+
+Set `HACKNET_KIND_IMAGE_LOAD=require` to fail when the current cluster is not
+entirely kind-on-Docker, or `disabled` only when an external registry/image
+loader already provides the exact references. The loader emits a
+machine-readable receipt and can also be run directly with
+`scripts/load-kind-images.sh --output=receipt.json IMAGE...`.
 
 The helper applies and waits for all three CRDs before Helm because Helm does
 not add or upgrade files under `crds/` for an existing release. It also puts
@@ -78,6 +87,13 @@ conspicuous `HACKNET_RECOVER_FAILED_RELEASE=1` and (only when necessary)
 `HACKNET_FORCE_CONFLICTS=1` escape hatches. A CRD previously owned by
 client-side apply may similarly require the one-time, explicit
 `HACKNET_FORCE_CRD_CONFLICTS=1` transition; it must not be a permanent default.
+The local build also produces `stacks-hacknet-io-pressure:dev`; the installer
+resolves its immutable local image ID, assigns a content-specific local tag,
+and sets `runOperator.ioPressureImage` alongside the controller images. For a
+registry deployment, publish the image built from
+`contrib/attacknet/io-pressure/Dockerfile` and configure that chart value to an
+immutable digest reference. It is the only executable the run controller will
+use for `io-pressure`; no FaultCampaign field can override it.
 
 If a local cluster still cannot resolve Docker Engine images, the chart has an
 explicit fallback that mounts its controller source into a public Python
@@ -151,13 +167,18 @@ controllers:
 
 The run controller has a separate namespaced service account. It can read the
 network and actor Pods, create/read its owner-bound schedule ConfigMap, manage
-only the two run APIs, and create/delete only
-`PodChaos`, `NetworkChaos`, `DNSChaos`, `IOChaos`, and `TimeChaos`. Actor Pods
+only the two run APIs, and create/delete (plus narrowly patch cleanup metadata
+on) only
+`PodChaos`, `NetworkChaos`, `DNSChaos`, `IOChaos`, and `TimeChaos`. It also
+creates one narrowly generated core/v1 Pod for the separately labelled
+I/O-pressure mechanism; the campaign cannot select its image or executable.
+Actor Pods
 remain credential-free. Apply the examples after the referenced
 `StacksNetwork` is Ready:
 
 ```sh
 kubectl apply -f contrib/helm/hacknet/examples/fault-campaign.json
+kubectl apply -f contrib/helm/hacknet/examples/fault-campaign-io-pressure.json
 kubectl apply -f contrib/helm/hacknet/examples/attacknet-run.json
 kubectl get faultcampaigns,attacknetruns -n hacknet-system -w
 ```
@@ -168,6 +189,25 @@ requested fault terminates `Inconclusive`, never `Passed`. Pod faults use
 Kubernetes-observed UID/readiness/restart evidence. Network, DNS, I/O, and time
 faults require the controlled active probe's before/during/after observations
 to prove both the requested effect and recovery.
+
+`io-pressure` / `disk-pressure` is deliberately distinct from per-syscall
+`IOChaos` and from Chaos Mesh `StressChaos`. It is an arm64-compatible pressure
+semantic compiled to an internal `IOPressurePod` descriptor. The run controller
+resolves exactly one admitted target Pod, its node, and its `/data` PVC and then
+creates a core/v1 Pod from the chart-configured trusted image. The CR cannot
+provide an image, command, shell, or raw stress arguments. The controller fixes
+the entrypoint arguments, non-root restricted security context, and
+severity-specific CPU/memory caps, and caps the low, medium, and high profiles
+at 60/180/300 seconds. High severity additionally
+requires `allowExtremeSeverity: true`. `IOPressureObserved` is Proven only
+when the trusted FSYNC probe meets both the configured minimum latency
+multiplier and minimum added milliseconds; `IOPressureRecovered` requires
+both values to return below those thresholds after the pressure Pod is gone.
+Only an exact, owner-bound Pod observed Running counts as actual injection; that
+bookkeeping alone cannot satisfy either assertion. Evidence records
+`mechanism=controller-owned-io-pressure-pod`, Pod UID, image ID, node, phase,
+target UID, and PVC claim. The pressure process unlinks its scratch files and
+directory before writing, so deletion cannot strand named campaign data.
 
 Replay reads the source run's sealed schedule through
 `k8s://attacknetruns/NAME/resolved-schedule`, verifies the requested digest,
@@ -239,14 +279,34 @@ intentionally absent from the actor's Service. The operator, rather than the
 actor, supplies an allowlist of enrolled actor FQDNs and named service ports.
 The bounded `POST /v1/probe` API can sample TCP reachability/latency, a selected
 DNS name plus a fixed cluster control, confined I/O under a private directory
-on the actor data volume, and wall plus monotonic clocks. `GET /healthz` is the
-only other endpoint. There is no shell or arbitrary hostname/path operation.
+on the actor data volume, wall plus monotonic clocks, and the probe runtime's
+bounded platform/architecture identity. `GET /healthz` is the only other
+endpoint. There is no shell or arbitrary hostname/path operation.
 
 The probe mounts the data volume at the actor's configured storage path so an
 IOChaos path can cover both containers. Enabling it adds a default `fsGroup`
 only when the actor did not supply one, allowing the non-root probe to create
 its private directory. Evidence consumers must fetch the response themselves;
 actor logs and actor-provided payloads are not authoritative probe results.
+
+For IOChaos, architecture is also an admission prerequisite. The installed
+Chaos Mesh 2.8.3 `toda` helper and its ptrace/assembly implementation are
+x86-64-only, so `runOperator.ioChaosSupportedArchitectures` defaults to
+`["x64"]`. An exact target reporting another architecture fails before any
+IOChaos object is created. Extend the list only after replacing and verifying
+the installed helper; a pressure workload is a different fault semantic and
+must be labelled as such. The bounded `io-pressure` / `disk-pressure` profile
+above is that separately labelled alternative; it must never be reported as
+IOChaos or as per-syscall fault injection.
+
+TimeChaos has the same fail-closed architecture prerequisite, for a different
+reason. Chaos Mesh 2.8.3 reported successful single-container injection on the
+local arm64 kind cluster while the selected Stacks process clock did not move;
+an independent Node-process canary then wedged the worker daemon during ptrace
+injection. `runOperator.timeChaosSupportedArchitectures` therefore defaults to
+`["x64"]`. Adding an architecture is a claim that a bounded platform canary
+proved the requested process-clock effect, recovery, and daemon cleanup—not
+merely that Chaos Mesh reported `AllInjected`.
 
 This is process-independent evidence, not a cryptographic process attestation.
 Containers in one Pod share a network namespace, so a deliberately modified

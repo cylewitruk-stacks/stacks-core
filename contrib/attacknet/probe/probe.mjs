@@ -16,6 +16,8 @@ const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_BODY_BYTES = 8192;
 const MAX_ATTEMPTS = 10;
 const MAX_IO_BYTES = 1024 * 1024;
+const MAX_METRICS_BYTES = 512 * 1024;
+const PROCESS_WALL_CLOCK_METRIC = 'stacks_node_process_wall_clock_seconds';
 
 function boundedInteger(value, name, minimum, maximum, fallback) {
   const selected = value === undefined ? fallback : value;
@@ -242,6 +244,67 @@ export async function clockObservation(request, context) {
   };
 }
 
+async function getText({host, port, path, timeoutMs}, request = http.get) {
+  return new Promise((resolveResult, reject) => {
+    const outgoing = request({host, port, path, timeout: timeoutMs}, response => {
+      const chunks = [];
+      let length = 0;
+      response.on('data', chunk => {
+        length += chunk.length;
+        if (length > MAX_METRICS_BYTES) {
+          outgoing.destroy(new Error(`metrics response exceeds ${MAX_METRICS_BYTES} bytes`));
+        } else {
+          chunks.push(chunk);
+        }
+      });
+      response.on('end', () => {
+        if ((response.statusCode ?? 0) !== 200) {
+          reject(new Error(`metrics endpoint returned HTTP ${response.statusCode ?? 0}`));
+          return;
+        }
+        resolveResult(Buffer.concat(chunks).toString('utf8'));
+      });
+    });
+    outgoing.on('timeout', () => outgoing.destroy(new Error('metrics request timed out')));
+    outgoing.on('error', reject);
+  });
+}
+
+function metricValue(text, metric) {
+  const lines = text.split('\n').filter(line => line.startsWith(`${metric} `));
+  if (lines.length !== 1) throw new Error(`metrics response must contain exactly one ${metric} sample`);
+  const value = Number(lines[0].slice(metric.length).trim());
+  if (!Number.isFinite(value) || value < 0 || value > 1e12) {
+    throw new Error(`${metric} sample is not a bounded timestamp`);
+  }
+  return value;
+}
+
+export async function processClockObservation(request, context) {
+  if (request.metric !== PROCESS_WALL_CLOCK_METRIC) {
+    throw new Error(`metric must be ${PROCESS_WALL_CLOCK_METRIC}`);
+  }
+  if (request.control !== undefined && typeof request.control !== 'boolean') throw new Error('control must be boolean');
+  const peer = namedPeer(context.peers, request.peer);
+  const port = namedPort(peer, request.port);
+  const before = performance.now();
+  const wallEpochSeconds = metricValue(await getText({
+    host: peer.host, port, path: '/metrics', timeoutMs: 2000,
+  }, context.httpGet), request.metric);
+  return {
+    actor: context.actor, probe: 'clock', status: 'ok', control: request.control === true,
+    wallEpochSeconds, monotonicSeconds: Number(context.monotonic()) / 1e9,
+    sampleWindowMs: roundMillis(performance.now() - before), metric: request.metric,
+  };
+}
+
+export async function systemObservation(_request, context) {
+  return {
+    actor: context.actor, probe: 'system', status: 'ok',
+    platform: context.platform, architecture: context.architecture,
+  };
+}
+
 export function createContext(environment = process.env, overrides = {}) {
   const actor = environment.PROBE_ACTOR;
   if (!ACTOR_RE.test(actor ?? '') || actor.length > 63) throw new Error('PROBE_ACTOR is invalid');
@@ -255,9 +318,12 @@ export function createContext(environment = process.env, overrides = {}) {
     dnsControl: environment.PROBE_DNS_CONTROL || 'kubernetes.default.svc.cluster.local',
     lookup: overrides.lookup ?? dns.lookup,
     connect: overrides.connect ?? net.createConnection,
+    httpGet: overrides.httpGet ?? http.get,
     ioFs: overrides.ioFs ?? fs,
     now: overrides.now ?? Date.now,
     monotonic: overrides.monotonic ?? process.hrtime.bigint,
+    platform: overrides.platform ?? process.platform,
+    architecture: overrides.architecture ?? process.arch,
   };
 }
 
@@ -268,14 +334,18 @@ export async function dispatchProbe(request, context) {
     dns: new Set(['kind', 'peer']),
     io: new Set(['kind', 'operation', 'file', 'bytes', 'attempts']),
     clock: new Set(['kind', 'control']),
+    processClock: new Set(['kind', 'peer', 'port', 'metric', 'control']),
+    system: new Set(['kind']),
   }[request.kind];
-  if (!allowed) throw new Error('kind must be network, dns, io, or clock');
+  if (!allowed) throw new Error('kind must be network, dns, io, clock, processClock, or system');
   exactRequestFields(request, allowed);
   const observation = await ({
     network: networkObservation,
     dns: dnsObservation,
     io: ioObservation,
     clock: clockObservation,
+    processClock: processClockObservation,
+    system: systemObservation,
   }[request.kind](request, context));
   return {
     schemaVersion: RESPONSE_SCHEMA,

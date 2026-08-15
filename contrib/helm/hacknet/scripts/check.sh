@@ -8,14 +8,37 @@ python3 -m unittest discover -s "${chart_dir}/operator" -p 'test_*.py' -v
 node --check "${chart_dir}/run-operator/controller.mjs"
 node --test "${chart_dir}/run-operator/controller.test.mjs"
 node --test "${chart_dir}/run-operator/probe-client.test.mjs"
+node --test "${chart_dir}/run-operator/image-context.test.mjs"
 node --test "${chart_dir}/crds/attacknet-crds.test.mjs"
 node --check "${chart_dir}/../../attacknet/probe/probe.mjs"
 node --test "${chart_dir}/../../attacknet/probe/probe.test.mjs"
+node --test "${chart_dir}/../../attacknet/io-pressure/image-context.test.mjs"
+if command -v go >/dev/null 2>&1; then
+  (cd "${chart_dir}/../../attacknet/io-pressure" && go test ./...)
+else
+  echo "go not installed; skipped bounded I/O-pressure workload tests" >&2
+fi
 
 helm_bin="${HELM_BIN:-helm}"
 if command -v "${helm_bin}" >/dev/null 2>&1; then
   "${helm_bin}" lint "${chart_dir}"
-  "${helm_bin}" template hacknet "${chart_dir}" --namespace hacknet-system --include-crds >/dev/null
+  rendered="$("${helm_bin}" template hacknet "${chart_dir}" --namespace hacknet-system --include-crds)"
+  if [[ "${rendered}" != *'resources: ["podchaos", "networkchaos", "dnschaos", "iochaos", "timechaos"]'* ]]; then
+    echo 'rendered run-operator RBAC is missing the bounded native Chaos resources' >&2
+    exit 1
+  fi
+  if [[ "${rendered}" != *$'resources: ["pods"]\n    verbs: ["get", "list", "watch", "create", "patch", "delete"]'* ]]; then
+    echo 'rendered run-operator RBAC lacks the exact controller-owned I/O-pressure Pod lifecycle verbs' >&2
+    exit 1
+  fi
+  if [[ "${rendered}" == *'resources: ["podchaos", "networkchaos", "dnschaos", "iochaos", "stresschaos"'* ]]; then
+    echo 'rendered run-operator RBAC still grants unused StressChaos authority' >&2
+    exit 1
+  fi
+  if [[ "${rendered}" != *'"kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos"]}'* ]]; then
+    echo 'rendered FaultCampaign status schema is missing IOPressurePod' >&2
+    exit 1
+  fi
   "${helm_bin}" template hacknet "${chart_dir}" --namespace hacknet-system \
     --set operator.developmentSource.enabled=true \
     --set runOperator.enabled=false \

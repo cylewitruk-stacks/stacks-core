@@ -10,6 +10,8 @@ backend_require
 evidence_actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" actors)"
 evidence_nodes="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" nodes)"
 probe_timeout="${ATTACKNET_PROBE_TIMEOUT_SECONDS:-10}"
+progress_window="$(node "${ATTACKNET_DIR}/progress-window.mjs" \
+  "${manifest}" "${ATTACKNET_PROGRESS_WINDOW_SECONDS:-}")"
 
 unready="$(backend_unready_actors bitcoin bitcoin-miner stacker ${evidence_actors})"
 if [ -n "${unready}" ]; then
@@ -50,7 +52,7 @@ case "${action}" in
     ;;
   progress)
     start="$(backend_exec_timeout "${probe_timeout}" bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
-    sleep "${ATTACKNET_PROGRESS_WINDOW_SECONDS:-45}"
+    sleep "${progress_window}"
     end="$(backend_exec_timeout "${probe_timeout}" bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
     capture_cohort "${temporary}/end-cohort.json"
     end_cohort_status=0
