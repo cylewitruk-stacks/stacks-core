@@ -1,5 +1,6 @@
 // Adapted from stacks-sbtc/sbtc docker/stacker/stacking under its ISC license.
 import crypto from 'node:crypto';
+import { renameSync, writeFileSync } from 'node:fs';
 import { type PoxInfo, Pox4SignatureTopic } from '@stacks/stacking';
 import {
   Cl,
@@ -23,6 +24,18 @@ const maxAmount = 2n ** 128n - 1n;
 let nextFee = 1_000;
 let stackingComplete = false;
 let epoch4FixturesComplete = false;
+const statusPath = process.env.STACKER_STATUS_PATH ?? '/tmp/attacknet-stacker-status.json';
+
+function writeStatus(phase: string, details: Record<string, unknown> = {}): void {
+  const temporary = `${statusPath}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify({
+    schemaVersion: 1,
+    phase,
+    observedAt: new Date().toISOString(),
+    ...details,
+  })}\n`);
+  renameSync(temporary, statusPath);
+}
 
 if (pox5StackingCycles < 1 || pox5StackingCycles > 96) {
   throw new Error('POX5_STACKING_CYCLES must be within the PoX-5 [1, 96] range');
@@ -392,14 +405,24 @@ async function runOnce(): Promise<void> {
       // The helper is stateless and may be restarted after the PoX-4 phase.
       // PoX-5 enrollment below is the authoritative readiness condition now.
       stackingComplete = true;
+      writeStatus('pox5-active', {burnHeight: poxInfo.current_burnchain_block_height});
       console.log('PoX-4 phase has passed; resuming bootstrap at PoX-5');
     } else if (!poxInfo.contract_id.endsWith('.pox-4')) {
+      writeStatus('waiting-for-pox4', {
+        burnHeight: poxInfo.current_burnchain_block_height,
+        contractId: poxInfo.contract_id,
+      });
       console.log(`Waiting for PoX-4; current contract is ${poxInfo.contract_id}`);
       return;
     } else {
+      writeStatus('pox4-submitting', {burnHeight: poxInfo.current_burnchain_block_height});
       await Promise.all(accounts.map(account => stackAccount(poxInfo, account)));
       stackingComplete = await registrationsConfirmed();
-      if (!stackingComplete) return;
+      if (!stackingComplete) {
+        writeStatus('pox4-submitted', {burnHeight: poxInfo.current_burnchain_block_height});
+        return;
+      }
+      writeStatus('pox4-confirmed', {burnHeight: poxInfo.current_burnchain_block_height});
       console.log(`All ${accounts.length} PoX-4 signer registrations are confirmed`);
     }
   }
@@ -416,11 +439,14 @@ async function runOnce(): Promise<void> {
   }
 }
 
+writeStatus('starting');
 await waitForNode();
+writeStatus('rpc-ready');
 for (;;) {
   try {
     await runOnce();
   } catch (error) {
+    writeStatus('degraded', {error: error instanceof Error ? error.message : String(error)});
     console.error('Stacking bootstrap failed; retrying', error);
   }
   await new Promise(resolve => setTimeout(resolve, intervalSeconds * 1_000));

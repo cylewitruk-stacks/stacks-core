@@ -736,7 +736,7 @@ def build_stateful_set(context: ActorContext) -> dict[str, Any]:
             pod_spec[field] = context.expand(value)
     stateful_spec: dict[str, Any] = {
         "serviceName": context.resource_name,
-        "replicas": 0 if spec.get("suspended", False) else 1,
+        "replicas": 0 if spec.get("suspended", False) or actor.get("suspended", False) else 1,
         "podManagementPolicy": "Parallel",
         # A deleted/pruned actor must not silently donate old chainstate to a
         # later test run. Suspension is reversible, so scale-to-zero retains it.

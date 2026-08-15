@@ -122,7 +122,7 @@ test('legacy signer companions subscribe to miner and signer StackerDBs', () => 
   assert.match(follower.config.files['config.toml'], /^stacker = false$/m);
 });
 
-test('bootstrap suppresses companion observers until signer runloops are initialized', () => {
+test('bootstrap suppresses companion observers and signers until the reward set is frozen', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-observer-bootstrap-'));
   const {resource, bootstrapResource} = renderTopology(buildTopology({signerCount: 2}), output);
   for (const name of ['signer-node-1', 'signer-node-2']) {
@@ -130,12 +130,24 @@ test('bootstrap suppresses companion observers until signer runloops are initial
     const bootstrapConfig = bootstrapResource.spec.actors.find(actor => actor.name === name).config.files['config.toml'];
     assert.match(finalConfig, /\[\[events_observer\]\]/);
     assert.doesNotMatch(bootstrapConfig, /\[\[events_observer\]\]/);
+    assert.equal(
+      bootstrapResource.spec.actors.find(actor => actor.name === name)
+        .dependencies.some(item => item.actor.startsWith('signer-')),
+      false,
+    );
+  }
+  for (const name of ['signer-1', 'signer-2']) {
+    assert.equal(resource.spec.actors.find(actor => actor.name === name).suspended, undefined);
+    assert.equal(bootstrapResource.spec.actors.find(actor => actor.name === name).suspended, true);
   }
   assert.deepEqual(
     JSON.parse(readFileSync(join(output, 'stacksnetwork.bootstrap.json'), 'utf8')),
     bootstrapResource,
   );
   const bootstrapCompose = JSON.parse(readFileSync(join(output, 'compose.bootstrap.yaml'), 'utf8'));
+  assert.equal(bootstrapCompose.services['signer-1'], undefined);
+  assert.equal(bootstrapCompose.services['signer-2'], undefined);
+  assert.equal(bootstrapCompose.services['signer-node-1'].depends_on?.['signer-1'], undefined);
   assert.doesNotMatch(
     readFileSync(join(output, bootstrapCompose.services['signer-node-1'].volumes[0].split(':')[0]), 'utf8'),
     /\[\[events_observer\]\]/,
@@ -154,11 +166,15 @@ test('manifest exposes deterministic protocol phase barriers', () => {
   const {manifest} = renderTopology(buildTopology(), output);
   assert.deepEqual(manifest.protocol, {
     burnchainBootstrapHeight: 202,
+    signerEnrollmentHeight: 208,
+    signerSetCutoffHeight: 215,
     observerEnableHeight: 220,
     signerRegistrationHeight: 222,
     nakamotoActivationHeight: 223,
     steadyBurnIntervalSeconds: 60,
   });
+  assert.equal(manifest.workloads.find(actor => actor.service === 'signer-1').stacksAddress,
+    'ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H');
 });
 
 test('Compose and Kubernetes renderers preserve workload identity, commands, dependencies, and config', () => {

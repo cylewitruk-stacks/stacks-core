@@ -254,8 +254,19 @@ extension is an alternative that uses the existing kubeconfig and consumes no
 attacknet cluster storage.
 
 The attacknet observability renderer provisions an anonymous, read-only
-Grafana instance for each network. Forward the retained network locally (the
-default full-topology name is shown):
+Grafana instance for each network. By default, `lifecycle.sh apply` also starts
+a rediscovering, loopback-only supervisor at <http://127.0.0.1:3000>. The
+supervisor survives a Grafana Pod replacement and follows the sole enrolled
+Grafana Service; it refuses ambiguity if more than one network is active. Its
+state is available through:
+
+```bash
+contrib/attacknet/local-access.sh status
+```
+
+Set `ATTACKNET_LOCAL_ACCESS_ENABLED=0` before lifecycle apply when unattended
+local access is unwanted. The equivalent one-shot manual forward (the default
+full-topology name is shown) is:
 
 ```bash
 kubectl -n hacknet-system port-forward \

@@ -345,6 +345,10 @@ function renderCompose(actors, output, network, filename = 'compose.yaml', confi
   mkdirSync(configsRoot, {recursive: true});
   for (const original of actors) {
     const actor = expandCompose(original, network);
+    // Compose has no replica-zero service equivalent.  Omitting an explicitly
+    // suspended actor preserves the same bootstrap intent as the Kubernetes
+    // StatefulSet and prevents it from caching a premature protocol verdict.
+    if (actor.suspended) continue;
     const serviceSpec = {
       image: actor.image,
       restart: 'unless-stopped',
@@ -400,16 +404,20 @@ export function renderTopology(topology, output, {
     },
   };
   // During initial IBD a node emits historical burn-block notifications.  A
-  // signer cannot initialize until its companion RPC is usable, so delivering
-  // those events immediately creates an unavoidable stale in-process backlog.
-  // Bootstrap without companion observers, prove signer runloop initialization,
-  // then roll the companions onto the final observer-enabled configuration.
+  // signer cannot initialize until its companion RPC and canonical reward set
+  // are usable. Starting it earlier can cache NotRegistered for the whole
+  // reward cycle. Bootstrap companions without observers or signer dependency,
+  // keep signers scaled to zero, then start both against the frozen reward set.
   const bootstrapResource = JSON.parse(JSON.stringify(resource));
   for (const actor of bootstrapResource.spec.actors.filter(actor => actor.role === 'companion')) {
     actor.config.files['config.toml'] = actor.config.files['config.toml'].replace(
       /\n\[\[events_observer\]\]\nendpoint = "[^"\n]+"\nevents_keys = \[[^\n]+\]\n/,
       '\n',
     );
+    actor.dependencies = (actor.dependencies ?? []).filter(item => !item.actor.startsWith('signer-'));
+  }
+  for (const actor of bootstrapResource.spec.actors.filter(actor => actor.role === 'signer')) {
+    actor.suspended = true;
   }
   const manifestActor = actor => ({
     service: actor.name,
@@ -418,16 +426,24 @@ export function renderTopology(topology, output, {
     companion: actor.role === 'signer' ? `signer-node-${actor.name.slice('signer-'.length)}` : undefined,
     signerIndex: actor.signerIndex,
     signerWeight: actor.signerWeight,
+    stacksAddress: actor.role === 'signer'
+      ? topology.signers[actor.signerIndex - 1][1]
+      : undefined,
     activationGate: actor.activationGate,
   });
   const manifest = {
     schemaVersion: 1, profile: 'mainnet-legacy-transport', network, namespace,
     protocol: {
       burnchainBootstrapHeight: 202,
+      // PoX-4 becomes available with Epoch 2.4. Pause here and let the
+      // stacker submit before advancing one burn block at a time. The reward
+      // set for cycle 11 is frozen when its prepare phase starts at 215.
+      signerEnrollmentHeight: 208,
+      signerSetCutoffHeight: 215,
       observerEnableHeight: 220,
-      // The stack transactions confirm at 220, and the signer runloops adopt
-      // that reward set on the following burn-block event. Height 222 is the
-      // last deterministic participation barrier before Nakamoto activates.
+      // The signer runloops adopt the already-frozen cycle-11 reward set on
+      // burn-block events after observers are enabled. Height 222 is the last
+      // deterministic participation barrier before Nakamoto activates.
       signerRegistrationHeight: 222,
       nakamotoActivationHeight: 223,
       steadyBurnIntervalSeconds: 60,

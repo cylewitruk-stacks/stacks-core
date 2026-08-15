@@ -265,6 +265,16 @@ class ResourceBuilderTests(unittest.TestCase):
         resources = controller.build_resources(fixture)
         self.assertTrue(all(item["spec"]["replicas"] == 0 for item in resources["statefulsets"]))
 
+    def test_actor_suspension_scales_only_that_actor_to_zero(self):
+        fixture = network_fixture()
+        fixture["spec"]["actors"][2]["suspended"] = True
+        resources = controller.build_resources(fixture)
+        replicas = {
+            item["metadata"]["labels"][controller.ACTOR_LABEL]: item["spec"]["replicas"]
+            for item in resources["statefulsets"]
+        }
+        self.assertEqual(replicas, {"miner-1": 1, "companion-1": 1, "signer-1": 0})
+
     def test_rejects_ambiguous_config_source(self):
         fixture = network_fixture()
         fixture["spec"]["actors"][0]["config"]["secretRef"] = {"name": "also-secret"}

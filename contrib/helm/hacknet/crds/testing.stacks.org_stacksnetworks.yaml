@@ -187,6 +187,10 @@ spec:
                       role:
                         type: string
                         enum: [burnchain, miner, signer, companion, follower, adversary, infrastructure]
+                      suspended:
+                        type: boolean
+                        default: false
+                        description: Scale only this actor to zero while retaining its storage.
                       signerIndex:
                         type: integer
                         minimum: 1

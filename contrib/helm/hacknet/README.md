@@ -64,12 +64,20 @@ images through its internal registry mirror. Keep the default
 `ErrImageNeverPull`. Install the normal packaged controller path with:
 
 ```sh
-helm upgrade --install hacknet contrib/helm/hacknet \
-  --namespace hacknet-system \
-  --create-namespace \
-  --wait \
-  --rollback-on-failure
+contrib/helm/hacknet/scripts/install-local.sh
 ```
+
+The helper applies and waits for all three CRDs before Helm because Helm does
+not add or upgrade files under `crds/` for an existing release. It also puts
+the exact local operator image IDs in Pod annotations so rebuilding a mutable
+development tag produces a rollout. Do not use `kubectl set image` on these
+Deployments: it creates managed-field ownership that can make both a Helm 4
+upgrade and rollback conflict. If a release is already failed, or field
+ownership must deliberately be recovered, inspect it first and use the
+conspicuous `HACKNET_RECOVER_FAILED_RELEASE=1` and (only when necessary)
+`HACKNET_FORCE_CONFLICTS=1` escape hatches. A CRD previously owned by
+client-side apply may similarly require the one-time, explicit
+`HACKNET_FORCE_CRD_CONFLICTS=1` transition; it must not be a permanent default.
 
 If a local cluster still cannot resolve Docker Engine images, the chart has an
 explicit fallback that mounts its controller source into a public Python

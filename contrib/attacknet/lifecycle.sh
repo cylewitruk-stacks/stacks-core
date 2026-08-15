@@ -10,6 +10,7 @@ STARTUP_SETTLE_SECONDS="${ATTACKNET_STARTUP_SETTLE_SECONDS:-5}"
 BOOTSTRAP_INTERVAL_SECONDS="${ATTACKNET_BOOTSTRAP_INTERVAL_SECONDS:-2}"
 OBSERVABILITY_ENABLED="${ATTACKNET_OBSERVABILITY_ENABLED:-1}"
 OBSERVABILITY_STORAGE_PREFLIGHT="${ATTACKNET_OBSERVABILITY_STORAGE_PREFLIGHT:-1}"
+LOCAL_ACCESS_ENABLED="${ATTACKNET_LOCAL_ACCESS_ENABLED:-1}"
 RUN_DESCRIPTOR=""
 RUN_ID="${ATTACKNET_RUN_ID:-}"
 RUN_SEED="${ATTACKNET_RUN_SEED:-}"
@@ -124,7 +125,7 @@ wait_deleted() {
   local remaining
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     remaining="$(kubectl -n "${NAMESPACE}" get pods,pvc,deployments,statefulsets,daemonsets,services,configmaps,secrets,serviceaccounts,roles,rolebindings \
-      -l "testing.stacks.org/network=${NETWORK}" -o name 2>/dev/null || true)"
+      -l "testing.stacks.org/network=${NETWORK},!testing.stacks.org/artifact" -o name 2>/dev/null || true)"
     if [ -z "${remaining}" ]; then
       echo "Deleted ${NETWORK} and all labeled children/PVCs"
       return 0
@@ -138,9 +139,9 @@ wait_deleted() {
 
 wait_bootstrap_foundation_ready() {
   local manifest="$1" deadline=$((SECONDS + TIMEOUT))
-  local actors expected pod_count unready
+  local actors total_expected statefulsets statefulset_count active_expected pod_count unready generation observed_generation
   actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" bootstrap-foundation)"
-  expected="$(node -e '
+  total_expected="$(node -e '
     const fs = require("node:fs");
     console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).workloads.length);
   ' "${manifest}")"
@@ -151,16 +152,26 @@ wait_bootstrap_foundation_ready() {
     pod_count="$(kubectl -n "${NAMESPACE}" get pods \
       -l "testing.stacks.org/network=${NETWORK},testing.stacks.org/actor" \
       -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | wc -w | tr -d ' ')"
+    statefulsets="$(kubectl -n "${NAMESPACE}" get statefulsets \
+      -l "testing.stacks.org/network=${NETWORK},testing.stacks.org/actor" \
+      -o json 2>/dev/null || echo '{"items":[]}')"
+    statefulset_count="$(jq -r '.items | length' <<<"${statefulsets}")"
+    active_expected="$(jq -r '[.items[] | select((.spec.replicas // 0) > 0)] | length' <<<"${statefulsets}")"
+    read -r generation observed_generation < <(kubectl -n "${NAMESPACE}" get stacksnetwork "${NETWORK}" \
+      -o jsonpath='{.metadata.generation}{" "}{.status.observedGeneration}{"\n"}' 2>/dev/null || true)
     unready="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
       "${ATTACKNET_DIR}/runtime-backend.sh" unready ${actors} 2>/dev/null || true)"
-    if [ "${pod_count}" = "${expected}" ] && [ -z "${unready}" ]; then
-      printf 'Bootstrap foundation Ready (%s actors); %s/%s Pods admitted\n' \
-        "$(wc -w <<<"${actors}" | tr -d ' ')" "${pod_count}" "${expected}"
+    if [ -n "${generation:-}" ] && [ "${generation}" = "${observed_generation:-}" ] \
+      && [ "${statefulset_count}" = "${total_expected}" ] \
+      && [ "${pod_count}" = "${active_expected}" ] && [ -z "${unready}" ]; then
+      printf 'Bootstrap foundation Ready (%s actors); %s/%s active Pods, %s/%s StatefulSets admitted\n' \
+        "$(wc -w <<<"${actors}" | tr -d ' ')" "${pod_count}" "${active_expected}" \
+        "${statefulset_count}" "${total_expected}"
       return 0
     fi
     sleep 3
   done
-  echo "${NETWORK} bootstrap foundation did not become Ready within ${TIMEOUT}s; unready: ${unready:-unknown}" >&2
+  echo "${NETWORK} bootstrap foundation did not become Ready within ${TIMEOUT}s; generation=${observed_generation:-0}/${generation:-0}, StatefulSets=${statefulset_count:-0}/${total_expected}, active Pods=${pod_count:-0}/${active_expected:-0}, unready: ${unready:-unknown}" >&2
   return 1
 }
 
@@ -273,6 +284,113 @@ wait_signers_registered() {
   return 1
 }
 
+wait_stacker_submission_window() {
+  local seconds="$1" cutoff_height="$2" deadline
+  local status phase burn_height
+  deadline=$((SECONDS + seconds))
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    status="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+      "${ATTACKNET_DIR}/runtime-backend.sh" exec stacker \
+      cat /tmp/attacknet-stacker-status.json 2>/dev/null || true)"
+    read -r phase burn_height < <(STATUS="${status}" node -e '
+      try {
+        const status = JSON.parse(process.env.STATUS);
+        console.log(`${status.phase ?? ""} ${status.burnHeight ?? ""}`);
+      } catch {}
+    ')
+    case "${phase:-}" in
+      pox4-submitted|pox4-confirmed)
+        if ! [[ "${burn_height:-}" =~ ^[0-9]+$ ]] || [ "${burn_height}" -ge "${cutoff_height}" ]; then
+          echo "stacker reported ${phase} at unsafe burn height ${burn_height:-unknown}; cutoff is ${cutoff_height}" >&2
+          return 2
+        fi
+        printf 'Stacker reported %s at burn height %s\n' "${phase}" "${burn_height}"
+        return 0
+        ;;
+      pox5-active)
+        echo 'PoX-4 signer enrollment was missed before PoX-5 became active' >&2
+        return 2
+        ;;
+    esac
+    sleep 1
+  done
+  return 1
+}
+
+signer_accounts_locked() {
+  local manifest="$1" addresses address account locked
+  addresses="$(node -e '
+    const fs = require("node:fs");
+    const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const signers = (manifest.workloads ?? manifest.actors ?? []).filter(actor => actor.type === "signer");
+    if (!signers.length || signers.some(actor => typeof actor.stacksAddress !== "string")) process.exit(2);
+    process.stdout.write(signers.map(actor => actor.stacksAddress).join(" "));
+  ' "${manifest}")" || return 2
+  for address in ${addresses}; do
+    account="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+      "${ATTACKNET_DIR}/runtime-backend.sh" exec miner-1 \
+      curl --fail --silent --max-time 3 \
+      "http://127.0.0.1:20443/v2/accounts/${address}?proof=0" 2>/dev/null || true)"
+    locked="$(ACCOUNT="${account}" node -e '
+      try {
+        const value = JSON.parse(process.env.ACCOUNT).locked;
+        if (typeof value === "string" && BigInt(value) > 0n) process.stdout.write("1");
+      } catch {}
+    ')"
+    [ "${locked}" = 1 ] || return 1
+  done
+  return 0
+}
+
+establish_signer_set() {
+  local manifest="$1" enrollment_height="$2" cutoff_height="$3"
+  local height current submitted=false result
+  [ "${enrollment_height}" -lt "${cutoff_height}" ] || {
+    echo "signer enrollment height ${enrollment_height} must precede cutoff ${cutoff_height}" >&2
+    return 2
+  }
+
+  # Do not race through the PoX-4 enrollment window. Pause at every burn
+  # height, wait for nodes to process it, and give the stacker at least one
+  # complete polling interval to publish. Once submission is observed, mine
+  # only as many blocks as needed to prove the lock in canonical chainstate.
+  for ((height = enrollment_height; height < cutoff_height; height += 1)); do
+    burst_to_height "${height}" "signer-enrollment-${height}"
+    wait_nodes_at_burn_height "${manifest}" pre-activation-nodes "${height}"
+    if signer_accounts_locked "${manifest}"; then
+      ledger_assertion signer-set-established pass \
+        "{\"confirmedHeight\":${height},\"cutoffHeight\":${cutoff_height}}"
+      printf 'Signer accounts locked at burn height %s before cutoff %s\n' "${height}" "${cutoff_height}"
+      return 0
+    fi
+    result=0
+    wait_stacker_submission_window "$((BOOTSTRAP_INTERVAL_SECONDS + 4))" "${cutoff_height}" || result=$?
+    if [ "${result}" -eq 0 ]; then
+      submitted=true
+      break
+    fi
+    [ "${result}" -eq 1 ] || return "${result}"
+  done
+
+  [ "${submitted}" = true ] || {
+    echo "stacker did not submit PoX-4 enrollment before burn height ${cutoff_height}" >&2
+    return 1
+  }
+  current="$(clock_status_value bitcoin_height)"
+  for ((height = current + 1; height < cutoff_height; height += 1)); do
+    burst_to_height "${height}" "signer-confirmation-${height}"
+    wait_nodes_at_burn_height "${manifest}" pre-activation-nodes "${height}"
+    if signer_accounts_locked "${manifest}"; then
+      ledger_assertion signer-set-established pass \
+        "{\"confirmedHeight\":${height},\"cutoffHeight\":${cutoff_height}}"
+      printf 'Signer accounts locked at burn height %s before cutoff %s\n' "${height}" "${cutoff_height}"
+      return 0
+    fi
+  done
+  echo "signer accounts were not locked before reward-set cutoff ${cutoff_height}" >&2
+  return 1
+}
+
 wait_companion_stackerdb_subscriptions() {
   local manifest="$1" deadline=$((SECONDS + TIMEOUT)) companions companion status missing
   companions="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" companions)"
@@ -336,13 +454,34 @@ wait_observability_ready() {
   kubectl -n "${NAMESPACE}" wait --for=condition=Available deployment \
     -l "testing.stacks.org/network=${NETWORK},app.kubernetes.io/part-of=stacks-attacknet" \
     --timeout="${TIMEOUT}s"
+  if [ "${LOCAL_ACCESS_ENABLED}" = 1 ]; then
+    KUBE_NAMESPACE="${NAMESPACE}" "${ATTACKNET_DIR}/local-access.sh" start
+  fi
+}
+
+ensure_burnchain_policy() {
+  local rendered_policy="$1"
+  if kubectl -n "${NAMESPACE}" get configmap "${NETWORK}-burnchain-policy" >/dev/null 2>&1; then
+    # The clock treats GENERATION as a monotonic process-level command ID.
+    # Reapplying a rendered generation-1 ConfigMap during resume can reuse an
+    # already-acknowledged generation and make a new burst look applied while
+    # the clock correctly ignores it. Preserve the admitted policy verbatim.
+    echo "Preserving admitted burnchain policy and monotonic generation for ${NETWORK}"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" apply -f "${rendered_policy}"
+}
+
+needs_post_ready_clock_start() {
+  local gated="$1" bootstrap_network="$2"
+  [ "${AUTO_START_BURNCHAIN}" = 1 ] && [ -z "${gated}" ] && [ ! -f "${bootstrap_network}" ]
 }
 
 apply_network() {
   local generated="${1:?generated topology directory required}"
   local manifest="${generated}/manifest.json" final_network="${generated}/stacksnetwork.json"
   local bootstrap_network="${generated}/stacksnetwork.bootstrap.json"
-  local gated desired_interval desired_jitter observer_height registration_height activation_height start_details storage_report
+  local gated desired_interval desired_jitter enrollment_height cutoff_height observer_height registration_height activation_height start_details storage_report
   if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
     node "${ATTACKNET_DIR}/observability/render.mjs" "${manifest}" \
       --output="${generated}/observability.json" \
@@ -389,7 +528,7 @@ apply_network() {
       --kind=run.started --phase=setup \
       "--details=${start_details}" >/dev/null
   fi
-  kubectl -n "${NAMESPACE}" apply -f "${generated}/burnchain-policy.configmap.json"
+  ensure_burnchain_policy "${generated}/burnchain-policy.configmap.json"
   if [ -f "${bootstrap_network}" ]; then
     kubectl -n "${NAMESPACE}" apply -f "${bootstrap_network}"
   else
@@ -399,6 +538,8 @@ apply_network() {
   desired_interval="$(sed -n 's/^INTERVAL_SECONDS=//p' "${generated}/policy.env" | tail -1)"
   desired_jitter="$(sed -n 's/^JITTER_SECONDS=//p' "${generated}/policy.env" | tail -1)"
   observer_height="$(manifest_protocol_value "${manifest}" observerEnableHeight)"
+  enrollment_height="$(manifest_protocol_value "${manifest}" signerEnrollmentHeight)"
+  cutoff_height="$(manifest_protocol_value "${manifest}" signerSetCutoffHeight)"
   registration_height="$(manifest_protocol_value "${manifest}" signerRegistrationHeight)"
   activation_height="$(manifest_protocol_value "${manifest}" nakamotoActivationHeight)"
   if [ "${AUTO_START_BURNCHAIN}" = 1 ] && { [ -n "${gated}" ] || [ -f "${bootstrap_network}" ]; }; then
@@ -406,6 +547,7 @@ apply_network() {
     # protocol gate: a signer may serve its event socket while it has no active
     # signer for the current reward cycle.
     wait_bootstrap_foundation_ready "${manifest}"
+    establish_signer_set "${manifest}" "${enrollment_height}" "${cutoff_height}"
     burst_to_height "${observer_height}" observer-enable
     wait_nodes_at_burn_height "${manifest}" pre-activation-nodes "${observer_height}"
     ledger_assertion nodes-at-observer-height pass \
@@ -441,7 +583,7 @@ apply_network() {
       wait_ready
     fi
   fi
-  if [ "${AUTO_START_BURNCHAIN}" = 1 ] && [ -z "${gated}" ]; then
+  if needs_post_ready_clock_start "${gated}" "${bootstrap_network}"; then
     sleep "${STARTUP_SETTLE_SECONDS}"
     KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
       "${ATTACKNET_DIR}/burnchain-policy.sh" run "${desired_interval:-60}" "${desired_jitter:-0}"
@@ -572,6 +714,22 @@ apply_error() {
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   command="${1:-}"
+  if [ "${command}" = apply ]; then
+    generated="${2:?usage: $0 apply GENERATED_DIR}"
+    identity="$(node "${ATTACKNET_DIR}/manifest-identity.mjs" "${generated}")"
+    rendered_network="$(jq -er .network <<<"${identity}")"
+    rendered_namespace="$(jq -er .namespace <<<"${identity}")"
+    if [ -n "${KUBE_NETWORK+x}" ] && [ "${KUBE_NETWORK}" != "${rendered_network}" ]; then
+      echo "KUBE_NETWORK=${KUBE_NETWORK} does not match rendered network ${rendered_network}" >&2
+      exit 2
+    fi
+    if [ -n "${KUBE_NAMESPACE+x}" ] && [ "${KUBE_NAMESPACE}" != "${rendered_namespace}" ]; then
+      echo "KUBE_NAMESPACE=${KUBE_NAMESPACE} does not match rendered namespace ${rendered_namespace}" >&2
+      exit 2
+    fi
+    NETWORK="${rendered_network}"
+    NAMESPACE="${rendered_namespace}"
+  fi
   case "${command}" in
     apply|delete)
       if [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then
