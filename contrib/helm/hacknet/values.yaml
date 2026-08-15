@@ -45,6 +45,48 @@ operator:
     seccompProfile:
       type: RuntimeDefault
 
+# A distinct identity reconciles adversarial runs. The StacksNetwork operator
+# intentionally has no Chaos Mesh permissions; actors have no Kubernetes token.
+runOperator:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: stacks-hacknet-run-operator
+    tag: dev
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  logLevel: INFO
+  reconcileIntervalSeconds: 5
+  resources:
+    requests:
+      cpu: 25m
+      memory: 48Mi
+    limits:
+      cpu: 250m
+      memory: 192Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+runServiceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
 serviceAccount:
   create: true
   name: ""

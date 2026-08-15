@@ -167,6 +167,14 @@ spec:
                       role:
                         type: string
                         enum: [burnchain, miner, signer, companion, follower, adversary, infrastructure]
+                      signerIndex:
+                        type: integer
+                        minimum: 1
+                        maximum: 1000
+                      signerWeight:
+                        type: number
+                        exclusiveMinimum: true
+                        minimum: 0
                       image:
                         type: string
                       imagePullPolicy:

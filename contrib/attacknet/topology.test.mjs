@@ -24,6 +24,26 @@ test('full topology is 28 protocol actors plus three bootstrap workloads', () =>
   assert.deepEqual(manifest.counts, {miners: 3, signers: 10, followers: 5});
 });
 
+test('admitted topology carries authoritative signer ownership and weight', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-signer-weights-'));
+  const {resource, manifest} = renderTopology(buildTopology({signerCount: 4}), output);
+  for (const index of [1, 2, 3, 4]) {
+    const weight = ((index - 1) % 3) + 1;
+    for (const name of [`signer-${index}`, `signer-node-${index}`]) {
+      const admitted = resource.spec.actors.find(actor => actor.name === name);
+      const recorded = manifest.actors.find(actor => actor.service === name);
+      assert.deepEqual(
+        {index: admitted.signerIndex, weight: admitted.signerWeight},
+        {index, weight},
+      );
+      assert.deepEqual(
+        {index: recorded.signerIndex, weight: recorded.signerWeight},
+        {index, weight},
+      );
+    }
+  }
+});
+
 test('every stacker key is paired with the same address funded at genesis', () => {
   const topology = buildTopology({signerCount: 10});
   const output = mkdtempSync(join(tmpdir(), 'attacknet-address-fixtures-'));

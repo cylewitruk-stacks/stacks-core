@@ -128,6 +128,35 @@ uninstall.
 
 ## Agent-facing API
 
+The chart installs three namespaced APIs with deliberately separate
+controllers:
+
+- `StacksNetwork` owns the system under test and has no Chaos Mesh permission.
+- `FaultCampaign` is either an inert reusable template (`spec.template: true`)
+  or one bounded execution with exact admitted Pod identities and a cleanup
+  finalizer.
+- `AttacknetRun` snapshots a finite catalog of templates by UID, generation,
+  and SHA-256 digest, then creates at most one owned execution at a time under
+  aggregate wall-time, fault-time, signer-impact, miner, and burnchain budgets.
+
+The run controller has a separate namespaced service account. It can read the
+network and actor Pods, manage only the two run APIs, and create/delete only
+`PodChaos`, `NetworkChaos`, `DNSChaos`, `IOChaos`, and `TimeChaos`. Actor Pods
+remain credential-free. Apply the examples after the referenced
+`StacksNetwork` is Ready:
+
+```sh
+kubectl apply -f contrib/helm/hacknet/examples/fault-campaign.json
+kubectl apply -f contrib/helm/hacknet/examples/attacknet-run.json
+kubectl get faultcampaigns,attacknetruns -n hacknet-system -w
+```
+
+Chaos Mesh `AllInjected` and `AllRecovered` conditions are retained as context,
+but are not effect evidence. An execution without trusted evidence of the
+requested fault terminates `Inconclusive`, never `Passed`. Pod faults currently
+use Kubernetes-observed UID/readiness/restart evidence. The active-probe path
+for network, DNS, I/O, and time faults is the next implementation increment.
+
 The CR contains global defaults and an explicit actor list. An actor can
 override its image, command, arguments, ports, resources, storage, probes,
 configuration, dependencies, labels, and telemetry settings. This supports a
@@ -290,7 +319,7 @@ stated hypothesis.
    before adding more fault controls.
 3. Port Bitcoin wallet funding, stacking, observer federation, and evidence
    archival as controlled Jobs or dedicated controllers.
-4. Add a `FaultCampaign`/`AttacknetRun` API with signer-weight-aware safety
-   admission and Chaos Mesh resources.
+4. Integrate trusted network/DNS/I/O/time proof probes with the namespaced
+   `FaultCampaign`/`AttacknetRun` controller and prove each Chaos family live.
 5. Add snapshot/restore and explicit evidence-preservation policy.
 6. Add leader election only when multiple controller replicas are warranted.

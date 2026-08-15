@@ -1,0 +1,258 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  AttacknetRunReconciler, FaultCampaignReconciler, FINALIZER, digest,
+  artifactDigest, networkManifest, podEffectResults, stableName,
+} from './controller.mjs';
+
+const uid = name => `uid-${name}`;
+const clone = value => value === null || value === undefined ? value : structuredClone(value);
+
+class FakeApi {
+  constructor() {
+    this.objects = new Map();
+    this.pods = [];
+  }
+  key(group, plural, name) { return `${group}/${plural}/${name}`; }
+  put(plural, value, group = 'testing.stacks.org') {
+    this.objects.set(this.key(group, plural, value.metadata.name), clone(value));
+  }
+  async get(plural, name, options = {}) {
+    const group = options.group ?? 'testing.stacks.org';
+    const value = this.objects.get(this.key(group, plural, name));
+    if (!value && !options.allow404) throw new Error(`missing ${group}/${plural}/${name}`);
+    return clone(value ?? null);
+  }
+  async list(plural, options = {}) {
+    if ((options.group ?? 'testing.stacks.org') === '' && plural === 'pods') return {items: clone(this.pods)};
+    const group = options.group ?? 'testing.stacks.org';
+    return {items: [...this.objects.entries()]
+      .filter(([key]) => key.startsWith(`${group}/${plural}/`)).map(([, value]) => clone(value))};
+  }
+  async create(plural, body, options = {}) {
+    const group = options.group ?? 'testing.stacks.org';
+    const value = clone(body);
+    value.metadata.uid ??= uid(value.metadata.name);
+    value.metadata.resourceVersion ??= '1';
+    this.put(plural, value, group);
+    return clone(value);
+  }
+  async patch(plural, name, body, options = {}) {
+    const group = options.group ?? 'testing.stacks.org';
+    const key = this.key(group, plural, name);
+    const current = this.objects.get(key);
+    if (!current) throw new Error(`missing ${key}`);
+    if (options.subresource === 'status') current.status = clone(body.status);
+    else current.metadata = {...current.metadata, ...(body.metadata ?? {})};
+    current.metadata.resourceVersion = String(Number(current.metadata.resourceVersion ?? 0) + 1);
+    return clone(current);
+  }
+  async delete(plural, name, options = {}) {
+    const group = options.group ?? 'testing.stacks.org';
+    this.objects.delete(this.key(group, plural, name));
+    return {};
+  }
+}
+
+function network() {
+  return {
+    apiVersion: 'testing.stacks.org/v1alpha1', kind: 'StacksNetwork',
+    metadata: {name: 'demo', namespace: 'hacknet', uid: uid('demo'), generation: 3, resourceVersion: '1'},
+    spec: {actors: [
+      {name: 'miner-1', role: 'miner'},
+      {name: 'signer-1', role: 'signer', signerIndex: 1, signerWeight: 1},
+      {name: 'signer-node-1', role: 'companion', signerIndex: 1, signerWeight: 1},
+      {name: 'signer-2', role: 'signer', signerIndex: 2, signerWeight: 2},
+      {name: 'signer-node-2', role: 'companion', signerIndex: 2, signerWeight: 2},
+      {name: 'signer-3', role: 'signer', signerIndex: 3, signerWeight: 3},
+      {name: 'signer-node-3', role: 'companion', signerIndex: 3, signerWeight: 3},
+    ]},
+    status: {phase: 'Ready'},
+  };
+}
+
+function pod(actor, role) {
+  return {
+    metadata: {name: `demo-${actor}-0`, uid: uid(actor), labels: {
+      'testing.stacks.org/network': 'demo', 'testing.stacks.org/actor': actor,
+      'testing.stacks.org/role': role,
+    }},
+    spec: {nodeName: 'worker-1'},
+    status: {
+      phase: 'Running', conditions: [{type: 'Ready', status: 'True'}],
+      containerStatuses: [{name: 'actor', ready: true, image: 'stacks:test', imageID: 'sha256:abc', restartCount: 0}],
+    },
+  };
+}
+
+function campaign({template = false, effect = true} = {}) {
+  return {
+    apiVersion: 'testing.stacks.org/v1alpha1', kind: 'FaultCampaign',
+    metadata: {
+      name: template ? 'kill-signer-template' : 'kill-signer', namespace: 'hacknet',
+      uid: uid(template ? 'template' : 'campaign'), generation: 1, resourceVersion: '1',
+      finalizers: template ? [] : [FINALIZER], creationTimestamp: '2026-01-01T00:00:00Z',
+    },
+    spec: {
+      template, networkRef: 'demo', target: {actors: ['signer-1']},
+      fault: {type: 'pod', action: 'pod-kill', mode: 'one', duration: '1s', parameters: {}},
+      safety: {maxUnavailableSignerPercent: 30, maxUnavailableMinerPercent: 50},
+      effectAssertions: effect ? [{type: 'PodRestarted'}] : [],
+      recoveryAssertions: [{type: 'TargetReady'}],
+    },
+  };
+}
+
+function attacknetRun(source, overrides = {}) {
+  const spec = {
+    networkRef: 'demo', seed: 'opaque-seed',
+    campaignCatalog: [{name: 'kill', campaignRef: source.metadata.name}],
+    sequence: [{id: 'step-one', campaign: 'kill', delayAfterSeconds: 0}],
+    budgets: {
+      maxCampaigns: 1, maxWallTimeSeconds: 1800,
+      maxCumulativeFaultSeconds: 60, maxActiveFaults: 1,
+      maxSignerImpactPercent: 30, maxBurnchainFaults: 0,
+      maxInconclusiveCampaigns: 0,
+    },
+    stopPolicy: {
+      onCampaignFailure: 'Stop', onInconclusive: 'Stop',
+      onBudgetExhausted: 'Stop', onSuccess: 'Continue',
+    },
+    ...overrides,
+  };
+  return {
+    apiVersion: 'testing.stacks.org/v1alpha1', kind: 'AttacknetRun',
+    metadata: {
+      name: 'run-a', namespace: 'hacknet', uid: uid('run-a'), generation: 1,
+      resourceVersion: '1', creationTimestamp: '2026-01-01T00:00:00Z',
+    },
+    spec,
+  };
+}
+
+test('authoritative manifest rejects inconsistent signer ownership and remains canonical', () => {
+  const fixture = network();
+  const manifest = networkManifest(fixture);
+  assert.deepEqual(manifest.actors[1], {service: 'signer-1', role: 'signer', signerIndex: 1, signerWeight: 1});
+  fixture.spec.actors[2].signerWeight = 2;
+  assert.throws(() => networkManifest(fixture), /inconsistent authoritative weight/);
+  assert.equal(digest({b: 2, a: 1}), digest({a: 1, b: 2}));
+  assert.ok(stableName('x'.repeat(63), 'child').length <= 63);
+});
+
+test('template campaigns validate without creating a fault', async () => {
+  const api = new FakeApi();
+  const value = campaign({template: true});
+  api.put('faultcampaigns', value);
+  await new FaultCampaignReconciler(api).reconcile(value);
+  const admitted = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(admitted.status.phase, 'Pending');
+  assert.equal(admitted.status.reason, 'TemplateReady');
+  assert.equal((await api.list('podchaos', {group: 'chaos-mesh.org'})).items.length, 0);
+});
+
+test('Pod effect proof is tied to the immutable admitted UID', () => {
+  const value = campaign();
+  value.status = {resolvedTargets: [{
+    actor: 'signer-1', podUid: uid('signer-1'), restartCount: 0,
+  }]};
+  const unchanged = podEffectResults(value, [pod('signer-1', 'signer')]);
+  assert.equal(unchanged[0].outcome, 'Failed');
+  const replacement = pod('signer-1', 'signer');
+  replacement.metadata.uid = uid('signer-1-replacement');
+  const observed = podEffectResults(value, [replacement]);
+  assert.equal(observed[0].outcome, 'Proven');
+  assert.match(observed[0].message, /admitted Pod UID disappeared/);
+});
+
+test('campaign proves admission/injection/recovery but never invents effect evidence', async () => {
+  const api = new FakeApi();
+  api.put('stacksnetworks', network());
+  api.pods = [pod('signer-1', 'signer')];
+  api.put('faultcampaigns', campaign());
+  const reconciler = new FaultCampaignReconciler(api);
+
+  let value = await api.get('faultcampaigns', 'kill-signer');
+  await reconciler.reconcile(value);
+  value = await api.get('faultcampaigns', 'kill-signer');
+  assert.equal(value.status.phase, 'Admitted');
+  assert.equal(value.status.resolvedTargets[0].podUid, uid('signer-1'));
+
+  await reconciler.reconcile(value);
+  value = await api.get('faultcampaigns', 'kill-signer');
+  assert.equal(value.status.phase, 'Injecting');
+  const chaos = await api.get('podchaos', 'kill-signer', {group: 'chaos-mesh.org'});
+  chaos.status = {conditions: [{type: 'AllInjected', status: 'True'}]};
+  api.put('podchaos', chaos, 'chaos-mesh.org');
+
+  await reconciler.reconcile(value);
+  value = await api.get('faultcampaigns', 'kill-signer');
+  assert.equal(value.status.phase, 'Active');
+  const recovered = await api.get('podchaos', 'kill-signer', {group: 'chaos-mesh.org'});
+  recovered.status.conditions.push({type: 'AllRecovered', status: 'True'});
+  api.put('podchaos', recovered, 'chaos-mesh.org');
+
+  await reconciler.reconcile(value);
+  value = await api.get('faultcampaigns', 'kill-signer');
+  assert.equal(value.status.phase, 'Recovering');
+  assert.equal(value.status.cleanup.allRecovered, true);
+  await reconciler.reconcile(value);
+  value = await api.get('faultcampaigns', 'kill-signer');
+  assert.equal(value.status.phase, 'Inconclusive');
+  assert.equal(value.status.reason, 'EffectNotProven');
+});
+
+test('AttacknetRun snapshots a referenced template into exactly one owned execution', async () => {
+  const api = new FakeApi();
+  const source = campaign({template: true, effect: false});
+  api.put('stacksnetworks', network());
+  api.put('faultcampaigns', source);
+  const run = attacknetRun(source);
+  api.put('attacknetruns', run);
+  await new AttacknetRunReconciler(api).reconcile(run, [source]);
+  const updated = await api.get('attacknetruns', 'run-a');
+  assert.equal(updated.status.phase, 'Running');
+  const child = await api.get('faultcampaigns', updated.status.activeCampaign);
+  assert.equal(child.spec.template, false);
+  assert.equal(child.metadata.ownerReferences[0].uid, run.metadata.uid);
+  assert.equal(child.metadata.annotations['testing.stacks.org/source-template-uid'], source.metadata.uid);
+  assert.equal(child.metadata.annotations['testing.stacks.org/source-template-digest'], artifactDigest(source.spec));
+});
+
+test('AttacknetRun refuses a campaign whose resolved signer impact exceeds the aggregate run budget', async () => {
+  const api = new FakeApi();
+  const source = campaign({template: true, effect: false});
+  const admitted = network();
+  api.put('stacksnetworks', admitted);
+  api.put('faultcampaigns', source);
+  const run = attacknetRun(source, {
+    budgets: {
+      ...attacknetRun(source).spec.budgets,
+      maxSignerImpactPercent: 10,
+    },
+  });
+  api.put('attacknetruns', run);
+  await new AttacknetRunReconciler(api).reconcile(run, [source]);
+  const updated = await api.get('attacknetruns', run.metadata.name);
+  assert.equal(updated.status.phase, 'Failed');
+  assert.equal(updated.status.reason, 'CampaignBudgetExhausted');
+  assert.equal((await api.list('faultcampaigns')).items.length, 1);
+});
+
+test('FaultCampaign finalizer removes an owned fault before permitting deletion', async () => {
+  const api = new FakeApi();
+  const value = campaign();
+  value.metadata.deletionTimestamp = '2026-01-01T00:00:00Z';
+  api.put('faultcampaigns', value);
+  api.put('podchaos', {
+    metadata: {name: value.metadata.name, uid: uid('chaos')},
+    status: {conditions: [{type: 'AllRecovered', status: 'True'}]},
+  }, 'chaos-mesh.org');
+  await new FaultCampaignReconciler(api).reconcile(value);
+  const updated = await api.get('faultcampaigns', value.metadata.name);
+  assert.deepEqual(updated.metadata.finalizers, []);
+  assert.equal(await api.get('podchaos', value.metadata.name, {
+    group: 'chaos-mesh.org', allow404: true,
+  }), null);
+});

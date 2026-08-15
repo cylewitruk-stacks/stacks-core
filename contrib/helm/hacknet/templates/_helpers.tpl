@@ -41,3 +41,20 @@ app.kubernetes.io/component: operator
 {{- default .Release.Namespace .Values.watchNamespace }}
 {{- end }}
 
+{{- define "hacknet.runOperatorName" -}}
+{{- printf "%s-run" (include "hacknet.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "hacknet.runOperatorSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "hacknet.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: run-operator
+{{- end }}
+
+{{- define "hacknet.runServiceAccountName" -}}
+{{- if .Values.runServiceAccount.create }}
+{{- default (include "hacknet.runOperatorName" .) .Values.runServiceAccount.name }}
+{{- else }}
+{{- required "runServiceAccount.name is required when runServiceAccount.create=false" .Values.runServiceAccount.name }}
+{{- end }}
+{{- end }}

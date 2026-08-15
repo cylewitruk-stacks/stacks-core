@@ -1,0 +1,43 @@
+{{- if .Values.runOperator.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "hacknet.runOperatorName" . }}
+  namespace: {{ include "hacknet.watchNamespace" . }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: run-operator
+rules:
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["stacksnetworks"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["faultcampaigns", "attacknetruns"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["faultcampaigns/status", "attacknetruns/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["chaos-mesh.org"]
+    resources: ["podchaos", "networkchaos", "dnschaos", "iochaos", "timechaos"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "hacknet.runOperatorName" . }}
+  namespace: {{ include "hacknet.watchNamespace" . }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: run-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hacknet.runServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "hacknet.runOperatorName" . }}
+{{- end }}

@@ -280,8 +280,16 @@ kubectl delete -f contrib/attacknet/chaos-dashboard-cluster-access.yaml
 
 ## Current milestone
 
-The operator and current-main topology renderer are functional. The next
-milestone is a staged live capacity/parity run, followed by first-class
-`AttacknetRun` and `FaultCampaign` resources backed by Chaos Mesh. Fault
-controls must cover process/Pod failure, partitions and latency, DNS, I/O, and
-wall-clock skew, while recording each actor's resolved admitted configuration.
+The operator and current-main topology renderer are functional. Namespaced
+`FaultCampaign` and `AttacknetRun` APIs now provide signer-weight-aware
+admission, exact Ready-Pod identity resolution, one-fault-at-a-time execution,
+aggregate run budgets, finalizer-backed cleanup, and immutable template
+snapshots. A separate restricted run controller owns only these APIs and the
+five Chaos Mesh resource kinds; the topology operator has no Chaos permission.
+
+`AllInjected` is bookkeeping, not proof. Pod faults can currently be proven
+from admitted Kubernetes Pod UID/readiness/restart state. Network, DNS, I/O,
+and wall-clock campaigns remain `Inconclusive` until their trusted active
+probe evidence is integrated. The next live milestone is therefore a staged
+capacity/parity run and one proof-of-effect/recovery canary for each fault
+family, not merely successful Chaos resource creation.

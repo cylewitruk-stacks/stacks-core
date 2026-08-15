@@ -187,6 +187,10 @@ function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex
   return {
     name,
     role,
+    ...(signerIndex === undefined ? {} : {
+      signerIndex,
+      signerWeight: ((signerIndex - 1) % 3) + 1,
+    }),
     activationGate: delayedMiner ? {kind: 'burn-height', height: 223} : undefined,
     image,
     imagePullPolicy: 'IfNotPresent',
@@ -215,6 +219,8 @@ function signerActor(index, signer, image) {
   return {
     name: `signer-${index}`,
     role: 'signer',
+    signerIndex: index,
+    signerWeight: ((index - 1) % 3) + 1,
     image,
     imagePullPolicy: 'IfNotPresent',
     command: ['stacks-signer', 'run', '--config', '/etc/stacks/signer.toml'],
@@ -403,12 +409,8 @@ export function renderTopology(topology, output, {network = 'attacknet', namespa
     type: actor.role === 'signer' ? 'signer' : actor.role === 'burnchain' || actor.role === 'infrastructure' ? 'infrastructure' : 'node',
     role: actor.role,
     companion: actor.role === 'signer' ? `signer-node-${actor.name.slice('signer-'.length)}` : undefined,
-    signerIndex: actor.role === 'signer'
-      ? Number(actor.name.slice('signer-'.length))
-      : actor.role === 'companion' ? Number(actor.name.slice('signer-node-'.length)) : undefined,
-    signerWeight: ['signer', 'companion'].includes(actor.role)
-      ? ((Number(actor.name.slice(actor.role === 'signer' ? 'signer-'.length : 'signer-node-'.length)) - 1) % 3) + 1
-      : undefined,
+    signerIndex: actor.signerIndex,
+    signerWeight: actor.signerWeight,
     activationGate: actor.activationGate,
   });
   const manifest = {

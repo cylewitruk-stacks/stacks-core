@@ -1,0 +1,255 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "attacknetruns.testing.stacks.org",
+    "labels": {"app.kubernetes.io/name": "hacknet"}
+  },
+  "spec": {
+    "group": "testing.stacks.org",
+    "scope": "Namespaced",
+    "names": {
+      "plural": "attacknetruns",
+      "singular": "attacknetrun",
+      "kind": "AttacknetRun",
+      "shortNames": ["arun"],
+      "categories": ["all"]
+    },
+    "versions": [{
+      "name": "v1alpha1",
+      "served": true,
+      "storage": true,
+      "additionalPrinterColumns": [
+        {"name": "Phase", "type": "string", "jsonPath": ".status.phase"},
+        {"name": "Network", "type": "string", "jsonPath": ".spec.networkRef"},
+        {"name": "Active", "type": "string", "jsonPath": ".status.activeCampaign"},
+        {"name": "Campaigns", "type": "integer", "jsonPath": ".status.budgetUsage.campaigns"},
+        {"name": "Attribution", "type": "string", "jsonPath": ".status.attribution"},
+        {"name": "Evidence", "type": "string", "jsonPath": ".status.evidenceURI", "priority": 1},
+        {"name": "Age", "type": "date", "jsonPath": ".metadata.creationTimestamp"}
+      ],
+      "subresources": {"status": {}},
+      "schema": {
+        "openAPIV3Schema": {
+          "type": "object",
+          "description": "A finite, reproducible and budgeted sequence of FaultCampaign templates against one StacksNetwork.",
+          "required": ["spec"],
+          "properties": {
+            "apiVersion": {"type": "string"},
+            "kind": {"type": "string"},
+            "metadata": {"type": "object"},
+            "spec": {
+              "type": "object",
+              "required": ["networkRef", "seed", "campaignCatalog", "sequence", "budgets", "stopPolicy", "attributionPolicy", "replay", "resume", "minimization"],
+              "properties": {
+                "networkRef": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                },
+                "seed": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256,
+                  "description": "Opaque reproducibility seed interpreted only by the named decision algorithm."
+                },
+                "decisionAlgorithm": {"type": "string", "minLength": 1, "maxLength": 128, "default": "hmac-sha256-decisions/v1"},
+                "campaignCatalog": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 64,
+                  "x-kubernetes-list-type": "map",
+                  "x-kubernetes-list-map-keys": ["name"],
+                  "items": {
+                    "type": "object",
+                    "required": ["name", "campaignRef"],
+                    "properties": {
+                      "name": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                      "campaignRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                      "expectedUID": {"type": "string", "minLength": 1, "maxLength": 128},
+                      "expectedGeneration": {"type": "integer", "minimum": 1},
+                      "expectedSpecDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                    }
+                  }
+                },
+                "sequence": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 256,
+                  "x-kubernetes-list-type": "atomic",
+                  "items": {
+                    "type": "object",
+                    "required": ["id", "campaign"],
+                    "properties": {
+                      "id": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                      "campaign": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                      "delayAfterSeconds": {"type": "integer", "minimum": 0, "maximum": 3600},
+                      "enabled": {"type": "boolean", "default": true}
+                    }
+                  }
+                },
+                "budgets": {
+                  "type": "object",
+                  "required": ["maxCampaigns", "maxWallTimeSeconds", "maxCumulativeFaultSeconds", "maxActiveFaults", "maxSignerImpactPercent", "maxBurnchainFaults", "maxInconclusiveCampaigns"],
+                  "properties": {
+                    "maxCampaigns": {"type": "integer", "minimum": 1, "maximum": 256},
+                    "maxWallTimeSeconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+                    "maxCumulativeFaultSeconds": {"type": "integer", "minimum": 1, "maximum": 36000},
+                    "maxActiveFaults": {"type": "integer", "enum": [1], "default": 1},
+                    "maxSignerImpactPercent": {"type": "integer", "minimum": 0, "maximum": 30},
+                    "maxBurnchainFaults": {"type": "integer", "minimum": 0, "maximum": 10},
+                    "maxInconclusiveCampaigns": {"type": "integer", "minimum": 0, "maximum": 64}
+                  },
+                  "x-kubernetes-validations": [{
+                    "rule": "self.maxCumulativeFaultSeconds <= self.maxWallTimeSeconds",
+                    "message": "maxCumulativeFaultSeconds cannot exceed maxWallTimeSeconds"
+                  }]
+                },
+                "stopPolicy": {
+                  "type": "object",
+                  "required": ["onCampaignFailure", "onInconclusive", "onBudgetExhausted", "onSuccess"],
+                  "properties": {
+                    "onCampaignFailure": {"type": "string", "enum": ["Stop", "PauseForTriage"]},
+                    "onInconclusive": {"type": "string", "enum": ["Stop", "PauseForTriage", "Continue"]},
+                    "onBudgetExhausted": {"type": "string", "enum": ["Stop", "Pause"]},
+                    "onSuccess": {"type": "string", "enum": ["Continue", "Stop"]}
+                  }
+                },
+                "attributionPolicy": {
+                  "type": "object",
+                  "required": ["requiredOnFailure", "requireIncidentBundle", "allowedTerminalStates"],
+                  "properties": {
+                    "requiredOnFailure": {"type": "boolean", "enum": [true]},
+                    "requireIncidentBundle": {"type": "boolean", "enum": [true]},
+                    "allowedTerminalStates": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string", "enum": ["Triaged", "Remediated", "Inconclusive"]}}
+                  }
+                },
+                "replay": {
+                  "type": "object",
+                  "required": ["enabled", "requireSameResolvedImages", "verifyExpectedFailure"],
+                  "properties": {
+                    "enabled": {"type": "boolean"},
+                    "sourceRunRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                    "descriptorURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
+                    "descriptorDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "requireSameResolvedImages": {"type": "boolean"},
+                    "verifyExpectedFailure": {"type": "boolean"}
+                  },
+                  "x-kubernetes-validations": [{
+                    "rule": "!self.enabled || (has(self.sourceRunRef) && has(self.descriptorURI) && has(self.descriptorDigest))",
+                    "message": "enabled replay requires sourceRunRef, descriptorURI, and descriptorDigest"
+                  }]
+                },
+                "resume": {
+                  "type": "object",
+                  "required": ["enabled", "requireSameSeed", "requireSameResolvedImages"],
+                  "properties": {
+                    "enabled": {"type": "boolean"},
+                    "sourceRunRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                    "afterInstructionId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+                    "requireSameSeed": {"type": "boolean", "enum": [true]},
+                    "requireSameResolvedImages": {"type": "boolean", "enum": [true]}
+                  },
+                  "x-kubernetes-validations": [{
+                    "rule": "!self.enabled || (has(self.sourceRunRef) && has(self.afterInstructionId))",
+                    "message": "enabled resume requires sourceRunRef and afterInstructionId"
+                  }]
+                },
+                "minimization": {
+                  "type": "object",
+                  "required": ["enabled", "strategy", "maxAttempts", "requireFreshNetwork"],
+                  "properties": {
+                    "enabled": {"type": "boolean"},
+                    "strategy": {"type": "string", "enum": ["FailurePrefix", "DeltaDebug"]},
+                    "maxAttempts": {"type": "integer", "minimum": 0, "maximum": 64},
+                    "requireFreshNetwork": {"type": "boolean", "enum": [true]}
+                  },
+                  "x-kubernetes-validations": [{
+                    "rule": "self.enabled || self.maxAttempts == 0",
+                    "message": "disabled minimization must use maxAttempts=0"
+                  }]
+                }
+              },
+              "x-kubernetes-validations": [
+                {"rule": "self.sequence.size() <= self.budgets.maxCampaigns", "message": "ordered sequence exceeds maxCampaigns budget"},
+                {"rule": "self.sequence.all(step, self.campaignCatalog.exists(campaign, campaign.name == step.campaign))", "message": "every sequence campaign must exist in campaignCatalog"},
+                {"rule": "self.sequence.all(step, self.sequence.filter(other, other.id == step.id).size() == 1)", "message": "sequence instruction IDs must be unique"},
+                {"rule": "!(self.replay.enabled && self.resume.enabled)", "message": "replay and resume cannot both be enabled"}
+              ]
+            },
+            "status": {
+              "type": "object",
+              "properties": {
+                "observedGeneration": {"type": "integer", "minimum": 0},
+                "phase": {"type": "string", "enum": ["Pending", "Preparing", "Running", "Paused", "Minimizing", "Passed", "Failed", "Aborted", "Inconclusive"]},
+                "reason": {"type": "string", "maxLength": 128},
+                "message": {"type": "string", "maxLength": 4096},
+                "lastTransitionTime": {"type": "string", "format": "date-time"},
+                "startedAt": {"type": "string", "format": "date-time"},
+                "completedAt": {"type": "string", "format": "date-time"},
+                "finishedAt": {"type": "string", "format": "date-time"},
+                "activeCampaign": {"type": "string", "nullable": true, "maxLength": 63},
+                "activeChild": {"type": "object", "required": ["instructionId", "name", "uid"], "properties": {
+                  "instructionId": {"type": "string", "maxLength": 63},
+                  "name": {"type": "string", "maxLength": 63},
+                  "uid": {"type": "string", "maxLength": 128},
+                  "startedAt": {"type": "string", "format": "date-time"}
+                }},
+                "resolvedCampaigns": {"type": "array", "maxItems": 64, "x-kubernetes-list-type": "map", "x-kubernetes-list-map-keys": ["name"], "items": {"type": "object", "required": ["name", "sourceName", "sourceUID", "sourceGeneration", "specDigest"], "properties": {
+                  "name": {"type": "string", "maxLength": 63},
+                  "sourceName": {"type": "string", "maxLength": 63},
+                  "sourceUID": {"type": "string", "maxLength": 128},
+                  "sourceGeneration": {"type": "integer", "minimum": 1},
+                  "specDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                }}},
+                "decisions": {"type": "array", "maxItems": 512, "x-kubernetes-list-type": "atomic", "items": {"type": "object", "required": ["index", "execution", "phase", "completedAt"], "properties": {
+                  "index": {"type": "integer", "minimum": 0, "maximum": 1000000},
+                  "execution": {"type": "string", "maxLength": 63},
+                  "phase": {"type": "string", "enum": ["Passed", "Failed", "Inconclusive"]},
+                  "completedAt": {"type": "string", "format": "date-time"},
+                  "source": {"type": "string", "maxLength": 63},
+                  "sequence": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                  "instructionId": {"type": "string", "maxLength": 63},
+                  "campaign": {"type": "string", "maxLength": 63},
+                  "childName": {"type": "string", "maxLength": 63},
+                  "decision": {"type": "string", "enum": ["Selected", "Skipped", "Started", "Passed", "Failed", "Inconclusive", "Stopped"]},
+                  "choiceDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "occurredAt": {"type": "string", "format": "date-time"},
+                  "detailsDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+                }}},
+                "budgetUsage": {"type": "object", "properties": {
+                  "campaigns": {"type": "integer", "minimum": 0, "maximum": 256},
+                  "campaignsStarted": {"type": "integer", "minimum": 0, "maximum": 256},
+                  "campaignsCompleted": {"type": "integer", "minimum": 0, "maximum": 256},
+                  "activeFaults": {"type": "integer", "minimum": 0, "maximum": 1},
+                  "wallTimeSeconds": {"type": "number", "minimum": 0, "maximum": 86400},
+                  "cumulativeFaultSeconds": {"type": "number", "minimum": 0, "maximum": 36000},
+                  "maximumSignerImpactPercent": {"type": "number", "minimum": 0, "maximum": 100},
+                  "burnchainFaults": {"type": "integer", "minimum": 0, "maximum": 10},
+                  "inconclusiveCampaigns": {"type": "integer", "minimum": 0, "maximum": 64},
+                  "minimizationAttempts": {"type": "integer", "minimum": 0, "maximum": 64}
+                }},
+                "attribution": {"type": "string", "enum": ["NotRequired", "Untriaged", "Triaged", "Remediated", "Inconclusive"]},
+                "attributionURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
+                "replayPlanURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
+                "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
+                "evidenceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                "cleanup": {"type": "object", "properties": {"required": {"type": "boolean"}, "completed": {"type": "boolean"}, "completedAt": {"type": "string", "format": "date-time"}, "message": {"type": "string", "maxLength": 2048}}},
+                "conditions": {"type": "array", "maxItems": 16, "x-kubernetes-list-type": "map", "x-kubernetes-list-map-keys": ["type"], "items": {"type": "object", "required": ["type", "status", "reason", "message", "lastTransitionTime"], "properties": {
+                  "type": {"type": "string", "maxLength": 128},
+                  "status": {"type": "string", "enum": ["True", "False", "Unknown"]},
+                  "reason": {"type": "string", "maxLength": 128},
+                  "message": {"type": "string", "maxLength": 4096},
+                  "observedGeneration": {"type": "integer", "minimum": 0},
+                  "lastTransitionTime": {"type": "string", "format": "date-time"}
+                }}}
+              }
+            }
+          }
+        }
+      }
+    }]
+  }
+}

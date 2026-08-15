@@ -53,6 +53,36 @@
         "podSecurityContext": {"type": "object"}
       }
     },
+    "runOperator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "replicaCount", "image", "reconcileIntervalSeconds"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "replicaCount": {"type": "integer", "const": 1},
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "tag", "pullPolicy"],
+          "properties": {
+            "repository": {"type": "string", "minLength": 1},
+            "tag": {"type": "string", "minLength": 1},
+            "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+          }
+        },
+        "imagePullSecrets": {"type": "array", "items": {"type": "object"}},
+        "logLevel": {"enum": ["DEBUG", "INFO", "WARNING", "ERROR"]},
+        "reconcileIntervalSeconds": {"type": "integer", "minimum": 1, "maximum": 60},
+        "resources": {"type": "object"},
+        "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+        "podLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+        "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+        "tolerations": {"type": "array", "items": {"type": "object"}},
+        "affinity": {"type": "object"},
+        "securityContext": {"type": "object"},
+        "podSecurityContext": {"type": "object"}
+      }
+    },
     "serviceAccount": {
       "type": "object",
       "additionalProperties": false,
@@ -63,7 +93,17 @@
         "annotations": {"type": "object", "additionalProperties": {"type": "string"}},
         "tokenExpirationSeconds": {"type": "integer", "minimum": 600, "maximum": 86400}
       }
+    },
+    "runServiceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
     }
   },
-  "required": ["operator", "serviceAccount", "watchNamespace"]
+  "required": ["operator", "runOperator", "serviceAccount", "runServiceAccount", "watchNamespace"]
 }
