@@ -1301,6 +1301,7 @@ fn bitcoind_integration_test() {
         assert!(res.contains("stacks_node_last_block_write_count 0"));
         assert!(res.contains("stacks_node_last_block_write_length 0"));
         assert!(res.contains("stacks_node_last_block_runtime 0"));
+        assert!(res.contains("stacks_node_process_wall_clock_seconds "));
         assert!(res.contains("stacks_node_last_block_transaction_count 1"));
 
         assert!(res.contains("stacks_node_last_mined_block_read_count 0"));

@@ -108,6 +108,31 @@ lazy_static! {
         &["conflict"]
     ).unwrap();
 
+    pub static ref SIGNER_GLOBAL_STATE_AVAILABLE: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_global_state_available",
+        "Whether the current reward-cycle evaluator can derive a global signer state (1 or 0)"
+    )).unwrap();
+    pub static ref SIGNER_GLOBAL_STATE_TOTAL_WEIGHT: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_global_state_total_weight",
+        "Total configured signer weight in the current reward cycle"
+    )).unwrap();
+    pub static ref SIGNER_GLOBAL_STATE_KNOWN_WEIGHT: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_global_state_known_weight",
+        "Configured signer weight from which a latest state update is currently known"
+    )).unwrap();
+    pub static ref SIGNER_GLOBAL_STATE_MAXIMUM_VIEW_WEIGHT: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_global_state_maximum_view_weight",
+        "Greatest signer weight currently supporting one exact global state view"
+    )).unwrap();
+    pub static ref SIGNER_GLOBAL_STATE_EVALUATOR_THRESHOLD_WEIGHT: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_global_state_evaluator_threshold_weight",
+        "Rounded-down weight threshold currently used by the global state evaluator"
+    )).unwrap();
+    pub static ref SIGNER_GLOBAL_STATE_CANONICAL_THRESHOLD_WEIGHT: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_global_state_canonical_threshold_weight",
+        "Rounded-up weight threshold enforced for Nakamoto block signatures"
+    )).unwrap();
+
     pub static ref SIGNER_AGREEMENT_CAPITULATION_LATENCIES_HISTOGRAM: HistogramVec = register_histogram_vec!(histogram_opts!(
         "stacks_signer_agreement_capitulation_latencies_histogram",
         "Measuring the time (in seconds) for the signer to agree (capitulate) with the signer set",

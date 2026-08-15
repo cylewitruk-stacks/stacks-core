@@ -61,6 +61,7 @@ pub mod actions {
     use crate::monitoring::prometheus::*;
     use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
     use crate::v0::signer_state::LocalStateMachine;
+    use libsigner::v0::signer_state::GlobalStateAgreementSnapshot;
 
     /// Update stacks tip height gauge
     pub fn update_stacks_tip_height(height: i64) {
@@ -174,6 +175,20 @@ pub mod actions {
             .inc();
     }
 
+    /// Record the current reward-cycle global-state support. Values are kept
+    /// as separate bounded gauges so a lifecycle gate can fail closed without
+    /// inferring agreement from proposal/rejection counters.
+    pub fn update_global_state_agreement(snapshot: GlobalStateAgreementSnapshot) {
+        SIGNER_GLOBAL_STATE_AVAILABLE.set(i64::from(snapshot.global_state_available));
+        SIGNER_GLOBAL_STATE_TOTAL_WEIGHT.set(i64::from(snapshot.total_weight));
+        SIGNER_GLOBAL_STATE_KNOWN_WEIGHT.set(i64::from(snapshot.known_weight));
+        SIGNER_GLOBAL_STATE_MAXIMUM_VIEW_WEIGHT.set(i64::from(snapshot.maximum_state_view_weight));
+        SIGNER_GLOBAL_STATE_EVALUATOR_THRESHOLD_WEIGHT
+            .set(i64::from(snapshot.evaluator_threshold_weight));
+        SIGNER_GLOBAL_STATE_CANONICAL_THRESHOLD_WEIGHT
+            .set(i64::from(snapshot.canonical_threshold_weight));
+    }
+
     /// Record the time (seconds) taken for a signer to agree with the signer set
     pub fn record_signer_agreement_capitulation_latency(latency_s: u64) {
         SIGNER_AGREEMENT_CAPITULATION_LATENCIES_HISTOGRAM
@@ -270,6 +285,12 @@ pub mod actions {
 
     /// Increment signer agreement state conflict counter
     pub fn increment_signer_agreement_state_conflict(_conflict: SignerAgreementStateConflict) {}
+
+    /// No-op global state support metrics when Prometheus is disabled.
+    pub fn update_global_state_agreement(
+        _snapshot: libsigner::v0::signer_state::GlobalStateAgreementSnapshot,
+    ) {
+    }
 
     /// Record the time (seconds) taken for a signer to agree with the signer set
     pub fn record_signer_agreement_capitulation_latency(_latency_s: u64) {}

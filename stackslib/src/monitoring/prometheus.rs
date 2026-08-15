@@ -34,6 +34,11 @@ lazy_static! {
         // Will use DEFAULT_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0] by default
     ), &["path"]).unwrap();
 
+    pub static ref PROCESS_WALL_CLOCK_TIME: Gauge = register_gauge!(opts!(
+        "stacks_node_process_wall_clock_seconds",
+        "Current Unix time observed by the Stacks process while serving this metrics scrape."
+    )).unwrap();
+
     pub static ref STX_BLOCKS_RECEIVED_COUNTER: IntCounter = register_int_counter!(opts!(
         "stacks_node_stx_blocks_received_total",
         "Total number of Stacks blocks received"
