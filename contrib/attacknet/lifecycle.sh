@@ -754,6 +754,17 @@ ensure_burnchain_policy() {
   kubectl -n "${NAMESPACE}" apply -f "${rendered_policy}"
 }
 
+ensure_clock_policy() {
+  local rendered_policy="$1"
+  if kubectl -n "${NAMESPACE}" get configmap "${NETWORK}-clock-policy" >/dev/null 2>&1; then
+    # This mutable data plane belongs to active FaultCampaigns. Reapplying the
+    # rendered zero offsets during resume could silently clear a live fault.
+    echo "Preserving admitted application-clock policy for ${NETWORK}"
+    return 0
+  fi
+  kubectl -n "${NAMESPACE}" apply -f "${rendered_policy}"
+}
+
 needs_post_ready_clock_start() {
   local gated="$1" bootstrap_network="$2"
   [ "${AUTO_START_BURNCHAIN}" = 1 ] && [ -z "${gated}" ] && [ ! -f "${bootstrap_network}" ]
@@ -811,6 +822,7 @@ apply_network() {
       "--details=${start_details}" >/dev/null
   fi
   ensure_burnchain_policy "${generated}/burnchain-policy.configmap.json"
+  ensure_clock_policy "${generated}/clock-policy.configmap.json"
   if [ -f "${bootstrap_network}" ]; then
     kubectl -n "${NAMESPACE}" apply -f "${bootstrap_network}"
   else
@@ -945,6 +957,7 @@ delete_network() {
   fi
   kubectl -n "${NAMESPACE}" delete stacksnetwork "${NETWORK}" --ignore-not-found --wait=false
   kubectl -n "${NAMESPACE}" delete configmap "${NETWORK}-burnchain-policy" --ignore-not-found
+  kubectl -n "${NAMESPACE}" delete configmap "${NETWORK}-clock-policy" --ignore-not-found
   kubectl -n "${NAMESPACE}" delete deployments,statefulsets,daemonsets,services,configmaps,secrets,pvc,serviceaccounts,roles,rolebindings \
     -l "testing.stacks.org/network=${NETWORK},app.kubernetes.io/part-of=stacks-attacknet" \
     --ignore-not-found --wait=false

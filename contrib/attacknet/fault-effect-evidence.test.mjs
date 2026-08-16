@@ -297,6 +297,21 @@ test('Time proof normalizes target wall-clock shift against monotonic and indepe
   assert.equal(noControl.verdict, 'Inconclusive');
 });
 
+test('controller-owned clock policy uses the same process-clock proof with distinct injection authority', () => {
+  const before = phase('before', 'application-process-metric', [
+    clock(target.actor, false, 1000, 100), clock('control-1', true, 2000, 500),
+  ], false, 'controller-clock-policy');
+  const during = phase('during', 'application-process-metric', [
+    clock(target.actor, false, 980, 110), clock('control-1', true, 2010, 510),
+  ], true, 'controller-clock-policy');
+  const after = phase('after', 'application-process-metric', [
+    clock(target.actor, false, 1020, 120), clock('control-1', true, 2020, 520),
+  ], false, 'controller-clock-policy');
+  const result = evaluate(campaign('ClockSkewPolicy', null, {timeOffset: '-30s'}), before, during, after);
+  assert.equal(result.verdict, 'Proven');
+  assert.equal(result.recovery.verdict, 'Proven');
+});
+
 test('rejects actor-supplied authority and malformed/unbounded probe data', () => {
   const actorSource = phase('before', 'active-probe', [network()]);
   actorSource.source.trust = 'actor-self-reported';

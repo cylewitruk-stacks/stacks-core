@@ -33,6 +33,8 @@ const CHAOS_PLURALS = Object.freeze({
   IOChaos: 'iochaos', TimeChaos: 'timechaos',
 });
 const IO_PRESSURE_MECHANISM = 'controller-owned-io-pressure-pod';
+const CLOCK_POLICY_MECHANISM = 'controller-owned-application-clock-policy';
+const CLOCK_POLICY_ZERO = '+0s\n';
 const IO_PRESSURE_MOUNT = '/data';
 const IO_PRESSURE_RESOURCES = Object.freeze({
   low: {requests: {cpu: '25m', memory: '24Mi'}, limits: {cpu: '250m', memory: '64Mi'}},
@@ -647,6 +649,7 @@ function chaosIdentity(campaign) {
   const kind = {
     pod: 'PodChaos', network: 'NetworkChaos', dns: 'DNSChaos', io: 'IOChaos',
     'io-pressure': 'IOPressurePod', time: 'TimeChaos',
+    'clock-skew': 'ClockSkewPolicy',
   }[type];
   if (!kind) throw new Error(`unsupported fault type ${type}`);
   if (kind === 'IOPressurePod') {
@@ -655,10 +658,38 @@ function chaosIdentity(campaign) {
       name: stableName('io-pressure', campaign.metadata.name),
     };
   }
+  if (kind === 'ClockSkewPolicy') {
+    return {
+      kind, plural: 'configmaps', group: '', version: 'v1',
+      name: `${campaign.spec.networkRef}-clock-policy`,
+    };
+  }
   return {
     kind, plural: CHAOS_PLURALS[kind], group: 'chaos-mesh.org',
     version: 'v1alpha1', name: campaign.metadata.name,
   };
+}
+
+function clockPolicyContract(campaign, policy) {
+  return {
+    mechanism: CLOCK_POLICY_MECHANISM,
+    network: campaign.spec.networkRef,
+    policyName: policy.metadata?.name,
+    policyUid: policy.metadata?.uid,
+    policyActors: Object.keys(policy.data ?? {}).sort(),
+    actors: (campaign.status?.resolvedTargets ?? []).map(target => target.actor).sort(),
+    offset: campaign.spec?.fault?.parameters?.timeOffset,
+  };
+}
+
+function clockPolicyMatches(policy, campaign, expectedOffset) {
+  if (policy.metadata?.labels?.['testing.stacks.org/network'] !== campaign.spec.networkRef
+      || policy.metadata?.labels?.['testing.stacks.org/clock-policy'] !== 'true') return false;
+  const selected = new Set((campaign.status?.resolvedTargets ?? []).map(target => target.actor));
+  return selected.size > 0
+    && [...selected].every(actor => policy.data?.[actor] === expectedOffset)
+    && Object.entries(policy.data ?? {}).every(([actor, value]) =>
+      value === (selected.has(actor) ? expectedOffset : CLOCK_POLICY_ZERO));
 }
 
 function identityOptions(identity, allow404 = false) {
@@ -836,6 +867,29 @@ export class FaultCampaignReconciler {
 
   async removeChaos(campaign) {
     const identity = chaosIdentity(campaign);
+    if (identity.kind === 'ClockSkewPolicy') {
+      // No policy mutation occurred for pre-admission failures.
+      if (!campaign.status?.chaos?.uid) return {absent: true, allRecovered: true, method: 'Normal'};
+      let current = await this.api.get(identity.plural, identity.name,
+        identityOptions(identity, true));
+      if (!current) return {absent: false, allRecovered: false, method: 'ClockPolicyMissing'};
+      if (current.metadata?.uid !== campaign.status.chaos.uid
+          || current.metadata?.labels?.['testing.stacks.org/network'] !== campaign.spec.networkRef
+          || current.metadata?.labels?.['testing.stacks.org/clock-policy'] !== 'true') {
+        throw new Error(`refusing to mutate unbound clock policy ${identity.name}`);
+      }
+      const reset = Object.fromEntries(
+        (campaign.status?.resolvedTargets ?? []).map(target => [target.actor, CLOCK_POLICY_ZERO]),
+      );
+      if (!clockPolicyMatches(current, campaign, CLOCK_POLICY_ZERO)) {
+        await this.api.patch(identity.plural, identity.name, {
+          metadata: {resourceVersion: current.metadata.resourceVersion}, data: reset,
+        }, identityOptions(identity));
+        current = await this.api.get(identity.plural, identity.name, identityOptions(identity));
+      }
+      const cleared = clockPolicyMatches(current, campaign, CLOCK_POLICY_ZERO);
+      return {absent: cleared, allRecovered: cleared, method: 'ClockPolicyReset'};
+    }
     const current = await this.api.get(identity.plural, identity.name,
       identityOptions(identity, true));
     if (!current) return {absent: true, allRecovered: true};
@@ -909,6 +963,37 @@ export class FaultCampaignReconciler {
 
   async faultCapabilityEvidence(campaign, pods, targets) {
     const type = campaign.spec?.fault?.type;
+    if (type === 'clock-skew') {
+      const policyName = `${campaign.spec.networkRef}-clock-policy`;
+      const policy = await this.api.get('configmaps', policyName, {group: '', allow404: true});
+      return targets.map(target => {
+        const pod = (pods.items ?? []).find(item => item.metadata?.uid === target.podUid);
+        const actor = pod?.spec?.containers?.find(item => item.name === 'actor');
+        const env = Object.fromEntries((actor?.env ?? [])
+          .filter(item => typeof item.value === 'string').map(item => [item.name, item.value]));
+        const mount = actor?.volumeMounts?.find(item => item.mountPath === '/run/attacknet-clock');
+        const volume = pod?.spec?.volumes?.find(item => item.name === mount?.name);
+        const cleanPolicy = Object.keys(policy?.data ?? {}).length > 0
+          && Object.values(policy.data).every(value => value === CLOCK_POLICY_ZERO);
+        const supported = policy?.metadata?.labels?.['testing.stacks.org/network'] === campaign.spec.networkRef
+          && policy?.metadata?.labels?.['testing.stacks.org/clock-policy'] === 'true'
+          && cleanPolicy
+          && policy?.data?.[target.actor] === CLOCK_POLICY_ZERO
+          && volume?.configMap?.name === policyName
+          && env.LD_PRELOAD === '/usr/lib/stacks-attacknet/libfaketime.so.1'
+          && env.FAKETIME_TIMESTAMP_FILE === `/run/attacknet-clock/${target.actor}`
+          && env.FAKETIME_DONT_FAKE_MONOTONIC === '1'
+          && env.FAKETIME_NO_CACHE === '1';
+        return {
+          actor: target.actor, podUid: target.podUid,
+          source: 'attacknet-run-operator/v1', observedAt: now(),
+          platform: 'application-clock-policy', architecture: 'image-contract', supported,
+          reason: supported
+            ? `${CLOCK_POLICY_MECHANISM} is mounted and initialized at zero offset`
+            : `${CLOCK_POLICY_MECHANISM} image, environment, volume, or zero-offset policy contract is incomplete`,
+        };
+      });
+    }
     if (type === 'io-pressure') {
       return targets.map(target => ({
         actor: target.actor, podUid: target.podUid,
@@ -975,7 +1060,7 @@ export class FaultCampaignReconciler {
         return {actor: target.actor, error: String(error.message ?? error)};
       }
     }));
-    if (identity.kind === 'TimeChaos') {
+    if (identity.kind === 'TimeChaos' || identity.kind === 'ClockSkewPolicy') {
       try {
         const control = controlTarget(network, pods, selectedActors);
         responses.push(await this.probes.probe(control, {
@@ -1012,6 +1097,16 @@ export class FaultCampaignReconciler {
       return;
     }
     if (TERMINAL_PHASES.has(campaign.status?.phase)) {
+      if (chaosIdentity(campaign).kind === 'ClockSkewPolicy'
+          && campaign.status?.chaos?.uid
+          && !(campaign.status?.recoveryResults ?? []).some(result =>
+            result.assertion === 'ClockSkewCleared' && result.outcome === 'Proven')) {
+        const cleanup = await this.removeChaos(campaign);
+        await this.patchStatus(campaign, status(campaign.status, 'Recovering', 'WaitingForClockRecoveryEvidence', {
+          cleanup: {...cleanup, observedAt: now()}, completedAt: null,
+        }));
+        return;
+      }
       const cleanup = await this.removeChaos(campaign);
       if (!cleanup.absent) return;
       if (campaign.status?.cleanup?.absent !== true) {
@@ -1162,6 +1257,36 @@ export class FaultCampaignReconciler {
 
     const identity = chaosIdentity(campaign);
     if (phase === 'Admitted') {
+      if (identity.kind === 'ClockSkewPolicy') {
+        const policy = await this.api.get(identity.plural, identity.name,
+          identityOptions(identity, true));
+        if (!policy || !clockPolicyMatches(policy, campaign, CLOCK_POLICY_ZERO)) {
+          await this.patchStatus(campaign, status(campaign.status, 'Failed', 'ClockPolicyUnavailable', {
+            message: 'application clock policy disappeared, changed identity, or was non-zero before injection',
+            completedAt: now(),
+          }));
+          return;
+        }
+        const offset = `${campaign.spec.fault.parameters.timeOffset}\n`;
+        const values = Object.fromEntries(
+          campaign.status.resolvedTargets.map(target => [target.actor, offset]),
+        );
+        const contractDigest = artifactDigest(clockPolicyContract(campaign, policy));
+        await this.api.patch(identity.plural, identity.name, {
+          metadata: {resourceVersion: policy.metadata.resourceVersion}, data: values,
+        }, identityOptions(identity));
+        const admitted = await this.api.get(identity.plural, identity.name, identityOptions(identity));
+        if (!clockPolicyMatches(admitted, campaign, offset)) {
+          throw new Error('application clock policy mutation was not durably admitted');
+        }
+        await this.patchStatus(campaign, status(campaign.status, 'Injecting', 'ClockPolicyApplied', {
+          chaos: {
+            kind: identity.kind, name: identity.name, uid: admitted.metadata.uid, createdAt: now(),
+            mechanism: CLOCK_POLICY_MECHANISM, resourceDigest: contractDigest,
+          },
+        }));
+        return;
+      }
       const existing = await this.api.get(identity.plural, identity.name,
         identityOptions(identity, true));
       if (existing && existing.metadata?.ownerReferences?.[0]?.uid !== campaign.metadata.uid) {
@@ -1208,6 +1333,90 @@ export class FaultCampaignReconciler {
       identityOptions(identity, true));
     if (phase === 'Injecting') {
       if (!chaos) throw new Error('Chaos resource disappeared before injection was observed');
+      if (identity.kind === 'ClockSkewPolicy') {
+        const offset = `${campaign.spec.fault.parameters.timeOffset}\n`;
+        if (chaos.metadata?.uid !== campaign.status?.chaos?.uid
+            || artifactDigest(clockPolicyContract(campaign, chaos)) !== campaign.status?.chaos?.resourceDigest
+            || !clockPolicyMatches(chaos, campaign, offset)) {
+          throw new Error('admitted application clock policy identity or values changed');
+        }
+        const pods = await this.api.list('pods', {
+          group: '', labels: `testing.stacks.org/network=${manifest.network}`,
+        });
+        const during = await this.collectProbePhase(campaign, compiled, network, pods, 'during', true);
+        const probeArtifacts = {...(campaign.status?.probeArtifacts ?? {}), duringJson: JSON.stringify(during)};
+        let evaluation;
+        try {
+          const before = JSON.parse(probeArtifacts.beforeJson);
+          const placeholderAfter = {
+            ...before, phase: 'after', capturedAt: now(),
+            injection: {
+              allInjectedObserved: false,
+              source: {
+                trust: 'orchestrator-observed', authority: 'controller-clock-policy',
+                collector: 'attacknet-run-operator/v1',
+              },
+            },
+          };
+          evaluation = evaluateFaultEffect({
+            campaign: compiled.resource, evidence: compiled.evidence,
+            resolvedTargets: {
+              schemaVersion: 1, network: manifest.network, namespace: manifest.namespace,
+              resolvedAt: campaign.status.admission.admittedAt,
+              targets: campaign.status.resolvedTargets,
+            },
+            before, during,
+            // Recovery is not classified in this phase. Supplying the clean
+            // baseline as a placeholder lets the shared evaluator classify
+            // only the requested before/during effect without trusting the
+            // policy mutation itself as evidence.
+            after: placeholderAfter,
+          });
+        } catch (error) {
+          if (elapsedSeconds(campaign.status?.chaos?.createdAt)
+              <= assertionTimeout(campaign.spec.effectAssertions, 90)) {
+            await this.patchStatus(campaign, status(campaign.status, 'Injecting', 'WaitingForEffectEvidence', {
+              probeArtifacts, message: String(error.message ?? error).slice(0, 1000),
+            }));
+            return;
+          }
+          const cleanup = await this.removeChaos(campaign);
+          await this.patchStatus(campaign, status(campaign.status, 'Recovering', 'ClockPolicyResetAfterInvalidEvidence', {
+            probeArtifacts, message: String(error.message ?? error).slice(0, 1000),
+            cleanup: {...cleanup, observedAt: now()},
+          }));
+          return;
+        }
+        if (evaluation.effect.verdict === 'Proven') {
+          await this.patchStatus(campaign, status(campaign.status, 'Active', 'ClockSkewObserved', {
+            injectedAt: campaign.status?.injectedAt ?? now(),
+            actualInjection: {
+              mechanism: CLOCK_POLICY_MECHANISM, allInjectedObserved: true,
+              configMapUid: chaos.metadata.uid, policyName: identity.name,
+              requestedOffset: campaign.spec.fault.parameters.timeOffset, observedAt: now(),
+            },
+            probeArtifacts,
+          }));
+          return;
+        }
+        if (elapsedSeconds(campaign.status?.chaos?.createdAt)
+            <= assertionTimeout(campaign.spec.effectAssertions, 90)) {
+          await this.patchStatus(campaign, status(campaign.status, 'Injecting', 'WaitingForEffectEvidence', {
+            actualInjection: {
+              mechanism: CLOCK_POLICY_MECHANISM, allInjectedObserved: false,
+              configMapUid: chaos.metadata.uid, policyName: identity.name,
+              requestedOffset: campaign.spec.fault.parameters.timeOffset, observedAt: now(),
+            },
+            probeArtifacts,
+          }));
+          return;
+        }
+        const cleanup = await this.removeChaos(campaign);
+        await this.patchStatus(campaign, status(campaign.status, 'Recovering', 'ClockPolicyResetAfterUnprovenEffect', {
+          probeArtifacts, cleanup: {...cleanup, observedAt: now()},
+        }));
+        return;
+      }
       if (identity.kind === 'IOPressurePod') {
         if (chaos.metadata?.uid !== campaign.status?.chaos?.uid
             || chaos.metadata?.ownerReferences?.[0]?.uid !== campaign.metadata.uid
@@ -1349,6 +1558,15 @@ export class FaultCampaignReconciler {
 
     if (phase === 'Active') {
       if (!chaos) throw new Error('Chaos resource disappeared without recovery evidence');
+      if (identity.kind === 'ClockSkewPolicy') {
+        if (elapsedSeconds(campaign.status.injectedAt)
+            < durationSeconds(compiled.resource.spec.duration)) return;
+        const cleanup = await this.removeChaos(campaign);
+        await this.patchStatus(campaign, status(campaign.status, 'Recovering', 'ClockPolicyReset', {
+          cleanup: {...cleanup, observedAt: now()},
+        }));
+        return;
+      }
       if (identity.kind === 'IOPressurePod') {
         if (ioPressurePodRunning(chaos)) {
           const deadline = durationSeconds(compiled.resource.spec.duration)
@@ -1432,8 +1650,8 @@ export class FaultCampaignReconciler {
     }
 
     if (phase === 'Recovering') {
-      const remaining = await this.api.get(identity.plural, identity.name,
-        identityOptions(identity, true));
+      const remaining = identity.kind === 'ClockSkewPolicy' ? null
+        : await this.api.get(identity.plural, identity.name, identityOptions(identity, true));
       if (remaining) return;
       // The absence check above is the authoritative cleanup barrier. Carry it
       // into the same status update that may become terminal; otherwise a
@@ -1479,12 +1697,12 @@ export class FaultCampaignReconciler {
           const assertion = {
             NetworkChaos: 'NetworkDegraded', DNSChaos: 'DNSDegraded',
             IOChaos: 'IODegraded', IOPressurePod: 'IOPressureObserved',
-            TimeChaos: 'ClockSkewObserved',
+            TimeChaos: 'ClockSkewObserved', ClockSkewPolicy: 'ClockSkewObserved',
           }[identity.kind];
           const recoveryAssertion = {
             NetworkChaos: 'NetworkRecovered', DNSChaos: 'DNSRecovered',
             IOChaos: 'IORecovered', IOPressurePod: 'IOPressureRecovered',
-            TimeChaos: 'ClockSkewCleared',
+            TimeChaos: 'ClockSkewCleared', ClockSkewPolicy: 'ClockSkewCleared',
           }[identity.kind];
           const title = value => value[0].toUpperCase() + value.slice(1);
           effectResults = evaluation.evaluations.map(item => ({
@@ -1529,7 +1747,7 @@ export class FaultCampaignReconciler {
           recoveredResults.some(result => result.assertion === assertion.type
             && (assertion.actor === undefined || result.actor === assertion.actor))));
       const proven = effectProven && recoveryProven;
-      if (effectProven && !recoveryProven
+      if ((effectProven || identity.kind === 'ClockSkewPolicy') && !recoveryProven
           && elapsedSeconds(campaign.status?.cleanup?.observedAt)
             <= assertionTimeout(campaign.spec.recoveryAssertions, 300)) {
         // Recovery is a bounded observation window, not a single sample. A

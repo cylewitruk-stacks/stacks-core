@@ -22,7 +22,7 @@ rules:
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "create", "patch", "delete"]
   - apiGroups: ["chaos-mesh.org"]
     resources: ["podchaos", "networkchaos", "dnschaos", "iochaos", "timechaos"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]

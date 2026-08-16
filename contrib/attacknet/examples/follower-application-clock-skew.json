@@ -1,0 +1,29 @@
+{
+  "apiVersion": "testing.stacks.org/v1alpha1",
+  "kind": "FaultCampaign",
+  "metadata": {
+    "name": "follower-1-application-clock-skew",
+    "namespace": "hacknet-system"
+  },
+  "spec": {
+    "template": true,
+    "networkRef": "attacknet",
+    "target": {"actors": ["follower-1"]},
+    "fault": {
+      "type": "clock-skew",
+      "mode": "all",
+      "duration": "20s",
+      "parameters": {
+        "timeOffset": "-30s",
+        "clockIds": ["CLOCK_REALTIME"],
+        "containerNames": ["actor"]
+      }
+    },
+    "safety": {
+      "maxUnavailableSignerPercent": 30,
+      "maxUnavailableMinerPercent": 50
+    },
+    "effectAssertions": [{"type": "ClockSkewObserved", "timeoutSeconds": 90}],
+    "recoveryAssertions": [{"type": "ClockSkewCleared", "timeoutSeconds": 180}]
+  }
+}

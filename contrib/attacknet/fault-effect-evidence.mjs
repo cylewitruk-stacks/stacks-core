@@ -13,6 +13,7 @@ const KIND_TO_PROBE = Object.freeze({
   IOChaos: 'io',
   IOPressurePod: 'io',
   TimeChaos: 'clock',
+  ClockSkewPolicy: 'clock',
 });
 const EXPECTED_AUTHORITY = Object.freeze({
   PodChaos: 'kubernetes-api',
@@ -21,6 +22,7 @@ const EXPECTED_AUTHORITY = Object.freeze({
   IOChaos: 'active-probe',
   IOPressurePod: 'active-probe',
   TimeChaos: 'application-process-metric',
+  ClockSkewPolicy: 'application-process-metric',
 });
 const PHASES = new Set(['before', 'during', 'after']);
 const POD_PHASES = new Set(['Pending', 'Running', 'Succeeded', 'Failed', 'Unknown']);
@@ -31,7 +33,10 @@ const ACTIONS = Object.freeze({
   IOChaos: new Set(['latency', 'fault', 'attrOverride', 'mistake']),
   IOPressurePod: new Set(['disk-pressure']),
   TimeChaos: new Set(['time']),
+  ClockSkewPolicy: new Set(['time']),
 });
+
+const CLOCK_KINDS = new Set(['TimeChaos', 'ClockSkewPolicy']);
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -282,17 +287,19 @@ function normalizePhase(value, expectedPhase, kind) {
   if (phase.schemaVersion !== FAULT_PROBE_SCHEMA) throw new Error(`${expectedPhase}.schemaVersion must be ${FAULT_PROBE_SCHEMA}`);
   if (phase.phase !== expectedPhase || !PHASES.has(phase.phase)) throw new Error(`${expectedPhase}.phase must be ${expectedPhase}`);
   const source = normalizeSource(phase.source, `${expectedPhase}.source`, EXPECTED_AUTHORITY[kind]);
-  if (kind === 'TimeChaos' && source.contentTrust !== 'actor-self-reported') {
+  if (CLOCK_KINDS.has(kind) && source.contentTrust !== 'actor-self-reported') {
     throw new Error(`${expectedPhase}.source.contentTrust must disclose actor-self-reported time content`);
   }
-  if (kind !== 'TimeChaos' && source.contentTrust !== undefined) {
+  if (!CLOCK_KINDS.has(kind) && source.contentTrust !== undefined) {
     throw new Error(`${expectedPhase}.source.contentTrust is only valid for TimeChaos`);
   }
   if (phase.capturedAt !== undefined && !Number.isFinite(Date.parse(phase.capturedAt))) {
     throw new Error(`${expectedPhase}.capturedAt must be RFC 3339 when present`);
   }
   const injection = normalizeInjection(phase.injection, `${expectedPhase}.injection`,
-    kind === 'IOPressurePod' ? 'kubernetes-pod-status' : 'chaos-mesh-status');
+    kind === 'IOPressurePod' ? 'kubernetes-pod-status'
+      : kind === 'ClockSkewPolicy' ? 'controller-clock-policy'
+        : 'chaos-mesh-status');
   if (!Array.isArray(phase.observations) || phase.observations.length > 10_000) {
     throw new Error(`${expectedPhase}.observations must be an array of at most 10000 entries`);
   }
@@ -303,6 +310,7 @@ function normalizePhase(value, expectedPhase, kind) {
     IOChaos: normalizeIoObservation,
     IOPressurePod: normalizeIoObservation,
     TimeChaos: normalizeClockObservation,
+    ClockSkewPolicy: normalizeClockObservation,
   }[kind];
   return {
     schemaVersion: phase.schemaVersion,
@@ -789,7 +797,7 @@ export function evaluateFaultEffect({campaign, evidence, resolvedTargets, before
   object(compiled.metadata, 'campaign.metadata');
   const name = string(compiled.metadata.name, 'campaign.metadata.name', 63);
   const spec = object(compiled.spec, 'campaign.spec');
-  const action = kind === 'TimeChaos' ? 'time'
+  const action = CLOCK_KINDS.has(kind) ? 'time'
     : kind === 'IOPressurePod' ? 'disk-pressure'
       : string(spec.action, 'campaign.spec.action', 64);
   if (!ACTIONS[kind].has(action)) throw new Error(`campaign action ${action} is unsupported for ${kind}`);
@@ -826,7 +834,7 @@ export function evaluateFaultEffect({campaign, evidence, resolvedTargets, before
     during: normalizePhase(during, 'during', kind),
     after: normalizePhase(after, 'after', kind),
   };
-  if (kind !== 'TimeChaos') {
+  if (!CLOCK_KINDS.has(kind)) {
     for (const [phaseName, phase] of Object.entries(phases)) {
       for (const observation of phase.observations) {
         if (!selectedActors.includes(observation.actor)) {
@@ -837,7 +845,7 @@ export function evaluateFaultEffect({campaign, evidence, resolvedTargets, before
   }
   const maps = Object.fromEntries(Object.entries(phases).map(([phase, value]) => [phase, mapByActor(value.observations)]));
   let evaluations;
-  if (kind === 'TimeChaos') {
+  if (CLOCK_KINDS.has(kind)) {
     evaluations = timeEvaluations(spec, targets.targets, phases.before.observations, phases.during.observations, phases.after.observations);
   } else {
     const evaluator = {

@@ -102,7 +102,11 @@ LABEL org.opencontainers.image.title="Stacks Attacknet node tools" \
       org.stacks.attacknet.cargo-profile="release-lite" \
       org.stacks.attacknet.debug-symbols="external"
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && apt-get install --yes --no-install-recommends ca-certificates curl libfaketime \
+    && install -d /usr/lib/stacks-attacknet \
+    && faketime_library="$(find /usr/lib -path '*/faketime/libfaketime.so.1' -print -quit)" \
+    && test -n "${faketime_library}" \
+    && ln -s "${faketime_library}" /usr/lib/stacks-attacknet/libfaketime.so.1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/runtime/bin/stacks-node /bin/stacks-node
 COPY --from=build /out/runtime/bin/stacks-signer /bin/stacks-signer

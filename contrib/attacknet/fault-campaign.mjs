@@ -12,6 +12,11 @@ const TYPES = Object.freeze({
   // a core/v1 Pod from trusted chart configuration. It is deliberately not a
   // Chaos Mesh StressChaos or IOChaos resource.
   'io-pressure': 'IOPressurePod', time: 'TimeChaos',
+  // A portable application-clock policy for attacknet-built actors. This is
+  // deliberately not called TimeChaos: it changes only the process-visible
+  // realtime clock through the image's bounded clock shim and never claims a
+  // kernel/Chaos Mesh injection.
+  'clock-skew': 'ClockSkewPolicy',
 });
 const ACTIONS = Object.freeze({
   pod: new Set(['pod-kill', 'pod-failure', 'container-kill']),
@@ -456,6 +461,18 @@ function validateTimeParameters(parameters, safety) {
   }
 }
 
+function validateClockSkewParameters(parameters, safety) {
+  validateTimeParameters(parameters, safety);
+  if (parameters.clockIds !== undefined
+      && (parameters.clockIds.length !== 1 || parameters.clockIds[0] !== 'CLOCK_REALTIME')) {
+    throw new Error('application clock-skew supports only CLOCK_REALTIME');
+  }
+  if (parameters.containerNames !== undefined
+      && (parameters.containerNames.length !== 1 || parameters.containerNames[0] !== 'actor')) {
+    throw new Error('application clock-skew must select exactly the actor container');
+  }
+}
+
 export function compileCampaign(campaign, manifest) {
   requireObject(campaign, 'campaign');
   requireObject(manifest, 'manifest');
@@ -470,10 +487,11 @@ export function compileCampaign(campaign, manifest) {
   const actors = manifestActors(manifest);
   const fault = requireObject(spec.fault, 'spec.fault');
   if (typeof fault.type !== 'string' || !(fault.type in TYPES)) throw new Error(`unsupported fault type ${fault.type}`);
-  if (fault.type !== 'time' && (typeof fault.action !== 'string' || !ACTIONS[fault.type].has(fault.action))) {
+  const actionless = fault.type === 'time' || fault.type === 'clock-skew';
+  if (!actionless && (typeof fault.action !== 'string' || !ACTIONS[fault.type].has(fault.action))) {
     throw new Error(`unsupported ${fault.type} action ${fault.action}`);
   }
-  if (fault.type === 'time' && fault.action !== undefined) throw new Error('time faults must not specify action');
+  if (actionless && fault.action !== undefined) throw new Error(`${fault.type} faults must not specify action`);
   const target = validateTarget(spec.target, 'spec.target');
   const selected = selectedActors(target, actors);
   const mode = normalizedMode(fault.mode ?? 'one', fault.value, selected.length);
@@ -509,16 +527,17 @@ export function compileCampaign(campaign, manifest) {
   const ioPressure = fault.type === 'io-pressure'
     ? validateIoPressureParameters(parameters, safety, seconds) : null;
   if (fault.type === 'time') validateTimeParameters(parameters, safety);
+  if (fault.type === 'clock-skew') validateClockSkewParameters(parameters, safety);
 
   const chaosSpec = {mode: mode.mode, duration, selector: selector(target, manifest)};
   if (mode.value !== undefined) chaosSpec.value = mode.value;
-  if (fault.type !== 'time' && fault.type !== 'io-pressure') chaosSpec.action = fault.action;
+  if (!actionless && fault.type !== 'io-pressure') chaosSpec.action = fault.action;
   Object.assign(chaosSpec, ioPressure?.executionParameters ?? parameters);
   const annotations = ioPressure ? {
     'testing.stacks.org/io-pressure-contract': JSON.stringify(ioPressure.evidence),
   } : undefined;
   const resource = {
-    apiVersion: fault.type === 'io-pressure'
+    apiVersion: fault.type === 'io-pressure' || fault.type === 'clock-skew'
       ? 'testing.stacks.org/internal' : 'chaos-mesh.org/v1alpha1',
     kind: TYPES[fault.type],
     metadata: {

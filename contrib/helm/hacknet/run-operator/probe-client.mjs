@@ -5,8 +5,11 @@ export const PROBE_PORT = 18080;
 export const PROCESS_WALL_CLOCK_METRIC = 'stacks_node_process_wall_clock_seconds';
 
 const KIND_TO_PROBE = Object.freeze({
-  NetworkChaos: 'network', DNSChaos: 'dns', IOChaos: 'io', IOPressurePod: 'io', TimeChaos: 'clock',
+  NetworkChaos: 'network', DNSChaos: 'dns', IOChaos: 'io', IOPressurePod: 'io',
+  TimeChaos: 'clock', ClockSkewPolicy: 'clock',
 });
+
+const CLOCK_KINDS = new Set(['TimeChaos', 'ClockSkewPolicy']);
 
 function globMatches(pattern, value) {
   const escaped = pattern.split('*')
@@ -57,7 +60,7 @@ export function buildProbeRequest({kind, campaign, compiledEvidence, network, ta
   if (kind === 'IOPressurePod') {
     return {kind: 'io', operation: 'FSYNC', attempts: 5, bytes: 4096, file: `${campaign.metadata.name}.dat`};
   }
-  if (kind === 'TimeChaos') return {
+  if (CLOCK_KINDS.has(kind)) return {
     kind: 'processClock', peer: target.actor, port: 'metrics',
     metric: PROCESS_WALL_CLOCK_METRIC, control: false,
   };
@@ -128,19 +131,21 @@ export class ProbeClient {
 export function probePhase({kind, phase, responses, allInjectedObserved = false}) {
   const probe = KIND_TO_PROBE[kind];
   if (!probe) throw new Error(`unsupported probe phase kind ${kind}`);
-  const authority = kind === 'TimeChaos' ? 'application-process-metric' : 'active-probe';
+  const authority = CLOCK_KINDS.has(kind) ? 'application-process-metric' : 'active-probe';
   return {
     schemaVersion: 'stacks-attacknet-fault-probe/v1', phase,
     source: {
       trust: 'orchestrator-observed', authority, collector: 'attacknet-probe/v1',
-      ...(kind === 'TimeChaos' ? {contentTrust: 'actor-self-reported'} : {}),
+      ...(CLOCK_KINDS.has(kind) ? {contentTrust: 'actor-self-reported'} : {}),
     },
     capturedAt: new Date().toISOString(),
     injection: {
       allInjectedObserved,
       source: {
         trust: 'orchestrator-observed',
-        authority: kind === 'IOPressurePod' ? 'kubernetes-pod-status' : 'chaos-mesh-status',
+        authority: kind === 'IOPressurePod' ? 'kubernetes-pod-status'
+          : kind === 'ClockSkewPolicy' ? 'controller-clock-policy'
+            : 'chaos-mesh-status',
         collector: 'attacknet-run-operator/v1',
       },
     },
@@ -157,7 +162,7 @@ export function baselineUsable(kind, phase, selectedActors) {
   if (kind === 'NetworkChaos') return observations.every(item => item.successes > 0);
   if (kind === 'DNSChaos') return observations.every(item => item.querySucceeded && item.controlSucceeded);
   if (kind === 'IOChaos' || kind === 'IOPressurePod') return observations.every(item => item.successes > 0);
-  if (kind === 'TimeChaos') {
+  if (CLOCK_KINDS.has(kind)) {
     return observations.length === selected.size
       && phase.observations.some(item => item.status === 'ok' && item.control === true && !selected.has(item.actor));
   }

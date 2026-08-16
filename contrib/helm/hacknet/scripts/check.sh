@@ -35,7 +35,7 @@ if command -v "${helm_bin}" >/dev/null 2>&1; then
     echo 'rendered run-operator RBAC still grants unused StressChaos authority' >&2
     exit 1
   fi
-  if [[ "${rendered}" != *'"kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos"]}'* ]]; then
+  if [[ "${rendered}" != *'"kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos", "ClockSkewPolicy"]}'* ]]; then
     echo 'rendered FaultCampaign status schema is missing IOPressurePod' >&2
     exit 1
   fi

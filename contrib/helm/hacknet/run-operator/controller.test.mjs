@@ -91,7 +91,10 @@ class FakeApi {
     const current = this.objects.get(key);
     if (!current) throw new Error(`missing ${key}`);
     if (options.subresource === 'status') current.status = clone(body.status);
-    else current.metadata = {...current.metadata, ...(body.metadata ?? {})};
+    else {
+      current.metadata = {...current.metadata, ...(body.metadata ?? {})};
+      if (body.data) current.data = {...(current.data ?? {}), ...clone(body.data)};
+    }
     current.metadata.resourceVersion = String(Number(current.metadata.resourceVersion ?? 0) + 1);
     return clone(current);
   }
@@ -230,6 +233,52 @@ function timeCampaign() {
   value.spec.effectAssertions = [{type: 'ClockSkewObserved'}];
   value.spec.recoveryAssertions = [{type: 'ClockSkewCleared'}];
   return value;
+}
+
+function clockSkewCampaign() {
+  const value = campaign();
+  value.metadata.name = 'skew-companion-application-clock';
+  value.metadata.uid = uid('skew-companion-application-clock');
+  value.spec.target = {actors: ['signer-node-1']};
+  value.spec.fault = {
+    type: 'clock-skew', mode: 'all', duration: '1s',
+    parameters: {
+      timeOffset: '-30s', clockIds: ['CLOCK_REALTIME'], containerNames: ['actor'],
+    },
+  };
+  value.spec.effectAssertions = [{type: 'ClockSkewObserved'}];
+  value.spec.recoveryAssertions = [{type: 'ClockSkewCleared'}];
+  return value;
+}
+
+function installClockPolicyFixture(api, admitted, actorName = 'signer-node-1') {
+  api.put('stacksnetworks', admitted);
+  api.pods = networkPods(admitted);
+  const targetPod = api.pods.find(item =>
+    item.metadata.labels['testing.stacks.org/actor'] === actorName);
+  const actor = targetPod.spec.containers.find(item => item.name === 'actor');
+  actor.env = [
+    {name: 'LD_PRELOAD', value: '/usr/lib/stacks-attacknet/libfaketime.so.1'},
+    {name: 'FAKETIME_TIMESTAMP_FILE', value: `/run/attacknet-clock/${actorName}`},
+    {name: 'FAKETIME_DONT_FAKE_MONOTONIC', value: '1'},
+    {name: 'FAKETIME_NO_CACHE', value: '1'},
+  ];
+  actor.volumeMounts.push({name: 'runtime-policy', mountPath: '/run/attacknet-clock'});
+  targetPod.spec.volumes.push({name: 'runtime-policy', configMap: {name: 'demo-clock-policy'}});
+  api.put('configmaps', {
+    apiVersion: 'v1', kind: 'ConfigMap',
+    metadata: {
+      name: 'demo-clock-policy', namespace: 'hacknet', uid: uid('clock-policy'), resourceVersion: '1',
+      labels: {'testing.stacks.org/network': 'demo', 'testing.stacks.org/clock-policy': 'true'},
+    },
+    data: {
+      'miner-1': '+0s\n',
+      'signer-node-1': '+0s\n',
+      'signer-node-2': '+0s\n',
+      'signer-node-3': '+0s\n',
+    },
+  }, '');
+  return targetPod;
 }
 
 function ioContainerRecords(value, {injectedCount = 0, recoveredCount = 0} = {}) {
@@ -453,6 +502,141 @@ test('TimeChaos fails admission before resource creation when its platform canar
   assert.equal(await api.get('configmaps', 'attacknet-mutation-lease', {
     group: '', allow404: true,
   }), null);
+});
+
+test('controller-owned application clock policy proves effect and recovery without creating TimeChaos', async () => {
+  const api = new FakeApi();
+  const admitted = network();
+  installClockPolicyFixture(api, admitted);
+  const value = clockSkewCampaign();
+  api.put('faultcampaigns', value);
+  let cleanTargetSamples = 0;
+  let observationPhase = 'before';
+  const probes = {probe: async (target, request) => {
+    if (request.kind !== 'processClock') throw new Error(`unexpected probe ${request.kind}`);
+    const policy = await api.get('configmaps', 'demo-clock-policy', {group: ''});
+    if (!request.control) {
+      if (policy.data['signer-node-1'] === '-30s\n') observationPhase = 'during';
+      else observationPhase = cleanTargetSamples++ === 0 ? 'before' : 'after';
+    }
+    const values = {
+      before: request.control ? [2000, 500] : [1000, 100],
+      during: request.control ? [2010, 510] : [980, 110],
+      after: request.control ? [2020, 520] : [1020, 120],
+    }[observationPhase];
+    return {observation: {
+      actor: target.actor, probe: 'clock', status: 'ok', control: request.control,
+      wallEpochSeconds: values[0], monotonicSeconds: values[1], sampleWindowMs: 5,
+      metric: 'stacks_node_process_wall_clock_seconds',
+    }};
+  }};
+  const reconciler = faultReconciler(api, probes);
+
+  await reconciler.reconcile(value);
+  let current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Admitted');
+  assert.equal(current.status.capabilityEvidence[0].supported, true);
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Injecting');
+  assert.equal((await api.get('configmaps', 'demo-clock-policy', {group: ''})).data['signer-node-1'], '-30s\n');
+  assert.equal((await api.list('timechaos', {group: 'chaos-mesh.org'})).items.length, 0);
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Active', JSON.stringify(current.status, null, 2));
+  assert.equal(current.status.reason, 'ClockSkewObserved');
+  current.status.injectedAt = new Date(Date.now() - 2000).toISOString();
+  api.put('faultcampaigns', current);
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Recovering');
+  assert.equal((await api.get('configmaps', 'demo-clock-policy', {group: ''})).data['signer-node-1'], '+0s\n');
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Passed');
+  assert.equal(current.status.reason, 'EffectAndRecoveryProven');
+  assert.equal(current.status.effectResults[0].assertion, 'ClockSkewObserved');
+  assert.equal(current.status.recoveryResults[0].assertion, 'ClockSkewCleared');
+});
+
+test('ineffective application clock injection resets first and retains its lease until process recovery', async () => {
+  const api = new FakeApi();
+  installClockPolicyFixture(api, network());
+  const value = clockSkewCampaign();
+  api.put('faultcampaigns', value);
+  const calls = new Map();
+  const probes = {probe: async (target, request) => {
+    if (request.kind !== 'processClock') throw new Error(`unexpected probe ${request.kind}`);
+    const index = calls.get(target.actor) ?? 0;
+    calls.set(target.actor, index + 1);
+    const targetWall = [1000, 1010, 990, 1030][Math.min(index, 3)];
+    const controlWall = [2000, 2010, 2020, 2030][Math.min(index, 3)];
+    return {observation: {
+      actor: target.actor, probe: 'clock', status: 'ok', control: request.control,
+      wallEpochSeconds: request.control ? controlWall : targetWall,
+      monotonicSeconds: 100 + index * 10, sampleWindowMs: 5,
+      metric: 'stacks_node_process_wall_clock_seconds',
+    }};
+  }};
+  const reconciler = faultReconciler(api, probes);
+
+  let current = await api.get('faultcampaigns', value.metadata.name);
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  current.status.chaos.createdAt = '2020-01-01T00:00:00Z';
+  api.put('faultcampaigns', current);
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Recovering');
+  assert.equal(current.status.reason, 'ClockPolicyResetAfterUnprovenEffect');
+  assert.equal((await api.get('configmaps', 'demo-clock-policy', {group: ''}))
+    .data['signer-node-1'], '+0s\n');
+  assert.ok(await api.get('configmaps', 'attacknet-mutation-lease', {group: ''}));
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Recovering');
+  assert.equal(current.status.reason, 'WaitingForRecoveryEvidence');
+  assert.ok(await api.get('configmaps', 'attacknet-mutation-lease', {group: ''}));
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Inconclusive');
+  assert.equal(current.status.reason, 'EffectNotProven');
+  assert.equal(current.status.recoveryResults[0].outcome, 'Proven');
+  assert.ok(await api.get('configmaps', 'attacknet-mutation-lease', {group: ''}));
+
+  await reconciler.reconcile(current);
+  assert.equal(await api.get('configmaps', 'attacknet-mutation-lease', {
+    group: '', allow404: true,
+  }), null);
+});
+
+test('application clock admission refuses a stale offset on an unselected actor', async () => {
+  const api = new FakeApi();
+  installClockPolicyFixture(api, network());
+  const policy = await api.get('configmaps', 'demo-clock-policy', {group: ''});
+  policy.data['miner-1'] = '-5s\n';
+  api.put('configmaps', policy, '');
+  const value = clockSkewCampaign();
+  api.put('faultcampaigns', value);
+
+  await faultReconciler(api, {probe: async () => {
+    throw new Error('an unclean policy must fail before baseline probing');
+  }}).reconcile(value);
+  const current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Failed');
+  assert.equal(current.status.reason, 'FaultCapabilityUnavailable');
+  assert.match(current.status.message, /policy contract is incomplete/);
+  assert.equal((await api.get('configmaps', 'demo-clock-policy', {group: ''}))
+    .data['signer-node-1'], '+0s\n');
 });
 
 test('FaultCampaign refuses to create Chaos after its canonical signer set changes', async () => {

@@ -77,7 +77,7 @@
                   "type": "object",
                   "required": ["type", "mode", "duration", "parameters"],
                   "properties": {
-                    "type": {"type": "string", "enum": ["pod", "network", "dns", "io", "io-pressure", "time"]},
+                    "type": {"type": "string", "enum": ["pod", "network", "dns", "io", "io-pressure", "time", "clock-skew"]},
                     "action": {
                       "type": "string",
                       "enum": ["pod-kill", "pod-failure", "container-kill", "netem", "delay", "loss", "duplicate", "corrupt", "partition", "bandwidth", "error", "random", "latency", "fault", "attrOverride", "mistake", "disk-pressure"]
@@ -202,7 +202,7 @@
                   },
                   "x-kubernetes-validations": [
                     {"rule": "self.mode in ['fixed', 'fixed-percent', 'random-max-percent'] ? has(self.value) : !has(self.value)", "message": "fixed modes require value and one/all modes must omit it"},
-                    {"rule": "self.type == 'time' ? !has(self.action) : has(self.action)", "message": "time faults omit action; every other fault requires it"},
+                    {"rule": "self.type in ['time', 'clock-skew'] ? !has(self.action) : has(self.action)", "message": "time and clock-skew faults omit action; every other fault requires it"},
                     {"rule": "self.type != 'pod' || self.action in ['pod-kill', 'pod-failure', 'container-kill']", "message": "invalid pod fault action"},
                     {"rule": "self.type != 'network' || self.action in ['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']", "message": "invalid network fault action"},
                     {"rule": "self.type != 'dns' || self.action in ['error', 'random']", "message": "invalid DNS fault action"},
@@ -221,6 +221,7 @@
                     {"rule": "self.type != 'io' || self.action != 'attrOverride' || has(self.parameters.attr)", "message": "I/O attrOverride requires parameters.attr"},
                     {"rule": "self.type != 'io-pressure' || has(self.parameters.severity) && has(self.parameters.workers) && has(self.parameters.bytesMiB) && has(self.parameters.writeSizeKiB) && has(self.parameters.minimumLatencyMultiplier) && has(self.parameters.minimumAddedLatencyMs)", "message": "I/O pressure requires a structured bounded resource and evidence profile"},
                     {"rule": "self.type != 'time' || has(self.parameters.timeOffset)", "message": "time faults require parameters.timeOffset"}
+                    ,{"rule": "self.type != 'clock-skew' || has(self.parameters.timeOffset)", "message": "clock-skew faults require parameters.timeOffset"}
                   ]
                 },
                 "safety": {
@@ -254,6 +255,8 @@
               "x-kubernetes-validations": [
                 {"rule": "!has(self.target.roles) || !('burnchain' in self.target.roles) || (has(self.safety.allowBurnchain) && self.safety.allowBurnchain)", "message": "burnchain role selection requires allowBurnchain=true"},
                 {"rule": "self.fault.type != 'time' || !has(self.fault.parameters.containerNames) || size(self.fault.parameters.containerNames) <= 1", "message": "TimeChaos may select at most one container per Pod"},
+                {"rule": "self.fault.type != 'clock-skew' || !has(self.fault.parameters.clockIds) || size(self.fault.parameters.clockIds) == 1 && self.fault.parameters.clockIds[0] == 'CLOCK_REALTIME'", "message": "application clock-skew supports only CLOCK_REALTIME"},
+                {"rule": "self.fault.type != 'clock-skew' || !has(self.fault.parameters.containerNames) || size(self.fault.parameters.containerNames) == 1 && self.fault.parameters.containerNames[0] == 'actor'", "message": "application clock-skew must select exactly the actor container"},
                 {"rule": "self.fault.type != 'io-pressure' || has(self.fault.parameters.containerNames) && size(self.fault.parameters.containerNames) == 1 && self.fault.parameters.containerNames[0] == 'actor'", "message": "disk-pressure must select exactly the actor container per Pod"},
                 {"rule": "self.fault.type != 'io-pressure' || has(self.target.actors) && size(self.target.actors) == 1 && (!has(self.target.roles) || size(self.target.roles) == 0)", "message": "disk-pressure must name exactly one actor target"},
                 {"rule": "self.fault.type != 'io-pressure' || duration(self.fault.duration) <= duration('5m')", "message": "disk-pressure duration must not exceed 5m"},
@@ -314,11 +317,11 @@
                   "reason": {"type": "string", "minLength": 1, "maxLength": 1024}
                 }}},
                 "chaos": {"type": "object", "required": ["kind", "name", "uid", "createdAt"], "properties": {
-                  "kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos"]},
+                  "kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos", "ClockSkewPolicy"]},
                   "name": {"type": "string", "maxLength": 63},
                   "uid": {"type": "string", "maxLength": 128},
                   "createdAt": {"type": "string", "format": "date-time"},
-                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod"]},
+                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod", "controller-owned-application-clock-policy"]},
                   "resourceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
                 }},
                 "injectedAt": {"type": "string", "format": "date-time"},
@@ -326,7 +329,7 @@
                   "allInjectedObserved": {"type": "boolean"},
                   "chaosResourceVersion": {"type": "string", "maxLength": 128},
                   "records": {"nullable": true, "x-kubernetes-preserve-unknown-fields": true},
-                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod"]},
+                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod", "controller-owned-application-clock-policy"]},
                   "podUid": {"type": "string", "maxLength": 128},
                   "image": {"type": "string", "maxLength": 2048},
                   "imageID": {"type": "string", "maxLength": 4096},
@@ -335,6 +338,9 @@
                   "targetActor": {"type": "string", "maxLength": 63},
                   "targetPodUid": {"type": "string", "maxLength": 128},
                   "pvcClaim": {"type": "string", "maxLength": 253},
+                  "configMapUid": {"type": "string", "maxLength": 128},
+                  "policyName": {"type": "string", "maxLength": 253},
+                  "requestedOffset": {"type": "string", "maxLength": 32},
                   "observedAt": {"type": "string", "format": "date-time"}
                 }},
                 "probeArtifacts": {"type": "object", "properties": {
@@ -350,7 +356,7 @@
                 }}},
                 "cleanup": {"type": "object", "required": ["absent", "allRecovered", "observedAt"], "properties": {
                   "absent": {"type": "boolean"}, "allRecovered": {"type": "boolean"},
-                  "method": {"type": "string", "enum": ["Normal", "ZeroInjectionFinalizerAbort"]},
+                  "method": {"type": "string", "enum": ["Normal", "ZeroInjectionFinalizerAbort", "ClockPolicyReset", "ClockPolicyMissing"]},
                   "zeroInjectionProven": {"type": "boolean"},
                   "observedAt": {"type": "string", "format": "date-time"}
                 }},

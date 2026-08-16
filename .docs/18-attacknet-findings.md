@@ -3589,6 +3589,52 @@ does pass the controller contract.
   to `inputs.runtime` with a backend discriminator and provide a deterministic
   v1-to-v2 reader. Do not silently rewrite sealed v1 evidence.
 
+## F-136: Chaos Mesh TimeChaos needs a separate portable application-clock fault on arm64
+
+- Classification: attacknet capability gap and truthful fault-semantics fix;
+  not a Stacks node or signer defect
+- State: fixed, regression-tested, locally proven in one process, and passed
+  end-to-end through the live `FaultCampaign`/`AttacknetRun` controller on the
+  three-node arm64 kind cluster
+- Trigger: F-082/F-083 established that Chaos Mesh 2.8.3 could report
+  `AllInjected` without moving the selected Stacks process clock on arm64, and
+  that a stronger process canary could wedge the daemon during detach. Simply
+  adding arm64 to the TimeChaos capability list would therefore create false
+  positive evidence and unsafe cleanup.
+- Correction: `time` remains the architecture-gated Chaos Mesh mechanism. A
+  distinct `clock-skew` type now compiles to the internal
+  `ClockSkewPolicy` mechanism. Attacknet-built node images preload libfaketime,
+  read their actor-specific offset from a read-only network ConfigMap, disable
+  caching, and preserve the real monotonic clock. The renderer creates every
+  supported actor key at `+0s`; the run controller verifies the exact admitted
+  Pod environment, mount, ConfigMap identity, zero baseline, and process metric
+  before it can mutate a selected key.
+- Local runtime proof: one unchanged container process moved realtime by
+  `-28.998s` when policy changed from `+0s` to `-30s`, then by `+31.002s` when
+  reset, while `/proc/uptime` advanced exactly `1.00s` at both transitions.
+  The retained record is
+  `contrib/attacknet/evidence/application-clock-shim-20260816T112847Z/`.
+- Live controller proof: fresh network `attacknet-clock-canary` passed all
+  phased barriers through Nakamoto activation. Sealed run `clock-canary-run`
+  selected exact Ready `follower-1` Pod UID
+  `4e759bab-65ad-4b9e-97dd-5ae7b32a1bce`. Relative target/control wall time
+  changed from `-0.012s` before injection to `-30.002s` during it while both
+  monotonic clocks advanced normally. The first post-reset sample still saw
+  the skew; the controller correctly remained `Recovering` and retained the
+  mutation lease. A later sample measured `-0.001s`, proving
+  `ClockSkewCleared`; only then did the campaign and run pass.
+- Post-recovery result: miner, companion, and follower agreed at burn 227 /
+  Stacks 19 on tip
+  `190b04ab8959bfc8f33b46f5356114327d53042983666c9f8c3eb2b0bc09725a`,
+  with zero height drift, four authenticated P2P conversations each, no
+  unauthenticated conversations, and no actor restart. The full capture is at
+  `contrib/attacknet/evidence/application-clock-k8s-20260816T1134Z/`.
+- Boundary: this is application-visible realtime skew, not kernel time and not
+  Chaos Mesh TimeChaos. It deliberately cannot affect Rust `Instant`-based
+  deadlines. Current positive admission covers node processes exporting
+  `stacks_node_process_wall_clock_seconds`; signer-only processes remain
+  unsupported until they expose an equivalent witness.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

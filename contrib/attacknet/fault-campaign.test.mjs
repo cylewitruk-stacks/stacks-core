@@ -48,10 +48,22 @@ test('compiles network, DNS, I/O, and explicit clock-source faults', () => {
     [{type: 'dns', action: 'error', parameters: {patterns: ['*.svc.cluster.local']}}, 'DNSChaos'],
     [{type: 'io', action: 'latency', parameters: {volumePath: '/data', path: '/data/**', delay: '100ms'}}, 'IOChaos'],
     [{type: 'time', parameters: {timeOffset: '-30s', clockIds: ['CLOCK_REALTIME']}}, 'TimeChaos'],
+    [{type: 'clock-skew', parameters: {
+      timeOffset: '-30s', clockIds: ['CLOCK_REALTIME'], containerNames: ['actor'],
+    }}, 'ClockSkewPolicy'],
   ];
   for (const [fault, kind] of cases) {
     assert.equal(compileCampaign(campaign({fault: {...fault, duration: '20s'}}), manifest).resource.kind, kind);
   }
+  const portable = compileCampaign(campaign({fault: {
+    type: 'clock-skew', duration: '20s',
+    parameters: {timeOffset: '-30s', clockIds: ['CLOCK_REALTIME'], containerNames: ['actor']},
+  }}), manifest);
+  assert.equal(portable.resource.apiVersion, 'testing.stacks.org/internal');
+  assert.throws(() => compileCampaign(campaign({fault: {
+    type: 'clock-skew', duration: '20s',
+    parameters: {timeOffset: '-30s', clockIds: ['CLOCK_MONOTONIC'], containerNames: ['actor']},
+  }}), manifest), /only CLOCK_REALTIME/);
 });
 
 test('compiles bounded disk I/O pressure to a trusted controller descriptor without accepting execution input', () => {

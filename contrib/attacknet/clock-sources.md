@@ -40,3 +40,19 @@ container for both wall and monotonic clocks. The campaign is inconclusive if
 the intended clock did not move by the requested offset. Recovery assertions
 must tolerate a discontinuous wall clock while still requiring monotonic chain
 progress after the fault is removed.
+
+There are two intentionally separate implementations:
+
+- `time` requests Chaos Mesh `TimeChaos` and remains architecture-gated. It is
+  unsupported on the current arm64 kind platform because the installed helper
+  neither produced the requested process-clock effect nor detached safely.
+- `clock-skew` uses the attacknet image's controller-owned libfaketime policy.
+  It changes only process-visible realtime, explicitly preserves monotonic
+  time, and is proven by the Stacks process metric relative to an unmodified
+  control actor. Policy mutation is bookkeeping, not proof.
+
+The portable path currently targets node processes (miner, companion,
+follower, or adversary). A signer-only campaign must fail capability admission
+until the signer exports an equivalent process-clock witness. Neither path may
+claim to accelerate a Rust `Instant` deadline without separate evidence that
+the monotonic clock moved.

@@ -40,6 +40,13 @@ test('plans only enrolled named network and DNS peers', () => {
     metric: 'stacks_node_process_wall_clock_seconds', control: false,
   });
   assert.deepEqual(buildProbeRequest({
+    kind: 'ClockSkewPolicy', campaign: campaign('clock-skew'), compiledEvidence: {}, network,
+    target: {actor: 'follower-1'},
+  }), {
+    kind: 'processClock', peer: 'follower-1', port: 'metrics',
+    metric: 'stacks_node_process_wall_clock_seconds', control: false,
+  });
+  assert.deepEqual(buildProbeRequest({
     kind: 'IOPressurePod', campaign: campaign('io-pressure'), compiledEvidence: {}, network,
     target: {actor: 'follower-1'},
   }), {kind: 'io', operation: 'FSYNC', attempts: 5, bytes: 4096, file: 'fault-a.dat'});
@@ -77,6 +84,17 @@ test('controller-owned I/O-pressure Pod uses the existing trusted active I/O pro
   assert.equal(phase.observations[0].probe, 'io');
   assert.equal(baselineUsable('IOPressurePod', phase, ['miner-1']), true);
   assert.equal(phase.injection.source.authority, 'kubernetes-pod-status');
+});
+
+test('controller-owned clock policy discloses its distinct injection authority', () => {
+  const response = {observation: {
+    actor: 'miner-1', probe: 'clock', status: 'ok', control: false,
+    wallEpochSeconds: 1, monotonicSeconds: 1, sampleWindowMs: 1,
+    metric: 'stacks_node_process_wall_clock_seconds',
+  }};
+  const phase = probePhase({kind: 'ClockSkewPolicy', phase: 'during', responses: [response], allInjectedObserved: true});
+  assert.equal(phase.source.authority, 'application-process-metric');
+  assert.equal(phase.injection.source.authority, 'controller-clock-policy');
 });
 
 test('ProbeClient pins response schema, kind, and actor identity', async () => {

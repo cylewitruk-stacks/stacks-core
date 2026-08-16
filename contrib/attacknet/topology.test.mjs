@@ -241,6 +241,40 @@ test('burnchain cadence is initially paused until the topology is ready', () => 
   assert.doesNotMatch(healthcheck.test.join(' '), /curl/);
 });
 
+test('node actors receive isolated hot-reloadable realtime policies on both backends', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-clock-policy-'));
+  const {resource, clockPolicy} = renderTopology(
+    buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output,
+    {network: 'clock-proof'},
+  );
+  const clockActors = resource.spec.actors
+    .filter(actor => ['miner', 'companion', 'follower', 'adversary'].includes(actor.role));
+  assert.deepEqual(Object.keys(clockPolicy.data).sort(), clockActors.map(actor => actor.name).sort());
+  assert.ok(Object.values(clockPolicy.data).every(value => value === '+0s\n'));
+  assert.equal(clockPolicy.metadata.name, 'clock-proof-clock-policy');
+
+  for (const actor of clockActors) {
+    assert.deepEqual(actor.runtimePolicy, {
+      configMapRef: {name: 'clock-proof-clock-policy'}, mountPath: '/run/attacknet-clock',
+    });
+    const environment = Object.fromEntries(actor.env.map(item => [item.name, item.value]));
+    assert.equal(environment.LD_PRELOAD, '/usr/lib/stacks-attacknet/libfaketime.so.1');
+    assert.equal(environment.FAKETIME_TIMESTAMP_FILE, `/run/attacknet-clock/${actor.name}`);
+    assert.equal(environment.FAKETIME_DONT_FAKE_MONOTONIC, '1');
+    assert.equal(environment.FAKETIME_NO_CACHE, '1');
+  }
+  const signer = resource.spec.actors.find(actor => actor.name === 'signer-1');
+  assert.equal(signer.runtimePolicy, undefined, 'signers lack a process-clock metric today');
+
+  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
+  for (const actor of clockActors) {
+    assert.ok(compose.services[actor.name].volumes.includes(
+      `./clock-policy/${actor.name}:/run/attacknet-clock/${actor.name}:ro`,
+    ));
+    assert.equal(readFileSync(join(output, 'clock-policy', actor.name), 'utf8'), '+0s\n');
+  }
+});
+
 test('Compose renders enrolled telemetry and an independently partitionable burnchain path', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-compose-harness-'));
   renderTopology(buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output,

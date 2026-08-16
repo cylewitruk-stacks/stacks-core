@@ -553,3 +553,25 @@ could detach. The chart therefore defaults
 only after a known process observes the requested offset and recovery and the
 Chaos resource cleans up normally; `AllInjected` alone is not capability
 evidence.
+
+For portable application-level realtime faults, use the distinct
+`clock-skew` fault type. Attacknet-built node images preload libfaketime and
+read one actor-specific offset from the network's controller-owned
+`<network>-clock-policy` ConfigMap. The renderer fixes monotonic time to the
+real clock (`FAKETIME_DONT_FAKE_MONOTONIC=1`), mounts the policy read-only, and
+initializes every supported actor to `+0s`. The run controller may change only
+the exact selected actors' keys, and it retains the global mutation lease
+until the Stacks process metric proves both the requested relative wall-clock
+shift and return to the independent control actor's clock. A ConfigMap write
+is never effect evidence. The campaign becomes inconclusive if the shim is
+missing or ineffective.
+
+This is deliberately not reported as Chaos Mesh `TimeChaos`: it exercises
+application-visible `CLOCK_REALTIME`, does not change kernel/host time, and
+leaves monotonic timeout machinery untouched. Current positive support covers
+attacknet-built miner, companion, follower, and adversary node processes,
+which export `stacks_node_process_wall_clock_seconds`; signer-only processes
+are rejected until an equivalent process-clock metric exists. See
+`examples/follower-application-clock-skew.json`. Local hot injection/recovery
+and a live arm64 kind `FaultCampaign`/`AttacknetRun` are retained under
+`contrib/attacknet/evidence/application-clock-{shim,k8s}-*/`.

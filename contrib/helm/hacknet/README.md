@@ -308,6 +308,19 @@ injection. `runOperator.timeChaosSupportedArchitectures` therefore defaults to
 proved the requested process-clock effect, recovery, and daemon cleanup—not
 merely that Chaos Mesh reported `AllInjected`.
 
+The separate `clock-skew` type is the portable application-clock mechanism for
+attacknet-built node images. It compiles to the internal `ClockSkewPolicy`
+descriptor rather than a Chaos Mesh resource. The topology renderer mounts a
+network-labelled ConfigMap at `/run/attacknet-clock`, with one zero-offset key
+per supported actor and a fixed libfaketime environment contract. The run
+controller verifies that exact admitted Pod contract, patches only selected
+keys, observes `stacks_node_process_wall_clock_seconds` against an independent
+control actor, resets the keys, and keeps the mutation lease until recovery is
+proven. Missing, stale, malformed, ineffective, or unrecovered policies fail
+closed. This supports node actors only today; signer-only processes lack the
+required process-clock metric. It must not be described as TimeChaos or as a
+kernel-clock fault.
+
 This is process-independent evidence, not a cryptographic process attestation.
 Containers in one Pod share a network namespace, so a deliberately modified
 actor could try to occupy port `18080` while the probe is absent or restarting.

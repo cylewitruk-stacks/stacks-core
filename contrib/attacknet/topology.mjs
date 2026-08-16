@@ -493,7 +493,12 @@ function renderCompose(actors, output, network, filename = 'compose.yaml', confi
         mounts.push(`./${actorConfigDirectory}/${actor.name}/${filename}:${actor.config.mountPath}/${filename}:ro`);
       }
     }
-    if (actor.runtimePolicy) mounts.push(`./policy.env:${actor.runtimePolicy.mountPath}/policy.env:ro`);
+    if (actor.runtimePolicy) {
+      const policyName = actor.runtimePolicy.configMapRef?.name ?? '';
+      mounts.push(policyName.endsWith('-clock-policy')
+        ? `./clock-policy/${actor.name}:${actor.runtimePolicy.mountPath}/${actor.name}:ro`
+        : `./policy.env:${actor.runtimePolicy.mountPath}/policy.env:ro`);
+    }
     if (actor.storage?.enabled) {
       const volume = `${actor.name}-data`;
       mounts.push(`${volume}:${actor.storage.mountPath}`);
@@ -580,7 +585,25 @@ export function renderTopology(topology, output, {
   probeImage = 'stacks-hacknet-probe:dev',
 } = {}) {
   mkdirSync(output, {recursive: true});
-  const actors = [...infrastructureActors(topology, network), ...topology.actors];
+  const clockPolicyName = `${network}-clock-policy`;
+  const clockCapableRoles = new Set(['miner', 'companion', 'follower', 'adversary']);
+  const actors = [...infrastructureActors(topology, network), ...topology.actors].map(actor => {
+    if (!clockCapableRoles.has(actor.role)) return actor;
+    if (actor.runtimePolicy) {
+      throw new Error(`actor ${actor.name} already uses runtimePolicy and cannot mount the attacknet clock policy`);
+    }
+    return {
+      ...actor,
+      runtimePolicy: {configMapRef: {name: clockPolicyName}, mountPath: '/run/attacknet-clock'},
+      env: [
+        ...(actor.env ?? []),
+        env('LD_PRELOAD', '/usr/lib/stacks-attacknet/libfaketime.so.1'),
+        env('FAKETIME_TIMESTAMP_FILE', `/run/attacknet-clock/${actor.name}`),
+        env('FAKETIME_DONT_FAKE_MONOTONIC', '1'),
+        env('FAKETIME_NO_CACHE', '1'),
+      ],
+    };
+  });
   // activationGate belongs to the backend-neutral run manifest.  The current
   // operator does not need it to build the Pod, so do not leak it into the CRD.
   const resourceActors = actors.map(({activationGate: _activationGate, ...actor}) => actor);
@@ -646,11 +669,31 @@ export function renderTopology(topology, output, {
     workloads: actors.map(manifestActor),
   };
   const policy = {apiVersion: 'v1', kind: 'ConfigMap', metadata: {name: `${network}-burnchain-policy`, namespace}, data: {'policy.env': 'GENERATION=1\nMODE=pause\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n'}};
+  const clockPolicy = {
+    apiVersion: 'v1', kind: 'ConfigMap',
+    metadata: {
+      name: clockPolicyName, namespace,
+      labels: {
+        'testing.stacks.org/network': network,
+        'testing.stacks.org/clock-policy': 'true',
+        'app.kubernetes.io/managed-by': 'stacks-attacknet-lifecycle',
+      },
+    },
+    data: Object.fromEntries(
+      actors.filter(actor => clockCapableRoles.has(actor.role)).map(actor => [actor.name, '+0s\n']),
+    ),
+  };
   writeFileSync(join(output, 'stacksnetwork.json'), `${JSON.stringify(resource, null, 2)}\n`);
   writeFileSync(join(output, 'stacksnetwork.bootstrap.json'), `${JSON.stringify(bootstrapResource, null, 2)}\n`);
   writeFileSync(join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(join(output, 'burnchain-policy.configmap.json'), `${JSON.stringify(policy, null, 2)}\n`);
+  writeFileSync(join(output, 'clock-policy.configmap.json'), `${JSON.stringify(clockPolicy, null, 2)}\n`);
   writeFileSync(join(output, 'policy.env'), policy.data['policy.env']);
+  const composeClockDirectory = join(output, 'clock-policy');
+  mkdirSync(composeClockDirectory, {recursive: true});
+  for (const [actor, offset] of Object.entries(clockPolicy.data)) {
+    writeFileSync(join(composeClockDirectory, actor), offset);
+  }
   // Only companion configurations differ between phases. Reusing the final
   // config paths for every other actor prevents Compose from needlessly
   // replacing the whole network at observer enablement.
@@ -658,7 +701,7 @@ export function renderTopology(topology, output, {
     actor => actor.role === 'companion' ? 'configs-bootstrap' : 'configs');
   renderCompose(actors, output, network);
   renderComposeObservability(manifest, output, network);
-  return {resource, bootstrapResource, manifest, policy};
+  return {resource, bootstrapResource, manifest, policy, clockPolicy};
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
