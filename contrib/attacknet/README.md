@@ -459,6 +459,26 @@ classification and evidence-before-delete. Remaining live gates are
 backend-paired assertion negative controls, additional version-skew profiles,
 and the final corrected 300+ burn-block soak.
 
+The final soak must use the measured runner rather than a hand-recorded start
+height. It first obtains an acknowledged cadence pause, waits for an exact
+network cohort at Bitcoin's current height, derives the target from that first
+sample, and pauses again before accepting the terminal cohort. A deterministic
+fault List may be applied within the same measured interval:
+
+```bash
+KUBE_NAMESPACE=hacknet-system KUBE_NETWORK=attacknet-final-soak \
+  contrib/attacknet/soak-runner.sh \
+  contrib/attacknet/evidence/RUN/verified-soak-300 \
+  contrib/attacknet/generated/manifest.json 300 \
+  contrib/attacknet/evidence/RUN/verified-fault-run.json
+```
+
+`result.json` can pass only when the observed Bitcoin-height delta is at least
+the requested interval, both paused boundary cohorts exactly agree with
+Bitcoin and each other, ordinary cohort samples pass, Pod disruptions are
+either an explicit active campaign target or fail the run, and the supplied
+`AttacknetRun` terminates `Passed`.
+
 IOChaos has an additional platform gate. Chaos Mesh 2.8.3 bundles an x86-64
 `toda` helper whose source also hard-codes x86-64 ptrace registers and emitted
 assembly. The chart therefore defaults
