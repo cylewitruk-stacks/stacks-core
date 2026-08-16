@@ -12,8 +12,11 @@ selector="app.kubernetes.io/name=attacknet-loki,testing.stacks.org/network=${net
 mkdir -p "${destination}"
 
 if [ "${ATTACKNET_OBSERVABILITY_ENABLED:-1}" = 0 ]; then
-  printf '{"schemaVersion":"stacks-attacknet-loki-export/v1","complete":true,"source":"disabled-by-configuration","entryCount":0}\n' >"${destination}/export.json"
   : >"${destination}/logs.jsonl"
+  gzip -f "${destination}/logs.jsonl"
+  compressed_bytes="$(wc -c <"${destination}/logs.jsonl.gz" | tr -d ' ')"
+  printf '{"schemaVersion":"stacks-attacknet-loki-export/v1","complete":true,"source":"disabled-by-configuration","entryCount":0,"logArtifact":"logs.jsonl.gz","compression":"gzip","uncompressedBytes":0,"compressedBytes":%s}\n' "${compressed_bytes}" >"${destination}/export.json"
+  (cd "${destination}" && find . -type f ! -name digests.sha256 -print0 | sort -z | xargs -0 shasum -a 256) >"${destination}/digests.sha256"
   exit 0
 fi
 
@@ -47,11 +50,4 @@ node "${root}/export-loki.mjs" \
   "--limit=${ATTACKNET_LOKI_EXPORT_PAGE_LIMIT:-5000}" \
   "--max-pages=${ATTACKNET_LOKI_EXPORT_MAX_PAGES:-1000}" \
   "--destination=${destination}"
-uncompressed_bytes="$(wc -c <"${destination}/logs.jsonl" | tr -d ' ')"
-gzip -f "${destination}/logs.jsonl"
-compressed_bytes="$(wc -c <"${destination}/logs.jsonl.gz" | tr -d ' ')"
-jq --argjson uncompressedBytes "${uncompressed_bytes}" --argjson compressedBytes "${compressed_bytes}" \
-  '.logArtifact="logs.jsonl.gz" | .compression="gzip" | .uncompressedBytes=$uncompressedBytes | .compressedBytes=$compressedBytes' \
-  "${destination}/export.json" >"${destination}/export.json.tmp"
-mv "${destination}/export.json.tmp" "${destination}/export.json"
 (cd "${destination}" && find . -type f ! -name digests.sha256 -print0 | sort -z | xargs -0 shasum -a 256) >"${destination}/digests.sha256"

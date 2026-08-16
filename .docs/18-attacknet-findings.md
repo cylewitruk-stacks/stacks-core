@@ -2988,8 +2988,8 @@ does pass the controller contract.
 
 - Classification: forensic-evidence preservation defect
 - State: corrected, regression-tested, and proven read-only against the active
-  full-topology Loki instance; final teardown integration remains to be
-  exercised after the measured soak completes
+  full-topology Loki instance; final destructive teardown ordering remains to
+  be exercised after the replacement measured soak completes
 - Evidence: actor incident capture retained at most 20,000 lines per current or
   previous container, while Loki retained the longer Kubernetes log stream on
   its own PVC. Normal teardown exported the trusted event journal and run
@@ -3012,6 +3012,60 @@ does pass the controller contract.
   77 pages and retained 380,802 actor log entries without a pagination gap.
   The final soak bundle will repeat the export over the complete run range and
   exercise the teardown ordering before this item is considered fully closed.
+
+## F-119: Full-run Loki export exhausted the host process heap
+
+- Classification: forensic exporter scalability and bounded-resource defect
+- State: corrected, regression-tested, and proven over the exact retained soak
+  window; full teardown export remains to be exercised
+- Evidence: the first post-soak capture accumulated every flattened Loki entry
+  in a JavaScript `Map`, then constructed a second sorted array and one giant
+  JSON string. Node reached its approximately 4 GiB heap limit in
+  `JsonStringify` and aborted. A first streaming correction proved the corpus
+  itself was much larger than the earlier smoke: after 1,000 pages it had
+  written 4,999,001 entries / 4.6 GiB and truthfully stopped at the configured
+  page cap rather than claiming completeness. The incomplete bytes were
+  removed after preserving the failure metadata.
+- Impact: the mandatory teardown export would preserve Loki's PVC by aborting
+  deletion, but could never complete for the long, high-cardinality runs it was
+  introduced to protect. Repeated retries also consumed several GiB of host
+  disk before compression.
+- Correction: pagination now retains exact-entry hashes only for the inclusive
+  boundary timestamp, streams each bounded page directly through gzip with
+  backpressure, and never retains the complete corpus or an uncompressed file.
+  An incomplete run keeps a clearly named `.partial` gzip plus metadata; the
+  observability-disabled path now emits the same compressed-artifact/digest
+  contract. Pagination and exact-deduplication semantics are unchanged.
+- Live proof: the exact measured window from
+  `2026-08-15T23:23:48.706Z` through `2026-08-16T00:49:39Z` completed 141
+  pages and 701,338 entries. It streamed 773,175,267 uncompressed bytes into a
+  39,341,951-byte gzip, recorded Loki 3.5.3 build identity and source objects,
+  and passed every retained digest. Evidence is under
+  `contrib/attacknet/evidence/final-soak-20260815T232258Z/post-soak-capture/loki/`.
+
+## F-120: The nominal 300-block soak contract captured its first cohort 111 blocks late
+
+- Classification: acceptance-evidence TOCTOU defect
+- State: acceptance claim invalidated; replacement runner and measured rerun
+  required
+- Evidence: the ad-hoc monitor embedded `start_height=202` before it began its
+  loop, and later wrote that value into `contract.json`. Its first timestamped
+  Pod and cohort sample, at the same recorded monitor start time, observed burn
+  height 313. The final sample was height 503. The directly monitored interval
+  is therefore 190 new burn blocks, not the claimed 301, even though the fresh
+  environment itself continuously traversed the omitted heights and the
+  deterministic campaigns retained their own evidence at burn 250.
+- Impact: subtracting a stale value from the final height can make an arbitrarily
+  short observation window pass a long-soak gate. This is the same broad class
+  of check-that-could-not-fail error that the attacknet is intended to prevent;
+  indirect evidence that the chain happened to run is not a substitute for the
+  requested continuously sampled acceptance window.
+- Required correction: while the external Bitcoin clock is acknowledged
+  paused, capture and validate the starting Bitcoin height and full canonical
+  cohort in one bounded start phase, derive the target only from that admitted
+  observation, then start cadence. The terminal result must cite the first and
+  final sample heights and reject any mismatch with the contract. Run a new
+  300-or-more-block window rather than reinterpreting this evidence as passing.
 
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
