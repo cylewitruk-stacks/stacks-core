@@ -3436,6 +3436,39 @@ does pass the controller contract.
   node or signer defect. The retained failure is still valuable evidence that
   the independent PoX enrollment gate cannot be bypassed by Pod readiness.
 
+## F-131: Enrolled telemetry loss is detected and attributed independently of actor readiness
+
+- Classification: deliberate observability negative control and clean recovery
+- State: Kubernetes live proof complete; Compose counterpart remains part of
+  the backend-parity gate
+- Setup: a fresh current-main network enrolled exactly four protocol actors.
+  The new backend-neutral telemetry invariant first proved one fresh
+  `up=1` series with the correct server-attached role for every manifest actor.
+  Controller-admitted campaign `telemetry-prometheus-partition` then selected
+  exact Ready `follower-1` Pod UID
+  `02d7d141-f2a3-49b2-ab8b-d4e625fdfc8f` and used the bounded
+  `harnessTarget: prometheus` contract. The compiler converted that name to
+  the exact network-scoped Prometheus labels; no raw address or arbitrary
+  selector was admitted.
+- Negative result: Chaos Mesh recorded successful rules on both the follower
+  and Prometheus Pod. The trusted active probe changed from 5/5 successful
+  attempts before injection to 0/5 during it. At the same time, the telemetry
+  invariant still observed all four attributable series but returned
+  `ok=false` and exit 1 because only `follower-1` was fresh with `up=0`,
+  reason-coded `scrape-down`. Actor/Kubernetes readiness was not used to excuse
+  the missing telemetry path.
+- Recovery: the run controller classified `NetworkDegraded=Proven` and
+  `NetworkRecovered=Proven`, observed normal `AllRecovered`, deleted the exact
+  NetworkChaos resource, and released the mutation lease. The same unchanged
+  telemetry assertion then passed with 4/4 actors, correct roles, `up=1`, and
+  sample age below 0.05 seconds. The focused admitted-state, orchestration,
+  timeline, and Loki bundle is retained at
+  `contrib/attacknet/evidence/telemetry-negative-control-20260816/`.
+- Operational result: a flat or empty Grafana panel can now be distinguished
+  from a healthy-but-idle chain and from an actor-specific scrape failure by a
+  machine-readable invariant. The Prometheus harness target remains a narrow
+  controller-owned exception rather than a general NetworkChaos escape hatch.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.
