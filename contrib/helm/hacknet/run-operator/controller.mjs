@@ -150,6 +150,32 @@ function assertionTimeout(assertions, fallback) {
   return values.length ? Math.max(...values) : fallback;
 }
 
+function ioPressureLatencyP95(phase, actor) {
+  const observation = phase?.observations?.find(item => item.actor === actor);
+  const value = observation?.status === 'ok' ? observation.latencyMsP95 : NaN;
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`I/O-pressure probe for ${actor} lacks a finite non-negative p95 latency`);
+  }
+  return value;
+}
+
+export function strongestIoPressurePhase(priorJson, candidate, actor) {
+  if (!priorJson) return candidate;
+  let prior;
+  try {
+    prior = JSON.parse(priorJson);
+  } catch (error) {
+    throw new Error(`stored I/O-pressure probe evidence is malformed: ${error.message}`);
+  }
+  // The I/O-pressure effect contract requires both a latency multiplier and
+  // an absolute latency increase against one immutable baseline. For the same
+  // actor and baseline, a larger p95 monotonically strengthens both clauses,
+  // so retaining the maximum is sufficient and keeps status bounded to one
+  // observation instead of accumulating an unbounded sample history.
+  return ioPressureLatencyP95(candidate, actor) > ioPressureLatencyP95(prior, actor)
+    ? candidate : prior;
+}
+
 export function stableName(...parts) {
   const candidate = parts.filter(Boolean).join('-').toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').replace(/-+/g, '-');
@@ -1327,7 +1353,26 @@ export class FaultCampaignReconciler {
         if (ioPressurePodRunning(chaos)) {
           const deadline = durationSeconds(compiled.resource.spec.duration)
             + assertionTimeout(campaign.spec.recoveryAssertions, 300);
-          if (elapsedSeconds(campaign.status.injectedAt) <= deadline) return;
+          if (elapsedSeconds(campaign.status.injectedAt) <= deadline) {
+            const pods = await this.api.list('pods', {
+              group: '', labels: `testing.stacks.org/network=${manifest.network}`,
+            });
+            const candidate = await this.collectProbePhase(
+              campaign, compiled, network, pods, 'during', true,
+            );
+            const actor = campaign.status.resolvedTargets[0].actor;
+            const strongest = strongestIoPressurePhase(
+              campaign.status?.probeArtifacts?.duringJson, candidate, actor,
+            );
+            await this.patchStatus(campaign, status(campaign.status, 'Active',
+              'SamplingEffectEvidence', {
+                probeArtifacts: {
+                  ...(campaign.status?.probeArtifacts ?? {}),
+                  duringJson: JSON.stringify(strongest),
+                },
+              }));
+            return;
+          }
           const cleanup = await this.removeChaos(campaign);
           await this.patchStatus(campaign, status(campaign.status, 'Failed', 'RecoveryTimeout', {
             message: 'I/O-pressure Pod remained Running beyond its bounded duration and recovery deadline',

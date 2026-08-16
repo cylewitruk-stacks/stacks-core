@@ -1018,7 +1018,9 @@ test('bounded controller-owned I/O-pressure Pod requires active evidence and str
   // The first post-fault sample is still elevated. Recovery assertions are a
   // bounded polling window, so the controller must retain Recovering and take
   // another trusted sample instead of making the first noisy result terminal.
-  const samples = [4, 12, 8, 4.5];
+  // The first Running sample can race the pressure process. A later active
+  // sample must replace it before recovery is evaluated.
+  const samples = [4, 0.9, 12, 8, 4.5];
   const probes = {probe: async (target, request) => {
     assert.equal(request.kind, 'io');
     assert.equal(request.operation, 'FSYNC');
@@ -1079,6 +1081,15 @@ test('bounded controller-owned I/O-pressure Pod requires active evidence and str
   assert.equal(current.status.actualInjection.node, 'worker-1');
   assert.equal(current.status.actualInjection.phase, 'Running');
   assert.equal(current.status.actualInjection.pvcClaim, 'data-demo-signer-1-0');
+
+  await reconciler.reconcile(current);
+  current = await api.get('faultcampaigns', value.metadata.name);
+  assert.equal(current.status.phase, 'Active');
+  assert.equal(current.status.reason, 'SamplingEffectEvidence');
+  assert.equal(
+    JSON.parse(current.status.probeArtifacts.duringJson).observations[0].latencyMsP95,
+    12,
+  );
 
   const completed = await api.get('pods', pressureName, {group: ''});
   completed.status.phase = 'Succeeded';

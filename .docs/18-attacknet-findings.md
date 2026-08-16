@@ -2879,6 +2879,54 @@ does pass the controller contract.
   forces one failed sample and proves a subsequent successful live-peer sample
   without triggering the lifecycle failure trap.
 
+## F-115: I/O-pressure effect sampling raced the pressure process
+
+- Classification: fault-effect evidence-window defect
+- State: corrected, regression-tested, and proven by a clean live rerun
+- Evidence: the first deterministic four-fault run passed Pod restart, network
+  delay, and DNS-error campaigns, then truthfully paused because its final
+  I/O-pressure campaign was `Inconclusive`. The controller-owned pressure Pod
+  ran to completion on the exact admitted `follower-3` PVC and was removed
+  cleanly. Its baseline FSYNC p95 was 0.861 ms, but the single sample taken as
+  soon as Kubernetes first reported the pressure Pod `Running` was only 0.893
+  ms. The first post-completion sample was 8.581 ms, demonstrating that the
+  requested effect became observable after the prematurely captured `during`
+  sample. This is an evidence-timing failure, not proof that the pressure
+  process failed or that recovery succeeded.
+- Impact: a real but delayed storage effect can be classified as absent, and a
+  still-elevated filesystem can then make recovery inconclusive. In an
+  agent-directed run this would discard a potentially causal fault from later
+  replay or minimization.
+- Correction and gate: while the bounded pressure Pod remains `Running`, every
+  controller reconcile now obtains another trusted active-probe sample and
+  retains only the highest p95 observation for the immutable actor and
+  baseline. Higher p95 monotonically strengthens both configured effect
+  clauses (latency multiplier and absolute added latency), while retaining one
+  sample keeps CR status bounded. Recovery remains a separate bounded polling
+  window and neither threshold is weakened. Regression coverage begins with a
+  deliberately too-early active sample, proves a later sample replaces it,
+  then requires both an initially elevated recovery sample and a subsequent
+  recovered sample before the campaign passes.
+- Live proof: immutable run-controller image
+  `stacks-hacknet-run-operator:local-6905c2efe11800cd` reran the four-fault
+  sequence without recreating any actor. Pod restart, 750 ms network delay,
+  targeted DNS error, and I/O pressure all ended `EffectAndRecoveryProven`
+  with confirmed cleanup absence; the parent run ended `SequenceCompleted`
+  with four of four campaigns complete and zero inconclusive results. For the
+  pressure campaign, baseline FSYNC p95 was 1.110 ms, the retained active p95
+  was 7.890 ms (7.108x and +6.780 ms), and the recovery p95 was 2.199 ms
+  (1.981x and +1.089 ms), satisfying the unchanged two-part effect and
+  recovery contracts. The shared post-fault verifier then found zero burn or
+  Stacks-height drift and one canonical tip across all 18 nodes at burn 250 /
+  Stacks height 52.
+- Preserved evidence: `FaultCampaign
+  final-soak-v1-4-pressure-one-follower-pvc` and paused `AttacknetRun
+  final-soak-v1` in the retained `attacknet-final-soak` environment, with the
+  rendered schedule at
+  `contrib/attacknet/evidence/final-soak-20260815T232258Z/fault-sequence.json`;
+  passing v2 request, run, campaigns, and post-fault cohort evidence are under
+  `contrib/attacknet/evidence/final-soak-20260815T232258Z/deterministic-faults-v2/`.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.
