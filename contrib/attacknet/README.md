@@ -456,8 +456,9 @@ topology. A real kind-worker outage carrying 53.33% signer weight also proved
 safe quorum pause and automatic recovery. Fresh-UID replay/minimization is now
 proven through one removal-only counterfactual with controller-owned
 classification and evidence-before-delete. Remaining live gates are
-backend-paired assertion negative controls, additional version-skew profiles,
-and the final corrected 300+ burn-block soak.
+backend-paired assertion negative controls and additional version-skew and
+modified-actor profiles. The corrected measured soak is proven over burn
+503 -> 803 with all four deterministic campaign families passing.
 
 The final soak must use the measured runner rather than a hand-recorded start
 height. It first obtains an acknowledged cadence pause, waits for an exact
@@ -477,7 +478,10 @@ KUBE_NAMESPACE=hacknet-system KUBE_NETWORK=attacknet-final-soak \
 the requested interval, both paused boundary cohorts exactly agree with
 Bitcoin and each other, ordinary cohort samples pass, Pod disruptions are
 either an explicit active campaign target or fail the run, and the supplied
-`AttacknetRun` terminates `Passed`.
+`AttacknetRun` terminates `Passed`. The runner also captures signer Prometheus
+counters at both paused boundaries and emits `signer-metric-deltas.json`; any
+counter decrease fails closed as a restart/truncated comparison, so a
+pre-existing cumulative rejection cannot be attributed to the soak window.
 
 IOChaos has an additional platform gate. Chaos Mesh 2.8.3 bundles an x86-64
 `toda` helper whose source also hard-codes x86-64 ptrace registers and emitted

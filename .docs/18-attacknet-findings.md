@@ -629,6 +629,13 @@ experiments require the apparatus to fail visibly and converge exactly.
   time, fetch time, local sortition and disposition. Add bounded counters for
   accepted, stale-view, bad-signer and missing-slot StackerDB outcomes so the
   dashboard exposes the distribution without log archaeology.
+- Measured-soak evidence: the exact burn 503 -> 803 Loki window contained 139
+  `Bad DB slot signer` errors across companions, including 34 on
+  `signer-node-9`. All 18 nodes nevertheless ended at the identical burn 803 /
+  Stacks 597 tip and every signer runloop remained ready and registered. The
+  successful outcome reinforces that the raw error is not by itself a
+  current-key failure; the missing bounded disposition metric remains the
+  actionable observability gap.
 
 ## F-038: Attacknet lifecycle needs protocol-height phases, not startup sleeps
 
@@ -719,6 +726,15 @@ experiments require the apparatus to fail visibly and converge exactly.
   reach threshold. This occurrence recovered in about two seconds and did not
   suppress the vote. Retain the condition as a measurable recovery path rather
   than filing it as a liveness defect on this evidence alone.
+- Long-window evidence: the exact 300-burn-block acceptance window contained
+  2,300 instances of this family (222--236 per signer), so the ordering window
+  is common rather than exceptional under the ten-second regtest cadence. The
+  same counter window recorded 3,013 accepted companion validations and zero
+  rejected companion validations across all ten signers; every actor ended on
+  the same canonical tip. It also recorded 246 policy-level rejections before
+  validation, which remain a separate tenure-policy signal. This demonstrates
+  repeated recovery without false validation rejection, while the high error
+  volume still justifies a bounded recovery counter and less alarming logging.
 
 ## F-043: A signer companion silently omits proposal transport unless configured as a `stacker`
 
@@ -2387,6 +2403,12 @@ does pass the controller contract.
 - Portability: this behavior predates attacknet and is transport-independent;
   the accelerated regtest makes its volume conspicuous but does not create the
   logical future-ancestor condition.
+- Measured-soak evidence: the exact burn 503 -> 803 window contained 300
+  `PoXAnchorBlockRequired` response errors plus 300 corresponding
+  `RequestFailure(400)` client errors--60 lines per signer--while the chain
+  advanced all 300 requested burn blocks and every signer remained registered.
+  The volume is therefore material forensic noise even though no liveness
+  failure accompanied it.
 
 ## F-098: A restored peer can amplify stale Nakamoto-inventory send warnings for minutes
 
@@ -3042,12 +3064,17 @@ does pass the controller contract.
   39,341,951-byte gzip, recorded Loki 3.5.3 build identity and source objects,
   and passed every retained digest. Evidence is under
   `contrib/attacknet/evidence/final-soak-20260815T232258Z/post-soak-capture/loki/`.
+- Replacement-soak proof: the corrected burn 503 -> 803 window exported
+  591,594 entries / 663,134,029 uncompressed bytes in 119 pages to a
+  35,634,893-byte gzip with zero malformed entries and verified digests. A
+  streaming summary found no panic, OOM, ENOSPC, segmentation-fault, assertion,
+  or stack-overflow family. The destructive full-run teardown export is still
+  the final closure gate for F-118/F-119.
 
 ## F-120: The nominal 300-block soak contract captured its first cohort 111 blocks late
 
 - Classification: acceptance-evidence TOCTOU defect
-- State: acceptance claim invalidated; replacement runner and measured rerun
-  required
+- State: fixed, regression-tested, and replaced by a passing measured run
 - Evidence: the ad-hoc monitor embedded `start_height=202` before it began its
   loop, and later wrote that value into `contract.json`. Its first timestamped
   Pod and cohort sample, at the same recorded monitor start time, observed burn
@@ -3066,6 +3093,37 @@ does pass the controller contract.
   observation, then start cadence. The terminal result must cite the first and
   final sample heights and reject any mismatch with the contract. Run a new
   300-or-more-block window rather than reinterpreting this evidence as passing.
+- Correction and live proof: `soak-runner.sh` now pauses first, requires exact
+  Bitcoin/burn/Stacks agreement, derives the target from that observed height,
+  samples the admitted baseline Pod UID set throughout the run, permits only an
+  active campaign's exact target to be temporarily unavailable, pauses again,
+  and rejects a terminal cohort that is not exact. The replacement run began
+  at burn 503 / Stacks 302 and ended at burn 803 / Stacks 597, directly
+  observing exactly 300 new burn blocks in 43 canonical cohort samples and 92
+  Pod-health samples. Its deterministic four-campaign `AttacknetRun` ended
+  `Passed`; every final actor agreed on the same tip. Evidence is under
+  `contrib/attacknet/evidence/final-soak-20260815T232258Z/verified-soak-300/`.
+
+## F-121: Cumulative signer counters can be misattributed to the measured soak window
+
+- Classification: acceptance-evidence attribution trap
+- State: fixed for future measured soaks; replacement evidence classified
+- Evidence: the terminal signer-4 scrape contained one rejected companion
+  validation. Read alone, it appeared to show that the 300-block soak exercised
+  a genuine invalid-block path. The paused burn-503 baseline scrape already
+  contained the same value; at burn 803 it was still one. All ten per-signer
+  deltas were zero for rejected validations.
+- Risk: cumulative Prometheus counters establish lifetime occurrence, not event
+  time. A restart can also decrease a counter and make subtraction silently
+  meaningless. Either mistake can turn an old event into a current acceptance
+  failure or hide a truncated observation window.
+- Correction: measured soaks now scrape every signer at both exact paused
+  boundaries and emit `signer-metric-deltas.json`. The summarizer treats an
+  uninstantiated labelled counter as zero, rejects capture-error markers,
+  requires identical signer inventories, and fails closed on any decreasing
+  counter. For the replacement window it records 3,259 proposals received,
+  3,013 validation accepts, zero validation rejects, 2,932 accepted responses,
+  and 246 policy rejections.
 
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean

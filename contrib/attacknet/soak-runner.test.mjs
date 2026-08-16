@@ -20,4 +20,7 @@ test('target comes from the measured contract rather than a hard-coded height', 
   assert.doesNotMatch(source, /target_height=[0-9]/);
   assert.match(source, /environment-assert/);
   assert.match(source, /burnchain-policy\.sh/);
+  assert.match(source, /start-signer-metrics/);
+  assert.match(source, /end-signer-metrics/);
+  assert.match(source, /signer-metric-deltas\.mjs/);
 });

@@ -326,6 +326,10 @@ the selector, range, every page boundary, source Kubernetes objects, and file
 digests alongside compressed `logs.jsonl.gz`. If a page cannot advance—such as more than one
 page of entries sharing one timestamp—or the bounded page count is exceeded,
 the export is marked incomplete and teardown stops before deleting Loki's PVC.
+`summarize-loki-export.mjs` then streams the compressed JSONL without loading
+the corpus into memory and emits bounded actor/level/error-family counts plus
+an explicit suspicious-runtime family list. The summary is an index for human
+and agent triage; the digest-verified JSONL remains the canonical evidence.
 
 ## Tests
 

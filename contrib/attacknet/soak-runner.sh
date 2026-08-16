@@ -91,6 +91,16 @@ capture_cohort() {
   ATTACKNET_MINIMUM_STACKS_HEIGHT=1 "${attacknet_dir}/verify.sh" "${manifest}" snapshot >"${destination}"
 }
 
+capture_signer_metrics() {
+  local destination="$1" service inventory
+  mkdir -p "${destination}"
+  inventory="$(node "${attacknet_dir}/manifest-inventory.mjs" "${manifest}" signers)"
+  for service in ${inventory}; do
+    "${runtime}" exec "${service}" curl --fail --silent http://127.0.0.1:31000/metrics \
+      >"${destination}/${service}.txt"
+  done
+}
+
 capture_exact_paused_cohort() {
   local destination="$1" height_file="$2" deadline=$((SECONDS + 300)) candidate height
   while [ "${SECONDS}" -lt "${deadline}" ]; do
@@ -177,6 +187,7 @@ fail_if_fault_run_terminal_bad() {
 # evidence bug where an unsampled earlier height was treated as the start.
 ATTACKNET_LOCK_OWNER="soak-runner:$$" "${policy}" pause
 capture_exact_paused_cohort "${evidence_dir}/start-cohort.json" "${evidence_dir}/start-height"
+capture_signer_metrics "${evidence_dir}/start-signer-metrics"
 start_height="$(<"${evidence_dir}/start-height")"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -244,6 +255,10 @@ done
 ATTACKNET_LOCK_OWNER="soak-runner:$$" "${policy}" pause
 cadence_running=0
 capture_exact_paused_cohort "${evidence_dir}/end-cohort.json" "${evidence_dir}/end-height"
+capture_signer_metrics "${evidence_dir}/end-signer-metrics"
+node "${attacknet_dir}/signer-metric-deltas.mjs" \
+  "${evidence_dir}/start-signer-metrics" "${evidence_dir}/end-signer-metrics" \
+  "${evidence_dir}/signer-metric-deltas.json"
 end_height="$(<"${evidence_dir}/end-height")"
 sample_count=$((sample_count + 1))
 cp "${evidence_dir}/end-cohort.json" \
