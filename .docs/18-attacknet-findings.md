@@ -3138,7 +3138,8 @@ does pass the controller contract.
 ## F-122: Observer-enablement accepted stale Ready Pods while their replacement revision was rolling
 
 - Classification: lifecycle/protocol-boundary ordering defect
-- State: root-caused, corrected, and regression-tested; fresh live proof pending
+- State: root-caused, corrected, regression-tested, and proven on a fresh live
+  full-topology lifecycle
 - Evidence: the mixed-version run applied the final companion observer configs
   while Bitcoin was paused at burn 220. The run ledger recorded the next burst
   at `08:34:05Z`, but several replacement companion Pods were not created until
@@ -3165,6 +3166,20 @@ does pass the controller contract.
   precedes the registration burst. The next fresh lifecycle run must retain a
   passing `observer-height-live-peer-connectivity` assertion to close the live
   portion of this finding.
+- Live acceptance: fresh run `attacknet-fresh-gate` held Bitcoin exactly at
+  burn 220 after the final resource was admitted. During the rollout all ten
+  companion StatefulSets were at generation 2 while their old Pods still
+  reported Ready, with zero updated replicas and mismatched current/update
+  revisions. The corrected gate did not advance. It waited for all exact
+  revisions and then for every pre-activation Stacks node to have a live
+  authenticated conversation. Only after that assertion passed did the clock
+  advance to burn 222, where all ten signers registered and all ten companions
+  exposed the `.miners` StackerDB. Activation at 223 then completed normally.
+  The shared verifier subsequently found all 18 Stacks nodes at burn 224 /
+  Stacks 20 on one tip with zero height drift, 27--33 authenticated live
+  conversations per node, and zero unauthenticated conversations. The focused
+  capture is retained at
+  `contrib/attacknet/evidence/fresh-preactivation-gate-20260816/`.
 
 ## F-123: A current-main companion returned NotFound while validating across a fast burn transition
 
@@ -3215,6 +3230,116 @@ does pass the controller contract.
   The assertion is present in both the sealed-input run ledger and the
   authenticated event journal. F-123 records the one independent healthy-node
   validation rejection instead of hiding it inside this positive result.
+
+## F-125: A simultaneous ten-companion rollout had a six-minute live-peer recovery tail
+
+- Classification: measured lifecycle/recovery performance observation
+- State: reproduced on a fresh full topology; safety gate worked; precise
+  legacy-P2P retry cause remains open
+- Trigger: enabling the ten final companion observer configurations at burn
+  220 replaced all ten companion Pods while Bitcoin was deliberately paused.
+  Kubernetes converged every StatefulSet to its exact update revision quickly,
+  but five new companions initially reported zero active inbound and outbound
+  conversations. Their configured bootstrap endpoints were DNS-correct and
+  directly TCP-reachable, and `private_neighbors = true` plus the effective
+  Pod IP were present in the runtime config.
+- Evidence: the lagging set fell from five actors at 3 seconds, to three at
+  130 seconds, and to one at 193 seconds. The final node acquired authenticated
+  peers after 366 seconds. During the early interval all three common
+  bootstrap nodes had twelve inbound conversations; that observation is
+  consistent with connection contention or retry backoff but does not prove a
+  hard twelve-peer ceiling. By release time the final companion had 15
+  authenticated connections and the post-activation cohort had 27--33 each.
+- Impact: the former lifecycle would have hidden this recovery tail by
+  advancing the protocol while some companions had no transport path. The new
+  gate preserves correctness, but a six-minute pause makes simultaneous
+  rollout recovery operationally expensive and could exhaust a shorter
+  deployment timeout. It also shows why Pod Ready and configured bootstrap
+  records cannot substitute for active `inbound`/`outbound` evidence.
+- Follow-up: retain the measured convergence duration as a baseline; classify
+  connection attempts/rejections/backoff directly before changing topology or
+  connection limits. A distributed deterministic bootstrap list may be worth
+  testing as a counterfactual, but should not be asserted as the fix without
+  that evidence. The run ledger's
+  `observer-height-live-peer-connectivity` assertion records the exact rows and
+  366-second convergence window in the F-122 evidence bundle.
+
+## F-126: The shared cohort assertion detects a Ready actor with a partitioned Bitcoin view
+
+- Classification: deliberate assertion negative control and clean recovery
+- State: Kubernetes half proven live; the equivalent Compose control remains
+  required before backend parity is complete
+- Setup: controller-admitted campaign `fresh-gate-burn-drift-negative`
+  selected exact Ready Pod `attacknet-fresh-gate-follower-5-0`, UID
+  `e4733ed5-d348-4f0b-b716-a20972abb682`, and partitioned it bidirectionally
+  only from the enrolled `bitcoin` actor for 90 seconds. Admission charged
+  zero signer/miner weight. Chaos Mesh recorded one successful injection for
+  each side of the pair; the trusted active probe changed from five successful
+  Bitcoin-P2P attempts before injection to zero of five during it.
+- Negative result: with Bitcoin deliberately accelerated to five-second
+  cadence, every Pod remained Ready and all Stacks nodes retained authenticated
+  P2P conversations. The unchanged backend-neutral verifier nevertheless
+  returned `ok=false`: the healthy cohort had reached burn 237 / Stacks 32--33
+  while `follower-5` remained at burn 232 / Stacks 28, producing reason-coded
+  `burnDrift=5` and `stacksDrift=5`. It reported no equal-height fork. This
+  proves readiness and internal P2P cannot mask a stale burnchain view.
+- Recovery: the run controller independently classified
+  `NetworkDegraded=Proven` and `NetworkRecovered=Proven`, observed normal
+  `AllRecovered`, deleted the exact NetworkChaos resource, and released the
+  mutation lease. After cadence paused, the same verifier passed with all 18
+  nodes at burn 253, Stacks drift one, one tip at each observed height, 28--33
+  authenticated conversations per node, and zero unauthenticated
+  conversations. The focused bundle is retained at
+  `contrib/attacknet/evidence/burn-drift-negative-control-20260816/`.
+- Follow-up: run the identical logical control through the Compose adapter and
+  retain the same fail/recover reason contract. Do not substitute container
+  pause for the burn-view partition: that would only re-prove actor readiness,
+  which already has paired evidence.
+
+## F-127: Isolating all miners from non-miner Stacks peers made miner-local RPC temporarily unobservable
+
+- Classification: node liveness/observability stress finding plus harness
+  diagnostic defect
+- State: reproduced and recovered; precise node-versus-fault-mechanism cause
+  remains open; silent verifier failure corrected and regression-tested
+- Trigger: a bounded NetworkChaos partition selected all three miners and all
+  ten companions plus five followers as the opposite side. Bitcoin remained
+  reachable and all miner Pods stayed `2/2 Ready`. The controller proved the
+  partition independently for each exact miner UID. A first attempt was
+  intentionally non-probative because cadence was paused; the global mutation
+  lease correctly prevented cadence from changing underneath the active
+  fault. Retry `fresh-gate-stacks-stall-negative-r2` started five-second
+  cadence before injection.
+- Observation: during the retry, a TCP connection to each miner's local
+  `127.0.0.1:20443` succeeded, but `/v2/info` produced no response within the
+  three-second direct bound and then exceeded the shared verifier's ten-second
+  bound. The Pods remained Ready. Miner logs show a dense interval of failed
+  StackerDB sends, dead-peer drops, and connection re-admission while the
+  partition was active. Unaffected followers and companions continued to
+  report a common view (sampled at burn 275 / Stacks 53), but the absence of a
+  timestamped cohort at injection prevents claiming an exact no-progress
+  interval from that sample alone.
+- Impact: the shared progress verifier correctly did not report a pass, but
+  its command substitution previously exited under `set -e` without naming
+  the failed actor or endpoint. `verify.sh` now emits bounded diagnostics such
+  as `miner-1 /v2/info probe failed within 10s`; a fake-backend regression test
+  proves the attribution and ensures the invariant evaluator is never called
+  with missing evidence. A Kubernetes-Ready miner whose RPC loop is
+  unobservable remains a useful liveness signal independent of whether Stacks
+  block production also stalls.
+- Recovery: Chaos Mesh reported normal recovery for both sides of every
+  selected relationship, the controller classified all three
+  `NetworkRecovered` assertions Proven, removed the exact resource, and
+  released the lease. After cadence paused, all miner RPC endpoints responded
+  and all 18 nodes converged exactly at burn 279 / Stacks 57 on one tip with
+  zero drift. The bounded evidence is retained at
+  `contrib/attacknet/evidence/miner-partition-observability-20260816/`.
+- Follow-up: repeat with progressively smaller target sets and capture native
+  RPC latency plus P2P queue/socket gauges to distinguish ordinary bounded
+  connection teardown, node event-loop starvation, and a Chaos Mesh rule
+  interaction. Do not file this as a current-main defect until that boundary
+  is classified, and do not count it as the still-missing clean
+  canonical-tip-stall negative control.
 
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean

@@ -23,8 +23,16 @@ capture_cohort() {
   local output="$1" actor first=true info neighbors
   printf '[' >"${output}"
   for actor in ${evidence_nodes}; do
-    info="$(backend_exec_timeout "${probe_timeout}" "${actor}" curl --fail --silent http://127.0.0.1:20443/v2/info)"
-    neighbors="$(backend_exec_timeout "${probe_timeout}" "${actor}" curl --fail --silent http://127.0.0.1:20443/v2/neighbors)"
+    if ! info="$(backend_exec_timeout "${probe_timeout}" "${actor}" \
+      curl --fail --silent http://127.0.0.1:20443/v2/info)"; then
+      echo "${actor} /v2/info probe failed within ${probe_timeout}s" >&2
+      return 1
+    fi
+    if ! neighbors="$(backend_exec_timeout "${probe_timeout}" "${actor}" \
+      curl --fail --silent http://127.0.0.1:20443/v2/neighbors)"; then
+      echo "${actor} /v2/neighbors probe failed within ${probe_timeout}s" >&2
+      return 1
+    fi
     if [ "${first}" = true ]; then first=false; else printf ',' >>"${output}"; fi
     ACTOR="${actor}" INFO="${info}" NEIGHBORS="${neighbors}" node -e '
       process.stdout.write(JSON.stringify({
