@@ -1,0 +1,45 @@
+{
+  "apiVersion": "testing.stacks.org/v1alpha1",
+  "kind": "FaultCampaign",
+  "metadata": {
+    "name": "dns-enrolled-peer-error",
+    "namespace": "hacknet-system"
+  },
+  "spec": {
+    "template": false,
+    "networkRef": "attacknet-telemetry-live",
+    "target": {"actors": ["follower-1"]},
+    "fault": {
+      "type": "dns",
+      "action": "error",
+      "mode": "all",
+      "duration": "45s",
+      "parameters": {
+        "patterns": [
+          "attacknet-telemetry-live-miner-1.hacknet-system.svc.cluster.local"
+        ],
+        "containerNames": ["actor", "attacknet-probe"]
+      }
+    },
+    "safety": {
+      "maxUnavailableSignerPercent": 30,
+      "maxUnavailableMinerPercent": 50,
+      "allowQuorumLoss": false,
+      "allowBurnchain": false,
+      "allowExtendedDuration": false,
+      "allowExtremeSeverity": false,
+      "allowMinerMajorityOutage": false,
+      "allowUnenrolledNetworkTargets": false
+    },
+    "effectAssertions": [{
+      "type": "DNSDegraded",
+      "actor": "follower-1",
+      "timeoutSeconds": 60
+    }],
+    "recoveryAssertions": [{
+      "type": "DNSRecovered",
+      "actor": "follower-1",
+      "timeoutSeconds": 180
+    }]
+  }
+}

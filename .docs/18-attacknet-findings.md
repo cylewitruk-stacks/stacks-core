@@ -3469,6 +3469,32 @@ does pass the controller contract.
   machine-readable invariant. The Prometheus harness target remains a narrow
   controller-owned exception rather than a general NetworkChaos escape hatch.
 
+## F-132: DNSChaos isolates an enrolled service lookup without poisoning the control resolver path
+
+- Classification: positive live DNS fault and recovery evidence
+- State: passed on the local arm64 three-node kind cluster
+- Setup: controller-admitted campaign `dns-enrolled-peer-error` targeted the
+  exact Ready `follower-1` Pod and both its actor and trusted-probe containers.
+  The only fault pattern was the enrolled miner service FQDN; admission charged
+  zero signer and miner unavailability. Chaos Mesh recorded successful
+  injection in both named containers.
+- Effect: before injection, the trusted probe resolved the miner service to
+  `10.244.1.47` and independently resolved
+  `kubernetes.default.svc.cluster.local` to `10.96.0.1`. During injection the
+  selected query failed with no answers while the Kubernetes control query
+  continued to succeed with the same answer. The controller therefore
+  classified `DNSDegraded=Proven` instead of treating `AllInjected` alone as
+  proof.
+- Recovery: after the 45-second fault, the selected service resolved again to
+  its original answer, the control remained healthy, Chaos Mesh reported
+  normal recovery, and the exact DNSChaos resource was absent. The controller
+  classified `DNSRecovered=Proven` and the campaign Passed. The focused bundle
+  is retained at `contrib/attacknet/evidence/dns-chaos-canary-20260816/`.
+- Scope: this proves the DNS fault/evidence machinery and its trust boundary;
+  it is not itself evidence of a Stacks defect. Longer scenarios should combine
+  DNS disruption with connection churn because established P2P connections do
+  not require repeated DNS resolution.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.
