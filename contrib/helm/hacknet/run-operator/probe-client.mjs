@@ -32,6 +32,9 @@ export function buildProbeRequest({kind, campaign, compiledEvidence, network, ta
   const excluded = new Set([target.actor]);
   if (kind === 'NetworkChaos') {
     const requested = compiledEvidence.peerSelectedActors ?? [];
+    if (requested.length === 1 && requested[0] === 'attacknet-prometheus') {
+      return {kind: 'network', peer: 'attacknet-prometheus', port: 'http', attempts: 5, timeoutMs: 2000};
+    }
     const peers = (requested.length ? requested.map(name => actorsByName.get(name)) : peerCandidates(network, excluded))
       .filter(Boolean).filter(actor => actor.name !== target.actor && namedPort(actor));
     const peer = peers.sort((left, right) => left.name.localeCompare(right.name))[0];

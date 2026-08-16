@@ -31,7 +31,10 @@ const SAFETY_FIELDS = Object.freeze({
   maxUnavailableMinerPercent: 'number',
   maxUnavailableSignerPercent: 'number',
 });
-const NETWORK_COMMON_FIELDS = new Set(['direction', 'peerTarget', 'target', 'targetDevice', 'device', 'externalTargets']);
+const NETWORK_COMMON_FIELDS = new Set(['direction', 'peerTarget', 'harnessTarget', 'target', 'targetDevice', 'device', 'externalTargets']);
+const HARNESS_NETWORK_TARGETS = Object.freeze({
+  prometheus: {actor: 'attacknet-prometheus', port: 'http', appName: 'attacknet-prometheus'},
+});
 const IO_METHODS = new Set([
   'READ', 'WRITE', 'FLUSH', 'FSYNC', 'FDATASYNC', 'READDIR', 'SYNC', 'OPEN', 'MKDIR',
   'MKNOD', 'CHOWN', 'CHMOD', 'UTIMES', 'LINK', 'UNLINK', 'RENAME',
@@ -285,8 +288,10 @@ function validateNetworkParameters(action, parameters, safety, actors, manifest)
   for (const field of ['targetDevice', 'device']) {
     if (parameters[field] !== undefined) requireString(parameters[field], `fault.parameters.${field}`, {maxLength: 64});
   }
-  if (parameters.target !== undefined && parameters.peerTarget !== undefined) {
-    throw new Error('use either fault.parameters.peerTarget or raw target, not both');
+  const targetForms = ['target', 'peerTarget', 'harnessTarget', 'externalTargets']
+    .filter(field => parameters[field] !== undefined);
+  if (targetForms.length > 1) {
+    throw new Error('use exactly one of fault.parameters.peerTarget, harnessTarget, raw target, or externalTargets');
   }
   if ((parameters.target !== undefined || parameters.externalTargets !== undefined)
       && safety.allowUnenrolledNetworkTargets !== true) {
@@ -303,6 +308,19 @@ function validateNetworkParameters(action, parameters, safety, actors, manifest)
     delete parameters.peerTarget;
     peerEvidence = peerSelected.map(actor => actor.service);
   }
+  if (parameters.harnessTarget !== undefined) {
+    const name = requireString(parameters.harnessTarget, 'fault.parameters.harnessTarget', {maxLength: 32});
+    const harness = HARNESS_NETWORK_TARGETS[name];
+    if (!harness) throw new Error(`unsupported fault.parameters.harnessTarget ${name}`);
+    parameters.target = {
+      mode: 'all',
+      selector: {namespaces: [manifest.namespace], labelSelectors: {
+        [NETWORK_LABEL]: manifest.network, 'app.kubernetes.io/name': harness.appName,
+      }},
+    };
+    delete parameters.harnessTarget;
+    peerEvidence = [harness.actor];
+  }
   if (parameters.target !== undefined && !isObject(parameters.target)) throw new Error('fault.parameters.target must be an object');
   if (parameters.externalTargets !== undefined) stringArray(parameters.externalTargets, 'fault.parameters.externalTargets', {required: true});
 
@@ -310,7 +328,7 @@ function validateNetworkParameters(action, parameters, safety, actors, manifest)
     throw new Error('network netem requires delay, loss, duplicate, or corrupt parameters');
   }
   if (action === 'partition' && parameters.target === undefined && parameters.externalTargets === undefined) {
-    throw new Error('network partition requires peerTarget, raw target, or externalTargets');
+    throw new Error('network partition requires peerTarget, harnessTarget, raw target, or externalTargets');
   }
   if (action !== 'netem' && action !== 'partition' && parameters[action] === undefined) {
     throw new Error(`network ${action} requires parameters.${action}`);

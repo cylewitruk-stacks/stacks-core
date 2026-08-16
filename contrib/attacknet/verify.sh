@@ -13,10 +13,12 @@ probe_timeout="${ATTACKNET_PROBE_TIMEOUT_SECONDS:-10}"
 progress_window="$(node "${ATTACKNET_DIR}/progress-window.mjs" \
   "${manifest}" "${ATTACKNET_PROGRESS_WINDOW_SECONDS:-}")"
 
-unready="$(backend_unready_actors bitcoin bitcoin-miner stacker ${evidence_actors})"
-if [ -n "${unready}" ]; then
-  echo "Unready actors: ${unready}" >&2
-  exit 1
+if [ "${action}" != telemetry ]; then
+  unready="$(backend_unready_actors bitcoin bitcoin-miner stacker ${evidence_actors})"
+  if [ -n "${unready}" ]; then
+    echo "Unready actors: ${unready}" >&2
+    exit 1
+  fi
 fi
 
 capture_cohort() {
@@ -47,6 +49,22 @@ capture_cohort() {
 
 temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
+if [ "${action}" = telemetry ]; then
+  network="$(node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).network)' "${manifest}")"
+  query="up{attacknet_network=\"${network}\",attacknet_actor!=\"\"}"
+  probe_actor="${evidence_nodes%% *}"
+  if ! backend_prometheus_query "${network}" "${query}" "${probe_actor}" >"${temporary}/telemetry.json"; then
+    echo "${network} Prometheus query failed within ${probe_timeout}s" >&2
+    exit 1
+  fi
+  observed_at="$(node -e 'process.stdout.write(String(Date.now()/1000))')"
+  telemetry_status=0
+  node "${ATTACKNET_DIR}/invariants.mjs" telemetry "${temporary}/telemetry.json" \
+    "${observed_at}" "${ATTACKNET_TELEMETRY_MAXIMUM_AGE_SECONDS:-15}" "${manifest}" \
+    >"${temporary}/telemetry-result.json" || telemetry_status=$?
+  cat "${temporary}/telemetry-result.json"
+  exit "${telemetry_status}"
+fi
 capture_cohort "${temporary}/cohort.json"
 cohort_status=0
 node "${ATTACKNET_DIR}/invariants.mjs" cohort "${temporary}/cohort.json" \
@@ -102,5 +120,5 @@ case "${action}" in
       exit 1
     fi
     ;;
-  *) echo "usage: $0 MANIFEST {snapshot|progress}" >&2; exit 2 ;;
+  *) echo "usage: $0 MANIFEST {snapshot|progress|telemetry}" >&2; exit 2 ;;
 esac

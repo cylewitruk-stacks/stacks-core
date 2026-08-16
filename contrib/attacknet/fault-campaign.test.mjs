@@ -232,6 +232,27 @@ test('rejects raw network selector escape and compiles enrolled peerTarget safel
   assert.equal(compiled.resource.spec.direction, 'both');
 });
 
+test('compiles the Prometheus harness target to a network-scoped server-owned selector', () => {
+  const compiled = compileCampaign(campaign({fault: {
+    type: 'network', action: 'partition', duration: '30s', parameters: {
+      harnessTarget: 'prometheus', direction: 'both',
+    },
+  }}), manifest);
+  assert.deepEqual(compiled.evidence.peerSelectedActors, ['attacknet-prometheus']);
+  assert.deepEqual(compiled.resource.spec.target, {
+    mode: 'all', selector: {namespaces: ['hacknet-system'], labelSelectors: {
+      'testing.stacks.org/network': 'attacknet',
+      'app.kubernetes.io/name': 'attacknet-prometheus',
+    }},
+  });
+  assert.equal(compiled.resource.spec.harnessTarget, undefined);
+  assert.throws(() => compileCampaign(campaign({fault: {
+    type: 'network', action: 'partition', duration: '30s', parameters: {
+      harnessTarget: 'prometheus', peerTarget: {actors: ['miner-1']},
+    },
+  }}), manifest), /use exactly one/);
+});
+
 test('bounds worst-case miner-majority outage independently of signer quorum', () => {
   const minerManifest = {...manifest, actors: [
     ...manifest.actors,

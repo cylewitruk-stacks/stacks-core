@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {heightCohort, networkCohort, peerConnectivity, progress} from './invariants.mjs';
+import {heightCohort, networkCohort, peerConnectivity, progress, telemetryCoverage} from './invariants.mjs';
 
 test('height cohort accepts bounded lag and reports both dimensions', () => {
   const result = heightCohort([
@@ -99,4 +99,41 @@ test('network cohort requires height, tip, and live-peer agreement together', ()
     neighbors: {bootstrap: [], sample: [], inbound: [{authenticated: true}], outbound: []},
   });
   assert.equal(networkCohort([sample('a'), sample('b')], 0, 1).ok, true);
+});
+
+const telemetryManifest = {actors: [
+  {service: 'miner-1', role: 'miner'},
+  {service: 'signer-1', role: 'signer'},
+]};
+const telemetryResponse = rows => ({status: 'success', data: {resultType: 'vector', result: rows}});
+const up = (actor, role, value = '1', timestamp = 100) => ({
+  metric: {attacknet_actor: actor, attacknet_role: role}, value: [timestamp, value],
+});
+
+test('telemetry coverage requires one fresh healthy series per manifest actor', () => {
+  const result = telemetryCoverage(telemetryResponse([
+    up('miner-1', 'miner'), up('signer-1', 'signer'),
+  ]), telemetryManifest, 110, 15);
+  assert.equal(result.ok, true);
+  assert.equal(result.expectedActors, 2);
+  assert.equal(result.observedUniqueActors, 2);
+});
+
+test('telemetry coverage reason-codes missing, down, stale, role, duplicate, and unexpected series', () => {
+  const result = telemetryCoverage(telemetryResponse([
+    up('miner-1', 'follower', '0', 80), up('miner-1', 'miner', '1', 100),
+    up('outsider', 'follower'),
+  ]), telemetryManifest, 110, 15);
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.rows[0].reasons, ['duplicate-series']);
+  assert.deepEqual(result.rows[1].reasons, ['missing-series']);
+  assert.deepEqual(result.unexpectedActors, ['outsider']);
+});
+
+test('telemetry coverage reports each single-series failure without accepting partial health', () => {
+  const down = telemetryCoverage(telemetryResponse([
+    up('miner-1', 'miner', '0', 100), up('signer-1', 'wrong', '1', 80),
+  ]), telemetryManifest, 110, 15);
+  assert.deepEqual(down.rows[0].reasons, ['scrape-down']);
+  assert.deepEqual(down.rows[1].reasons, ['role-mismatch', 'stale-sample']);
 });

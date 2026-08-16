@@ -111,8 +111,58 @@ export function progress(start, end, minimumBurnBlocks = 1, minimumStacksBlocks 
   };
 }
 
+export function telemetryCoverage(apiResponse, manifest, observedAtSeconds, maximumAgeSeconds = 15) {
+  if (apiResponse?.status !== 'success' || apiResponse?.data?.resultType !== 'vector'
+      || !Array.isArray(apiResponse?.data?.result)) {
+    throw new Error('invalid Prometheus instant-vector response');
+  }
+  const observedAt = Number(observedAtSeconds);
+  const maximumAge = Number(maximumAgeSeconds);
+  if (!Number.isFinite(observedAt) || !Number.isFinite(maximumAge) || maximumAge < 0) {
+    throw new Error('invalid telemetry observation time or age ceiling');
+  }
+  const expected = new Map((manifest.actors ?? []).map(actor => [actor.service, actor.role]));
+  if (expected.size === 0) throw new Error('manifest has no enrolled actors');
+  const byActor = new Map();
+  for (const sample of apiResponse.data.result) {
+    const actor = sample?.metric?.attacknet_actor;
+    if (typeof actor !== 'string' || actor.length === 0) continue;
+    const rows = byActor.get(actor) ?? [];
+    rows.push(sample);
+    byActor.set(actor, rows);
+  }
+  const rows = [...expected.entries()].map(([actor, role]) => {
+    const samples = byActor.get(actor) ?? [];
+    const sample = samples[0];
+    const timestamp = Number(sample?.value?.[0]);
+    const value = Number(sample?.value?.[1]);
+    const sampleAgeSeconds = Number.isFinite(timestamp) ? Math.max(0, observedAt - timestamp) : null;
+    const observedRole = sample?.metric?.attacknet_role ?? null;
+    const reasons = [];
+    if (samples.length === 0) reasons.push('missing-series');
+    if (samples.length > 1) reasons.push('duplicate-series');
+    if (samples.length === 1 && observedRole !== role) reasons.push('role-mismatch');
+    if (samples.length === 1 && value !== 1) reasons.push('scrape-down');
+    if (samples.length === 1 && (!Number.isFinite(sampleAgeSeconds) || sampleAgeSeconds > maximumAge)) {
+      reasons.push('stale-sample');
+    }
+    return {actor, role, observedRole, value: Number.isFinite(value) ? value : null,
+      sampleTimestamp: Number.isFinite(timestamp) ? timestamp : null, sampleAgeSeconds, reasons};
+  });
+  const unexpectedActors = [...byActor.keys()].filter(actor => !expected.has(actor)).sort();
+  return {
+    ok: rows.every(row => row.reasons.length === 0) && unexpectedActors.length === 0,
+    expectedActors: expected.size,
+    observedUniqueActors: byActor.size,
+    observedAt,
+    maximumAgeSeconds: maximumAge,
+    unexpectedActors,
+    rows,
+  };
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const [command, inputPath, rawValue, rawMinimum] = process.argv.slice(2);
+  const [command, inputPath, rawValue, rawMinimum, manifestPath] = process.argv.slice(2);
   const input = JSON.parse(readFileSync(inputPath, 'utf8'));
   let result;
   if (command === 'cohort') result = networkCohort(input, Number(rawValue ?? 2), Number(rawMinimum ?? 0));
@@ -120,7 +170,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   else if (command === 'progress') {
     result = progress(input.start, input.end, Number(rawValue ?? 1), Number(rawMinimum ?? 1));
   }
-  else throw new Error('usage: invariants.mjs {cohort|peers|progress} INPUT [LIMIT]');
+  else if (command === 'telemetry') {
+    if (!manifestPath) throw new Error('telemetry invariant requires a manifest path');
+    result = telemetryCoverage(input, JSON.parse(readFileSync(manifestPath, 'utf8')),
+      Number(rawValue), Number(rawMinimum ?? 15));
+  }
+  else throw new Error('usage: invariants.mjs {cohort|peers|progress|telemetry} INPUT [LIMIT]');
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   if (!result.ok) process.exitCode = 1;
 }

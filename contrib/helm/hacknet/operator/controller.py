@@ -559,6 +559,13 @@ def build_probe_container(
         }
         for actor in context.spec["actors"]
     }
+    # A controller-named, credential-free harness endpoint lets FaultCampaigns
+    # prove loss and recovery of observability without admitting arbitrary
+    # external selectors into the probe's network allowlist.
+    peers["attacknet-prometheus"] = {
+        "host": f"{context.network_name}-attacknet-prometheus.{context.namespace}.svc.cluster.local",
+        "ports": {"http": 9090},
+    }
     # The probe receives no Kubernetes token and no actor-provided result
     # channel. Its peer/port allowlist is generated solely from the admitted
     # StacksNetwork inventory.

@@ -142,6 +142,7 @@
                           },
                           "x-kubernetes-validations": [{"rule": "has(self.actors) || has(self.roles)", "message": "peerTarget requires at least one actor or role selector"}]
                         },
+                        "harnessTarget": {"type": "string", "enum": ["prometheus"]},
                         "delay": {
                           "description": "Chaos Mesh Delay object for network faults, or duration string for IOChaos latency. The compiler performs the action-dependent type check.",
                           "x-kubernetes-preserve-unknown-fields": true
@@ -207,11 +208,11 @@
                     {"rule": "self.type != 'dns' || self.action in ['error', 'random']", "message": "invalid DNS fault action"},
                     {"rule": "self.type != 'io' || self.action in ['latency', 'fault', 'attrOverride', 'mistake']", "message": "invalid I/O fault action"},
                     {"rule": "self.type != 'io-pressure' || self.action == 'disk-pressure'", "message": "invalid I/O-pressure fault action"},
-                    {"rule": "self.type != 'network' || !has(self.parameters.target) || !has(self.parameters.peerTarget)", "message": "network faults may use target or peerTarget, not both"},
+                    {"rule": "self.type != 'network' || (has(self.parameters.target) ? 1 : 0) + (has(self.parameters.peerTarget) ? 1 : 0) + (has(self.parameters.harnessTarget) ? 1 : 0) + (has(self.parameters.externalTargets) ? 1 : 0) <= 1", "message": "network faults may use only one target form"},
                     {"rule": "self.type != 'network' || self.action != 'loss' || has(self.parameters.loss)", "message": "network loss requires parameters.loss"},
                     {"rule": "self.type != 'network' || self.action != 'duplicate' || has(self.parameters.duplicate)", "message": "network duplicate requires parameters.duplicate"},
                     {"rule": "self.type != 'network' || self.action != 'corrupt' || has(self.parameters.corrupt)", "message": "network corrupt requires parameters.corrupt"},
-                    {"rule": "self.type != 'network' || self.action != 'partition' || has(self.parameters.target) || has(self.parameters.peerTarget) || has(self.parameters.externalTargets)", "message": "network partition requires peerTarget, target, or externalTargets"},
+                    {"rule": "self.type != 'network' || self.action != 'partition' || has(self.parameters.target) || has(self.parameters.peerTarget) || has(self.parameters.harnessTarget) || has(self.parameters.externalTargets)", "message": "network partition requires peerTarget, harnessTarget, target, or externalTargets"},
                     {"rule": "self.type != 'network' || self.action != 'bandwidth' || has(self.parameters.bandwidth)", "message": "network bandwidth requires parameters.bandwidth"},
                     {"rule": "self.type != 'dns' || has(self.parameters.patterns)", "message": "DNS faults require parameters.patterns"},
                     {"rule": "self.type != 'io' || has(self.parameters.volumePath)", "message": "I/O faults require parameters.volumePath"},

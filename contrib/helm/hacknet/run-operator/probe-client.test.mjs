@@ -25,6 +25,10 @@ test('plans only enrolled named network and DNS peers', () => {
     kind: 'NetworkChaos', campaign: campaign('network'), compiledEvidence: {}, network, target,
   }), {kind: 'network', peer: 'follower-1', port: 'p2p', attempts: 5, timeoutMs: 2000});
   assert.deepEqual(buildProbeRequest({
+    kind: 'NetworkChaos', campaign: campaign('network'),
+    compiledEvidence: {peerSelectedActors: ['attacknet-prometheus']}, network, target,
+  }), {kind: 'network', peer: 'attacknet-prometheus', port: 'http', attempts: 5, timeoutMs: 2000});
+  assert.deepEqual(buildProbeRequest({
     kind: 'DNSChaos', campaign: campaign('dns', {patterns: ['attacknet-signer-node-1.hacknet.svc.cluster.local']}),
     compiledEvidence: {}, network, target,
   }), {kind: 'dns', peer: 'signer-node-1'});

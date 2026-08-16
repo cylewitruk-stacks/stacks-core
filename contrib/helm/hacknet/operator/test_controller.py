@@ -161,6 +161,10 @@ class ResourceBuilderTests(unittest.TestCase):
         peer_map = json.loads(next(item["value"] for item in probe["env"] if item["name"] == "PROBE_PEERS_JSON"))
         self.assertEqual(peer_map["companion-1"]["host"], "demo-companion-1.hacknet.svc.cluster.local")
         self.assertEqual(peer_map["companion-1"]["ports"]["rpc"], 20443)
+        self.assertEqual(
+            peer_map["attacknet-prometheus"],
+            {"host": "demo-attacknet-prometheus.hacknet.svc.cluster.local", "ports": {"http": 9090}},
+        )
         self.assertFalse(miner["automountServiceAccountToken"])
         self.assertEqual(miner["securityContext"]["fsGroup"], 65532)
         self.assertTrue(probe["securityContext"]["runAsNonRoot"])

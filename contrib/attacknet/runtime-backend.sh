@@ -202,6 +202,22 @@ backend_resume() {
   esac
 }
 
+# Query the backend's enrolled Prometheus through an actor that already has a
+# bounded HTTP client.  Assertions consume the same Prometheus API response on
+# Compose and Kubernetes; only service discovery belongs in this adapter.
+backend_prometheus_query() {
+  local network="$1"
+  local query="$2"
+  local probe_actor="${3:?manifest-derived probe actor required}"
+  local endpoint
+  case "${ATTACKNET_BACKEND}" in
+    compose) endpoint='http://prometheus:9090/api/v1/query' ;;
+    kubernetes) endpoint="http://${network}-attacknet-prometheus:9090/api/v1/query" ;;
+  esac
+  backend_exec_timeout "${ATTACKNET_PROBE_TIMEOUT_SECONDS:-10}" "${probe_actor}" \
+    curl --fail --silent --get --data-urlencode "query=${query}" "${endpoint}"
+}
+
 backend_runtime_description() {
   case "${ATTACKNET_BACKEND}" in
     compose) backend_compose ps --all --format json ;;
@@ -224,7 +240,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     signal) backend_signal "$@" ;;
     pause) backend_pause "$@" ;;
     resume) backend_resume "$@" ;;
+    prometheus-query) backend_prometheus_query "$@" ;;
     describe) backend_runtime_description ;;
-    *) echo "usage: $0 {exec|logs|exists|unready|signal|pause|resume|describe} ..." >&2; exit 2 ;;
+    *) echo "usage: $0 {exec|logs|exists|unready|signal|pause|resume|prometheus-query|describe} ..." >&2; exit 2 ;;
   esac
 fi
