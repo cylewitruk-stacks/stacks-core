@@ -215,7 +215,7 @@ function resultFor(plan, issued, outcome, uid) {
   };
 }
 
-test('ddmin is adaptive, counterfactual, and accepts evidence only from unique fresh networks', () => {
+test('ddmin is adaptive, counterfactual, and accepts evidence only from fresh networks', () => {
   const {run, context} = fixture();
   const schedule = resolveAttacknetSchedule(run, context);
   let plan = createDdminPlan(schedule, {
@@ -241,11 +241,50 @@ test('ddmin is adaptive, counterfactual, and accepts evidence only from unique f
 
   issued = issueDdminAttempt(plan);
   plan = issued.plan;
-  assert.ok(issued.attempt, 'target or parameter minimization must follow campaign reduction');
-  const duplicate = resultFor(plan, issued, 'FailureAbsent', 'fresh-1');
-  assert.throws(() => recordDdminOutcome(plan, duplicate), /already used/);
-  plan = recordDdminOutcome(plan, resultFor(plan, issued, 'FailureAbsent', 'fresh-2'));
-  assert.equal(plan.attempts.length, 2);
+  assert.equal(issued.attempt, null, 'non-monotone pod parameters must not become live experiments');
+  assert.equal(plan.phase, 'Complete');
+  assert.equal(plan.attempts.length, 1);
+  assert.equal(plan.result.causalMinimalityClaimed, false);
+});
+
+test('ddmin runs only monotone parameter removals and records impossible candidates as non-causal skips', () => {
+  const {run, context} = fixture();
+  const source = {
+    metadata: {name: 'netem', uid: 'uid-netem', generation: 1},
+    spec: {
+      template: true, networkRef: 'attacknet', target: {actors: ['miner-1']},
+      fault: {type: 'network', action: 'netem', mode: 'all', duration: '10s', parameters: {
+        direction: 'to', peerTarget: {actors: ['miner-2']},
+        delay: {latency: '100ms'}, duplicate: {duplicate: '10'},
+      }},
+      safety: {maxUnavailableSignerPercent: 30, maxUnavailableMinerPercent: 50},
+    },
+  };
+  context.campaigns = [source];
+  delete context.decisionSpaces;
+  run.spec.campaignCatalog = [{name: 'netem', campaignRef: 'netem'}];
+  run.spec.sequence = [{id: 'netem-only', campaign: 'netem', delayAfterSeconds: 0, enabled: true}];
+  const schedule = resolveAttacknetSchedule(run, context);
+  let plan = createDdminPlan(schedule, {requireFreshNetwork: true, maxAttempts: 4,
+    expectedFailure: {assertion: 'NetworkDegraded', status: 'Failed'}});
+
+  let issued = issueDdminAttempt(plan);
+  plan = issued.plan;
+  assert.deepEqual(issued.attempt.counterfactual.removed, ['delay']);
+  assert.equal(issued.attempt.schedule.actions[0].resolved.parameters.direction, 'to');
+  assert.ok(issued.attempt.schedule.actions[0].resolved.parameters.peerTarget,
+    'scope parameters must remain fixed because their absence broadens the fault');
+  plan = recordDdminOutcome(plan, resultFor(plan, issued, 'FailureReproduced', 'fresh-netem-1'));
+
+  issued = issueDdminAttempt(plan);
+  plan = issued.plan;
+  assert.equal(issued.attempt, null, 'removing the final netem effect is structurally inadmissible');
+  assert.equal(plan.phase, 'Complete');
+  assert.equal(plan.attempts.length, 1);
+  assert.equal(plan.structuralSkips.length, 1);
+  assert.deepEqual(plan.structuralSkips[0].removed, ['duplicate']);
+  assert.equal(plan.structuralSkips[0].causalEvidence, false);
+  assert.match(plan.structuralSkips[0].reason, /netem requires/);
   assert.equal(plan.result.causalMinimalityClaimed, false);
 });
 

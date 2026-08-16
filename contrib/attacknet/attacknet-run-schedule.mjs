@@ -540,6 +540,21 @@ function firstDimension(schedule) {
   return dimensionState('campaigns', null, campaigns);
 }
 
+function removableParameterKeys(action) {
+  const fault = action.resolved.campaignSpec.fault;
+  // Parameter absence is frequently a broader or merely different fault:
+  // omitted network direction defaults to both, omitted peerTarget removes a
+  // traffic boundary, and omitted containerNames broadens container scope.
+  // The only presently proven monotone top-level removal is deleting one
+  // independent impairment from a multi-effect netem campaign. Extend this
+  // allowlist only with an explicit fault-contract argument and tests.
+  if (fault.type === 'network' && fault.action === 'netem') {
+    return ['corrupt', 'delay', 'duplicate', 'loss']
+      .filter(key => Object.hasOwn(action.resolved.parameters, key));
+  }
+  return [];
+}
+
 function followingDimension(plan, current) {
   const faults = plan.candidate.actions.filter(action => action.kind === 'fault-campaign');
   if (current.kind === 'campaigns') {
@@ -552,10 +567,10 @@ function followingDimension(plan, current) {
   }
   const start = current.kind === 'parameters' ? current.actionIndex + 1 : 0;
   const nextParameters = faults.findIndex((action, index) => index >= start
-    && Object.keys(action.resolved.parameters).length > 0);
+    && removableParameterKeys(action).length > 0);
   if (nextParameters >= 0) {
     return dimensionState('parameters', nextParameters,
-      Object.keys(faults[nextParameters].resolved.parameters).sort());
+      removableParameterKeys(faults[nextParameters]));
   }
   return null;
 }
@@ -597,6 +612,41 @@ function materializeCandidate(plan, removed) {
   delete unsigned.integrity;
   candidate.integrity = {algorithm: 'sha256', digest: sha256Value(unsigned)};
   return candidate;
+}
+
+function structuralManifestFor(action) {
+  const spec = action.resolved.campaignSpec;
+  const actors = new Map();
+  const addActor = (service, role = 'ddmin-target') => {
+    if (!actors.has(service)) actors.set(service, {service, role});
+  };
+  const addSelector = (target, prefix) => {
+    if (!target || typeof target !== 'object') return;
+    const roles = Array.isArray(target.roles) ? target.roles : [];
+    for (const service of (target.actors ?? [])) {
+      addActor(service, roles.length === 1 ? roles[0] : 'ddmin-target');
+    }
+    for (const [index, role] of roles.entries()) addActor(`${prefix}-${index + 1}`, role);
+  };
+  for (const service of action.resolved.targets) addActor(service);
+  addSelector(spec.target, 'target-role');
+  addSelector(spec.fault?.parameters?.peerTarget, 'peer-role');
+  // Campaign removal cannot create a malformed retained action, while target
+  // and parameter removal can. Reuse the canonical compiler against a bounded
+  // synthetic manifest so action-specific requirements remain defined in one
+  // place. This is admission-domain validation only, never causal evidence.
+  return {
+    network: spec.networkRef,
+    namespace: 'ddmin-structural-validation',
+    actors: [...actors.values()],
+  };
+}
+
+function validateMaterializedCandidate(candidate) {
+  for (const action of candidate.actions.filter(item => item.kind === 'fault-campaign')) {
+    compileCampaign({metadata: {name: 'ddmin-structural-validation'}, spec: copy(action.resolved.campaignSpec)},
+      structuralManifestFor(action));
+  }
 }
 
 function sealCandidate(candidate) {
@@ -806,11 +856,16 @@ export function createDdminPlan(schedule, options = {}) {
     dimension: firstDimension(schedule),
     pendingAttempt: null,
     attempts: [],
+    structuralSkips: [],
     result: {
       empiricallyReduced: false,
       oneMinimalUnderObservedCounterfactuals: false,
       causalMinimalityClaimed: false,
       statement: 'No reduction claim exists until candidate removals are rerun on fresh networks.',
+    },
+    parameterReductionPolicy: {
+      name: 'monotone-parameter-removals/v1',
+      disclosure: 'Only parameters whose absence is contractually a weaker fault are eligible; defaults that broaden or change scope remain fixed.',
     },
   };
   if (plan.dimension.items.length <= 1) advanceDimension(plan);
@@ -829,20 +884,44 @@ export function issueDdminAttempt(input) {
   if (plan.schemaVersion !== ATTACKNET_DDMIN_SCHEMA) throw new Error('unsupported ddmin schema');
   if (plan.pendingAttempt) throw new Error('record the pending ddmin attempt before issuing another');
   if (new Set(['Complete', 'Inconclusive', 'BudgetExhausted']).has(plan.phase)) return {plan, attempt: null};
-  if (plan.attempts.length >= plan.maxAttempts) {
-    plan.phase = 'BudgetExhausted';
-    plan.result.statement = 'The minimization attempt budget was exhausted; no minimality claim is valid.';
-    return {plan, attempt: null};
+  if (!Array.isArray(plan.structuralSkips)) plan.structuralSkips = [];
+  let state;
+  let removed;
+  let candidate;
+  // A structural skip advances the deterministic search exactly like a
+  // non-reproducing removal, but is not an experiment outcome and consumes no
+  // live-attempt budget. The finite partition cursor bounds this loop.
+  while (true) {
+    if (plan.attempts.length >= plan.maxAttempts) {
+      plan.phase = 'BudgetExhausted';
+      plan.result.statement = 'The minimization attempt budget was exhausted; no minimality claim is valid.';
+      return {plan, attempt: null};
+    }
+    if (!plan.dimension) {
+      plan.phase = 'Complete';
+      return {plan, attempt: null};
+    }
+    state = plan.dimension;
+    const partitions = chunks(state.items, Math.min(state.granularity, state.items.length));
+    if (state.cursor >= partitions.length) throw new Error('ddmin cursor exceeds its partition round');
+    removed = partitions[state.cursor];
+    candidate = materializeCandidate(plan, removed);
+    try {
+      validateMaterializedCandidate(candidate);
+      break;
+    } catch (error) {
+      plan.structuralSkips.push({
+        dimension: state.kind,
+        instructionId: state.actionIndex === null ? null
+          : plan.candidate.actions.filter(action => action.kind === 'fault-campaign')[state.actionIndex].instructionId,
+        removed: [...removed],
+        candidateDigest: candidate.integrity.digest,
+        reason: String(error?.message ?? error),
+        causalEvidence: false,
+      });
+      advanceNonReproducingPartition(plan);
+    }
   }
-  if (!plan.dimension) {
-    plan.phase = 'Complete';
-    return {plan, attempt: null};
-  }
-  const state = plan.dimension;
-  const partitions = chunks(state.items, Math.min(state.granularity, state.items.length));
-  if (state.cursor >= partitions.length) throw new Error('ddmin cursor exceeds its partition round');
-  const removed = partitions[state.cursor];
-  const candidate = materializeCandidate(plan, removed);
   const attempt = {
     id: ddminAttemptId(plan, candidate, removed),
     ordinal: plan.attempts.length + 1,
@@ -863,6 +942,21 @@ export function issueDdminAttempt(input) {
     removed, dimension: state.kind, actionIndex: state.actionIndex};
   plan.phase = 'AwaitingCounterfactual';
   return {plan, attempt};
+}
+
+function advanceNonReproducingPartition(plan) {
+  const state = plan.dimension;
+  const partitionCount = chunks(state.items, Math.min(state.granularity, state.items.length)).length;
+  state.cursor += 1;
+  if (state.cursor >= partitionCount) {
+    if (state.granularity >= state.items.length) {
+      advanceDimension(plan);
+    } else {
+      state.granularity = Math.min(state.items.length, state.granularity * 2);
+      state.cursor = 0;
+      state.round += 1;
+    }
+  }
 }
 
 function validateFreshNetwork(plan, result) {
@@ -910,7 +1004,6 @@ export function recordDdminOutcome(input, result) {
   plan.pendingAttempt = null;
   plan.phase = 'Planning';
   const state = plan.dimension;
-  const partitionCount = chunks(state.items, Math.min(state.granularity, state.items.length)).length;
   if (result.outcome === 'FailureReproduced') {
     plan.candidate = candidate;
     state.items = state.items.filter(item => !pending.removed.includes(item));
@@ -920,16 +1013,7 @@ export function recordDdminOutcome(input, result) {
     state.reproduced = true;
     if (state.items.length <= (state.kind === 'parameters' ? 0 : 1)) advanceDimension(plan);
   } else {
-    state.cursor += 1;
-    if (state.cursor >= partitionCount) {
-      if (state.granularity >= state.items.length) {
-        advanceDimension(plan);
-      } else {
-        state.granularity = Math.min(state.items.length, state.granularity * 2);
-        state.cursor = 0;
-        state.round += 1;
-      }
-    }
+    advanceNonReproducingPartition(plan);
   }
   return plan;
 }

@@ -62,6 +62,15 @@ assertions classify the outcome. Uncertain dimensions remain in the candidate
 set. This makes the intended process LLM-guided delta debugging rather than
 either exhaustive subset search or intuition-only incident analysis.
 
+Parameter removal has an additional monotonicity boundary. Omitting a field is
+not always a weaker fault: absent `direction` means both directions, absent
+`peerTarget` removes a traffic boundary, and absent `containerNames` can select
+more containers. The scheduler therefore admits only explicitly proven
+monotone parameter removals (currently individual effects from a multi-effect
+`network/netem` campaign). It runs the canonical compiler before issuing a
+counterfactual and records malformed reductions as `structuralSkips` with
+`causalEvidence=false`; they do not consume a fresh network or attempt budget.
+
 ## Running
 
 The source `AttacknetRun` must be terminal and its network must still be

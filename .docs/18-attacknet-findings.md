@@ -3635,6 +3635,33 @@ does pass the controller contract.
   `stacks_node_process_wall_clock_seconds`; signer-only processes remain
   unsupported until they expose an equivalent witness.
 
+## F-137: Deleting a fault parameter is not necessarily a smaller experiment
+
+- Classification: minimization correctness and resource-efficiency defect;
+  not a Stacks node or signer defect
+- State: fixed offline and regression-tested; latest-source live minimization
+  acceptance remains pending
+- Trigger: the hierarchical minimizer treated every top-level parameter as a
+  removable dimension. Several apparent deletions actually broaden behavior:
+  network chaos defaults an omitted `direction` to both directions, removing
+  `peerTarget` removes a traffic boundary, and omitting `containerNames` can
+  affect more containers. Required-field deletion also produced candidates
+  the controller could never admit, but only after paying for a clean network.
+- Correction: parameter ddmin now uses an explicit monotone-removal policy.
+  The only currently admitted class is deleting one independent impairment
+  from a multi-effect `network/netem` campaign. All scope/default parameters
+  remain fixed until their fault contract proves weaker absence semantics.
+  Before issuing any live attempt, the scheduler runs the canonical campaign
+  compiler against the materialized reduction. Structurally impossible
+  candidates are recorded as bounded `structuralSkips` with
+  `causalEvidence=false` and consume neither a fresh cluster nor attempt
+  budget.
+- Evidence boundary: a structural skip says only that the candidate is outside
+  the admitted experiment domain. It is not `FailureAbsent`, does not prove
+  irrelevance, and is never used as causal evidence. Focused schedule/executor
+  tests prove scope fields stay fixed, a valid netem-effect removal is issued,
+  and removing the final required effect completes without a live run.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

@@ -63,8 +63,17 @@ still match exactly.
 
 `createDdminPlan()`, `issueDdminAttempt()`, and `recordDdminOutcome()` implement
 adaptive hierarchical delta debugging over campaigns, exact target sets, and
-top-level fault parameters. Every issued attempt is a counterfactual schedule,
-not a conclusion. The executor must admission-check the candidate and run it
+top-level fault parameters. Parameter removal is deliberately conservative:
+only fields whose absence is contractually a weaker fault are eligible. Today
+that means independent impairment fields in a multi-effect `network/netem`
+campaign. Scope/default fields such as `direction`, `peerTarget`, and
+`containerNames` are fixed because deleting them can broaden the experiment.
+The canonical campaign compiler rejects structurally impossible candidates
+before a cluster is created; the plan records those as non-causal structural
+skips which consume no live-attempt budget.
+
+Every issued attempt is a counterfactual schedule, not a conclusion. The
+executor must admission-check the candidate and run it
 on a clean network with:
 
 - a UID different from the source network and every earlier attempt;
