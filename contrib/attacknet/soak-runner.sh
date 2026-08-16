@@ -290,4 +290,47 @@ finish_args=(finish "--contract=${evidence_dir}/soak-contract.json" \
   "--output=${evidence_dir}/result.json")
 [ -z "${fault_run_name}" ] || finish_args+=("--fault-run-phase=${final_fault_phase}")
 node "${attacknet_dir}/soak-evidence.mjs" "${finish_args[@]}"
+
+# Bind the independently useful soak artifact back into the canonical run
+# ledger and authenticated timeline. This prevents a passing result directory
+# from drifting away from the lifecycle status that ultimately owns teardown.
+run_descriptor="$(node "${attacknet_dir}/run-ledger.mjs" locate \
+  "--namespace=${namespace}" "--network=${network}")"
+run_id="$(node -e '
+  const fs=require("node:fs");
+  process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).run.id);
+' "${run_descriptor}")"
+soak_details="$(RESULT="${evidence_dir}/result.json" DELTAS="${evidence_dir}/signer-metric-deltas.json" node -e '
+  const fs=require("node:fs");
+  const result=JSON.parse(fs.readFileSync(process.env.RESULT,"utf8"));
+  const deltas=JSON.parse(fs.readFileSync(process.env.DELTAS,"utf8"));
+  process.stdout.write(JSON.stringify({
+    startHeight:result.startHeight,
+    endHeight:result.endHeight,
+    observedNewBurnBlocks:result.observedNewBurnBlocks,
+    minimumNewBurnBlocks:result.minimumNewBurnBlocks,
+    sampleCount:result.sampleCount,
+    faultRunPhase:result.faultRunPhase,
+    signerCount:deltas.signerCount,
+    validationRejectionsObserved:deltas.validationRejectionsObserved,
+    evidenceDirectory:process.env.RESULT.replace(/\/result\.json$/, ""),
+  }));
+')"
+node "${attacknet_dir}/run-ledger.mjs" append "${run_descriptor}" assertion-result \
+  "$(DETAILS="${soak_details}" node -e '
+    process.stdout.write(JSON.stringify({assertion:"measured-soak",status:"pass",details:JSON.parse(process.env.DETAILS)}));
+  ')" >/dev/null
+soak_event_details="$(DETAILS="${soak_details}" node -e '
+  const details=JSON.parse(process.env.DETAILS);
+  process.stdout.write(JSON.stringify({
+    name:"measured-soak",
+    passed:true,
+    value:details.observedNewBurnBlocks,
+    minimumBurnBlocks:details.minimumNewBurnBlocks,
+    ...details,
+  }));
+')"
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
+  "${attacknet_dir}/observability/record-event.sh" --kind=invariant.observed --phase=soak \
+  --outcome=pass "--details=${soak_event_details}" >/dev/null
 cat "${evidence_dir}/result.json"

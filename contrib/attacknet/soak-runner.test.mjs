@@ -23,4 +23,7 @@ test('target comes from the measured contract rather than a hard-coded height', 
   assert.match(source, /start-signer-metrics/);
   assert.match(source, /end-signer-metrics/);
   assert.match(source, /signer-metric-deltas\.mjs/);
+  assert.match(source, /run-ledger\.mjs" append/);
+  assert.match(source, /record-event\.sh/);
+  assert.match(source, /assertion:\s*"measured-soak"/);
 });
