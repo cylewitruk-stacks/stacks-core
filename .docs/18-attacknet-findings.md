@@ -640,7 +640,7 @@ experiments require the apparatus to fail visibly and converge exactly.
 ## F-038: Attacknet lifecycle needs protocol-height phases, not startup sleeps
 
 - Classification: orchestration design correction
-- State: implemented; clean live verification pending
+- State: implemented and proven by the clean full-topology lifecycle
 - Evidence: a two-second bootstrap cadence crossed reward-cycle and Nakamoto
   boundaries while companions rolled and signers initialized. Pod readiness
   ordering could narrow the race but could not prove which protocol state each
@@ -651,11 +651,16 @@ experiments require the apparatus to fail visibly and converge exactly.
   signer-registration and Nakamoto activation heights. Lifecycle advances with
   exact paused bursts, verifies node convergence at each barrier, and permits
   steady cadence only after every signer is a current-cycle participant.
+- Live proof: the replacement lifecycle reached each exact height barrier,
+  admitted all 31 actors, proved all ten current-cycle signer identities and
+  weights, crossed Nakamoto activation only after the signer gate, and later
+  completed the measured burn 503 -> 803 soak without a startup sleep being
+  used as protocol evidence.
 
 ## F-039: Raw actor logs are node-local and can disappear before forensics
 
 - Classification: attacknet observability and evidence-retention gap
-- State: identified; Loki/Alloy integration in progress
+- State: corrected and proven through full-run destructive teardown
 - Evidence: Prometheus centrally scrapes actor metrics and the authenticated
   event bridge persists orchestrator events, but raw stdout/stderr is read from
   containerd only when `kubectl logs` or incident capture runs. Only the current
@@ -669,11 +674,16 @@ experiments require the apparatus to fail visibly and converge exactly.
   image identity. Treat message bodies as actor-self-reported and potentially
   malicious; Kubernetes metadata and authenticated orchestration events remain
   the authoritative correlation sources.
+- Live proof: node-local Alloy collectors attached Kubernetes identity and
+  streamed the complete run into Loki. The mandatory teardown artifact retained
+  10,329,085 entries / 10.14 GB uncompressed as a digest-verified 368.9 MB gzip
+  before any observability or actor PVC was deleted. Bounded `kubectl logs`
+  snapshots remain a secondary incident source rather than the sole history.
 
 ## F-040: Confirmed stacking requires a subsequent burn event before signer participation
 
 - Classification: protocol-fixture sequencing fact exposed by a truthful gate
-- State: corrected in the attacknet manifest; clean rerun pending
+- State: corrected and proven in the clean full-topology lifecycle
 - Evidence: all ten `stack-stx` transactions were confirmed at burn height 220.
   At 221 every signer reported `runloop_ready=1` but
   `registered_for_current_reward_cycle=0`. An exact diagnostic block to 222
@@ -740,8 +750,7 @@ experiments require the apparatus to fail visibly and converge exactly.
 
 - Classification: current-main configuration ambiguity and attacknet bootstrap
   defect; transport-independent of libp2p
-- State: topology fixed and live diagnostic verified; fresh lifecycle run
-  pending
+- State: topology fixed and proven over the clean 300-block acceptance window
 - Evidence: miners repeatedly accepted proposals into their local
   `ST000000000000000000002AMW42H.miners` slots, while every signer companion's
   metadata endpoint returned `StackerDB contract not found` and no signer log
@@ -2355,9 +2364,7 @@ does pass the controller contract.
 ## F-096: The Bitcoin clock health server could close before reading the kubelet request
 
 - Classification: harness readiness false-negative and HTTP lifecycle defect
-- State: reproduced over the long full-topology run; corrected and
-  regression-tested offline; clean live rollout proof belongs to the next
-  clean run
+- State: corrected, regression-tested, and live-proven over the measured soak
 - Evidence: the clock mined continuously with zero container restarts, but
   Kubernetes accumulated 36 intermittent readiness failures over roughly four
   hours. The kubelet error was
@@ -2374,9 +2381,10 @@ does pass the controller contract.
   slow clients are closed without occupying the single-threaded listener
   indefinitely. A behavioral test performs 50 complete HTTP exchanges and
   requires every response body and status.
-- Operational note: the current admitted clock uses the prior ConfigMap and is
-  intentionally not hot-rolled during the soak. The next clean lifecycle run
-  must show no recurrence before this is marked live-proven.
+- Live proof: the corrected clock Pod ran with zero restarts and remained Ready
+  in all 92 independently captured Pod-health samples across the exact burn
+  503 -> 803 interval, including the four deterministic fault campaigns. The
+  final lifecycle teardown completed without a clock-health exception.
 
 ## F-097: Expected future reward-set lookup state is emitted as an error storm
 
@@ -3009,9 +3017,7 @@ does pass the controller contract.
 ## F-118: Teardown discarded Loki's longer forensic log history
 
 - Classification: forensic-evidence preservation defect
-- State: corrected, regression-tested, and proven read-only against the active
-  full-topology Loki instance; final destructive teardown ordering remains to
-  be exercised after the replacement measured soak completes
+- State: corrected, regression-tested, and proven through destructive teardown
 - Evidence: actor incident capture retained at most 20,000 lines per current or
   previous container, while Loki retained the longer Kubernetes log stream on
   its own PVC. Normal teardown exported the trusted event journal and run
@@ -3032,14 +3038,16 @@ does pass the controller contract.
 - Live proof: a read-only export from `attacknet-final-soak` queried Loki 3.5.3
   from the run's recorded creation time through burn height 347. It completed
   77 pages and retained 380,802 actor log entries without a pagination gap.
-  The final soak bundle will repeat the export over the complete run range and
-  exercise the teardown ordering before this item is considered fully closed.
+  The final teardown then exported 2,067 pages / 10,329,085 entries before its
+  first destructive call, verified the gzip and metadata digests, finalized the
+  run `passed`, deleted the owner and all actor/observability PVCs, and waited
+  until the exact labeled resource set was empty. This closes both preservation
+  and ordering rather than inferring them from a read-only capture.
 
 ## F-119: Full-run Loki export exhausted the host process heap
 
 - Classification: forensic exporter scalability and bounded-resource defect
-- State: corrected, regression-tested, and proven over the exact retained soak
-  window; full teardown export remains to be exercised
+- State: corrected, regression-tested, and proven over the full teardown range
 - Evidence: the first post-soak capture accumulated every flattened Loki entry
   in a JavaScript `Map`, then constructed a second sorted array and one giant
   JSON string. Node reached its approximately 4 GiB heap limit in
@@ -3068,8 +3076,10 @@ does pass the controller contract.
   591,594 entries / 663,134,029 uncompressed bytes in 119 pages to a
   35,634,893-byte gzip with zero malformed entries and verified digests. A
   streaming summary found no panic, OOM, ENOSPC, segmentation-fault, assertion,
-  or stack-overflow family. The destructive full-run teardown export is still
-  the final closure gate for F-118/F-119.
+  or stack-overflow family. The subsequent mandatory teardown streamed the
+  complete run's 10,140,307,541 uncompressed bytes into a 368,876,029-byte gzip
+  across 2,067 pages with bounded memory, marked the export complete, and
+  passed all three retained digests before storage deletion.
 
 ## F-120: The nominal 300-block soak contract captured its first cohort 111 blocks late
 
