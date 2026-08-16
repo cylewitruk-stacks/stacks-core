@@ -136,6 +136,32 @@ The general live gate is:
    it to the observed generation, actor, and Pod UID;
 6. only then run compatibility, missed-upgrade, and modified-actor assertions.
 
+`mixed-matrix-evidence.mjs` is the fail-closed summarizer for that final gate.
+Its configuration names the rendered manifest, admitted Pod list, exact build
+records, paused-window signer metrics and node snapshots, the modified signer
+log, and minimum burn/Stacks progress. It requires immutable runtime joins for
+both the released and locally modified actors, preserves the original signer
+weights and 70% threshold, proves the modified signer did not validate or
+approve proposals, requires healthy signer approvals, and requires the exact
+node cohort—including the released actor—to converge at both boundaries.
+Validation rejections from otherwise healthy nodes are observations, never
+silently attributed to the deliberate adversary.
+
+```sh
+node contrib/attacknet/mixed-matrix-evidence.mjs \
+  /absolute/path/to/config.json /absolute/path/to/result.json
+```
+
+The full 31-workload proof at
+`evidence/mixed-current-release-modified-20260816/` ran exact 4.0.2 follower-5
+and a source-pinned `reject-all` signer alongside the current cohort. Burn
+height advanced 227 to 248, Stacks height advanced 24 to 44, the adversarial
+1/25-weight signer rejected all 26 proposals it received, the healthy cohort
+emitted 188 accepted responses, and all 18 Stacks nodes converged. The result
+digest is bound into the finalized run ledger and authenticated event journal;
+the teardown bundle preserves 149,567 centralized log entries and the complete
+run finished `passed` before all run PVCs were removed.
+
 The unit tests fake all Docker and kind execution and separately exercise the
 OCI identity resolver and admission join. They prove the default path runs no
 executor, source drift aborts before a build, kind loading is opt-in, release

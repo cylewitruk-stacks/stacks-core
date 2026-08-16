@@ -108,7 +108,23 @@ test('bootstrap readiness counts admitted nonzero replicas, not suspended actors
   const manifest = join(root, 'manifest.json');
   writeFileSync(manifest, `${JSON.stringify({workloads: Array.from({length: 7}, (_, index) => ({service: `actor-${index}`}))})}\n`);
   const statefulsets = JSON.stringify({
-    items: Array.from({length: 7}, (_, index) => ({spec: {replicas: index === 5 ? 0 : 1}})),
+    items: Array.from({length: 7}, (_, index) => {
+      const replicas = index === 5 ? 0 : 1;
+      return {
+        metadata: {
+          generation: 1,
+          labels: {'testing.stacks.org/actor': `actor-${index}`},
+        },
+        spec: {replicas},
+        status: replicas === 0 ? {} : {
+          observedGeneration: 1,
+          readyReplicas: 1,
+          updatedReplicas: 1,
+          currentRevision: 'revision-1',
+          updateRevision: 'revision-1',
+        },
+      };
+    }),
   });
   const result = spawnSync('bash', ['-c', `
     source "$LIFECYCLE"
@@ -155,6 +171,20 @@ test('bootstrap readiness counts admitted nonzero replicas, not suspended actors
   assert.match(result.stdout, /6\/6 active Pods, 7\/7 StatefulSets admitted/);
 });
 
+test('bootstrap readiness rejects an old Ready Pod while its admitted StatefulSet revision is rolling', () => {
+  const result = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    stale='{"items":[{"metadata":{"generation":2,"labels":{"testing.stacks.org/actor":"companion-1"}},"spec":{"replicas":1},"status":{"observedGeneration":1,"readyReplicas":1,"updatedReplicas":0,"currentRevision":"old","updateRevision":"new"}}]}'
+    current='{"items":[{"metadata":{"generation":2,"labels":{"testing.stacks.org/actor":"companion-1"}},"spec":{"replicas":1},"status":{"observedGeneration":2,"readyReplicas":1,"updatedReplicas":1,"currentRevision":"new","updateRevision":"new"}}]}'
+    [ "$(statefulset_rollout_unready companion-1 "$stale")" = companion-1 ]
+    [ -z "$(statefulset_rollout_unready companion-1 "$current")" ]
+  `], {
+    encoding: 'utf8',
+    env: {...process.env, LIFECYCLE: lifecycle},
+  });
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('two-phase bootstrap never receives a second generic clock-start command', () => {
   const root = mkdtempSync(join(tmpdir(), 'attacknet-clock-path-'));
   const bootstrap = join(root, 'stacksnetwork.bootstrap.json');
@@ -175,6 +205,38 @@ test('two-phase bootstrap never receives a second generic clock-start command', 
     },
   });
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('the final cohort proves live transport while burn height is still frozen at observer enablement', () => {
+  const root = mkdtempSync(join(tmpdir(), 'attacknet-observer-transport-gate-'));
+  const calls = join(root, 'calls');
+  const result = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    wait_bootstrap_foundation_ready() { printf '%s\n' foundation >>"$CALLS"; }
+    wait_live_peer_connectivity() {
+      printf '%s\n' "peers:$2" >>"$CALLS"
+      LIVE_PEER_CONNECTIVITY_RESULT='{"group":"pre-activation-nodes","convergenceSeconds":7,"minimumAuthenticatedConnections":1,"maximumUnauthenticatedConnections":0,"rows":[]}'
+    }
+    ledger_assertion() { printf '%s\n' "assertion:$1:$2:$3" >>"$CALLS"; }
+    wait_final_preactivation_transport_ready manifest.json 220
+  `], {
+    encoding: 'utf8',
+    env: {...process.env, LIFECYCLE: lifecycle, CALLS: calls},
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const observed = readFileSync(calls, 'utf8');
+  assert.match(observed, /^foundation\npeers:pre-activation-nodes\n/);
+  assert.match(observed, /assertion:observer-height-live-peer-connectivity:pass:/);
+  assert.match(observed, /"observedHeight":220/);
+
+  // The helper's behaviour is tested above; this small ordering tripwire makes
+  // its placement load-bearing.  A future lifecycle refactor must not move the
+  // burn-222 registration burst ahead of the burn-220 transport proof.
+  const source = readFileSync(lifecycle, 'utf8');
+  const applyBody = source.slice(source.indexOf('apply_network() {'), source.indexOf('\ndelete_network() {'));
+  const gateAt = applyBody.indexOf('wait_final_preactivation_transport_ready "${manifest}" "${observer_height}"');
+  const registrationAt = applyBody.indexOf('burst_to_height "${registration_height}" signer-registration');
+  assert.ok(gateAt >= 0 && registrationAt > gateAt);
 });
 
 test('startup gates require live conversations and canonical global-state support', () => {

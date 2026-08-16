@@ -3135,6 +3135,87 @@ does pass the controller contract.
   3,013 validation accepts, zero validation rejects, 2,932 accepted responses,
   and 246 policy rejections.
 
+## F-122: Observer-enablement accepted stale Ready Pods while their replacement revision was rolling
+
+- Classification: lifecycle/protocol-boundary ordering defect
+- State: root-caused, corrected, and regression-tested; fresh live proof pending
+- Evidence: the mixed-version run applied the final companion observer configs
+  while Bitcoin was paused at burn 220. The run ledger recorded the next burst
+  at `08:34:05Z`, but several replacement companion Pods were not created until
+  `08:34:30Z` through `08:34:34Z`. The lifecycle's foundation check accepted
+  the old Ready Pods while the new StatefulSet template revision was still
+  rolling. Those replacement processes therefore started after Bitcoin had
+  already reached the burn-222 registration barrier. The truthful live-peer
+  gate then waited 718 seconds before all 16 pre-activation nodes had a real
+  authenticated conversation. The retained node logs begin by processing the
+  reward-cycle boundary without a live peer path and include `Missing canonical
+  anchor block`; this was not a slow Kubernetes scheduling event disguised as
+  healthy protocol readiness.
+- Root cause: the gate checked CR generation, aggregate replica counts, and Pod
+  Ready state, but did not join each protocol-foundation actor to its
+  StatefulSet `metadata.generation`, `status.observedGeneration`, updated
+  replica, and matching current/update revisions. Pod readiness is not tied to
+  the newly admitted template while the old Pod remains alive.
+- Correction: `wait_bootstrap_foundation_ready` now requires the exact admitted
+  StatefulSet revision for every foundation actor. After the final resource is
+  applied, the lifecycle additionally proves authenticated connectivity for
+  every pre-activation Stacks node while Bitcoin is still frozen at burn 220;
+  the burn-222 check remains as a second barrier. Tests prove that an old Ready
+  Pod with a stale revision is rejected and that the burn-220 transport proof
+  precedes the registration burst. The next fresh lifecycle run must retain a
+  passing `observer-height-live-peer-connectivity` assertion to close the live
+  portion of this finding.
+
+## F-123: A current-main companion returned NotFound while validating across a fast burn transition
+
+- Classification: transport-independent signer/node liveness-margin finding
+- State: observed and bounded; node root cause and mainnet frequency remain open
+- Evidence: during the deliberate three-second burn burst, signer 5 submitted
+  proposal `1239fa548665be70944a0038c53458e62f63d249d8c3b6584149fef628358600`
+  (height 26, burn 229) to its unmodified current-main companion. That companion
+  had stored and advanced to the proposal's parent
+  `101a2012d006ccbbd2227226f250959a94168082f489c1883c06e19820d017ff`
+  at `08:50:42.323Z`. It processed burn sortition 229 at
+  `08:50:45.262Z` through `.269Z`, received the proposal at `.340Z`, and the
+  signer received `BlockValidateReject { reason: "Chainstate Error: Not found",
+  reason_code: NotFoundError }` at `.386Z`. The same node stored the approved
+  block at `.975Z` and advanced to it at `.987Z`; the complete cohort later
+  converged.
+- Impact: one healthy signer carrying 3/25 (12%) weight temporarily cast a
+  validation rejection even though the proposal became canonical. In this run
+  the remaining honest weight preserved liveness, but correlated occurrences
+  would erode quorum margin. This is separate from the deliberately modified
+  signer and was surfaced explicitly by the mixed-matrix classifier.
+- Scope caution: a three-second regtest burn cadence deliberately compresses a
+  coordination window that is normally much wider. This evidence proves a real
+  current-main state-transition race under stress, not its production rate or
+  security severity. A focused reproduction should identify the exact missing
+  chainstate/sortition lookup and determine whether transient absence should be
+  retried/unavailable rather than emitted as a validity verdict before filing
+  a prescriptive fix.
+
+## F-124: Immutable current, released, and deliberately modified actors interoperated under bounded adversity
+
+- Classification: positive mixed-version/adversarial acceptance evidence
+- State: passed and cryptographically attributed
+- Evidence: the live 31-workload run joined every tested Pod UID and runtime
+  image ID to its build record. `follower-5` ran exact release 4.0.2 source
+  `1b57c3fb6709ab927f9179ab6814f874c84f5303`; `signer-1` ran the exact current
+  source plus only the retained `reject-all` testing patch. Its weight was 1 of
+  25, leaving 24 against an 18-weight threshold. Across the measured window,
+  burn height advanced 227 to 248 and Stacks height 24 to 44. The modified
+  signer rejected all 26 proposals it received and accepted none, while the
+  nine healthy signers emitted 188 accepted responses. All 18 Stacks nodes,
+  including the released follower, ended at the same burn height, Stacks
+  height, and tip.
+- Attribution: the backend-neutral classifier result is
+  `contrib/attacknet/evidence/mixed-current-release-modified-20260816/matrix-proof/result.json`
+  with digest
+  `sha256:a9bc55bc71ce25e0917c081bd19a1b1535fc71e660b30268e507f4d759fdddeb`.
+  The assertion is present in both the sealed-input run ledger and the
+  authenticated event journal. F-123 records the one independent healthy-node
+  validation rejection instead of hiding it inside this positive result.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

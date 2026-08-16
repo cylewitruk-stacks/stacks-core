@@ -159,9 +159,34 @@ wait_deleted() {
   return 1
 }
 
+statefulset_rollout_unready() {
+  local actors="$1" statefulsets="$2"
+  ACTORS="${actors}" STATEFULSETS="${statefulsets}" node -e '
+    const wanted = new Set(process.env.ACTORS.trim().split(/\s+/).filter(Boolean));
+    const items = JSON.parse(process.env.STATEFULSETS).items ?? [];
+    const byActor = new Map(items.map(item => [
+      item.metadata?.labels?.["testing.stacks.org/actor"], item,
+    ]));
+    const missing = [...wanted].filter(actor => {
+      const item = byActor.get(actor);
+      const generation = Number(item?.metadata?.generation ?? 0);
+      const status = item?.status ?? {};
+      return !item
+        || Number(item.spec?.replicas ?? 0) < 1
+        || generation < 1
+        || Number(status.observedGeneration ?? 0) < generation
+        || Number(status.readyReplicas ?? 0) < 1
+        || Number(status.updatedReplicas ?? 0) < 1
+        || !status.currentRevision
+        || status.currentRevision !== status.updateRevision;
+    });
+    process.stdout.write(missing.join(" "));
+  '
+}
+
 wait_bootstrap_foundation_ready() {
   local manifest="$1" deadline=$((SECONDS + TIMEOUT))
-  local actors total_expected statefulsets statefulset_count active_expected pod_count unready generation observed_generation
+  local actors total_expected statefulsets statefulset_count active_expected pod_count unready rollout_unready generation observed_generation
   actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" bootstrap-foundation)"
   total_expected="$(node -e '
     const fs = require("node:fs");
@@ -183,9 +208,15 @@ wait_bootstrap_foundation_ready() {
       -o jsonpath='{.metadata.generation}{" "}{.status.observedGeneration}{"\n"}' 2>/dev/null || true)
     unready="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
       "${ATTACKNET_DIR}/runtime-backend.sh" unready ${actors} 2>/dev/null || true)"
+    # Pod Ready alone is insufficient during the observer-enablement rollout:
+    # the old Pod can remain Ready after the StatefulSet template changes and
+    # until its replacement is created.  Require the exact admitted revision
+    # for every protocol-foundation actor before the external clock advances.
+    rollout_unready="$(statefulset_rollout_unready "${actors}" "${statefulsets}" 2>/dev/null || printf '%s' "${actors}")"
     if [ -n "${generation:-}" ] && [ "${generation}" = "${observed_generation:-}" ] \
       && [ "${statefulset_count}" = "${total_expected}" ] \
-      && [ "${pod_count}" = "${active_expected}" ] && [ -z "${unready}" ]; then
+      && [ "${pod_count}" = "${active_expected}" ] && [ -z "${unready}" ] \
+      && [ -z "${rollout_unready}" ]; then
       printf 'Bootstrap foundation Ready (%s actors); %s/%s active Pods, %s/%s StatefulSets admitted\n' \
         "$(wc -w <<<"${actors}" | tr -d ' ')" "${pod_count}" "${active_expected}" \
         "${statefulset_count}" "${total_expected}"
@@ -193,7 +224,7 @@ wait_bootstrap_foundation_ready() {
     fi
     sleep 3
   done
-  echo "${NETWORK} bootstrap foundation did not become Ready within ${TIMEOUT}s; generation=${observed_generation:-0}/${generation:-0}, StatefulSets=${statefulset_count:-0}/${total_expected}, active Pods=${pod_count:-0}/${active_expected:-0}, unready: ${unready:-unknown}" >&2
+  echo "${NETWORK} bootstrap foundation did not become Ready within ${TIMEOUT}s; generation=${observed_generation:-0}/${generation:-0}, StatefulSets=${statefulset_count:-0}/${total_expected}, active Pods=${pod_count:-0}/${active_expected:-0}, unready: ${unready:-none}, stale rollout: ${rollout_unready:-none}" >&2
   return 1
 }
 
@@ -351,6 +382,25 @@ wait_live_peer_connectivity() {
   echo "${group} nodes did not establish live authenticated P2P connectivity: ${result:-unavailable}" >&2
   rm -f "${samples}"
   return 1
+}
+
+# The final pre-Nakamoto cohort is introduced while the external burnchain is
+# paused at observerEnableHeight.  Prove that every active Stacks node has a
+# real authenticated conversation before advancing another burn block.  A Pod
+# being Ready (or a configured bootstrap row appearing in /v2/neighbors) is not
+# evidence of a live P2P path, and a replacement legacy node must not first
+# enter service immediately before the hard-fork boundary.
+wait_final_preactivation_transport_ready() {
+  local manifest="$1" observed_height="$2" result
+  wait_bootstrap_foundation_ready "${manifest}"
+  wait_live_peer_connectivity "${manifest}" pre-activation-nodes
+  result="${LIVE_PEER_CONNECTIVITY_RESULT}"
+  ledger_assertion observer-height-live-peer-connectivity pass \
+    "$(RESULT="${result}" HEIGHT="${observed_height}" node -e '
+      const value=JSON.parse(process.env.RESULT);
+      value.observedHeight=Number(process.env.HEIGHT);
+      process.stdout.write(JSON.stringify(value));
+    ')"
 }
 
 signer_metric_value() {
@@ -778,7 +828,7 @@ apply_network() {
     if [ -f "${bootstrap_network}" ]; then
       echo "Enabling companion observers at burn height ${observer_height}"
       kubectl -n "${NAMESPACE}" apply -f "${final_network}"
-      wait_bootstrap_foundation_ready "${manifest}"
+      wait_final_preactivation_transport_ready "${manifest}" "${observer_height}"
     fi
     burst_to_height "${registration_height}" signer-registration
     wait_nodes_at_burn_height "${manifest}" pre-activation-nodes "${registration_height}"
