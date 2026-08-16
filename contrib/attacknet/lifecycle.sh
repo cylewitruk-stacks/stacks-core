@@ -94,6 +94,24 @@ ledger_export() {
   node "${ATTACKNET_DIR}/run-ledger.mjs" export "${RUN_DESCRIPTOR}" "${destination}" >/dev/null
 }
 
+ledger_created_at() {
+  [ -n "${RUN_DESCRIPTOR}" ] && [ -r "${RUN_DESCRIPTOR}" ] || return 1
+  node -e '
+    const fs=require("node:fs");
+    const value=JSON.parse(fs.readFileSync(process.argv[1], "utf8")).run?.createdAt;
+    if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) process.exit(2);
+    process.stdout.write(value);
+  ' "${RUN_DESCRIPTOR}"
+}
+
+export_loki_evidence() {
+  local destination="$1" started
+  [ "${OBSERVABILITY_ENABLED}" = 1 ] || return 0
+  started="$(ledger_created_at)"
+  KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+    "${ATTACKNET_DIR}/observability/export-loki.sh" "${destination}" "${started}"
+}
+
 locate_ledger() {
   node "${ATTACKNET_DIR}/run-ledger.mjs" locate \
     "--namespace=${NAMESPACE}" "--network=${NETWORK}" 2>/dev/null
@@ -852,6 +870,10 @@ delete_network() {
         echo 'warning: failed to record run.finished before teardown' >&2
       KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" ATTACKNET_RUN_ID="${RUN_ID}" \
         "${ATTACKNET_DIR}/observability/export-kubernetes-report.sh" "${bundle}/timeline" "${RUN_ID}"
+      # Loki outlives kubelet log rotation and is therefore mandatory teardown
+      # evidence. A partial export aborts before any observability PVC is
+      # deleted, preserving the authoritative source for forensic recovery.
+      export_loki_evidence "${bundle}/loki"
     fi
     if [ "${descriptor_status}" = running ]; then
       ledger_assertion run-final-status \
@@ -916,6 +938,8 @@ capture() {
         "${ATTACKNET_DIR}/observability/export-kubernetes-report.sh" \
         "${destination}/timeline" "${RUN_ID}" || \
         echo 'warning: failed to export trusted timeline during capture' >&2
+      export_loki_evidence "${destination}/loki" || \
+        echo 'warning: failed to export centralized Loki logs during capture' >&2
     fi
   fi
 }

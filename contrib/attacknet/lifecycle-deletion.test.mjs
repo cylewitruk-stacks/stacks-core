@@ -44,3 +44,15 @@ esac
   assert.match(invocation, /testing\.stacks\.org\/network=attacknet,!testing\.stacks\.org\/artifact/);
   assert.match(invocation, /pods,pvc,deployments,statefulsets,daemonsets,services,configmaps/);
 });
+
+test('teardown exports centralized logs before issuing destructive Kubernetes calls', () => {
+  const lifecycle = readFileSync(new URL('./lifecycle.sh', import.meta.url), 'utf8');
+  const body = lifecycle.slice(lifecycle.indexOf('delete_network() {'), lifecycle.indexOf('\ncapture() {'));
+  const exportAt = body.indexOf('export_loki_evidence "${bundle}/loki"');
+  const ownerDeleteAt = body.indexOf('delete stacksnetwork "${NETWORK}"');
+  const observabilityDeleteAt = body.indexOf('delete deployments,statefulsets,daemonsets');
+  assert.ok(exportAt >= 0, 'teardown must export Loki');
+  assert.ok(ownerDeleteAt > exportAt, 'owner deletion must follow Loki export');
+  assert.ok(observabilityDeleteAt > exportAt, 'observability deletion must follow Loki export');
+  assert.doesNotMatch(body.slice(exportAt, ownerDeleteAt), /\|\|\s*true/);
+});

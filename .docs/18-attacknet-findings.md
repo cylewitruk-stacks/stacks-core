@@ -2984,6 +2984,35 @@ does pass the controller contract.
   retry failure; the clock status simultaneously reported generation 14 at
   burn height 297.
 
+## F-118: Teardown discarded Loki's longer forensic log history
+
+- Classification: forensic-evidence preservation defect
+- State: corrected, regression-tested, and proven read-only against the active
+  full-topology Loki instance; final teardown integration remains to be
+  exercised after the measured soak completes
+- Evidence: actor incident capture retained at most 20,000 lines per current or
+  previous container, while Loki retained the longer Kubernetes log stream on
+  its own PVC. Normal teardown exported the trusted event journal and run
+  descriptor and then deleted that PVC without querying Loki. F-098 had already
+  demonstrated that a single amplified warning could consume the bounded actor
+  snapshot in under two hours, so the deleted source contained material causal
+  history that the evidence bundle did not.
+- Correction: a network-scoped exporter now records the exact LogQL selector,
+  start/end nanoseconds, Loki build identity, admitted ConfigMap/StatefulSet/
+  Service/Pod source objects, every page boundary, entry counts, compressed
+  JSONL, and file digests. Pagination re-queries an inclusive nanosecond
+  boundary and de-duplicates exact labelled entries; if a full page cannot
+  advance (including an overfull identical timestamp) or the bounded page count
+  is exhausted, it reports an incomplete export instead of skipping data.
+  Normal teardown treats this export as mandatory and stops before deleting
+  observability storage on failure. Lifecycle and incident capture retain the
+  same evidence but do not destroy a running source when capture fails.
+- Live proof: a read-only export from `attacknet-final-soak` queried Loki 3.5.3
+  from the run's recorded creation time through burn height 347. It completed
+  77 pages and retained 380,802 actor log entries without a pagination gap.
+  The final soak bundle will repeat the export over the complete run range and
+  exercise the teardown ordering before this item is considered fully closed.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

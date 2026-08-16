@@ -112,6 +112,17 @@ KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${time
   "${ATTACKNET_DIR}/observability/export-kubernetes-report.sh" \
   "${destination}/timeline" "${timeline_run_id}" >/dev/null \
   || capture_error incident-timeline-export "$?"
+if [ -r "${run_descriptor}" ]; then
+  loki_start="$(node -e '
+    const fs=require("node:fs");
+    process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).run.createdAt);
+  ' "${run_descriptor}")"
+else
+  loki_start="$(node -e 'console.log(new Date(Date.now()-2*60*60*1000).toISOString())')"
+fi
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+  "${ATTACKNET_DIR}/observability/export-loki.sh" "${destination}/loki" "${loki_start}" \
+  || capture_error incident-loki-export "$?"
 
 SOURCE_REVISION="$(git -C "${ATTACKNET_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)" \
   INCIDENT_PHASE="${phase}" INCIDENT_REASON="${reason}" RUN_ID="${run_id}" \
@@ -176,6 +187,7 @@ DESTINATION="${destination}" node -e '
     "kubernetes/stacksnetwork.admitted.json", "kubernetes/pods.admitted.json",
     "burnchain-policy.admitted.json", "chaos-mesh.json", "digests.sha256",
     "timeline/export.json", "timeline/timeline.jsonl", "timeline/timeline.html",
+    "loki/export.json", "loki/logs.jsonl.gz", "loki/digests.sha256",
   ];
   const missing = required.filter(file => !fs.existsSync(path.join(root, file)));
   const captureErrors = fs.readFileSync(path.join(root, "capture-errors.jsonl"), "utf8")

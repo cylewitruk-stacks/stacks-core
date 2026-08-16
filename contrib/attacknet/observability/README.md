@@ -318,6 +318,15 @@ identity.
   snapshots, raw incident logs, and relevant time-series data before teardown
   for longer-lived evidence.
 
+`export-loki.sh` performs that log export for normal teardown, lifecycle
+capture, and incident capture. It queries the exact network label over the
+run's recorded time range, paginates with an inclusive nanosecond cursor,
+de-duplicates only identical labelled entries at the page boundary, and writes
+the selector, range, every page boundary, source Kubernetes objects, and file
+digests alongside compressed `logs.jsonl.gz`. If a page cannot advance—such as more than one
+page of entries sharing one timestamp—or the bounded page count is exceeded,
+the export is marked incomplete and teardown stops before deleting Loki's PVC.
+
 ## Tests
 
 ```bash
