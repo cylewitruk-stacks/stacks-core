@@ -3341,6 +3341,75 @@ does pass the controller contract.
   is classified, and do not count it as the still-missing clean
   canonical-tip-stall negative control.
 
+## F-128: The shared progress assertion detects canonical Stacks stalling while Bitcoin advances
+
+- Classification: deliberate assertion negative control and clean recovery
+- State: Kubernetes half proven live; equivalent Compose control remains
+  required for backend parity
+- Setup: controller-admitted campaign
+  `fresh-gate-signer-partition-stall-negative` selected all ten exact signer
+  Pod UIDs and partitioned them bidirectionally from their ten enrolled
+  companion nodes for 90 seconds. Five active network probes per signer changed
+  from all successful before injection to zero successful during it. The
+  controller independently classified `NetworkDegraded=Proven` for every
+  target. Bitcoin cadence was acknowledged at five seconds before injection,
+  so the global mutation lease did not permit an unrecorded policy change
+  during the fault.
+- Negative result: all node RPC probes remained responsive. Over the unchanged
+  backend-neutral verifier's 20-second window Bitcoin advanced from 287 to 291
+  while every Stacks node remained at height 60 on tip
+  `9ce4f0a22fd9410e081d64e8c0e27974a650df2b602b8d5e8ca136ff0e5d02ac`.
+  The verifier returned `ok=false` with the explicit reason `Stacks delta 0 <
+  1`; it did not confuse burn progress, Pod readiness, or continued legacy-P2P
+  connectivity with canonical Stacks progress.
+- Recovery: Chaos Mesh reported normal `AllRecovered`, the exact
+  `NetworkChaos` resource was absent, and the controller classified
+  `NetworkRecovered=Proven` for all ten UIDs. After the cadence was paused, the
+  same verifier passed with all 18 nodes exactly at burn 304 / Stacks 61 on one
+  tip, zero height drift, 28--33 authenticated conversations per node, and no
+  unauthenticated conversations. The focused capture is retained at
+  `contrib/attacknet/evidence/signer-partition-stall-negative-control-20260816/`.
+- Follow-up: execute the same logical signer-to-companion partition through the
+  Compose adapter and require the identical fail/recover reason contract. F-129
+  records the additional companion burn-view behavior exposed by this control.
+
+## F-129: Default blocking event delivery lets an unavailable signer stall its companion node
+
+- Classification: transport-independent liveness coupling and configuration
+  safety finding
+- State: deterministically reproduced on current main; recovery proven;
+  production configuration guidance and desired default require review
+- Evidence: before the signer partition, `signer-node-1` processed burn 283.
+  Beginning at `09:46:55.952Z`, its event-dispatcher worker timed out delivering
+  the burn event to `signer-1` and retried indefinitely with backoff capped at
+  three seconds. It downloaded or processed no later burn block during the
+  partition even though ordinary followers reached burn 292 and miners reached
+  291 in the verifier sample. Immediately after network recovery at
+  `09:48:29Z`, it resumed from 283 and processed the accumulated burn blocks in
+  order. The other nine companion nodes showed the same 8--10-block lag, and
+  the full cohort later converged exactly at burn 304.
+- Mechanism: this is explicit current-main behavior, not a Kubernetes or
+  libp2p artifact. `NodeConfig::event_dispatcher_blocking` defaults to `true`;
+  `effective_event_dispatcher_queue_size()` therefore returns zero. The event
+  worker's `initiate_send()` waits for successful completion, while HTTP
+  delivery retries without a terminal bound. The configuration documentation
+  itself warns that a slow observer can stall the node. In this topology the
+  observer is the companion's signer process, so signer unavailability also
+  freezes the otherwise healthy Stacks node's burn view.
+- Risk: operators commonly colocate a signer with its companion and may expect
+  signer failure to remove only that signer's vote. With the default, a dead,
+  partitioned, or indefinitely slow signer also prevents its node from tracking
+  Bitcoin and serving a fresh chain view. Correlated signer endpoint failures
+  therefore create correlated companion lag and a larger recovery backlog.
+- Required follow-up: evaluate `event_dispatcher_blocking=false` with the
+  persisted bounded queue as the recommended signer-companion configuration,
+  including queue-full, restart, ordering, and stale-signer behavior. Preserve
+  blocking mode as an explicit scenario knob so the attacknet can reproduce
+  the production default. Add metrics for pending event payloads, oldest age,
+  retry count, and effective blocking state; without them a Ready node silently
+  freezes. Do not silently change the production default until delivery
+  ordering and backlog safety have been reviewed.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.
