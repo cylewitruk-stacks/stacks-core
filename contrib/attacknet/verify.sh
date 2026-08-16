@@ -13,7 +13,8 @@ probe_timeout="${ATTACKNET_PROBE_TIMEOUT_SECONDS:-10}"
 progress_window="$(node "${ATTACKNET_DIR}/progress-window.mjs" \
   "${manifest}" "${ATTACKNET_PROGRESS_WINDOW_SECONDS:-}")"
 
-if [ "${action}" != telemetry ]; then
+if [ "${action}" != telemetry ] && [ "${action}" != progress-allow-unready ] \
+    && [ "${action}" != snapshot-allow-unready ]; then
   unready="$(backend_unready_actors bitcoin bitcoin-miner stacker ${evidence_actors})"
   if [ -n "${unready}" ]; then
     echo "Unready actors: ${unready}" >&2
@@ -72,11 +73,11 @@ node "${ATTACKNET_DIR}/invariants.mjs" cohort "${temporary}/cohort.json" \
   >"${temporary}/cohort-result.json" || cohort_status=$?
 
 case "${action}" in
-  snapshot)
+  snapshot|snapshot-allow-unready)
     cat "${temporary}/cohort-result.json"
     exit "${cohort_status}"
     ;;
-  progress)
+  progress|progress-allow-unready)
     start="$(backend_exec_timeout "${probe_timeout}" bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
     sleep "${progress_window}"
     end="$(backend_exec_timeout "${probe_timeout}" bitcoin bitcoin-cli -regtest -rpcuser=devnet -rpcpassword=devnet getblockcount)"
@@ -120,5 +121,5 @@ case "${action}" in
       exit 1
     fi
     ;;
-  *) echo "usage: $0 MANIFEST {snapshot|progress|telemetry}" >&2; exit 2 ;;
+  *) echo "usage: $0 MANIFEST {snapshot|snapshot-allow-unready|progress|progress-allow-unready|telemetry}" >&2; exit 2 ;;
 esac

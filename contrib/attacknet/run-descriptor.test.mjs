@@ -90,7 +90,7 @@ test('pre-apply descriptors resolve admitted state and immutable runtime images 
     type: 'assertion-result', occurredAt: '2026-08-15T01:01:00Z',
     payload: {assertion: 'ready', status: 'pass'},
   });
-  assert.throws(() => finalizeDescriptor(observedReady, 'passed'), /complete admitted-manifest/);
+  assert.throws(() => finalizeDescriptor(observedReady, 'passed'), /complete admitted.*manifest/);
   const resolved = resolveRuntimeInputs(pending, {
     admittedManifestPath: paths.admitted,
     images: [{

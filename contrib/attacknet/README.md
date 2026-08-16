@@ -56,6 +56,7 @@ Start with a capacity stage before attempting the 31-workload full topology:
 
 ```bash
 node contrib/attacknet/topology.mjs \
+  --network=attacknet-stage-1 \
   --miners=1 --signers=1 --followers=1 \
   --output=contrib/attacknet/generated/stage-1
 
@@ -63,13 +64,20 @@ KUBE_NETWORK=attacknet-stage-1 \
   contrib/attacknet/lifecycle.sh apply contrib/attacknet/generated/stage-1
 ```
 
-The same render includes `compose.yaml`, so a local smoke can instead use:
+The same render includes an automated two-phase Compose reference lifecycle.
+It uses the same manifest-derived protocol barriers and assertion functions as
+Kubernetes, preserves volumes across observer enablement, and enrolls a
+backend-local Prometheus instance for the same telemetry-coverage invariant:
 
 ```bash
+contrib/attacknet/compose-lifecycle.sh apply \
+  contrib/attacknet/generated/stage-1
+
 ATTACKNET_BACKEND=compose \
+ATTACKNET_PROJECT=attacknet-stage-1 \
 ATTACKNET_COMPOSE=contrib/attacknet/generated/stage-1/compose.yaml \
-  contrib/attacknet/verify.sh \
-  contrib/attacknet/generated/stage-1/manifest.json snapshot
+ATTACKNET_COMPOSE_EXTRA=contrib/attacknet/generated/stage-1/compose.observability.yaml \
+  contrib/attacknet/verify.sh contrib/attacknet/generated/stage-1/manifest.json snapshot
 ```
 
 Kubernetes startup is deliberately two-phase. Companion nodes first perform
@@ -83,13 +91,14 @@ companion rollout, and resumes the requested cadence. This prevents historical
 IBD notifications from being misclassified as live forks without deadlocking
 signer initialization at genesis.
 
-The renderer also emits `compose.bootstrap.yaml`. A Compose runner must follow
-the same two-phase contract—start the bootstrap file, wait for signer runloop
-readiness, then apply `compose.yaml` while preserving node volumes—rather than
-starting the final file cold. The Kubernetes lifecycle is currently the
-canonical automated implementation of this contract. Compose cadence uses the
-same policy script and process-level acknowledgement when its backend settings
-are supplied:
+The renderer emits `compose.bootstrap.yaml`, `compose.yaml`, and
+`compose.observability.yaml`. Do not start the final file cold:
+`compose-lifecycle.sh` is the canonical automated Compose transition. It first
+starts the observer-free companion configurations, establishes the PoX reward
+set, and then changes only companion mounts while adding signers. Bitcoin and
+unchanged Stacks nodes retain their original containers and named volumes.
+Compose cadence uses the same policy script and process-level acknowledgement
+when its backend settings are supplied:
 
 ```bash
 KUBE_NETWORK=attacknet-compose-smoke \
@@ -99,6 +108,28 @@ ATTACKNET_COMPOSE=contrib/attacknet/generated/stage-1/compose.bootstrap.yaml \
 ATTACKNET_COMPOSE_POLICY=contrib/attacknet/generated/stage-1/policy.env \
   contrib/attacknet/burnchain-policy.sh burst 6
 ```
+
+The Compose model has distinct `default` and `burnchain` networks. Node actors
+join both; Bitcoin joins only `burnchain`. Disconnecting a node from the
+project's burnchain network therefore creates a Bitcoin-view fault without
+also removing its Stacks P2P or Prometheus path. Teardown is explicit and
+recoverable until invoked:
+
+```bash
+contrib/attacknet/compose-negative-controls.sh \
+  contrib/attacknet/generated/stage-1 \
+  contrib/attacknet/evidence/compose-stage-1-controls
+
+ATTACKNET_RUN_FINAL_STATUS=passed \
+  contrib/attacknet/compose-lifecycle.sh delete \
+  contrib/attacknet/generated/stage-1
+```
+
+The control sequence pauses autonomous cadence, proves exact telemetry loss,
+disconnects one actor only from Bitcoin while retaining its Stacks path, and
+pauses a signer to prove Bitcoin progress with zero canonical Stacks progress.
+Each expected failure must be attributed by the shared invariant and followed
+by a clean recovery before teardown can be marked passed.
 
 Bursts are persisted as an absolute Bitcoin target height. Recreating the
 clock resumes only the missing suffix and mines zero blocks when that target

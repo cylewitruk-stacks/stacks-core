@@ -8,11 +8,19 @@ RUNTIME_BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ATTACKNET_BACKEND="${ATTACKNET_BACKEND:-${POC_BACKEND:-kubernetes}}"
 ATTACKNET_PROJECT="${ATTACKNET_PROJECT:-stacks-attacknet}"
 ATTACKNET_COMPOSE="${ATTACKNET_COMPOSE:-${RUNTIME_BACKEND_DIR}/generated/compose.yaml}"
+ATTACKNET_COMPOSE_EXTRA="${ATTACKNET_COMPOSE_EXTRA:-}"
 KUBE_NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}"
 KUBE_NETWORK="${KUBE_NETWORK:-attacknet}"
 
 backend_compose() {
-  docker compose -p "${ATTACKNET_PROJECT}" -f "${ATTACKNET_COMPOSE}" "$@"
+  local files=(-f "${ATTACKNET_COMPOSE}") extra
+  if [ -n "${ATTACKNET_COMPOSE_EXTRA}" ]; then
+    local IFS=':'
+    for extra in ${ATTACKNET_COMPOSE_EXTRA}; do
+      [ -n "${extra}" ] && files+=(-f "${extra}")
+    done
+  fi
+  docker compose -p "${ATTACKNET_PROJECT}" "${files[@]}" "$@"
 }
 
 backend_require() {
@@ -57,8 +65,17 @@ backend_exec_timeout() {
   local actor="$2"
   shift 2
   case "${ATTACKNET_BACKEND}" in
-    compose) timeout --signal=TERM --kill-after=5 "${seconds}" docker compose \
-      -p "${ATTACKNET_PROJECT}" -f "${ATTACKNET_COMPOSE}" exec -T "${actor}" "$@" ;;
+    compose)
+      local files=(-f "${ATTACKNET_COMPOSE}") extra
+      if [ -n "${ATTACKNET_COMPOSE_EXTRA}" ]; then
+        local IFS=':'
+        for extra in ${ATTACKNET_COMPOSE_EXTRA}; do
+          [ -n "${extra}" ] && files+=(-f "${extra}")
+        done
+      fi
+      timeout --signal=TERM --kill-after=5 "${seconds}" docker compose \
+        -p "${ATTACKNET_PROJECT}" "${files[@]}" exec -T "${actor}" "$@" </dev/null
+      ;;
     kubernetes)
       local pod
       pod="$(backend_pod "${actor}")" || return
@@ -138,7 +155,9 @@ backend_unready_actors() {
       status_json="$(backend_compose ps --all --format json)"
       node -e '
         const fs = require("node:fs");
-        const rows = fs.readFileSync(0, "utf8").trim().split(/\n+/).filter(Boolean).map(JSON.parse);
+        const raw = fs.readFileSync(0, "utf8").trim();
+        const parsed = raw ? raw.split(/\n+/).filter(Boolean).map(JSON.parse) : [];
+        const rows = parsed.length === 1 && Array.isArray(parsed[0]) ? parsed[0] : parsed;
         const byService = new Map(rows.map(row => [row.Service, row]));
         const unready = process.argv.slice(1).filter(service => {
           const row = byService.get(service);

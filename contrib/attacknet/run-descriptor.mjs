@@ -199,10 +199,10 @@ export function initializeDescriptor(metadata, options = {}) {
         ...(metadata.admittedManifestPath
           ? {
               admittedManifest: artifact(metadata.admittedManifestPath, readFile),
-              resolution: {complete: true, missingImageScopes: []},
+              resolution: {backend: metadata.runtimeBackend ?? 'kubernetes', complete: true, missingImageScopes: []},
             }
           : {
-              resolution: {complete: false, missingImageScopes: metadata.images.map(image => image.scope)},
+              resolution: {backend: metadata.runtimeBackend ?? 'kubernetes', complete: false, missingImageScopes: metadata.images.map(image => image.scope)},
             }),
       },
     },
@@ -233,9 +233,17 @@ export function resolveRuntimeInputs(descriptor, resolution, options = {}) {
   }
   const missingImageScopes = images.filter(image => !image.resolvedDigest).map(image => image.scope);
   const result = deepCopy(descriptor);
+  const priorBackend = result.inputs.kubernetes.resolution.backend;
+  const backend = resolution.backend ?? priorBackend ?? 'kubernetes';
+  if (!new Set(['kubernetes', 'compose']).has(backend)) {
+    throw new Error(`unsupported runtime backend ${backend}`);
+  }
+  if (priorBackend && priorBackend !== backend) {
+    throw new Error(`runtime backend changed from ${priorBackend} to ${backend}`);
+  }
   result.inputs.images = images;
   result.inputs.kubernetes.admittedManifest = artifact(resolution.admittedManifestPath, readFile);
-  result.inputs.kubernetes.resolution = {complete: missingImageScopes.length === 0, missingImageScopes};
+  result.inputs.kubernetes.resolution = {backend, complete: missingImageScopes.length === 0, missingImageScopes};
   return seal(result);
 }
 
@@ -291,7 +299,7 @@ export function finalizeDescriptor(descriptor, status, options = {}) {
   if (descriptor.run.status !== 'running') throw new Error(`cannot finalize a ${descriptor.run.status} run`);
   if (!new Set(['passed', 'failed', 'aborted']).has(status)) throw new Error('final status must be passed, failed, or aborted');
   if (status === 'passed' && descriptor.inputs.kubernetes.resolution.complete !== true) {
-    throw new Error('a passed run requires complete admitted-manifest and image resolution');
+    throw new Error('a passed run requires complete admitted runtime manifest and image resolution');
   }
   const counts = eventCounts(descriptor.timeline);
   const failed = counts.assertions.fail + counts.assertions.error;
@@ -342,6 +350,10 @@ export function validateDescriptor(descriptor, options = {}) {
   requireObject(descriptor.inputs.kubernetes, 'inputs.kubernetes');
   validateArtifact(descriptor.inputs.kubernetes.requestedManifest, 'inputs.kubernetes.requestedManifest');
   requireObject(descriptor.inputs.kubernetes.resolution, 'inputs.kubernetes.resolution');
+  if (descriptor.inputs.kubernetes.resolution.backend !== undefined) {
+    requireEnum(descriptor.inputs.kubernetes.resolution.backend,
+      new Set(['kubernetes', 'compose']), 'inputs.kubernetes.resolution.backend');
+  }
   if (typeof descriptor.inputs.kubernetes.resolution.complete !== 'boolean') {
     throw new Error('inputs.kubernetes.resolution.complete must be boolean');
   }
@@ -352,7 +364,7 @@ export function validateDescriptor(descriptor, options = {}) {
   if (descriptor.inputs.kubernetes.admittedManifest) {
     validateArtifact(descriptor.inputs.kubernetes.admittedManifest, 'inputs.kubernetes.admittedManifest');
   } else if (descriptor.inputs.kubernetes.resolution.complete) {
-    throw new Error('complete Kubernetes resolution requires an admitted manifest');
+    throw new Error('complete runtime resolution requires an admitted manifest');
   }
   normalizeNondeterminism(descriptor.nondeterminism);
   const timeline = requireArray(descriptor.timeline, 'timeline');

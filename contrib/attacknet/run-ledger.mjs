@@ -66,7 +66,8 @@ function renderedConfigurationFiles(root) {
   const topLevel = new Set([
     'stacksnetwork.json', 'stacksnetwork.bootstrap.json',
     'burnchain-policy.configmap.json', 'policy.env',
-    'compose.yaml', 'compose.bootstrap.yaml',
+    'compose.yaml', 'compose.bootstrap.yaml', 'compose.observability.yaml',
+    'prometheus.compose.yml',
   ]);
   return listFiles(root).filter(path => {
     const relative = path.slice(root.length + 1);
@@ -177,6 +178,7 @@ export function initializeRun(generated, options = {}) {
     // belong in protected evidence, not in the replayable SUT configuration.
     configPaths: configurationSnapshots,
     requestedManifestPath: requestedManifestSnapshot,
+    runtimeBackend: options.runtimeBackend ?? process.env.ATTACKNET_BACKEND ?? 'kubernetes',
     images: JSON.parse(readFileSync(requestedManifestPath, 'utf8')).spec.actors.map(actor => ({
       scope: actor.name,
       requestedRef: actor.image,
@@ -230,8 +232,51 @@ export function resolveRun(descriptorPath, admittedManifestPath, podsPath) {
   }, null, 2)}\n`);
   const normalizedImages = images.map(({admittedRef: _admittedRef, ...image}) => image);
   writeDescriptor(descriptorPath, resolveRuntimeInputs(descriptor, {
-    admittedManifestPath: admittedManifestSnapshot,
+    backend: 'kubernetes', admittedManifestPath: admittedManifestSnapshot,
     images: normalizedImages,
+  }));
+  return descriptorPath;
+}
+
+export function resolveComposeRun(descriptorPath, admittedManifestPath, containersPath) {
+  const descriptor = readDescriptor(descriptorPath);
+  const containers = JSON.parse(readFileSync(containersPath, 'utf8'));
+  if (!Array.isArray(containers)) throw new Error('Compose container inspection must be an array');
+  const byService = new Map(containers.map(container => [
+    container.Config?.Labels?.['com.docker.compose.service'], container,
+  ]).filter(([service]) => typeof service === 'string' && service.length > 0));
+  const images = descriptor.inputs.images.map(image => {
+    const container = byService.get(image.scope);
+    if (!container) throw new Error(`no admitted Compose container found for image scope ${image.scope}`);
+    if (container.State?.Running !== true) {
+      throw new Error(`Compose actor ${image.scope} was not Running at runtime resolution`);
+    }
+    const admittedRef = container.Config?.Image;
+    if (admittedRef !== image.requestedRef) {
+      throw new Error(`Compose actor ${image.scope} admitted image ${admittedRef ?? '<missing>'} instead of ${image.requestedRef}`);
+    }
+    const resolvedDigest = container.Image;
+    if (!/^sha256:[0-9a-f]{64}$/.test(resolvedDigest ?? '')) {
+      throw new Error(`Compose actor ${image.scope} has no immutable Docker image ID`);
+    }
+    return {
+      scope: image.scope,
+      requestedRef: image.requestedRef,
+      resolvedRef: `docker-image://${resolvedDigest}`,
+      resolvedDigest,
+    };
+  });
+  const artifacts = join(dirname(descriptorPath), 'run-artifacts');
+  const admittedManifestSnapshot = snapshotArtifact(
+    admittedManifestPath, artifacts, 'runtime-inputs');
+  const containersSnapshot = snapshotArtifact(containersPath, artifacts, 'runtime-inputs');
+  const resolutionPath = join(artifacts, 'compose-runtime-resolution.json');
+  writeAtomic(resolutionPath, `${JSON.stringify({
+    backend: 'compose', observedAdmittedManifestPath: resolve(admittedManifestPath),
+    admittedManifestSnapshot, containersSnapshot, images,
+  }, null, 2)}\n`);
+  writeDescriptor(descriptorPath, resolveRuntimeInputs(descriptor, {
+    backend: 'compose', admittedManifestPath: admittedManifestSnapshot, images,
   }));
   return descriptorPath;
 }
@@ -341,6 +386,14 @@ export function runCli(argv) {
     const [descriptor, admitted, pods] = args;
     if (!descriptor || !admitted || !pods) throw new Error('usage: run-ledger.mjs resolve DESCRIPTOR ADMITTED_MANIFEST PODS_JSON');
     process.stdout.write(`${resolveRun(descriptor, admitted, pods)}\n`);
+    return;
+  }
+  if (command === 'resolve-compose') {
+    const [descriptor, admitted, containers] = args;
+    if (!descriptor || !admitted || !containers) {
+      throw new Error('usage: run-ledger.mjs resolve-compose DESCRIPTOR ADMITTED_COMPOSE CONTAINERS_INSPECTED');
+    }
+    process.stdout.write(`${resolveComposeRun(descriptor, admitted, containers)}\n`);
     return;
   }
   if (command === 'append') {

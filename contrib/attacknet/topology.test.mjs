@@ -241,6 +241,36 @@ test('burnchain cadence is initially paused until the topology is ready', () => 
   assert.doesNotMatch(healthcheck.test.join(' '), /curl/);
 });
 
+test('Compose renders enrolled telemetry and an independently partitionable burnchain path', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-compose-harness-'));
+  renderTopology(buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output,
+    {network: 'compose-proof'});
+  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
+  const telemetry = JSON.parse(readFileSync(join(output, 'compose.observability.yaml'), 'utf8'));
+  const prometheus = JSON.parse(readFileSync(join(output, 'prometheus.compose.yml'), 'utf8'));
+  assert.deepEqual(compose.services.bitcoin.networks, ['burnchain']);
+  assert.deepEqual(compose.services['follower-1'].networks, ['default', 'burnchain']);
+  assert.deepEqual(compose.services['signer-1'].networks, undefined);
+  assert.equal(telemetry.services.prometheus.image, 'prom/prometheus:v3.5.0');
+  const targets = prometheus.scrape_configs.flatMap(job => job.static_configs);
+  assert.deepEqual(targets.map(target => target.labels.attacknet_actor).sort(),
+    ['follower-1', 'miner-1', 'signer-1', 'signer-2', 'signer-node-1', 'signer-node-2']);
+  assert.ok(targets.every(target => target.labels.attacknet_network === 'compose-proof'));
+});
+
+test('Compose phase transition only changes companion config mounts and adds signers', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-compose-phases-'));
+  renderTopology(buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output);
+  const bootstrap = JSON.parse(readFileSync(join(output, 'compose.bootstrap.yaml'), 'utf8'));
+  const final = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
+  for (const actor of ['bitcoin', 'bitcoin-miner', 'stacker', 'miner-1', 'follower-1']) {
+    assert.deepEqual(bootstrap.services[actor], final.services[actor], `${actor} must not roll`);
+  }
+  assert.equal(bootstrap.services['signer-1'], undefined);
+  assert.match(bootstrap.services['signer-node-1'].volumes.join(' '), /configs-bootstrap/);
+  assert.match(final.services['signer-node-1'].volumes.join(' '), /\.\/configs\//);
+});
+
 test('manifest exposes deterministic protocol phase barriers', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-protocol-phases-'));
   const {manifest} = renderTopology(buildTopology(), output);

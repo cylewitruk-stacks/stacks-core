@@ -3267,8 +3267,8 @@ does pass the controller contract.
 ## F-126: The shared cohort assertion detects a Ready actor with a partitioned Bitcoin view
 
 - Classification: deliberate assertion negative control and clean recovery
-- State: Kubernetes half proven live; the equivalent Compose control remains
-  required before backend parity is complete
+- State: Kubernetes and Compose controls proven live with the same invariant;
+  clean recovery proven on both backends
 - Setup: controller-admitted campaign `fresh-gate-burn-drift-negative`
   selected exact Ready Pod `attacknet-fresh-gate-follower-5-0`, UID
   `e4733ed5-d348-4f0b-b716-a20972abb682`, and partitioned it bidirectionally
@@ -3291,10 +3291,10 @@ does pass the controller contract.
   authenticated conversations per node, and zero unauthenticated
   conversations. The focused bundle is retained at
   `contrib/attacknet/evidence/burn-drift-negative-control-20260816/`.
-- Follow-up: run the identical logical control through the Compose adapter and
-  retain the same fail/recover reason contract. Do not substitute container
-  pause for the burn-view partition: that would only re-prove actor readiness,
-  which already has paired evidence.
+- Compose parity: F-133 records the equivalent burnchain-only network detach.
+  The unchanged cohort invariant reported `burnDrift=3`, then passed after the
+  target reattached and converged. This did not substitute a process pause for
+  the burn-view partition.
 
 ## F-127: Isolating all miners from non-miner Stacks peers made miner-local RPC temporarily unobservable
 
@@ -3344,8 +3344,8 @@ does pass the controller contract.
 ## F-128: The shared progress assertion detects canonical Stacks stalling while Bitcoin advances
 
 - Classification: deliberate assertion negative control and clean recovery
-- State: Kubernetes half proven live; equivalent Compose control remains
-  required for backend parity
+- State: Kubernetes and Compose controls proven live with the same invariant;
+  clean recovery proven on both backends
 - Setup: controller-admitted campaign
   `fresh-gate-signer-partition-stall-negative` selected all ten exact signer
   Pod UIDs and partitioned them bidirectionally from their ten enrolled
@@ -3369,9 +3369,11 @@ does pass the controller contract.
   tip, zero height drift, 28--33 authenticated conversations per node, and no
   unauthenticated conversations. The focused capture is retained at
   `contrib/attacknet/evidence/signer-partition-stall-negative-control-20260816/`.
-- Follow-up: execute the same logical signer-to-companion partition through the
-  Compose adapter and require the identical fail/recover reason contract. F-129
-  records the additional companion burn-view behavior exposed by this control.
+- Compose parity: F-133 records the corresponding signer-availability control.
+  Bitcoin advanced six blocks while the shared progress invariant observed
+  zero Stacks progress; after resume, both chains advanced 15 blocks. F-129
+  records the additional companion burn-view behavior exposed by the
+  Kubernetes signer-to-companion partition.
 
 ## F-129: Default blocking event delivery lets an unavailable signer stall its companion node
 
@@ -3439,8 +3441,8 @@ does pass the controller contract.
 ## F-131: Enrolled telemetry loss is detected and attributed independently of actor readiness
 
 - Classification: deliberate observability negative control and clean recovery
-- State: Kubernetes live proof complete; Compose counterpart remains part of
-  the backend-parity gate
+- State: Kubernetes and Compose live proofs complete; exact actor attribution
+  and recovery proven on both backends
 - Setup: a fresh current-main network enrolled exactly four protocol actors.
   The new backend-neutral telemetry invariant first proved one fresh
   `up=1` series with the correct server-attached role for every manifest actor.
@@ -3468,6 +3470,8 @@ does pass the controller contract.
   from a healthy-but-idle chain and from an actor-specific scrape failure by a
   machine-readable invariant. The Prometheus harness target remains a narrow
   controller-owned exception rather than a general NetworkChaos escape hatch.
+  F-133 records the Compose counterpart, where the same invariant attributed
+  only `follower-1` as `scrape-down` and then returned to 4/4 healthy actors.
 
 ## F-132: DNSChaos isolates an enrolled service lookup without poisoning the control resolver path
 
@@ -3494,6 +3498,96 @@ does pass the controller contract.
   it is not itself evidence of a Stacks defect. Longer scenarios should combine
   DNS disruption with connection churn because established P2P connections do
   not require repeated DNS resolution.
+
+## F-133: The automated Compose reference backend reproduces the Kubernetes failure contracts
+
+- Classification: backend-parity acceptance evidence and clean recovery
+- State: passed live with a fresh current-main 1/1/1 topology; evidence-first
+  teardown and complete named-volume reclamation proven
+- Baseline: `compose-lifecycle.sh` created a clean-volume seven-workload
+  topology plus enrolled Prometheus, established PoX-4 at burn 210--211,
+  paused exactly at observer height 220, changed only the companion
+  configuration while adding the signer, and proved registration, global
+  signer state, live authenticated P2P, and post-Nakamoto block production at
+  burn 223. Prometheus then observed exactly one fresh correctly-labelled
+  series for each of the four protocol actors.
+- Telemetry control: pausing `follower-1` left its enrolled series present but
+  changed only that series to `up=0`. The unchanged backend-neutral invariant
+  returned exit 1 with reason `scrape-down`; after resume it returned to 4/4
+  fresh healthy series.
+- Burn-view control: the follower was disconnected only from the Compose
+  `burnchain` network while its default Stacks P2P/telemetry network remained
+  attached. At the measured sample, miner and companion were at burn 234 /
+  Stacks 26 while the follower remained at burn 231 / Stacks 24. The shared
+  cohort invariant returned `ok=false`, `burnDrift=3`, `stacksDrift=2`, and no
+  equal-height fork. Reattachment restored a healthy common cohort.
+- Canonical-progress control: with the sole signer paused, Bitcoin advanced
+  from 237 to 243 while the minimum Stacks height remained exactly 29. The
+  same progress invariant returned `ok=false` because Stacks delta was zero.
+  After signer recovery, Bitcoin and Stacks each advanced 15 blocks over the
+  recovery window and the invariant passed.
+- Evidence: the machine summary and all baseline/fault/recovery results are
+  retained in
+  `contrib/attacknet/evidence/compose-parity-controls-20260816/`. The runner
+  holds the global mutation lease for the complete sequence and has an
+  idempotent cleanup trap that reconnects networks, resumes paused actors, and
+  pauses cadence on every exit.
+- Seal/teardown: run
+  `attacknet-compose-parity-20260816T104212533Z-fc5593b4` finalized `passed`
+  with 17 passing assertions, zero failed/error assertions, 14 cadence
+  transitions, and all seven actor image IDs resolved to immutable Docker
+  digests. The descriptor/config/container/log bundle was exported before
+  Compose removed all eight containers, both project networks, and all six
+  project-scoped named volumes. Both global leases were absent afterward.
+- Scope: Compose uses process pause and Docker network detachment whereas
+  Kubernetes uses controller-owned Chaos Mesh resources. Behavioral parity is
+  the invariant/effect/recovery contract, not identical infrastructure APIs.
+
+## F-134: Docker health becomes unready during a burnchain-only detach before local RPC fails
+
+- Classification: harness/runtime health-semantics ambiguity
+- State: reproduced; negative-control sampler corrected and regression surface
+  documented
+- Observation: disconnecting `follower-1` only from the Compose burnchain
+  network caused Docker to report the container unhealthy even though its
+  local `/v2/info` and `/v2/neighbors` endpoints remained responsive and all
+  four authenticated Stacks P2P conversations continued. The ordinary
+  verifier therefore refused the sample at its readiness precondition before
+  the cohort invariant could classify the expected burn drift.
+- Correction: deliberate controls use explicit
+  `snapshot-allow-unready`/`progress-allow-unready` modes. These modes relax
+  only the readiness precondition; endpoint probes remain bounded and the
+  unchanged cohort/progress invariant still must produce structured evidence.
+  Ordinary baseline and recovery checks continue to require every actor Ready.
+- Timing lesson: a fixed three-second delay initially sampled `burnDrift=2`,
+  exactly the allowed ceiling, because healthy nodes had not processed the
+  full Bitcoin burst yet. The control now waits on an observed healthy-node
+  burn height relative to the isolated actor before sampling. Wall-clock sleep
+  is not accepted as proof of protocol separation.
+- Scope: this is not a Stacks node defect. It is a reminder that container
+  health, local RPC availability, protocol freshness, and expected fault state
+  are distinct evidence dimensions.
+
+## F-135: Run-descriptor v1 names its backend-neutral resolution slot `kubernetes`
+
+- Classification: evidence-schema naming debt and migration note
+- State: behavior made truthful; schema rename deferred to a versioned format
+- Trigger: the first passed Compose teardown failed closed because descriptor
+  v1 correctly requires an admitted manifest and immutable image resolution,
+  but the Compose lifecycle had only captured those artifacts rather than
+  joining them into the sealed descriptor.
+- Correction: Compose resolution now requires one Running container per exact
+  actor service, checks that Docker admitted the requested image reference,
+  captures its immutable `sha256` image ID, snapshots the fully resolved
+  Compose model and container inspections, and records
+  `resolution.backend="compose"`. Substituted images, stopped containers,
+  missing actors, or malformed IDs fail before a run can be marked passed.
+- Naming debt: the v1 field holding requested/admitted runtime manifests is
+  still `inputs.kubernetes`, because existing evidence and replay artifacts
+  already depend on that signed schema. The nested explicit backend prevents
+  misinterpretation, but a future `stacks-attacknet-run/v2` should rename this
+  to `inputs.runtime` with a backend discriminator and provide a deterministic
+  v1-to-v2 reader. Do not silently rewrite sealed v1 evidence.
 
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean

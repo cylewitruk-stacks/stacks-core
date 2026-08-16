@@ -10,16 +10,25 @@ It records:
 - a caller-supplied run ID, seed, and named seed/decision algorithm;
 - exact source revision, plus a patch digest when the worktree is dirty;
 - raw-file SHA-256 digests for topology, rendered configuration, and the
-  server-admitted Kubernetes manifest;
+  runtime-admitted Kubernetes or Compose manifest;
 - both requested image references and runtime-resolved image digests;
 - a contiguous ledger of fault decisions, cadence changes, and assertion results;
 - an explicit disclosure of remaining nondeterminism; and
 - a digest of the complete descriptor itself.
 
-The admitted manifest must be captured from the API server, not copied from the
-requested YAML. Likewise, image digests must come from admitted/running pod status,
-not from a mutable tag. Store all referenced artifacts beside the descriptor in the
-evidence bundle; `validate --verify-files` then detects missing or modified inputs.
+For Kubernetes, the admitted manifest must be captured from the API server, not
+copied from the requested YAML, and image digests must come from running Pod
+status. For Compose, resolution captures `docker compose config` plus exact
+container inspections, requires one Running container per actor service, verifies
+the requested image reference, and records the immutable Docker image ID. Store
+all referenced artifacts beside the descriptor in the evidence bundle;
+`validate --verify-files` then detects missing or modified inputs.
+
+Schema v1 predates the Compose backend and retains the field name
+`inputs.kubernetes` for this backend-neutral resolution slot. The nested
+`resolution.backend` is authoritative (`kubernetes` or `compose`). A future v2
+can rename the field to `inputs.runtime`; sealed v1 evidence must not be silently
+rewritten.
 
 ## Commands
 
@@ -70,13 +79,14 @@ the contiguous `sequence`. They must be serialized by the run controller and
 supplied in causal order. `recordedAt` defaults to the recorder clock and is kept
 separate from `occurredAt`.
 
-Initialization normally happens before Kubernetes apply. In that mode metadata
+Initialization normally happens before runtime apply. In that mode metadata
 uses `requestedManifestPath`, and image entries contain only `scope` and
-`requestedRef`. After the network is Ready, `resolve` supplies the API-server
-admitted manifest and the `resolvedRef`/`resolvedDigest` observed for every actor
-container. A run cannot finalize as `passed` while this resolution is incomplete;
-failed or aborted bootstrap attempts retain an explicit incomplete-resolution
-record rather than losing their evidence.
+`requestedRef`. After the network is Ready, Kubernetes `resolve` supplies the
+API-server-admitted manifest and Pod image identities; the Compose lifecycle uses
+`run-ledger.mjs resolve-compose` to supply the resolved Compose model and exact
+container image IDs. A run cannot finalize as `passed` while this resolution is
+incomplete. Failed or aborted bootstrap attempts retain an explicit incomplete-
+resolution record rather than losing their evidence or blocking teardown.
 
 `minimize` selects the first failed/errored assertion by default, or the named one
 with `--assertion=ID`. It emits a planned replay containing the original seed and

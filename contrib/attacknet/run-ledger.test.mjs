@@ -8,12 +8,13 @@ import {
   appendRunEvent,
   exportRun,
   initializeRun,
+  resolveComposeRun,
   resolveRun,
   runContext,
 } from './run-ledger.mjs';
 import {initializeDescriptor, readDescriptor, writeDescriptor} from './run-descriptor.mjs';
 
-function fixture() {
+function fixture(runtimeBackend) {
   const root = mkdtempSync(join(tmpdir(), 'attacknet-ledger-'));
   const topology = join(root, 'manifest.json');
   const requested = join(root, 'stacksnetwork.json');
@@ -34,6 +35,7 @@ function fixture() {
     runId: 'ledger-test', seed: '9', seedAlgorithm: 'test/v1', createdAt: '2026-08-15T00:00:00Z',
     sourceRevision: 'abcdef1', sourceDirty: false, topologyPath: topology,
     configPaths: [requested], requestedManifestPath: requested,
+    ...(runtimeBackend ? {runtimeBackend} : {}),
     images: [{scope: 'miner-1', requestedRef}],
     nondeterminism: {statement: 'test disclosure', disclosed: []},
   });
@@ -110,4 +112,38 @@ test('resolution refuses missing Pods instead of fabricating an image identity',
   const empty = join(value.root, 'empty-pods.json');
   writeFileSync(empty, '{"items":[]}\n');
   assert.throws(() => resolveRun(value.descriptor, value.admitted, empty), /no admitted Pod/);
+});
+
+test('Compose runtime resolution binds service, requested ref, running state, and immutable image ID', () => {
+  const value = fixture('compose');
+  const containers = join(value.root, 'containers.json');
+  writeFileSync(containers, JSON.stringify([{
+    Config: {Image: 'stacks-core:main', Labels: {'com.docker.compose.service': 'miner-1'}},
+    Image: value.digest,
+    State: {Running: true},
+  }]));
+  resolveComposeRun(value.descriptor, value.admitted, containers);
+  const descriptor = readDescriptor(value.descriptor);
+  assert.deepEqual(descriptor.inputs.kubernetes.resolution,
+    {backend: 'compose', complete: true, missingImageScopes: []});
+  assert.equal(descriptor.inputs.images[0].resolvedRef, `docker-image://${value.digest}`);
+  assert.doesNotThrow(() => exportRun(value.descriptor, join(value.root, 'compose-bundle')));
+});
+
+test('Compose runtime resolution refuses an image substitution or stopped actor', () => {
+  for (const [name, container, pattern] of [
+    ['substituted', {
+      Config: {Image: 'stacks-core:other', Labels: {'com.docker.compose.service': 'miner-1'}},
+      Image: `sha256:${'c'.repeat(64)}`, State: {Running: true},
+    }, /admitted image/],
+    ['stopped', {
+      Config: {Image: 'stacks-core:main', Labels: {'com.docker.compose.service': 'miner-1'}},
+      Image: `sha256:${'c'.repeat(64)}`, State: {Running: false},
+    }, /was not Running/],
+  ]) {
+    const value = fixture('compose');
+    const containers = join(value.root, `${name}.json`);
+    writeFileSync(containers, JSON.stringify([container]));
+    assert.throws(() => resolveComposeRun(value.descriptor, value.admitted, containers), pattern);
+  }
 });

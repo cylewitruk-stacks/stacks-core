@@ -17,6 +17,11 @@ RUN_ID="${ATTACKNET_RUN_ID:-}"
 RUN_SEED="${ATTACKNET_RUN_SEED:-}"
 LIVE_PEER_CONNECTIVITY_RESULT='{}'
 ENVIRONMENT_LOCK="${ATTACKNET_DIR}/environment-lock.sh"
+LIFECYCLE_BACKEND="${ATTACKNET_BACKEND:-kubernetes}"
+COMPOSE_PROJECT="${ATTACKNET_PROJECT:-${NETWORK}}"
+COMPOSE_FILE="${ATTACKNET_COMPOSE:-}"
+COMPOSE_EXTRA="${ATTACKNET_COMPOSE_EXTRA:-}"
+COMPOSE_POLICY="${ATTACKNET_COMPOSE_POLICY:-${COMPOSE_FILE:+$(dirname "${COMPOSE_FILE}")/policy.env}}"
 
 [[ "${NETWORK}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
   echo "invalid Kubernetes network name: ${NETWORK}" >&2
@@ -25,6 +30,24 @@ ENVIRONMENT_LOCK="${ATTACKNET_DIR}/environment-lock.sh"
 [[ "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
   echo "invalid Kubernetes namespace: ${NAMESPACE}" >&2
   exit 2
+}
+
+# Protocol barriers use one logical backend adapter. Kubernetes lifecycle
+# remains responsible for admission/rollout; the Compose lifecycle sources
+# these same protocol checks rather than maintaining a second definition of
+# signer registration, peer connectivity, or chain convergence.
+runtime_backend() {
+  ATTACKNET_BACKEND="${LIFECYCLE_BACKEND}" ATTACKNET_PROJECT="${COMPOSE_PROJECT}" \
+    ATTACKNET_COMPOSE="${COMPOSE_FILE}" ATTACKNET_COMPOSE_EXTRA="${COMPOSE_EXTRA}" \
+    KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+    "${ATTACKNET_DIR}/runtime-backend.sh" "$@"
+}
+
+burnchain_policy() {
+  ATTACKNET_BACKEND="${LIFECYCLE_BACKEND}" ATTACKNET_PROJECT="${COMPOSE_PROJECT}" \
+    ATTACKNET_COMPOSE="${COMPOSE_FILE}" ATTACKNET_COMPOSE_POLICY="${COMPOSE_POLICY}" \
+    KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+    "${ATTACKNET_DIR}/burnchain-policy.sh" "$@"
 }
 
 ledger_append() {
@@ -206,8 +229,7 @@ wait_bootstrap_foundation_ready() {
     active_expected="$(jq -r '[.items[] | select((.spec.replicas // 0) > 0)] | length' <<<"${statefulsets}")"
     read -r generation observed_generation < <(kubectl -n "${NAMESPACE}" get stacksnetwork "${NETWORK}" \
       -o jsonpath='{.metadata.generation}{" "}{.status.observedGeneration}{"\n"}' 2>/dev/null || true)
-    unready="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/runtime-backend.sh" unready ${actors} 2>/dev/null || true)"
+    unready="$(runtime_backend unready ${actors} 2>/dev/null || true)"
     # Pod Ready alone is insufficient during the observer-enablement rollout:
     # the old Pod can remain Ready after the StatefulSet template changes and
     # until its replacement is created.  Require the exact admitted revision
@@ -233,8 +255,7 @@ wait_actor_group_ready() {
   local actors unready
   actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" "${group}")"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    unready="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/runtime-backend.sh" unready ${actors} 2>/dev/null || true)"
+    unready="$(runtime_backend unready ${actors} 2>/dev/null || true)"
     if [ -z "${unready}" ]; then
       printf '%s Ready (%s actors)\n' "${group}" "$(wc -w <<<"${actors}" | tr -d ' ')"
       return 0
@@ -258,8 +279,7 @@ manifest_protocol_value() {
 
 clock_status_value() {
   local key="$1"
-  ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-    "${ATTACKNET_DIR}/runtime-backend.sh" exec bitcoin-miner \
+  runtime_backend exec bitcoin-miner \
     sed -n "s/^${key}=//p" /tmp/hacknet-burnchain-clock.env 2>/dev/null | tail -1
 }
 
@@ -289,8 +309,7 @@ wait_nodes_at_burn_height() {
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     lagging=""
     for actor in ${actors}; do
-      info="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${actor}" \
+      info="$(runtime_backend exec "${actor}" \
         curl --fail --silent --max-time 3 http://127.0.0.1:20443/v2/info 2>/dev/null || true)"
       height="$(printf '%s' "${info}" | node -e '
         let raw = ""; process.stdin.on("data", chunk => raw += chunk);
@@ -321,8 +340,7 @@ wait_live_peer_connectivity() {
     first=true
     printf '[' >"${samples}"
     for actor in ${actors}; do
-      neighbors="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${actor}" \
+      neighbors="$(runtime_backend exec "${actor}" \
         curl --fail --silent --max-time 3 http://127.0.0.1:20443/v2/neighbors 2>/dev/null || true)"
       if [ "${first}" = true ]; then first=false; else printf ',' >>"${samples}"; fi
       ACTOR="${actor}" NEIGHBORS="${neighbors}" node -e '
@@ -415,8 +433,7 @@ wait_signer_global_state() {
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     missing=""
     for signer in ${signers}; do
-      metrics="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${signer}" \
+      metrics="$(runtime_backend exec "${signer}" \
         curl --fail --silent --max-time 3 http://127.0.0.1:31000/metrics 2>/dev/null || true)"
       available="$(signer_metric_value "${metrics}" stacks_signer_global_state_available)"
       known="$(signer_metric_value "${metrics}" stacks_signer_global_state_known_weight)"
@@ -451,8 +468,7 @@ wait_signer_set_parity() {
   response_file="$(mktemp)"
   report_file="$(mktemp)"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    pox="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/runtime-backend.sh" exec miner-1 \
+    pox="$(runtime_backend exec miner-1 \
       curl --fail --silent --max-time 3 http://127.0.0.1:20443/v2/pox 2>/dev/null || true)"
     cycle="$(POX="${pox}" node -e '
       try {
@@ -461,8 +477,7 @@ wait_signer_set_parity() {
       } catch {}
     ')"
     if [[ "${cycle}" =~ ^[0-9]+$ ]]; then
-      reward_set="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-        "${ATTACKNET_DIR}/runtime-backend.sh" exec miner-1 \
+      reward_set="$(runtime_backend exec miner-1 \
         curl --fail --silent --max-time 3 \
         "http://127.0.0.1:20443/v3/stacker_set/${cycle}" 2>/dev/null || true)"
       if REWARD_SET="${reward_set}" node -e '
@@ -499,8 +514,7 @@ minimum_node_stacks_height() {
   local manifest="$1" group="$2" actors actor info height minimum=""
   actors="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" "${group}")"
   for actor in ${actors}; do
-    info="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/runtime-backend.sh" exec "${actor}" \
+    info="$(runtime_backend exec "${actor}" \
       curl --fail --silent --max-time 3 http://127.0.0.1:20443/v2/info 2>/dev/null || true)"
     height="$(INFO="${info}" node -e '
       try {
@@ -534,8 +548,7 @@ wait_signers_registered() {
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     missing=""
     for signer in ${signers}; do
-      metrics="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${signer}" \
+      metrics="$(runtime_backend exec "${signer}" \
         curl --fail --silent --max-time 3 http://127.0.0.1:31000/metrics 2>/dev/null || true)"
       if ! grep -q '^stacks_signer_runloop_ready 1$' <<<"${metrics}" \
         || ! grep -q '^stacks_signer_registered_for_current_reward_cycle 1$' <<<"${metrics}"; then
@@ -558,8 +571,7 @@ wait_stacker_submission_window() {
   local status phase burn_height
   deadline=$((SECONDS + seconds))
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    status="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/runtime-backend.sh" exec stacker \
+    status="$(runtime_backend exec stacker \
       cat /tmp/attacknet-stacker-status.json 2>/dev/null || true)"
     read -r phase burn_height < <(STATUS="${status}" node -e '
       try {
@@ -596,8 +608,7 @@ signer_accounts_locked() {
     process.stdout.write(signers.map(actor => actor.stacksAddress).join(" "));
   ' "${manifest}")" || return 2
   for address in ${addresses}; do
-    account="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/runtime-backend.sh" exec miner-1 \
+    account="$(runtime_backend exec miner-1 \
       curl --fail --silent --max-time 3 \
       "http://127.0.0.1:20443/v2/accounts/${address}?proof=0" 2>/dev/null || true)"
     locked="$(ACCOUNT="${account}" node -e '
@@ -666,8 +677,7 @@ wait_companion_stackerdb_subscriptions() {
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     missing=""
     for companion in ${companions}; do
-      status="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-        "${ATTACKNET_DIR}/runtime-backend.sh" exec "${companion}" \
+      status="$(runtime_backend exec "${companion}" \
         curl --silent --output /dev/null --write-out '%{http_code}' --max-time 3 \
         http://127.0.0.1:20443/v2/stackerdb/ST000000000000000000002AMW42H/miners \
         2>/dev/null || true)"
@@ -700,8 +710,7 @@ burst_to_height() {
   delta=$((target - current))
   if [ "${delta}" -gt 0 ]; then
     ledger_cadence paused "burst:${delta}" "advance-to-${phase}" "${target}" "${current}"
-    KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/burnchain-policy.sh" burst "${delta}" "${BOOTSTRAP_INTERVAL_SECONDS}"
+    burnchain_policy burst "${delta}" "${BOOTSTRAP_INTERVAL_SECONDS}"
   fi
   wait_clock_paused_at "${target}"
   observed="$(clock_status_value bitcoin_height)"
@@ -866,8 +875,7 @@ apply_network() {
     ledger_assertion signer-set-parity pass "${signer_set_report}"
     ledger_assertion first-nakamoto-block pass \
       "{\"minimumStacksHeight\":$((pre_activation_stacks_height + 1)),\"observedHeight\":$(clock_status_value bitcoin_height)}"
-    KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/burnchain-policy.sh" run "${desired_interval:-60}" "${desired_jitter:-0}"
+    burnchain_policy run "${desired_interval:-60}" "${desired_jitter:-0}"
     ledger_cadence paused "run:${desired_interval:-60}s:jitter-${desired_jitter:-0}s" \
       steady-state-after-nakamoto-proof "${activation_height}" "$(clock_status_value bitcoin_height)"
   else
@@ -880,8 +888,7 @@ apply_network() {
   fi
   if needs_post_ready_clock_start "${gated}" "${bootstrap_network}"; then
     sleep "${STARTUP_SETTLE_SECONDS}"
-    KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-      "${ATTACKNET_DIR}/burnchain-policy.sh" run "${desired_interval:-60}" "${desired_jitter:-0}"
+    burnchain_policy run "${desired_interval:-60}" "${desired_jitter:-0}"
     ledger_cadence paused "run:${desired_interval:-60}s:jitter-${desired_jitter:-0}s" startup-complete
   fi
   ledger_capture_runtime
@@ -974,8 +981,7 @@ capture() {
   kubectl -n "${NAMESPACE}" logs -l 'app.kubernetes.io/component=run-operator' \
     --all-containers=true --since=1h --timestamps \
     >"${destination}/run-operator.log"
-  ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
-    "${ATTACKNET_DIR}/runtime-backend.sh" describe >"${destination}/runtime.json"
+  runtime_backend describe >"${destination}/runtime.json"
   RUN_DESCRIPTOR="$(locate_ledger || true)"
   if [ -n "${RUN_DESCRIPTOR}" ] && [ -r "${RUN_DESCRIPTOR}" ]; then
     RUN_ID="$(node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).run.id)' "${RUN_DESCRIPTOR}")"

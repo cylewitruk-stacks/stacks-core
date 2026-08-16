@@ -456,7 +456,7 @@ function composeHealthcheck(actor) {
     return {test: ['CMD-SHELL', "curl --fail --silent http://127.0.0.1:31000/metrics | grep -q '^stacks_signer_runloop_ready 1$'"], interval: '2s', timeout: '2s', retries: 180};
   }
   if (actor.name === 'stacker') {
-    return {test: ['CMD-SHELL', 'test -r /proc/1/status'], interval: '5s', timeout: '2s', retries: 60};
+    return {test: ['CMD-SHELL', 'test -s /tmp/attacknet-stacker-status.json'], interval: '2s', timeout: '2s', retries: 180};
   }
   return {test: ['CMD-SHELL', 'curl --fail --silent http://127.0.0.1:20443/v2/info >/dev/null'], interval: '5s', timeout: '3s', retries: 180};
 }
@@ -464,8 +464,6 @@ function composeHealthcheck(actor) {
 function renderCompose(actors, output, network, filename = 'compose.yaml', configDirectory = 'configs') {
   const services = {};
   const volumes = {};
-  const configsRoot = join(output, configDirectory);
-  mkdirSync(configsRoot, {recursive: true});
   for (const original of actors) {
     const actor = expandCompose(original, network);
     // Compose has no replica-zero service equivalent.  Omitting an explicitly
@@ -485,11 +483,14 @@ function renderCompose(actors, output, network, filename = 'compose.yaml', confi
     }
     const mounts = [];
     if (actor.config?.files) {
-      const actorDirectory = join(configsRoot, actor.name);
+      const actorConfigDirectory = typeof configDirectory === 'function'
+        ? configDirectory(actor)
+        : configDirectory;
+      const actorDirectory = join(output, actorConfigDirectory, actor.name);
       mkdirSync(actorDirectory, {recursive: true});
       for (const [filename, contents] of Object.entries(actor.config.files)) {
         writeFileSync(join(actorDirectory, filename), expandCompose(contents, network));
-        mounts.push(`./${configDirectory}/${actor.name}/${filename}:${actor.config.mountPath}/${filename}:ro`);
+        mounts.push(`./${actorConfigDirectory}/${actor.name}/${filename}:${actor.config.mountPath}/${filename}:ro`);
       }
     }
     if (actor.runtimePolicy) mounts.push(`./policy.env:${actor.runtimePolicy.mountPath}/policy.env:ro`);
@@ -499,10 +500,77 @@ function renderCompose(actors, output, network, filename = 'compose.yaml', confi
       volumes[volume] = {};
     }
     if (mounts.length) serviceSpec.volumes = mounts;
+    // Keep the burnchain path on a separate Docker network.  A Compose
+    // negative control can then disconnect only Bitcoin RPC/P2P while leaving
+    // Stacks P2P and telemetry reachable, matching the Kubernetes partition
+    // invariant instead of simulating a total process outage.
+    if (actor.role === 'burnchain') serviceSpec.networks = ['burnchain'];
+    else if (actor.name === 'bitcoin-miner'
+        || ['miner', 'companion', 'follower'].includes(actor.role)) {
+      serviceSpec.networks = ['default', 'burnchain'];
+    }
     services[actor.name] = serviceSpec;
   }
-  const compose = {name: network, services, volumes};
+  const compose = {name: network, services, volumes, networks: {default: {}, burnchain: {}}};
   writeFileSync(join(output, filename), `${JSON.stringify(compose, null, 2)}\n`);
+}
+
+function renderComposeObservability(manifest, output, network) {
+  const nodes = manifest.actors.filter(actor => actor.type === 'node');
+  const signers = manifest.actors.filter(actor => actor.type === 'signer');
+  const staticConfigs = (actors, port) => actors.map(actor => ({
+    targets: [`${actor.service}:${port}`],
+    labels: {
+      attacknet_network: network,
+      attacknet_actor: actor.service,
+      attacknet_role: actor.role,
+      evidence_source: 'actor_self_reported',
+    },
+  }));
+  const config = {
+    global: {scrape_interval: '5s', evaluation_interval: '5s', external_labels: {
+      attacknet_network: network, evidence_scope: 'hacknet-compose',
+    }},
+    scrape_configs: [
+      {
+        job_name: 'stacks-node-metrics', honor_labels: false, honor_timestamps: false,
+        scrape_timeout: '3s', sample_limit: 50000, label_limit: 64,
+        label_name_length_limit: 128, label_value_length_limit: 1024,
+        body_size_limit: '16MB', static_configs: staticConfigs(nodes, 20446),
+      },
+      {
+        job_name: 'stacks-signer-metrics', honor_labels: false, honor_timestamps: false,
+        scrape_timeout: '3s', sample_limit: 50000, label_limit: 64,
+        label_name_length_limit: 128, label_value_length_limit: 1024,
+        body_size_limit: '16MB', static_configs: staticConfigs(signers, 31000),
+      },
+    ],
+  };
+  writeFileSync(join(output, 'prometheus.compose.yml'), `${JSON.stringify(config, null, 2)}\n`);
+  const compose = {
+    name: network,
+    services: {
+      prometheus: {
+        image: 'prom/prometheus:v3.5.0', restart: 'unless-stopped',
+        command: [
+          '--config.file=/etc/prometheus/prometheus.yml',
+          '--storage.tsdb.path=/prometheus', '--storage.tsdb.retention.time=24h',
+        ],
+        volumes: [
+          './prometheus.compose.yml:/etc/prometheus/prometheus.yml:ro',
+          'prometheus-data:/prometheus',
+        ],
+        healthcheck: {
+          test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:9090/-/ready'],
+          interval: '5s', timeout: '3s', retries: 60,
+        },
+        networks: ['default'],
+      },
+    },
+    volumes: {'prometheus-data': {}},
+    networks: {default: {}},
+  };
+  writeFileSync(join(output, 'compose.observability.yaml'), `${JSON.stringify(compose, null, 2)}\n`);
 }
 
 export function renderTopology(topology, output, {
@@ -583,8 +651,13 @@ export function renderTopology(topology, output, {
   writeFileSync(join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(join(output, 'burnchain-policy.configmap.json'), `${JSON.stringify(policy, null, 2)}\n`);
   writeFileSync(join(output, 'policy.env'), policy.data['policy.env']);
-  renderCompose(bootstrapResource.spec.actors, output, network, 'compose.bootstrap.yaml', 'configs-bootstrap');
+  // Only companion configurations differ between phases. Reusing the final
+  // config paths for every other actor prevents Compose from needlessly
+  // replacing the whole network at observer enablement.
+  renderCompose(bootstrapResource.spec.actors, output, network, 'compose.bootstrap.yaml',
+    actor => actor.role === 'companion' ? 'configs-bootstrap' : 'configs');
   renderCompose(actors, output, network);
+  renderComposeObservability(manifest, output, network);
   return {resource, bootstrapResource, manifest, policy};
 }
 
