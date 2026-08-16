@@ -25,7 +25,11 @@ esac
   chmodSync(kubectl, 0o755);
   const lifecycle = new URL('./lifecycle.sh', import.meta.url).pathname;
   const child = spawnSync('bash', ['-c',
-    'source "$1"; NAMESPACE=hacknet-system; NETWORK=attacknet; TIMEOUT=4; wait_deleted',
+    // The fake owner deliberately survives one two-second poll. Leave enough
+    // wall-clock margin for this process-heavy suite to schedule the second
+    // poll; the assertion below, not an artificially tight timeout, proves
+    // the retained-artifact selector and deletion state machine.
+    'source "$1"; NAMESPACE=hacknet-system; NETWORK=attacknet; TIMEOUT=10; wait_deleted',
     '_', lifecycle], {
     encoding: 'utf8',
     env: {

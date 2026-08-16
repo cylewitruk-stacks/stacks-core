@@ -90,6 +90,20 @@ test('an exact burst target is idempotent across clock restarts', () => {
   assert.match(result.stdout, /^after=0$/m);
 });
 
+test('USR2 interrupts the old cadence sleep so policy can be applied promptly', () => {
+  const result = spawnSync('bash', ['-c', `
+    source "$1"
+    trap wake_for_policy USR2
+    parent=$$
+    (sleep 0.1; kill -USR2 "$parent") &
+    SECONDS=0
+    policy_sleep 60
+    printf 'elapsed=%s\\n' "$SECONDS"
+  `, '_', script], {encoding: 'utf8', timeout: 2000});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^elapsed=[01]$/m);
+});
+
 test('the health server consumes requests before a clean HTTP close', async () => {
   const reservation = createServer();
   reservation.listen(0, '127.0.0.1');

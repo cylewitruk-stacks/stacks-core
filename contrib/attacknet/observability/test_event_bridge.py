@@ -170,6 +170,18 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(context.exception.code, 400)
         context.exception.close()
 
+    def test_long_running_acceptance_events_have_an_explicit_soak_phase(self):
+        status, body, _ = self.request(
+            "POST", "/api/v1/events",
+            self.event(
+                eventId="soak-policy", kind="policy.changed", phase="soak",
+                actor=None, campaign=None, faultType=None,
+                details={"mode": "run", "generation": 13, "intervalSeconds": 10},
+            ),
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["event"]["phase"], "soak")
+
     def test_lifecycle_and_incident_events_use_bounded_active_harness_phases(self):
         lifecycle = self.event(
             eventId="run-finished", kind="run.finished", phase="teardown",

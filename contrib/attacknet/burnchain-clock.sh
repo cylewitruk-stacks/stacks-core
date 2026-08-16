@@ -18,6 +18,7 @@ applied_generation=""
 burst_remaining=0
 address_cursor=0
 health_pid=""
+sleep_pid=""
 last_bitcoin_uptime=""
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -238,9 +239,26 @@ ensure_health_server() {
   health_pid="$!"
 }
 
-stop() { running=false; [ -z "${health_pid}" ] || kill "${health_pid}" 2>/dev/null || true; }
+policy_sleep() {
+  local delay="$1"
+  sleep "${delay}" &
+  sleep_pid="$!"
+  wait "${sleep_pid}" 2>/dev/null || true
+  sleep_pid=""
+}
+
+stop() {
+  running=false
+  [ -z "${sleep_pid}" ] || kill "${sleep_pid}" 2>/dev/null || true
+  [ -z "${health_pid}" ] || kill "${health_pid}" 2>/dev/null || true
+}
 request_block() { force_block=true; }
-wake_for_policy() { :; }
+wake_for_policy() {
+  # Bash defers a trap while it synchronously waits for an external `sleep`.
+  # Use a wait builtin around a tracked child so USR2 runs immediately and can
+  # end the old cadence interval before the next policy read.
+  [ -z "${sleep_pid}" ] || kill "${sleep_pid}" 2>/dev/null || true
+}
 main() {
   local address delay height
   trap stop TERM INT
@@ -296,13 +314,13 @@ main() {
       if [ "${burst_remaining}" -gt 0 ]; then
         delay="${policy_interval}"
         if [ "${policy_jitter}" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi
-        sleep "${delay}" || true
+        policy_sleep "${delay}"
       fi
       continue
     fi
     delay="${policy_interval}"
     if [ "${policy_jitter}" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi
-    sleep "${delay}" || true
+    policy_sleep "${delay}"
   done
 
   write_status stopped "${height:-unknown}" terminated

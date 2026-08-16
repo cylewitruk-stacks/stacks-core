@@ -2927,6 +2927,63 @@ does pass the controller contract.
   passing v2 request, run, campaigns, and post-fault cohort evidence are under
   `contrib/attacknet/evidence/final-soak-20260815T232258Z/deterministic-faults-v2/`.
 
+## F-116: Signalling PID 1 did not interrupt the burnchain clock's old cadence sleep
+
+- Classification: cadence-control acknowledgment and responsiveness defect
+- State: fixed, regression-tested, and proven with a live rolled clock
+- Evidence: after the deterministic faults, policy generation 11 requested a
+  change from 60-second to 10-second Bitcoin intervals. The ConfigMap and
+  projected file both contained generation 11, but the controller process
+  status remained at generation 10 until the old 60-second sleep naturally
+  ended. `burnchain-policy.sh` therefore timed out after 30 seconds and
+  correctly refused to emit `policy.changed`. At 00:06:53Z the old sleep ended,
+  the clock logged generation 11, and subsequent blocks arrived every 10
+  seconds. The signal had not provided the documented prompt wake-up.
+- Root cause: Bash defers a trapped signal while synchronously waiting for an
+  external foreground `sleep`. Sending `USR2` to the Bash PID 1 ran the no-op
+  handler only after that child returned, so the policy acknowledgment latency
+  was bounded by the *previous* cadence rather than the apply timeout.
+- Impact: slowing, accelerating, pausing, or switching a burst at runtime can
+  report a false control failure even though the generation applies later.
+  More importantly, a requested pause can still allow the already-scheduled
+  old interval to elapse before it is observed, making exact fault timing less
+  controllable and confusing the causal ledger.
+- Correction and gate: cadence sleeps now run as a tracked child under Bash's
+  `wait` builtin. The `USR2` handler kills only that tracked sleep, causing an
+  immediate loop boundary and policy reread; shutdown uses the same bounded
+  cleanup. A regression test starts a nominal 60-second sleep, signals the
+  parent, and requires it to return within two seconds. The timeout is not
+  lengthened to hide the wake-up defect.
+- Live proof: only the stateless `bitcoin-miner` clock Pod was rolled; the
+  bitcoind Pod retained UID `2b0f20a8-91c4-42c9-8596-6a60c562edaa` and its
+  uninterrupted chain. Generation 12 first established a 60-second interval.
+  Generation 13 then changed it to 10 seconds and completed projection,
+  signal, process reread, and acknowledgment in 5.7 seconds, inside the
+  unchanged 30-second deadline and far short of the old interval.
+
+## F-117: The trusted event schema had no phase for a long-running soak
+
+- Classification: observability vocabulary and evidence-attribution gap
+- State: fixed, regression-tested, and proven on the live bridge
+- Evidence: the applied generation-12 cadence transition succeeded, but an
+  event explicitly labelled `phase=soak` was rejected with HTTP 400 on all
+  three authenticated writer attempts. The bridge's bounded phase set included
+  setup, bootstrap, baseline, faults, verification, capture, incident, and
+  teardown, but not the central long-running acceptance phase.
+- Impact: a soak operator must either mislabel hours of observations as
+  `baseline`/`verification` or lose their trusted timeline records. Both make
+  human incident reconstruction and agent filtering less precise.
+- Correction and gate: `soak` is now a first-class bounded phase, with an HTTP
+  contract test proving an authenticated `policy.changed` event is accepted
+  and persisted under that phase. The cadence script remained truthful: it
+  warned about the journal failure but did not claim the observation failed or
+  roll back the already-acknowledged policy.
+- Live proof: the event ConfigMap and its checksum-bound Deployment were rolled
+  without replacing the journal PVC. Generation 14 then applied the 10-second
+  cadence and emitted `policy.changed` with `phase=soak` without a warning or
+  retry failure; the clock status simultaneously reported generation 14 at
+  burn height 297.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

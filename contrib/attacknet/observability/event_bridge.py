@@ -38,7 +38,7 @@ ALLOWED_KINDS = frozenset(
 )
 ALLOWED_PHASES = frozenset(
     {
-        "setup", "bootstrap", "baseline", "injecting", "fault-active",
+        "setup", "bootstrap", "baseline", "soak", "injecting", "fault-active",
         "recovering", "verification", "capture", "incident", "teardown", "complete",
     }
 )
