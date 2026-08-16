@@ -3410,6 +3410,32 @@ does pass the controller contract.
   freezes. Do not silently change the production default until delivery
   ordering and backlog safety have been reviewed.
 
+## F-130: A substituted stacker image could run the wrong process while reporting Ready
+
+- Classification: attacknet apparatus contract and fail-fast finding
+- State: reproduced during a preserved bootstrap failure; corrected and
+  regression-tested before retry
+- Trigger: a small telemetry-control render mistakenly set both
+  `--node-image` and `--stacker-image` to the Stacks node image. The stacker
+  actor inherited that image's default entrypoint, started `stacks-node`, and
+  passed its former readiness probe because `/proc/1/status` existed. It never
+  wrote `/tmp/attacknet-stacker-status.json` or submitted PoX-4 enrollment, so
+  the lifecycle's independent cutoff gate stopped the run at burn 215 and
+  preserved its bootstrap-failure bundle.
+- Impact: the consensus fixture gate prevented a false healthy network, but
+  the weak actor contract consumed the complete enrollment window before
+  identifying a deterministic configuration error. The same shape could hide
+  a malformed custom stacker image behind Kubernetes Ready.
+- Correction: the rendered stacker actor now executes the explicit bounded
+  contract `npx tsx /stacker/stacking.ts` instead of inheriting an image
+  entrypoint, and readiness requires a non-empty stacker-owned status file.
+  A wrong image therefore fails immediately. CLI help now distinguishes the
+  dedicated stacker-client image and names its default. A behavioral topology
+  test pins both the command and status readiness contract.
+- Scope: this was an attacknet invocation/configuration error, not a Stacks
+  node or signer defect. The retained failure is still valuable evidence that
+  the independent PoX enrollment gate cannot be bypassed by Pod readiness.
+
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean
 run is also evidence and should record the invariant and observation window.

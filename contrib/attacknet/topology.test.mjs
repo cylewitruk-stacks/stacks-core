@@ -99,6 +99,16 @@ test('every stacker key is paired with the same address funded at genesis', () =
   }
 });
 
+test('stacker execution is explicit and readiness proves its status contract', () => {
+  const topology = buildTopology({minerCount: 1, signerCount: 1, followerCount: 1});
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-stacker-contract-'));
+  const stacker = renderTopology(topology, output).resource.spec.actors
+    .find(actor => actor.name === 'stacker');
+  assert.deepEqual(stacker.command, ['npx', 'tsx', '/stacker/stacking.ts']);
+  assert.deepEqual(stacker.readinessProbe.exec.command,
+    ['test', '-s', '/tmp/attacknet-stacker-status.json']);
+});
+
 test('mainnet profile contains legacy transport and current-main image only', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-main-profile-'));
   renderTopology(buildTopology(), output);

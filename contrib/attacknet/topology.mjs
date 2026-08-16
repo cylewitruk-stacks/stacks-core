@@ -89,8 +89,8 @@ Options:
   --miners=N                 miner count, 0-${LIMITS.miners} (default: 1)
   --signers=N                signer/companion pair count, 0-${LIMITS.signers} (default: 1)
   --followers=N              follower count, 0-${LIMITS.followers} (default: 1)
-  --node-image=IMAGE         default Stacks node/signer image
-  --stacker-image=IMAGE      stacking bootstrap image
+  --node-image=IMAGE         default Stacks node/signer image (default: stacks-core-attacknet:main)
+  --stacker-image=IMAGE      dedicated stacking-client image (default: stacks-attacknet-stacker:local)
   --actor-image=ACTOR=IMAGE  per-actor image override; repeatable
   --actor-env=ACTOR:NAME=VALUE
                               per-actor environment value; repeatable
@@ -409,9 +409,14 @@ function infrastructureActors(topology, network) {
     },
     {
       name: 'stacker', role: 'infrastructure', image: topology.stackerImage, imagePullPolicy: 'IfNotPresent',
+      // Do not inherit the image entrypoint: a mistaken node image otherwise
+      // starts stacks-node, passes a process-only readiness check, and silently
+      // misses the finite PoX enrollment window. Custom stacker images must
+      // implement this narrow, observable execution contract.
+      command: ['npx', 'tsx', '/stacker/stacking.ts'],
       env: [env('STACKS_CORE_RPC_HOST', service('miner-1')), env('STACKS_CORE_RPC_PORT', 20443), env('STACKING_KEYS', stackingKeys.join(',')), env('STACKING_ADDRESSES', topology.signers.map(([, address]) => address).join(',')), env('STACKING_CYCLES', 12), env('POX5_STACKING_CYCLES', 96), env('POX5_RENEWAL_WINDOW_CYCLES', 48), env('STACKING_INTERVAL', 2), env('EPOCH_4_FIXTURE_DEPLOY_HEIGHT', 223)],
       dependencies: [{actor: 'miner-1', port: 20443}],
-      readinessProbe: {exec: {command: ['test', '-r', '/proc/1/status']}, periodSeconds: 5},
+      readinessProbe: {exec: {command: ['test', '-s', '/tmp/attacknet-stacker-status.json']}, periodSeconds: 2, failureThreshold: 60},
       storage: {enabled: false}, resources: {requests: {cpu: '50m', memory: '128Mi'}, limits: {cpu: '1', memory: '1Gi'}},
     },
   ];
