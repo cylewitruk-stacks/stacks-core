@@ -1018,6 +1018,29 @@ export function recordDdminOutcome(input, result) {
   return plan;
 }
 
+/**
+ * Re-evaluate durable counterfactual outcomes under the current deterministic
+ * search policy. This is useful when a scheduler correction narrows the
+ * admissible reduction domain: runtime evidence is reused, never rewritten,
+ * and every candidate digest must still match the newly issued attempt.
+ */
+export function rebuildDdminPlan(schedule, options, recordedResults) {
+  let plan = createDdminPlan(schedule, options);
+  for (const [index, recorded] of array(recordedResults, 'recordedResults', {maximum: 256}).entries()) {
+    const issued = issueDdminAttempt(plan);
+    plan = issued.plan;
+    if (!issued.attempt) throw new Error(`recordedResults[${index}] has no matching deterministic attempt`);
+    const claimedCandidate = recorded.run?.candidateScheduleDigest ?? recorded.candidateScheduleDigest;
+    if (claimedCandidate !== undefined
+        && digest(claimedCandidate, `recordedResults[${index}] candidateScheduleDigest`)
+          !== issued.attempt.schedule.integrity.digest) {
+      throw new Error(`recordedResults[${index}] candidate schedule digest differs from the deterministic attempt`);
+    }
+    plan = recordDdminOutcome(plan, {...copy(recorded), attemptId: issued.attempt.id});
+  }
+  return issueDdminAttempt(plan);
+}
+
 function atomicWrite(path, value) {
   const temporary = join(dirname(path), `.${path.split('/').at(-1)}.${process.pid}.tmp`);
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {mode: 0o600});
@@ -1032,7 +1055,7 @@ function output(path, value) {
 export function runScheduleCli(argv) {
   const [command, inputPath, outputPath] = argv;
   if (!command || !inputPath) {
-    throw new Error('usage: attacknet-run-schedule.mjs resolve|replay|ddmin-init|ddmin-next|ddmin-record INPUT [OUTPUT]');
+    throw new Error('usage: attacknet-run-schedule.mjs resolve|replay|ddmin-init|ddmin-next|ddmin-record|ddmin-rebuild INPUT [OUTPUT]');
   }
   const input = JSON.parse(readFileSync(inputPath, 'utf8'));
   let result;
@@ -1041,6 +1064,7 @@ export function runScheduleCli(argv) {
   else if (command === 'ddmin-init') result = createDdminPlan(input.schedule, input.options);
   else if (command === 'ddmin-next') result = issueDdminAttempt(input.plan ?? input);
   else if (command === 'ddmin-record') result = recordDdminOutcome(input.plan, input.result);
+  else if (command === 'ddmin-rebuild') result = rebuildDdminPlan(input.schedule, input.options, input.recordedResults);
   else throw new Error(`unknown command ${command}`);
   output(outputPath, result);
   return result;

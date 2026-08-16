@@ -131,9 +131,16 @@ packet-duplication campaign. Baseline UID
 `909dcff4-ec7a-416a-9575-8ba337d5d6c5` reproduced the trusted
 `NetworkDegraded=Failed` assertion. Candidate UID
 `a6fc4529-8c0b-41de-a9df-1a0ac7b3efc8` removed only the Pod kill and reproduced
-the same assertion. The one-attempt budget then expired, so the result makes no
-minimality claim. Evidence is retained under
+the same assertion. The original one-attempt execution stopped truthfully at
+its budget. After the monotone-removal correction, `rebuildDdminPlan()`
+verified the immutable baseline-attempt digest, outcome digest, and exact
+candidate schedule digest, then replayed that durable outcome through the
+current scheduler. The reduced single-campaign schedule is now `Complete` and
+one-minimal only within the declared admitted counterfactual domain;
+`causalMinimalityClaimed` remains false. Evidence is retained under
 `contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/`.
+The digest-bound reclassification is in
+`policy-reclassification-v2/result.json` in that bundle.
 
 The live sequence also exposed and closed four harness defects: noncanonical
 image ordering, failure to wait for owner-CR deletion, directory-depth-derived

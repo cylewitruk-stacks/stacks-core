@@ -12,6 +12,7 @@ import {
   createDdminPlan,
   describeDdminCandidate,
   issueDdminAttempt,
+  rebuildDdminPlan,
   recordDdminOutcome,
   resolveAttacknetSchedule,
   validateResolvedSchedule,
@@ -286,6 +287,29 @@ test('ddmin runs only monotone parameter removals and records impossible candida
   assert.equal(plan.structuralSkips[0].causalEvidence, false);
   assert.match(plan.structuralSkips[0].reason, /netem requires/);
   assert.equal(plan.result.causalMinimalityClaimed, false);
+});
+
+test('ddmin deterministically reclassifies durable live outcomes under a corrected reduction policy', () => {
+  const {run, context} = fixture();
+  const schedule = resolveAttacknetSchedule(run, context);
+  let issued = issueDdminAttempt(createDdminPlan(schedule, {requireFreshNetwork: true, maxAttempts: 1,
+    expectedFailure: {assertion: 'chain-progress', status: 'fail'}}));
+  const recorded = resultFor(issued.plan, issued, 'FailureReproduced', 'historic-fresh-uid');
+  recorded.run = {candidateScheduleDigest: issued.attempt.schedule.integrity.digest};
+
+  const rebuilt = rebuildDdminPlan(schedule, {requireFreshNetwork: true, maxAttempts: 2,
+    expectedFailure: {assertion: 'chain-progress', status: 'fail'}}, [recorded]);
+  assert.equal(rebuilt.attempt, null);
+  assert.equal(rebuilt.plan.phase, 'Complete');
+  assert.equal(rebuilt.plan.attempts.length, 1);
+  assert.equal(rebuilt.plan.attempts[0].freshNetwork.uid, 'historic-fresh-uid');
+  assert.equal(rebuilt.plan.result.empiricallyReduced, true);
+  assert.equal(rebuilt.plan.result.oneMinimalUnderObservedCounterfactuals, true);
+  assert.equal(rebuilt.plan.result.causalMinimalityClaimed, false);
+
+  recorded.run.candidateScheduleDigest = `sha256:${'f'.repeat(64)}`;
+  assert.throws(() => rebuildDdminPlan(schedule, {requireFreshNetwork: true, maxAttempts: 2,
+    expectedFailure: {assertion: 'chain-progress', status: 'fail'}}, [recorded]), /candidate schedule digest differs/);
 });
 
 test('ddmin candidate admission permits only source removals on a fresh identical network', () => {

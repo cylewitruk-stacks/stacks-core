@@ -2710,15 +2710,24 @@ does pass the controller contract.
   on a second clean network UID `a6fc4529-8c0b-41de-a9df-1a0ac7b3efc8`, and
   reproduced the same trusted assertion. Both runs used the same manifest,
   admitted image set, source template identities, seed, and source schedule.
-- Interpretation: this proves one useful semantic reduction—the Pod kill was
-  not necessary for the observed failure under this replay. The one-attempt
-  budget then expired, so the executor correctly reports `BudgetExhausted`,
-  `empiricallyReduced=false`, and `causalMinimalityClaimed=false`; it does not
-  claim the remaining campaign is minimal or causal in any broader sense.
+- Interpretation: the original one-attempt execution correctly stopped at
+  `BudgetExhausted`. After F-137 defined monotone parameter-removal semantics,
+  `ddmin-rebuild` deterministically re-evaluated the immutable source schedule
+  and exact recorded outcome digests. The remaining campaign has one target
+  and no safely removable parameter: deleting `direction` or `peerTarget`
+  broadens scope, while deleting its sole `duplicate` effect is structurally
+  invalid. The current policy therefore reports `Complete`,
+  `empiricallyReduced=true`, and
+  `oneMinimalUnderObservedCounterfactuals=true` for that bounded admitted
+  reduction domain. `causalMinimalityClaimed` remains false; this is not a
+  claim that packet duplication caused the TCP-level negative result in every
+  execution.
 - Cleanup and evidence: both fresh networks exported evidence before deletion;
   no `StacksNetwork`, environment lease, or mutation lease remained. The
   execution receipt's canonical SHA-256 integrity verified locally. Bundle:
   `contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/`.
+  The digest-bound policy reclassification is in
+  `policy-reclassification-v2/result.json` within that bundle.
 
 ## F-108: A restarted burnchain clock replayed a completed one-shot burst
 
@@ -3661,6 +3670,10 @@ does pass the controller contract.
   irrelevance, and is never used as causal evidence. Focused schedule/executor
   tests prove scope fields stay fixed, a valid netem-effect removal is issued,
   and removing the final required effect completes without a live run.
+- Durable-evidence gate: `rebuildDdminPlan()` replays recorded outcomes only
+  when the corrected scheduler issues the same candidate digest. Reclassifying
+  F-107 verified both original artifact digests and the exact live candidate
+  digest before producing the updated bounded result; drift is rejected.
 
 Each capacity stage, negative control, fault campaign, mixed-version run, and
 long soak must append findings here before its evidence is summarized. A clean

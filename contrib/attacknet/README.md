@@ -484,12 +484,14 @@ independent recovery proof. Resolved replay requires a fresh network UID with
 the same manifest and images. Live proof now covers Pod failure, NetworkChaos,
 DNSChaos, and the controller-owned arm64 I/O-pressure mechanism on the complete
 topology. A real kind-worker outage carrying 53.33% signer weight also proved
-safe quorum pause and automatic recovery. Fresh-UID replay/minimization is now
+safe quorum pause and automatic recovery. Fresh-UID replay/minimization is
 proven through one removal-only counterfactual with controller-owned
-classification and evidence-before-delete. Remaining live gates are
-backend-paired assertion negative controls and additional version-skew and
-modified-actor profiles. The corrected measured soak is proven over burn
-503 -> 803 with all four deterministic campaign families passing.
+classification and evidence-before-delete; the corrected monotone policy
+reclassifies the digest-bound result as one-minimal only within its admitted
+counterfactual domain and never claims causality. Backend-paired negative
+controls and immutable current/released/modified actor interoperability are
+also proven. The corrected measured soak is proven over burn 503 -> 803 with
+all four deterministic campaign families passing.
 
 The final soak must use the measured runner rather than a hand-recorded start
 height. It first obtains an acknowledged cadence pause, waits for an exact

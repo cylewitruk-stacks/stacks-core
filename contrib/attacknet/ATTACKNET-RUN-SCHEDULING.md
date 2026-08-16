@@ -100,6 +100,7 @@ node attacknet-run-schedule.mjs replay INPUT [OUTPUT]
 node attacknet-run-schedule.mjs ddmin-init INPUT [OUTPUT]
 node attacknet-run-schedule.mjs ddmin-next INPUT [OUTPUT]
 node attacknet-run-schedule.mjs ddmin-record INPUT [OUTPUT]
+node attacknet-run-schedule.mjs ddmin-rebuild INPUT [OUTPUT]
 ```
 
 The command inputs are thin wrappers around the JavaScript APIs:
@@ -109,6 +110,9 @@ The command inputs are thin wrappers around the JavaScript APIs:
 - `ddmin-init`: `{ "schedule": ..., "options": ... }`
 - `ddmin-next`: `{ "plan": ... }`
 - `ddmin-record`: `{ "plan": ..., "result": ... }`
+- `ddmin-rebuild`: `{ "schedule": ..., "options": ..., "recordedResults": [...] }`;
+  every recorded candidate digest must match the attempt issued by the current
+  deterministic policy before its durable outcome is reused.
 
 The run controller integration point is the resolved `actions` array. Create
 one child `FaultCampaign` at a time from
