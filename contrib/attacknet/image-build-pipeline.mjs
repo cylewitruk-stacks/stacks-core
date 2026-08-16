@@ -27,6 +27,8 @@ const ID = /^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/;
 const IMAGE_REPOSITORY = /^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?\/)*[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
 const SOURCE_KINDS = new Set(['current', 'releasedGitRef', 'localModified']);
 const PLATFORMS = new Set(['linux/amd64', 'linux/arm64']);
+const CARGO_FEATURE = /^[a-zA-Z0-9_-]{1,64}$/;
+const DEFAULT_CARGO_FEATURES = Object.freeze(['monitoring_prom', 'slog_json']);
 
 function fail(message) { throw new Error(message); }
 function object(value, path) {
@@ -155,6 +157,9 @@ function validateDockerfile(contents, path) {
     [/FROM\s+\$\{CARGO_CHEF_IMAGE\}/, 'digest-pinnable cargo-chef base'],
     [/ARG\s+RUNTIME_IMAGE=/, 'RUNTIME_IMAGE build argument'],
     [/FROM\s+\$\{RUNTIME_IMAGE\}/, 'digest-pinnable runtime base'],
+    [/ARG\s+ATTACKNET_CARGO_FEATURES=/, 'ATTACKNET_CARGO_FEATURES build argument'],
+    [/cargo\s+chef\s+cook[\s\S]*?--features\s+"?\$\{ATTACKNET_CARGO_FEATURES\}"?/, 'Cargo Chef feature-keyed dependency build'],
+    [/cargo\s+build[\s\S]*?--features\s+"?\$\{ATTACKNET_CARGO_FEATURES\}"?/, 'feature-keyed runtime build'],
   ];
   for (const [pattern, description] of checks) {
     if (!pattern.test(contents)) fail(`${path} does not provide ${description}`);
@@ -195,11 +200,21 @@ export function planImageBuildPipeline(input, {baseDirectory = process.cwd()} = 
   const ids = new Set();
   const profiles = input.profiles.map((profile, index) => {
     object(profile, `profiles[${index}]`);
-    exactKeys(profile, ['id', 'source'], `profiles[${index}]`);
+    exactKeys(profile, ['id', 'source', 'cargoFeatures'], `profiles[${index}]`);
     if (!ID.test(profile.id ?? '')) fail(`profiles[${index}].id is invalid`);
     if (ids.has(profile.id)) fail(`duplicate profile ${profile.id}`);
     ids.add(profile.id);
     const source = resolveSource(profile.source, defaultRepository, baseDirectory);
+    const cargoFeatures = profile.cargoFeatures ?? DEFAULT_CARGO_FEATURES;
+    if (!Array.isArray(cargoFeatures) || cargoFeatures.length < 1 || cargoFeatures.length > 16
+        || cargoFeatures.some(feature => typeof feature !== 'string' || !CARGO_FEATURE.test(feature))) {
+      fail(`profiles[${index}].cargoFeatures must contain 1 through 16 bounded Cargo features`);
+    }
+    if (new Set(cargoFeatures).size !== cargoFeatures.length) fail(`profiles[${index}].cargoFeatures contains duplicates`);
+    for (const required of DEFAULT_CARGO_FEATURES) {
+      if (!cargoFeatures.includes(required)) fail(`profiles[${index}].cargoFeatures must include ${required}`);
+    }
+    const normalizedCargoFeatures = [...cargoFeatures].sort();
     const buildKey = {
       schema: 'stacks-attacknet-image-build-key/v1',
       source: {
@@ -213,13 +228,14 @@ export function planImageBuildPipeline(input, {baseDirectory = process.cwd()} = 
       targetPlatform,
       cargoProfile: 'release-lite',
       cargoIncremental: false,
-      features: ['monitoring_prom', 'slog_json'],
+      features: normalizedCargoFeatures,
       binaries: ['stacks-node', 'stacks-signer', 'stacks-inspect'],
     };
     const buildKeyDigest = artifactDigest(buildKey);
     return {
       id: profile.id,
       source,
+      cargoFeatures: normalizedCargoFeatures,
       buildKey,
       buildKeyDigest,
       plannedLocalRef: `${imageRepository}:src-${tagFragment(buildKeyDigest)}`,
@@ -454,6 +470,7 @@ export function executeImageBuildPipeline(plan, {
       '--output', `type=local,dest=${recipeOutput}`,
       '--build-arg', `CARGO_CHEF_IMAGE=${plan.baseImages.cargoChef}`,
       '--build-arg', `RUNTIME_IMAGE=${plan.baseImages.runtime}`,
+      '--build-arg', `ATTACKNET_CARGO_FEATURES=${profile.cargoFeatures.join(',')}`,
       context,
     ];
     runner('docker', recipeArgs, {
@@ -477,6 +494,7 @@ export function executeImageBuildPipeline(plan, {
       '--load',
       '--build-arg', `CARGO_CHEF_IMAGE=${plan.baseImages.cargoChef}`,
       '--build-arg', `RUNTIME_IMAGE=${plan.baseImages.runtime}`,
+      '--build-arg', `ATTACKNET_CARGO_FEATURES=${profile.cargoFeatures.join(',')}`,
       '--build-arg', 'CARGO_INCREMENTAL=0',
       '--build-arg', `STACKS_NODE_VERSION=attacknet-${profile.id}-${profile.source.revision.slice(0, 12)}`,
       '--build-arg', `GIT_BRANCH=${profile.source.requestedRef}`,
@@ -495,6 +513,7 @@ export function executeImageBuildPipeline(plan, {
       localRef,
       baseImages: plan.baseImages,
       cargoIncremental: false,
+      cargoFeatures: profile.cargoFeatures,
       provenanceMode: 'max',
       sbomRequested: true,
       labels: {

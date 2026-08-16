@@ -59,6 +59,27 @@ function repeatedMapOption(name) {
   }));
 }
 
+function repeatedActorEnvOption() {
+  const marker = '--actor-env=';
+  const result = {};
+  for (const argument of process.argv.filter(value => value.startsWith(marker))) {
+    const binding = argument.slice(marker.length);
+    const actorSeparator = binding.indexOf(':');
+    const valueSeparator = binding.indexOf('=', actorSeparator + 1);
+    if (actorSeparator < 1 || valueSeparator <= actorSeparator + 1) {
+      throw new Error(`actor-env must use ACTOR:NAME=VALUE, received ${binding}`);
+    }
+    const actor = binding.slice(0, actorSeparator);
+    const name = binding.slice(actorSeparator + 1, valueSeparator);
+    const value = binding.slice(valueSeparator + 1);
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) throw new Error(`invalid actor environment name ${name}`);
+    result[actor] ??= [];
+    if (result[actor].some(entry => entry.name === name)) throw new Error(`duplicate actor environment ${actor}:${name}`);
+    result[actor].push({name, value});
+  }
+  return result;
+}
+
 function usage() {
   return `usage: topology.mjs [options]
 
@@ -71,6 +92,8 @@ Options:
   --node-image=IMAGE         default Stacks node/signer image
   --stacker-image=IMAGE      stacking bootstrap image
   --actor-image=ACTOR=IMAGE  per-actor image override; repeatable
+  --actor-env=ACTOR:NAME=VALUE
+                              per-actor environment value; repeatable
   --probes=true|false        add trusted fault-probe sidecars (default: false)
   --probe-image=IMAGE        trusted fault-probe image
   --output=DIR               rendered output directory
@@ -296,7 +319,7 @@ function signerActor(index, signer, image) {
   };
 }
 
-export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 1, nodeImage = 'stacks-core-attacknet:main', stackerImage = 'stacks-attacknet-stacker:local', actorImages = {}} = {}) {
+export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 1, nodeImage = 'stacks-core-attacknet:main', stackerImage = 'stacks-attacknet-stacker:local', actorImages = {}, actorEnvs = {}} = {}) {
   if (minerCount < 1 || minerCount > LIMITS.miners) throw new Error('minerCount out of range');
   if (signerCount < 1 || signerCount > LIMITS.signers) throw new Error('signerCount out of range');
   if (followerCount < 0 || followerCount > LIMITS.followers) throw new Error('followerCount out of range');
@@ -342,6 +365,20 @@ export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 
   const knownActors = new Set(actors.map(actor => actor.name));
   for (const name of Object.keys(actorImages)) {
     if (!knownActors.has(name)) throw new Error(`actor image override references unknown actor ${name}`);
+  }
+  for (const [name, entries] of Object.entries(actorEnvs)) {
+    if (!knownActors.has(name)) throw new Error(`actor environment override references unknown actor ${name}`);
+    if (!Array.isArray(entries)) throw new Error(`actor environment override for ${name} must be an array`);
+    const actor = actors.find(candidate => candidate.name === name);
+    const occupied = new Set((actor.env ?? []).map(entry => entry.name));
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+          || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(entry.name ?? '')
+          || typeof entry.value !== 'string') throw new Error(`invalid actor environment override for ${name}`);
+      if (occupied.has(entry.name)) throw new Error(`actor environment ${name}:${entry.name} is already defined`);
+      occupied.add(entry.name);
+      actor.env.push({name: entry.name, value: entry.value});
+    }
   }
   return {minerCount, signerCount, followerCount, nodeImage, stackerImage, actors, signers};
 }
@@ -558,6 +595,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     nodeImage: option('node-image', 'stacks-core-attacknet:main'),
     stackerImage: option('stacker-image', 'stacks-attacknet-stacker:local'),
     actorImages: repeatedMapOption('actor-image'),
+    actorEnvs: repeatedActorEnvOption(),
   });
   const output = resolve(option('output', join(ROOT, 'generated')));
   const probeEnabled = option('probes', 'false');

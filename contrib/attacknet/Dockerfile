@@ -24,6 +24,7 @@ FROM chef AS build
 ARG STACKS_NODE_VERSION="attacknet-dev"
 ARG GIT_BRANCH="unknown"
 ARG GIT_COMMIT="unknown"
+ARG ATTACKNET_CARGO_FEATURES="monitoring_prom,slog_json"
 ENV CARGO_INCREMENTAL=0
 
 WORKDIR /src
@@ -33,7 +34,7 @@ RUN --mount=type=cache,id=stacks-attacknet-cargo,target=/usr/local/cargo/registr
     --mount=type=cache,id=stacks-attacknet-target,target=/src/target \
     cargo chef cook \
     --profile release-lite \
-    --features monitoring_prom,slog_json \
+    --features "${ATTACKNET_CARGO_FEATURES}" \
     --bin stacks-node \
     --bin stacks-signer \
     --bin stacks-inspect \
@@ -44,7 +45,7 @@ RUN --mount=type=cache,id=stacks-attacknet-cargo,target=/usr/local/cargo/registr
     --mount=type=cache,id=stacks-attacknet-target,target=/src/target \
     cargo build \
     --profile release-lite \
-    --features monitoring_prom,slog_json \
+    --features "${ATTACKNET_CARGO_FEATURES}" \
     --bin stacks-node \
     --bin stacks-signer \
     --bin stacks-inspect \

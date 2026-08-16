@@ -102,6 +102,13 @@
         "cargoProfile": {"type": "string", "minLength": 1},
         "cargoChef": {"const": true},
         "cargoIncremental": {"const": false},
+        "cargoFeatures": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"}
+        },
         "builderImage": {"type": "string", "minLength": 1},
         "runtimeImage": {"type": "string", "minLength": 1},
         "recipeDigest": {"$ref": "#/$defs/sha256"},

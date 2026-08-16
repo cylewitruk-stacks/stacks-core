@@ -308,6 +308,20 @@ test('per-actor images express mixed-version and modified builds', () => {
   assert.throws(() => buildTopology({actorImages: {'signer-9': 'stacks:old'}}), /unknown actor/);
 });
 
+test('per-actor environment expresses bounded adversarial behavior without affecting peers', () => {
+  const topology = buildTopology({
+    signerCount: 2,
+    actorEnvs: {'signer-2': [{name: 'STACKS_SIGNER_TEST_DIRECTIVE', value: 'reject-all'}]},
+  });
+  assert.deepEqual(topology.actors.find(actor => actor.name === 'signer-2').env, [
+    {name: 'RUST_LOG', value: 'info'},
+    {name: 'STACKS_SIGNER_TEST_DIRECTIVE', value: 'reject-all'},
+  ]);
+  assert.deepEqual(topology.actors.find(actor => actor.name === 'signer-1').env, [{name: 'RUST_LOG', value: 'info'}]);
+  assert.throws(() => buildTopology({actorEnvs: {'signer-9': [{name: 'SAFE', value: '1'}]}}), /unknown actor/);
+  assert.throws(() => buildTopology({actorEnvs: {'signer-1': [{name: 'RUST_LOG', value: 'trace'}]}}), /already defined/);
+});
+
 test('post-Nakamoto miners are activation-gated in the manifest but not the CRD', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-activation-gate-'));
   const {resource, manifest} = renderTopology(buildTopology({minerCount: 3}), output);

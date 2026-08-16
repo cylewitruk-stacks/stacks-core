@@ -52,7 +52,9 @@ function fixture() {
     'FROM scratch AS cargo-chef-recipe',
     'COPY --from=planner /src/recipe.json /recipe.json',
     'FROM chef AS build',
-    'RUN cargo chef cook --recipe-path recipe.json',
+    'ARG ATTACKNET_CARGO_FEATURES="monitoring_prom,slog_json"',
+    'RUN cargo chef cook --recipe-path recipe.json --features "${ATTACKNET_CARGO_FEATURES}"',
+    'RUN cargo build --features "${ATTACKNET_CARGO_FEATURES}"',
     'ARG RUNTIME_IMAGE=debian:latest',
     'FROM ${RUNTIME_IMAGE}',
     '',
@@ -74,6 +76,7 @@ function fixture() {
       {
         id: 'modified',
         source: {kind: 'localModified', baseRef: 'HEAD', changeId: 'adversarial-change'},
+        cargoFeatures: ['testing', 'slog_json', 'monitoring_prom'],
       },
     ],
   };
@@ -165,6 +168,7 @@ test('plan resolves exact current, release, and local-modified sources without e
   assert.equal(output.plan.profiles[1].source.revision, releasedRevision);
   assert.equal(output.plan.profiles[1].source.dirty, false);
   assert.equal(output.plan.profiles[2].source.dirty, true);
+  assert.deepEqual(output.plan.profiles[2].cargoFeatures, ['monitoring_prom', 'slog_json', 'testing']);
   assert.match(output.plan.profiles[0].plannedLocalRef, /:src-[0-9a-f]{24}$/);
   assert.equal(output.plan.acceptanceReady, false);
 });
@@ -196,6 +200,7 @@ test('execution uses BuildKit provenance, content tags, exact source contexts, a
     assert.ok(call.args.includes('--sbom=true'));
     assert.ok(call.args.includes(`CARGO_CHEF_IMAGE=${cargoChef}`));
     assert.ok(call.args.includes(`RUNTIME_IMAGE=${runtime}`));
+    assert.ok(call.args.some(argument => argument.startsWith('ATTACKNET_CARGO_FEATURES=')));
     assert.ok(call.args.includes('CARGO_INCREMENTAL=0'));
     assert.equal(call.env.CARGO_INCREMENTAL, '0');
     assert.match(call.args[call.args.indexOf('--tag') + 1], /:content-[0-9a-f]{24}$/);
@@ -217,6 +222,22 @@ test('execution uses BuildKit provenance, content tags, exact source contexts, a
   assert.equal(readFileSync(join(root, 'contexts', 'released', 'tracked.txt'), 'utf8'), 'committed\n');
   assert.equal(readFileSync(join(root, 'contexts', 'current', 'tracked.txt'), 'utf8'), 'current\n');
   assert.equal(readFileSync(join(root, 'contexts', 'modified', 'modified.txt'), 'utf8'), 'local modification\n');
+});
+
+test('profile Cargo features are bounded, reproducible, and retain monitoring', () => {
+  const {input} = fixture();
+  input.profiles[0].cargoFeatures = ['testing', 'monitoring_prom', 'slog_json'];
+  const plan = planImageBuildPipeline(input);
+  assert.deepEqual(plan.profiles[0].cargoFeatures, ['monitoring_prom', 'slog_json', 'testing']);
+  const duplicate = fixture().input;
+  duplicate.profiles[0].cargoFeatures = ['monitoring_prom', 'slog_json', 'testing', 'testing'];
+  assert.throws(() => planImageBuildPipeline(duplicate), /duplicates/);
+  const missing = fixture().input;
+  missing.profiles[0].cargoFeatures = ['testing', 'slog_json'];
+  assert.throws(() => planImageBuildPipeline(missing), /must include monitoring_prom/);
+  const malformed = fixture().input;
+  malformed.profiles[0].cargoFeatures = ['monitoring_prom', 'slog_json', 'testing;touch-pwned'];
+  assert.throws(() => planImageBuildPipeline(malformed), /bounded Cargo features/);
 });
 
 test('kind loading is explicit and remains separate from Kubernetes admission', () => {

@@ -112,8 +112,14 @@ node contrib/attacknet/topology.mjs \
   --miners=3 --signers=10 --followers=5 \
   --actor-image=miner-3=stacks-core:v4.0.2 \
   --actor-image=signer-10=stacks-core:malicious \
+  --actor-env=signer-10:STACKS_SIGNER_TEST_DIRECTIVE=reject-all \
   --output=contrib/attacknet/generated/mixed
 ```
+
+Deliberately modified images and their bounded directives are documented in
+[`ADVERSARIAL-ACTORS.md`](ADVERSARIAL-ACTORS.md). They are separate,
+provenance-bound test artifacts; the normal production image contains no
+runtime adversary switch.
 
 For a bounded, reviewable current/old/modified matrix, describe the complete
 actor inventory, profiles, and ordered phases in the

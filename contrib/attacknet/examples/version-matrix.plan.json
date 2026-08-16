@@ -18,6 +18,7 @@
         "cargoProfile": "release-lite",
         "cargoChef": true,
         "cargoIncremental": false,
+        "cargoFeatures": ["monitoring_prom", "slog_json", "testing"],
         "builderImage": "lukemathwalker/cargo-chef:0.1.77-rust-1.96.0-bookworm",
         "runtimeImage": "debian:bookworm-slim"
       },

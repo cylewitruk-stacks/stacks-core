@@ -106,6 +106,13 @@ or `localModified` profile intentionally captures all tracked and untracked
 source files in that worktree; sharing a dirty worktree makes both profiles
 represent the same source state.
 
+Profiles may declare a bounded `cargoFeatures` list. The normalized list is
+part of the build key, invocation record, and version-matrix provenance, and is
+passed identically to Cargo Chef and the final Cargo build. Every attacknet
+image retains `monitoring_prom` and `slog_json`; deliberately modified signer
+fixtures additionally use the existing `testing` feature. See
+[`ADVERSARIAL-ACTORS.md`](ADVERSARIAL-ACTORS.md).
+
 ## Live evidence and remaining boundary
 
 After Docker Desktop storage was repaired on 2026-08-15, the pipeline built

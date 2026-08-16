@@ -113,6 +113,7 @@ test('local modified builds capture worktree and complete build provenance', () 
     image: {requestedRef: image('modified', SHA_C), origin: 'localBuild', platforms: ['linux/arm64']},
     build: {
       dockerfile: 'Dockerfile', cargoProfile: 'release-lite', cargoChef: true, cargoIncremental: false,
+      cargoFeatures: ['testing', 'slog_json', 'monitoring_prom'],
       builderImage: image('cargo-chef', SHA_B), runtimeImage: image('debian', SHA_D),
       recipeDigest: SHA_A, buildInvocationDigest: SHA_C,
       attestationRef: 'evidence/builds/modified.intoto.jsonl',
@@ -129,7 +130,23 @@ test('local modified builds capture worktree and complete build provenance', () 
   assert.match(output.profiles.modified.source.sourceStateDigest, /^sha256:[0-9a-f]{64}$/);
   assert.deepEqual(output.profiles.modified.source.untrackedFiles.map(item => item.path), ['modified.txt']);
   assert.equal(output.profiles.modified.build.cargoIncremental, false);
+  assert.deepEqual(output.profiles.modified.build.cargoFeatures, ['monitoring_prom', 'slog_json', 'testing']);
   assert.equal(output.phases[2].actorProfiles['signer-1'], 'modified');
+});
+
+test('local build feature provenance is bounded and preserves monitoring support', () => {
+  const repository = repositoryFixture();
+  const input = matrix(repository);
+  input.profiles.current.image.origin = 'localBuild';
+  delete input.profiles.current.image.attestationRef;
+  delete input.profiles.current.image.attestationDigest;
+  input.profiles.current.build = {
+    dockerfile: 'Dockerfile', cargoProfile: 'release-lite', cargoChef: true, cargoIncremental: false,
+    cargoFeatures: ['testing'], builderImage: image('cargo-chef', SHA_B), runtimeImage: image('debian', SHA_D),
+  };
+  assert.throws(() => compileVersionMatrix(input), /must include monitoring_prom/);
+  input.profiles.current.build.cargoFeatures = ['monitoring_prom', 'slog_json', 'testing', 'testing'];
+  assert.throws(() => compileVersionMatrix(input), /must not contain duplicates/);
 });
 
 test('local builds without attestations remain plans, never acceptance inputs', () => {

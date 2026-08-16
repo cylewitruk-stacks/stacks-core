@@ -16,6 +16,8 @@ const SOURCE_KINDS = new Set(['current', 'releasedGitRef', 'localModified']);
 const PHASE_KINDS = new Set(['baseline', 'rolling-upgrade', 'missed-upgrade', 'modified-actor']);
 const EXPECTED_OUTCOMES = new Set(['compatible', 'intentional-failure', 'observe']);
 const COMPATIBILITY = new Set(['compatible', 'intentionally-incompatible', 'unknown']);
+const CARGO_FEATURE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const DEFAULT_CARGO_FEATURES = ['monitoring_prom', 'slog_json'];
 
 function fail(message) { throw new Error(message); }
 function object(value, path) {
@@ -176,19 +178,29 @@ function validateImage(image, targetPlatform, acceptance, unresolved, path) {
 
 function validateBuild(build, profilePath, source, acceptance, unresolved) {
   object(build, `${profilePath}.build`);
-  exactKeys(build, ['dockerfile', 'cargoProfile', 'cargoChef', 'cargoIncremental', 'builderImage', 'runtimeImage', 'recipeDigest', 'buildInvocationDigest', 'attestationRef', 'attestationDigest'], `${profilePath}.build`);
+  exactKeys(build, ['dockerfile', 'cargoProfile', 'cargoChef', 'cargoIncremental', 'cargoFeatures', 'builderImage', 'runtimeImage', 'recipeDigest', 'buildInvocationDigest', 'attestationRef', 'attestationDigest'], `${profilePath}.build`);
   if (build.cargoChef !== true) fail(`${profilePath}.build.cargoChef must be true`);
   if (build.cargoIncremental !== false) fail(`${profilePath}.build.cargoIncremental must be false`);
   const dockerfile = string(build.dockerfile, `${profilePath}.build.dockerfile`);
   const dockerfileBytes = source.kind === 'releasedGitRef'
     ? gitBlob(source.repositoryPath, source.revision, dockerfile)
     : readFileSync(safeRepositoryFile(source.repositoryPath, dockerfile));
+  const cargoFeatures = build.cargoFeatures ?? DEFAULT_CARGO_FEATURES;
+  if (!Array.isArray(cargoFeatures) || cargoFeatures.length < 1 || cargoFeatures.length > 16
+      || cargoFeatures.some(feature => typeof feature !== 'string' || !CARGO_FEATURE.test(feature))) {
+    fail(`${profilePath}.build.cargoFeatures must contain 1 through 16 bounded Cargo features`);
+  }
+  unique(cargoFeatures, `${profilePath}.build.cargoFeatures`);
+  for (const required of DEFAULT_CARGO_FEATURES) {
+    if (!cargoFeatures.includes(required)) fail(`${profilePath}.build.cargoFeatures must include ${required}`);
+  }
   const result = {
     dockerfile,
     dockerfileDigest: digestBytes(dockerfileBytes),
     cargoProfile: string(build.cargoProfile, `${profilePath}.build.cargoProfile`),
     cargoChef: true,
     cargoIncremental: false,
+    cargoFeatures: [...cargoFeatures].sort(),
     builderImage: string(build.builderImage, `${profilePath}.build.builderImage`),
     runtimeImage: string(build.runtimeImage, `${profilePath}.build.runtimeImage`),
     recipeDigest: build.recipeDigest ?? null,
