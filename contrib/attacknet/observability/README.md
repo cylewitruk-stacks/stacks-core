@@ -136,6 +136,19 @@ admitted image tag is the best available version identity. Exact image digest
 comes from the trusted actor-state observation. Current main does not export a
 separate build/version information metric.
 
+The dashboards also contain the complete 22-family Workstream M observation
+contract: signer readiness, registration, state freshness, companion drift
+inputs, pending validation backlog, exact global-state support, bounded policy
+and validation outcomes, response-delivery results, legacy coordinator rounds
+and response weight, proposal-to-threshold latency, and Nakamoto transport
+boundaries. These panels intentionally show no data when the selected actor
+image does not contain the corresponding instrumentation. An R1 run must record
+each signal as `merged`, `attacknet-patch`, or `unavailable` for the exact
+admitted image; a blank panel must never be silently interpreted as a healthy
+zero. Burn-chain and Stacks-chain cohort progress are separate panels with
+independent vertical scales because Nakamoto block cadence is much faster than
+Bitcoin burn-block cadence.
+
 The **Explore actor logs** links open Grafana Explore for longer LogQL queries.
 The dashboards are optimized for humans. Automated agents should query
 Prometheus, Loki, and the authenticated journal API directly and retain the raw

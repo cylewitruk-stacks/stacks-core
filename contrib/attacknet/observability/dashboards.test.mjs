@@ -97,6 +97,47 @@ test('dashboard queries cover every current-main node and signer metric family',
   assert.deepEqual(missing, [], `dashboard coverage missing: ${missing.join(', ')}`);
 });
 
+test('dashboards cover the complete Workstream M contract without conflating chain scales', () => {
+  const overview = readDashboard('attacknet-overview.json');
+  const actor = readDashboard('attacknet-actor.json');
+  const dashboardText = JSON.stringify([overview, actor]);
+  for (const metric of [
+    'stacks_signer_runloop_ready',
+    'stacks_signer_registered_for_current_reward_cycle',
+    'stacks_signer_registered_for_next_reward_cycle',
+    'stacks_signer_state_burn_block_height',
+    'stacks_signer_state_last_changed_timestamp_seconds',
+    'stacks_signer_companion_burn_block_height',
+    'stacks_signer_pending_block_validations',
+    'stacks_signer_global_state_available',
+    'stacks_signer_global_state_total_weight',
+    'stacks_signer_global_state_known_weight',
+    'stacks_signer_global_state_maximum_view_weight',
+    'stacks_signer_global_state_evaluator_threshold_weight',
+    'stacks_signer_global_state_canonical_threshold_weight',
+    'stacks_signer_block_proposals_received',
+    'stacks_signer_policy_evaluations_total',
+    'stacks_signer_policy_rejections_total',
+    'stacks_signer_block_validation_lifecycle_total',
+    'stacks_signer_block_response_deliveries_total',
+    'stacks_node_signer_coordinator_rounds_total',
+    'stacks_node_signer_response_weight_total',
+    'stacks_node_signer_coordinator_milestone_seconds_bucket',
+    'stacks_node_nakamoto_block_transfers_total',
+  ]) assert.match(dashboardText, new RegExp(metric), `missing Workstream M metric ${metric}`);
+
+  const burnPanel = overview.panels.find(panel => panel.title === 'Burn-chain cohort progress');
+  const stacksPanel = overview.panels.find(panel => panel.title === 'Stacks-chain cohort progress');
+  assert.ok(burnPanel);
+  assert.ok(stacksPanel);
+  const burnQueries = JSON.stringify(burnPanel.targets);
+  const stacksQueries = JSON.stringify(stacksPanel.targets);
+  assert.match(burnQueries, /stacks_node_burn_block_height/);
+  assert.doesNotMatch(burnQueries, /stacks_node_stacks_tip_height/);
+  assert.match(stacksQueries, /stacks_node_stacks_tip_height/);
+  assert.doesNotMatch(stacksQueries, /stacks_node_burn_block_height/);
+});
+
 test('histogram units and counter queries preserve exported metric semantics', () => {
   for (const dashboard of [readDashboard('attacknet-overview.json'), readDashboard('attacknet-actor.json')]) {
     for (const panel of dashboard.panels) {

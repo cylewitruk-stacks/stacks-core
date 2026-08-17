@@ -89,7 +89,9 @@
       "targets": [
         {"expr": "stacks_node_burn_block_height{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "burn height", "refId": "A"},
         {"expr": "stacks_node_stacks_tip_height{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "Stacks height", "refId": "B"},
-        {"expr": "stacks_signer_stacks_node_height{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "signer's node height", "refId": "C"}
+        {"expr": "stacks_signer_stacks_node_height{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "signer's node height", "refId": "C"},
+        {"expr": "stacks_signer_state_burn_block_height{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "signer state burn height", "refId": "D"},
+        {"expr": "stacks_signer_companion_burn_block_height{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "companion burn height", "refId": "E"}
       ],
       "title": "Self-reported chain progress",
       "type": "timeseries"
@@ -145,7 +147,7 @@
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
       "description": "Signer lifecycle flags and reward cycle. Empty for node-only actors. Registered-current=0 means the signer cannot contribute weight now.",
-      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [{"options": {"0": {"color": "red", "text": "NO"}, "1": {"color": "green", "text": "YES"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": [{"matcher": {"id": "byName", "options": "reward cycle"}, "properties": [{"id": "mappings", "value": []}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}]}]},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [{"options": {"0": {"color": "red", "text": "NO"}, "1": {"color": "green", "text": "YES"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": [{"matcher": {"id": "byRegexp", "options": "/reward cycle|pending validations/"}, "properties": [{"id": "mappings", "value": []}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}]}]},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
       "id": 11,
       "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name", "wideLayout": true},
@@ -153,7 +155,8 @@
         {"expr": "stacks_signer_runloop_ready{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "runloop ready", "refId": "A"},
         {"expr": "stacks_signer_registered_for_current_reward_cycle{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "registered current", "refId": "B"},
         {"expr": "stacks_signer_registered_for_next_reward_cycle{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "registered next", "refId": "C"},
-        {"expr": "stacks_signer_current_reward_cycle{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "reward cycle", "refId": "D"}
+        {"expr": "stacks_signer_current_reward_cycle{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "reward cycle", "refId": "D"},
+        {"expr": "stacks_signer_pending_block_validations{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "pending validations", "refId": "E"}
       ],
       "title": "Signer participation state (self-reported)",
       "type": "stat"
@@ -169,7 +172,10 @@
         {"expr": "rate(stacks_signer_block_proposals_received{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "proposals", "refId": "A"},
         {"expr": "rate(stacks_signer_block_validation_responses{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "validation {{response_type}}", "refId": "B"},
         {"expr": "rate(stacks_signer_block_pre_commits_sent{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "precommits", "refId": "C"},
-        {"expr": "rate(stacks_signer_block_responses_sent{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "response {{response_type}}", "refId": "D"}
+        {"expr": "rate(stacks_signer_block_responses_sent{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "legacy response {{response_type}}", "refId": "D"},
+        {"expr": "rate(stacks_signer_policy_evaluations_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "policy {{classification}}/{{action}}", "refId": "E"},
+        {"expr": "rate(stacks_signer_block_validation_lifecycle_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "lifecycle {{event}}/{{reason}}", "refId": "F"},
+        {"expr": "rate(stacks_signer_block_response_deliveries_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "delivery {{response_type}}/{{outcome}}", "refId": "G"}
       ],
       "title": "Signer decision pipeline (self-reported)",
       "type": "timeseries"
@@ -245,12 +251,13 @@
       "id": 18,
       "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "rate(stacks_node_nakamoto_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "Nakamoto pushes", "refId": "A"},
-        {"expr": "rate(stacks_node_stx_micro_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "microblocks received", "refId": "B"},
-        {"expr": "rate(stacks_node_stx_micro_blocks_served_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "microblocks served", "refId": "C"},
-        {"expr": "rate(stacks_node_stx_confirmed_micro_blocks_served_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "confirmed microblocks served", "refId": "D"},
-        {"expr": "rate(stacks_node_btc_ops_sent_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "burn ops sent", "refId": "E"},
-        {"expr": "rate(stacks_node_message_count{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "message {{name}}", "refId": "F"}
+        {"expr": "rate(stacks_node_nakamoto_block_transfers_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "Nakamoto {{direction}} {{source}}/{{outcome}}", "refId": "A"},
+        {"expr": "rate(stacks_node_nakamoto_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "Nakamoto P2P message ingress (compatibility)", "refId": "B"},
+        {"expr": "rate(stacks_node_stx_micro_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "microblocks received", "refId": "C"},
+        {"expr": "rate(stacks_node_stx_micro_blocks_served_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "microblocks served", "refId": "D"},
+        {"expr": "rate(stacks_node_stx_confirmed_micro_blocks_served_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "confirmed microblocks served", "refId": "E"},
+        {"expr": "rate(stacks_node_btc_ops_sent_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "burn ops sent", "refId": "F"},
+        {"expr": "rate(stacks_node_message_count{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "message {{name}}", "refId": "G"}
       ],
       "title": "Node protocol traffic (self-reported)",
       "type": "timeseries"
@@ -349,20 +356,54 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
-      "description": "Wall-clock offset sampled inside the Stacks process, compared with Prometheus query time. This actor-self-reported signal is useful for spotting process-visible clock skew; FaultCampaign effect evidence still relies on the independent orchestrator probe rather than trusting this value.",
+      "description": "Bounded signer policy classification, policy reason, companion-validation lifecycle, and final delivery outcomes. unavailable/reject truthfully means current code could not evaluate but still emitted a rejection; this panel does not imply abstention.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "fillOpacity": 25, "lineWidth": 1, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 79},
+      "id": 25,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "rate(stacks_signer_policy_evaluations_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "policy {{classification}}/{{action}}", "refId": "A"},
+        {"expr": "rate(stacks_signer_policy_rejections_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "reject {{reason}}", "refId": "B"},
+        {"expr": "rate(stacks_signer_block_validation_lifecycle_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "validation {{event}}/{{reason}}", "refId": "C"},
+        {"expr": "rate(stacks_signer_block_response_deliveries_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "delivery {{response_type}}/{{outcome}}", "refId": "D"}
+      ],
+      "title": "Signer policy and validation outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Legacy node-side signer-coordinator rounds, unique response weight, and proposal-to-threshold p95. unavailable_classified overlaps rejected_effective in current behavior. The latency series is monotonic elapsed time in seconds.",
+      "fieldConfig": {"defaults": {"custom": {"axisPlacement": "left", "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": [{"matcher": {"id": "byRegexp", "options": "/threshold p95/"}, "properties": [{"id": "unit", "value": "s"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 79},
+      "id": 26,
+      "options": {"legend": {"calcs": ["sum", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "rate(stacks_node_signer_coordinator_rounds_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "round {{event}}/{{outcome}}", "refId": "A"},
+        {"expr": "rate(stacks_node_signer_response_weight_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "weight {{classification}}", "refId": "B"},
+        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "threshold p95 {{outcome}}", "refId": "C"}
+      ],
+      "title": "Legacy coordinator decisions and threshold",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Wall-clock offset and signer-state age are sampled from actor process clocks. They expose clock skew or frozen signer state, but FaultCampaign effect evidence still relies on the independent orchestrator probe rather than trusting these values.",
       "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}, "unit": "s"}, "overrides": []},
-      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 79},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 87},
       "id": 24,
       "options": {"legend": {"calcs": ["lastNotNull", "min", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-      "targets": [{"expr": "stacks_node_process_wall_clock_seconds{attacknet_network=\"$network\",attacknet_actor=\"$actor\"} - time()", "legendFormat": "process wall-clock offset", "refId": "A"}],
-      "title": "Process-visible wall-clock offset (self-reported)",
+      "targets": [
+        {"expr": "stacks_node_process_wall_clock_seconds{attacknet_network=\"$network\",attacknet_actor=\"$actor\"} - time()", "legendFormat": "process wall-clock offset", "refId": "A"},
+        {"expr": "time() - stacks_signer_state_last_changed_timestamp_seconds{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "signer state age", "refId": "B"}
+      ],
+      "title": "Process clock and signer-state freshness (self-reported)",
       "type": "timeseries"
     },
     {
       "datasource": {"type": "loki", "uid": "attacknet-loki"},
       "description": "Raw actor stdout/stderr. Kubernetes attaches the stream identity; the body remains fully actor-controlled and untrusted. Use surrounding trusted fault/readiness state to establish causality.",
       "fieldConfig": {"defaults": {}, "overrides": []},
-      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 85},
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 93},
       "id": 16,
       "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
       "targets": [{"datasource": {"type": "loki", "uid": "attacknet-loki"}, "editorMode": "code", "expr": "{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "queryType": "range", "refId": "A"}],

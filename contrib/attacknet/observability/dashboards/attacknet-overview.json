@@ -160,7 +160,10 @@
       "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
         {"expr": "sum by (attacknet_actor) (rate(stacks_signer_block_proposals_received{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "proposal {{attacknet_actor}}", "refId": "A"},
-        {"expr": "sum by (attacknet_actor,response_type) (rate(stacks_signer_block_responses_sent{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "{{response_type}} {{attacknet_actor}}", "refId": "B"}
+        {"expr": "sum by (attacknet_actor,response_type) (rate(stacks_signer_block_responses_sent{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "legacy {{response_type}} {{attacknet_actor}}", "refId": "B"},
+        {"expr": "sum by (attacknet_actor,classification,action) (rate(stacks_signer_policy_evaluations_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "policy {{classification}}/{{action}} {{attacknet_actor}}", "refId": "C"},
+        {"expr": "sum by (attacknet_actor,event,reason) (rate(stacks_signer_block_validation_lifecycle_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "validation {{event}}/{{reason}} {{attacknet_actor}}", "refId": "D"},
+        {"expr": "sum by (attacknet_actor,response_type,outcome) (rate(stacks_signer_block_response_deliveries_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "delivery {{response_type}}/{{outcome}} {{attacknet_actor}}", "refId": "E"}
       ],
       "title": "Signer proposal and vote rates",
       "type": "timeseries"
@@ -378,6 +381,47 @@
         {"expr": "stacks_signer_global_state_available{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "available {{attacknet_actor}}", "refId": "F"}
       ],
       "title": "Signer global-state support (self-reported)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Legacy coordinator round outcomes and unique signer weight accepted, effectively rejected, or independently classified as unavailable. Unavailable weight overlaps rejected_effective on current main; it is not discounted or renormalized.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 101},
+      "id": 28,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (attacknet_actor,event,outcome) (rate(stacks_node_signer_coordinator_rounds_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "round {{event}}/{{outcome}} {{attacknet_actor}}", "refId": "A"},
+        {"expr": "sum by (attacknet_actor,classification) (rate(stacks_node_signer_response_weight_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "weight {{classification}} {{attacknet_actor}}", "refId": "B"}
+      ],
+      "title": "Legacy coordinator rounds and response weight",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Real proposal-to-weighted-threshold latency from the legacy coordinator's monotonic round timer. This is the production calibration signal; timeout and chain-change exits intentionally do not appear as thresholds.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 101},
+      "id": 29,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "p50 {{outcome}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "p95 {{outcome}}", "refId": "B"}
+      ],
+      "title": "Proposal-to-threshold latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Bounded Nakamoto block ingress, P2P relay handoff, and completed HTTP serving rates. A block may cross multiple boundaries; do not sum all series as unique blocks. All values are actor-self-reported.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 110},
+      "id": 30,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (attacknet_actor,direction,source,outcome) (rate(stacks_node_nakamoto_block_transfers_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "{{direction}} {{source}}/{{outcome}} {{attacknet_actor}}", "refId": "A"}
+      ],
+      "title": "Nakamoto block transfer boundaries",
       "type": "timeseries"
     }
   ],
