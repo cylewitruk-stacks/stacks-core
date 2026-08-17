@@ -32,6 +32,11 @@ use stacks::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState};
 use stacks::chainstate::stacks::Error as ChainstateError;
 use stacks::codec::StacksMessageCodec;
 use stacks::libstackerdb::StackerDBChunkData;
+use stacks::monitoring::{
+    increment_signer_coordinator_round, observe_signer_coordinator_milestone,
+    SignerCoordinatorMilestone, SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent,
+    SignerCoordinatorRoundOutcome,
+};
 use stacks::net::stackerdb::StackerDBs;
 use stacks::types::chainstate::{StacksBlockId, StacksPrivateKey, StacksPublicKey};
 use stacks::types::MinerDiagnosticData;
@@ -304,7 +309,15 @@ impl SignerCoordinator {
             debug!("Sending block proposal message to signers";
                 "signer_signature_hash" => %block.header.signer_signature_hash(),
             );
-            Self::send_miners_message::<SignerMessageV0>(
+            // Keep the metric timer separate from the rejection timer below:
+            // publication latency belongs in proposal-to-response measurements,
+            // but must not alter timeout behavior.
+            let metric_round_started_at = Instant::now();
+            self.stackerdb_comms.begin_proposal_publication(
+                &block.header.signer_signature_hash(),
+                metric_round_started_at,
+            );
+            let publication_result = Self::send_miners_message::<SignerMessageV0>(
                 &self.message_key,
                 sortdb,
                 election_sortition,
@@ -315,8 +328,19 @@ impl SignerCoordinator {
                 &mut self.miners_session,
                 &election_sortition.consensus_hash,
                 miner_db,
-            )?;
+            );
+            if let Err(error) = publication_result {
+                self.stackerdb_comms
+                    .cancel_proposal_publication(&block.header.signer_signature_hash());
+                return Err(error);
+            }
+            self.stackerdb_comms
+                .confirm_proposal_publication(&block.header.signer_signature_hash());
             counters.bump_naka_proposed_blocks();
+            increment_signer_coordinator_round(
+                SignerCoordinatorRoundEvent::Started,
+                SignerCoordinatorRoundOutcome::Pending,
+            );
 
             #[cfg(test)]
             {
@@ -330,6 +354,10 @@ impl SignerCoordinator {
                     crate::tests::nakamoto_integrations::TestSigningChannel::get_signature()
                 {
                     debug!("Short-circuiting waiting for signers, using test signature");
+                    increment_signer_coordinator_round(
+                        SignerCoordinatorRoundEvent::Completed,
+                        SignerCoordinatorRoundOutcome::Approved,
+                    );
                     return Ok(signatures);
                 }
             }
@@ -341,6 +369,26 @@ impl SignerCoordinator {
                 chain_state,
                 sortdb,
                 counters,
+                metric_round_started_at,
+            );
+
+            let round_outcome = match &res {
+                Ok(_) => SignerCoordinatorRoundOutcome::Approved,
+                Err(NakamotoNodeError::SignersRejected { .. }) => {
+                    SignerCoordinatorRoundOutcome::Rejected
+                }
+                Err(NakamotoNodeError::SignatureTimeout) => SignerCoordinatorRoundOutcome::Timeout,
+                Err(NakamotoNodeError::BurnchainTipChanged) => {
+                    SignerCoordinatorRoundOutcome::BurnchainTipChanged
+                }
+                Err(NakamotoNodeError::StacksTipChanged) => {
+                    SignerCoordinatorRoundOutcome::StacksTipChanged
+                }
+                Err(_) => SignerCoordinatorRoundOutcome::Error,
+            };
+            increment_signer_coordinator_round(
+                SignerCoordinatorRoundEvent::Completed,
+                round_outcome,
             );
 
             match res {
@@ -366,6 +414,7 @@ impl SignerCoordinator {
         chain_state: &mut StacksChainState,
         sortdb: &SortitionDB,
         counters: &Counters,
+        metric_round_started_at: Instant,
     ) -> Result<Vec<MessageSignature>, NakamotoNodeError> {
         // the amount of current rejections (used to eventually modify the timeout)
         let mut rejections: u32 = 0;
@@ -428,6 +477,11 @@ impl SignerCoordinator {
                     {
                         debug!("SignCoordinator: Found signatures in relayed block");
                         counters.bump_naka_signer_pushed_blocks();
+                        observe_signer_coordinator_milestone(
+                            SignerCoordinatorMilestone::ProposalToThreshold,
+                            SignerCoordinatorMilestoneOutcome::Approved,
+                            metric_round_started_at.elapsed(),
+                        );
                         return Ok(stored_block.header.signer_signature);
                     }
 
@@ -467,6 +521,11 @@ impl SignerCoordinator {
                             error!("Nakamoto miner produced a non-nakamoto block");
                             return Err(NakamotoNodeError::UnexpectedChainState);
                         };
+                        observe_signer_coordinator_milestone(
+                            SignerCoordinatorMilestone::ProposalToThreshold,
+                            SignerCoordinatorMilestoneOutcome::Approved,
+                            metric_round_started_at.elapsed(),
+                        );
                         return Ok(stored_block.signer_signature);
                     } else if &highest_stacks_block_id != parent_block_id {
                         info!("SignCoordinator: Exiting due to new stacks tip";
@@ -513,6 +572,11 @@ impl SignerCoordinator {
                     "signer_signature_hash" => %block_signer_sighash,
                 );
                 counters.bump_naka_rejected_blocks();
+                observe_signer_coordinator_milestone(
+                    SignerCoordinatorMilestone::ProposalToThreshold,
+                    SignerCoordinatorMilestoneOutcome::Rejected,
+                    metric_round_started_at.elapsed(),
+                );
 
                 // Only act on failed txids that a blocking minority (>30% weight) agrees on
                 let blocking_minority = self.total_weight.saturating_sub(self.weight_threshold);
@@ -537,6 +601,11 @@ impl SignerCoordinator {
             } else if block_status.total_weight_approved >= self.weight_threshold {
                 info!("Received enough signatures, block accepted";
                     "signer_signature_hash" => %block_signer_sighash,
+                );
+                observe_signer_coordinator_milestone(
+                    SignerCoordinatorMilestone::ProposalToThreshold,
+                    SignerCoordinatorMilestoneOutcome::Approved,
+                    metric_round_started_at.elapsed(),
                 );
                 return Ok(block_status.gathered_signatures.values().cloned().collect());
             } else if rejections_timer.elapsed() > *rejections_timeout {

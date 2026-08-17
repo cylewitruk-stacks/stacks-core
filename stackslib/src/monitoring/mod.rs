@@ -476,6 +476,71 @@ define_named_enum!(MinerStopReason {
     DeadlineReached("deadline_reached"),
 });
 
+define_named_enum!(SignerCoordinatorRoundEvent {
+    Started("started"),
+    Completed("completed"),
+});
+
+define_named_enum!(SignerCoordinatorRoundOutcome {
+    Pending("pending"),
+    Approved("approved"),
+    Rejected("rejected"),
+    Timeout("timeout"),
+    BurnchainTipChanged("burnchain_tip_changed"),
+    StacksTipChanged("stacks_tip_changed"),
+    Error("error"),
+});
+
+define_named_enum!(SignerResponseWeightClassification {
+    Approved("approved"),
+    RejectedEffective("rejected_effective"),
+    UnavailableClassified("unavailable_classified"),
+});
+
+define_named_enum!(SignerCoordinatorMilestone {
+    ProposalToFirstResponse("proposal_to_first_response"),
+    ProposalToThreshold("proposal_to_threshold"),
+});
+
+define_named_enum!(SignerCoordinatorMilestoneOutcome {
+    Approved("approved"),
+    Rejected("rejected"),
+});
+
+/// Increment a legacy signer-coordinator round lifecycle event.
+#[allow(unused_variables)]
+pub fn increment_signer_coordinator_round(
+    event: SignerCoordinatorRoundEvent,
+    outcome: SignerCoordinatorRoundOutcome,
+) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::SIGNER_COORDINATOR_ROUNDS
+        .with_label_values(&[event.get_name_str(), outcome.get_name_str()])
+        .inc();
+}
+
+/// Add unique signer weight to a bounded response classification.
+#[allow(unused_variables)]
+pub fn add_signer_response_weight(classification: SignerResponseWeightClassification, weight: u32) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::SIGNER_RESPONSE_WEIGHT
+        .with_label_values(&[classification.get_name_str()])
+        .inc_by(i64::from(weight));
+}
+
+/// Observe elapsed seconds from proposal publication to a bounded round milestone.
+#[allow(unused_variables)]
+pub fn observe_signer_coordinator_milestone(
+    milestone: SignerCoordinatorMilestone,
+    outcome: SignerCoordinatorMilestoneOutcome,
+    elapsed: std::time::Duration,
+) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::SIGNER_COORDINATOR_MILESTONE_SECONDS
+        .with_label_values(&[milestone.get_name_str(), outcome.get_name_str()])
+        .observe(elapsed.as_secs_f64());
+}
+
 // Increment the counter for the given miner stop reason.
 #[allow(unused_variables)]
 pub fn increment_miner_stop_reason(reason: MinerStopReason) {
@@ -495,3 +560,64 @@ impl fmt::Display for SetGlobalBurnchainSignerError {
 }
 
 impl Error for SetGlobalBurnchainSignerError {}
+
+#[cfg(all(test, feature = "monitoring_prom"))]
+mod signer_coordinator_metric_tests {
+    use std::time::Duration;
+
+    use super::prometheus::{
+        SIGNER_COORDINATOR_MILESTONE_SECONDS, SIGNER_COORDINATOR_ROUNDS, SIGNER_RESPONSE_WEIGHT,
+    };
+    use super::{
+        add_signer_response_weight, increment_signer_coordinator_round,
+        observe_signer_coordinator_milestone, SignerCoordinatorMilestone,
+        SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent,
+        SignerCoordinatorRoundOutcome, SignerResponseWeightClassification,
+    };
+
+    #[test]
+    fn signer_coordinator_metrics_preserve_overlap_and_bounded_labels() {
+        let started = SIGNER_COORDINATOR_ROUNDS.with_label_values(&["started", "pending"]);
+        let completed = SIGNER_COORDINATOR_ROUNDS.with_label_values(&["completed", "approved"]);
+        let started_before = started.get();
+        let completed_before = completed.get();
+        increment_signer_coordinator_round(
+            SignerCoordinatorRoundEvent::Started,
+            SignerCoordinatorRoundOutcome::Pending,
+        );
+        increment_signer_coordinator_round(
+            SignerCoordinatorRoundEvent::Completed,
+            SignerCoordinatorRoundOutcome::Approved,
+        );
+        assert_eq!(started.get(), started_before + 1);
+        assert_eq!(completed.get(), completed_before + 1);
+
+        let rejected = SIGNER_RESPONSE_WEIGHT.with_label_values(&["rejected_effective"]);
+        let unavailable = SIGNER_RESPONSE_WEIGHT.with_label_values(&["unavailable_classified"]);
+        let rejected_before = rejected.get();
+        let unavailable_before = unavailable.get();
+        add_signer_response_weight(SignerResponseWeightClassification::RejectedEffective, 7);
+        add_signer_response_weight(SignerResponseWeightClassification::UnavailableClassified, 7);
+        assert_eq!(rejected.get(), rejected_before + 7);
+        assert_eq!(unavailable.get(), unavailable_before + 7);
+
+        let first_response = SIGNER_COORDINATOR_MILESTONE_SECONDS
+            .with_label_values(&["proposal_to_first_response", "approved"]);
+        let threshold = SIGNER_COORDINATOR_MILESTONE_SECONDS
+            .with_label_values(&["proposal_to_threshold", "rejected"]);
+        let first_response_before = first_response.get_sample_count();
+        let count_before = threshold.get_sample_count();
+        observe_signer_coordinator_milestone(
+            SignerCoordinatorMilestone::ProposalToFirstResponse,
+            SignerCoordinatorMilestoneOutcome::Approved,
+            Duration::from_millis(25),
+        );
+        observe_signer_coordinator_milestone(
+            SignerCoordinatorMilestone::ProposalToThreshold,
+            SignerCoordinatorMilestoneOutcome::Rejected,
+            Duration::from_millis(250),
+        );
+        assert_eq!(first_response.get_sample_count(), first_response_before + 1);
+        assert_eq!(threshold.get_sample_count(), count_before + 1);
+    }
+}

@@ -261,6 +261,28 @@ lazy_static! {
         &["reason"]
     ).unwrap();
 
+    pub static ref SIGNER_COORDINATOR_ROUNDS: IntCounterVec = register_int_counter_vec!(
+        "stacks_node_signer_coordinator_rounds",
+        "Legacy signer-coordinator rounds by lifecycle event and bounded outcome",
+        &["event", "outcome"]
+    ).unwrap();
+
+    pub static ref SIGNER_RESPONSE_WEIGHT: IntCounterVec = register_int_counter_vec!(
+        "stacks_node_signer_response_weight",
+        "Unique signer response weight observed by the legacy coordinator; unavailable_classified is an overlapping subset of rejected_effective",
+        &["classification"]
+    ).unwrap();
+
+    pub static ref SIGNER_COORDINATOR_MILESTONE_SECONDS: HistogramVec =
+        register_histogram_vec!(
+            histogram_opts!(
+                "stacks_node_signer_coordinator_milestone_seconds",
+                "Elapsed seconds from proposal publication to a bounded signer-coordinator milestone"
+            ),
+            &["milestone", "outcome"]
+        )
+        .unwrap();
+
     pub static ref UNREACHABLE_ERRORS_COUNTER: IntCounterVec = register_int_counter_vec!(
         "stacks_unreachable_errors_total",
         "Number of unreachable Clarity VM errors triggered (indicates potential bugs)",

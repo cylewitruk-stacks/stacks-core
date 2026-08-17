@@ -19,11 +19,11 @@ use std::sync::mpsc::Receiver;
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libsigner::v0::messages::{
-    BlockAccepted, BlockResponse, MessageSlotID, RejectCode, SignerMessage as SignerMessageV0,
-    StateMachineUpdate,
+    BlockAccepted, BlockResponse, MessageSlotID, RejectCode, RejectReason,
+    SignerMessage as SignerMessageV0, StateMachineUpdate,
 };
 use libsigner::v0::signer_state::{GlobalStateEvaluator, SignerStateMachine};
 use libsigner::{SignerEntries, SignerEvent, SignerSession, StackerDBSession};
@@ -34,6 +34,10 @@ use stacks::chainstate::stacks::boot::{NakamotoSignerEntry, RewardSet, SIGNERS_N
 use stacks::chainstate::stacks::events::StackerDBChunksEvent;
 use stacks::chainstate::stacks::Error as ChainstateError;
 use stacks::codec::StacksMessageCodec;
+use stacks::monitoring::{
+    add_signer_response_weight, observe_signer_coordinator_milestone, SignerCoordinatorMilestone,
+    SignerCoordinatorMilestoneOutcome, SignerResponseWeightClassification,
+};
 use stacks::net::api::postblock_proposal::ValidateRejectCode;
 use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
 use stacks::types::PublicKey;
@@ -56,6 +60,18 @@ pub static TEST_IGNORE_SIGNERS: LazyLock<TestFlag<bool>> = LazyLock::new(TestFla
 /// waking up to check timeouts?
 pub static EVENT_RECEIVER_POLL: Duration = Duration::from_millis(500);
 
+/// Return whether a rejection says the signer could not produce a validity
+/// decision. This classification is observational only: the legacy
+/// coordinator still counts all rejection weight exactly as before.
+fn is_unavailable_rejection(reason: &RejectReason) -> bool {
+    matches!(
+        reason,
+        RejectReason::ConnectivityIssues(_)
+            | RejectReason::NoSortitionView
+            | RejectReason::NoSignerConsensus
+    )
+}
+
 /// Tracks per-txid rejection data from signers
 #[derive(Debug, Clone, Default)]
 pub struct FailedTxInfo {
@@ -64,6 +80,69 @@ pub struct FailedTxInfo {
     /// The weight of signers who specifically reported this txid as
     /// genuinely problematic (e.g. DDoS vector, parse error, Clarity crash)
     pub problematic_weight: u32,
+}
+
+/// Process-local state used only to time the first signer response to one
+/// proposal. It is deliberately separate from the response
+/// accumulator so resetting a metric milestone cannot alter consensus state.
+#[derive(Debug, Clone, Default)]
+struct SignerResponseMetricsState {
+    proposal_started_at: Option<Instant>,
+    publication_confirmed: bool,
+    first_response: Option<(SignerCoordinatorMilestoneOutcome, Instant)>,
+    first_response_observed: bool,
+}
+
+impl SignerResponseMetricsState {
+    fn begin_publication(&mut self, started_at: Instant) {
+        // Responses do not carry a publication-round identifier. Preserve the
+        // first successful publication as the only attribution boundary rather
+        // than misattributing a delayed response to a later resend.
+        if self.proposal_started_at.is_none() && !self.first_response_observed {
+            self.proposal_started_at = Some(started_at);
+            self.publication_confirmed = false;
+            self.first_response = None;
+        }
+    }
+
+    fn confirm_publication(&mut self) -> Option<(SignerCoordinatorMilestoneOutcome, Duration)> {
+        self.proposal_started_at?;
+        self.publication_confirmed = true;
+        self.take_first_response()
+    }
+
+    fn cancel_publication(&mut self) {
+        // A failed retry cannot invalidate an earlier successful publication.
+        if !self.publication_confirmed {
+            self.proposal_started_at = None;
+            self.first_response = None;
+        }
+    }
+
+    fn record_first_response(
+        &mut self,
+        outcome: SignerCoordinatorMilestoneOutcome,
+        observed_at: Instant,
+    ) -> Option<(SignerCoordinatorMilestoneOutcome, Duration)> {
+        if self.proposal_started_at.is_none()
+            || self.first_response.is_some()
+            || self.first_response_observed
+        {
+            return None;
+        }
+        self.first_response = Some((outcome, observed_at));
+        self.take_first_response()
+    }
+
+    fn take_first_response(&mut self) -> Option<(SignerCoordinatorMilestoneOutcome, Duration)> {
+        if !self.publication_confirmed || self.first_response_observed {
+            return None;
+        }
+        let started_at = self.proposal_started_at?;
+        let (outcome, observed_at) = self.first_response.take()?;
+        self.first_response_observed = true;
+        Some((outcome, observed_at.saturating_duration_since(started_at)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +157,31 @@ pub struct BlockStatus {
     pub total_weight_rejected: u32,
     /// Per-txid rejection tracking from signers
     pub failed_txids: HashMap<Txid, FailedTxInfo>,
+    /// Round-scoped, observation-only response timing state.
+    response_metrics: SignerResponseMetricsState,
+}
+
+fn observe_first_signer_response(
+    block: &mut BlockStatus,
+    outcome: SignerCoordinatorMilestoneOutcome,
+) {
+    let observation = block
+        .response_metrics
+        .record_first_response(outcome, Instant::now());
+    observe_first_signer_response_if_ready(observation);
+}
+
+fn observe_first_signer_response_if_ready(
+    observation: Option<(SignerCoordinatorMilestoneOutcome, Duration)>,
+) {
+    let Some((outcome, elapsed)) = observation else {
+        return;
+    };
+    observe_signer_coordinator_milestone(
+        SignerCoordinatorMilestone::ProposalToFirstResponse,
+        outcome,
+        elapsed,
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +519,10 @@ impl StackerDBListener {
                             block.total_weight_approved = block
                                 .total_weight_approved
                                 .saturating_add(signer_entry.weight);
+                            add_signer_response_weight(
+                                SignerResponseWeightClassification::Approved,
+                                signer_entry.weight,
+                            );
 
                             info!("StackerDBListener: Signature Added to block";
                                 "signer_signature_hash" => %block_sighash,
@@ -433,7 +541,12 @@ impl StackerDBListener {
                             );
                         }
                         block.gathered_signatures.insert(slot_id, signature);
-                        block.responded_signers.insert(slot_id);
+                        if block.responded_signers.insert(slot_id) {
+                            observe_first_signer_response(
+                                block,
+                                SignerCoordinatorMilestoneOutcome::Approved,
+                            );
+                        }
 
                         if block.total_weight_approved >= self.weight_threshold {
                             // Signal to anyone waiting on this block that we have enough signatures
@@ -484,9 +597,24 @@ impl StackerDBListener {
                         };
 
                         if block.responded_signers.insert(slot_id) {
+                            observe_first_signer_response(
+                                block,
+                                SignerCoordinatorMilestoneOutcome::Rejected,
+                            );
                             block.total_weight_rejected = block
                                 .total_weight_rejected
                                 .saturating_add(signer_entry.weight);
+                            add_signer_response_weight(
+                                SignerResponseWeightClassification::RejectedEffective,
+                                signer_entry.weight,
+                            );
+                            if is_unavailable_rejection(&rejected_data.response_data.reject_reason)
+                            {
+                                add_signer_response_weight(
+                                    SignerResponseWeightClassification::UnavailableClassified,
+                                    signer_entry.weight,
+                                );
+                            }
 
                             // Track transactions that failed validation, accumulating
                             // per-txid signer weight and whether any signer flagged
@@ -670,8 +798,45 @@ impl StackerDBListenerComms {
             total_weight_approved: 0,
             total_weight_rejected: 0,
             failed_txids: HashMap::new(),
+            response_metrics: SignerResponseMetricsState::default(),
         };
         blocks.insert(block.signer_signature_hash(), block_status);
+    }
+
+    /// Begin proposal publication. Only the first successful publication is
+    /// retained because signer responses do not identify a resend round.
+    pub fn begin_proposal_publication(
+        &self,
+        signer_sighash: &Sha512Trunc256Sum,
+        started_at: Instant,
+    ) {
+        let (lock, _cvar) = &*self.blocks;
+        let mut blocks = lock.lock().expect("FATAL: failed to lock block status");
+        if let Some(block) = blocks.get_mut(signer_sighash) {
+            block.response_metrics.begin_publication(started_at);
+        }
+    }
+
+    /// Confirm that the proposal publication completed. A very fast response
+    /// may already be waiting; emit it now rather than racing the HTTP upload.
+    pub fn confirm_proposal_publication(&self, signer_sighash: &Sha512Trunc256Sum) {
+        let (lock, _cvar) = &*self.blocks;
+        let mut blocks = lock.lock().expect("FATAL: failed to lock block status");
+        let observation = blocks
+            .get_mut(signer_sighash)
+            .and_then(|block| block.response_metrics.confirm_publication());
+        drop(blocks);
+        observe_first_signer_response_if_ready(observation);
+    }
+
+    /// Discard observation state when proposal publication fails. Consensus
+    /// response state remains untouched.
+    pub fn cancel_proposal_publication(&self, signer_sighash: &Sha512Trunc256Sum) {
+        let (lock, _cvar) = &*self.blocks;
+        let mut blocks = lock.lock().expect("FATAL: failed to lock block status");
+        if let Some(block) = blocks.get_mut(signer_sighash) {
+            block.response_metrics.cancel_publication();
+        }
     }
 
     /// Reset rejections for a block proposal.
@@ -794,5 +959,97 @@ impl StackerDBListenerComms {
             .lock()
             .expect("FATAL: failed to lock global state evaluator");
         eval.determine_global_state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use libsigner::v0::messages::RejectReason;
+    use stacks::monitoring::SignerCoordinatorMilestoneOutcome;
+
+    use super::{is_unavailable_rejection, SignerResponseMetricsState};
+
+    #[test]
+    fn unavailable_rejection_classification_is_narrow() {
+        assert!(is_unavailable_rejection(&RejectReason::ConnectivityIssues(
+            "free-form text is not exported".into()
+        )));
+        assert!(is_unavailable_rejection(&RejectReason::NoSortitionView));
+        assert!(is_unavailable_rejection(&RejectReason::NoSignerConsensus));
+        assert!(!is_unavailable_rejection(
+            &RejectReason::InvalidTenureExtend
+        ));
+        assert!(!is_unavailable_rejection(
+            &RejectReason::SortitionViewMismatch
+        ));
+    }
+
+    #[test]
+    fn first_response_timing_is_exactly_once_per_proposal() {
+        let mut state = SignerResponseMetricsState::default();
+        let first_round = Instant::now();
+
+        assert_eq!(state.confirm_publication(), None);
+        state.begin_publication(first_round);
+        // A response may race the publication acknowledgement. Retain it but
+        // do not emit a successful-publication metric prematurely.
+        assert_eq!(
+            state.record_first_response(
+                SignerCoordinatorMilestoneOutcome::Approved,
+                first_round + Duration::from_millis(25)
+            ),
+            None
+        );
+        assert_eq!(
+            state.confirm_publication(),
+            Some((
+                SignerCoordinatorMilestoneOutcome::Approved,
+                Duration::from_millis(25)
+            ))
+        );
+        assert_eq!(
+            state.record_first_response(
+                SignerCoordinatorMilestoneOutcome::Rejected,
+                first_round + Duration::from_millis(50)
+            ),
+            None
+        );
+
+        // A resend cannot establish a new timing boundary because responses do
+        // not identify which publication round caused them.
+        let retry_round = first_round + Duration::from_secs(1);
+        state.begin_publication(retry_round);
+        assert_eq!(
+            state.record_first_response(
+                SignerCoordinatorMilestoneOutcome::Rejected,
+                retry_round + Duration::from_millis(10)
+            ),
+            None
+        );
+
+        let mut failed_publication = SignerResponseMetricsState::default();
+        failed_publication.begin_publication(retry_round);
+        failed_publication.cancel_publication();
+        assert_eq!(failed_publication.confirm_publication(), None);
+
+        // A failed retry does not erase the timing state of a proposal that was
+        // already published successfully.
+        let mut successful_publication = SignerResponseMetricsState::default();
+        successful_publication.begin_publication(first_round);
+        assert_eq!(successful_publication.confirm_publication(), None);
+        successful_publication.begin_publication(retry_round);
+        successful_publication.cancel_publication();
+        assert_eq!(
+            successful_publication.record_first_response(
+                SignerCoordinatorMilestoneOutcome::Approved,
+                retry_round + Duration::from_millis(10)
+            ),
+            Some((
+                SignerCoordinatorMilestoneOutcome::Approved,
+                Duration::from_millis(1010)
+            ))
+        );
     }
 }
