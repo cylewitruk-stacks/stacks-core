@@ -399,16 +399,18 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
-      "description": "Real proposal-to-weighted-threshold latency from the legacy coordinator's monotonic round timer. This is the production calibration signal; timeout and chain-change exits intentionally do not appear as thresholds.",
+      "description": "Monotonic publish-to-answer latency to the first valid signer response, plus proposal-round latency to a weighted decision threshold. Both include StackerDB upload latency. Comparing their distributions helps diagnose weighted-tail/quorum accumulation delay, but subtracting aggregate quantiles is not a per-proposal delta. Timeout and chain-change exits intentionally do not claim thresholds.",
       "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "s"}, "overrides": []},
       "gridPos": {"h": 9, "w": 12, "x": 12, "y": 101},
       "id": 29,
       "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "histogram_quantile(0.50, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "p50 {{outcome}}", "refId": "A"},
-        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "p95 {{outcome}}", "refId": "B"}
+        {"expr": "histogram_quantile(0.50, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_first_response\"}[15m])))", "legendFormat": "first response p50 {{outcome}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_first_response\"}[15m])))", "legendFormat": "first response p95 {{outcome}}", "refId": "B"},
+        {"expr": "histogram_quantile(0.50, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "threshold p50 {{outcome}}", "refId": "C"},
+        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=~\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "threshold p95 {{outcome}}", "refId": "D"}
       ],
-      "title": "Proposal-to-threshold latency",
+      "title": "Proposal response and threshold latency",
       "type": "timeseries"
     },
     {

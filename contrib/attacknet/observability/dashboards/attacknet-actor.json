@@ -372,17 +372,18 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
-      "description": "Legacy node-side signer-coordinator rounds, unique response weight, and proposal-to-threshold p95. unavailable_classified overlaps rejected_effective in current behavior. The latency series is monotonic elapsed time in seconds.",
-      "fieldConfig": {"defaults": {"custom": {"axisPlacement": "left", "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": [{"matcher": {"id": "byRegexp", "options": "/threshold p95/"}, "properties": [{"id": "unit", "value": "s"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
+      "description": "Legacy node-side signer-coordinator rounds, unique response weight, publish-to-first-response p95, and proposal-to-threshold p95. Both latencies include StackerDB upload; comparing their distributions helps diagnose weighted-tail/quorum delay, but aggregate quantile subtraction is not a per-proposal delta. unavailable_classified overlaps rejected_effective in current behavior.",
+      "fieldConfig": {"defaults": {"custom": {"axisPlacement": "left", "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": [{"matcher": {"id": "byRegexp", "options": "/(first response|threshold) p95/"}, "properties": [{"id": "unit", "value": "s"}, {"id": "custom.axisPlacement", "value": "right"}]}]},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 79},
       "id": 26,
       "options": {"legend": {"calcs": ["sum", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
         {"expr": "rate(stacks_node_signer_coordinator_rounds_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "round {{event}}/{{outcome}}", "refId": "A"},
         {"expr": "rate(stacks_node_signer_response_weight_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "weight {{classification}}", "refId": "B"},
-        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "threshold p95 {{outcome}}", "refId": "C"}
+        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=\"$actor\",milestone=\"proposal_to_first_response\"}[15m])))", "legendFormat": "first response p95 {{outcome}}", "refId": "C"},
+        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "threshold p95 {{outcome}}", "refId": "D"}
       ],
-      "title": "Legacy coordinator decisions and threshold",
+      "title": "Legacy coordinator response and decisions",
       "type": "timeseries"
     },
     {

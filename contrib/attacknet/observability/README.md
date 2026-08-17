@@ -140,8 +140,8 @@ The dashboards also contain the complete 22-family Workstream M observation
 contract: signer readiness, registration, state freshness, companion drift
 inputs, pending validation backlog, exact global-state support, bounded policy
 and validation outcomes, response-delivery results, legacy coordinator rounds
-and response weight, proposal-to-threshold latency, and Nakamoto transport
-boundaries. These panels intentionally show no data when the selected actor
+and response weight, proposal-to-first-response and proposal-to-threshold
+latency, and Nakamoto transport boundaries. These panels intentionally show no data when the selected actor
 image does not contain the corresponding instrumentation. An R1 run must record
 each signal as `merged`, `attacknet-patch`, or `unavailable` for the exact
 admitted image; a blank panel must never be silently interpreted as a healthy

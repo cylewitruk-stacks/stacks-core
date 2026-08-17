@@ -126,6 +126,9 @@ test('dashboards cover the complete Workstream M contract without conflating cha
     'stacks_node_nakamoto_block_transfers_total',
   ]) assert.match(dashboardText, new RegExp(metric), `missing Workstream M metric ${metric}`);
 
+  assert.match(dashboardText, /proposal_to_first_response/);
+  assert.match(dashboardText, /proposal_to_threshold/);
+
   const burnPanel = overview.panels.find(panel => panel.title === 'Burn-chain cohort progress');
   const stacksPanel = overview.panels.find(panel => panel.title === 'Stacks-chain cohort progress');
   assert.ok(burnPanel);
