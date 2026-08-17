@@ -43,7 +43,10 @@ use crate::chainstate::stacks::db::unconfirmed::ProcessedUnconfirmedState;
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::{StacksBlockHeader, TransactionPayload};
 use crate::core::mempool::{MemPoolDB, *};
-use crate::monitoring::update_stacks_tip_height;
+use crate::monitoring::{
+    add_nakamoto_block_transfers, update_stacks_tip_height, NakamotoBlockTransferDirection,
+    NakamotoBlockTransferOutcome, NakamotoBlockTransferSource,
+};
 use crate::net::chat::*;
 use crate::net::connection::*;
 use crate::net::db::*;
@@ -562,6 +565,71 @@ pub enum BlockAcceptResponse {
     Rejected(String),
 }
 
+fn transfer_source(
+    obtained_method: NakamotoBlockObtainMethod,
+) -> Option<NakamotoBlockTransferSource> {
+    match obtained_method {
+        NakamotoBlockObtainMethod::Pushed => Some(NakamotoBlockTransferSource::P2pPush),
+        NakamotoBlockObtainMethod::Downloaded => Some(NakamotoBlockTransferSource::TenureDownload),
+        NakamotoBlockObtainMethod::Uploaded => Some(NakamotoBlockTransferSource::RpcUpload),
+        NakamotoBlockObtainMethod::Mined | NakamotoBlockObtainMethod::Shadow => None,
+    }
+}
+
+fn transfer_outcome(
+    result: &Result<BlockAcceptResponse, chainstate_error>,
+) -> NakamotoBlockTransferOutcome {
+    match result {
+        Ok(BlockAcceptResponse::Accepted) => NakamotoBlockTransferOutcome::Accepted,
+        Ok(BlockAcceptResponse::AlreadyStored) => NakamotoBlockTransferOutcome::Duplicate,
+        Ok(BlockAcceptResponse::Rejected(_)) => NakamotoBlockTransferOutcome::Rejected,
+        Err(_) => NakamotoBlockTransferOutcome::Error,
+    }
+}
+
+#[cfg(test)]
+mod transfer_metric_tests {
+    use super::*;
+
+    #[test]
+    fn transfer_source_excludes_non_network_blocks() {
+        assert_eq!(
+            transfer_source(NakamotoBlockObtainMethod::Pushed),
+            Some(NakamotoBlockTransferSource::P2pPush)
+        );
+        assert_eq!(
+            transfer_source(NakamotoBlockObtainMethod::Downloaded),
+            Some(NakamotoBlockTransferSource::TenureDownload)
+        );
+        assert_eq!(
+            transfer_source(NakamotoBlockObtainMethod::Uploaded),
+            Some(NakamotoBlockTransferSource::RpcUpload)
+        );
+        assert_eq!(transfer_source(NakamotoBlockObtainMethod::Mined), None);
+        assert_eq!(transfer_source(NakamotoBlockObtainMethod::Shadow), None);
+    }
+
+    #[test]
+    fn transfer_outcome_preserves_acceptance_semantics() {
+        assert_eq!(
+            transfer_outcome(&Ok(BlockAcceptResponse::Accepted)),
+            NakamotoBlockTransferOutcome::Accepted
+        );
+        assert_eq!(
+            transfer_outcome(&Ok(BlockAcceptResponse::AlreadyStored)),
+            NakamotoBlockTransferOutcome::Duplicate
+        );
+        assert_eq!(
+            transfer_outcome(&Ok(BlockAcceptResponse::Rejected("invalid".into()))),
+            NakamotoBlockTransferOutcome::Rejected
+        );
+        assert_eq!(
+            transfer_outcome(&Err(chainstate_error::PoxNoRewardCycle)),
+            NakamotoBlockTransferOutcome::Error
+        );
+    }
+}
+
 impl BlockAcceptResponse {
     /// Does this response indicate that the block was accepted to the staging DB
     pub fn is_accepted(&self) -> bool {
@@ -902,6 +970,41 @@ impl Relayer {
     /// * If there was an unrecognized signer
     /// * If the coordinator is closed, and `coord_comms` is Some(..)
     pub fn process_new_nakamoto_block_ext(
+        burnchain: &Burnchain,
+        sortdb: &SortitionDB,
+        sort_handle: &mut SortitionHandleConn,
+        chainstate: &mut StacksChainState,
+        stacks_tip: &StacksBlockId,
+        block: &NakamotoBlock,
+        coord_comms: Option<&CoordinatorChannels>,
+        obtained_method: NakamotoBlockObtainMethod,
+        force_broadcast: bool,
+    ) -> Result<BlockAcceptResponse, chainstate_error> {
+        let result = Self::process_new_nakamoto_block_ext_inner(
+            burnchain,
+            sortdb,
+            sort_handle,
+            chainstate,
+            stacks_tip,
+            block,
+            coord_comms,
+            obtained_method,
+            force_broadcast,
+        );
+
+        if let Some(source) = transfer_source(obtained_method) {
+            add_nakamoto_block_transfers(
+                NakamotoBlockTransferDirection::Received,
+                source,
+                transfer_outcome(&result),
+                1,
+            );
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_new_nakamoto_block_ext_inner(
         burnchain: &Burnchain,
         sortdb: &SortitionDB,
         sort_handle: &mut SortitionHandleConn,
@@ -2726,11 +2829,26 @@ impl Relayer {
                 );
             }
 
+            let relay_count = relay_blocks.len();
             let msg = StacksMessageType::NakamotoBlocks(NakamotoBlocksData {
                 blocks: relay_blocks,
             });
-            if let Err(e) = self.p2p.broadcast_message(relayers, msg) {
-                warn!("Failed to broadcast Nakamoto blocks: {:?}", &e);
+            match self.p2p.broadcast_message(relayers, msg) {
+                Ok(()) => add_nakamoto_block_transfers(
+                    NakamotoBlockTransferDirection::Sent,
+                    NakamotoBlockTransferSource::P2pRelay,
+                    NakamotoBlockTransferOutcome::Queued,
+                    relay_count,
+                ),
+                Err(e) => {
+                    add_nakamoto_block_transfers(
+                        NakamotoBlockTransferDirection::Sent,
+                        NakamotoBlockTransferSource::P2pRelay,
+                        NakamotoBlockTransferOutcome::Failed,
+                        relay_count,
+                    );
+                    warn!("Failed to broadcast Nakamoto blocks: {:?}", &e);
+                }
             }
         }
 

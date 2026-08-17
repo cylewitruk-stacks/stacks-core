@@ -70,6 +70,67 @@ pub fn increment_stx_blocks_received_counter() {
     prometheus::STX_BLOCKS_RECEIVED_COUNTER.inc();
 }
 
+define_named_enum!(NakamotoBlockTransferDirection {
+    Received("received"),
+    Sent("sent"),
+});
+
+define_named_enum!(NakamotoBlockTransferSource {
+    P2pPush("p2p_push"),
+    TenureDownload("tenure_download"),
+    RpcUpload("rpc_upload"),
+    P2pRelay("p2p_relay"),
+    RpcServe("rpc_serve"),
+});
+
+define_named_enum!(NakamotoBlockTransferOutcome {
+    Accepted("accepted"),
+    Duplicate("duplicate"),
+    Rejected("rejected"),
+    Error("error"),
+    Queued("queued"),
+    Completed("completed"),
+    Failed("failed"),
+});
+
+/// Add a bounded number of Nakamoto blocks to the transfer counter.
+#[allow(unused_variables)]
+pub fn add_nakamoto_block_transfers(
+    direction: NakamotoBlockTransferDirection,
+    source: NakamotoBlockTransferSource,
+    outcome: NakamotoBlockTransferOutcome,
+    count: usize,
+) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::NAKAMOTO_BLOCK_TRANSFERS
+        .with_label_values(&[
+            direction.get_name_str(),
+            source.get_name_str(),
+            outcome.get_name_str(),
+        ])
+        .inc_by(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+#[cfg(all(test, feature = "monitoring_prom"))]
+#[test]
+fn test_nakamoto_block_transfer_counter_uses_bounded_labels() {
+    let counter = prometheus::NAKAMOTO_BLOCK_TRANSFERS.with_label_values(&[
+        NakamotoBlockTransferDirection::Received.get_name_str(),
+        NakamotoBlockTransferSource::P2pPush.get_name_str(),
+        NakamotoBlockTransferOutcome::Accepted.get_name_str(),
+    ]);
+    let before = counter.get();
+
+    add_nakamoto_block_transfers(
+        NakamotoBlockTransferDirection::Received,
+        NakamotoBlockTransferSource::P2pPush,
+        NakamotoBlockTransferOutcome::Accepted,
+        3,
+    );
+
+    assert_eq!(counter.get(), before + 3);
+}
+
 pub fn increment_stx_micro_blocks_received_counter() {
     #[cfg(feature = "monitoring_prom")]
     prometheus::STX_MICRO_BLOCKS_RECEIVED_COUNTER.inc();
