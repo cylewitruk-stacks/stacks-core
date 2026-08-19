@@ -12,9 +12,11 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+//! Tests for Clarity value types and their physical storage codecs.
+mod packed_codec;
 mod serialization;
 mod signatures;
-mod storage;
 
 use rstest::rstest;
 use stacks_common::types::StacksEpochId;

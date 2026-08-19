@@ -44,3 +44,10 @@ path = "fuzz_targets/execute_v2_raw.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "packed_value_codec"
+path = "fuzz_targets/packed_value_codec.rs"
+test = false
+doc = false
+bench = false

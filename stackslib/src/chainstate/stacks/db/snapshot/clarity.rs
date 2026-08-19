@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! Clarity side-store copying for chainstate snapshots.
+
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -24,24 +26,25 @@ use stacks_common::types::chainstate::StacksBlockId;
 
 use super::common::{
     assert_source_schema, clone_schemas_from_source, with_indexes_dropped,
-    with_offline_write_session, MARF_INFRA_TABLES,
+    with_offline_write_session,
 };
-use super::fork_storage::{collect_leaf_value_hashes, copy_leaf_referenced_rows};
+use super::fork_storage::{
+    collect_leaf_value_hashes, copy_leaf_referenced_rows, ReferencedRowLayout,
+};
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _, MARF};
 use crate::chainstate::stacks::index::storage::{TrieFileStorage, TrieHashCalculationMode};
-use crate::chainstate::stacks::index::Error;
+use crate::chainstate::stacks::index::{Error, MARF_SQLITE_TABLES};
+use crate::clarity_vm::database::binary_value_store::{self, ValueStorageFormat};
 use crate::util_lib::db::sqlite_open;
 
 /// Clarity side-storage tables copied by [`copy_clarity_side_tables`].
 const CLARITY_SIDE_TABLES: &[&str] = &[DATA_TABLE_NAME, METADATA_TABLE_NAME];
-
-/// Every table the Clarity snapshot accounts for: side-storage copied by
-/// [`copy_clarity_side_tables`] ([`CLARITY_SIDE_TABLES`]) or owned by the MARF
-/// trie itself, recreated by [`MARF::squash_to_path`] ([`MARF_INFRA_TABLES`]).
+/// Every table the Clarity snapshot accounts for: Clarity-owned side storage
+/// or MARF-owned trie storage recreated by [`MARF::squash_to_path`].
 fn known_clarity_tables() -> Vec<&'static str> {
-    CLARITY_SIDE_TABLES
+    binary_value_store::table_names()
         .iter()
-        .chain(MARF_INFRA_TABLES)
+        .chain(MARF_SQLITE_TABLES)
         .copied()
         .collect()
 }
@@ -77,6 +80,8 @@ pub fn copy_clarity_side_tables(
     // Reject an unrecognized source schema before any destination work.
     let src_conn = open_readonly_clarity_db(src_db_path)?;
     assert_source_tables_classified(&src_conn)?;
+    let side_store_format = binary_value_store::detect(&src_conn)
+        .map_err(|error| Error::CorruptionError(error.to_string()))?;
 
     // Walk the squashed trie before opening dst for writes. we need
     // the readonly MARF view, and `marf_sqlite_open` would fight the
@@ -96,10 +101,32 @@ pub fn copy_clarity_side_tables(
         &[("src", src_db_path)],
         "",
         |conn| -> Result<ClaritySideTableStats, Error> {
-            clone_schemas_from_source(conn, CLARITY_SIDE_TABLES)?;
+            let (side_tables, data_table, metadata_table) = match side_store_format {
+                ValueStorageFormat::LegacyText => {
+                    (CLARITY_SIDE_TABLES, DATA_TABLE_NAME, METADATA_TABLE_NAME)
+                }
+                ValueStorageFormat::BinaryV1 => (
+                    binary_value_store::table_names(),
+                    binary_value_store::data_table_name(),
+                    binary_value_store::metadata_table_name(),
+                ),
+            };
+            clone_schemas_from_source(conn, side_tables)?;
+
+            if side_store_format == ValueStorageFormat::BinaryV1 {
+                // Preserve database-local shape IDs verbatim. The dictionary is
+                // deliberately copied whole instead of filtering and remapping
+                // the small set of descriptors referenced by reachable rows.
+                binary_value_store::copy_snapshot_auxiliary_rows(conn)
+                    .map_err(|error| Error::CorruptionError(error.to_string()))?;
+            }
 
             let t = Instant::now();
-            let src_data_count = SqliteConnection::count_data_rows(&src_conn)?;
+            let src_data_count = match side_store_format {
+                ValueStorageFormat::LegacyText => SqliteConnection::count_data_rows(&src_conn)?,
+                ValueStorageFormat::BinaryV1 => binary_value_store::data_row_count(&src_conn)
+                    .map_err(|error| Error::CorruptionError(error.to_string()))?,
+            };
             let needed_count = needed_keys.len() as u64;
             let pruned_count = src_data_count.saturating_sub(needed_count);
             info!(
@@ -110,11 +137,18 @@ pub fn copy_clarity_side_tables(
 
             // data_table is content-addressed (key = hex MARFValue), like
             // the index `__fork_storage`, so it shares the same stream-filter.
-            let data_rows = copy_leaf_referenced_rows(conn, DATA_TABLE_NAME, "key", &needed_keys)?;
+            let row_layout = match side_store_format {
+                ValueStorageFormat::LegacyText => ReferencedRowLayout::KeyValue,
+                ValueStorageFormat::BinaryV1 => {
+                    ReferencedRowLayout::KeyValueAndExtra(binary_value_store::data_shape_id_column())
+                }
+            };
+            let data_rows =
+                copy_leaf_referenced_rows(conn, data_table, "key", row_layout, &needed_keys)?;
 
             let t = Instant::now();
             let (metadata_scanned, metadata_rows) =
-                with_indexes_dropped(conn, METADATA_TABLE_NAME, |conn| {
+                with_indexes_dropped(conn, metadata_table, |conn| {
                     copy_required_metadata_rows(&src_conn, conn, &required_contract_ids)
                 })?;
             info!(
@@ -159,9 +193,9 @@ fn copy_required_metadata_rows(
 ) -> Result<(u64, u64), Error> {
     let mut scanned: u64 = 0;
     let mut copied: u64 = 0;
-    SqliteConnection::visit_metadata_rows(src_conn, |row| {
+    binary_value_store::visit_metadata_rows(src_conn, |row| {
         scanned += 1;
-        let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(row.key) else {
+        let Some((contract_id, _meta_key)) = binary_value_store::parse_metadata_key(row.key) else {
             return Err(Error::CorruptionError(format!(
                 "metadata_table key is not in clr-meta:: format: {}",
                 row.key
@@ -170,7 +204,7 @@ fn copy_required_metadata_rows(
         if !required.contains(contract_id) {
             return Ok(());
         }
-        SqliteConnection::insert_metadata_row(dst_conn, row)?;
+        binary_value_store::insert_metadata_row(dst_conn, row)?;
         copied += 1;
         Ok(())
     })?;
@@ -183,8 +217,8 @@ fn copy_required_metadata_rows(
 fn scan_metadata_contract_ids(conn: &Connection) -> Result<Vec<String>, Error> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut ordered: Vec<String> = Vec::new();
-    SqliteConnection::visit_metadata_keys(conn, |key| {
-        let Some((contract_id, _meta_key)) = SqliteConnection::parse_metadata_key(key) else {
+    binary_value_store::visit_metadata_keys(conn, |key| {
+        let Some((contract_id, _meta_key)) = binary_value_store::parse_metadata_key(key) else {
             return Err(Error::CorruptionError(format!(
                 "metadata_table key is not in clr-meta:: format: {key}"
             )));

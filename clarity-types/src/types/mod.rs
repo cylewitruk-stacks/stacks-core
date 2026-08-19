@@ -13,9 +13,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! Core Clarity value representations and type signatures.
+
+pub mod codec;
 pub mod serialization;
 pub mod signatures;
-pub mod storage;
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;

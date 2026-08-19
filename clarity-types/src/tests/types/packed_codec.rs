@@ -5,25 +5,24 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-use std::collections::BTreeMap;
+//! End-to-end tests for canonical packed Clarity value storage.
 
 use proptest::prelude::*;
 use stacks_common::types::StacksEpochId;
 
 use crate::representations::{ClarityName, ContractName};
-use crate::types::signatures::CallableSubtype;
-use crate::types::storage::{
-    PACKED_VALUE_HEADER_LEN, StructuralValidation, ValueShape, decode_canonical_packed,
-    decode_packed_value, encode_canonical_packed_value,
-    encode_canonical_packed_value_with_consensus_len, encode_packed_value, encode_value_shape,
-    packed_int_width, packed_uint_width, reconstruct_consensus,
+use crate::types::codec::packed::{
+    ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, VALUE_SHAPE_VERSION, ValueShape,
+    audit_reconstruction, decode_canonical_packed, encode_canonical_packed_value,
+    encode_canonical_packed_value_with_consensus_len, encode_value_shape, reconstruct_consensus,
     transcode_consensus_to_canonical_packed, transcode_consensus_with_shape,
-    validate_canonical_packed, validate_packed_value,
+    validate_canonical_packed,
 };
+use crate::types::signatures::CallableSubtype;
 use crate::types::{
-    CallableData, ListTypeData, PrincipalData, QualifiedContractIdentifier, SequenceSubtype,
-    StandardPrincipalData, StringSubtype, TraitIdentifier, TupleData, TupleTypeSignature,
-    TypeSignature, Value,
+    CallableData, ListTypeData, MAX_TYPE_DEPTH, MAX_VALUE_SIZE, PrincipalData,
+    QualifiedContractIdentifier, SequenceSubtype, StandardPrincipalData, StringSubtype,
+    TraitIdentifier, TupleData, TupleTypeSignature, TypeSignature, Value,
 };
 
 const EPOCH: StacksEpochId = StacksEpochId::Epoch40;
@@ -39,23 +38,15 @@ fn contract(seed: u8, name: &str) -> QualifiedContractIdentifier {
     )
 }
 
-fn assert_round_trip(value: Value, expected: TypeSignature) -> Vec<u8> {
-    let consensus = value.serialize_to_vec().unwrap();
-    let packed = encode_packed_value(&value, &expected, &EPOCH).unwrap();
-    assert_eq!(packed.consensus_byte_len(), consensus.len() as u32);
-    let validated = validate_packed_value(packed.as_bytes(), &expected).unwrap();
-    assert_eq!(validated.consensus_byte_len(), consensus.len() as u32);
-    let decoded = decode_packed_value(packed.as_bytes(), &expected, &EPOCH).unwrap();
-    assert_eq!(decoded.value, value);
-    assert_eq!(decoded.value.serialize_to_vec().unwrap(), consensus);
-    packed.into_bytes()
-}
-
 fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8> {
     let consensus = value.serialize_to_vec().unwrap();
-    let packed =
-        encode_canonical_packed_value(&value, &expected, &EPOCH, StructuralValidation::Enabled)
-            .unwrap();
+    let packed = encode_canonical_packed_value(
+        &value,
+        &expected,
+        &EPOCH,
+        ConsensusLengthValidation::Enabled,
+    )
+    .unwrap();
     validate_canonical_packed(packed.as_bytes(), &expected, &EPOCH).unwrap();
     let decoded = decode_canonical_packed(packed.as_bytes(), &expected, &EPOCH).unwrap();
     assert_eq!(decoded.value, value);
@@ -69,13 +60,56 @@ fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8>
         shape.as_bytes()
     );
     assert_eq!(
-        reconstruct_consensus(packed.as_bytes(), shape.as_bytes()).unwrap(),
+        audit_reconstruction(packed.as_bytes(), shape.as_bytes()).unwrap(),
         consensus
     );
     let (transcoded, transcoded_shape) = transcode_consensus_with_shape(&consensus).unwrap();
     assert_eq!(transcoded.as_bytes(), packed.as_bytes());
     assert_eq!(transcoded_shape, shape);
     packed.into_bytes()
+}
+
+#[test]
+fn canonical_wire_format_has_stable_golden_vectors() {
+    assert_eq!(
+        assert_canonical_round_trip(Value::UInt(256), TypeSignature::UIntType),
+        [17, 0, 0, 0, 1, 0]
+    );
+
+    let list_type = ListTypeData::new_list(TypeSignature::UIntType, 3).unwrap();
+    let list = Value::list_with_type(
+        &EPOCH,
+        vec![Value::UInt(0), Value::UInt(255), Value::UInt(256)],
+        list_type.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        assert_canonical_round_trip(
+            list,
+            TypeSignature::SequenceType(SequenceSubtype::ListType(list_type)),
+        ),
+        [56, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 255, 1, 0]
+    );
+
+    let tuple = TupleData::from_data(vec![
+        (ClarityName::from_literal("a"), Value::UInt(1)),
+        (ClarityName::from_literal("b"), Value::Bool(true)),
+    ])
+    .unwrap();
+    let tuple_type = TupleTypeSignature::try_from(vec![
+        (ClarityName::from_literal("a"), TypeSignature::UIntType),
+        (ClarityName::from_literal("b"), TypeSignature::BoolType),
+    ])
+    .unwrap();
+    let tuple = Value::Tuple(tuple);
+    assert_eq!(
+        assert_canonical_round_trip(tuple.clone(), TypeSignature::TupleType(tuple_type)),
+        [27, 0, 0, 0, 0, 0, 1, 2, 1, 1]
+    );
+    assert_eq!(
+        encode_value_shape(&tuple).unwrap().as_bytes(),
+        [VALUE_SHAPE_VERSION, 0x0c, 2, 1, b'a', 1, 1, b'b', 2]
+    );
 }
 
 #[test]
@@ -104,6 +138,21 @@ fn value_shape_merges_active_list_branches() {
 
 #[test]
 fn value_shape_rejects_noncanonical_and_mismatched_descriptors() {
+    let empty_tuple_shape = [1, 0x0c, 0];
+    assert!(ValueShape::from_bytes(&empty_tuple_shape).is_err());
+    assert!(reconstruct_consensus(&[5, 0, 0, 0], &empty_tuple_shape).is_err());
+
+    // A merged response descriptor is valid within a heterogeneous list, but
+    // is not canonical for one response value with only one active branch.
+    let overgeneralized_response_shape = [VALUE_SHAPE_VERSION, 0x0b, 0x00, 0x04];
+    let overgeneralized_response = [10, 0, 0, 0, 0, 64, 123, 123, 123];
+    assert!(
+        reconstruct_consensus(&overgeneralized_response, &overgeneralized_response_shape).is_ok()
+    );
+    assert!(
+        audit_reconstruction(&overgeneralized_response, &overgeneralized_response_shape).is_err()
+    );
+
     let value = Value::UInt(7);
     let consensus = value.serialize_to_vec().unwrap();
     let (packed, shape) = transcode_consensus_with_shape(&consensus).unwrap();
@@ -116,6 +165,142 @@ fn value_shape_rejects_noncanonical_and_mismatched_descriptors() {
 
     let nonminimal_tuple_count = [1, 0x0c, 0x80, 0x00];
     assert!(ValueShape::from_bytes(&nonminimal_tuple_count).is_err());
+}
+
+#[test]
+fn consensus_transcoder_rejects_noncanonical_tuple_order() {
+    const TUPLE_HEADER_LEN: usize = 5;
+    const ONE_CHAR_UINT_FIELD_LEN: usize = 19;
+
+    let canonical = Value::Tuple(
+        TupleData::from_data(vec![
+            (ClarityName::from_literal("a"), Value::UInt(1)),
+            (ClarityName::from_literal("b"), Value::UInt(2)),
+        ])
+        .unwrap(),
+    )
+    .serialize_to_vec()
+    .unwrap();
+    assert_eq!(
+        canonical.len(),
+        TUPLE_HEADER_LEN + 2 * ONE_CHAR_UINT_FIELD_LEN
+    );
+
+    let mut noncanonical = canonical[..TUPLE_HEADER_LEN].to_vec();
+    noncanonical.extend_from_slice(&canonical[TUPLE_HEADER_LEN + ONE_CHAR_UINT_FIELD_LEN..]);
+    noncanonical.extend_from_slice(
+        &canonical[TUPLE_HEADER_LEN..TUPLE_HEADER_LEN + ONE_CHAR_UINT_FIELD_LEN],
+    );
+    assert!(Value::try_deserialize_slice_exact_untyped(&noncanonical).is_ok());
+    assert!(transcode_consensus_to_canonical_packed(&noncanonical).is_err());
+    assert!(transcode_consensus_with_shape(&noncanonical).is_err());
+}
+
+#[test]
+fn value_shape_enforces_depth_and_size_bounds() {
+    const OPTIONAL_SOME_SHAPE: u8 = 0x08;
+    const BOOL_SHAPE: u8 = 0x02;
+
+    let mut too_deep = vec![VALUE_SHAPE_VERSION];
+    too_deep.extend(std::iter::repeat_n(
+        OPTIONAL_SOME_SHAPE,
+        usize::from(MAX_TYPE_DEPTH) + 1,
+    ));
+    too_deep.push(BOOL_SHAPE);
+    assert!(ValueShape::from_bytes(&too_deep).is_err());
+
+    let oversized = vec![0; MAX_VALUE_SIZE as usize + 1];
+    assert!(ValueShape::from_bytes(&oversized).is_err());
+}
+
+#[test]
+fn canonical_storage_bytes_are_epoch_independent() {
+    let value = Value::Tuple(
+        TupleData::from_data(vec![
+            (ClarityName::from_literal("active"), Value::Bool(true)),
+            (ClarityName::from_literal("amount"), Value::UInt(42)),
+        ])
+        .unwrap(),
+    );
+    let expected = TypeSignature::TupleType(
+        TupleTypeSignature::try_from(vec![
+            (ClarityName::from_literal("active"), TypeSignature::BoolType),
+            (ClarityName::from_literal("amount"), TypeSignature::UIntType),
+        ])
+        .unwrap(),
+    );
+    let mut reference = None;
+    for epoch in StacksEpochId::ALL {
+        let packed = encode_canonical_packed_value(
+            &value,
+            &expected,
+            epoch,
+            ConsensusLengthValidation::Enabled,
+        )
+        .unwrap();
+        let decoded = decode_canonical_packed(packed.as_bytes(), &expected, epoch).unwrap();
+        assert_eq!(decoded.value, value);
+        match &reference {
+            Some(bytes) => assert_eq!(packed.as_bytes(), bytes),
+            None => reference = Some(packed.into_bytes()),
+        }
+    }
+}
+
+#[test]
+fn canonical_storage_preserves_historically_sanitized_tuples() {
+    let historical = Value::Tuple(
+        TupleData::from_data(vec![
+            (ClarityName::from_literal("active"), Value::Bool(true)),
+            (ClarityName::from_literal("obsolete"), Value::UInt(42)),
+        ])
+        .unwrap(),
+    )
+    .serialize_to_vec()
+    .unwrap();
+    let expected = TypeSignature::TupleType(
+        TupleTypeSignature::try_from(vec![(
+            ClarityName::from_literal("active"),
+            TypeSignature::BoolType,
+        )])
+        .unwrap(),
+    );
+
+    let sanitized = Value::try_deserialize_slice_at_epoch(&historical, &expected, &EPOCH).unwrap();
+    let sanitized_consensus = sanitized.serialize_to_vec().unwrap();
+    assert_ne!(sanitized_consensus, historical);
+
+    let strict =
+        Value::try_deserialize_slice_at_epoch(&historical, &expected, &StacksEpochId::Epoch41)
+            .unwrap();
+    assert_eq!(strict, sanitized);
+    assert_canonical_round_trip(sanitized, expected);
+}
+
+#[test]
+fn schema_free_reconstruction_preserves_unsanitized_list_elements() {
+    let narrow = Value::Tuple(
+        TupleData::from_data(vec![(ClarityName::from_literal("a"), Value::UInt(1))]).unwrap(),
+    );
+    let wide = Value::Tuple(
+        TupleData::from_data(vec![
+            (ClarityName::from_literal("a"), Value::UInt(1)),
+            (ClarityName::from_literal("b"), Value::Bool(true)),
+        ])
+        .unwrap(),
+    );
+    let historical = Value::cons_list_unsanitized(vec![narrow, wide]).unwrap();
+    let consensus = historical.serialize_to_vec().unwrap();
+
+    let (packed, shape) = transcode_consensus_with_shape(&consensus).unwrap();
+    assert_eq!(shape.as_bytes()[..2], [VALUE_SHAPE_VERSION, 0x0f]);
+    assert_eq!(
+        audit_reconstruction(packed.as_bytes(), shape.as_bytes()).unwrap(),
+        consensus
+    );
+
+    // Per-element framing is non-canonical when every element admits one shared shape.
+    assert!(ValueShape::from_bytes(&[VALUE_SHAPE_VERSION, 0x0f, 2, 1, 1]).is_err());
 }
 
 #[test]
@@ -185,7 +370,7 @@ fn canonical_round_trips_all_runtime_shapes() {
         TypeSignature::SequenceType(SequenceSubtype::ListType(bool_list_type)),
     );
 
-    let ascii = Value::string_ascii_from_bytes(b"track-c".to_vec()).unwrap();
+    let ascii = Value::string_ascii_from_bytes(b"packed-codec".to_vec()).unwrap();
     assert_canonical_round_trip(
         ascii,
         TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::ASCII(
@@ -375,15 +560,19 @@ fn canonical_supplied_consensus_length_matches_regular_encoding() {
     let value = Value::some(Value::UInt(7)).unwrap();
     let expected = TypeSignature::new_option(TypeSignature::UIntType).unwrap();
     let consensus_len = value.serialize_to_vec().unwrap().len() as u32;
-    let regular =
-        encode_canonical_packed_value(&value, &expected, &EPOCH, StructuralValidation::Enabled)
-            .unwrap();
+    let regular = encode_canonical_packed_value(
+        &value,
+        &expected,
+        &EPOCH,
+        ConsensusLengthValidation::Enabled,
+    )
+    .unwrap();
     let supplied = encode_canonical_packed_value_with_consensus_len(
         &value,
         &expected,
         &EPOCH,
         consensus_len,
-        StructuralValidation::Enabled,
+        ConsensusLengthValidation::Enabled,
     )
     .unwrap();
     assert_eq!(supplied.as_bytes(), regular.as_bytes());
@@ -394,7 +583,7 @@ fn canonical_supplied_consensus_length_matches_regular_encoding() {
             &expected,
             &EPOCH,
             consensus_len - 1,
-            StructuralValidation::Enabled,
+            ConsensusLengthValidation::Enabled,
         )
         .is_err()
     );
@@ -417,299 +606,6 @@ fn canonical_decoder_rejects_header_and_body_corruption() {
     assert!(decode_canonical_packed(&packed[..packed.len() - 1], &expected, &EPOCH).is_err());
 }
 
-#[test]
-fn round_trips_integer_boundaries() {
-    let mut signed = vec![i128::MIN, -1, 0, 1, i128::MAX];
-    for width in 1..16 {
-        let sign_bit = 8 * width - 1;
-        let minimum = -(1i128 << sign_bit);
-        let maximum = (1i128 << sign_bit) - 1;
-        signed.extend([minimum - 1, minimum, maximum, maximum + 1]);
-        assert_eq!(packed_int_width(minimum), width);
-        assert_eq!(packed_int_width(maximum), width);
-        assert_eq!(packed_int_width(minimum - 1), width + 1);
-        assert_eq!(packed_int_width(maximum + 1), width + 1);
-    }
-    for value in signed {
-        let bytes = assert_round_trip(Value::Int(value), TypeSignature::IntType);
-        assert!(bytes.len() <= PACKED_VALUE_HEADER_LEN + 16);
-    }
-
-    let mut unsigned = vec![0, 1, u128::MAX];
-    for width in 1..16 {
-        let next_width = 1u128 << (8 * width);
-        unsigned.extend([next_width - 1, next_width]);
-        assert_eq!(packed_uint_width(next_width - 1), width);
-        assert_eq!(packed_uint_width(next_width), width + 1);
-    }
-    for value in unsigned {
-        let bytes = assert_round_trip(Value::UInt(value), TypeSignature::UIntType);
-        assert!(bytes.len() <= PACKED_VALUE_HEADER_LEN + 16);
-    }
-}
-
-#[test]
-fn round_trips_integer_lane_extremes() {
-    let uint_type = ListTypeData::new_list(TypeSignature::UIntType, 4).unwrap();
-    for values in [
-        vec![],
-        vec![Value::UInt(0); 4],
-        vec![Value::UInt(0), Value::UInt(256), Value::UInt(u128::MAX)],
-    ] {
-        let value = Value::list_with_type(&EPOCH, values, uint_type.clone()).unwrap();
-        assert_round_trip(
-            value,
-            TypeSignature::SequenceType(SequenceSubtype::ListType(uint_type.clone())),
-        );
-    }
-
-    let int_type = ListTypeData::new_list(TypeSignature::IntType, 4).unwrap();
-    for values in [
-        vec![],
-        vec![Value::Int(0); 4],
-        vec![Value::Int(i128::MIN), Value::Int(0), Value::Int(i128::MAX)],
-    ] {
-        let value = Value::list_with_type(&EPOCH, values, int_type.clone()).unwrap();
-        assert_round_trip(
-            value,
-            TypeSignature::SequenceType(SequenceSubtype::ListType(int_type.clone())),
-        );
-    }
-}
-
-#[test]
-fn round_trips_scalars_sequences_and_principals() {
-    assert_round_trip(Value::Bool(false), TypeSignature::BoolType);
-    assert_round_trip(Value::Bool(true), TypeSignature::BoolType);
-
-    let buffer = Value::buff_from((0..=255).collect()).unwrap();
-    let buffer_type =
-        TypeSignature::SequenceType(SequenceSubtype::BufferType(512u32.try_into().unwrap()));
-    assert_round_trip(buffer, buffer_type);
-
-    let ascii = Value::string_ascii_from_bytes(b"borrow-compatible".to_vec()).unwrap();
-    let ascii_type = TypeSignature::SequenceType(SequenceSubtype::StringType(
-        StringSubtype::ASCII(64u32.try_into().unwrap()),
-    ));
-    assert_round_trip(ascii, ascii_type);
-
-    let utf8 = Value::string_utf8_from_bytes("Hej, 世界 👋".as_bytes().to_vec()).unwrap();
-    let utf8_type = TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::UTF8(
-        64u32.try_into().unwrap(),
-    )));
-    assert_round_trip(utf8, utf8_type);
-
-    assert_round_trip(
-        Value::Principal(PrincipalData::Standard(standard_principal(1))),
-        TypeSignature::PrincipalType,
-    );
-    assert_round_trip(
-        Value::Principal(PrincipalData::Contract(contract(2, "pool"))),
-        TypeSignature::PrincipalType,
-    );
-}
-
-#[test]
-fn round_trips_wrappers_tuples_and_lists() {
-    assert_round_trip(
-        Value::none(),
-        TypeSignature::new_option(TypeSignature::UIntType).unwrap(),
-    );
-    assert_round_trip(
-        Value::some(Value::UInt(123)).unwrap(),
-        TypeSignature::new_option(TypeSignature::UIntType).unwrap(),
-    );
-    assert_round_trip(
-        Value::okay(Value::Bool(true)).unwrap(),
-        TypeSignature::new_response(TypeSignature::BoolType, TypeSignature::UIntType).unwrap(),
-    );
-    assert_round_trip(
-        Value::error(Value::UInt(9)).unwrap(),
-        TypeSignature::new_response(TypeSignature::BoolType, TypeSignature::UIntType).unwrap(),
-    );
-
-    let tuple = TupleData::from_data(vec![
-        (ClarityName::from_literal("active"), Value::Bool(true)),
-        (
-            ClarityName::from_literal("memo"),
-            Value::string_ascii_from_bytes(b"hello".to_vec()).unwrap(),
-        ),
-        (ClarityName::from_literal("sequence"), Value::UInt(255)),
-    ])
-    .unwrap();
-    let mut type_map = BTreeMap::new();
-    type_map.insert(ClarityName::from_literal("active"), TypeSignature::BoolType);
-    type_map.insert(
-        ClarityName::from_literal("memo"),
-        TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::ASCII(
-            32u32.try_into().unwrap(),
-        ))),
-    );
-    type_map.insert(
-        ClarityName::from_literal("sequence"),
-        TypeSignature::UIntType,
-    );
-    let tuple_type = TupleTypeSignature::try_from(type_map).unwrap();
-    assert_round_trip(Value::Tuple(tuple), TypeSignature::TupleType(tuple_type));
-
-    let uints = vec![0u128, 1, 255, 256, u16::MAX as u128]
-        .into_iter()
-        .map(Value::UInt)
-        .collect();
-    let uint_list_type = ListTypeData::new_list(TypeSignature::UIntType, 10).unwrap();
-    let uint_list = Value::list_with_type(&EPOCH, uints, uint_list_type.clone()).unwrap();
-    assert_round_trip(
-        uint_list,
-        TypeSignature::SequenceType(SequenceSubtype::ListType(uint_list_type)),
-    );
-
-    let ints = vec![i128::MIN, -129, -1, 0, 128, i128::MAX]
-        .into_iter()
-        .map(Value::Int)
-        .collect();
-    let int_list_type = ListTypeData::new_list(TypeSignature::IntType, 10).unwrap();
-    let int_list = Value::list_with_type(&EPOCH, ints, int_list_type.clone()).unwrap();
-    assert_round_trip(
-        int_list,
-        TypeSignature::SequenceType(SequenceSubtype::ListType(int_list_type)),
-    );
-
-    let bools = (0..73).map(|index| Value::Bool(index % 3 == 0)).collect();
-    let bool_list_type = ListTypeData::new_list(TypeSignature::BoolType, 100).unwrap();
-    let bool_list = Value::list_with_type(&EPOCH, bools, bool_list_type.clone()).unwrap();
-    assert_round_trip(
-        bool_list,
-        TypeSignature::SequenceType(SequenceSubtype::ListType(bool_list_type)),
-    );
-}
-
-#[test]
-fn round_trips_callable_variants() {
-    let known_contract = contract(3, "known");
-    let principal_value = Value::CallableContract(CallableData {
-        contract_identifier: known_contract.clone(),
-        trait_identifier: None,
-    });
-    let packed = assert_round_trip(
-        principal_value,
-        TypeSignature::CallableType(CallableSubtype::Principal(known_contract)),
-    );
-    assert_eq!(packed.len(), PACKED_VALUE_HEADER_LEN);
-
-    let trait_id = TraitIdentifier::new(
-        standard_principal(4),
-        ContractName::from_literal("trait-contract"),
-        ClarityName::from_literal("transferable"),
-    );
-    let trait_value = Value::CallableContract(CallableData {
-        contract_identifier: contract(5, "implementation"),
-        trait_identifier: Some(Box::new(trait_id.clone())),
-    });
-    assert_round_trip(
-        trait_value.clone(),
-        TypeSignature::CallableType(CallableSubtype::Trait(trait_id.clone())),
-    );
-    assert_round_trip(trait_value, TypeSignature::TraitReferenceType(trait_id));
-}
-
-#[test]
-fn caller_schema_controls_schema_free_records() {
-    let short = TypeSignature::SequenceType(SequenceSubtype::BufferType(16u32.try_into().unwrap()));
-    let long = TypeSignature::SequenceType(SequenceSubtype::BufferType(32u32.try_into().unwrap()));
-    let value = Value::buff_from(vec![1, 2, 3]).unwrap();
-    let packed = encode_packed_value(&value, &short, &EPOCH).unwrap();
-    assert_eq!(
-        decode_packed_value(packed.as_bytes(), &long, &EPOCH)
-            .unwrap()
-            .value,
-        value
-    );
-    let too_short =
-        TypeSignature::SequenceType(SequenceSubtype::BufferType(2u32.try_into().unwrap()));
-    assert!(decode_packed_value(packed.as_bytes(), &too_short, &EPOCH).is_err());
-
-    let left = TupleTypeSignature::try_from(vec![(
-        ClarityName::from_literal("left"),
-        TypeSignature::UIntType,
-    )])
-    .unwrap();
-    let right = TupleTypeSignature::try_from(vec![(
-        ClarityName::from_literal("right"),
-        TypeSignature::UIntType,
-    )])
-    .unwrap();
-    let value = Value::Tuple(
-        TupleData::from_data(vec![(ClarityName::from_literal("left"), Value::UInt(1))]).unwrap(),
-    );
-    let packed = encode_packed_value(&value, &TypeSignature::TupleType(left), &EPOCH).unwrap();
-    let decoded =
-        decode_packed_value(packed.as_bytes(), &TypeSignature::TupleType(right), &EPOCH).unwrap();
-    assert_eq!(
-        decoded.value,
-        Value::Tuple(
-            TupleData::from_data(vec![(ClarityName::from_literal("right"), Value::UInt(1),)])
-                .unwrap()
-        )
-    );
-}
-
-#[test]
-fn rejects_corrupt_headers_scalars_lanes_and_directories() {
-    let expected = TypeSignature::UIntType;
-    let mut packed = assert_round_trip(Value::UInt(1), expected.clone());
-    packed[0] ^= 1;
-    assert!(validate_packed_value(&packed, &expected).is_err());
-
-    let mut packed = assert_round_trip(Value::UInt(1), expected.clone());
-    packed[PACKED_VALUE_HEADER_LEN] = 0;
-    assert!(validate_packed_value(&packed, &expected).is_err());
-    assert!(decode_packed_value(&packed, &expected, &EPOCH).is_err());
-
-    let list_type = ListTypeData::new_list(TypeSignature::UIntType, 10).unwrap();
-    let expected = TypeSignature::SequenceType(SequenceSubtype::ListType(list_type.clone()));
-    let value =
-        Value::list_with_type(&EPOCH, vec![Value::UInt(1), Value::UInt(256)], list_type).unwrap();
-    let mut packed = assert_round_trip(value, expected.clone());
-    packed.pop();
-    assert!(validate_packed_value(&packed, &expected).is_err());
-    assert!(decode_packed_value(&packed, &expected, &EPOCH).is_err());
-
-    let item_type =
-        TypeSignature::SequenceType(SequenceSubtype::BufferType(16u32.try_into().unwrap()));
-    let list_type = ListTypeData::new_list(item_type.clone(), 4).unwrap();
-    let expected = TypeSignature::SequenceType(SequenceSubtype::ListType(list_type.clone()));
-    let value = Value::list_with_type(
-        &EPOCH,
-        vec![
-            Value::buff_from(vec![1]).unwrap(),
-            Value::buff_from(vec![2, 3]).unwrap(),
-        ],
-        list_type,
-    )
-    .unwrap();
-    let mut packed = assert_round_trip(value, expected.clone());
-    packed[PACKED_VALUE_HEADER_LEN + 4] = 9;
-    assert!(validate_packed_value(&packed, &expected).is_err());
-    assert!(decode_packed_value(&packed, &expected, &EPOCH).is_err());
-}
-
-#[test]
-fn logical_length_matches_consensus_for_large_integer_list() {
-    let list_type = ListTypeData::new_list(TypeSignature::UIntType, 1001).unwrap();
-    let values = (0..1001).map(|value| Value::UInt(value as u128)).collect();
-    let value = Value::list_with_type(&EPOCH, values, list_type.clone()).unwrap();
-    let consensus_len = value.serialize_to_vec().unwrap().len();
-    let packed = encode_packed_value(
-        &value,
-        &TypeSignature::SequenceType(SequenceSubtype::ListType(list_type)),
-        &EPOCH,
-    )
-    .unwrap();
-    assert_eq!(consensus_len, 17_022);
-    assert_eq!(packed.as_bytes().len(), 2_010);
-    assert_eq!(PACKED_VALUE_HEADER_LEN, 4);
-}
-
 proptest! {
     #[test]
     fn property_round_trips_scalar_and_lane_values(
@@ -719,8 +615,6 @@ proptest! {
         unsigned_lane in prop::collection::vec(any::<u128>(), 0..64),
         bool_lane in prop::collection::vec(any::<bool>(), 0..128),
     ) {
-        assert_round_trip(Value::Int(signed), TypeSignature::IntType);
-        assert_round_trip(Value::UInt(unsigned), TypeSignature::UIntType);
         assert_canonical_round_trip(Value::Int(signed), TypeSignature::IntType);
         assert_canonical_round_trip(Value::UInt(unsigned), TypeSignature::UIntType);
 
@@ -730,11 +624,6 @@ proptest! {
             signed_lane.into_iter().map(Value::Int).collect(),
             signed_type.clone(),
         ).unwrap();
-        assert_round_trip(
-            signed_value.clone(),
-            TypeSignature::SequenceType(SequenceSubtype::ListType(signed_type)),
-        );
-        let signed_type = ListTypeData::new_list(TypeSignature::IntType, 64).unwrap();
         assert_canonical_round_trip(
             signed_value,
             TypeSignature::SequenceType(SequenceSubtype::ListType(signed_type)),
@@ -746,11 +635,6 @@ proptest! {
             unsigned_lane.into_iter().map(Value::UInt).collect(),
             unsigned_type.clone(),
         ).unwrap();
-        assert_round_trip(
-            unsigned_value.clone(),
-            TypeSignature::SequenceType(SequenceSubtype::ListType(unsigned_type)),
-        );
-        let unsigned_type = ListTypeData::new_list(TypeSignature::UIntType, 64).unwrap();
         assert_canonical_round_trip(
             unsigned_value,
             TypeSignature::SequenceType(SequenceSubtype::ListType(unsigned_type)),
@@ -762,48 +646,19 @@ proptest! {
             bool_lane.into_iter().map(Value::Bool).collect(),
             bool_type.clone(),
         ).unwrap();
-        assert_round_trip(
-            bool_value.clone(),
-            TypeSignature::SequenceType(SequenceSubtype::ListType(bool_type)),
-        );
-        let bool_type = ListTypeData::new_list(TypeSignature::BoolType, 128).unwrap();
         assert_canonical_round_trip(
             bool_value,
             TypeSignature::SequenceType(SequenceSubtype::ListType(bool_type)),
         );
     }
 
-    #[test]
-    fn arbitrary_bytes_never_escape_structural_validation(
-        body in prop::collection::vec(any::<u8>(), 0..512),
-        logical_len in any::<u32>(),
-        schema_selector in 0u8..5,
-    ) {
-        let expected = match schema_selector {
-            0 => TypeSignature::IntType,
-            1 => TypeSignature::UIntType,
-            2 => TypeSignature::BoolType,
-            3 => TypeSignature::new_option(TypeSignature::UIntType).unwrap(),
-            _ => TypeSignature::SequenceType(SequenceSubtype::BufferType(
-                256u32.try_into().unwrap(),
-            )),
-        };
-        let mut bytes = Vec::with_capacity(PACKED_VALUE_HEADER_LEN + body.len());
-        bytes.extend_from_slice(&logical_len.to_le_bytes());
-        bytes.extend_from_slice(&body);
-        if let Ok(validated) = validate_packed_value(&bytes, &expected) {
-            let decoded = validated.to_owned_value(&EPOCH).unwrap();
-            let reencoded = encode_packed_value(&decoded, &expected, &EPOCH).unwrap();
-            prop_assert_eq!(reencoded.as_bytes(), bytes.as_slice());
-        }
-    }
 
     #[test]
     fn arbitrary_packed_and_shape_bytes_fail_closed(
         packed in prop::collection::vec(any::<u8>(), 0..512),
         descriptor in prop::collection::vec(any::<u8>(), 0..256),
     ) {
-        if let Ok(consensus) = reconstruct_consensus(&packed, &descriptor) {
+        if let Ok(consensus) = audit_reconstruction(&packed, &descriptor) {
             let value = Value::try_deserialize_slice_exact_untyped(&consensus).unwrap();
             let transcoded = transcode_consensus_to_canonical_packed(&consensus).unwrap();
             prop_assert_eq!(transcoded.as_bytes(), packed.as_slice());

@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! Persistent and read-only MARF-backed Clarity stores.
+
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -32,7 +34,6 @@ use rusqlite::Connection;
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
 use stacks_common::types::StacksEpochId;
-use stacks_common::util::hash::to_hex;
 
 use crate::chainstate::stacks::index::marf::{
     test_override_marf_compression, MARFOpenOpts, MarfConnection, MarfTransaction, MARF,
@@ -42,9 +43,8 @@ use crate::chainstate::stacks::index::{ClarityMarfTrieId, Error, MARFValue};
 use crate::clarity_vm::clarity::{
     ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
 };
+use crate::clarity_vm::database::binary_value_store::{self, ValueStorageFormat};
 use crate::clarity_vm::database::ephemeral::EphemeralMarfStore;
-use crate::clarity_vm::database::track_c;
-use crate::clarity_vm::database::typed_value::{self, TypedValueStorageMode};
 use crate::clarity_vm::special::handle_contract_call_special_cases;
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 use crate::util_lib::db::{Error as DatabaseError, IndexDBConn};
@@ -65,7 +65,7 @@ pub struct MarfedKV {
     /// all data referenced by ClarityMarfStore implementations (including the read-only and
     /// persistent MARF stores).
     ephemeral_marf: Option<MARF<StacksBlockId>>,
-    value_storage_mode: TypedValueStorageMode,
+    value_storage_format: ValueStorageFormat,
 }
 
 impl MarfedKV {
@@ -73,8 +73,7 @@ impl MarfedKV {
         path_str: &str,
         unconfirmed: bool,
         marf_opts: Option<MARFOpenOpts>,
-        value_storage_mode: TypedValueStorageMode,
-    ) -> Result<MARF<StacksBlockId>, VmExecutionError> {
+    ) -> Result<(MARF<StacksBlockId>, ValueStorageFormat), VmExecutionError> {
         let mut path = PathBuf::from(path_str);
 
         std::fs::create_dir_all(&path).map_err(|_| VmInternalError::FailedToCreateDataDirectory)?;
@@ -99,9 +98,8 @@ impl MarfedKV {
         };
 
         if SqliteConnection::check_schema(marf.sqlite_conn()).is_ok() {
-            typed_value::initialize(marf.sqlite_conn(), value_storage_mode)?;
-            // no need to initialize
-            return Ok(marf);
+            let value_storage_format = binary_value_store::detect(marf.sqlite_conn())?;
+            return Ok((marf, value_storage_format));
         }
 
         let tx = marf
@@ -109,11 +107,12 @@ impl MarfedKV {
             .map_err(|err| VmInternalError::DBError(err.to_string()))?;
 
         SqliteConnection::initialize_conn(&tx)?;
-        typed_value::initialize(&tx, value_storage_mode)?;
+        let value_storage_format = ValueStorageFormat::BinaryV1;
+        binary_value_store::initialize_empty(&tx)?;
         tx.commit()
             .map_err(|err| VmInternalError::SqliteError(IncomparableError { err }))?;
 
-        Ok(marf)
+        Ok((marf, value_storage_format))
     }
 
     pub fn open(
@@ -121,8 +120,7 @@ impl MarfedKV {
         miner_tip: Option<&StacksBlockId>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<MarfedKV, VmExecutionError> {
-        let value_storage_mode = TypedValueStorageMode::from_environment()?;
-        let marf = MarfedKV::setup_db(path_str, false, marf_opts, value_storage_mode)?;
+        let (marf, value_storage_format) = MarfedKV::setup_db(path_str, false, marf_opts)?;
         let chain_tip = match miner_tip {
             Some(miner_tip) => miner_tip.clone(),
             None => StacksBlockId::sentinel(),
@@ -132,7 +130,7 @@ impl MarfedKV {
             marf,
             chain_tip,
             ephemeral_marf: None,
-            value_storage_mode,
+            value_storage_format,
         })
     }
 
@@ -141,8 +139,7 @@ impl MarfedKV {
         miner_tip: Option<&StacksBlockId>,
         marf_opts: Option<MARFOpenOpts>,
     ) -> Result<MarfedKV, VmExecutionError> {
-        let value_storage_mode = TypedValueStorageMode::from_environment()?;
-        let marf = MarfedKV::setup_db(path_str, true, marf_opts, value_storage_mode)?;
+        let (marf, value_storage_format) = MarfedKV::setup_db(path_str, true, marf_opts)?;
         let chain_tip = match miner_tip {
             Some(miner_tip) => miner_tip.clone(),
             None => StacksBlockId::sentinel(),
@@ -152,7 +149,7 @@ impl MarfedKV {
             marf,
             chain_tip,
             ephemeral_marf: None,
-            value_storage_mode,
+            value_storage_format,
         })
     }
 
@@ -171,13 +168,11 @@ impl MarfedKV {
                 .expect("FATAL: non-UTF-8 character in filename")
         );
 
-        let value_storage_mode = TypedValueStorageMode::from_environment().unwrap();
-        let marf = MarfedKV::setup_db(
+        let (marf, value_storage_format) = MarfedKV::setup_db(
             path.to_str()
                 .expect("Inexplicably non-UTF-8 character in filename"),
             false,
             None,
-            value_storage_mode,
         )
         .unwrap();
 
@@ -187,7 +182,7 @@ impl MarfedKV {
             marf,
             chain_tip,
             ephemeral_marf: None,
-            value_storage_mode,
+            value_storage_format,
         }
     }
 
@@ -210,7 +205,7 @@ impl MarfedKV {
         ReadOnlyMarfStore {
             chain_tip,
             marf: &mut self.marf,
-            value_storage_mode: self.value_storage_mode,
+            value_storage_format: self.value_storage_format,
         }
     }
 
@@ -233,7 +228,7 @@ impl MarfedKV {
         Ok(ReadOnlyMarfStore {
             chain_tip,
             marf: &mut self.marf,
-            value_storage_mode: self.value_storage_mode,
+            value_storage_format: self.value_storage_format,
         })
     }
 
@@ -271,7 +266,7 @@ impl MarfedKV {
         PersistentWritableMarfStore {
             chain_tip,
             marf: tx,
-            value_storage_mode: self.value_storage_mode,
+            value_storage_format: self.value_storage_format,
         }
     }
 
@@ -300,7 +295,7 @@ impl MarfedKV {
         PersistentWritableMarfStore {
             chain_tip,
             marf: tx,
-            value_storage_mode: self.value_storage_mode,
+            value_storage_format: self.value_storage_format,
         }
     }
 
@@ -335,7 +330,9 @@ impl MarfedKV {
             .map_err(|err| VmInternalError::DBError(err.to_string()))?;
 
         SqliteConnection::initialize_conn(&tx)?;
-        typed_value::initialize(&tx, self.value_storage_mode)?;
+        if self.value_storage_format.is_binary() {
+            binary_value_store::initialize_empty(&tx)?;
+        }
         tx.commit()
             .map_err(|err| VmInternalError::SqliteError(IncomparableError { err }))?;
 
@@ -344,7 +341,7 @@ impl MarfedKV {
         let read_only_marf = ReadOnlyMarfStore {
             chain_tip: base_tip.clone(),
             marf: &mut self.marf,
-            value_storage_mode: self.value_storage_mode,
+            value_storage_format: self.value_storage_format,
         };
 
         let Some(ephemeral_marf) = self.ephemeral_marf.as_mut() else {
@@ -409,7 +406,8 @@ pub struct PersistentWritableMarfStore<'a> {
     chain_tip: StacksBlockId,
     /// The transaction to the MARF instance
     marf: MarfTransaction<'a, StacksBlockId>,
-    value_storage_mode: TypedValueStorageMode,
+    /// Immutable physical format selected when the side store opened.
+    value_storage_format: ValueStorageFormat,
 }
 
 /// A wrapper around a MARF handle which allows only read access to the MARF's keys off of a given
@@ -419,73 +417,45 @@ pub struct ReadOnlyMarfStore<'a> {
     chain_tip: StacksBlockId,
     /// Handle to the MARF being read
     marf: &'a mut MARF<StacksBlockId>,
-    value_storage_mode: TypedValueStorageMode,
+    /// Immutable physical format selected when the side store opened.
+    value_storage_format: ValueStorageFormat,
 }
 
 impl ClarityMarfStore for ReadOnlyMarfStore<'_> {}
 impl ClarityMarfStore for PersistentWritableMarfStore<'_> {}
 
-fn get_typed_or_promote(
+/// Load a required typed value from Binary V1 after MARF traversal resolves its hash.
+fn get_typed_side_value(
     conn: &Connection,
-    mode: TypedValueStorageMode,
     marf_value: &MARFValue,
     expected: &TypeSignature,
     epoch: &StacksEpochId,
 ) -> Result<TypedValueResult, VmExecutionError> {
-    if let Some(result) = typed_value::get(conn, mode, marf_value, expected, epoch)? {
-        return Ok(result);
-    }
-
-    if mode.uses_canonical_data_table() {
-        return Err(VmInternalError::Expect(format!(
-            "ERROR: MARF contained value_hash not found in Track C side storage: {}",
+    binary_value_store::get_typed(conn, marf_value, expected, epoch)?.ok_or_else(|| {
+        VmInternalError::Expect(format!(
+            "ERROR: MARF contained value_hash not found in Binary V1 side storage: {}",
             marf_value.to_hex()
         ))
-        .into());
-    }
-
-    typed_value::record_fallback();
-    let side_key = marf_value.to_hex();
-    let canonical = SqliteConnection::get(conn, &side_key)?.ok_or_else(|| {
-        VmInternalError::Expect(format!(
-            "ERROR: MARF contained value_hash not found in side storage: {side_key}"
-        ))
-    })?;
-    let value =
-        clarity::vm::types::Value::try_deserialize_hex_at_epoch(&canonical, expected, epoch)
-            .map_err(|error| VmInternalError::DBError(error.to_string()))?;
-    let consensus = value
-        .serialize_to_vec()
-        .map_err(|error| VmInternalError::DBError(error.to_string()))?;
-    if to_hex(&consensus) == canonical {
-        let typed = clarity::vm::database::TypedValueData {
-            value: value.clone(),
-            expected: expected.clone(),
-            epoch: *epoch,
-            consensus,
-        };
-        typed_value::put(conn, mode, marf_value, &canonical, typed)?;
-    }
-    Ok(TypedValueResult {
-        value,
-        serialized_byte_len: canonical.len() as u64 / 2,
+        .into()
     })
 }
 
+/// Load an optional canonical value through the database's immutable physical format.
 fn get_side_value(
     conn: &Connection,
-    mode: TypedValueStorageMode,
+    mode: ValueStorageFormat,
     marf_value: &MARFValue,
 ) -> Result<Option<String>, VmExecutionError> {
-    if mode.uses_canonical_data_table() {
-        track_c::get_generic(conn, marf_value)
+    if mode.is_binary() {
+        binary_value_store::get_generic(conn, marf_value)
     } else {
         SqliteConnection::get(conn, &marf_value.to_hex())
     }
 }
 
+/// Load a canonical value and report a missing side-store row as MARF corruption.
 fn get_required_side_value(
-    mode: TypedValueStorageMode,
+    mode: ValueStorageFormat,
     conn: &Connection,
     marf_value: &MARFValue,
 ) -> Result<String, VmExecutionError> {
@@ -498,19 +468,21 @@ fn get_required_side_value(
     })
 }
 
+/// Store canonical text using the database's immutable physical format.
 fn put_generic_side_value(
     conn: &Connection,
-    mode: TypedValueStorageMode,
+    mode: ValueStorageFormat,
     marf_value: &MARFValue,
     canonical: &str,
 ) -> Result<(), VmExecutionError> {
-    if mode.uses_canonical_data_table() {
-        track_c::put_generic(conn, marf_value, canonical)
+    if mode.is_binary() {
+        binary_value_store::put_generic(conn, marf_value, canonical)
     } else {
         SqliteConnection::put(conn, &marf_value.to_hex(), canonical)
     }
 }
 
+/// Decode a legacy canonical-hex value under the caller's declared read schema.
 fn decode_legacy_typed(
     canonical: String,
     expected: &TypeSignature,
@@ -533,7 +505,15 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
     /// Returns Ok(()) on success
     /// Returns Err(VmInternalError(..)) on sqlite failure
     fn commit_metadata_for_trie(&mut self, target: &StacksBlockId) -> Result<(), VmExecutionError> {
-        SqliteConnection::commit_metadata_to(self.marf.sqlite_tx(), &self.chain_tip, target)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::commit_metadata_to(
+                self.marf.sqlite_tx(),
+                self.chain_tip.as_bytes(),
+                target.as_bytes(),
+            )
+        } else {
+            SqliteConnection::commit_metadata_to(self.marf.sqlite_tx(), &self.chain_tip, target)
+        }
     }
 
     /// Drop metadata for the given `target` trie. This just drops the metadata rows with `target`
@@ -542,7 +522,11 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
     /// Returns Ok(()) on success
     /// Returns Err(VmInternalError(..)) on sqlite failure
     fn drop_metadata_for_trie(&mut self, target: &StacksBlockId) -> Result<(), VmExecutionError> {
-        SqliteConnection::drop_metadata(self.marf.sqlite_tx(), target)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::drop_metadata(self.marf.sqlite_tx(), target.as_bytes())
+        } else {
+            SqliteConnection::drop_metadata(self.marf.sqlite_tx(), target)
+        }
     }
 
     /// Seal the trie -- compute the root hash.
@@ -629,8 +613,8 @@ impl ClarityMarfStoreTransaction for PersistentWritableMarfStore<'_> {
 
 impl ReadOnlyMarfStore<'_> {
     /// Return the physical Clarity value-storage mode used by this store.
-    pub fn value_storage_mode(&self) -> TypedValueStorageMode {
-        self.value_storage_mode
+    pub fn value_storage_format(&self) -> ValueStorageFormat {
+        self.value_storage_format
     }
 
     /// Determine if there is a trie in the underlying MARF with the given ID `bhh`.
@@ -667,13 +651,12 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
         expected: &TypeSignature,
         epoch: &StacksEpochId,
     ) -> Result<Option<TypedValueResult>, VmExecutionError> {
-        if !self.value_storage_mode.is_integrated() {
+        if !self.value_storage_format.is_binary() {
             return self
                 .get_data(key)?
                 .map(|canonical| decode_legacy_typed(canonical, expected, epoch))
                 .transpose();
         }
-        let value_storage_mode = self.value_storage_mode;
         self.marf
             .get(&self.chain_tip, key)
             .or_else(|error| match error {
@@ -682,13 +665,7 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             })
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|marf_value| {
-                get_typed_or_promote(
-                    self.get_side_store(),
-                    value_storage_mode,
-                    &marf_value,
-                    expected,
-                    epoch,
-                )
+                get_typed_side_value(self.get_side_store(), &marf_value, expected, epoch)
             })
             .transpose()
     }
@@ -804,7 +781,7 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|(marf_value, proof)| {
                 let data = get_required_side_value(
-                    self.value_storage_mode,
+                    self.value_storage_format,
                     self.get_side_store(),
                     &marf_value,
                 )?;
@@ -826,7 +803,7 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|(marf_value, proof)| {
                 let data = get_required_side_value(
-                    self.value_storage_mode,
+                    self.value_storage_format,
                     self.get_side_store(),
                     &marf_value,
                 )?;
@@ -859,7 +836,11 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             })
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|marf_value| {
-                get_required_side_value(self.value_storage_mode, self.get_side_store(), &marf_value)
+                get_required_side_value(
+                    self.value_storage_format,
+                    self.get_side_store(),
+                    &marf_value,
+                )
             })
             .transpose()
     }
@@ -882,7 +863,11 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|marf_value| {
                 trace!("MarfedKV get side-key for {:?}: {:?}", hash, marf_value);
-                get_required_side_value(self.value_storage_mode, self.get_side_store(), &marf_value)
+                get_required_side_value(
+                    self.value_storage_format,
+                    self.get_side_store(),
+                    &marf_value,
+                )
             })
             .transpose()
     }
@@ -914,7 +899,11 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        sqlite_get_metadata(self, contract, key)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::get_store_metadata(self, contract, key)
+        } else {
+            sqlite_get_metadata(self, contract, key)
+        }
     }
 
     fn get_metadata_manual(
@@ -923,7 +912,11 @@ impl ClarityBackingStore for ReadOnlyMarfStore<'_> {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        sqlite_get_metadata_manual(self, at_height, contract, key)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::get_store_metadata_manual(self, at_height, contract, key)
+        } else {
+            sqlite_get_metadata_manual(self, at_height, contract, key)
+        }
     }
 }
 
@@ -937,7 +930,7 @@ impl PersistentWritableMarfStore<'_> {
 
 impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     fn stores_typed_values(&self) -> bool {
-        self.value_storage_mode.is_integrated()
+        self.value_storage_format.is_binary()
     }
 
     fn get_typed_value(
@@ -946,7 +939,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         expected: &TypeSignature,
         epoch: &StacksEpochId,
     ) -> Result<Option<TypedValueResult>, VmExecutionError> {
-        if !self.value_storage_mode.is_integrated() {
+        if !self.value_storage_format.is_binary() {
             return self
                 .get_data(key)?
                 .map(|canonical| decode_legacy_typed(canonical, expected, epoch))
@@ -960,13 +953,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             })
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|marf_value| {
-                get_typed_or_promote(
-                    self.marf.sqlite_tx(),
-                    self.value_storage_mode,
-                    &marf_value,
-                    expected,
-                    epoch,
-                )
+                get_typed_side_value(self.marf.sqlite_tx(), &marf_value, expected, epoch)
             })
             .transpose()
     }
@@ -1024,7 +1011,11 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|marf_value| {
                 trace!("MarfedKV get side-key for {:?}: {:?}", key, marf_value);
-                get_required_side_value(self.value_storage_mode, self.marf.sqlite_tx(), &marf_value)
+                get_required_side_value(
+                    self.value_storage_format,
+                    self.marf.sqlite_tx(),
+                    &marf_value,
+                )
             })
             .transpose()
     }
@@ -1047,7 +1038,11 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|marf_value| {
                 trace!("MarfedKV get side-key for {:?}: {:?}", hash, marf_value);
-                get_required_side_value(self.value_storage_mode, self.marf.sqlite_tx(), &marf_value)
+                get_required_side_value(
+                    self.value_storage_format,
+                    self.marf.sqlite_tx(),
+                    &marf_value,
+                )
             })
             .transpose()
     }
@@ -1065,7 +1060,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|(marf_value, proof)| {
                 let data = get_required_side_value(
-                    self.value_storage_mode,
+                    self.value_storage_format,
                     self.marf.sqlite_tx(),
                     &marf_value,
                 )?;
@@ -1087,7 +1082,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure on GET".into()))?
             .map(|(marf_value, proof)| {
                 let data = get_required_side_value(
-                    self.value_storage_mode,
+                    self.value_storage_format,
                     self.marf.sqlite_tx(),
                     &marf_value,
                 )?;
@@ -1166,7 +1161,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             let marf_value = MARFValue::from_value(&value);
             put_generic_side_value(
                 self.marf.sqlite_tx(),
-                self.value_storage_mode,
+                self.value_storage_format,
                 &marf_value,
                 &value,
             )?;
@@ -1182,7 +1177,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         &mut self,
         entries: Vec<DataStoreEntry>,
     ) -> Result<(), VmExecutionError> {
-        if !self.value_storage_mode.is_integrated() {
+        if !self.value_storage_format.is_binary() {
             return self.put_all_data(
                 entries
                     .into_iter()
@@ -1196,9 +1191,8 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         for entry in entries {
             let marf_value = MARFValue::from_value(&entry.canonical);
             if let Some(typed) = entry.typed {
-                typed_value::put(
+                binary_value_store::put_typed(
                     self.marf.sqlite_tx(),
-                    self.value_storage_mode,
                     &marf_value,
                     &entry.canonical,
                     typed,
@@ -1206,7 +1200,7 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             } else {
                 put_generic_side_value(
                     self.marf.sqlite_tx(),
-                    self.value_storage_mode,
+                    self.value_storage_format,
                     &marf_value,
                     &entry.canonical,
                 )?;
@@ -1232,7 +1226,11 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         key: &str,
         value: &str,
     ) -> Result<(), VmExecutionError> {
-        sqlite_insert_metadata(self, contract, key, value)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::insert_store_metadata(self, contract, key, value)
+        } else {
+            sqlite_insert_metadata(self, contract, key, value)
+        }
     }
 
     fn get_metadata(
@@ -1240,7 +1238,11 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        sqlite_get_metadata(self, contract, key)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::get_store_metadata(self, contract, key)
+        } else {
+            sqlite_get_metadata(self, contract, key)
+        }
     }
 
     fn get_metadata_manual(
@@ -1249,7 +1251,11 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        sqlite_get_metadata_manual(self, at_height, contract, key)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::get_store_metadata_manual(self, at_height, contract, key)
+        } else {
+            sqlite_get_metadata_manual(self, at_height, contract, key)
+        }
     }
 }
 

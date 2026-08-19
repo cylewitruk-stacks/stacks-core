@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! High-level Clarity state access and typed value persistence.
+
 use stacks_common::consts::{
     BITCOIN_REGTEST_FIRST_BLOCK_HASH, BITCOIN_REGTEST_FIRST_BLOCK_HEIGHT,
     BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP, FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH,
@@ -599,7 +601,7 @@ impl<'a> ClarityDatabase<'a> {
 
         let stored_value = if sanitize {
             // Preserve the existing consensus serialization behavior.  The declared
-            // type is retained solely as the schema for the experimental physical
+            // type is retained solely as the schema for the packed physical
             // encoding; sanitization has historically used the value's actual type.
             let sanitization_type = TypeSignature::type_of(&value)?;
             let value_size = value

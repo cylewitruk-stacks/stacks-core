@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! Ephemeral Clarity MARF storage layered over a persistent read-only store.
+
 use std::mem;
 
 use clarity::util::hash::Sha512Trunc256Sum;
@@ -36,9 +38,8 @@ use crate::chainstate::stacks::index::{Error, MARFValue};
 use crate::clarity_vm::clarity::{
     ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
 };
+use crate::clarity_vm::database::binary_value_store::{self, ValueStorageFormat};
 use crate::clarity_vm::database::marf::ReadOnlyMarfStore;
-use crate::clarity_vm::database::track_c;
-use crate::clarity_vm::database::typed_value::{self, TypedValueStorageMode};
 use crate::clarity_vm::special::handle_contract_call_special_cases;
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 
@@ -61,7 +62,7 @@ pub struct EphemeralMarfStore<'a> {
     /// Handle to on-disk MARF
     read_only_marf: ReadOnlyMarfStore<'a>,
     /// Physical value format shared by the RAM and attached stores.
-    value_storage_mode: TypedValueStorageMode,
+    value_storage_format: ValueStorageFormat,
 }
 
 impl ClarityMarfStore for EphemeralMarfStore<'_> {}
@@ -77,8 +78,15 @@ impl ClarityMarfStoreTransaction for EphemeralMarfStore<'_> {
     fn commit_metadata_for_trie(&mut self, target: &StacksBlockId) -> Result<(), VmExecutionError> {
         if let Some(tip) = self.ephemeral_marf.get_open_chain_tip() {
             self.teardown_views();
-            let res =
-                SqliteConnection::commit_metadata_to(self.ephemeral_marf.sqlite_tx(), tip, target);
+            let res = if self.value_storage_format.is_binary() {
+                binary_value_store::commit_metadata_to(
+                    self.ephemeral_marf.sqlite_tx(),
+                    tip.as_bytes(),
+                    target.as_bytes(),
+                )
+            } else {
+                SqliteConnection::commit_metadata_to(self.ephemeral_marf.sqlite_tx(), tip, target)
+            };
             self.setup_views();
             res
         } else {
@@ -94,7 +102,11 @@ impl ClarityMarfStoreTransaction for EphemeralMarfStore<'_> {
     /// Returns Err(VmInternalError(..)) on sqlite failure
     fn drop_metadata_for_trie(&mut self, target: &StacksBlockId) -> Result<(), VmExecutionError> {
         self.teardown_views();
-        let res = SqliteConnection::drop_metadata(self.ephemeral_marf.sqlite_tx(), target);
+        let res = if self.value_storage_format.is_binary() {
+            binary_value_store::drop_metadata(self.ephemeral_marf.sqlite_tx(), target.as_bytes())
+        } else {
+            SqliteConnection::drop_metadata(self.ephemeral_marf.sqlite_tx(), target)
+        };
         self.setup_views();
         res
     }
@@ -231,7 +243,7 @@ impl<'a> EphemeralMarfStore<'a> {
         mut read_only_marf: ReadOnlyMarfStore<'a>,
         ephemeral_marf_tx: MarfTransaction<'a, StacksBlockId>,
     ) -> Result<Self, Error> {
-        let value_storage_mode = read_only_marf.value_storage_mode();
+        let value_storage_format = read_only_marf.value_storage_format();
         let base_tip_height = read_only_marf.get_current_block_height();
         let ephemeral_tip = ephemeral_marf_tx
             .get_open_chain_tip()
@@ -243,7 +255,7 @@ impl<'a> EphemeralMarfStore<'a> {
             base_tip_height,
             ephemeral_marf: ephemeral_marf_tx,
             read_only_marf,
-            value_storage_mode,
+            value_storage_format,
         };
 
         // setup views so that the ephemeral MARF's data and metadata tables show all MARF
@@ -271,29 +283,28 @@ impl<'a> EphemeralMarfStore<'a> {
     /// is not far behind.
     fn setup_views(&self) {
         let conn = self.ephemeral_marf.sqlite_conn();
-        conn.execute(
-            "ALTER TABLE data_table RENAME TO ephemeral_data_table",
-            NO_PARAMS,
-        )
-        .expect("FATAL: failed to rename data_table to ephemeral_data_table");
+        if !self.value_storage_format.is_binary() {
+            conn.execute(
+                "ALTER TABLE data_table RENAME TO ephemeral_data_table",
+                NO_PARAMS,
+            )
+            .expect("FATAL: failed to rename data_table to ephemeral_data_table");
+        }
         conn.execute(
             "ALTER TABLE metadata_table RENAME TO ephemeral_metadata_table",
             NO_PARAMS,
         )
         .expect("FATAL: failed to rename metadata_table to ephemeral_metadata_table");
-        let data_view = if self.value_storage_mode.uses_canonical_data_table() {
-            "CREATE TEMP VIEW data_table(value_hash, record) AS
-             SELECT value_hash, record FROM main.ephemeral_data_table
-             UNION
-             SELECT value_hash, record FROM read_only_marf.data_table"
-        } else {
-            "CREATE TEMP VIEW data_table(key, value) AS
+        if !self.value_storage_format.is_binary() {
+            conn.execute(
+                "CREATE TEMP VIEW data_table(key, value) AS
              SELECT key, value FROM main.ephemeral_data_table
              UNION
-             SELECT key, value FROM read_only_marf.data_table"
-        };
-        conn.execute(data_view, NO_PARAMS)
+             SELECT key, value FROM read_only_marf.data_table",
+                NO_PARAMS,
+            )
             .expect("FATAL: failed to setup temp view data_table on ephemeral MARF DB");
+        }
         conn.execute("CREATE TEMP VIEW metadata_table(key, blockhash, value) AS SELECT * FROM main.ephemeral_metadata_table UNION SELECT * FROM read_only_marf.metadata_table", NO_PARAMS)
             .expect("FATAL: failed to setup temp view metadata_table on ephemeral MARF DB");
     }
@@ -306,15 +317,19 @@ impl<'a> EphemeralMarfStore<'a> {
     /// is not far behind.
     fn teardown_views(&self) {
         let conn = self.ephemeral_marf.sqlite_conn();
-        conn.execute("DROP VIEW data_table", NO_PARAMS)
-            .expect("FATAL: failed to drop data_table view");
+        if !self.value_storage_format.is_binary() {
+            conn.execute("DROP VIEW data_table", NO_PARAMS)
+                .expect("FATAL: failed to drop data_table view");
+        }
         conn.execute("DROP VIEW metadata_table", NO_PARAMS)
             .expect("FATAL: failed to drop metadata_table view");
-        conn.execute(
-            "ALTER TABLE ephemeral_data_table RENAME TO data_table",
-            NO_PARAMS,
-        )
-        .expect("FATAL: failed to restore data_table");
+        if !self.value_storage_format.is_binary() {
+            conn.execute(
+                "ALTER TABLE ephemeral_data_table RENAME TO data_table",
+                NO_PARAMS,
+            )
+            .expect("FATAL: failed to restore data_table");
+        }
         conn.execute(
             "ALTER TABLE ephemeral_metadata_table RENAME TO metadata_table",
             NO_PARAMS,
@@ -332,7 +347,7 @@ impl<'a> EphemeralMarfStore<'a> {
         }
     }
 
-    /// Helper function to cast a Result<Option<T>, Error> into Result<Option<T>, VmExecutionError>
+    /// Convert a MARF `Result<Option<T>, Error>` into the backing-store error type.
     fn handle_marf_result<T>(res: Result<Option<T>, Error>) -> Result<Option<T>, VmExecutionError> {
         match res {
             Ok(result_opt) => Ok(result_opt),
@@ -392,7 +407,7 @@ impl<'a> EphemeralMarfStore<'a> {
 
 impl ClarityBackingStore for EphemeralMarfStore<'_> {
     fn stores_typed_values(&self) -> bool {
-        self.value_storage_mode.is_integrated()
+        self.value_storage_format.is_binary()
     }
 
     fn get_typed_value(
@@ -401,7 +416,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         expected: &TypeSignature,
         epoch: &StacksEpochId,
     ) -> Result<Option<TypedValueResult>, VmExecutionError> {
-        if !self.value_storage_mode.uses_canonical_data_table() {
+        if !self.value_storage_format.is_binary() {
             return self
                 .get_data(key)?
                 .map(|canonical| {
@@ -418,7 +433,6 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 .transpose();
         }
 
-        let mode = self.value_storage_mode;
         self.get_with_fn(
             key,
             |ephemeral_marf, tip, key| {
@@ -426,9 +440,8 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 else {
                     return Ok(None);
                 };
-                typed_value::get(
+                binary_value_store::get_typed(
                     ephemeral_marf.sqlite_conn(),
-                    mode,
                     &marf_value,
                     expected,
                     epoch,
@@ -506,7 +519,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             "Ephemeral MarfedKV get_data: {key:?} tip={:?}",
             &self.open_tip
         );
-        let mode = self.value_storage_mode;
+        let mode = self.value_storage_format;
         self.get_with_fn(
             key,
             |ephemeral_marf, tip, key| {
@@ -514,8 +527,8 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 else {
                     return Ok(None);
                 };
-                let data = if mode.uses_canonical_data_table() {
-                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                let data = if mode.is_binary() {
+                    binary_value_store::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
                 } else {
                     SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
                 }
@@ -541,7 +554,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             hash,
             &self.open_tip
         );
-        let mode = self.value_storage_mode;
+        let mode = self.value_storage_format;
         self.get_with_fn(
             hash,
             |ephemeral_marf, tip, hash| {
@@ -555,8 +568,8 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                     hash,
                     marf_value
                 );
-                let data = if mode.uses_canonical_data_table() {
-                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                let data = if mode.is_binary() {
+                    binary_value_store::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
                 } else {
                     SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
                 }
@@ -585,7 +598,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             key,
             &self.open_tip
         );
-        let mode = self.value_storage_mode;
+        let mode = self.value_storage_format;
         self.get_with_fn(
             key,
             |ephemeral_marf, tip, key| {
@@ -594,8 +607,8 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 else {
                     return Ok(None);
                 };
-                let data = if mode.uses_canonical_data_table() {
-                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                let data = if mode.is_binary() {
+                    binary_value_store::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
                 } else {
                     SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
                 }
@@ -624,7 +637,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             hash,
             &self.open_tip
         );
-        let mode = self.value_storage_mode;
+        let mode = self.value_storage_format;
         self.get_with_fn(
             hash,
             |ephemeral_marf, tip, path| {
@@ -633,8 +646,8 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                 else {
                     return Ok(None);
                 };
-                let data = if mode.uses_canonical_data_table() {
-                    track_c::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
+                let data = if mode.is_binary() {
+                    binary_value_store::get_generic(ephemeral_marf.sqlite_conn(), &marf_value)?
                 } else {
                     SqliteConnection::get(ephemeral_marf.sqlite_conn(), &marf_value.to_hex())?
                 }
@@ -781,8 +794,12 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         let result = (|| {
             for (key, value) in items {
                 let marf_value = MARFValue::from_value(&value);
-                if self.value_storage_mode.uses_canonical_data_table() {
-                    track_c::put_generic(self.ephemeral_marf.sqlite_tx(), &marf_value, &value)?;
+                if self.value_storage_format.is_binary() {
+                    binary_value_store::put_generic(
+                        self.ephemeral_marf.sqlite_tx(),
+                        &marf_value,
+                        &value,
+                    )?;
                 } else {
                     SqliteConnection::put(
                         self.ephemeral_marf.sqlite_tx(),
@@ -809,7 +826,7 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         &mut self,
         entries: Vec<DataStoreEntry>,
     ) -> Result<(), VmExecutionError> {
-        if !self.value_storage_mode.uses_canonical_data_table() {
+        if !self.value_storage_format.is_binary() {
             return self.put_all_data(
                 entries
                     .into_iter()
@@ -825,15 +842,14 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             for entry in entries {
                 let marf_value = MARFValue::from_value(&entry.canonical);
                 if let Some(typed) = entry.typed {
-                    typed_value::put(
+                    binary_value_store::put_typed(
                         self.ephemeral_marf.sqlite_tx(),
-                        self.value_storage_mode,
                         &marf_value,
                         &entry.canonical,
                         typed,
                     )?;
                 } else {
-                    track_c::put_generic(
+                    binary_value_store::put_generic(
                         self.ephemeral_marf.sqlite_tx(),
                         &marf_value,
                         &entry.canonical,
@@ -875,7 +891,11 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         value: &str,
     ) -> Result<(), VmExecutionError> {
         self.teardown_views();
-        let res = sqlite_insert_metadata(self, contract, key, value);
+        let res = if self.value_storage_format.is_binary() {
+            binary_value_store::insert_store_metadata(self, contract, key, value)
+        } else {
+            sqlite_insert_metadata(self, contract, key, value)
+        };
         self.setup_views();
         res
     }
@@ -890,7 +910,11 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        sqlite_get_metadata(self, contract, key)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::get_store_metadata(self, contract, key)
+        } else {
+            sqlite_get_metadata(self, contract, key)
+        }
     }
 
     /// Load up metadata at a specific block height from the metadata table (materialized view) in
@@ -904,7 +928,11 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
         contract: &QualifiedContractIdentifier,
         key: &str,
     ) -> Result<Option<String>, VmExecutionError> {
-        sqlite_get_metadata_manual(self, at_height, contract, key)
+        if self.value_storage_format.is_binary() {
+            binary_value_store::get_store_metadata_manual(self, at_height, contract, key)
+        } else {
+            sqlite_get_metadata_manual(self, at_height, contract, key)
+        }
     }
 }
 

@@ -19,9 +19,14 @@
 use std::path::PathBuf;
 
 use clarity::vm::database::clarity_store::make_contract_hash_key;
-use clarity::vm::database::{ClarityBackingStore, MetadataRow, SqliteConnection};
+use clarity::vm::database::{
+    ClarityBackingStore, DataStoreEntry, SqliteConnection, TypedValueData,
+};
+use clarity::vm::types::{TupleData, TypeSignature, Value};
+use clarity::vm::ClarityName;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
-use stacks_common::util::hash::Sha512Trunc256Sum;
+use stacks_common::types::StacksEpochId;
+use stacks_common::util::hash::{to_hex, Sha512Trunc256Sum};
 use tempfile::tempdir;
 
 use super::super::clarity::assert_source_tables_classified;
@@ -30,7 +35,21 @@ use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
 use crate::chainstate::stacks::index::storage::TrieHashCalculationMode;
 use crate::chainstate::stacks::index::{ClarityMarfTrieId as _, Error, MARFValue};
 use crate::clarity_vm::clarity::ClarityMarfStoreTransaction as _;
+use crate::clarity_vm::database::binary_value_store::{self, MetadataBlockId, MetadataRow};
 use crate::clarity_vm::database::marf::MarfedKV;
+
+fn packed_snapshot_fixture() -> (Value, TypeSignature, Vec<u8>) {
+    let value = Value::Tuple(
+        TupleData::from_data(vec![
+            (ClarityName::from_literal("active"), Value::Bool(true)),
+            (ClarityName::from_literal("amount"), Value::UInt(42)),
+        ])
+        .unwrap(),
+    );
+    let expected = TypeSignature::type_of(&value).unwrap();
+    let consensus = value.serialize_to_vec().unwrap();
+    (value, expected, consensus)
+}
 
 /// Build a Clarity MARF with N blocks of data and a single contract.
 /// Returns the block hashes for each height.
@@ -70,6 +89,20 @@ fn build_clarity_marf(
                 ),
                 (contract_key, contract_commitment),
             ])
+            .unwrap();
+
+        let (value, expected, consensus) = packed_snapshot_fixture();
+        store
+            .put_all_data_entries(vec![DataStoreEntry {
+                key: "typed_snapshot_key".into(),
+                canonical: to_hex(&consensus),
+                typed: Some(TypedValueData {
+                    value,
+                    expected,
+                    epoch: StacksEpochId::Epoch40,
+                    consensus,
+                }),
+            }])
             .unwrap();
 
         // metadata_table entries (via insert_metadata)
@@ -215,20 +248,72 @@ fn test_squashed_clarity_marf_data_reads_work() {
         let val2 = store.get_data("clarity_key_2").unwrap();
         assert!(val2.is_some(), "clarity_key_2 should be readable");
         assert_eq!(val2.unwrap(), "clarity_val_2");
+
+        let (expected_value, expected_type, consensus) = packed_snapshot_fixture();
+        let typed = store
+            .get_typed_value(
+                "typed_snapshot_key",
+                &expected_type,
+                &StacksEpochId::Epoch40,
+            )
+            .unwrap()
+            .expect("packed value should survive snapshot copying");
+        assert_eq!(typed.value, expected_value);
+        assert_eq!(typed.serialized_byte_len, consensus.len() as u64);
+        assert_eq!(
+            store
+                .get_data("typed_snapshot_key")
+                .unwrap()
+                .expect("packed canonical value should survive snapshot copying"),
+            to_hex(&consensus)
+        );
     }
 
     // Stale overwritten values are pruned from the content-addressed
     // data_table: only the tip value of clarity_key_1 survives.
     let conn = rusqlite::Connection::open(&squashed_db).unwrap();
-    let stale: u64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM data_table \
-             WHERE value LIKE 'clarity_val_1%' AND value != 'clarity_val_1_at_3'",
-            [],
-            |row| row.get(0),
-        )
+    let mut statement = conn.prepare("SELECT key FROM data_table").unwrap();
+    let value_hashes: Vec<MARFValue> = statement
+        .query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            Ok(MARFValue(bytes.try_into().expect("Binary V1 key width")))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(stale, 0, "overwritten values must be pruned");
+    let mut canonical_values = Vec::with_capacity(value_hashes.len());
+    for value_hash in value_hashes {
+        canonical_values.push(
+            binary_value_store::get_generic(&conn, &value_hash)
+                .unwrap()
+                .expect("every copied key must resolve"),
+        );
+    }
+    assert!(canonical_values
+        .iter()
+        .any(|value| value == "clarity_val_1_at_3"));
+    assert!(
+        !canonical_values
+            .iter()
+            .any(|value| value.starts_with("clarity_val_1") && value != "clarity_val_1_at_3"),
+        "overwritten values must be pruned"
+    );
+}
+
+/// Raw proof reads reconstruct canonical text from a Binary V1 side-store row.
+#[test]
+fn test_binary_value_store_data_read_with_proof_works() {
+    let dir = tempdir().unwrap();
+    let blocks = build_clarity_marf(dir.path(), 4, "test-contract", "");
+    let mut kv = MarfedKV::open(dir.path().to_str().unwrap(), Some(&blocks[3]), None).unwrap();
+    let mut store = kv.begin_read_only(Some(&blocks[3]));
+
+    let (proved_value, proof) = store
+        .get_data_with_proof("clarity_key_1")
+        .unwrap()
+        .expect("clarity_key_1 should have a proof");
+    assert_eq!(proved_value, "clarity_val_1_at_3");
+    assert!(!proof.is_empty());
 }
 
 /// Contract metadata reads through `MarfedKV` work on the squashed MARF
@@ -274,12 +359,12 @@ fn test_metadata_exclusions() {
 
     // A rogue but well-formed row in src: a contract with no trie commitment.
     let src_conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
-    SqliteConnection::insert_metadata_row(
+    binary_value_store::insert_metadata_row(
         &src_conn,
         &MetadataRow {
             key: "clr-meta::ST000000000000000000002AMW42H.ghost::source",
-            block_id: &blocks[0].to_hex(),
-            value: "ghost",
+            block_id: MetadataBlockId::Bytes(blocks[0].as_bytes()),
+            value: Some("ghost"),
         },
     )
     .unwrap();
@@ -294,7 +379,7 @@ fn test_metadata_exclusions() {
 
     let conn = rusqlite::Connection::open(&squashed_db).unwrap();
     let mut rogue = 0;
-    SqliteConnection::visit_metadata_keys(&conn, |key| -> Result<(), rusqlite::Error> {
+    binary_value_store::visit_metadata_keys(&conn, |key| -> Result<(), rusqlite::Error> {
         if key.contains("ghost") {
             rogue += 1;
         }
@@ -313,12 +398,12 @@ fn test_malformed_metadata_key_is_corruption() {
     let blocks = build_clarity_marf(&src_dir, 4, "test-contract", "");
 
     let src_conn = rusqlite::Connection::open(clarity_marf_db_path(&src_dir)).unwrap();
-    SqliteConnection::insert_metadata_row(
+    binary_value_store::insert_metadata_row(
         &src_conn,
         &MetadataRow {
             key: "not-a-metadata-key",
-            block_id: &blocks[0].to_hex(),
-            value: "junk",
+            block_id: MetadataBlockId::Bytes(blocks[0].as_bytes()),
+            value: Some("junk"),
         },
     )
     .unwrap();

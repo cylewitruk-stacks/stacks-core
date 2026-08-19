@@ -13,6 +13,8 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+//! Clarity backing-store interfaces and persistence-neutral database abstractions.
 #[cfg(feature = "rusqlite")]
 pub use sqlite::MemoryBackingStore;
 
