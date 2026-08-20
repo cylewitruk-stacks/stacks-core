@@ -173,9 +173,9 @@
         {"expr": "rate(stacks_signer_block_validation_responses{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "validation {{response_type}}", "refId": "B"},
         {"expr": "rate(stacks_signer_block_pre_commits_sent{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "precommits", "refId": "C"},
         {"expr": "rate(stacks_signer_block_responses_sent{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "legacy response {{response_type}}", "refId": "D"},
-        {"expr": "rate(stacks_signer_policy_evaluations_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "policy {{classification}}/{{action}}", "refId": "E"},
-        {"expr": "rate(stacks_signer_block_validation_lifecycle_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "lifecycle {{event}}/{{reason}}", "refId": "F"},
-        {"expr": "rate(stacks_signer_block_response_deliveries_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "delivery {{response_type}}/{{outcome}}", "refId": "G"}
+        {"expr": "rate(stacks_signer_policy_evaluations{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "policy {{classification}}/{{action}}", "refId": "E"},
+        {"expr": "rate(stacks_signer_block_validation_lifecycle{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "lifecycle {{event}}/{{reason}}", "refId": "F"},
+        {"expr": "rate(stacks_signer_block_response_deliveries{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "delivery {{response_type}}/{{outcome}}", "refId": "G"}
       ],
       "title": "Signer decision pipeline (self-reported)",
       "type": "timeseries"
@@ -251,7 +251,7 @@
       "id": 18,
       "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "rate(stacks_node_nakamoto_block_transfers_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "Nakamoto {{direction}} {{source}}/{{outcome}}", "refId": "A"},
+        {"expr": "rate(stacks_node_nakamoto_block_transfers{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "Nakamoto {{direction}} {{source}}/{{outcome}}", "refId": "A"},
         {"expr": "rate(stacks_node_nakamoto_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "Nakamoto P2P message ingress (compatibility)", "refId": "B"},
         {"expr": "rate(stacks_node_stx_micro_blocks_received_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "microblocks received", "refId": "C"},
         {"expr": "rate(stacks_node_stx_micro_blocks_served_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[2m])", "legendFormat": "microblocks served", "refId": "D"},
@@ -362,10 +362,10 @@
       "id": 25,
       "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "rate(stacks_signer_policy_evaluations_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "policy {{classification}}/{{action}}", "refId": "A"},
-        {"expr": "rate(stacks_signer_policy_rejections_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "reject {{reason}}", "refId": "B"},
-        {"expr": "rate(stacks_signer_block_validation_lifecycle_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "validation {{event}}/{{reason}}", "refId": "C"},
-        {"expr": "rate(stacks_signer_block_response_deliveries_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "delivery {{response_type}}/{{outcome}}", "refId": "D"}
+        {"expr": "rate(stacks_signer_policy_evaluations{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "policy {{classification}}/{{action}}", "refId": "A"},
+        {"expr": "rate(stacks_signer_policy_rejections{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "reject {{reason}}", "refId": "B"},
+        {"expr": "rate(stacks_signer_block_validation_lifecycle{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "validation {{event}}/{{reason}}", "refId": "C"},
+        {"expr": "rate(stacks_signer_block_response_deliveries{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "delivery {{response_type}}/{{outcome}}", "refId": "D"}
       ],
       "title": "Signer policy and validation outcomes",
       "type": "timeseries"
@@ -378,8 +378,8 @@
       "id": 26,
       "options": {"legend": {"calcs": ["sum", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "rate(stacks_node_signer_coordinator_rounds_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "round {{event}}/{{outcome}}", "refId": "A"},
-        {"expr": "rate(stacks_node_signer_response_weight_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "weight {{classification}}", "refId": "B"},
+        {"expr": "rate(stacks_node_signer_coordinator_rounds{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "round {{event}}/{{outcome}}", "refId": "A"},
+        {"expr": "rate(stacks_node_signer_response_weight{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "weight {{classification}}", "refId": "B"},
         {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=\"$actor\",milestone=\"proposal_to_first_response\"}[15m])))", "legendFormat": "first response p95 {{outcome}}", "refId": "C"},
         {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(stacks_node_signer_coordinator_milestone_seconds_bucket{attacknet_network=\"$network\",attacknet_actor=\"$actor\",milestone=\"proposal_to_threshold\"}[15m])))", "legendFormat": "threshold p95 {{outcome}}", "refId": "D"}
       ],
@@ -410,6 +410,20 @@
       "targets": [{"datasource": {"type": "loki", "uid": "attacknet-loki"}, "editorMode": "code", "expr": "{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "queryType": "range", "refId": "A"}],
       "title": "Actor logs (untrusted content; trusted stream identity)",
       "type": "logs"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Render-time aggregate profile from the actor scrape target plus exact per-family provenance from the orchestrator-owned metadata metric. unavailable means Workstream M panels should be empty and must not be read as zero. mixed means applicable families have more than one exact provenance. These declarations must still match the sealed capability manifest and admitted runtime-image evidence.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 105},
+      "id": 27,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [
+        {"expr": "max by (attacknet_actor,attacknet_role,requested_image,instrumentation_profile,instrumentation_provenance,event_dispatch_mode) (up{attacknet_network=\"$network\",attacknet_actor=\"$actor\"})", "format": "table", "instant": true, "refId": "A"},
+        {"expr": "max by (attacknet_actor,attacknet_role,family,provenance,evidence_source) (attacknet_instrumentation_family_provenance{attacknet_network=\"$network\",attacknet_actor=\"$actor\"})", "format": "table", "instant": true, "refId": "B"}
+      ],
+      "title": "Instrumentation capability declaration",
+      "type": "table"
     }
   ],
   "refresh": "5s",

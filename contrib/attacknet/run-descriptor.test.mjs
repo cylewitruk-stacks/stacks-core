@@ -7,12 +7,14 @@ import test from 'node:test';
 
 import {
   appendEvent,
+  attachInstrumentationCapabilities,
   canonicalJson,
   deriveReplayDescriptor,
   finalizeDescriptor,
   initializeDescriptor,
   resolveRuntimeInputs,
   seededChoice,
+  sha256Value,
   validateDescriptor,
 } from './run-descriptor.mjs';
 
@@ -100,6 +102,24 @@ test('pre-apply descriptors resolve admitted state and immutable runtime images 
   });
   assert.equal(resolved.inputs.kubernetes.resolution.complete, true);
   assert.equal(validateDescriptor(resolved, {verifyFiles: true}), true);
+});
+
+test('run descriptor refuses a self-sealed but semantically incomplete instrumentation claim', () => {
+  const {metadata, root} = fixture();
+  const manifestPath = join(root, 'instrumentation.json');
+  const manifest = {
+    schema: 'stacks-attacknet-instrumentation-capabilities/v1', manifestId: 'phase-1',
+    acceptanceReady: true, profiles: [{id: 'patched-main'}],
+  };
+  manifest.manifestDigest = sha256Value(manifest);
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  assert.throws(() => attachInstrumentationCapabilities(initializeDescriptor(metadata), manifestPath), /inventory/);
+
+  manifest.acceptanceReady = false;
+  delete manifest.manifestDigest;
+  manifest.manifestDigest = sha256Value(manifest);
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  assert.throws(() => attachInstrumentationCapabilities(initializeDescriptor(metadata), manifestPath), /not acceptance-ready/);
 });
 
 test('finalization enforces assertion outcome and detects descriptor or artifact tampering', () => {

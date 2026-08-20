@@ -24,6 +24,19 @@ the requested image reference, and records the immutable Docker image ID. Store
 all referenced artifacts beside the descriptor in the evidence bundle;
 `validate --verify-files` then detects missing or modified inputs.
 
+Runs that claim Phase 1 instrumentation attach the acceptance-ready capability
+manifest after image admission and before finalization:
+
+```bash
+node contrib/attacknet/run-descriptor.mjs instrumentation "$RUN_DESCRIPTOR" \
+  --manifest=evidence/instrumentation-capabilities.json
+```
+
+The attachment preserves the capability-manifest digest and profile IDs beside
+the topology, configuration, admitted manifest, and resolved image inputs. An
+offline or incomplete capability manifest is rejected rather than being
+recorded as acceptance evidence.
+
 Schema v1 predates the Compose backend and retains the field name
 `inputs.kubernetes` for this backend-neutral resolution slot. The nested
 `resolution.backend` is authoritative (`kubernetes` or `compose`). A future v2

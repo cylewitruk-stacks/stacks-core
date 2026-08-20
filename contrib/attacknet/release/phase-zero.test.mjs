@@ -128,6 +128,8 @@ test('offline result accepts only complete, unique, observed suite results', () 
       {name: 'python', tests: 2, passed: 2, failed: 0},
     ],
   });
+  assert.equal(result.schemaVersion, 'stacks-attacknet-offline-check-result/v1');
+  assert.equal(result.status, 'passed');
   assert.equal(result.recordedAt, '2026-08-19T00:00:00.000Z');
   assert.deepEqual(result.suites.map(item => item.name), ['node', 'python']);
   assert.throws(() => buildOfflineResult({
@@ -160,6 +162,24 @@ test('the phase gate requires two complete approvals over the exact contract and
   const incomplete = approval('Claude Opus 5', packet);
   incomplete.reviewedInventory.pop();
   assert.throws(() => evaluatePhaseGate(contract, packet, [codex, incomplete]), /did not review/);
+});
+
+test('inventory digests use locale-independent UTF-16 code-unit ordering', () => {
+  const contract = {
+    ...load(contractPath),
+    requiredInventory: ['source:z', 'source:a', 'source:A'],
+    requirements: ['deterministic-order'],
+  };
+  const packet = sealedPacket(contract);
+  const byId = new Map(packet.inventory.map(item => [item.id, item]));
+  const ordered = ['source:A', 'source:a', 'source:z'].map(id => byId.get(id));
+  assert.equal(packet.sourceDigest, sha256(ordered));
+
+  const resealed = sealReviewPacket(contract, {
+    ...packet,
+    inventory: [...packet.inventory].reverse(),
+  });
+  assert.equal(resealed.sourceDigest, packet.sourceDigest);
 });
 
 test('empty or modified contracts cannot vacuously close a phase', () => {

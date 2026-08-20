@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from event_bridge import EventServer, Journal
+from event_bridge import EventServer, Journal, load_instrumentation_provenance
 
 
 TOKEN = "a" * 64
@@ -127,6 +127,35 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('attacknet_recovery_duration_seconds{campaign="delay-miner",evidence_source="orchestrator_observed",network="attacknet"} 8.5', metrics)
         self.assertIn('attacknet_burnchain_policy_info{evidence_source="orchestrator_observed",generation="7",mode="run",network="attacknet"} 1', metrics)
         self.assertIn('attacknet_run_info{evidence_source="orchestrator_observed",network="attacknet",phase="verification",run_id="run-123",seed="' + "12" * 32 + '"} 1', metrics)
+
+    def test_instrumentation_provenance_is_bounded_orchestrator_metadata(self):
+        provenance_path = Path(self.temporary.name) / "instrumentation.json"
+        provenance_path.write_text(json.dumps({
+            "schema": "stacks-attacknet-instrumentation-provenance/v1",
+            "actors": [{
+                "actor": "signer-1", "role": "signer",
+                "families": [
+                    {"family": "M01", "provenance": "unavailable"},
+                    {"family": "M02", "provenance": "attacknet-patch"},
+                ],
+            }],
+        }))
+        records = load_instrumentation_provenance(provenance_path)
+        journal = Journal(Path(self.temporary.name) / "provenance-timeline.jsonl", records)
+        metrics = journal.prometheus()
+        self.assertIn(
+            'attacknet_instrumentation_family_provenance{attacknet_actor="signer-1",attacknet_role="signer",family="M01",provenance="unavailable"} 1',
+            metrics,
+        )
+        self.assertIn(
+            'attacknet_instrumentation_family_provenance{attacknet_actor="signer-1",attacknet_role="signer",family="M02",provenance="attacknet-patch"} 1',
+            metrics,
+        )
+        invalid = json.loads(provenance_path.read_text())
+        invalid["actors"][0]["families"][0]["provenance"] = "mixed"
+        provenance_path.write_text(json.dumps(invalid))
+        with self.assertRaisesRegex(ValueError, "unsupported instrumentation provenance"):
+            load_instrumentation_provenance(provenance_path)
 
     def test_projected_state_does_not_leak_from_an_older_run(self):
         self.request("POST", "/api/v1/events", self.event(eventId="old-injection"))

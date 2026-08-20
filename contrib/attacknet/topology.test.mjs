@@ -157,8 +157,23 @@ test('every node receives deterministic diverse non-self bootstrap identities', 
   assert.match(miner.config.files['config.toml'], /\$\{SERVICE:follower-1\}:20444/);
   assert.match(miner.config.files['config.toml'], /\$\{SERVICE:follower-2\}:20444/);
   const follower = nodes.find(actor => actor.name === 'follower-1');
-  assert.match(follower.config.files['config.toml'], /\$\{SERVICE:miner-1\}:20444/);
   assert.match(follower.config.files['config.toml'], /\$\{SERVICE:follower-2\}:20444/);
+
+  const alwaysOn = new Set(['miner-1', ...Array.from({length: 5}, (_, index) => `follower-${index + 1}`)]);
+  const selectedBy = new Map([...alwaysOn].map(actor => [actor, 0]));
+  for (const actor of nodes) {
+    const peers = actor.config.files['config.toml']
+      .match(/^bootstrap_node = "([^"]+)"$/m)[1]
+      .split(',')
+      .map(peer => peer.match(/\$\{SERVICE:([^}]+)\}/)[1]);
+    assert.equal(peers.every(peer => alwaysOn.has(peer)), true, `${actor.name} bootstrap peers must be always-on`);
+    for (const peer of peers) selectedBy.set(peer, selectedBy.get(peer) + 1);
+  }
+  assert.deepEqual(
+    [...selectedBy.values()],
+    [...alwaysOn].map(() => 9),
+    'rotated selection must distribute full-topology dials evenly across always-on bootstrap nodes',
+  );
 });
 
 test('small topology bootstrap adapts without self references', () => {
@@ -195,6 +210,45 @@ test('legacy signer companions subscribe to miner and signer StackerDBs', () => 
   }
   const follower = actors.find(actor => actor.role === 'follower');
   assert.match(follower.config.files['config.toml'], /^stacker = false$/m);
+});
+
+test('healthy topology makes queued event delivery explicit and retains blocking as a scenario knob', () => {
+  const queued = buildTopology({signerCount: 1});
+  for (const actor of queued.actors.filter(actor => actor.role !== 'signer')) {
+    assert.match(actor.config.files['config.toml'], /^event_dispatcher_blocking = false$/m);
+    assert.match(actor.config.files['config.toml'], /^event_dispatcher_queue_size = 1000$/m);
+    assert.equal(actor.eventDispatchMode, 'queued');
+  }
+  const blocking = buildTopology({signerCount: 1, eventDispatchMode: 'blocking'});
+  assert.match(blocking.actors.find(actor => actor.role === 'companion').config.files['config.toml'],
+    /^event_dispatcher_blocking = true$/m);
+  assert.throws(() => buildTopology({eventDispatchMode: 'implicit'}), /queued or blocking/);
+});
+
+test('rendered actors declare instrumentation profile, provenance, image, and dispatch mode', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-instrumentation-profile-'));
+  const {manifest, resource} = renderTopology(buildTopology({
+    instrumentationProfile: 'patched-main', instrumentationProvenance: 'attacknet-patch',
+    actorInstrumentation: {'signer-1': 'release:unavailable'},
+  }), output);
+  const miner = manifest.actors.find(actor => actor.service === 'miner-1');
+  assert.deepEqual(miner.instrumentation, {profile: 'patched-main', provenance: 'attacknet-patch'});
+  assert.equal(miner.eventDispatchMode, 'queued');
+  assert.equal(miner.requestedImage, 'stacks-core-attacknet:main');
+  assert.deepEqual(manifest.actors.find(actor => actor.service === 'signer-1').instrumentation,
+    {profile: 'release', provenance: 'unavailable'});
+  assert.equal(manifest.protocol.eventDispatchMode, 'queued');
+  assert.equal(resource.spec.actors.some(actor => actor.instrumentation || actor.eventDispatchMode), false,
+    'capability declarations must not leak into the strict StacksNetwork CRD actor schema');
+  const mixed = renderTopology(buildTopology({
+    instrumentationProfile: 'partial-main', instrumentationProvenance: 'mixed',
+  }), mkdtempSync(join(tmpdir(), 'attacknet-mixed-instrumentation-')));
+  assert.deepEqual(mixed.manifest.actors.find(actor => actor.service === 'miner-1').instrumentation,
+    {profile: 'partial-main', provenance: 'mixed'});
+  assert.deepEqual(mixed.manifest.workloads.find(actor => actor.service === 'bitcoin').instrumentation,
+    {profile: 'unmodified', provenance: 'unavailable'});
+  assert.throws(() => buildTopology({actorInstrumentation: {bitcoin: 'partial-main:mixed'}}),
+    /unknown actor/);
 });
 
 test('bootstrap suppresses companion observers and signers until the reward set is frozen', () => {
@@ -316,6 +370,7 @@ test('manifest exposes deterministic protocol phase barriers', () => {
     signerRegistrationHeight: 222,
     nakamotoActivationHeight: 223,
     steadyBurnIntervalSeconds: 60,
+    eventDispatchMode: 'queued',
   });
   assert.equal(manifest.workloads.find(actor => actor.service === 'signer-1').stacksAddress,
     'ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H');

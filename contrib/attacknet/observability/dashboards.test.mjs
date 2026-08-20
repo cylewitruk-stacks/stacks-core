@@ -4,6 +4,9 @@ import {dirname, join} from 'node:path';
 import test from 'node:test';
 import {fileURLToPath} from 'node:url';
 
+import {loadInventory} from '../instrumentation/capability-manifest.mjs';
+import {prometheusRules, validatePrometheusRulesAgainstInventory} from './render.mjs';
+
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
 function readDashboard(name) {
@@ -101,30 +104,9 @@ test('dashboards cover the complete Workstream M contract without conflating cha
   const overview = readDashboard('attacknet-overview.json');
   const actor = readDashboard('attacknet-actor.json');
   const dashboardText = JSON.stringify([overview, actor]);
-  for (const metric of [
-    'stacks_signer_runloop_ready',
-    'stacks_signer_registered_for_current_reward_cycle',
-    'stacks_signer_registered_for_next_reward_cycle',
-    'stacks_signer_state_burn_block_height',
-    'stacks_signer_state_last_changed_timestamp_seconds',
-    'stacks_signer_companion_burn_block_height',
-    'stacks_signer_pending_block_validations',
-    'stacks_signer_global_state_available',
-    'stacks_signer_global_state_total_weight',
-    'stacks_signer_global_state_known_weight',
-    'stacks_signer_global_state_maximum_view_weight',
-    'stacks_signer_global_state_evaluator_threshold_weight',
-    'stacks_signer_global_state_canonical_threshold_weight',
-    'stacks_signer_block_proposals_received',
-    'stacks_signer_policy_evaluations_total',
-    'stacks_signer_policy_rejections_total',
-    'stacks_signer_block_validation_lifecycle_total',
-    'stacks_signer_block_response_deliveries_total',
-    'stacks_node_signer_coordinator_rounds_total',
-    'stacks_node_signer_response_weight_total',
-    'stacks_node_signer_coordinator_milestone_seconds_bucket',
-    'stacks_node_nakamoto_block_transfers_total',
-  ]) assert.match(dashboardText, new RegExp(metric), `missing Workstream M metric ${metric}`);
+  for (const family of loadInventory().families) {
+    assert.match(dashboardText, new RegExp(family.family), `missing Workstream M metric ${family.family}`);
+  }
 
   assert.match(dashboardText, /proposal_to_first_response/);
   assert.match(dashboardText, /proposal_to_threshold/);
@@ -141,7 +123,39 @@ test('dashboards cover the complete Workstream M contract without conflating cha
   assert.doesNotMatch(stacksQueries, /stacks_node_burn_block_height/);
 });
 
+test('Prometheus instrumentation rules resolve every family, label, and value through the inventory', () => {
+  const inventory = loadInventory();
+  assert.equal(validatePrometheusRulesAgainstInventory(prometheusRules(), inventory), true);
+  assert.throws(() => validatePrometheusRulesAgainstInventory(
+    'expr: rate(stacks_signer_policy_evaluations{classification="invented"}[2m])', inventory),
+  /unknown M15.classification value invented/);
+  assert.throws(() => validatePrometheusRulesAgainstInventory(
+    'expr: rate(stacks_signer_policy_evaluations_total{classification="unavailable"}[2m])', inventory),
+  /M15 as stacks_signer_policy_evaluations_total, not its exact exporter name/);
+});
+
+test('dashboards expose capability provenance and treat unavailable series as no data', () => {
+  for (const dashboard of [readDashboard('attacknet-overview.json'), readDashboard('attacknet-actor.json')]) {
+    const panel = dashboard.panels.find(candidate => candidate.title.includes('Instrumentation capability'));
+    assert.ok(panel, `${dashboard.uid} lacks instrumentation capability panel`);
+    const text = JSON.stringify(panel);
+    assert.match(text, /instrumentation_profile/);
+    assert.match(text, /instrumentation_provenance/);
+    assert.match(text, /attacknet_instrumentation_family_provenance/);
+    assert.match(text, /family/);
+    assert.match(text, /provenance/);
+    assert.match(text, /evidence_source/);
+    assert.match(text, /requested_image/);
+    assert.match(text, /event_dispatch_mode/);
+    assert.match(panel.description, /unavailable.*(?:empty|gap|zero)/i);
+    assert.match(panel.description, /sealed capability manifest/i);
+  }
+});
+
 test('histogram units and counter queries preserve exported metric semantics', () => {
+  const counterFamilies = loadInventory().families
+    .filter(family => family.type === 'counter')
+    .map(family => family.family);
   for (const dashboard of [readDashboard('attacknet-overview.json'), readDashboard('attacknet-actor.json')]) {
     for (const panel of dashboard.panels) {
       const expressions = (panel.targets ?? []).map(target => target.expr).join('\n');
@@ -152,6 +166,12 @@ test('histogram units and counter queries preserve exported metric semantics', (
         assert.match(expressions, /histogram_quantile\(/);
       }
       for (const target of panel.targets ?? []) {
+        for (const family of counterFamilies) {
+          if (!target.expr.includes(family)) continue;
+          assert.doesNotMatch(target.expr, new RegExp(`${family}_total\\b`),
+            `${panel.title} must use the Rust exporter's exact counter family name`);
+          assert.match(target.expr, /rate\(/, `${panel.title} must render ${family} as a change rate`);
+        }
         if (/stacks_(?:node|signer)_[a-z_]+(?:_total|_received|_sent)\{/.test(target.expr)
             && !target.expr.includes('stacks_node_active_miners_total')) {
           assert.match(target.expr, /rate\(/, `${panel.title} must render counters as change rates`);

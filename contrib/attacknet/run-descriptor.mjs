@@ -111,6 +111,99 @@ function artifact(path, readFile) {
   return {path: requireString(path, 'artifact path'), digest: sha256File(path, readFile)};
 }
 
+function instrumentationArtifact(path, readFile) {
+  const bytes = readFile(path);
+  let manifest;
+  try { manifest = JSON.parse(bytes.toString()); } catch (error) { throw new Error(`instrumentation capability manifest is not JSON: ${error.message}`); }
+  if (manifest?.schema !== 'stacks-attacknet-instrumentation-capabilities/v1') throw new Error('unsupported instrumentation capability manifest');
+  const unsigned = deepCopy(manifest);
+  delete unsigned.manifestDigest;
+  if (manifest.manifestDigest !== sha256Value(unsigned)) throw new Error('instrumentation capability manifest digest mismatch');
+  if (manifest.acceptanceReady !== true) throw new Error('instrumentation capability manifest is not acceptance-ready');
+  const readEvidence = (item, label) => {
+    validateArtifact(item, label);
+    const artifactBytes = readFile(item.path);
+    if (sha256File(item.path, () => artifactBytes) !== item.digest) throw new Error(`${label} artifact digest mismatch`);
+    try { return JSON.parse(artifactBytes.toString()); }
+    catch (error) { throw new Error(`${label} is not JSON: ${error.message}`); }
+  };
+  const verifySelfDigest = (value, field, label) => {
+    const claimed = value?.[field];
+    const body = deepCopy(value); delete body[field];
+    if (!/^sha256:[0-9a-f]{64}$/.test(claimed ?? '') || sha256Value(body) !== claimed) {
+      throw new Error(`${label} ${field} does not verify`);
+    }
+  };
+  validateArtifact(manifest.inventory, 'instrumentation inventory');
+  if (sha256File(manifest.inventory.path, readFile) !== manifest.inventory.digest) throw new Error('instrumentation inventory artifact digest mismatch');
+  const profiles = requireArray(manifest.profiles, 'instrumentation profiles');
+  if (profiles.length === 0) throw new Error('instrumentation profiles cannot be empty');
+  for (const [profileIndex, profile] of profiles.entries()) {
+    requireObject(profile, `instrumentation profiles[${profileIndex}]`);
+    const actors = requireArray(profile.actors, `instrumentation profiles[${profileIndex}].actors`);
+    const signals = requireArray(profile.signals, `instrumentation profiles[${profileIndex}].signals`);
+    if (!profile.build?.artifact) throw new Error(`instrumentation profile ${profile.id} has no build evidence`);
+    const buildRecord = readEvidence(profile.build.artifact, `instrumentation profile ${profile.id} build`);
+    verifySelfDigest(buildRecord, 'recordDigest', `instrumentation profile ${profile.id} build`);
+    const patched = signals.filter(signal => signal.provenance === 'attacknet-patch');
+    const merged = signals.filter(signal => signal.provenance === 'merged');
+    if (patched.length > 0) validateArtifact(profile.patch, `instrumentation profile ${profile.id} patch`);
+    if (merged.some(signal => !profile.build.instrumentationSourceAudit?.familiesPresent?.includes(signal.id))) {
+      throw new Error(`instrumentation profile ${profile.id} merged provenance lacks source audit`);
+    }
+    for (const actor of actors) {
+      const admission = profile.admissions?.find(item => item.actor === actor.name);
+      if (!admission) throw new Error(`instrumentation profile ${profile.id} has no admission for ${actor.name}`);
+      const admissionRecord = readEvidence(admission.artifact, `instrumentation profile ${profile.id} admission ${actor.name}`);
+      verifySelfDigest(admissionRecord, 'evidenceDigest', `instrumentation profile ${profile.id} admission ${actor.name}`);
+      const smoke = profile.configStartupSmokes?.find(item => item.actor === actor.name);
+      if (!smoke) throw new Error(`instrumentation profile ${profile.id} has no config smoke for ${actor.name}`);
+      const smokeRecord = readEvidence(smoke.artifact, `instrumentation profile ${profile.id} smoke ${actor.name}`);
+      verifySelfDigest(smokeRecord, 'evidenceDigest', `instrumentation profile ${profile.id} smoke ${actor.name}`);
+      const required = signals.some(signal => signal.provenance !== 'unavailable' && signal.roles?.includes(actor.role));
+      const runtime = profile.runtimeMetricPresence?.find(item => item.actor === actor.name);
+      if (required && !runtime) {
+        throw new Error(`instrumentation profile ${profile.id} has no runtime metric evidence for ${actor.name}`);
+      }
+      if (runtime) {
+        const runtimeRecord = readEvidence(runtime.artifact, `instrumentation profile ${profile.id} runtime ${actor.name}`);
+        verifySelfDigest(runtimeRecord, 'evidenceDigest', `instrumentation profile ${profile.id} runtime ${actor.name}`);
+        if (runtimeRecord.result !== 'Passed' || runtimeRecord.podUID !== admission.podUID
+          || runtimeRecord.runtimeImageID !== admission.runtimeImageID) {
+          throw new Error(`instrumentation profile ${profile.id} runtime evidence is not bound to admission for ${actor.name}`);
+        }
+        if (sha256File(runtime.metricsArtifact.path, readFile) !== runtime.metricsArtifact.digest
+          || runtime.metricsArtifact.digest !== runtime.metricsDigest) {
+          throw new Error(`instrumentation profile ${profile.id} runtime metrics artifact mismatch for ${actor.name}`);
+        }
+      }
+    }
+  }
+  const evidenceArtifacts = [manifest.inventory?.artifact ?? manifest.inventory]
+    .concat(manifest.profiles.flatMap(profile => [
+      profile.patch,
+      profile.build?.artifact,
+      ...(profile.admissions ?? []).map(item => item.artifact),
+      ...(profile.configStartupSmokes ?? []).map(item => item.artifact),
+      ...(profile.runtimeMetricPresence ?? []).map(item => item.artifact),
+      ...(profile.runtimeMetricPresence ?? []).map(item => item.metricsArtifact),
+    ]))
+    .filter(item => item?.path && item?.digest)
+    .filter((item, index, items) => items.findIndex(candidate =>
+      candidate.path === item.path && candidate.digest === item.digest) === index)
+    .map(item => ({path: item.path, digest: item.digest}));
+  for (const item of evidenceArtifacts) {
+    if (sha256File(item.path, readFile) !== item.digest) throw new Error(`instrumentation evidence artifact digest mismatch: ${item.path}`);
+  }
+  return {
+    ...artifact(path, () => bytes), manifestDigest: manifest.manifestDigest,
+    manifestId: requireString(manifest.manifestId, 'instrumentation manifestId'),
+    profiles: profiles.map((profile, index) =>
+      requireString(profile.id, `instrumentation profiles[${index}].id`)).sort(),
+    evidenceArtifacts,
+  };
+}
+
 function normalizeImages(images, {allowUnresolved = false} = {}) {
   const normalized = requireArray(images, 'images').map((image, index) => {
     requireObject(image, `images[${index}]`);
@@ -247,6 +340,15 @@ export function resolveRuntimeInputs(descriptor, resolution, options = {}) {
   return seal(result);
 }
 
+export function attachInstrumentationCapabilities(descriptor, path, options = {}) {
+  validateDescriptor(descriptor);
+  if (descriptor.run.status !== 'running') throw new Error(`cannot attach instrumentation capabilities to a ${descriptor.run.status} run`);
+  if (descriptor.inputs.instrumentation !== undefined) throw new Error('instrumentation capabilities are already attached');
+  const result = deepCopy(descriptor);
+  result.inputs.instrumentation = instrumentationArtifact(path, options.readFile ?? readFileSync);
+  return seal(result);
+}
+
 function normalizeEvent(event, sequence, recordedAt) {
   requireObject(event, 'event');
   const type = requireEnum(event.type, EVENT_TYPES, 'event.type');
@@ -366,6 +468,15 @@ export function validateDescriptor(descriptor, options = {}) {
   } else if (descriptor.inputs.kubernetes.resolution.complete) {
     throw new Error('complete runtime resolution requires an admitted manifest');
   }
+  if (descriptor.inputs.instrumentation !== undefined) {
+    validateArtifact(descriptor.inputs.instrumentation, 'inputs.instrumentation');
+    if (!/^sha256:[0-9a-f]{64}$/.test(descriptor.inputs.instrumentation.manifestDigest ?? '')) throw new Error('inputs.instrumentation.manifestDigest is invalid');
+    requireString(descriptor.inputs.instrumentation.manifestId, 'inputs.instrumentation.manifestId');
+    requireArray(descriptor.inputs.instrumentation.profiles, 'inputs.instrumentation.profiles')
+      .forEach((profile, index) => requireString(profile, `inputs.instrumentation.profiles[${index}]`));
+    requireArray(descriptor.inputs.instrumentation.evidenceArtifacts ?? [], 'inputs.instrumentation.evidenceArtifacts')
+      .forEach((item, index) => validateArtifact(item, `inputs.instrumentation.evidenceArtifacts[${index}]`));
+  }
   normalizeNondeterminism(descriptor.nondeterminism);
   const timeline = requireArray(descriptor.timeline, 'timeline');
   let previousTimestamp = -Infinity;
@@ -433,6 +544,10 @@ export function validateDescriptor(descriptor, options = {}) {
       artifacts.push(descriptor.inputs.kubernetes.admittedManifest);
     }
     if (descriptor.source.diff) artifacts.push(descriptor.source.diff);
+    if (descriptor.inputs.instrumentation) {
+      artifacts.push(descriptor.inputs.instrumentation);
+      artifacts.push(...(descriptor.inputs.instrumentation.evidenceArtifacts ?? []));
+    }
     for (const item of artifacts) {
       if (sha256File(item.path, readFile) !== item.digest) throw new Error(`artifact digest mismatch: ${item.path}`);
     }
@@ -537,6 +652,15 @@ export function runCli(argv) {
     process.stdout.write(`${descriptor.integrity.digest}\n`);
     return;
   }
+  if (command === 'instrumentation') {
+    const [path] = args;
+    const manifestPath = option(args, 'manifest');
+    if (!path || !manifestPath) throw new Error('usage: run-descriptor.mjs instrumentation DESCRIPTOR --manifest=CAPABILITIES.json');
+    const descriptor = attachInstrumentationCapabilities(readDescriptor(path), manifestPath);
+    writeDescriptor(path, descriptor);
+    process.stdout.write(`${descriptor.integrity.digest}\n`);
+    return;
+  }
   if (command === 'validate') {
     const [path] = args;
     if (!path) throw new Error('usage: run-descriptor.mjs validate DESCRIPTOR [--verify-files]');
@@ -562,7 +686,7 @@ export function runCli(argv) {
     process.stdout.write(`${JSON.stringify(seededChoice(descriptor.randomness.seed, namespace, Number(indexText), choices))}\n`);
     return;
   }
-  throw new Error('commands: init, resolve, append, finalize, validate, minimize, choose');
+  throw new Error('commands: init, resolve, instrumentation, append, finalize, validate, minimize, choose');
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

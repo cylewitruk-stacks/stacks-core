@@ -308,6 +308,10 @@ function descriptorArtifacts(descriptor) {
   ];
   if (descriptor.inputs.kubernetes.admittedManifest) artifacts.push(descriptor.inputs.kubernetes.admittedManifest);
   if (descriptor.source.diff) artifacts.push(descriptor.source.diff);
+  if (descriptor.inputs.instrumentation) {
+    artifacts.push(descriptor.inputs.instrumentation);
+    artifacts.push(...(descriptor.inputs.instrumentation.evidenceArtifacts ?? []));
+  }
   return artifacts;
 }
 

@@ -1,0 +1,2717 @@
+diff --git a/docs/metrics/nakamoto-block-transfers.md b/docs/metrics/nakamoto-block-transfers.md
+new file mode 100644
+index 0000000000..0636681543
+--- /dev/null
++++ b/docs/metrics/nakamoto-block-transfers.md
+@@ -0,0 +1,87 @@
++# Nakamoto block transfer metrics
++
++The node exports one bounded counter family for Nakamoto block movement:
++
++```text
++stacks_node_nakamoto_block_transfers_total{direction,source,outcome}
++```
++
++This fills the post-Epoch-3 visibility gap left by
++`stacks_node_stx_blocks_received_total`, which only observes legacy block
++messages. It is an observation-only metric and does not alter validation,
++storage, relay, or HTTP behavior.
++
++## Label contract
++
++All labels are closed Rust enums. No block identifier, peer identifier, error
++text, URL, or other unbounded value is used as a label.
++
++| Label | Values | Meaning |
++| --- | --- | --- |
++| `direction` | `received`, `sent` | Whether the local node consumed or emitted the transfer. |
++| `source` | `p2p_push`, `tenure_download`, `rpc_upload`, `p2p_relay`, `rpc_serve` | The bounded transport boundary that supplied or emitted the block. |
++| `outcome` | `accepted`, `duplicate`, `rejected`, `error`, `queued`, `completed`, `failed` | The result appropriate to that boundary. |
++
++Only meaningful combinations are emitted:
++
++- received blocks use `p2p_push`, `tenure_download`, or `rpc_upload` with
++  `accepted`, `duplicate`, `rejected`, or `error`;
++- P2P relays use `p2p_relay` with `queued` or `failed`;
++- HTTP block streams use `rpc_serve` with `completed`.
++
++Locally mined and SIP-created shadow blocks are intentionally excluded because
++they are not network transfers.
++
++## Counting boundaries
++
++Received blocks are counted exactly once around
++`Relayer::process_new_nakamoto_block_ext`, after the existing acceptance result
++is known. The wrapper delegates all consensus and storage work to the original
++inner implementation and then classifies the unchanged result. In particular,
++`duplicate` means the node already had the block; it does not imply invalidity.
++
++P2P relay counts are measured in blocks, not messages. `queued` means the
++bounded block batch was successfully handed to the P2P network handle. It does
++not claim that any remote peer received or accepted the blocks. `failed` means
++that handoff failed.
++
++An HTTP-served block is counted when its stream reaches EOF. A per-stream flag
++prevents repeated empty chunk polls from incrementing the counter more than
++once. Resetting a tenure stream for its next block also resets that flag, so
++each completely served block contributes one observation.
++
++## PromQL examples
++
++Accepted ingress rate by transport:
++
++```promql
++sum by (source) (
++  rate(stacks_node_nakamoto_block_transfers_total{
++    direction="received", outcome="accepted"
++  }[5m])
++)
++```
++
++Duplicate ratio for received blocks:
++
++```promql
++sum(rate(stacks_node_nakamoto_block_transfers_total{
++  direction="received", outcome="duplicate"
++}[5m]))
++/
++clamp_min(sum(rate(stacks_node_nakamoto_block_transfers_total{
++  direction="received"
++}[5m])), 1)
++```
++
++P2P relay handoff failures:
++
++```promql
++sum(rate(stacks_node_nakamoto_block_transfers_total{
++  direction="sent", source="p2p_relay", outcome="failed"
++}[5m]))
++```
++
++These counters are process-local and reset when the node restarts. Use
++`rate()`/`increase()` for interval analysis and join them with orchestrator
++restart evidence when reconstructing an incident.
+diff --git a/docs/metrics/node-signer-coordinator.md b/docs/metrics/node-signer-coordinator.md
+new file mode 100644
+index 0000000000..30b9476113
+--- /dev/null
++++ b/docs/metrics/node-signer-coordinator.md
+@@ -0,0 +1,103 @@
++# Legacy signer-coordinator metrics
++
++These metrics expose the node miner's existing StackerDB-based signing round.
++They are available when the node is built with the `monitoring_prom` feature
++and a Prometheus endpoint is configured.
++
++The instrumentation is observation-only: it does not change signature or
++rejection accumulation, thresholds, timeout steps, retries, transaction
++exclusion, or any consensus decision. Labels are finite and exclude block
++hashes, signer identities, transaction IDs, error text, and other unbounded
++values. Counters reset when the node process restarts.
++
++Every valid finite label tuple is initialized when node metrics serving starts.
++A non-winning miner therefore exports zero-valued coordinator series instead
++of appearing indistinguishable from a binary without this instrumentation.
++Family absence remains an exporter or capability failure.
++
++## Metrics
++
++### `stacks_node_signer_coordinator_rounds_total`
++
++Counts proposal-round lifecycle events.
++
++- `event`: `started` or `completed`
++- `outcome`: `pending` for starts; completed outcomes are `approved`,
++  `rejected`, `timeout`, `burnchain_tip_changed`, `stacks_tip_changed`, or
++  `error`
++
++A timeout followed by a proposal resend is two rounds. This makes retry churn
++explicit without putting proposal hashes into labels.
++
++### `stacks_node_signer_response_weight_total`
++
++Adds the configured signer weight at the exact points where the legacy
++listener adds a unique response to its accumulator.
++
++- `approved`: weight added to `total_weight_approved`
++- `rejected_effective`: weight added to `total_weight_rejected`
++- `unavailable_classified`: an overlapping subset of `rejected_effective`
++  whose signed reason is `ConnectivityIssues`, `NoSortitionView`, or
++  `NoSignerConsensus`
++
++The overlapping classification is deliberate. Current legacy behavior still
++counts unavailable weight as rejection weight. This metric does not discount,
++renormalize, or otherwise change that arithmetic. `InvalidTenureExtend` is not
++classified as unavailable because the current reason represents both genuine
++policy verdicts and some RPC failures.
++
++### `stacks_node_signer_coordinator_milestone_seconds`
++
++Histogram of monotonic elapsed seconds from the start of proposal publication
++to two bounded milestones, each with `outcome="approved"` or
++`outcome="rejected"`:
++
++- `proposal_to_first_response` records the first cryptographically valid,
++  proposal-unique accepted or rejected response after a successful publication;
++- `proposal_to_threshold` records an approved or rejected weight threshold,
++  including approved blocks recovered from local chainstate.
++
++The first-response milestone is emitted at most once per proposal. It does not
++reset on resends because signer responses carry no publication-round identifier;
++doing so could misattribute a delayed response to a retry. Accumulated approval
++and rejection behavior remains unchanged. A response that races the StackerDB
++publication acknowledgement is retained and emitted only after the publication
++succeeds; a failed initial publication emits neither milestone. The metric timer
++starts immediately before publication so it includes proposal-upload latency.
++The existing rejection timer still starts after each publication and is
++unchanged.
++
++Both milestones include StackerDB proposal-upload latency, so
++`proposal_to_first_response` is publish-to-answer latency rather than pure
++signer processing latency. The two histograms are independently aggregated and
++can be compared only as separate diagnostic distributions. They cannot produce
++an exact per-proposal weight-accumulation interval, and their independently
++calculated percentiles must not be subtracted. That interval would require its
++own explicitly recorded observation if operators later need it.
++
++Timeout and chain-change exits do not claim that a threshold was reached; use
++the rounds counter for those outcomes. At the population level, a stable-fast
++first-response distribution alongside a slower threshold distribution suggests
++weighted-tail or quorum accumulation delay. Both distributions moving together
++instead points toward publication, propagation, or initial signer
++responsiveness.
++
++Examples:
++
++```promql
++histogram_quantile(
++  0.95,
++  sum by (le, milestone, outcome) (
++    rate(stacks_node_signer_coordinator_milestone_seconds_bucket[15m])
++  )
++)
++```
++
++```promql
++sum by (classification) (
++  rate(stacks_node_signer_response_weight_total[5m])
++)
++```
++
++Process restarts create counter discontinuities. Consumers comparing actors
++must use rates or reset-aware deltas rather than raw lifetime totals.
+diff --git a/docs/metrics/signer-lifecycle.md b/docs/metrics/signer-lifecycle.md
+new file mode 100644
+index 0000000000..12702e45d3
+--- /dev/null
++++ b/docs/metrics/signer-lifecycle.md
+@@ -0,0 +1,40 @@
++# Signer lifecycle metrics
++
++These metrics are exported by `stacks-signer` when it is built with the
++`monitoring_prom` feature and `metrics_endpoint` is configured. They describe
++process readiness and observed state; they do not alter signer policy,
++thresholds, retries, persistence, or protocol messages.
++
++All counters and gauges have process-lifetime reset semantics. A missing time
++series means the process is not being scraped; it must not be interpreted as a
++zero value.
++
++| Metric | Type | Meaning |
++| --- | --- | --- |
++| `stacks_signer_runloop_ready` | gauge | `1` after successful outer-runloop initialization, otherwise `0`. |
++| `stacks_signer_registered_for_current_reward_cycle` | gauge | Whether this process hosts a registered signer for the current cycle. |
++| `stacks_signer_registered_for_next_reward_cycle` | gauge | Whether this process hosts a registered signer for the next cycle. |
++| `stacks_signer_state_burn_block_height` | gauge | Burn height represented by the current signer's committed local state. A pending update continues to report its prior committed height. |
++| `stacks_signer_state_last_changed_timestamp_seconds` | gauge | Unix timestamp of the last actual local-state transition. Re-observing an unchanged state does not refresh it. |
++| `stacks_signer_companion_burn_block_height` | gauge | Latest canonical burn height learned successfully from the companion node. |
++| `stacks_signer_pending_block_validations` | gauge | Current pending-validation backlog. It is initialized once from signer DB and maintained at successful queue transitions; scrapes do not query SQLite. |
++| `stacks_signer_global_state_available` | gauge | Whether the current-cycle evaluator can derive a supported exact global state. |
++| `stacks_signer_global_state_total_weight` | gauge | Total configured signer weight. |
++| `stacks_signer_global_state_known_weight` | gauge | Weight for which a latest state update is known. |
++| `stacks_signer_global_state_maximum_view_weight` | gauge | Greatest weight supporting one exact state view. |
++| `stacks_signer_global_state_evaluator_threshold_weight` | gauge | Threshold used by the current evaluator implementation. |
++| `stacks_signer_global_state_canonical_threshold_weight` | gauge | Rounded-up weight required by canonical Nakamoto signature validation. |
++
++The evaluator and canonical thresholds are deliberately separate observations.
++They can differ for signer sets whose weighted threshold is not an integer.
++Exporting both does not change either threshold.
++
++Signer/companion drift is calculated by subtracting
++`stacks_signer_state_burn_block_height` or the companion height from an
++independently collected node burn height. Do not label these metrics with
++signer keys, block hashes, or peer identities; deployment systems can attach a
++bounded actor identity at scrape time.
++
++`stacks_signer_state_last_changed_timestamp_seconds` is sampled from the signer
++process wall clock. Clock-fault experiments must compare it with an independent
++collector clock before interpreting apparent staleness.
+diff --git a/docs/metrics/signer-proposal-outcomes.md b/docs/metrics/signer-proposal-outcomes.md
+new file mode 100644
+index 0000000000..95273c47d1
+--- /dev/null
++++ b/docs/metrics/signer-proposal-outcomes.md
+@@ -0,0 +1,87 @@
++# Signer proposal and validation outcome metrics
++
++These metrics are available when `stacks-signer` is built with the
++`monitoring_prom` feature and `metrics_endpoint` is configured.
++
++All labels are selected from finite enums. Proposal hashes, peer identities,
++addresses, error text, and other unbounded values are deliberately excluded.
++Counters reset when the signer process restarts.
++
++Every valid finite label tuple is initialized when the metrics endpoint
++starts. A zero-valued series therefore means that outcome has not been
++observed; family absence means the exporter or capability is unavailable. This
++is especially important for healthy signers that have never rejected a
++proposal.
++
++## Metrics
++
++### `stacks_signer_policy_evaluations_total`
++
++Counts proposal-policy evaluations after all policy checks and test overrides.
++
++- `classification`: `proceed`, `verdict_reject`, or `unavailable`
++- `action`: `continue` or `reject`
++
++Classification describes what the signer knew; action describes what the
++current implementation did. In particular, current protocol behavior records
++availability failures as `classification="unavailable",action="reject"`.
++This metric does not change or conceal that behavior.
++
++`ConnectivityIssues`, `NoSortitionView`, and `NoSignerConsensus` are classified
++as unavailable. `InvalidTenureExtend` remains a verdict rejection because the
++legacy reason represents both genuine policy verdicts and some RPC failures;
++separating those cases requires a behavior/API change outside this
++instrumentation-only change.
++
++### `stacks_signer_policy_rejections_total`
++
++Counts policy rejections by the finite `reason` derived from `RejectReason`.
++Free-form reason text is never used as a label. This is intentionally distinct
++from node validation rejections.
++
++### `stacks_signer_block_validation_lifecycle_total`
++
++Counts effective companion-node validation lifecycle transitions.
++
++- `event`: `submitted`, `retried`, `accepted`, `rejected`, or `expired`
++- `reason`: `none`, except rejected validations use a finite
++  `ValidateRejectCode` label
++
++Accepted and rejected events are recorded only after the response is matched
++to a tracked, undecided, statically valid proposal. Duplicate, late, and stray
++responses therefore remain visible in the older raw response counter but do
++not double-count this effective lifecycle metric.
++
++### `stacks_signer_block_response_deliveries_total`
++
++Counts final response delivery attempts.
++
++- `response_type`: `accepted` or `rejected`
++- `outcome`: `sent` or `failed`
++
++An RPC call returning an acknowledgement with `accepted=false` is a failed
++delivery. The existing `stacks_signer_block_responses_sent_total` metric is
++retained unchanged for compatibility.
++
++## Operational examples
++
++Availability failures that current code turns into rejections:
++
++```promql
++rate(stacks_signer_policy_evaluations_total{classification="unavailable",action="reject"}[5m])
++```
++
++Effective validation outcomes by reason:
++
++```promql
++sum by (event, reason) (rate(stacks_signer_block_validation_lifecycle_total[5m]))
++```
++
++Failed final response deliveries:
++
++```promql
++sum by (response_type) (rate(stacks_signer_block_response_deliveries_total{outcome="failed"}[5m]))
++```
++
++These counters are observational. They do not alter proposal policy,
++validation, retries, response delivery, threshold arithmetic, or consensus.
+diff --git a/libsigner/src/tests/signer_state.rs b/libsigner/src/tests/signer_state.rs
+index 975809d95d..9d41e88ca6 100644
+--- a/libsigner/src/tests/signer_state.rs
++++ b/libsigner/src/tests/signer_state.rs
+@@ -821,3 +821,26 @@ fn thresholds_partition_weight_space() {
+     assert!(evaluator.reached_agreement(700_000_000));
+     assert!(evaluator.reached_disagreement(700_000_000));
+ }
++
++#[test]
++fn agreement_snapshot_exposes_discrete_threshold_gap_and_state_support() {
++    let mut state_test = SignerStateTest::new(19);
++    for weight in state_test.global_eval.address_weights.values_mut() {
++        *weight = 1;
++    }
++    state_test.global_eval.total_weight = 19;
++
++    // Thirteen signers move to one new state; the remaining six retain the
++    // initial state installed by the test fixture.
++    let supporting: Vec<_> = (0..13).collect();
++    state_test.update_signers(&supporting, vec![state_test.tx_a.clone()]);
++
++    let snapshot = state_test.global_eval.agreement_snapshot();
++    assert_eq!(snapshot.total_weight, 19);
++    assert_eq!(snapshot.known_weight, 19);
++    assert_eq!(snapshot.maximum_state_view_weight, 13);
++    assert_eq!(snapshot.evaluator_threshold_weight, 13);
++    assert_eq!(snapshot.canonical_threshold_weight, 14);
++    assert!(snapshot.global_state_available);
++    assert!(snapshot.maximum_state_view_weight < snapshot.canonical_threshold_weight);
++}
+diff --git a/libsigner/src/v0/signer_state.rs b/libsigner/src/v0/signer_state.rs
+index 586af63c96..3c16d443ca 100644
+--- a/libsigner/src/v0/signer_state.rs
++++ b/libsigner/src/v0/signer_state.rs
+@@ -37,6 +37,27 @@ pub struct GlobalStateEvaluator {
+     pub total_weight: u32,
+ }
+ 
++/// A bounded, read-only account of the weight currently visible to the global
++/// signer-state evaluator. This is deliberately separate from a consensus
++/// decision: operators need to distinguish "no messages", "messages without
++/// one supported view", and "a global view is available" without parsing
++/// signer logs during an incident.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct GlobalStateAgreementSnapshot {
++    /// Total configured signer weight for the reward cycle.
++    pub total_weight: u32,
++    /// Weight from configured signers for which any latest update is known.
++    pub known_weight: u32,
++    /// Greatest weight supporting one exact burn/miner/protocol state view.
++    pub maximum_state_view_weight: u32,
++    /// Rounded-down threshold used by the current evaluator implementation.
++    pub evaluator_threshold_weight: u32,
++    /// Rounded-up threshold enforced for Nakamoto block signatures.
++    pub canonical_threshold_weight: u32,
++    /// Whether the current evaluator can derive a global state.
++    pub global_state_available: bool,
++}
++
+ impl GlobalStateEvaluator {
+     /// Create a new state evaluator
+     pub fn new(
+@@ -166,6 +187,58 @@ impl GlobalStateEvaluator {
+         true
+     }
+ 
++    /// Return current global-state support without mutating evaluator state.
++    ///
++    /// Both threshold values are exposed intentionally. They are presently
++    /// different when `total_weight * 7` is not divisible by ten; retaining
++    /// both makes that protocol inconsistency observable until it can be
++    /// changed with an explicit mixed-version rollout plan.
++    pub fn agreement_snapshot(&self) -> GlobalStateAgreementSnapshot {
++        let known_weight = self.address_updates.keys().fold(0u32, |weight, address| {
++            weight.saturating_add(self.address_weights.get(address).copied().unwrap_or(0))
++        });
++        let evaluator_numerator =
++            u64::from(self.total_weight).strict_mul(NAKAMOTO_SIGNER_BLOCK_APPROVAL_THRESHOLD);
++        let evaluator_threshold_weight = u32::try_from(evaluator_numerator / 10)
++            .expect("global signer-state threshold cannot exceed u32");
++        let canonical_threshold_weight = u32::try_from(evaluator_numerator.div_ceil(10))
++            .expect("canonical signer threshold cannot exceed u32");
++
++        let active_signer_protocol_version =
++            self.determine_latest_supported_signer_protocol_version();
++        let mut state_views = HashMap::new();
++        if let Some(active_signer_protocol_version) = active_signer_protocol_version {
++            for (address, update) in &self.address_updates {
++                let Some(weight) = self.address_weights.get(address) else {
++                    continue;
++                };
++                let (burn_block, burn_block_height) = update.content.burn_block_view();
++                let state_machine = SignerStateMachine {
++                    burn_block: burn_block.clone(),
++                    burn_block_height,
++                    current_miner: update.content.current_miner().clone().into(),
++                    active_signer_protocol_version,
++                    tx_replay_set: ReplayTransactionSet::none(),
++                };
++                let entry = state_views
++                    .entry(SignerStateMachineKey(state_machine))
++                    .or_insert(0u32);
++                *entry = entry.saturating_add(*weight);
++            }
++        }
++        let maximum_state_view_weight = state_views.values().copied().max().unwrap_or(0);
++
++        GlobalStateAgreementSnapshot {
++            total_weight: self.total_weight,
++            known_weight,
++            maximum_state_view_weight,
++            evaluator_threshold_weight,
++            canonical_threshold_weight,
++            global_state_available: active_signer_protocol_version.is_some()
++                && maximum_state_view_weight >= evaluator_threshold_weight,
++        }
++    }
++
+     /// Check if the supplied vote weight crosses the global agreement threshold.
+     /// Returns true if it has, false otherwise.
+     pub fn reached_agreement(&self, vote_weight: u32) -> bool {
+diff --git a/stacks-node/src/monitoring/mod.rs b/stacks-node/src/monitoring/mod.rs
+index 4c254681e8..830f23b5a5 100644
+--- a/stacks-node/src/monitoring/mod.rs
++++ b/stacks-node/src/monitoring/mod.rs
+@@ -13,6 +13,7 @@ pub enum MonitoringError {
+ 
+ #[cfg(feature = "monitoring_prom")]
+ pub fn start_serving_monitoring_metrics(bind_address: String) -> Result<(), MonitoringError> {
++    stacks::monitoring::initialize_signer_coordinator_metrics();
+     prometheus::start_serving_prometheus_metrics(bind_address)
+ }
+ 
+diff --git a/stacks-node/src/nakamoto_node/signer_coordinator.rs b/stacks-node/src/nakamoto_node/signer_coordinator.rs
+index 2a85437ee9..1112b105ae 100644
+--- a/stacks-node/src/nakamoto_node/signer_coordinator.rs
++++ b/stacks-node/src/nakamoto_node/signer_coordinator.rs
+@@ -32,6 +32,11 @@ use stacks::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState};
+ use stacks::chainstate::stacks::Error as ChainstateError;
+ use stacks::codec::StacksMessageCodec;
+ use stacks::libstackerdb::StackerDBChunkData;
++use stacks::monitoring::{
++    increment_signer_coordinator_round, observe_signer_coordinator_milestone,
++    SignerCoordinatorMilestone, SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent,
++    SignerCoordinatorRoundOutcome,
++};
+ use stacks::net::stackerdb::StackerDBs;
+ use stacks::types::chainstate::{StacksBlockId, StacksPrivateKey, StacksPublicKey};
+ use stacks::types::MinerDiagnosticData;
+@@ -304,7 +309,15 @@ impl SignerCoordinator {
+             debug!("Sending block proposal message to signers";
+                 "signer_signature_hash" => %block.header.signer_signature_hash(),
+             );
+-            Self::send_miners_message::<SignerMessageV0>(
++            // Keep the metric timer separate from the rejection timer below:
++            // publication latency belongs in proposal-to-response measurements,
++            // but must not alter timeout behavior.
++            let metric_round_started_at = Instant::now();
++            self.stackerdb_comms.begin_proposal_publication(
++                &block.header.signer_signature_hash(),
++                metric_round_started_at,
++            );
++            let publication_result = Self::send_miners_message::<SignerMessageV0>(
+                 &self.message_key,
+                 sortdb,
+                 election_sortition,
+@@ -315,8 +328,19 @@ impl SignerCoordinator {
+                 &mut self.miners_session,
+                 &election_sortition.consensus_hash,
+                 miner_db,
+-            )?;
++            );
++            if let Err(error) = publication_result {
++                self.stackerdb_comms
++                    .cancel_proposal_publication(&block.header.signer_signature_hash());
++                return Err(error);
++            }
++            self.stackerdb_comms
++                .confirm_proposal_publication(&block.header.signer_signature_hash());
+             counters.bump_naka_proposed_blocks();
++            increment_signer_coordinator_round(
++                SignerCoordinatorRoundEvent::Started,
++                SignerCoordinatorRoundOutcome::Pending,
++            );
+ 
+             #[cfg(test)]
+             {
+@@ -330,6 +354,10 @@ impl SignerCoordinator {
+                     crate::tests::nakamoto_integrations::TestSigningChannel::get_signature()
+                 {
+                     debug!("Short-circuiting waiting for signers, using test signature");
++                    increment_signer_coordinator_round(
++                        SignerCoordinatorRoundEvent::Completed,
++                        SignerCoordinatorRoundOutcome::Approved,
++                    );
+                     return Ok(signatures);
+                 }
+             }
+@@ -341,6 +369,26 @@ impl SignerCoordinator {
+                 chain_state,
+                 sortdb,
+                 counters,
++                metric_round_started_at,
++            );
++
++            let round_outcome = match &res {
++                Ok(_) => SignerCoordinatorRoundOutcome::Approved,
++                Err(NakamotoNodeError::SignersRejected { .. }) => {
++                    SignerCoordinatorRoundOutcome::Rejected
++                }
++                Err(NakamotoNodeError::SignatureTimeout) => SignerCoordinatorRoundOutcome::Timeout,
++                Err(NakamotoNodeError::BurnchainTipChanged) => {
++                    SignerCoordinatorRoundOutcome::BurnchainTipChanged
++                }
++                Err(NakamotoNodeError::StacksTipChanged) => {
++                    SignerCoordinatorRoundOutcome::StacksTipChanged
++                }
++                Err(_) => SignerCoordinatorRoundOutcome::Error,
++            };
++            increment_signer_coordinator_round(
++                SignerCoordinatorRoundEvent::Completed,
++                round_outcome,
+             );
+ 
+             match res {
+@@ -366,6 +414,7 @@ impl SignerCoordinator {
+         chain_state: &mut StacksChainState,
+         sortdb: &SortitionDB,
+         counters: &Counters,
++        metric_round_started_at: Instant,
+     ) -> Result<Vec<MessageSignature>, NakamotoNodeError> {
+         // the amount of current rejections (used to eventually modify the timeout)
+         let mut rejections: u32 = 0;
+@@ -428,6 +477,11 @@ impl SignerCoordinator {
+                     {
+                         debug!("SignCoordinator: Found signatures in relayed block");
+                         counters.bump_naka_signer_pushed_blocks();
++                        observe_signer_coordinator_milestone(
++                            SignerCoordinatorMilestone::ProposalToThreshold,
++                            SignerCoordinatorMilestoneOutcome::Approved,
++                            metric_round_started_at.elapsed(),
++                        );
+                         return Ok(stored_block.header.signer_signature);
+                     }
+ 
+@@ -467,6 +521,11 @@ impl SignerCoordinator {
+                             error!("Nakamoto miner produced a non-nakamoto block");
+                             return Err(NakamotoNodeError::UnexpectedChainState);
+                         };
++                        observe_signer_coordinator_milestone(
++                            SignerCoordinatorMilestone::ProposalToThreshold,
++                            SignerCoordinatorMilestoneOutcome::Approved,
++                            metric_round_started_at.elapsed(),
++                        );
+                         return Ok(stored_block.signer_signature);
+                     } else if &highest_stacks_block_id != parent_block_id {
+                         info!("SignCoordinator: Exiting due to new stacks tip";
+@@ -513,6 +572,11 @@ impl SignerCoordinator {
+                     "signer_signature_hash" => %block_signer_sighash,
+                 );
+                 counters.bump_naka_rejected_blocks();
++                observe_signer_coordinator_milestone(
++                    SignerCoordinatorMilestone::ProposalToThreshold,
++                    SignerCoordinatorMilestoneOutcome::Rejected,
++                    metric_round_started_at.elapsed(),
++                );
+ 
+                 // Only act on failed txids that a blocking minority (>30% weight) agrees on
+                 let blocking_minority = self.total_weight.saturating_sub(self.weight_threshold);
+@@ -538,6 +602,11 @@ impl SignerCoordinator {
+                 info!("Received enough signatures, block accepted";
+                     "signer_signature_hash" => %block_signer_sighash,
+                 );
++                observe_signer_coordinator_milestone(
++                    SignerCoordinatorMilestone::ProposalToThreshold,
++                    SignerCoordinatorMilestoneOutcome::Approved,
++                    metric_round_started_at.elapsed(),
++                );
+                 return Ok(block_status.gathered_signatures.values().cloned().collect());
+             } else if rejections_timer.elapsed() > *rejections_timeout {
+                 warn!("Timed out while waiting for responses from signers";
+diff --git a/stacks-node/src/nakamoto_node/stackerdb_listener.rs b/stacks-node/src/nakamoto_node/stackerdb_listener.rs
+index 5ca783e9ff..0923b2c5e1 100644
+--- a/stacks-node/src/nakamoto_node/stackerdb_listener.rs
++++ b/stacks-node/src/nakamoto_node/stackerdb_listener.rs
+@@ -19,11 +19,11 @@ use std::sync::mpsc::Receiver;
+ #[cfg(test)]
+ use std::sync::LazyLock;
+ use std::sync::{Arc, Condvar, Mutex};
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use libsigner::v0::messages::{
+-    BlockAccepted, BlockResponse, MessageSlotID, RejectCode, SignerMessage as SignerMessageV0,
+-    StateMachineUpdate,
++    BlockAccepted, BlockResponse, MessageSlotID, RejectCode, RejectReason,
++    SignerMessage as SignerMessageV0, StateMachineUpdate,
+ };
+ use libsigner::v0::signer_state::{GlobalStateEvaluator, SignerStateMachine};
+ use libsigner::{SignerEntries, SignerEvent, SignerSession, StackerDBSession};
+@@ -34,6 +34,10 @@ use stacks::chainstate::stacks::boot::{NakamotoSignerEntry, RewardSet, SIGNERS_N
+ use stacks::chainstate::stacks::events::StackerDBChunksEvent;
+ use stacks::chainstate::stacks::Error as ChainstateError;
+ use stacks::codec::StacksMessageCodec;
++use stacks::monitoring::{
++    add_signer_response_weight, observe_signer_coordinator_milestone, SignerCoordinatorMilestone,
++    SignerCoordinatorMilestoneOutcome, SignerResponseWeightClassification,
++};
+ use stacks::net::api::postblock_proposal::ValidateRejectCode;
+ use stacks::types::chainstate::{StacksAddress, StacksPublicKey};
+ use stacks::types::PublicKey;
+@@ -56,6 +60,18 @@ pub static TEST_IGNORE_SIGNERS: LazyLock<TestFlag<bool>> = LazyLock::new(TestFla
+ /// waking up to check timeouts?
+ pub static EVENT_RECEIVER_POLL: Duration = Duration::from_millis(500);
+ 
++/// Return whether a rejection says the signer could not produce a validity
++/// decision. This classification is observational only: the legacy
++/// coordinator still counts all rejection weight exactly as before.
++fn is_unavailable_rejection(reason: &RejectReason) -> bool {
++    matches!(
++        reason,
++        RejectReason::ConnectivityIssues(_)
++            | RejectReason::NoSortitionView
++            | RejectReason::NoSignerConsensus
++    )
++}
++
+ /// Tracks per-txid rejection data from signers
+ #[derive(Debug, Clone, Default)]
+ pub struct FailedTxInfo {
+@@ -66,6 +82,69 @@ pub struct FailedTxInfo {
+     pub problematic_weight: u32,
+ }
+ 
++/// Process-local state used only to time the first signer response to one
++/// proposal. It is deliberately separate from the response
++/// accumulator so resetting a metric milestone cannot alter consensus state.
++#[derive(Debug, Clone, Default)]
++struct SignerResponseMetricsState {
++    proposal_started_at: Option<Instant>,
++    publication_confirmed: bool,
++    first_response: Option<(SignerCoordinatorMilestoneOutcome, Instant)>,
++    first_response_observed: bool,
++}
++
++impl SignerResponseMetricsState {
++    fn begin_publication(&mut self, started_at: Instant) {
++        // Responses do not carry a publication-round identifier. Preserve the
++        // first successful publication as the only attribution boundary rather
++        // than misattributing a delayed response to a later resend.
++        if self.proposal_started_at.is_none() && !self.first_response_observed {
++            self.proposal_started_at = Some(started_at);
++            self.publication_confirmed = false;
++            self.first_response = None;
++        }
++    }
++
++    fn confirm_publication(&mut self) -> Option<(SignerCoordinatorMilestoneOutcome, Duration)> {
++        self.proposal_started_at?;
++        self.publication_confirmed = true;
++        self.take_first_response()
++    }
++
++    fn cancel_publication(&mut self) {
++        // A failed retry cannot invalidate an earlier successful publication.
++        if !self.publication_confirmed {
++            self.proposal_started_at = None;
++            self.first_response = None;
++        }
++    }
++
++    fn record_first_response(
++        &mut self,
++        outcome: SignerCoordinatorMilestoneOutcome,
++        observed_at: Instant,
++    ) -> Option<(SignerCoordinatorMilestoneOutcome, Duration)> {
++        if self.proposal_started_at.is_none()
++            || self.first_response.is_some()
++            || self.first_response_observed
++        {
++            return None;
++        }
++        self.first_response = Some((outcome, observed_at));
++        self.take_first_response()
++    }
++
++    fn take_first_response(&mut self) -> Option<(SignerCoordinatorMilestoneOutcome, Duration)> {
++        if !self.publication_confirmed || self.first_response_observed {
++            return None;
++        }
++        let started_at = self.proposal_started_at?;
++        let (outcome, observed_at) = self.first_response.take()?;
++        self.first_response_observed = true;
++        Some((outcome, observed_at.saturating_duration_since(started_at)))
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct BlockStatus {
+     /// Set of the slot ids of signers who have responded
+@@ -78,6 +157,31 @@ pub struct BlockStatus {
+     pub total_weight_rejected: u32,
+     /// Per-txid rejection tracking from signers
+     pub failed_txids: HashMap<Txid, FailedTxInfo>,
++    /// Round-scoped, observation-only response timing state.
++    response_metrics: SignerResponseMetricsState,
++}
++
++fn observe_first_signer_response(
++    block: &mut BlockStatus,
++    outcome: SignerCoordinatorMilestoneOutcome,
++) {
++    let observation = block
++        .response_metrics
++        .record_first_response(outcome, Instant::now());
++    observe_first_signer_response_if_ready(observation);
++}
++
++fn observe_first_signer_response_if_ready(
++    observation: Option<(SignerCoordinatorMilestoneOutcome, Duration)>,
++) {
++    let Some((outcome, elapsed)) = observation else {
++        return;
++    };
++    observe_signer_coordinator_milestone(
++        SignerCoordinatorMilestone::ProposalToFirstResponse,
++        outcome,
++        elapsed,
++    );
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -415,6 +519,10 @@ impl StackerDBListener {
+                             block.total_weight_approved = block
+                                 .total_weight_approved
+                                 .saturating_add(signer_entry.weight);
++                            add_signer_response_weight(
++                                SignerResponseWeightClassification::Approved,
++                                signer_entry.weight,
++                            );
+ 
+                             info!("StackerDBListener: Signature Added to block";
+                                 "signer_signature_hash" => %block_sighash,
+@@ -433,7 +541,12 @@ impl StackerDBListener {
+                             );
+                         }
+                         block.gathered_signatures.insert(slot_id, signature);
+-                        block.responded_signers.insert(slot_id);
++                        if block.responded_signers.insert(slot_id) {
++                            observe_first_signer_response(
++                                block,
++                                SignerCoordinatorMilestoneOutcome::Approved,
++                            );
++                        }
+ 
+                         if block.total_weight_approved >= self.weight_threshold {
+                             // Signal to anyone waiting on this block that we have enough signatures
+@@ -484,9 +597,24 @@ impl StackerDBListener {
+                         };
+ 
+                         if block.responded_signers.insert(slot_id) {
++                            observe_first_signer_response(
++                                block,
++                                SignerCoordinatorMilestoneOutcome::Rejected,
++                            );
+                             block.total_weight_rejected = block
+                                 .total_weight_rejected
+                                 .saturating_add(signer_entry.weight);
++                            add_signer_response_weight(
++                                SignerResponseWeightClassification::RejectedEffective,
++                                signer_entry.weight,
++                            );
++                            if is_unavailable_rejection(&rejected_data.response_data.reject_reason)
++                            {
++                                add_signer_response_weight(
++                                    SignerResponseWeightClassification::UnavailableClassified,
++                                    signer_entry.weight,
++                                );
++                            }
+ 
+                             // Track transactions that failed validation, accumulating
+                             // per-txid signer weight and whether any signer flagged
+@@ -670,10 +798,47 @@ impl StackerDBListenerComms {
+             total_weight_approved: 0,
+             total_weight_rejected: 0,
+             failed_txids: HashMap::new(),
++            response_metrics: SignerResponseMetricsState::default(),
+         };
+         blocks.insert(block.signer_signature_hash(), block_status);
+     }
+ 
++    /// Begin proposal publication. Only the first successful publication is
++    /// retained because signer responses do not identify a resend round.
++    pub fn begin_proposal_publication(
++        &self,
++        signer_sighash: &Sha512Trunc256Sum,
++        started_at: Instant,
++    ) {
++        let (lock, _cvar) = &*self.blocks;
++        let mut blocks = lock.lock().expect("FATAL: failed to lock block status");
++        if let Some(block) = blocks.get_mut(signer_sighash) {
++            block.response_metrics.begin_publication(started_at);
++        }
++    }
++
++    /// Confirm that the proposal publication completed. A very fast response
++    /// may already be waiting; emit it now rather than racing the HTTP upload.
++    pub fn confirm_proposal_publication(&self, signer_sighash: &Sha512Trunc256Sum) {
++        let (lock, _cvar) = &*self.blocks;
++        let mut blocks = lock.lock().expect("FATAL: failed to lock block status");
++        let observation = blocks
++            .get_mut(signer_sighash)
++            .and_then(|block| block.response_metrics.confirm_publication());
++        drop(blocks);
++        observe_first_signer_response_if_ready(observation);
++    }
++
++    /// Discard observation state when proposal publication fails. Consensus
++    /// response state remains untouched.
++    pub fn cancel_proposal_publication(&self, signer_sighash: &Sha512Trunc256Sum) {
++        let (lock, _cvar) = &*self.blocks;
++        let mut blocks = lock.lock().expect("FATAL: failed to lock block status");
++        if let Some(block) = blocks.get_mut(signer_sighash) {
++            block.response_metrics.cancel_publication();
++        }
++    }
++
+     /// Reset rejections for a block proposal.
+     /// This is used when a block proposal times out and we need to retry it by
+     /// clearing the block's rejections. Block approvals cannot be cleared
+@@ -796,3 +961,95 @@ impl StackerDBListenerComms {
+         eval.determine_global_state()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::time::{Duration, Instant};
++
++    use libsigner::v0::messages::RejectReason;
++    use stacks::monitoring::SignerCoordinatorMilestoneOutcome;
++
++    use super::{is_unavailable_rejection, SignerResponseMetricsState};
++
++    #[test]
++    fn unavailable_rejection_classification_is_narrow() {
++        assert!(is_unavailable_rejection(&RejectReason::ConnectivityIssues(
++            "free-form text is not exported".into()
++        )));
++        assert!(is_unavailable_rejection(&RejectReason::NoSortitionView));
++        assert!(is_unavailable_rejection(&RejectReason::NoSignerConsensus));
++        assert!(!is_unavailable_rejection(
++            &RejectReason::InvalidTenureExtend
++        ));
++        assert!(!is_unavailable_rejection(
++            &RejectReason::SortitionViewMismatch
++        ));
++    }
++
++    #[test]
++    fn first_response_timing_is_exactly_once_per_proposal() {
++        let mut state = SignerResponseMetricsState::default();
++        let first_round = Instant::now();
++
++        assert_eq!(state.confirm_publication(), None);
++        state.begin_publication(first_round);
++        // A response may race the publication acknowledgement. Retain it but
++        // do not emit a successful-publication metric prematurely.
++        assert_eq!(
++            state.record_first_response(
++                SignerCoordinatorMilestoneOutcome::Approved,
++                first_round + Duration::from_millis(25)
++            ),
++            None
++        );
++        assert_eq!(
++            state.confirm_publication(),
++            Some((
++                SignerCoordinatorMilestoneOutcome::Approved,
++                Duration::from_millis(25)
++            ))
++        );
++        assert_eq!(
++            state.record_first_response(
++                SignerCoordinatorMilestoneOutcome::Rejected,
++                first_round + Duration::from_millis(50)
++            ),
++            None
++        );
++
++        // A resend cannot establish a new timing boundary because responses do
++        // not identify which publication round caused them.
++        let retry_round = first_round + Duration::from_secs(1);
++        state.begin_publication(retry_round);
++        assert_eq!(
++            state.record_first_response(
++                SignerCoordinatorMilestoneOutcome::Rejected,
++                retry_round + Duration::from_millis(10)
++            ),
++            None
++        );
++
++        let mut failed_publication = SignerResponseMetricsState::default();
++        failed_publication.begin_publication(retry_round);
++        failed_publication.cancel_publication();
++        assert_eq!(failed_publication.confirm_publication(), None);
++
++        // A failed retry does not erase the timing state of a proposal that was
++        // already published successfully.
++        let mut successful_publication = SignerResponseMetricsState::default();
++        successful_publication.begin_publication(first_round);
++        assert_eq!(successful_publication.confirm_publication(), None);
++        successful_publication.begin_publication(retry_round);
++        successful_publication.cancel_publication();
++        assert_eq!(
++            successful_publication.record_first_response(
++                SignerCoordinatorMilestoneOutcome::Approved,
++                retry_round + Duration::from_millis(10)
++            ),
++            Some((
++                SignerCoordinatorMilestoneOutcome::Approved,
++                Duration::from_millis(1010)
++            ))
++        );
++    }
++}
+diff --git a/stacks-signer/README.md b/stacks-signer/README.md
+index cd8b49c8a6..b207e6c477 100644
+--- a/stacks-signer/README.md
++++ b/stacks-signer/README.md
+@@ -34,7 +34,10 @@ To use stacks-signer, you need to build and install the Rust program. You can do
+    ```
+ 
+ You must specify the "metrics_endpoint" option in the config file to serve these metrics.
+-See [metrics documentation](TODO) for a complete breakdown of the available metrics.
++See the [signer lifecycle metrics documentation](../docs/metrics/signer-lifecycle.md)
++for readiness, registration, state freshness, and pending-validation semantics.
++See the [signer metrics documentation](../docs/metrics/signer-proposal-outcomes.md)
++for the proposal and validation outcome metrics.
+ 
+ ## Usage
+ 
+diff --git a/stacks-signer/src/monitoring/mod.rs b/stacks-signer/src/monitoring/mod.rs
+index d6da832c44..36b62c5374 100644
+--- a/stacks-signer/src/monitoring/mod.rs
++++ b/stacks-signer/src/monitoring/mod.rs
+@@ -14,6 +14,9 @@
+ // You should have received a copy of the GNU General Public License
+ // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 
++use blockstack_lib::net::api::postblock_proposal::ValidateRejectCode;
++#[cfg(feature = "monitoring_prom")]
++use libsigner::v0::messages::{RejectReason, RejectReasonPrefix};
+ use stacks_common::define_named_enum;
+ 
+ #[cfg(feature = "monitoring_prom")]
+@@ -50,17 +53,233 @@ SignerAgreementStateConflict {
+     MinerView("miner_view"),
+ });
+ 
++/// The finite epistemic classification of a proposal-policy evaluation.
++#[cfg(feature = "monitoring_prom")]
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum PolicyClassification {
++    /// Policy passed and companion validation may proceed.
++    Proceed,
++    /// Policy produced a validity verdict.
++    VerdictReject,
++    /// Policy could not produce a validity verdict.
++    Unavailable,
++}
++
++#[cfg(feature = "monitoring_prom")]
++impl PolicyClassification {
++    const fn as_str(self) -> &'static str {
++        match self {
++            Self::Proceed => "proceed",
++            Self::VerdictReject => "verdict_reject",
++            Self::Unavailable => "unavailable",
++        }
++    }
++}
++
++/// The effective action taken by current signer policy.
++#[cfg(feature = "monitoring_prom")]
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum PolicyAction {
++    /// Continue toward companion validation.
++    Continue,
++    /// Emit a rejection.
++    Reject,
++}
++
++#[cfg(feature = "monitoring_prom")]
++impl PolicyAction {
++    const fn as_str(self) -> &'static str {
++        match self {
++            Self::Continue => "continue",
++            Self::Reject => "reject",
++        }
++    }
++}
++
++/// A finite block-validation lifecycle transition.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ValidationLifecycleEvent {
++    /// Submission to the companion succeeded.
++    Submitted,
++    /// A queued validation is being attempted again.
++    Retried,
++    /// The companion accepted the proposal.
++    Accepted,
++    /// The companion rejected the proposal with a bounded code.
++    Rejected(ValidateRejectCode),
++    /// The submitted validation exceeded its response deadline.
++    Expired,
++}
++
++impl ValidationLifecycleEvent {
++    #[cfg(feature = "monitoring_prom")]
++    fn labels(self) -> (&'static str, &'static str) {
++        match self {
++            Self::Submitted => ("submitted", "none"),
++            Self::Retried => ("retried", "none"),
++            Self::Accepted => ("accepted", "none"),
++            Self::Rejected(code) => ("rejected", validate_reject_code_label(code)),
++            Self::Expired => ("expired", "none"),
++        }
++    }
++}
++
++#[cfg(feature = "monitoring_prom")]
++fn policy_classification(reason: Option<&RejectReason>) -> (PolicyClassification, PolicyAction) {
++    match reason {
++        None => (PolicyClassification::Proceed, PolicyAction::Continue),
++        Some(
++            RejectReason::ConnectivityIssues(_)
++            | RejectReason::NoSortitionView
++            | RejectReason::NoSignerConsensus,
++        ) => (PolicyClassification::Unavailable, PolicyAction::Reject),
++        Some(_) => (PolicyClassification::VerdictReject, PolicyAction::Reject),
++    }
++}
++
++#[cfg(feature = "monitoring_prom")]
++fn reject_reason_prefix_label(prefix: RejectReasonPrefix) -> &'static str {
++    match prefix {
++        RejectReasonPrefix::ValidationFailed => "validation_failed",
++        RejectReasonPrefix::ConnectivityIssues => "connectivity_issues",
++        RejectReasonPrefix::RejectedInPriorRound => "rejected_in_prior_round",
++        RejectReasonPrefix::NoSortitionView => "no_sortition_view",
++        RejectReasonPrefix::SortitionViewMismatch => "sortition_view_mismatch",
++        RejectReasonPrefix::TestingDirective => "testing_directive",
++        RejectReasonPrefix::ReorgNotAllowed => "reorg_not_allowed",
++        RejectReasonPrefix::InvalidBitvec => "invalid_bitvec",
++        RejectReasonPrefix::PubkeyHashMismatch => "pubkey_hash_mismatch",
++        RejectReasonPrefix::InvalidMiner => "invalid_miner",
++        RejectReasonPrefix::NotLatestSortitionWinner => "not_latest_sortition_winner",
++        RejectReasonPrefix::InvalidParentBlock => "invalid_parent_block",
++        RejectReasonPrefix::DuplicateBlockFound => "duplicate_block_found",
++        RejectReasonPrefix::InvalidTenureExtend => "invalid_tenure_extend",
++        RejectReasonPrefix::IrrecoverablePubkeyHash => "irrecoverable_pubkey_hash",
++        RejectReasonPrefix::NoSignerConsensus => "no_signer_consensus",
++        RejectReasonPrefix::ConsensusHashMismatch => "consensus_hash_mismatch",
++        RejectReasonPrefix::ProblematicTransactions => "problematic_transactions",
++        RejectReasonPrefix::Unknown => "unknown",
++        RejectReasonPrefix::NotRejected => "not_rejected",
++    }
++}
++
++#[cfg(feature = "monitoring_prom")]
++fn reject_reason_label(reason: &RejectReason) -> &'static str {
++    reject_reason_prefix_label(RejectReasonPrefix::from(reason))
++}
++
++#[cfg(feature = "monitoring_prom")]
++const POLICY_REJECTION_PREFIXES: [RejectReasonPrefix; 20] = [
++    RejectReasonPrefix::ValidationFailed,
++    RejectReasonPrefix::ConnectivityIssues,
++    RejectReasonPrefix::RejectedInPriorRound,
++    RejectReasonPrefix::NoSortitionView,
++    RejectReasonPrefix::SortitionViewMismatch,
++    RejectReasonPrefix::TestingDirective,
++    RejectReasonPrefix::ReorgNotAllowed,
++    RejectReasonPrefix::InvalidBitvec,
++    RejectReasonPrefix::PubkeyHashMismatch,
++    RejectReasonPrefix::InvalidMiner,
++    RejectReasonPrefix::NotLatestSortitionWinner,
++    RejectReasonPrefix::InvalidParentBlock,
++    RejectReasonPrefix::DuplicateBlockFound,
++    RejectReasonPrefix::InvalidTenureExtend,
++    RejectReasonPrefix::IrrecoverablePubkeyHash,
++    RejectReasonPrefix::NoSignerConsensus,
++    RejectReasonPrefix::ConsensusHashMismatch,
++    RejectReasonPrefix::ProblematicTransactions,
++    RejectReasonPrefix::Unknown,
++    RejectReasonPrefix::NotRejected,
++];
++
++#[cfg(feature = "monitoring_prom")]
++const VALIDATION_REJECT_CODES: [ValidateRejectCode; 13] = [
++    ValidateRejectCode::BadBlockHash,
++    ValidateRejectCode::BadTransaction,
++    ValidateRejectCode::InvalidBlock,
++    ValidateRejectCode::ChainstateError,
++    ValidateRejectCode::UnknownParent,
++    ValidateRejectCode::NonCanonicalTenure,
++    ValidateRejectCode::NoSuchTenure,
++    ValidateRejectCode::InvalidTransactionReplay,
++    ValidateRejectCode::InvalidParentBlock,
++    ValidateRejectCode::InvalidTimestamp,
++    ValidateRejectCode::NetworkChainMismatch,
++    ValidateRejectCode::NotFoundError,
++    ValidateRejectCode::ProblematicTransaction,
++];
++
++#[cfg(feature = "monitoring_prom")]
++const fn validate_reject_code_label(code: ValidateRejectCode) -> &'static str {
++    match code {
++        ValidateRejectCode::BadBlockHash => "bad_block_hash",
++        ValidateRejectCode::BadTransaction => "bad_transaction",
++        ValidateRejectCode::InvalidBlock => "invalid_block",
++        ValidateRejectCode::ChainstateError => "chainstate_error",
++        ValidateRejectCode::UnknownParent => "unknown_parent",
++        ValidateRejectCode::NonCanonicalTenure => "non_canonical_tenure",
++        ValidateRejectCode::NoSuchTenure => "no_such_tenure",
++        ValidateRejectCode::InvalidTransactionReplay => "invalid_transaction_replay",
++        ValidateRejectCode::InvalidParentBlock => "invalid_parent_block",
++        ValidateRejectCode::InvalidTimestamp => "invalid_timestamp",
++        ValidateRejectCode::NetworkChainMismatch => "network_chain_mismatch",
++        ValidateRejectCode::NotFoundError => "not_found_error",
++        ValidateRejectCode::ProblematicTransaction => "problematic_transaction",
++    }
++}
++
++#[cfg(feature = "monitoring_prom")]
++fn initialize_proposal_outcome_metrics() {
++    use self::prometheus::{
++        BLOCK_RESPONSE_DELIVERIES, BLOCK_VALIDATION_LIFECYCLE, POLICY_EVALUATIONS,
++        POLICY_REJECTIONS,
++    };
++
++    for (classification, action) in [
++        (PolicyClassification::Proceed, PolicyAction::Continue),
++        (PolicyClassification::VerdictReject, PolicyAction::Reject),
++        (PolicyClassification::Unavailable, PolicyAction::Reject),
++    ] {
++        POLICY_EVALUATIONS.with_label_values(&[classification.as_str(), action.as_str()]);
++    }
++    for prefix in POLICY_REJECTION_PREFIXES {
++        POLICY_REJECTIONS.with_label_values(&[reject_reason_prefix_label(prefix)]);
++    }
++    for (event, reason) in [
++        ("submitted", "none"),
++        ("retried", "none"),
++        ("accepted", "none"),
++        ("expired", "none"),
++    ] {
++        BLOCK_VALIDATION_LIFECYCLE.with_label_values(&[event, reason]);
++    }
++    for code in VALIDATION_REJECT_CODES {
++        BLOCK_VALIDATION_LIFECYCLE
++            .with_label_values(&["rejected", validate_reject_code_label(code)]);
++    }
++    for response_type in ["accepted", "rejected"] {
++        for outcome in ["sent", "failed"] {
++            BLOCK_RESPONSE_DELIVERIES.with_label_values(&[response_type, outcome]);
++        }
++    }
++}
++
+ /// Actions for updating metrics
+ #[cfg(feature = "monitoring_prom")]
+ pub mod actions {
+     use ::prometheus::HistogramTimer;
+     use blockstack_lib::chainstate::nakamoto::NakamotoBlock;
++    use libsigner::v0::messages::RejectReason;
+     use stacks_common::error;
+ 
+     use crate::config::GlobalConfig;
+     use crate::monitoring::prometheus::*;
+-    use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
++    use crate::monitoring::{
++        policy_classification, reject_reason_label, SignerAgreementStateChangeReason,
++        SignerAgreementStateConflict, ValidationLifecycleEvent,
++    };
+     use crate::v0::signer_state::LocalStateMachine;
++    use libsigner::v0::signer_state::GlobalStateAgreementSnapshot;
+ 
+     /// Update stacks tip height gauge
+     pub fn update_stacks_tip_height(height: i64) {
+@@ -72,6 +291,44 @@ pub mod actions {
+         CURRENT_REWARD_CYCLE.set(reward_cycle);
+     }
+ 
++    /// Record whether the outer signer runloop has initialized successfully.
++    pub fn update_runloop_ready(ready: bool) {
++        SIGNER_RUNLOOP_READY.set(i64::from(ready));
++    }
++
++    /// Record whether this process can participate in the current and next
++    /// reward cycles. Runloop initialization alone does not imply either.
++    pub fn update_reward_cycle_registration(current: bool, next: bool) {
++        SIGNER_REGISTERED_CURRENT_REWARD_CYCLE.set(i64::from(current));
++        SIGNER_REGISTERED_NEXT_REWARD_CYCLE.set(i64::from(next));
++    }
++
++    /// Record the current signer's local agreement state and pending backlog.
++    pub fn update_signer_state(
++        burn_block_height: Option<u64>,
++        last_changed_timestamp_seconds: Option<u64>,
++        pending_block_validations: u64,
++    ) {
++        SIGNER_STATE_BURN_BLOCK_HEIGHT.set(
++            burn_block_height
++                .and_then(|height| i64::try_from(height).ok())
++                .unwrap_or_default(),
++        );
++        SIGNER_STATE_LAST_CHANGED_TIMESTAMP_SECONDS.set(
++            last_changed_timestamp_seconds
++                .and_then(|timestamp| i64::try_from(timestamp).ok())
++                .unwrap_or_default(),
++        );
++        SIGNER_PENDING_BLOCK_VALIDATIONS
++            .set(i64::try_from(pending_block_validations).unwrap_or(i64::MAX));
++    }
++
++    /// Record a canonical burn height learned successfully from the companion.
++    pub fn update_companion_burn_block_height(burn_block_height: u64) {
++        SIGNER_COMPANION_BURN_BLOCK_HEIGHT
++            .set(i64::try_from(burn_block_height).unwrap_or(i64::MAX));
++    }
++
+     /// Increment the block validation responses counter
+     pub fn increment_block_validation_responses(accepted: bool) {
+         let label_value = if accepted { "accepted" } else { "rejected" };
+@@ -91,6 +348,37 @@ pub mod actions {
+         BLOCK_PROPOSALS_RECEIVED.inc();
+     }
+ 
++    /// Record the proposal policy's epistemic classification separately from
++    /// the action taken by the current protocol implementation.
++    pub fn record_policy_evaluation(reason: Option<&RejectReason>) {
++        let (classification, action) = policy_classification(reason);
++        POLICY_EVALUATIONS
++            .with_label_values(&[classification.as_str(), action.as_str()])
++            .inc();
++        if let Some(reason) = reason {
++            POLICY_REJECTIONS
++                .with_label_values(&[reject_reason_label(reason)])
++                .inc();
++        }
++    }
++
++    /// Record a block-validation lifecycle transition.
++    pub fn record_validation_lifecycle(event: ValidationLifecycleEvent) {
++        let (event, reason) = event.labels();
++        BLOCK_VALIDATION_LIFECYCLE
++            .with_label_values(&[event, reason])
++            .inc();
++    }
++
++    /// Record whether a final signer response was delivered to StackerDB.
++    pub fn record_block_response_delivery(accepted: bool, delivered: bool) {
++        let response_type = if accepted { "accepted" } else { "rejected" };
++        let outcome = if delivered { "sent" } else { "failed" };
++        BLOCK_RESPONSE_DELIVERIES
++            .with_label_values(&[response_type, outcome])
++            .inc();
++    }
++
+     /// Increment the block pre-commit sent counter
+     pub fn increment_block_pre_commits_sent() {
+         BLOCK_PRE_COMMITS_SENT.inc();
+@@ -162,6 +450,20 @@ pub mod actions {
+             .inc();
+     }
+ 
++    /// Record the current reward-cycle global-state support. Values are kept
++    /// as separate bounded gauges so a lifecycle gate can fail closed without
++    /// inferring agreement from proposal/rejection counters.
++    pub fn update_global_state_agreement(snapshot: GlobalStateAgreementSnapshot) {
++        SIGNER_GLOBAL_STATE_AVAILABLE.set(i64::from(snapshot.global_state_available));
++        SIGNER_GLOBAL_STATE_TOTAL_WEIGHT.set(i64::from(snapshot.total_weight));
++        SIGNER_GLOBAL_STATE_KNOWN_WEIGHT.set(i64::from(snapshot.known_weight));
++        SIGNER_GLOBAL_STATE_MAXIMUM_VIEW_WEIGHT.set(i64::from(snapshot.maximum_state_view_weight));
++        SIGNER_GLOBAL_STATE_EVALUATOR_THRESHOLD_WEIGHT
++            .set(i64::from(snapshot.evaluator_threshold_weight));
++        SIGNER_GLOBAL_STATE_CANONICAL_THRESHOLD_WEIGHT
++            .set(i64::from(snapshot.canonical_threshold_weight));
++    }
++
+     /// Record the time (seconds) taken for a signer to agree with the signer set
+     pub fn record_signer_agreement_capitulation_latency(latency_s: u64) {
+         SIGNER_AGREEMENT_CAPITULATION_LATENCIES_HISTOGRAM
+@@ -175,6 +477,11 @@ pub mod actions {
+         if config.metrics_endpoint.is_none() {
+             return Ok(());
+         }
++        // Vector collectors do not appear in Prometheus exposition until a
++        // labelled child exists. Instantiate every valid finite tuple so zero
++        // means "not observed" and family absence means an exporter/capability
++        // failure, including for healthy rejection-free signers.
++        super::initialize_proposal_outcome_metrics();
+         let _ = std::thread::Builder::new()
+             .name("signer_metrics".to_string())
+             .spawn(move || {
+@@ -192,9 +499,12 @@ pub mod actions {
+     use blockstack_lib::chainstate::nakamoto::NakamotoBlock;
+     use stacks_common::info;
+ 
+-    use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
++    use crate::monitoring::{
++        SignerAgreementStateChangeReason, SignerAgreementStateConflict, ValidationLifecycleEvent,
++    };
+     use crate::v0::signer_state::LocalStateMachine;
+     use crate::GlobalConfig;
++    use libsigner::v0::messages::RejectReason;
+ 
+     /// Update stacks tip height gauge
+     pub fn update_stacks_tip_height(_height: i64) {}
+@@ -202,6 +512,23 @@ pub mod actions {
+     /// Update the current reward cycle
+     pub fn update_reward_cycle(_reward_cycle: i64) {}
+ 
++    /// No-op runloop readiness metric when Prometheus is disabled.
++    pub fn update_runloop_ready(_ready: bool) {}
++
++    /// No-op reward-cycle registration metrics when Prometheus is disabled.
++    pub fn update_reward_cycle_registration(_current: bool, _next: bool) {}
++
++    /// No-op local signer state metrics when Prometheus is disabled.
++    pub fn update_signer_state(
++        _burn_block_height: Option<u64>,
++        _last_changed_timestamp_seconds: Option<u64>,
++        _pending_block_validations: u64,
++    ) {
++    }
++
++    /// No-op companion burn height metric when Prometheus is disabled.
++    pub fn update_companion_burn_block_height(_burn_block_height: u64) {}
++
+     /// Increment the block validation responses counter
+     pub fn increment_block_validation_responses(_accepted: bool) {}
+ 
+@@ -211,6 +538,15 @@ pub mod actions {
+     /// Increment the number of block proposals received
+     pub fn increment_block_proposals_received() {}
+ 
++    /// No-op proposal-policy evaluation recorder.
++    pub fn record_policy_evaluation(_reason: Option<&RejectReason>) {}
++
++    /// No-op block-validation lifecycle recorder.
++    pub fn record_validation_lifecycle(_event: ValidationLifecycleEvent) {}
++
++    /// No-op final response-delivery recorder.
++    pub fn record_block_response_delivery(_accepted: bool, _delivered: bool) {}
++
+     /// Increment the block pre-commits sent counter
+     pub fn increment_block_pre_commits_sent() {}
+ 
+@@ -253,6 +589,12 @@ pub mod actions {
+     /// Increment signer agreement state conflict counter
+     pub fn increment_signer_agreement_state_conflict(_conflict: SignerAgreementStateConflict) {}
+ 
++    /// No-op global state support metrics when Prometheus is disabled.
++    pub fn update_global_state_agreement(
++        _snapshot: libsigner::v0::signer_state::GlobalStateAgreementSnapshot,
++    ) {
++    }
++
+     /// Record the time (seconds) taken for a signer to agree with the signer set
+     pub fn record_signer_agreement_capitulation_latency(_latency_s: u64) {}
+ 
+@@ -286,3 +628,165 @@ fn test_remove_origin_from_path() {
+     let path = remove_origin_from_path(full_path, origin);
+     assert_eq!(path, "/v2/info");
+ }
++
++#[cfg(all(test, feature = "monitoring_prom"))]
++#[test]
++fn lifecycle_metrics_export_bounded_gauges() {
++    actions::update_runloop_ready(true);
++    actions::update_reward_cycle_registration(true, false);
++    actions::update_signer_state(Some(123), Some(456), 7);
++    actions::update_companion_burn_block_height(125);
++
++    assert_eq!(prometheus::SIGNER_RUNLOOP_READY.get(), 1);
++    assert_eq!(prometheus::SIGNER_REGISTERED_CURRENT_REWARD_CYCLE.get(), 1);
++    assert_eq!(prometheus::SIGNER_REGISTERED_NEXT_REWARD_CYCLE.get(), 0);
++    assert_eq!(prometheus::SIGNER_STATE_BURN_BLOCK_HEIGHT.get(), 123);
++    assert_eq!(
++        prometheus::SIGNER_STATE_LAST_CHANGED_TIMESTAMP_SECONDS.get(),
++        456
++    );
++    assert_eq!(prometheus::SIGNER_PENDING_BLOCK_VALIDATIONS.get(), 7);
++    assert_eq!(prometheus::SIGNER_COMPANION_BURN_BLOCK_HEIGHT.get(), 125);
++
++    let exposition = prometheus::gather_metrics_string();
++    for metric in [
++        "stacks_signer_runloop_ready",
++        "stacks_signer_registered_for_current_reward_cycle",
++        "stacks_signer_registered_for_next_reward_cycle",
++        "stacks_signer_state_burn_block_height",
++        "stacks_signer_state_last_changed_timestamp_seconds",
++        "stacks_signer_companion_burn_block_height",
++        "stacks_signer_pending_block_validations",
++    ] {
++        assert!(exposition.contains(metric), "missing metric {metric}");
++    }
++}
++
++#[cfg(all(test, feature = "monitoring_prom"))]
++mod tests {
++    use blockstack_lib::net::api::postblock_proposal::ValidateRejectCode;
++    use libsigner::v0::messages::RejectReason;
++    use prometheus::core::Collector;
++
++    use super::actions::{
++        record_block_response_delivery, record_policy_evaluation, record_validation_lifecycle,
++    };
++    use super::prometheus::{
++        BLOCK_RESPONSE_DELIVERIES, BLOCK_VALIDATION_LIFECYCLE, POLICY_EVALUATIONS,
++        POLICY_REJECTIONS,
++    };
++    use super::{
++        initialize_proposal_outcome_metrics, policy_classification, validate_reject_code_label,
++        PolicyAction, PolicyClassification, ValidationLifecycleEvent,
++    };
++
++    #[test]
++    fn proposal_outcome_metrics_initialize_every_valid_tuple() {
++        initialize_proposal_outcome_metrics();
++
++        assert_eq!(POLICY_EVALUATIONS.collect()[0].get_metric().len(), 3);
++        assert_eq!(POLICY_REJECTIONS.collect()[0].get_metric().len(), 20);
++        assert_eq!(
++            BLOCK_VALIDATION_LIFECYCLE.collect()[0].get_metric().len(),
++            17
++        );
++        assert_eq!(BLOCK_RESPONSE_DELIVERIES.collect()[0].get_metric().len(), 4);
++    }
++
++    #[test]
++    fn proposal_outcome_metrics_use_bounded_truthful_labels() {
++        assert_eq!(
++            policy_classification(None),
++            (PolicyClassification::Proceed, PolicyAction::Continue)
++        );
++        assert_eq!(
++            policy_classification(Some(&RejectReason::ConnectivityIssues(
++                "arbitrary RPC text must not become a label".into()
++            ))),
++            (PolicyClassification::Unavailable, PolicyAction::Reject)
++        );
++        assert_eq!(
++            policy_classification(Some(&RejectReason::InvalidTenureExtend)),
++            (PolicyClassification::VerdictReject, PolicyAction::Reject)
++        );
++
++        let proceed = POLICY_EVALUATIONS.with_label_values(&["proceed", "continue"]);
++        let unavailable = POLICY_EVALUATIONS.with_label_values(&["unavailable", "reject"]);
++        let verdict = POLICY_EVALUATIONS.with_label_values(&["verdict_reject", "reject"]);
++        let connectivity = POLICY_REJECTIONS.with_label_values(&["connectivity_issues"]);
++        let invalid_tenure = POLICY_REJECTIONS.with_label_values(&["invalid_tenure_extend"]);
++        let before = (
++            proceed.get(),
++            unavailable.get(),
++            verdict.get(),
++            connectivity.get(),
++            invalid_tenure.get(),
++        );
++
++        record_policy_evaluation(None);
++        record_policy_evaluation(Some(&RejectReason::ConnectivityIssues("first".into())));
++        record_policy_evaluation(Some(&RejectReason::ConnectivityIssues("second".into())));
++        record_policy_evaluation(Some(&RejectReason::InvalidTenureExtend));
++
++        assert_eq!(proceed.get(), before.0 + 1);
++        assert_eq!(unavailable.get(), before.1 + 2);
++        assert_eq!(verdict.get(), before.2 + 1);
++        assert_eq!(connectivity.get(), before.3 + 2);
++        assert_eq!(invalid_tenure.get(), before.4 + 1);
++
++        let submitted = BLOCK_VALIDATION_LIFECYCLE.with_label_values(&["submitted", "none"]);
++        let rejected =
++            BLOCK_VALIDATION_LIFECYCLE.with_label_values(&["rejected", "invalid_parent_block"]);
++        let submitted_before = submitted.get();
++        let rejected_before = rejected.get();
++        record_validation_lifecycle(ValidationLifecycleEvent::Submitted);
++        record_validation_lifecycle(ValidationLifecycleEvent::Rejected(
++            ValidateRejectCode::InvalidParentBlock,
++        ));
++        assert_eq!(submitted.get(), submitted_before + 1);
++        assert_eq!(rejected.get(), rejected_before + 1);
++
++        let sent = BLOCK_RESPONSE_DELIVERIES.with_label_values(&["accepted", "sent"]);
++        let failed = BLOCK_RESPONSE_DELIVERIES.with_label_values(&["accepted", "failed"]);
++        let sent_before = sent.get();
++        let failed_before = failed.get();
++        record_block_response_delivery(true, true);
++        record_block_response_delivery(true, false);
++        assert_eq!(sent.get(), sent_before + 1);
++        assert_eq!(failed.get(), failed_before + 1);
++
++        let validation_labels = [
++            (ValidateRejectCode::BadBlockHash, "bad_block_hash"),
++            (ValidateRejectCode::BadTransaction, "bad_transaction"),
++            (ValidateRejectCode::InvalidBlock, "invalid_block"),
++            (ValidateRejectCode::ChainstateError, "chainstate_error"),
++            (ValidateRejectCode::UnknownParent, "unknown_parent"),
++            (
++                ValidateRejectCode::NonCanonicalTenure,
++                "non_canonical_tenure",
++            ),
++            (ValidateRejectCode::NoSuchTenure, "no_such_tenure"),
++            (
++                ValidateRejectCode::InvalidTransactionReplay,
++                "invalid_transaction_replay",
++            ),
++            (
++                ValidateRejectCode::InvalidParentBlock,
++                "invalid_parent_block",
++            ),
++            (ValidateRejectCode::InvalidTimestamp, "invalid_timestamp"),
++            (
++                ValidateRejectCode::NetworkChainMismatch,
++                "network_chain_mismatch",
++            ),
++            (ValidateRejectCode::NotFoundError, "not_found_error"),
++            (
++                ValidateRejectCode::ProblematicTransaction,
++                "problematic_transaction",
++            ),
++        ];
++        for (code, expected) in validation_labels {
++            assert_eq!(validate_reject_code_label(code), expected);
++        }
++    }
++}
+diff --git a/stacks-signer/src/monitoring/prometheus.rs b/stacks-signer/src/monitoring/prometheus.rs
+index 84b28b7310..b3d99037a4 100644
+--- a/stacks-signer/src/monitoring/prometheus.rs
++++ b/stacks-signer/src/monitoring/prometheus.rs
+@@ -48,6 +48,26 @@ lazy_static! {
+         "The number of block proposals received by the signer"
+     ))
+     .unwrap();
++    pub static ref POLICY_EVALUATIONS: IntCounterVec = register_int_counter_vec!(
++        "stacks_signer_policy_evaluations",
++        "Signer proposal-policy evaluations by epistemic classification and effective action",
++        &["classification", "action"]
++    ).unwrap();
++    pub static ref POLICY_REJECTIONS: IntCounterVec = register_int_counter_vec!(
++        "stacks_signer_policy_rejections",
++        "Signer proposal-policy rejections by finite RejectReasonPrefix",
++        &["reason"]
++    ).unwrap();
++    pub static ref BLOCK_VALIDATION_LIFECYCLE: IntCounterVec = register_int_counter_vec!(
++        "stacks_signer_block_validation_lifecycle",
++        "Block validation transitions; reason is none except for finite ValidateRejectCode rejections",
++        &["event", "reason"]
++    ).unwrap();
++    pub static ref BLOCK_RESPONSE_DELIVERIES: IntCounterVec = register_int_counter_vec!(
++        "stacks_signer_block_response_deliveries",
++        "Final signer response delivery attempts by response type and outcome",
++        &["response_type", "outcome"]
++    ).unwrap();
+     pub static ref BLOCK_PRE_COMMITS_SENT: IntCounter = register_int_counter!(opts!(
+         "stacks_signer_block_pre_commits_sent",
+         "The number of block pre-commits sent by the signer"
+@@ -57,6 +77,34 @@ lazy_static! {
+         "stacks_signer_current_reward_cycle",
+         "The current reward cycle"
+     )).unwrap();
++    pub static ref SIGNER_RUNLOOP_READY: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_runloop_ready",
++        "Whether the outer signer runloop has initialized successfully (1) or is still retrying (0)"
++    )).unwrap();
++    pub static ref SIGNER_REGISTERED_CURRENT_REWARD_CYCLE: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_registered_for_current_reward_cycle",
++        "Whether this signer has an active registered signer instance for the current reward cycle"
++    )).unwrap();
++    pub static ref SIGNER_REGISTERED_NEXT_REWARD_CYCLE: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_registered_for_next_reward_cycle",
++        "Whether this signer has an active registered signer instance for the next reward cycle"
++    )).unwrap();
++    pub static ref SIGNER_STATE_BURN_BLOCK_HEIGHT: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_state_burn_block_height",
++        "Burn block height represented by the current signer's local agreement state"
++    )).unwrap();
++    pub static ref SIGNER_STATE_LAST_CHANGED_TIMESTAMP_SECONDS: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_state_last_changed_timestamp_seconds",
++        "Unix timestamp at which the current signer's local agreement state last changed"
++    )).unwrap();
++    pub static ref SIGNER_COMPANION_BURN_BLOCK_HEIGHT: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_companion_burn_block_height",
++        "Latest canonical burn block height learned successfully from the signer's companion node"
++    )).unwrap();
++    pub static ref SIGNER_PENDING_BLOCK_VALIDATIONS: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_pending_block_validations",
++        "Number of block validations currently pending in the signer process"
++    )).unwrap();
+     pub static ref SIGNER_STX_BALANCE: IntGauge = register_int_gauge!(opts!(
+         "stacks_signer_stx_balance",
+         "The current STX balance of the signer"
+@@ -96,6 +144,31 @@ lazy_static! {
+         &["conflict"]
+     ).unwrap();
+ 
++    pub static ref SIGNER_GLOBAL_STATE_AVAILABLE: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_global_state_available",
++        "Whether the current reward-cycle evaluator can derive a global signer state (1 or 0)"
++    )).unwrap();
++    pub static ref SIGNER_GLOBAL_STATE_TOTAL_WEIGHT: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_global_state_total_weight",
++        "Total configured signer weight in the current reward cycle"
++    )).unwrap();
++    pub static ref SIGNER_GLOBAL_STATE_KNOWN_WEIGHT: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_global_state_known_weight",
++        "Configured signer weight from which a latest state update is currently known"
++    )).unwrap();
++    pub static ref SIGNER_GLOBAL_STATE_MAXIMUM_VIEW_WEIGHT: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_global_state_maximum_view_weight",
++        "Greatest signer weight currently supporting one exact global state view"
++    )).unwrap();
++    pub static ref SIGNER_GLOBAL_STATE_EVALUATOR_THRESHOLD_WEIGHT: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_global_state_evaluator_threshold_weight",
++        "Rounded-down weight threshold currently used by the global state evaluator"
++    )).unwrap();
++    pub static ref SIGNER_GLOBAL_STATE_CANONICAL_THRESHOLD_WEIGHT: IntGauge = register_int_gauge!(opts!(
++        "stacks_signer_global_state_canonical_threshold_weight",
++        "Rounded-up weight threshold enforced for Nakamoto block signatures"
++    )).unwrap();
++
+     pub static ref SIGNER_AGREEMENT_CAPITULATION_LATENCIES_HISTOGRAM: HistogramVec = register_histogram_vec!(histogram_opts!(
+         "stacks_signer_agreement_capitulation_latencies_histogram",
+         "Measuring the time (in seconds) for the signer to agree (capitulate) with the signer set",
+diff --git a/stacks-signer/src/runloop.rs b/stacks-signer/src/runloop.rs
+index fd2c81fba1..7d572db4e9 100644
+--- a/stacks-signer/src/runloop.rs
++++ b/stacks-signer/src/runloop.rs
+@@ -381,14 +381,21 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
+         } else {
+             self.state = State::RegisteredSigners;
+         }
++        crate::monitoring::actions::update_companion_burn_block_height(
++            self.current_reward_cycle_info
++                .as_ref()
++                .expect("reward-cycle info was just initialized")
++                .last_burnchain_block_height,
++        );
++        self.update_registration_metrics();
+         Ok(())
+     }
+ 
+     fn refresh_runloop(&mut self, ev_burn_block_height: u64) -> Result<(), ClientError> {
+-        let current_burn_block_height = std::cmp::max(
+-            self.stacks_client.get_peer_info()?.burn_block_height,
+-            ev_burn_block_height,
+-        );
++        let companion_burn_block_height = self.stacks_client.get_peer_info()?.burn_block_height;
++        crate::monitoring::actions::update_companion_burn_block_height(companion_burn_block_height);
++        let current_burn_block_height =
++            std::cmp::max(companion_burn_block_height, ev_burn_block_height);
+         let reward_cycle_info = self
+             .current_reward_cycle_info
+             .as_mut()
+@@ -444,9 +451,22 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
+         } else {
+             self.state = State::RegisteredSigners;
+         }
++        self.update_registration_metrics();
+         Ok(())
+     }
+ 
++    fn update_registration_metrics(&self) {
++        let Some(reward_cycle_info) = self.current_reward_cycle_info else {
++            crate::monitoring::actions::update_reward_cycle_registration(false, false);
++            return;
++        };
++        let current = reward_cycle_info.reward_cycle;
++        crate::monitoring::actions::update_reward_cycle_registration(
++            Self::is_registered_for_cycle(&self.stacks_signers, current),
++            Self::is_registered_for_cycle(&self.stacks_signers, current.saturating_add(1)),
++        );
++    }
++
+     fn is_configured_for_cycle(
+         stacks_signers: &HashMap<u64, ConfiguredSigner<Signer, T>>,
+         reward_cycle: u64,
+@@ -574,6 +594,8 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug>
+         }
+ 
+         if self.state == State::Uninitialized {
++            crate::monitoring::actions::update_runloop_ready(false);
++            self.update_registration_metrics();
+             if let Err(e) = self.initialize_runloop() {
+                 error!("Failed to initialize signer runloop: {e}.");
+                 if let Some(event) = event {
+@@ -581,6 +603,7 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug>
+                 }
+                 return None;
+             }
++            crate::monitoring::actions::update_runloop_ready(true);
+         } else if let Some(SignerEvent::NewBurnBlock { burn_height, .. }) = event {
+             if let Err(e) = self.refresh_runloop(burn_height) {
+                 error!("Failed to refresh signer runloop: {e}.");
+diff --git a/stacks-signer/src/signerdb.rs b/stacks-signer/src/signerdb.rs
+index 73ce392f98..ab5b955b46 100644
+--- a/stacks-signer/src/signerdb.rs
++++ b/stacks-signer/src/signerdb.rs
+@@ -1991,6 +1991,20 @@ impl SignerDb {
+         Ok(sighash_opt.is_some())
+     }
+ 
++    /// Count pending block validations when constructing signer metrics.
++    ///
++    /// The signer calls this once during initialization and then maintains the
++    /// gauge at the existing successful queue transitions. Prometheus scrapes
++    /// never query SQLite.
++    pub fn get_pending_block_validation_count(&self) -> Result<u64, DBError> {
++        let count: i64 = self.db.query_row(
++            "SELECT COUNT(*) FROM block_validations_pending",
++            params![],
++            |row| row.get(0),
++        )?;
++        u64::try_from(count).map_err(|_| DBError::Overflow)
++    }
++
+     /// Returns:
+     /// * the time (epoch time in seconds) of the last tenure change during the tenure identified by `tenure`
+     ///   where the change cause matches `cause_match`
+@@ -3729,6 +3743,7 @@ pub mod tests {
+ 
+         let pending_hash = db.get_and_remove_pending_block_validation().unwrap();
+         assert!(pending_hash.is_none());
++        assert_eq!(db.get_pending_block_validation_count().unwrap(), 0);
+ 
+         db.insert_pending_block_validation(&Sha512Trunc256Sum([0x01; 32]), 1000)
+             .unwrap();
+@@ -3736,6 +3751,7 @@ pub mod tests {
+             .unwrap();
+         db.insert_pending_block_validation(&Sha512Trunc256Sum([0x03; 32]), 3000)
+             .unwrap();
++        assert_eq!(db.get_pending_block_validation_count().unwrap(), 3);
+ 
+         let (pending_hash, _) = db
+             .get_and_remove_pending_block_validation()
+@@ -3745,6 +3761,7 @@ pub mod tests {
+ 
+         let pendings = db.get_all_pending_block_validations().unwrap();
+         assert_eq!(pendings.len(), 2);
++        assert_eq!(db.get_pending_block_validation_count().unwrap(), 2);
+ 
+         let (pending_hash, _) = db
+             .get_and_remove_pending_block_validation()
+@@ -3754,6 +3771,7 @@ pub mod tests {
+ 
+         let pendings = db.get_all_pending_block_validations().unwrap();
+         assert_eq!(pendings.len(), 1);
++        assert_eq!(db.get_pending_block_validation_count().unwrap(), 1);
+ 
+         let (pending_hash, _) = db
+             .get_and_remove_pending_block_validation()
+@@ -3763,6 +3781,7 @@ pub mod tests {
+ 
+         let pendings = db.get_all_pending_block_validations().unwrap();
+         assert!(pendings.is_empty());
++        assert_eq!(db.get_pending_block_validation_count().unwrap(), 0);
+     }
+ 
+     #[test]
+diff --git a/stacks-signer/src/v0/signer.rs b/stacks-signer/src/v0/signer.rs
+index 2fb2dffb45..0d1866d81b 100644
+--- a/stacks-signer/src/v0/signer.rs
++++ b/stacks-signer/src/v0/signer.rs
+@@ -122,6 +122,10 @@ pub struct Signer {
+     pub block_proposal_max_age_secs: u64,
+     /// The signer's local state machine used in signer set agreement
+     pub local_state_machine: LocalStateMachine,
++    /// Process-local count of validations queued successfully in signer DB.
++    pending_block_validations: u64,
++    /// Last process wall-clock timestamp at which the local state changed.
++    local_state_last_changed_timestamp_seconds: Option<u64>,
+     /// Cache of stacks block IDs for blocks recently processed by our stacks-node
+     recently_processed: RecentlyProcessedBlocks<100>,
+     /// The signer's global state evaluator
+@@ -292,6 +296,14 @@ impl SignerTrait<SignerMessage> for Signer {
+             warn!("Failed to initialize local state machine for signer: {e:?}");
+             LocalStateMachine::Uninitialized
+         });
++        let pending_block_validations = signer_db
++            .get_pending_block_validation_count()
++            .unwrap_or_else(|error| {
++                warn!("Failed to initialize pending-validation metric: {error:?}");
++                0
++            });
++        let local_state_last_changed_timestamp_seconds =
++            (!matches!(signer_state, LocalStateMachine::Uninitialized)).then(get_epoch_time_secs);
+         Self {
+             private_key: signer_config.stacks_private_key,
+             stacks_address,
+@@ -308,6 +320,8 @@ impl SignerTrait<SignerMessage> for Signer {
+             block_proposal_validation_timeout: signer_config.block_proposal_validation_timeout,
+             block_proposal_max_age_secs: signer_config.block_proposal_max_age_secs,
+             local_state_machine: signer_state,
++            pending_block_validations,
++            local_state_last_changed_timestamp_seconds,
+             recently_processed: RecentlyProcessedBlocks::new(),
+             global_state_evaluator,
+             validate_with_replay_tx: signer_config.validate_with_replay_tx,
+@@ -356,13 +370,14 @@ impl SignerTrait<SignerMessage> for Signer {
+             self.proposal_config.tenure_last_block_proposal_timeout,
+             &mut self.last_capitulate_miner_view,
+         );
+-
+         if prior_state != self.local_state_machine {
++            self.note_local_state_change();
+             let version = self.get_signer_protocol_version();
+             self.local_state_machine
+                 .send_signer_update_message(&mut self.stackerdb, version);
+             prior_state = self.local_state_machine.clone();
+         }
++        self.update_current_cycle_metrics(current_reward_cycle);
+ 
+         let event_parity = match event {
+             // Block proposal events do have reward cycles, but each proposal has its own cycle,
+@@ -405,10 +420,12 @@ impl SignerTrait<SignerMessage> for Signer {
+         self.check_pending_block_validations(stacks_client);
+ 
+         if prior_state != self.local_state_machine {
++            self.note_local_state_change();
+             let version = self.get_signer_protocol_version();
+             self.local_state_machine
+                 .send_signer_update_message(&mut self.stackerdb, version);
+         }
++        self.update_current_cycle_metrics(current_reward_cycle);
+     }
+ 
+     fn has_unprocessed_blocks(&self) -> bool {
+@@ -448,6 +465,54 @@ impl SignerTrait<SignerMessage> for Signer {
+ }
+ 
+ impl Signer {
++    fn note_local_state_change(&mut self) {
++        self.local_state_last_changed_timestamp_seconds = Some(get_epoch_time_secs());
++    }
++
++    fn update_current_cycle_metrics(&self, current_reward_cycle: u64) {
++        // A signer process can briefly host current and next reward-cycle
++        // instances. Export only the current one through the unlabelled gauges
++        // so the next instance cannot overwrite operational readiness.
++        if self.reward_cycle == current_reward_cycle {
++            crate::monitoring::actions::update_global_state_agreement(
++                self.global_state_evaluator.agreement_snapshot(),
++            );
++            crate::monitoring::actions::update_signer_state(
++                self.local_state_machine.burn_block_height(),
++                self.local_state_last_changed_timestamp_seconds,
++                self.pending_block_validations,
++            );
++        }
++    }
++
++    fn enqueue_pending_block_validation(
++        &mut self,
++        signer_signature_hash: &Sha512Trunc256Sum,
++        added_epoch_time: u64,
++    ) {
++        match self
++            .signer_db
++            .insert_pending_block_validation(signer_signature_hash, added_epoch_time)
++        {
++            Ok(()) => {
++                self.pending_block_validations = self.pending_block_validations.saturating_add(1);
++            }
++            Err(error) => {
++                warn!("{self}: Failed to insert pending block validation: {error:?}");
++            }
++        }
++    }
++
++    fn take_pending_block_validation(
++        &mut self,
++    ) -> Result<Option<(Sha512Trunc256Sum, u64)>, DBError> {
++        let pending = self.signer_db.get_and_remove_pending_block_validation()?;
++        if pending.is_some() {
++            self.pending_block_validations = self.pending_block_validations.saturating_sub(1);
++        }
++        Ok(pending)
++    }
++
+     /// Determine this signers response to a proposed block
+     /// Returns a BlockResponse if we have already validated the block
+     /// Returns None otherwise
+@@ -996,6 +1061,7 @@ impl Signer {
+             .send_message_with_retry::<SignerMessage>(block_response.into())
+         {
+             Ok(ack) => {
++                crate::monitoring::actions::record_block_response_delivery(accepted, ack.accepted);
+                 if !ack.accepted {
+                     warn!(
+                         "{self}: Block response not accepted by stacker-db: {:?}",
+@@ -1006,6 +1072,7 @@ impl Signer {
+                 crate::monitoring::actions::record_block_response_latency(block);
+             }
+             Err(e) => {
++                crate::monitoring::actions::record_block_response_delivery(accepted, false);
+                 warn!("{self}: Failed to send block response to stacker-db: {e:?}",);
+             }
+         }
+@@ -1429,6 +1496,12 @@ impl Signer {
+         let block_rejection =
+             self.test_reject_block_proposal(block_proposal, &mut block_info, block_rejection);
+ 
++        crate::monitoring::actions::record_policy_evaluation(
++            block_rejection
++                .as_ref()
++                .map(|rejection| &rejection.response_data.reject_reason),
++        );
++
+         if let Some(block_rejection) = block_rejection {
+             // We know proposal is invalid. Send rejection message, do not do further validation and do not store it.
+             self.send_block_response(&block_info.block, block_rejection.into());
+@@ -1460,11 +1533,10 @@ impl Signer {
+                 warn!("{self}: cannot submit block proposal for validation as we are already waiting for a response for a prior submission. Inserting pending proposal.";
+                     "signer_signature_hash" => signer_signature_hash.to_string(),
+                 );
+-                self.signer_db
+-                    .insert_pending_block_validation(&signer_signature_hash, get_epoch_time_secs())
+-                    .unwrap_or_else(|e| {
+-                        warn!("{self}: Failed to insert pending block validation: {e:?}")
+-                    });
++                self.enqueue_pending_block_validation(
++                    &signer_signature_hash,
++                    get_epoch_time_secs(),
++                );
+             }
+ 
+             // Do not store KNOWN invalid blocks as this could DOS the signer. We only store blocks that are valid or unknown.
+@@ -1691,6 +1763,10 @@ impl Signer {
+             return;
+         }
+ 
++        crate::monitoring::actions::record_validation_lifecycle(
++            crate::monitoring::ValidationLifecycleEvent::Accepted,
++        );
++
+         if let Some(block_rejection) =
+             self.check_block_against_signer_db_state(stacks_client, &block_info.block)
+         {
+@@ -1760,6 +1836,11 @@ impl Signer {
+             debug!("{self}: Block is syntatically invalid; will not store");
+             return;
+         }
++        crate::monitoring::actions::record_validation_lifecycle(
++            crate::monitoring::ValidationLifecycleEvent::Rejected(
++                block_validate_reject.reason_code,
++            ),
++        );
+         if let Err(e) = block_info.mark_locally_rejected() {
+             if !block_info.has_reached_consensus() {
+                 warn!("{self}: Failed to mark block as locally rejected: {e:?}");
+@@ -1829,19 +1910,21 @@ impl Signer {
+             return;
+         }
+ 
+-        let (signer_sig_hash, insert_ts) =
+-            match self.signer_db.get_and_remove_pending_block_validation() {
+-                Ok(Some(x)) => x,
+-                Ok(None) => {
+-                    return;
+-                }
+-                Err(e) => {
+-                    warn!("{self}: Failed to get pending block validation: {e:?}");
+-                    return;
+-                }
+-            };
++        let (signer_sig_hash, insert_ts) = match self.take_pending_block_validation() {
++            Ok(Some(x)) => x,
++            Ok(None) => {
++                return;
++            }
++            Err(e) => {
++                warn!("{self}: Failed to get pending block validation: {e:?}");
++                return;
++            }
++        };
+ 
+         info!("{self}: Found a pending block validation: {signer_sig_hash:?}");
++        crate::monitoring::actions::record_validation_lifecycle(
++            crate::monitoring::ValidationLifecycleEvent::Retried,
++        );
+         match self.signer_db.block_lookup(&signer_sig_hash) {
+             Ok(Some(block_info)) => {
+                 self.submit_block_for_validation(stacks_client, &block_info.block, insert_ts);
+@@ -1896,6 +1979,9 @@ impl Signer {
+             "{self}: Failed to receive block validation response within {} ms. Rejecting block.", self.block_proposal_validation_timeout.as_millis();
+             "signer_signature_hash" => %proposal_signer_sighash,
+         );
++        crate::monitoring::actions::record_validation_lifecycle(
++            crate::monitoring::ValidationLifecycleEvent::Expired,
++        );
+         let rejection = self.create_block_rejection(
+             RejectReason::ConnectivityIssues(
+                 "failed to receive block validation response in time".to_string(),
+@@ -2335,11 +2421,7 @@ impl Signer {
+                         "signer_signature_hash" => %signer_signature_hash,
+                         "parent_block_id" => %block.header.parent_block_id,
+                 );
+-                self.signer_db
+-                    .insert_pending_block_validation(&signer_signature_hash, added_epoch_time)
+-                    .unwrap_or_else(|e| {
+-                        warn!("{self}: Failed to insert pending block validation: {e:?}")
+-                    });
++                self.enqueue_pending_block_validation(&signer_signature_hash, added_epoch_time);
+                 return;
+             } else {
+                 debug!("{self}: Cannot confirm that we have processed parent, but we've waited proposal_wait_for_parent_time, will submit proposal");
+@@ -2358,17 +2440,16 @@ impl Signer {
+         ) {
+             Ok(_) => {
+                 self.submitted_block_proposal = Some((signer_signature_hash, Instant::now()));
++                crate::monitoring::actions::record_validation_lifecycle(
++                    crate::monitoring::ValidationLifecycleEvent::Submitted,
++                );
+             }
+             Err(ClientError::RequestFailure(status)) => {
+                 if status.as_u16() == TOO_MANY_REQUESTS_STATUS {
+                     info!("{self}: Received 429 from stacks node for block validation request. Inserting pending block validation...";
+                         "signer_signature_hash" => %signer_signature_hash,
+                     );
+-                    self.signer_db
+-                        .insert_pending_block_validation(&signer_signature_hash, added_epoch_time)
+-                        .unwrap_or_else(|e| {
+-                            warn!("{self}: Failed to insert pending block validation: {e:?}")
+-                        });
++                    self.enqueue_pending_block_validation(&signer_signature_hash, added_epoch_time);
+                 } else {
+                     warn!("{self}: Received non-429 status from stacks node: {status}");
+                 }
+diff --git a/stacks-signer/src/v0/signer_state.rs b/stacks-signer/src/v0/signer_state.rs
+index 29b627a09e..0c6ed5274c 100644
+--- a/stacks-signer/src/v0/signer_state.rs
++++ b/stacks-signer/src/v0/signer_state.rs
+@@ -73,6 +73,30 @@ pub enum LocalStateMachine {
+     },
+ }
+ 
++#[cfg(test)]
++mod metric_tests {
++    use super::{LocalStateMachine, NewBurnBlock, StateMachineUpdate};
++    use stacks_common::types::chainstate::ConsensusHash;
++
++    #[test]
++    fn local_state_reports_only_the_committed_burn_height() {
++        assert_eq!(LocalStateMachine::Uninitialized.burn_block_height(), None);
++
++        let prior = LocalStateMachine::place_holder(1);
++        let initialized = LocalStateMachine::Initialized(prior.clone());
++        assert_eq!(initialized.burn_block_height(), Some(0));
++
++        let pending = LocalStateMachine::Pending {
++            prior,
++            update: StateMachineUpdate::BurnBlock(NewBurnBlock {
++                burn_block_height: 1,
++                consensus_hash: ConsensusHash([1; 20]),
++            }),
++        };
++        assert_eq!(pending.burn_block_height(), Some(0));
++    }
++}
++
+ /// A pending update for a signer state machine
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub enum StateMachineUpdate {
+@@ -232,6 +256,19 @@ impl LocalStateMachine {
+         }
+     }
+ 
++    /// Return the burn block height represented by this local state.
++    ///
++    /// A pending state still represents its prior committed view until the
++    /// pending update is applied.
++    pub fn burn_block_height(&self) -> Option<u64> {
++        match self {
++            Self::Initialized(state) | Self::Pending { prior: state, .. } => {
++                Some(state.burn_block_height)
++            }
++            Self::Uninitialized => None,
++        }
++    }
++
+     /// Send the local state machine as a signer update message to stackerdb
+     pub fn send_signer_update_message(
+         &self,
+diff --git a/stackslib/src/monitoring/mod.rs b/stackslib/src/monitoring/mod.rs
+index 293980b639..6f5c5cc186 100644
+--- a/stackslib/src/monitoring/mod.rs
++++ b/stackslib/src/monitoring/mod.rs
+@@ -70,6 +70,67 @@ pub fn increment_stx_blocks_received_counter() {
+     prometheus::STX_BLOCKS_RECEIVED_COUNTER.inc();
+ }
+ 
++define_named_enum!(NakamotoBlockTransferDirection {
++    Received("received"),
++    Sent("sent"),
++});
++
++define_named_enum!(NakamotoBlockTransferSource {
++    P2pPush("p2p_push"),
++    TenureDownload("tenure_download"),
++    RpcUpload("rpc_upload"),
++    P2pRelay("p2p_relay"),
++    RpcServe("rpc_serve"),
++});
++
++define_named_enum!(NakamotoBlockTransferOutcome {
++    Accepted("accepted"),
++    Duplicate("duplicate"),
++    Rejected("rejected"),
++    Error("error"),
++    Queued("queued"),
++    Completed("completed"),
++    Failed("failed"),
++});
++
++/// Add a bounded number of Nakamoto blocks to the transfer counter.
++#[allow(unused_variables)]
++pub fn add_nakamoto_block_transfers(
++    direction: NakamotoBlockTransferDirection,
++    source: NakamotoBlockTransferSource,
++    outcome: NakamotoBlockTransferOutcome,
++    count: usize,
++) {
++    #[cfg(feature = "monitoring_prom")]
++    prometheus::NAKAMOTO_BLOCK_TRANSFERS
++        .with_label_values(&[
++            direction.get_name_str(),
++            source.get_name_str(),
++            outcome.get_name_str(),
++        ])
++        .inc_by(i64::try_from(count).unwrap_or(i64::MAX));
++}
++
++#[cfg(all(test, feature = "monitoring_prom"))]
++#[test]
++fn test_nakamoto_block_transfer_counter_uses_bounded_labels() {
++    let counter = prometheus::NAKAMOTO_BLOCK_TRANSFERS.with_label_values(&[
++        NakamotoBlockTransferDirection::Received.get_name_str(),
++        NakamotoBlockTransferSource::P2pPush.get_name_str(),
++        NakamotoBlockTransferOutcome::Accepted.get_name_str(),
++    ]);
++    let before = counter.get();
++
++    add_nakamoto_block_transfers(
++        NakamotoBlockTransferDirection::Received,
++        NakamotoBlockTransferSource::P2pPush,
++        NakamotoBlockTransferOutcome::Accepted,
++        3,
++    );
++
++    assert_eq!(counter.get(), before + 3);
++}
++
+ pub fn increment_stx_micro_blocks_received_counter() {
+     #[cfg(feature = "monitoring_prom")]
+     prometheus::STX_MICRO_BLOCKS_RECEIVED_COUNTER.inc();
+@@ -476,6 +537,135 @@ define_named_enum!(MinerStopReason {
+     DeadlineReached("deadline_reached"),
+ });
+ 
++define_named_enum!(SignerCoordinatorRoundEvent {
++    Started("started"),
++    Completed("completed"),
++});
++
++define_named_enum!(SignerCoordinatorRoundOutcome {
++    Pending("pending"),
++    Approved("approved"),
++    Rejected("rejected"),
++    Timeout("timeout"),
++    BurnchainTipChanged("burnchain_tip_changed"),
++    StacksTipChanged("stacks_tip_changed"),
++    Error("error"),
++});
++
++define_named_enum!(SignerResponseWeightClassification {
++    Approved("approved"),
++    RejectedEffective("rejected_effective"),
++    UnavailableClassified("unavailable_classified"),
++});
++
++define_named_enum!(SignerCoordinatorMilestone {
++    ProposalToFirstResponse("proposal_to_first_response"),
++    ProposalToThreshold("proposal_to_threshold"),
++});
++
++define_named_enum!(SignerCoordinatorMilestoneOutcome {
++    Approved("approved"),
++    Rejected("rejected"),
++});
++
++/// Increment a legacy signer-coordinator round lifecycle event.
++#[allow(unused_variables)]
++pub fn increment_signer_coordinator_round(
++    event: SignerCoordinatorRoundEvent,
++    outcome: SignerCoordinatorRoundOutcome,
++) {
++    #[cfg(feature = "monitoring_prom")]
++    prometheus::SIGNER_COORDINATOR_ROUNDS
++        .with_label_values(&[event.get_name_str(), outcome.get_name_str()])
++        .inc();
++}
++
++/// Add unique signer weight to a bounded response classification.
++#[allow(unused_variables)]
++pub fn add_signer_response_weight(classification: SignerResponseWeightClassification, weight: u32) {
++    #[cfg(feature = "monitoring_prom")]
++    prometheus::SIGNER_RESPONSE_WEIGHT
++        .with_label_values(&[classification.get_name_str()])
++        .inc_by(i64::from(weight));
++}
++
++/// Observe elapsed seconds from proposal publication to a bounded round milestone.
++#[allow(unused_variables)]
++pub fn observe_signer_coordinator_milestone(
++    milestone: SignerCoordinatorMilestone,
++    outcome: SignerCoordinatorMilestoneOutcome,
++    elapsed: std::time::Duration,
++) {
++    #[cfg(feature = "monitoring_prom")]
++    prometheus::SIGNER_COORDINATOR_MILESTONE_SECONDS
++        .with_label_values(&[milestone.get_name_str(), outcome.get_name_str()])
++        .observe(elapsed.as_secs_f64());
++}
++
++/// Register every bounded legacy signer-coordinator metric tuple at zero.
++///
++/// Prometheus vector collectors do not expose a family until at least one
++/// labelled child has been instantiated.  Initializing the finite protocol
++/// domains makes "no coordinator event yet" distinguishable from "this binary
++/// does not export the instrumentation" on miners that have not won a tenure.
++pub fn initialize_signer_coordinator_metrics() {
++    #[cfg(feature = "monitoring_prom")]
++    {
++        for (event, outcome) in [
++            (
++                SignerCoordinatorRoundEvent::Started,
++                SignerCoordinatorRoundOutcome::Pending,
++            ),
++            (
++                SignerCoordinatorRoundEvent::Completed,
++                SignerCoordinatorRoundOutcome::Approved,
++            ),
++            (
++                SignerCoordinatorRoundEvent::Completed,
++                SignerCoordinatorRoundOutcome::Rejected,
++            ),
++            (
++                SignerCoordinatorRoundEvent::Completed,
++                SignerCoordinatorRoundOutcome::Timeout,
++            ),
++            (
++                SignerCoordinatorRoundEvent::Completed,
++                SignerCoordinatorRoundOutcome::BurnchainTipChanged,
++            ),
++            (
++                SignerCoordinatorRoundEvent::Completed,
++                SignerCoordinatorRoundOutcome::StacksTipChanged,
++            ),
++            (
++                SignerCoordinatorRoundEvent::Completed,
++                SignerCoordinatorRoundOutcome::Error,
++            ),
++        ] {
++            prometheus::SIGNER_COORDINATOR_ROUNDS
++                .with_label_values(&[event.get_name_str(), outcome.get_name_str()]);
++        }
++        for classification in [
++            SignerResponseWeightClassification::Approved,
++            SignerResponseWeightClassification::RejectedEffective,
++            SignerResponseWeightClassification::UnavailableClassified,
++        ] {
++            prometheus::SIGNER_RESPONSE_WEIGHT.with_label_values(&[classification.get_name_str()]);
++        }
++        for milestone in [
++            SignerCoordinatorMilestone::ProposalToFirstResponse,
++            SignerCoordinatorMilestone::ProposalToThreshold,
++        ] {
++            for outcome in [
++                SignerCoordinatorMilestoneOutcome::Approved,
++                SignerCoordinatorMilestoneOutcome::Rejected,
++            ] {
++                prometheus::SIGNER_COORDINATOR_MILESTONE_SECONDS
++                    .with_label_values(&[milestone.get_name_str(), outcome.get_name_str()]);
++            }
++        }
++    }
++}
++
+ // Increment the counter for the given miner stop reason.
+ #[allow(unused_variables)]
+ pub fn increment_miner_stop_reason(reason: MinerStopReason) {
+@@ -495,3 +685,79 @@ impl fmt::Display for SetGlobalBurnchainSignerError {
+ }
+ 
+ impl Error for SetGlobalBurnchainSignerError {}
++
++#[cfg(all(test, feature = "monitoring_prom"))]
++mod signer_coordinator_metric_tests {
++    use std::time::Duration;
++
++    use super::prometheus::{
++        SIGNER_COORDINATOR_MILESTONE_SECONDS, SIGNER_COORDINATOR_ROUNDS, SIGNER_RESPONSE_WEIGHT,
++    };
++    use super::{
++        add_signer_response_weight, increment_signer_coordinator_round,
++        initialize_signer_coordinator_metrics, observe_signer_coordinator_milestone,
++        SignerCoordinatorMilestone, SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent,
++        SignerCoordinatorRoundOutcome, SignerResponseWeightClassification,
++    };
++
++    #[test]
++    fn signer_coordinator_metrics_initialize_every_valid_tuple() {
++        use ::prometheus::core::Collector;
++
++        initialize_signer_coordinator_metrics();
++        assert_eq!(SIGNER_COORDINATOR_ROUNDS.collect()[0].get_metric().len(), 7);
++        assert_eq!(SIGNER_RESPONSE_WEIGHT.collect()[0].get_metric().len(), 3);
++        assert_eq!(
++            SIGNER_COORDINATOR_MILESTONE_SECONDS.collect()[0]
++                .get_metric()
++                .len(),
++            4
++        );
++    }
++
++    #[test]
++    fn signer_coordinator_metrics_preserve_overlap_and_bounded_labels() {
++        let started = SIGNER_COORDINATOR_ROUNDS.with_label_values(&["started", "pending"]);
++        let completed = SIGNER_COORDINATOR_ROUNDS.with_label_values(&["completed", "approved"]);
++        let started_before = started.get();
++        let completed_before = completed.get();
++        increment_signer_coordinator_round(
++            SignerCoordinatorRoundEvent::Started,
++            SignerCoordinatorRoundOutcome::Pending,
++        );
++        increment_signer_coordinator_round(
++            SignerCoordinatorRoundEvent::Completed,
++            SignerCoordinatorRoundOutcome::Approved,
++        );
++        assert_eq!(started.get(), started_before + 1);
++        assert_eq!(completed.get(), completed_before + 1);
++
++        let rejected = SIGNER_RESPONSE_WEIGHT.with_label_values(&["rejected_effective"]);
++        let unavailable = SIGNER_RESPONSE_WEIGHT.with_label_values(&["unavailable_classified"]);
++        let rejected_before = rejected.get();
++        let unavailable_before = unavailable.get();
++        add_signer_response_weight(SignerResponseWeightClassification::RejectedEffective, 7);
++        add_signer_response_weight(SignerResponseWeightClassification::UnavailableClassified, 7);
++        assert_eq!(rejected.get(), rejected_before + 7);
++        assert_eq!(unavailable.get(), unavailable_before + 7);
++
++        let first_response = SIGNER_COORDINATOR_MILESTONE_SECONDS
++            .with_label_values(&["proposal_to_first_response", "approved"]);
++        let threshold = SIGNER_COORDINATOR_MILESTONE_SECONDS
++            .with_label_values(&["proposal_to_threshold", "rejected"]);
++        let first_response_before = first_response.get_sample_count();
++        let count_before = threshold.get_sample_count();
++        observe_signer_coordinator_milestone(
++            SignerCoordinatorMilestone::ProposalToFirstResponse,
++            SignerCoordinatorMilestoneOutcome::Approved,
++            Duration::from_millis(25),
++        );
++        observe_signer_coordinator_milestone(
++            SignerCoordinatorMilestone::ProposalToThreshold,
++            SignerCoordinatorMilestoneOutcome::Rejected,
++            Duration::from_millis(250),
++        );
++        assert_eq!(first_response.get_sample_count(), first_response_before + 1);
++        assert_eq!(threshold.get_sample_count(), count_before + 1);
++    }
++}
+diff --git a/stackslib/src/monitoring/prometheus.rs b/stackslib/src/monitoring/prometheus.rs
+index aacb14b35a..ed333f076a 100644
+--- a/stackslib/src/monitoring/prometheus.rs
++++ b/stackslib/src/monitoring/prometheus.rs
+@@ -39,6 +39,12 @@ lazy_static! {
+         "Total number of Stacks blocks received"
+     )).unwrap();
+ 
++    pub static ref NAKAMOTO_BLOCK_TRANSFERS: IntCounterVec = register_int_counter_vec!(
++        "stacks_node_nakamoto_block_transfers",
++        "Nakamoto block transfers by bounded direction, source, and outcome",
++        &["direction", "source", "outcome"]
++    ).unwrap();
++
+     pub static ref STX_MICRO_BLOCKS_RECEIVED_COUNTER: IntCounter = register_int_counter!(opts!(
+         "stacks_node_stx_micro_blocks_received_total",
+         "Total number of Stacks micro blocks received"
+@@ -261,6 +267,28 @@ lazy_static! {
+         &["reason"]
+     ).unwrap();
+ 
++    pub static ref SIGNER_COORDINATOR_ROUNDS: IntCounterVec = register_int_counter_vec!(
++        "stacks_node_signer_coordinator_rounds",
++        "Legacy signer-coordinator rounds by lifecycle event and bounded outcome",
++        &["event", "outcome"]
++    ).unwrap();
++
++    pub static ref SIGNER_RESPONSE_WEIGHT: IntCounterVec = register_int_counter_vec!(
++        "stacks_node_signer_response_weight",
++        "Unique signer response weight observed by the legacy coordinator; unavailable_classified is an overlapping subset of rejected_effective",
++        &["classification"]
++    ).unwrap();
++
++    pub static ref SIGNER_COORDINATOR_MILESTONE_SECONDS: HistogramVec =
++        register_histogram_vec!(
++            histogram_opts!(
++                "stacks_node_signer_coordinator_milestone_seconds",
++                "Elapsed seconds from proposal publication to a bounded signer-coordinator milestone"
++            ),
++            &["milestone", "outcome"]
++        )
++        .unwrap();
++
+     pub static ref UNREACHABLE_ERRORS_COUNTER: IntCounterVec = register_int_counter_vec!(
+         "stacks_unreachable_errors_total",
+         "Number of unreachable Clarity VM errors triggered (indicates potential bugs)",
+diff --git a/stackslib/src/net/api/getblock_v3.rs b/stackslib/src/net/api/getblock_v3.rs
+index dffb2c38f3..f8aa4df37e 100644
+--- a/stackslib/src/net/api/getblock_v3.rs
++++ b/stackslib/src/net/api/getblock_v3.rs
+@@ -24,6 +24,10 @@ use stacks_common::types::net::PeerHost;
+ use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoStagingBlocksConn};
+ use crate::chainstate::stacks::db::StacksChainState;
+ use crate::chainstate::stacks::Error as ChainError;
++use crate::monitoring::{
++    add_nakamoto_block_transfers, NakamotoBlockTransferDirection, NakamotoBlockTransferOutcome,
++    NakamotoBlockTransferSource,
++};
+ use crate::net::http::{
+     parse_bytes, Error, HttpChunkGenerator, HttpContentType, HttpNotFound, HttpRequest,
+     HttpRequestContents, HttpRequestPreamble, HttpResponse, HttpResponseContents,
+@@ -58,6 +62,17 @@ pub struct NakamotoBlockStream {
+     pub staging_db_conn: NakamotoStagingBlocksConn,
+     /// rowid of the block
+     pub rowid: i64,
++    /// whether the completed transfer was already recorded for this block
++    transfer_completed: bool,
++}
++
++fn mark_rpc_serve_completed(transfer_completed: &mut bool, bytes_read: usize) -> bool {
++    if bytes_read != 0 || *transfer_completed {
++        return false;
++    }
++
++    *transfer_completed = true;
++    true
+ }
+ 
+ impl NakamotoBlockStream {
+@@ -82,6 +97,7 @@ impl NakamotoBlockStream {
+             total_bytes: 0,
+             staging_db_conn: db_conn,
+             rowid,
++            transfer_completed: false,
+         })
+     }
+ 
+@@ -103,6 +119,7 @@ impl NakamotoBlockStream {
+         self.offset = 0;
+         self.total_bytes = 0;
+         self.rowid = rowid;
++        self.transfer_completed = false;
+         Ok(())
+     }
+ }
+@@ -280,10 +297,35 @@ impl HttpChunkGenerator for NakamotoBlockStream {
+         self.offset += num_read as u64;
+         self.total_bytes += num_read as u64;
+ 
++        if mark_rpc_serve_completed(&mut self.transfer_completed, num_read) {
++            add_nakamoto_block_transfers(
++                NakamotoBlockTransferDirection::Sent,
++                NakamotoBlockTransferSource::RpcServe,
++                NakamotoBlockTransferOutcome::Completed,
++                1,
++            );
++        }
++
+         Ok(buf)
+     }
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rpc_serve_completion_is_recorded_once_per_stream() {
++        let mut completed = false;
++
++        assert!(!mark_rpc_serve_completed(&mut completed, 4096));
++        assert!(mark_rpc_serve_completed(&mut completed, 0));
++        assert!(!mark_rpc_serve_completed(&mut completed, 0));
++
++        assert!(completed);
++    }
++}
++
+ impl StacksHttpRequest {
+     pub fn new_get_nakamoto_block(host: PeerHost, block_id: StacksBlockId) -> StacksHttpRequest {
+         StacksHttpRequest::new_for_peer(
+diff --git a/stackslib/src/net/relay.rs b/stackslib/src/net/relay.rs
+index 0eae7a1069..8b4e47db48 100644
+--- a/stackslib/src/net/relay.rs
++++ b/stackslib/src/net/relay.rs
+@@ -41,7 +41,10 @@ use crate::chainstate::stacks::db::unconfirmed::ProcessedUnconfirmedState;
+ use crate::chainstate::stacks::db::StacksChainState;
+ use crate::chainstate::stacks::{StacksBlockHeader, TransactionPayload};
+ use crate::core::mempool::{MemPoolDB, *};
+-use crate::monitoring::update_stacks_tip_height;
++use crate::monitoring::{
++    add_nakamoto_block_transfers, update_stacks_tip_height, NakamotoBlockTransferDirection,
++    NakamotoBlockTransferOutcome, NakamotoBlockTransferSource,
++};
+ use crate::net::chat::*;
+ use crate::net::connection::*;
+ use crate::net::db::*;
+@@ -560,6 +563,71 @@ pub enum BlockAcceptResponse {
+     Rejected(String),
+ }
+ 
++fn transfer_source(
++    obtained_method: NakamotoBlockObtainMethod,
++) -> Option<NakamotoBlockTransferSource> {
++    match obtained_method {
++        NakamotoBlockObtainMethod::Pushed => Some(NakamotoBlockTransferSource::P2pPush),
++        NakamotoBlockObtainMethod::Downloaded => Some(NakamotoBlockTransferSource::TenureDownload),
++        NakamotoBlockObtainMethod::Uploaded => Some(NakamotoBlockTransferSource::RpcUpload),
++        NakamotoBlockObtainMethod::Mined | NakamotoBlockObtainMethod::Shadow => None,
++    }
++}
++
++fn transfer_outcome(
++    result: &Result<BlockAcceptResponse, chainstate_error>,
++) -> NakamotoBlockTransferOutcome {
++    match result {
++        Ok(BlockAcceptResponse::Accepted) => NakamotoBlockTransferOutcome::Accepted,
++        Ok(BlockAcceptResponse::AlreadyStored) => NakamotoBlockTransferOutcome::Duplicate,
++        Ok(BlockAcceptResponse::Rejected(_)) => NakamotoBlockTransferOutcome::Rejected,
++        Err(_) => NakamotoBlockTransferOutcome::Error,
++    }
++}
++
++#[cfg(test)]
++mod transfer_metric_tests {
++    use super::*;
++
++    #[test]
++    fn transfer_source_excludes_non_network_blocks() {
++        assert_eq!(
++            transfer_source(NakamotoBlockObtainMethod::Pushed),
++            Some(NakamotoBlockTransferSource::P2pPush)
++        );
++        assert_eq!(
++            transfer_source(NakamotoBlockObtainMethod::Downloaded),
++            Some(NakamotoBlockTransferSource::TenureDownload)
++        );
++        assert_eq!(
++            transfer_source(NakamotoBlockObtainMethod::Uploaded),
++            Some(NakamotoBlockTransferSource::RpcUpload)
++        );
++        assert_eq!(transfer_source(NakamotoBlockObtainMethod::Mined), None);
++        assert_eq!(transfer_source(NakamotoBlockObtainMethod::Shadow), None);
++    }
++
++    #[test]
++    fn transfer_outcome_preserves_acceptance_semantics() {
++        assert_eq!(
++            transfer_outcome(&Ok(BlockAcceptResponse::Accepted)),
++            NakamotoBlockTransferOutcome::Accepted
++        );
++        assert_eq!(
++            transfer_outcome(&Ok(BlockAcceptResponse::AlreadyStored)),
++            NakamotoBlockTransferOutcome::Duplicate
++        );
++        assert_eq!(
++            transfer_outcome(&Ok(BlockAcceptResponse::Rejected("invalid".into()))),
++            NakamotoBlockTransferOutcome::Rejected
++        );
++        assert_eq!(
++            transfer_outcome(&Err(chainstate_error::PoxNoRewardCycle)),
++            NakamotoBlockTransferOutcome::Error
++        );
++    }
++}
++
+ impl BlockAcceptResponse {
+     /// Does this response indicate that the block was accepted to the staging DB
+     pub fn is_accepted(&self) -> bool {
+@@ -909,6 +977,41 @@ impl Relayer {
+         coord_comms: Option<&CoordinatorChannels>,
+         obtained_method: NakamotoBlockObtainMethod,
+         force_broadcast: bool,
++    ) -> Result<BlockAcceptResponse, chainstate_error> {
++        let result = Self::process_new_nakamoto_block_ext_inner(
++            burnchain,
++            sortdb,
++            sort_handle,
++            chainstate,
++            stacks_tip,
++            block,
++            coord_comms,
++            obtained_method,
++            force_broadcast,
++        );
++
++        if let Some(source) = transfer_source(obtained_method) {
++            add_nakamoto_block_transfers(
++                NakamotoBlockTransferDirection::Received,
++                source,
++                transfer_outcome(&result),
++                1,
++            );
++        }
++        result
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn process_new_nakamoto_block_ext_inner(
++        burnchain: &Burnchain,
++        sortdb: &SortitionDB,
++        sort_handle: &mut SortitionHandleConn,
++        chainstate: &mut StacksChainState,
++        stacks_tip: &StacksBlockId,
++        block: &NakamotoBlock,
++        coord_comms: Option<&CoordinatorChannels>,
++        obtained_method: NakamotoBlockObtainMethod,
++        force_broadcast: bool,
+     ) -> Result<BlockAcceptResponse, chainstate_error> {
+         info!(
+             "Handle incoming Nakamoto block {}/{} obtained via {}",
+@@ -2744,11 +2847,26 @@ impl Relayer {
+                 );
+             }
+ 
++            let relay_count = relay_blocks.len();
+             let msg = StacksMessageType::NakamotoBlocks(NakamotoBlocksData {
+                 blocks: relay_blocks,
+             });
+-            if let Err(e) = self.p2p.broadcast_message(relayers, msg) {
+-                warn!("Failed to broadcast Nakamoto blocks: {:?}", &e);
++            match self.p2p.broadcast_message(relayers, msg) {
++                Ok(()) => add_nakamoto_block_transfers(
++                    NakamotoBlockTransferDirection::Sent,
++                    NakamotoBlockTransferSource::P2pRelay,
++                    NakamotoBlockTransferOutcome::Queued,
++                    relay_count,
++                ),
++                Err(e) => {
++                    add_nakamoto_block_transfers(
++                        NakamotoBlockTransferDirection::Sent,
++                        NakamotoBlockTransferSource::P2pRelay,
++                        NakamotoBlockTransferOutcome::Failed,
++                        relay_count,
++                    );
++                    warn!("Failed to broadcast Nakamoto blocks: {:?}", &e);
++                }
+             }
+         }
+ 

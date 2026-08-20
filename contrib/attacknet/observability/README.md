@@ -149,6 +149,43 @@ zero. Burn-chain and Stacks-chain cohort progress are separate panels with
 independent vertical scales because Nakamoto block cadence is much faster than
 Bitcoin burn-block cadence.
 
+Each actor scrape target carries only the render-time aggregate
+`instrumentation_profile`, `instrumentation_provenance`, `requested_image`,
+and `event_dispatch_mode` declarations. Exact family metadata is projected by
+the orchestrator bridge as the bounded
+`attacknet_instrumentation_family_provenance{attacknet_actor,attacknet_role,family,provenance}`
+metric. This avoids copying 22 target labels onto every actor-exported series.
+The dashboard capability tables surface both forms so an `unavailable` profile
+cannot be read as a healthy zero. `mixed` means applicable families have more
+than one of the three exact provenances. The per-family metric comes from a
+digest-bound qualification plan for the exact rendered manifest, rather than
+being inferred from that aggregate. The qualified capability manifest joins the build
+source audit, Pod UID, runtime image identity, admitted config, and retained
+runtime metric-family snapshot. Prometheus rules alert
+on correlated signer participation loss, frozen signer state, validation
+unavailability, and Nakamoto propagation failure. A separate two-minute
+`AttacknetInstrumentationProvenanceExporterAbsent` alert detects loss of the
+central provenance inventory whenever the Prometheus configuration contains at
+least one node or signer scrape target. The non-empty-topology guard prevents a
+deliberately actor-free render from being reported as an exporter failure;
+actor unreachability remains the responsibility of the scrape-target alerts.
+`AttacknetActorMetricsUnreachable` makes that boundary explicit by warning
+after an enrolled node or signer target has remained `up == 0` for 30 seconds;
+Pod readiness alone is not accepted as evidence that telemetry is reachable.
+Family-presence rules use the exact exporter name recorded by the inventory:
+Rust counters retain their declared base name in this metrics endpoint, while
+histogram presence is checked through the generated `_count` child series.
+The two-minute `for` interval suppresses false startup noise before the first
+scrape. With the configured five-second scrape and evaluation intervals,
+ordinary metric disappearance or scrape failure normally fires after roughly
+two minutes plus one cycle because Prometheus records stale markers; the
+five-minute lookback is only a fallback when no stale marker is available.
+Each family-absence alert
+selects only actors declaring that family `merged` or `attacknet-patch`; a
+mixed actor cannot generate a false absence alert for an intentionally
+unavailable family. The capability table must still be checked before
+interpreting alert silence as health.
+
 The **Explore actor logs** links open Grafana Explore for longer LogQL queries.
 The dashboards are optimized for humans. Automated agents should query
 Prometheus, Loki, and the authenticated journal API directly and retain the raw

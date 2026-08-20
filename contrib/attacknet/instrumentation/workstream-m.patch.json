@@ -1,0 +1,10 @@
+{
+  "schema": "stacks-attacknet-carried-patch/v1",
+  "patch": "workstream-m.patch",
+  "digest": "sha256:48e56bffe097b42d1297b4081a2674bf9ac18d643d79f580da799bae3af15585",
+  "upstreamBaseRevision": "6b002604da0533e69f4ebdceb2747954f496a3ea",
+  "expectedSourceStateDigest": "sha256:6d332a0ca21d2214eddc4078d4ffb451ac00405519c5750eca45d6308e853e9b",
+  "inventoryVersion": "workstream-m/1",
+  "families": ["M01","M02","M03","M04","M05","M06","M07","M08","M09","M10","M11","M12","M13","M15","M16","M17","M18","M19","M20","M21","M22"],
+  "scope": "Observation-only Workstream M integration, including proposal_to_first_response and bounded zero-series initialization for both node coordinator and signer outcome vectors."
+}

@@ -36,6 +36,7 @@ run_node_suite() {
 }
 
 run_node_suite attacknet-node "${ATTACKNET_DIR}"/*.test.mjs
+run_node_suite instrumentation-node "${ATTACKNET_DIR}"/instrumentation/*.test.mjs
 run_node_suite observability-node "${ATTACKNET_DIR}"/observability/*.test.mjs
 run_node_suite release-node "${ATTACKNET_DIR}"/release/*.test.mjs
 bash -n "${ATTACKNET_DIR}"/*.sh

@@ -74,7 +74,11 @@ function scopedInventoryDigest(packet, kinds) {
   return sha256(packet.inventory
     .filter(item => kinds.has(item.kind))
     .map(({id, kind, path, digest: itemDigest}) => ({id, kind, path, digest: itemDigest}))
-    .sort((left, right) => left.id.localeCompare(right.id)));
+    // Use the same locale-independent UTF-16 code-unit ordering as
+    // Array.prototype.sort() and canonical() above.  localeCompare() depends
+    // on the host's locale and ICU build, so it cannot define an artifact
+    // digest that independent reviewers must reproduce byte-for-byte.
+    .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
 }
 
 function unsignedPacket(packet) {

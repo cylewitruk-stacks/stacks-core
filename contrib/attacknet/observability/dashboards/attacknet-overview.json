@@ -161,9 +161,9 @@
       "targets": [
         {"expr": "sum by (attacknet_actor) (rate(stacks_signer_block_proposals_received{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "proposal {{attacknet_actor}}", "refId": "A"},
         {"expr": "sum by (attacknet_actor,response_type) (rate(stacks_signer_block_responses_sent{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "legacy {{response_type}} {{attacknet_actor}}", "refId": "B"},
-        {"expr": "sum by (attacknet_actor,classification,action) (rate(stacks_signer_policy_evaluations_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "policy {{classification}}/{{action}} {{attacknet_actor}}", "refId": "C"},
-        {"expr": "sum by (attacknet_actor,event,reason) (rate(stacks_signer_block_validation_lifecycle_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "validation {{event}}/{{reason}} {{attacknet_actor}}", "refId": "D"},
-        {"expr": "sum by (attacknet_actor,response_type,outcome) (rate(stacks_signer_block_response_deliveries_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "delivery {{response_type}}/{{outcome}} {{attacknet_actor}}", "refId": "E"}
+        {"expr": "sum by (attacknet_actor,classification,action) (rate(stacks_signer_policy_evaluations{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "policy {{classification}}/{{action}} {{attacknet_actor}}", "refId": "C"},
+        {"expr": "sum by (attacknet_actor,event,reason) (rate(stacks_signer_block_validation_lifecycle{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "validation {{event}}/{{reason}} {{attacknet_actor}}", "refId": "D"},
+        {"expr": "sum by (attacknet_actor,response_type,outcome) (rate(stacks_signer_block_response_deliveries{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[2m]))", "legendFormat": "delivery {{response_type}}/{{outcome}} {{attacknet_actor}}", "refId": "E"}
       ],
       "title": "Signer proposal and vote rates",
       "type": "timeseries"
@@ -391,8 +391,8 @@
       "id": 28,
       "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "sum by (attacknet_actor,event,outcome) (rate(stacks_node_signer_coordinator_rounds_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "round {{event}}/{{outcome}} {{attacknet_actor}}", "refId": "A"},
-        {"expr": "sum by (attacknet_actor,classification) (rate(stacks_node_signer_response_weight_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "weight {{classification}} {{attacknet_actor}}", "refId": "B"}
+        {"expr": "sum by (attacknet_actor,event,outcome) (rate(stacks_node_signer_coordinator_rounds{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "round {{event}}/{{outcome}} {{attacknet_actor}}", "refId": "A"},
+        {"expr": "sum by (attacknet_actor,classification) (rate(stacks_node_signer_response_weight{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "weight {{classification}} {{attacknet_actor}}", "refId": "B"}
       ],
       "title": "Legacy coordinator rounds and response weight",
       "type": "timeseries"
@@ -421,10 +421,25 @@
       "id": 30,
       "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "sum by (attacknet_actor,direction,source,outcome) (rate(stacks_node_nakamoto_block_transfers_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "{{direction}} {{source}}/{{outcome}} {{attacknet_actor}}", "refId": "A"}
+        {"expr": "sum by (attacknet_actor,direction,source,outcome) (rate(stacks_node_nakamoto_block_transfers{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m]))", "legendFormat": "{{direction}} {{source}}/{{outcome}} {{attacknet_actor}}", "refId": "A"}
       ],
       "title": "Nakamoto block transfer boundaries",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Render-time aggregate profile for each reachable endpoint plus exact per-family provenance from the orchestrator-owned metadata metric. unavailable means missing Workstream M series are an expected capability gap, never a healthy zero. mixed means the actor's applicable families have more than one exact provenance. Verify these declarations against the sealed capability manifest, admitted Pod UID, and runtime image evidence.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 119},
+      "id": 31,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [
+        {"expr": "max by (attacknet_actor,attacknet_role,requested_image,instrumentation_profile,instrumentation_provenance,event_dispatch_mode) (up{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"})", "format": "table", "instant": true, "refId": "A"},
+        {"expr": "max by (attacknet_actor,attacknet_role,family,provenance,evidence_source) (attacknet_instrumentation_family_provenance{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"})", "format": "table", "instant": true, "refId": "B"}
+      ],
+      "title": "Instrumentation capability declarations",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true}, "renameByName": {"attacknet_actor": "Actor", "attacknet_role": "Role", "event_dispatch_mode": "Event dispatch", "instrumentation_profile": "Capability profile", "instrumentation_provenance": "Signal provenance", "requested_image": "Requested image"}}}],
+      "type": "table"
     }
   ],
   "refresh": "5s",

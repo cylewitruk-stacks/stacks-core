@@ -29,6 +29,8 @@ const SOURCE_KINDS = new Set(['current', 'releasedGitRef', 'localModified']);
 const PLATFORMS = new Set(['linux/amd64', 'linux/arm64']);
 const CARGO_FEATURE = /^[a-zA-Z0-9_-]{1,64}$/;
 const DEFAULT_CARGO_FEATURES = Object.freeze(['monitoring_prom', 'slog_json']);
+const INSTRUMENTATION_INVENTORY = resolve(
+  dirname(fileURLToPath(import.meta.url)), 'instrumentation', 'inventory-v1.json');
 
 function fail(message) { throw new Error(message); }
 function object(value, path) {
@@ -327,6 +329,20 @@ export function stagedContextDigest(directory) {
   return artifactDigest({schema: 'stacks-attacknet-staged-context/v1', files: treeEntries(directory)});
 }
 
+export function auditInstrumentationSource(directory, inventoryPath = INSTRUMENTATION_INVENTORY) {
+  const inventoryBytes = readFileSync(inventoryPath);
+  const inventory = JSON.parse(inventoryBytes.toString('utf8'));
+  const rust = treeEntries(directory).filter(entry => entry.path.endsWith('.rs'))
+    .map(entry => readFileSync(safePath(directory, entry.path)).toString('utf8')).join('\n');
+  return {
+    method: 'exact-source-string-audit/v1',
+    inventoryVersion: inventory.inventoryVersion,
+    inventoryDigest: sha256(inventoryBytes),
+    sourceContextDigest: stagedContextDigest(directory),
+    familiesPresent: inventory.families.filter(family => rust.includes(family.family)).map(family => family.id).sort(),
+  };
+}
+
 function assertSourceUnchanged(profile) {
   const fresh = profile.source.kind === 'releasedGitRef'
     ? {revision: git(profile.source.repository, ['rev-parse', '--verify', `${profile.source.revision}^{commit}`]), sourceStateDigest: profile.source.sourceStateDigest}
@@ -457,6 +473,7 @@ export function executeImageBuildPipeline(plan, {
     stager(profile, context);
     assertSourceUnchanged(profile);
     const contextDigest = stagedContextDigest(context);
+    const instrumentationSourceAudit = auditInstrumentationSource(context);
     const contentDigest = artifactDigest({buildKeyDigest: profile.buildKeyDigest, contextDigest});
     const localRef = `${plan.imageRepository}:content-${tagFragment(contentDigest)}`;
     const recipeOutput = join(scratch, `${profile.id}-cargo-chef-recipe`);
@@ -561,6 +578,7 @@ export function executeImageBuildPipeline(plan, {
       imageDigest,
       immutableRef,
       imageIdentity,
+      instrumentationSourceAudit,
       cargoChefRecipe: {
         path: basename(recipeEvidencePath),
         digest: recipeDigest,

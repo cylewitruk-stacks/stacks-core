@@ -15,15 +15,21 @@ digest proves what a human or model actually inspected.
 2. Populate the phase contract's complete, non-empty `requiredInventory` in a packet that
    follows `review-packet.schema.json`. Hash files byte-for-byte and build the
    packet's `sourceDigest` and `evidenceDigest` from their respective immutable
-   inventories.
+   inventories. Each scoped inventory is projected to
+   `{id, kind, path, digest}`, sorted by `id` in ascending UTF-16 code-unit
+   order (not locale collation), encoded as the canonical JSON described
+   below, and hashed as UTF-8 bytes with SHA-256.
    The local schema validator deliberately implements a finite JSON Schema
    subset and rejects every keyword outside that subset. Structural keywords
    such as `properties`, `items`, and `pattern` also require their explicit
    compatible `type`; unsupported or ambiguous schema changes therefore stop
    packet validation instead of silently weakening it.
-3. Bind `contractDigest` to the exact contract and set `binding.digest` to the SHA-256 digest of canonical packet JSON with the
-   entire `binding` member omitted. `phase-review.mjs` performs this same
-   calculation.
+3. Bind `contractDigest` to the exact contract and set `binding.digest` to the
+   SHA-256 digest of canonical packet JSON with the entire `binding` member
+   omitted. Canonical JSON preserves array order; sorts object keys in
+   ascending UTF-16 code-unit order; uses JSON string escaping and JSON's
+   finite-number, Boolean, and null spellings; and inserts no insignificant
+   whitespace. `phase-review.mjs` performs this same calculation.
 4. Give each reviewer the complete packet and every inventory item. A reduced
    packet records non-applicable full-tier material explicitly in its matrix;
    it does not silently omit it.
@@ -60,6 +66,22 @@ node contrib/attacknet/release/phase-zero-packet.mjs \
 The builder fails if the offline result or any historical evidence is absent.
 The unit suite injects a synthetic inventory, so clean-clone CI does not need
 the gitignored historical archive merely to test packet semantics.
+
+Phase 1 uses a Full packet. Its live summary must pin the signed candidate,
+the externally archived evidence plus archive index, each load-bearing live
+artifact, and every required passed assertion. Generate it only after the
+post-commit baseline and negative controls complete:
+
+```bash
+node contrib/attacknet/release/phase-one-packet.mjs \
+  --live-summary=.docs/reviews/attacknet-phase-1/live-summary.json \
+  --offline-result=.docs/reviews/attacknet-phase-1/offline-result.json \
+  --output=.docs/reviews/attacknet-phase-1/packet.json
+```
+
+The builder rejects a dirty candidate, a live run pinned to another commit,
+artifact or archive drift, and any missing/failed live assertion. An archive
+path without a verified digest is not evidence custody.
 
 ## Evidence preservation
 

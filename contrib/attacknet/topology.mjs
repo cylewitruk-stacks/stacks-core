@@ -94,6 +94,14 @@ Options:
   --actor-image=ACTOR=IMAGE  per-actor image override; repeatable
   --actor-env=ACTOR:NAME=VALUE
                               per-actor environment value; repeatable
+  --event-dispatch=queued|blocking
+                              explicit node event-delivery mode (default: queued)
+  --instrumentation-profile=ID
+                              capability-manifest profile (default: unmodified)
+  --instrumentation-provenance=merged|attacknet-patch|mixed|unavailable
+                              default 22-family provenance (default: unavailable)
+  --actor-instrumentation=ACTOR=PROFILE:PROVENANCE
+                              per-actor capability override; repeatable
   --probes=true|false        add trusted fault-probe sidecars (default: false)
   --probe-image=IMAGE        trusted fault-probe image
   --output=DIR               rendered output directory
@@ -127,7 +135,7 @@ function epochsAndBalances(signers) {
   return [...epochs, ...balances].join('\n\n');
 }
 
-function nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers, bootstrapPeers}) {
+function nodeConfig({name, seedByte, miner, minerIndex, signerIndex, signers, bootstrapPeers, eventDispatchMode}) {
   // On the current-main legacy transport, `stacker` is also the subscription
   // switch for the boot `.miners` and signer StackerDB replicas.  A signer
   // companion is not a miner, but it must set this flag or proposals can only
@@ -165,6 +173,8 @@ seed = "${repeated(seedByte)}"
 local_peer_seed = "${repeated(seedByte)}"
 miner = ${miner}
 stacker = ${subscribesToSignerStackerDBs}
+event_dispatcher_blocking = ${eventDispatchMode === 'blocking'}
+event_dispatcher_queue_size = 1000
 use_test_genesis_chainstate = true
 pox_5_sbtc_contract = "${CONTRACT_ACCOUNT}.sbtc-token"
 pox_5_sbtc_registry_contract = "${CONTRACT_ACCOUNT}.sbtc-registry"
@@ -230,11 +240,11 @@ function signerConsensusWeight(index) {
   return Math.floor(targetSlots * 1.5);
 }
 
-function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex, signers, image, bootstrapPeers}) {
+function nodeActor({name, role, seedByte, miner = false, minerIndex, signerIndex, signers, image, bootstrapPeers, eventDispatchMode}) {
   const delayedMiner = miner && minerIndex > 0;
   const files = {
     'config.toml': nodeConfig({
-      name, seedByte, miner, minerIndex, signerIndex, signers, bootstrapPeers,
+      name, seedByte, miner, minerIndex, signerIndex, signers, bootstrapPeers, eventDispatchMode,
     }),
     'configure-node.sh': readFileSync(join(ROOT, 'configure-node.sh'), 'utf8'),
   };
@@ -319,10 +329,13 @@ function signerActor(index, signer, image) {
   };
 }
 
-export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 1, nodeImage = 'stacks-core-attacknet:main', stackerImage = 'stacks-attacknet-stacker:local', actorImages = {}, actorEnvs = {}} = {}) {
+export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 1, nodeImage = 'stacks-core-attacknet:main', stackerImage = 'stacks-attacknet-stacker:local', actorImages = {}, actorEnvs = {}, eventDispatchMode = 'queued', instrumentationProfile = 'unmodified', instrumentationProvenance = 'unavailable', actorInstrumentation = {}} = {}) {
   if (minerCount < 1 || minerCount > LIMITS.miners) throw new Error('minerCount out of range');
   if (signerCount < 1 || signerCount > LIMITS.signers) throw new Error('signerCount out of range');
   if (followerCount < 0 || followerCount > LIMITS.followers) throw new Error('followerCount out of range');
+  if (!['queued', 'blocking'].includes(eventDispatchMode)) throw new Error('eventDispatchMode must be queued or blocking');
+  if (!/^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/.test(instrumentationProfile)) throw new Error('instrumentationProfile is invalid');
+  if (!['merged', 'attacknet-patch', 'mixed', 'unavailable'].includes(instrumentationProvenance)) throw new Error('instrumentationProvenance is invalid');
   const signers = SIGNERS.slice(0, signerCount);
   const nodeIdentities = [
     ...Array.from({length: minerCount}, (_, index) => ({
@@ -336,35 +349,65 @@ export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 
     })),
   ];
   // Bootstrap is a recovery mechanism, not an architectural dependency on a
-  // single privileged actor. Prefer the always-on first miner and followers,
-  // then companions and additional miners. Every node receives up to three
-  // distinct, non-self identities from the admitted topology. The list is
-  // deterministic so evidence and replay descriptors remain reproducible.
-  const bootstrapOrder = [
+  // single privileged actor. Spread initial dials evenly across nodes that are
+  // guaranteed to be listening throughout preactivation. Late companions and
+  // activation-gated miners are deliberately excluded: a peer that misses one
+  // of those listeners can fill its ordinary neighbor set and never retry the
+  // missed bootstrap entry. Small topologies fall back to the complete node
+  // set so every node still retains a non-self recovery peer.
+  const alwaysOnBootstrap = [
     nodeIdentities.find(actor => actor.name === 'miner-1'),
     ...nodeIdentities.filter(actor => actor.name.startsWith('follower-')),
-    ...nodeIdentities.filter(actor => actor.name.startsWith('signer-node-')),
-    ...nodeIdentities.filter(actor => actor.name.startsWith('miner-') && actor.name !== 'miner-1'),
   ].filter(Boolean);
-  const bootstrapPeersFor = name => bootstrapOrder.filter(actor => actor.name !== name).slice(0, 3);
+  const bootstrapOrder = alwaysOnBootstrap.length >= 2 ? alwaysOnBootstrap : nodeIdentities;
+  const bootstrapPeersFor = name => {
+    const position = nodeIdentities.findIndex(actor => actor.name === name);
+    if (position < 0) throw new Error(`node identity ${name} is absent from topology`);
+    const count = Math.min(3, bootstrapOrder.length - (bootstrapOrder.some(actor => actor.name === name) ? 1 : 0));
+    const peers = [];
+    for (let offset = 0; peers.length < count; offset += 1) {
+      const candidate = bootstrapOrder[(position + offset) % bootstrapOrder.length];
+      if (candidate.name !== name && !peers.includes(candidate)) peers.push(candidate);
+    }
+    return peers;
+  };
   const actors = [];
   for (let index = 0; index < minerCount; index += 1) {
     const name = `miner-${index + 1}`;
-    actors.push(nodeActor({name, role: 'miner', seedByte: MINERS[index][0], miner: true, minerIndex: index, signers, image: actorImages[name] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(name)}));
+    actors.push(nodeActor({name, role: 'miner', seedByte: MINERS[index][0], miner: true, minerIndex: index, signers, image: actorImages[name] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(name), eventDispatchMode}));
   }
   for (let index = 1; index <= signerCount; index += 1) {
     const companion = `signer-node-${index}`;
     const signer = `signer-${index}`;
-    actors.push(nodeActor({name: companion, role: 'companion', seedByte: (0x20 + index).toString(16), signerIndex: index, signers, image: actorImages[companion] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(companion)}));
+    actors.push(nodeActor({name: companion, role: 'companion', seedByte: (0x20 + index).toString(16), signerIndex: index, signers, image: actorImages[companion] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(companion), eventDispatchMode}));
     actors.push(signerActor(index, signers[index - 1], actorImages[signer] ?? nodeImage));
   }
   for (let index = 1; index <= followerCount; index += 1) {
     const name = `follower-${index}`;
-    actors.push(nodeActor({name, role: 'follower', seedByte: (0x30 + index).toString(16), signers, image: actorImages[name] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(name)}));
+    actors.push(nodeActor({name, role: 'follower', seedByte: (0x30 + index).toString(16), signers, image: actorImages[name] ?? nodeImage, bootstrapPeers: bootstrapPeersFor(name), eventDispatchMode}));
   }
   const knownActors = new Set(actors.map(actor => actor.name));
   for (const name of Object.keys(actorImages)) {
     if (!knownActors.has(name)) throw new Error(`actor image override references unknown actor ${name}`);
+  }
+  for (const [name, declaration] of Object.entries(actorInstrumentation)) {
+    if (!knownActors.has(name)) throw new Error(`actor instrumentation references unknown actor ${name}`);
+    const actor = actors.find(candidate => candidate.name === name);
+    if (!['miner', 'companion', 'follower', 'signer'].includes(actor.role)) {
+      throw new Error(`actor instrumentation cannot target non-protocol actor ${name}`);
+    }
+    if (!/^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?:(?:merged|attacknet-patch|mixed|unavailable)$/.test(declaration)) {
+      throw new Error(`actor instrumentation ${name} must use PROFILE:merged|attacknet-patch|mixed|unavailable`);
+    }
+  }
+  for (const actor of actors) {
+    const instrumentable = ['miner', 'companion', 'follower', 'signer'].includes(actor.role);
+    const fallback = instrumentable
+      ? `${instrumentationProfile}:${instrumentationProvenance}`
+      : 'unmodified:unavailable';
+    const [profile, provenance] = (actorInstrumentation[actor.name] ?? fallback).split(':');
+    actor.instrumentation = {profile, provenance};
+    if (actor.role !== 'signer') actor.eventDispatchMode = eventDispatchMode;
   }
   for (const [name, entries] of Object.entries(actorEnvs)) {
     if (!knownActors.has(name)) throw new Error(`actor environment override references unknown actor ${name}`);
@@ -380,7 +423,7 @@ export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 
       actor.env.push({name: entry.name, value: entry.value});
     }
   }
-  return {minerCount, signerCount, followerCount, nodeImage, stackerImage, actors, signers};
+  return {minerCount, signerCount, followerCount, nodeImage, stackerImage, actors, signers, eventDispatchMode, instrumentationProfile, instrumentationProvenance};
 }
 
 function infrastructureActors(topology, network) {
@@ -606,7 +649,12 @@ export function renderTopology(topology, output, {
   });
   // activationGate belongs to the backend-neutral run manifest.  The current
   // operator does not need it to build the Pod, so do not leak it into the CRD.
-  const resourceActors = actors.map(({activationGate: _activationGate, ...actor}) => actor);
+  const resourceActors = actors.map(({
+    activationGate: _activationGate,
+    instrumentation: _instrumentation,
+    eventDispatchMode: _eventDispatchMode,
+    ...actor
+  }) => actor);
   const resource = {
     apiVersion: 'testing.stacks.org/v1alpha1', kind: 'StacksNetwork',
     metadata: {name: network, namespace, labels: {'testing.stacks.org/profile': 'mainnet-legacy-transport'}},
@@ -645,6 +693,9 @@ export function renderTopology(topology, output, {
       ? topology.signers[actor.signerIndex - 1][1]
       : undefined,
     activationGate: actor.activationGate,
+    requestedImage: actor.image,
+    instrumentation: actor.instrumentation ?? {profile: 'unmodified', provenance: 'unavailable'},
+    eventDispatchMode: actor.eventDispatchMode,
   });
   const manifest = {
     schemaVersion: 1, profile: 'mainnet-legacy-transport', network, namespace,
@@ -662,6 +713,7 @@ export function renderTopology(topology, output, {
       signerRegistrationHeight: 222,
       nakamotoActivationHeight: 223,
       steadyBurnIntervalSeconds: 60,
+      eventDispatchMode: topology.eventDispatchMode,
     },
     counts: {miners: topology.minerCount, signers: topology.signerCount, followers: topology.followerCount},
     images: {node: topology.nodeImage, stacker: topology.stackerImage},
@@ -717,6 +769,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     stackerImage: option('stacker-image', 'stacks-attacknet-stacker:local'),
     actorImages: repeatedMapOption('actor-image'),
     actorEnvs: repeatedActorEnvOption(),
+    eventDispatchMode: option('event-dispatch', 'queued'),
+    instrumentationProfile: option('instrumentation-profile', 'unmodified'),
+    instrumentationProvenance: option('instrumentation-provenance', 'unavailable'),
+    actorInstrumentation: repeatedMapOption('actor-instrumentation'),
   });
   const output = resolve(option('output', join(ROOT, 'generated')));
   const probeEnabled = option('probes', 'false');

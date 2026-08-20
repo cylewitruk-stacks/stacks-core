@@ -216,6 +216,9 @@ test('execution uses BuildKit provenance, content tags, exact source contexts, a
   assert.equal(result.profiles[0].imageIdentity.expectedRuntimeImageID, SHA_E);
   assert.match(result.profiles[0].cargoChefRecipe.digest, /^sha256:[0-9a-f]{64}$/);
   assert.match(result.profiles[0].buildInvocation.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(result.profiles[0].instrumentationSourceAudit.method, 'exact-source-string-audit/v1');
+  assert.equal(result.profiles[0].instrumentationSourceAudit.sourceContextDigest, result.profiles[0].stagedContextDigest);
+  assert.match(result.profiles[0].instrumentationSourceAudit.inventoryDigest, /^sha256:[0-9a-f]{64}$/);
   assert.equal(
     readFileSync(join(root, 'evidence', result.profiles[0].cargoChefRecipe.path), 'utf8'),
     '{"skeleton":{"manifests":[]}}\n');

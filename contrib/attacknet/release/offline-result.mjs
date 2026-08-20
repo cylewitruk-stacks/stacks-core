@@ -31,6 +31,7 @@ export function buildOfflineResult({sourceRevision, suites, command = 'contrib/a
   const result = {
     schemaVersion: OFFLINE_RESULT_SCHEMA,
     sourceRevision,
+    status: 'passed',
     recordedAt,
     command,
     suites: suites.map(suite),

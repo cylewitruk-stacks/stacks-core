@@ -9,13 +9,21 @@ if [ -z "${node_ip}" ]; then
   node_ip="$(hostname -i | awk '{ print $1 }')"
 fi
 
-case "${node_ip}" in
-  *:*|'')
-    echo "could not derive an IPv4 address for this actor: ${node_ip:-empty}" >&2
-    exit 1
-    ;;
-esac
+if ! awk -v ip="${node_ip}" 'BEGIN {
+  count = split(ip, octets, ".")
+  if (count != 4) exit 1
+  for (i = 1; i <= 4; i++) {
+    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1
+  }
+}' </dev/null; then
+  echo "could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}" >&2
+  exit 1
+fi
 
-sed "s/__NODE_IP__/${node_ip}/g" "${template}" >"${rendered}"
+temporary="${rendered}.tmp.$$"
+trap 'rm -f "${temporary}"' EXIT
+sed "s/__NODE_IP__/${node_ip}/g" "${template}" >"${temporary}"
+mv "${temporary}" "${rendered}"
+trap - EXIT
 export STACKS_ATTACKNET_CONFIG="${rendered}"
 exec "$@"

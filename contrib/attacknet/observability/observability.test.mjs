@@ -4,7 +4,9 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
 
-import {renderObservability} from './render.mjs';
+import {loadInventory} from '../instrumentation/capability-manifest.mjs';
+import {sha256File, sha256Value} from '../run-descriptor.mjs';
+import {instrumentationExpectationsFromPlan, renderObservability} from './render.mjs';
 import {readEvents, renderReport} from './report.mjs';
 
 const manifest = {
@@ -12,7 +14,7 @@ const manifest = {
   network: 'attacknet-test',
   namespace: 'hacknet-system',
   workloads: [
-    {service: 'miner-1', type: 'node', role: 'miner'},
+    {service: 'miner-1', type: 'node', role: 'miner', requestedImage: 'stacks:patched', instrumentation: {profile: 'patched-main', provenance: 'mixed'}, eventDispatchMode: 'queued'},
     {service: 'signer-node-1', type: 'node', role: 'companion'},
     {service: 'signer-1', type: 'signer', role: 'signer'},
     {service: 'follower-1', type: 'node', role: 'follower'},
@@ -20,8 +22,22 @@ const manifest = {
   ],
 };
 
+const instrumentationExpectations = [{
+  actor: 'miner-1', role: 'miner',
+  families: loadInventory().families.filter(family => family.roles.includes('miner')).map(family => ({
+    id: family.id,
+    provenance: family.id === 'M19' ? 'unavailable' : 'attacknet-patch',
+  })),
+}];
+
+function render(options = {}) {
+  return renderObservability(manifest, {
+    eventToken: 'c'.repeat(64), instrumentationExpectations, ...options,
+  });
+}
+
 test('render emits actor-labelled scrape targets and restricted credential-free observers', () => {
-  const rendered = renderObservability(manifest, {eventToken: 'c'.repeat(64)});
+  const rendered = render();
   const resources = new Map(rendered.items.map(item => [`${item.kind}/${item.metadata.name}`, item]));
   const prometheus = resources.get('ConfigMap/attacknet-test-attacknet-prometheus');
   const nodes = JSON.parse(prometheus.data['nodes.json']);
@@ -33,10 +49,57 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
   ]);
   assert.equal(nodes[1].labels.attacknet_role, 'companion');
   assert.equal(nodes[1].labels.evidence_source, 'actor_self_reported');
+  assert.equal(nodes[0].labels.requested_image, 'stacks:patched');
+  assert.equal(nodes[0].labels.instrumentation_profile, 'patched-main');
+  assert.equal(nodes[0].labels.instrumentation_provenance, 'mixed');
+  assert.equal(Object.keys(nodes[0].labels).some(label => /^instrumentation_m\d+_provenance$/.test(label)), false);
+  assert.equal(nodes[0].labels.event_dispatch_mode, 'queued');
+  assert.equal(nodes[1].labels.instrumentation_provenance, 'unavailable');
   assert.equal(signers[0].targets[0], 'attacknet-test-signer-1:31000');
   assert.match(prometheus.data['prometheus.yml'], /attacknet-orchestrator-events/);
   assert.match(prometheus.data['prometheus.yml'], /job_name: attacknet-run-controller/);
   assert.match(prometheus.data['prometheus.yml'], /targets: \["hacknet-run:8080"\]/);
+  assert.match(prometheus.data['prometheus.yml'], /attacknet\.rules\.yml/);
+  for (const alert of [
+    'AttacknetInstrumentationProvenanceExporterAbsent',
+    'AttacknetActorMetricsUnreachable',
+    'AttacknetCorrelatedSignerParticipationLoss', 'AttacknetSignerStateFrozen',
+    'AttacknetSignerValidationUnavailable', 'AttacknetNakamotoPropagationFailure',
+  ]) assert.match(prometheus.data['attacknet.rules.yml'], new RegExp(alert));
+  const actorScrapeJobs = [...prometheus.data['prometheus.yml'].matchAll(
+    /^\s*- job_name: (stacks-(?:node|signer)-metrics)$/gm,
+  )].map(match => match[1]).sort();
+  const watchdogJobs = prometheus.data['attacknet.rules.yml']
+    .match(/absent\(attacknet_instrumentation_family_provenance\) and on\(\) \(count\(up\{job=~"([^"]+)"\}\) > 0\)/)?.[1]
+    .split('|').sort();
+  assert.deepEqual(watchdogJobs, actorScrapeJobs);
+  const unreachableJobs = prometheus.data['attacknet.rules.yml']
+    .match(/AttacknetActorMetricsUnreachable[\s\S]*?up\{job=~"([^"]+)"\} == 0/)?.[1]
+    .split('|').sort();
+  assert.deepEqual(unreachableJobs, actorScrapeJobs);
+  assert.match(prometheus.data['attacknet.rules.yml'], /AttacknetActorMetricsUnreachable[\s\S]*?for: 30s/);
+  assert.match(
+    prometheus.data['attacknet.rules.yml'],
+    /AttacknetInstrumentationProvenanceExporterAbsent[\s\S]*?for: 2m/,
+  );
+  assert.match(prometheus.data['attacknet.rules.yml'], /classification="unavailable"/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /outcome=~"failed\|error\|rejected"/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /attacknet_instrumentation_family_provenance\{family="M19",provenance=~"merged\|attacknet-patch",attacknet_role=~"miner",evidence_source="orchestrator_observed"/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /AttacknetInstrumentationAbsentM15[\s\S]*?stacks_signer_policy_evaluations\)/);
+  assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /stacks_signer_policy_evaluations_total/);
+  assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /stacks_node_nakamoto_block_transfers_total/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /AttacknetInstrumentationAbsentM21[\s\S]*?stacks_node_signer_coordinator_milestone_seconds_count\)/);
+  assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /instrumentation_m19_provenance/);
+  assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /instrumentation_provenance!="unavailable"/);
+
+  const events = resources.get('ConfigMap/attacknet-test-attacknet-events');
+  const provenance = JSON.parse(events.data['instrumentation-provenance.json']);
+  assert.equal(provenance.schema, 'stacks-attacknet-instrumentation-provenance/v1');
+  const miner = provenance.actors.find(actor => actor.actor === 'miner-1');
+  assert.equal(miner.families.find(family => family.family === 'M19').provenance, 'unavailable');
+  assert.equal(miner.families.find(family => family.family === 'M20').provenance, 'attacknet-patch');
+  const companion = provenance.actors.find(actor => actor.actor === 'signer-node-1');
+  assert.ok(companion.families.every(family => family.provenance === 'unavailable'));
 
   for (const name of ['events', 'prometheus', 'grafana']) {
     const deployment = resources.get(`Deployment/attacknet-test-attacknet-${name}`);
@@ -55,22 +118,55 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
   const secretConsumers = deployments.filter(deployment =>
     deployment.spec.template.spec.volumes.some(volume => volume.secret?.secretName === secretName));
   assert.deepEqual(secretConsumers.map(deployment => deployment.metadata.name), ['attacknet-test-attacknet-events']);
+  const eventContainer = resources.get('Deployment/attacknet-test-attacknet-events').spec.template.spec.containers[0];
+  assert.ok(eventContainer.command.includes('--instrumentation-provenance=/opt/attacknet/instrumentation-provenance.json'));
+  assert.ok(eventContainer.volumeMounts.some(mount => mount.subPath === 'instrumentation-provenance.json' && mount.readOnly));
 });
 
 test('run-controller metrics target is explicit and cannot inject Prometheus config', () => {
-  const rendered = renderObservability(manifest, {
-    eventToken: 'c'.repeat(64), runOperatorTarget: 'custom-run.hacknet-system.svc:8080',
-  });
+  const rendered = render({runOperatorTarget: 'custom-run.hacknet-system.svc:8080'});
   const prometheus = rendered.items.find(item => item.kind === 'ConfigMap'
     && item.metadata.name === 'attacknet-test-attacknet-prometheus');
   assert.match(prometheus.data['prometheus.yml'], /custom-run\.hacknet-system\.svc:8080/);
   assert.throws(() => renderObservability(manifest, {
-    eventToken: 'c'.repeat(64), runOperatorTarget: 'run:8080\n  - job_name: forged',
+    eventToken: 'c'.repeat(64), instrumentationExpectations,
+    runOperatorTarget: 'run:8080\n  - job_name: forged',
   }), /bounded DNS name/);
 });
 
+test('mixed instrumentation requires exact per-family expectations', () => {
+  assert.throws(() => renderObservability(manifest, {eventToken: 'c'.repeat(64)}), /lacks per-family expectations/);
+  const invalid = structuredClone(instrumentationExpectations);
+  invalid[0].families[0].provenance = 'mixed';
+  assert.throws(() => renderObservability(manifest, {
+    eventToken: 'c'.repeat(64), instrumentationExpectations: invalid,
+  }), /invalid .* provenance/);
+  const incomplete = structuredClone(instrumentationExpectations);
+  incomplete[0].families.pop();
+  assert.throws(() => renderObservability(manifest, {
+    eventToken: 'c'.repeat(64), instrumentationExpectations: incomplete,
+  }), /instrumentation expectation omits/);
+});
+
+test('per-family expectations come only from a digest-bound qualification plan', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'attacknet-instrumentation-plan-'));
+  const manifestPath = join(directory, 'manifest.json');
+  writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
+  const plan = {
+    schema: 'stacks-attacknet-phase-1-qualification-plan/v1',
+    renderedManifest: {path: manifestPath, digest: sha256File(manifestPath)},
+    instrumentationFamilyExpectations: instrumentationExpectations,
+  };
+  plan.planDigest = sha256Value(plan);
+  assert.deepEqual(instrumentationExpectationsFromPlan(plan, manifestPath), instrumentationExpectations);
+  writeFileSync(manifestPath, `${JSON.stringify({...manifest, network: 'changed'})}\n`);
+  assert.throws(() => instrumentationExpectationsFromPlan(plan, manifestPath), /does not bind the rendered manifest/);
+  plan.instrumentationFamilyExpectations[0].families[0].provenance = 'merged';
+  assert.throws(() => instrumentationExpectationsFromPlan(plan), /plan digest mismatch/);
+});
+
 test('render centralizes actor logs with collector-attached Kubernetes identity and bounded retention', () => {
-  const rendered = renderObservability(manifest, {eventToken: 'c'.repeat(64)});
+  const rendered = render();
   const resources = new Map(rendered.items.map(item => [`${item.kind}/${item.metadata.name}`, item]));
   const loki = resources.get('ConfigMap/attacknet-test-attacknet-loki');
   assert.match(loki.data['loki.yaml'], /retention_period: 168h/);

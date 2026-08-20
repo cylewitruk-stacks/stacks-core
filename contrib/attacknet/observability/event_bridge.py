@@ -44,6 +44,10 @@ ALLOWED_PHASES = frozenset(
 )
 MAX_BODY_BYTES = 256 * 1024
 MAX_LABEL_LENGTH = 128
+INSTRUMENTATION_SCHEMA = "stacks-attacknet-instrumentation-provenance/v1"
+INSTRUMENTATION_FAMILIES = frozenset(f"M{number:02d}" for number in range(1, 23))
+INSTRUMENTATION_PROVENANCE = frozenset({"merged", "attacknet-patch", "unavailable"})
+INSTRUMENTATION_ROLES = frozenset({"miner", "companion", "follower", "signer"})
 
 
 def _now_rfc3339() -> str:
@@ -72,6 +76,50 @@ def _bounded_label(value: Any, field_name: str) -> str:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number {value}")
+
+
+def load_instrumentation_provenance(path: Path) -> tuple[dict[str, str], ...]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"invalid instrumentation provenance file: {error}") from error
+    if not isinstance(document, dict) or set(document) != {"schema", "actors"}:
+        raise ValueError("instrumentation provenance must contain only schema and actors")
+    if document["schema"] != INSTRUMENTATION_SCHEMA:
+        raise ValueError("unsupported instrumentation provenance schema")
+    actors = document["actors"]
+    if not isinstance(actors, list) or len(actors) > 256:
+        raise ValueError("instrumentation provenance actors must be an array of at most 256 entries")
+    records: list[dict[str, str]] = []
+    seen_actors: set[str] = set()
+    for actor_entry in actors:
+        if not isinstance(actor_entry, dict) or set(actor_entry) != {"actor", "role", "families"}:
+            raise ValueError("instrumentation actor must contain only actor, role, and families")
+        actor = _bounded_label(actor_entry["actor"], "instrumentation actor")
+        role = _bounded_label(actor_entry["role"], "instrumentation role")
+        if actor in seen_actors:
+            raise ValueError(f"duplicate instrumentation actor {actor}")
+        if role not in INSTRUMENTATION_ROLES:
+            raise ValueError(f"unsupported instrumentation role {role}")
+        seen_actors.add(actor)
+        families = actor_entry["families"]
+        if not isinstance(families, list) or len(families) > len(INSTRUMENTATION_FAMILIES):
+            raise ValueError("instrumentation families must be a bounded array")
+        seen_families: set[str] = set()
+        for family_entry in families:
+            if not isinstance(family_entry, dict) or set(family_entry) != {"family", "provenance"}:
+                raise ValueError("instrumentation family must contain only family and provenance")
+            family = family_entry["family"]
+            provenance = family_entry["provenance"]
+            if family not in INSTRUMENTATION_FAMILIES:
+                raise ValueError(f"unsupported instrumentation family {family}")
+            if provenance not in INSTRUMENTATION_PROVENANCE:
+                raise ValueError(f"unsupported instrumentation provenance {provenance}")
+            if family in seen_families:
+                raise ValueError(f"duplicate instrumentation family {family} for {actor}")
+            seen_families.add(family)
+            records.append({"actor": actor, "role": role, "family": family, "provenance": provenance})
+    return tuple(sorted(records, key=lambda item: (item["actor"], item["family"])))
 
 
 def validate_event(candidate: Any) -> dict[str, Any]:
@@ -158,6 +206,7 @@ def validate_event(candidate: Any) -> dict[str, Any]:
 @dataclass
 class Journal:
     path: Path
+    instrumentation_provenance: tuple[dict[str, str], ...] = field(default_factory=tuple)
     lock: threading.RLock = field(default_factory=threading.RLock)
     events: list[dict[str, Any]] = field(default_factory=list)
     event_ids: dict[str, int] = field(default_factory=dict)
@@ -222,6 +271,19 @@ class Journal:
             network, kind, phase, campaign, actor, outcome = key
             label_set = _labels(network=network, kind=kind, phase=phase, campaign=campaign, actor=actor, outcome=outcome, evidence_source="orchestrator_observed")
             lines.append(f"attacknet_journal_events_total{{{label_set}}} {value}")
+
+        lines.extend([
+            "# HELP attacknet_instrumentation_family_provenance Orchestrator-declared instrumentation provenance for one actor and applicable family.",
+            "# TYPE attacknet_instrumentation_family_provenance gauge",
+        ])
+        for record in self.instrumentation_provenance:
+            labels = _labels(
+                attacknet_actor=record["actor"],
+                attacknet_role=record["role"],
+                family=record["family"],
+                provenance=record["provenance"],
+            )
+            lines.append(f"attacknet_instrumentation_family_provenance{{{labels}}} 1")
 
         latest_run: dict[str, dict[str, Any]] = {}
         run_seeds: dict[tuple[str, str], str] = {}
@@ -459,6 +521,7 @@ def main() -> None:
     parser.add_argument("--listen", default=os.environ.get("ATTACKNET_EVENT_LISTEN", "0.0.0.0:9464"))
     parser.add_argument("--journal", default=os.environ.get("ATTACKNET_EVENT_JOURNAL", "/data/timeline.jsonl"))
     parser.add_argument("--token-file", default=os.environ.get("ATTACKNET_EVENT_TOKEN_FILE", "/run/secrets/attacknet/token"))
+    parser.add_argument("--instrumentation-provenance", default=os.environ.get("ATTACKNET_INSTRUMENTATION_PROVENANCE"))
     arguments = parser.parse_args()
     host, port_text = arguments.listen.rsplit(":", 1)
     token_path = Path(arguments.token_file)
@@ -468,7 +531,11 @@ def main() -> None:
         raise SystemExit("event token must contain at least 32 characters")
     server = EventServer(
         (host, int(port_text)),
-        Journal(Path(arguments.journal)),
+        Journal(
+            Path(arguments.journal),
+            load_instrumentation_provenance(Path(arguments.instrumentation_provenance))
+            if arguments.instrumentation_provenance else (),
+        ),
         lambda: token_path.read_text(encoding="utf-8"),
     )
     print(f"attacknet event bridge listening on {host}:{port_text}", flush=True)

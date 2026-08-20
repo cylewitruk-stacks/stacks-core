@@ -239,6 +239,84 @@ test('the final cohort proves live transport while burn height is still frozen a
   assert.ok(gateAt >= 0 && registrationAt > gateAt);
 });
 
+test('available instrumentation fails before the first Kubernetes mutation without qualification input', () => {
+  const root = mkdtempSync(join(tmpdir(), 'attacknet-instrumentation-preflight-'));
+  writeFileSync(join(root, 'manifest.json'), `${JSON.stringify({schemaVersion: 1, actors: [{
+    service: 'signer-1', role: 'signer', requestedImage: 'stacks:patched',
+    instrumentation: {profile: 'patched-main', provenance: 'attacknet-patch'},
+  }]})}\n`);
+  const calls = join(root, 'kubectl-calls');
+  const result = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    OBSERVABILITY_ENABLED=0
+    kubectl() { printf '%s\n' "$*" >>"$CALLS"; }
+    status=0
+    apply_network "$GENERATED" || status=$?
+    printf 'status=%s\n' "$status"
+  `], {encoding: 'utf8', env: {
+    ...process.env, LIFECYCLE: lifecycle, GENERATED: root, CALLS: calls,
+    ATTACKNET_INSTRUMENTATION_INPUT: '',
+  }});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /status=2/);
+  assert.equal(existsSync(calls), false);
+
+  const source = readFileSync(lifecycle, 'utf8');
+  const applyBody = source.slice(source.indexOf('apply_network() {'), source.indexOf('\ndelete_network() {'));
+  const preflight = applyBody.indexOf('phase-1-qualification.mjs" preflight');
+  const firstMutation = applyBody.indexOf('ledger_refresh_context');
+  const finalize = applyBody.indexOf('phase-1-qualification.mjs" finalize');
+  const lifecycleReady = applyBody.indexOf('ledger_assertion lifecycle-ready');
+  assert.ok(preflight >= 0 && firstMutation >= 0 && preflight < firstMutation);
+  assert.ok(finalize >= 0 && lifecycleReady >= 0 && finalize < lifecycleReady);
+  const portResult = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    printf '%s,%s,%s,%s\n' \
+      "$(instrumentation_metrics_port signer)" \
+      "$(instrumentation_metrics_port miner)" \
+      "$(instrumentation_metrics_port companion)" \
+      "$(instrumentation_metrics_port follower)"
+  `], {encoding: 'utf8', env: {...process.env, LIFECYCLE: lifecycle}});
+  assert.equal(portResult.status, 0, portResult.stderr);
+  assert.equal(portResult.stdout, '31000,20446,20446,20446\n');
+  const unsupported = spawnSync('bash', ['-c', 'source "$LIFECYCLE"; instrumentation_metrics_port adversary'],
+    {encoding: 'utf8', env: {...process.env, LIFECYCLE: lifecycle}});
+  assert.equal(unsupported.status, 2);
+  assert.match(unsupported.stderr, /unsupported instrumented actor role/);
+});
+
+test('companion .miners readiness fails closed on a missing subscription', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'attacknet-miners-subscription-')));
+  writeFileSync(join(root, 'manifest-inventory.mjs'),
+    readFileSync(resolve('contrib/attacknet/manifest-inventory.mjs'), 'utf8'));
+  const manifest = join(root, 'manifest.json');
+  writeFileSync(manifest, `${JSON.stringify({actors: [
+    {service: 'signer-node-1', type: 'node', role: 'companion'},
+  ]})}\n`);
+  const result = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    ATTACKNET_DIR="$FAKE_ATTACKNET_DIR"
+    TIMEOUT=2
+    runtime_backend() { printf 404; }
+    wait_companion_stackerdb_subscriptions "$MANIFEST"
+  `], {encoding: 'utf8', env: {
+    ...process.env, LIFECYCLE: lifecycle, FAKE_ATTACKNET_DIR: root, MANIFEST: manifest,
+  }});
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /did not instantiate the \.miners StackerDB/);
+
+  const healthy = spawnSync('bash', ['-c', `
+    source "$LIFECYCLE"
+    ATTACKNET_DIR="$FAKE_ATTACKNET_DIR"
+    TIMEOUT=2
+    runtime_backend() { printf 200; }
+    wait_companion_stackerdb_subscriptions "$MANIFEST"
+  `], {encoding: 'utf8', env: {
+    ...process.env, LIFECYCLE: lifecycle, FAKE_ATTACKNET_DIR: root, MANIFEST: manifest,
+  }});
+  assert.equal(healthy.status, 0, healthy.stderr);
+});
+
 test('startup gates require live conversations and canonical global-state support', () => {
   // macOS exposes TMPDIR through /var while import.meta resolves /private/var.
   // Use one canonical path so CLI-entrypoint identity remains true.

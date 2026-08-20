@@ -426,6 +426,39 @@ signer_metric_value() {
   awk -v metric="${name}" '$1 == metric { print $2; exit }' <<<"${metrics}"
 }
 
+instrumentation_metrics_port() {
+  case "${1:-}" in
+    signer) printf '%s\n' 31000 ;;
+    miner|companion|follower) printf '%s\n' 20446 ;;
+    *) echo "unsupported instrumented actor role: ${1:-<empty>}" >&2; return 2 ;;
+  esac
+}
+
+capture_instrumentation_metrics() {
+  local manifest="$1" output="$2" actor role port
+  mkdir -p "${output}"
+  while IFS=$'\t' read -r actor role; do
+    [ -n "${actor}" ] || continue
+    port="$(instrumentation_metrics_port "${role}")"
+    runtime_backend exec "${actor}" \
+      curl --fail --silent --max-time 5 "http://127.0.0.1:${port}/metrics" \
+      >"${output}/${actor}.prom"
+    [ -s "${output}/${actor}.prom" ] || {
+      echo "instrumentation metrics scrape for ${actor} was empty" >&2
+      return 1
+    }
+  done < <(node -e '
+    const fs = require("node:fs");
+    const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    for (const actor of manifest.actors ?? manifest.workloads ?? []) {
+      if (["miner", "companion", "follower", "signer"].includes(actor.role)
+          && actor.instrumentation?.provenance !== "unavailable") {
+        console.log(`${actor.service}\t${actor.role}`);
+      }
+    }
+  ' "${manifest}")
+}
+
 wait_signer_global_state() {
   local manifest="$1" deadline=$((SECONDS + TIMEOUT)) signers signer metrics
   local available known maximum canonical missing stable=0
@@ -673,6 +706,7 @@ establish_signer_set() {
 
 wait_companion_stackerdb_subscriptions() {
   local manifest="$1" deadline=$((SECONDS + TIMEOUT)) companions companion status missing
+  missing=""
   companions="$(node "${ATTACKNET_DIR}/manifest-inventory.mjs" "${manifest}" companions)"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     missing=""
@@ -775,10 +809,32 @@ apply_network() {
   local manifest="${generated}/manifest.json" final_network="${generated}/stacksnetwork.json"
   local bootstrap_network="${generated}/stacksnetwork.bootstrap.json"
   local gated desired_interval desired_jitter enrollment_height cutoff_height observer_height registration_height activation_height start_details storage_report pre_activation_stacks_height signer_set_report post_activation_peer_result
+  local instrumentation_requirement instrumentation_input instrumentation_plan instrumentation_result artifacts instrumentation_metrics
+  local -a observability_render_args
+  instrumentation_requirement="$(node "${ATTACKNET_DIR}/instrumentation/phase-1-qualification.mjs" required "${manifest}")"
+  instrumentation_input="${ATTACKNET_INSTRUMENTATION_INPUT:-}"
+  instrumentation_plan="${generated}/instrumentation-qualification-plan.json"
+  if [ "${instrumentation_requirement}" = required ]; then
+    if [ -z "${instrumentation_input}" ] || [ ! -r "${instrumentation_input}" ]; then
+      echo 'a readable ATTACKNET_INSTRUMENTATION_INPUT is required when the rendered manifest declares available instrumentation' >&2
+      return 2
+    fi
+    # This is deliberately before run-context, observability, policy, or
+    # StacksNetwork admission. A declared capability cannot start Kubernetes
+    # mutation without sealed build and per-actor configuration-smoke inputs.
+    node "${ATTACKNET_DIR}/instrumentation/phase-1-qualification.mjs" preflight \
+      "${manifest}" "${instrumentation_input}" --output="${instrumentation_plan}"
+  fi
   if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
-    node "${ATTACKNET_DIR}/observability/render.mjs" "${manifest}" \
-      --output="${generated}/observability.json" \
-      --token-output="${generated}/event-token"
+    observability_render_args=(
+      "${manifest}"
+      "--output=${generated}/observability.json"
+      "--token-output=${generated}/event-token"
+    )
+    if [ "${instrumentation_requirement}" = required ]; then
+      observability_render_args+=("--instrumentation-plan=${instrumentation_plan}")
+    fi
+    node "${ATTACKNET_DIR}/observability/render.mjs" "${observability_render_args[@]}"
   fi
   RUN_DESCRIPTOR="$(node "${ATTACKNET_DIR}/run-ledger.mjs" init "${generated}")"
   RUN_ID="$(node -e '
@@ -904,6 +960,17 @@ apply_network() {
     ledger_cadence paused "run:${desired_interval:-60}s:jitter-${desired_jitter:-0}s" startup-complete
   fi
   ledger_capture_runtime
+  if [ "${instrumentation_requirement}" = required ]; then
+    artifacts="$(dirname "${RUN_DESCRIPTOR}")/run-artifacts"
+    instrumentation_metrics="${artifacts}/instrumentation-runtime-metrics"
+    capture_instrumentation_metrics "${manifest}" "${instrumentation_metrics}"
+    instrumentation_result="$(node "${ATTACKNET_DIR}/instrumentation/phase-1-qualification.mjs" finalize \
+      "${instrumentation_plan}" "${manifest}" "${instrumentation_input}" \
+      "${artifacts}/stacksnetwork.admitted.json" "${artifacts}/pods.admitted.json" \
+      "${RUN_DESCRIPTOR}" --output-directory="${artifacts}/instrumentation" \
+      --metrics-directory="${instrumentation_metrics}")"
+    ledger_assertion instrumentation-qualified pass "${instrumentation_result}"
+  fi
   ledger_assertion lifecycle-ready pass \
     "{\"burnHeight\":$(clock_status_value bitcoin_height || echo null)}"
   ledger_refresh_context

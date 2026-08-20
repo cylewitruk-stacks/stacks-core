@@ -1,5 +1,12 @@
 # Stacks Attacknet
 
+Instrumentation is an explicit image capability. Read
+[`INSTRUMENTATION.md`](INSTRUMENTATION.md) before using signer/node metrics in
+an experiment: it defines the 22-family inventory, `merged`,
+`attacknet-patch`, and `unavailable` family provenance (`mixed` at actor-summary
+level), per-image config smokes,
+runtime identity linkage, compatibility guards, and missing-series semantics.
+
 This directory contains the transport-independent test harness for adversarial
 Stacks regtest networks. The default profile follows the node and signer code
 on current `main`; it uses the production StackerDB signer transport. A future
