@@ -434,15 +434,26 @@ or Chaos Mesh controls. TimeChaos scenarios must first inventory which code
 uses wall clock versus monotonic time so the injected fault can affect the
 stated hypothesis.
 
-## Next increments
+## Productization status and next work
 
-1. Extract the backend-neutral topology, assertion, scenario, and evidence
-   layers; keep only a thin Compose/Kubernetes execution adapter.
-2. Port the full 28-actor topology and run an incremental capacity preflight
-   before adding more fault controls.
-3. Port Bitcoin wallet funding, stacking, observer federation, and evidence
-   archival as controlled Jobs or dedicated controllers.
-4. Integrate trusted network/DNS/I/O/time proof probes with the namespaced
-   `FaultCampaign`/`AttacknetRun` controller and prove each Chaos family live.
-5. Add snapshot/restore and explicit evidence-preservation policy.
-6. Add leader election only when multiple controller replicas are warranted.
+The backend-neutral topology, assertions, runtime adapters, evidence ledger,
+full 28-actor topology, Bitcoin funding/stacking lifecycle, authenticated
+telemetry, `FaultCampaign`, and `AttacknetRun` paths now exist. The accepted
+local-kind baseline includes a measured 300-new-burn-block soak, deterministic
+Pod/network/DNS/controller-owned I/O faults, portable application-clock skew,
+mixed current/released/modified actors, worker/PVC recovery, replay, and
+bounded removal-only minimization. Do not use the earlier migration checklist
+as evidence that these capabilities are still absent.
+
+The machine-readable capability boundary and terminal evidence digests live in
+`contrib/attacknet/release/baseline-v1.json`. Release 1 productization proceeds
+through the tracked Attacknet release contract and handoff documents: freeze
+instrumentation and compatibility guards, add the human/agent command surface,
+then implement portable profiles and controller-owned protocol assertions.
+Bounded Bitcoin reorgs and multi-bitcoind split views follow those attribution
+foundations.
+
+Managed-cluster, x86-native Chaos helpers, portable/multi-zone CSI,
+organization registry/identity integration, and controller HA remain explicit
+future qualifications. The local Release 1 must report those as deferred or
+capability-rejected, never as implied passes.

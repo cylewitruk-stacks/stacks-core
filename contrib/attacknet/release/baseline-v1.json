@@ -1,0 +1,228 @@
+{
+  "schemaVersion": "stacks-attacknet-release-baseline/v1",
+  "acceptedAt": "2026-08-16T12:00:00.000Z",
+  "acceptedExecution": {
+    "sourceRevision": "ffb82cc33505cf17602b32e6b4dcfd7f1b24e686",
+    "dirtyPatchDigest": "sha256:52f0bee9bdc98c8db766c07f4e2bce20c66a55c1e5916bea9d45430bdae80f15",
+    "topology": {
+      "backend": "kubernetes-kind",
+      "architecture": "arm64",
+      "controlPlanes": 1,
+      "workers": 2,
+      "protocolActors": 28,
+      "workloads": 31,
+      "miners": 3,
+      "signers": 10,
+      "companions": 10,
+      "followers": 5,
+      "manifestDigest": "sha256:46dc6b55520b3b6eea2644b2de047ae9c3ccc3db63972eec59c24e94170b9ac8"
+    },
+    "observedProgress": {
+      "burnHeight": {"start": 503, "end": 803, "delta": 300},
+      "stacksHeight": {"start": 302, "end": 597, "delta": 295}
+    }
+  },
+  "offlineVerification": {
+    "sourceRevision": "e1515979a2dbce6e9de0d842b249d229901a0cc8",
+    "recordedAt": "2026-08-18T11:08:00.000Z",
+    "command": "contrib/attacknet/check.sh",
+    "suites": [
+      {"name": "attacknet-node", "tests": 196, "passed": 196, "failed": 0},
+      {"name": "observability-node", "tests": 40, "passed": 40, "failed": 0},
+      {"name": "release-node", "tests": 9, "passed": 9, "failed": 0},
+      {"name": "event-bridge-python", "tests": 10, "passed": 10, "failed": 0},
+      {"name": "offline-operator-workloads", "tests": 31, "passed": 31, "failed": 0}
+    ]
+  },
+  "evidence": [
+    {
+      "id": "measured-300-burn-soak",
+      "path": "contrib/attacknet/evidence/final-soak-20260815T232258Z/verified-soak-300/result.json",
+      "digest": "sha256:2536353a7f40ee0c0062e722628bdd61ae29852f0985c3813f3925f8c39792e5",
+      "status": "passed"
+    },
+    {
+      "id": "deterministic-fault-run",
+      "path": "contrib/attacknet/evidence/final-soak-20260815T232258Z/verified-fault-run.json",
+      "digest": "sha256:09fb15e515ed307f13b98b2572ebd6dcbb6b0c010de423da1a1f3c700ba7ca21",
+      "status": "passed"
+    },
+    {
+      "id": "mixed-current-release-modified",
+      "path": "contrib/attacknet/evidence/mixed-current-release-modified-20260816/matrix-proof/result.json",
+      "digest": "sha256:a9bc55bc71ce25e0917c081bd19a1b1535fc71e660b30268e507f4d759fdddeb",
+      "status": "passed"
+    },
+    {
+      "id": "worker-outage",
+      "path": "contrib/attacknet/evidence/worker-outage-recovery-20260815T192000Z/result.json",
+      "digest": "sha256:e03678c59795093a2b36f7ad9ce43aa0c680364d31883f8262957c49932a095b",
+      "status": "passed"
+    },
+    {
+      "id": "compose-parity-controls",
+      "path": "contrib/attacknet/evidence/compose-parity-controls-20260816/result.json",
+      "digest": "sha256:6b0b95430c1935b4a40b941a58c8d002e0939c0490105ae584578a1eed97292f",
+      "status": "passed"
+    },
+    {
+      "id": "application-clock",
+      "path": "contrib/attacknet/evidence/application-clock-k8s-20260816T1134Z/acceptance.json",
+      "digest": "sha256:a51332c8170c56b0131094b85c3dd2e2b7ad922ac7f0ef232c0932eefa89ee01",
+      "status": "passed"
+    },
+    {
+      "id": "local-path-pvc-recovery",
+      "path": "contrib/attacknet/evidence/pvc-node-affinity-recovery-20260815T190500Z/result.json",
+      "digest": "sha256:5a91c8f5a0a884b45fe7dad472f54b1b08c7df6487ce100d861e9239e252fefa",
+      "status": "passed"
+    },
+    {
+      "id": "signer-partition-negative-control",
+      "path": "contrib/attacknet/evidence/signer-partition-stall-negative-control-20260816/result.json",
+      "digest": "sha256:0b7e1cc3cac2a510b9385261e8d64aa32913430a9b66295265a6f35dd7565102",
+      "status": "passed"
+    },
+    {
+      "id": "fresh-network-ddmin",
+      "path": "contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/policy-reclassification-v2/result.json",
+      "digest": "sha256:b0dc93992de793935c282c26c9ec5cc004be2f8b26f7f5102dc8f54fd7d0cdce",
+      "status": "passed"
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "local-kind-arm64-full-topology",
+      "status": "supported",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "measured-300-new-burn-block-soak",
+      "status": "supported",
+      "evidence": ["measured-300-burn-soak", "deterministic-fault-run"]
+    },
+    {
+      "id": "mixed-current-release-modified-actors",
+      "status": "supported",
+      "evidence": ["mixed-current-release-modified"]
+    },
+    {
+      "id": "pod-network-dns-and-controller-owned-io-faults",
+      "status": "supported",
+      "evidence": ["deterministic-fault-run", "signer-partition-negative-control"]
+    },
+    {
+      "id": "application-realtime-skew",
+      "status": "supported",
+      "evidence": ["application-clock"]
+    },
+    {
+      "id": "local-path-same-node-recovery-and-stranding",
+      "status": "supported",
+      "evidence": ["local-path-pvc-recovery", "worker-outage"]
+    },
+    {
+      "id": "compose-behavioral-reference-controls",
+      "status": "supported",
+      "evidence": ["compose-parity-controls"]
+    },
+    {
+      "id": "fresh-network-replay-and-removal-only-ddmin",
+      "status": "supported",
+      "evidence": ["fresh-network-ddmin"]
+    },
+    {
+      "id": "native-chaos-mesh-iochaos-arm64",
+      "status": "capability-rejected",
+      "reason": "Chaos Mesh 2.8.3 ships an x86-only toda helper; use controller-owned io-pressure.",
+      "evidence": ["deterministic-fault-run"]
+    },
+    {
+      "id": "native-chaos-mesh-timechaos-arm64",
+      "status": "capability-rejected",
+      "reason": "The installed helper did not produce truthful, fail-safe effect evidence; use application realtime skew.",
+      "evidence": ["application-clock"]
+    },
+    {
+      "id": "native-chaos-mesh-stresschaos-arm64",
+      "status": "capability-rejected",
+      "reason": "Chaos Mesh 2.8.3 StressChaos did not preserve the admitted custom stress-ng contract on this platform; Release 1 must use the bounded controller-owned I/O-pressure helper and must not advertise native StressChaos disk pressure.",
+      "evidence": ["deterministic-fault-run"]
+    },
+    {
+      "id": "cold-start-capacity-reservation",
+      "status": "not-done",
+      "reason": "The local capacity preflight observes current kubelet filesystems but does not reserve the subsequent image, PVC, and cold-start write burst; operators must provision headroom outside the harness.",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "actor-egress-network-policy",
+      "status": "not-done",
+      "reason": "The isolated kind profile enables private_neighbors for RFC1918 Pod networking and does not yet install per-scenario egress NetworkPolicy; it is not a production deployment profile.",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "cryptographically-attested-active-probes",
+      "status": "not-done",
+      "reason": "Same-Pod active probes are process-isolated and Kubernetes-identified but are not cryptographically attributable against a malicious actor sharing the network namespace.",
+      "evidence": ["deterministic-fault-run"]
+    },
+    {
+      "id": "teardown-centralized-log-corpus-export",
+      "status": "not-done",
+      "reason": "Incident capture retains bounded Kubernetes logs and the trusted event timeline, but normal teardown does not yet export the complete retained Loki corpus.",
+      "evidence": ["deterministic-fault-run"]
+    },
+    {
+      "id": "matching-kubernetes-client-packaging",
+      "status": "not-done",
+      "reason": "Release 1 diagnoses Kubernetes client/server compatibility but does not package a version-matched kubectl binary; the local operator supplies the client toolchain.",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "portable-csi-cross-node-reattachment",
+      "status": "deferred",
+      "reason": "The local kind profile has node-local storage only.",
+      "unavailableDependency": "A portable CSI implementation and multi-node storage environment are unavailable in the local kind profile.",
+      "affectedRequirement": "Cross-node persistent-volume reattachment and multi-zone recovery qualification.",
+      "currentCapability": "Local-path same-node recovery and explicit node-stranding behavior are proven.",
+      "risk": "Release 1 does not establish recovery semantics for portable or zonal storage.",
+      "reopenCondition": "A supported portable CSI and multi-node or multi-zone test cluster are available.",
+      "evidence": ["local-path-pvc-recovery"]
+    },
+    {
+      "id": "managed-cluster-x86-and-multi-zone-qualification",
+      "status": "deferred",
+      "reason": "External cluster, architecture, registry, and CSI dependencies are outside Release 1.",
+      "unavailableDependency": "No managed x86-64 multi-zone cluster is available to this Release 1 qualification.",
+      "affectedRequirement": "Managed-cluster admission, autoscaler, maintenance, native x86 Chaos helpers, and multi-zone behavior.",
+      "currentCapability": "A three-node arm64 Docker Desktop kind cluster is qualified.",
+      "risk": "Managed-cluster and x86-specific behavior may differ from the local evidence.",
+      "reopenCondition": "Managed x86-64 workers with the target storage and cluster policies are available.",
+      "evidence": ["worker-outage"]
+    },
+    {
+      "id": "multi-bitcoin-and-bounded-reorg-campaigns",
+      "status": "not-done",
+      "reason": "Required Release 1 productization work in Phases 7 and 8 is not implemented yet; this is not an external deferral.",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "controller-ha-leader-election",
+      "status": "not-done",
+      "reason": "Release 1 deliberately runs singleton controllers; HA is future implementation work, not an unavailable external dependency.",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "enterprise-registry-and-identity-federation",
+      "status": "deferred",
+      "reason": "Enterprise registry federation and organization identity-provider integration require external infrastructure not available for Release 1.",
+      "unavailableDependency": "An enterprise/private registry and organization identity provider are unavailable.",
+      "affectedRequirement": "Enterprise artifact federation and organization-authenticated access qualification.",
+      "currentCapability": "Release 1 supports immutable GHCR digests and exact local revision builds with provenance.",
+      "risk": "Private-registry policy, federation, and enterprise identity integration are unqualified.",
+      "reopenCondition": "A representative private registry and organization identity-provider environment are available.",
+      "evidence": ["mixed-current-release-modified"]
+    }
+  ]
+}

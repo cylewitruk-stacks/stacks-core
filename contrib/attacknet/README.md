@@ -10,6 +10,32 @@ The Helm chart in `contrib/helm/hacknet` supplies the reliable namespaced
 control plane. This directory supplies the system-under-test topology,
 burnchain policy, backend adapter, assertions, and evidence capture.
 
+## Release baseline
+
+The accepted local-kind baseline is indexed by
+`release/baseline-v1.json`. It records the exact source and dirty-patch
+identity of the accepted run, terminal evidence digests, the 28-actor /
+31-workload topology, the measured burn 503 -> 803 and Stacks 302 -> 597 window,
+supported capabilities, capability-rejected native arm64 helpers, and deferred
+external-cluster work. Validate the tracked contract without requiring the
+large local evidence archive with:
+
+```bash
+node contrib/attacknet/release/baseline.mjs validate \
+  contrib/attacknet/release/baseline-v1.json
+```
+
+When the referenced archive is present, add `--verify-evidence --root=.` to
+check every byte digest read-only. The baseline is the product's release claim;
+development findings are tracked externally as issues or in a separate backlog
+and are intentionally not copied into the release inventory. Any finding that
+limits an advertised capability must first be represented here as `not-done`,
+`deferred`, or `capability-rejected` before it leaves the development backlog.
+
+Productization phases use the digest-bound reduced/full packet contract in
+`release/PHASE-REVIEWS.md`. A phase is not complete merely because its tests
+pass: both named reviewers must approve the same complete packet inventory.
+
 ## Design boundaries
 
 - Bitcoin Core, its Stacks-blind block clock, and the policy that steers the

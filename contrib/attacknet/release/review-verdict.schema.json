@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stacks.org/schemas/attacknet-phase-review-verdict-v1.json",
+  "title": "Stacks Attacknet phase review verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "reviewer", "verdict", "contractDigest", "packetDigest", "sourceDigest", "evidenceDigest", "scope", "materialSource", "reviewedInventory", "omissions", "reviewText"],
+  "properties": {
+    "schemaVersion": {"const": "stacks-attacknet-phase-review-verdict/v1"},
+    "reviewer": {"enum": ["Codex", "Claude Opus 5"]},
+    "verdict": {"enum": ["Approved", "Changes requested", "Inconclusive"]},
+    "contractDigest": {"$ref": "#/$defs/digest"},
+    "packetDigest": {"$ref": "#/$defs/digest"},
+    "sourceDigest": {"$ref": "#/$defs/digest"},
+    "evidenceDigest": {"$ref": "#/$defs/digest"},
+    "scope": {"enum": ["complete", "scoped", "incomplete"]},
+    "materialSource": {"enum": ["direct-read", "relayed"]},
+    "reviewedInventory": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "omissions": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "reviewText": {"type": "string", "minLength": 1}
+  },
+  "$defs": {"digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+}

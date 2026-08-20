@@ -144,5 +144,6 @@ The digest-bound reclassification is in
 
 The live sequence also exposed and closed four harness defects: noncanonical
 image ordering, failure to wait for owner-CR deletion, directory-depth-derived
-source evidence, and redundant teardown of an already-absent network. These are
-recorded as F-103 through F-107 in `.docs/18-attacknet-findings.md`.
+source evidence, and redundant teardown of an already-absent network. Detailed
+development history belongs in the external issue tracker rather than this
+product guide.
