@@ -993,6 +993,8 @@ fn decode_fixed_hex<const N: usize>(value: &str, label: &str) -> Result<[u8; N],
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use clarity::vm::types::Value;
     use stacks_common::util::hash::to_hex;
 
@@ -1144,11 +1146,11 @@ mod tests {
             fs::metadata(destination).unwrap().len()
         );
         assert!(!report.cutover_completed);
-        assert!(matches!(
+        assert_matches!(
             events.last(),
             Some(MigrationEvent::DestinationCompleted { bytes })
                 if *bytes == report.destination_bytes
-        ));
+        );
         let phases: Vec<_> = events
             .iter()
             .filter_map(|event| match event {

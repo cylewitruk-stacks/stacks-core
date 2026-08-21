@@ -12,6 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+use std::assert_matches;
 use std::io::Write;
 
 use rstest::rstest;
@@ -542,10 +543,10 @@ fn borrowed_slice_deserialization_matches_vec_entry_points() {
     let mut trailing = bytes;
     trailing.push(0);
     assert!(Value::try_deserialize_slice_at_epoch(&trailing, &expected_type, &epoch).is_ok());
-    assert!(matches!(
+    assert_matches!(
         Value::try_deserialize_slice_exact_at_epoch(&trailing, &expected_type, &epoch),
         Err(SerializationError::LeftoverBytesInDeserialization)
-    ));
+    );
 }
 
 #[test]

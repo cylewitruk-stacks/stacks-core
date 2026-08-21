@@ -7,6 +7,8 @@
 
 //! End-to-end tests for canonical packed Clarity value storage.
 
+use std::assert_matches;
+
 use proptest::prelude::*;
 use stacks_common::types::StacksEpochId;
 
@@ -73,10 +75,10 @@ fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8>
 #[test]
 fn admitted_value_rejects_mismatched_schema_and_preserves_encoding() {
     let value = Value::UInt(42);
-    assert!(matches!(
+    assert_matches!(
         AdmittedValue::new(value.clone(), &TypeSignature::BoolType, &EPOCH),
         Err(PackedValueError::TypeMismatch)
-    ));
+    );
 
     let admitted = AdmittedValue::new(value.clone(), &TypeSignature::UIntType, &EPOCH).unwrap();
     assert_eq!(admitted.value(), &value);

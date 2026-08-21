@@ -18,7 +18,7 @@ mod migration;
 mod schema;
 
 use std::collections::HashMap;
-use std::str;
+use std::{debug_assert_matches, str};
 
 use clarity::vm::database::{
     ClarityBackingStore, SqliteConnection, TypedValueData, TypedValueResult,
@@ -682,10 +682,10 @@ fn encode_reversible(canonical: &str) -> EncodedRecord {
 
 /// Wrap a payload in the current record-version and kind envelope.
 fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
-    debug_assert!(matches!(
+    debug_assert_matches!(
         kind,
         KIND_CANONICAL_UTF8 | KIND_CANONICAL_HEX_BYTES | KIND_CANONICAL_PACKED
-    ));
+    );
     let mut record = Vec::with_capacity(payload.len() + 2);
     record.extend_from_slice(&[RECORD_VERSION, kind]);
     record.extend_from_slice(payload);

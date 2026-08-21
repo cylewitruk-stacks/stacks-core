@@ -1082,7 +1082,7 @@ impl<C: Clone, T: MarfTrieId> Drop for IndexDBTx<'_, C, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{assert_matches, fs};
 
     use rstest::rstest;
 
@@ -1132,10 +1132,10 @@ mod tests {
         assert_eq!(objects[1].kind, "index");
         assert_eq!(objects[1].table, "value\"table");
 
-        assert!(matches!(
+        assert_matches!(
             sqlite_schema_objects(&connection, "main; ATTACH"),
             Err(sqlite_error::InvalidParameterName(name)) if name == "main; ATTACH"
-        ));
+        );
     }
 
     #[test]
