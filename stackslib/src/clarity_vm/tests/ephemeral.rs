@@ -18,6 +18,7 @@
 use std::fs;
 
 use clarity::vm::database::{DataStoreEntry, TypedValueData};
+use clarity::vm::types::codec::packed::AdmittedValue;
 use clarity::vm::types::{StacksAddressExtensions, TupleData, TypeSignature, Value};
 use clarity::vm::{ClarityName, ContractName};
 use pinny::tag;
@@ -315,9 +316,7 @@ fn test_ephemeral_binary_store_uses_database_local_shape_ids() {
         key: "typed-dummy".into(),
         canonical: dummy_canonical,
         typed: Some(TypedValueData {
-            value: dummy_value,
-            expected: TypeSignature::UIntType,
-            epoch,
+            admitted: AdmittedValue::new(dummy_value, &TypeSignature::UIntType, &epoch).unwrap(),
             consensus: dummy_consensus,
         }),
     };
@@ -337,9 +336,7 @@ fn test_ephemeral_binary_store_uses_database_local_shape_ids() {
         key: "typed-base".into(),
         canonical: base_canonical.clone(),
         typed: Some(TypedValueData {
-            value: base_value.clone(),
-            expected: base_type.clone(),
-            epoch,
+            admitted: AdmittedValue::new(base_value.clone(), &base_type, &epoch).unwrap(),
             consensus: base_consensus.clone(),
         }),
     };
@@ -395,9 +392,7 @@ fn test_ephemeral_binary_store_uses_database_local_shape_ids() {
             key: "typed-local".into(),
             canonical: local_canonical.clone(),
             typed: Some(TypedValueData {
-                value: local_value.clone(),
-                expected: local_type.clone(),
-                epoch,
+                admitted: AdmittedValue::new(local_value.clone(), &local_type, &epoch).unwrap(),
                 consensus: local_consensus.clone(),
             }),
         }])

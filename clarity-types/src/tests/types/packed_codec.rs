@@ -12,8 +12,9 @@ use stacks_common::types::StacksEpochId;
 
 use crate::representations::{ClarityName, ContractName};
 use crate::types::codec::packed::{
-    ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, VALUE_SHAPE_VERSION, ValueShape,
-    audit_reconstruction, decode_canonical_packed, encode_canonical_packed_value,
+    AdmittedValue, ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValueError,
+    VALUE_SHAPE_VERSION, ValueShape, audit_reconstruction, decode_canonical_packed,
+    encode_canonical_packed_admitted, encode_canonical_packed_value,
     encode_canonical_packed_value_with_consensus_len, encode_value_shape, reconstruct_consensus,
     transcode_consensus_to_canonical_packed, transcode_consensus_with_shape,
     validate_canonical_packed,
@@ -67,6 +68,34 @@ fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8>
     assert_eq!(transcoded.as_bytes(), packed.as_bytes());
     assert_eq!(transcoded_shape, shape);
     packed.into_bytes()
+}
+
+#[test]
+fn admitted_value_rejects_mismatched_schema_and_preserves_encoding() {
+    let value = Value::UInt(42);
+    assert!(matches!(
+        AdmittedValue::new(value.clone(), &TypeSignature::BoolType, &EPOCH),
+        Err(PackedValueError::TypeMismatch)
+    ));
+
+    let admitted = AdmittedValue::new(value.clone(), &TypeSignature::UIntType, &EPOCH).unwrap();
+    assert_eq!(admitted.value(), &value);
+    let consensus_len = value.serialized_size().unwrap();
+    let encoded_admitted = encode_canonical_packed_admitted(
+        &admitted,
+        consensus_len,
+        ConsensusLengthValidation::Enabled,
+    )
+    .unwrap();
+    let encoded_checked = encode_canonical_packed_value_with_consensus_len(
+        &value,
+        &TypeSignature::UIntType,
+        &EPOCH,
+        consensus_len,
+        ConsensusLengthValidation::Enabled,
+    )
+    .unwrap();
+    assert_eq!(encoded_admitted, encoded_checked);
 }
 
 #[test]

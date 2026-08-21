@@ -25,9 +25,9 @@ use clarity::vm::database::{
 };
 use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::codec::packed::{
-    audit_reconstruction, decode_canonical_packed,
-    encode_canonical_packed_value_with_consensus_len, encode_value_shape, reconstruct_consensus,
-    transcode_consensus_with_shape, ConsensusLengthValidation,
+    audit_reconstruction, decode_canonical_packed, encode_canonical_packed_admitted,
+    encode_value_shape, reconstruct_consensus, transcode_consensus_with_shape,
+    ConsensusLengthValidation,
 };
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TypeSignature, Value};
 use rusqlite::types::ValueRef;
@@ -344,15 +344,13 @@ pub fn put_typed(
     typed: TypedValueData,
 ) -> Result<(), VmExecutionError> {
     let consensus_byte_len = validate_typed_canonical(&typed, canonical)?;
-    let packed = encode_canonical_packed_value_with_consensus_len(
-        &typed.value,
-        &typed.expected,
-        &typed.epoch,
+    let packed = encode_canonical_packed_admitted(
+        &typed.admitted,
         consensus_byte_len,
         ConsensusLengthValidation::Disabled,
     )
     .map_err(codec_error)?;
-    let shape = encode_value_shape(&typed.value).map_err(codec_error)?;
+    let shape = encode_value_shape(typed.admitted.value()).map_err(codec_error)?;
     let encoded = EncodedRecord {
         record: record(KIND_CANONICAL_PACKED, packed.as_bytes()),
         shape: Some(shape.into_bytes()),
@@ -862,6 +860,7 @@ fn storage_error(message: impl Into<String>) -> VmExecutionError {
 
 #[cfg(test)]
 mod tests {
+    use clarity::vm::types::codec::packed::AdmittedValue;
     use clarity::vm::types::TypeSignature;
     use stacks_common::types::StacksEpochId;
     use stacks_common::util::hash::to_hex;
@@ -897,9 +896,7 @@ mod tests {
         (
             canonical,
             TypedValueData {
-                value,
-                expected,
-                epoch: EPOCH,
+                admitted: AdmittedValue::new(value, &expected, &EPOCH).unwrap(),
                 consensus,
             },
             hash,
@@ -1166,7 +1163,7 @@ mod tests {
         let (canonical, data, hash) = typed(value.clone(), TypeSignature::UIntType);
 
         let transaction = conn.transaction().unwrap();
-        put_typed(&transaction, &hash, &canonical, data.clone()).unwrap();
+        put_typed(&transaction, &hash, &canonical, data).unwrap();
         transaction.rollback().unwrap();
 
         let (rows, shapes): (u64, u64) = conn
@@ -1179,7 +1176,9 @@ mod tests {
             .unwrap();
         assert_eq!((rows, shapes), (0, 0));
 
-        put_typed(&conn, &hash, &canonical, data).unwrap();
+        let (_, repeated_data, repeated_hash) = typed(value.clone(), TypeSignature::UIntType);
+        assert_eq!(repeated_hash, hash);
+        put_typed(&conn, &hash, &canonical, repeated_data).unwrap();
         assert_eq!(
             get_typed(&conn, &hash, &TypeSignature::UIntType, &EPOCH)
                 .unwrap()

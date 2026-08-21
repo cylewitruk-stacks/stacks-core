@@ -42,6 +42,7 @@ use crate::vm::database::structures::{
 use crate::vm::database::{ClarityBackingStore, RollbackWrapper, TypedValueData};
 use crate::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 use crate::vm::representations::ClarityName;
+use crate::vm::types::codec::packed::AdmittedValue;
 use crate::vm::types::serialization::NONE_SERIALIZATION_LEN;
 use crate::vm::types::{
     PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData, TypeSignature,
@@ -588,7 +589,7 @@ impl<'a> ClarityDatabase<'a> {
         self.put_value_with_type_and_size(key, value, &expected, epoch)
     }
 
-    /// Store a Clarity value while retaining its declared schema for physical encoding.
+    /// Store a Clarity value, admitting its sanitized form when typed storage requires it.
     pub fn put_value_with_type_and_size(
         &mut self,
         key: &str,
@@ -600,9 +601,9 @@ impl<'a> ClarityDatabase<'a> {
         let mut pre_sanitized_size = None;
 
         let stored_value = if sanitize {
-            // Preserve the existing consensus serialization behavior.  The declared
-            // type is retained solely as the schema for the packed physical
-            // encoding; sanitization has historically used the value's actual type.
+            // Preserve the existing consensus serialization behavior. Sanitization has
+            // historically used the value's actual type; declared-type admission happens after
+            // sanitization when the backing store requires a typed value.
             let sanitization_type = TypeSignature::type_of(&value)?;
             let value_size = value
                 .serialized_size()
@@ -627,13 +628,13 @@ impl<'a> ClarityDatabase<'a> {
         let size = serialized.len() as u64;
         let hex_serialized = to_hex(serialized.as_slice());
         if self.store.stores_typed_values() {
+            let admitted = AdmittedValue::new(stored_value, expected, epoch)
+                .map_err(|error| VmInternalError::DBError(error.to_string()))?;
             self.store.put_typed_value(
                 key,
                 hex_serialized,
                 TypedValueData {
-                    value: stored_value,
-                    expected: expected.clone(),
-                    epoch: *epoch,
+                    admitted,
                     consensus: serialized,
                 },
             )?;

@@ -746,14 +746,14 @@ impl RollbackWrapper<'_> {
 #[cfg(test)]
 mod typed_write_tests {
     use super::*;
+    use crate::vm::types::codec::packed::AdmittedValue;
 
     fn typed_uint(value: u128) -> TypedValueData {
         let value = Value::UInt(value);
         TypedValueData {
             consensus: value.serialize_to_vec().unwrap(),
-            value,
-            expected: TypeSignature::UIntType,
-            epoch: StacksEpochId::Epoch40,
+            admitted: AdmittedValue::new(value, &TypeSignature::UIntType, &StacksEpochId::Epoch40)
+                .unwrap(),
         }
     }
 
@@ -783,7 +783,10 @@ mod typed_write_tests {
 
         let entries = rollback_data_pre_bottom_commit(edits, &mut lookup_map).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].typed.as_ref().unwrap().value, Value::UInt(1));
+        assert_eq!(
+            entries[0].typed.as_ref().unwrap().admitted.value(),
+            &Value::UInt(1)
+        );
         assert!(entries[1].typed.is_none());
         assert!(lookup_map.is_empty());
     }
@@ -808,7 +811,7 @@ mod typed_write_tests {
         let (_, check) = edits.pop().unwrap();
         let pending = rollback_data_lookup_map(&key, &check, &mut lookup_map).unwrap();
         assert_eq!(pending.canonical, "000000000000000000000000000000000001");
-        assert_eq!(pending.typed.unwrap().value, Value::UInt(1));
+        assert_eq!(pending.typed.unwrap().admitted.value(), &Value::UInt(1));
         assert!(lookup_map.is_empty());
     }
 

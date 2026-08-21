@@ -22,6 +22,7 @@ use clarity::vm::database::clarity_store::make_contract_hash_key;
 use clarity::vm::database::{
     ClarityBackingStore, DataStoreEntry, SqliteConnection, TypedValueData,
 };
+use clarity::vm::types::codec::packed::AdmittedValue;
 use clarity::vm::types::{TupleData, TypeSignature, Value};
 use clarity::vm::ClarityName;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
@@ -97,9 +98,8 @@ fn build_clarity_marf(
                 key: "typed_snapshot_key".into(),
                 canonical: to_hex(&consensus),
                 typed: Some(TypedValueData {
-                    value,
-                    expected,
-                    epoch: StacksEpochId::Epoch40,
+                    admitted: AdmittedValue::new(value, &expected, &StacksEpochId::Epoch40)
+                        .unwrap(),
                     consensus,
                 }),
             }])

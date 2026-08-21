@@ -50,6 +50,24 @@ pub const PACKED_VALUE_HEADER_LEN: usize = 4;
 /// Version byte for the active value-shape descriptor grammar.
 pub const VALUE_SHAPE_VERSION: u8 = 1;
 
+/// A Clarity value proven to conform to its declared storage type.
+///
+/// Construction performs epoch-aware admission once. Commit-time physical encoding accepts this
+/// type so it cannot accidentally repeat or omit that check. The type is deliberately move-only
+/// to prevent accidental deep copies of retained value trees.
+#[derive(Debug)]
+pub struct AdmittedValue {
+    /// Runtime value admitted by the declared storage type.
+    value: Value,
+}
+
+impl AdmittedValue {
+    /// Borrow the admitted runtime value.
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
 /// The encoded bytes and logical length produced by the packed codec.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedValue {

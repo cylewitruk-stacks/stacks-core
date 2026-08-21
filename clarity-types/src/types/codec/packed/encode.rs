@@ -10,19 +10,28 @@
 use stacks_common::types::StacksEpochId;
 
 use super::{
-    ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue, PackedValueError, ValueShape,
-    directory, layout, primitive, shape,
+    AdmittedValue, ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue,
+    PackedValueError, ValueShape, directory, layout, primitive, shape,
 };
 use crate::types::signatures::CallableSubtype;
 use crate::types::{
     CharType, QualifiedContractIdentifier, SequenceData, TupleData, TypeSignature, Value,
 };
 
-/// Encode canonical packed after the caller has performed epoch-aware admission.
+/// Encode a value whose owned type state proves epoch-aware admission already succeeded.
 ///
-/// Physical bytes depend only on the active [`Value`]. `expected` and epoch
-/// deliberately do not reach this function.
+/// Physical bytes depend only on the active [`Value`]; the admitted value does not retain the
+/// declared type or epoch.
 pub fn encode_canonical_packed_admitted(
+    admitted: &AdmittedValue,
+    consensus_byte_len: u32,
+    validation: ConsensusLengthValidation,
+) -> Result<PackedValue, PackedValueError> {
+    encode_canonical_value(admitted.value(), consensus_byte_len, validation)
+}
+
+/// Encode a value whose admission or canonical consensus parsing was established by its caller.
+fn encode_canonical_value(
     value: &Value,
     consensus_byte_len: u32,
     validation: ConsensusLengthValidation,
@@ -78,15 +87,8 @@ pub fn encode_canonical_packed_value_with_consensus_len(
     consensus_byte_len: u32,
     validation: ConsensusLengthValidation,
 ) -> Result<PackedValue, PackedValueError> {
-    let admitted = if matches!(value, Value::CallableContract(_)) {
-        canonical_callable_admitted(value, expected)?
-    } else {
-        expected.admits(epoch, value)?
-    };
-    if !admitted {
-        return Err(PackedValueError::TypeMismatch);
-    }
-    encode_canonical_packed_admitted(value, consensus_byte_len, validation)
+    ensure_canonical_value_admitted(value, expected, epoch)?;
+    encode_canonical_value(value, consensus_byte_len, validation)
 }
 
 /// Transcode one exact self-describing consensus value into canonical packed.
@@ -100,11 +102,41 @@ pub fn transcode_consensus_to_canonical_packed(
     let value = deserialize_canonical_consensus(consensus)?;
     let consensus_byte_len =
         u32::try_from(consensus.len()).map_err(|_| PackedValueError::SizeOverflow)?;
-    encode_canonical_packed_admitted(
+    encode_canonical_value(
         &value,
         consensus_byte_len,
         ConsensusLengthValidation::Enabled,
     )
+}
+
+impl AdmittedValue {
+    /// Validate and retain one value for later physical encoding.
+    pub fn new(
+        value: Value,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Self, PackedValueError> {
+        ensure_canonical_value_admitted(&value, expected, epoch)?;
+        Ok(Self { value })
+    }
+}
+
+/// Require `value` to conform to the declared storage type.
+fn ensure_canonical_value_admitted(
+    value: &Value,
+    expected: &TypeSignature,
+    epoch: &StacksEpochId,
+) -> Result<(), PackedValueError> {
+    let admitted = if matches!(value, Value::CallableContract(_)) {
+        canonical_callable_admitted(value, expected)?
+    } else {
+        expected.admits(epoch, value)?
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(PackedValueError::TypeMismatch)
+    }
 }
 
 /// Check callable admission without allowing the declared callable subtype to affect encoding.
@@ -402,7 +434,7 @@ pub fn transcode_consensus_with_shape(
     let value = deserialize_canonical_consensus(consensus)?;
     let consensus_byte_len =
         u32::try_from(consensus.len()).map_err(|_| PackedValueError::SizeOverflow)?;
-    let packed = encode_canonical_packed_admitted(
+    let packed = encode_canonical_value(
         &value,
         consensus_byte_len,
         ConsensusLengthValidation::Enabled,

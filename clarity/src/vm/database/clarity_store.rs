@@ -27,23 +27,20 @@ use crate::vm::database::{
     ClarityDatabase, ClarityDeserializable, ClaritySerializable, NULL_BURN_STATE_DB, NULL_HEADER_DB,
 };
 use crate::vm::errors::{VmExecutionError, VmInternalError};
+use crate::vm::types::codec::packed::AdmittedValue;
 use crate::vm::types::{PrincipalData, QualifiedContractIdentifier, TypeSignature};
 
-/// Schema and value retained for a typed Clarity value write.
-#[derive(Clone, Debug)]
+/// Admitted value data retained until a typed Clarity write commits.
+#[derive(Debug)]
 pub struct TypedValueData {
-    /// Sanitized runtime value whose consensus bytes equal [`DataStoreEntry::canonical`].
-    pub value: Value,
-    /// Declared schema used to encode and later interpret the physical payload.
-    pub expected: TypeSignature,
-    /// Epoch governing typed deserialization of this value.
-    pub epoch: StacksEpochId,
+    /// Sanitized runtime value already admitted by its declared storage type.
+    pub admitted: AdmittedValue,
     /// Exact consensus serialization, retained so commit-time encoders do not serialize twice.
     pub consensus: Vec<u8>,
 }
 
 /// One logical key/value edit committed by a backing store.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DataStoreEntry {
     /// Logical MARF key.
     pub key: String,
