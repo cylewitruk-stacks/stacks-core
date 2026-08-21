@@ -1,0 +1,1193 @@
+{
+  "schema": "stacks-attacknet-command-registry/v1",
+  "interfaceVersion": "1.0.0",
+  "entryPoint": "contrib/attacknet/attacknet",
+  "argumentConventions": {
+    "options": "Positional arguments precede options. Every positional and option has explicit requiredness and type metadata; valued options use --name=value and boolean switches use --name.",
+    "errors": "Usage errors write a concise diagnostic and command usage to stderr and exit 2.",
+    "plan": "--plan and --dry-run are aliases. They emit the delegated process and unresolved environment-input source as JSON without reading referenced manifests or executing anything.",
+    "stdout": "Machine-readable commands write JSON to stdout where the command contract says so; diagnostics use stderr.",
+    "environment": "The facade inherits its process environment for compatibility. Only the command-line inputs recorded here are versioned public inputs; helper-specific environment overrides are advanced and unstable unless a command contract explicitly names them."
+  },
+  "exitCodes": {
+    "0": "Command completed successfully.",
+    "1": "The operation or an environmental/verification check failed.",
+    "2": "The command or arguments were invalid."
+  },
+  "commands": [
+    {
+      "name": "help",
+      "purpose": "Show top-level, command-group, or leaf-command help generated from this registry.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-none",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "COMMAND",
+            "required": false,
+            "variadic": true,
+            "maximumItems": 2
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Human-readable help on stdout."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": false,
+      "examples": [
+        "attacknet help",
+        "attacknet help lifecycle apply"
+      ],
+      "implementation": {
+        "visibility": "builtin",
+        "kind": "help"
+      }
+    },
+    {
+      "name": "commands",
+      "purpose": "Emit the complete versioned machine contract for agents.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-none",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [],
+        "options": [
+          {
+            "name": "--json",
+            "type": "boolean",
+            "required": true
+          }
+        ]
+      },
+      "outputs": [
+        "The complete command registry as JSON."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": false,
+      "examples": [
+        "attacknet commands --json"
+      ],
+      "implementation": {
+        "visibility": "builtin",
+        "kind": "commands"
+      }
+    },
+    {
+      "name": "doctor",
+      "purpose": "Report host, cluster, image, storage, helper, architecture, and port compatibility.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-read",
+      "requiredPrivileges": "Docker and Kubernetes read access when those capabilities are installed.",
+      "inputs": {
+        "positionals": [],
+        "options": [
+          {
+            "name": "--json",
+            "type": "boolean",
+            "required": false
+          }
+        ]
+      },
+      "outputs": [
+        "Human compatibility report, or the complete report as JSON with --json."
+      ],
+      "backendSupport": [
+        "offline",
+        "docker",
+        "kubernetes"
+      ],
+      "plan": false,
+      "examples": [
+        "attacknet doctor",
+        "attacknet doctor --json"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "doctor.mjs",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "render",
+      "purpose": "Render a deterministic Attacknet topology for Kubernetes and Compose.",
+      "stability": "stable",
+      "sideEffectClass": "local-filesystem-write",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [],
+        "options": [
+          {
+            "name": "--miners",
+            "type": "integer",
+            "required": false,
+            "minimum": 0
+          },
+          {
+            "name": "--signers",
+            "type": "integer",
+            "required": false,
+            "minimum": 0
+          },
+          {
+            "name": "--followers",
+            "type": "integer",
+            "required": false,
+            "minimum": 0
+          },
+          {
+            "name": "--network",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "--namespace",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "--node-image",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "--stacker-image",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "--actor-image",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "--actor-env",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "--output",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "--probes",
+            "type": "enum",
+            "required": false,
+            "enum": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "name": "--probe-image",
+            "type": "string",
+            "required": false
+          }
+        ]
+      },
+      "outputs": [
+        "Rendered manifests, configs, and Compose files in --output."
+      ],
+      "backendSupport": [
+        "kubernetes",
+        "compose"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet render --miners=1 --signers=1 --followers=1 --output=generated/small",
+        "attacknet render --output=generated/small --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "topology.mjs",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "lifecycle apply",
+      "purpose": "Create and bootstrap a rendered Attacknet.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-mutation",
+      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace write for Kubernetes.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "GENERATED_DIR",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": [
+          {
+            "name": "--backend",
+            "type": "enum",
+            "required": false,
+            "enum": [
+              "kubernetes",
+              "compose"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        "Progress on stdout and an initialized run descriptor under GENERATED_DIR/runs."
+      ],
+      "backendSupport": [
+        "kubernetes",
+        "compose"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet lifecycle apply generated/small --backend=kubernetes",
+        "attacknet lifecycle apply generated/small --backend=compose --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "kind": "lifecycle",
+        "action": "apply"
+      }
+    },
+    {
+      "name": "lifecycle wait",
+      "purpose": "Wait for a rendered Attacknet to become ready.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-read",
+      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace read for Kubernetes.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "GENERATED_DIR",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": [
+          {
+            "name": "--backend",
+            "type": "enum",
+            "required": false,
+            "enum": [
+              "kubernetes",
+              "compose"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        "Readiness or verification result on stdout."
+      ],
+      "backendSupport": [
+        "kubernetes",
+        "compose"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet lifecycle wait generated/small --backend=kubernetes"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "kind": "lifecycle",
+        "action": "wait"
+      }
+    },
+    {
+      "name": "lifecycle capture",
+      "purpose": "Capture admitted lifecycle state before teardown or investigation.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-read-and-local-write",
+      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace read for Kubernetes.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "GENERATED_DIR",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "EVIDENCE_DIR",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": [
+          {
+            "name": "--backend",
+            "type": "enum",
+            "required": false,
+            "enum": [
+              "kubernetes",
+              "compose"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        "Evidence files in EVIDENCE_DIR."
+      ],
+      "backendSupport": [
+        "kubernetes",
+        "compose"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet lifecycle capture generated/small evidence/admitted --backend=kubernetes"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "kind": "lifecycle",
+        "action": "capture"
+      }
+    },
+    {
+      "name": "lifecycle delete",
+      "purpose": "Finalize evidence and delete a rendered Attacknet and owned storage.",
+      "stability": "stable",
+      "sideEffectClass": "destructive-runtime-mutation",
+      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace delete for Kubernetes.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "GENERATED_DIR",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": [
+          {
+            "name": "--backend",
+            "type": "enum",
+            "required": false,
+            "enum": [
+              "kubernetes",
+              "compose"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        "Final evidence location and deletion status on stdout."
+      ],
+      "backendSupport": [
+        "kubernetes",
+        "compose"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet lifecycle delete generated/small --backend=kubernetes --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "kind": "lifecycle",
+        "action": "delete"
+      }
+    },
+    {
+      "name": "verify",
+      "purpose": "Evaluate a live network snapshot, progress window, or telemetry coverage.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-read",
+      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace read for Kubernetes.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "MANIFEST",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "ACTION",
+            "required": true,
+            "variadic": false,
+            "enum": [
+              "snapshot",
+              "snapshot-allow-unready",
+              "progress",
+              "progress-allow-unready",
+              "telemetry"
+            ]
+          }
+        ],
+        "options": [
+          {
+            "name": "--backend",
+            "type": "enum",
+            "required": false,
+            "enum": [
+              "kubernetes",
+              "compose"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        "Machine-readable assertion result on stdout."
+      ],
+      "backendSupport": [
+        "kubernetes",
+        "compose"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet verify generated/small/manifest.json snapshot --backend=kubernetes"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "verify.sh",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "campaign plan",
+      "purpose": "Validate and compile a bounded fault campaign without applying it.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-none",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "CAMPAIGN_JSON",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "MANIFEST",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "OUTPUT_JSON",
+            "required": false,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Compiled resource and safety evidence on stdout, or OUTPUT_JSON and OUTPUT_JSON.evidence.json."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": false,
+      "examples": [
+        "attacknet campaign plan examples/miner-network-delay.json generated/small/manifest.json"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "fault-campaign.mjs",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "campaign run",
+      "purpose": "Execute a bounded directly-rendered Chaos Mesh campaign with baseline, recovery, and evidence gates.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-mutation",
+      "requiredPrivileges": "Kubernetes namespace and supported fault-helper write access.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "CAMPAIGN_JSON",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "MANIFEST",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "EVIDENCE_DIR",
+            "required": false,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Campaign evidence directory and verification artifacts. Controller-owned internal policies and one-shot kill actions are rejected and require the FaultCampaign / AttacknetRun API."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet campaign run examples/miner-network-delay.json generated/small/manifest.json evidence/campaign --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "campaign-runner.sh",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "evidence capture",
+      "purpose": "Capture backend-neutral actor state, metrics, logs, and runtime identity.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-read-and-local-write",
+      "requiredPrivileges": "Backend read/exec/log access.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "EVIDENCE_DIR",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "MANIFEST",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "LOG_SINCE",
+            "required": false,
+            "variadic": false
+          }
+        ],
+        "options": [
+          {
+            "name": "--backend",
+            "type": "enum",
+            "required": false,
+            "enum": [
+              "kubernetes",
+              "compose"
+            ]
+          }
+        ]
+      },
+      "outputs": [
+        "Evidence tree in EVIDENCE_DIR."
+      ],
+      "backendSupport": [
+        "kubernetes",
+        "compose"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet evidence capture evidence/run generated/small/manifest.json --backend=kubernetes"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "evidence-harness.sh",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "evidence export",
+      "purpose": "Export a sealed run descriptor and its referenced artifacts.",
+      "stability": "stable",
+      "sideEffectClass": "local-filesystem-write",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "DESCRIPTOR",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "DESTINATION",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Portable evidence bundle in DESTINATION."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet evidence export generated/small/runs/RUN/run.json evidence/export"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "run-ledger.mjs",
+        "prefix": [
+          "export"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "replay derive",
+      "purpose": "Derive a deterministic failure-prefix replay descriptor from a failed run.",
+      "stability": "stable",
+      "sideEffectClass": "local-filesystem-write",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "DESCRIPTOR",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "OUTPUT",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": [
+          {
+            "name": "--assertion",
+            "type": "string",
+            "required": false
+          }
+        ]
+      },
+      "outputs": [
+        "Replay descriptor at OUTPUT and its digest on stdout."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet replay derive evidence/run.json evidence/replay.json"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "run-descriptor.mjs",
+        "prefix": [
+          "minimize"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "replay resolve",
+      "purpose": "Resolve a replay envelope against a fresh admitted network context.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-none",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "INPUT_JSON",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "OUTPUT_JSON",
+            "required": false,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Resolved replay schedule on stdout or in OUTPUT_JSON."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": false,
+      "examples": [
+        "attacknet replay resolve replay-input.json resolved-replay.json"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "attacknet-run-schedule.mjs",
+        "prefix": [
+          "replay"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "minimize plan",
+      "purpose": "Initialize a deterministic bounded delta-debugging plan.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-none",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "INPUT_JSON",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "OUTPUT_JSON",
+            "required": false,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Delta-debugging plan on stdout or in OUTPUT_JSON."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": false,
+      "examples": [
+        "attacknet minimize plan ddmin-input.json ddmin-plan.json"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "attacknet-run-schedule.mjs",
+        "prefix": [
+          "ddmin-init"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "minimize execute",
+      "purpose": "Run fresh-network baseline replay and bounded Kubernetes delta debugging.",
+      "stability": "experimental",
+      "sideEffectClass": "destructive-runtime-mutation",
+      "requiredPrivileges": "Kubernetes create/delete and AttacknetRun access in the configured namespace.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "CONFIG_JSON",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Execution receipt on stdout and durable per-attempt evidence under the configured directory."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet minimize execute ddmin-config.json --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "kubernetes-ddmin-adapter.mjs",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "dashboard local",
+      "purpose": "Disable Chaos Dashboard auth for a local cluster and start loopback access.",
+      "stability": "stable",
+      "sideEffectClass": "security-sensitive-runtime-mutation",
+      "requiredPrivileges": "Kubernetes dashboard deployment write access.",
+      "inputs": {
+        "positionals": [],
+        "options": []
+      },
+      "outputs": [
+        "Local dashboard URL and access supervisor status."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet dashboard local --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "chaos-dashboard.sh",
+        "prefix": [
+          "local"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "dashboard secure",
+      "purpose": "Re-enable Chaos Dashboard authentication.",
+      "stability": "stable",
+      "sideEffectClass": "security-sensitive-runtime-mutation",
+      "requiredPrivileges": "Kubernetes dashboard deployment write access.",
+      "inputs": {
+        "positionals": [],
+        "options": []
+      },
+      "outputs": [
+        "Applied security mode status."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet dashboard secure"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "chaos-dashboard.sh",
+        "prefix": [
+          "secure"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "dashboard token",
+      "purpose": "Install and print the persistent local dashboard token.",
+      "stability": "stable",
+      "sideEffectClass": "secret-output-and-runtime-mutation",
+      "requiredPrivileges": "Kubernetes Secret and RBAC write/read access.",
+      "inputs": {
+        "positionals": [],
+        "options": []
+      },
+      "outputs": [
+        "Dashboard token on stdout; treat it as a secret."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet dashboard token --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "chaos-dashboard.sh",
+        "prefix": [
+          "token"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "dashboard start",
+      "purpose": "Start resilient loopback-only dashboard access.",
+      "stability": "stable",
+      "sideEffectClass": "local-process-mutation",
+      "requiredPrivileges": "Kubernetes service read access and permission to create a local process.",
+      "inputs": {
+        "positionals": [],
+        "options": []
+      },
+      "outputs": [
+        "Supervisor PID, log, and loopback URL."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet dashboard start"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "chaos-dashboard.sh",
+        "prefix": [
+          "start"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "dashboard stop",
+      "purpose": "Stop resilient local dashboard access.",
+      "stability": "stable",
+      "sideEffectClass": "local-process-mutation",
+      "requiredPrivileges": "Permission to stop the owned local supervisor process.",
+      "inputs": {
+        "positionals": [],
+        "options": []
+      },
+      "outputs": [
+        "Stop status."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet dashboard stop"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "chaos-dashboard.sh",
+        "prefix": [
+          "stop"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "dashboard status",
+      "purpose": "Report dashboard security and local-access state.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-read",
+      "requiredPrivileges": "Kubernetes dashboard deployment read access.",
+      "inputs": {
+        "positionals": [],
+        "options": []
+      },
+      "outputs": [
+        "Security mode, access status, PID, URL, and log path."
+      ],
+      "backendSupport": [
+        "kubernetes"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet dashboard status"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "bash",
+        "path": "chaos-dashboard.sh",
+        "prefix": [
+          "status"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "image plan",
+      "purpose": "Validate a mixed-version image pipeline and emit its build plan.",
+      "stability": "stable",
+      "sideEffectClass": "runtime-none",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "PIPELINE_JSON",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Machine-readable build plan on stdout."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": false,
+      "examples": [
+        "attacknet image plan pipeline.json"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "image-build-pipeline.mjs",
+        "prefix": [],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "image build",
+      "purpose": "Execute an admitted image pipeline and optionally load exact images into kind.",
+      "stability": "experimental",
+      "sideEffectClass": "image-and-runtime-mutation",
+      "requiredPrivileges": "Docker/BuildKit access and, with --load-kind, kind node access.",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "PIPELINE_JSON",
+            "required": true,
+            "variadic": false
+          }
+        ],
+        "options": [
+          {
+            "name": "--output-dir",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "--load-kind",
+            "type": "string",
+            "required": false
+          }
+        ]
+      },
+      "outputs": [
+        "Build records in --output-dir and a machine-readable result on stdout."
+      ],
+      "backendSupport": [
+        "docker",
+        "kind"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet image build pipeline.json --output-dir=evidence/images --plan"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "image-build-pipeline.mjs",
+        "prefix": [
+          "--execute"
+        ],
+        "kind": "program"
+      }
+    },
+    {
+      "name": "image admission",
+      "purpose": "Join build provenance to admitted actor and runtime image identity.",
+      "stability": "stable",
+      "sideEffectClass": "local-filesystem-write",
+      "requiredPrivileges": "none",
+      "inputs": {
+        "positionals": [
+          {
+            "name": "BUILD_RECORD",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "NETWORK_JSON",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "POD_JSON",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "ACTOR",
+            "required": true,
+            "variadic": false
+          },
+          {
+            "name": "OUTPUT_JSON",
+            "required": false,
+            "variadic": false
+          }
+        ],
+        "options": []
+      },
+      "outputs": [
+        "Admission-evidence JSON on stdout or in OUTPUT_JSON."
+      ],
+      "backendSupport": [
+        "offline"
+      ],
+      "plan": true,
+      "examples": [
+        "attacknet image admission build.json network.json pod.json miner-1 admission.json"
+      ],
+      "implementation": {
+        "visibility": "internal",
+        "program": "node",
+        "path": "image-admission-evidence.mjs",
+        "prefix": [],
+        "kind": "program"
+      }
+    }
+  ],
+  "internalHelpers": [
+    "attacknet-run-schedule.mjs",
+    "burnchain-clock.sh",
+    "burnchain-policy.sh",
+    "campaign-runner.sh",
+    "campaign-targets.mjs",
+    "capacity-preflight.sh",
+    "chaos-dashboard.sh",
+    "chaos-resource.sh",
+    "check.sh",
+    "command-contract.cjs",
+    "compose-lifecycle.sh",
+    "compose-negative-controls.sh",
+    "configure-node.sh",
+    "ddmin-executor.mjs",
+    "doctor.mjs",
+    "environment-lock.sh",
+    "evidence-harness.sh",
+    "fault-campaign.mjs",
+    "fault-effect-evidence.mjs",
+    "final-soak-run.mjs",
+    "image-admission-evidence.mjs",
+    "image-build-pipeline.mjs",
+    "incident-capture.sh",
+    "instrumentation/capability-manifest.mjs",
+    "instrumentation/config-startup-smoke.mjs",
+    "instrumentation/phase-1-qualification.mjs",
+    "instrumentation/runtime-metric-evidence.mjs",
+    "invariants.mjs",
+    "join-after-nakamoto.sh",
+    "kubernetes-ddmin-adapter.mjs",
+    "lifecycle.sh",
+    "local-access.sh",
+    "manifest-identity.mjs",
+    "manifest-inventory.mjs",
+    "mixed-matrix-evidence.mjs",
+    "node-capacity.mjs",
+    "observability/actor-states.mjs",
+    "observability/emit-event.sh",
+    "observability/emit-kubernetes-event.sh",
+    "observability/event.mjs",
+    "observability/event_bridge.py",
+    "observability/export-kubernetes-report.sh",
+    "observability/export-loki.mjs",
+    "observability/export-loki.sh",
+    "observability/export-report.sh",
+    "observability/record-actor-states.sh",
+    "observability/record-event.sh",
+    "observability/record-verification.sh",
+    "observability/render.mjs",
+    "observability/report.mjs",
+    "observability/storage-preflight.sh",
+    "observability/summarize-loki-export.mjs",
+    "observability/verification-events.mjs",
+    "operator-pressure.mjs",
+    "phase-two-readonly-evidence.mjs",
+    "probe/probe.mjs",
+    "progress-window.mjs",
+    "release/baseline.mjs",
+    "release/offline-result.mjs",
+    "release/phase-one-packet.mjs",
+    "release/phase-review.mjs",
+    "release/phase-two-packet.mjs",
+    "release/phase-zero-packet.mjs",
+    "release/schema-validator.mjs",
+    "run-descriptor.mjs",
+    "run-ledger.mjs",
+    "runtime-backend.sh",
+    "signer-metric-deltas.mjs",
+    "signer-set-parity.mjs",
+    "soak-evidence.mjs",
+    "soak-observation.mjs",
+    "soak-runner.sh",
+    "topology.mjs",
+    "verify.sh",
+    "version-matrix.mjs"
+  ]
+}

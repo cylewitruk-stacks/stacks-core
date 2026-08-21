@@ -30,6 +30,12 @@ digest proves what a human or model actually inspected.
    ascending UTF-16 code-unit order; uses JSON string escaping and JSON's
    finite-number, Boolean, and null spellings; and inserts no insignificant
    whitespace. `phase-review.mjs` performs this same calculation.
+   The packet also records `toolingDigest`, a canonical digest over
+   `phase-review.mjs`, `schema-validator.mjs`, and the three review schemas.
+   Before evaluating a packet, compare it with
+   `node contrib/attacknet/release/phase-review.mjs tooling-digest`. A mismatch
+   means the reviewer must use the verifier from the packet's candidate
+   revision; it is not evidence that the packet was tampered with.
 4. Give each reviewer the complete packet and every inventory item. A reduced
    packet records non-applicable full-tier material explicitly in its matrix;
    it does not silently omit it.
@@ -83,7 +89,30 @@ The builder rejects a dirty candidate, a live run pinned to another commit,
 artifact or archive drift, and any missing/failed live assertion. An archive
 path without a verified digest is not evidence custody.
 
+Phase 2 was planned as Reduced, but its final candidate also hardens review
+evidence semantics and corrects the post-chaos progress window. Its packet is
+therefore truthfully upgraded to Full by the compatibility rules. The builder
+requires compatible-doctor evidence, complete live human and agent facade
+workflows, a bounded fault and evidence capture through that facade, the
+cadence-aware progress artifact, and clean teardown:
+
+```bash
+node contrib/attacknet/release/phase-two-packet.mjs \
+  --live-summary=.docs/reviews/attacknet-phase-2/live-summary.json \
+  --offline-result=.docs/reviews/attacknet-phase-2/offline-result.json \
+  --output=.docs/reviews/attacknet-phase-2/packet.json
+```
+
 ## Evidence preservation
+
+Every packet inventory `path` is a portable, forward-slash relative locator.
+The path a packet builder uses to read local bytes is deliberately separate:
+tracked-source locators resolve against the candidate checkout, and external
+evidence and test locators resolve against `evidenceRoot`, itself relative to
+the directory containing the packet. Phase 2 requires this explicit root;
+Phase 0 and Phase 1 packets predate the field and retain their approved v1
+layout. Absolute
+workstation paths and parent traversal are rejected.
 
 `baseline.mjs validate --verify-evidence` reads reference artifacts and checks
 their byte digests. A mutation negative control changes fixture bytes and proves

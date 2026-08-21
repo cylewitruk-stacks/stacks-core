@@ -12,6 +12,19 @@ node "${ATTACKNET_DIR}/fault-campaign.mjs" "${campaign}" "${manifest}" "${resour
 cp "${campaign}" "${destination}/campaign.requested.json"
 cp "${manifest}" "${destination}/manifest.json"
 
+resource_api_version="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).apiVersion)' "${resource}")"
+resource_kind="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).kind)' "${resource}")"
+resource_action="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).spec.action ?? "")' "${resource}")"
+if [ "${resource_api_version}" = testing.stacks.org/internal ]; then
+  echo 'campaign run cannot execute controller-owned internal policies; submit this campaign through the FaultCampaign / AttacknetRun API' >&2
+  exit 2
+fi
+if [ "${resource_kind}" = PodChaos ] \
+  && { [ "${resource_action}" = pod-kill ] || [ "${resource_action}" = container-kill ]; }; then
+  echo "campaign run cannot prove AllRecovered for one-shot ${resource_action}; submit this campaign through the FaultCampaign / AttacknetRun API" >&2
+  exit 2
+fi
+
 namespace="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.namespace)' "${resource}")"
 network="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.labels["testing.stacks.org/network"])' "${resource}")"
 lock_script="${ATTACKNET_DIR}/environment-lock.sh"
@@ -26,7 +39,6 @@ elif [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then
 else
   "${lock_script}" assert "${network}" "${ATTACKNET_MUTATION_TOKEN}"
 fi
-resource_kind="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).kind)' "${resource}")"
 kind="$(printf '%s' "${resource_kind}" | tr '[:upper:]' '[:lower:]')"
 name="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.name)' "${resource}")"
 duration_seconds="$(node -e '
@@ -263,8 +275,20 @@ recovery_duration=$(( $(date +%s) - recovery_started ))
 emit_event recovery.complete verification "" "{\"durationSeconds\":${recovery_duration}}"
 if [ "${kind}" = timechaos ]; then capture_clocks "${destination}/clocks-after.jsonl"; fi
 event_phase=verification
+post_chaos_progress_window="$(node "${ATTACKNET_DIR}/progress-window.mjs" \
+  "${manifest}" "${ATTACKNET_POST_CHAOS_PROGRESS_SECONDS:-}")"
+PROGRESS_WINDOW_SECONDS="${post_chaos_progress_window}" \
+  PROGRESS_WINDOW_OVERRIDE="${ATTACKNET_POST_CHAOS_PROGRESS_SECONDS:-}" \
+  node -e '
+    const configured = process.env.PROGRESS_WINDOW_OVERRIDE;
+    process.stdout.write(`${JSON.stringify({
+      schema: "stacks-attacknet-progress-window/v1",
+      seconds: Number(process.env.PROGRESS_WINDOW_SECONDS),
+      source: configured ? "explicit-override" : "manifest-cadence-plus-jitter-margin",
+    }, null, 2)}\n`);
+  ' >"${destination}/post-chaos-progress-window.json"
 if ! ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
-  ATTACKNET_PROGRESS_WINDOW_SECONDS="${ATTACKNET_POST_CHAOS_PROGRESS_SECONDS:-45}" \
+  ATTACKNET_PROGRESS_WINDOW_SECONDS="${post_chaos_progress_window}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" progress \
   >"${destination}/post-chaos-progress.json" 2>"${destination}/post-chaos-progress.stderr"; then
   ledger_assertion "campaign-${name}-post-chaos-progress" fail '{"phase":"verification"}' || true
@@ -275,7 +299,8 @@ if ! ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${
   emit_invariant post-chaos-progress false verification || true
   fail_campaign 'post-chaos burnchain and Stacks progress invariant failed'
 fi
-ledger_assertion "campaign-${name}-post-chaos-progress" pass '{"phase":"verification"}'
+ledger_assertion "campaign-${name}-post-chaos-progress" pass \
+  "{\"phase\":\"verification\",\"windowSeconds\":${post_chaos_progress_window}}"
 emit_invariant post-chaos-progress true verification
 KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
   "${ATTACKNET_DIR}/observability/record-verification.sh" \

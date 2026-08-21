@@ -2,7 +2,7 @@
 
 import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
-import {dirname, join} from 'node:path';
+import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {loadSchema, validateSchema} from './schema-validator.mjs';
@@ -15,6 +15,13 @@ const releaseDir = dirname(fileURLToPath(import.meta.url));
 const contractSchema = loadSchema(join(releaseDir, 'review-contract.schema.json'));
 const packetSchema = loadSchema(join(releaseDir, 'review-packet.schema.json'));
 const verdictSchema = loadSchema(join(releaseDir, 'review-verdict.schema.json'));
+const REVIEW_TOOLING_FILES = Object.freeze([
+  'phase-review.mjs',
+  'schema-validator.mjs',
+  'review-contract.schema.json',
+  'review-packet.schema.json',
+  'review-verdict.schema.json',
+]);
 const SOURCE_KINDS = new Set(['source', 'document', 'analysis', 'instructions', 'diff']);
 const EVIDENCE_KINDS = new Set(['evidence', 'test']);
 const INVENTORY_KINDS = new Set([...SOURCE_KINDS, ...EVIDENCE_KINDS]);
@@ -31,6 +38,17 @@ function canonical(value) {
 
 export function sha256(value) {
   return `sha256:${createHash('sha256').update(canonical(value)).digest('hex')}`;
+}
+
+function sha256Bytes(value) {
+  return `sha256:${createHash('sha256').update(value).digest('hex')}`;
+}
+
+export function reviewToolingDigest() {
+  return sha256(REVIEW_TOOLING_FILES.map(path => ({
+    path,
+    digest: sha256Bytes(readFileSync(join(releaseDir, path))),
+  })));
 }
 
 function object(value, field) {
@@ -56,13 +74,21 @@ function strings(value, field, {nonEmpty = false} = {}) {
   return value;
 }
 
+function portableRelativeLocator(value, field) {
+  const locator = string(value, field);
+  if (locator.startsWith('/') || locator.includes('\\') || locator.split('/').includes('..')) {
+    throw new Error(`${field} must be a portable relative locator`);
+  }
+  return locator;
+}
+
 function inventoryIds(packet) {
   if (!Array.isArray(packet.inventory) || packet.inventory.length === 0) throw new Error('packet.inventory must be a non-empty array');
   const ids = packet.inventory.map((item, index) => {
     object(item, `packet.inventory[${index}]`);
     string(item.kind, `packet.inventory[${index}].kind`);
     if (!INVENTORY_KINDS.has(item.kind)) throw new Error(`packet.inventory[${index}].kind is unsupported`);
-    string(item.path, `packet.inventory[${index}].path`);
+    portableRelativeLocator(item.path, `packet.inventory[${index}].path`);
     digest(item.digest, `packet.inventory[${index}].digest`);
     return string(item.id, `packet.inventory[${index}].id`);
   });
@@ -92,6 +118,11 @@ export function validateReviewPacket(contract, packet) {
   validateSchema(packet, packetSchema, 'packet');
   if (contract.schemaVersion !== REVIEW_CONTRACT_SCHEMA) throw new Error('unsupported review contract schema');
   if (packet.schemaVersion !== REVIEW_PACKET_SCHEMA) throw new Error('unsupported review packet schema');
+  digest(packet.toolingDigest, 'packet.toolingDigest');
+  const expectedToolingDigest = reviewToolingDigest();
+  if (packet.toolingDigest !== expectedToolingDigest) {
+    throw new Error(`packet requires review tooling ${packet.toolingDigest}; current tooling is ${expectedToolingDigest}; run the verifier from the candidate revision`);
+  }
   if (packet.phase !== contract.phase) throw new Error('packet phase does not match contract');
   object(packet.candidate, 'packet.candidate');
   string(packet.candidate.sourceRevision, 'packet.candidate.sourceRevision');
@@ -104,6 +135,7 @@ export function validateReviewPacket(contract, packet) {
   if (packet.contractDigest !== expectedContractDigest) throw new Error('packet contractDigest does not match contract');
   digest(packet.sourceDigest, 'packet.sourceDigest');
   digest(packet.evidenceDigest, 'packet.evidenceDigest');
+  if (packet.evidenceRoot !== undefined) portableRelativeLocator(packet.evidenceRoot, 'packet.evidenceRoot');
   strings(packet.requirements, 'packet.requirements');
   const ids = new Set(inventoryIds(packet));
   const expectedSource = scopedInventoryDigest(packet, SOURCE_KINDS);
@@ -139,9 +171,17 @@ export function validateReviewPacket(contract, packet) {
   return true;
 }
 
+export function resolveEvidenceInventoryPath(packetPath, packet, item) {
+  if (!EVIDENCE_KINDS.has(item?.kind)) throw new Error('only evidence and test inventory items resolve against evidenceRoot');
+  const evidenceRoot = portableRelativeLocator(packet?.evidenceRoot, 'packet.evidenceRoot');
+  const locator = portableRelativeLocator(item.path, 'inventory item path');
+  return resolve(dirname(packetPath), evidenceRoot, locator);
+}
+
 export function sealReviewPacket(contract, input) {
   const packet = structuredClone(input);
   delete packet.binding;
+  packet.toolingDigest = reviewToolingDigest();
   packet.contractDigest = sha256(contract);
   inventoryIds(packet);
   packet.sourceDigest = scopedInventoryDigest(packet, SOURCE_KINDS);
@@ -187,8 +227,12 @@ function load(path) {
 }
 
 function main(argv) {
+  if (argv[0] === 'tooling-digest' && argv.length === 1) {
+    console.log(reviewToolingDigest());
+    return 0;
+  }
   if (argv.length < 3 || argv[0] !== 'gate') {
-    console.error('usage: phase-review.mjs gate CONTRACT PACKET VERDICT...');
+    console.error('usage: phase-review.mjs tooling-digest | gate CONTRACT PACKET VERDICT...');
     return 2;
   }
   const result = evaluatePhaseGate(load(argv[1]), load(argv[2]), argv.slice(3).map(load));

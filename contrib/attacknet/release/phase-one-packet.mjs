@@ -3,7 +3,7 @@
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {readFileSync, writeFileSync} from 'node:fs';
-import {dirname, isAbsolute, resolve} from 'node:path';
+import {basename, dirname, isAbsolute, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {deriveGitCandidate} from './phase-zero-packet.mjs';
@@ -36,8 +36,8 @@ function digestFile(path, root = repoRoot) {
   return `sha256:${createHash('sha256').update(readFileSync(absolute(path, root))).digest('hex')}`;
 }
 
-function item(id, kind, path, root = repoRoot) {
-  return {id, kind, path, digest: digestFile(path, root)};
+function item(id, kind, path, root = repoRoot, sourcePath = path) {
+  return {id, kind, path, digest: digestFile(sourcePath, root)};
 }
 
 function assertObject(value, label) {
@@ -136,17 +136,17 @@ export function buildPhaseOnePacket({
   const artifacts = live.artifacts;
   const inventory = [
     ...phaseOneCandidateInventorySpec(root, candidate.sourceRevision).map(parts => item(...parts, root)),
-    item('test:offline-check', 'test', offlineResultPath, root),
-    item('evidence:archive-index', 'evidence', live.archive.indexPath, root),
-    item('evidence:archive', 'evidence', live.archive.path, root),
-    item('evidence:live-summary', 'evidence', liveSummaryPath, root),
-    item('evidence:image-build', 'evidence', artifacts.imageBuild.path, root),
-    item('evidence:baseline-capability', 'evidence', artifacts.baselineCapability.path, root),
-    item('evidence:baseline-run', 'evidence', artifacts.baselineRun.path, root),
-    item('evidence:alert-active', 'evidence', artifacts.alertActive.path, root),
-    item('evidence:alert-recovered', 'evidence', artifacts.alertRecovered.path, root),
-    item('evidence:blocking-capability', 'evidence', artifacts.blockingCapability.path, root),
-    item('evidence:blocking-run', 'evidence', artifacts.blockingRun.path, root),
+    item('test:offline-check', 'test', 'review/offline-result.json', root, offlineResultPath),
+    item('evidence:archive-index', 'evidence', live.archive.indexEntry, root, live.archive.indexPath),
+    item('evidence:archive', 'evidence', `archive/${basename(live.archive.path)}`, root, live.archive.path),
+    item('evidence:live-summary', 'evidence', 'review/live-summary.json', root, liveSummaryPath),
+    item('evidence:image-build', 'evidence', artifacts.imageBuild.archiveEntry, root, artifacts.imageBuild.path),
+    item('evidence:baseline-capability', 'evidence', artifacts.baselineCapability.archiveEntry, root, artifacts.baselineCapability.path),
+    item('evidence:baseline-run', 'evidence', artifacts.baselineRun.archiveEntry, root, artifacts.baselineRun.path),
+    item('evidence:alert-active', 'evidence', artifacts.alertActive.archiveEntry, root, artifacts.alertActive.path),
+    item('evidence:alert-recovered', 'evidence', artifacts.alertRecovered.archiveEntry, root, artifacts.alertRecovered.path),
+    item('evidence:blocking-capability', 'evidence', artifacts.blockingCapability.archiveEntry, root, artifacts.blockingCapability.path),
+    item('evidence:blocking-run', 'evidence', artifacts.blockingRun.archiveEntry, root, artifacts.blockingRun.path),
   ];
   return sealReviewPacket(contract, {
     schemaVersion: REVIEW_PACKET_SCHEMA,

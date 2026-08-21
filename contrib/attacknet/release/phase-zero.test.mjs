@@ -12,6 +12,7 @@ import {
   REVIEW_PACKET_SCHEMA,
   REVIEW_VERDICT_SCHEMA,
   evaluatePhaseGate,
+  reviewToolingDigest,
   sealReviewPacket,
   sha256,
   validateReviewPacket,
@@ -180,6 +181,23 @@ test('inventory digests use locale-independent UTF-16 code-unit ordering', () =>
     inventory: [...packet.inventory].reverse(),
   });
   assert.equal(resealed.sourceDigest, packet.sourceDigest);
+});
+
+test('packets identify their exact review tooling and use portable locators', () => {
+  const contract = load(contractPath);
+  const packet = sealedPacket(contract);
+  assert.equal(packet.toolingDigest, reviewToolingDigest());
+
+  const wrongTooling = structuredClone(packet);
+  wrongTooling.toolingDigest = `sha256:${'f'.repeat(64)}`;
+  wrongTooling.binding.digest = sha256((({binding, ...rest}) => rest)(wrongTooling));
+  assert.throws(() => validateReviewPacket(contract, wrongTooling), /requires review tooling.*candidate revision/);
+
+  for (const path of ['/Users/reviewer/evidence.json', '../evidence.json', 'review\\evidence.json']) {
+    const invalid = structuredClone(packet);
+    invalid.inventory[0].path = path;
+    assert.throws(() => sealReviewPacket(contract, invalid), /portable relative locator/);
+  }
 });
 
 test('empty or modified contracts cannot vacuously close a phase', () => {

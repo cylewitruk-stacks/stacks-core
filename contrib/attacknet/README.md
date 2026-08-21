@@ -1,11 +1,66 @@
 # Stacks Attacknet
 
+## Quickstart and command discovery
+
+The `attacknet` facade is the public interface; the other scripts in this
+directory are implementation helpers. From the repository root, a human can
+render, start, inspect, fault, capture, and delete a small Kubernetes network
+with this sequence (use only non-valuable regtest keys and funds):
+
+```bash
+ATTACKNET=contrib/attacknet/attacknet
+$ATTACKNET doctor
+$ATTACKNET render --miners=1 --signers=1 --followers=1 \
+  --output=contrib/attacknet/generated/quickstart
+$ATTACKNET lifecycle apply contrib/attacknet/generated/quickstart \
+  --backend=kubernetes
+$ATTACKNET verify contrib/attacknet/generated/quickstart/manifest.json snapshot \
+  --backend=kubernetes
+$ATTACKNET campaign plan contrib/attacknet/examples/follower-network-delay.json \
+  contrib/attacknet/generated/quickstart/manifest.json /tmp/attacknet-fault.json
+$ATTACKNET campaign run contrib/attacknet/examples/follower-network-delay.json \
+  contrib/attacknet/generated/quickstart/manifest.json \
+  contrib/attacknet/evidence/quickstart-fault
+$ATTACKNET evidence capture contrib/attacknet/evidence/quickstart \
+  contrib/attacknet/generated/quickstart/manifest.json --backend=kubernetes
+$ATTACKNET lifecycle delete contrib/attacknet/generated/quickstart \
+  --backend=kubernetes
+```
+
+Run `contrib/attacknet/attacknet help COMMAND` (for example, `help lifecycle
+apply`) before a mutating command. Commands that support it accept `--plan` or
+`--dry-run` and return the resolved invocation as JSON without executing it.
+Use `--backend=compose` for the small Compose reference workflow.
+
+`campaign run` directly executes campaigns that compile to Chaos Mesh
+resources. Controller-owned policies such as the arm64 `clock-skew` and
+`io-pressure` alternatives must be submitted through the `FaultCampaign` /
+`AttacknetRun` API; the direct runner rejects these internal descriptors before
+it reads or mutates the cluster. It likewise rejects one-shot `pod-kill` and
+`container-kill` actions because Chaos Mesh cannot report `AllRecovered` for
+them; those actions require the controller-owned recovery/effect contract.
+
+An agent should discover the interface from the versioned registry, without
+listing this directory or reading helper source:
+
+```bash
+contrib/attacknet/attacknet commands --json
+contrib/attacknet/attacknet help campaign run
+contrib/attacknet/attacknet campaign run CAMPAIGN MANIFEST EVIDENCE_DIR --plan
+```
+
+The JSON registry includes every input, output, exit code, backend, privilege,
+side-effect, stability, example, and plan-mode contract. Exit `0` is success,
+`1` is an operation or compatibility failure, and `2` is an argument error.
+Offline source tests do not require Docker or Kubernetes; `doctor` owns host
+and cluster compatibility checks.
+
 Instrumentation is an explicit image capability. Read
 [`INSTRUMENTATION.md`](INSTRUMENTATION.md) before using signer/node metrics in
 an experiment: it defines the 22-family inventory, `merged`,
 `attacknet-patch`, and `unavailable` family provenance (`mixed` at actor-summary
-level), per-image config smokes,
-runtime identity linkage, compatibility guards, and missing-series semantics.
+level), per-image config smokes, runtime identity linkage, compatibility
+guards, and missing-series semantics.
 
 This directory contains the transport-independent test harness for adversarial
 Stacks regtest networks. The default profile follows the node and signer code
@@ -58,6 +113,16 @@ pass: both named reviewers must approve the same complete packet inventory.
   Actor Pods have no service-account token.
 
 ## Local images
+
+> **Maintainer implementation reference.** The public, versioned interface is
+> `contrib/attacknet/attacknet` and `attacknet commands --json`. The remaining
+> sections intentionally show underlying scripts for harness development and
+> forensic debugging; those helper entry points, environment variables, and
+> argument layouts are internal and may change without an Attacknet interface
+> version bump. In particular, `burnchain-policy.sh`, `version-matrix.mjs`,
+> `soak-runner.sh`, `environment-lock.sh`, `local-access.sh`,
+> `capacity-preflight.sh`, and `compose-negative-controls.sh` are not public
+> CLIs in Release 1. Agents and end users must not automate against them.
 
 Build current main's node and signer binaries:
 
