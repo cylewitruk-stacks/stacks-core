@@ -11,9 +11,7 @@ use std::str;
 
 use stacks_common::types::StacksEpochId;
 
-use super::{
-    DecodedPackedValue, PACKED_VALUE_HEADER_LEN, PackedValueError, directory, layout, primitive,
-};
+use super::{DecodedPackedValue, PackedValueError, PackedValueRef, directory, layout, primitive};
 use crate::types::signatures::{CallableSubtype, SequenceSubtype, StringSubtype};
 use crate::types::{
     ASCIIData, CallableData, CharType, ListTypeData, PrincipalData, QualifiedContractIdentifier,
@@ -21,20 +19,13 @@ use crate::types::{
 };
 
 /// Decode and validate one canonical packed record under a declared read schema.
-pub fn decode_canonical_packed(
-    bytes: &[u8],
+pub fn value(
+    packed: PackedValueRef<'_>,
     expected: &TypeSignature,
     epoch: &StacksEpochId,
 ) -> Result<DecodedPackedValue, PackedValueError> {
-    let header = bytes
-        .get(..PACKED_VALUE_HEADER_LEN)
-        .ok_or(PackedValueError::InvalidRecord(
-            "truncated canonical header",
-        ))?;
-    let expected_len = primitive::read_u32_le(header)?;
-    let (value, actual_len) =
-        decode_canonical_body(&bytes[PACKED_VALUE_HEADER_LEN..], expected, epoch)?;
-    if actual_len != expected_len {
+    let (value, actual_len) = body(packed.body(), expected, epoch)?;
+    if actual_len != packed.consensus_byte_len() {
         return Err(PackedValueError::InvalidRecord(
             "canonical logical consensus length mismatch",
         ));
@@ -45,23 +36,11 @@ pub fn decode_canonical_packed(
     })
 }
 
-/// Decode and discard a canonical packed value under the declared read schema.
-///
-/// This performs full structural validation but also materializes an owned [`Value`]. It is intended
-/// for admission and test tooling, not as a cheaper alternative to [`decode_canonical_packed`].
-pub fn validate_canonical_packed(
-    bytes: &[u8],
-    expected: &TypeSignature,
-    epoch: &StacksEpochId,
-) -> Result<(), PackedValueError> {
-    decode_canonical_packed(bytes, expected, epoch).map(|_| ())
-}
-
 /// Decode one complete packed body under its caller-supplied schema.
 ///
 /// The returned length is the value's consensus-serialized length, used to validate the record
 /// header and preserve consensus cost accounting.
-fn decode_canonical_body(
+fn body(
     bytes: &[u8],
     expected: &TypeSignature,
     epoch: &StacksEpochId,
@@ -131,16 +110,14 @@ fn decode_canonical_body(
                 logical_len,
             ))
         }
-        CallableType(subtype) => decode_canonical_callable(bytes, subtype),
-        TraitReferenceType(trait_identifier) => {
-            decode_canonical_trait_callable(bytes, trait_identifier.clone())
-        }
+        CallableType(subtype) => callable(bytes, subtype),
+        TraitReferenceType(trait_identifier) => trait_callable(bytes, trait_identifier.clone()),
         OptionalType(inner) => {
             let (tag, child) = primitive::split_tag(bytes)?;
             match tag {
                 0 if child.is_empty() => Ok((Value::none(), 1)),
                 1 => {
-                    let (value, child_len) = decode_canonical_body(child, inner, epoch)?;
+                    let (value, child_len) = body(child, inner, epoch)?;
                     Ok((
                         Value::some(value)?,
                         primitive::checked_logical_add(1, child_len)?,
@@ -153,14 +130,14 @@ fn decode_canonical_body(
             let (tag, child) = primitive::split_tag(bytes)?;
             match tag {
                 0 => {
-                    let (value, child_len) = decode_canonical_body(child, &types.1, epoch)?;
+                    let (value, child_len) = body(child, &types.1, epoch)?;
                     Ok((
                         Value::error(value)?,
                         primitive::checked_logical_add(1, child_len)?,
                     ))
                 }
                 1 => {
-                    let (value, child_len) = decode_canonical_body(child, &types.0, epoch)?;
+                    let (value, child_len) = body(child, &types.0, epoch)?;
                     Ok((
                         Value::okay(value)?,
                         primitive::checked_logical_add(1, child_len)?,
@@ -169,8 +146,8 @@ fn decode_canonical_body(
                 _ => Err(PackedValueError::InvalidRecord("invalid response")),
             }
         }
-        TupleType(tuple) => decode_canonical_tuple(bytes, tuple, epoch),
-        SequenceType(SequenceSubtype::ListType(list)) => decode_canonical_list(bytes, list, epoch),
+        TupleType(tuple_type) => tuple(bytes, tuple_type, epoch),
+        SequenceType(SequenceSubtype::ListType(list_type)) => list(bytes, list_type, epoch),
         NoType => Err(PackedValueError::InvalidRecord("NoType cannot be active")),
         ListUnionType(_) => Err(PackedValueError::UnsupportedSchema(
             "ListUnionType is analysis-only",
@@ -179,9 +156,7 @@ fn decode_canonical_body(
 }
 
 /// Decode the canonical contract-principal body shared by callable schema variants.
-fn decode_canonical_contract(
-    bytes: &[u8],
-) -> Result<(QualifiedContractIdentifier, u32), PackedValueError> {
+fn contract(bytes: &[u8]) -> Result<(QualifiedContractIdentifier, u32), PackedValueError> {
     let principal = primitive::PackedPrincipal::parse(bytes)?;
     let logical_len = principal.consensus_byte_len()?;
     let PrincipalData::Contract(contract) = principal.to_principal_data()? else {
@@ -193,11 +168,8 @@ fn decode_canonical_contract(
 }
 
 /// Decode a callable contract and restore the identity implied by its callable subtype.
-fn decode_canonical_callable(
-    bytes: &[u8],
-    expected: &CallableSubtype,
-) -> Result<(Value, u32), PackedValueError> {
-    let (contract_identifier, logical_len) = decode_canonical_contract(bytes)?;
+fn callable(bytes: &[u8], expected: &CallableSubtype) -> Result<(Value, u32), PackedValueError> {
+    let (contract_identifier, logical_len) = contract(bytes)?;
     let trait_identifier = match expected {
         CallableSubtype::Principal(expected_contract) => {
             if contract_identifier != *expected_contract {
@@ -217,11 +189,11 @@ fn decode_canonical_callable(
 }
 
 /// Decode a trait-reference callable while restoring its schema-provided trait identifier.
-fn decode_canonical_trait_callable(
+fn trait_callable(
     bytes: &[u8],
     trait_identifier: TraitIdentifier,
 ) -> Result<(Value, u32), PackedValueError> {
-    let (contract_identifier, logical_len) = decode_canonical_contract(bytes)?;
+    let (contract_identifier, logical_len) = contract(bytes)?;
     Ok((
         Value::CallableContract(CallableData {
             contract_identifier,
@@ -232,7 +204,7 @@ fn decode_canonical_trait_callable(
 }
 
 /// Decode a tuple using fixed concatenation or an offset directory selected by its schema.
-fn decode_canonical_tuple(
+fn tuple(
     bytes: &[u8],
     expected: &crate::types::TupleTypeSignature,
     epoch: &StacksEpochId,
@@ -257,7 +229,7 @@ fn decode_canonical_tuple(
             let field = bytes
                 .get(cursor..end)
                 .ok_or(PackedValueError::InvalidRecord("truncated canonical tuple"))?;
-            let (value, child_len) = decode_canonical_body(field, field_type, epoch)?;
+            let (value, child_len) = body(field, field_type, epoch)?;
             logical_len = primitive::tuple_logical_add(logical_len, name.as_str(), child_len)?;
             fields.push((name.clone(), value));
             cursor = end;
@@ -270,8 +242,7 @@ fn decode_canonical_tuple(
     } else {
         let directory = directory::Directory::parse(bytes, expected.get_type_map().len())?;
         for (index, (name, field_type)) in expected.get_type_map().iter().enumerate() {
-            let (value, child_len) =
-                decode_canonical_body(directory.child(index)?, field_type, epoch)?;
+            let (value, child_len) = body(directory.child(index)?, field_type, epoch)?;
             logical_len = primitive::tuple_logical_add(logical_len, name.as_str(), child_len)?;
             fields.push((name.clone(), value));
         }
@@ -286,7 +257,7 @@ fn decode_canonical_tuple(
 }
 
 /// Decode a counted list using its scalar lane, fixed-width, or directory-framed layout.
-fn decode_canonical_list(
+fn list(
     bytes: &[u8],
     expected: &ListTypeData,
     epoch: &StacksEpochId,
@@ -345,7 +316,7 @@ fn decode_canonical_list(
                         .ok_or(PackedValueError::InvalidRecord(
                             "truncated canonical fixed list",
                         ))?;
-                    let (value, child_len) = decode_canonical_body(child, element_type, epoch)?;
+                    let (value, child_len) = body(child, element_type, epoch)?;
                     children_len = primitive::checked_logical_add(children_len, child_len)?;
                     values.push(value);
                 }
@@ -356,8 +327,7 @@ fn decode_canonical_list(
                 let mut values = Vec::with_capacity(count);
                 let mut children_len = 0u32;
                 for index in 0..count {
-                    let (value, child_len) =
-                        decode_canonical_body(directory.child(index)?, element_type, epoch)?;
+                    let (value, child_len) = body(directory.child(index)?, element_type, epoch)?;
                     children_len = primitive::checked_logical_add(children_len, child_len)?;
                     values.push(value);
                 }

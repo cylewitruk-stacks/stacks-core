@@ -10,39 +10,27 @@
 use stacks_common::types::StacksEpochId;
 
 use super::{
-    AdmittedValue, ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue,
-    PackedValueError, ValueShape, directory, layout, primitive, shape,
+    ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue, PackedValueError, ValueShape,
+    directory, layout, primitive, shape,
 };
 use crate::types::signatures::CallableSubtype;
 use crate::types::{
     CharType, QualifiedContractIdentifier, SequenceData, TupleData, TypeSignature, Value,
 };
 
-/// Encode a value whose owned type state proves epoch-aware admission already succeeded.
-///
-/// Physical bytes depend only on the active [`Value`]; the admitted value does not retain the
-/// declared type or epoch.
-pub fn encode_canonical_packed_admitted(
-    admitted: &AdmittedValue,
-    consensus_byte_len: u32,
-    validation: ConsensusLengthValidation,
-) -> Result<PackedValue, PackedValueError> {
-    encode_canonical_value(admitted.value(), consensus_byte_len, validation)
-}
-
 /// Encode a value whose admission or canonical consensus parsing was established by its caller.
-fn encode_canonical_value(
+pub fn value(
     value: &Value,
     consensus_byte_len: u32,
     validation: ConsensusLengthValidation,
 ) -> Result<PackedValue, PackedValueError> {
-    let body_len = canonical_body_len(value)?;
+    let body_len = body_len(value)?;
     let total_len = PACKED_VALUE_HEADER_LEN
         .checked_add(body_len)
         .ok_or(PackedValueError::SizeOverflow)?;
     let mut bytes = Vec::with_capacity(total_len);
     bytes.extend_from_slice(&consensus_byte_len.to_le_bytes());
-    encode_canonical_body(value, &mut bytes)?;
+    body(value, &mut bytes)?;
     if bytes.len() != total_len {
         return Err(PackedValueError::InvalidRecord(
             "canonical encoder length calculation disagrees with output",
@@ -61,74 +49,30 @@ fn encode_canonical_value(
     })
 }
 
-/// Admit and encode a canonical packed record.
-pub fn encode_canonical_packed_value(
-    value: &Value,
-    expected: &TypeSignature,
-    epoch: &StacksEpochId,
-    validation: ConsensusLengthValidation,
-) -> Result<PackedValue, PackedValueError> {
-    encode_canonical_packed_value_with_consensus_len(
-        value,
-        expected,
-        epoch,
-        value.serialized_size()?,
-        validation,
-    )
-}
-
-/// Admit and encode canonical packed using a consensus length already computed by the write path.
-///
-/// Callers must pass the length of `value`'s exact current consensus bytes.
-pub fn encode_canonical_packed_value_with_consensus_len(
-    value: &Value,
-    expected: &TypeSignature,
-    epoch: &StacksEpochId,
-    consensus_byte_len: u32,
-    validation: ConsensusLengthValidation,
-) -> Result<PackedValue, PackedValueError> {
-    ensure_canonical_value_admitted(value, expected, epoch)?;
-    encode_canonical_value(value, consensus_byte_len, validation)
-}
-
 /// Transcode one exact self-describing consensus value into canonical packed.
 ///
 /// This correctness-first implementation materializes one bounded Clarity value. The migration API
 /// remains streaming at row granularity; a direct cursor implementation can replace this without
 /// changing the format.
-pub fn transcode_consensus_to_canonical_packed(
-    consensus: &[u8],
-) -> Result<PackedValue, PackedValueError> {
+pub fn transcode(consensus: &[u8]) -> Result<PackedValue, PackedValueError> {
     let value = deserialize_canonical_consensus(consensus)?;
     let consensus_byte_len =
         u32::try_from(consensus.len()).map_err(|_| PackedValueError::SizeOverflow)?;
-    encode_canonical_value(
+    self::value(
         &value,
         consensus_byte_len,
-        ConsensusLengthValidation::Enabled,
+        ConsensusLengthValidation::Disabled,
     )
 }
 
-impl AdmittedValue {
-    /// Validate and retain one value for later physical encoding.
-    pub fn new(
-        value: Value,
-        expected: &TypeSignature,
-        epoch: &StacksEpochId,
-    ) -> Result<Self, PackedValueError> {
-        ensure_canonical_value_admitted(&value, expected, epoch)?;
-        Ok(Self { value })
-    }
-}
-
 /// Require `value` to conform to the declared storage type.
-fn ensure_canonical_value_admitted(
+pub fn validate_admission(
     value: &Value,
     expected: &TypeSignature,
     epoch: &StacksEpochId,
 ) -> Result<(), PackedValueError> {
     let admitted = if matches!(value, Value::CallableContract(_)) {
-        canonical_callable_admitted(value, expected)?
+        callable_admitted(value, expected)?
     } else {
         expected.admits(epoch, value)?
     };
@@ -140,10 +84,7 @@ fn ensure_canonical_value_admitted(
 }
 
 /// Check callable admission without allowing the declared callable subtype to affect encoding.
-fn canonical_callable_admitted(
-    value: &Value,
-    expected: &TypeSignature,
-) -> Result<bool, PackedValueError> {
+fn callable_admitted(value: &Value, expected: &TypeSignature) -> Result<bool, PackedValueError> {
     let Value::CallableContract(callable) = value else {
         return Ok(false);
     };
@@ -162,12 +103,12 @@ fn canonical_callable_admitted(
 
 /// Measure the exact body size before encoding so the record needs one allocation.
 ///
-/// This intentionally mirrors [`encode_canonical_body`]. Keeping sizing separate avoids a temporary
+/// This intentionally mirrors [`body`]. Keeping sizing separate avoids a temporary
 /// body buffer and lets directory encoding reserve its final record capacity up front.
-fn canonical_body_len(value: &Value) -> Result<usize, PackedValueError> {
+fn body_len(value: &Value) -> Result<usize, PackedValueError> {
     match value {
-        Value::Int(value) => Ok(canonical_int_width(*value)),
-        Value::UInt(value) => Ok(canonical_uint_width(*value)),
+        Value::Int(value) => Ok(int_width(*value)),
+        Value::UInt(value) => Ok(uint_width(*value)),
         Value::Bool(_) => Ok(1),
         Value::Sequence(SequenceData::Buffer(buffer)) => Ok(buffer.data.len()),
         Value::Sequence(SequenceData::String(CharType::ASCII(string))) => Ok(string.data.len()),
@@ -179,57 +120,53 @@ fn canonical_body_len(value: &Value) -> Result<usize, PackedValueError> {
             })
         }
         Value::Principal(principal) => primitive::principal_body_len(principal),
-        Value::CallableContract(callable) => {
-            canonical_contract_body_len(&callable.contract_identifier)
-        }
+        Value::CallableContract(callable) => contract_body_len(&callable.contract_identifier),
         Value::Optional(optional) => match &optional.data {
             None => Ok(1),
-            Some(child) => canonical_body_len(child)?
+            Some(child) => body_len(child)?
                 .checked_add(1)
                 .ok_or(PackedValueError::SizeOverflow),
         },
-        Value::Response(response) => canonical_body_len(&response.data)?
+        Value::Response(response) => body_len(&response.data)?
             .checked_add(1)
             .ok_or(PackedValueError::SizeOverflow),
-        Value::Tuple(tuple) => canonical_tuple_body_len(tuple),
-        Value::Sequence(SequenceData::List(list)) => canonical_list_body_len(list),
+        Value::Tuple(tuple) => tuple_body_len(tuple),
+        Value::Sequence(SequenceData::List(list)) => list_body_len(list),
     }
 }
 
 /// Return the packed byte length of a callable contract's canonical principal identity.
-fn canonical_contract_body_len(
-    contract: &QualifiedContractIdentifier,
-) -> Result<usize, PackedValueError> {
+fn contract_body_len(contract: &QualifiedContractIdentifier) -> Result<usize, PackedValueError> {
     22usize
         .checked_add(contract.name.as_str().len())
         .ok_or(PackedValueError::SizeOverflow)
 }
 
 /// Return the non-zero canonical scalar width used for one unsigned integer.
-fn canonical_uint_width(value: u128) -> usize {
+fn uint_width(value: u128) -> usize {
     primitive::packed_uint_width(value).max(1)
 }
 
 /// Return the non-zero canonical scalar width used for one signed integer.
-fn canonical_int_width(value: i128) -> usize {
+fn int_width(value: i128) -> usize {
     primitive::packed_int_width(value).max(1)
 }
 
 /// Select the non-zero element width shared by a canonical unsigned-integer lane.
-fn canonical_unsigned_lane_width(values: &[Value]) -> Result<usize, PackedValueError> {
+fn unsigned_lane_width(values: &[Value]) -> Result<usize, PackedValueError> {
     Ok(primitive::unsigned_lane_width(values)?.max(1))
 }
 
 /// Select the non-zero element width shared by a canonical signed-integer lane.
-fn canonical_signed_lane_width(values: &[Value]) -> Result<usize, PackedValueError> {
+fn signed_lane_width(values: &[Value]) -> Result<usize, PackedValueError> {
     Ok(primitive::signed_lane_width(values)?.max(1))
 }
 
 /// Measure a tuple body, including an offset directory when any child is variable-width.
-fn canonical_tuple_body_len(tuple: &TupleData) -> Result<usize, PackedValueError> {
+fn tuple_body_len(tuple: &TupleData) -> Result<usize, PackedValueError> {
     let data_len = tuple.data_map.values().try_fold(0usize, |total, value| {
         total
-            .checked_add(canonical_body_len(value)?)
+            .checked_add(body_len(value)?)
             .ok_or(PackedValueError::SizeOverflow)
     })?;
     if tuple
@@ -244,16 +181,16 @@ fn canonical_tuple_body_len(tuple: &TupleData) -> Result<usize, PackedValueError
 }
 
 /// Measure a list body using the same lane or framing choice as the encoder.
-fn canonical_list_body_len(list: &crate::types::ListData) -> Result<usize, PackedValueError> {
+fn list_body_len(list: &crate::types::ListData) -> Result<usize, PackedValueError> {
     let count = list.data.len();
     if count == 0 {
         return Ok(4);
     }
     let elements_len = match layout::list_layout(list) {
-        layout::ListLayout::UnsignedLane => canonical_unsigned_lane_width(&list.data)?
+        layout::ListLayout::UnsignedLane => unsigned_lane_width(&list.data)?
             .checked_mul(count)
             .ok_or(PackedValueError::SizeOverflow)?,
-        layout::ListLayout::SignedLane => canonical_signed_lane_width(&list.data)?
+        layout::ListLayout::SignedLane => signed_lane_width(&list.data)?
             .checked_mul(count)
             .ok_or(PackedValueError::SizeOverflow)?,
         layout::ListLayout::BooleanLane => {
@@ -261,13 +198,13 @@ fn canonical_list_body_len(list: &crate::types::ListData) -> Result<usize, Packe
         }
         layout::ListLayout::Fixed => list.data.iter().try_fold(0usize, |total, value| {
             total
-                .checked_add(canonical_body_len(value)?)
+                .checked_add(body_len(value)?)
                 .ok_or(PackedValueError::SizeOverflow)
         })?,
         layout::ListLayout::Variable => {
             let data_len = list.data.iter().try_fold(0usize, |total, value| {
                 total
-                    .checked_add(canonical_body_len(value)?)
+                    .checked_add(body_len(value)?)
                     .ok_or(PackedValueError::SizeOverflow)
             })?;
             return 4usize
@@ -281,14 +218,14 @@ fn canonical_list_body_len(list: &crate::types::ListData) -> Result<usize, Packe
 }
 
 /// Append the schema-independent packed body for one active value.
-fn encode_canonical_body(value: &Value, output: &mut Vec<u8>) -> Result<(), PackedValueError> {
+fn body(value: &Value, output: &mut Vec<u8>) -> Result<(), PackedValueError> {
     match value {
         Value::Int(value) => {
-            let width = canonical_int_width(*value);
+            let width = int_width(*value);
             output.extend_from_slice(&value.to_be_bytes()[16 - width..]);
         }
         Value::UInt(value) => {
-            let width = canonical_uint_width(*value);
+            let width = uint_width(*value);
             output.extend_from_slice(&value.to_be_bytes()[16 - width..]);
         }
         Value::Bool(value) => output.push(u8::from(*value)),
@@ -303,27 +240,27 @@ fn encode_canonical_body(value: &Value, output: &mut Vec<u8>) -> Result<(), Pack
         }
         Value::Principal(principal) => primitive::encode_principal(principal, output),
         Value::CallableContract(callable) => {
-            encode_canonical_contract(&callable.contract_identifier, output);
+            contract(&callable.contract_identifier, output);
         }
         Value::Optional(optional) => match &optional.data {
             None => output.push(0),
             Some(child) => {
                 output.push(1);
-                encode_canonical_body(child, output)?;
+                body(child, output)?;
             }
         },
         Value::Response(response) => {
             output.push(u8::from(response.committed));
-            encode_canonical_body(&response.data, output)?;
+            body(&response.data, output)?;
         }
-        Value::Tuple(tuple) => encode_canonical_tuple(tuple, output)?,
-        Value::Sequence(SequenceData::List(list)) => encode_canonical_list(list, output)?,
+        Value::Tuple(tuple_value) => tuple(tuple_value, output)?,
+        Value::Sequence(SequenceData::List(list_value)) => list(list_value, output)?,
     }
     Ok(())
 }
 
 /// Append the canonical contract-principal representation used by callable values.
-fn encode_canonical_contract(contract: &QualifiedContractIdentifier, output: &mut Vec<u8>) {
+fn contract(contract: &QualifiedContractIdentifier, output: &mut Vec<u8>) {
     output.push(1);
     output.push(contract.issuer.version());
     output.extend_from_slice(&contract.issuer.1);
@@ -331,7 +268,7 @@ fn encode_canonical_contract(contract: &QualifiedContractIdentifier, output: &mu
 }
 
 /// Append tuple children in consensus field order, framing variable-width children by offset.
-fn encode_canonical_tuple(tuple: &TupleData, output: &mut Vec<u8>) -> Result<(), PackedValueError> {
+fn tuple(tuple: &TupleData, output: &mut Vec<u8>) -> Result<(), PackedValueError> {
     // Fixed tuples are self-framing under either the active value or an admitting schema. Any
     // variable child requires a directory so readers can find child boundaries without scanning.
     if tuple
@@ -340,23 +277,20 @@ fn encode_canonical_tuple(tuple: &TupleData, output: &mut Vec<u8>) -> Result<(),
         .all(|value| layout::fixed_value_width(value).is_some())
     {
         for value in tuple.data_map.values() {
-            encode_canonical_body(value, output)?;
+            body(value, output)?;
         }
         return Ok(());
     }
     let directory = directory::reserve_wide_directory(tuple.data_map.len(), output)?;
     for (index, value) in tuple.data_map.values().enumerate() {
-        encode_canonical_body(value, output)?;
+        body(value, output)?;
         directory.write_wide_offset(output, index + 1)?;
     }
     directory.compact(output)
 }
 
 /// Append a list count and its canonically selected lane or child framing.
-fn encode_canonical_list(
-    list: &crate::types::ListData,
-    output: &mut Vec<u8>,
-) -> Result<(), PackedValueError> {
+fn list(list: &crate::types::ListData, output: &mut Vec<u8>) -> Result<(), PackedValueError> {
     let count = u32::try_from(list.data.len()).map_err(|_| PackedValueError::SizeOverflow)?;
     output.extend_from_slice(&count.to_le_bytes());
     if list.data.is_empty() {
@@ -366,7 +300,7 @@ fn encode_canonical_list(
         // Homogeneous scalar lanes amortize width metadata across the entire list. The active values
         // select the lane width; declared integer bounds never affect physical bytes.
         layout::ListLayout::UnsignedLane => {
-            let width = canonical_unsigned_lane_width(&list.data)?;
+            let width = unsigned_lane_width(&list.data)?;
             for value in &list.data {
                 let Value::UInt(value) = value else {
                     return Err(PackedValueError::TypeMismatch);
@@ -375,7 +309,7 @@ fn encode_canonical_list(
             }
         }
         layout::ListLayout::SignedLane => {
-            let width = canonical_signed_lane_width(&list.data)?;
+            let width = signed_lane_width(&list.data)?;
             for value in &list.data {
                 let Value::Int(value) = value else {
                     return Err(PackedValueError::TypeMismatch);
@@ -412,13 +346,13 @@ fn encode_canonical_list(
         }
         layout::ListLayout::Fixed => {
             for value in &list.data {
-                encode_canonical_body(value, output)?;
+                body(value, output)?;
             }
         }
         layout::ListLayout::Variable => {
             let directory = directory::reserve_wide_directory(list.data.len(), output)?;
             for (index, value) in list.data.iter().enumerate() {
-                encode_canonical_body(value, output)?;
+                body(value, output)?;
                 directory.write_wide_offset(output, index + 1)?;
             }
             directory.compact(output)?;
@@ -428,16 +362,16 @@ fn encode_canonical_list(
 }
 
 /// Transcode one exact consensus value into canonical packed bytes and its descriptor.
-pub fn transcode_consensus_with_shape(
+pub fn transcode_with_shape(
     consensus: &[u8],
 ) -> Result<(PackedValue, ValueShape), PackedValueError> {
     let value = deserialize_canonical_consensus(consensus)?;
     let consensus_byte_len =
         u32::try_from(consensus.len()).map_err(|_| PackedValueError::SizeOverflow)?;
-    let packed = encode_canonical_value(
+    let packed = self::value(
         &value,
         consensus_byte_len,
-        ConsensusLengthValidation::Enabled,
+        ConsensusLengthValidation::Disabled,
     )?;
     let shape = shape::encode_value_shape(&value)?;
     Ok((packed, shape))

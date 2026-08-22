@@ -24,8 +24,10 @@
 use std::error::Error;
 use std::fmt;
 
+use stacks_common::types::StacksEpochId;
+
 use crate::errors::ClarityTypeError;
-use crate::types::Value;
+use crate::types::{TypeSignature, Value};
 
 mod decode;
 mod directory;
@@ -34,15 +36,6 @@ mod layout;
 mod primitive;
 mod reconstruct;
 mod shape;
-
-pub use decode::{decode_canonical_packed, validate_canonical_packed};
-pub use encode::{
-    encode_canonical_packed_admitted, encode_canonical_packed_value,
-    encode_canonical_packed_value_with_consensus_len, transcode_consensus_to_canonical_packed,
-    transcode_consensus_with_shape,
-};
-pub use reconstruct::{audit_reconstruction, reconstruct_consensus};
-pub use shape::encode_value_shape;
 
 /// Number of bytes before a packed V1 value body.
 pub const PACKED_VALUE_HEADER_LEN: usize = 4;
@@ -62,9 +55,28 @@ pub struct AdmittedValue {
 }
 
 impl AdmittedValue {
+    /// Validate and retain one value for later physical encoding.
+    pub fn new(
+        value: Value,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Self, PackedValueError> {
+        encode::validate_admission(&value, expected, epoch)?;
+        Ok(Self { value })
+    }
+
     /// Borrow the admitted runtime value.
     pub fn value(&self) -> &Value {
         &self.value
+    }
+
+    /// Encode this admitted value using a caller-supplied consensus length.
+    pub fn encode_packed(
+        &self,
+        consensus_byte_len: u32,
+        validation: ConsensusLengthValidation,
+    ) -> Result<PackedValue, PackedValueError> {
+        encode::value(self.value(), consensus_byte_len, validation)
     }
 }
 
@@ -78,6 +90,18 @@ pub struct PackedValue {
 }
 
 impl PackedValue {
+    /// Transcode one exact self-describing consensus value into canonical packed storage.
+    pub fn transcode_consensus(consensus: &[u8]) -> Result<Self, PackedValueError> {
+        encode::transcode(consensus)
+    }
+
+    /// Transcode consensus bytes and derive their schema-free reconstruction metadata.
+    pub fn transcode_consensus_with_shape(
+        consensus: &[u8],
+    ) -> Result<(Self, ValueShape), PackedValueError> {
+        encode::transcode_with_shape(consensus)
+    }
+
     /// Return the complete packed record bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
@@ -92,6 +116,82 @@ impl PackedValue {
     pub fn consensus_byte_len(&self) -> u32 {
         self.consensus_byte_len
     }
+
+    /// Borrow this owned record through the packed record read API.
+    pub fn as_packed_ref(&self) -> PackedValueRef<'_> {
+        PackedValueRef {
+            bytes: &self.bytes,
+            consensus_byte_len: self.consensus_byte_len,
+        }
+    }
+}
+
+/// A framed borrowed view over one canonical packed value record.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedValueRef<'a> {
+    /// Complete packed record bytes.
+    bytes: &'a [u8],
+    /// Equivalent consensus-serialization length read from the record header.
+    consensus_byte_len: u32,
+}
+
+impl<'a> PackedValueRef<'a> {
+    /// Parse the common packed record header without decoding its schema-dependent body.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, PackedValueError> {
+        let header =
+            bytes
+                .get(..PACKED_VALUE_HEADER_LEN)
+                .ok_or(PackedValueError::InvalidRecord(
+                    "truncated canonical header",
+                ))?;
+        Ok(Self {
+            bytes,
+            consensus_byte_len: primitive::read_u32_le(header)?,
+        })
+    }
+
+    /// Return the complete borrowed record bytes.
+    pub fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Return the equivalent consensus-serialization length from the record header.
+    pub const fn consensus_byte_len(self) -> u32 {
+        self.consensus_byte_len
+    }
+
+    /// Decode and validate this record under a declared read schema.
+    pub fn decode(
+        self,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<DecodedPackedValue, PackedValueError> {
+        decode::value(self, expected, epoch)
+    }
+
+    /// Structurally validate this record under a declared read schema.
+    pub fn validate(
+        self,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<(), PackedValueError> {
+        self.decode(expected, epoch).map(|_| ())
+    }
+
+    /// Reconstruct exact consensus bytes using an active-shape descriptor.
+    pub fn reconstruct_consensus(self, descriptor: &[u8]) -> Result<Vec<u8>, PackedValueError> {
+        reconstruct::reconstruct_consensus(self, descriptor)
+    }
+
+    /// Reconstruct consensus bytes and prove this record and shape are canonical.
+    pub fn audit_reconstruction(self, descriptor: &[u8]) -> Result<Vec<u8>, PackedValueError> {
+        reconstruct::audit_reconstruction(self, descriptor)
+    }
+
+    /// Return the packed body after the common logical-length header.
+    fn body(self) -> &'a [u8] {
+        &self.bytes[PACKED_VALUE_HEADER_LEN..]
+    }
 }
 
 /// Canonical reconstruction metadata for one active Clarity value shape.
@@ -102,6 +202,11 @@ impl PackedValue {
 pub struct ValueShape(Vec<u8>);
 
 impl ValueShape {
+    /// Derive canonical reconstruction metadata solely from an active value.
+    pub fn from_value(value: &Value) -> Result<Self, PackedValueError> {
+        shape::encode_value_shape(value)
+    }
+
     /// Borrow the complete versioned descriptor.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
@@ -126,9 +231,9 @@ impl ValueShape {
 
 /// Whether to verify a caller-supplied consensus length before returning an encoding.
 ///
-/// Admission, migration, and test tooling should use [`ConsensusLengthValidation::Enabled`]. A
-/// persistence path that obtained the length from the same consensus bytes used for the MARF hash
-/// may skip this redundant `Value::serialized_size` calculation on its write hot path.
+/// Use [`ConsensusLengthValidation::Enabled`] when the supplied length has not already been proven
+/// against the value. A persistence or transcoding path that obtained the length from verified
+/// consensus bytes may skip this redundant `Value::serialized_size` calculation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ConsensusLengthValidation {
     /// Recompute and compare the value's consensus serialization length.

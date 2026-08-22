@@ -25,9 +25,7 @@ use clarity::vm::database::{
 };
 use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::codec::packed::{
-    audit_reconstruction, decode_canonical_packed, encode_canonical_packed_admitted,
-    encode_value_shape, reconstruct_consensus, transcode_consensus_with_shape,
-    ConsensusLengthValidation,
+    ConsensusLengthValidation, PackedValue, PackedValueRef, ValueShape,
 };
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TypeSignature, Value};
 use rusqlite::types::ValueRef;
@@ -344,13 +342,11 @@ pub fn put_typed(
     typed: TypedValueData,
 ) -> Result<(), VmExecutionError> {
     let consensus_byte_len = validate_typed_canonical(&typed, canonical)?;
-    let packed = encode_canonical_packed_admitted(
-        &typed.admitted,
-        consensus_byte_len,
-        ConsensusLengthValidation::Disabled,
-    )
-    .map_err(codec_error)?;
-    let shape = encode_value_shape(typed.admitted.value()).map_err(codec_error)?;
+    let packed = typed
+        .admitted
+        .encode_packed(consensus_byte_len, ConsensusLengthValidation::Disabled)
+        .map_err(codec_error)?;
+    let shape = ValueShape::from_value(typed.admitted.value()).map_err(codec_error)?;
     let encoded = EncodedRecord {
         record: record(KIND_CANONICAL_PACKED, packed.as_bytes()),
         shape: Some(shape.into_bytes()),
@@ -376,7 +372,7 @@ pub fn encode_migrated(canonical: &str) -> Result<EncodedRecord, VmExecutionErro
             shape: None,
         });
     };
-    match transcode_consensus_with_shape(&consensus) {
+    match PackedValue::transcode_consensus_with_shape(&consensus) {
         Ok((packed, shape)) => Ok(EncodedRecord {
             record: record(KIND_CANONICAL_PACKED, packed.as_bytes()),
             shape: Some(shape.into_bytes()),
@@ -414,7 +410,9 @@ pub fn get_typed(
             payload.len() as u64,
         ),
         KIND_CANONICAL_PACKED => {
-            let decoded = decode_canonical_packed(payload, expected, epoch).map_err(codec_error)?;
+            let decoded = PackedValueRef::parse(payload)
+                .and_then(|packed| packed.decode(expected, epoch))
+                .map_err(codec_error)?;
             (decoded.value, u64::from(decoded.consensus_byte_len))
         }
         KIND_CANONICAL_UTF8 => {
@@ -740,10 +738,11 @@ fn canonical_from_record(
         }
         KIND_CANONICAL_PACKED => {
             let shape = shape.ok_or_else(|| storage_error("packed row is missing its shape"))?;
+            let packed = PackedValueRef::parse(payload).map_err(codec_error)?;
             let consensus = if audit {
-                audit_reconstruction(payload, shape)
+                packed.audit_reconstruction(shape)
             } else {
-                reconstruct_consensus(payload, shape)
+                packed.reconstruct_consensus(shape)
             };
             consensus
                 .map(|consensus| to_hex(&consensus))

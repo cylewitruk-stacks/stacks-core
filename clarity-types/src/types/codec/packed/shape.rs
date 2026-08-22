@@ -134,14 +134,181 @@ pub fn parse_value_shape(bytes: &[u8]) -> Result<ActiveShape, PackedValueError> 
             "unsupported value-shape version",
         ));
     }
-    let mut cursor = 0usize;
-    let shape = ActiveShape::parse(body, &mut cursor, 0)?;
-    if cursor != body.len() {
-        return Err(PackedValueError::InvalidRecord(
-            "value shape has trailing bytes",
-        ));
+    ShapeParser::new(body).parse()
+}
+
+/// Stateful reader for one recursive active-shape descriptor body.
+struct ShapeParser<'a> {
+    /// Descriptor body, excluding its version byte.
+    bytes: &'a [u8],
+    /// Next unread byte within `bytes`.
+    cursor: usize,
+}
+
+impl<'a> ShapeParser<'a> {
+    /// Begin parsing one descriptor body.
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
     }
-    Ok(shape)
+
+    /// Parse one complete descriptor body with no trailing bytes.
+    fn parse(mut self) -> Result<ActiveShape, PackedValueError> {
+        let shape = self.parse_shape(0)?;
+        if self.cursor != self.bytes.len() {
+            return Err(PackedValueError::InvalidRecord(
+                "value shape has trailing bytes",
+            ));
+        }
+        Ok(shape)
+    }
+
+    /// Parse one recursive shape node while enforcing depth and canonicality limits.
+    fn parse_shape(&mut self, depth: u8) -> Result<ActiveShape, PackedValueError> {
+        if depth > crate::types::MAX_TYPE_DEPTH {
+            return Err(PackedValueError::InvalidRecord(
+                "value shape exceeds maximum depth",
+            ));
+        }
+        let opcode = ShapeOpcode::from_byte(self.take_byte()?)?;
+        let child_depth = depth.checked_add(1).ok_or(PackedValueError::SizeOverflow)?;
+        match opcode {
+            ShapeOpcode::Int => Ok(ActiveShape::Int),
+            ShapeOpcode::UInt => Ok(ActiveShape::UInt),
+            ShapeOpcode::Bool => Ok(ActiveShape::Bool),
+            ShapeOpcode::Buffer => Ok(ActiveShape::Buffer),
+            ShapeOpcode::Ascii => Ok(ActiveShape::Ascii),
+            ShapeOpcode::Utf8 => Ok(ActiveShape::Utf8),
+            ShapeOpcode::Principal => Ok(ActiveShape::Principal),
+            ShapeOpcode::OptionalNone => Ok(ActiveShape::Optional(None)),
+            ShapeOpcode::OptionalSome => Ok(ActiveShape::Optional(Some(Box::new(
+                self.parse_shape(child_depth)?,
+            )))),
+            ShapeOpcode::ResponseOk => Ok(ActiveShape::Response {
+                ok: Some(Box::new(self.parse_shape(child_depth)?)),
+                err: None,
+            }),
+            ShapeOpcode::ResponseErr => Ok(ActiveShape::Response {
+                ok: None,
+                err: Some(Box::new(self.parse_shape(child_depth)?)),
+            }),
+            ShapeOpcode::ResponseBoth => Ok(ActiveShape::Response {
+                ok: Some(Box::new(self.parse_shape(child_depth)?)),
+                err: Some(Box::new(self.parse_shape(child_depth)?)),
+            }),
+            ShapeOpcode::Tuple => self.parse_tuple(child_depth),
+            ShapeOpcode::EmptyList => Ok(ActiveShape::List(None)),
+            ShapeOpcode::List => Ok(ActiveShape::List(Some(Box::new(
+                self.parse_shape(child_depth)?,
+            )))),
+            ShapeOpcode::ListElements => self.parse_list_elements(child_depth),
+        }
+    }
+
+    /// Parse a non-empty, canonically ordered tuple descriptor.
+    fn parse_tuple(&mut self, child_depth: u8) -> Result<ActiveShape, PackedValueError> {
+        let count = self.take_varuint()?;
+        if count == 0 {
+            return Err(PackedValueError::InvalidRecord(
+                "value-shape tuple has no fields",
+            ));
+        }
+        if count > self.bytes.len().saturating_sub(self.cursor) / 2 {
+            return Err(PackedValueError::InvalidRecord(
+                "value-shape tuple field count exceeds descriptor",
+            ));
+        }
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_len = usize::from(self.take_byte()?);
+            let end = self
+                .cursor
+                .checked_add(name_len)
+                .ok_or(PackedValueError::SizeOverflow)?;
+            let name_bytes =
+                self.bytes
+                    .get(self.cursor..end)
+                    .ok_or(PackedValueError::InvalidRecord(
+                        "truncated value-shape tuple name",
+                    ))?;
+            let name = str::from_utf8(name_bytes)
+                .map_err(|_| PackedValueError::InvalidRecord("invalid tuple name UTF-8"))?;
+            let name = ClarityName::try_from(name.to_owned())
+                .map_err(|_| PackedValueError::InvalidRecord("invalid tuple name"))?;
+            if fields
+                .last()
+                .is_some_and(|(previous, _): &(ClarityName, ActiveShape)| previous >= &name)
+            {
+                return Err(PackedValueError::InvalidRecord(
+                    "tuple shape fields are not canonical",
+                ));
+            }
+            self.cursor = end;
+            fields.push((name, self.parse_shape(child_depth)?));
+        }
+        Ok(ActiveShape::Tuple(fields))
+    }
+
+    /// Parse non-mergeable per-element list descriptors.
+    fn parse_list_elements(&mut self, child_depth: u8) -> Result<ActiveShape, PackedValueError> {
+        let count = self.take_varuint()?;
+        if count == 0 || count > self.bytes.len().saturating_sub(self.cursor) {
+            return Err(PackedValueError::InvalidRecord(
+                "invalid per-element list-shape count",
+            ));
+        }
+        let mut elements = Vec::with_capacity(count);
+        for _ in 0..count {
+            elements.push(self.parse_shape(child_depth)?);
+        }
+        if merge_list_elements(&elements).is_ok() {
+            return Err(PackedValueError::InvalidRecord(
+                "mergeable list uses per-element shapes",
+            ));
+        }
+        Ok(ActiveShape::ListElements(elements))
+    }
+
+    /// Decode one minimal unsigned LEB128 descriptor integer.
+    fn take_varuint(&mut self) -> Result<usize, PackedValueError> {
+        let start = self.cursor;
+        let mut value = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let byte = self.take_byte()?;
+            let part = usize::from(byte & 0x7f)
+                .checked_shl(shift)
+                .ok_or(PackedValueError::SizeOverflow)?;
+            value = value
+                .checked_add(part)
+                .ok_or(PackedValueError::SizeOverflow)?;
+            if byte & 0x80 == 0 {
+                if self.cursor - start > 1 && byte & 0x7f == 0 {
+                    return Err(PackedValueError::InvalidRecord(
+                        "non-canonical value-shape varuint",
+                    ));
+                }
+                return Ok(value);
+            }
+            shift = shift.checked_add(7).ok_or(PackedValueError::SizeOverflow)?;
+            if shift >= usize::BITS {
+                return Err(PackedValueError::SizeOverflow);
+            }
+        }
+    }
+
+    /// Read one descriptor byte and advance the parser.
+    fn take_byte(&mut self) -> Result<u8, PackedValueError> {
+        let byte = self
+            .bytes
+            .get(self.cursor)
+            .copied()
+            .ok_or(PackedValueError::InvalidRecord("truncated value shape"))?;
+        self.cursor = self
+            .cursor
+            .checked_add(1)
+            .ok_or(PackedValueError::SizeOverflow)?;
+        Ok(byte)
+    }
 }
 
 impl ActiveShape {
@@ -338,110 +505,6 @@ impl ActiveShape {
         Ok(())
     }
 
-    /// Parse one recursive shape node while enforcing depth and canonicality limits.
-    fn parse(bytes: &[u8], cursor: &mut usize, depth: u8) -> Result<Self, PackedValueError> {
-        if depth > crate::types::MAX_TYPE_DEPTH {
-            return Err(PackedValueError::InvalidRecord(
-                "value shape exceeds maximum depth",
-            ));
-        }
-        let opcode = ShapeOpcode::from_byte(take_shape_byte(bytes, cursor)?)?;
-        let child_depth = depth.checked_add(1).ok_or(PackedValueError::SizeOverflow)?;
-        match opcode {
-            ShapeOpcode::Int => Ok(Self::Int),
-            ShapeOpcode::UInt => Ok(Self::UInt),
-            ShapeOpcode::Bool => Ok(Self::Bool),
-            ShapeOpcode::Buffer => Ok(Self::Buffer),
-            ShapeOpcode::Ascii => Ok(Self::Ascii),
-            ShapeOpcode::Utf8 => Ok(Self::Utf8),
-            ShapeOpcode::Principal => Ok(Self::Principal),
-            ShapeOpcode::OptionalNone => Ok(Self::Optional(None)),
-            ShapeOpcode::OptionalSome => Ok(Self::Optional(Some(Box::new(Self::parse(
-                bytes,
-                cursor,
-                child_depth,
-            )?)))),
-            ShapeOpcode::ResponseOk => Ok(Self::Response {
-                ok: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
-                err: None,
-            }),
-            ShapeOpcode::ResponseErr => Ok(Self::Response {
-                ok: None,
-                err: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
-            }),
-            ShapeOpcode::ResponseBoth => Ok(Self::Response {
-                ok: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
-                err: Some(Box::new(Self::parse(bytes, cursor, child_depth)?)),
-            }),
-            ShapeOpcode::Tuple => {
-                let count = decode_varuint(bytes, cursor)?;
-                if count == 0 {
-                    return Err(PackedValueError::InvalidRecord(
-                        "value-shape tuple has no fields",
-                    ));
-                }
-                if count > bytes.len().saturating_sub(*cursor) / 2 {
-                    return Err(PackedValueError::InvalidRecord(
-                        "value-shape tuple field count exceeds descriptor",
-                    ));
-                }
-                let mut fields = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let name_len = usize::from(take_shape_byte(bytes, cursor)?);
-                    let end = cursor
-                        .checked_add(name_len)
-                        .ok_or(PackedValueError::SizeOverflow)?;
-                    let name_bytes =
-                        bytes
-                            .get(*cursor..end)
-                            .ok_or(PackedValueError::InvalidRecord(
-                                "truncated value-shape tuple name",
-                            ))?;
-                    let name = str::from_utf8(name_bytes)
-                        .map_err(|_| PackedValueError::InvalidRecord("invalid tuple name UTF-8"))?;
-                    let name = ClarityName::try_from(name.to_owned())
-                        .map_err(|_| PackedValueError::InvalidRecord("invalid tuple name"))?;
-                    if fields
-                        .last()
-                        .is_some_and(|(previous, _): &(ClarityName, Self)| previous >= &name)
-                    {
-                        return Err(PackedValueError::InvalidRecord(
-                            "tuple shape fields are not canonical",
-                        ));
-                    }
-                    *cursor = end;
-                    let shape = Self::parse(bytes, cursor, child_depth)?;
-                    fields.push((name, shape));
-                }
-                Ok(Self::Tuple(fields))
-            }
-            ShapeOpcode::EmptyList => Ok(Self::List(None)),
-            ShapeOpcode::List => Ok(Self::List(Some(Box::new(Self::parse(
-                bytes,
-                cursor,
-                child_depth,
-            )?)))),
-            ShapeOpcode::ListElements => {
-                let count = decode_varuint(bytes, cursor)?;
-                if count == 0 || count > bytes.len().saturating_sub(*cursor) {
-                    return Err(PackedValueError::InvalidRecord(
-                        "invalid per-element list-shape count",
-                    ));
-                }
-                let mut elements = Vec::with_capacity(count);
-                for _ in 0..count {
-                    elements.push(Self::parse(bytes, cursor, child_depth)?);
-                }
-                if merge_list_elements(&elements).is_ok() {
-                    return Err(PackedValueError::InvalidRecord(
-                        "mergeable list uses per-element shapes",
-                    ));
-                }
-                Ok(Self::ListElements(elements))
-            }
-        }
-    }
-
     /// Return this active shape's directory-free packed width, if fixed.
     pub fn fixed_width(&self) -> Option<usize> {
         match self {
@@ -505,45 +568,4 @@ fn encode_varuint(mut value: usize, output: &mut Vec<u8>) -> Result<(), PackedVa
             return Ok(());
         }
     }
-}
-
-/// Decode one minimal unsigned LEB128 descriptor integer and advance `cursor`.
-fn decode_varuint(bytes: &[u8], cursor: &mut usize) -> Result<usize, PackedValueError> {
-    let start = *cursor;
-    let mut value = 0usize;
-    let mut shift = 0u32;
-    loop {
-        let byte = take_shape_byte(bytes, cursor)?;
-        let part = usize::from(byte & 0x7f)
-            .checked_shl(shift)
-            .ok_or(PackedValueError::SizeOverflow)?;
-        value = value
-            .checked_add(part)
-            .ok_or(PackedValueError::SizeOverflow)?;
-        if byte & 0x80 == 0 {
-            // A multi-byte unsigned LEB128 ending in a zero payload has a redundant high group.
-            if *cursor - start > 1 && byte & 0x7f == 0 {
-                return Err(PackedValueError::InvalidRecord(
-                    "non-canonical value-shape varuint",
-                ));
-            }
-            return Ok(value);
-        }
-        shift = shift.checked_add(7).ok_or(PackedValueError::SizeOverflow)?;
-        if shift >= usize::BITS {
-            return Err(PackedValueError::SizeOverflow);
-        }
-    }
-}
-
-/// Read one descriptor byte and advance `cursor` with checked arithmetic.
-fn take_shape_byte(bytes: &[u8], cursor: &mut usize) -> Result<u8, PackedValueError> {
-    let byte = bytes
-        .get(*cursor)
-        .copied()
-        .ok_or(PackedValueError::InvalidRecord("truncated value shape"))?;
-    *cursor = cursor
-        .checked_add(1)
-        .ok_or(PackedValueError::SizeOverflow)?;
-    Ok(byte)
 }

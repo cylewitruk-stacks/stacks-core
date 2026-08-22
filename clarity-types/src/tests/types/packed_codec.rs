@@ -14,12 +14,8 @@ use stacks_common::types::StacksEpochId;
 
 use crate::representations::{ClarityName, ContractName};
 use crate::types::codec::packed::{
-    AdmittedValue, ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValueError,
-    VALUE_SHAPE_VERSION, ValueShape, audit_reconstruction, decode_canonical_packed,
-    encode_canonical_packed_admitted, encode_canonical_packed_value,
-    encode_canonical_packed_value_with_consensus_len, encode_value_shape, reconstruct_consensus,
-    transcode_consensus_to_canonical_packed, transcode_consensus_with_shape,
-    validate_canonical_packed,
+    AdmittedValue, ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue,
+    PackedValueError, PackedValueRef, VALUE_SHAPE_VERSION, ValueShape,
 };
 use crate::types::signatures::CallableSubtype;
 use crate::types::{
@@ -43,30 +39,32 @@ fn contract(seed: u8, name: &str) -> QualifiedContractIdentifier {
 
 fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8> {
     let consensus = value.serialize_to_vec().unwrap();
-    let packed = encode_canonical_packed_value(
-        &value,
-        &expected,
-        &EPOCH,
-        ConsensusLengthValidation::Enabled,
-    )
-    .unwrap();
-    validate_canonical_packed(packed.as_bytes(), &expected, &EPOCH).unwrap();
-    let decoded = decode_canonical_packed(packed.as_bytes(), &expected, &EPOCH).unwrap();
-    assert_eq!(decoded.value, value);
+    let consensus_len = u32::try_from(consensus.len()).unwrap();
+    let admitted = AdmittedValue::new(value, &expected, &EPOCH).unwrap();
+    let packed = admitted
+        .encode_packed(consensus_len, ConsensusLengthValidation::Enabled)
+        .unwrap();
+    packed.as_packed_ref().validate(&expected, &EPOCH).unwrap();
+    let decoded = packed.as_packed_ref().decode(&expected, &EPOCH).unwrap();
+    assert_eq!(&decoded.value, admitted.value());
     assert_eq!(decoded.value.serialize_to_vec().unwrap(), consensus);
     assert_eq!(decoded.consensus_byte_len, consensus.len() as u32);
-    let transcoded = transcode_consensus_to_canonical_packed(&consensus).unwrap();
+    let transcoded = PackedValue::transcode_consensus(&consensus).unwrap();
     assert_eq!(transcoded.as_bytes(), packed.as_bytes());
-    let shape = encode_value_shape(&value).unwrap();
+    let shape = ValueShape::from_value(admitted.value()).unwrap();
     assert_eq!(
         ValueShape::from_bytes(shape.as_bytes()).unwrap().as_bytes(),
         shape.as_bytes()
     );
     assert_eq!(
-        audit_reconstruction(packed.as_bytes(), shape.as_bytes()).unwrap(),
+        packed
+            .as_packed_ref()
+            .audit_reconstruction(shape.as_bytes())
+            .unwrap(),
         consensus
     );
-    let (transcoded, transcoded_shape) = transcode_consensus_with_shape(&consensus).unwrap();
+    let (transcoded, transcoded_shape) =
+        PackedValue::transcode_consensus_with_shape(&consensus).unwrap();
     assert_eq!(transcoded.as_bytes(), packed.as_bytes());
     assert_eq!(transcoded_shape, shape);
     packed.into_bytes()
@@ -82,22 +80,14 @@ fn admitted_value_rejects_mismatched_schema_and_preserves_encoding() {
 
     let admitted = AdmittedValue::new(value.clone(), &TypeSignature::UIntType, &EPOCH).unwrap();
     assert_eq!(admitted.value(), &value);
-    let consensus_len = value.serialized_size().unwrap();
-    let encoded_admitted = encode_canonical_packed_admitted(
-        &admitted,
-        consensus_len,
-        ConsensusLengthValidation::Enabled,
-    )
-    .unwrap();
-    let encoded_checked = encode_canonical_packed_value_with_consensus_len(
-        &value,
-        &TypeSignature::UIntType,
-        &EPOCH,
-        consensus_len,
-        ConsensusLengthValidation::Enabled,
-    )
-    .unwrap();
-    assert_eq!(encoded_admitted, encoded_checked);
+    let consensus_len = u32::try_from(value.serialize_to_vec().unwrap().len()).unwrap();
+    let encoded_admitted = admitted
+        .encode_packed(consensus_len, ConsensusLengthValidation::Enabled)
+        .unwrap();
+    let encoded_trusted = admitted
+        .encode_packed(consensus_len, ConsensusLengthValidation::Disabled)
+        .unwrap();
+    assert_eq!(encoded_admitted, encoded_trusted);
 }
 
 #[test]
@@ -138,7 +128,7 @@ fn canonical_wire_format_has_stable_golden_vectors() {
         [27, 0, 0, 0, 0, 0, 1, 2, 1, 1]
     );
     assert_eq!(
-        encode_value_shape(&tuple).unwrap().as_bytes(),
+        ValueShape::from_value(&tuple).unwrap().as_bytes(),
         [VALUE_SHAPE_VERSION, 0x0c, 2, 1, b'a', 1, 1, b'b', 2]
     );
 }
@@ -171,28 +161,46 @@ fn value_shape_merges_active_list_branches() {
 fn value_shape_rejects_noncanonical_and_mismatched_descriptors() {
     let empty_tuple_shape = [1, 0x0c, 0];
     assert!(ValueShape::from_bytes(&empty_tuple_shape).is_err());
-    assert!(reconstruct_consensus(&[5, 0, 0, 0], &empty_tuple_shape).is_err());
+    assert!(
+        PackedValueRef::parse(&[5, 0, 0, 0])
+            .and_then(|packed| packed.reconstruct_consensus(&empty_tuple_shape))
+            .is_err()
+    );
 
     // A merged response descriptor is valid within a heterogeneous list, but
     // is not canonical for one response value with only one active branch.
     let overgeneralized_response_shape = [VALUE_SHAPE_VERSION, 0x0b, 0x00, 0x04];
     let overgeneralized_response = [10, 0, 0, 0, 0, 64, 123, 123, 123];
     assert!(
-        reconstruct_consensus(&overgeneralized_response, &overgeneralized_response_shape).is_ok()
+        PackedValueRef::parse(&overgeneralized_response)
+            .and_then(|packed| packed.reconstruct_consensus(&overgeneralized_response_shape))
+            .is_ok()
     );
     assert!(
-        audit_reconstruction(&overgeneralized_response, &overgeneralized_response_shape).is_err()
+        PackedValueRef::parse(&overgeneralized_response)
+            .and_then(|packed| packed.audit_reconstruction(&overgeneralized_response_shape))
+            .is_err()
     );
 
     let value = Value::UInt(7);
     let consensus = value.serialize_to_vec().unwrap();
-    let (packed, shape) = transcode_consensus_with_shape(&consensus).unwrap();
+    let (packed, shape) = PackedValue::transcode_consensus_with_shape(&consensus).unwrap();
 
     let mut trailing = shape.as_bytes().to_vec();
     trailing.push(0);
     assert!(ValueShape::from_bytes(&trailing).is_err());
-    assert!(reconstruct_consensus(packed.as_bytes(), &[1, 2]).is_err());
-    assert!(reconstruct_consensus(packed.as_bytes(), &[2, 1]).is_err());
+    assert!(
+        packed
+            .as_packed_ref()
+            .reconstruct_consensus(&[1, 2])
+            .is_err()
+    );
+    assert!(
+        packed
+            .as_packed_ref()
+            .reconstruct_consensus(&[2, 1])
+            .is_err()
+    );
 
     let nonminimal_tuple_count = [1, 0x0c, 0x80, 0x00];
     assert!(ValueShape::from_bytes(&nonminimal_tuple_count).is_err());
@@ -223,8 +231,8 @@ fn consensus_transcoder_rejects_noncanonical_tuple_order() {
         &canonical[TUPLE_HEADER_LEN..TUPLE_HEADER_LEN + ONE_CHAR_UINT_FIELD_LEN],
     );
     assert!(Value::try_deserialize_slice_exact_untyped(&noncanonical).is_ok());
-    assert!(transcode_consensus_to_canonical_packed(&noncanonical).is_err());
-    assert!(transcode_consensus_with_shape(&noncanonical).is_err());
+    assert!(PackedValue::transcode_consensus(&noncanonical).is_err());
+    assert!(PackedValue::transcode_consensus_with_shape(&noncanonical).is_err());
 }
 
 #[test]
@@ -260,16 +268,14 @@ fn canonical_storage_bytes_are_epoch_independent() {
         ])
         .unwrap(),
     );
+    let consensus_len = u32::try_from(value.serialize_to_vec().unwrap().len()).unwrap();
     let mut reference = None;
     for epoch in StacksEpochId::ALL {
-        let packed = encode_canonical_packed_value(
-            &value,
-            &expected,
-            epoch,
-            ConsensusLengthValidation::Enabled,
-        )
-        .unwrap();
-        let decoded = decode_canonical_packed(packed.as_bytes(), &expected, epoch).unwrap();
+        let admitted = AdmittedValue::new(value.clone(), &expected, epoch).unwrap();
+        let packed = admitted
+            .encode_packed(consensus_len, ConsensusLengthValidation::Enabled)
+            .unwrap();
+        let decoded = packed.as_packed_ref().decode(&expected, epoch).unwrap();
         assert_eq!(decoded.value, value);
         match &reference {
             Some(bytes) => assert_eq!(packed.as_bytes(), bytes),
@@ -323,10 +329,13 @@ fn schema_free_reconstruction_preserves_unsanitized_list_elements() {
     let historical = Value::cons_list_unsanitized(vec![narrow, wide]).unwrap();
     let consensus = historical.serialize_to_vec().unwrap();
 
-    let (packed, shape) = transcode_consensus_with_shape(&consensus).unwrap();
+    let (packed, shape) = PackedValue::transcode_consensus_with_shape(&consensus).unwrap();
     assert_eq!(shape.as_bytes()[..2], [VALUE_SHAPE_VERSION, 0x0f]);
     assert_eq!(
-        audit_reconstruction(packed.as_bytes(), shape.as_bytes()).unwrap(),
+        packed
+            .as_packed_ref()
+            .audit_reconstruction(shape.as_bytes())
+            .unwrap(),
         consensus
     );
 
@@ -564,18 +573,30 @@ fn canonical_zero_integers_use_one_byte_scalars_and_lanes() {
 fn canonical_decoder_rejects_empty_and_non_minimal_zero_integers() {
     let empty_scalar = 17u32.to_le_bytes();
     for expected in [TypeSignature::UIntType, TypeSignature::IntType] {
-        assert!(decode_canonical_packed(&empty_scalar, &expected, &EPOCH).is_err());
+        assert!(
+            PackedValueRef::parse(&empty_scalar)
+                .and_then(|packed| packed.decode(&expected, &EPOCH))
+                .is_err()
+        );
 
         let mut wide_scalar = empty_scalar.to_vec();
         wide_scalar.extend_from_slice(&[0, 0]);
-        assert!(decode_canonical_packed(&wide_scalar, &expected, &EPOCH).is_err());
+        assert!(
+            PackedValueRef::parse(&wide_scalar)
+                .and_then(|packed| packed.decode(&expected, &EPOCH))
+                .is_err()
+        );
 
         let list_type = ListTypeData::new_list(expected, 2).unwrap();
         let expected = TypeSignature::SequenceType(SequenceSubtype::ListType(list_type));
         let mut wide_lane = 39u32.to_le_bytes().to_vec();
         wide_lane.extend_from_slice(&2u32.to_le_bytes());
         wide_lane.extend_from_slice(&[0, 0, 0, 0]);
-        assert!(decode_canonical_packed(&wide_lane, &expected, &EPOCH).is_err());
+        assert!(
+            PackedValueRef::parse(&wide_lane)
+                .and_then(|packed| packed.decode(&expected, &EPOCH))
+                .is_err()
+        );
     }
 }
 
@@ -583,40 +604,27 @@ fn canonical_decoder_rejects_empty_and_non_minimal_zero_integers() {
 fn canonical_transcoder_requires_exact_consensus_consumption() {
     let mut consensus = Value::UInt(1).serialize_to_vec().unwrap();
     consensus.push(0);
-    assert!(transcode_consensus_to_canonical_packed(&consensus).is_err());
+    assert!(PackedValue::transcode_consensus(&consensus).is_err());
 }
 
 #[test]
-fn canonical_supplied_consensus_length_matches_regular_encoding() {
+fn admitted_encoding_validates_supplied_consensus_length() {
     let value = Value::some(Value::UInt(7)).unwrap();
     let expected = TypeSignature::new_option(TypeSignature::UIntType).unwrap();
     let consensus_len = value.serialize_to_vec().unwrap().len() as u32;
-    let regular = encode_canonical_packed_value(
-        &value,
-        &expected,
-        &EPOCH,
-        ConsensusLengthValidation::Enabled,
-    )
-    .unwrap();
-    let supplied = encode_canonical_packed_value_with_consensus_len(
-        &value,
-        &expected,
-        &EPOCH,
-        consensus_len,
-        ConsensusLengthValidation::Enabled,
-    )
-    .unwrap();
-    assert_eq!(supplied.as_bytes(), regular.as_bytes());
+    let admitted = AdmittedValue::new(value, &expected, &EPOCH).unwrap();
+    let checked = admitted
+        .encode_packed(consensus_len, ConsensusLengthValidation::Enabled)
+        .unwrap();
+    let trusted = admitted
+        .encode_packed(consensus_len, ConsensusLengthValidation::Disabled)
+        .unwrap();
+    assert_eq!(checked, trusted);
 
     assert!(
-        encode_canonical_packed_value_with_consensus_len(
-            &value,
-            &expected,
-            &EPOCH,
-            consensus_len - 1,
-            ConsensusLengthValidation::Enabled,
-        )
-        .is_err()
+        admitted
+            .encode_packed(consensus_len - 1, ConsensusLengthValidation::Enabled,)
+            .is_err()
     );
 }
 
@@ -628,13 +636,25 @@ fn canonical_decoder_rejects_header_and_body_corruption() {
 
     let mut wrong_length = packed.clone();
     wrong_length[..4].copy_from_slice(&1u32.to_le_bytes());
-    assert!(decode_canonical_packed(&wrong_length, &expected, &EPOCH).is_err());
+    assert!(
+        PackedValueRef::parse(&wrong_length)
+            .and_then(|packed| packed.decode(&expected, &EPOCH))
+            .is_err()
+    );
 
     let mut invalid_tag = packed.clone();
     invalid_tag[PACKED_VALUE_HEADER_LEN] = 2;
-    assert!(decode_canonical_packed(&invalid_tag, &expected, &EPOCH).is_err());
+    assert!(
+        PackedValueRef::parse(&invalid_tag)
+            .and_then(|packed| packed.decode(&expected, &EPOCH))
+            .is_err()
+    );
 
-    assert!(decode_canonical_packed(&packed[..packed.len() - 1], &expected, &EPOCH).is_err());
+    assert!(
+        PackedValueRef::parse(&packed[..packed.len() - 1])
+            .and_then(|packed| packed.decode(&expected, &EPOCH))
+            .is_err()
+    );
 }
 
 proptest! {
@@ -689,9 +709,11 @@ proptest! {
         packed in prop::collection::vec(any::<u8>(), 0..512),
         descriptor in prop::collection::vec(any::<u8>(), 0..256),
     ) {
-        if let Ok(consensus) = audit_reconstruction(&packed, &descriptor) {
+        if let Ok(consensus) = PackedValueRef::parse(&packed)
+            .and_then(|packed| packed.audit_reconstruction(&descriptor))
+        {
             let value = Value::try_deserialize_slice_exact_untyped(&consensus).unwrap();
-            let transcoded = transcode_consensus_to_canonical_packed(&consensus).unwrap();
+            let transcoded = PackedValue::transcode_consensus(&consensus).unwrap();
             prop_assert_eq!(transcoded.as_bytes(), packed.as_slice());
             prop_assert_eq!(value.serialize_to_vec().unwrap(), consensus);
         }

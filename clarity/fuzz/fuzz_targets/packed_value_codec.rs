@@ -11,8 +11,7 @@
 
 use clarity::vm::representations::ClarityName;
 use clarity::vm::types::codec::packed::{
-    audit_reconstruction, decode_canonical_packed, encode_canonical_packed_value,
-    encode_value_shape, transcode_consensus_with_shape, ConsensusLengthValidation, ValueShape,
+    AdmittedValue, ConsensusLengthValidation, PackedValue, PackedValueRef, ValueShape,
 };
 use clarity::vm::types::{
     ListTypeData, SequenceSubtype, TupleData, TupleTypeSignature, TypeSignature, Value,
@@ -67,13 +66,15 @@ fn check_consensus(consensus: &[u8], epoch: &StacksEpochId) {
         .serialize_to_vec()
         .expect("a decoded Clarity value must serialize");
     if canonical != consensus {
-        assert!(transcode_consensus_with_shape(consensus).is_err());
+        assert!(PackedValue::transcode_consensus_with_shape(consensus).is_err());
         return;
     }
-    let (packed, shape) = transcode_consensus_with_shape(consensus)
+    let (packed, shape) = PackedValue::transcode_consensus_with_shape(consensus)
         .expect("every exactly decoded consensus value must transcode");
     assert_eq!(
-        audit_reconstruction(packed.as_bytes(), shape.as_bytes())
+        packed
+            .as_packed_ref()
+            .audit_reconstruction(shape.as_bytes())
             .expect("a canonical packed record must reconstruct"),
         consensus
     );
@@ -82,18 +83,18 @@ fn check_consensus(consensus: &[u8], epoch: &StacksEpochId) {
     let Ok(expected) = TypeSignature::type_of(&value) else {
         return;
     };
-    let Ok(typed) =
-        encode_canonical_packed_value(&value, &expected, epoch, ConsensusLengthValidation::Enabled)
-    else {
+    let value_shape = ValueShape::from_value(&value).expect("an encodable value must have a shape");
+    let Ok(admitted) = AdmittedValue::new(value, &expected, epoch) else {
         return;
     };
+    let typed = admitted
+        .encode_packed(
+            u32::try_from(consensus.len()).expect("Clarity consensus value length is bounded"),
+            ConsensusLengthValidation::Disabled,
+        )
+        .expect("an admitted value must pack");
     assert_eq!(typed.as_bytes(), packed.as_bytes());
-    assert_eq!(
-        encode_value_shape(&value)
-            .expect("an encodable value must have a shape")
-            .as_bytes(),
-        shape.as_bytes()
-    );
+    assert_eq!(value_shape.as_bytes(), shape.as_bytes());
 }
 
 /// Fold at most sixteen fuzz bytes into a deterministic unsigned integer.
@@ -193,23 +194,32 @@ fn check_generated(selector: u8, bytes: &[u8], epoch: &StacksEpochId) {
     let consensus = value
         .serialize_to_vec()
         .expect("a generated value must serialize");
-    let packed =
-        encode_canonical_packed_value(&value, &expected, epoch, ConsensusLengthValidation::Enabled)
-            .expect("a generated value must pack");
-    let shape = encode_value_shape(&value).expect("a generated value must have a shape");
-    let (transcoded, transcoded_shape) =
-        transcode_consensus_with_shape(&consensus).expect("a generated value must transcode");
-    assert_eq!(transcoded.as_bytes(), packed.as_bytes());
+    let shape = ValueShape::from_value(&value).expect("a generated value must have a shape");
+    let (packed, transcoded_shape) = PackedValue::transcode_consensus_with_shape(&consensus)
+        .expect("a generated value must transcode");
     assert_eq!(transcoded_shape.as_bytes(), shape.as_bytes());
     assert_eq!(
-        audit_reconstruction(packed.as_bytes(), shape.as_bytes())
+        packed
+            .as_packed_ref()
+            .audit_reconstruction(shape.as_bytes())
             .expect("a generated value must reconstruct"),
         consensus
     );
-    let decoded = decode_canonical_packed(packed.as_bytes(), &expected, epoch)
+    let decoded = packed
+        .as_packed_ref()
+        .decode(&expected, epoch)
         .expect("a generated value must decode");
     assert_eq!(decoded.value, value);
     assert_eq!(decoded.consensus_byte_len as usize, consensus.len());
+    let admitted = AdmittedValue::new(value, &expected, epoch)
+        .expect("a generated value must be admitted by its schema");
+    let typed = admitted
+        .encode_packed(
+            u32::try_from(consensus.len()).expect("Clarity consensus value length is bounded"),
+            ConsensusLengthValidation::Disabled,
+        )
+        .expect("a generated value must pack");
+    assert_eq!(typed.as_bytes(), packed.as_bytes());
 }
 
 fuzz_target!(|input: &[u8]| {
@@ -232,23 +242,28 @@ fuzz_target!(|input: &[u8]| {
 
     let _ = ValueShape::from_bytes(descriptor);
 
-    if let Ok(decoded) = decode_canonical_packed(packed_bytes, &expected, epoch) {
+    if let Ok(decoded) =
+        PackedValueRef::parse(packed_bytes).and_then(|packed| packed.decode(&expected, epoch))
+    {
         let consensus = decoded
             .value
             .serialize_to_vec()
             .expect("a decoded packed value must serialize");
         assert_eq!(decoded.consensus_byte_len as usize, consensus.len());
-        let reencoded = encode_canonical_packed_value(
-            &decoded.value,
-            &expected,
-            epoch,
-            ConsensusLengthValidation::Enabled,
-        )
-        .expect("a decoded packed value must re-encode");
+        let admitted = AdmittedValue::new(decoded.value, &expected, epoch)
+            .expect("a decoded packed value must remain admitted");
+        let reencoded = admitted
+            .encode_packed(
+                u32::try_from(consensus.len()).expect("Clarity consensus value length is bounded"),
+                ConsensusLengthValidation::Disabled,
+            )
+            .expect("a decoded packed value must re-encode");
         assert_eq!(reencoded.as_bytes(), packed_bytes);
     }
 
-    if let Ok(consensus) = audit_reconstruction(packed_bytes, descriptor) {
+    if let Ok(consensus) = PackedValueRef::parse(packed_bytes)
+        .and_then(|packed| packed.audit_reconstruction(descriptor))
+    {
         let value = Value::try_deserialize_slice_exact_untyped(&consensus)
             .expect("reconstruction must produce one exact consensus value");
         assert_eq!(
@@ -257,7 +272,7 @@ fuzz_target!(|input: &[u8]| {
                 .expect("a reconstructed value must serialize"),
             consensus
         );
-        let (repacked, reshaped) = transcode_consensus_with_shape(&consensus)
+        let (repacked, reshaped) = PackedValue::transcode_consensus_with_shape(&consensus)
             .expect("a reconstructed value must transcode");
         assert_eq!(repacked.as_bytes(), packed_bytes);
         assert_eq!(reshaped.as_bytes(), descriptor);
