@@ -20,9 +20,8 @@ use std::path::PathBuf;
 
 use clarity::vm::database::clarity_store::make_contract_hash_key;
 use clarity::vm::database::{
-    ClarityBackingStore, DataStoreEntry, SqliteConnection, TypedValueData,
+    ClarityBackingStore, DataStoreEntry, DataStoreValue, SqliteConnection, TypedValueData,
 };
-use clarity::vm::types::codec::packed::AdmittedValue;
 use clarity::vm::types::{TupleData, TypeSignature, Value};
 use clarity::vm::ClarityName;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
@@ -92,16 +91,13 @@ fn build_clarity_marf(
             ])
             .unwrap();
 
-        let (value, expected, consensus) = packed_snapshot_fixture();
+        let (value, expected, _consensus) = packed_snapshot_fixture();
         store
             .put_all_data_entries(vec![DataStoreEntry {
                 key: "typed_snapshot_key".into(),
-                canonical: to_hex(&consensus),
-                typed: Some(TypedValueData {
-                    admitted: AdmittedValue::new(value, &expected, &StacksEpochId::Epoch40)
-                        .unwrap(),
-                    consensus,
-                }),
+                value: DataStoreValue::Typed(
+                    TypedValueData::prepare(value, &expected, &StacksEpochId::Epoch40).unwrap(),
+                ),
             }])
             .unwrap();
 

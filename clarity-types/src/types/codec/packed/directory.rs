@@ -237,7 +237,7 @@ fn write_offset(
     width.write(target, value)
 }
 
-/// A validated borrowed view over a packed offset directory.
+/// A borrowed view over packed directory framing and validated endpoints.
 pub struct Directory<'a> {
     /// Contiguous encoded offset table, excluding the width tag.
     offsets: &'a [u8],
@@ -250,7 +250,10 @@ pub struct Directory<'a> {
 }
 
 impl<'a> Directory<'a> {
-    /// Parse and validate one complete canonical directory and child-data region.
+    /// Parse canonical directory framing and validate its fixed endpoints.
+    ///
+    /// [`Directory::children`] validates every intermediate boundary while consuming the children,
+    /// avoiding a second offset-table scan on successful decode and reconstruction paths.
     pub fn parse(bytes: &'a [u8], count: usize) -> Result<Self, PackedValueError> {
         let (&code, rest) = bytes
             .split_first()
@@ -275,16 +278,6 @@ impl<'a> Directory<'a> {
             return Err(PackedValueError::InvalidRecord(
                 "invalid directory endpoints",
             ));
-        }
-        let mut previous = 0usize;
-        for index in 1..=count {
-            let offset = directory.offset(index)?;
-            if offset < previous || offset > data.len() {
-                return Err(PackedValueError::InvalidRecord(
-                    "invalid directory ordering",
-                ));
-            }
-            previous = offset;
         }
         Ok(directory)
     }
@@ -312,22 +305,64 @@ impl<'a> Directory<'a> {
         )
     }
 
-    /// Borrow one framed child body.
-    pub fn child(&self, index: usize) -> Result<&'a [u8], PackedValueError> {
-        if index >= self.count {
-            return Err(PackedValueError::InvalidRecord("child index out of bounds"));
+    /// Iterate through every child while validating each offset exactly once.
+    pub fn children(&self) -> DirectoryChildren<'_, 'a> {
+        DirectoryChildren {
+            directory: self,
+            index: 0,
+            previous: 0,
         }
-        let start = self.offset(index)?;
-        let end = self.offset(index + 1)?;
-        self.data
-            .get(start..end)
-            .ok_or(PackedValueError::InvalidRecord("invalid child offsets"))
+    }
+}
+
+/// Forward iterator that validates directory ordering while yielding child slices.
+pub struct DirectoryChildren<'directory, 'bytes> {
+    /// Borrowed validated directory framing.
+    directory: &'directory Directory<'bytes>,
+    /// Index of the next child body.
+    index: usize,
+    /// Start offset of the next child body.
+    previous: usize,
+}
+
+impl<'bytes> Iterator for DirectoryChildren<'_, 'bytes> {
+    type Item = Result<&'bytes [u8], PackedValueError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.directory.count {
+            return None;
+        }
+        let end = if self.index + 1 == self.directory.count {
+            self.directory.data.len()
+        } else {
+            match self.directory.offset(self.index + 1) {
+                Ok(offset) => offset,
+                Err(error) => {
+                    self.index = self.directory.count;
+                    return Some(Err(error));
+                }
+            }
+        };
+        if end < self.previous || end > self.directory.data.len() {
+            self.index = self.directory.count;
+            return Some(Err(PackedValueError::InvalidRecord(
+                "invalid directory ordering",
+            )));
+        }
+        let child = self
+            .directory
+            .data
+            .get(self.previous..end)
+            .ok_or(PackedValueError::InvalidRecord("invalid child offsets"));
+        self.previous = end;
+        self.index += 1;
+        Some(child)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::OffsetWidth;
+    use super::{Directory, OffsetWidth};
 
     #[test]
     fn offset_width_changes_at_integer_boundaries() {
@@ -345,5 +380,23 @@ mod tests {
             OffsetWidth::for_data_len(u16::MAX as usize + 1),
             OffsetWidth::U32
         );
+    }
+
+    #[test]
+    fn child_iteration_validates_each_boundary_once() {
+        let valid = [0, 0, 1, 2, 0xaa, 0xbb];
+        let directory = Directory::parse(&valid, 2).unwrap();
+        let children = directory.children().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(children, [&[0xaa][..], &[0xbb][..]]);
+
+        let invalid = [0, 0, 2, 1, 0xaa];
+        let directory = Directory::parse(&invalid, 2).unwrap();
+        assert!(directory.children().next().unwrap().is_err());
+
+        let descending = [0, 0, 1, 0, 1, 0xaa];
+        let directory = Directory::parse(&descending, 3).unwrap();
+        let mut children = directory.children();
+        assert_eq!(children.next().unwrap().unwrap(), &[0xaa]);
+        assert!(children.next().unwrap().is_err());
     }
 }

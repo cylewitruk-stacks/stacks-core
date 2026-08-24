@@ -228,8 +228,8 @@ impl ConsensusReconstructor {
             }
         } else {
             let directory = directory::Directory::parse(bytes, fields.len())?;
-            for (index, (name, shape)) in fields.iter().enumerate() {
-                self.reconstruct_tuple_field(name, directory.child(index)?, shape)?;
+            for ((name, shape), child) in fields.iter().zip(directory.children()) {
+                self.reconstruct_tuple_field(name, child?, shape)?;
             }
         }
         Ok(())
@@ -368,8 +368,8 @@ impl ConsensusReconstructor {
             }
         } else {
             let directory = directory::Directory::parse(elements, count)?;
-            for index in 0..count {
-                self.reconstruct_body(directory.child(index)?, shapes.get(index)?)?;
+            for (index, child) in directory.children().enumerate() {
+                self.reconstruct_body(child?, shapes.get(index)?)?;
             }
         }
         Ok(())

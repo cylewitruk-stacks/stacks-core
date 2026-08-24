@@ -78,6 +78,19 @@ impl AdmittedValue {
     ) -> Result<PackedValue, PackedValueError> {
         encode::value(self.value(), consensus_byte_len, validation)
     }
+
+    /// Encode this value after an opaque caller-owned prefix in one allocation.
+    ///
+    /// This permits an encompassing storage format to write its own envelope first and avoid
+    /// allocating and copying a second payload buffer.
+    pub fn encode_packed_with_prefix(
+        &self,
+        prefix: &[u8],
+        consensus_byte_len: u32,
+        validation: ConsensusLengthValidation,
+    ) -> Result<Vec<u8>, PackedValueError> {
+        encode::prefixed_value(self.value(), prefix, consensus_byte_len, validation)
+    }
 }
 
 /// The encoded bytes and logical length produced by the packed codec.

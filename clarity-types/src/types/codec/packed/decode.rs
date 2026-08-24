@@ -241,8 +241,9 @@ fn tuple(
         }
     } else {
         let directory = directory::Directory::parse(bytes, expected.get_type_map().len())?;
-        for (index, (name, field_type)) in expected.get_type_map().iter().enumerate() {
-            let (value, child_len) = body(directory.child(index)?, field_type, epoch)?;
+        for ((name, field_type), child) in expected.get_type_map().iter().zip(directory.children())
+        {
+            let (value, child_len) = body(child?, field_type, epoch)?;
             logical_len = primitive::tuple_logical_add(logical_len, name.as_str(), child_len)?;
             fields.push((name.clone(), value));
         }
@@ -326,8 +327,8 @@ fn list(
                 let directory = directory::Directory::parse(elements, count)?;
                 let mut values = Vec::with_capacity(count);
                 let mut children_len = 0u32;
-                for index in 0..count {
-                    let (value, child_len) = body(directory.child(index)?, element_type, epoch)?;
+                for child in directory.children() {
+                    let (value, child_len) = body(child?, element_type, epoch)?;
                     children_len = primitive::checked_logical_add(children_len, child_len)?;
                     values.push(value);
                 }

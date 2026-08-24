@@ -88,6 +88,15 @@ fn admitted_value_rejects_mismatched_schema_and_preserves_encoding() {
         .encode_packed(consensus_len, ConsensusLengthValidation::Disabled)
         .unwrap();
     assert_eq!(encoded_admitted, encoded_trusted);
+    let prefixed = admitted
+        .encode_packed_with_prefix(
+            &[0xa5, 0x5a],
+            consensus_len,
+            ConsensusLengthValidation::Disabled,
+        )
+        .unwrap();
+    assert_eq!(&prefixed[..2], &[0xa5, 0x5a]);
+    assert_eq!(&prefixed[2..], encoded_trusted.as_bytes());
 }
 
 #[test]
@@ -154,6 +163,20 @@ fn value_shape_merges_active_list_branches() {
     assert_canonical_round_trip(
         value,
         TypeSignature::SequenceType(SequenceSubtype::ListType(list_type)),
+    );
+}
+
+#[test]
+fn homogeneous_list_reuses_one_active_shape() {
+    let element = || {
+        Value::Tuple(
+            TupleData::from_data(vec![(ClarityName::from_literal("a"), Value::UInt(1))]).unwrap(),
+        )
+    };
+    let value = Value::cons_list_unsanitized(vec![element(), element(), element()]).unwrap();
+    assert_eq!(
+        ValueShape::from_value(&value).unwrap().as_bytes(),
+        [VALUE_SHAPE_VERSION, 0x0e, 0x0c, 1, 1, b'a', 1]
     );
 }
 

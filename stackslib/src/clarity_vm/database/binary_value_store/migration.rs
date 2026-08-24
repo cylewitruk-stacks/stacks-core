@@ -252,7 +252,11 @@ pub fn migrate(
     create_generic_tables(&destination, &schema)?;
     binary_value_store::initialize_migration_destination(&destination)?;
 
-    let source_uri = readonly_uri(&config.source)?;
+    // The reserved source connection below excludes writers, and preflight
+    // rejects non-empty journals. An immutable attachment therefore observes
+    // the same checkpointed bytes without self-conflicting with that writer
+    // reservation inside SQLite's per-process lock manager.
+    let source_uri = immutable_uri(&config.source)?;
     destination.execute("ATTACH DATABASE ?1 AS migration_source", [source_uri])?;
     configure_attached_source(&destination, config.cache_mib)?;
 
@@ -679,12 +683,7 @@ fn cutover_error(
     )
 }
 
-/// Build a read-only URI that participates in normal SQLite locking and WAL handling.
-fn readonly_uri(path: &Path) -> Result<String, rusqlite::Error> {
-    sqlite_readonly_uri(path, false)
-}
-
-/// Build an immutable read-only URI for a finalized database with no sidecars.
+/// Build an immutable read-only URI for checkpointed bytes protected from writers.
 fn immutable_uri(path: &Path) -> Result<String, rusqlite::Error> {
     sqlite_readonly_uri(path, true)
 }
@@ -843,6 +842,9 @@ fn migrate_data(
     destination: &mut Connection,
     on_event: &mut dyn FnMut(MigrationEvent),
 ) -> Result<(DataMigrationStats, (u64, u64, u64)), Box<dyn Error>> {
+    // Preserve the legacy table's sequential scan. Its key index is not
+    // covering, so key-order traversal turns each payload fetch into a random
+    // lookup across the much larger source database.
     let mut statement = source.prepare("SELECT key, value FROM data_table ORDER BY rowid")?;
     let mut rows = statement.query([])?;
     let mut stats = DataMigrationStats::default();
@@ -1046,7 +1048,7 @@ mod tests {
         destination
             .execute(
                 "ATTACH DATABASE ?1 AS migration_source",
-                [readonly_uri(&source_path).unwrap()],
+                [immutable_uri(&source_path).unwrap()],
             )
             .unwrap();
         let mut events = Vec::new();
@@ -1176,17 +1178,15 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_source_uris_handle_paths_requiring_escaping() {
+    fn immutable_source_uris_handle_paths_requiring_escaping() {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join("space and # hash");
         fs::create_dir(&nested).unwrap();
         let source_path = nested.join("marf.sqlite");
         legacy_database(&source_path);
 
-        let readonly = readonly_uri(&source_path).unwrap();
         let immutable = immutable_uri(&source_path).unwrap();
-        assert!(readonly.contains("space%20and%20%23%20hash"));
-        assert!(!readonly.contains("immutable=1"));
+        assert!(immutable.contains("space%20and%20%23%20hash"));
         assert!(immutable.contains("immutable=1"));
         assert_eq!(
             binary_value_store::detect(&immutable_connection(&source_path).unwrap()).unwrap(),

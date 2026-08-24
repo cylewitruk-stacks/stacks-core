@@ -351,16 +351,73 @@ impl ActiveShape {
                 .collect::<Result<Vec<_>, PackedValueError>>()
                 .map(Self::Tuple),
             Value::Sequence(SequenceData::List(list)) => {
+                let Some((first, rest)) = list.data.split_first() else {
+                    return Ok(Self::List(None));
+                };
+                let first_shape = Self::from_value(first)?;
+                if rest
+                    .iter()
+                    .all(|element| first_shape.matches_value(element))
+                {
+                    return Ok(Self::List(Some(Box::new(first_shape))));
+                }
                 let elements = list
                     .data
                     .iter()
                     .map(Self::from_value)
                     .collect::<Result<Vec<_>, _>>()?;
-                if elements.is_empty() {
-                    return Ok(Self::List(None));
-                }
                 Ok(list_shape_from_elements(elements))
             }
+        }
+    }
+
+    /// Return whether this descriptor can reconstruct one active value without widening.
+    fn matches_value(&self, value: &Value) -> bool {
+        match (self, value) {
+            (Self::Int, Value::Int(_))
+            | (Self::UInt, Value::UInt(_))
+            | (Self::Bool, Value::Bool(_))
+            | (Self::Buffer, Value::Sequence(SequenceData::Buffer(_)))
+            | (Self::Ascii, Value::Sequence(SequenceData::String(CharType::ASCII(_))))
+            | (Self::Utf8, Value::Sequence(SequenceData::String(CharType::UTF8(_))))
+            | (Self::Principal, Value::Principal(_) | Value::CallableContract(_)) => true,
+            (Self::Optional(_), Value::Optional(optional)) if optional.data.is_none() => true,
+            (Self::Optional(Some(shape)), Value::Optional(optional)) => optional
+                .data
+                .as_deref()
+                .is_some_and(|value| shape.matches_value(value)),
+            (
+                Self::Response {
+                    ok: Some(shape), ..
+                },
+                Value::Response(response),
+            ) if response.committed => shape.matches_value(&response.data),
+            (
+                Self::Response {
+                    err: Some(shape), ..
+                },
+                Value::Response(response),
+            ) if !response.committed => shape.matches_value(&response.data),
+            (Self::Tuple(fields), Value::Tuple(tuple)) => {
+                fields.len() == tuple.data_map.len()
+                    && fields.iter().zip(&tuple.data_map).all(
+                        |((expected_name, expected_shape), (name, value))| {
+                            expected_name == name && expected_shape.matches_value(value)
+                        },
+                    )
+            }
+            (Self::List(None), Value::Sequence(SequenceData::List(list))) => list.data.is_empty(),
+            (Self::List(Some(shape)), Value::Sequence(SequenceData::List(list))) => {
+                list.data.iter().all(|value| shape.matches_value(value))
+            }
+            (Self::ListElements(shapes), Value::Sequence(SequenceData::List(list))) => {
+                shapes.len() == list.data.len()
+                    && shapes
+                        .iter()
+                        .zip(&list.data)
+                        .all(|(shape, value)| shape.matches_value(value))
+            }
+            _ => false,
         }
     }
 

@@ -30,13 +30,89 @@ use crate::vm::errors::{VmExecutionError, VmInternalError};
 use crate::vm::types::codec::packed::AdmittedValue;
 use crate::vm::types::{PrincipalData, QualifiedContractIdentifier, TypeSignature};
 
-/// Admitted value data retained until a typed Clarity write commits.
+/// Canonical and admitted representations retained until a typed Clarity write commits.
+///
+/// Construction derives every field from one sanitized [`Value`]. Keeping the fields private
+/// prevents a backing-store caller from pairing packed bytes with an unrelated canonical hash or
+/// logical consensus length.
 #[derive(Debug)]
 pub struct TypedValueData {
+    /// Exact lowercase canonical string used to derive the MARF value hash.
+    canonical: String,
     /// Sanitized runtime value already admitted by its declared storage type.
-    pub admitted: AdmittedValue,
-    /// Exact consensus serialization, retained so commit-time encoders do not serialize twice.
-    pub consensus: Vec<u8>,
+    admitted: AdmittedValue,
+    /// Length of the admitted value's exact consensus serialization.
+    consensus_byte_len: u32,
+}
+
+impl TypedValueData {
+    /// Admit and serialize one sanitized value exactly once for deferred physical storage.
+    pub fn prepare(
+        value: Value,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Self, VmInternalError> {
+        let admitted = AdmittedValue::new(value, expected, epoch)
+            .map_err(|error| VmInternalError::DBError(error.to_string()))?;
+        let consensus = admitted
+            .value()
+            .serialize_to_vec()
+            .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?;
+        let consensus_byte_len = u32::try_from(consensus.len())
+            .map_err(|_| VmInternalError::Expect("Clarity value exceeds u32 length".into()))?;
+        Ok(Self {
+            canonical: to_hex(&consensus),
+            admitted,
+            consensus_byte_len,
+        })
+    }
+
+    /// Borrow the exact canonical string associated with the admitted value.
+    pub fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    /// Borrow the admitted runtime value.
+    pub fn admitted(&self) -> &AdmittedValue {
+        &self.admitted
+    }
+
+    /// Return the exact consensus byte length associated with the admitted value.
+    pub fn consensus_byte_len(&self) -> u32 {
+        self.consensus_byte_len
+    }
+
+    /// Consume this typed write and return its canonical text for an untyped backing store.
+    pub fn into_canonical(self) -> String {
+        self.canonical
+    }
+}
+
+/// Physical input retained for one logical backing-store edit.
+#[derive(Debug)]
+pub enum DataStoreValue {
+    /// Canonical text for storage backends without a typed physical representation.
+    Canonical(String),
+    /// A canonical string bound to its admitted typed representation.
+    Typed(TypedValueData),
+}
+
+impl DataStoreValue {
+    /// Borrow the canonical string used for MARF hashing and pending reads.
+    pub fn canonical(&self) -> &str {
+        match self {
+            Self::Canonical(canonical) => canonical,
+            Self::Typed(typed) => typed.canonical(),
+        }
+    }
+
+    /// Consume this value and return its canonical string.
+    pub fn into_canonical(self) -> String {
+        match self {
+            Self::Canonical(canonical) => canonical,
+            Self::Typed(typed) => typed.into_canonical(),
+        }
+    }
 }
 
 /// One logical key/value edit committed by a backing store.
@@ -44,10 +120,8 @@ pub struct TypedValueData {
 pub struct DataStoreEntry {
     /// Logical MARF key.
     pub key: String,
-    /// Exact lowercase canonical string used to derive the MARF value hash.
-    pub canonical: String,
-    /// Typed value metadata when this edit originated from a Clarity `Value` write.
-    pub typed: Option<TypedValueData>,
+    /// Canonical text and optional typed physical-encoding input.
+    pub value: DataStoreValue,
 }
 
 /// A typed value returned directly by a backing store.
@@ -97,7 +171,7 @@ pub trait ClarityBackingStore {
         self.put_all_data(
             entries
                 .into_iter()
-                .map(|entry| (entry.key, entry.canonical))
+                .map(|entry| (entry.key, entry.value.into_canonical()))
                 .collect(),
         )
     }

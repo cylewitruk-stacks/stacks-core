@@ -23,7 +23,8 @@ use clarity::vm::database::sqlite::{
     sqlite_insert_metadata,
 };
 use clarity::vm::database::{
-    ClarityBackingStore, DataStoreEntry, SpecialCaseHandler, SqliteConnection, TypedValueResult,
+    ClarityBackingStore, DataStoreEntry, DataStoreValue, SpecialCaseHandler, SqliteConnection,
+    TypedValueResult,
 };
 use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::{QualifiedContractIdentifier, TypeSignature};
@@ -785,32 +786,34 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
     /// Returns Ok(()) on success
     /// Returns Err(..) on inner MARF errors.
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
-        let mut keys = Vec::with_capacity(items.len());
-        let mut values = Vec::with_capacity(items.len());
-
         // we're only writing, so get rid of the temporary views and restore the data and metadata
         // tables in the ephemeral MARF so this works.
         self.teardown_views();
         let result = (|| {
-            for (key, value) in items {
-                let marf_value = MARFValue::from_value(&value);
-                if self.value_storage_format.is_binary() {
-                    binary_value_store::put_generic(
-                        self.ephemeral_marf.sqlite_tx(),
-                        &marf_value,
-                        &value,
-                    )?;
-                } else {
+            let (keys, values) = if self.value_storage_format.is_binary() {
+                let entries = items
+                    .into_iter()
+                    .map(|(key, canonical)| DataStoreEntry {
+                        key,
+                        value: DataStoreValue::Canonical(canonical),
+                    })
+                    .collect();
+                binary_value_store::put_entries(self.ephemeral_marf.sqlite_tx(), entries)?
+            } else {
+                let mut keys = Vec::with_capacity(items.len());
+                let mut values = Vec::with_capacity(items.len());
+                for (key, value) in items {
+                    let marf_value = MARFValue::from_value(&value);
                     SqliteConnection::put(
                         self.ephemeral_marf.sqlite_tx(),
                         &marf_value.to_hex(),
                         &value,
                     )?;
+                    keys.push(key);
+                    values.push(marf_value);
                 }
-
-                keys.push(key);
-                values.push(marf_value);
-            }
+                (keys, values)
+            };
             self.ephemeral_marf
                 .insert_batch(&keys, values)
                 .map_err(|error| VmInternalError::MarfFailure(error.to_string()))?;
@@ -830,34 +833,15 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             return self.put_all_data(
                 entries
                     .into_iter()
-                    .map(|entry| (entry.key, entry.canonical))
+                    .map(|entry| (entry.key, entry.value.into_canonical()))
                     .collect(),
             );
         }
 
-        let mut keys = Vec::with_capacity(entries.len());
-        let mut values = Vec::with_capacity(entries.len());
         self.teardown_views();
         let result = (|| {
-            for entry in entries {
-                let marf_value = MARFValue::from_value(&entry.canonical);
-                if let Some(typed) = entry.typed {
-                    binary_value_store::put_typed(
-                        self.ephemeral_marf.sqlite_tx(),
-                        &marf_value,
-                        &entry.canonical,
-                        typed,
-                    )?;
-                } else {
-                    binary_value_store::put_generic(
-                        self.ephemeral_marf.sqlite_tx(),
-                        &marf_value,
-                        &entry.canonical,
-                    )?;
-                }
-                keys.push(entry.key);
-                values.push(marf_value);
-            }
+            let (keys, values) =
+                binary_value_store::put_entries(self.ephemeral_marf.sqlite_tx(), entries)?;
             self.ephemeral_marf
                 .insert_batch(&keys, values)
                 .map_err(|error| VmInternalError::MarfFailure(error.to_string()))?;

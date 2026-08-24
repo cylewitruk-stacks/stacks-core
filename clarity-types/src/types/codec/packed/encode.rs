@@ -24,14 +24,33 @@ pub fn value(
     consensus_byte_len: u32,
     validation: ConsensusLengthValidation,
 ) -> Result<PackedValue, PackedValueError> {
+    let bytes = prefixed_value(value, &[], consensus_byte_len, validation)?;
+    Ok(PackedValue {
+        bytes,
+        consensus_byte_len,
+    })
+}
+
+/// Encode one exact packed record after an opaque prefix in one allocation.
+pub fn prefixed_value(
+    value: &Value,
+    prefix: &[u8],
+    consensus_byte_len: u32,
+    validation: ConsensusLengthValidation,
+) -> Result<Vec<u8>, PackedValueError> {
     let body_len = body_len(value)?;
-    let total_len = PACKED_VALUE_HEADER_LEN
+    let record_len = PACKED_VALUE_HEADER_LEN
         .checked_add(body_len)
         .ok_or(PackedValueError::SizeOverflow)?;
-    let mut bytes = Vec::with_capacity(total_len);
-    bytes.extend_from_slice(&consensus_byte_len.to_le_bytes());
-    body(value, &mut bytes)?;
-    if bytes.len() != total_len {
+    let total_len = prefix
+        .len()
+        .checked_add(record_len)
+        .ok_or(PackedValueError::SizeOverflow)?;
+    let mut output = Vec::with_capacity(total_len);
+    output.extend_from_slice(prefix);
+    output.extend_from_slice(&consensus_byte_len.to_le_bytes());
+    body(value, &mut output)?;
+    if output.len() != total_len {
         return Err(PackedValueError::InvalidRecord(
             "canonical encoder length calculation disagrees with output",
         ));
@@ -43,10 +62,7 @@ pub fn value(
             "canonical encoder logical length mismatch",
         ));
     }
-    Ok(PackedValue {
-        bytes,
-        consensus_byte_len,
-    })
+    Ok(output)
 }
 
 /// Transcode one exact self-describing consensus value into canonical packed.

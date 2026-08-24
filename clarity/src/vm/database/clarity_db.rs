@@ -42,7 +42,6 @@ use crate::vm::database::structures::{
 use crate::vm::database::{ClarityBackingStore, RollbackWrapper, TypedValueData};
 use crate::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 use crate::vm::representations::ClarityName;
-use crate::vm::types::codec::packed::AdmittedValue;
 use crate::vm::types::serialization::NONE_SERIALIZATION_LEN;
 use crate::vm::types::{
     PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData, TypeSignature,
@@ -622,27 +621,20 @@ impl<'a> ClarityDatabase<'a> {
             value
         };
 
-        let serialized = stored_value
-            .serialize_to_vec()
-            .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?;
-        let size = serialized.len() as u64;
-        let hex_serialized = to_hex(serialized.as_slice());
         if self.store.stores_typed_values() {
-            let admitted = AdmittedValue::new(stored_value, expected, epoch)
-                .map_err(|error| VmInternalError::DBError(error.to_string()))?;
-            self.store.put_typed_value(
-                key,
-                hex_serialized,
-                TypedValueData {
-                    admitted,
-                    consensus: serialized,
-                },
-            )?;
+            let typed = TypedValueData::prepare(stored_value, expected, epoch)?;
+            let size = u64::from(typed.consensus_byte_len());
+            self.store.put_typed_value(key, typed)?;
+            Ok(pre_sanitized_size.unwrap_or(size))
         } else {
+            let serialized = stored_value
+                .serialize_to_vec()
+                .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?;
+            let size = serialized.len() as u64;
+            let hex_serialized = to_hex(serialized.as_slice());
             self.store.put_data(key, &hex_serialized)?;
+            Ok(pre_sanitized_size.unwrap_or(size))
         }
-
-        Ok(pre_sanitized_size.unwrap_or(size))
     }
 
     pub fn get_value(

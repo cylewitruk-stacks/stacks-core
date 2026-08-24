@@ -17,8 +17,7 @@
 
 use std::fs;
 
-use clarity::vm::database::{DataStoreEntry, TypedValueData};
-use clarity::vm::types::codec::packed::AdmittedValue;
+use clarity::vm::database::{DataStoreEntry, DataStoreValue, TypedValueData};
 use clarity::vm::types::{StacksAddressExtensions, TupleData, TypeSignature, Value};
 use clarity::vm::{ClarityName, ContractName};
 use pinny::tag;
@@ -310,15 +309,11 @@ fn test_ephemeral_binary_store_uses_database_local_shape_ids() {
     let epoch = StacksEpochId::Epoch40;
 
     let dummy_value = Value::UInt(1);
-    let dummy_consensus = dummy_value.serialize_to_vec().unwrap();
-    let dummy_canonical = to_hex(&dummy_consensus);
     let dummy_entry = DataStoreEntry {
         key: "typed-dummy".into(),
-        canonical: dummy_canonical,
-        typed: Some(TypedValueData {
-            admitted: AdmittedValue::new(dummy_value, &TypeSignature::UIntType, &epoch).unwrap(),
-            consensus: dummy_consensus,
-        }),
+        value: DataStoreValue::Typed(
+            TypedValueData::prepare(dummy_value, &TypeSignature::UIntType, &epoch).unwrap(),
+        ),
     };
 
     let base_value = Value::Tuple(
@@ -334,11 +329,9 @@ fn test_ephemeral_binary_store_uses_database_local_shape_ids() {
     let base_hash = MARFValue::from_value(&base_canonical);
     let base_entry = DataStoreEntry {
         key: "typed-base".into(),
-        canonical: base_canonical.clone(),
-        typed: Some(TypedValueData {
-            admitted: AdmittedValue::new(base_value.clone(), &base_type, &epoch).unwrap(),
-            consensus: base_consensus.clone(),
-        }),
+        value: DataStoreValue::Typed(
+            TypedValueData::prepare(base_value.clone(), &base_type, &epoch).unwrap(),
+        ),
     };
 
     let base_tip = StacksBlockId([1; 32]);
@@ -390,11 +383,9 @@ fn test_ephemeral_binary_store_uses_database_local_shape_ids() {
     ephemeral
         .put_all_data_entries(vec![DataStoreEntry {
             key: "typed-local".into(),
-            canonical: local_canonical.clone(),
-            typed: Some(TypedValueData {
-                admitted: AdmittedValue::new(local_value.clone(), &local_type, &epoch).unwrap(),
-                consensus: local_consensus.clone(),
-            }),
+            value: DataStoreValue::Typed(
+                TypedValueData::prepare(local_value.clone(), &local_type, &epoch).unwrap(),
+            ),
         }])
         .unwrap();
 

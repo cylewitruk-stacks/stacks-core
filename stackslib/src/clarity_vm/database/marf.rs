@@ -26,7 +26,8 @@ use clarity::vm::database::sqlite::{
     sqlite_insert_metadata,
 };
 use clarity::vm::database::{
-    ClarityBackingStore, DataStoreEntry, SpecialCaseHandler, SqliteConnection, TypedValueResult,
+    ClarityBackingStore, DataStoreEntry, DataStoreValue, SpecialCaseHandler, SqliteConnection,
+    TypedValueResult,
 };
 use clarity::vm::errors::{IncomparableError, RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::{QualifiedContractIdentifier, TypeSignature};
@@ -466,20 +467,6 @@ fn get_required_side_value(
         ))
         .into()
     })
-}
-
-/// Store canonical text using the database's immutable physical format.
-fn put_generic_side_value(
-    conn: &Connection,
-    mode: ValueStorageFormat,
-    marf_value: &MARFValue,
-    canonical: &str,
-) -> Result<(), VmExecutionError> {
-    if mode.is_binary() {
-        binary_value_store::put_generic(conn, marf_value, canonical)
-    } else {
-        SqliteConnection::put(conn, &marf_value.to_hex(), canonical)
-    }
 }
 
 /// Decode a legacy canonical-hex value under the caller's declared read schema.
@@ -1155,16 +1142,25 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     }
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
+        if self.value_storage_format.is_binary() {
+            let entries = items
+                .into_iter()
+                .map(|(key, canonical)| DataStoreEntry {
+                    key,
+                    value: DataStoreValue::Canonical(canonical),
+                })
+                .collect();
+            let (keys, values) = binary_value_store::put_entries(self.marf.sqlite_tx(), entries)?;
+            return self.marf.insert_batch(&keys, values).map_err(|_| {
+                VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into()
+            });
+        }
+
         let mut keys = Vec::with_capacity(items.len());
         let mut values = Vec::with_capacity(items.len());
-        for (key, value) in items.into_iter() {
+        for (key, value) in items {
             let marf_value = MARFValue::from_value(&value);
-            put_generic_side_value(
-                self.marf.sqlite_tx(),
-                self.value_storage_format,
-                &marf_value,
-                &value,
-            )?;
+            SqliteConnection::put(self.marf.sqlite_tx(), &marf_value.to_hex(), &value)?;
             keys.push(key);
             values.push(marf_value);
         }
@@ -1181,33 +1177,12 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
             return self.put_all_data(
                 entries
                     .into_iter()
-                    .map(|entry| (entry.key, entry.canonical))
+                    .map(|entry| (entry.key, entry.value.into_canonical()))
                     .collect(),
             );
         }
 
-        let mut keys = Vec::with_capacity(entries.len());
-        let mut values = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let marf_value = MARFValue::from_value(&entry.canonical);
-            if let Some(typed) = entry.typed {
-                binary_value_store::put_typed(
-                    self.marf.sqlite_tx(),
-                    &marf_value,
-                    &entry.canonical,
-                    typed,
-                )?;
-            } else {
-                put_generic_side_value(
-                    self.marf.sqlite_tx(),
-                    self.value_storage_format,
-                    &marf_value,
-                    &entry.canonical,
-                )?;
-            }
-            keys.push(entry.key);
-            values.push(marf_value);
-        }
+        let (keys, values) = binary_value_store::put_entries(self.marf.sqlite_tx(), entries)?;
         self.marf
             .insert_batch(&keys, values)
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())

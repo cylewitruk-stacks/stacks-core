@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use std::{debug_assert_matches, str};
 
 use clarity::vm::database::{
-    ClarityBackingStore, SqliteConnection, TypedValueData, TypedValueResult,
+    ClarityBackingStore, DataStoreEntry, DataStoreValue, SqliteConnection, TypedValueData,
+    TypedValueResult,
 };
 use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
 use clarity::vm::types::codec::packed::{
@@ -44,10 +45,10 @@ use self::schema::{
 };
 use crate::chainstate::stacks::index::MARFValue;
 
-/// Maximum number of descriptor-to-ID mappings retained by an offline writer.
-const MIGRATION_SHAPE_CACHE_CAPACITY: usize = 65_536;
-/// Maximum descriptor bytes retained by an offline writer.
-const MIGRATION_SHAPE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of descriptor-to-ID mappings retained by one writer cache.
+const SHAPE_CACHE_CAPACITY: usize = 65_536;
+/// Maximum descriptor bytes retained by one writer cache.
+const SHAPE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Exact canonical UTF-8 for values whose logical representation is textual.
 const KIND_CANONICAL_UTF8: u8 = 0;
@@ -78,7 +79,54 @@ pub struct EncodedRecord {
     /// Versioned record envelope stored in `data_table.value`.
     record: Vec<u8>,
     /// Canonical active-value descriptor required by packed generic reads.
-    shape: Option<Vec<u8>>,
+    shape: Option<ValueShape>,
+}
+
+/// Bounded cache of validated descriptors and their database-local IDs.
+#[derive(Debug, Default)]
+struct ShapeCache {
+    /// Descriptor-to-database-ID mappings safe for the cache's transaction lifetime.
+    ids: HashMap<Vec<u8>, i64>,
+    /// Descriptor payload bytes currently charged to `ids`.
+    bytes: usize,
+    /// Number of descriptors resolved without SQLite work.
+    hits: u64,
+    /// Number of descriptors requiring a dictionary lookup or insert.
+    misses: u64,
+    /// Number of cached mappings discarded by bounded-cache eviction.
+    evictions: u64,
+}
+
+impl ShapeCache {
+    /// Resolve a validated shape through this cache and the normalized SQLite dictionary.
+    fn intern(&mut self, conn: &Connection, shape: &ValueShape) -> Result<i64, VmExecutionError> {
+        let descriptor = shape.as_bytes();
+        if let Some(id) = self.ids.get(descriptor) {
+            self.hits += 1;
+            return Ok(*id);
+        }
+        let id = intern_shape(conn, descriptor)?;
+        if descriptor.len() > SHAPE_CACHE_BYTES {
+            self.misses += 1;
+            return Ok(id);
+        }
+        if self.ids.len() >= SHAPE_CACHE_CAPACITY
+            || self.bytes.saturating_add(descriptor.len()) > SHAPE_CACHE_BYTES
+        {
+            self.evictions += self.ids.len() as u64;
+            self.ids.clear();
+            self.bytes = 0;
+        }
+        self.ids.insert(descriptor.to_vec(), id);
+        self.bytes += descriptor.len();
+        self.misses += 1;
+        Ok(id)
+    }
+
+    /// Return `(cache hits, cache misses, entries evicted)` for diagnostics.
+    fn stats(&self) -> (u64, u64, u64) {
+        (self.hits, self.misses, self.evictions)
+    }
 }
 
 /// Shape dictionary cache used while streaming an offline migration.
@@ -88,16 +136,8 @@ pub struct EncodedRecord {
 /// be reused.
 #[derive(Debug, Default)]
 pub struct MigrationWriter {
-    /// Bounded descriptor-to-database-ID cache spanning committed migration batches.
-    shape_ids: HashMap<Vec<u8>, i64>,
-    /// Descriptor payload bytes currently charged to `shape_ids`.
-    shape_bytes: usize,
-    /// Number of rows that reused a cached dictionary ID.
-    shape_hits: u64,
-    /// Number of rows that required a dictionary lookup or insert.
-    shape_misses: u64,
-    /// Number of cached mappings discarded by bounded-cache eviction.
-    shape_evictions: u64,
+    /// Bounded descriptor cache spanning committed migration batches.
+    shapes: ShapeCache,
 }
 
 impl MigrationWriter {
@@ -123,8 +163,9 @@ impl MigrationWriter {
             ));
         }
         let shape_id = encoded
-            .shape()
-            .map(|shape| self.intern_shape(conn, shape))
+            .shape
+            .as_ref()
+            .map(|shape| self.shapes.intern(conn, shape))
             .transpose()?;
         let inserted = conn
             .prepare_cached(INSERT_DATA)
@@ -142,35 +183,7 @@ impl MigrationWriter {
 
     /// Return `(cache hits, cache misses, entries evicted)` for diagnostics.
     pub fn shape_cache_stats(&self) -> (u64, u64, u64) {
-        (self.shape_hits, self.shape_misses, self.shape_evictions)
-    }
-
-    /// Resolve one descriptor to its database-local ID through the bounded migration cache.
-    fn intern_shape(
-        &mut self,
-        conn: &Connection,
-        descriptor: &[u8],
-    ) -> Result<i64, VmExecutionError> {
-        if let Some(id) = self.shape_ids.get(descriptor) {
-            self.shape_hits += 1;
-            return Ok(*id);
-        }
-        let id = intern_shape(conn, descriptor)?;
-        if descriptor.len() > MIGRATION_SHAPE_CACHE_BYTES {
-            self.shape_misses += 1;
-            return Ok(id);
-        }
-        if self.shape_ids.len() >= MIGRATION_SHAPE_CACHE_CAPACITY
-            || self.shape_bytes.saturating_add(descriptor.len()) > MIGRATION_SHAPE_CACHE_BYTES
-        {
-            self.shape_evictions += self.shape_ids.len() as u64;
-            self.shape_ids.clear();
-            self.shape_bytes = 0;
-        }
-        self.shape_ids.insert(descriptor.to_vec(), id);
-        self.shape_bytes += descriptor.len();
-        self.shape_misses += 1;
-        Ok(id)
+        self.shapes.stats()
     }
 }
 
@@ -182,8 +195,60 @@ impl EncodedRecord {
 
     /// Borrow the normalized active-shape descriptor, when required.
     pub fn shape(&self) -> Option<&[u8]> {
-        self.shape.as_deref()
+        self.shape.as_ref().map(ValueShape::as_bytes)
     }
+}
+
+/// Store one block's logical edits while reusing content hashes and normalized shapes.
+///
+/// Duplicate hashes are skipped only after their canonical strings compare equal, preserving the
+/// collision detection performed by row reconciliation without retaining additional payload copies.
+pub fn put_entries(
+    conn: &Connection,
+    entries: Vec<DataStoreEntry>,
+) -> Result<(Vec<String>, Vec<MARFValue>), VmExecutionError> {
+    let mut first_by_hash = HashMap::<MARFValue, usize>::with_capacity(entries.len());
+    let mut hashed = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let value_hash = MARFValue::from_value(entry.value.canonical());
+        let is_first = match first_by_hash.get(&value_hash) {
+            Some(first) => {
+                let first_entry = entries
+                    .get(*first)
+                    .ok_or_else(|| storage_error("invalid Binary V1 batch hash index"))?;
+                if first_entry.value.canonical() != entry.value.canonical() {
+                    return Err(storage_error(
+                        "distinct canonical values produced one MARF value hash",
+                    ));
+                }
+                false
+            }
+            None => {
+                first_by_hash.insert(value_hash.clone(), index);
+                true
+            }
+        };
+        hashed.push((value_hash, is_first));
+    }
+
+    let mut shapes = ShapeCache::default();
+    let mut keys = Vec::with_capacity(entries.len());
+    let mut values = Vec::with_capacity(entries.len());
+    for (entry, (value_hash, is_first)) in entries.into_iter().zip(hashed) {
+        if is_first {
+            match entry.value {
+                DataStoreValue::Canonical(canonical) => {
+                    put_generic(conn, &value_hash, &canonical, &mut shapes)?;
+                }
+                DataStoreValue::Typed(typed) => {
+                    put_typed(conn, &value_hash, typed, &mut shapes)?;
+                }
+            }
+        }
+        keys.push(entry.key);
+        values.push(value_hash);
+    }
+    Ok((keys, values))
 }
 
 /// Detect and fully validate the immutable side-store format.
@@ -334,34 +399,38 @@ where
     Ok(count)
 }
 
-/// Encode and store one typed Clarity value under its unchanged logical hash.
-pub fn put_typed(
+/// Encode and store one prepared typed Clarity value under its precomputed logical hash.
+fn put_typed(
     conn: &Connection,
     value_hash: &MARFValue,
-    canonical: &str,
     typed: TypedValueData,
+    shapes: &mut ShapeCache,
 ) -> Result<(), VmExecutionError> {
-    let consensus_byte_len = validate_typed_canonical(&typed, canonical)?;
-    let packed = typed
-        .admitted
-        .encode_packed(consensus_byte_len, ConsensusLengthValidation::Disabled)
+    let record = typed
+        .admitted()
+        .encode_packed_with_prefix(
+            &[RECORD_VERSION, KIND_CANONICAL_PACKED],
+            typed.consensus_byte_len(),
+            ConsensusLengthValidation::Disabled,
+        )
         .map_err(codec_error)?;
-    let shape = ValueShape::from_value(typed.admitted.value()).map_err(codec_error)?;
+    let shape = ValueShape::from_value(typed.admitted().value()).map_err(codec_error)?;
     let encoded = EncodedRecord {
-        record: record(KIND_CANONICAL_PACKED, packed.as_bytes()),
-        shape: Some(shape.into_bytes()),
+        record,
+        shape: Some(shape),
     };
-    insert_or_reconcile(conn, value_hash, canonical, &encoded)
+    insert_or_reconcile(conn, value_hash, typed.canonical(), &encoded, shapes)
 }
 
 /// Store one generic canonical value in an intrinsically reversible kind.
-pub fn put_generic(
+fn put_generic(
     conn: &Connection,
     value_hash: &MARFValue,
     canonical: &str,
+    shapes: &mut ShapeCache,
 ) -> Result<(), VmExecutionError> {
     let encoded = encode_reversible(canonical);
-    insert_or_reconcile(conn, value_hash, canonical, &encoded)
+    insert_or_reconcile(conn, value_hash, canonical, &encoded, shapes)
 }
 
 /// Classify one legacy canonical value for the offline migration.
@@ -375,7 +444,7 @@ pub fn encode_migrated(canonical: &str) -> Result<EncodedRecord, VmExecutionErro
     match PackedValue::transcode_consensus_with_shape(&consensus) {
         Ok((packed, shape)) => Ok(EncodedRecord {
             record: record(KIND_CANONICAL_PACKED, packed.as_bytes()),
-            shape: Some(shape.into_bytes()),
+            shape: Some(shape),
         }),
         Err(_) => Ok(EncodedRecord {
             record: record(KIND_CANONICAL_HEX_BYTES, &consensus),
@@ -592,16 +661,12 @@ fn insert_or_reconcile(
     value_hash: &MARFValue,
     canonical: &str,
     encoded: &EncodedRecord,
+    shapes: &mut ShapeCache,
 ) -> Result<(), VmExecutionError> {
-    if MARFValue::from_value(canonical) != *value_hash {
-        return Err(storage_error(
-            "canonical value does not reproduce its data-table key",
-        ));
-    }
     let shape_id = encoded
         .shape
-        .as_deref()
-        .map(|shape| intern_shape(conn, shape))
+        .as_ref()
+        .map(|shape| shapes.intern(conn, shape))
         .transpose()?;
     let inserted = conn
         .prepare_cached(INSERT_DATA)
@@ -615,7 +680,9 @@ fn insert_or_reconcile(
 
     let (existing_record, existing_shape) = load_with_shape(conn, value_hash)?
         .ok_or_else(|| storage_error("Binary V1 row disappeared during reconciliation"))?;
-    if existing_record == encoded.record && existing_shape.as_deref() == encoded.shape.as_deref() {
+    if existing_record == encoded.record
+        && existing_shape.as_deref() == encoded.shape.as_ref().map(ValueShape::as_bytes)
+    {
         return Ok(());
     }
     let existing_canonical =
@@ -632,9 +699,8 @@ fn insert_or_reconcile(
     ))
 }
 
-/// Validate and intern a descriptor, returning its database-local unsigned 32-bit ID.
+/// Intern a codec-validated descriptor, returning its database-local unsigned 32-bit ID.
 fn intern_shape(conn: &Connection, descriptor: &[u8]) -> Result<i64, VmExecutionError> {
-    clarity::vm::types::codec::packed::ValueShape::from_bytes(descriptor).map_err(codec_error)?;
     conn.prepare_cached(INSERT_SHAPE)
         .and_then(|mut statement| statement.execute([descriptor]))
         .map_err(sql_error)?;
@@ -764,35 +830,6 @@ fn exact_lower_hex(canonical: &str) -> Option<Vec<u8>> {
     hex_bytes(canonical).ok()
 }
 
-/// Compare consensus bytes with canonical lowercase hex without allocating a second encoding.
-fn consensus_matches_canonical(consensus: &[u8], canonical: &str) -> bool {
-    /// Lowercase hexadecimal alphabet used by the allocation-free comparison.
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    canonical.len() == consensus.len().saturating_mul(2)
-        && canonical
-            .as_bytes()
-            .chunks_exact(2)
-            .zip(consensus)
-            .all(|(encoded, byte)| {
-                encoded.first() == HEX.get(usize::from(byte >> 4))
-                    && encoded.get(1) == HEX.get(usize::from(byte & 0x0f))
-            })
-}
-
-/// Verify typed consensus bytes reproduce the canonical MARF payload and return their length.
-fn validate_typed_canonical(
-    typed: &TypedValueData,
-    canonical: &str,
-) -> Result<u32, VmExecutionError> {
-    if !consensus_matches_canonical(&typed.consensus, canonical) {
-        return Err(storage_error(
-            "typed value does not reproduce its canonical MARF payload",
-        ));
-    }
-    u32::try_from(typed.consensus.len())
-        .map_err(|_| storage_error("Clarity value exceeds the Binary V1 length field"))
-}
-
 /// Decode raw consensus bytes, restoring callable metadata supplied only by the read schema.
 fn decode_consensus_payload(
     payload: &[u8],
@@ -859,7 +896,6 @@ fn storage_error(message: impl Into<String>) -> VmExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use clarity::vm::types::codec::packed::AdmittedValue;
     use clarity::vm::types::TypeSignature;
     use stacks_common::types::StacksEpochId;
     use stacks_common::util::hash::to_hex;
@@ -889,17 +925,22 @@ mod tests {
     }
 
     fn typed(value: Value, expected: TypeSignature) -> (String, TypedValueData, MARFValue) {
-        let consensus = value.serialize_to_vec().unwrap();
-        let canonical = to_hex(&consensus);
+        let data = TypedValueData::prepare(value, &expected, &EPOCH).unwrap();
+        let canonical = data.canonical().to_owned();
         let hash = MARFValue::from_value(&canonical);
-        (
-            canonical,
-            TypedValueData {
-                admitted: AdmittedValue::new(value, &expected, &EPOCH).unwrap(),
-                consensus,
-            },
-            hash,
-        )
+        (canonical, data, hash)
+    }
+
+    fn store_typed(conn: &Connection, hash: &MARFValue, data: TypedValueData) {
+        put_typed(conn, hash, data, &mut ShapeCache::default()).unwrap();
+    }
+
+    fn store_generic(conn: &Connection, hash: &MARFValue, canonical: &str) {
+        put_generic(conn, hash, canonical, &mut ShapeCache::default()).unwrap();
+    }
+
+    fn reconcile(conn: &Connection, hash: &MARFValue, canonical: &str, encoded: &EncodedRecord) {
+        insert_or_reconcile(conn, hash, canonical, encoded, &mut ShapeCache::default()).unwrap();
     }
 
     fn initialize_completed(conn: &Connection) {
@@ -977,7 +1018,23 @@ mod tests {
 
         let value = Value::UInt(42);
         let (canonical, data, hash) = typed(value.clone(), TypeSignature::UIntType);
-        put_typed(&conn, &hash, &canonical, data).unwrap();
+        let expected_packed = data
+            .admitted()
+            .encode_packed(
+                data.consensus_byte_len(),
+                ConsensusLengthValidation::Disabled,
+            )
+            .unwrap();
+        let expected_record = record(KIND_CANONICAL_PACKED, expected_packed.as_bytes());
+        store_typed(&conn, &hash, data);
+        let stored_record: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM data_table WHERE key = ?1",
+                [hash.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_record, expected_record);
         assert_eq!(
             get_typed(&conn, &hash, &TypeSignature::UIntType, &EPOCH)
                 .unwrap()
@@ -998,10 +1055,86 @@ mod tests {
 
         let generic = "not hexadecimal";
         let generic_hash = MARFValue::from_value(generic);
-        put_generic(&conn, &generic_hash, generic).unwrap();
+        store_generic(&conn, &generic_hash, generic);
         assert_eq!(
             get_generic(&conn, &generic_hash).unwrap().as_deref(),
             Some(generic)
+        );
+    }
+
+    #[test]
+    fn live_batch_reuses_duplicate_values_and_shape_ids() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_completed(&conn);
+
+        let first =
+            TypedValueData::prepare(Value::UInt(1), &TypeSignature::UIntType, &EPOCH).unwrap();
+        let second =
+            TypedValueData::prepare(Value::UInt(2), &TypeSignature::UIntType, &EPOCH).unwrap();
+        let repeated =
+            TypedValueData::prepare(Value::UInt(1), &TypeSignature::UIntType, &EPOCH).unwrap();
+        let (keys, hashes) = put_entries(
+            &conn,
+            vec![
+                DataStoreEntry {
+                    key: "first".into(),
+                    value: DataStoreValue::Typed(first),
+                },
+                DataStoreEntry {
+                    key: "second".into(),
+                    value: DataStoreValue::Typed(second),
+                },
+                DataStoreEntry {
+                    key: "repeated".into(),
+                    value: DataStoreValue::Typed(repeated),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(keys, ["first", "second", "repeated"]);
+        assert_eq!(hashes[0], hashes[2]);
+        let (rows, shapes): (u64, u64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM data_table),
+                        (SELECT COUNT(*) FROM clarity_value_shapes)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, shapes), (2, 1));
+    }
+
+    #[test]
+    fn live_batch_reuses_equal_values_across_generic_and_typed_writes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_completed(&conn);
+
+        let typed =
+            TypedValueData::prepare(Value::Bool(true), &TypeSignature::BoolType, &EPOCH).unwrap();
+        let canonical = typed.canonical().to_owned();
+        let (_, hashes) = put_entries(
+            &conn,
+            vec![
+                DataStoreEntry {
+                    key: "generic".into(),
+                    value: DataStoreValue::Canonical(canonical),
+                },
+                DataStoreEntry {
+                    key: "typed".into(),
+                    value: DataStoreValue::Typed(typed),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(hashes[0], hashes[1]);
+        assert_eq!(
+            get_typed(&conn, &hashes[0], &TypeSignature::BoolType, &EPOCH)
+                .unwrap()
+                .unwrap()
+                .value,
+            Value::Bool(true)
         );
     }
 
@@ -1012,7 +1145,7 @@ mod tests {
 
         let canonical = "";
         let hash = MARFValue::from_value(canonical);
-        put_generic(&conn, &hash, canonical).unwrap();
+        store_generic(&conn, &hash, canonical);
 
         let (storage_class, record_len, shape_id): (String, u64, Option<i64>) = conn
             .query_row(
@@ -1044,7 +1177,7 @@ mod tests {
         let hash = MARFValue::from_value(&canonical);
         let encoded = encode_migrated(&canonical).unwrap();
         assert!(encoded.shape().is_some());
-        insert_or_reconcile(&conn, &hash, &canonical, &encoded).unwrap();
+        reconcile(&conn, &hash, &canonical, &encoded);
         assert_eq!(
             get_generic(&conn, &hash).unwrap().as_deref(),
             Some(canonical.as_str())
@@ -1054,7 +1187,7 @@ mod tests {
         let hash = MARFValue::from_value(non_value_hex);
         let encoded = encode_migrated(non_value_hex).unwrap();
         assert!(encoded.shape().is_none());
-        insert_or_reconcile(&conn, &hash, non_value_hex, &encoded).unwrap();
+        reconcile(&conn, &hash, non_value_hex, &encoded);
         assert_eq!(
             get_generic(&conn, &hash).unwrap().as_deref(),
             Some(non_value_hex)
@@ -1099,8 +1232,8 @@ mod tests {
         initialize_completed(&conn);
         let value = Value::Bool(true);
         let (canonical, data, hash) = typed(value.clone(), TypeSignature::BoolType);
-        put_typed(&conn, &hash, &canonical, data).unwrap();
-        put_generic(&conn, &hash, &canonical).unwrap();
+        store_typed(&conn, &hash, data);
+        store_generic(&conn, &hash, &canonical);
         assert_eq!(
             get_generic(&conn, &hash).unwrap().as_deref(),
             Some(canonical.as_str())
@@ -1120,7 +1253,7 @@ mod tests {
         initialize_completed(&conn);
         let value = Value::UInt(42);
         let (canonical, data, hash) = typed(value.clone(), TypeSignature::UIntType);
-        put_typed(&conn, &hash, &canonical, data).unwrap();
+        store_typed(&conn, &hash, data);
 
         // A typed read needs only the packed record and its caller-supplied
         // schema. Removing the reconstruction-only dictionary makes an
@@ -1144,7 +1277,7 @@ mod tests {
         let canonical = to_hex(&Value::UInt(42).serialize_to_vec().unwrap());
         let hash = MARFValue::from_value(&canonical);
         let encoded = encode_migrated(&canonical).unwrap();
-        insert_or_reconcile(&conn, &hash, &canonical, &encoded).unwrap();
+        reconcile(&conn, &hash, &canonical, &encoded);
 
         conn.execute(
             "UPDATE data_table SET value = ?1, value_shape_id = NULL WHERE key = ?2",
@@ -1162,7 +1295,7 @@ mod tests {
         let (canonical, data, hash) = typed(value.clone(), TypeSignature::UIntType);
 
         let transaction = conn.transaction().unwrap();
-        put_typed(&transaction, &hash, &canonical, data).unwrap();
+        store_typed(&transaction, &hash, data);
         transaction.rollback().unwrap();
 
         let (rows, shapes): (u64, u64) = conn
@@ -1177,7 +1310,7 @@ mod tests {
 
         let (_, repeated_data, repeated_hash) = typed(value.clone(), TypeSignature::UIntType);
         assert_eq!(repeated_hash, hash);
-        put_typed(&conn, &hash, &canonical, repeated_data).unwrap();
+        store_typed(&conn, &hash, repeated_data);
         assert_eq!(
             get_typed(&conn, &hash, &TypeSignature::UIntType, &EPOCH)
                 .unwrap()
