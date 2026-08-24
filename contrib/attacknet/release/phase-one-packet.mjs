@@ -7,7 +7,7 @@ import {basename, dirname, isAbsolute, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {deriveGitCandidate} from './phase-zero-packet.mjs';
-import {REVIEW_PACKET_SCHEMA, sealReviewPacket} from './phase-review.mjs';
+import {REVIEW_PACKET_SCHEMA_V1, sealReviewPacket} from './phase-review.mjs';
 
 const releaseDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(releaseDir, '../../..');
@@ -149,7 +149,7 @@ export function buildPhaseOnePacket({
     item('evidence:blocking-run', 'evidence', artifacts.blockingRun.archiveEntry, root, artifacts.blockingRun.path),
   ];
   return sealReviewPacket(contract, {
-    schemaVersion: REVIEW_PACKET_SCHEMA,
+    schemaVersion: REVIEW_PACKET_SCHEMA_V1,
     phase: 1,
     tier: 'Full',
     candidate,

@@ -62,7 +62,7 @@ timeline. Evidence must retain the exact partition and mining schedule.
 
 ## Fault composition and fuzz mode
 
-Once burnchain faults are bounded and attributable, `AttacknetRun` can compose:
+Once burnchain faults are bounded and attributable, `AttacknetRun` can combine:
 
 - Bitcoin reorganization or view splits;
 - flash-block cadence;
@@ -117,4 +117,3 @@ The Release 1 baseline also records these unfinished items:
 - packaging a Kubernetes client matched to the server version.
 
 These are product work, not claims that the harness already satisfies.
-

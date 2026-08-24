@@ -2,6 +2,8 @@
 set -euo pipefail
 
 chart_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+go_status=passed
+helm_status=passed
 
 python3 -m py_compile "${chart_dir}/operator/controller.py"
 python3 -m unittest discover -s "${chart_dir}/operator" -p 'test_*.py' -v
@@ -16,6 +18,7 @@ node --test "${chart_dir}/../../attacknet/io-pressure/image-context.test.mjs"
 if command -v go >/dev/null 2>&1; then
   (cd "${chart_dir}/../../attacknet/io-pressure" && go test ./...)
 else
+  go_status=skipped-unavailable
   echo "go not installed; skipped bounded I/O-pressure workload tests" >&2
 fi
 
@@ -44,5 +47,24 @@ if command -v "${helm_bin}" >/dev/null 2>&1; then
     --set runOperator.enabled=false \
     --set serviceAccount.tokenExpirationSeconds=600 >/dev/null
 else
+  helm_status=skipped-unavailable
   echo "helm not installed; skipped chart lint/render (set HELM_BIN to an explicit binary)" >&2
+fi
+
+if [[ -n "${HACKNET_OFFLINE_RESULT:-}" ]]; then
+  if [[ "${go_status}" = passed ]]; then
+    optional=("--optional=go:passed")
+  else
+    optional=("--optional=go:skipped-unavailable:Go toolchain not installed")
+  fi
+  if [[ "${helm_status}" = passed ]]; then
+    optional+=("--optional=helm:passed")
+  else
+    optional+=("--optional=helm:skipped-unavailable:Helm executable not installed")
+  fi
+  node "${chart_dir}/../../attacknet/release/hacknet-offline-result.mjs" \
+    "--output=${HACKNET_OFFLINE_RESULT}" \
+    "--source-revision=$(git -C "${chart_dir}/../../.." rev-parse HEAD)" \
+    --required=topology-operator,run-operator,crd-contracts,probe,image-context,chart-contract \
+    "${optional[@]}"
 fi

@@ -7,18 +7,28 @@ import {fileURLToPath} from 'node:url';
 
 import {loadSchema, validateSchema} from './schema-validator.mjs';
 
-export const REVIEW_CONTRACT_SCHEMA = 'stacks-attacknet-phase-review-contract/v1';
-export const REVIEW_PACKET_SCHEMA = 'stacks-attacknet-phase-review-packet/v1';
+export const REVIEW_CONTRACT_SCHEMA_V1 = 'stacks-attacknet-phase-review-contract/v1';
+export const REVIEW_PACKET_SCHEMA_V1 = 'stacks-attacknet-phase-review-packet/v1';
+export const REVIEW_CONTRACT_SCHEMA = 'stacks-attacknet-phase-review-contract/v2';
+export const REVIEW_PACKET_SCHEMA = 'stacks-attacknet-phase-review-packet/v2';
 export const REVIEW_VERDICT_SCHEMA = 'stacks-attacknet-phase-review-verdict/v1';
 
 const releaseDir = dirname(fileURLToPath(import.meta.url));
-const contractSchema = loadSchema(join(releaseDir, 'review-contract.schema.json'));
-const packetSchema = loadSchema(join(releaseDir, 'review-packet.schema.json'));
+const contractSchemas = new Map([
+  [REVIEW_CONTRACT_SCHEMA_V1, loadSchema(join(releaseDir, 'review-contract-v1.schema.json'))],
+  [REVIEW_CONTRACT_SCHEMA, loadSchema(join(releaseDir, 'review-contract.schema.json'))],
+]);
+const packetSchemas = new Map([
+  [REVIEW_PACKET_SCHEMA_V1, loadSchema(join(releaseDir, 'review-packet-v1.schema.json'))],
+  [REVIEW_PACKET_SCHEMA, loadSchema(join(releaseDir, 'review-packet.schema.json'))],
+]);
 const verdictSchema = loadSchema(join(releaseDir, 'review-verdict.schema.json'));
 const REVIEW_TOOLING_FILES = Object.freeze([
   'phase-review.mjs',
   'schema-validator.mjs',
+  'review-contract-v1.schema.json',
   'review-contract.schema.json',
+  'review-packet-v1.schema.json',
   'review-packet.schema.json',
   'review-verdict.schema.json',
 ]);
@@ -114,15 +124,23 @@ function unsignedPacket(packet) {
 }
 
 export function validateReviewPacket(contract, packet) {
+  const contractSchema = contractSchemas.get(contract?.schemaVersion);
+  const packetSchema = packetSchemas.get(packet?.schemaVersion);
+  if (!contractSchema) throw new Error('unsupported review contract schema');
+  if (!packetSchema) throw new Error('unsupported review packet schema');
   validateSchema(contract, contractSchema, 'contract');
   validateSchema(packet, packetSchema, 'packet');
-  if (contract.schemaVersion !== REVIEW_CONTRACT_SCHEMA) throw new Error('unsupported review contract schema');
-  if (packet.schemaVersion !== REVIEW_PACKET_SCHEMA) throw new Error('unsupported review packet schema');
+  const expectedPacketSchema = contract.schemaVersion === REVIEW_CONTRACT_SCHEMA_V1
+    ? REVIEW_PACKET_SCHEMA_V1 : REVIEW_PACKET_SCHEMA;
+  if (packet.schemaVersion !== expectedPacketSchema) {
+    throw new Error('packet schema version does not match contract schema version');
+  }
   digest(packet.toolingDigest, 'packet.toolingDigest');
   const expectedToolingDigest = reviewToolingDigest();
   if (packet.toolingDigest !== expectedToolingDigest) {
     throw new Error(`packet requires review tooling ${packet.toolingDigest}; current tooling is ${expectedToolingDigest}; run the verifier from the candidate revision`);
   }
+  if (packet.reviewId !== contract.reviewId) throw new Error('packet reviewId does not match contract');
   if (packet.phase !== contract.phase) throw new Error('packet phase does not match contract');
   object(packet.candidate, 'packet.candidate');
   string(packet.candidate.sourceRevision, 'packet.candidate.sourceRevision');
@@ -219,7 +237,13 @@ export function evaluatePhaseGate(contract, packet, verdicts) {
     for (const id of packetInventory) if (!reviewed.has(id)) throw new Error(`${reviewer} did not review ${id}`);
   }
   for (const reviewer of requiredReviewers) if (!seen.has(reviewer)) throw new Error(`missing approval from ${reviewer}`);
-  return {status: `Approved for ${contract.releaseScope} scope`, phase: packet.phase, packetDigest, contractDigest: packet.contractDigest};
+  return {
+    status: `Approved for ${contract.releaseScope} scope`,
+    ...(packet.reviewId ? {reviewId: packet.reviewId} : {}),
+    phase: packet.phase,
+    packetDigest,
+    contractDigest: packet.contractDigest,
+  };
 }
 
 function load(path) {

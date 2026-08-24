@@ -32,7 +32,6 @@
     "evidence:accepted-fault-run",
     "evidence:accepted-mixed-version",
     "evidence:accepted-worker-outage",
-    "evidence:accepted-compose-parity",
     "evidence:accepted-clock",
     "evidence:accepted-pvc",
     "evidence:accepted-negative-control",

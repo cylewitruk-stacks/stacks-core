@@ -17,11 +17,6 @@ RUN_ID="${ATTACKNET_RUN_ID:-}"
 RUN_SEED="${ATTACKNET_RUN_SEED:-}"
 LIVE_PEER_CONNECTIVITY_RESULT='{}'
 ENVIRONMENT_LOCK="${ATTACKNET_DIR}/environment-lock.sh"
-LIFECYCLE_BACKEND="${ATTACKNET_BACKEND:-kubernetes}"
-COMPOSE_PROJECT="${ATTACKNET_PROJECT:-${NETWORK}}"
-COMPOSE_FILE="${ATTACKNET_COMPOSE:-}"
-COMPOSE_EXTRA="${ATTACKNET_COMPOSE_EXTRA:-}"
-COMPOSE_POLICY="${ATTACKNET_COMPOSE_POLICY:-${COMPOSE_FILE:+$(dirname "${COMPOSE_FILE}")/policy.env}}"
 
 [[ "${NETWORK}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
   echo "invalid Kubernetes network name: ${NETWORK}" >&2
@@ -32,21 +27,15 @@ COMPOSE_POLICY="${ATTACKNET_COMPOSE_POLICY:-${COMPOSE_FILE:+$(dirname "${COMPOSE
   exit 2
 }
 
-# Protocol barriers use one logical backend adapter. Kubernetes lifecycle
-# remains responsible for admission/rollout; the Compose lifecycle sources
-# these same protocol checks rather than maintaining a second definition of
-# signer registration, peer connectivity, or chain convergence.
+# Protocol barriers use logical actor names through the Kubernetes runtime
+# boundary rather than depending on generated Pod names.
 runtime_backend() {
-  ATTACKNET_BACKEND="${LIFECYCLE_BACKEND}" ATTACKNET_PROJECT="${COMPOSE_PROJECT}" \
-    ATTACKNET_COMPOSE="${COMPOSE_FILE}" ATTACKNET_COMPOSE_EXTRA="${COMPOSE_EXTRA}" \
-    KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+  KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
     "${ATTACKNET_DIR}/runtime-backend.sh" "$@"
 }
 
 burnchain_policy() {
-  ATTACKNET_BACKEND="${LIFECYCLE_BACKEND}" ATTACKNET_PROJECT="${COMPOSE_PROJECT}" \
-    ATTACKNET_COMPOSE="${COMPOSE_FILE}" ATTACKNET_COMPOSE_POLICY="${COMPOSE_POLICY}" \
-    KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
+  KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}" \
     "${ATTACKNET_DIR}/burnchain-policy.sh" "$@"
 }
 

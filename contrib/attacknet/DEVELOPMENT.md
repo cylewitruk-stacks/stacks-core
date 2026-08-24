@@ -17,8 +17,8 @@ assertions, or evidence machinery. End users should begin with
   actors to realistic disorder.
 - Actor counts and loops derive from `manifest.json`; no harness code may embed
   a fixed signer count.
-- Compose and Kubernetes render from the same topology model and execute the
-  same assertions through a thin backend adapter.
+- Kubernetes resources and the assertion manifest render from one topology
+  model; assertions address logical actors through a Kubernetes adapter.
 
 Adaptive decisions remain outside the controllers. Agents submit bounded APIs
 and observe status/evidence rather than receiving unrestricted cluster access.
@@ -91,10 +91,8 @@ node contrib/attacknet/topology.mjs \
   --output=contrib/attacknet/generated/dev
 ```
 
-The renderer emits Kubernetes resources, actor configs, a shared manifest,
-policy files, and Compose bootstrap/final/observability files. Kubernetes and
-Compose must remain behaviorally comparable, but Kubernetes is canonical for
-fault campaigns.
+The renderer emits bootstrap and final Kubernetes resources, actor configs, a
+shared assertion manifest, and policy resources.
 
 Startup dependencies are two-phase because signer nodes must complete initial
 block download before live event observers are enabled. Do not create a second
@@ -180,7 +178,7 @@ Run the complete offline suite from the repository root:
 contrib/attacknet/check.sh
 ```
 
-The suite covers the command registry, renderer and schemas, backend command
+The suite covers the command registry, renderer and schemas, Kubernetes command
 drift, campaign admission, observability, release contracts, Python
 controllers, and the offline 31-workload render.
 
@@ -204,4 +202,3 @@ binding can change the environment after rendering.
   dashboard screenshot as behavioral proof.
 - Keep fault decisions bounded, seeded, ordered, and replayable.
 - Add a regression assertion for every check that previously could not fail.
-

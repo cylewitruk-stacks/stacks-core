@@ -1,9 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# Shared evidence collectors. The payloads are deliberately backend-neutral:
-# logical actor names are filenames, while runtime-specific admitted state is
-# captured separately by runtime-backend.sh describe.
+# Shared Kubernetes evidence collectors. Logical actor names remain stable
+# filenames while admitted Pod and PVC state is captured separately.
 
 EVIDENCE_HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if ! declare -F backend_exec >/dev/null; then
@@ -82,29 +81,27 @@ evidence_capture_all() {
   evidence_capture_node_info "${destination}/node-info"
   evidence_capture_metrics "${destination}/metrics"
   evidence_capture_logs "${destination}/logs" "${since}"
-  if [ "${ATTACKNET_BACKEND:-compose}" = kubernetes ]; then
-    run_descriptor="$(node "${EVIDENCE_HARNESS_DIR}/run-ledger.mjs" locate \
-      "--target=${manifest}" "--namespace=${KUBE_NAMESPACE:-hacknet-system}" \
-      "--network=${KUBE_NETWORK:-attacknet}" 2>/dev/null || true)"
-    if [ -r "${run_descriptor}" ]; then
-      run_id="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).run.id)' "${run_descriptor}")"
-      node "${EVIDENCE_HARNESS_DIR}/run-ledger.mjs" export "${run_descriptor}" \
-        "${destination}/run" >/dev/null || \
-        printf '{"attacknetCaptureError":true,"probe":"run_ledger_export"}\n' \
-          >"${destination}/run-ledger-error.json"
-      KUBE_NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}" \
-        KUBE_NETWORK="${KUBE_NETWORK:-attacknet}" ATTACKNET_RUN_ID="${run_id}" \
-        "${EVIDENCE_HARNESS_DIR}/observability/record-actor-states.sh" capture || true
-      KUBE_NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}" \
-        KUBE_NETWORK="${KUBE_NETWORK:-attacknet}" ATTACKNET_RUN_ID="${run_id}" \
-        "${EVIDENCE_HARNESS_DIR}/observability/export-kubernetes-report.sh" \
-        "${destination}/timeline" "${run_id}" >/dev/null || \
-        printf '{"attacknetCaptureError":true,"probe":"timeline_export"}\n' \
-          >"${destination}/timeline-export-error.json"
-    else
-      printf '{"attacknetCaptureError":true,"probe":"run_ledger_missing"}\n' \
+  run_descriptor="$(node "${EVIDENCE_HARNESS_DIR}/run-ledger.mjs" locate \
+    "--target=${manifest}" "--namespace=${KUBE_NAMESPACE:-hacknet-system}" \
+    "--network=${KUBE_NETWORK:-attacknet}" 2>/dev/null || true)"
+  if [ -r "${run_descriptor}" ]; then
+    run_id="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).run.id)' "${run_descriptor}")"
+    node "${EVIDENCE_HARNESS_DIR}/run-ledger.mjs" export "${run_descriptor}" \
+      "${destination}/run" >/dev/null || \
+      printf '{"attacknetCaptureError":true,"probe":"run_ledger_export"}\n' \
         >"${destination}/run-ledger-error.json"
-    fi
+    KUBE_NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}" \
+      KUBE_NETWORK="${KUBE_NETWORK:-attacknet}" ATTACKNET_RUN_ID="${run_id}" \
+      "${EVIDENCE_HARNESS_DIR}/observability/record-actor-states.sh" capture || true
+    KUBE_NAMESPACE="${KUBE_NAMESPACE:-hacknet-system}" \
+      KUBE_NETWORK="${KUBE_NETWORK:-attacknet}" ATTACKNET_RUN_ID="${run_id}" \
+      "${EVIDENCE_HARNESS_DIR}/observability/export-kubernetes-report.sh" \
+      "${destination}/timeline" "${run_id}" >/dev/null || \
+      printf '{"attacknetCaptureError":true,"probe":"timeline_export"}\n' \
+        >"${destination}/timeline-export-error.json"
+  else
+    printf '{"attacknetCaptureError":true,"probe":"run_ledger_missing"}\n' \
+      >"${destination}/run-ledger-error.json"
   fi
 }
 

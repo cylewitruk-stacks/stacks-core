@@ -328,7 +328,7 @@ export function resolveRuntimeInputs(descriptor, resolution, options = {}) {
   const result = deepCopy(descriptor);
   const priorBackend = result.inputs.kubernetes.resolution.backend;
   const backend = resolution.backend ?? priorBackend ?? 'kubernetes';
-  if (!new Set(['kubernetes', 'compose']).has(backend)) {
+  if (backend !== 'kubernetes') {
     throw new Error(`unsupported runtime backend ${backend}`);
   }
   if (priorBackend && priorBackend !== backend) {
@@ -454,7 +454,7 @@ export function validateDescriptor(descriptor, options = {}) {
   requireObject(descriptor.inputs.kubernetes.resolution, 'inputs.kubernetes.resolution');
   if (descriptor.inputs.kubernetes.resolution.backend !== undefined) {
     requireEnum(descriptor.inputs.kubernetes.resolution.backend,
-      new Set(['kubernetes', 'compose']), 'inputs.kubernetes.resolution.backend');
+      new Set(['kubernetes']), 'inputs.kubernetes.resolution.backend');
   }
   if (typeof descriptor.inputs.kubernetes.resolution.complete !== 'boolean') {
     throw new Error('inputs.kubernetes.resolution.complete must be boolean');

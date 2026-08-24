@@ -10,8 +10,7 @@ regtest keys and funds with no value.
 ## Release 1 scope
 
 Release 1 is qualified on a three-node, arm64 Docker Desktop Kubernetes cluster
-using the `kind` provisioner. Kubernetes is the canonical adversarial backend;
-Compose is a smaller behavioral-reference backend.
+using the `kind` provisioner. Kubernetes is the sole Attacknet runtime.
 
 The accepted full topology contains 3 miners, 10 signers with one configured
 Stacks node each, and 5 followers. Start with the 1/1/1 topology below before
@@ -138,12 +137,10 @@ $ATTACKNET render \
   --probes=true \
   --output=contrib/attacknet/generated/quickstart
 
-$ATTACKNET lifecycle apply contrib/attacknet/generated/quickstart \
-  --backend=kubernetes
+$ATTACKNET lifecycle apply contrib/attacknet/generated/quickstart
 
 $ATTACKNET verify \
-  contrib/attacknet/generated/quickstart/manifest.json snapshot \
-  --backend=kubernetes
+  contrib/attacknet/generated/quickstart/manifest.json snapshot
 ```
 
 Cold startup includes Bitcoin bootstrap, PoX setup, signer initialization, and
@@ -204,8 +201,7 @@ Capture a final snapshot:
 ```bash
 $ATTACKNET evidence capture \
   contrib/attacknet/evidence/quickstart \
-  contrib/attacknet/generated/quickstart/manifest.json \
-  --backend=kubernetes
+  contrib/attacknet/generated/quickstart/manifest.json
 ```
 
 ### Tear down
@@ -214,8 +210,7 @@ Teardown deletes the `StacksNetwork` and its owned actor PVCs. Capture anything
 needed for forensics first:
 
 ```bash
-$ATTACKNET lifecycle delete contrib/attacknet/generated/quickstart \
-  --backend=kubernetes
+$ATTACKNET lifecycle delete contrib/attacknet/generated/quickstart
 ```
 
 Chaos Mesh and the Hacknet controllers remain installed for later runs. Remove
@@ -272,8 +267,7 @@ compatibility failure, and `2` means invalid arguments.
 
 > **Maintainer implementation reference.** `burnchain-policy.sh`,
 > `version-matrix.mjs`, `soak-runner.sh`, `environment-lock.sh`,
-> `local-access.sh`, `capacity-preflight.sh`, and
-> `compose-negative-controls.sh` are not public CLIs in Release 1. Agents and
+> `local-access.sh`, and `capacity-preflight.sh` are not public CLIs in Release 1. Agents and
 > end users must not automate against them. Use `contrib/attacknet/attacknet`
 > and `attacknet commands --json`; helper arguments and environment variables
 > may change without an Attacknet interface-version bump.
@@ -284,7 +278,7 @@ compatibility failure, and `2` means invalid arguments.
   dashboards, serialization, recovery, and teardown.
 - [`EVIDENCE.md`](EVIDENCE.md): evidence trust, capture, soak qualification,
   incident handling, replay, and minimization.
-- [`DEVELOPMENT.md`](DEVELOPMENT.md): images, renderers, version matrices,
+- [`DEVELOPMENT.md`](DEVELOPMENT.md): images, topology rendering, version matrices,
   controller development, and offline checks.
 - [`ROADMAP.md`](ROADMAP.md): unimplemented burnchain reorg, multi-Bitcoin,
   managed-cluster, storage, and controller-HA work.

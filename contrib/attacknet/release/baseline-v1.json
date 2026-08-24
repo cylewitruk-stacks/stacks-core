@@ -60,12 +60,6 @@
       "status": "passed"
     },
     {
-      "id": "compose-parity-controls",
-      "path": "contrib/attacknet/evidence/compose-parity-controls-20260816/result.json",
-      "digest": "sha256:6b0b95430c1935b4a40b941a58c8d002e0939c0490105ae584578a1eed97292f",
-      "status": "passed"
-    },
-    {
       "id": "application-clock",
       "path": "contrib/attacknet/evidence/application-clock-k8s-20260816T1134Z/acceptance.json",
       "digest": "sha256:a51332c8170c56b0131094b85c3dd2e2b7ad922ac7f0ef232c0932eefa89ee01",
@@ -120,11 +114,6 @@
       "id": "local-path-same-node-recovery-and-stranding",
       "status": "supported",
       "evidence": ["local-path-pvc-recovery", "worker-outage"]
-    },
-    {
-      "id": "compose-behavioral-reference-controls",
-      "status": "supported",
-      "evidence": ["compose-parity-controls"]
     },
     {
       "id": "fresh-network-replay-and-removal-only-ddmin",

@@ -8,7 +8,7 @@ plane has passed `contrib/attacknet/attacknet doctor`. Begin with the
 
 Use `contrib/attacknet/attacknet` for routine human and agent workflows. Its
 versioned registry is the source of truth for inputs, outputs, privileges,
-side effects, backends, and exit codes:
+side effects, execution environments, and exit codes:
 
 ```bash
 contrib/attacknet/attacknet commands --json
@@ -17,7 +17,7 @@ contrib/attacknet/attacknet help COMMAND
 
 Scripts such as `burnchain-policy.sh`, `version-matrix.mjs`, `soak-runner.sh`,
 `environment-lock.sh`, `local-access.sh`, `capacity-preflight.sh`, and
-`compose-negative-controls.sh` are maintainer/debugging interfaces. Their
+other implementation helpers are maintainer/debugging interfaces. Their
 environment variables and argument layouts may change without an Attacknet
 interface-version bump.
 
@@ -33,11 +33,9 @@ $ATTACKNET render \
   --miners=1 --signers=1 --followers=1 --probes=true \
   --output=contrib/attacknet/generated/small
 
-$ATTACKNET lifecycle apply contrib/attacknet/generated/small \
-  --backend=kubernetes
+$ATTACKNET lifecycle apply contrib/attacknet/generated/small
 
-$ATTACKNET verify contrib/attacknet/generated/small/manifest.json snapshot \
-  --backend=kubernetes
+$ATTACKNET verify contrib/attacknet/generated/small/manifest.json snapshot
 ```
 
 ### Full topology
@@ -65,8 +63,7 @@ $ATTACKNET render \
   --miners=3 --signers=10 --followers=5 --probes=true \
   --output=contrib/attacknet/generated/full
 
-$ATTACKNET lifecycle apply contrib/attacknet/generated/full \
-  --backend=kubernetes
+$ATTACKNET lifecycle apply contrib/attacknet/generated/full
 ```
 
 ### Two-phase startup
@@ -178,8 +175,8 @@ owner is gone and inspect admitted state. Automatic stale-lease takeover is
 intentionally absent because it would hide controller or garbage-collector
 failure.
 
-Kubernetes actors cannot be frozen with the Compose-only cgroup pause command.
-Use a bounded controller-owned Pod fault and let its finalizer own recovery.
+Use a bounded controller-owned Pod fault for process unavailability and let its
+finalizer own recovery.
 
 ## Dashboards and local access
 
@@ -236,24 +233,6 @@ kubectl -n headlamp port-forward service/headlamp 8080:80 \
 Open <http://127.0.0.1:8080>. Give Headlamp a bounded viewer identity; actor
 Pods remain credential-free.
 
-## Compose reference backend
-
-Compose uses the same topology model, manifests, assertions, two-phase startup,
-burnchain policy, and telemetry-coverage invariant:
-
-```bash
-$ATTACKNET lifecycle apply contrib/attacknet/generated/small \
-  --backend=compose
-
-$ATTACKNET verify contrib/attacknet/generated/small/manifest.json snapshot \
-  --backend=compose
-```
-
-The Compose model separates `default` and `burnchain` networks. Disconnecting
-a node from only `burnchain` creates a Bitcoin-view fault without removing its
-Stacks P2P or Prometheus path. Compose remains a small behavioral reference;
-Kubernetes is canonical for adversarial campaigns.
-
 ## Recovery and teardown
 
 On failure, preserve the network, admitted resources, PVCs, logs, and incident
@@ -275,15 +254,13 @@ Capture before deleting:
 ```bash
 $ATTACKNET evidence capture \
   contrib/attacknet/evidence/incident-manual \
-  contrib/attacknet/generated/full/manifest.json \
-  --backend=kubernetes
+  contrib/attacknet/generated/full/manifest.json
 ```
 
 Then delete through the same generated directory that created the network:
 
 ```bash
-$ATTACKNET lifecycle delete contrib/attacknet/generated/full \
-  --backend=kubernetes
+$ATTACKNET lifecycle delete contrib/attacknet/generated/full
 ```
 
 Deleting the `StacksNetwork` garbage-collects owned ConfigMaps, Services,
@@ -294,4 +271,3 @@ reclaimed.
 See [`EVIDENCE.md`](EVIDENCE.md) and
 [`FAILURE-ATTRIBUTION.md`](FAILURE-ATTRIBUTION.md) before classifying an
 incident.
-

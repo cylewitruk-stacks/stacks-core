@@ -143,7 +143,7 @@ SOURCE_REVISION="$(git -C "${ATTACKNET_DIR}" rev-parse HEAD 2>/dev/null || echo 
 
 cp "${manifest}" "${destination}/manifest.json" || capture_error manifest-copy "$?"
 
-ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   evidence_capture_all "${destination}/actors" "${manifest}" \
   "${ATTACKNET_INCIDENT_LOG_SINCE:-2h}" || capture_error actor-evidence "$?"
 

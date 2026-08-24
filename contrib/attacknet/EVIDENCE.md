@@ -24,14 +24,13 @@ See [`INSTRUMENTATION.md`](INSTRUMENTATION.md) for metric-family provenance and
 
 ## Capture a live run
 
-Use the public facade to capture backend-neutral actor state, metrics, logs,
+Use the public facade to capture Kubernetes actor state, metrics, logs,
 runtime identity, and the trusted timeline:
 
 ```bash
 contrib/attacknet/attacknet evidence capture \
   contrib/attacknet/evidence/RUN/snapshot \
-  contrib/attacknet/generated/full/manifest.json \
-  --backend=kubernetes
+  contrib/attacknet/generated/full/manifest.json
 ```
 
 Capture before teardown. Failed campaigns preserve their network and create an
@@ -40,7 +39,6 @@ incident bundle rather than silently rebuilding the system under test.
 For a longer bounded collection window, maintainers can use:
 
 ```bash
-ATTACKNET_BACKEND=kubernetes \
 contrib/attacknet/evidence-harness.sh \
   contrib/attacknet/evidence/RUN/behavior \
   contrib/attacknet/generated/full/manifest.json 1h
@@ -175,4 +173,3 @@ counterfactual domain; it does not establish causality.
 An LLM may prioritize likely contributors, but every retained/rejected
 candidate must remain machine-recorded and behaviorally tested. See
 [`DDMIN-EXECUTION.md`](DDMIN-EXECUTION.md) for the execution contract.
-

@@ -43,7 +43,7 @@ fault_run_file="${4:-}"
   exit 2
 }
 
-export ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}"
+export KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}"
 runtime="${attacknet_dir}/runtime-backend.sh"
 policy="${attacknet_dir}/burnchain-policy.sh"
 lock="${attacknet_dir}/environment-lock.sh"

@@ -10,18 +10,15 @@ It records:
 - a caller-supplied run ID, seed, and named seed/decision algorithm;
 - exact source revision, plus a patch digest when the worktree is dirty;
 - raw-file SHA-256 digests for topology, rendered configuration, and the
-  runtime-admitted Kubernetes or Compose manifest;
+  runtime-admitted Kubernetes manifest;
 - both requested image references and runtime-resolved image digests;
 - a contiguous ledger of fault decisions, cadence changes, and assertion results;
 - an explicit disclosure of remaining nondeterminism; and
 - a digest of the complete descriptor itself.
 
-For Kubernetes, the admitted manifest must be captured from the API server, not
-copied from the requested YAML, and image digests must come from running Pod
-status. For Compose, resolution captures `docker compose config` plus exact
-container inspections, requires one Running container per actor service, verifies
-the requested image reference, and records the immutable Docker image ID. Store
-all referenced artifacts beside the descriptor in the evidence bundle;
+The admitted manifest must be captured from the Kubernetes API server, not
+copied from requested YAML, and image digests must come from running Pod status.
+Store all referenced artifacts beside the descriptor in the evidence bundle;
 `validate --verify-files` then detects missing or modified inputs.
 
 Runs that claim Phase 1 instrumentation attach the acceptance-ready capability
@@ -37,11 +34,9 @@ the topology, configuration, admitted manifest, and resolved image inputs. An
 offline or incomplete capability manifest is rejected rather than being
 recorded as acceptance evidence.
 
-Schema v1 predates the Compose backend and retains the field name
-`inputs.kubernetes` for this backend-neutral resolution slot. The nested
-`resolution.backend` is authoritative (`kubernetes` or `compose`). A future v2
-can rename the field to `inputs.runtime`; sealed v1 evidence must not be silently
-rewritten.
+Schema v1 records admitted runtime state under `inputs.kubernetes`; the nested
+`resolution.backend` is always `kubernetes`. Sealed v1 evidence must not be
+silently rewritten.
 
 ## Commands
 
@@ -95,11 +90,10 @@ separate from `occurredAt`.
 Initialization normally happens before runtime apply. In that mode metadata
 uses `requestedManifestPath`, and image entries contain only `scope` and
 `requestedRef`. After the network is Ready, Kubernetes `resolve` supplies the
-API-server-admitted manifest and Pod image identities; the Compose lifecycle uses
-`run-ledger.mjs resolve-compose` to supply the resolved Compose model and exact
-container image IDs. A run cannot finalize as `passed` while this resolution is
-incomplete. Failed or aborted bootstrap attempts retain an explicit incomplete-
-resolution record rather than losing their evidence or blocking teardown.
+API-server-admitted manifest and Pod image identities. A run cannot finalize as
+`passed` while this resolution is incomplete. Failed or aborted bootstrap
+attempts retain an explicit incomplete-resolution record rather than losing
+their evidence or blocking teardown.
 
 `minimize` selects the first failed/errored assertion by default, or the named one
 with `--assertion=ID`. It emits a planned replay containing the original seed and

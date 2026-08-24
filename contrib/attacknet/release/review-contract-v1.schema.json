@@ -1,12 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://stacks.org/schemas/attacknet-phase-review-contract-v2.json",
+  "$id": "https://stacks.org/schemas/attacknet-phase-review-contract-v1.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "reviewId", "phase", "releaseScope", "tier", "requiredReviewers", "requirements", "requiredInventory"],
+  "required": ["schemaVersion", "phase", "releaseScope", "tier", "requiredReviewers", "requirements", "requiredInventory"],
   "properties": {
-    "schemaVersion": {"const": "stacks-attacknet-phase-review-contract/v2"},
-    "reviewId": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "schemaVersion": {"const": "stacks-attacknet-phase-review-contract/v1"},
     "phase": {"type": "integer", "minimum": 0},
     "releaseScope": {"type": "string", "minLength": 1},
     "tier": {"enum": ["Reduced", "Full"]},

@@ -1,13 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://stacks.org/schemas/attacknet-phase-review-packet-v2.json",
-  "title": "Stacks Attacknet phase review packet",
+  "$id": "https://stacks.org/schemas/attacknet-phase-review-packet-v1.json",
+  "title": "Stacks Attacknet phase review packet v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "reviewId", "toolingDigest", "contractDigest", "phase", "tier", "candidate", "sourceDigest", "evidenceDigest", "requirements", "inventory", "matrix", "compatibility", "limitations", "reproduction", "binding"],
+  "required": ["schemaVersion", "toolingDigest", "contractDigest", "phase", "tier", "candidate", "sourceDigest", "evidenceDigest", "requirements", "inventory", "matrix", "compatibility", "limitations", "reproduction", "binding"],
   "properties": {
-    "schemaVersion": {"const": "stacks-attacknet-phase-review-packet/v2"},
-    "reviewId": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "schemaVersion": {"const": "stacks-attacknet-phase-review-packet/v1"},
     "toolingDigest": {"$ref": "#/$defs/digest"},
     "contractDigest": {"$ref": "#/$defs/digest"},
     "phase": {"type": "integer", "minimum": 0},

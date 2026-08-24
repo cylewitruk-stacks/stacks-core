@@ -6,6 +6,16 @@ code-review system: it proves that both recorded verdicts name the same
 declared source, evidence, and complete inventory. It does not pretend that a
 digest proves what a human or model actually inspected.
 
+Later commits do not invalidate an approval bound to an earlier revision. A
+later change to an approved release claim instead uses a new contract and
+packet. Such amendments carry a stable `reviewId` in both artifacts so they
+cannot be confused with the numbered phase they follow.
+
+The approved Phase 0–2 artifacts retain the v1 contract and packet schemas.
+They are the only grandfathered checkpoints without `reviewId`. Schema v2
+requires `reviewId` in both artifacts, and all new phases and amendments must
+use v2.
+
 ## Packet lifecycle
 
 1. Freeze the candidate commit. The packet builder derives the exact `HEAD`,
@@ -102,6 +112,26 @@ node contrib/attacknet/release/phase-two-packet.mjs \
   --offline-result=.docs/reviews/attacknet-phase-2/offline-result.json \
   --output=.docs/reviews/attacknet-phase-2/packet.json
 ```
+
+Release 1 amendment A1 follows Phase 2 without reusing the plan's Phase 3,
+which remains reserved for portable deployment profiles. A1 removes the
+unreleased Compose runtime and narrows the Release 1 baseline to Kubernetes.
+It is Full-tier because runtime behavior and evidence interpretation change.
+The packet requires a single signed amendment commit, the exact binary diff,
+both offline suite results, and a live Kubernetes apply, verify, bounded fault,
+capture, and clean teardown:
+
+```bash
+node contrib/attacknet/release/release-1-a1-packet.mjs \
+  --live-summary=.docs/reviews/attacknet-release-1-a1/live/live-summary.json \
+  --offline-result=.docs/reviews/attacknet-release-1-a1/live/offline-result.json \
+  --hacknet-result=.docs/reviews/attacknet-release-1-a1/live/hacknet-result.json \
+  --output=.docs/reviews/attacknet-release-1-a1/packet.json
+```
+
+See `contrib/attacknet/evidence-packets/release-1-a1/README.md` for the complete
+evidence procedure. The gate result must identify
+`release-1-amendment-a1-compose-retirement`.
 
 ## Evidence preservation
 

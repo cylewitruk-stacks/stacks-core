@@ -285,7 +285,7 @@ failure after the policy mutation warns without encouraging a dangerous retry;
 set `ATTACKNET_EVENT_STRICT=1` when evidence completeness should terminate the
 caller.
 
-`record-verification.sh RESULT SCOPE PHASE` translates backend-neutral
+`record-verification.sh RESULT SCOPE PHASE` translates stable
 `verify.sh` JSON into separate bounded observations for burn and Stacks drift,
 canonical-tip agreement, authenticated connectivity, minimum height, and both
 progress dimensions. It deliberately excludes actor rows from Prometheus-bound

@@ -118,7 +118,7 @@
     },
     {
       "name": "render",
-      "purpose": "Render a deterministic Attacknet topology for Kubernetes and Compose.",
+      "purpose": "Render a deterministic Attacknet topology for Kubernetes.",
       "stability": "stable",
       "sideEffectClass": "local-filesystem-write",
       "requiredPrivileges": "none",
@@ -195,11 +195,10 @@
         ]
       },
       "outputs": [
-        "Rendered manifests, configs, and Compose files in --output."
+        "Rendered Kubernetes resources, manifests, and configs in --output."
       ],
       "backendSupport": [
-        "kubernetes",
-        "compose"
+        "kubernetes"
       ],
       "plan": true,
       "examples": [
@@ -219,7 +218,7 @@
       "purpose": "Create and bootstrap a rendered Attacknet.",
       "stability": "stable",
       "sideEffectClass": "runtime-mutation",
-      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace write for Kubernetes.",
+      "requiredPrivileges": "Kubernetes namespace write access.",
       "inputs": {
         "positionals": [
           {
@@ -228,29 +227,18 @@
             "variadic": false
           }
         ],
-        "options": [
-          {
-            "name": "--backend",
-            "type": "enum",
-            "required": false,
-            "enum": [
-              "kubernetes",
-              "compose"
-            ]
-          }
-        ]
+        "options": []
       },
       "outputs": [
         "Progress on stdout and an initialized run descriptor under GENERATED_DIR/runs."
       ],
       "backendSupport": [
-        "kubernetes",
-        "compose"
+        "kubernetes"
       ],
       "plan": true,
       "examples": [
-        "attacknet lifecycle apply generated/small --backend=kubernetes",
-        "attacknet lifecycle apply generated/small --backend=compose --plan"
+        "attacknet lifecycle apply generated/small",
+        "attacknet lifecycle apply generated/small --plan"
       ],
       "implementation": {
         "visibility": "internal",
@@ -263,7 +251,7 @@
       "purpose": "Wait for a rendered Attacknet to become ready.",
       "stability": "stable",
       "sideEffectClass": "runtime-read",
-      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace read for Kubernetes.",
+      "requiredPrivileges": "Kubernetes namespace read access.",
       "inputs": {
         "positionals": [
           {
@@ -272,28 +260,17 @@
             "variadic": false
           }
         ],
-        "options": [
-          {
-            "name": "--backend",
-            "type": "enum",
-            "required": false,
-            "enum": [
-              "kubernetes",
-              "compose"
-            ]
-          }
-        ]
+        "options": []
       },
       "outputs": [
         "Readiness or verification result on stdout."
       ],
       "backendSupport": [
-        "kubernetes",
-        "compose"
+        "kubernetes"
       ],
       "plan": true,
       "examples": [
-        "attacknet lifecycle wait generated/small --backend=kubernetes"
+        "attacknet lifecycle wait generated/small"
       ],
       "implementation": {
         "visibility": "internal",
@@ -306,7 +283,7 @@
       "purpose": "Capture admitted lifecycle state before teardown or investigation.",
       "stability": "stable",
       "sideEffectClass": "runtime-read-and-local-write",
-      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace read for Kubernetes.",
+      "requiredPrivileges": "Kubernetes namespace read access.",
       "inputs": {
         "positionals": [
           {
@@ -320,28 +297,17 @@
             "variadic": false
           }
         ],
-        "options": [
-          {
-            "name": "--backend",
-            "type": "enum",
-            "required": false,
-            "enum": [
-              "kubernetes",
-              "compose"
-            ]
-          }
-        ]
+        "options": []
       },
       "outputs": [
         "Evidence files in EVIDENCE_DIR."
       ],
       "backendSupport": [
-        "kubernetes",
-        "compose"
+        "kubernetes"
       ],
       "plan": true,
       "examples": [
-        "attacknet lifecycle capture generated/small evidence/admitted --backend=kubernetes"
+        "attacknet lifecycle capture generated/small evidence/admitted"
       ],
       "implementation": {
         "visibility": "internal",
@@ -354,7 +320,7 @@
       "purpose": "Finalize evidence and delete a rendered Attacknet and owned storage.",
       "stability": "stable",
       "sideEffectClass": "destructive-runtime-mutation",
-      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace delete for Kubernetes.",
+      "requiredPrivileges": "Kubernetes namespace delete access.",
       "inputs": {
         "positionals": [
           {
@@ -363,28 +329,17 @@
             "variadic": false
           }
         ],
-        "options": [
-          {
-            "name": "--backend",
-            "type": "enum",
-            "required": false,
-            "enum": [
-              "kubernetes",
-              "compose"
-            ]
-          }
-        ]
+        "options": []
       },
       "outputs": [
         "Final evidence location and deletion status on stdout."
       ],
       "backendSupport": [
-        "kubernetes",
-        "compose"
+        "kubernetes"
       ],
       "plan": true,
       "examples": [
-        "attacknet lifecycle delete generated/small --backend=kubernetes --plan"
+        "attacknet lifecycle delete generated/small --plan"
       ],
       "implementation": {
         "visibility": "internal",
@@ -397,7 +352,7 @@
       "purpose": "Evaluate a live network snapshot, progress window, or telemetry coverage.",
       "stability": "stable",
       "sideEffectClass": "runtime-read",
-      "requiredPrivileges": "Docker access for Compose; Kubernetes namespace read for Kubernetes.",
+      "requiredPrivileges": "Kubernetes namespace read access.",
       "inputs": {
         "positionals": [
           {
@@ -418,28 +373,17 @@
             ]
           }
         ],
-        "options": [
-          {
-            "name": "--backend",
-            "type": "enum",
-            "required": false,
-            "enum": [
-              "kubernetes",
-              "compose"
-            ]
-          }
-        ]
+        "options": []
       },
       "outputs": [
         "Machine-readable assertion result on stdout."
       ],
       "backendSupport": [
-        "kubernetes",
-        "compose"
+        "kubernetes"
       ],
       "plan": true,
       "examples": [
-        "attacknet verify generated/small/manifest.json snapshot --backend=kubernetes"
+        "attacknet verify generated/small/manifest.json snapshot"
       ],
       "implementation": {
         "visibility": "internal",
@@ -539,10 +483,10 @@
     },
     {
       "name": "evidence capture",
-      "purpose": "Capture backend-neutral actor state, metrics, logs, and runtime identity.",
+      "purpose": "Capture Kubernetes actor state, metrics, logs, and runtime identity.",
       "stability": "stable",
       "sideEffectClass": "runtime-read-and-local-write",
-      "requiredPrivileges": "Backend read/exec/log access.",
+      "requiredPrivileges": "Kubernetes namespace read, exec, and log access.",
       "inputs": {
         "positionals": [
           {
@@ -561,28 +505,17 @@
             "variadic": false
           }
         ],
-        "options": [
-          {
-            "name": "--backend",
-            "type": "enum",
-            "required": false,
-            "enum": [
-              "kubernetes",
-              "compose"
-            ]
-          }
-        ]
+        "options": []
       },
       "outputs": [
         "Evidence tree in EVIDENCE_DIR."
       ],
       "backendSupport": [
-        "kubernetes",
-        "compose"
+        "kubernetes"
       ],
       "plan": true,
       "examples": [
-        "attacknet evidence capture evidence/run generated/small/manifest.json --backend=kubernetes"
+        "attacknet evidence capture evidence/run generated/small/manifest.json"
       ],
       "implementation": {
         "visibility": "internal",
@@ -1124,8 +1057,6 @@
     "chaos-resource.sh",
     "check.sh",
     "command-contract.cjs",
-    "compose-lifecycle.sh",
-    "compose-negative-controls.sh",
     "configure-node.sh",
     "ddmin-executor.mjs",
     "doctor.mjs",
@@ -1172,11 +1103,14 @@
     "probe/probe.mjs",
     "progress-window.mjs",
     "release/baseline.mjs",
+    "release/hacknet-offline-result.mjs",
     "release/offline-result.mjs",
     "release/phase-one-packet.mjs",
     "release/phase-review.mjs",
     "release/phase-two-packet.mjs",
     "release/phase-zero-packet.mjs",
+    "release/portable-live-evidence.mjs",
+    "release/release-1-a1-packet.mjs",
     "release/schema-validator.mjs",
     "run-descriptor.mjs",
     "run-ledger.mjs",

@@ -44,13 +44,13 @@ export function captureReadOnlyWalkthrough(outputPath) {
     const compiled = invoke(['campaign', 'plan', campaign, manifest, fault]);
     const humanPersona = [
       {...rendered, step: 'render', artifact: {manifestFileDigest: sha256(readFileSync(manifest))}},
-      {...plan(['lifecycle', 'apply', temporary, '--backend=kubernetes', '--plan']), step: 'start-plan'},
-      {...plan(['verify', manifest, 'snapshot', '--backend=kubernetes', '--dry-run']), step: 'inspect-plan'},
+      {...plan(['lifecycle', 'apply', temporary, '--plan']), step: 'start-plan'},
+      {...plan(['verify', manifest, 'snapshot', '--dry-run']), step: 'inspect-plan'},
       {...compiled, step: 'fault-compile', artifact: {compiledResourceFileDigest: sha256(readFileSync(fault))}},
       {...plan(['campaign', 'run', campaign, manifest, join(temporary, 'evidence/campaign'), '--plan']), step: 'fault-run-plan'},
       {...plan(['evidence', 'capture', join(temporary, 'evidence/capture'), manifest,
-        '--backend=kubernetes', '--dry-run']), step: 'capture-plan'},
-      {...plan(['lifecycle', 'delete', temporary, '--backend=kubernetes', '--plan']), step: 'delete-plan'},
+        '--dry-run']), step: 'capture-plan'},
+      {...plan(['lifecycle', 'delete', temporary, '--plan']), step: 'delete-plan'},
     ];
     const value = {
       schema: 'stacks-attacknet-phase-2-plan-walkthrough/v1',

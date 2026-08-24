@@ -9,7 +9,9 @@ import {validateBaseline} from './baseline.mjs';
 import {buildPhaseZeroPacket} from './phase-zero-packet.mjs';
 import {buildOfflineResult} from './offline-result.mjs';
 import {
+  REVIEW_CONTRACT_SCHEMA,
   REVIEW_PACKET_SCHEMA,
+  REVIEW_PACKET_SCHEMA_V1,
   REVIEW_VERDICT_SCHEMA,
   evaluatePhaseGate,
   reviewToolingDigest,
@@ -36,7 +38,9 @@ function sealedPacket(contract, overrides = {}) {
     digest: `sha256:${String(index + 1).padStart(64, '0')}`,
   }));
   return sealReviewPacket(contract, {
-    schemaVersion: REVIEW_PACKET_SCHEMA,
+    schemaVersion: contract.schemaVersion === 'stacks-attacknet-phase-review-contract/v1'
+      ? REVIEW_PACKET_SCHEMA_V1 : REVIEW_PACKET_SCHEMA,
+    ...(contract.reviewId ? {reviewId: contract.reviewId} : {}),
     phase: contract.phase,
     tier: contract.tier,
     candidate: {
@@ -82,6 +86,10 @@ function approval(reviewer, packet, overrides = {}) {
 test('the tracked release baseline is structurally valid and digest substitution is detected', () => {
   const baseline = load(baselinePath);
   assert.equal(validateBaseline(baseline), true);
+  assert.equal(
+    [...baseline.evidence, ...baseline.capabilities].some(item => item.id.includes('compose')),
+    false,
+  );
   const root = mkdtempSync(join(tmpdir(), 'attacknet-baseline-'));
   const artifact = join(root, 'evidence.json');
   writeFileSync(artifact, '{"passed":true}\n');
@@ -163,6 +171,47 @@ test('the phase gate requires two complete approvals over the exact contract and
   const incomplete = approval('Claude Opus 5', packet);
   incomplete.reviewedInventory.pop();
   assert.throws(() => evaluatePhaseGate(contract, packet, [codex, incomplete]), /did not review/);
+});
+
+test('v1 approvals remain verifiable while v2 makes review IDs mandatory', () => {
+  const historical = load(contractPath);
+  const historicalPacket = sealedPacket(historical);
+  const historicalVerdicts = historical.requiredReviewers
+    .map(reviewer => approval(reviewer, historicalPacket));
+  assert.equal(evaluatePhaseGate(historical, historicalPacket, historicalVerdicts).reviewId, undefined);
+  assert.throws(
+    () => sealedPacket({...historical, reviewId: 'not-a-v1-field'}),
+    /reviewId is not allowed/,
+  );
+
+  const contract = {
+    ...historical,
+    schemaVersion: REVIEW_CONTRACT_SCHEMA,
+    reviewId: 'release-1-amendment-a1',
+  };
+  const packet = sealedPacket(contract);
+  const verdicts = contract.requiredReviewers.map(reviewer => approval(reviewer, packet));
+  const result = evaluatePhaseGate(contract, packet, verdicts);
+  assert.equal(result.reviewId, contract.reviewId);
+
+  const missingContractId = structuredClone(contract);
+  delete missingContractId.reviewId;
+  assert.throws(() => sealedPacket(missingContractId), /reviewId/);
+
+  const missingPacketId = structuredClone(packet);
+  delete missingPacketId.reviewId;
+  delete missingPacketId.binding;
+  assert.throws(() => sealReviewPacket(contract, missingPacketId), /reviewId/);
+
+  assert.throws(
+    () => sealedPacket(contract, {reviewId: 'release-1-amendment-a2'}),
+    /reviewId does not match/,
+  );
+  const wrongPacketVersion = structuredClone(packet);
+  wrongPacketVersion.schemaVersion = REVIEW_PACKET_SCHEMA_V1;
+  delete wrongPacketVersion.reviewId;
+  delete wrongPacketVersion.binding;
+  assert.throws(() => sealReviewPacket(contract, wrongPacketVersion), /schema version does not match/);
 });
 
 test('inventory digests use locale-independent UTF-16 code-unit ordering', () => {

@@ -120,9 +120,9 @@ capture_clocks() {
   local output="$1" actor wall monotonic
   : >"${output}"
   for actor in ${selected_actors}; do
-    wall="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+    wall="$(KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
       "${ATTACKNET_DIR}/runtime-backend.sh" exec "${actor}" date +%s)"
-    monotonic="$(ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+    monotonic="$(KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
       "${ATTACKNET_DIR}/runtime-backend.sh" exec "${actor}" sh -c "cut -d' ' -f1 /proc/uptime")"
     printf '{"actor":"%s","wallEpoch":%s,"monotonicSeconds":%s}\n' \
       "${actor}" "${wall}" "${monotonic}" >>"${output}"
@@ -194,7 +194,7 @@ on_error() {
 trap 'on_error ${LINENO}' ERR
 trap 'cleanup || true' EXIT INT TERM
 
-if ! ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+if ! KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" snapshot \
   >"${destination}/before-verification.json" 2>"${destination}/before-verification.stderr"; then
   ledger_assertion "campaign-${name}-baseline-health" fail '{"phase":"baseline"}' || true
@@ -215,7 +215,7 @@ kubectl -n "${namespace}" get pods \
   >"${destination}/pods-before-injection.json"
 node "${ATTACKNET_DIR}/campaign-targets.mjs" "${manifest}" "${resource}.evidence.json" \
   "${destination}/pods-before-injection.json" "${destination}/resolved-targets.json"
-ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/runtime-backend.sh" describe >"${destination}/before-runtime.json"
 if [ "${kind}" = timechaos ]; then capture_clocks "${destination}/clocks-before.jsonl"; fi
 
@@ -251,7 +251,7 @@ trap - EXIT INT TERM
 event_phase=recovering
 recovery_started="$(date +%s)"
 deadline=$((SECONDS + ${ATTACKNET_RECOVERY_TIMEOUT_SECONDS:-300}))
-until ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+until KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" snapshot >"${destination}/after-verification.json" 2>"${destination}/recovery-errors.log"; do
   if [ "${SECONDS}" -ge "${deadline}" ]; then
     ledger_assertion "campaign-${name}-recovery-health" fail '{"phase":"verification"}' || true
@@ -287,7 +287,7 @@ PROGRESS_WINDOW_SECONDS="${post_chaos_progress_window}" \
       source: configured ? "explicit-override" : "manifest-cadence-plus-jitter-margin",
     }, null, 2)}\n`);
   ' >"${destination}/post-chaos-progress-window.json"
-if ! ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+if ! KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   ATTACKNET_PROGRESS_WINDOW_SECONDS="${post_chaos_progress_window}" \
   "${ATTACKNET_DIR}/verify.sh" "${manifest}" progress \
   >"${destination}/post-chaos-progress.json" 2>"${destination}/post-chaos-progress.stderr"; then
@@ -305,7 +305,7 @@ emit_invariant post-chaos-progress true verification
 KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" ATTACKNET_RUN_ID="${run_id}" \
   "${ATTACKNET_DIR}/observability/record-verification.sh" \
   "${destination}/post-chaos-progress.json" "campaign-${name}-progress" verification
-ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
+KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}" \
   "${ATTACKNET_DIR}/runtime-backend.sh" describe >"${destination}/after-runtime.json"
 if [ -r "${run_descriptor}" ]; then
   node "${ATTACKNET_DIR}/run-ledger.mjs" export "${run_descriptor}" \

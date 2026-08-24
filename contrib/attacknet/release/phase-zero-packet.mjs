@@ -6,7 +6,7 @@ import {execFileSync} from 'node:child_process';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-import {REVIEW_PACKET_SCHEMA, sealReviewPacket} from './phase-review.mjs';
+import {REVIEW_PACKET_SCHEMA_V1, sealReviewPacket} from './phase-review.mjs';
 
 const releaseDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(releaseDir, '../../..');
@@ -52,8 +52,8 @@ export function phaseZeroInventorySpec(offlineResultPath) {
     ['source:offline-result', 'source', 'contrib/attacknet/release/offline-result.mjs'],
     ['source:phase-zero-tests', 'source', 'contrib/attacknet/release/phase-zero.test.mjs'],
     ['source:offline-check', 'source', 'contrib/attacknet/check.sh'],
-    ['source:contract-schema', 'source', 'contrib/attacknet/release/review-contract.schema.json'],
-    ['source:packet-schema', 'source', 'contrib/attacknet/release/review-packet.schema.json'],
+    ['source:contract-schema', 'source', 'contrib/attacknet/release/review-contract-v1.schema.json'],
+    ['source:packet-schema', 'source', 'contrib/attacknet/release/review-packet-v1.schema.json'],
     ['source:verdict-schema', 'source', 'contrib/attacknet/release/review-verdict.schema.json'],
     ['source:phase-contract', 'source', 'contrib/attacknet/release/phase-0-contract.json'],
     ['evidence:baseline-manifest', 'evidence', 'contrib/attacknet/release/baseline-v1.json'],
@@ -65,7 +65,6 @@ export function phaseZeroInventorySpec(offlineResultPath) {
     ['evidence:accepted-fault-run', 'evidence', 'contrib/attacknet/evidence/final-soak-20260815T232258Z/verified-fault-run.json'],
     ['evidence:accepted-mixed-version', 'evidence', 'contrib/attacknet/evidence/mixed-current-release-modified-20260816/matrix-proof/result.json'],
     ['evidence:accepted-worker-outage', 'evidence', 'contrib/attacknet/evidence/worker-outage-recovery-20260815T192000Z/result.json'],
-    ['evidence:accepted-compose-parity', 'evidence', 'contrib/attacknet/evidence/compose-parity-controls-20260816/result.json'],
     ['evidence:accepted-clock', 'evidence', 'contrib/attacknet/evidence/application-clock-k8s-20260816T1134Z/acceptance.json'],
     ['evidence:accepted-pvc', 'evidence', 'contrib/attacknet/evidence/pvc-node-affinity-recovery-20260815T190500Z/result.json'],
     ['evidence:accepted-negative-control', 'evidence', 'contrib/attacknet/evidence/signer-partition-stall-negative-control-20260816/result.json'],
@@ -85,7 +84,7 @@ export function buildPhaseZeroPacket({
   const contract = load('contrib/attacknet/release/phase-0-contract.json', root);
   const resolvedInventory = inventory ?? phaseZeroInventorySpec(offlineResultPath).map(parts => item(...parts, root));
   return sealReviewPacket(contract, {
-    schemaVersion: REVIEW_PACKET_SCHEMA,
+    schemaVersion: REVIEW_PACKET_SCHEMA_V1,
     phase: 0,
     tier: 'Reduced',
     candidate: {

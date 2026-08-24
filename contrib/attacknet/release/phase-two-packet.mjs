@@ -7,13 +7,13 @@ import {basename, dirname, isAbsolute, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {deriveGitCandidate} from './phase-zero-packet.mjs';
-import {REVIEW_PACKET_SCHEMA, sealReviewPacket} from './phase-review.mjs';
+import {validatePortableLiveSummary} from './portable-live-evidence.mjs';
+import {REVIEW_PACKET_SCHEMA_V1, sealReviewPacket} from './phase-review.mjs';
 
 const releaseDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(releaseDir, '../../..');
 const PHASE_ONE_REVISION = 'e61c589a66f04d436f6777622176e43d06ae9266';
 const LIVE_SCHEMA = 'stacks-attacknet-phase-2-live-evidence/v1';
-const ARCHIVE_INDEX_SCHEMA = 'stacks-attacknet-evidence-archive-index/v1';
 const REQUIRED_ARTIFACTS = Object.freeze([
   'doctor', 'humanWorkflow', 'agentWorkflow', 'cleanTeardown',
 ]);
@@ -51,16 +51,6 @@ function candidateKind(path) {
   return 'source';
 }
 
-function object(value, label) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
-  return value;
-}
-
-function archiveMembers(path, root = repoRoot) {
-  return new Set(execFileSync('tar', ['-tf', absolute(path, root)], {encoding: 'utf8'})
-    .split('\n').filter(Boolean).map(member => member.replace(/^\.\//, '').replace(/\/$/, '')));
-}
-
 export function phaseTwoCandidateInventorySpec(root = repoRoot, candidateRevision = 'HEAD') {
   const parent = execFileSync('git', ['rev-parse', `${candidateRevision}^`], {cwd: root, encoding: 'utf8'}).trim();
   if (parent !== PHASE_ONE_REVISION) {
@@ -74,56 +64,13 @@ export function phaseTwoCandidateInventorySpec(root = repoRoot, candidateRevisio
 }
 
 export function validatePhaseTwoLiveSummary(summary, candidate, root = repoRoot) {
-  object(summary, 'live summary');
-  if (summary.schema !== LIVE_SCHEMA) throw new Error('live summary uses an unsupported schema');
-  if (summary.candidateRevision !== candidate.sourceRevision) throw new Error('live evidence does not pin the candidate revision');
-  if (candidate.commitPending) throw new Error('Phase 2 packet requires a clean committed candidate');
-
-  const archive = object(summary.archive, 'live summary archive');
-  for (const key of ['path', 'digest', 'indexPath', 'indexDigest', 'indexEntry', 'location']) {
-    if (typeof archive[key] !== 'string' || archive[key].length === 0) throw new Error(`live summary archive.${key} is required`);
-  }
-  if (digestFile(archive.path, root) !== archive.digest) throw new Error('live evidence archive digest mismatch');
-  if (digestFile(archive.indexPath, root) !== archive.indexDigest) throw new Error('live evidence archive index digest mismatch');
-  const index = load(archive.indexPath, root);
-  if (index.schema !== ARCHIVE_INDEX_SCHEMA || index.candidateRevision !== candidate.sourceRevision) {
-    throw new Error('live evidence archive index does not pin the supported schema and candidate');
-  }
-  if (!Array.isArray(index.entries) || index.entries.length === 0) throw new Error('live evidence archive index entries are required');
-  const indexed = new Map();
-  for (const [position, entry] of index.entries.entries()) {
-    object(entry, `live evidence archive index entry ${position}`);
-    if (typeof entry.path !== 'string' || entry.path.length === 0 || entry.path.startsWith('/')
-      || entry.path.includes('\\') || entry.path.split('/').includes('..')) {
-      throw new Error(`live evidence archive index entry ${position} has an unsafe path`);
-    }
-    if (!/^sha256:[0-9a-f]{64}$/.test(entry.digest) || !Number.isSafeInteger(entry.size) || entry.size < 0) {
-      throw new Error(`live evidence archive index entry ${position} is incomplete`);
-    }
-    if (indexed.has(entry.path)) throw new Error(`live evidence archive index duplicates ${entry.path}`);
-    indexed.set(entry.path, entry);
-  }
-  const members = archiveMembers(archive.path, root);
-  if (!members.has(archive.indexEntry)) throw new Error('live evidence archive omits its index');
-
-  const artifacts = object(summary.artifacts, 'live summary artifacts');
-  for (const key of REQUIRED_ARTIFACTS) {
-    const artifact = object(artifacts[key], `live summary artifacts.${key}`);
-    if (typeof artifact.path !== 'string' || typeof artifact.digest !== 'string' || typeof artifact.archiveEntry !== 'string') {
-      throw new Error(`live summary artifact ${key} is incomplete`);
-    }
-    if (digestFile(artifact.path, root) !== artifact.digest) throw new Error(`live summary artifact ${key} digest mismatch`);
-    if (indexed.get(artifact.archiveEntry)?.digest !== artifact.digest || !members.has(artifact.archiveEntry)) {
-      throw new Error(`live evidence archive does not bind artifact ${key}`);
-    }
-  }
-  const assertions = Array.isArray(summary.assertions) ? summary.assertions : [];
-  const byId = new Map(assertions.map(assertion => [assertion?.id, assertion]));
-  if (byId.size !== assertions.length) throw new Error('live summary contains duplicate assertion IDs');
-  for (const id of REQUIRED_ASSERTIONS) {
-    if (byId.get(id)?.status !== 'passed') throw new Error(`live summary assertion ${id} is not passed`);
-  }
-  return summary;
+  return validatePortableLiveSummary(summary, candidate, {
+    root,
+    schema: LIVE_SCHEMA,
+    checkpoint: 'Phase 2',
+    requiredArtifacts: REQUIRED_ARTIFACTS,
+    requiredAssertions: REQUIRED_ASSERTIONS,
+  });
 }
 
 export function buildPhaseTwoPacket({
@@ -155,7 +102,7 @@ export function buildPhaseTwoPacket({
     )),
   ];
   return sealReviewPacket(contract, {
-    schemaVersion: REVIEW_PACKET_SCHEMA,
+    schemaVersion: REVIEW_PACKET_SCHEMA_V1,
     phase: 2,
     tier: 'Full',
     candidate,

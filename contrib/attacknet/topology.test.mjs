@@ -33,6 +33,12 @@ test('full topology is 28 protocol actors plus three bootstrap workloads', () =>
   assert.equal(manifest.workloads.length, 31);
   assert.equal(resource.spec.actors.length, 31);
   assert.deepEqual(manifest.counts, {miners: 3, signers: 10, followers: 5});
+  for (const retiredArtifact of [
+    'compose.yaml', 'compose.bootstrap.yaml', 'compose.observability.yaml',
+    'prometheus.compose.yml',
+  ]) {
+    assert.equal(existsSync(join(output, retiredArtifact)), false, retiredArtifact);
+  }
 });
 
 test('trusted probes are default-off and explicitly parameterized for Kubernetes', () => {
@@ -273,29 +279,21 @@ test('bootstrap suppresses companion observers and signers until the reward set 
     JSON.parse(readFileSync(join(output, 'stacksnetwork.bootstrap.json'), 'utf8')),
     bootstrapResource,
   );
-  const bootstrapCompose = JSON.parse(readFileSync(join(output, 'compose.bootstrap.yaml'), 'utf8'));
-  assert.equal(bootstrapCompose.services['signer-1'], undefined);
-  assert.equal(bootstrapCompose.services['signer-2'], undefined);
-  assert.equal(bootstrapCompose.services['signer-node-1'].depends_on?.['signer-1'], undefined);
-  assert.doesNotMatch(
-    readFileSync(join(output, bootstrapCompose.services['signer-node-1'].volumes[0].split(':')[0]), 'utf8'),
-    /\[\[events_observer\]\]/,
-  );
 });
 
 test('burnchain cadence is initially paused until the topology is ready', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-paused-clock-'));
-  renderTopology(buildTopology(), output);
+  const {resource} = renderTopology(buildTopology(), output);
   assert.match(readFileSync(join(output, 'policy.env'), 'utf8'), /^MODE=pause$/m);
   assert.match(readFileSync(join(output, 'policy.env'), 'utf8'), /^INTERVAL_SECONDS=60$/m);
-  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
-  const healthcheck = compose.services['bitcoin-miner'].healthcheck;
-  assert.deepEqual(healthcheck.test.slice(0, 3), ['CMD', 'perl', '-MIO::Socket::INET']);
-  assert.match(healthcheck.test[4], /PeerPort=>18500/);
-  assert.doesNotMatch(healthcheck.test.join(' '), /curl/);
+  assert.deepEqual(resource.spec.actors.find(actor => actor.name === 'bitcoin-miner').readinessProbe, {
+    httpGet: {path: '/', port: 'bootstrap'},
+    periodSeconds: 2,
+    failureThreshold: 60,
+  });
 });
 
-test('node actors receive isolated hot-reloadable realtime policies on both backends', () => {
+test('node actors receive isolated hot-reloadable realtime policies', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-clock-policy-'));
   const {resource, clockPolicy} = renderTopology(
     buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output,
@@ -319,44 +317,30 @@ test('node actors receive isolated hot-reloadable realtime policies on both back
   }
   const signer = resource.spec.actors.find(actor => actor.name === 'signer-1');
   assert.equal(signer.runtimePolicy, undefined, 'signers lack a process-clock metric today');
-
-  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
-  for (const actor of clockActors) {
-    assert.ok(compose.services[actor.name].volumes.includes(
-      `./clock-policy/${actor.name}:/run/attacknet-clock/${actor.name}:ro`,
-    ));
-    assert.equal(readFileSync(join(output, 'clock-policy', actor.name), 'utf8'), '+0s\n');
-  }
 });
 
-test('Compose renders enrolled telemetry and an independently partitionable burnchain path', () => {
-  const output = mkdtempSync(join(tmpdir(), 'attacknet-compose-harness-'));
-  renderTopology(buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output,
-    {network: 'compose-proof'});
-  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
-  const telemetry = JSON.parse(readFileSync(join(output, 'compose.observability.yaml'), 'utf8'));
-  const prometheus = JSON.parse(readFileSync(join(output, 'prometheus.compose.yml'), 'utf8'));
-  assert.deepEqual(compose.services.bitcoin.networks, ['burnchain']);
-  assert.deepEqual(compose.services['follower-1'].networks, ['default', 'burnchain']);
-  assert.deepEqual(compose.services['signer-1'].networks, undefined);
-  assert.equal(telemetry.services.prometheus.image, 'prom/prometheus:v3.5.0');
-  const targets = prometheus.scrape_configs.flatMap(job => job.static_configs);
-  assert.deepEqual(targets.map(target => target.labels.attacknet_actor).sort(),
-    ['follower-1', 'miner-1', 'signer-1', 'signer-2', 'signer-node-1', 'signer-node-2']);
-  assert.ok(targets.every(target => target.labels.attacknet_network === 'compose-proof'));
-});
-
-test('Compose phase transition only changes companion config mounts and adds signers', () => {
-  const output = mkdtempSync(join(tmpdir(), 'attacknet-compose-phases-'));
-  renderTopology(buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output);
-  const bootstrap = JSON.parse(readFileSync(join(output, 'compose.bootstrap.yaml'), 'utf8'));
-  const final = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
+test('Kubernetes phase transition only changes signer-node configuration and signer suspension', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-kubernetes-phases-'));
+  const {resource: final, bootstrapResource: bootstrap} = renderTopology(
+    buildTopology({minerCount: 1, signerCount: 2, followerCount: 1}), output,
+  );
   for (const actor of ['bitcoin', 'bitcoin-miner', 'stacker', 'miner-1', 'follower-1']) {
-    assert.deepEqual(bootstrap.services[actor], final.services[actor], `${actor} must not roll`);
+    assert.deepEqual(
+      bootstrap.spec.actors.find(candidate => candidate.name === actor),
+      final.spec.actors.find(candidate => candidate.name === actor),
+      `${actor} must not roll`,
+    );
   }
-  assert.equal(bootstrap.services['signer-1'], undefined);
-  assert.match(bootstrap.services['signer-node-1'].volumes.join(' '), /configs-bootstrap/);
-  assert.match(final.services['signer-node-1'].volumes.join(' '), /\.\/configs\//);
+  assert.equal(bootstrap.spec.actors.find(actor => actor.name === 'signer-1').suspended, true);
+  assert.equal(final.spec.actors.find(actor => actor.name === 'signer-1').suspended, undefined);
+  assert.doesNotMatch(
+    bootstrap.spec.actors.find(actor => actor.name === 'signer-node-1').config.files['config.toml'],
+    /\[\[events_observer\]\]/,
+  );
+  assert.match(
+    final.spec.actors.find(actor => actor.name === 'signer-node-1').config.files['config.toml'],
+    /\[\[events_observer\]\]/,
+  );
 });
 
 test('manifest exposes deterministic protocol phase barriers', () => {
@@ -376,47 +360,22 @@ test('manifest exposes deterministic protocol phase barriers', () => {
     'ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H');
 });
 
-test('Compose and Kubernetes renderers preserve workload identity, commands, dependencies, and config', () => {
-  const composeExpand = value => value
-    .replaceAll('${NETWORK}', 'attacknet')
-    .replaceAll('${NAMESPACE}', 'compose')
-    .replaceAll(/\$\{SERVICE:([a-z][-a-z0-9]*[a-z0-9])\}/g, '$1');
-  const output = mkdtempSync(join(tmpdir(), 'attacknet-parity-'));
-  const {resource} = renderTopology(
+test('Kubernetes renderer preserves workload identity and requested images', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-kubernetes-renderer-'));
+  const {resource, manifest} = renderTopology(
     buildTopology({minerCount: 2, signerCount: 3, followerCount: 2}),
     output,
   );
-  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
   assert.deepEqual(
-    Object.keys(compose.services).sort(),
+    manifest.workloads.map(actor => actor.service).sort(),
     resource.spec.actors.map(actor => actor.name).sort(),
   );
   for (const actor of resource.spec.actors) {
-    const service = compose.services[actor.name];
-    assert.equal(service.image, actor.image, `${actor.name} image`);
-    assert.deepEqual(service.entrypoint, actor.command, `${actor.name} command`);
-    assert.deepEqual(service.command, actor.args, `${actor.name} args`);
-    assert.deepEqual(
-      service.environment,
-      Object.fromEntries((actor.env ?? []).map(item => [item.name, composeExpand(item.value)])),
-      `${actor.name} environment`,
-    );
-    assert.deepEqual(
-      Object.keys(service.depends_on ?? {}).sort(),
-      (actor.dependencies ?? []).map(item => item.actor).sort(),
-      `${actor.name} dependencies`,
-    );
-    for (const [filename, source] of Object.entries(actor.config?.files ?? {})) {
-      const mount = service.volumes.find(item => item.includes(`/${actor.name}/${filename}:`));
-      assert.ok(mount, `${actor.name} ${filename} mount`);
-      const rendered = readFileSync(join(output, mount.split(':')[0]), 'utf8');
-      const expected = composeExpand(source);
-      assert.equal(rendered, expected, `${actor.name} ${filename} contents`);
-    }
-    if (actor.storage?.enabled) {
-      assert.ok(service.volumes.includes(`${actor.name}-data:${actor.storage.mountPath}`));
-    }
+    const workload = manifest.workloads.find(candidate => candidate.service === actor.name);
+    assert.equal(workload.requestedImage, actor.image, `${actor.name} image`);
+    assert.equal(workload.role, actor.role, `${actor.name} role`);
   }
+  assert.deepEqual(JSON.parse(readFileSync(join(output, 'stacksnetwork.json'), 'utf8')), resource);
 });
 
 test('invalid counts fail before rendering', () => {
@@ -463,11 +422,9 @@ test('post-Nakamoto miners are activation-gated in the manifest but not the CRD'
     '${SERVICE:miner-1}');
 });
 
-test('renderers resolve delayed-miner activation discovery for each backend', () => {
+test('Kubernetes renderer preserves delayed-miner activation discovery', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-activation-discovery-'));
   renderTopology(buildTopology({minerCount: 2}), output, {network: 'scope-a'});
-  const compose = JSON.parse(readFileSync(join(output, 'compose.yaml'), 'utf8'));
-  assert.equal(compose.services['miner-2'].environment.NAKAMOTO_SOURCE_HOST, 'miner-1');
   const resource = JSON.parse(readFileSync(join(output, 'stacksnetwork.json'), 'utf8'));
   assert.equal(resource.spec.actors.find(actor => actor.name === 'miner-2')
     .env.find(item => item.name === 'NAKAMOTO_SOURCE_HOST').value, '${SERVICE:miner-1}');

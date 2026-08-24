@@ -454,9 +454,8 @@ packaged deployments.
 
 ## Current product boundary
 
-Kubernetes is the canonical adversarial backend. Compose remains a short,
-deterministic behavioral-reference loop; it is no longer authoritative for the
-full topology.
+Kubernetes is the sole Attacknet runtime. Hacknet supplies its Kubernetes
+control plane; Attacknet supplies topology, scenarios, assertions, and evidence.
 
 Release 1 has qualified the local three-node arm64 profile, full 28-actor
 topology, authenticated telemetry, bounded fault campaigns, seeded runs,

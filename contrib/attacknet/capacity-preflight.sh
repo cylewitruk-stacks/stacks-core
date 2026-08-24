@@ -44,7 +44,7 @@ wait_for_stage_convergence() {
   mkdir -p "${output}/verification-attempts"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     attempt=$((attempt + 1))
-    if ATTACKNET_BACKEND=kubernetes KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${network}" \
+    if KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${network}" \
       "${ATTACKNET_DIR}/verify.sh" "${manifest}" progress \
       >"${output}/verification-attempts/${attempt}.json" \
       2>"${output}/verification-attempts/${attempt}.stderr"; then

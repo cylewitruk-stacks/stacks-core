@@ -48,7 +48,6 @@ test('the README keeps the public facade boundary explicit', () => {
   for (const helper of [
     'burnchain-policy.sh', 'version-matrix.mjs', 'soak-runner.sh',
     'environment-lock.sh', 'local-access.sh', 'capacity-preflight.sh',
-    'compose-negative-controls.sh',
   ]) assert.match(prose, new RegExp(helper.replaceAll('.', '\\.')));
 });
 
@@ -72,6 +71,7 @@ test('every workflow and every implementation entry point is explicitly classifi
   assert.equal(new Set(internal).size, internal.length);
   assert.deepEqual(internal, implementationFiles(directory));
   for (const helper of internal) assert.ok(statSync(resolve(directory, helper)).isFile(), helper);
+  assert.equal(internal.some(helper => helper.includes('compose')), false);
   for (const command of registry.commands) {
     assert.equal(typeof command.purpose, 'string');
     assert.equal(typeof command.stability, 'string');
@@ -85,6 +85,8 @@ test('every workflow and every implementation entry point is explicitly classifi
       && typeof item.required === 'boolean' && typeof item.type === 'string'));
     assert.ok(Array.isArray(command.outputs));
     assert.ok(Array.isArray(command.backendSupport));
+    assert.equal(command.inputs.options.some(option => option.name === '--backend'), false);
+    assert.equal(command.backendSupport.includes('compose'), false);
     assert.ok(Array.isArray(command.examples));
     assert.equal(typeof command.plan, 'boolean');
     if (command.implementation.visibility === 'internal' && command.implementation.path) {
@@ -146,8 +148,8 @@ test('argument errors always use exit 2 and do not execute an implementation', (
     [['verify', 'manifest.json', 'unknown'], /ACTION must be one of/],
     [['campaign', 'run', 'campaign.json'], /expected 2-3 positional arguments/],
     [['image', 'plan', 'pipeline.json', '--plan'], /unknown option --plan/],
-    [['render', '--backend=compose'], /unknown option --backend/],
-    [['verify', '--backend=compose', 'manifest.json', 'snapshot'], /positional arguments must precede options/],
+    [['render', '--backend=kubernetes'], /unknown option --backend/],
+    [['verify', 'manifest.json', 'snapshot', '--backend=kubernetes'], /unknown option --backend/],
     [['commands'], /--json is required/],
     [['campaign', 'plan', '-h', 'manifest.json'], /unknown option -h/],
     [['render', '--miners=NaN'], /must be an integer/],
@@ -177,7 +179,7 @@ test('plan and dry-run resolve but never execute mutating commands', () => {
   for (const action of ['apply', 'wait', 'capture', 'delete']) {
     const args = ['lifecycle', action, '/does/not/exist'];
     if (action === 'capture') args.push('/also/missing');
-    args.push('--backend=kubernetes', '--plan');
+    args.push('--plan');
     const result = run(...args);
     assert.equal(result.status, 0, `${action}: ${result.stderr}`);
     const plan = JSON.parse(result.stdout);
@@ -206,7 +208,7 @@ test('offline render remains reachable through the facade', () => {
   assert.match(plan.invocation.args[0], /topology\.mjs$/);
 });
 
-test('the quickstart topology and fault plan compose through only the public facade', t => {
+test('the quickstart topology and fault plan execute through only the public facade', t => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-command-quickstart-'));
   t.after(() => rmSync(output, {recursive: true, force: true}));
   execFileSync(attacknet, ['render', '--miners=1', '--signers=1', '--followers=1', `--output=${output}`]);
@@ -234,7 +236,7 @@ test('the quickstart topology and fault plan compose through only the public fac
   for (const action of ['apply', 'wait', 'capture', 'delete']) {
     const args = ['lifecycle', action, output];
     if (action === 'capture') args.push(join(output, 'evidence'));
-    args.push('--backend=kubernetes', '--plan');
+    args.push('--plan');
     const plan = JSON.parse(execFileSync(attacknet, args, {encoding: 'utf8'}));
     assert.equal(plan.command, `lifecycle ${action}`);
     assert.equal(plan.executed, false);

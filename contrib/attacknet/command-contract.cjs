@@ -85,10 +85,8 @@ function validateImplementation(command, root, internals) {
   }
   if (implementation.kind === 'lifecycle') {
     if (implementation.visibility !== 'internal' || !LIFECYCLE_ACTIONS.has(implementation.action)) fail(`${command.name} lifecycle action is invalid`);
-    for (const script of ['lifecycle.sh', 'compose-lifecycle.sh']) {
-      const source = readFileSync(join(root, script), 'utf8');
-      if (!new RegExp(`(?:^|[|\\s])${implementation.action}(?:[|)\\s])`, 'm').test(source)) fail(`${command.name} action is absent from ${script}`);
-    }
+    const source = readFileSync(join(root, 'lifecycle.sh'), 'utf8');
+    if (!new RegExp(`(?:^|[|\\s])${implementation.action}(?:[|)\\s])`, 'm').test(source)) fail(`${command.name} action is absent from lifecycle.sh`);
     return;
   }
   if (implementation.visibility !== 'internal' || !internals.has(implementation.path)) fail(`${command.name} path is not classified internal`);

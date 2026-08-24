@@ -155,10 +155,6 @@ function validateArguments(command, args) {
       return `${contract.name} must be one of: ${contract.enum.join(', ')}`;
     }
   }
-  const backend = args.find(item => item.startsWith('--backend='))?.slice('--backend='.length);
-  if (backend && !command.backendSupport.includes(backend)) {
-    return `backend ${backend} is not supported; choose ${command.backendSupport.join(' or ')}`;
-  }
   return null;
 }
 
@@ -170,28 +166,17 @@ function readManifest(path) {
   }
 }
 
-function backendEnvironment(backend, manifestPath) {
-  if (!backend || !manifestPath) return {};
+function kubernetesEnvironment(manifestPath) {
+  if (!manifestPath) return {};
   const manifest = readManifest(manifestPath);
-  const generated = dirname(resolve(manifestPath));
-  const environment = {
-    ATTACKNET_BACKEND: backend,
+  return {
     KUBE_NETWORK: String(manifest.network ?? ''),
     KUBE_NAMESPACE: String(manifest.namespace ?? ''),
   };
-  if (backend === 'compose') {
-    environment.ATTACKNET_PROJECT = environment.KUBE_NETWORK;
-    environment.ATTACKNET_COMPOSE = join(generated, 'compose.yaml');
-    environment.ATTACKNET_COMPOSE_EXTRA = join(generated, 'compose.observability.yaml');
-    environment.ATTACKNET_COMPOSE_POLICY = join(generated, 'policy.env');
-  }
-  return environment;
 }
 
 function invocation(command, args, {resolveEnvironment = true} = {}) {
-  const backendOption = args.find(item => item.startsWith('--backend='));
-  const backend = backendOption?.slice('--backend='.length);
-  const forwarded = args.filter(item => item !== backendOption && item !== '--plan' && item !== '--dry-run');
+  const forwarded = args.filter(item => item !== '--plan' && item !== '--dry-run');
   const implementation = command.implementation;
   let executable;
   let executionArgs;
@@ -201,31 +186,24 @@ function invocation(command, args, {resolveEnvironment = true} = {}) {
   if (implementation.kind === 'lifecycle') {
     const generated = forwarded[0];
     const evidence = forwarded[1];
-    const selectedBackend = backend ?? 'kubernetes';
-    if (selectedBackend === 'compose') {
-      executable = 'bash';
-      executionArgs = [join(ATTACKNET_DIR, 'compose-lifecycle.sh'), implementation.action, generated];
-      if (evidence) executionArgs.push(evidence);
-    } else {
-      executable = 'bash';
-      executionArgs = [join(ATTACKNET_DIR, 'lifecycle.sh'), implementation.action];
-      if (implementation.action === 'apply') executionArgs.push(generated);
-      if (implementation.action === 'capture') executionArgs.push(evidence);
-      const manifestPath = join(resolve(generated), 'manifest.json');
-      environmentSource = {kind: 'rendered-manifest', path: manifestPath, resolved: resolveEnvironment};
-      environment = resolveEnvironment
-        ? backendEnvironment(selectedBackend, manifestPath)
-        : {ATTACKNET_BACKEND: selectedBackend};
-    }
+    executable = 'bash';
+    executionArgs = [join(ATTACKNET_DIR, 'lifecycle.sh'), implementation.action];
+    if (implementation.action === 'apply') executionArgs.push(generated);
+    if (implementation.action === 'capture') executionArgs.push(evidence);
+    const manifestPath = join(resolve(generated), 'manifest.json');
+    environmentSource = {kind: 'rendered-manifest', path: manifestPath, resolved: resolveEnvironment};
+    environment = resolveEnvironment
+      ? kubernetesEnvironment(manifestPath)
+      : {};
   } else {
     executable = implementation.program === 'node' ? process.execPath : implementation.program;
     executionArgs = [join(ATTACKNET_DIR, implementation.path), ...(implementation.prefix ?? []), ...forwarded];
-    if (backend) {
+    if (['verify', 'evidence capture'].includes(command.name)) {
       let manifestPath;
       if (command.name === 'verify') manifestPath = forwarded[0];
       if (command.name === 'evidence capture') manifestPath = forwarded[1];
       environmentSource = {kind: 'manifest', path: resolve(manifestPath), resolved: resolveEnvironment};
-      environment = resolveEnvironment ? backendEnvironment(backend, manifestPath) : {ATTACKNET_BACKEND: backend};
+      environment = resolveEnvironment ? kubernetesEnvironment(manifestPath) : {};
     }
   }
   return {executable, args: executionArgs, environment, environmentSource};
