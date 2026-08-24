@@ -8,7 +8,7 @@ import test from 'node:test';
 const script = resolve('contrib/helm/hacknet/scripts/install-local.sh');
 const digest = `sha256:${'a'.repeat(64)}`;
 
-function fixture(status = '') {
+function fixture(status = '', helmVersion = 'v4.2.4') {
   const root = mkdtempSync(join(tmpdir(), 'hacknet-install-'));
   const bin = join(root, 'bin');
   const log = join(root, 'calls.log');
@@ -17,7 +17,7 @@ function fixture(status = '') {
   const commands = {
     docker: `#!/bin/sh\necho "docker $*" >>"${log}"\necho '${digest}'\n`,
     kubectl: `#!/bin/sh\necho "kubectl $*" >>"${log}"\n`,
-    helm: `#!/bin/sh\necho "helm $*" >>"${log}"\nif [ "$1" = status ]; then ${status ? `printf '%s\\n' '{"info":{"status":"${status}"}}'` : 'exit 1'}; fi\n`,
+    helm: `#!/bin/sh\necho "helm $*" >>"${log}"\nif [ "$1" = version ]; then printf '%s\\n' '${helmVersion}'; fi\nif [ "$1" = status ]; then ${status ? `printf '%s\\n' '{"info":{"status":"${status}"}}'` : 'exit 1'}; fi\n`,
     jq: '#!/bin/sh\nsed -n \'s/.*"status":"\\([^"]*\\)".*/\\1/p\'\n',
   };
   for (const [name, contents] of Object.entries(commands)) {
@@ -52,7 +52,25 @@ test('installs CRDs before Helm and rolls Pods on exact local image IDs', () => 
   assert.match(calls[upgrade], /operator\.image\.tag=local-a{16}/);
   assert.match(calls[upgrade], /runOperator\.image\.tag=local-a{16}/);
   assert.match(calls[upgrade], /runOperator\.ioPressureImage\.tag=local-a{16}/);
+  assert.match(calls[upgrade], /--rollback-on-failure/);
+  assert.doesNotMatch(calls[upgrade], /--atomic/);
   assert.doesNotMatch(calls[upgrade], /--force-conflicts/);
+});
+
+test('uses Helm 3 atomic rollback semantics and rejects unsupported majors before mutation', () => {
+  const helmThree = fixture('', 'v3.19.0');
+  const installed = run(helmThree);
+  assert.equal(installed.status, 0, installed.stderr);
+  const upgrade = readFileSync(helmThree.log, 'utf8').split('\n')
+    .find(line => line.startsWith('helm upgrade'));
+  assert.match(upgrade, /--atomic/);
+  assert.doesNotMatch(upgrade, /--rollback-on-failure/);
+
+  const unsupported = fixture('', 'v5.0.0');
+  const rejected = run(unsupported);
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /unsupported Helm major version/);
+  assert.doesNotMatch(readFileSync(unsupported.log, 'utf8'), /docker |kubectl |helm upgrade/);
 });
 
 test('help is read-only and unknown arguments fail closed', () => {

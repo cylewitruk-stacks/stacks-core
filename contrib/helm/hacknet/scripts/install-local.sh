@@ -28,6 +28,21 @@ case "${kind_image_load}" in
   *) echo 'HACKNET_KIND_IMAGE_LOAD must be auto, require, or disabled' >&2; exit 2 ;;
 esac
 
+helm_version="$(helm version --template '{{.Version}}')" || {
+  echo 'could not determine Helm version' >&2
+  exit 1
+}
+if [[ ! "${helm_version}" =~ ^v?([0-9]+)\. ]]; then
+  echo "could not parse Helm version: ${helm_version}" >&2
+  exit 1
+fi
+helm_major="${BASH_REMATCH[1]}"
+case "${helm_major}" in
+  3) helm_failure_args=(--atomic) ;;
+  4) helm_failure_args=(--rollback-on-failure) ;;
+  *) echo "unsupported Helm major version: ${helm_major}; expected 3 or 4" >&2; exit 1 ;;
+esac
+
 operator_id="$(docker image inspect --format '{{.Id}}' "${operator_image}")"
 run_operator_id="$(docker image inspect --format '{{.Id}}' "${run_operator_image}")"
 io_pressure_id="$(docker image inspect --format '{{.Id}}' "${io_pressure_image}")"
@@ -111,7 +126,7 @@ helm_args=(
   --namespace "${namespace}"
   --create-namespace
   --wait
-  --rollback-on-failure
+  "${helm_failure_args[@]}"
   --set-string "operator.podAnnotations.attacknet-build=${operator_id}"
   --set-string "runOperator.podAnnotations.attacknet-build=${run_operator_id}"
   --set-string "operator.image.repository=${operator_repository}"

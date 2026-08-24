@@ -105,8 +105,10 @@ contrib/helm/hacknet/scripts/install-local.sh
 kubectl get deployments -n hacknet-system
 ```
 
-The operator, run-operator, and event-bridge Deployments must become Available.
-Actor Pods never receive Kubernetes service-account credentials.
+The topology-operator and run-operator Deployments must become Available. The
+network-scoped event bridge and observability stack are created later by
+`lifecycle apply`. Actor Pods never receive Kubernetes service-account
+credentials.
 
 #### 4. Run the compatibility doctor
 

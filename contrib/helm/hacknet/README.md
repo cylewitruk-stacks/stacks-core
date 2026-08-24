@@ -1,251 +1,272 @@
 # Hacknet operator
 
-Hacknet is the first Kubernetes-native deployment layer for disposable Stacks
-regtest and adversarial test networks. The chart installs a namespaced
-`StacksNetwork` controller. Creating a `StacksNetwork` causes the controller to
-reconcile one Service and one single-replica StatefulSet per declared actor,
-plus generated configuration and optional telemetry sidecars.
+Hacknet is the Kubernetes control plane for disposable Stacks regtest and
+adversarial networks. It reconciles actor workloads, executes bounded fault
+campaigns, and records status suitable for humans and automation.
 
-This is test infrastructure. It is not a production Stacks operator. Never use
-valuable private keys, wallets, or funds in a Hacknet namespace.
+This is test infrastructure, not a production Stacks operator. Use only
+generated regtest keys and funds with no value.
 
-## Why an operator
+## Start here
 
-Helm installs and upgrades the control plane. The operator remains active after
-installation and owns the domain-specific lifecycle:
+Most users should follow the product-level
+[Attacknet guide](../../attacknet/README.md). It covers the supported public
+CLI, topology rendering, observability, fault execution, evidence capture, and
+teardown.
 
-- stable, independently disruptable miner, signer, companion, follower,
-  burnchain, infrastructure, and adversarial actors;
-- per-actor image selection for mixed-version and modified-build tests;
-- Pod recreation through StatefulSets rather than unreconciled bare Pods;
-- optional persistent storage without coupling actor failure domains;
-- OpenTelemetry Collector sidecars colocated with their actor;
-- deterministic service discovery and dependency waits;
-- status reporting suitable for humans and an external agent; and
-- stable labels for Chaos Mesh selectors and evidence collection.
+Use this document when you need to install or operate the Hacknet controllers,
+submit custom resources directly, or develop the chart. Raw helper scripts and
+custom-resource layouts are lower-level interfaces; the versioned
+`contrib/attacknet/attacknet` facade remains the Release 1 automation boundary.
 
-Adaptive decisions deliberately stay outside the controller. An agent can
-create or patch a constrained `StacksNetwork`, observe its status and telemetry,
-and create bounded Chaos Mesh experiments without receiving unrestricted
-cluster-admin access.
+## What the chart installs
 
-## Current scope
+Hacknet installs two namespaced controllers with separate service accounts:
 
-The operator deploys and reconciles actor processes. The transport-independent
-topology, watch-only Bitcoin wallet setup, stacking bootstrap, runtime adapter,
-and evidence harness live in `contrib/attacknet`. `examples/minimal.yaml` stays
-as a small deployment smoke; generated attacknet resources are the scalable
-current-main system-under-test profile.
+- the topology operator reconciles `StacksNetwork` resources into ConfigMaps,
+  Services, StatefulSets, PVCs, and optional telemetry/probe sidecars;
+- the run operator reconciles `FaultCampaign` and `AttacknetRun` resources and
+  has narrowly scoped permissions for supported Chaos Mesh resources; and
+- both controllers expose health and Prometheus endpoints through namespaced
+  Services.
 
-The chart requires Kubernetes 1.27 or newer. Hacknet relies on the stable
-StatefulSet PVC retention policy introduced in that release.
+The local installer applies all three CRDs before running Helm so an existing
+installation receives schema updates. Helm intentionally leaves those CRDs
+installed when the release is removed.
+
+Hacknet does **not** install or configure:
+
+- Docker Desktop or Kubernetes;
+- Chaos Mesh;
+- host tools such as Helm, `kubectl`, Node.js, Python, or `jq`;
+- Stacks actor images; or
+- the per-network Prometheus, Grafana, Loki, Alloy, and event-bridge stack.
+
+Attacknet renders the observability resources with each network. Chaos Mesh is
+cluster infrastructure with a separate privilege and upgrade lifecycle.
+
+## Supported local profile
+
+The chart declares Kubernetes 1.27 or newer because it relies on stable
+StatefulSet PVC-retention policy. Release 1 qualification is narrower: a local,
+three-node, arm64 Docker Desktop cluster using the `kind` provisioner. Treat
+`attacknet doctor` and
+[`baseline-v1.json`](../../attacknet/release/baseline-v1.json) as authoritative
+for the currently accepted product profile.
+
+From the repository root, the local workflow requires:
+
+| Dependency | Requirement |
+| --- | --- |
+| Docker | Docker Desktop with the daemon running |
+| Kubernetes | Docker Desktop `kind`; one control plane and two workers for the accepted profile |
+| Helm | Major version 3 or 4 |
+| `kubectl` | Within one minor version of the Kubernetes server |
+| `jq` | Available on the host for installer and evidence helpers |
+| Node.js | 20 or newer |
+| Python | 3.11 or newer |
+| Metrics API | `metrics.k8s.io/v1beta1` reachable for capacity checks |
+| Storage | One default StorageClass; at least 8 GiB available per node for the full topology |
+| Architecture | Local `arm64` or `x64`; cluster `arm64` or `amd64` |
+
+Do not apply Hacknet to a shared or production cluster.
 
 ## Install on Docker Desktop Kubernetes
 
-After enabling Kubernetes in Docker Desktop, verify the context before making
-changes:
+### 1. Verify the cluster
 
-```sh
+```bash
 kubectl config current-context
 kubectl cluster-info
+kubectl get nodes -o wide
 ```
 
-From the repository root, build the controller. Set `BUILD_STACKS_IMAGE=1` to
-also build the current-main node/signer image used by the smoke example.
+Confirm this is the intended local Docker Desktop cluster before continuing.
 
-```sh
-contrib/helm/hacknet/scripts/build-local.sh
+### 2. Install Chaos Mesh
+
+Release 1 is pinned to Chaos Mesh 2.8.3. Docker Desktop `kind` nodes use
+containerd:
+
+```bash
+helm repo add chaos-mesh https://charts.chaos-mesh.org
+helm repo update
+helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
+  --namespace chaos-mesh \
+  --create-namespace \
+  --version 2.8.3 \
+  --set chaosDaemon.runtime=containerd \
+  --set chaosDaemon.socketPath=/run/containerd/containerd.sock \
+  --wait
+
+kubectl get pods -n chaos-mesh
+```
+
+Every Chaos Mesh Pod must become Ready. Use the
+[official installation guide](https://chaos-mesh.org/docs/production-installation-using-helm/)
+when the cluster uses a different container runtime.
+
+### 3. Build local images
+
+Build the topology operator, run operator, active probe, I/O-pressure helper,
+and the current Stacks node/signer image:
+
+```bash
 BUILD_STACKS_IMAGE=1 contrib/helm/hacknet/scripts/build-local.sh
 ```
 
-Docker Desktop's Docker image store and each kind node's containerd store are
-separate. The installer assigns content-derived tags, detects a
-kind-on-Docker cluster from server-assigned provider IDs, imports all three
-chart images into every node, and verifies the imported references before
-Helm runs. Keep the default `IfNotPresent` policy: `Never` can reject a valid
-local transport path before kubelet resolves it. Install the normal packaged
-controller path with:
+A cold Stacks image build can take tens of minutes. Its Dockerfile uses Cargo
+Chef and BuildKit cache mounts for subsequent revisions.
 
-```sh
+### 4. Install Hacknet
+
+```bash
 contrib/helm/hacknet/scripts/install-local.sh
+kubectl get deployments -n hacknet-system
+kubectl get crd \
+  stacksnetworks.testing.stacks.org \
+  faultcampaigns.testing.stacks.org \
+  attacknetruns.testing.stacks.org
 ```
 
-Set `HACKNET_KIND_IMAGE_LOAD=require` to fail when the current cluster is not
-entirely kind-on-Docker, or `disabled` only when an external registry/image
-loader already provides the exact references. The loader emits a
-machine-readable receipt and can also be run directly with
-`scripts/load-kind-images.sh --output=receipt.json IMAGE...`.
+Both controller Deployments must become Available. The installer:
 
-The helper applies and waits for all three CRDs before Helm because Helm does
-not add or upgrade files under `crds/` for an existing release. It also puts
-the exact local operator image IDs in Pod annotations so rebuilding a mutable
-development tag produces a rollout. Do not use `kubectl set image` on these
-Deployments: it creates managed-field ownership that can make both a Helm 4
-upgrade and rollback conflict. If a release is already failed, or field
-ownership must deliberately be recovered, inspect it first and use the
-conspicuous `HACKNET_RECOVER_FAILED_RELEASE=1` and (only when necessary)
-`HACKNET_FORCE_CONFLICTS=1` escape hatches. A CRD previously owned by
-client-side apply may similarly require the one-time, explicit
-`HACKNET_FORCE_CRD_CONFLICTS=1` transition; it must not be a permanent default.
-The local build also produces `stacks-hacknet-io-pressure:dev`; the installer
-resolves its immutable local image ID, assigns a content-specific local tag,
-and sets `runOperator.ioPressureImage` alongside the controller images. For a
-registry deployment, publish the image built from
-`contrib/attacknet/io-pressure/Dockerfile` and configure that chart value to an
-immutable digest reference. It is the only executable the run controller will
-use for `io-pressure`; no FaultCampaign field can override it.
+- assigns content-derived tags to the local chart-managed images;
+- imports those exact images into every Docker Desktop `kind` node;
+- server-side applies and waits for all three CRDs; and
+- performs an atomic Helm upgrade with rollback on failure.
 
-If a local cluster still cannot resolve Docker Engine images, the chart has an
-explicit fallback that mounts its controller source into a public Python
-runtime without pushing a development image. This is not the packaged path:
+Set `HACKNET_KIND_IMAGE_LOAD=require` to reject a cluster that is not entirely
+Docker-backed `kind`. Use `disabled` only when a registry or external image
+loader already provides immutable references.
 
-```sh
-helm upgrade --install hacknet contrib/helm/hacknet \
+### 5. Run the compatibility doctor
+
+```bash
+contrib/attacknet/attacknet doctor
+```
+
+Do not begin an acceptance or baseline run until it reports `compatible`.
+Use `contrib/attacknet/attacknet doctor --json` for automation.
+
+## First controller smoke
+
+The image-independent smoke uses public BusyBox actors to exercise dependency
+gates, Services, StatefulSets, PVCs, status, and garbage collection:
+
+```bash
+kubectl apply \
   --namespace hacknet-system \
-  --create-namespace \
-  --wait \
-  --rollback-on-failure \
-  --set operator.developmentSource.enabled=true
+  --filename contrib/helm/hacknet/examples/operator-smoke.yaml
+
+kubectl get stacksnetworks,pods,pvc --namespace hacknet-system --watch
 ```
 
-For a registry-hosted image, leave `operator.developmentSource.enabled=false`
-and configure `operator.image` normally.
-The operator uses an explicitly projected, rotating service-account token and
-reads it from disk for every API request. For a local rotation smoke, set
-`serviceAccount.tokenExpirationSeconds=600`; the packaged default is 3600.
-Kubelet rotates projected tokens before their requested expiry rather than on
-that exact boundary. The 600-second Docker Desktop smoke observed replacement
-after roughly 543 seconds, so tests should compare token identity and continued
-reconciliation instead of sleeping for a presumed fixed interval.
+Wait until the resource is Ready, then stop the watch with Ctrl-C. In another
+terminal, inspect the reconciled resource:
 
-First apply the image-independent operator lifecycle smoke into the watched
-namespace. It uses public BusyBox actors and exercises dependencies, Services,
-StatefulSets, and PVCs without requiring a branch Stacks image:
-
-```sh
-kubectl apply -n hacknet-system -f contrib/helm/hacknet/examples/operator-smoke.yaml
-kubectl get stacksnetworks,pods,pvc -n hacknet-system -w
-kubectl describe stacksnetwork operator-smoke -n hacknet-system
+```bash
+kubectl describe stacksnetwork operator-smoke --namespace hacknet-system
+kubectl get stacksnetwork operator-smoke \
+  --namespace hacknet-system \
+  --output=jsonpath='{.status.phase}{"\n"}'
 ```
 
-After loading or publishing the branch Stacks image, apply the burnchain and
-follower smoke network:
+Success means the phase reaches `Ready` and both actors report ready in
+`.status.actors`. Remove the smoke and confirm its actor PVCs disappear:
 
-```sh
-kubectl apply -n hacknet-system -f contrib/helm/hacknet/examples/minimal.yaml
-kubectl get stacksnetworks,pods,pvc -n hacknet-system -w
-kubectl describe stacksnetwork minimal -n hacknet-system
+```bash
+kubectl delete stacksnetwork operator-smoke --namespace hacknet-system
+kubectl get statefulsets,services,configmaps,pvc \
+  --namespace hacknet-system \
+  --selector=testing.stacks.org/network=operator-smoke
 ```
 
-`examples/operator-telemetry-smoke.yaml` provides a public-image-only check of
-the per-actor OpenTelemetry sidecar, generated scrape configuration, service
-discovery, and bearer-token delivery to a disposable in-cluster OTLP sink. The
-example comment shows how to create its non-production token Secret.
+The final query should return no owned resources after Kubernetes garbage
+collection completes.
 
-Deleting the custom resource garbage-collects its owned ConfigMaps, Services,
-StatefulSets, and actor PVCs. Scaling an actor to zero—including through
-`spec.suspended`—retains its PVC so the operation is reversible. This is encoded
-as `whenDeleted: Delete` and `whenScaled: Retain` on every actor StatefulSet;
-the underlying StorageClass still determines when the backing volume is
-physically reclaimed. Helm intentionally does not delete installed CRDs during
-uninstall.
+## First Stacks smoke
 
-## Agent-facing API
+`examples/minimal.yaml` starts Bitcoin Core, a separate burnchain clock, and a
+Stacks follower. Import the locally built Stacks image into every `kind` node
+before applying it:
 
-The chart installs three namespaced APIs with deliberately separate
-controllers:
+```bash
+contrib/helm/hacknet/scripts/load-kind-images.sh \
+  stacks-core-attacknet:main
 
-- `StacksNetwork` owns the system under test and has no Chaos Mesh permission.
-- `FaultCampaign` is either an inert reusable template (`spec.template: true`)
-  or one bounded execution with exact admitted Pod identities and a cleanup
-  finalizer.
-- `AttacknetRun` resolves the complete finite catalog before the first fault,
-  pinning template UID/generation/spec, admitted network UID/generation,
-  exact actor image digests, seed decisions, and aggregate budgets in a sealed,
-  gzip-compressed, owner-bound ConfigMap. It then creates at most one owned
-  execution at a time from that immutable schedule.
+kubectl apply \
+  --namespace hacknet-system \
+  --filename contrib/helm/hacknet/examples/minimal.yaml
 
-The run controller has a separate namespaced service account. It can read the
-network and actor Pods, create/read its owner-bound schedule ConfigMap, manage
-only the two run APIs, and create/delete (plus narrowly patch cleanup metadata
-on) only
-`PodChaos`, `NetworkChaos`, `DNSChaos`, `IOChaos`, and `TimeChaos`. It also
-creates one narrowly generated core/v1 Pod for the separately labelled
-I/O-pressure mechanism; the campaign cannot select its image or executable.
-Actor Pods
-remain credential-free. Apply the examples after the referenced
-`StacksNetwork` is Ready:
-
-```sh
-kubectl apply -f contrib/helm/hacknet/examples/fault-campaign.json
-kubectl apply -f contrib/helm/hacknet/examples/fault-campaign-io-pressure.json
-kubectl apply -f contrib/helm/hacknet/examples/attacknet-run.json
-kubectl get faultcampaigns,attacknetruns -n hacknet-system -w
+kubectl get stacksnetworks,pods,pvc --namespace hacknet-system --watch
 ```
 
-Chaos Mesh `AllInjected` and `AllRecovered` conditions are retained as context,
-but are not effect evidence. An execution without trusted evidence of the
-requested fault terminates `Inconclusive`, never `Passed`. Pod faults use
-Kubernetes-observed UID/readiness/restart evidence. Network, DNS, I/O, and time
-faults require the controlled active probe's before/during/after observations
-to prove both the requested effect and recovery.
+This is a controller smoke, not the supported full-network workflow. Use the
+[Attacknet guide](../../attacknet/README.md) to render a funded signer/miner
+topology, deploy observability, verify invariants, and retain evidence.
 
-`io-pressure` / `disk-pressure` is deliberately distinct from per-syscall
-`IOChaos` and from Chaos Mesh `StressChaos`. It is an arm64-compatible pressure
-semantic compiled to an internal `IOPressurePod` descriptor. The run controller
-resolves exactly one admitted target Pod, its node, and its `/data` PVC and then
-creates a core/v1 Pod from the chart-configured trusted image. The CR cannot
-provide an image, command, shell, or raw stress arguments. The controller fixes
-the entrypoint arguments, non-root restricted security context, and
-severity-specific CPU/memory caps, and caps the low, medium, and high profiles
-at 60/180/300 seconds. High severity additionally
-requires `allowExtremeSeverity: true`. `IOPressureObserved` is Proven only
-when the trusted FSYNC probe meets both the configured minimum latency
-multiplier and minimum added milliseconds; `IOPressureRecovered` requires
-both values to return below those thresholds after the pressure Pod is gone.
-Only an exact, owner-bound Pod observed Running counts as actual injection; that
-bookkeeping alone cannot satisfy either assertion. Evidence records
-`mechanism=controller-owned-io-pressure-pod`, Pod UID, image ID, node, phase,
-target UID, and PVC claim. The pressure process unlinks its scratch files and
-directory before writing, so deletion cannot strand named campaign data.
+## Status, suspension, and storage
 
-Replay reads the source run's sealed schedule through
-`k8s://attacknetruns/NAME/resolved-schedule`, verifies the requested digest,
-requires the same manifest and admitted image digests, and refuses to run on
-the source network UID. The new schedule is rebound only to the separately
-identified fresh network; runtime interleavings remain explicitly
-nondeterministic.
+The topology controller reports `Pending`, `Progressing`, `Ready`, `Degraded`,
+or `Suspended`, plus each actor's resolved image, resource name, and readiness:
 
-The CR contains global defaults and an explicit actor list. An actor can
-override its image, command, arguments, ports, resources, storage, probes,
-configuration, dependencies, labels, and telemetry settings. This supports a
-current build, an old release, and a maliciously modified build in one network
-without changing the chart.
+```bash
+kubectl get stacksnetworks --namespace hacknet-system
+kubectl get stacksnetwork minimal \
+  --namespace hacknet-system \
+  --output=jsonpath='{.status.actors}'
+```
 
-Configuration has exactly one of these sources:
+Setting `spec.suspended: true` scales actor StatefulSets to zero while retaining
+their PVCs. Removing it reconciles each actor back to one replica.
 
-- `inline`, for public non-secret regtest configuration;
-- `configMapRef`, for configuration managed outside the CR; or
-- `secretRef`, for private keys and tokens.
+Every actor StatefulSet uses:
 
-Referenced node ConfigMaps/Secrets contain `Config.toml` by default; signer
-references contain `signer.toml`. Set `config.key` when the mounted key differs.
+```yaml
+persistentVolumeClaimRetentionPolicy:
+  whenDeleted: Delete
+  whenScaled: Retain
+```
 
-The operator does not have RBAC permission to read Secrets. Kubernetes mounts a
-referenced Secret directly into the actor Pod. Secret-backed config is strongly
-preferred for signer and miner keys, even in a disposable environment.
+Deleting the `StacksNetwork` garbage-collects its owned ConfigMaps, Services,
+StatefulSets, and PVCs. The StorageClass determines when the backing volume is
+physically reclaimed.
 
-Inline configuration, commands, arguments, environment values, and telemetry
-endpoints support these literal substitutions:
+An invalid actor makes the complete desired topology invalid. The controller
+validates all actors before mutation, leaves the last known-good topology
+running, and reports `Degraded`. It never adopts a same-named resource unless
+that resource's controller owner UID matches the current `StacksNetwork`.
 
-| Placeholder | Result |
+## API model
+
+### `StacksNetwork`
+
+`StacksNetwork` owns the system under test. Its controller has no Chaos Mesh
+permission. The resource contains global defaults and an explicit actor list;
+each actor can override its image, command, arguments, ports, resources,
+storage, probes, configuration, dependencies, labels, and telemetry settings.
+
+Configuration has exactly one source:
+
+- `inline` for public, non-secret regtest configuration;
+- `configMapRef` for externally managed configuration; or
+- `secretRef` for keys and tokens.
+
+The operator cannot read Secrets. Kubernetes mounts a referenced Secret
+directly into the actor Pod. Prefer Secret-backed signer and miner
+configuration even in disposable environments.
+
+Configuration, command, argument, environment, and telemetry strings support:
+
+| Placeholder | Expansion |
 | --- | --- |
 | `${NETWORK}` | `StacksNetwork.metadata.name` |
 | `${NAMESPACE}` | resource namespace |
 | `${ACTOR}` | current actor name |
-| `${SERVICE:actor-name}` | controller-generated Service name for an actor |
+| `${SERVICE:actor-name}` | generated Service name for the referenced actor |
 
-Every actor Pod has the following non-overridable labels:
+Every actor Pod receives these non-overridable labels:
 
 ```text
 testing.stacks.org/network=<StacksNetwork name>
@@ -254,206 +275,193 @@ testing.stacks.org/role=<role>
 app.kubernetes.io/managed-by=hacknet-operator
 ```
 
-Those labels are the supported selection surface for Chaos Mesh. For example,
-a companion-only fault selects `role=companion` plus a specific actor, while a
-quorum guard can calculate signer weight before allowing the experiment.
-
-## Telemetry sidecars
-
-When telemetry is enabled, the controller adds an OTel Collector sidecar. It
-scrapes the actor on localhost (`31000` for signers, `20446` otherwise) and
-exports OTLP/HTTP to `telemetry.exporterEndpoint`. The bearer token can come
-from `telemetry.tokenSecretRef`; it is mounted as an environment value without
-the operator reading it.
-
-The federation's strict metric allowlist and authenticated per-actor enrollment remain
-collector/federation responsibilities. The initial sidecar establishes the Pod
-organization and export path without silently duplicating the evolving schema
-inside the operator.
-
-## Trusted active-probe sidecars
-
-`spec.probe.enabled` is false by default. When enabled, every actor Pod gets a
-credential-free `attacknet-probe` sidecar on Pod port `18080`; that port is
-intentionally absent from the actor's Service. The operator, rather than the
-actor, supplies an allowlist of enrolled actor FQDNs and named service ports.
-The bounded `POST /v1/probe` API can sample TCP reachability/latency, a selected
-DNS name plus a fixed cluster control, confined I/O under a private directory
-on the actor data volume, wall plus monotonic clocks, and the probe runtime's
-bounded platform/architecture identity. `GET /healthz` is the only other
-endpoint. There is no shell or arbitrary hostname/path operation.
-
-The probe mounts the data volume at the actor's configured storage path so an
-IOChaos path can cover both containers. Enabling it adds a default `fsGroup`
-only when the actor did not supply one, allowing the non-root probe to create
-its private directory. Evidence consumers must fetch the response themselves;
-actor logs and actor-provided payloads are not authoritative probe results.
-
-For IOChaos, architecture is also an admission prerequisite. The installed
-Chaos Mesh 2.8.3 `toda` helper and its ptrace/assembly implementation are
-x86-64-only, so `runOperator.ioChaosSupportedArchitectures` defaults to
-`["x64"]`. An exact target reporting another architecture fails before any
-IOChaos object is created. Extend the list only after replacing and verifying
-the installed helper; a pressure workload is a different fault semantic and
-must be labelled as such. The bounded `io-pressure` / `disk-pressure` profile
-above is that separately labelled alternative; it must never be reported as
-IOChaos or as per-syscall fault injection.
-
-TimeChaos has the same fail-closed architecture prerequisite, for a different
-reason. Chaos Mesh 2.8.3 reported successful single-container injection on the
-local arm64 kind cluster while the selected Stacks process clock did not move;
-an independent Node-process canary then wedged the worker daemon during ptrace
-injection. `runOperator.timeChaosSupportedArchitectures` therefore defaults to
-`["x64"]`. Adding an architecture is a claim that a bounded platform canary
-proved the requested process-clock effect, recovery, and daemon cleanup—not
-merely that Chaos Mesh reported `AllInjected`.
-
-The separate `clock-skew` type is the portable application-clock mechanism for
-attacknet-built node images. It compiles to the internal `ClockSkewPolicy`
-descriptor rather than a Chaos Mesh resource. The topology renderer mounts a
-network-labelled ConfigMap at `/run/attacknet-clock`, with one zero-offset key
-per supported actor and a fixed libfaketime environment contract. The run
-controller verifies that exact admitted Pod contract, patches only selected
-keys, observes `stacks_node_process_wall_clock_seconds` against an independent
-control actor, resets the keys, and keeps the mutation lease until recovery is
-proven. Missing, stale, malformed, ineffective, or unrecovered policies fail
-closed. This supports node actors only today; signer-only processes lack the
-required process-clock metric. It must not be described as TimeChaos or as a
-kernel-clock fault.
-
-This is process-independent evidence, not a cryptographic process attestation.
-Containers in one Pod share a network namespace, so a deliberately modified
-actor could try to occupy port `18080` while the probe is absent or restarting.
-The run controller therefore admits only an exact Ready Pod UID whose
-`attacknet-probe` container is independently Ready, and a probe outage or
-identity mismatch makes the result inconclusive. A future threat model that
-requires proof against that narrow same-Pod impersonation race must add a
-per-Pod probe signing key (mounted only into the probe) and verify signatures in
-the run controller; the current credential-free contract deliberately does not
-claim that stronger property.
-
-The topology renderer accepts `--probes=true` and `--probe-image=...`. The
-local build helper produces `stacks-hacknet-probe:dev`.
-
-## Status and suspension
-
-The controller reports `Pending`, `Progressing`, `Ready`, `Degraded`, or
-`Suspended`, plus each actor's resolved image, resource name, and readiness.
+These labels are the supported selection surface for fault injection and
+evidence. The schema's legacy `companion` role identifies a configured signer
+node; new prose and user-facing names should call it a signer node.
 
 An actor may set `runtimeExposure: reachable` to publish its headless-Service
-endpoint before the pod is Ready. The default, `ready`, keeps bootstrap
-deterministic. This is a discovery control: it affects new DNS lookups, not
-already-established connections, and therefore is not a substitute for a
-runtime fault such as Chaos Mesh network or process disruption.
+endpoint before its Pod is Ready. The default, `ready`, keeps bootstrap
+deterministic. This affects DNS discovery and new connections, not established
+sessions, and is not a runtime fault mechanism.
 
-```sh
-kubectl get snet -n hacknet-system
-kubectl get snet minimal -n hacknet-system -o jsonpath='{.status.actors}'
+### `FaultCampaign`
+
+`FaultCampaign` is either an inert reusable template (`spec.template: true`) or
+one bounded execution. The run controller resolves exact admitted Pod
+identities and owns cleanup through a finalizer.
+
+Supported native Chaos Mesh resources are `PodChaos`, `NetworkChaos`,
+`DNSChaos`, `IOChaos`, and `TimeChaos`. The controller can also create one
+restricted I/O-pressure Pod from the chart-configured trusted image. Campaigns
+cannot supply that image, executable, shell, or arbitrary arguments.
+
+Apply direct examples only after the referenced network is Ready:
+
+```bash
+kubectl apply --filename contrib/helm/hacknet/examples/fault-campaign.json
+kubectl apply --filename contrib/helm/hacknet/examples/fault-campaign-io-pressure.json
+kubectl get faultcampaigns --namespace hacknet-system --watch
 ```
 
-Setting `spec.suspended: true` scales all actor StatefulSets to zero while
-retaining their resources and storage. Removing it reconciles them back to one
-replica.
+Chaos Mesh `AllInjected` and `AllRecovered` conditions are context, not proof
+that the target experienced the requested effect. Without trusted effect and
+recovery observations, a campaign terminates `Inconclusive`, never `Passed`.
 
-An invalid actor makes the complete desired topology invalid. The controller
-validates every actor before mutating resources, leaves the last known-good
-network running, and reports `Degraded`; it does not partially apply the valid
-subset. Likewise, it refuses to adopt a same-named Kubernetes resource unless
-that resource's controller owner UID matches the current `StacksNetwork`.
+### `AttacknetRun`
 
-The controller reads its projected service-account token for every API request,
-so kubelet token rotation does not require a restart. Readiness follows API
-availability. Liveness follows controller-loop progress rather than API success,
-avoiding a Pod restart storm when the Kubernetes API server is unavailable.
-Its Service exposes dependency-free Prometheus metrics on `/metrics`, including
-bounded method/status API-request counters, request latency, reconcile outcome
-and latency, per-reconcile API volume, process start time, and managed-network
-count. Capacity evidence compares snapshots from the same process and fails if
-the controller restarted or observed throttling, server errors, or transport
-failures during a stage.
+`AttacknetRun` resolves a finite fault catalog before the first action. It pins
+template identity and generation, network identity and generation, admitted
+actor image digests, seeded decisions, and aggregate budgets in a sealed,
+owner-bound ConfigMap. It creates at most one owned campaign at a time.
 
-## Development checks
+```bash
+kubectl apply --filename contrib/helm/hacknet/examples/attacknet-run.json
+kubectl get attacknetruns,faultcampaigns \
+  --namespace hacknet-system \
+  --watch
+```
 
-```sh
+Replay verifies the source schedule digest, requires the same manifest and
+admitted images, and refuses to run against the source network UID. It
+reproduces intended actions and seeded choices; Kubernetes and protocol
+interleavings remain nondeterministic.
+
+## Telemetry and trusted probes
+
+When actor telemetry is enabled, the topology controller adds an OpenTelemetry
+Collector sidecar. It scrapes the actor on localhost (`31000` for signers and
+`20446` for nodes) and exports OTLP/HTTP to `telemetry.exporterEndpoint`. A
+bearer token may come from `telemetry.tokenSecretRef` without the operator
+reading it.
+
+`spec.probe.enabled` is false by default. When enabled, each actor receives a
+credential-free `attacknet-probe` sidecar on Pod port `18080`. The port is not
+published through the actor Service. The bounded probe API can observe:
+
+- enrolled TCP endpoints and latency;
+- a selected DNS name plus a fixed cluster control;
+- confined filesystem I/O under the actor data volume;
+- wall and monotonic clocks; and
+- bounded platform and architecture identity.
+
+There is no shell, arbitrary hostname, or arbitrary path operation. The run
+controller admits probe evidence only from an exact Ready Pod UID whose probe
+container is independently Ready. Actor logs and actor-provided payloads are
+not authoritative probe evidence.
+
+For a direct, locally authored `StacksNetwork` that enables probes, import the
+probe image before applying the resource:
+
+```bash
+contrib/helm/hacknet/scripts/load-kind-images.sh \
+  stacks-hacknet-probe:dev
+```
+
+The public Attacknet lifecycle resolves and transports its declared probe image
+as part of the rendered topology.
+
+## Architecture-specific fault boundaries
+
+Chaos Mesh 2.8.3 native `IOChaos` and `TimeChaos` are rejected on arm64. The
+installed I/O helper is x86-64-only, and local TimeChaos testing reported an
+ineffective process-clock shift plus a wedged daemon canary. Extend
+`runOperator.ioChaosSupportedArchitectures` or
+`runOperator.timeChaosSupportedArchitectures` only after an effect-and-recovery
+canary succeeds on that architecture.
+
+Attacknet supplies two separately labelled portable mechanisms:
+
+- `io-pressure` applies bounded controller-owned pressure to a selected actor
+  PVC and proves an FSYNC latency effect and recovery; and
+- `clock-skew` updates a mounted application-clock policy for compatible node
+  images and proves the process wall-clock offset against a control actor.
+
+Neither mechanism may be reported as native Chaos Mesh IOChaos or TimeChaos.
+
+## Security and controller behavior
+
+- Actor Pods receive no Kubernetes service-account token.
+- The topology operator has namespaced workload permissions and no Chaos Mesh
+  permissions.
+- The run operator has a separate namespaced identity and a finite Chaos Mesh
+  resource allowlist.
+- Both controllers use restricted Pod security contexts and projected,
+  rotating service-account tokens.
+- Readiness reflects Kubernetes API availability; liveness reflects controller
+  loop progress, avoiding restart storms during API outages.
+- Controller metrics expose bounded API, reconcile, process, and managed-run
+  measurements for capacity and incident attribution.
+
+Control-plane hardening is always enabled. Adversarial freedom belongs in
+explicit actor images and data-plane fault controls, not in compromising the
+experiment controller.
+
+## Troubleshooting
+
+| Symptom | First action |
+| --- | --- |
+| Controller image is unavailable | Re-run `build-local.sh`, then `install-local.sh`; Docker Engine and `kind` node image stores are separate. |
+| CRD schema did not update | Inspect managed fields, then use `HACKNET_FORCE_CRD_CONFLICTS=1` once only when deliberately reclaiming ownership. |
+| Helm release is `failed` | Run `helm status hacknet -n hacknet-system`; set `HACKNET_RECOVER_FAILED_RELEASE=1` only after identifying the cause. |
+| Upgrade reports a managed-field conflict | Do not use `kubectl set image`; inspect ownership before considering `HACKNET_FORCE_CONFLICTS=1`. |
+| New same-named network is `Degraded` | Wait for old-UID garbage collection; if it persists, inspect finalizers and garbage-collector health. Never adopt old children. |
+| Actor Pod remains Pending after node disruption | Inspect PVC node affinity and placement. Local-path storage does not prove cross-node reattachment. |
+| Fault remains `Inconclusive` | Inspect probe availability and effect evidence; Chaos Mesh injection conditions alone are insufficient. |
+
+The operator intentionally does not duplicate Kubernetes garbage collection.
+If an old owner UID's child is stuck, visible failure is preferable to silently
+hiding a cluster-level finalizer or garbage-collector fault.
+
+## Uninstall
+
+Delete or archive all test networks and evidence before removing the control
+plane:
+
+```bash
+kubectl get stacksnetworks,faultcampaigns,attacknetruns --all-namespaces
+helm uninstall hacknet --namespace hacknet-system
+```
+
+The Hacknet CRDs remain installed. Remove them only after confirming that no
+custom resources remain. Chaos Mesh is independent and can remain installed
+for future runs:
+
+```bash
+helm uninstall chaos-mesh --namespace chaos-mesh
+```
+
+## Development
+
+Run the offline chart and controller checks from the repository root:
+
+```bash
 contrib/helm/hacknet/scripts/check.sh
 ```
 
-The check runs controller unit tests and, when Helm is installed, lints and
-renders the chart. A live-cluster smoke should additionally confirm StatefulSet
-recreation, status transitions, sidecar export, projected-token rotation
-(use the documented 600-second smoke setting for a bounded test), CR deletion,
-and that no actor PVC survives deletion.
+A live change should additionally prove:
 
-It should also delete and immediately recreate a same-named `StacksNetwork`.
-Until background garbage collection removes the old UID's children, the new
-resource must report `Degraded` with an ownership-collision diagnostic; it must
-then converge by creating fresh children, never adopting the old resources. If
-that condition persists, inspect finalizers and garbage-collector health on the
-old StatefulSets, Services, and ConfigMaps. The Role already permits deletion
-of those child kinds, but the controller intentionally does not duplicate
-garbage collection merely because the former owner UID is gone. Automatically
-compensating would hide a cluster-level GC or finalizer fault behind an
-apparently healthy network; manual removal remains an explicit operator action.
+- StatefulSet recreation and status transitions;
+- telemetry and active-probe readiness when enabled;
+- projected service-account token rotation;
+- suspension with PVC retention;
+- custom-resource deletion with PVC reclamation; and
+- delete-and-immediate-recreate behavior without adoption of old resources.
 
-Actor Pods never receive the operator's service-account token. Ownership,
-namespaced RBAC, restricted Pod security, token projection, and evidence
-integrity are control-plane invariants and remain enabled even for malicious
-actor scenarios. Fault realism belongs in explicit data-plane controls; it
-must not depend on compromising the experiment controller itself.
+For a registry deployment, publish immutable controller, run-operator, probe,
+I/O-pressure, and actor image references. The development-source ConfigMap
+fallback exists only for local controller debugging and must remain disabled in
+packaged deployments.
 
-## Compose-to-Hacknet migration discipline
+## Current product boundary
 
-The proven Compose topology remains authoritative while the complete 28-actor
-network is ported. The port must share one topology model and, more importantly,
-run the same assertion and evidence code against both backends. HTTP/RPC,
-Prometheus, observer, drift, lifecycle-conservation, and released-proposal
-checks must not be rewritten for Kubernetes. Only process execution, service
-addressing, logs, lifecycle operations, and artifact copying belong in thin
-Compose and Kubernetes adapters. Harness loops must enumerate actors, roles,
-and signer/companion relationships from that model; hardcoded actor counts and
-synthesized numeric service-name ranges are prohibited.
+Kubernetes is the canonical adversarial backend. Compose remains a short,
+deterministic behavioral-reference loop; it is no longer authoritative for the
+full topology.
 
-Before adding more fault APIs, bring up the full topology incrementally on the
-target cluster and record admitted Pod resources, PVC/PV placement, startup
-latency, reconciliation duration/API pressure, throttling, OOMs, evictions, and
-probe failures. A single-node kind cluster proves control-plane and local-PVC
-lifecycle behavior, but it does not prove rescheduling or CSI reattachment.
-
-After parity is demonstrated, Hacknet becomes authoritative for long soaks,
-mixed-version runs, malicious builds, and adversarial evidence. Compose remains
-the short deterministic developer loop. Cutover requires the same actor IDs,
-images/config hashes, shared assertions, current chaos scenarios, evidence
-schema, deliberate negative-test detection, and a clean 300+ burn-block run
-without cluster resource pressure.
-
-Readiness-gated Services are a deterministic default, not a claim about the
-public network. Withdrawing an endpoint affects discovery and new connections,
-not established application sessions. Future dependency cycles should be detected
-and reported, not prohibited; runtime degradation belongs to explicit process
-or Chaos Mesh controls. TimeChaos scenarios must first inventory which code
-uses wall clock versus monotonic time so the injected fault can affect the
-stated hypothesis.
-
-## Productization status and next work
-
-The backend-neutral topology, assertions, runtime adapters, evidence ledger,
-full 28-actor topology, Bitcoin funding/stacking lifecycle, authenticated
-telemetry, `FaultCampaign`, and `AttacknetRun` paths now exist. The accepted
-local-kind baseline includes a measured 300-new-burn-block soak, deterministic
-Pod/network/DNS/controller-owned I/O faults, portable application-clock skew,
-mixed current/released/modified actors, worker/PVC recovery, replay, and
-bounded removal-only minimization. Do not use the earlier migration checklist
-as evidence that these capabilities are still absent.
-
-The machine-readable capability boundary and terminal evidence digests live in
-`contrib/attacknet/release/baseline-v1.json`. Release 1 productization proceeds
-through the tracked Attacknet release contract and handoff documents: freeze
-instrumentation and compatibility guards, add the human/agent command surface,
-then implement portable profiles and controller-owned protocol assertions.
-Bounded Bitcoin reorgs and multi-bitcoind split views follow those attribution
-foundations.
-
-Managed-cluster, x86-native Chaos helpers, portable/multi-zone CSI,
-organization registry/identity integration, and controller HA remain explicit
-future qualifications. The local Release 1 must report those as deferred or
-capability-rejected, never as implied passes.
+Release 1 has qualified the local three-node arm64 profile, full 28-actor
+topology, authenticated telemetry, bounded fault campaigns, seeded runs,
+replay, and removal-only minimization. Managed clusters, x86-native Chaos
+helpers, portable or multi-zone CSI, registry/enterprise identity integration,
+and controller HA remain explicitly unqualified. Consult the machine-readable
+[Release 1 baseline](../../attacknet/release/baseline-v1.json) rather than
+inferring support from a rendered resource or successful Helm installation.
