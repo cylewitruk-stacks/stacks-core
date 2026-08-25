@@ -13,13 +13,6 @@ import (
 )
 
 var (
-	actionsByType = map[string]map[string]bool{
-		"pod":         {"pod-kill": true, "pod-failure": true, "container-kill": true},
-		"network":     {"netem": true, "delay": true, "loss": true, "duplicate": true, "corrupt": true, "partition": true, "bandwidth": true},
-		"dns":         {"error": true, "random": true},
-		"io":          {"latency": true, "fault": true, "attrOverride": true, "mistake": true},
-		"io-pressure": {"disk-pressure": true},
-	}
 	ioMethods        = stringSet("READ", "WRITE", "FLUSH", "FSYNC", "FDATASYNC", "READDIR", "SYNC", "OPEN", "MKDIR", "MKNOD", "CHOWN", "CHMOD", "UTIMES", "LINK", "UNLINK", "RENAME")
 	clockIDs         = stringSet("CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID")
 	rateRE           = regexp.MustCompile(`^(\d+(?:\.\d+)?)(bps|kbps|mbps|gbps)$`)
@@ -47,30 +40,50 @@ var pressureLimits = map[string]pressureLimit{
 
 func validateParameters(kind, action string, parameters map[string]any, safety attacknetv1alpha1.FaultSafety, duration time.Duration, manifest Manifest) (parameterResult, error) {
 	result := parameterResult{Parameters: cloneMap(parameters)}
-	if allowed, exists := actionsByType[kind]; exists && !allowed[action] {
+	definition, err := mechanismForType(kind)
+	if err != nil {
+		return result, err
+	}
+	if len(definition.AllowedActions) > 0 && !definition.AllowedActions[action] {
 		return result, fmt.Errorf("unsupported %s action %s", kind, action)
 	}
-	if (kind == "time" || kind == "clock-skew") && action != "" {
+	if len(definition.AllowedActions) == 0 && action != "" {
 		return result, fmt.Errorf("%s faults must not specify action", kind)
 	}
+	return definition.Parameters(action, result.Parameters, safety, duration, manifest)
+}
+
+func podParameterValidator(action string, values map[string]any, safety attacknetv1alpha1.FaultSafety, _ time.Duration, _ Manifest) (parameterResult, error) {
+	result := parameterResult{Parameters: values}
+	return result, validatePodParameters(action, values, safety)
+}
+
+func networkParameterValidator(action string, values map[string]any, safety attacknetv1alpha1.FaultSafety, _ time.Duration, manifest Manifest) (parameterResult, error) {
+	result := parameterResult{Parameters: values}
 	var err error
-	switch kind {
-	case "pod":
-		err = validatePodParameters(action, result.Parameters, safety)
-	case "network":
-		result.PeerSelectedActors, err = validateNetworkParameters(action, result.Parameters, safety, manifest)
-	case "dns":
-		err = validateDNSParameters(result.Parameters)
-	case "io":
-		err = validateIOParameters(action, result.Parameters, safety)
-	case "io-pressure":
-		result.Parameters, result.IOPressure, err = validateIOPressureParameters(result.Parameters, safety, duration)
-	case "time":
-		err = validateTimeParameters(result.Parameters, safety, false)
-	case "clock-skew":
-		err = validateTimeParameters(result.Parameters, safety, true)
-	}
+	result.PeerSelectedActors, err = validateNetworkParameters(action, values, safety, manifest)
 	return result, err
+}
+
+func dnsParameterValidator(_ string, values map[string]any, _ attacknetv1alpha1.FaultSafety, _ time.Duration, _ Manifest) (parameterResult, error) {
+	return parameterResult{Parameters: values}, validateDNSParameters(values)
+}
+
+func ioParameterValidator(action string, values map[string]any, safety attacknetv1alpha1.FaultSafety, _ time.Duration, _ Manifest) (parameterResult, error) {
+	return parameterResult{Parameters: values}, validateIOParameters(action, values, safety)
+}
+
+func ioPressureParameterValidator(_ string, values map[string]any, safety attacknetv1alpha1.FaultSafety, duration time.Duration, _ Manifest) (parameterResult, error) {
+	parameters, evidence, err := validateIOPressureParameters(values, safety, duration)
+	return parameterResult{Parameters: parameters, IOPressure: evidence}, err
+}
+
+func timeParameterValidator(_ string, values map[string]any, safety attacknetv1alpha1.FaultSafety, _ time.Duration, _ Manifest) (parameterResult, error) {
+	return parameterResult{Parameters: values}, validateTimeParameters(values, safety, false)
+}
+
+func clockSkewParameterValidator(_ string, values map[string]any, safety attacknetv1alpha1.FaultSafety, _ time.Duration, _ Manifest) (parameterResult, error) {
+	return parameterResult{Parameters: values}, validateTimeParameters(values, safety, true)
 }
 
 func validatePodParameters(action string, values map[string]any, safety attacknetv1alpha1.FaultSafety) error {

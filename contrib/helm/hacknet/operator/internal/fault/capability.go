@@ -24,22 +24,22 @@ type capabilityObservation struct {
 }
 
 func (r *Reconciler) capabilityEvidence(ctx context.Context, campaign *attacknetv1alpha1.FaultCampaign, pods []corev1.Pod, targets []attacknetv1alpha1.ResolvedTarget) []capabilityObservation {
-	kind := campaign.Spec.Fault.Type
-	if kind != "io" && kind != "time" && kind != "clock-skew" && kind != "io-pressure" {
+	definition := mustMechanismForType(campaign.Spec.Fault.Type)
+	if definition.Capability == noCapability {
 		return nil
 	}
 	result := make([]capabilityObservation, 0, len(targets))
 	for _, target := range targets {
 		base := capabilityObservation{Actor: target.Actor, PodUID: target.PodUID, Source: "attacknet-run-operator/v1", ObservedAt: r.now().Format("2006-01-02T15:04:05.000Z07:00")}
-		switch kind {
-		case "io-pressure":
+		switch definition.Capability {
+		case ioPressureCapability:
 			base.Platform, base.Architecture = "kubernetes-core-pod", "native-image"
 			base.Supported = r.IOPressureImage != ""
 			base.Reason = "controller-owned bounded I/O-pressure image is configured"
 			if !base.Supported {
 				base.Reason = "trusted I/O-pressure image is not configured"
 			}
-		case "clock-skew":
+		case clockPolicyCapabilityKind:
 			base.Platform, base.Architecture = "application-clock-policy", "image-contract"
 			base.Supported, base.Reason = clockPodCapability(campaign, target, pods)
 			policy := &corev1.ConfigMap{}
@@ -62,7 +62,7 @@ func (r *Reconciler) capabilityEvidence(ctx context.Context, campaign *attacknet
 			base.Architecture, _ = observation["architecture"].(string)
 			allowed := r.IOChaosArchitectures
 			mechanism := "IOChaos"
-			if kind == "time" {
+			if definition.Capability == timeChaosCapability {
 				allowed, mechanism = r.TimeChaosArchitectures, "TimeChaos"
 			}
 			if len(allowed) == 0 {

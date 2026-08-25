@@ -39,7 +39,8 @@ func clockInjectionProven(campaign *attacknetv1alpha1.FaultCampaign, targets []a
 	for _, target := range targets {
 		selected[target.Actor] = true
 	}
-	kind := kindByType[campaign.Spec.Fault.Type]
+	definition := mustMechanismForType(campaign.Spec.Fault.Type)
+	kind := definition.MutationKind
 	for _, phase := range []string{"before", "during"} {
 		value, err := decodeProbePhase(artifacts[phase+"Json"], phase, kind, selected)
 		if err != nil {
@@ -69,7 +70,8 @@ func evaluateProbeEvidence(campaign *attacknetv1alpha1.FaultCampaign, compiled C
 	for _, target := range targets {
 		selected[target.Actor] = true
 	}
-	kind := kindByType[campaign.Spec.Fault.Type]
+	definition := mustMechanismForType(campaign.Spec.Fault.Type)
+	kind := definition.MutationKind
 	for _, phase := range []string{"before", "during", "after"} {
 		value, err := decodeProbePhase(artifacts[phase+"Json"], phase, kind, selected)
 		if err != nil {
@@ -77,7 +79,7 @@ func evaluateProbeEvidence(campaign *attacknetv1alpha1.FaultCampaign, compiled C
 		}
 		phases[phase] = value
 	}
-	if kind == "TimeChaos" || kind == "ClockSkewPolicy" {
+	if definition.EffectKind == "clock" {
 		if err := validateClockSemantics(phases, targets); err != nil {
 			return effectReport{}, err
 		}
@@ -92,20 +94,20 @@ func evaluateProbeEvidence(campaign *attacknetv1alpha1.FaultCampaign, compiled C
 		return result
 	}
 	evaluations := make([]effectEvaluation, 0, len(targets))
-	if kind == "TimeChaos" || kind == "ClockSkewPolicy" {
+	if definition.EffectKind == "clock" {
 		evaluations = evaluateClocks(campaign, targets, phases)
 	} else {
 		for _, target := range targets {
 			before, during, after := byActor("before", target.Actor), byActor("during", target.Actor), byActor("after", target.Actor)
 			var evaluation effectEvaluation
-			switch kind {
-			case "NetworkChaos":
+			switch definition.EffectKind {
+			case "network":
 				evaluation = evaluateNetwork(campaign.Spec.Fault.Action, compiled.Evidence.Parameters, target.Actor, before, during, after, set(compiled.Evidence.PeerSelectedActors))
-			case "DNSChaos":
+			case "dns":
 				evaluation = evaluateDNS(campaign.Spec.Fault.Action, compiled.Evidence.Parameters, target.Actor, before, during, after)
-			case "IOChaos":
+			case "io":
 				evaluation = evaluateIO(campaign.Spec.Fault.Action, compiled.Evidence.Parameters, target.Actor, before, during, after)
-			case "IOPressurePod":
+			case "io-pressure":
 				evaluation = evaluateIOPressure(compiled.Evidence.IOPressure, target.Actor, before, during, after)
 			default:
 				return effectReport{}, fmt.Errorf("unsupported probe evidence kind %s", kind)

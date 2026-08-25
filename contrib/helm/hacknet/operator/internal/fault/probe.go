@@ -75,8 +75,12 @@ func (p HTTPProbeClient) Probe(ctx context.Context, target attacknetv1alpha1.Res
 }
 
 func probeRequest(kind string, campaign *attacknetv1alpha1.FaultCampaign, target attacknetv1alpha1.ResolvedTarget, network *attacknetv1alpha1.StacksNetwork, compiled Compiled) (map[string]any, error) {
-	switch kind {
-	case "NetworkChaos":
+	definition, err := mechanismForMutationKind(kind)
+	if err != nil {
+		return nil, err
+	}
+	switch definition.ProbeKind {
+	case "network":
 		if len(compiled.Evidence.PeerSelectedActors) == 1 && compiled.Evidence.PeerSelectedActors[0] == "attacknet-prometheus" {
 			return map[string]any{"kind": "network", "peer": "attacknet-prometheus", "port": "http", "attempts": 5, "timeoutMs": 2000}, nil
 		}
@@ -96,7 +100,7 @@ func probeRequest(kind string, campaign *attacknetv1alpha1.FaultCampaign, target
 			return map[string]any{"kind": "network", "peer": candidates[0].Name, "port": preferredPort(candidates[0]), "attempts": 5, "timeoutMs": 2000}, nil
 		}
 		return nil, fmt.Errorf("no enrolled peer endpoint is available for %s", target.Actor)
-	case "DNSChaos":
+	case "dns":
 		patterns, _ := stringsValue(compiled.Evidence.Parameters["patterns"], "patterns", true, nil)
 		candidates := make([]attacknetv1alpha1.ActorSpec, 0, len(network.Spec.Actors))
 		for _, actor := range network.Spec.Actors {
@@ -116,7 +120,7 @@ func probeRequest(kind string, campaign *attacknetv1alpha1.FaultCampaign, target
 			return nil, fmt.Errorf("no enrolled service name matches the DNS fault patterns for %s", target.Actor)
 		}
 		return map[string]any{"kind": "dns", "peer": candidates[0].Name}, nil
-	case "IOChaos":
+	case "io":
 		operation := "FSYNC"
 		if methods, ok := compiled.Evidence.Parameters["methods"].([]any); ok {
 			for _, candidate := range methods {
@@ -128,9 +132,7 @@ func probeRequest(kind string, campaign *attacknetv1alpha1.FaultCampaign, target
 			}
 		}
 		return map[string]any{"kind": "io", "operation": operation, "attempts": 5, "bytes": 4096, "file": campaign.Name + ".dat"}, nil
-	case "IOPressurePod":
-		return map[string]any{"kind": "io", "operation": "FSYNC", "attempts": 5, "bytes": 4096, "file": campaign.Name + ".dat"}, nil
-	case "TimeChaos", "ClockSkewPolicy":
+	case "clock":
 		return map[string]any{"kind": "processClock", "peer": target.Actor, "port": "metrics", "metric": "stacks_node_process_wall_clock_seconds", "control": false}, nil
 	default:
 		return nil, fmt.Errorf("no active probe contract for %s", kind)

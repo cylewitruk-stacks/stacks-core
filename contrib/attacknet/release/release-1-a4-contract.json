@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "stacks-attacknet-phase-review-contract/v2",
+  "reviewId": "release-1-amendment-a4-controller-composability",
+  "phase": 2,
+  "releaseScope": "Release 1 controller composability amendment A4",
+  "tier": "Full",
+  "requiredReviewers": [
+    "Codex",
+    "Claude Opus 5"
+  ],
+  "requirements": [
+    "single-signed-commit-directly-on-approved-a3-with-exact-diff",
+    "one-closed-complete-fault-mechanism-registry-governs-all-seven-fault-types",
+    "fault-and-topology-decomposition-preserves-one-authoritative-reconciler-per-crd",
+    "immutable-schedule-persistence-is-a-focused-direct-read-collaborator",
+    "a3-render-compile-lifecycle-safety-identity-and-evidence-behavior-remains-equivalent",
+    "controller-extension-boundaries-state-machines-and-invariants-are-documented",
+    "clean-go-race-envtest-helm-whole-product-and-live-kind-verification",
+    "portable-self-identifying-review-evidence"
+  ],
+  "requiredInventory": [
+    "candidate:contrib/helm/hacknet/operator/ARCHITECTURE.md",
+    "candidate:contrib/helm/hacknet/operator/internal/fault/mechanism.go",
+    "candidate:contrib/helm/hacknet/operator/internal/fault/mechanism_test.go",
+    "candidate:contrib/helm/hacknet/operator/internal/fault/reconciler.go",
+    "candidate:contrib/helm/hacknet/operator/internal/fault/phases.go",
+    "candidate:contrib/helm/hacknet/operator/internal/fault/mutation.go",
+    "candidate:contrib/helm/hacknet/operator/internal/run/schedule_store.go",
+    "candidate:contrib/helm/hacknet/operator/internal/topology/render.go",
+    "candidate:contrib/helm/hacknet/operator/internal/topology/statefulset.go",
+    "candidate:contrib/attacknet/release/release-1-a2-evidence.mjs",
+    "candidate:contrib/attacknet/release/release-1-a4-contract.json",
+    "candidate:contrib/attacknet/release/release-1-a4-evidence.mjs",
+    "candidate:contrib/attacknet/release/release-1-a4-packet.mjs",
+    "candidate:contrib/attacknet/release/release-1-a4-verify.mjs",
+    "candidate:contrib/attacknet/release/release-1-a4.test.mjs",
+    "candidate:contrib/attacknet/evidence-packets/release-1-a4/README.md",
+    "diff:candidate-controller-composability",
+    "test:attacknet-check",
+    "test:hacknet-check",
+    "evidence:archive-index",
+    "evidence:archive",
+    "evidence:live-summary",
+    "evidence:verification",
+    "evidence:topology-live",
+    "evidence:reversible-fault-live",
+    "evidence:pod-kill-live",
+    "evidence:restart-resume-live",
+    "evidence:clean-teardown"
+  ]
+}

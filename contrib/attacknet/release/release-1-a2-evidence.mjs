@@ -258,6 +258,20 @@ const VALIDATORS = Object.freeze({
   cleanTeardown: validateTeardown,
 });
 
+/**
+ * Validate one controller live-qualification artifact using the compatibility
+ * schema established by A2. Later behavior-preserving amendments reuse these
+ * semantics instead of maintaining independent copies of the same validators.
+ */
+export function validateControllerLiveArtifact(kind, value, candidate) {
+  const validator = VALIDATORS[kind];
+  if (!validator || !['topologyLive', 'reversibleFaultLive', 'podKillLive', 'restartResumeLive', 'cleanTeardown'].includes(kind)) {
+    fail(`unsupported controller live artifact ${kind}`);
+  }
+  validator(value, candidate);
+  return value;
+}
+
 function portablePath(root, path) {
   const value = relative(root, path);
   if (!value || value.startsWith('..') || isAbsolute(value) || value.includes('\\')) {

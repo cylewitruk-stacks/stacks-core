@@ -23,8 +23,6 @@ const (
 	RoleLabel    = "testing.stacks.org/role"
 )
 
-var kindByType = map[string]string{"pod": "PodChaos", "network": "NetworkChaos", "dns": "DNSChaos", "io": "IOChaos", "time": "TimeChaos", "io-pressure": "IOPressurePod", "clock-skew": "ClockSkewPolicy"}
-
 // ManifestActor is one declared network actor used for selection and safety accounting.
 type ManifestActor struct {
 	Name, Role   string
@@ -84,10 +82,11 @@ func Compile(campaign *attacknetv1alpha1.FaultCampaign, manifest Manifest) (Comp
 	if campaign.Spec.NetworkRef != manifest.Network {
 		return Compiled{}, fmt.Errorf("networkRef %s does not match manifest %s", campaign.Spec.NetworkRef, manifest.Network)
 	}
-	kind, ok := kindByType[campaign.Spec.Fault.Type]
-	if !ok {
-		return Compiled{}, fmt.Errorf("unsupported fault type %s", campaign.Spec.Fault.Type)
+	definition, err := mechanismForType(campaign.Spec.Fault.Type)
+	if err != nil {
+		return Compiled{}, err
 	}
+	kind := definition.MutationKind
 	selected, err := selectActors(campaign.Spec.Target, manifest.Actors)
 	if err != nil {
 		return Compiled{}, err

@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
+import {readFileSync, readdirSync} from 'node:fs';
 import {dirname, join} from 'node:path';
 import test from 'node:test';
 import {fileURLToPath} from 'node:url';
 
 const root = dirname(fileURLToPath(import.meta.url));
-const runController = readFileSync(join(root, 'operator', 'internal', 'run', 'reconciler.go'), 'utf8');
-const faultController = readFileSync(join(root, 'operator', 'internal', 'fault', 'reconciler.go'), 'utf8');
+function packageSource(name) {
+  const directory = join(root, 'operator', 'internal', name);
+  return readdirSync(directory)
+    .filter(file => file.endsWith('.go') && !file.endsWith('_test.go'))
+    .sort()
+    .map(file => readFileSync(join(directory, file), 'utf8'))
+    .join('\n');
+}
+
+const runController = packageSource('run');
+const faultController = packageSource('fault');
 const ownership = readFileSync(join(root, 'operator', 'internal', 'ownership', 'ownership.go'), 'utf8');
 
 test('run operator owner references are limited to run-domain resources', () => {

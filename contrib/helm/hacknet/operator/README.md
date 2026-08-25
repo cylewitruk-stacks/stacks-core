@@ -14,6 +14,9 @@ post-admission network/Pod identity barriers, recovery classification, and the
 final mutation-disappearance check. These direct reads narrow informer-cache
 staleness windows; they are not an atomic Kubernetes snapshot.
 
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for package ownership, durable state
+machines, invariants, and the supported fault-mechanism extension process.
+
 ## Development
 
 Go 1.26 and `controller-gen` 0.21 are the pinned development versions.

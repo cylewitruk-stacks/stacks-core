@@ -18,6 +18,10 @@ var phaseFields = fieldSet("schemaVersion", "phase", "source", "capturedAt", "in
 // decodeProbePhase validates an orchestrator-produced probe artifact before it
 // can contribute to a fault verdict.
 func decodeProbePhase(encoded, expectedPhase, kind string, selectedActors map[string]bool) (probePhase, error) {
+	definition, err := mechanismForMutationKind(kind)
+	if err != nil {
+		return probePhase{}, err
+	}
 	decoder := json.NewDecoder(bytes.NewBufferString(encoded))
 	decoder.UseNumber()
 	var raw map[string]any
@@ -66,7 +70,7 @@ func decodeProbePhase(encoded, expectedPhase, kind string, selectedActors map[st
 			return probePhase{}, err
 		}
 		actor := text(observation["actor"])
-		if kind != "TimeChaos" && kind != "ClockSkewPolicy" && !selectedActors[actor] {
+		if definition.EffectKind != "clock" && !selectedActors[actor] {
 			return probePhase{}, fmt.Errorf("%s contains non-target actor %s", field, actor)
 		}
 		if observation["status"] == "ok" {
@@ -82,6 +86,10 @@ func decodeProbePhase(encoded, expectedPhase, kind string, selectedActors map[st
 }
 
 func validateProbeSource(value any, field, kind string) error {
+	definition, err := mechanismForMutationKind(kind)
+	if err != nil {
+		return err
+	}
 	source, ok := value.(map[string]any)
 	if !ok {
 		return fmt.Errorf("%s must be an object", field)
@@ -90,7 +98,7 @@ func validateProbeSource(value any, field, kind string) error {
 		return err
 	}
 	authority := "active-probe"
-	clock := kind == "TimeChaos" || kind == "ClockSkewPolicy"
+	clock := definition.EffectKind == "clock"
 	if clock {
 		authority = "application-process-metric"
 	}
@@ -110,6 +118,10 @@ func validateProbeSource(value any, field, kind string) error {
 }
 
 func validateProbeInjection(value any, field, kind string) error {
+	definition, err := mechanismForMutationKind(kind)
+	if err != nil {
+		return err
+	}
 	injection, ok := value.(map[string]any)
 	if !ok {
 		return fmt.Errorf("%s must be an object", field)
@@ -128,9 +140,9 @@ func validateProbeInjection(value any, field, kind string) error {
 		return err
 	}
 	authority := "chaos-mesh-status"
-	if kind == "IOPressurePod" {
+	if definition.Backend == ioPressureBackend {
 		authority = "kubernetes-pod-status"
-	} else if kind == "ClockSkewPolicy" {
+	} else if definition.Backend == clockPolicyBackend {
 		authority = "controller-clock-policy"
 	}
 	if source["trust"] != "orchestrator-observed" || source["authority"] != authority {
@@ -140,10 +152,11 @@ func validateProbeInjection(value any, field, kind string) error {
 }
 
 func validateObservation(value map[string]any, field, kind string) error {
-	probe := map[string]string{
-		"NetworkChaos": "network", "DNSChaos": "dns", "IOChaos": "io",
-		"IOPressurePod": "io", "TimeChaos": "clock", "ClockSkewPolicy": "clock",
-	}[kind]
+	definition, err := mechanismForMutationKind(kind)
+	if err != nil {
+		return err
+	}
+	probe := definition.ProbeKind
 	if probe == "" {
 		return fmt.Errorf("unsupported probe evidence kind %s", kind)
 	}

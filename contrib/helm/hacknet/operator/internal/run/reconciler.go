@@ -31,8 +31,6 @@ import (
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
 )
 
-const scheduleFormat = "stacks-attacknet-schedule-configmap/v1"
-
 // Reconciler executes immutable AttacknetRun schedules one campaign at a time.
 type Reconciler struct {
 	client.Client
@@ -385,73 +383,14 @@ func (r *Reconciler) validateResume(ctx context.Context, run *attacknetv1alpha1.
 }
 
 func (r *Reconciler) persistSchedule(ctx context.Context, run *attacknetv1alpha1.AttacknetRun, schedule resolvedSchedule) (attacknetv1alpha1.ScheduleReference, error) {
-	payload, err := encodeSchedule(schedule)
-	if err != nil {
-		return attacknetv1alpha1.ScheduleReference{}, err
-	}
-	name := stableName(run.Name, "resolved-schedule")
-	specDigest, _ := canonical.ArtifactDigest(run.Spec)
-	cm := &corev1.ConfigMap{}
-	key := types.NamespacedName{Namespace: run.Namespace, Name: name}
-	err = r.APIReader.Get(ctx, key, cm)
-	if apierrors.IsNotFound(err) {
-		cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace, Labels: map[string]string{fault.NetworkLabel: run.Spec.NetworkRef, "testing.stacks.org/run": run.Name, "testing.stacks.org/artifact": "resolved-schedule"}, Annotations: map[string]string{"testing.stacks.org/schedule-format": scheduleFormat, "testing.stacks.org/schedule-digest": schedule.Integrity.Digest, "testing.stacks.org/run-generation": fmt.Sprint(run.Generation), "testing.stacks.org/run-spec-digest": specDigest}, OwnerReferences: []metav1.OwnerReference{ownership.Reference(run, attacknetv1alpha1.GroupVersion.WithKind("AttacknetRun"))}}, BinaryData: map[string][]byte{"schedule.json.gz": payload}}
-		if createErr := r.Create(ctx, cm); createErr != nil {
-			if !apierrors.IsAlreadyExists(createErr) {
-				return attacknetv1alpha1.ScheduleReference{}, createErr
-			}
-			cm = &corev1.ConfigMap{}
-			if err := r.APIReader.Get(ctx, key, cm); err != nil {
-				return attacknetv1alpha1.ScheduleReference{}, err
-			}
-		}
-	} else if err != nil {
-		return attacknetv1alpha1.ScheduleReference{}, err
-	}
-	owner := metav1.GetControllerOf(cm)
-	if owner == nil || owner.UID != run.UID {
-		return attacknetv1alpha1.ScheduleReference{}, fmt.Errorf("refusing to adopt ConfigMap %s", name)
-	}
-	if cm.Annotations["testing.stacks.org/schedule-format"] != scheduleFormat ||
-		cm.Annotations["testing.stacks.org/schedule-digest"] != schedule.Integrity.Digest ||
-		cm.Annotations["testing.stacks.org/run-generation"] != fmt.Sprint(run.Generation) ||
-		cm.Annotations["testing.stacks.org/run-spec-digest"] != specDigest {
-		return attacknetv1alpha1.ScheduleReference{}, errors.New("immutable schedule already exists for different run inputs")
-	}
-	persisted, err := decodeSchedule(cm.BinaryData["schedule.json.gz"])
-	if err != nil || persisted.Integrity.Digest != schedule.Integrity.Digest {
-		return attacknetv1alpha1.ScheduleReference{}, errors.New("immutable schedule already exists with different contents")
-	}
-	return attacknetv1alpha1.ScheduleReference{Name: name, UID: string(cm.UID), Digest: persisted.Integrity.Digest, RunGeneration: run.Generation, RunSpecDigest: specDigest}, nil
+	return r.scheduleStore().persist(ctx, run, schedule)
 }
 func (r *Reconciler) readSchedule(ctx context.Context, run *attacknetv1alpha1.AttacknetRun, reference attacknetv1alpha1.ScheduleReference) (resolvedSchedule, error) {
-	cm := &corev1.ConfigMap{}
-	if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: reference.Name}, cm); err != nil {
-		return resolvedSchedule{}, err
-	}
-	owner := metav1.GetControllerOf(cm)
-	if owner == nil || owner.UID != run.UID || string(cm.UID) != reference.UID {
-		return resolvedSchedule{}, errors.New("resolved schedule ownership or UID changed")
-	}
-	if cm.Annotations["testing.stacks.org/schedule-format"] != scheduleFormat ||
-		cm.Annotations["testing.stacks.org/schedule-digest"] != reference.Digest ||
-		cm.Annotations["testing.stacks.org/run-generation"] != fmt.Sprint(reference.RunGeneration) ||
-		cm.Annotations["testing.stacks.org/run-spec-digest"] != reference.RunSpecDigest ||
-		reference.RunGeneration != run.Generation {
-		return resolvedSchedule{}, errors.New("resolved schedule metadata changed or no longer matches the run")
-	}
-	specDigest, err := canonical.ArtifactDigest(run.Spec)
-	if err != nil || specDigest != reference.RunSpecDigest {
-		return resolvedSchedule{}, errors.New("resolved schedule run inputs changed")
-	}
-	schedule, err := decodeSchedule(cm.BinaryData["schedule.json.gz"])
-	if err != nil {
-		return schedule, err
-	}
-	if schedule.Integrity.Digest != reference.Digest {
-		return schedule, errors.New("resolved schedule reference digest changed")
-	}
-	return schedule, nil
+	return r.scheduleStore().read(ctx, run, reference)
+}
+
+func (r *Reconciler) scheduleStore() scheduleStore {
+	return scheduleStore{writer: r.Client, reader: r.APIReader}
 }
 
 func (r *Reconciler) startAction(ctx context.Context, run *attacknetv1alpha1.AttacknetRun, next attacknetv1alpha1.AttacknetRunStatus, action action, usage *attacknetv1alpha1.BudgetUsage) error {
