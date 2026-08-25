@@ -25,6 +25,23 @@ test('stage topology derives actor inventory from requested counts', () => {
   assert.equal(topology.actors.filter(actor => actor.role === 'follower').length, 2);
 });
 
+test('zero-signer topologies omit signer workloads and the unused stacker', () => {
+  const output = mkdtempSync(join(tmpdir(), 'attacknet-zero-signers-'));
+  const topology = buildTopology({minerCount: 1, signerCount: 0, followerCount: 1});
+  const {resource, manifest} = renderTopology(topology, output);
+  assert.equal(topology.signers.length, 0);
+  assert.equal(resource.spec.actors.some(actor => actor.role === 'signer'), false);
+  assert.equal(resource.spec.actors.some(actor => actor.role === 'companion'), false);
+  assert.equal(resource.spec.actors.some(actor => actor.name === 'stacker'), false);
+  assert.equal(manifest.workloads.length, 4);
+
+  const cliOutput = mkdtempSync(join(tmpdir(), 'attacknet-zero-signers-cli-'));
+  const result = spawnSync(process.execPath, [resolve('contrib/attacknet/topology.mjs'),
+    '--miners=1', '--signers=0', '--followers=1', `--output=${cliOutput}`], {encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Rendered 4 workloads/);
+});
+
 test('full topology is 28 protocol actors plus three bootstrap workloads', () => {
   const output = mkdtempSync(join(tmpdir(), 'attacknet-topology-'));
   const topology = buildTopology({minerCount: 3, signerCount: 10, followerCount: 5});
@@ -52,6 +69,10 @@ test('trusted probes are default-off and explicitly parameterized for Kubernetes
   }).resource;
   assert.deepEqual(enabled.spec.probe, {
     enabled: true, image: 'registry.local/attacknet-probe:sha-123', imagePullPolicy: 'IfNotPresent',
+    additionalServices: [{
+      name: 'attacknet-prometheus', serviceName: 'attacknet-attacknet-prometheus',
+      ports: [{name: 'http', port: 9090}],
+    }],
   });
 });
 

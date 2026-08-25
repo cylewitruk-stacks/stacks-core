@@ -20,7 +20,6 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        checksum/development-source: {{ ternary ((.Files.Get "operator/controller.py") | sha256sum) "disabled" .Values.operator.developmentSource.enabled | quote }}
         {{- with .Values.operator.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -35,28 +34,22 @@ spec:
       {{- end }}
       containers:
         - name: operator
-          {{- if .Values.operator.developmentSource.enabled }}
-          image: "{{ .Values.operator.developmentSource.runtimeImage.repository }}:{{ .Values.operator.developmentSource.runtimeImage.tag }}"
-          imagePullPolicy: {{ .Values.operator.developmentSource.runtimeImage.pullPolicy }}
-          command: ["python", "/app/controller.py"]
-          {{- else }}
           image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
-          {{- end }}
+          args:
+            - --watch-namespace={{ include "hacknet.watchNamespace" . }}
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --max-concurrent-reconciles=1
+            - --zap-log-level={{ lower .Values.operator.logLevel }}
           securityContext:
             {{- toYaml .Values.operator.securityContext | nindent 12 }}
-          env:
-            - name: WATCH_NAMESPACE
-              value: {{ include "hacknet.watchNamespace" . | quote }}
-            - name: RECONCILE_INTERVAL_SECONDS
-              value: {{ .Values.operator.reconcileIntervalSeconds | quote }}
-            - name: LOG_LEVEL
-              value: {{ .Values.operator.logLevel | quote }}
-            - name: PYTHONDONTWRITEBYTECODE
-              value: "1"
           ports:
-            - name: health
+            - name: metrics
               containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
               protocol: TCP
           readinessProbe:
             httpGet:
@@ -76,12 +69,6 @@ spec:
             - name: kube-api-access
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
-            {{- if .Values.operator.developmentSource.enabled }}
-            - name: development-source
-              mountPath: /app/controller.py
-              subPath: controller.py
-              readOnly: true
-            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -103,11 +90,6 @@ spec:
                       fieldRef:
                         apiVersion: v1
                         fieldPath: metadata.namespace
-        {{- if .Values.operator.developmentSource.enabled }}
-        - name: development-source
-          configMap:
-            name: {{ include "hacknet.fullname" . }}-development-source
-        {{- end }}
       {{- with .Values.operator.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

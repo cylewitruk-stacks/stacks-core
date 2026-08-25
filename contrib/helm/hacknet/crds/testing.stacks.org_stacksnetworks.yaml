@@ -141,6 +141,10 @@ spec:
                     resources:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
+                    metricsPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
                     tokenSecretRef:
                       type: object
                       required: [name, key]
@@ -153,8 +157,9 @@ spec:
                   type: object
                   description: >-
                     Optional trusted active-probe sidecar settings. Disabled by
-                    default. The probe has no Kubernetes credential and is not
-                    published through actor Services.
+                    default. The probe has no Kubernetes credential. When
+                    enabled, its bounded unauthenticated API is published on
+                    actor Service port 18080 for peer-throughput observations.
                   properties:
                     enabled:
                       type: boolean
@@ -169,6 +174,44 @@ spec:
                     resources:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
+                    additionalServices: &probeAdditionalServices
+                      type: array
+                      maxItems: 16
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [name]
+                      items:
+                        type: object
+                        required: [name, serviceName, ports]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                            maxLength: 63
+                            pattern: "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+                          serviceName:
+                            type: string
+                            minLength: 1
+                            maxLength: 63
+                            pattern: "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+                          ports:
+                            type: array
+                            minItems: 1
+                            maxItems: 16
+                            x-kubernetes-list-type: map
+                            x-kubernetes-list-map-keys: [name]
+                            items:
+                              type: object
+                              required: [name, port]
+                              properties:
+                                name:
+                                  type: string
+                                  minLength: 1
+                                  maxLength: 15
+                                  pattern: "^[a-z]([-a-z0-9]*[a-z0-9])?$"
+                                port:
+                                  type: integer
+                                  minimum: 1
+                                  maximum: 65535
                 actors:
                   type: array
                   minItems: 1
@@ -397,6 +440,7 @@ spec:
                           resources:
                             type: object
                             x-kubernetes-preserve-unknown-fields: true
+                          additionalServices: *probeAdditionalServices
                       labels:
                         type: object
                         additionalProperties: {type: string}
@@ -418,6 +462,14 @@ spec:
                   type: integer
                 readySummary:
                   type: string
+                inventoryReady:
+                  type: boolean
+                inventoryDigest:
+                  type: string
+                  pattern: "^sha256:[0-9a-f]{64}$"
+                inventoryObservedAt:
+                  type: string
+                  format: date-time
                 actors:
                   type: array
                   x-kubernetes-list-type: map
@@ -431,7 +483,20 @@ spec:
                       resourceName: {type: string}
                       image: {type: string}
                       ready: {type: boolean}
+                      identityReady: {type: boolean}
                       readyReplicas: {type: integer}
+                      updatedReplicas: {type: integer}
+                      generation: {type: integer, format: int64}
+                      observedGeneration: {type: integer, format: int64}
+                      currentRevision: {type: string, nullable: true}
+                      updateRevision: {type: string, nullable: true}
+                      serviceName: {type: string}
+                      statefulSetUID: {type: string, nullable: true}
+                      statefulSetResourceVersion: {type: string, nullable: true}
+                      podName: {type: string, nullable: true}
+                      podUID: {type: string, nullable: true}
+                      podResourceVersion: {type: string, nullable: true}
+                      runtimeImageID: {type: string, nullable: true}
                 conditions:
                   type: array
                   x-kubernetes-list-type: map
@@ -446,6 +511,7 @@ spec:
                         enum: ["True", "False", Unknown]
                       reason: {type: string}
                       message: {type: string}
+                      observedGeneration: {type: integer, format: int64}
                       lastTransitionTime:
                         type: string
                         format: date-time

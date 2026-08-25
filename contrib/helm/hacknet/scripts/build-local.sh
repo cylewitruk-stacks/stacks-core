@@ -4,13 +4,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 
 docker build \
+  --build-arg BINARY=topology-operator \
   --tag stacks-hacknet-operator:dev \
   "${repo_root}/contrib/helm/hacknet/operator"
 
 docker build \
+  --build-arg BINARY=run-operator \
   --tag stacks-hacknet-run-operator:dev \
-  --file "${repo_root}/contrib/helm/hacknet/run-operator/Dockerfile" \
-  "${repo_root}"
+  "${repo_root}/contrib/helm/hacknet/operator"
 
 docker build \
   --tag stacks-hacknet-probe:dev \

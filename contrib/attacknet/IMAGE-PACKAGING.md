@@ -59,13 +59,8 @@ the default image. Named backtraces remain more useful than with
 `--strip-all`/`--strip-unneeded` because the ordinary symbol table is retained,
 but full source/line debugging requires the matching external symbols.
 
-The dependency-free Python operator could use an Alpine Python base, but doing
-so also changes libc, DNS, OpenSSL, and CA-bundle behavior on its Kubernetes API
-TLS path. Its current image size is almost entirely the shared Python base, so
-that switch should be validated as a separate runtime change with an in-cluster
-TLS/reconciliation smoke test. The Node run-controller and probe are already
-small source-only layers over Alpine Node bases; rewriting either application
-does not target their dominant runtime layers. Their bases are shareable only
-when both Dockerfiles resolve to the exact same Node/Alpine image and layer
-digests. The current floating probe tag and pinned run-controller tag need not
-do so, and aligning them is a separate Node/distro upgrade decision.
+The topology and run controllers are statically linked Go binaries in the same
+distroless image recipe. Their build uses separate module and compiler cache
+mounts, and each image selects one binary through the `BINARY` build argument.
+The active probe remains a small Node image because its HTTP observation logic
+is data-plane instrumentation rather than Kubernetes reconciliation.

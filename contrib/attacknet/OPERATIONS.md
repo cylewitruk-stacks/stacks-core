@@ -132,6 +132,18 @@ kubectl apply -f contrib/helm/hacknet/examples/attacknet-run.json
 kubectl get faultcampaigns,attacknetruns -n hacknet-system -w
 ```
 
+Lifecycle apply normally owns the persistent environment lease. If these
+resources are applied directly, first claim the lease for their `networkRef`:
+
+```bash
+KUBE_NAMESPACE=hacknet-system \
+  contrib/attacknet/environment-lock.sh claim attacknet operator fault-campaign
+```
+
+Without the matching lease, campaigns remain `Pending` with reason
+`WaitingForEnvironmentLease` and cannot inject a mutation. Release the lease
+only after all campaigns prove cleanup and the network has been removed.
+
 Before its first fault, `AttacknetRun` seals the resolved schedule, network
 identity, image digests, seed decisions, and aggregate budgets in an
 owner-bound ConfigMap. Execution uses only those pinned instructions.

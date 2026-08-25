@@ -793,6 +793,20 @@ needs_post_ready_clock_start() {
   [ "${AUTO_START_BURNCHAIN}" = 1 ] && [ -z "${gated}" ] && [ ! -f "${bootstrap_network}" ]
 }
 
+ensure_chaos_injection_namespace() {
+  local expected=enabled observed
+  # Chaos Mesh's filtered-namespace contract is an annotation, not a label.
+  # A label with the same key is ignored and makes every selector look empty.
+  kubectl annotate namespace "${NAMESPACE}" chaos-mesh.org/inject="${expected}" \
+    --overwrite >/dev/null
+  observed="$(kubectl get namespace "${NAMESPACE}" \
+    -o jsonpath='{.metadata.annotations.chaos-mesh\.org/inject}')"
+  if [ "${observed}" != "${expected}" ]; then
+    echo "namespace ${NAMESPACE} is not enabled for Chaos Mesh injection" >&2
+    return 1
+  fi
+}
+
 apply_network() {
   local generated="${1:?generated topology directory required}"
   local manifest="${generated}/manifest.json" final_network="${generated}/stacksnetwork.json"
@@ -814,6 +828,11 @@ apply_network() {
     node "${ATTACKNET_DIR}/instrumentation/phase-1-qualification.mjs" preflight \
       "${manifest}" "${instrumentation_input}" --output="${instrumentation_plan}"
   fi
+  # Chaos Mesh installations commonly filter injection to explicitly enabled
+  # namespaces. Every Attacknet workload namespace is an intentional fault
+  # target, so make that admission explicit only after all local preflight
+  # checks have passed and immediately before Kubernetes mutation begins.
+  ensure_chaos_injection_namespace
   if [ "${OBSERVABILITY_ENABLED}" = 1 ]; then
     observability_render_args=(
       "${manifest}"
@@ -1116,6 +1135,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     NETWORK="${rendered_network}"
     NAMESPACE="${rendered_namespace}"
   fi
+  # Recursive lock acquisition must retain the resolved identity even when it
+  # came from the rendered manifest rather than the caller's environment.
+  export KUBE_NAMESPACE="${NAMESPACE}" KUBE_NETWORK="${NETWORK}"
   case "${command}" in
     apply|delete)
       if [ -z "${ATTACKNET_MUTATION_TOKEN:-}" ]; then

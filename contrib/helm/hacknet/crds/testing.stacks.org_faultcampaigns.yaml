@@ -278,9 +278,24 @@
                 "message": {"type": "string", "maxLength": 4096},
                 "lastTransitionTime": {"type": "string", "format": "date-time"},
                 "templateDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                "admission": {"type": "object", "required": ["networkUid", "networkGeneration", "compiledDigest", "admittedAt", "signerImpact", "minerImpact"], "properties": {
+                "admission": {"type": "object", "required": ["networkUid", "networkGeneration", "networkInventory", "compiledDigest", "admittedAt", "signerImpact", "minerImpact"], "properties": {
                   "networkUid": {"type": "string", "minLength": 1, "maxLength": 128},
                   "networkGeneration": {"type": "integer", "minimum": 1},
+                  "campaignGeneration": {"type": "integer", "minimum": 1},
+                  "campaignSpecDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                  "networkInventory": {"type": "object", "required": ["digest", "observedGeneration", "actors"], "properties": {
+                    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "observedGeneration": {"type": "integer", "minimum": 1},
+                    "observedAt": {"type": "string", "format": "date-time", "nullable": true},
+                    "resourceVersion": {"type": "string", "nullable": true, "maxLength": 128},
+                    "actors": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "object", "required": ["name", "role", "serviceName", "statefulSetName", "statefulSetUID", "controllerRevision", "podName", "podUID", "requestedImage", "runtimeImageID"], "properties": {
+                      "name": {"type": "string", "maxLength": 40}, "role": {"type": "string", "maxLength": 32},
+                      "serviceName": {"type": "string", "maxLength": 63}, "statefulSetName": {"type": "string", "maxLength": 63},
+                      "statefulSetUID": {"type": "string", "maxLength": 128}, "controllerRevision": {"type": "string", "maxLength": 253},
+                      "podName": {"type": "string", "maxLength": 253}, "podUID": {"type": "string", "maxLength": 128},
+                      "requestedImage": {"type": "string", "maxLength": 2048}, "runtimeImageID": {"type": "string", "maxLength": 4096}
+                    }}}
+                  }},
                   "compiledDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
                   "admittedAt": {"type": "string", "format": "date-time"},
                   "signerSetRewardCycle": {"type": "integer", "minimum": 0},
@@ -359,6 +374,16 @@
                   "method": {"type": "string", "enum": ["Normal", "ZeroInjectionFinalizerAbort", "ClockPolicyReset", "ClockPolicyMissing"]},
                   "zeroInjectionProven": {"type": "boolean"},
                   "observedAt": {"type": "string", "format": "date-time"}
+                }},
+                "identityDivergence": {"type": "object", "required": ["observedAt", "differences"], "properties": {
+                  "expectedDigest": {"type": "string", "nullable": true, "pattern": "^sha256:[0-9a-f]{64}$"},
+                  "currentDigest": {"type": "string", "nullable": true, "pattern": "^sha256:[0-9a-f]{64}$"},
+                  "observedAt": {"type": "string", "format": "date-time"},
+                  "differences": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "object", "required": ["scope", "field"], "properties": {
+                    "scope": {"type": "string", "maxLength": 63}, "field": {"type": "string", "maxLength": 63},
+                    "expected": {"x-kubernetes-int-or-string": true, "nullable": true}, "current": {"x-kubernetes-int-or-string": true, "nullable": true},
+                    "message": {"type": "string", "maxLength": 1024}
+                  }}}
                 }},
                 "completedAt": {"type": "string", "format": "date-time"},
                 "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},

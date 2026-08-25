@@ -63,6 +63,7 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
   for (const alert of [
     'AttacknetInstrumentationProvenanceExporterAbsent',
     'AttacknetActorMetricsUnreachable',
+    'AttacknetOrchestratorMetricsCollectionFailed',
     'AttacknetCorrelatedSignerParticipationLoss', 'AttacknetSignerStateFrozen',
     'AttacknetSignerValidationUnavailable', 'AttacknetNakamotoPropagationFailure',
   ]) assert.match(prometheus.data['attacknet.rules.yml'], new RegExp(alert));
@@ -78,6 +79,8 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
     .split('|').sort();
   assert.deepEqual(unreachableJobs, actorScrapeJobs);
   assert.match(prometheus.data['attacknet.rules.yml'], /AttacknetActorMetricsUnreachable[\s\S]*?for: 30s/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /AttacknetOrchestratorMetricsCollectionFailed[\s\S]*?attacknet_orchestrator_metrics_collection_success == 0/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /AttacknetOrchestratorMetricsCollectionFailed[\s\S]*?up\{job="attacknet-run-controller"\} == 1/);
   assert.match(
     prometheus.data['attacknet.rules.yml'],
     /AttacknetInstrumentationProvenanceExporterAbsent[\s\S]*?for: 2m/,

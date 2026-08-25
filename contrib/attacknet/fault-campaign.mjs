@@ -2,6 +2,8 @@
 
 import {readFileSync, writeFileSync} from 'node:fs';
 
+import {canonicalJson} from './run-descriptor.mjs';
+
 const NETWORK_LABEL = 'testing.stacks.org/network';
 const ACTOR_LABEL = 'testing.stacks.org/actor';
 const ROLE_LABEL = 'testing.stacks.org/role';
@@ -534,7 +536,7 @@ export function compileCampaign(campaign, manifest) {
   if (!actionless && fault.type !== 'io-pressure') chaosSpec.action = fault.action;
   Object.assign(chaosSpec, ioPressure?.executionParameters ?? parameters);
   const annotations = ioPressure ? {
-    'testing.stacks.org/io-pressure-contract': JSON.stringify(ioPressure.evidence),
+    'testing.stacks.org/io-pressure-contract': canonicalJson(ioPressure.evidence),
   } : undefined;
   const resource = {
     apiVersion: fault.type === 'io-pressure' || fault.type === 'clock-skew'

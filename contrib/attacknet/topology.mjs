@@ -331,7 +331,7 @@ function signerActor(index, signer, image) {
 
 export function buildTopology({minerCount = 1, signerCount = 1, followerCount = 1, nodeImage = 'stacks-core-attacknet:main', stackerImage = 'stacks-attacknet-stacker:local', actorImages = {}, actorEnvs = {}, eventDispatchMode = 'queued', instrumentationProfile = 'unmodified', instrumentationProvenance = 'unavailable', actorInstrumentation = {}} = {}) {
   if (minerCount < 1 || minerCount > LIMITS.miners) throw new Error('minerCount out of range');
-  if (signerCount < 1 || signerCount > LIMITS.signers) throw new Error('signerCount out of range');
+  if (signerCount < 0 || signerCount > LIMITS.signers) throw new Error('signerCount out of range');
   if (followerCount < 0 || followerCount > LIMITS.followers) throw new Error('followerCount out of range');
   if (!['queued', 'blocking'].includes(eventDispatchMode)) throw new Error('eventDispatchMode must be queued or blocking');
   if (!/^[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?$/.test(instrumentationProfile)) throw new Error('instrumentationProfile is invalid');
@@ -430,7 +430,7 @@ function infrastructureActors(topology, network) {
   const wallets = Array.from({length: topology.minerCount}, (_, index) => `attacknet-miner-${index + 1}`);
   const addresses = MINERS.slice(0, topology.minerCount).map(miner => miner[2]);
   const stackingKeys = topology.signers.map(signer => signer[0]);
-  return [
+  const actors = [
     {
       name: 'bitcoin', role: 'burnchain', image: 'bitcoin/bitcoin:25.2', imagePullPolicy: 'IfNotPresent',
       command: ['bitcoind'], args: ['-conf=/home/bitcoin/.bitcoin/bitcoin.conf', '-datadir=/home/bitcoin/.bitcoin', '-nosettings'],
@@ -463,6 +463,9 @@ function infrastructureActors(topology, network) {
       storage: {enabled: false}, resources: {requests: {cpu: '50m', memory: '128Mi'}, limits: {cpu: '1', memory: '1Gi'}},
     },
   ];
+  return topology.signerCount === 0
+    ? actors.filter(actor => actor.name !== 'stacker')
+    : actors;
 }
 
 export function renderTopology(topology, output, {
@@ -505,7 +508,13 @@ export function renderTopology(topology, output, {
     spec: {
       defaults: {nodeImage: topology.nodeImage, imagePullPolicy: 'IfNotPresent', storage: {enabled: true, size: '2Gi'}},
       telemetry: {enabled: false},
-      probe: {enabled: probes, image: probeImage, imagePullPolicy: 'IfNotPresent'},
+      probe: {
+        enabled: probes, image: probeImage, imagePullPolicy: 'IfNotPresent',
+        ...(probes ? {additionalServices: [{
+          name: 'attacknet-prometheus', serviceName: `${network}-attacknet-prometheus`,
+          ports: [{name: 'http', port: 9090}],
+        }]} : {}),
+      },
       actors: resourceActors,
     },
   };
@@ -609,11 +618,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const output = resolve(option('output', join(ROOT, 'generated')));
   const probeEnabled = option('probes', 'false');
   if (!['true', 'false'].includes(probeEnabled)) throw new Error('probes must be true or false');
-  renderTopology(topology, output, {
+  const rendered = renderTopology(topology, output, {
     network: option('network', 'attacknet'),
     namespace: option('namespace', 'hacknet-system'),
     probes: probeEnabled === 'true',
     probeImage: option('probe-image', 'stacks-hacknet-probe:dev'),
   });
-  console.log(`Rendered ${topology.actors.length + 3} workloads to ${output}`);
+  console.log(`Rendered ${rendered.manifest.workloads.length} workloads to ${output}`);
 }

@@ -65,6 +65,7 @@ From the repository root, the local workflow requires:
 | `jq` | Available on the host for installer and evidence helpers |
 | Node.js | 20 or newer |
 | Python | 3.11 or newer |
+| Go | 1.26 for controller development and local source builds |
 | Metrics API | `metrics.k8s.io/v1beta1` reachable for capacity checks |
 | Storage | One default StorageClass; at least 8 GiB available per node for the full topology |
 | Architecture | Local `arm64` or `x64`; cluster `arm64` or `amd64` |
@@ -279,6 +280,14 @@ These labels are the supported selection surface for fault injection and
 evidence. The schema's legacy `companion` role identifies a configured signer
 node; new prose and user-facing names should call it a signer node.
 
+After every actor rollout is complete, `status.inventoryDigest` binds the
+current generation to the admitted StatefulSet UID/revision, Pod UID, requested
+image, runtime image ID, Service, and role of every actor. The digest is absent
+while any identity is incomplete. Observation timestamps and Kubernetes
+resource versions are reported alongside it but are deliberately excluded from
+the digest. Consumers must wait for `status.inventoryReady: true` and must still
+recheck live Pod identity immediately before a mutation.
+
 An actor may set `runtimeExposure: reachable` to publish its headless-Service
 endpoint before its Pod is Ready. The default, `ready`, keeps bootstrap
 deterministic. This affects DNS discovery and new connections, not established
@@ -288,20 +297,41 @@ sessions, and is not a runtime fault mechanism.
 
 `FaultCampaign` is either an inert reusable template (`spec.template: true`) or
 one bounded execution. The run controller resolves exact admitted Pod
-identities and owns cleanup through a finalizer.
+identities and owns cleanup through a finalizer. It removes that finalizer once
+terminal cleanup is durably proven, so completed campaigns cannot strand a
+namespace after the controller itself is removed.
+
+Admission snapshots the complete `StacksNetwork` inventory digest. Every later
+reconciliation compares the snapshot with both current status and live Pods.
+An unplanned identity change is never silently retargeted: owned fault state is
+cleaned up and the campaign ends `Inconclusive` with reason
+`TargetIdentityDiverged` and structured before/current evidence. An intentional
+`pod-kill` may replace only its selected Pod identity; all other identities
+remain pinned.
 
 Supported native Chaos Mesh resources are `PodChaos`, `NetworkChaos`,
 `DNSChaos`, `IOChaos`, and `TimeChaos`. The controller can also create one
 restricted I/O-pressure Pod from the chart-configured trusted image. Campaigns
 cannot supply that image, executable, shell, or arbitrary arguments.
 
-Apply direct examples only after the referenced network is Ready:
+Apply direct examples only after the referenced network is Ready and the
+environment lease names that network. The public Attacknet lifecycle commands
+manage this lease automatically; direct Hacknet use must claim and release it
+explicitly:
 
 ```bash
+KUBE_NAMESPACE=hacknet-system \
+  contrib/attacknet/environment-lock.sh claim attacknet operator fault-campaign
 kubectl apply --filename contrib/helm/hacknet/examples/fault-campaign.json
 kubectl apply --filename contrib/helm/hacknet/examples/fault-campaign-io-pressure.json
 kubectl get faultcampaigns --namespace hacknet-system --watch
+# After all campaigns are terminal with cleanup proven and the network is gone:
+KUBE_NAMESPACE=hacknet-system \
+  contrib/attacknet/environment-lock.sh release attacknet
 ```
+
+A campaign created without the matching environment lease remains `Pending`
+with reason `WaitingForEnvironmentLease`; it never injects a fault.
 
 Chaos Mesh `AllInjected` and `AllRecovered` conditions are context, not proof
 that the target experienced the requested effect. Without trusted effect and
@@ -313,6 +343,17 @@ recovery observations, a campaign terminates `Inconclusive`, never `Passed`.
 template identity and generation, network identity and generation, admitted
 actor image digests, seeded decisions, and aggregate budgets in a sealed,
 owner-bound ConfigMap. It creates at most one owned campaign at a time.
+
+The run also pins the complete admitted inventory. Unplanned divergence ends
+the run `Inconclusive` and prevents remaining actions from starting. A proven,
+intentional `pod-kill` records an explicit inventory transition before a later
+action may use the replacement Pod.
+
+Terminal phase records the run outcome; it does not by itself prove cleanup.
+Wait for `status.cleanup.completed: true` before archiving the terminal result
+or tearing down its network. The controller continues observing owned
+campaigns after the outcome is known and sets `status.finishedAt` only after
+each campaign has proved mutation cleanup and target recovery.
 
 ```bash
 kubectl apply --filename contrib/helm/hacknet/examples/attacknet-run.json
@@ -335,8 +376,10 @@ bearer token may come from `telemetry.tokenSecretRef` without the operator
 reading it.
 
 `spec.probe.enabled` is false by default. When enabled, each actor receives a
-credential-free `attacknet-probe` sidecar on Pod port `18080`. The port is not
-published through the actor Service. The bounded probe API can observe:
+credential-free `attacknet-probe` sidecar on Pod port `18080`. The actor
+Service publishes that port so enrolled peers can perform bounded throughput
+observations. The API is intentionally unauthenticated; do not expose actor
+Services outside the isolated test network. The bounded probe API can observe:
 
 - enrolled TCP endpoints and latency;
 - a selected DNS name plus a fixed cluster control;
@@ -348,6 +391,12 @@ There is no shell, arbitrary hostname, or arbitrary path operation. The run
 controller admits probe evidence only from an exact Ready Pod UID whose probe
 container is independently Ready. Actor logs and actor-provided payloads are
 not authoritative probe evidence.
+
+Actor Services are always included in the probe allowlist. Additional
+credential-free harness Services must be declared explicitly through bounded
+`spec.probe.additionalServices` entries containing a DNS-label Service name and
+named ports. Attacknet's topology renderer uses this extension for its
+Prometheus endpoint; the generic default adds no Attacknet-specific peer.
 
 For a direct, locally authored `StacksNetwork` that enables probes, import the
 probe image before applying the resource:
@@ -447,10 +496,13 @@ A live change should additionally prove:
 - custom-resource deletion with PVC reclamation; and
 - delete-and-immediate-recreate behavior without adoption of old resources.
 
-For a registry deployment, publish immutable controller, run-operator, probe,
-I/O-pressure, and actor image references. The development-source ConfigMap
-fallback exists only for local controller debugging and must remain disabled in
-packaged deployments.
+For a registry deployment, publish immutable topology-operator, run-operator,
+probe, I/O-pressure, and actor image references. Controllers are compiled Go
+binaries; no source-mount execution fallback exists.
+
+Controller implementation and envtest instructions are in
+[`operator/README.md`](operator/README.md). The authored CRDs remain the schema
+source of truth, while `controller-gen` owns typed deep-copy generation.
 
 ## Current product boundary
 

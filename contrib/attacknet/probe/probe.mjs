@@ -17,6 +17,7 @@ const MAX_BODY_BYTES = 8192;
 const MAX_ATTEMPTS = 10;
 const MAX_IO_BYTES = 1024 * 1024;
 const MAX_METRICS_BYTES = 512 * 1024;
+const MAX_THROUGHPUT_BYTES = 1024 * 1024;
 const PROCESS_WALL_CLOCK_METRIC = 'stacks_node_process_wall_clock_seconds';
 
 function boundedInteger(value, name, minimum, maximum, fallback) {
@@ -103,15 +104,45 @@ async function connectOnce({host, port, timeoutMs, connect = net.createConnectio
   });
 }
 
+async function throughputOnce({host, port, bytes, timeoutMs, get = http.get}) {
+  const started = performance.now();
+  return new Promise((resolveResult, reject) => {
+    let received = 0;
+    const outgoing = get({host, port, path: `/v1/payload?bytes=${bytes}`, timeout: timeoutMs}, response => {
+      response.on('data', chunk => {
+        received += chunk.length;
+        if (received > bytes) outgoing.destroy(new Error('throughput response exceeded requested bytes'));
+      });
+      response.on('end', () => {
+        if ((response.statusCode ?? 0) !== 200 || received !== bytes) {
+          reject(new Error(`throughput endpoint returned HTTP ${response.statusCode ?? 0} with ${received}/${bytes} bytes`));
+          return;
+        }
+        const seconds = Math.max((performance.now() - started) / 1000, 0.000001);
+        resolveResult(received / seconds);
+      });
+    });
+    outgoing.on('timeout', () => outgoing.destroy(new Error('throughput request timed out')));
+    outgoing.on('error', reject);
+  });
+}
+
 export async function networkObservation(request, context) {
   const peer = namedPeer(context.peers, request.peer);
   const port = namedPort(peer, request.port);
   const attempts = boundedInteger(request.attempts, 'attempts', 1, MAX_ATTEMPTS, 5);
-  const timeoutMs = boundedInteger(request.timeoutMs, 'timeoutMs', 50, 2000, 1000);
+  const timeoutMs = boundedInteger(request.timeoutMs, 'timeoutMs', 50, request.throughputBytes === undefined ? 2000 : 10000, 1000);
   const results = await Promise.all(Array.from({length: attempts}, () =>
     connectOnce({host: peer.host, port, timeoutMs, connect: context.connect})));
   const samples = results.filter(sample => sample.success).map(sample => sample.latencyMs);
   const protocolErrors = results.length - samples.length;
+  const throughputBytesPerSecond = request.throughputBytes === undefined ? null : await throughputOnce({
+    host: peer.host,
+    port,
+    bytes: boundedInteger(request.throughputBytes, 'throughputBytes', 4096, MAX_THROUGHPUT_BYTES),
+    timeoutMs,
+    get: context.httpGet,
+  });
   return {
     actor: context.actor, probe: 'network', status: 'ok',
     probeName: `${request.peer}-${request.port}`,
@@ -121,7 +152,7 @@ export async function networkObservation(request, context) {
     latencyMsP50: percentile(samples, 0.50),
     latencyMsP95: percentile(samples, 0.95),
     protocolErrors,
-    throughputBytesPerSecond: null,
+    throughputBytesPerSecond,
   };
 }
 
@@ -330,7 +361,7 @@ export function createContext(environment = process.env, overrides = {}) {
 export async function dispatchProbe(request, context) {
   if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('request must be a JSON object');
   const allowed = {
-    network: new Set(['kind', 'peer', 'port', 'attempts', 'timeoutMs']),
+    network: new Set(['kind', 'peer', 'port', 'attempts', 'timeoutMs', 'throughputBytes']),
     dns: new Set(['kind', 'peer']),
     io: new Set(['kind', 'operation', 'file', 'bytes', 'attempts']),
     clock: new Set(['kind', 'control']),
@@ -378,6 +409,18 @@ export function createServer(context) {
     try {
       if (request.method === 'GET' && request.url === '/healthz') {
         send(response, 200, {status: 'ok', actor: context.actor});
+        return;
+      }
+      const url = new URL(request.url, 'http://attacknet-probe.invalid');
+      if (request.method === 'GET' && url.pathname === '/v1/payload') {
+        if ([...url.searchParams.keys()].some(key => key !== 'bytes')) throw new Error('unsupported payload parameter');
+        const bytes = boundedInteger(Number(url.searchParams.get('bytes')), 'bytes', 4096, MAX_THROUGHPUT_BYTES);
+        response.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-length': bytes,
+          'cache-control': 'no-store',
+        });
+        response.end(Buffer.alloc(bytes));
         return;
       }
       if (request.method !== 'POST' || request.url !== '/v1/probe') {

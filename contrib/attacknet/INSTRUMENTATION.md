@@ -229,7 +229,8 @@ per-proposal weight-accumulation time.
 
 The signed candidate run passed 203 core Attacknet Node tests, 20
 instrumentation-contract tests, 44 observability Node tests, 11 event-bridge
-Python tests, and the 31-workload offline operator render. This proves the
+event-bridge Python tests, Go controller tests, and the 31-workload offline
+operator render. This proves the
 offline mechanisms and negative controls only; it does not replace the live
 image/admission/scrape evidence or dual review listed in the phase packet.
 

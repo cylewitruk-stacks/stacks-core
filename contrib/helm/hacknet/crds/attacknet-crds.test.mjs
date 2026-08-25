@@ -183,6 +183,17 @@ test('FaultCampaign status accepts the bounded controller evidence contract', ()
     admission: {
       networkUid: '7ac3', networkGeneration: 1, compiledDigest: `sha256:${'a'.repeat(64)}`,
       admittedAt: '2026-08-15T01:59:00Z',
+      networkInventory: {
+        digest: `sha256:${'d'.repeat(64)}`, observedGeneration: 1,
+        observedAt: '2026-08-15T01:58:59Z', resourceVersion: '17',
+        actors: [{
+          name: 'miner-2', role: 'miner', serviceName: 'attacknet-miner-2',
+          statefulSetName: 'attacknet-miner-2', statefulSetUID: 'statefulset-uid',
+          controllerRevision: 'attacknet-miner-2-revision', podName: 'attacknet-miner-2-0',
+          podUID: 'pod-uid', requestedImage: 'stacks:test',
+          runtimeImageID: `containerd://sha256:${'e'.repeat(64)}`,
+        }],
+      },
       signerImpact: {totalWeight: 19, affectedWeight: 0, percent: 0},
       minerImpact: {totalCount: 3, affectedCount: 1, percent: 33.333},
     },
@@ -281,6 +292,7 @@ test('AttacknetRun is a namespaced status API with a finite referenced catalog',
   for (const field of ['scheduleRef', 'scheduleSummary', 'activeChild', 'resolvedCampaigns', 'decisions', 'budgetUsage', 'attribution', 'evidenceURI']) {
     assert.ok(root.properties.status.properties[field], `missing status.${field}`);
   }
+  assert.deepEqual(root.properties.status.properties.cleanup.required, ['required', 'completed']);
 });
 
 test('valid AttacknetRun example satisfies the structural OpenAPI subset', () => {
@@ -318,6 +330,7 @@ test('AttacknetRun status accepts serialized controller decisions and budget evi
       evidenceURI: 'k8s://attacknetruns/ddmin-001/terminal-assertion-evidence',
       causalMinimalityClaimed: false,
     },
+    cleanup: {required: true, completed: true, completedAt: '2026-08-15T02:10:00Z'},
     attribution: 'NotRequired', evidenceURI: 'file:///evidence/run.json',
   };
   assert.deepEqual(validate(value, schema(runCRD)), []);

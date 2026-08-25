@@ -95,6 +95,12 @@ Baseline and recovery checks include:
 - no unexplained metric counter reset during a measured window;
 - terminal `AttacknetRun` status consistent with its campaign results.
 
+A terminal run outcome is not a cleanup receipt. Consumers must also require
+`status.cleanup.required=true` and `status.cleanup.completed=true` before they
+archive evidence or tear down an experiment. The run controller continues to
+reconcile terminal runs until every owned campaign has proved mutation cleanup
+and target recovery.
+
 The verifier derives actor inventories from `manifest.json`; it does not assume
 a fixed signer count.
 

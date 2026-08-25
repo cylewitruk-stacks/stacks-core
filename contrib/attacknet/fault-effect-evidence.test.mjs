@@ -128,6 +128,26 @@ test('Network effect requires a matching named peer probe delta', () => {
   assert.equal(wrongPeer.verdict, 'Inconclusive');
 });
 
+test('Bandwidth proof requires bounded throughput reduction and subsequent recovery', () => {
+  const compiled = campaign('NetworkChaos', 'bandwidth', {bandwidth: {rate: '1mbps'}});
+  const proven = evaluate(
+    compiled,
+    phase('before', 'active-probe', [network({throughputBytesPerSecond: 1_000_000})]),
+    phase('during', 'active-probe', [network({throughputBytesPerSecond: 120_000})], true),
+    phase('after', 'active-probe', [network({throughputBytesPerSecond: 900_000})]),
+  );
+  assert.equal(proven.verdict, 'Proven');
+  assert.equal(proven.recovery.verdict, 'Proven');
+
+  const unchanged = evaluate(
+    compiled,
+    phase('before', 'active-probe', [network({throughputBytesPerSecond: 1_000_000})]),
+    phase('during', 'active-probe', [network({throughputBytesPerSecond: 900_000})], true),
+    phase('after', 'active-probe', [network({throughputBytesPerSecond: 900_000})]),
+  );
+  assert.equal(unchanged.verdict, 'Failed');
+});
+
 function dns(values = {}) {
   return {
     actor: target.actor, probe: 'dns', status: 'ok', probeName: 'companion-dns',

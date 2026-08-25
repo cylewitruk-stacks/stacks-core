@@ -3,23 +3,36 @@ set -euo pipefail
 
 chart_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 go_status=passed
+envtest_status=skipped-unavailable
 helm_status=passed
 
-python3 -m py_compile "${chart_dir}/operator/controller.py"
-python3 -m unittest discover -s "${chart_dir}/operator" -p 'test_*.py' -v
-node --check "${chart_dir}/run-operator/controller.mjs"
-node --test "${chart_dir}/run-operator/controller.test.mjs"
-node --test "${chart_dir}/run-operator/probe-client.test.mjs"
-node --test "${chart_dir}/run-operator/image-context.test.mjs"
+if command -v go >/dev/null 2>&1; then
+  unformatted="$(gofmt -l "${chart_dir}/operator")"
+  if [[ -n "${unformatted}" ]]; then
+    echo "Go operator sources are not formatted:" >&2
+    printf '%s\n' "${unformatted}" >&2
+    exit 1
+  fi
+  (cd "${chart_dir}/operator" && go vet ./...)
+  (cd "${chart_dir}/operator" && go test ./...)
+  (cd "${chart_dir}/operator" && go test -race ./...)
+  if [[ -n "${KUBEBUILDER_ASSETS:-}" ]]; then
+    (cd "${chart_dir}/operator" && go test -tags=integration ./internal/integration)
+    envtest_status=passed
+  else
+    echo "KUBEBUILDER_ASSETS is unset; skipped controller-runtime envtest" >&2
+  fi
+else
+  go_status=skipped-unavailable
+  echo "go not installed; skipped controller and bounded I/O-pressure workload tests" >&2
+fi
 node --test "${chart_dir}/crds/attacknet-crds.test.mjs"
+node --test "${chart_dir}/security-contract.test.mjs"
 node --check "${chart_dir}/../../attacknet/probe/probe.mjs"
 node --test "${chart_dir}/../../attacknet/probe/probe.test.mjs"
 node --test "${chart_dir}/../../attacknet/io-pressure/image-context.test.mjs"
-if command -v go >/dev/null 2>&1; then
+if [[ "${go_status}" = passed ]]; then
   (cd "${chart_dir}/../../attacknet/io-pressure" && go test ./...)
-else
-  go_status=skipped-unavailable
-  echo "go not installed; skipped bounded I/O-pressure workload tests" >&2
 fi
 
 helm_bin="${HELM_BIN:-helm}"
@@ -30,7 +43,7 @@ if command -v "${helm_bin}" >/dev/null 2>&1; then
     echo 'rendered run-operator RBAC is missing the bounded native Chaos resources' >&2
     exit 1
   fi
-  if [[ "${rendered}" != *$'resources: ["pods"]\n    verbs: ["get", "list", "watch", "create", "patch", "delete"]'* ]]; then
+  if [[ "${rendered}" != *$'resources: ["pods"]\n    verbs: ["get", "list", "watch", "create", "delete"]'* ]]; then
     echo 'rendered run-operator RBAC lacks the exact controller-owned I/O-pressure Pod lifecycle verbs' >&2
     exit 1
   fi
@@ -43,7 +56,6 @@ if command -v "${helm_bin}" >/dev/null 2>&1; then
     exit 1
   fi
   "${helm_bin}" template hacknet "${chart_dir}" --namespace hacknet-system \
-    --set operator.developmentSource.enabled=true \
     --set runOperator.enabled=false \
     --set serviceAccount.tokenExpirationSeconds=600 >/dev/null
 else
@@ -61,6 +73,11 @@ if [[ -n "${HACKNET_OFFLINE_RESULT:-}" ]]; then
     optional+=("--optional=helm:passed")
   else
     optional+=("--optional=helm:skipped-unavailable:Helm executable not installed")
+  fi
+  if [[ "${envtest_status}" = passed ]]; then
+    optional+=("--optional=envtest:passed")
+  else
+    optional+=("--optional=envtest:skipped-unavailable:KUBEBUILDER_ASSETS not configured")
   fi
   node "${chart_dir}/../../attacknet/release/hacknet-offline-result.mjs" \
     "--output=${HACKNET_OFFLINE_RESULT}" \

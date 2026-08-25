@@ -5,8 +5,9 @@ usage() {
   cat >&2 <<'EOF'
 usage: load-kind-images.sh [--mode=auto|require] [--output=RECEIPT.json] IMAGE...
 
-Loads exact local Docker image references into every node of the current kind
-cluster and verifies the references in each node's containerd store. `auto`
+Loads exact local Docker image references for the cluster's single node
+platform into every node of the current kind cluster and verifies the
+references in each node's containerd store. `auto`
 prints a skipped receipt when the current cluster is not entirely
 kind-on-Docker; `require` fails instead. It never mutates Kubernetes objects.
 EOF
@@ -36,12 +37,25 @@ imports_tsv="${temporary}/imports.tsv"
 : >"${imports_tsv}"
 
 "${kubectl_bin}" get nodes -o json | jq -r \
-  '.items[] | [.metadata.name, (.spec.providerID // "")] | @tsv' >"${nodes_tsv}"
+  '.items[] | [.metadata.name, (.spec.providerID // ""),
+    (.status.nodeInfo.operatingSystem // ""), (.status.nodeInfo.architecture // "")] | @tsv' \
+  >"${nodes_tsv}"
 [ -s "${nodes_tsv}" ] || { echo 'current cluster has no nodes' >&2; exit 1; }
 
 all_kind=true
-while IFS=$'\t' read -r node provider; do
+platform=""
+while IFS=$'\t' read -r node provider operating_system architecture; do
   if [[ "${provider}" != kind://docker/*/"${node}" ]]; then all_kind=false; fi
+  [ -n "${operating_system}" ] && [ -n "${architecture}" ] || {
+    echo "kind node ${node} did not report an operating system and architecture" >&2
+    exit 1
+  }
+  node_platform="${operating_system}/${architecture}"
+  if [ -n "${platform}" ] && [ "${platform}" != "${node_platform}" ]; then
+    echo "kind image loading requires one node platform; found ${platform} and ${node_platform}" >&2
+    exit 1
+  fi
+  platform="${node_platform}"
 done <"${nodes_tsv}"
 if [ "${all_kind}" != true ]; then
   [ "${mode}" = auto ] || {
@@ -84,11 +98,15 @@ for image in "${images[@]}"; do
   printf '%s\t%s\t%s\n' "${image}" "$(normalize_reference "${image}")" "${image_id}" \
     >>"${host_records}"
 done
-"${docker_bin}" save --output "${archive}" "${images[@]}"
+# A Docker tag may retain a multi-platform OCI index even when only the host
+# platform's content is present locally. Importing that incomplete index with
+# `ctr --all-platforms` fails on the first absent manifest. Export the exact
+# platform every kind node reports and import only that complete image graph.
+"${docker_bin}" save --platform "${platform}" --output "${archive}" "${images[@]}"
 
-while IFS=$'\t' read -r node provider; do
+while IFS=$'\t' read -r node provider operating_system architecture; do
   "${docker_bin}" container inspect "${node}" >/dev/null
-  "${docker_bin}" exec -i "${node}" ctr -n k8s.io images import --all-platforms - \
+  "${docker_bin}" exec -i "${node}" ctr -n k8s.io images import - \
     <"${archive}" >/dev/null
   loaded="$(${docker_bin} exec "${node}" ctr -n k8s.io images ls -q)"
   while IFS=$'\t' read -r image normalized image_id; do
@@ -96,8 +114,9 @@ while IFS=$'\t' read -r node provider; do
       echo "kind node ${node} did not retain ${normalized}" >&2
       exit 1
     }
-    printf '%s\t%s\t%s\t%s\t%s\n' \
-      "${node}" "${provider}" "${image}" "${normalized}" "${image_id}" >>"${imports_tsv}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${node}" "${provider}" "${operating_system}" "${architecture}" \
+      "${image}" "${normalized}" "${image_id}" >>"${imports_tsv}"
   done <"${host_records}"
 done <"${nodes_tsv}"
 
@@ -105,10 +124,13 @@ receipt="$(NODE_FILE="${nodes_tsv}" IMPORT_FILE="${imports_tsv}" node -e '
   const fs = require("node:fs");
   const rows = path => fs.readFileSync(path, "utf8").trim().split(/\n/).filter(Boolean)
     .map(line => line.split("\t"));
-  const nodes = rows(process.env.NODE_FILE).map(([name, providerID]) => ({name, providerID}));
+  const nodes = rows(process.env.NODE_FILE).map(
+    ([name, providerID, operatingSystem, architecture]) =>
+      ({name, providerID, operatingSystem, architecture}));
   const imports = rows(process.env.IMPORT_FILE).map(
-    ([node, providerID, requestedRef, importedRef, hostImageID]) =>
-      ({node, providerID, requestedRef, importedRef, hostImageID, verified: true}));
+    ([node, providerID, operatingSystem, architecture, requestedRef, importedRef, hostImageID]) =>
+      ({node, providerID, operatingSystem, architecture,
+        requestedRef, importedRef, hostImageID, verified: true}));
   console.log(JSON.stringify({
     schemaVersion: "stacks-attacknet-kind-image-load/v1",
     outcome: "Loaded",

@@ -258,6 +258,13 @@ export function prometheusRules() {
           severity: warning
         annotations:
           summary: An enrolled actor metrics endpoint is unreachable
+      - alert: AttacknetOrchestratorMetricsCollectionFailed
+        expr: attacknet_orchestrator_metrics_collection_success == 0 or (absent(attacknet_orchestrator_metrics_collection_success) and on() (count(up{job="attacknet-run-controller"} == 1) > 0))
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: The run operator cannot publish authoritative campaign and run state
       - alert: AttacknetCorrelatedSignerParticipationLoss
         expr: count(stacks_signer_registered_for_current_reward_cycle == 0) by (attacknet_network) >= 2
         for: 30s

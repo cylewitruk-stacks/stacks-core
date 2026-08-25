@@ -492,14 +492,18 @@ function networkContract(action, spec, baseline, active) {
   };
 }
 
-function networkRecovered(baseline, after) {
+function networkRecovered(action, baseline, after) {
   if (!after || baseline.successes === 0) return after ? 'failed' : 'inconclusive';
   const beforeRate = baseline.successes / baseline.attempts;
   const afterRate = after.successes / after.attempts;
   const reachable = afterRate >= Math.max(0.5, beforeRate - 0.1);
   const latency = after.successes === 0 || baseline.latencyMsP95 === null
     ? false : after.latencyMsP95 <= Math.max(baseline.latencyMsP95 * 2, baseline.latencyMsP95 + 50);
-  return reachable && latency ? 'proven' : 'failed';
+  const throughput = action !== 'bandwidth'
+    || (after.throughputBytesPerSecond !== null
+      && baseline.throughputBytesPerSecond > 0
+      && after.throughputBytesPerSecond >= baseline.throughputBytesPerSecond * 0.8);
+  return reachable && latency && throughput ? 'proven' : 'failed';
 }
 
 function networkEvaluation(action, spec, target, before, during, after, allowedPeers) {
@@ -520,8 +524,8 @@ function networkEvaluation(action, spec, target, before, during, after, allowedP
     details.push({key, ...contract});
     if (contract.proven) {
       return {
-        actor: target.actor, effect: 'proven', recovery: networkRecovered(beforeObservation, recovered.get(key)),
-        reason: `named reachability/latency probe observed ${contract.reason}`, metrics: contract.metrics,
+        actor: target.actor, effect: 'proven', recovery: networkRecovered(action, beforeObservation, recovered.get(key)),
+        reason: `named reachability/latency/throughput probe observed ${contract.reason}`, metrics: contract.metrics,
       };
     }
   }

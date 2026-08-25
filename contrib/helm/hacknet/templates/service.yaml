@@ -10,7 +10,7 @@ spec:
   selector:
     {{- include "hacknet.selectorLabels" . | nindent 4 }}
   ports:
-    - name: http
+    - name: metrics
       port: 8080
-      targetPort: health
+      targetPort: metrics
       protocol: TCP

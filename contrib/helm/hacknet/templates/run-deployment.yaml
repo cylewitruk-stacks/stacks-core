@@ -38,30 +38,28 @@ spec:
         - name: run-operator
           image: "{{ .Values.runOperator.image.repository }}:{{ .Values.runOperator.image.tag }}"
           imagePullPolicy: {{ .Values.runOperator.image.pullPolicy }}
+          args:
+            - --watch-namespace={{ include "hacknet.watchNamespace" . }}
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --max-concurrent-reconciles=1
+            - --zap-log-level={{ lower .Values.runOperator.logLevel }}
+            - --iochaos-supported-architectures={{ join "," .Values.runOperator.ioChaosSupportedArchitectures }}
+            - --timechaos-supported-architectures={{ join "," .Values.runOperator.timeChaosSupportedArchitectures }}
+            - --io-pressure-image-pull-policy={{ .Values.runOperator.ioPressureImage.pullPolicy }}
+            {{- if .Values.runOperator.ioPressureImage.digest }}
+            - --io-pressure-image={{ .Values.runOperator.ioPressureImage.repository }}@{{ .Values.runOperator.ioPressureImage.digest }}
+            {{- else }}
+            - --io-pressure-image={{ .Values.runOperator.ioPressureImage.repository }}:{{ .Values.runOperator.ioPressureImage.tag }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.runOperator.securityContext | nindent 12 }}
-          env:
-            - name: WATCH_NAMESPACE
-              value: {{ include "hacknet.watchNamespace" . | quote }}
-            - name: RECONCILE_INTERVAL_SECONDS
-              value: {{ .Values.runOperator.reconcileIntervalSeconds | quote }}
-            - name: LOG_LEVEL
-              value: {{ .Values.runOperator.logLevel | quote }}
-            - name: IOCHAOS_SUPPORTED_ARCHITECTURES
-              value: {{ join "," .Values.runOperator.ioChaosSupportedArchitectures | quote }}
-            - name: TIMECHAOS_SUPPORTED_ARCHITECTURES
-              value: {{ join "," .Values.runOperator.timeChaosSupportedArchitectures | quote }}
-            - name: IO_PRESSURE_IMAGE
-              {{- if .Values.runOperator.ioPressureImage.digest }}
-              value: {{ printf "%s@%s" .Values.runOperator.ioPressureImage.repository .Values.runOperator.ioPressureImage.digest | quote }}
-              {{- else }}
-              value: {{ printf "%s:%s" .Values.runOperator.ioPressureImage.repository .Values.runOperator.ioPressureImage.tag | quote }}
-              {{- end }}
-            - name: IO_PRESSURE_IMAGE_PULL_POLICY
-              value: {{ .Values.runOperator.ioPressureImage.pullPolicy | quote }}
           ports:
-            - name: health
+            - name: metrics
               containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
               protocol: TCP
           readinessProbe:
             httpGet: {path: /readyz, port: health}

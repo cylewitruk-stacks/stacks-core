@@ -136,6 +136,31 @@ test('Kubernetes adapter refuses to overlap even one existing active run', () =>
   assert.throws(() => adapter.assertExclusive({maxActive: 1}), /second active AttacknetRun/);
 });
 
+test('Kubernetes adapter waits for terminal run cleanup evidence', () => {
+  let reads = 0;
+  const calls = [];
+  const runner = {run: (command, args) => {
+    calls.push({command, args});
+    if (command === 'sleep') return {status: 0, stdout: '', stderr: ''};
+    reads += 1;
+    return {status: 0, stderr: '', stdout: JSON.stringify({
+      metadata: {name: 'attempt'},
+      status: {
+        phase: 'Failed',
+        cleanup: {required: true, completed: reads > 1},
+      },
+    })};
+  }};
+  const adapter = new KubernetesDdminAdapter({
+    namespace: 'hacknet-system', network: 'attacknet', sourceRunRef: 'source-run',
+    generatedDirectory: '/tmp/generated', timeoutSeconds: 60, pollSeconds: 1,
+  }, runner);
+  const result = adapter.waitForRun({run: {name: 'attempt'}});
+  assert.equal(result.status.cleanup.completed, true);
+  assert.equal(reads, 2);
+  assert.equal(calls.filter(call => call.command === 'sleep').length, 1);
+});
+
 test('Kubernetes adapter distinguishes an absent network from an API failure', () => {
   const config = {
     namespace: 'hacknet-system', network: 'attacknet', sourceRunRef: 'source-run',

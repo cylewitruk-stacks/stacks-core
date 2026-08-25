@@ -8,7 +8,7 @@ import {gunzipSync} from 'node:zlib';
 
 import {
   classifyTerminalAssertion, networkManifest, resolvedNetworkImages,
-} from '../helm/hacknet/run-operator/controller.mjs';
+} from './kubernetes-runtime-contracts.mjs';
 import {describeDdminCandidate} from './attacknet-run-schedule.mjs';
 import {
   admittedInputContract, evidenceDigestFor, executeDdmin,
@@ -363,7 +363,10 @@ export class KubernetesDdminAdapter {
     const deadline = Date.now() + this.timeoutSeconds * 1000;
     while (Date.now() < deadline) {
       const current = this.getJson('attacknetrun', run.name);
-      if (TERMINAL.has(current.status?.phase) || current.status?.phase === 'Paused') return current;
+      if (current.status?.phase === 'Paused') return current;
+      if (TERMINAL.has(current.status?.phase)
+          && current.status?.cleanup?.required === true
+          && current.status.cleanup.completed === true) return current;
       this.runner.run('sleep', [String(this.pollSeconds)]);
     }
     return {metadata: {name: run.name, uid: run.uid}, status: {

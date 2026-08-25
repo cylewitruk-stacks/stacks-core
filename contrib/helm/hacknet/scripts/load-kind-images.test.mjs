@@ -8,7 +8,7 @@ import test from 'node:test';
 const script = resolve('contrib/helm/hacknet/scripts/load-kind-images.sh');
 const imageId = `sha256:${'a'.repeat(64)}`;
 
-function fixture({kind = true} = {}) {
+function fixture({kind = true, architectures = ['arm64', 'arm64']} = {}) {
   const root = mkdtempSync(join(tmpdir(), 'hacknet-kind-load-'));
   const bin = join(root, 'bin');
   const log = join(root, 'calls.log');
@@ -20,7 +20,10 @@ function fixture({kind = true} = {}) {
   const kubectl = `#!/bin/sh
 echo "kubectl $*" >>"${log}"
 cat <<'JSON'
-${JSON.stringify({items: nodes.map(name => ({metadata: {name}, spec: {providerID: provider(name)}}))})}
+${JSON.stringify({items: nodes.map((name, index) => ({
+    metadata: {name}, spec: {providerID: provider(name)},
+    status: {nodeInfo: {operatingSystem: 'linux', architecture: architectures[index]}},
+  }))})}
 JSON
 `;
   const docker = `#!/bin/sh
@@ -62,11 +65,22 @@ test('loads and verifies every exact image on every kind-on-Docker node', () => 
   const receipt = JSON.parse(readFileSync(item.output, 'utf8'));
   assert.equal(receipt.outcome, 'Loaded');
   assert.equal(receipt.nodes.length, 2);
+  assert.ok(receipt.nodes.every(node => node.operatingSystem === 'linux' && node.architecture === 'arm64'));
   assert.equal(receipt.images.length, 4);
   assert.ok(receipt.images.every(row => row.verified && row.hostImageID === imageId));
   const calls = readFileSync(item.log, 'utf8');
-  assert.match(calls, /docker exec -i worker-1 ctr -n k8s.io images import --all-platforms -/);
-  assert.match(calls, /docker exec -i worker-2 ctr -n k8s.io images import --all-platforms -/);
+  assert.match(calls, /docker save --platform linux\/arm64 --output .* operator:exact runner:exact/);
+  assert.match(calls, /docker exec -i worker-1 ctr -n k8s.io images import -/);
+  assert.match(calls, /docker exec -i worker-2 ctr -n k8s.io images import -/);
+  assert.doesNotMatch(calls, /--all-platforms/);
+});
+
+test('fails closed before Docker when kind nodes have mixed platforms', () => {
+  const item = fixture({architectures: ['arm64', 'amd64']});
+  const result = run(item, '--mode=require', 'operator:exact');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /requires one node platform/);
+  assert.doesNotMatch(readFileSync(item.log, 'utf8'), /docker /);
 });
 
 test('auto mode skips a non-kind cluster while require mode fails closed', () => {

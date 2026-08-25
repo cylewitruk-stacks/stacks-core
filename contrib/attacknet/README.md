@@ -196,6 +196,11 @@ prove the requested latency distribution. Evidence-grade effect assertions use
 the controller-owned `FaultCampaign` and `AttacknetRun` APIs described in
 [`OPERATIONS.md`](OPERATIONS.md).
 
+Controller-managed campaigns and runs bind to the topology operator's complete
+admitted-inventory digest. If an unrelated StatefulSet, Pod, or runtime image
+changes after admission, the controller cleans up the owned fault, records the
+identity difference, and stops rather than silently selecting the replacement.
+
 Capture a final snapshot:
 
 ```bash

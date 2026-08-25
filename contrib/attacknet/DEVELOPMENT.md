@@ -179,8 +179,9 @@ contrib/attacknet/check.sh
 ```
 
 The suite covers the command registry, renderer and schemas, Kubernetes command
-drift, campaign admission, observability, release contracts, Python
-controllers, and the offline 31-workload render.
+drift, campaign admission, observability, release contracts, Go
+controller-runtime reconcilers, envtest when configured, and the offline
+31-workload production render.
 
 Before a live full-topology change:
 

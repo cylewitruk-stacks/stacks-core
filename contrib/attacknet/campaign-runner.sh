@@ -27,6 +27,10 @@ fi
 
 namespace="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.namespace)' "${resource}")"
 network="$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).metadata.labels["testing.stacks.org/network"])' "${resource}")"
+# The lock helper derives its ConfigMap namespace from these variables. Export
+# the values compiled into the campaign before recursively entering the locked
+# execution, including when the caller did not set either variable.
+export KUBE_NAMESPACE="${namespace}" KUBE_NETWORK="${network}"
 lock_script="${ATTACKNET_DIR}/environment-lock.sh"
 if [ "${ATTACKNET_LOCK_DISABLED:-0}" = 1 ]; then
   [ "${ATTACKNET_NEGATIVE_CONTROL:-0}" = 1 ] || {

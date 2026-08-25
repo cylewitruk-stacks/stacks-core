@@ -1,0 +1,222 @@
+{
+  "schemaVersion": "stacks-attacknet-controller-equivalence/v1",
+  "legacyRevision": "f8a853a0f21c9edebec92398fb56500ae10e1a22",
+  "entries": [
+    {
+      "id": "topology-validation-and-typed-api",
+      "domain": "topology",
+      "legacy": ["contrib/helm/hacknet/operator/controller.py:validate_network"],
+      "go": ["contrib/helm/hacknet/operator/api/v1alpha1", "contrib/helm/hacknet/operator/internal/topology/render.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go", "contrib/helm/hacknet/crds/attacknet-crds.test.mjs"],
+      "live": []
+    },
+    {
+      "id": "topology-resource-rendering",
+      "domain": "topology",
+      "legacy": ["contrib/helm/hacknet/operator/controller.py:build_resources"],
+      "go": ["contrib/helm/hacknet/operator/internal/topology/render.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go", "contrib/attacknet/topology.test.mjs", "contrib/attacknet/topology-render-equivalence.test.mjs"],
+      "live": ["topology-admitted-inventory"]
+    },
+    {
+      "id": "topology-config-expansion-and-secrets",
+      "domain": "topology",
+      "legacy": ["contrib/helm/hacknet/operator/controller.py:expand_value", "contrib/helm/hacknet/operator/controller.py:build_config_map"],
+      "go": ["contrib/helm/hacknet/operator/internal/topology/render.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go"],
+      "live": []
+    },
+    {
+      "id": "topology-pod-security-storage-and-sidecars",
+      "domain": "topology",
+      "legacy": ["contrib/helm/hacknet/operator/controller.py:build_stateful_set", "contrib/helm/hacknet/operator/controller.py:build_telemetry_container", "contrib/helm/hacknet/operator/controller.py:build_probe_container"],
+      "go": ["contrib/helm/hacknet/operator/internal/topology/render.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go", "contrib/helm/hacknet/security-contract.test.mjs"],
+      "live": ["topology-admitted-inventory"]
+    },
+    {
+      "id": "topology-apply-prune-ownership-and-immutability",
+      "domain": "topology",
+      "legacy": ["contrib/helm/hacknet/operator/controller.py:Reconciler.reconcile", "contrib/helm/hacknet/operator/controller.py:KubernetesClient.apply_resource"],
+      "go": ["contrib/helm/hacknet/operator/internal/ownership/ownership.go", "contrib/helm/hacknet/operator/internal/topology/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/ownership/ownership_test.go", "contrib/helm/hacknet/operator/internal/topology/reconciler_test.go", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
+      "live": ["topology-mutable-reconcile", "clean-teardown"]
+    },
+    {
+      "id": "topology-readiness-status-and-inventory",
+      "domain": "topology",
+      "legacy": ["contrib/helm/hacknet/operator/controller.py:build_status", "contrib/helm/hacknet/operator/controller.py:degraded_status"],
+      "go": ["contrib/helm/hacknet/operator/internal/topology/reconciler.go", "contrib/helm/hacknet/operator/internal/inventory/inventory.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/topology/reconciler_test.go", "contrib/helm/hacknet/operator/internal/inventory/inventory_test.go", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
+      "live": ["topology-admitted-inventory", "inventory-withdrawal"]
+    },
+    {
+      "id": "manager-health-metrics-and-token-rotation",
+      "domain": "topology",
+      "legacy": ["contrib/helm/hacknet/operator/controller.py:HealthState", "contrib/helm/hacknet/operator/controller.py:OperatorMetrics", "contrib/helm/hacknet/operator/controller.py:KubernetesClient._read_token"],
+      "go": ["contrib/helm/hacknet/operator/internal/manager/options.go", "contrib/helm/hacknet/operator/cmd/topology-operator/main.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/integration/envtest_test.go", "contrib/helm/hacknet/security-contract.test.mjs"],
+      "live": ["controller-restart-resume"]
+    },
+    {
+      "id": "canonical-admitted-inventory-digest",
+      "domain": "identity",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:networkManifest", "contrib/helm/hacknet/run-operator/controller.mjs:resolvedNetworkImages"],
+      "go": ["contrib/helm/hacknet/operator/internal/canonical/canonical.go", "contrib/helm/hacknet/operator/internal/inventory/inventory.go", "contrib/helm/hacknet/operator/internal/inventory/reader.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/canonical/canonical_test.go", "contrib/helm/hacknet/operator/internal/inventory/inventory_test.go"],
+      "live": ["topology-admitted-inventory"]
+    },
+    {
+      "id": "signer-set-resolution-and-weight-binding",
+      "domain": "signer-set",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:SignerSetClient"],
+      "go": ["contrib/helm/hacknet/operator/internal/signerset/resolver.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/signerset/resolver_test.go"],
+      "live": []
+    },
+    {
+      "id": "fault-compilation-all-kinds",
+      "domain": "fault",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:FaultCampaignReconciler.reconcile"],
+      "go": ["contrib/helm/hacknet/operator/internal/fault/compiler.go", "contrib/helm/hacknet/operator/internal/fault/parameters.go", "contrib/helm/hacknet/operator/cmd/compile-check/main.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/compiler_test.go", "contrib/helm/hacknet/operator/internal/fault/parameters_test.go", "contrib/attacknet/fault-compiler-equivalence.test.mjs"],
+      "live": ["reversible-network-fault", "one-shot-pod-kill"]
+    },
+    {
+      "id": "fault-capability-and-architecture-gates",
+      "domain": "fault",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:FaultCampaignReconciler.faultCapabilityEvidence"],
+      "go": ["contrib/helm/hacknet/operator/internal/fault/capability.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/compiler_test.go"],
+      "live": []
+    },
+    {
+      "id": "fault-target-resolution-and-safety-budget",
+      "domain": "fault",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:minimumAffected", "contrib/helm/hacknet/run-operator/controller.mjs:SignerSetClient"],
+      "go": ["contrib/helm/hacknet/operator/internal/fault/compiler.go", "contrib/helm/hacknet/operator/internal/signerset/resolver.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/compiler_test.go", "contrib/helm/hacknet/operator/internal/signerset/resolver_test.go"],
+      "live": []
+    },
+    {
+      "id": "fault-mutation-lease-and-finalizer",
+      "domain": "fault",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:FaultCampaignReconciler.holdMutationLease", "contrib/helm/hacknet/run-operator/controller.mjs:FaultCampaignReconciler.deletion"],
+      "go": ["contrib/helm/hacknet/operator/internal/fault/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/status_test.go", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
+      "live": ["reversible-network-fault", "one-shot-pod-kill", "clean-teardown"]
+    },
+    {
+      "id": "fault-live-identity-barrier",
+      "domain": "identity",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:resolvedNetworkImages"],
+      "go": ["contrib/helm/hacknet/operator/internal/inventory/reader.go", "contrib/helm/hacknet/operator/internal/fault/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/status_test.go", "contrib/helm/hacknet/operator/internal/fault/reconciler_contract_test.go"],
+      "live": ["one-shot-pod-kill"]
+    },
+    {
+      "id": "fault-injection-effect-and-recovery-evidence",
+      "domain": "fault",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:actualInjectionEvidence", "contrib/helm/hacknet/run-operator/controller.mjs:podEffectResults", "contrib/helm/hacknet/run-operator/controller.mjs:FaultCampaignReconciler.collectProbePhase"],
+      "go": ["contrib/helm/hacknet/operator/internal/fault/effect.go", "contrib/helm/hacknet/operator/internal/fault/effect_validation.go", "contrib/helm/hacknet/operator/internal/fault/probe.go", "contrib/helm/hacknet/operator/internal/fault/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/effect_test.go", "contrib/helm/hacknet/operator/internal/fault/probe_test.go", "contrib/helm/hacknet/operator/internal/fault/status_test.go", "contrib/attacknet/probe/probe.test.mjs", "contrib/attacknet/fault-effect-evidence.test.mjs"],
+      "live": ["reversible-network-fault", "one-shot-pod-kill"]
+    },
+    {
+      "id": "fault-io-pressure-and-clock-policy",
+      "domain": "fault",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:buildIoPressurePod", "contrib/helm/hacknet/run-operator/controller.mjs:clockPolicyContract"],
+      "go": ["contrib/helm/hacknet/operator/internal/fault/reconciler.go", "contrib/helm/hacknet/operator/internal/fault/parameters.go", "contrib/helm/hacknet/operator/internal/ownership/ownership.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/parameters_test.go", "contrib/helm/hacknet/operator/internal/fault/status_test.go", "contrib/helm/hacknet/operator/internal/ownership/ownership_test.go"],
+      "live": []
+    },
+    {
+      "id": "fault-terminal-status-and-metrics",
+      "domain": "fault",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:status", "contrib/helm/hacknet/run-operator/controller.mjs:prometheusMetrics"],
+      "go": ["contrib/helm/hacknet/operator/internal/fault/reconciler.go", "contrib/helm/hacknet/operator/internal/manager/options.go", "contrib/helm/hacknet/operator/internal/orchestratormetrics/collector.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/status_test.go", "contrib/helm/hacknet/operator/internal/orchestratormetrics/collector_test.go", "contrib/attacknet/observability/observability.test.mjs"],
+      "live": ["reversible-network-fault"]
+    },
+    {
+      "id": "run-schedule-resolution-sealing-and-persistence",
+      "domain": "run",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:encodeSchedule", "contrib/helm/hacknet/run-operator/controller.mjs:decodeSchedule", "contrib/helm/hacknet/run-operator/controller.mjs:AttacknetRunReconciler.prepareSchedule"],
+      "go": ["contrib/helm/hacknet/operator/internal/run/schedule.go", "contrib/helm/hacknet/operator/internal/run/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/run/schedule_test.go", "contrib/helm/hacknet/operator/internal/run/status_test.go"],
+      "live": ["reversible-network-fault"]
+    },
+    {
+      "id": "run-template-snapshot-and-child-ownership",
+      "domain": "run",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:AttacknetRunReconciler.reconcile"],
+      "go": ["contrib/helm/hacknet/operator/internal/ownership/ownership.go", "contrib/helm/hacknet/operator/internal/run/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/ownership/ownership_test.go", "contrib/helm/hacknet/operator/internal/run/status_test.go", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
+      "live": ["reversible-network-fault"]
+    },
+    {
+      "id": "run-aggregate-safety-budget",
+      "domain": "run",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:AttacknetRunReconciler.reconcile"],
+      "go": ["contrib/helm/hacknet/operator/internal/run/reconciler.go", "contrib/helm/hacknet/operator/internal/signerset/resolver.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/run/status_test.go"],
+      "live": []
+    },
+    {
+      "id": "run-replay-and-ddmin-admission",
+      "domain": "run",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:AttacknetRunReconciler.reconcile"],
+      "go": ["contrib/helm/hacknet/operator/internal/run/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/run/status_test.go", "contrib/attacknet/kubernetes-runtime-contracts.test.mjs"],
+      "live": []
+    },
+    {
+      "id": "run-restart-resume-and-idempotency",
+      "domain": "run",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:AttacknetRunReconciler.reconcile"],
+      "go": ["contrib/helm/hacknet/operator/internal/run/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/run/status_test.go", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
+      "live": ["controller-restart-resume"]
+    },
+    {
+      "id": "run-terminal-classification-fails-closed",
+      "domain": "run",
+      "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:classifyTerminalAssertion"],
+      "go": ["contrib/helm/hacknet/operator/internal/run/reconciler.go"],
+      "tests": ["contrib/helm/hacknet/operator/internal/run/classification_test.go", "contrib/helm/hacknet/operator/internal/run/status_test.go"],
+      "live": []
+    },
+    {
+      "id": "crd-schema-status-and-cel-contract",
+      "domain": "api",
+      "legacy": ["contrib/helm/hacknet/crds/testing.stacks.org_stacksnetworks.yaml", "contrib/helm/hacknet/crds/testing.stacks.org_faultcampaigns.yaml", "contrib/helm/hacknet/crds/testing.stacks.org_attacknetruns.yaml"],
+      "go": ["contrib/helm/hacknet/operator/api/v1alpha1"],
+      "tests": ["contrib/helm/hacknet/crds/attacknet-crds.test.mjs", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
+      "live": ["topology-admitted-inventory"]
+    },
+    {
+      "id": "least-privilege-rbac-and-process-boundary",
+      "domain": "security",
+      "legacy": ["contrib/helm/hacknet/templates/rbac.yaml", "contrib/helm/hacknet/templates/run-rbac.yaml"],
+      "go": ["contrib/helm/hacknet/operator/cmd/topology-operator/main.go", "contrib/helm/hacknet/operator/cmd/run-operator/main.go"],
+      "tests": ["contrib/helm/hacknet/security-contract.test.mjs", "contrib/helm/hacknet/scripts/check.sh"],
+      "live": []
+    },
+    {
+      "id": "helm-image-entrypoints-and-local-build",
+      "domain": "packaging",
+      "legacy": ["contrib/helm/hacknet/operator/Dockerfile", "contrib/helm/hacknet/run-operator/Dockerfile"],
+      "go": ["contrib/helm/hacknet/operator/Dockerfile", "contrib/helm/hacknet/operator/Makefile", "contrib/helm/hacknet/operator/tools/go.mod", "contrib/helm/hacknet/scripts/build-local.sh", "contrib/helm/hacknet/templates/deployment.yaml", "contrib/helm/hacknet/templates/run-deployment.yaml"],
+      "tests": ["contrib/helm/hacknet/scripts/check.sh", "contrib/helm/hacknet/security-contract.test.mjs"],
+      "live": ["controller-restart-resume"]
+    },
+    {
+      "id": "attacknet-runtime-contract-consumers",
+      "domain": "integration",
+      "legacy": ["contrib/attacknet/kubernetes-ddmin-adapter.mjs", "contrib/attacknet/topology.mjs"],
+      "go": ["contrib/attacknet/kubernetes-runtime-contracts.mjs", "contrib/helm/hacknet/operator/api/v1alpha1"],
+      "tests": ["contrib/attacknet/kubernetes-runtime-contracts.test.mjs", "contrib/attacknet/topology.test.mjs"],
+      "live": []
+    }
+  ]
+}

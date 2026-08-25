@@ -15,7 +15,7 @@ function context(overrides = {}) {
     PROBE_ACTOR: 'signer-node-1',
     PROBE_DATA_ROOT: mkdtempSync(join(tmpdir(), 'attacknet-probe-')),
     PROBE_PEERS_JSON: JSON.stringify({
-      'miner-1': {host: 'demo-miner-1', ports: {rpc: 20443, p2p: 20444}},
+      'miner-1': {host: 'demo-miner-1', ports: {rpc: 20443, p2p: 20444, probe: 18080}},
       'signer-node-1': {host: 'demo-signer-node-1', ports: {rpc: 20443, metrics: 20446}},
     }),
     PROBE_DNS_CONTROL: 'kubernetes.default.svc.cluster.local',
@@ -64,6 +64,37 @@ test('network observation samples an enrolled named port without arbitrary addre
     () => dispatchProbe({kind: 'network', peer: 'miner-1', port: 'admin'}, ctx),
     /exposed peer port/,
   );
+});
+
+test('network observation measures bounded throughput through an enrolled probe endpoint', async () => {
+  class Socket extends EventEmitter {
+    setTimeout() {}
+    destroy() {}
+  }
+  const result = await dispatchProbe({
+    kind: 'network', peer: 'miner-1', port: 'probe', attempts: 1,
+    timeoutMs: 5000, throughputBytes: 4096,
+  }, context({
+    connect: () => {
+      const socket = new Socket();
+      queueMicrotask(() => socket.emit('connect'));
+      return socket;
+    },
+    httpGet: (options, callback) => {
+      const outgoing = new EventEmitter();
+      outgoing.destroy = error => outgoing.emit('error', error);
+      queueMicrotask(() => {
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        callback(response);
+        response.emit('data', Buffer.alloc(Number(new URL(options.path, 'http://probe.invalid').searchParams.get('bytes'))));
+        response.emit('end');
+      });
+      return outgoing;
+    },
+  }));
+  assert.equal(result.observation.successes, 1);
+  assert.ok(result.observation.throughputBytesPerSecond > 0);
 });
 
 test('I/O is confined to a deterministic private directory and returns digests', async () => {
@@ -146,6 +177,9 @@ test('HTTP API exposes only health and the bounded probe dispatcher', async () =
   try {
     const health = await fetch(`http://127.0.0.1:${address.port}/healthz`);
     assert.equal(health.status, 200);
+    const payload = await fetch(`http://127.0.0.1:${address.port}/v1/payload?bytes=4096`);
+    assert.equal(payload.status, 200);
+    assert.equal((await payload.arrayBuffer()).byteLength, 4096);
     const probe = await fetch(`http://127.0.0.1:${address.port}/v1/probe`, {
       method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({kind: 'clock'}),
     });

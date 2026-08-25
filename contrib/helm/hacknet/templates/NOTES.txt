@@ -1,18 +1,13 @@
 The Hacknet operator is installed in namespace {{ .Release.Namespace }} and
 watches StacksNetwork resources in namespace {{ include "hacknet.watchNamespace" . }}.
 
-Build the local StacksNetwork and trusted run-controller images before
+Build the local topology-operator and trusted run-operator images before
 installation when using the default image settings:
 
   contrib/helm/hacknet/scripts/build-local.sh
 
-If Docker Desktop kind cannot resolve the local image with the default
-IfNotPresent policy, use the explicit source-mount smoke fallback:
-
-  helm upgrade --install hacknet contrib/helm/hacknet \
-    --namespace {{ .Release.Namespace }} \
-    --set operator.developmentSource.enabled=true \
-    --set runOperator.enabled=false
+The installer imports the exact local images into every Docker Desktop kind
+node. There is no source-mount controller fallback.
 
 Inspect networks with:
 

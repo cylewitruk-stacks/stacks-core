@@ -16,6 +16,7 @@
       "duration": "45s",
       "parameters": {
         "direction": "both",
+        "peerTarget": {"roles": ["follower"], "mode": "all"},
         "delay": {"latency": "750ms", "jitter": "200ms", "correlation": "50"}
       }
     },
