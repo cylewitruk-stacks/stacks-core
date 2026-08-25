@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "stacks-attacknet-phase-review-contract/v2",
+  "reviewId": "release-1-amendment-a3-controller-hardening",
+  "phase": 2,
+  "releaseScope": "Release 1 controller hardening amendment A3",
+  "tier": "Full",
+  "requiredReviewers": [
+    "Codex",
+    "Claude Opus 5"
+  ],
+  "requirements": [
+    "single-signed-commit-directly-on-approved-a2-with-exact-diff",
+    "clock-skew-capability-admission-preserves-the-approved-legacy-safety-contract",
+    "rendered-operator-rbac-matches-a-structural-exact-least-privilege-contract",
+    "topology-render-equivalence-covers-multi-actor-probe-disabled-and-storage-disabled-profiles",
+    "clean-go-race-envtest-helm-whole-product-and-live-kind-verification",
+    "portable-self-identifying-review-evidence"
+  ],
+  "requiredInventory": [
+    "candidate:contrib/helm/hacknet/operator/internal/fault/capability.go",
+    "candidate:contrib/helm/hacknet/operator/internal/fault/capability_test.go",
+    "candidate:contrib/helm/hacknet/operator/internal/rbac/validate.go",
+    "candidate:contrib/helm/hacknet/operator/internal/rbac/validate_test.go",
+    "candidate:contrib/helm/hacknet/operator/cmd/rbac-check/main.go",
+    "candidate:contrib/helm/hacknet/scripts/check.sh",
+    "candidate:contrib/attacknet/topology-render-equivalence.test.mjs",
+    "candidate:contrib/attacknet/release/release-1-a3-contract.json",
+    "candidate:contrib/attacknet/release/release-1-a3-clock-live.mjs",
+    "candidate:contrib/attacknet/release/release-1-a3-evidence.mjs",
+    "candidate:contrib/attacknet/release/release-1-a3-packet.mjs",
+    "candidate:contrib/attacknet/release/release-1-a3-verify.mjs",
+    "candidate:contrib/attacknet/release/release-1-a3.test.mjs",
+    "candidate:contrib/attacknet/evidence-packets/release-1-a3/README.md",
+    "diff:candidate-controller-hardening",
+    "test:attacknet-check",
+    "test:hacknet-check",
+    "evidence:archive-index",
+    "evidence:archive",
+    "evidence:live-summary",
+    "evidence:verification",
+    "evidence:clock-policy-live"
+  ]
+}

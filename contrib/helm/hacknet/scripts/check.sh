@@ -39,17 +39,8 @@ helm_bin="${HELM_BIN:-helm}"
 if command -v "${helm_bin}" >/dev/null 2>&1; then
   "${helm_bin}" lint "${chart_dir}"
   rendered="$("${helm_bin}" template hacknet "${chart_dir}" --namespace hacknet-system --include-crds)"
-  if [[ "${rendered}" != *'resources: ["podchaos", "networkchaos", "dnschaos", "iochaos", "timechaos"]'* ]]; then
-    echo 'rendered run-operator RBAC is missing the bounded native Chaos resources' >&2
-    exit 1
-  fi
-  if [[ "${rendered}" != *$'resources: ["pods"]\n    verbs: ["get", "list", "watch", "create", "delete"]'* ]]; then
-    echo 'rendered run-operator RBAC lacks the exact controller-owned I/O-pressure Pod lifecycle verbs' >&2
-    exit 1
-  fi
-  if [[ "${rendered}" == *'resources: ["podchaos", "networkchaos", "dnschaos", "iochaos", "stresschaos"'* ]]; then
-    echo 'rendered run-operator RBAC still grants unused StressChaos authority' >&2
-    exit 1
+  if [[ "${go_status}" = passed ]]; then
+    printf '%s\n' "${rendered}" | (cd "${chart_dir}/operator" && go run ./cmd/rbac-check)
   fi
   if [[ "${rendered}" != *'"kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos", "ClockSkewPolicy"]}'* ]]; then
     echo 'rendered FaultCampaign status schema is missing IOPressurePod' >&2

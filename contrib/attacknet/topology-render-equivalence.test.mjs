@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {mkdtempSync, readFileSync, rmSync} from 'node:fs';
+import {mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import test from 'node:test';
@@ -127,31 +127,69 @@ function renderGo(input, actors) {
   }));
 }
 
-test('Go topology renderer preserves the approved A1 workload contract', () => {
-  const output = mkdtempSync(join(tmpdir(), 'attacknet-topology-equivalence-'));
-  try {
-    const topology = buildTopology({minerCount: 1, signerCount: 1, followerCount: 1});
-    const {resource} = renderTopology(topology, output, {network: 'equivalence', namespace: 'attacknet-equivalence', probes: true});
-    const input = join(output, 'stacksnetwork.json');
-    const legacy = renderLegacy(input);
-    const go = renderGo(input, resource.spec.actors.length);
+const scenarios = [
+  {
+    name: 'baseline with trusted probes',
+    counts: {minerCount: 1, signerCount: 1, followerCount: 1},
+    probes: true,
+  },
+  {
+    name: 'multi-actor peer ordering',
+    counts: {minerCount: 3, signerCount: 3, followerCount: 2},
+    probes: true,
+  },
+  {
+    name: 'trusted probes disabled',
+    counts: {minerCount: 1, signerCount: 1, followerCount: 1},
+    probes: false,
+  },
+  {
+    name: 'actor storage disabled',
+    counts: {minerCount: 1, signerCount: 1, followerCount: 1},
+    probes: false,
+    configure(resource) {
+      const actor = resource.spec.actors.find(candidate => candidate.name === 'follower-1');
+      assert(actor, 'storage-disabled fixture lost follower-1');
+      actor.storage = {enabled: false};
+    },
+  },
+];
 
-    for (const service of go.services) {
-      assert.equal(service.metadata.labels['app.kubernetes.io/managed-by'], 'hacknet-operator');
-      assert.equal(service.metadata.labels['testing.stacks.org/managed-by'], 'stacks-hacknet-operator');
-      assert(service.spec.ports.some(port => port.name === 'probe' && port.port === 18080));
-      service.spec.ports = service.spec.ports.filter(port => port.name !== 'probe');
-    }
-    for (const service of legacy.services) {
-      assert(!service.spec.ports?.some(port => port.name === 'probe'));
-    }
+for (const scenario of scenarios) {
+  test(`Go topology renderer preserves the approved A1 workload contract: ${scenario.name}`, () => {
+    const output = mkdtempSync(join(tmpdir(), 'attacknet-topology-equivalence-'));
+    try {
+      const topology = buildTopology(scenario.counts);
+      const {resource} = renderTopology(topology, output, {
+        network: 'equivalence', namespace: 'attacknet-equivalence', probes: scenario.probes,
+      });
+      scenario.configure?.(resource);
+      const input = join(output, 'stacksnetwork.json');
+      writeFileSync(input, `${JSON.stringify(resource, null, 2)}\n`);
+      const legacy = renderLegacy(input);
+      const go = renderGo(input, resource.spec.actors.length);
 
-    assert.deepEqual(
-      normalizeResources(go, {go: true}),
-      normalizeResources(legacy, {go: false}),
-      'Go renderer drifted from the approved A1 resource contract outside documented security and probe-endpoint improvements',
-    );
-  } finally {
-    rmSync(output, {recursive: true, force: true});
-  }
-});
+      for (const service of go.services) {
+        assert.equal(service.metadata.labels['app.kubernetes.io/managed-by'], 'hacknet-operator');
+        assert.equal(service.metadata.labels['testing.stacks.org/managed-by'], 'stacks-hacknet-operator');
+        const probePorts = (service.spec.ports ?? []).filter(port => port.name === 'probe');
+        assert.equal(probePorts.length, scenario.probes ? 1 : 0);
+        if (scenario.probes) {
+          assert.equal(probePorts[0].port, 18080);
+          service.spec.ports = service.spec.ports.filter(port => port.name !== 'probe');
+        }
+      }
+      for (const service of legacy.services) {
+        assert(!service.spec.ports?.some(port => port.name === 'probe'));
+      }
+
+      assert.deepEqual(
+        normalizeResources(go, {go: true}),
+        normalizeResources(legacy, {go: false}),
+        `Go renderer drifted from the approved A1 resource contract in ${scenario.name} outside documented security and probe-endpoint improvements`,
+      );
+    } finally {
+      rmSync(output, {recursive: true, force: true});
+    }
+  });
+}

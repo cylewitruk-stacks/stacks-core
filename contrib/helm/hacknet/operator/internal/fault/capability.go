@@ -41,11 +41,14 @@ func (r *Reconciler) capabilityEvidence(ctx context.Context, campaign *attacknet
 			}
 		case "clock-skew":
 			base.Platform, base.Architecture = "application-clock-policy", "image-contract"
-			base.Supported, base.Reason = clockCapability(campaign, target, pods)
+			base.Supported, base.Reason = clockPodCapability(campaign, target, pods)
 			policy := &corev1.ConfigMap{}
-			if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: campaign.Namespace, Name: campaign.Spec.NetworkRef + "-clock-policy"}, policy); err != nil || policy.Labels[NetworkLabel] != campaign.Spec.NetworkRef || policy.Labels["testing.stacks.org/clock-policy"] != "true" || policy.Data[target.Actor] != clockPolicyZero {
+			if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: campaign.Namespace, Name: campaign.Spec.NetworkRef + "-clock-policy"}, policy); err != nil {
 				base.Supported = false
-				base.Reason = "application clock policy is missing, has the wrong identity, or is not at zero offset"
+				base.Reason = "application clock policy could not be read"
+			} else if supported, reason := clockPolicyCapability(campaign, target, policy); !supported {
+				base.Supported = false
+				base.Reason = reason
 			}
 		default:
 			probe := r.Probes
@@ -81,7 +84,8 @@ func (r *Reconciler) capabilityEvidence(ctx context.Context, campaign *attacknet
 	return result
 }
 
-func clockCapability(campaign *attacknetv1alpha1.FaultCampaign, target attacknetv1alpha1.ResolvedTarget, pods []corev1.Pod) (bool, string) {
+func clockPodCapability(campaign *attacknetv1alpha1.FaultCampaign, target attacknetv1alpha1.ResolvedTarget, pods []corev1.Pod) (bool, string) {
+	policyName := campaign.Spec.NetworkRef + "-clock-policy"
 	for _, pod := range pods {
 		if string(pod.UID) != target.PodUID {
 			continue
@@ -94,17 +98,43 @@ func clockCapability(campaign *attacknetv1alpha1.FaultCampaign, target attacknet
 			for _, variable := range container.Env {
 				environment[variable.Name] = variable.Value
 			}
-			mounted := false
+			policyVolume := ""
 			for _, mount := range container.VolumeMounts {
 				if mount.MountPath == "/run/attacknet-clock" {
-					mounted = true
+					policyVolume = mount.Name
+					break
 				}
 			}
-			supported := mounted && environment["LD_PRELOAD"] == "/usr/lib/stacks-attacknet/libfaketime.so.1" && environment["FAKETIME_TIMESTAMP_FILE"] == "/run/attacknet-clock/"+target.Actor && environment["FAKETIME_DONT_FAKE_MONOTONIC"] == "1" && environment["FAKETIME_NO_CACHE"] == "1"
+			mountedPolicy := false
+			for _, volume := range pod.Spec.Volumes {
+				if volume.Name == policyVolume && volume.ConfigMap != nil && volume.ConfigMap.Name == policyName {
+					mountedPolicy = true
+					break
+				}
+			}
+			supported := mountedPolicy && environment["LD_PRELOAD"] == "/usr/lib/stacks-attacknet/libfaketime.so.1" && environment["FAKETIME_TIMESTAMP_FILE"] == "/run/attacknet-clock/"+target.Actor && environment["FAKETIME_DONT_FAKE_MONOTONIC"] == "1" && environment["FAKETIME_NO_CACHE"] == "1"
 			if supported {
-				return true, "libfaketime/v1 image environment and policy mount are present"
+				return true, "libfaketime/v1 image environment and bound policy mount are present"
 			}
 		}
 	}
-	return false, "libfaketime/v1 image environment or policy mount is incomplete for " + campaign.Spec.NetworkRef
+	return false, "libfaketime/v1 image environment or bound policy mount is incomplete for " + campaign.Spec.NetworkRef
+}
+
+func clockPolicyCapability(campaign *attacknetv1alpha1.FaultCampaign, target attacknetv1alpha1.ResolvedTarget, policy *corev1.ConfigMap) (bool, string) {
+	if policy.Labels[NetworkLabel] != campaign.Spec.NetworkRef || policy.Labels["testing.stacks.org/clock-policy"] != "true" {
+		return false, "application clock policy has the wrong identity"
+	}
+	if len(policy.Data) == 0 {
+		return false, "application clock policy has no actor entries"
+	}
+	for _, value := range policy.Data {
+		if value != clockPolicyZero {
+			return false, "application clock policy is not globally at zero offset"
+		}
+	}
+	if policy.Data[target.Actor] != clockPolicyZero {
+		return false, "application clock policy does not contain the target at zero offset"
+	}
+	return true, "application clock policy identity and global zero-offset state are established"
 }
