@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! MARF index types, proofs, and physical storage modules.
+
 use std::hash::Hash;
 use std::{error, fmt, io};
 
@@ -38,6 +40,18 @@ pub mod squash;
 pub mod storage;
 pub mod trie;
 pub mod trie_sql;
+
+/// Tables owned by the MARF storage layer in each MARF-backed SQLite database.
+pub const MARF_SQLITE_TABLES: &[&str] = &[
+    "marf_data",
+    "__fork_storage",
+    "marf_squash_info",
+    "marf_squashed_blocks",
+    "mined_blocks",
+    "block_extension_locks",
+    "schema_version",
+    "migrated_version",
+];
 
 #[cfg(test)]
 pub mod test;
