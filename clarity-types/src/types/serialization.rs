@@ -1167,16 +1167,18 @@ impl Value {
         Value::deserialize_read(&mut bytes.as_slice(), Some(expected), sanitize)
     }
 
-    /// Behaves like [`Self::try_deserialize_bytes`], selecting historical
-    /// tuple-field handling before Epoch 4.1 and exact field-set enforcement
-    /// from Epoch 4.1 onward.
+    /// Epoch-aware typed deserialization from a borrowed byte slice.
+    ///
+    /// This selects historical tuple-field handling before Epoch 4.1 and exact field-set
+    /// enforcement from Epoch 4.1 onward. Like [`Self::try_deserialize_bytes`], it permits trailing
+    /// bytes.
     pub fn try_deserialize_bytes_at_epoch(
-        bytes: &Vec<u8>,
+        bytes: &[u8],
         expected: &TypeSignature,
         epoch: &StacksEpochId,
     ) -> Result<Value, SerializationError> {
         Self::deserialize_read_count_with_options(
-            &mut bytes.as_slice(),
+            &mut &*bytes,
             Some(expected),
             epoch.value_sanitizing(),
             TupleFieldsBehavior::from_epoch(epoch),
@@ -1209,18 +1211,19 @@ impl Value {
         Value::try_deserialize_bytes_at_epoch(&data, expected, epoch)
     }
 
-    /// Deserialize a byte buffer into a Clarity Value of `expected` type,
-    /// requiring the whole buffer to be consumed. Sanitization (Epoch 2.4+) and
-    /// strict typed-tuple field enforcement (Epoch 4.1+) are derived from `epoch`
-    /// so consensus behavior is gated entirely by the execution epoch.
+    /// Deserialize a borrowed byte slice into a Clarity Value of `expected` type, requiring the
+    /// whole slice to be consumed.
+    ///
+    /// Sanitization (Epoch 2.4+) and strict typed-tuple field enforcement (Epoch 4.1+) are derived
+    /// from `epoch`, so consensus behavior is gated entirely by the execution epoch.
     pub fn try_deserialize_bytes_exact_at_epoch(
-        bytes: &Vec<u8>,
+        bytes: &[u8],
         expected: &TypeSignature,
         epoch: &StacksEpochId,
     ) -> Result<Value, SerializationError> {
         let input_length = bytes.len();
         let (value, read_count) = Value::deserialize_read_count_with_options(
-            &mut bytes.as_slice(),
+            &mut &*bytes,
             Some(expected),
             epoch.value_sanitizing(),
             TupleFieldsBehavior::from_epoch(epoch),
@@ -1239,6 +1242,25 @@ impl Value {
         bytes: &Vec<u8>,
     ) -> Result<Value, SerializationError> {
         Value::deserialize_read(&mut bytes.as_slice(), None, false)
+    }
+
+    /// Deserialize exactly one self-describing consensus value from a borrowed byte slice without
+    /// applying a declared type.
+    ///
+    /// This is intended for offline physical-storage migration. Consensus VM reads must continue
+    /// using the epoch-aware typed entry points.
+    pub fn try_deserialize_slice_exact_untyped(bytes: &[u8]) -> Result<Value, SerializationError> {
+        let (value, read_count) = Value::deserialize_read_count_with_options(
+            &mut &*bytes,
+            None,
+            false,
+            TupleFieldsBehavior::LEGACY,
+        )?;
+        if read_count != bytes.len() as u64 {
+            Err(SerializationError::LeftoverBytesInDeserialization)
+        } else {
+            Ok(value)
+        }
     }
 
     /// Try to deserialize a value from a hex string without type information. This *does not*
