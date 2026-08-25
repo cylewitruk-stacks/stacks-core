@@ -1,3 +1,5 @@
+//! Chainstate-backed Clarity database implementations.
+
 use std::ops::Deref;
 
 use clarity::types::chainstate::TrieHash;
@@ -35,6 +37,7 @@ use crate::clarity_vm::special::handle_contract_call_special_cases;
 use crate::core::{StacksEpoch, StacksEpochId};
 use crate::util_lib::db::{DBConn, Error as DBError, FromColumn, FromRow};
 
+pub mod binary_value_store;
 pub mod ephemeral;
 pub mod marf;
 
