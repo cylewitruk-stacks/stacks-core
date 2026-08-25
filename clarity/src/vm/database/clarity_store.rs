@@ -16,6 +16,7 @@
 
 #[cfg(feature = "rusqlite")]
 use rusqlite::Connection;
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::{Sha512Trunc256Sum, hex_bytes, to_hex};
 
@@ -26,7 +27,111 @@ use crate::vm::database::{
     ClarityDatabase, ClarityDeserializable, ClaritySerializable, NULL_BURN_STATE_DB, NULL_HEADER_DB,
 };
 use crate::vm::errors::{VmExecutionError, VmInternalError};
-use crate::vm::types::{PrincipalData, QualifiedContractIdentifier};
+use crate::vm::types::codec::packed::AdmittedValue;
+use crate::vm::types::{PrincipalData, QualifiedContractIdentifier, TypeSignature};
+
+/// Canonical and admitted representations retained until a typed Clarity write commits.
+///
+/// Construction derives every field from one sanitized [`Value`]. Keeping the fields private
+/// prevents a backing-store caller from pairing packed bytes with an unrelated canonical hash or
+/// logical consensus length.
+#[derive(Debug)]
+pub struct TypedValueData {
+    /// Exact lowercase canonical string used to derive the MARF value hash.
+    canonical: String,
+    /// Sanitized runtime value already admitted by its declared storage type.
+    admitted: AdmittedValue,
+    /// Length of the admitted value's exact consensus serialization.
+    consensus_byte_len: u32,
+}
+
+impl TypedValueData {
+    /// Admit and serialize one sanitized value exactly once for deferred physical storage.
+    pub fn prepare(
+        value: Value,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Self, VmInternalError> {
+        let admitted = AdmittedValue::new(value, expected, epoch)
+            .map_err(|error| VmInternalError::DBError(error.to_string()))?;
+        let consensus = admitted
+            .value()
+            .serialize_to_vec()
+            .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?;
+        let consensus_byte_len = u32::try_from(consensus.len())
+            .map_err(|_| VmInternalError::Expect("Clarity value exceeds u32 length".into()))?;
+        Ok(Self {
+            canonical: to_hex(&consensus),
+            admitted,
+            consensus_byte_len,
+        })
+    }
+
+    /// Borrow the exact canonical string associated with the admitted value.
+    pub fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    /// Borrow the admitted runtime value.
+    pub fn admitted(&self) -> &AdmittedValue {
+        &self.admitted
+    }
+
+    /// Return the exact consensus byte length associated with the admitted value.
+    pub fn consensus_byte_len(&self) -> u32 {
+        self.consensus_byte_len
+    }
+
+    /// Consume this typed write and return its canonical text for an untyped backing store.
+    pub fn into_canonical(self) -> String {
+        self.canonical
+    }
+}
+
+/// Physical input retained for one logical backing-store edit.
+#[derive(Debug)]
+pub enum DataStoreValue {
+    /// Canonical text for storage backends without a typed physical representation.
+    Canonical(String),
+    /// A canonical string bound to its admitted typed representation.
+    Typed(TypedValueData),
+}
+
+impl DataStoreValue {
+    /// Borrow the canonical string used for MARF hashing and pending reads.
+    pub fn canonical(&self) -> &str {
+        match self {
+            Self::Canonical(canonical) => canonical,
+            Self::Typed(typed) => typed.canonical(),
+        }
+    }
+
+    /// Consume this value and return its canonical string.
+    pub fn into_canonical(self) -> String {
+        match self {
+            Self::Canonical(canonical) => canonical,
+            Self::Typed(typed) => typed.into_canonical(),
+        }
+    }
+}
+
+/// One logical key/value edit committed by a backing store.
+#[derive(Debug)]
+pub struct DataStoreEntry {
+    /// Logical MARF key.
+    pub key: String,
+    /// Canonical text and optional typed physical-encoding input.
+    pub value: DataStoreValue,
+}
+
+/// A typed value returned directly by a backing store.
+#[derive(Debug)]
+pub struct TypedValueResult {
+    /// Materialized runtime value.
+    pub value: Value,
+    /// Length of the equivalent consensus serialization.
+    pub serialized_byte_len: u64,
+}
 
 pub struct NullBackingStore {}
 
@@ -51,12 +156,49 @@ pub type SpecialCaseHandler = &'static dyn Fn(
 //    will _panic_. The rationale for this is that under no condition should the interpreter
 //    attempt to continue processing in the event of an unexpected storage error.
 pub trait ClarityBackingStore {
+    /// Whether writes should retain typed values for an alternate physical representation.
+    fn stores_typed_values(&self) -> bool {
+        false
+    }
+
     /// put K-V data into the committed datastore
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError>;
+    /// Commit logical edits while retaining typed values for physical encodings that need them.
+    fn put_all_data_entries(
+        &mut self,
+        entries: Vec<DataStoreEntry>,
+    ) -> Result<(), VmExecutionError> {
+        self.put_all_data(
+            entries
+                .into_iter()
+                .map(|entry| (entry.key, entry.value.into_canonical()))
+                .collect(),
+        )
+    }
     /// fetch K-V out of the committed datastore
     fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError>;
     /// fetch Hash(K)-V out of the commmitted datastore
     fn get_data_from_path(&mut self, hash: &TrieHash) -> Result<Option<String>, VmExecutionError>;
+    /// Fetch and decode a declared Clarity value.
+    ///
+    /// Stores with a typed physical representation override this method. The default preserves the
+    /// legacy canonical-string behavior.
+    fn get_typed_value(
+        &mut self,
+        key: &str,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<Option<TypedValueResult>, VmExecutionError> {
+        let Some(canonical) = self.get_data(key)? else {
+            return Ok(None);
+        };
+        let value = Value::try_deserialize_hex_at_epoch(&canonical, expected, epoch)
+            .map_err(|error| VmInternalError::DBError(error.to_string()))?;
+        Ok(Some(TypedValueResult {
+            value,
+            serialized_byte_len: canonical.len() as u64 / 2,
+        }))
+    }
     /// fetch K-V out of the committed datastore, along with the byte representation
     ///  of the Merkle proof for that key-value pair
     fn get_data_with_proof(
