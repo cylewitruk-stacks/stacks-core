@@ -69,11 +69,12 @@ pub mod postmempoolquery;
 pub mod postmicroblock;
 pub mod poststackerdbchunk;
 pub mod posttransaction;
+pub mod txsimulate;
 
 #[cfg(test)]
 mod tests;
 
-impl StacksHttp {
+impl<CSP: crate::chainstate::stacks::db::ChainStatePersistence> StacksHttp<CSP> {
     /// Register all RPC methods.
     /// Put your new RPC method handlers here.
     pub fn register_rpc_methods(&mut self) {
@@ -81,6 +82,9 @@ impl StacksHttp {
             self.auth_token.clone(),
         ));
         self.register_rpc_endpoint(blocksimulate::RPCNakamotoBlockSimulateRequestHandler::new(
+            self.auth_token.clone(),
+        ));
+        self.register_rpc_endpoint(txsimulate::RPCTransactionSimulateRequestHandler::new(
             self.auth_token.clone(),
         ));
         self.register_rpc_endpoint(callreadonly::RPCCallReadOnlyRequestHandler::new(

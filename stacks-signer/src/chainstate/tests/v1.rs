@@ -13,7 +13,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::fs;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -41,7 +40,6 @@ use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::chainstate::{
     ConsensusHash, StacksBlockId, StacksPrivateKey, StacksPublicKey, TrieHash,
 };
-use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::{function_name, info};
@@ -119,10 +117,8 @@ fn setup_test_environment(
         CHAIN_ID_TESTNET,
     );
 
-    let signer_db_dir = "/tmp/stacks-node-tests/signer-units/";
-    let signer_db_path = format!("{signer_db_dir}/{fn_name}.{}.sqlite", get_epoch_time_secs());
-    fs::create_dir_all(signer_db_dir).unwrap();
-    let signer_db = SignerDb::new(signer_db_path).unwrap();
+    let signer_db = SignerDb::new(":memory:")
+        .unwrap_or_else(|error| panic!("failed to create signer DB for {fn_name}: {error}"));
 
     let mut block = NakamotoBlock::new(
         NakamotoBlockHeader {
@@ -530,8 +526,9 @@ where
         client: stacks_client,
         config: _,
     } = MockServerClient::new();
+    let port = server.local_addr().unwrap().port();
     let (_stacks_client, mut signer_db, block_sk, mut view, mut block) =
-        setup_test_environment(function_name!());
+        setup_test_environment(&format!("{}_{port}", function_name!()));
     let mut parent_block_header = make_parent_header_meta(&block_sk, &mut block);
     parent_block_header.burn_view = Some(view.cur_sortition.data.consensus_hash.clone());
     let response = crate::client::tests::build_get_tenure_tip_response(&parent_block_header);
@@ -639,13 +636,7 @@ fn check_block_proposal_timeout() {
 
 #[test]
 fn check_sortition_timeout() {
-    let signer_db_dir = "/tmp/stacks-node-tests/signer-units/";
-    let signer_db_path = format!(
-        "{signer_db_dir}/sortition_timeout.{}.sqlite",
-        get_epoch_time_secs()
-    );
-    fs::create_dir_all(signer_db_dir).unwrap();
-    let mut signer_db = SignerDb::new(signer_db_path).unwrap();
+    let mut signer_db = SignerDb::new(":memory:").unwrap();
 
     let block_sk = StacksPrivateKey::from_seed(&[0, 1]);
     let block_pk = StacksPublicKey::from_private(&block_sk);
@@ -722,7 +713,19 @@ fn check_sortition_timeout() {
     block_info.mark_pre_committed().unwrap();
     signer_db.insert_block(&block_info).unwrap();
 
-    // This will no longer be timed out as we have a non-empty tenure
+    // A block we have only pre-committed to must NOT suppress the timeout: a pre-commit puts no
+    // signature over the block.
+    assert!(SortitionState::is_timed_out(
+        &sortition.data.consensus_hash,
+        &signer_db,
+        Duration::from_secs(1)
+    )
+    .unwrap());
+
+    // Once we actually sign the block, the tenure is no longer empty and must not time out.
+    block_info.mark_locally_accepted(false).unwrap();
+    signer_db.insert_block(&block_info).unwrap();
+
     assert!(!SortitionState::is_timed_out(
         &sortition.data.consensus_hash,
         &signer_db,
