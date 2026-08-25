@@ -896,6 +896,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "clarity-value-storage-migrate"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "stackslib 0.0.1",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

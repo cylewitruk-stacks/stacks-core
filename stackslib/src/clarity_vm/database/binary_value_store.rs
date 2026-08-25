@@ -22,6 +22,7 @@
 #![deny(missing_docs)]
 
 mod metadata;
+mod migration;
 mod schema;
 
 use std::collections::HashMap;
@@ -42,6 +43,10 @@ use stacks_common::types::StacksEpochId;
 use stacks_common::util::hash::{hex_bytes, to_hex};
 
 pub use self::metadata::{MetadataBlockId, MetadataRow};
+pub use self::migration::{
+    migrate, DataMigrationStats, IntegrityLevel, MigrationConfig, MigrationEvent, MigrationMode,
+    MigrationPhase, MigrationReport, ShapeCacheStats, DEFAULT_CACHE_MIB, MAX_CACHE_MIB,
+};
 use self::schema::{
     AUDIT_DATA, FORMAT_TABLE, GET_GENERIC, GET_SHAPE_ID, GET_TYPED, INSERT_DATA, INSERT_SHAPE,
     RECORD_VERSION,
