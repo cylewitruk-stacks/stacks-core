@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "stacks-attacknet-phase-review-contract/v2",
+  "reviewId": "release-1-amendment-a7-legacy-retirement",
+  "phase": 2,
+  "releaseScope": "Release 1 legacy-retirement amendment A7",
+  "tier": "Reduced",
+  "requiredReviewers": [
+    "Codex",
+    "Claude Opus 5"
+  ],
+  "requirements": [
+    "single-signed-commit-directly-on-approved-a6-with-exact-diff-and-deletion-inventory",
+    "retired-v1alpha1-executable-runtime-and-testdata-are-absent-from-the-product-tree",
+    "active-instrumentation-and-observability-consumers-use-current-owned-modules",
+    "topology-and-fault-equivalence-use-digest-verified-reproducible-golden-vectors",
+    "historical-release-records-remain-revision-scoped-and-current-documentation-is-truthful",
+    "repository-boundary-and-controller-equivalence-contracts-fail-closed",
+    "clean-operator-attacknet-hacknet-and-helm-offline-verification",
+    "portable-self-identifying-review-evidence"
+  ],
+  "requiredInventory": [
+    "candidate:contrib/attacknet/README.md",
+    "candidate:contrib/attacknet/docs/development/README.md",
+    "candidate:contrib/attacknet/instrumentation/artifact-digest.mjs",
+    "candidate:contrib/attacknet/instrumentation/image-admission-evidence.mjs",
+    "candidate:contrib/attacknet/instrumentation/run-descriptor.mjs",
+    "candidate:contrib/attacknet/instrumentation/phase-1-qualification.mjs",
+    "candidate:contrib/attacknet/observability/render.mjs",
+    "candidate:contrib/attacknet/test/contracts/repository-boundary.test.mjs",
+    "candidate:contrib/attacknet/test/equivalence/fault-compiler-equivalence.test.mjs",
+    "candidate:contrib/attacknet/test/equivalence/topology-render-equivalence.test.mjs",
+    "candidate:contrib/attacknet/test/support/equivalence-fixtures.mjs",
+    "candidate:contrib/attacknet/test/support/generate-v1alpha1-equivalence-fixtures.mjs",
+    "candidate:contrib/attacknet/test/fixtures/equivalence/README.md",
+    "candidate:contrib/attacknet/test/fixtures/equivalence/v1alpha1/manifest.json",
+    "candidate:contrib/attacknet/release/controller-equivalence-v1.json",
+    "candidate:contrib/attacknet/release/amendments/a7/contract.json",
+    "candidate:contrib/attacknet/release/amendments/a7/evidence.mjs",
+    "candidate:contrib/attacknet/release/amendments/a7/packet.mjs",
+    "candidate:contrib/attacknet/release/amendments/a7/verify.mjs",
+    "candidate:contrib/attacknet/release/amendments/a7/a7.test.mjs",
+    "candidate:contrib/attacknet/evidence-packets/release-1-a7/README.md",
+    "diff:candidate-legacy-retirement",
+    "evidence:deleted-paths",
+    "test:attacknet-check",
+    "test:hacknet-check",
+    "evidence:verification",
+    "evidence:archive-index",
+    "evidence:archive",
+    "evidence:summary"
+  ]
+}

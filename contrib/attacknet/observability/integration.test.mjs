@@ -175,61 +175,6 @@ test('explicitly disabled observability needs no cluster and leaves a truthful e
   assert.equal(writerResult.status, 0, writerResult.stderr);
 });
 
-test('applied burnchain policy is journaled only after clock acknowledgement', () => {
-  const {directory, kubectl} = fixture();
-  const capture = join(directory, 'policy-event.json');
-  const argumentsCapture = join(directory, 'args.json');
-  const policy = 'GENERATION=1\nMODE=run\nINTERVAL_SECONDS=20\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
-  const result = spawnSync(join(root, '..', 'legacy', 'v1alpha1', 'runtime', 'burnchain-policy.sh'), ['pause'], {
-    encoding: 'utf8', env: {
-      ...process.env,
-      ATTACKNET_KUBECTL: kubectl,
-      ATTACKNET_LOCK_DISABLED: '1',
-      ATTACKNET_NEGATIVE_CONTROL: '1',
-      ATTACKNET_RUN_ID: 'policy-run',
-      FAKE_POLICY: policy,
-      FAKE_POLICY_GENERATION: '2',
-      FAKE_EVENT_CAPTURE: capture,
-      FAKE_ARGUMENT_CAPTURE: argumentsCapture,
-    },
-  });
-  assert.equal(result.status, 0, result.stderr);
-  const event = JSON.parse(readFileSync(capture, 'utf8'));
-  assert.equal(event.kind, 'policy.changed');
-  assert.deepEqual(event.details, {
-    mode: 'pause', generation: 2, intervalSeconds: 20, jitterSeconds: 0,
-    burstBlocks: 0, burstTargetHeight: 0,
-    addressMode: 'round-robin', fixedAddressIndex: 0, applied: true,
-  });
-});
-
-test('exact burnchain bursts retain an inter-block bootstrap cadence and end paused', () => {
-  const {directory, kubectl} = fixture();
-  const capture = join(directory, 'burst-event.json');
-  const argumentsCapture = join(directory, 'args.json');
-  const policy = 'GENERATION=4\nMODE=run\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
-  const result = spawnSync(join(root, '..', 'legacy', 'v1alpha1', 'runtime', 'burnchain-policy.sh'), ['burst', '3', '2'], {
-    encoding: 'utf8', env: {
-      ...process.env,
-      ATTACKNET_KUBECTL: kubectl,
-      ATTACKNET_LOCK_DISABLED: '1',
-      ATTACKNET_NEGATIVE_CONTROL: '1',
-      ATTACKNET_RUN_ID: 'burst-run',
-      FAKE_POLICY: policy,
-      FAKE_POLICY_GENERATION: '5',
-      FAKE_EVENT_CAPTURE: capture,
-      FAKE_ARGUMENT_CAPTURE: argumentsCapture,
-    },
-  });
-  assert.equal(result.status, 0, result.stderr);
-  const event = JSON.parse(readFileSync(capture, 'utf8'));
-  assert.deepEqual(event.details, {
-    mode: 'pause', generation: 5, intervalSeconds: 2, jitterSeconds: 0,
-    burstBlocks: 3, burstTargetHeight: 203,
-    addressMode: 'round-robin', fixedAddressIndex: 0, applied: true,
-  });
-});
-
 test('verification recorder emits each bounded assertion through the trusted writer', () => {
   const {directory, kubectl} = fixture();
   const resultPath = join(directory, 'verification.json');

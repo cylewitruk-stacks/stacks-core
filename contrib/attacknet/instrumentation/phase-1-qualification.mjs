@@ -7,11 +7,11 @@ import {
 import {basename, dirname, isAbsolute, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-import {joinImageAdmissionEvidence} from '../legacy/v1alpha1/runtime/image-admission-evidence.mjs';
+import {joinImageAdmissionEvidence} from './image-admission-evidence.mjs';
+import {canonicalJson, sha256File, sha256Value} from './artifact-digest.mjs';
 import {
-  attachInstrumentationCapabilities, canonicalJson, readDescriptor, sha256File,
-  sha256Value, writeDescriptor,
-} from '../legacy/v1alpha1/runtime/run-descriptor.mjs';
+  attachInstrumentationCapabilities, readDescriptor, writeDescriptor,
+} from './run-descriptor.mjs';
 import {compileCapabilityManifest, loadInventory} from './capability-manifest.mjs';
 import {buildRuntimeMetricEvidence} from './runtime-metric-evidence.mjs';
 

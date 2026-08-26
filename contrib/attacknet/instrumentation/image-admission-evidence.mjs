@@ -1,9 +1,4 @@
-#!/usr/bin/env node
-
 import {createHash} from 'node:crypto';
-import {readFileSync, realpathSync, writeFileSync} from 'node:fs';
-import {resolve} from 'node:path';
-import {fileURLToPath} from 'node:url';
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
@@ -105,27 +100,4 @@ export function joinImageAdmissionEvidence({buildRecord, network, pod, actor}) {
   };
   evidence.evidenceDigest = digest(evidence);
   return evidence;
-}
-
-function main() {
-  const [buildPath, networkPath, podPath, actor, outputPath] = process.argv.slice(2);
-  if (!buildPath || !networkPath || !podPath || !actor) {
-    fail('usage: image-admission-evidence.mjs BUILD_RECORD NETWORK_JSON POD_JSON ACTOR [OUTPUT]');
-  }
-  const evidence = joinImageAdmissionEvidence({
-    buildRecord: JSON.parse(readFileSync(resolve(buildPath), 'utf8')),
-    network: JSON.parse(readFileSync(resolve(networkPath), 'utf8')),
-    pod: JSON.parse(readFileSync(resolve(podPath), 'utf8')),
-    actor,
-  });
-  const serialized = `${JSON.stringify(evidence, null, 2)}\n`;
-  if (outputPath) writeFileSync(resolve(outputPath), serialized);
-  else process.stdout.write(serialized);
-}
-
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try { main(); } catch (error) {
-    console.error(`image-admission-evidence: ${error.message}`);
-    process.exitCode = 1;
-  }
 }

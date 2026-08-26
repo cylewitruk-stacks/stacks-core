@@ -20,7 +20,7 @@ observability, or evidence machinery. Operators should begin with the root
 The Go module is under [`../../../helm/hacknet/operator/`](../../../helm/hacknet/operator/).
 Do not create parallel API types or canonical encoders outside it.
 
-## Public and historical interfaces
+## Public and compatibility interfaces
 
 Build the supported CLI and inspect its machine contract:
 
@@ -29,9 +29,10 @@ Build the supported CLI and inspect its machine contract:
 /tmp/attacknet commands --json
 ```
 
-The v1alpha1 Node/shell prototype is frozen under
-[`../../legacy/`](../../legacy/README.md). It is an equivalence reference, not
-an extension point or supported operator interface.
+The v1alpha1 Node/shell prototype is retained by Git history, not as executable
+code in the current tree. Immutable vectors under
+[`../../test/fixtures/equivalence/`](../../test/fixtures/equivalence/) protect
+the approved compatibility boundary without creating a second extension point.
 
 ## Local images
 
@@ -113,8 +114,8 @@ bash contrib/helm/hacknet/scripts/check.sh
 make -C contrib/helm/hacknet/operator verify
 ```
 
-The product suite enforces the root allowlist, image paths, legacy boundary,
-Go-versus-v1alpha1 equivalence, instrumentation, observability, and historical
+The product suite enforces the root allowlist, image paths, retired-runtime
+absence, golden v1alpha1 equivalence, instrumentation, observability, and historical
 release contracts. The operator suite covers unit tests, race checks, generated
 artifacts, envtest when configured, and structural RBAC.
 

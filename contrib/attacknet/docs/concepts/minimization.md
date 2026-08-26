@@ -61,6 +61,5 @@ The final claim is only “one smaller admitted candidate reproduced the outcome
 under the recorded fresh-network counterfactual.” Attacknet does not claim
 causal minimality.
 
-The retired v1alpha1 adapter is retained under
-[`../../legacy/`](../../legacy/README.md) solely for historical evidence
-verification.
+The retired v1alpha1 adapter remains available at the revision bound by its
+historical review packet; it is not shipped in the current product tree.

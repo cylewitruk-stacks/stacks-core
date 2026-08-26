@@ -57,6 +57,6 @@ not contain runtime adversary switches. Compile test-only directives only in a
 dedicated worktree and image, then assign that image to a bounded actor. See
 [`adversarial-actors.md`](adversarial-actors.md).
 
-Historical v1alpha1 build-planner evidence is retained under
-[`../../legacy/`](../../legacy/README.md), but its Node command surface is not a
-supported workflow.
+Historical v1alpha1 build-planner evidence remains bound to its reviewed Git
+revision and evidence archive. Its Node command surface is not shipped or
+supported as a current workflow.

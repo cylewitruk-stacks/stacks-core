@@ -5,9 +5,10 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
 
+import {sha256Value} from './artifact-digest.mjs';
 import {
-  initializeDescriptor, readDescriptor, sha256Value, validateDescriptor, writeDescriptor,
-} from '../legacy/v1alpha1/runtime/run-descriptor.mjs';
+  initializeDescriptor, readDescriptor, validateDescriptor, writeDescriptor,
+} from './run-descriptor.mjs';
 import {
   finalizeQualification, preflightQualification, qualificationRequired,
 } from './phase-1-qualification.mjs';

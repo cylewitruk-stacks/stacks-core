@@ -20,9 +20,9 @@ $ATTACKNET doctor --output json
 The controllers own topology reconciliation, fault admission, scheduling,
 injection, rollback, recovery, replay, minimization, and terminal
 classification. The client submits desired state, observes status, manages
-local images/Helm/port-forwards, and captures bounded evidence. The shell and
-Node files under [`../../legacy/`](../../legacy/README.md) are historical
-qualification inputs, not an operator API.
+local images/Helm/port-forwards, and captures bounded evidence. Retired shell
+and Node implementations are absent from the current product tree; pinned Git
+revisions and immutable fixtures preserve historical qualification evidence.
 
 ## Control-plane lifecycle
 

@@ -278,12 +278,12 @@ Campaign integration follows these rules:
 4. emit every verification result as `invariant.observed`;
 5. emit `recovery.complete` with the measured clear-to-pass duration.
 
-The cadence controller emits `policy.changed` after the ConfigMap generation
-is observed by the external Bitcoin clock. Requested policy is insufficient:
-the event describes the applied and process-acknowledged policy. A journal
-failure after the policy mutation warns without encouraging a dangerous retry;
-set `ATTACKNET_EVENT_STRICT=1` when evidence completeness should terminate the
-caller.
+The event bridge accepts `policy.changed` observations from trusted
+orchestration extensions. Such an observation must describe an applied,
+process-acknowledged policy rather than requested state. The supported
+`BurnchainPolicy` controller exposes acknowledged clock generation, mode, and
+cadence through its status and bounded `attacknet_burnchain_clock_*` metrics;
+it does not depend on a journal write to apply policy.
 
 `record-verification.sh RESULT SCOPE PHASE` translates stable
 `verify.sh` JSON into separate bounded observations for burn and Stacks drift,

@@ -15,6 +15,7 @@ image-build and mixed-version planning inputs, not Kubernetes resources.
 Runtime evidence, generated manifests, digests, and replay descriptors also
 remain canonical JSON.
 
-Legacy v1alpha1 compatibility fixtures live under
-`../testdata/legacy-v1alpha1/`; they are not supported authoring examples. Use
-`attacknet convert` for the bounded legacy resource kinds it supports.
+Immutable v1alpha1 compatibility vectors live under
+[`../test/fixtures/equivalence/`](../test/fixtures/equivalence/); they are not
+supported authoring examples. Use `attacknet convert` for the bounded legacy
+resource kinds it supports.

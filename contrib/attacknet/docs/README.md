@@ -13,5 +13,6 @@ material is grouped by audience and responsibility:
   contracts.
 
 The supported product surface is the typed Go CLI and the
-`testing.stacks.org/v1beta1` API. Historical v1alpha1 implementation material
-lives under [`../legacy/`](../legacy/README.md).
+`testing.stacks.org/v1beta1` API. Digest-verified v1alpha1 compatibility vectors
+live under [`../test/fixtures/equivalence/`](../test/fixtures/equivalence/);
+retired implementations are available only from their pinned Git revisions.

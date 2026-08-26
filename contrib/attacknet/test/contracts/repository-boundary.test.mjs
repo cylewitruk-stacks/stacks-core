@@ -1,23 +1,29 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {readFileSync, readdirSync, statSync} from 'node:fs';
+import {existsSync, readFileSync, readdirSync, statSync} from 'node:fs';
 import {dirname, join, relative, resolve, sep} from 'node:path';
 import test from 'node:test';
 import {fileURLToPath} from 'node:url';
 
+import {loadEquivalenceFixtures} from '../support/equivalence-fixtures.mjs';
+
 const attacknetRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const repositoryRoot = resolve(attacknetRoot, '..', '..');
-const legacyRoot = join(attacknetRoot, 'legacy', 'v1alpha1');
-const manifest = JSON.parse(readFileSync(join(legacyRoot, 'manifest.v1.json'), 'utf8'));
 const trackedPaths = new Set(execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], {
   cwd: repositoryRoot,
   encoding: 'utf8',
 }).split('\0').filter(Boolean));
 const allowedRootEntries = new Set([
   '.gitignore', 'README.md', 'config', 'docs', 'evidence', 'evidence-packets',
-  'examples', 'generated', 'images', 'instrumentation', 'legacy',
-  'observability', 'release', 'test', 'testdata',
+  'examples', 'generated', 'images', 'instrumentation',
+  'observability', 'release', 'test',
 ]);
+const retiredRuntimeNames = [
+  'burnchain-clock.sh', 'burnchain-policy.sh', 'configure-node.sh',
+  'fault-campaign.mjs', 'fault-effect-evidence.mjs',
+  'image-admission-evidence.mjs', 'join-after-nakamoto.sh',
+  'kubernetes-runtime-contracts.mjs', 'run-descriptor.mjs', 'topology.mjs',
+];
 
 function filesBelow(root, accept) {
   const files = [];
@@ -49,27 +55,15 @@ function assertTrackedDocumentationTarget(path, label) {
   assert.equal(tracked, true, `${label} is not present in a clean checkout`);
 }
 
-test('legacy runtime entries are qualification-only and bound to implemented Go successors', () => {
-  assert.equal(manifest.schema, 'stacks-attacknet-legacy-runtime/v1');
-  assert.equal(manifest.policy, 'internal-qualification-only');
-  assert.ok(manifest.entries.length > 0);
-
-  const paths = manifest.entries.map(entry => entry.path);
-  assert.equal(new Set(paths).size, paths.length, 'legacy runtime paths must be unique');
-  const retainedFiles = filesBelow(join(legacyRoot, 'runtime'), () => true)
-    .map(path => relative(legacyRoot, path).split(sep).join('/'))
-    .sort();
-  assert.deepEqual([...paths].sort(), retainedFiles,
-    'every retained legacy file must have an explicit owner and removal gate');
-  for (const entry of manifest.entries) {
-    assert.match(entry.path, /\.(?:mjs|sh)$/);
-    assert.equal(entry.disposition, 'retained-qualification');
-    assert.match(entry.owner, /^(?:fault-controller|instrumentation|release-qualification|topology-controller)$/);
-    assert.ok(entry.successors.length > 0, `${entry.path} has no Go successor`);
-    assert.ok(entry.removalGates.length > 0, `${entry.path} has no removal gate`);
-    assertRepositoryFile(`contrib/attacknet/legacy/v1alpha1/${entry.path}`, entry.path);
-    for (const successor of entry.successors) assertRepositoryFile(successor, `${entry.path} successor`);
-  }
+test('retired runtime is absent and immutable equivalence fixtures are verified', () => {
+  assert.equal(existsSync(join(attacknetRoot, 'legacy')), false, 'legacy runtime directory must not be shipped');
+  assert.equal(existsSync(join(attacknetRoot, 'testdata')), false, 'retired v1alpha1 testdata must not be shipped');
+  const fixtures = loadEquivalenceFixtures();
+  assert.equal(fixtures.manifest.entries.length, 9);
+  assertRepositoryFile(
+    'contrib/attacknet/test/support/generate-v1alpha1-equivalence-fixtures.mjs',
+    'equivalence fixture generator',
+  );
 });
 
 test('public operator guides expose only the typed Go surface', () => {
@@ -82,8 +76,7 @@ test('public operator guides expose only the typed Go surface', () => {
     const source = readFileSync(path, 'utf8');
     assert.doesNotMatch(source, /contrib\/attacknet\/attacknet(?:\s|`|$)/,
       `${relative(repositoryRoot, path)} advertises the retired Node facade`);
-    for (const entry of manifest.entries) {
-      const name = entry.path.split('/').at(-1);
+    for (const name of retiredRuntimeNames) {
       assert.doesNotMatch(source, new RegExp(name.replaceAll('.', '\\.')),
         `${relative(repositoryRoot, path)} advertises qualification-only helper ${name}`);
     }
@@ -98,11 +91,10 @@ test('the Attacknet root is an explicit product-directory allowlist', () => {
 });
 
 test('v1beta1 YAML examples do not invoke compatibility runtime helpers', () => {
-  const names = manifest.entries.map(entry => entry.path.split('/').at(-1));
   const exampleRoots = [join(attacknetRoot, 'examples'), join(repositoryRoot, 'contrib', 'helm', 'hacknet', 'examples')];
   for (const path of exampleRoots.flatMap(root => filesBelow(root, candidate => /\.ya?ml$/.test(candidate)))) {
     const source = readFileSync(path, 'utf8');
-    for (const name of names) assert.doesNotMatch(source, new RegExp(name.replaceAll('.', '\\.')),
+    for (const name of retiredRuntimeNames) assert.doesNotMatch(source, new RegExp(name.replaceAll('.', '\\.')),
       `${relative(repositoryRoot, path)} invokes compatibility helper ${name}`);
   }
 });
@@ -110,7 +102,7 @@ test('v1beta1 YAML examples do not invoke compatibility runtime helpers', () => 
 test('local Markdown links in current Attacknet documentation resolve', () => {
   const documentation = [
     join(attacknetRoot, 'README.md'),
-    ...['config', 'docs', 'examples', 'images', 'legacy', 'test']
+    ...['config', 'docs', 'examples', 'images', 'test']
       .flatMap(directory => filesBelow(join(attacknetRoot, directory), path => path.endsWith('.md'))),
     join(attacknetRoot, 'observability', 'README.md'),
     join(attacknetRoot, 'release', 'README.md'),

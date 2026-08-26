@@ -65,7 +65,7 @@ inconclusive.
 
 ## Historical descriptors
 
-Release evidence created before v1beta1 used a standalone Node descriptor.
-That implementation is frozen under
-[`../../legacy/v1alpha1/`](../../legacy/v1alpha1/README.md) for historical
-verification only. New runs must use `AttacknetRun` status and the typed Go CLI.
+Release evidence created before v1beta1 used a standalone Node descriptor. Its
+reviewed source remains available at the revision recorded by each historical
+packet, but is not shipped in the current product tree. New runs must use
+`AttacknetRun` status and the typed Go CLI.

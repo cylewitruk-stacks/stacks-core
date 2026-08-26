@@ -6,7 +6,7 @@ import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 import {loadInventory} from '../instrumentation/capability-manifest.mjs';
-import {sha256File, sha256Value} from '../legacy/v1alpha1/runtime/run-descriptor.mjs';
+import {sha256File, sha256Value} from '../instrumentation/artifact-digest.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DNS_LABEL = /^[a-z]([-a-z0-9]*[a-z0-9])?$/;

@@ -269,9 +269,10 @@ helm uninstall chaos-mesh -n chaos-mesh
   interface. Use `attacknet commands --json` for the agent-readable contract.
 - Controllers own admission, scheduling, mutation, rollback, recovery, and
   terminal classification. The CLI submits intent and reads status.
-- The frozen v1alpha1 Node/shell implementation lives under
-  [`legacy/`](legacy/README.md). It is retained only for historical
-  equivalence evidence and is not a supported operator interface.
+- Immutable, digest-verified v1alpha1 compatibility vectors live under
+  [`test/fixtures/equivalence/`](test/fixtures/equivalence/). The retired
+  Node/shell implementation remains available only through its pinned Git
+  revisions and is not shipped as a second operator interface.
 - JSON evidence and historical release machinery remain intentionally separate
   from YAML authoring.
 - Actor counts and identities come from `StacksNetwork.status`; harness code

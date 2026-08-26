@@ -112,9 +112,10 @@ and namespace unless `--namespace` is supplied.
 | `image build`, `image load`, `install local` | Shell image/build/install helpers | Workload reconciliation and image admission |
 | `burnchain status`, `pause`, `resume`, `cadence`, `flash` | Shell clock-policy mutation | Clock execution and acknowledgement |
 
-The Go binary is the supported public surface. Legacy shell and Node files are
-retained under [`../../legacy/`](../../legacy/README.md) only as historical
-qualification or v1alpha1 equivalence inputs; their arguments are not a
+The Go binary is the supported public surface. The retired shell and Node
+implementations are not shipped in the current tree; digest-verified
+compatibility vectors preserve the bounded v1alpha1 contract. Historical
+arguments remain available in their pinned Git revisions and are not a current
 compatibility contract.
 
 ## Known risks and follow-up

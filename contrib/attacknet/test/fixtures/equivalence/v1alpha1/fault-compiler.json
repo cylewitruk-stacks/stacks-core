@@ -1,0 +1,831 @@
+{
+  "manifest": {
+    "network": "attacknet",
+    "namespace": "hacknet-system",
+    "actors": [
+      {
+        "service": "miner-1",
+        "role": "miner"
+      },
+      {
+        "service": "signer-1",
+        "role": "signer",
+        "signerIndex": 1,
+        "signerWeight": 8
+      },
+      {
+        "service": "signer-node-1",
+        "role": "companion",
+        "signerIndex": 1,
+        "signerWeight": 8
+      },
+      {
+        "service": "signer-2",
+        "role": "signer",
+        "signerIndex": 2,
+        "signerWeight": 2
+      },
+      {
+        "service": "signer-node-2",
+        "role": "companion",
+        "signerIndex": 2,
+        "signerWeight": 2
+      }
+    ]
+  },
+  "cases": [
+    {
+      "campaign": {
+        "apiVersion": "testing.stacks.org/v1alpha1",
+        "kind": "FaultCampaign",
+        "metadata": {
+          "name": "pod-failure",
+          "namespace": "hacknet-system"
+        },
+        "spec": {
+          "networkRef": "attacknet",
+          "target": {
+            "actors": [
+              "signer-node-2"
+            ]
+          },
+          "fault": {
+            "mode": "one",
+            "duration": "30s",
+            "type": "pod",
+            "action": "pod-failure",
+            "parameters": {}
+          },
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      },
+      "expected": {
+        "resource": {
+          "apiVersion": "chaos-mesh.org/v1alpha1",
+          "kind": "PodChaos",
+          "metadata": {
+            "name": "pod-failure",
+            "namespace": "hacknet-system",
+            "labels": {
+              "testing.stacks.org/network": "attacknet",
+              "testing.stacks.org/campaign": "pod-failure"
+            }
+          },
+          "spec": {
+            "mode": "one",
+            "duration": "30s",
+            "selector": {
+              "namespaces": [
+                "hacknet-system"
+              ],
+              "labelSelectors": {
+                "testing.stacks.org/network": "attacknet"
+              },
+              "expressionSelectors": [
+                {
+                  "key": "testing.stacks.org/actor",
+                  "operator": "In",
+                  "values": [
+                    "signer-node-2"
+                  ]
+                }
+              ]
+            },
+            "action": "pod-failure"
+          }
+        },
+        "evidence": {
+          "selectedActors": [
+            "signer-node-2"
+          ],
+          "signerImpact": {
+            "totalWeight": 10,
+            "affectedWeight": 2,
+            "percent": 20
+          },
+          "minerImpact": {
+            "totalCount": 1,
+            "affectedCount": 0,
+            "percent": 0
+          },
+          "maximumAffectedActors": 1,
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      }
+    },
+    {
+      "campaign": {
+        "apiVersion": "testing.stacks.org/v1alpha1",
+        "kind": "FaultCampaign",
+        "metadata": {
+          "name": "network-delay",
+          "namespace": "hacknet-system"
+        },
+        "spec": {
+          "networkRef": "attacknet",
+          "target": {
+            "actors": [
+              "signer-node-2"
+            ]
+          },
+          "fault": {
+            "mode": "one",
+            "duration": "30s",
+            "type": "network",
+            "action": "delay",
+            "parameters": {
+              "direction": "both",
+              "peerTarget": {
+                "actors": [
+                  "miner-1"
+                ],
+                "mode": "all"
+              },
+              "delay": {
+                "latency": "100ms"
+              }
+            }
+          },
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      },
+      "expected": {
+        "resource": {
+          "apiVersion": "chaos-mesh.org/v1alpha1",
+          "kind": "NetworkChaos",
+          "metadata": {
+            "name": "network-delay",
+            "namespace": "hacknet-system",
+            "labels": {
+              "testing.stacks.org/network": "attacknet",
+              "testing.stacks.org/campaign": "network-delay"
+            }
+          },
+          "spec": {
+            "mode": "one",
+            "duration": "30s",
+            "selector": {
+              "namespaces": [
+                "hacknet-system"
+              ],
+              "labelSelectors": {
+                "testing.stacks.org/network": "attacknet"
+              },
+              "expressionSelectors": [
+                {
+                  "key": "testing.stacks.org/actor",
+                  "operator": "In",
+                  "values": [
+                    "signer-node-2"
+                  ]
+                }
+              ]
+            },
+            "action": "delay",
+            "direction": "both",
+            "delay": {
+              "latency": "100ms"
+            },
+            "target": {
+              "mode": "all",
+              "selector": {
+                "namespaces": [
+                  "hacknet-system"
+                ],
+                "labelSelectors": {
+                  "testing.stacks.org/network": "attacknet"
+                },
+                "expressionSelectors": [
+                  {
+                    "key": "testing.stacks.org/actor",
+                    "operator": "In",
+                    "values": [
+                      "miner-1"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "evidence": {
+          "selectedActors": [
+            "signer-node-2"
+          ],
+          "peerSelectedActors": [
+            "miner-1"
+          ],
+          "signerImpact": {
+            "totalWeight": 10,
+            "affectedWeight": 2,
+            "percent": 20
+          },
+          "minerImpact": {
+            "totalCount": 1,
+            "affectedCount": 0,
+            "percent": 0
+          },
+          "maximumAffectedActors": 1,
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      }
+    },
+    {
+      "campaign": {
+        "apiVersion": "testing.stacks.org/v1alpha1",
+        "kind": "FaultCampaign",
+        "metadata": {
+          "name": "dns-error",
+          "namespace": "hacknet-system"
+        },
+        "spec": {
+          "networkRef": "attacknet",
+          "target": {
+            "actors": [
+              "signer-node-2"
+            ]
+          },
+          "fault": {
+            "mode": "one",
+            "duration": "30s",
+            "type": "dns",
+            "action": "error",
+            "parameters": {
+              "patterns": [
+                "invalid.*"
+              ]
+            }
+          },
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      },
+      "expected": {
+        "resource": {
+          "apiVersion": "chaos-mesh.org/v1alpha1",
+          "kind": "DNSChaos",
+          "metadata": {
+            "name": "dns-error",
+            "namespace": "hacknet-system",
+            "labels": {
+              "testing.stacks.org/network": "attacknet",
+              "testing.stacks.org/campaign": "dns-error"
+            }
+          },
+          "spec": {
+            "mode": "one",
+            "duration": "30s",
+            "selector": {
+              "namespaces": [
+                "hacknet-system"
+              ],
+              "labelSelectors": {
+                "testing.stacks.org/network": "attacknet"
+              },
+              "expressionSelectors": [
+                {
+                  "key": "testing.stacks.org/actor",
+                  "operator": "In",
+                  "values": [
+                    "signer-node-2"
+                  ]
+                }
+              ]
+            },
+            "action": "error",
+            "patterns": [
+              "invalid.*"
+            ]
+          }
+        },
+        "evidence": {
+          "selectedActors": [
+            "signer-node-2"
+          ],
+          "signerImpact": {
+            "totalWeight": 10,
+            "affectedWeight": 2,
+            "percent": 20
+          },
+          "minerImpact": {
+            "totalCount": 1,
+            "affectedCount": 0,
+            "percent": 0
+          },
+          "maximumAffectedActors": 1,
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      }
+    },
+    {
+      "campaign": {
+        "apiVersion": "testing.stacks.org/v1alpha1",
+        "kind": "FaultCampaign",
+        "metadata": {
+          "name": "io-latency",
+          "namespace": "hacknet-system"
+        },
+        "spec": {
+          "networkRef": "attacknet",
+          "target": {
+            "actors": [
+              "signer-node-2"
+            ]
+          },
+          "fault": {
+            "mode": "one",
+            "duration": "30s",
+            "type": "io",
+            "action": "latency",
+            "parameters": {
+              "volumePath": "/data",
+              "path": "/data/**",
+              "delay": "10ms",
+              "methods": [
+                "READ",
+                "WRITE"
+              ]
+            }
+          },
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      },
+      "expected": {
+        "resource": {
+          "apiVersion": "chaos-mesh.org/v1alpha1",
+          "kind": "IOChaos",
+          "metadata": {
+            "name": "io-latency",
+            "namespace": "hacknet-system",
+            "labels": {
+              "testing.stacks.org/network": "attacknet",
+              "testing.stacks.org/campaign": "io-latency"
+            }
+          },
+          "spec": {
+            "mode": "one",
+            "duration": "30s",
+            "selector": {
+              "namespaces": [
+                "hacknet-system"
+              ],
+              "labelSelectors": {
+                "testing.stacks.org/network": "attacknet"
+              },
+              "expressionSelectors": [
+                {
+                  "key": "testing.stacks.org/actor",
+                  "operator": "In",
+                  "values": [
+                    "signer-node-2"
+                  ]
+                }
+              ]
+            },
+            "action": "latency",
+            "volumePath": "/data",
+            "path": "/data/**",
+            "delay": "10ms",
+            "methods": [
+              "READ",
+              "WRITE"
+            ]
+          }
+        },
+        "evidence": {
+          "selectedActors": [
+            "signer-node-2"
+          ],
+          "signerImpact": {
+            "totalWeight": 10,
+            "affectedWeight": 2,
+            "percent": 20
+          },
+          "minerImpact": {
+            "totalCount": 1,
+            "affectedCount": 0,
+            "percent": 0
+          },
+          "maximumAffectedActors": 1,
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      }
+    },
+    {
+      "campaign": {
+        "apiVersion": "testing.stacks.org/v1alpha1",
+        "kind": "FaultCampaign",
+        "metadata": {
+          "name": "time-offset",
+          "namespace": "hacknet-system"
+        },
+        "spec": {
+          "networkRef": "attacknet",
+          "target": {
+            "actors": [
+              "signer-node-2"
+            ]
+          },
+          "fault": {
+            "mode": "one",
+            "duration": "30s",
+            "type": "time",
+            "parameters": {
+              "timeOffset": "+1m",
+              "clockIds": [
+                "CLOCK_REALTIME"
+              ],
+              "containerNames": [
+                "actor"
+              ]
+            }
+          },
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      },
+      "expected": {
+        "resource": {
+          "apiVersion": "chaos-mesh.org/v1alpha1",
+          "kind": "TimeChaos",
+          "metadata": {
+            "name": "time-offset",
+            "namespace": "hacknet-system",
+            "labels": {
+              "testing.stacks.org/network": "attacknet",
+              "testing.stacks.org/campaign": "time-offset"
+            }
+          },
+          "spec": {
+            "mode": "one",
+            "duration": "30s",
+            "selector": {
+              "namespaces": [
+                "hacknet-system"
+              ],
+              "labelSelectors": {
+                "testing.stacks.org/network": "attacknet"
+              },
+              "expressionSelectors": [
+                {
+                  "key": "testing.stacks.org/actor",
+                  "operator": "In",
+                  "values": [
+                    "signer-node-2"
+                  ]
+                }
+              ]
+            },
+            "timeOffset": "+1m",
+            "clockIds": [
+              "CLOCK_REALTIME"
+            ],
+            "containerNames": [
+              "actor"
+            ]
+          }
+        },
+        "evidence": {
+          "selectedActors": [
+            "signer-node-2"
+          ],
+          "signerImpact": {
+            "totalWeight": 10,
+            "affectedWeight": 2,
+            "percent": 20
+          },
+          "minerImpact": {
+            "totalCount": 1,
+            "affectedCount": 0,
+            "percent": 0
+          },
+          "maximumAffectedActors": 1,
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      }
+    },
+    {
+      "campaign": {
+        "apiVersion": "testing.stacks.org/v1alpha1",
+        "kind": "FaultCampaign",
+        "metadata": {
+          "name": "io-pressure",
+          "namespace": "hacknet-system"
+        },
+        "spec": {
+          "networkRef": "attacknet",
+          "target": {
+            "actors": [
+              "signer-node-2"
+            ]
+          },
+          "fault": {
+            "mode": "one",
+            "duration": "30s",
+            "type": "io-pressure",
+            "action": "disk-pressure",
+            "parameters": {
+              "containerNames": [
+                "actor"
+              ],
+              "severity": "low",
+              "workers": 1,
+              "bytesMiB": 32,
+              "writeSizeKiB": 256,
+              "minimumLatencyMultiplier": 2,
+              "minimumAddedLatencyMs": 5
+            }
+          },
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      },
+      "expected": {
+        "resource": {
+          "apiVersion": "testing.stacks.org/internal",
+          "kind": "IOPressurePod",
+          "metadata": {
+            "name": "io-pressure",
+            "namespace": "hacknet-system",
+            "labels": {
+              "testing.stacks.org/network": "attacknet",
+              "testing.stacks.org/campaign": "io-pressure"
+            },
+            "annotations": {
+              "testing.stacks.org/io-pressure-contract": "{\"bytesMiB\":32,\"minimumAddedLatencyMs\":5,\"minimumLatencyMultiplier\":2,\"semantic\":\"disk-io-pressure\",\"severity\":\"low\",\"tempPath\":\"/data\",\"workers\":1,\"writeSizeKiB\":256}"
+            }
+          },
+          "spec": {
+            "mode": "one",
+            "duration": "30s",
+            "selector": {
+              "namespaces": [
+                "hacknet-system"
+              ],
+              "labelSelectors": {
+                "testing.stacks.org/network": "attacknet"
+              },
+              "expressionSelectors": [
+                {
+                  "key": "testing.stacks.org/actor",
+                  "operator": "In",
+                  "values": [
+                    "signer-node-2"
+                  ]
+                }
+              ]
+            },
+            "containerNames": [
+              "actor"
+            ],
+            "workers": 1,
+            "bytesMiB": 32,
+            "writeSizeKiB": 256
+          }
+        },
+        "evidence": {
+          "selectedActors": [
+            "signer-node-2"
+          ],
+          "signerImpact": {
+            "totalWeight": 10,
+            "affectedWeight": 2,
+            "percent": 20
+          },
+          "minerImpact": {
+            "totalCount": 1,
+            "affectedCount": 0,
+            "percent": 0
+          },
+          "maximumAffectedActors": 1,
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          },
+          "ioPressure": {
+            "semantic": "disk-io-pressure",
+            "severity": "low",
+            "workers": 1,
+            "bytesMiB": 32,
+            "writeSizeKiB": 256,
+            "tempPath": "/data",
+            "minimumLatencyMultiplier": 2,
+            "minimumAddedLatencyMs": 5
+          }
+        }
+      }
+    },
+    {
+      "campaign": {
+        "apiVersion": "testing.stacks.org/v1alpha1",
+        "kind": "FaultCampaign",
+        "metadata": {
+          "name": "clock-skew",
+          "namespace": "hacknet-system"
+        },
+        "spec": {
+          "networkRef": "attacknet",
+          "target": {
+            "actors": [
+              "signer-node-2"
+            ]
+          },
+          "fault": {
+            "mode": "one",
+            "duration": "30s",
+            "type": "clock-skew",
+            "parameters": {
+              "timeOffset": "-30s",
+              "clockIds": [
+                "CLOCK_REALTIME"
+              ],
+              "containerNames": [
+                "actor"
+              ]
+            }
+          },
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      },
+      "expected": {
+        "resource": {
+          "apiVersion": "testing.stacks.org/internal",
+          "kind": "ClockSkewPolicy",
+          "metadata": {
+            "name": "clock-skew",
+            "namespace": "hacknet-system",
+            "labels": {
+              "testing.stacks.org/network": "attacknet",
+              "testing.stacks.org/campaign": "clock-skew"
+            }
+          },
+          "spec": {
+            "mode": "one",
+            "duration": "30s",
+            "selector": {
+              "namespaces": [
+                "hacknet-system"
+              ],
+              "labelSelectors": {
+                "testing.stacks.org/network": "attacknet"
+              },
+              "expressionSelectors": [
+                {
+                  "key": "testing.stacks.org/actor",
+                  "operator": "In",
+                  "values": [
+                    "signer-node-2"
+                  ]
+                }
+              ]
+            },
+            "timeOffset": "-30s",
+            "clockIds": [
+              "CLOCK_REALTIME"
+            ],
+            "containerNames": [
+              "actor"
+            ]
+          }
+        },
+        "evidence": {
+          "selectedActors": [
+            "signer-node-2"
+          ],
+          "signerImpact": {
+            "totalWeight": 10,
+            "affectedWeight": 2,
+            "percent": 20
+          },
+          "minerImpact": {
+            "totalCount": 1,
+            "affectedCount": 0,
+            "percent": 0
+          },
+          "maximumAffectedActors": 1,
+          "safety": {
+            "maxUnavailableSignerPercent": 30,
+            "maxUnavailableMinerPercent": 50,
+            "allowQuorumLoss": false,
+            "allowBurnchain": false,
+            "allowExtendedDuration": false,
+            "allowExtremeSeverity": false,
+            "allowMinerMajorityOutage": false,
+            "allowUnenrolledNetworkTargets": false
+          }
+        }
+      }
+    }
+  ]
+}

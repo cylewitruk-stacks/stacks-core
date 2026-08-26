@@ -58,6 +58,5 @@ attacknet watch --namespace hacknet-system AttacknetRun bounded-mixed-faults
 ```
 
 The public contract is `testing.stacks.org/v1beta1` plus controller status.
-The retired Node scheduler is retained under
-[`../../legacy/`](../../legacy/README.md) only as a historical equivalence
-reference.
+The retired Node scheduler remains available only at its reviewed Git revision;
+it is not a second implementation in the current product tree.

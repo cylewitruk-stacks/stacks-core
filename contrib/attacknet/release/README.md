@@ -1,7 +1,7 @@
 # Attacknet release records
 
 This directory contains the Release 1 baseline, review contracts, packet
-builders, schemas, and the A1–A5 amendment history. These artifacts bind exact
+builders, schemas, and the A1–A7 amendment history. These artifacts bind exact
 historical revisions and paths; they are intentionally not rearranged by
 repository-hygiene changes.
 

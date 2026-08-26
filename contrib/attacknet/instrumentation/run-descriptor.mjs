@@ -1,8 +1,8 @@
-#!/usr/bin/env node
-
-import {createHash, createHmac} from 'node:crypto';
+import {createHmac} from 'node:crypto';
 import {readFileSync, renameSync, writeFileSync} from 'node:fs';
 import {dirname, join} from 'node:path';
+
+import {canonicalJson, sha256File, sha256Value} from './artifact-digest.mjs';
 
 export const RUN_DESCRIPTOR_SCHEMA = 'stacks-attacknet-run/v1';
 
@@ -44,39 +44,6 @@ function normalizedTimestamp(value, field) {
 
 function deepCopy(value) {
   return JSON.parse(JSON.stringify(value));
-}
-
-// JSON object keys are sorted recursively. Array order remains significant: it is
-// used for the event ledger and replay schedule.
-export function canonicalJson(value) {
-  const seen = new Set();
-  function visit(item) {
-    if (item === null || typeof item === 'string' || typeof item === 'boolean') return item;
-    if (typeof item === 'number') {
-      if (!Number.isFinite(item)) throw new Error('canonical JSON cannot encode a non-finite number');
-      return item;
-    }
-    if (Array.isArray(item)) return item.map(visit);
-    if (!isObject(item)) throw new Error(`canonical JSON cannot encode ${typeof item}`);
-    if (seen.has(item)) throw new Error('canonical JSON cannot encode a cyclic object');
-    seen.add(item);
-    const result = {};
-    for (const key of Object.keys(item).sort()) {
-      if (item[key] === undefined) throw new Error(`canonical JSON cannot encode undefined at ${key}`);
-      result[key] = visit(item[key]);
-    }
-    seen.delete(item);
-    return result;
-  }
-  return JSON.stringify(visit(value));
-}
-
-export function sha256Value(value) {
-  return `sha256:${createHash('sha256').update(canonicalJson(value)).digest('hex')}`;
-}
-
-export function sha256File(path, readFile = readFileSync) {
-  return `sha256:${createHash('sha256').update(readFile(path)).digest('hex')}`;
 }
 
 // Stable, namespaced experiment choices.  The ordered choice list and the
@@ -601,99 +568,4 @@ export function writeDescriptor(path, descriptor) {
   const temporary = join(dirname(path), `.${path.split('/').at(-1)}.${process.pid}.tmp`);
   writeFileSync(temporary, `${JSON.stringify(descriptor, null, 2)}\n`, {mode: 0o600});
   renameSync(temporary, path);
-}
-
-function option(args, name) {
-  const prefix = `--${name}=`;
-  return args.find(argument => argument.startsWith(prefix))?.slice(prefix.length);
-}
-
-export function runCli(argv) {
-  const [command, ...args] = argv;
-  if (command === 'init') {
-    const [output] = args;
-    const metadataPath = option(args, 'metadata');
-    if (!output || !metadataPath) throw new Error('usage: run-descriptor.mjs init OUTPUT --metadata=METADATA.json');
-    const descriptor = initializeDescriptor(JSON.parse(readFileSync(metadataPath, 'utf8')));
-    writeDescriptor(output, descriptor);
-    process.stdout.write(`${descriptor.integrity.digest}\n`);
-    return;
-  }
-  if (command === 'append') {
-    const [path] = args;
-    const eventPath = option(args, 'event');
-    if (!path || !eventPath) throw new Error('usage: run-descriptor.mjs append DESCRIPTOR --event=EVENT.json');
-    const descriptor = appendEvent(readDescriptor(path), JSON.parse(readFileSync(eventPath, 'utf8')));
-    writeDescriptor(path, descriptor);
-    process.stdout.write(`${descriptor.timeline.at(-1).sequence}\n`);
-    return;
-  }
-  if (command === 'resolve') {
-    const [path] = args;
-    const resolutionPath = option(args, 'resolution');
-    if (!path || !resolutionPath) {
-      throw new Error('usage: run-descriptor.mjs resolve DESCRIPTOR --resolution=RESOLUTION.json');
-    }
-    const descriptor = resolveRuntimeInputs(
-      readDescriptor(path),
-      JSON.parse(readFileSync(resolutionPath, 'utf8')),
-    );
-    writeDescriptor(path, descriptor);
-    process.stdout.write(`${descriptor.integrity.digest}\n`);
-    return;
-  }
-  if (command === 'finalize') {
-    const [path] = args;
-    const status = option(args, 'status');
-    const finalizedAt = option(args, 'at');
-    if (!path || !status) throw new Error('usage: run-descriptor.mjs finalize DESCRIPTOR --status=passed|failed|aborted [--at=TIMESTAMP]');
-    const descriptor = finalizeDescriptor(readDescriptor(path), status, {finalizedAt});
-    writeDescriptor(path, descriptor);
-    process.stdout.write(`${descriptor.integrity.digest}\n`);
-    return;
-  }
-  if (command === 'instrumentation') {
-    const [path] = args;
-    const manifestPath = option(args, 'manifest');
-    if (!path || !manifestPath) throw new Error('usage: run-descriptor.mjs instrumentation DESCRIPTOR --manifest=CAPABILITIES.json');
-    const descriptor = attachInstrumentationCapabilities(readDescriptor(path), manifestPath);
-    writeDescriptor(path, descriptor);
-    process.stdout.write(`${descriptor.integrity.digest}\n`);
-    return;
-  }
-  if (command === 'validate') {
-    const [path] = args;
-    if (!path) throw new Error('usage: run-descriptor.mjs validate DESCRIPTOR [--verify-files]');
-    validateDescriptor(readDescriptor(path), {verifyFiles: args.includes('--verify-files')});
-    process.stdout.write('valid\n');
-    return;
-  }
-  if (command === 'minimize') {
-    const [path, output] = args;
-    if (!path || !output) throw new Error('usage: run-descriptor.mjs minimize DESCRIPTOR OUTPUT [--assertion=ID]');
-    const replay = deriveReplayDescriptor(readDescriptor(path), {assertion: option(args, 'assertion')});
-    writeDescriptor(output, replay);
-    process.stdout.write(`${replay.integrity.digest}\n`);
-    return;
-  }
-  if (command === 'choose') {
-    const [path, namespace, indexText, ...choices] = args;
-    if (!path || !namespace || indexText === undefined || choices.length === 0) {
-      throw new Error('usage: run-descriptor.mjs choose DESCRIPTOR NAMESPACE INDEX CHOICE...');
-    }
-    const descriptor = readDescriptor(path);
-    validateDescriptor(descriptor);
-    process.stdout.write(`${JSON.stringify(seededChoice(descriptor.randomness.seed, namespace, Number(indexText), choices))}\n`);
-    return;
-  }
-  throw new Error('commands: init, resolve, instrumentation, append, finalize, validate, minimize, choose');
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  try {
-    runCli(process.argv.slice(2));
-  } catch (error) {
-    process.stderr.write(`run descriptor: ${error.message}\n`);
-    process.exitCode = 1;
-  }
 }

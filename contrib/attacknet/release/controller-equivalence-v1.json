@@ -15,7 +15,7 @@
       "domain": "topology",
       "legacy": ["contrib/helm/hacknet/operator/controller.py:build_resources"],
       "go": ["contrib/helm/hacknet/operator/internal/topology/render.go"],
-      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go", "contrib/attacknet/legacy/v1alpha1/runtime/topology.test.mjs", "contrib/attacknet/test/equivalence/topology-render-equivalence.test.mjs"],
+      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go", "contrib/attacknet/test/equivalence/topology-render-equivalence.test.mjs", "contrib/attacknet/test/fixtures/equivalence/v1alpha1/manifest.json"],
       "live": ["topology-admitted-inventory"]
     },
     {
@@ -119,7 +119,7 @@
       "domain": "fault",
       "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:actualInjectionEvidence", "contrib/helm/hacknet/run-operator/controller.mjs:podEffectResults", "contrib/helm/hacknet/run-operator/controller.mjs:FaultCampaignReconciler.collectProbePhase"],
       "go": ["contrib/helm/hacknet/operator/internal/fault/effect.go", "contrib/helm/hacknet/operator/internal/fault/effect_validation.go", "contrib/helm/hacknet/operator/internal/fault/probe.go", "contrib/helm/hacknet/operator/internal/fault/reconciler.go"],
-      "tests": ["contrib/helm/hacknet/operator/internal/fault/effect_test.go", "contrib/helm/hacknet/operator/internal/fault/probe_test.go", "contrib/helm/hacknet/operator/internal/fault/status_test.go", "contrib/attacknet/images/probe/probe.test.mjs", "contrib/attacknet/legacy/v1alpha1/runtime/fault-effect-evidence.test.mjs"],
+      "tests": ["contrib/helm/hacknet/operator/internal/fault/effect_test.go", "contrib/helm/hacknet/operator/internal/fault/probe_test.go", "contrib/helm/hacknet/operator/internal/fault/status_test.go", "contrib/attacknet/images/probe/probe.test.mjs"],
       "live": ["reversible-network-fault", "one-shot-pod-kill"]
     },
     {
@@ -167,7 +167,7 @@
       "domain": "run",
       "legacy": ["contrib/helm/hacknet/run-operator/controller.mjs:AttacknetRunReconciler.reconcile"],
       "go": ["contrib/helm/hacknet/operator/internal/run/reconciler.go"],
-      "tests": ["contrib/helm/hacknet/operator/internal/run/status_test.go", "contrib/attacknet/legacy/v1alpha1/runtime/kubernetes-runtime-contracts.test.mjs"],
+      "tests": ["contrib/helm/hacknet/operator/internal/run/status_test.go", "contrib/helm/hacknet/operator/internal/run/schedule_test.go"],
       "live": []
     },
     {
@@ -215,7 +215,7 @@
       "domain": "integration",
       "legacy": ["contrib/attacknet/kubernetes-ddmin-adapter.mjs", "contrib/attacknet/topology.mjs"],
       "go": ["contrib/helm/hacknet/operator/api/v1beta1", "contrib/helm/hacknet/operator/internal/run/v1beta1_reconciler.go"],
-      "tests": ["contrib/attacknet/legacy/v1alpha1/runtime/kubernetes-runtime-contracts.test.mjs", "contrib/attacknet/legacy/v1alpha1/runtime/topology.test.mjs"],
+      "tests": ["contrib/attacknet/test/equivalence/topology-render-equivalence.test.mjs", "contrib/helm/hacknet/operator/internal/run/status_test.go"],
       "live": []
     }
   ]
