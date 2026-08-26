@@ -42,13 +42,7 @@ pub fn reconstruct_consensus(
         usize::try_from(expected_len).map_err(|_| PackedValueError::SizeOverflow)?;
     let mut reconstructor = ConsensusReconstructor::with_capacity(expected_capacity);
     reconstructor.reconstruct_body(packed.body(), &shape)?;
-    let consensus = reconstructor.finish();
-    if consensus.len() != expected_capacity {
-        return Err(PackedValueError::InvalidRecord(
-            "reconstructed consensus length mismatch",
-        ));
-    }
-    Ok(consensus)
+    reconstructor.finish()
 }
 
 /// Reconstruct consensus bytes and prove the packed payload and shape are canonical.
@@ -75,6 +69,8 @@ pub fn audit_reconstruction(
 struct ConsensusReconstructor {
     /// Reconstructed consensus bytes accumulated in wire order.
     output: Vec<u8>,
+    /// Exact output length declared by the packed record.
+    expected_len: usize,
 }
 
 impl ConsensusReconstructor {
@@ -82,12 +78,55 @@ impl ConsensusReconstructor {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             output: Vec::with_capacity(capacity),
+            expected_len: capacity,
         }
     }
 
-    /// Consume the reconstructor and return the completed consensus bytes.
-    fn finish(self) -> Vec<u8> {
-        self.output
+    /// Consume the reconstructor after verifying the exact declared output length.
+    fn finish(self) -> Result<Vec<u8>, PackedValueError> {
+        if self.output.len() != self.expected_len {
+            return Err(PackedValueError::InvalidRecord(
+                "reconstructed consensus length mismatch",
+            ));
+        }
+        Ok(self.output)
+    }
+
+    /// Reject an append that would exceed the record's declared logical length.
+    fn ensure_remaining(&self, additional: usize) -> Result<(), PackedValueError> {
+        let end = self
+            .output
+            .len()
+            .checked_add(additional)
+            .ok_or(PackedValueError::SizeOverflow)?;
+        if end > self.expected_len {
+            return Err(PackedValueError::InvalidRecord(
+                "reconstructed consensus exceeds declared length",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Append one byte without exceeding the declared logical length.
+    fn push(&mut self, byte: u8) -> Result<(), PackedValueError> {
+        self.ensure_remaining(1)?;
+        self.output.push(byte);
+        Ok(())
+    }
+
+    /// Append a byte slice without exceeding the declared logical length.
+    fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), PackedValueError> {
+        self.ensure_remaining(bytes.len())?;
+        self.output.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Append `count` copies of one byte without exceeding the declared logical length.
+    fn extend_repeated(&mut self, count: usize, byte: u8) -> Result<(), PackedValueError> {
+        self.ensure_remaining(count)?;
+        let end = self.output.len() + count;
+        self.output.resize(end, byte);
+        Ok(())
     }
 
     /// Append exact consensus bytes for one packed body and its active shape.
@@ -99,20 +138,20 @@ impl ConsensusReconstructor {
         match shape {
             ActiveShape::Int => {
                 primitive::validate_canonical_signed_scalar(bytes)?;
-                self.output.push(TypePrefix::Int.to_u8());
+                self.push(TypePrefix::Int.to_u8())?;
                 let fill = if bytes[0] & 0x80 == 0 { 0 } else { 0xff };
                 self.append_integer_padding(bytes.len(), fill)?;
-                self.output.extend_from_slice(bytes);
+                self.extend_from_slice(bytes)?;
             }
             ActiveShape::UInt => {
                 primitive::validate_canonical_unsigned_scalar(bytes)?;
-                self.output.push(TypePrefix::UInt.to_u8());
+                self.push(TypePrefix::UInt.to_u8())?;
                 self.append_integer_padding(bytes.len(), 0)?;
-                self.output.extend_from_slice(bytes);
+                self.extend_from_slice(bytes)?;
             }
             ActiveShape::Bool => match bytes {
-                [0] => self.output.push(TypePrefix::BoolFalse.to_u8()),
-                [1] => self.output.push(TypePrefix::BoolTrue.to_u8()),
+                [0] => self.push(TypePrefix::BoolFalse.to_u8())?,
+                [1] => self.push(TypePrefix::BoolTrue.to_u8())?,
                 _ => return Err(PackedValueError::InvalidRecord("invalid boolean")),
             },
             ActiveShape::Buffer => self.reconstruct_sequence(TypePrefix::Buffer.to_u8(), bytes)?,
@@ -131,11 +170,9 @@ impl ConsensusReconstructor {
             ActiveShape::Optional(child_shape) => {
                 let (tag, child) = primitive::split_tag(bytes)?;
                 match (tag, child_shape) {
-                    (0, _) if child.is_empty() => {
-                        self.output.push(TypePrefix::OptionalNone.to_u8())
-                    }
+                    (0, _) if child.is_empty() => self.push(TypePrefix::OptionalNone.to_u8())?,
                     (1, Some(shape)) => {
-                        self.output.push(TypePrefix::OptionalSome.to_u8());
+                        self.push(TypePrefix::OptionalSome.to_u8())?;
                         self.reconstruct_body(child, shape)?;
                     }
                     _ => {
@@ -155,7 +192,7 @@ impl ConsensusReconstructor {
                 let shape = shape.ok_or(PackedValueError::InvalidRecord(
                     "response branch is absent from value shape",
                 ))?;
-                self.output.push(prefix);
+                self.push(prefix)?;
                 self.reconstruct_body(child, shape)?;
             }
             ActiveShape::Tuple(fields) => self.reconstruct_tuple(bytes, fields)?,
@@ -171,29 +208,27 @@ impl ConsensusReconstructor {
 
     /// Append a consensus sequence prefix, byte length, and payload.
     fn reconstruct_sequence(&mut self, prefix: u8, bytes: &[u8]) -> Result<(), PackedValueError> {
-        self.output.push(prefix);
-        self.output.extend_from_slice(
+        self.push(prefix)?;
+        self.extend_from_slice(
             &u32::try_from(bytes.len())
                 .map_err(|_| PackedValueError::SizeOverflow)?
                 .to_be_bytes(),
-        );
-        self.output.extend_from_slice(bytes);
-        Ok(())
+        )?;
+        self.extend_from_slice(bytes)
     }
 
     /// Reconstruct a standard or contract principal consensus value.
     fn reconstruct_principal(&mut self, bytes: &[u8]) -> Result<(), PackedValueError> {
         match primitive::PackedPrincipal::parse(bytes)? {
             primitive::PackedPrincipal::Standard(principal) => {
-                self.output.push(TypePrefix::PrincipalStandard.to_u8());
-                self.output.extend_from_slice(principal);
+                self.push(TypePrefix::PrincipalStandard.to_u8())?;
+                self.extend_from_slice(principal)?;
             }
             primitive::PackedPrincipal::Contract { issuer, name } => {
-                self.output.push(TypePrefix::PrincipalContract.to_u8());
-                self.output.extend_from_slice(issuer);
-                self.output
-                    .push(u8::try_from(name.len()).map_err(|_| PackedValueError::SizeOverflow)?);
-                self.output.extend_from_slice(name.as_bytes());
+                self.push(TypePrefix::PrincipalContract.to_u8())?;
+                self.extend_from_slice(issuer)?;
+                self.push(u8::try_from(name.len()).map_err(|_| PackedValueError::SizeOverflow)?)?;
+                self.extend_from_slice(name.as_bytes())?;
             }
         }
         Ok(())
@@ -205,12 +240,12 @@ impl ConsensusReconstructor {
         bytes: &[u8],
         fields: &[(ClarityName, ActiveShape)],
     ) -> Result<(), PackedValueError> {
-        self.output.push(TypePrefix::Tuple.to_u8());
-        self.output.extend_from_slice(
+        self.push(TypePrefix::Tuple.to_u8())?;
+        self.extend_from_slice(
             &u32::try_from(fields.len())
                 .map_err(|_| PackedValueError::SizeOverflow)?
                 .to_be_bytes(),
-        );
+        )?;
         if fields
             .iter()
             .all(|(_, shape)| shape.fixed_width().is_some())
@@ -251,9 +286,8 @@ impl ConsensusReconstructor {
         shape: &ActiveShape,
     ) -> Result<(), PackedValueError> {
         let name = name.as_str().as_bytes();
-        self.output
-            .push(u8::try_from(name.len()).map_err(|_| PackedValueError::SizeOverflow)?);
-        self.output.extend_from_slice(name);
+        self.push(u8::try_from(name.len()).map_err(|_| PackedValueError::SizeOverflow)?)?;
+        self.extend_from_slice(name)?;
         self.reconstruct_body(bytes, shape)
     }
 }
@@ -319,12 +353,12 @@ impl ConsensusReconstructor {
         element_shapes: Option<ListShapes<'_>>,
     ) -> Result<(), PackedValueError> {
         let (count, elements) = primitive::split_list(bytes)?;
-        self.output.push(TypePrefix::List.to_u8());
-        self.output.extend_from_slice(
+        self.push(TypePrefix::List.to_u8())?;
+        self.extend_from_slice(
             &u32::try_from(count)
                 .map_err(|_| PackedValueError::SizeOverflow)?
                 .to_be_bytes(),
-        );
+        )?;
         if count == 0 {
             if !elements.is_empty() || matches!(element_shapes, Some(ListShapes::PerElement(_))) {
                 return Err(PackedValueError::InvalidRecord(
@@ -392,9 +426,9 @@ impl ConsensusReconstructor {
         let lane = primitive::IntegerLane::parse_unsigned(elements, count)?;
         let width = lane.width();
         for element in lane.iter() {
-            self.output.push(TypePrefix::UInt.to_u8());
+            self.push(TypePrefix::UInt.to_u8())?;
             self.append_integer_padding(width, 0)?;
-            self.output.extend_from_slice(element);
+            self.extend_from_slice(element)?;
         }
         Ok(())
     }
@@ -408,10 +442,10 @@ impl ConsensusReconstructor {
         let lane = primitive::IntegerLane::parse_signed(elements, count)?;
         let width = lane.width();
         for element in lane.iter() {
-            self.output.push(TypePrefix::Int.to_u8());
+            self.push(TypePrefix::Int.to_u8())?;
             let fill = if element[0] & 0x80 == 0 { 0 } else { 0xff };
             self.append_integer_padding(width, fill)?;
-            self.output.extend_from_slice(element);
+            self.extend_from_slice(element)?;
         }
         Ok(())
     }
@@ -427,13 +461,7 @@ impl ConsensusReconstructor {
             .ok_or(PackedValueError::InvalidRecord(
                 "packed integer exceeds 16 bytes",
             ))?;
-        let end = self
-            .output
-            .len()
-            .checked_add(padding)
-            .ok_or(PackedValueError::SizeOverflow)?;
-        self.output.resize(end, fill);
-        Ok(())
+        self.extend_repeated(padding, fill)
     }
 
     /// Expand a bit-packed Boolean lane into consensus Boolean prefixes.
@@ -447,11 +475,11 @@ impl ConsensusReconstructor {
             let byte = elements
                 .get(index / 8)
                 .ok_or(PackedValueError::InvalidRecord("truncated boolean lane"))?;
-            self.output.push(if byte & (1 << (index % 8)) == 0 {
+            self.push(if byte & (1 << (index % 8)) == 0 {
                 TypePrefix::BoolFalse.to_u8()
             } else {
                 TypePrefix::BoolTrue.to_u8()
-            });
+            })?;
         }
         Ok(())
     }

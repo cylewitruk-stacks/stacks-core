@@ -27,9 +27,9 @@ use crate::types::codec::packed::{
 };
 use crate::types::signatures::CallableSubtype;
 use crate::types::{
-    CallableData, ListTypeData, MAX_TYPE_DEPTH, MAX_VALUE_SIZE, PrincipalData,
-    QualifiedContractIdentifier, SequenceSubtype, StandardPrincipalData, StringSubtype,
-    TraitIdentifier, TupleData, TupleTypeSignature, TypeSignature, Value,
+    BOUND_VALUE_SERIALIZATION_BYTES, CallableData, ListTypeData, MAX_TYPE_DEPTH, MAX_VALUE_SIZE,
+    PrincipalData, QualifiedContractIdentifier, SequenceSubtype, StandardPrincipalData,
+    StringSubtype, TraitIdentifier, TupleData, TupleTypeSignature, TypeSignature, Value,
 };
 
 const EPOCH: StacksEpochId = StacksEpochId::Epoch40;
@@ -235,6 +235,35 @@ fn value_shape_rejects_noncanonical_and_mismatched_descriptors() {
 
     let nonminimal_tuple_count = [1, 0x0c, 0x80, 0x00];
     assert!(ValueShape::from_bytes(&nonminimal_tuple_count).is_err());
+}
+
+#[test]
+fn reconstruction_never_exceeds_the_declared_consensus_length() {
+    let mut packed = 5u32.to_le_bytes().to_vec();
+    packed.extend_from_slice(&[0x5a; 32]);
+    let buffer_shape = [VALUE_SHAPE_VERSION, 0x03];
+
+    assert_matches!(
+        PackedValueRef::parse(&packed)
+            .and_then(|packed| packed.reconstruct_consensus(&buffer_shape)),
+        Err(PackedValueError::InvalidRecord(
+            "reconstructed consensus exceeds declared length"
+        ))
+    );
+}
+
+#[test]
+fn packed_record_body_cannot_exceed_the_clarity_value_bound() {
+    let oversized_len =
+        PACKED_VALUE_HEADER_LEN + usize::try_from(BOUND_VALUE_SERIALIZATION_BYTES).unwrap() + 1;
+    let packed = vec![0; oversized_len];
+
+    assert_matches!(
+        PackedValueRef::parse(&packed),
+        Err(PackedValueError::InvalidRecord(
+            "packed value body exceeds maximum size"
+        ))
+    );
 }
 
 #[test]

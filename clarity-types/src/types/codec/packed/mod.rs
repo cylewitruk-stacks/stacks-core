@@ -159,6 +159,13 @@ pub struct PackedValueRef<'a> {
 impl<'a> PackedValueRef<'a> {
     /// Parse the common packed record header without decoding its schema-dependent body.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, PackedValueError> {
+        let max_body_len = usize::try_from(crate::types::BOUND_VALUE_SERIALIZATION_BYTES)
+            .map_err(|_| PackedValueError::SizeOverflow)?;
+        if bytes.len().saturating_sub(PACKED_VALUE_HEADER_LEN) > max_body_len {
+            return Err(PackedValueError::InvalidRecord(
+                "packed value body exceeds maximum size",
+            ));
+        }
         let header =
             bytes
                 .get(..PACKED_VALUE_HEADER_LEN)
