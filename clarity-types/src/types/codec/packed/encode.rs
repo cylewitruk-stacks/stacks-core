@@ -120,7 +120,7 @@ fn callable_admitted(value: &Value, expected: &TypeSignature) -> Result<bool, Pa
         | TypeSignature::TraitReferenceType(trait_identifier) => {
             Ok(callable.trait_identifier.as_deref() == Some(trait_identifier))
         }
-        TypeSignature::PrincipalType => Ok(true),
+        TypeSignature::PrincipalType => Ok(callable.trait_identifier.is_none()),
         _ => Ok(false),
     }
 }

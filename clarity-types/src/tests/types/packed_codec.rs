@@ -572,6 +572,30 @@ fn canonical_bytes_ignore_bounds_inactive_branches_and_callable_view() {
 }
 
 #[test]
+fn principal_admission_rejects_trait_qualified_callables() {
+    let contract = contract(9, "principal-admission");
+    let trait_id = TraitIdentifier::new(
+        standard_principal(4),
+        ContractName::from_literal("trait-contract"),
+        ClarityName::from_literal("transferable"),
+    );
+    let principal_view = Value::CallableContract(CallableData {
+        contract_identifier: contract.clone(),
+        trait_identifier: None,
+    });
+    assert!(AdmittedValue::new(principal_view, &TypeSignature::PrincipalType, &EPOCH).is_ok());
+
+    let trait_view = Value::CallableContract(CallableData {
+        contract_identifier: contract,
+        trait_identifier: Some(Box::new(trait_id)),
+    });
+    assert_matches!(
+        AdmittedValue::new(trait_view, &TypeSignature::PrincipalType, &EPOCH),
+        Err(PackedValueError::TypeMismatch)
+    );
+}
+
+#[test]
 fn canonical_empty_lists_and_parent_framing_are_schema_independent() {
     let bool_list = ListTypeData::new_list(TypeSignature::BoolType, 8).unwrap();
     let uint_list = ListTypeData::new_list(TypeSignature::UIntType, 1024).unwrap();
