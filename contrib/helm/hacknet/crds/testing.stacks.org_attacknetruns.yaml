@@ -1,352 +1,810 @@
-{
-  "apiVersion": "apiextensions.k8s.io/v1",
-  "kind": "CustomResourceDefinition",
-  "metadata": {
-    "name": "attacknetruns.testing.stacks.org",
-    "labels": {"app.kubernetes.io/name": "hacknet"}
-  },
-  "spec": {
-    "group": "testing.stacks.org",
-    "scope": "Namespaced",
-    "names": {
-      "plural": "attacknetruns",
-      "singular": "attacknetrun",
-      "kind": "AttacknetRun",
-      "shortNames": ["arun"],
-      "categories": ["all"]
-    },
-    "versions": [{
-      "name": "v1alpha1",
-      "served": true,
-      "storage": true,
-      "additionalPrinterColumns": [
-        {"name": "Phase", "type": "string", "jsonPath": ".status.phase"},
-        {"name": "Network", "type": "string", "jsonPath": ".spec.networkRef"},
-        {"name": "Active", "type": "string", "jsonPath": ".status.activeCampaign"},
-        {"name": "Campaigns", "type": "integer", "jsonPath": ".status.budgetUsage.campaigns"},
-        {"name": "Attribution", "type": "string", "jsonPath": ".status.attribution"},
-        {"name": "Evidence", "type": "string", "jsonPath": ".status.evidenceURI", "priority": 1},
-        {"name": "Age", "type": "date", "jsonPath": ".metadata.creationTimestamp"}
-      ],
-      "subresources": {"status": {}},
-      "schema": {
-        "openAPIV3Schema": {
-          "type": "object",
-          "description": "A finite, reproducible and budgeted sequence of FaultCampaign templates against one StacksNetwork.",
-          "required": ["spec"],
-          "properties": {
-            "apiVersion": {"type": "string"},
-            "kind": {"type": "string"},
-            "metadata": {"type": "object"},
-            "spec": {
-              "type": "object",
-              "required": ["networkRef", "seed", "campaignCatalog", "sequence", "budgets", "stopPolicy", "attributionPolicy", "replay", "resume", "minimization"],
-              "properties": {
-                "networkRef": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 63,
-                  "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-                },
-                "seed": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 256,
-                  "description": "Opaque reproducibility seed interpreted only by the named decision algorithm."
-                },
-                "decisionAlgorithm": {"type": "string", "minLength": 1, "maxLength": 128, "default": "hmac-sha256-decisions/v1"},
-                "campaignCatalog": {
-                  "type": "array",
-                  "minItems": 1,
-                  "maxItems": 64,
-                  "x-kubernetes-list-type": "map",
-                  "x-kubernetes-list-map-keys": ["name"],
-                  "items": {
-                    "type": "object",
-                    "required": ["name", "campaignRef"],
-                    "properties": {
-                      "name": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                      "campaignRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                      "expectedUID": {"type": "string", "minLength": 1, "maxLength": 128},
-                      "expectedGeneration": {"type": "integer", "minimum": 1},
-                      "expectedSpecDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-                    }
-                  }
-                },
-                "sequence": {
-                  "type": "array",
-                  "minItems": 1,
-                  "maxItems": 256,
-                  "x-kubernetes-list-type": "atomic",
-                  "items": {
-                    "type": "object",
-                    "required": ["id", "campaign"],
-                    "properties": {
-                      "id": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                      "campaign": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                      "delayAfterSeconds": {"type": "integer", "minimum": 0, "maximum": 3600},
-                      "enabled": {"type": "boolean", "default": true}
-                    }
-                  }
-                },
-                "budgets": {
-                  "type": "object",
-                  "required": ["maxCampaigns", "maxWallTimeSeconds", "maxCumulativeFaultSeconds", "maxActiveFaults", "maxSignerImpactPercent", "maxBurnchainFaults", "maxInconclusiveCampaigns"],
-                  "properties": {
-                    "maxCampaigns": {"type": "integer", "minimum": 1, "maximum": 256},
-                    "maxWallTimeSeconds": {"type": "integer", "minimum": 60, "maximum": 86400},
-                    "maxCumulativeFaultSeconds": {"type": "integer", "minimum": 1, "maximum": 36000},
-                    "maxActiveFaults": {"type": "integer", "enum": [1], "default": 1},
-                    "maxSignerImpactPercent": {"type": "integer", "minimum": 0, "maximum": 30},
-                    "maxBurnchainFaults": {"type": "integer", "minimum": 0, "maximum": 10},
-                    "maxInconclusiveCampaigns": {"type": "integer", "minimum": 0, "maximum": 64}
-                  },
-                  "x-kubernetes-validations": [{
-                    "rule": "self.maxCumulativeFaultSeconds <= self.maxWallTimeSeconds",
-                    "message": "maxCumulativeFaultSeconds cannot exceed maxWallTimeSeconds"
-                  }]
-                },
-                "stopPolicy": {
-                  "type": "object",
-                  "required": ["onCampaignFailure", "onInconclusive", "onBudgetExhausted", "onSuccess"],
-                  "properties": {
-                    "onCampaignFailure": {"type": "string", "enum": ["Stop", "PauseForTriage"]},
-                    "onInconclusive": {"type": "string", "enum": ["Stop", "PauseForTriage", "Continue"]},
-                    "onBudgetExhausted": {"type": "string", "enum": ["Stop", "Pause"]},
-                    "onSuccess": {"type": "string", "enum": ["Continue", "Stop"]}
-                  }
-                },
-                "attributionPolicy": {
-                  "type": "object",
-                  "required": ["requiredOnFailure", "requireIncidentBundle", "allowedTerminalStates"],
-                  "properties": {
-                    "requiredOnFailure": {"type": "boolean", "enum": [true]},
-                    "requireIncidentBundle": {"type": "boolean", "enum": [true]},
-                    "allowedTerminalStates": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string", "enum": ["Triaged", "Remediated", "Inconclusive"]}}
-                  }
-                },
-                "replay": {
-                  "type": "object",
-                  "required": ["enabled", "requireSameResolvedImages", "verifyExpectedFailure"],
-                  "properties": {
-                    "enabled": {"type": "boolean"},
-                    "sourceRunRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                    "descriptorURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
-                    "descriptorDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "attemptId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 63},
-                    "expectedStatus": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
-                    "requireSameResolvedImages": {"type": "boolean"},
-                    "verifyExpectedFailure": {"type": "boolean"}
-                  },
-                  "x-kubernetes-validations": [{
-                    "rule": "!self.enabled || (has(self.sourceRunRef) && has(self.descriptorURI) && has(self.descriptorDigest) && has(self.attemptId) && (!self.verifyExpectedFailure || (has(self.expectedAssertion) && has(self.expectedStatus))))",
-                    "message": "enabled replay requires sourceRunRef, descriptorURI, descriptorDigest, attemptId, and an assertion/status when expected-failure verification is enabled"
-                  }]
-                },
-                "resume": {
-                  "type": "object",
-                  "required": ["enabled", "requireSameSeed", "requireSameResolvedImages"],
-                  "properties": {
-                    "enabled": {"type": "boolean"},
-                    "sourceRunRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                    "afterInstructionId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                    "requireSameSeed": {"type": "boolean", "enum": [true]},
-                    "requireSameResolvedImages": {"type": "boolean", "enum": [true]}
-                  },
-                  "x-kubernetes-validations": [{
-                    "rule": "!self.enabled || (has(self.sourceRunRef) && has(self.afterInstructionId))",
-                    "message": "enabled resume requires sourceRunRef and afterInstructionId"
-                  }]
-                },
-                "minimization": {
-                  "type": "object",
-                  "required": ["enabled", "strategy", "maxAttempts", "requireFreshNetwork"],
-                  "properties": {
-                    "enabled": {"type": "boolean"},
-                    "strategy": {"type": "string", "enum": ["FailurePrefix", "DeltaDebug"]},
-                    "maxAttempts": {"type": "integer", "minimum": 0, "maximum": 64},
-                    "requireFreshNetwork": {"type": "boolean", "enum": [true]},
-                    "sourceRunRef": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                    "sourceScheduleDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "attemptId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                    "candidateScheduleDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 63},
-                    "expectedStatus": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
-                    "retained": {
-                      "type": "array", "minItems": 1, "maxItems": 256, "x-kubernetes-list-type": "atomic",
-                      "items": {
-                        "type": "object", "required": ["instructionId", "removedTargets", "removedParameters"],
-                        "properties": {
-                          "instructionId": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
-                          "removedTargets": {"type": "array", "maxItems": 100, "items": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"}},
-                          "removedParameters": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
-                        }
-                      }
-                    }
-                  },
-                  "x-kubernetes-validations": [
-                    {
-                      "rule": "self.enabled || self.maxAttempts == 0",
-                      "message": "disabled minimization must use maxAttempts=0"
-                    },
-                    {
-                      "rule": "!self.enabled || (self.strategy == 'DeltaDebug' && self.maxAttempts == 1 && has(self.sourceRunRef) && has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.candidateScheduleDigest) && has(self.expectedAssertion) && has(self.expectedStatus) && has(self.retained))",
-                      "message": "enabled minimization is one bounded DeltaDebug attempt and requires immutable source, candidate, expectation, and retained-action fields"
-                    }
-                  ]
-                }
-              },
-              "x-kubernetes-validations": [
-                {"rule": "self.sequence.size() <= self.budgets.maxCampaigns", "message": "ordered sequence exceeds maxCampaigns budget"},
-                {"rule": "self.sequence.all(step, self.campaignCatalog.exists(campaign, campaign.name == step.campaign))", "message": "every sequence campaign must exist in campaignCatalog"},
-                {"rule": "self.sequence.all(step, self.sequence.filter(other, other.id == step.id).size() == 1)", "message": "sequence instruction IDs must be unique"},
-                {"rule": "!(self.replay.enabled && self.resume.enabled)", "message": "replay and resume cannot both be enabled"},
-                {"rule": "!(self.minimization.enabled && (self.replay.enabled || self.resume.enabled))", "message": "a minimization attempt cannot also be replay or resume"}
-              ]
-            },
-            "status": {
-              "type": "object",
-              "properties": {
-                "observedGeneration": {"type": "integer", "minimum": 0},
-                "phase": {"type": "string", "enum": ["Pending", "Preparing", "Running", "Paused", "Minimizing", "Passed", "Failed", "Aborted", "Inconclusive"]},
-                "reason": {"type": "string", "maxLength": 128},
-                "message": {"type": "string", "maxLength": 4096},
-                "lastTransitionTime": {"type": "string", "format": "date-time"},
-                "startedAt": {"type": "string", "format": "date-time"},
-                "completedAt": {"type": "string", "format": "date-time"},
-                "finishedAt": {"type": "string", "format": "date-time"},
-                "activeCampaign": {"type": "string", "nullable": true, "maxLength": 63},
-                "scheduleRef": {"type": "object", "required": ["name", "uid", "digest", "runGeneration", "runSpecDigest"], "properties": {
-                  "name": {"type": "string", "minLength": 1, "maxLength": 63},
-                  "uid": {"type": "string", "minLength": 1, "maxLength": 128},
-                  "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "runGeneration": {"type": "integer", "minimum": 1},
-                  "runSpecDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-                }},
-                "scheduleSummary": {"type": "object", "required": ["schemaVersion", "actions", "replay", "networkUid", "networkGeneration", "manifestDigest"], "properties": {
-                  "schemaVersion": {"type": "string", "maxLength": 128},
-                  "actions": {"type": "integer", "minimum": 0, "maximum": 256},
-                  "replay": {"type": "boolean"},
-                  "networkUid": {"type": "string", "minLength": 1, "maxLength": 128},
-                  "networkGeneration": {"type": "integer", "minimum": 1},
-                  "manifestDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "signerSetRewardCycle": {"type": "integer", "minimum": 0},
-                  "signerSetTotalWeight": {"type": "integer", "minimum": 1},
-                  "signerSetDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "signerSetObservedFrom": {"type": "string", "minLength": 1, "maxLength": 40},
-                  "networkInventory": {"type": "object", "required": ["digest", "observedGeneration", "actors"], "properties": {
-                    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "observedGeneration": {"type": "integer", "minimum": 1},
-                    "observedAt": {"type": "string", "format": "date-time", "nullable": true},
-                    "resourceVersion": {"type": "string", "nullable": true, "maxLength": 128},
-                    "actors": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "object", "required": ["name", "role", "serviceName", "statefulSetName", "statefulSetUID", "controllerRevision", "podName", "podUID", "requestedImage", "runtimeImageID"], "properties": {
-                      "name": {"type": "string", "maxLength": 40}, "role": {"type": "string", "maxLength": 32},
-                      "serviceName": {"type": "string", "maxLength": 63}, "statefulSetName": {"type": "string", "maxLength": 63},
-                      "statefulSetUID": {"type": "string", "maxLength": 128}, "controllerRevision": {"type": "string", "maxLength": 253},
-                      "podName": {"type": "string", "maxLength": 253}, "podUID": {"type": "string", "maxLength": 128},
-                      "requestedImage": {"type": "string", "maxLength": 2048}, "runtimeImageID": {"type": "string", "maxLength": 4096}
-                    }}}
-                  }}
-                }},
-                "activeChild": {"type": "object", "required": ["instructionId", "name", "uid"], "properties": {
-                  "instructionId": {"type": "string", "maxLength": 63},
-                  "name": {"type": "string", "maxLength": 63},
-                  "uid": {"type": "string", "maxLength": 128},
-                  "startedAt": {"type": "string", "format": "date-time"}
-                }},
-                "resolvedCampaigns": {"type": "array", "maxItems": 64, "x-kubernetes-list-type": "map", "x-kubernetes-list-map-keys": ["name"], "items": {"type": "object", "required": ["name", "sourceName", "sourceUID", "sourceGeneration", "specDigest"], "properties": {
-                  "name": {"type": "string", "maxLength": 63},
-                  "sourceName": {"type": "string", "maxLength": 63},
-                  "sourceUID": {"type": "string", "maxLength": 128},
-                  "sourceGeneration": {"type": "integer", "minimum": 1},
-                  "specDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-                }}},
-                "decisions": {"type": "array", "maxItems": 512, "x-kubernetes-list-type": "atomic", "items": {"type": "object", "required": ["index", "execution", "phase", "completedAt"], "properties": {
-                  "index": {"type": "integer", "minimum": 0, "maximum": 1000000},
-                  "execution": {"type": "string", "maxLength": 63},
-                  "phase": {"type": "string", "enum": ["Passed", "Failed", "Inconclusive"]},
-                  "completedAt": {"type": "string", "format": "date-time"},
-                  "source": {"type": "string", "maxLength": 63},
-                  "sequence": {"type": "integer", "minimum": 1, "maximum": 1000000},
-                  "instructionId": {"type": "string", "maxLength": 63},
-                  "campaign": {"type": "string", "maxLength": 63},
-                  "childName": {"type": "string", "maxLength": 63},
-                  "decision": {"type": "string", "enum": ["Selected", "Skipped", "Started", "Passed", "Failed", "Inconclusive", "Stopped"]},
-                  "choiceDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-                  "occurredAt": {"type": "string", "format": "date-time"},
-                  "detailsDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-                }}},
-                "budgetUsage": {"type": "object", "properties": {
-                  "campaigns": {"type": "integer", "minimum": 0, "maximum": 256},
-                  "campaignsStarted": {"type": "integer", "minimum": 0, "maximum": 256},
-                  "campaignsCompleted": {"type": "integer", "minimum": 0, "maximum": 256},
-                  "activeFaults": {"type": "integer", "minimum": 0, "maximum": 1},
-                  "wallTimeSeconds": {"type": "number", "minimum": 0, "maximum": 86400},
-                  "cumulativeFaultSeconds": {"type": "number", "minimum": 0, "maximum": 36000},
-                  "maximumSignerImpactPercent": {"type": "number", "minimum": 0, "maximum": 100},
-                  "burnchainFaults": {"type": "integer", "minimum": 0, "maximum": 10},
-                  "inconclusiveCampaigns": {"type": "integer", "minimum": 0, "maximum": 64},
-                  "minimizationAttempts": {"type": "integer", "minimum": 0, "maximum": 64}
-                }},
-                "identityDivergence": {"type": "object", "required": ["observedAt", "differences"], "properties": {
-                  "expectedDigest": {"type": "string", "nullable": true, "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "currentDigest": {"type": "string", "nullable": true, "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "observedAt": {"type": "string", "format": "date-time"},
-                  "differences": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "object", "required": ["scope", "field"], "properties": {
-                    "scope": {"type": "string", "maxLength": 63}, "field": {"type": "string", "maxLength": 63},
-                    "expected": {"x-kubernetes-int-or-string": true, "nullable": true}, "current": {"x-kubernetes-int-or-string": true, "nullable": true},
-                    "message": {"type": "string", "maxLength": 1024}
-                  }}}
-                }},
-                "identityTransitions": {"type": "array", "maxItems": 256, "items": {"type": "object", "required": ["campaign", "actors", "previousDigest", "currentDigest", "observedAt"], "properties": {
-                  "campaign": {"type": "string", "maxLength": 63},
-                  "actors": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "maxLength": 40}},
-                  "previousDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "currentDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "observedAt": {"type": "string", "format": "date-time"}
-                }}},
-                "attribution": {"type": "string", "enum": ["NotRequired", "Untriaged", "Triaged", "Remediated", "Inconclusive"]},
-                "attributionURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
-                "replayPlanURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
-                "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
-                "evidenceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                "terminalClassification": {
-                  "type": "object",
-                  "required": ["attemptId", "candidateScheduleDigest", "expectedAssertion", "expectedStatus", "outcome", "reason", "observationCount", "observations", "evidenceDigest", "evidenceURI", "causalMinimalityClaimed"],
-                  "properties": {
-                    "attemptId": {"type": "string", "minLength": 1, "maxLength": 63},
-                    "candidateScheduleDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "expectedAssertion": {"type": "string", "minLength": 1, "maxLength": 63},
-                    "expectedStatus": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
-                    "outcome": {"type": "string", "enum": ["FailureReproduced", "FailureAbsent", "Inconclusive"]},
-                    "reason": {"type": "string", "minLength": 1, "maxLength": 128},
-                    "observationCount": {"type": "integer", "minimum": 0, "maximum": 25600},
-                    "observations": {"type": "array", "maxItems": 256, "items": {"type": "object", "required": ["child", "source", "outcome"], "properties": {
-                      "child": {"type": "string", "maxLength": 63},
-                      "source": {"type": "string", "enum": ["effect", "recovery"]},
-                      "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]},
-                      "actor": {"type": "string", "maxLength": 63}
-                    }}},
-                    "evidenceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
-                    "causalMinimalityClaimed": {"type": "boolean", "enum": [false]}
-                  }
-                },
-                "cleanup": {"type": "object", "required": ["required", "completed"], "properties": {"required": {"type": "boolean"}, "completed": {"type": "boolean"}, "completedAt": {"type": "string", "format": "date-time"}, "message": {"type": "string", "maxLength": 2048}}},
-                "conditions": {"type": "array", "maxItems": 16, "x-kubernetes-list-type": "map", "x-kubernetes-list-map-keys": ["type"], "items": {"type": "object", "required": ["type", "status", "reason", "message", "lastTransitionTime"], "properties": {
-                  "type": {"type": "string", "maxLength": 128},
-                  "status": {"type": "string", "enum": ["True", "False", "Unknown"]},
-                  "reason": {"type": "string", "maxLength": 128},
-                  "message": {"type": "string", "maxLength": 4096},
-                  "observedGeneration": {"type": "integer", "minimum": 0},
-                  "lastTransitionTime": {"type": "string", "format": "date-time"}
-                }}}
-              }
-            }
-          }
-        }
-      }
-    }]
-  }
-}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: attacknetruns.testing.stacks.org
+spec:
+  group: testing.stacks.org
+  names:
+    kind: AttacknetRun
+    listKind: AttacknetRunList
+    plural: attacknetruns
+    singular: attacknetrun
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: AttacknetRun declares a finite reproducible schedule of FaultCampaigns.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AttacknetRunSpec defines a finite schedule and its safety/evidence
+              policy.
+            properties:
+              attributionPolicy:
+                description: AttributionPolicy requires attributable evidence for
+                  adverse outcomes.
+                properties:
+                  allowedTerminalStates:
+                    items:
+                      type: string
+                    type: array
+                  requireIncidentBundle:
+                    type: boolean
+                  requiredOnFailure:
+                    type: boolean
+                required:
+                - allowedTerminalStates
+                - requireIncidentBundle
+                - requiredOnFailure
+                type: object
+              budgets:
+                description: RunBudgets bound aggregate mutation, duration, concurrency,
+                  and ambiguity.
+                properties:
+                  maxActiveFaults:
+                    format: int32
+                    maximum: 512
+                    minimum: 1
+                    type: integer
+                  maxBurnchainFaults:
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
+                  maxCampaigns:
+                    format: int32
+                    maximum: 1024
+                    minimum: 1
+                    type: integer
+                  maxCumulativeFaultSeconds:
+                    format: int32
+                    maximum: 604800
+                    minimum: 1
+                    type: integer
+                  maxInconclusiveCampaigns:
+                    format: int32
+                    maximum: 64
+                    minimum: 0
+                    type: integer
+                  maxSignerImpactPercent:
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  maxWallTimeSeconds:
+                    format: int32
+                    maximum: 604800
+                    minimum: 1
+                    type: integer
+                required:
+                - maxActiveFaults
+                - maxBurnchainFaults
+                - maxCampaigns
+                - maxCumulativeFaultSeconds
+                - maxInconclusiveCampaigns
+                - maxSignerImpactPercent
+                - maxWallTimeSeconds
+                type: object
+                x-kubernetes-validations:
+                - message: maxCumulativeFaultSeconds cannot exceed maxWallTimeSeconds
+                  rule: self.maxCumulativeFaultSeconds <= self.maxWallTimeSeconds
+              campaignCatalog:
+                items:
+                  description: CampaignCatalogEntry binds a logical name to an immutable
+                    campaign template.
+                  properties:
+                    campaignRef:
+                      type: string
+                    expectedGeneration:
+                      format: int64
+                      type: integer
+                    expectedSpecDigest:
+                      type: string
+                    expectedUID:
+                      type: string
+                    name:
+                      type: string
+                  required:
+                  - campaignRef
+                  - name
+                  type: object
+                maxItems: 256
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              decisionAlgorithm:
+                enum:
+                - dependency-trigger-scheduler/v1
+                type: string
+              executions:
+                items:
+                  description: RunExecutionSpec identifies one campaign execution
+                    in the schedule DAG.
+                  properties:
+                    campaign:
+                      type: string
+                    dependsOn:
+                      items:
+                        description: RunExecutionDependency waits for another execution
+                          to reach a named state.
+                        properties:
+                          delay:
+                            type: string
+                          execution:
+                            type: string
+                          state:
+                            enum:
+                            - Injected
+                            - Effective
+                            - Recovered
+                            - Terminal
+                            type: string
+                        required:
+                        - execution
+                        - state
+                        type: object
+                      type: array
+                    enabled:
+                      type: boolean
+                    id:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                    trigger:
+                      description: RunTriggerSpec defines a trusted condition that
+                        makes an execution eligible.
+                      properties:
+                        afterRunStart:
+                          type: string
+                        burnHeight:
+                          format: int64
+                          type: integer
+                        observation:
+                          description: ObservationTriggerSpec waits for one bounded
+                            trusted observation.
+                          properties:
+                            actor:
+                              type: string
+                            expected:
+                              type: string
+                            timeoutSeconds:
+                              format: int32
+                              type: integer
+                            type:
+                              type: string
+                          required:
+                          - timeoutSeconds
+                          - type
+                          type: object
+                        stacksHeight:
+                          format: int64
+                          type: integer
+                      type: object
+                      x-kubernetes-validations:
+                      - message: at most one run trigger may be set
+                        rule: '(has(self.afterRunStart) ? 1 : 0) + (has(self.burnHeight)
+                          ? 1 : 0) + (has(self.stacksHeight) ? 1 : 0) + (has(self.observation)
+                          ? 1 : 0) <= 1'
+                  required:
+                  - campaign
+                  - id
+                  type: object
+                maxItems: 1024
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+              minimization:
+                description: MinimizationSpec describes one bounded, fresh-network
+                  delta-debug attempt.
+                properties:
+                  attemptId:
+                    type: string
+                  candidateScheduleDigest:
+                    type: string
+                  enabled:
+                    type: boolean
+                  expectedAssertion:
+                    type: string
+                  expectedStatus:
+                    type: string
+                  maxAttempts:
+                    format: int32
+                    type: integer
+                  requireFreshNetwork:
+                    type: boolean
+                  retained:
+                    items:
+                      description: RetainedExecution describes one removal-only minimization
+                        candidate.
+                      properties:
+                        executionId:
+                          type: string
+                        removedActions:
+                          items:
+                            type: string
+                          type: array
+                        removedParameters:
+                          items:
+                            type: string
+                          type: array
+                        removedStages:
+                          items:
+                            type: string
+                          type: array
+                        removedTargets:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - executionId
+                      type: object
+                    type: array
+                  sourceRunRef:
+                    type: string
+                  sourceScheduleDigest:
+                    type: string
+                  strategy:
+                    enum:
+                    - DeltaDebug
+                    - FailurePrefix
+                    type: string
+                required:
+                - enabled
+                - maxAttempts
+                - requireFreshNetwork
+                - strategy
+                type: object
+                x-kubernetes-validations:
+                - message: disabled minimization requires maxAttempts=0
+                  rule: self.enabled || self.maxAttempts == 0
+                - message: enabled minimization requires one bounded fresh-network
+                    DeltaDebug attempt and immutable source and expectation fields
+                  rule: '!self.enabled || (self.strategy == ''DeltaDebug'' && self.maxAttempts
+                    == 1 && self.requireFreshNetwork && has(self.sourceRunRef) &&
+                    has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.expectedAssertion)
+                    && has(self.expectedStatus) && has(self.retained) && self.retained.size()
+                    > 0)'
+              networkRef:
+                type: string
+              replay:
+                description: ReplaySpec pins a run to an immutable prior descriptor
+                  and expectation.
+                properties:
+                  attemptId:
+                    type: string
+                  descriptorDigest:
+                    type: string
+                  descriptorURI:
+                    type: string
+                  enabled:
+                    type: boolean
+                  expectedAssertion:
+                    type: string
+                  expectedStatus:
+                    type: string
+                  requireSameResolvedImages:
+                    type: boolean
+                  sourceRunRef:
+                    type: string
+                  verifyExpectedFailure:
+                    type: boolean
+                required:
+                - enabled
+                - requireSameResolvedImages
+                - verifyExpectedFailure
+                type: object
+                x-kubernetes-validations:
+                - message: enabled replay requires immutable source, descriptor, attempt,
+                    and expected-failure fields
+                  rule: '!self.enabled || (has(self.sourceRunRef) && has(self.descriptorURI)
+                    && has(self.descriptorDigest) && has(self.attemptId) && (!self.verifyExpectedFailure
+                    || (has(self.expectedAssertion) && has(self.expectedStatus))))'
+              resume:
+                description: ResumeSpec identifies a prior run execution boundary
+                  to resume after.
+                properties:
+                  afterExecutionId:
+                    type: string
+                  enabled:
+                    type: boolean
+                  requireSameResolvedImages:
+                    type: boolean
+                  requireSameSeed:
+                    type: boolean
+                  sourceRunRef:
+                    type: string
+                required:
+                - enabled
+                - requireSameResolvedImages
+                - requireSameSeed
+                type: object
+                x-kubernetes-validations:
+                - message: enabled resume requires sourceRunRef and afterExecutionId
+                  rule: '!self.enabled || (has(self.sourceRunRef) && has(self.afterExecutionId))'
+              seed:
+                type: string
+              stopPolicy:
+                description: StopPolicy defines terminal handling for each campaign
+                  outcome.
+                properties:
+                  onBudgetExhausted:
+                    enum:
+                    - Stop
+                    - Pause
+                    type: string
+                  onCampaignFailure:
+                    enum:
+                    - Continue
+                    - Stop
+                    - PauseForTriage
+                    type: string
+                  onInconclusive:
+                    enum:
+                    - Continue
+                    - Stop
+                    - PauseForTriage
+                    type: string
+                  onSuccess:
+                    enum:
+                    - Continue
+                    - Stop
+                    type: string
+                required:
+                - onBudgetExhausted
+                - onCampaignFailure
+                - onInconclusive
+                - onSuccess
+                type: object
+            required:
+            - attributionPolicy
+            - budgets
+            - campaignCatalog
+            - executions
+            - minimization
+            - networkRef
+            - replay
+            - resume
+            - seed
+            - stopPolicy
+            type: object
+            x-kubernetes-validations:
+            - message: replay, resume, and minimization are mutually exclusive
+              rule: '(self.replay.enabled ? 1 : 0) + (self.resume.enabled ? 1 : 0)
+                + (self.minimization.enabled ? 1 : 0) <= 1'
+            - message: enabled executions exceed maxCampaigns budget
+              rule: self.executions.filter(execution, !has(execution.enabled) || execution.enabled).size()
+                <= self.budgets.maxCampaigns
+          status:
+            description: AttacknetRunStatus is the durable scheduler and evidence
+              state machine.
+            properties:
+              activeChildren:
+                items:
+                  description: ActiveRunChild identifies one currently executing campaign
+                    child.
+                  properties:
+                    executionId:
+                      type: string
+                    name:
+                      type: string
+                    startedAt:
+                      format: date-time
+                      type: string
+                    uid:
+                      type: string
+                  required:
+                  - executionId
+                  - name
+                  - uid
+                  type: object
+                type: array
+              attribution:
+                type: string
+              attributionURI:
+                type: string
+              budgetUsage:
+                description: BudgetUsage reports aggregate consumption of sealed run
+                  budgets.
+                properties:
+                  activeCampaigns:
+                    format: int32
+                    type: integer
+                  activeFaults:
+                    format: int32
+                    type: integer
+                  burnchainFaults:
+                    format: int32
+                    type: integer
+                  campaigns:
+                    format: int32
+                    type: integer
+                  campaignsCompleted:
+                    format: int32
+                    type: integer
+                  campaignsStarted:
+                    format: int32
+                    type: integer
+                  cumulativeFaultMillis:
+                    format: int64
+                    type: integer
+                  inconclusiveCampaigns:
+                    format: int32
+                    type: integer
+                  maximumSignerImpactBasisPoints:
+                    format: int32
+                    type: integer
+                  minimizationAttempts:
+                    format: int32
+                    type: integer
+                  wallTimeMillis:
+                    format: int64
+                    type: integer
+                type: object
+              cleanup:
+                description: RunCleanup reports cleanup completeness independently
+                  from run outcome.
+                properties:
+                  completed:
+                    type: boolean
+                  completedAt:
+                    format: date-time
+                    type: string
+                  message:
+                    type: string
+                  required:
+                    type: boolean
+                required:
+                - completed
+                - required
+                type: object
+              completedAt:
+                format: date-time
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              decisions:
+                items:
+                  x-kubernetes-preserve-unknown-fields: true
+                type: array
+              evidenceDigest:
+                type: string
+              evidenceURI:
+                type: string
+              finishedAt:
+                format: date-time
+                type: string
+              identityDivergence:
+                description: IdentityDivergence records an immutable identity mismatch
+                  without retargeting.
+                properties:
+                  currentDigest:
+                    type: string
+                  differences:
+                    items:
+                      description: IdentityDifference describes one bounded inventory
+                        mismatch.
+                      properties:
+                        current:
+                          type: string
+                        expected:
+                          type: string
+                        field:
+                          type: string
+                        message:
+                          type: string
+                        scope:
+                          type: string
+                      required:
+                      - field
+                      type: object
+                    type: array
+                  expectedDigest:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                required:
+                - observedAt
+                type: object
+              identityTransitions:
+                items:
+                  description: IdentityTransition records an explicitly permitted
+                    Pod identity replacement.
+                  properties:
+                    actors:
+                      items:
+                        type: string
+                      type: array
+                    campaign:
+                      type: string
+                    currentDigest:
+                      type: string
+                    observedAt:
+                      format: date-time
+                      type: string
+                    previousDigest:
+                      type: string
+                  required:
+                  - actors
+                  - campaign
+                  - currentDigest
+                  - observedAt
+                  - previousDigest
+                  type: object
+                type: array
+              lastTransitionTime:
+                format: date-time
+                type: string
+              message:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+              reason:
+                type: string
+              replayPlanURI:
+                type: string
+              resolvedCampaigns:
+                items:
+                  description: ResolvedCampaign records immutable source-template
+                    identity.
+                  properties:
+                    name:
+                      type: string
+                    sourceGeneration:
+                      format: int64
+                      type: integer
+                    sourceName:
+                      type: string
+                    sourceUID:
+                      type: string
+                    specDigest:
+                      type: string
+                  required:
+                  - name
+                  - sourceGeneration
+                  - sourceName
+                  - sourceUID
+                  - specDigest
+                  type: object
+                type: array
+              scheduleRef:
+                description: ScheduleReference identifies the immutable controller-owned
+                  schedule object.
+                properties:
+                  digest:
+                    type: string
+                  name:
+                    type: string
+                  runGeneration:
+                    format: int64
+                    type: integer
+                  runSpecDigest:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - digest
+                - name
+                - runGeneration
+                - runSpecDigest
+                - uid
+                type: object
+              scheduleSummary:
+                description: ScheduleSummary records immutable topology and schedule
+                  admission facts.
+                properties:
+                  executions:
+                    format: int32
+                    type: integer
+                  manifestDigest:
+                    type: string
+                  networkGeneration:
+                    format: int64
+                    type: integer
+                  networkInventory:
+                    description: NetworkInventory is the complete authoritative actor
+                      inventory bound to a run.
+                    properties:
+                      actors:
+                        items:
+                          description: AdmittedActorIdentity is the immutable runtime
+                            identity admitted for one actor.
+                          properties:
+                            controllerRevision:
+                              type: string
+                            name:
+                              type: string
+                            podName:
+                              type: string
+                            podUID:
+                              type: string
+                            requestedImage:
+                              type: string
+                            role:
+                              type: string
+                            runtimeImageID:
+                              type: string
+                            serviceName:
+                              type: string
+                            statefulSetName:
+                              type: string
+                            statefulSetUID:
+                              type: string
+                          required:
+                          - controllerRevision
+                          - name
+                          - podName
+                          - podUID
+                          - requestedImage
+                          - role
+                          - runtimeImageID
+                          - serviceName
+                          - statefulSetName
+                          - statefulSetUID
+                          type: object
+                        type: array
+                      digest:
+                        type: string
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        type: integer
+                      resourceVersion:
+                        type: string
+                    required:
+                    - actors
+                    - digest
+                    - observedGeneration
+                    type: object
+                  networkUid:
+                    type: string
+                  replay:
+                    type: boolean
+                  schemaVersion:
+                    type: string
+                  signerSetDigest:
+                    type: string
+                  signerSetObservedFrom:
+                    type: string
+                  signerSetRewardCycle:
+                    format: int64
+                    type: integer
+                  signerSetTotalWeight:
+                    format: int64
+                    type: integer
+                required:
+                - executions
+                - manifestDigest
+                - networkGeneration
+                - networkInventory
+                - networkUid
+                - replay
+                - schemaVersion
+                type: object
+              startedAt:
+                format: date-time
+                type: string
+              terminalClassification:
+                description: TerminalClassification records expected-versus-observed
+                  replay evidence.
+                properties:
+                  attemptId:
+                    type: string
+                  candidateScheduleDigest:
+                    type: string
+                  causalMinimalityClaimed:
+                    type: boolean
+                  evidenceDigest:
+                    type: string
+                  evidenceURI:
+                    type: string
+                  expectedAssertion:
+                    type: string
+                  expectedStatus:
+                    type: string
+                  observationCount:
+                    format: int32
+                    type: integer
+                  observations:
+                    items:
+                      x-kubernetes-preserve-unknown-fields: true
+                    type: array
+                  outcome:
+                    type: string
+                  reason:
+                    type: string
+                type: object
+              triggerReceipts:
+                items:
+                  x-kubernetes-preserve-unknown-fields: true
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

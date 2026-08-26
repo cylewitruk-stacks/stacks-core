@@ -1,0 +1,15 @@
+Dockerfile*
+target
+.dockerignore
+.git
+.docs
+docker/libp2p-poc/generated
+contrib/attacknet/generated
+contrib/attacknet/evidence
+
+# These trees are not Cargo workspace inputs for the Attacknet node/signer
+# image and substantially inflate the local BuildKit context.
+stacks-signer-bridge
+stacks-network
+contrib/stacks-network-observer
+docker

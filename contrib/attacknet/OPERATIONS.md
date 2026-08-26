@@ -1,285 +1,181 @@
 # Attacknet operations
 
-This guide covers established Release 1 operations after the local control
-plane has passed `contrib/attacknet/attacknet doctor`. Begin with the
-[README quickstart](README.md) on a new installation.
+This guide covers routine Release 1 operation after the typed Go client and
+local control plane pass the [README quickstart](README.md). Attacknet is
+disposable regtest infrastructure; never use valuable keys or funds.
 
-## Public interface
+## Public boundary
 
-Use `contrib/attacknet/attacknet` for routine human and agent workflows. Its
-versioned registry is the source of truth for inputs, outputs, privileges,
-side effects, execution environments, and exit codes:
+Build the client once and use it for supported host and Kubernetes workflows:
 
 ```bash
-contrib/attacknet/attacknet commands --json
-contrib/attacknet/attacknet help COMMAND
+(cd contrib/helm/hacknet/operator && \
+  go build -o /tmp/stacks-attacknet ./cmd/attacknet)
+ATTACKNET=/tmp/stacks-attacknet
+
+$ATTACKNET commands --json
+$ATTACKNET doctor --output json
 ```
 
-Scripts such as `burnchain-policy.sh`, `version-matrix.mjs`, `soak-runner.sh`,
-`environment-lock.sh`, `local-access.sh`, `capacity-preflight.sh`, and
-other implementation helpers are maintainer/debugging interfaces. Their
-environment variables and argument layouts may change without an Attacknet
-interface-version bump.
+The controllers own topology reconciliation, fault admission, scheduling,
+injection, rollback, recovery, replay, minimization, and terminal
+classification. The client submits desired state, observes status, manages
+local images/Helm/port-forwards, and captures bounded evidence. Shell and Node
+files in this directory are compatibility or qualification internals, not an
+operator API.
+
+## Control-plane lifecycle
+
+Build and install exact local images:
+
+```bash
+$ATTACKNET image build --repo-root "$(pwd)" --stacks
+$ATTACKNET install local \
+  --chart-dir contrib/helm/hacknet \
+  --namespace hacknet-system \
+  --release hacknet \
+  --kind-image-load require
+$ATTACKNET image load --mode require \
+  stacks-core-attacknet:main \
+  stacks-attacknet-stacker:local
+```
+
+The installer refuses failed Helm releases and field conflicts unless the
+corresponding recovery flag is explicit. It applies CRDs separately, waits for
+`Established`, content-tags chart images by immutable Docker ID, and verifies
+their import on every kind node.
 
 ## Network lifecycle
 
-### Small topology
+Human-authored resources are YAML. Start with the minimal network:
 
 ```bash
-ATTACKNET=contrib/attacknet/attacknet
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/minimal-burnchain-policy.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/minimal.yaml
 
-$ATTACKNET render \
-  --network=attacknet-small \
-  --miners=1 --signers=1 --followers=1 --probes=true \
-  --output=contrib/attacknet/generated/small
-
-$ATTACKNET lifecycle apply contrib/attacknet/generated/small
-
-$ATTACKNET verify contrib/attacknet/generated/small/manifest.json snapshot
+$ATTACKNET wait --namespace hacknet-system --for condition=Ready \
+  BurnchainPolicy minimal
+$ATTACKNET wait --namespace hacknet-system --for condition=Ready \
+  StacksNetwork minimal
 ```
 
-### Full topology
+Use `submit --dry-run` before mutation when server-side schema and admission
+validation are desired. Dry-run does not execute a controller workflow.
 
-The qualified full protocol topology has 28 actors: 3 miners, 10 signers, 10
-Stacks nodes configured for those signers, and 5 followers. Bitcoin Core, the
-burnchain clock, and stacker bootstrap bring the total to 31 workloads.
+The qualified full protocol shape is
+[`../helm/hacknet/examples/accepted-28.yaml`](../helm/hacknet/examples/accepted-28.yaml).
+It requires the referenced ConfigMaps and Secrets. Actor and signer identities
+come from `StacksNetwork.status`; never infer them from names alone.
 
-Run the capacity preflight before the first full deployment:
+Delete runs and campaigns before their network:
 
 ```bash
-contrib/attacknet/capacity-preflight.sh
+$ATTACKNET delete --namespace hacknet-system --wait AttacknetRun bounded-run
+$ATTACKNET delete --namespace hacknet-system --wait FaultCampaign partition
+$ATTACKNET delete --namespace hacknet-system --wait BurnchainPolicy minimal
+$ATTACKNET delete --namespace hacknet-system --wait StacksNetwork minimal
 ```
 
-The default stages are `1:1:1`, `2:4:2`, and `3:10:5` in
-miners/signers/followers order. Every stage uses fresh PVCs because signer-count
-changes alter genesis balances. The retained `operator-pressure.json` records
-API request counts, reconciliation latency, and transport errors.
-
-After it passes:
-
-```bash
-$ATTACKNET render \
-  --network=attacknet \
-  --miners=3 --signers=10 --followers=5 --probes=true \
-  --output=contrib/attacknet/generated/full
-
-$ATTACKNET lifecycle apply contrib/attacknet/generated/full
-```
-
-### Two-phase startup
-
-Kubernetes startup deliberately performs initial block download without signer
-event observers. The external Bitcoin clock advances until PoX and Nakamoto
-state exist. After every signer proves initialization from its configured
-node's live RPC view, lifecycle orchestration pauses the clock, applies the
-observer-enabled resources, waits for the node rollouts, and resumes cadence.
-
-This avoids replaying historical IBD notifications as live forks. Do not bypass
-the lifecycle facade by cold-starting final generated resources directly.
+Foreground deletion waits for controller finalizers. Deleting a
+`StacksNetwork` deletes actor PVCs; suspension retains them.
 
 ## Burnchain cadence
 
-Bitcoin Core and its Stacks-blind clock are separate failure domains. Policy
-can pause, run continuously, or mine a bounded burst without restarting
-Bitcoin:
+Bitcoin Core and the Stacks-blind clock are separate failure domains. Change
+clock policy without replacing Bitcoin Core:
 
 ```bash
-contrib/attacknet/burnchain-policy.sh pause
-contrib/attacknet/burnchain-policy.sh run 20 0
-contrib/attacknet/burnchain-policy.sh burst 3
+$ATTACKNET burnchain status --namespace hacknet-system minimal
+$ATTACKNET burnchain pause --namespace hacknet-system minimal
+$ATTACKNET burnchain cadence --namespace hacknet-system --interval 20s minimal
+$ATTACKNET burnchain resume --namespace hacknet-system minimal
+$ATTACKNET burnchain flash --namespace hacknet-system \
+  --blocks 3 --request-id operator-flash-3 minimal
 ```
 
-Bursts persist an absolute Bitcoin target height. Restarting the clock resumes
-only the missing suffix and never replays a completed burst.
+Flash request IDs are idempotency keys. Status distinguishes requested policy,
+observed generation, Bitcoin height, acknowledgement, and errors.
 
-## Bounded fault execution
+## Faults and runs
 
-### Direct Chaos Mesh smoke
-
-The facade can run a campaign that compiles directly to a Chaos Mesh resource:
+A `FaultCampaign` contains stages; each stage may contain multiple actions.
+The controller admits the union of potentially overlapping signer weight,
+miners, burnchain actors, resources, and mechanisms. A partial injection must
+roll back and cannot pass.
 
 ```bash
-$ATTACKNET campaign plan \
-  contrib/attacknet/examples/follower-network-delay.json \
-  contrib/attacknet/generated/full/manifest.json \
-  /tmp/follower-delay.json
-
-$ATTACKNET campaign run \
-  contrib/attacknet/examples/follower-network-delay.json \
-  contrib/attacknet/generated/full/manifest.json \
-  contrib/attacknet/evidence/follower-delay
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/fault-campaign-concurrent.yaml
+$ATTACKNET wait --namespace hacknet-system --for terminal \
+  FaultCampaign concurrent-network-and-dns
 ```
 
-The direct runner verifies baseline health, `AllInjected`, `AllRecovered`,
-resource removal, network recovery, and post-fault progress. It does not claim
-independent proof of the requested packet impairment.
+An `AttacknetRun` seals its execution DAG, trusted trigger receipts, budgets,
+network inventory digest, and template digests before starting children. It
+may overlap declared independent executions, replay on a fresh network with
+the same immutable actor images, and run bounded removal-only minimization.
+Ambiguous marginal effects remain `Inconclusive`.
 
-Controller-owned policies and one-shot kill actions are intentionally rejected
-by the direct runner. Use the APIs below when the effect itself must be proven.
+Do not create raw Chaos Mesh resources for product workflows. They bypass
+Attacknet admission, attribution, cleanup, and evidence semantics.
 
-### Evidence-grade `FaultCampaign`
+## Dashboards
 
-`FaultCampaign` resolves targets to exact current Ready Pod UIDs and immutable
-admitted image identities. It enforces finite duration/severity limits,
-signer-weight and miner-impact budgets, one active fault at a time, and
-finalizer-owned cleanup.
-
-The example template and run target the full network named `attacknet`:
+Start loopback-only forwards through the typed client:
 
 ```bash
-kubectl apply -f contrib/helm/hacknet/examples/fault-campaign.json
-kubectl apply -f contrib/helm/hacknet/examples/attacknet-run.json
-kubectl get faultcampaigns,attacknetruns -n hacknet-system -w
+$ATTACKNET dashboard start --target grafana --namespace hacknet-system
+$ATTACKNET dashboard start --target chaos
+$ATTACKNET dashboard status --target grafana
+$ATTACKNET dashboard stop --target grafana
 ```
 
-Lifecycle apply normally owns the persistent environment lease. If these
-resources are applied directly, first claim the lease for their `networkRef`:
+The client discovers an exact Service, proves the listener, and records the
+owned PID plus command. `stop` refuses to signal a reused or mismatched PID.
+Forwards do not auto-reconnect after process or cluster restart; inspect
+`status` and start them again explicitly.
+
+Chaos Dashboard authorization remains a cluster installation decision. Never
+disable authentication or grant cluster-wide Chaos permissions on a shared
+cluster.
+
+## Evidence and incident response
+
+Capture evidence before deleting or replacing the network:
 
 ```bash
-KUBE_NAMESPACE=hacknet-system \
-  contrib/attacknet/environment-lock.sh claim attacknet operator fault-campaign
+$ATTACKNET evidence snapshot --namespace hacknet-system \
+  --output /tmp/run.json AttacknetRun bounded-run
+
+$ATTACKNET evidence incident --namespace hacknet-system \
+  --output /tmp/attacknet-incident-minimal minimal
 ```
 
-Without the matching lease, campaigns remain `Pending` with reason
-`WaitingForEnvironmentLease` and cannot inject a mutation. Release the lease
-only after all campaigns prove cleanup and the network has been removed.
+The incident collector binds to the admitted inventory, verifies exact Pod
+UIDs before reading logs, captures exactly owned resources and UID-scoped
+Events, enforces resource/byte/time bounds, and records omissions rather than
+silently substituting replacement data. External Prometheus/Loki artifacts and
+terminal run records still need separate preservation.
 
-Before its first fault, `AttacknetRun` seals the resolved schedule, network
-identity, image digests, seed decisions, and aggregate budgets in an
-owner-bound ConfigMap. Execution uses only those pinned instructions.
+On a failed or inconclusive run, do not restart the target merely to clear a
+check. Preserve controller status, admitted Pods, mutations, logs, metrics,
+events, and PVCs until root-cause attribution is complete. See
+[`EVIDENCE.md`](EVIDENCE.md) and
+[`FAILURE-ATTRIBUTION.md`](FAILURE-ATTRIBUTION.md).
 
-`AllInjected` is bookkeeping, not effect evidence. Pod faults use observed Pod
-UID/readiness/restart state. Network and DNS faults use controlled
-before/during/after probes. I/O and clock faults use mechanism-specific trusted
-metrics. An execution without sufficient effect evidence ends `Inconclusive`,
-never `Passed`.
+## Troubleshooting
 
-### Architecture-specific faults
+| Symptom | First action |
+| --- | --- |
+| Missing v1beta1 API | Run `attacknet doctor`; inspect CRDs and both controller Deployments. |
+| Image pull failure | Rebuild, then use `attacknet image load` for every actor image. |
+| Network Pending | Inspect the referenced `BurnchainPolicy`, Pod status, and Conditions. |
+| Campaign waiting | Inspect its admitted inventory, shared mutation lease, and cumulative run budget. |
+| Inconclusive result | Preserve evidence; inspect identity divergence, effect ambiguity, and rollback. |
+| Pod Pending after node loss | Inspect PVC node affinity; portable cross-node CSI is outside Release 1. |
+| Unsupported native fault | Use `io-pressure` or application `clock-skew`; do not bypass capability admission. |
 
-Chaos Mesh 2.8.3 native IOChaos and TimeChaos are gated to `amd64`. On the
-qualified arm64 cluster:
-
-- Use `io-pressure` / `disk-pressure` for bounded data-PVC pressure. The run
-  controller owns the trusted image, command, resources, target PVC, and
-  cleanup. See
-  `contrib/helm/hacknet/examples/fault-campaign-io-pressure.json`.
-- Use application `clock-skew` for process-visible realtime changes. Monotonic
-  time remains real. The controller must observe both the requested offset and
-  recovery against an independent control actor.
-
-Neither mechanism is reported as its superficially similar Chaos Mesh fault.
-Do not extend architecture allowlists without independent effect and recovery
-proof.
-
-## Environment serialization
-
-One Kubernetes cluster may contain only one active Attacknet. Apply and delete
-hold a persistent environment lease. Cadence changes, evidence capture, and
-complete campaigns take a short-lived mutation lease. Read-only Prometheus,
-Loki, API, and dashboard queries remain concurrent.
-
-```bash
-contrib/attacknet/environment-lock.sh status
-```
-
-Do not remove a lease because an operation is merely slow. First prove its
-owner is gone and inspect admitted state. Automatic stale-lease takeover is
-intentionally absent because it would hide controller or garbage-collector
-failure.
-
-Use a bounded controller-owned Pod fault for process unavailability and let its
-finalizer own recovery.
-
-## Dashboards and local access
-
-### Grafana
-
-Lifecycle apply maintains a rediscovering loopback forward to the sole enrolled
-Grafana Service:
-
-```bash
-contrib/attacknet/local-access.sh status
-```
-
-Open <http://127.0.0.1:3000>. The network command center and actor drill-down
-show chain progress, cohort divergence, fault context, admitted image identity,
-role-specific metrics, and centralized logs.
-
-Disable automatic local access for an unattended run by setting
-`ATTACKNET_LOCAL_ACCESS_ENABLED=0` before lifecycle apply.
-
-### Chaos Dashboard
-
-For a disposable loopback-only local cluster:
-
-```bash
-contrib/attacknet/chaos-dashboard.sh local
-contrib/attacknet/chaos-dashboard.sh status
-```
-
-Open <http://127.0.0.1:2333>. Restore authenticated mode with:
-
-```bash
-contrib/attacknet/chaos-dashboard.sh secure
-```
-
-Never disable Dashboard authentication on a shared or remotely reachable
-cluster. The optional cluster-scoped local credential is documented in
-`chaos-dashboard-cluster-access.yaml`; it can create and delete any Chaos Mesh
-experiment and must never be mounted into an actor Pod.
-
-### Headlamp
-
-Headlamp is the preferred cluster-wide resource viewer. Installing it is
-optional and independent of Attacknet:
-
-```bash
-helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/
-helm repo update
-helm upgrade --install headlamp headlamp/headlamp \
-  --namespace headlamp --create-namespace
-kubectl -n headlamp port-forward service/headlamp 8080:80 \
-  --address=127.0.0.1
-```
-
-Open <http://127.0.0.1:8080>. Give Headlamp a bounded viewer identity; actor
-Pods remain credential-free.
-
-## Recovery and teardown
-
-On failure, preserve the network, admitted resources, PVCs, logs, and incident
-directory until attribution is complete. Do not recreate the system under test
-to make a failed check pass.
-
-Useful first checks:
-
-```bash
-$ATTACKNET doctor --json
-contrib/attacknet/environment-lock.sh status
-contrib/attacknet/local-access.sh status
-kubectl get stacksnetworks,faultcampaigns,attacknetruns -n hacknet-system
-kubectl get pods,pvc -n hacknet-system -o wide
-```
-
-Capture before deleting:
-
-```bash
-$ATTACKNET evidence capture \
-  contrib/attacknet/evidence/incident-manual \
-  contrib/attacknet/generated/full/manifest.json
-```
-
-Then delete through the same generated directory that created the network:
-
-```bash
-$ATTACKNET lifecycle delete contrib/attacknet/generated/full
-```
-
-Deleting the `StacksNetwork` garbage-collects owned ConfigMaps, Services,
-StatefulSets, and actor PVCs. Scaling/suspension retains PVCs so it remains
-reversible. The StorageClass determines when backing storage is physically
-reclaimed.
-
-See [`EVIDENCE.md`](EVIDENCE.md) and
-[`FAILURE-ATTRIBUTION.md`](FAILURE-ATTRIBUTION.md) before classifying an
-incident.
+Headlamp or another cluster viewer may be installed independently. Give it a
+bounded viewer identity; actor Pods remain credential-free.

@@ -1,8 +1,9 @@
 # Stacks Attacknet
 
-Stacks Attacknet runs disposable, adversarial Stacks regtest networks. It can
-mix node and signer versions, inject bounded faults, verify recovery, centralize
-telemetry, and retain enough evidence to reproduce and triage failures.
+Stacks Attacknet runs disposable adversarial Stacks regtest networks. It can
+mix node and signer versions, execute bounded concurrent faults, schedule
+experiments from trusted observations, verify recovery, and retain evidence for
+reproduction and triage.
 
 This is test infrastructure, not a production deployment. Use only generated
 regtest keys and funds with no value.
@@ -10,40 +11,33 @@ regtest keys and funds with no value.
 ## Release 1 scope
 
 Release 1 is qualified on a three-node, arm64 Docker Desktop Kubernetes cluster
-using the `kind` provisioner. Kubernetes is the sole Attacknet runtime.
-
-The accepted full topology contains 3 miners, 10 signers with one configured
-Stacks node each, and 5 followers. Start with the 1/1/1 topology below before
-attempting that 28-actor network.
+using the `kind` provisioner. Kubernetes is the only runtime. The accepted full
+topology has 3 miners, 10 signers with one signer node each, and 5 followers.
+Start with the minimal topology before attempting the 28-actor example.
 
 Release 1 does not claim managed-cluster, x86-64, portable CSI, multi-zone, or
-controller-HA qualification. Native Chaos Mesh IOChaos and TimeChaos are not
-supported on arm64; use Attacknet's `io-pressure` and `clock-skew` mechanisms.
-The complete capability statement is
-[`release/baseline-v1.json`](release/baseline-v1.json).
+controller-HA qualification. Native Chaos Mesh `IOChaos` and `TimeChaos` are
+not supported on arm64; use Attacknet's `io-pressure` and `clock-skew`
+mechanisms. See [`release/baseline-v1.json`](release/baseline-v1.json).
 
 ## Prerequisites
 
-Run commands from the repository root. The supported local profile requires:
+Run commands from the repository root.
 
 | Dependency | Release 1 requirement |
 | --- | --- |
 | Docker | Docker Desktop with the daemon running |
-| Kubernetes | Docker Desktop `kind`, Kubernetes minor reported compatible by `doctor`, one control plane and two workers |
-| Node.js | 20 or newer |
-| Python | 3.11 or newer |
+| Kubernetes | Docker Desktop `kind`, one control plane and two workers |
+| Go | 1.26 |
+| Node.js | 20 or newer only for developer/release qualification |
+| Python | 3.11 or newer only for developer/release qualification |
 | Helm | Major version 3 or 4 |
 | `kubectl` | Within one minor version of the Kubernetes server |
-| Storage | Exactly one default StorageClass and at least 8 GiB available on every node |
+| Storage | One default StorageClass and at least 8 GiB per node |
 | Architecture | Local `arm64` or `x64`; cluster `arm64` or `amd64` |
 
-The local access supervisors use loopback ports 3000, 2333, 8080, and 9464.
-Stop anything already listening on those ports before installation. The full
-topology is resource-intensive; prove the small topology first and run the
-capacity preflight before scaling up.
-
-Enable Kubernetes in Docker Desktop, select the `kind` provisioner, configure
-three nodes, and verify the context before continuing:
+Do not continue if the active Kubernetes context points at a shared or
+production cluster.
 
 ```bash
 kubectl config current-context
@@ -51,19 +45,11 @@ kubectl cluster-info
 kubectl get nodes -o wide
 ```
 
-Do not continue if these commands point at a shared or production cluster.
+## Install
 
-## Quickstart and command discovery
+### 1. Install Chaos Mesh
 
-The steps below cover the human workflow and the stable command surface used by
-automation. Complete them in order on a new local installation.
-
-### Install the local control plane
-
-#### 1. Install Chaos Mesh
-
-Attacknet Release 1 is pinned to Chaos Mesh 2.8.3. Docker Desktop's `kind`
-nodes use containerd:
+Release 1 pins Chaos Mesh 2.8.3. Docker Desktop `kind` uses containerd.
 
 ```bash
 helm repo add chaos-mesh https://charts.chaos-mesh.org
@@ -79,217 +65,225 @@ helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
 kubectl get pods -n chaos-mesh
 ```
 
-Every listed Chaos Mesh Pod must become Ready. See the
-[official Helm installation guide](https://chaos-mesh.org/docs/production-installation-using-helm/)
-when using a different container runtime.
+Every Chaos Mesh Pod must become Ready.
 
-#### 2. Build the local images
+The supported installation enables Chaos Mesh namespace filtering. The local
+installer explicitly annotates its target namespace with
+`chaos-mesh.org/inject=enabled`; without that annotation Chaos Mesh accepts a
+fault resource but selects no Pods. Set
+`HACKNET_CHAOS_NAMESPACE_INJECTION=disabled` only for a control plane that must
+never inject native Chaos Mesh faults.
 
-The first command builds the topology operator, run operator, active probe,
-I/O-pressure helper, and current Stacks node/signer image. A cold Rust build can
-take tens of minutes. The second command builds the stacker bootstrap image.
+### 2. Build and install the control plane
 
 ```bash
-BUILD_STACKS_IMAGE=1 contrib/helm/hacknet/scripts/build-local.sh
-docker build -t stacks-attacknet-stacker:local contrib/attacknet/stacker
+(cd contrib/helm/hacknet/operator && \
+  go build -o /tmp/stacks-attacknet ./cmd/attacknet)
+ATTACKNET=/tmp/stacks-attacknet
+
+$ATTACKNET image build --repo-root "$(pwd)" --stacks
+$ATTACKNET install local \
+  --chart-dir contrib/helm/hacknet \
+  --namespace hacknet-system \
+  --release hacknet \
+  --kind-image-load require
+
+$ATTACKNET image load --mode require \
+  stacks-core-attacknet:main \
+  stacks-attacknet-stacker:local
 ```
 
-#### 3. Install Hacknet
-
-The installer assigns content-derived image tags, imports them into every local
-`kind` node, applies the three CRDs, and installs the two restricted controllers:
+The typed installer resolves every control-plane image to an immutable local
+Docker ID, content-tags it, imports it into every `kind` node, and verifies the
+selected platform's CRI runtime image ID. It then applies the four v1beta1 CRDs
+explicitly and performs an atomic Helm install. Actor images are loaded
+separately because a `StacksNetwork`, not the chart, selects them.
+Actor Pods never receive Kubernetes service-account credentials.
 
 ```bash
-contrib/helm/hacknet/scripts/install-local.sh
 kubectl get deployments -n hacknet-system
+$ATTACKNET doctor
 ```
 
-The topology-operator and run-operator Deployments must become Available. The
-network-scoped event bridge and observability stack are created later by
-`lifecycle apply`. Actor Pods never receive Kubernetes service-account
-credentials.
+Do not start a run until both controller Deployments are Available and the
+doctor reports every v1beta1 API available. Use `--output json` for automation.
 
-#### 4. Run the compatibility doctor
+## First network
+
+Human inputs are YAML. JSON remains the canonical machine format for schedules,
+digests, evidence, and review packets.
 
 ```bash
-contrib/attacknet/attacknet doctor
+$ATTACKNET validate \
+  --file contrib/helm/hacknet/examples/minimal-burnchain-policy.yaml
+$ATTACKNET validate --file contrib/helm/hacknet/examples/minimal.yaml
+
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/minimal-burnchain-policy.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/minimal.yaml
+
+$ATTACKNET wait --namespace hacknet-system --for condition=Ready \
+  BurnchainPolicy minimal
+$ATTACKNET wait --namespace hacknet-system --for condition=Ready \
+  StacksNetwork minimal
 ```
 
-Do not start a baseline run until it reports `compatible`. For machine-readable
-diagnostics, use `attacknet doctor --json`.
+`StacksNetwork` declares Bitcoin actors, Stacks nodes, signer sets, enrollment,
+workload defaults, telemetry, and probes. `BurnchainPolicy` independently
+controls Bitcoin bootstrap, cadence, pause/resume, destinations, and bounded
+flash blocks. Bitcoin Core does not wait for or interpret Stacks.
 
-### First network
-
-The `attacknet` facade is the supported public interface. Other scripts in this
-directory are implementation helpers unless another document explicitly says
-otherwise.
-
-Render and start a small network with trusted active-probe sidecars:
+Inspect admitted identities and policy state:
 
 ```bash
-ATTACKNET=contrib/attacknet/attacknet
-
-$ATTACKNET render \
-  --network=attacknet \
-  --miners=1 \
-  --signers=1 \
-  --followers=1 \
-  --probes=true \
-  --output=contrib/attacknet/generated/quickstart
-
-$ATTACKNET lifecycle apply contrib/attacknet/generated/quickstart
-
-$ATTACKNET verify \
-  contrib/attacknet/generated/quickstart/manifest.json snapshot
+$ATTACKNET get --namespace hacknet-system StacksNetwork minimal
+$ATTACKNET get --namespace hacknet-system BurnchainPolicy minimal
 ```
 
-Cold startup includes Bitcoin bootstrap, PoX setup, signer initialization, and
-an observer-enabled node rollout. Follow the lifecycle output instead of using
-a fixed sleep. Success means the apply command completes and `verify` returns a
-machine-readable passing snapshot.
+The 28-actor shape is in
+[`../helm/hacknet/examples/accepted-28.yaml`](../helm/hacknet/examples/accepted-28.yaml).
+It references complete miner/signer configs and enrollment credentials in
+Secrets; create those inputs before submitting it.
 
-### Observe the network
+## Run concurrent faults
 
-Lifecycle apply starts a rediscovering, loopback-only Grafana forward by
-default. Open <http://127.0.0.1:3000> and select the `attacknet` network.
-
-Inspect local-access state with:
+A `FaultCampaign` is an aggregate-admitted graph. It may contain multiple
+actions in one stage and overlapping stages triggered by time, prior-stage
+milestones, burn height, Stacks height, or a trusted observation. The controller
+evaluates safety over the union of active mutations and rolls back partial
+injection before classifying the campaign.
 
 ```bash
-contrib/attacknet/local-access.sh status
-contrib/attacknet/chaos-dashboard.sh local
-contrib/attacknet/chaos-dashboard.sh status
+$ATTACKNET validate \
+  --file contrib/helm/hacknet/examples/fault-campaign-minimal.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/fault-campaign-minimal.yaml
+$ATTACKNET wait --namespace hacknet-system --for terminal \
+  FaultCampaign minimal-follower-restart
 ```
 
-The Chaos Dashboard is then available at <http://127.0.0.1:2333>. Local mode
-disables Dashboard authentication and must never be used for a shared or
-remotely reachable cluster.
+Separate campaigns share one namespace mutation lease. Express intentionally
+concurrent faults as stages/actions in one campaign so their combined signer,
+miner, burnchain, target, and resource impact is visible at admission.
 
-Grafana is for human triage. Agents should query Prometheus, Loki, and the
-trusted event journal directly and retain the raw responses. See
-[`observability/README.md`](observability/README.md) for dashboard, metric, log,
-and trust-boundary details.
+`AttacknetRun` seals a deterministic execution DAG before creating campaigns.
+It records trigger receipts, enforces aggregate budgets, supports replay and
+resume, and performs removal-only minimization without claiming causal
+minimality from an inconclusive attempt.
 
-### Run a first fault
-
-Plan before mutating the cluster:
+The advanced run example expects a full network named `attacknet`. Its two
+catalog resources are inert templates until referenced by the run:
 
 ```bash
-$ATTACKNET campaign plan \
-  contrib/attacknet/examples/follower-network-delay.json \
-  contrib/attacknet/generated/quickstart/manifest.json \
-  /tmp/attacknet-fault.json
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/fault-campaign.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/fault-campaign-io-pressure.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/attacknet-run.yaml
+$ATTACKNET wait --namespace hacknet-system --for terminal \
+  AttacknetRun bounded-mixed-faults
 ```
 
-Run the bounded delay and retain its evidence:
+Stacks-height and arbitrary observation triggers remain Pending unless a
+trusted observation reader is configured. Burn-height and controller-owned
+dependency milestones work from uncached, identity-bound Kubernetes status.
+
+## Observe and retain evidence
+
+Grafana is for human triage. Agents should query Prometheus, Loki, Kubernetes,
+and the trusted event journal directly and retain the raw responses. See
+[`observability/README.md`](observability/README.md) for metrics, dashboards,
+logs, and evidence-source trust.
+
+The typed client can capture either a bounded single-resource snapshot or an
+identity-bound incident bundle:
 
 ```bash
-$ATTACKNET campaign run \
-  contrib/attacknet/examples/follower-network-delay.json \
-  contrib/attacknet/generated/quickstart/manifest.json \
-  contrib/attacknet/evidence/quickstart-fault
+$ATTACKNET evidence snapshot --namespace hacknet-system \
+  --output contrib/attacknet/evidence/quickstart-run.json \
+  AttacknetRun triggered-overlap
+
+$ATTACKNET evidence incident --namespace hacknet-system \
+  --output /tmp/attacknet-incident-minimal \
+  minimal
 ```
 
-This direct-run workflow proves Chaos Mesh resource injection, cleanup,
-network recovery, and post-fault chain progress. It does not independently
-prove the requested latency distribution. Evidence-grade effect assertions use
-the controller-owned `FaultCampaign` and `AttacknetRun` APIs described in
-[`OPERATIONS.md`](OPERATIONS.md).
+A resource snapshot is not a complete incident bundle. `evidence incident`
+uses admitted Pod names and UIDs, refuses replacement-Pod log attribution, and
+captures bounded owned resources, Events, and log tails with per-artifact
+digests and explicit omissions. Preserve metrics and terminal run artifacts
+separately. Follow [`EVIDENCE.md`](EVIDENCE.md) and
+[`FAILURE-ATTRIBUTION.md`](FAILURE-ATTRIBUTION.md).
 
-Controller-managed campaigns and runs bind to the topology operator's complete
-admitted-inventory digest. If an unrelated StatefulSet, Pod, or runtime image
-changes after admission, the controller cleans up the owned fault, records the
-identity difference, and stops rather than silently selecting the replacement.
-
-Capture a final snapshot:
+For local human dashboards:
 
 ```bash
-$ATTACKNET evidence capture \
-  contrib/attacknet/evidence/quickstart \
-  contrib/attacknet/generated/quickstart/manifest.json
+$ATTACKNET dashboard start --target grafana --namespace hacknet-system
+$ATTACKNET dashboard start --target chaos
+$ATTACKNET dashboard status --target grafana
+$ATTACKNET dashboard stop --target grafana
 ```
 
-### Tear down
+Port-forwards bind loopback only and are tracked by exact process identity.
 
-Teardown deletes the `StacksNetwork` and its owned actor PVCs. Capture anything
-needed for forensics first:
+## Teardown
+
+Delete runs and campaigns first, then the clock policy and network. Foreground
+deletion waits for controller finalizers and owned-resource cleanup.
 
 ```bash
-$ATTACKNET lifecycle delete contrib/attacknet/generated/quickstart
+$ATTACKNET delete --namespace hacknet-system --wait \
+  AttacknetRun bounded-mixed-faults
+$ATTACKNET delete --namespace hacknet-system --wait \
+  FaultCampaign minimal-follower-restart
+$ATTACKNET delete --namespace hacknet-system --wait BurnchainPolicy minimal
+$ATTACKNET delete --namespace hacknet-system --wait StacksNetwork minimal
 ```
 
-Chaos Mesh and the Hacknet controllers remain installed for later runs. Remove
-them only when the whole local test installation is no longer needed:
+Capture forensic evidence before deletion. Deleting a `StacksNetwork` removes
+its owned actor PVCs. Helm intentionally leaves CRDs installed; do not remove
+them while custom resources remain.
 
 ```bash
 helm uninstall hacknet -n hacknet-system
 helm uninstall chaos-mesh -n chaos-mesh
 ```
 
-Helm intentionally leaves Hacknet CRDs installed. Do not delete them while any
-Attacknet custom resources remain.
-
-### Common problems
+## Troubleshooting
 
 | Symptom | First action |
 | --- | --- |
-| `doctor` reports missing images | Re-run `build-local.sh`, build the stacker image, then run `install-local.sh` to import exact tags into every node. |
-| Kubernetes is unreachable or has the wrong version | Confirm Docker Desktop Kubernetes is running and inspect `kubectl config current-context`. Never work around this against another cluster. |
-| Chaos Mesh checks fail | Run `helm list -n chaos-mesh` and `kubectl get pods,crd -n chaos-mesh`; confirm chart 2.8.3 and the containerd socket settings. |
-| Port 3000 or 2333 is unreachable | Inspect `local-access.sh status` and `chaos-dashboard.sh status`; restart the relevant supervisor rather than creating competing forwards. |
-| Apply reports an image-pull failure | Re-run `install-local.sh`; Docker's image store and each `kind` node's containerd store are separate. |
-| An operation reports an environment lease | Run `contrib/attacknet/environment-lock.sh status`. Do not steal a lease until its owner is proven dead and admitted state is inspected. |
-| A fault or verification fails | Preserve the network and the generated incident/evidence directory. Capture more evidence before teardown. |
-| A Pod is pending after node disruption | Inspect PVC node affinity and placement. Release 1 proves local-path same-node recovery, not portable cross-node reattachment. |
+| Doctor reports a missing API | Re-run `attacknet install local`; inspect both controller Deployments and CRDs. |
+| Actor image cannot be pulled | Re-run `attacknet image build` and `attacknet image load`; Docker and each `kind` node have separate image stores. |
+| Network remains Pending | Inspect its referenced `BurnchainPolicy`, actor Pods, and current `status.conditions`. |
+| Campaign waits for a lease | Inspect active campaigns; do not steal or manually edit the controller-owned lease. |
+| Campaign is Inconclusive | Preserve the network and evidence. Inspect identity divergence, partial rollback, effect, and recovery status before retrying. |
+| Pod remains Pending after node disruption | Inspect PVC node affinity. Release 1 does not prove portable cross-node reattachment. |
+| Fault is unsupported on arm64 | Use `io-pressure` or `clock-skew`; do not bypass the capability gate. |
 
-More detailed recovery procedures are in [`OPERATIONS.md`](OPERATIONS.md).
+## Public and internal boundaries
 
-### Command discovery
-
-Read help before every mutating command:
-
-```bash
-contrib/attacknet/attacknet help
-contrib/attacknet/attacknet help lifecycle apply
-contrib/attacknet/attacknet help campaign run
-contrib/attacknet/attacknet commands --json
-```
-
-Commands that support `--plan` or `--dry-run` emit the resolved invocation as
-JSON without executing it. Exit `0` means success, `1` means an operational or
-compatibility failure, and `2` means invalid arguments.
-
-## Design boundaries
-
-- The `attacknet` facade and its versioned command registry are the public
-  interface. Actor images and internal helpers are implementation details.
-- Bitcoin Core, the Stacks-blind burnchain clock, and the policy steering that
-  clock are separate failure domains.
-- Actor Pods receive no Kubernetes service-account credentials. Control-plane
-  hardening does not constrain faults applied to the data plane.
-- Actor counts and inventories come from `manifest.json`; harness logic must not
-  encode fixed signer, miner, or follower counts.
-
-> **Maintainer implementation reference.** `burnchain-policy.sh`,
-> `version-matrix.mjs`, `soak-runner.sh`, `environment-lock.sh`,
-> `local-access.sh`, and `capacity-preflight.sh` are not public CLIs in Release 1. Agents and
-> end users must not automate against them. Use `contrib/attacknet/attacknet`
-> and `attacknet commands --json`; helper arguments and environment variables
-> may change without an Attacknet interface-version bump.
+- The typed Go client and `testing.stacks.org/v1beta1` resources are the public
+  interface. Use `attacknet commands --json` for the agent-readable contract.
+- Controllers own admission, scheduling, mutation, rollback, recovery, and
+  terminal classification. The CLI submits intent and reads status.
+- Shell and JavaScript under this directory are compatibility, qualification,
+  or frozen-evidence internals. They are not a supported operator interface;
+  do not automate against their arguments.
+- JSON evidence and historical release machinery remain intentionally separate
+  from YAML authoring.
+- Actor counts and identities come from `StacksNetwork.status`; harness code
+  must not hardcode signer, miner, or follower counts.
 
 ## Further reading
 
-- [`OPERATIONS.md`](OPERATIONS.md): full topologies, controlled faults,
-  dashboards, serialization, recovery, and teardown.
-- [`EVIDENCE.md`](EVIDENCE.md): evidence trust, capture, soak qualification,
-  incident handling, replay, and minimization.
-- [`DEVELOPMENT.md`](DEVELOPMENT.md): images, topology rendering, version matrices,
-  controller development, and offline checks.
-- [`ROADMAP.md`](ROADMAP.md): unimplemented burnchain reorg, multi-Bitcoin,
-  managed-cluster, storage, and controller-HA work.
-- [`INSTRUMENTATION.md`](INSTRUMENTATION.md): portable metric-family contracts
-  and provenance.
+- [`OPERATIONS.md`](OPERATIONS.md): runtime operations and recovery.
+- [`GO-CLI.md`](GO-CLI.md): typed client contract.
+- [`EVIDENCE.md`](EVIDENCE.md): evidence capture, replay, and minimization.
+- [`DEVELOPMENT.md`](DEVELOPMENT.md): controller and image development.
+- [`ROADMAP.md`](ROADMAP.md): deferred environments and fault mechanisms.
+- [`INSTRUMENTATION.md`](INSTRUMENTATION.md): portable metric contracts.
 - [`ADVERSARIAL-ACTORS.md`](ADVERSARIAL-ACTORS.md): bounded modified actors.
-- [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md): run descriptors, seeds, and replay.
-- [`FAILURE-ATTRIBUTION.md`](FAILURE-ATTRIBUTION.md): triage and root-cause
-  evidence requirements.
+- [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md): seeds and replay.

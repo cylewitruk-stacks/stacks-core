@@ -26,7 +26,6 @@ else
   go_status=skipped-unavailable
   echo "go not installed; skipped controller and bounded I/O-pressure workload tests" >&2
 fi
-node --test "${chart_dir}/crds/attacknet-crds.test.mjs"
 node --test "${chart_dir}/security-contract.test.mjs"
 node --check "${chart_dir}/../../attacknet/probe/probe.mjs"
 node --test "${chart_dir}/../../attacknet/probe/probe.test.mjs"
@@ -41,10 +40,6 @@ if command -v "${helm_bin}" >/dev/null 2>&1; then
   rendered="$("${helm_bin}" template hacknet "${chart_dir}" --namespace hacknet-system --include-crds)"
   if [[ "${go_status}" = passed ]]; then
     printf '%s\n' "${rendered}" | (cd "${chart_dir}/operator" && go run ./cmd/rbac-check)
-  fi
-  if [[ "${rendered}" != *'"kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos", "ClockSkewPolicy"]}'* ]]; then
-    echo 'rendered FaultCampaign status schema is missing IOPressurePod' >&2
-    exit 1
   fi
   "${helm_bin}" template hacknet "${chart_dir}" --namespace hacknet-system \
     --set runOperator.enabled=false \

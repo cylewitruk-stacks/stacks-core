@@ -1,0 +1,157 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: accepted-28
+spec:
+  defaults:
+    nodeImage: stacks-core-attacknet:main
+    signerImage: stacks-core-attacknet:main
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
+    imagePullPolicy: IfNotPresent
+    bootstrapPeers:
+      - 034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444
+    workload:
+      storage: {enabled: true, size: 2Gi}
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {cpu: "4", memory: 4Gi}
+  genesis:
+    pox5:
+      sbtcContract: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token
+      sbtcRegistryContract: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry
+    balances:
+      - {address: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H, amount: 10000000000000000}
+      - {address: ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z, amount: 10000000000000000}
+      - {address: ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551, amount: 10000000000000000}
+      - {address: ST361P1W3HRW7VTPD1S935RF8PJFMRAF4GJMPMQZN, amount: 10000000000000000}
+      - {address: ST1GY0T7R417K2Q2S17DJE3SVEMKRQ2EPJ4PGD5B8, amount: 10000000000000000}
+      - {address: ST2YS424BPZM2TR8TKEAFQDTA1441AAVR9ZP7K4S0, amount: 10000000000000000}
+      - {address: ST332XG8HFYG31EBQ2RWZ3R85AQ6VXTGXQHJYH0K5, amount: 10000000000000000}
+      - {address: ST2N5TCTPRMT6EXTFSCPTGBQ0K04B44H79XPH6YXS, amount: 10000000000000000}
+      - {address: ST64T36C5EABZ2T1Y6KWN03RSWAKJK59QHE2D83N, amount: 10000000000000000}
+      - {address: ST3MWT31K0SX74MHJCEWGZY5MR05X61FC5HEVK3W1, amount: 10000000000000000}
+  burnchain:
+    policyRef: {name: accepted-28}
+    nodes:
+      - name: bitcoin
+        config: {generated: {profile: bitcoin-regtest/v1}}
+        workload:
+          storage: {enabled: true, size: 4Gi}
+  nodes:
+    # Miner configs contain private mining keys and therefore come from
+    # independently created Secrets rather than from this public resource.
+    # Complete external configs must reproduce spec.genesis exactly.
+    - name: miner-1
+      role: miner
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: accepted-28-miner-1, key: config.toml}}
+    - name: miner-2
+      role: miner
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: accepted-28-miner-2, key: config.toml}}
+    - name: miner-3
+      role: miner
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: accepted-28-miner-3, key: config.toml}}
+    - name: follower-1
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+    - name: follower-2
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+    - name: follower-3
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+    - name: follower-4
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+    - name: follower-5
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+  signerSets:
+    - name: active
+      members:
+        - name: signer-1
+          nodeName: signer-node-1
+          index: 1
+          weight: 1
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-1, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-2
+          nodeName: signer-node-2
+          index: 2
+          weight: 3
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-2, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-3
+          nodeName: signer-node-3
+          index: 3
+          weight: 4
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-3, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-4
+          nodeName: signer-node-4
+          index: 4
+          weight: 1
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-4, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-5
+          nodeName: signer-node-5
+          index: 5
+          weight: 3
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-5, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-6
+          nodeName: signer-node-6
+          index: 6
+          weight: 4
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-6, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-7
+          nodeName: signer-node-7
+          index: 7
+          weight: 1
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-7, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-8
+          nodeName: signer-node-8
+          index: 8
+          weight: 3
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-8, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-9
+          nodeName: signer-node-9
+          index: 9
+          weight: 4
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-9, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-10
+          nodeName: signer-node-10
+          index: 10
+          weight: 1
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: accepted-28-signer-10, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+  enrollment:
+    name: stacker
+    image: stacks-attacknet-stacker:local
+    nodeRef: miner-1
+    credentialsSecretRef:
+      name: accepted-28-stacker-credentials
+      keysKey: private-keys
+      addressesKey: addresses

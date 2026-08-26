@@ -39,16 +39,16 @@ function implementationFiles(root, prefix = '') {
   return found.sort();
 }
 
-test('the README keeps the public facade boundary explicit', () => {
+test('the README keeps the typed public surface and qualification boundary explicit', () => {
   const readme = readFileSync(join(directory, 'README.md'), 'utf8');
   const prose = readme.replace(/^> ?/gm, '').replace(/\s+/g, ' ');
-  assert.match(prose, /Maintainer implementation reference/);
-  assert.match(prose, /not public CLIs in Release 1/);
-  assert.match(prose, /Agents and end users must not automate against them/);
-  for (const helper of [
-    'burnchain-policy.sh', 'version-matrix.mjs', 'soak-runner.sh',
-    'environment-lock.sh', 'local-access.sh', 'capacity-preflight.sh',
-  ]) assert.match(prose, new RegExp(helper.replaceAll('.', '\\.')));
+  assert.match(prose, /Public and internal boundaries/);
+  assert.match(prose, /typed Go client and `testing\.stacks\.org\/v1beta1` resources are the public interface/);
+  assert.match(prose, /Node\.js.*only for developer\/release qualification/);
+  assert.doesNotMatch(prose, /contrib\/attacknet\/attacknet(?:\s|`|$)/);
+  for (const helper of registry.internalHelpers) {
+    assert.doesNotMatch(prose, new RegExp(helper.replaceAll('.', '\\.')));
+  }
 });
 
 test('machine discovery returns the exact checked-in versioned registry', () => {
@@ -212,19 +212,19 @@ test('the quickstart topology and fault plan execute through only the public fac
   const output = mkdtempSync(join(tmpdir(), 'attacknet-command-quickstart-'));
   t.after(() => rmSync(output, {recursive: true, force: true}));
   execFileSync(attacknet, ['render', '--miners=1', '--signers=1', '--followers=1', `--output=${output}`]);
-  const campaign = join(directory, 'examples/follower-network-delay.json');
+  const campaign = join(directory, 'testdata/legacy-v1alpha1/follower-network-delay.json');
   const compiled = join(output, 'fault.json');
   execFileSync(attacknet, ['campaign', 'plan', campaign, join(output, 'manifest.json'), compiled]);
   const resource = JSON.parse(readFileSync(compiled, 'utf8'));
   assert.equal(resource.apiVersion, 'chaos-mesh.org/v1alpha1');
   assert.equal(resource.kind, 'NetworkChaos');
 
-  const internal = join(directory, 'examples/follower-application-clock-skew.json');
+  const internal = join(directory, 'testdata/legacy-v1alpha1/follower-application-clock-skew.json');
   const rejected = run('campaign', 'run', internal, join(output, 'manifest.json'), join(output, 'internal-evidence'));
   assert.equal(rejected.status, 2);
   assert.match(rejected.stderr, /controller-owned internal policies/);
 
-  const oneShot = join(directory, 'examples/ddmin-live-pod-template.json');
+  const oneShot = join(directory, 'testdata/legacy-v1alpha1/ddmin-live-pod-template.json');
   const oneShotCampaign = JSON.parse(readFileSync(oneShot, 'utf8'));
   oneShotCampaign.spec.networkRef = 'attacknet';
   const oneShotPath = join(output, 'one-shot.json');
@@ -245,13 +245,14 @@ test('the quickstart topology and fault plan execute through only the public fac
 
 test('quickstart covers both personas and Phase 2 uses the shared immutable gate', () => {
   const readme = readFileSync(join(directory, 'README.md'), 'utf8');
-  const start = readme.indexOf('## Quickstart and command discovery');
-  const end = readme.indexOf('## Design boundaries');
-  assert.ok(start >= 0, 'Human quickstart heading must exist');
-  assert.ok(end > start, 'Design boundaries must follow the quickstart');
+  const start = readme.indexOf('## Install');
+  const end = readme.indexOf('## Public and internal boundaries');
+  assert.ok(start >= 0, 'Install heading must exist');
+  assert.ok(end > start, 'Public boundary must follow the operator workflow');
   const quickstart = readme.slice(start, end);
-  for (const workflow of ['doctor', 'render', 'lifecycle apply', 'verify', 'campaign plan',
-    'campaign run', 'evidence capture', 'lifecycle delete', 'commands --json', '--plan']) {
+  for (const workflow of ['image build', 'install local', 'doctor', '$ATTACKNET validate',
+    '$ATTACKNET submit', '$ATTACKNET wait', 'evidence incident', '$ATTACKNET delete',
+    'dashboard start', 'dashboard stop']) {
     assert.match(quickstart, new RegExp(workflow.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
 

@@ -1,0 +1,53 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: bounded-mixed-faults
+  namespace: hacknet-system
+spec:
+  networkRef: attacknet
+  seed: overnight-20260825-001
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - name: mixed-disruption
+      campaignRef: mixed-peer-disruption
+    - name: disk-pressure
+      campaignRef: pressure-follower-disk
+  executions:
+    - id: peer-disruption
+      campaign: mixed-disruption
+      trigger:
+        afterRunStart: 15s
+    - id: disk-pressure
+      campaign: disk-pressure
+      trigger:
+        afterRunStart: 20s
+  budgets:
+    maxCampaigns: 2
+    maxWallTimeSeconds: 1800
+    maxCumulativeFaultSeconds: 180
+    maxActiveFaults: 3
+    maxSignerImpactPercent: 30
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: PauseForTriage
+    onInconclusive: PauseForTriage
+    onBudgetExhausted: Stop
+    onSuccess: Continue
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: true
+    allowedTerminalStates: [Triaged, Remediated, Inconclusive]
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true
+  minimization:
+    enabled: false
+    strategy: FailurePrefix
+    maxAttempts: 0
+    requireFreshNetwork: true

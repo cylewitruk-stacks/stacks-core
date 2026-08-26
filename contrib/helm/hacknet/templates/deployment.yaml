@@ -42,6 +42,18 @@ spec:
             - --health-probe-bind-address=:8081
             - --max-concurrent-reconciles=1
             - --zap-log-level={{ lower .Values.operator.logLevel }}
+            {{- if .Values.burnchainClock.image.digest }}
+            - --burnchain-clock-image={{ .Values.burnchainClock.image.repository }}@{{ .Values.burnchainClock.image.digest }}
+            {{- else }}
+            - --burnchain-clock-image={{ .Values.burnchainClock.image.repository }}:{{ .Values.burnchainClock.image.tag }}
+            {{- end }}
+            - --burnchain-clock-image-pull-policy={{ .Values.burnchainClock.image.pullPolicy }}
+            {{- if .Values.probe.image.digest }}
+            - --probe-image={{ .Values.probe.image.repository }}@{{ .Values.probe.image.digest }}
+            {{- else }}
+            - --probe-image={{ .Values.probe.image.repository }}:{{ .Values.probe.image.tag }}
+            {{- end }}
+            - --probe-image-pull-policy={{ .Values.probe.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.operator.securityContext | nindent 12 }}
           ports:

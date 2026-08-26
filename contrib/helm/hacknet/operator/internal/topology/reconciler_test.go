@@ -106,3 +106,27 @@ func TestPruneRefusesLabelOnlyDeletionAuthority(t *testing.T) {
 		t.Fatalf("foreign resource was removed: %v", err)
 	}
 }
+
+func TestPruneIgnoresResourcesOwnedByAnotherController(t *testing.T) {
+	scheme := testScheme(t)
+	network := testNetwork()
+	policyResource := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "attacknet-clock", Namespace: network.Namespace,
+		Labels: map[string]string{
+			managedByLabel: "stacks-burnchain-policy-controller",
+			networkLabel:   network.Name,
+		},
+	}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(network, policyResource).Build()
+	reconciler := &Reconciler{Client: client, Scheme: scheme}
+	resources, err := Render(network, scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.applyAndPrune(context.Background(), network, resources); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: network.Namespace, Name: policyResource.Name}, &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("other controller's resource was removed: %v", err)
+	}
+}

@@ -41,7 +41,7 @@ const campaigns = [
   campaign('network-delay', {type: 'network', action: 'delay', parameters: {
     direction: 'both', peerTarget: {actors: ['miner-1'], mode: 'all'}, delay: {latency: '100ms'},
   }}),
-  campaign('dns-error', {type: 'dns', action: 'error', parameters: {patterns: ['*.invalid']}}),
+  campaign('dns-error', {type: 'dns', action: 'error', parameters: {patterns: ['invalid.*']}}),
   campaign('io-latency', {type: 'io', action: 'latency', parameters: {
     volumePath: '/data', path: '/data/**', delay: '10ms', methods: ['READ', 'WRITE'],
   }}),

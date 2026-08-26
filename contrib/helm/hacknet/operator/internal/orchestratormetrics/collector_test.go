@@ -10,40 +10,40 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
+	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
 
 func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 	scheme := runtime.NewScheme()
-	if err := attacknetv1alpha1.AddToScheme(scheme); err != nil {
+	if err := attacknetv1beta1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	result, err := json.Marshal(map[string]any{"actor": "signer-1", "assertion": "PodRestarted", "outcome": "Proven"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	campaign := &attacknetv1alpha1.FaultCampaign{
+	campaign := &attacknetv1beta1.FaultCampaign{
 		ObjectMeta: metav1.ObjectMeta{Name: "partition", Namespace: "test"},
-		Spec: attacknetv1alpha1.FaultCampaignSpec{
-			NetworkRef: "network", Fault: attacknetv1alpha1.FaultSpec{Type: "pod"},
-		},
-		Status: attacknetv1alpha1.FaultCampaignStatus{
+		Spec:       attacknetv1beta1.FaultCampaignSpec{NetworkRef: "network"},
+		Status: attacknetv1beta1.FaultCampaignStatus{
 			Phase: "Passed", Reason: "AssertionsPassed",
-			ResolvedTargets: []attacknetv1alpha1.ResolvedTarget{{Actor: "signer-1", Role: "signer", Node: "worker-1"}},
-			EffectResults:   []apixv1.JSON{{Raw: result}},
+			Stages: []attacknetv1beta1.FaultStageStatus{{ID: "stage-1", Actions: []attacknetv1beta1.FaultActionStatus{{
+				ID: "action-1", ResolvedTargets: []attacknetv1beta1.ResolvedTarget{{Actor: "signer-1", Role: "signer", Node: "worker-1"}},
+				EffectResults: []apixv1.JSON{{Raw: result}},
+			}}}},
 		},
 	}
-	run := &attacknetv1alpha1.AttacknetRun{
+	run := &attacknetv1beta1.AttacknetRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "test"},
-		Spec: attacknetv1alpha1.AttacknetRunSpec{
-			NetworkRef: "network", Minimization: attacknetv1alpha1.MinimizationSpec{Enabled: true},
+		Spec: attacknetv1beta1.AttacknetRunSpec{
+			NetworkRef: "network", Minimization: attacknetv1beta1.MinimizationSpec{Enabled: true},
 		},
-		Status: attacknetv1alpha1.AttacknetRunStatus{
+		Status: attacknetv1beta1.AttacknetRunStatus{
 			Phase: "Passed", Reason: "SequenceCompleted", Attribution: "NotRequired",
-			ScheduleRef:     &attacknetv1alpha1.ScheduleReference{Digest: "sha256:schedule"},
-			ScheduleSummary: &attacknetv1alpha1.ScheduleSummary{Replay: true},
-			BudgetUsage:     &attacknetv1alpha1.BudgetUsage{CampaignsStarted: 1, CumulativeFaultSeconds: 30},
-			TerminalClassification: &attacknetv1alpha1.TerminalClassification{
+			ScheduleRef:     &attacknetv1beta1.ScheduleReference{Digest: "sha256:schedule"},
+			ScheduleSummary: &attacknetv1beta1.ScheduleSummary{Replay: true},
+			BudgetUsage:     &attacknetv1beta1.BudgetUsage{CampaignsStarted: 1, CumulativeFaultMillis: 30_000},
+			TerminalClassification: &attacknetv1beta1.TerminalClassification{
 				AttemptID: "attempt-1", CandidateScheduleDigest: "sha256:candidate",
 				ExpectedAssertion: "ChainProgress", ExpectedStatus: "failed",
 				Outcome: "reproduced", Reason: "ExpectedFailureObserved", EvidenceDigest: "sha256:evidence",
@@ -66,7 +66,7 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 		"attacknet_fault_campaign_target_info":              1,
 		"attacknet_fault_campaign_assertion_outcome":        1,
 		"attacknet_run_info":                                1,
-		"attacknet_run_budget_usage":                        10,
+		"attacknet_run_budget_usage":                        11,
 		"attacknet_run_minimization_outcome":                1,
 		"attacknet_orchestrator_metrics_collection_success": 1,
 	}
@@ -91,14 +91,14 @@ func TestCollectorFailsClosedWithoutAReader(t *testing.T) {
 
 func TestCollectorWatchdogFailsClosedOnMalformedEvidence(t *testing.T) {
 	scheme := runtime.NewScheme()
-	if err := attacknetv1alpha1.AddToScheme(scheme); err != nil {
+	if err := attacknetv1beta1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	campaign := &attacknetv1alpha1.FaultCampaign{
+	campaign := &attacknetv1beta1.FaultCampaign{
 		ObjectMeta: metav1.ObjectMeta{Name: "malformed", Namespace: "test"},
-		Spec:       attacknetv1alpha1.FaultCampaignSpec{NetworkRef: "network"},
-		Status: attacknetv1alpha1.FaultCampaignStatus{
-			EffectResults: []apixv1.JSON{{Raw: []byte(`{"assertion":"NetworkDegraded"}`)}},
+		Spec:       attacknetv1beta1.FaultCampaignSpec{NetworkRef: "network"},
+		Status: attacknetv1beta1.FaultCampaignStatus{
+			Stages: []attacknetv1beta1.FaultStageStatus{{ID: "stage-1", EffectResults: []apixv1.JSON{{Raw: []byte(`{"assertion":"NetworkDegraded"}`)}}}},
 		},
 	}
 	registry := prometheus.NewPedanticRegistry()

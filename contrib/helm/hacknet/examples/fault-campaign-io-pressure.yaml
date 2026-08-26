@@ -1,0 +1,39 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: pressure-follower-disk
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 3000
+    maxUnavailableMinerBasisPoints: 5000
+    maxConcurrentFaults: 1
+  stages:
+    - id: disk-pressure
+      faults:
+        - id: follower-pressure
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: io-pressure
+            action: disk-pressure
+            mode: all
+            duration: 45s
+            parameters:
+              containerNames: [actor]
+              severity: low
+              workers: 1
+              bytesMiB: 32
+              writeSizeKiB: 256
+              minimumLatencyMultiplier: 2
+              minimumAddedLatencyMs: 5
+          effectAssertions:
+            - type: IOPressureObserved
+              actor: follower-1
+              timeoutSeconds: 90
+          recoveryAssertions:
+            - type: IOPressureRecovered
+              actor: follower-1
+              timeoutSeconds: 300

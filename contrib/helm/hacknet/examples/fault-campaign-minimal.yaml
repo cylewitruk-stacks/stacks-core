@@ -1,0 +1,31 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: minimal-follower-restart
+spec:
+  networkRef: minimal
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+  stages:
+    - id: restart-follower
+      faults:
+        - id: kill-follower
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: pod
+            action: pod-kill
+            mode: one
+            duration: 1s
+            parameters: {}
+          effectAssertions:
+            - type: PodRestarted
+              actor: follower-1
+              timeoutSeconds: 120
+          recoveryAssertions:
+            - type: TargetReady
+              actor: follower-1
+              timeoutSeconds: 300

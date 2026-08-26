@@ -40,17 +40,20 @@ test('installs CRDs before Helm and rolls Pods on exact local image IDs', () => 
   const result = run(item);
   assert.equal(result.status, 0, result.stderr);
   const calls = readFileSync(item.log, 'utf8').trim().split('\n');
+  const annotate = calls.findIndex(line => line.startsWith('kubectl annotate namespace hacknet-system chaos-mesh.org/inject=enabled --overwrite'));
   const apply = calls.findIndex(line => line.startsWith('kubectl apply'));
   const wait = calls.findIndex(line => line.startsWith('kubectl wait'));
   const upgrade = calls.findIndex(line => line.startsWith('helm upgrade'));
-  assert.ok(apply >= 0 && wait > apply && upgrade > wait);
+  assert.ok(annotate >= 0 && apply > annotate && wait > apply && upgrade > wait);
   assert.match(calls[upgrade], new RegExp(`operator\\.podAnnotations\\.attacknet-build=${digest}`));
   assert.match(calls[upgrade], new RegExp(`runOperator\\.podAnnotations\\.attacknet-build=${digest}`));
   assert.match(calls.join('\n'), /docker image tag stacks-hacknet-operator:dev stacks-hacknet-operator:local-a{16}/);
   assert.match(calls.join('\n'), /docker image tag stacks-hacknet-run-operator:dev stacks-hacknet-run-operator:local-a{16}/);
+  assert.match(calls.join('\n'), /docker image tag stacks-hacknet-burnchain-clock:dev stacks-hacknet-burnchain-clock:local-a{16}/);
   assert.match(calls.join('\n'), /docker image tag stacks-hacknet-io-pressure:dev stacks-hacknet-io-pressure:local-a{16}/);
   assert.match(calls[upgrade], /operator\.image\.tag=local-a{16}/);
   assert.match(calls[upgrade], /runOperator\.image\.tag=local-a{16}/);
+  assert.match(calls[upgrade], /burnchainClock\.image\.tag=local-a{16}/);
   assert.match(calls[upgrade], /runOperator\.ioPressureImage\.tag=local-a{16}/);
   assert.match(calls[upgrade], /--rollback-on-failure/);
   assert.doesNotMatch(calls[upgrade], /--atomic/);
@@ -117,4 +120,17 @@ test('invalid kind image loading mode fails before CRD or Helm mutation', () => 
   assert.equal(result.status, 2);
   const calls = readFileSync(item.log, 'utf8');
   assert.doesNotMatch(calls, /kubectl |helm /);
+});
+
+test('namespace fault injection requires an explicit valid installer policy', () => {
+  const disabled = fixture();
+  const allowed = run(disabled, {HACKNET_CHAOS_NAMESPACE_INJECTION: 'disabled'});
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.doesNotMatch(readFileSync(disabled.log, 'utf8'), /chaos-mesh.org\/inject=enabled/);
+
+  const invalid = fixture();
+  const rejected = run(invalid, {HACKNET_CHAOS_NAMESPACE_INJECTION: 'sometimes'});
+  assert.equal(rejected.status, 2);
+  assert.match(rejected.stderr, /must be enabled or disabled/);
+  assert.doesNotMatch(readFileSync(invalid.log, 'utf8'), /kubectl |helm upgrade/);
 });

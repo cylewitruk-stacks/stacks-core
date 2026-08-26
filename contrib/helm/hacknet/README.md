@@ -16,21 +16,24 @@ teardown.
 
 Use this document when you need to install or operate the Hacknet controllers,
 submit custom resources directly, or develop the chart. Raw helper scripts and
-custom-resource layouts are lower-level interfaces; the versioned
-`contrib/attacknet/attacknet` facade remains the Release 1 automation boundary.
+custom-resource layouts are lower-level interfaces; the typed Go `attacknet`
+client is the Release 1 automation boundary.
 
 ## What the chart installs
 
-Hacknet installs two namespaced controllers with separate service accounts:
+Hacknet installs two namespaced controller managers with separate service
+accounts:
 
 - the topology operator reconciles `StacksNetwork` resources into ConfigMaps,
-  Services, StatefulSets, PVCs, and optional telemetry/probe sidecars;
+  Services, StatefulSets, PVCs, and optional telemetry/probe sidecars, and
+  reconciles `BurnchainPolicy` resources into externally steerable clock
+  workloads;
 - the run operator reconciles `FaultCampaign` and `AttacknetRun` resources and
   has narrowly scoped permissions for supported Chaos Mesh resources; and
 - both controllers expose health and Prometheus endpoints through namespaced
   Services.
 
-The local installer applies all three CRDs before running Helm so an existing
+The local installer applies all four CRDs before running Helm so an existing
 installation receives schema updates. Helm intentionally leaves those CRDs
 installed when the release is removed.
 
@@ -38,7 +41,7 @@ Hacknet does **not** install or configure:
 
 - Docker Desktop or Kubernetes;
 - Chaos Mesh;
-- host tools such as Helm, `kubectl`, Node.js, Python, or `jq`;
+- host tools such as Helm, `kubectl`, Docker, or Go;
 - Stacks actor images; or
 - the per-network Prometheus, Grafana, Loki, Alloy, and event-bridge stack.
 
@@ -62,9 +65,6 @@ From the repository root, the local workflow requires:
 | Kubernetes | Docker Desktop `kind`; one control plane and two workers for the accepted profile |
 | Helm | Major version 3 or 4 |
 | `kubectl` | Within one minor version of the Kubernetes server |
-| `jq` | Available on the host for installer and evidence helpers |
-| Node.js | 20 or newer |
-| Python | 3.11 or newer |
 | Go | 1.26 for controller development and local source builds |
 | Metrics API | `metrics.k8s.io/v1beta1` reachable for capacity checks |
 | Storage | One default StorageClass; at least 8 GiB available per node for the full topology |
@@ -107,13 +107,24 @@ Every Chaos Mesh Pod must become Ready. Use the
 [official installation guide](https://chaos-mesh.org/docs/production-installation-using-helm/)
 when the cluster uses a different container runtime.
 
+The supported installation enables Chaos Mesh namespace filtering. The local
+installer annotates its release namespace with
+`chaos-mesh.org/inject=enabled`; without that annotation Chaos Mesh accepts a
+fault resource but selects no Pods. Set
+`attacknet install local --chaos-injection disabled` only for a control plane
+that must never inject native Chaos Mesh faults.
+
 ### 3. Build local images
 
-Build the topology operator, run operator, active probe, I/O-pressure helper,
-and the current Stacks node/signer image:
+Build the typed client, control-plane images, active probe, I/O-pressure helper,
+stacker client, and the current Stacks node/signer image:
 
 ```bash
-BUILD_STACKS_IMAGE=1 contrib/helm/hacknet/scripts/build-local.sh
+(cd contrib/helm/hacknet/operator && \
+  go build -o /tmp/stacks-attacknet ./cmd/attacknet)
+ATTACKNET=/tmp/stacks-attacknet
+
+$ATTACKNET image build --repo-root "$(pwd)" --stacks
 ```
 
 A cold Stacks image build can take tens of minutes. Its Dockerfile uses Cargo
@@ -122,10 +133,15 @@ Chef and BuildKit cache mounts for subsequent revisions.
 ### 4. Install Hacknet
 
 ```bash
-contrib/helm/hacknet/scripts/install-local.sh
+$ATTACKNET install local \
+  --chart-dir contrib/helm/hacknet \
+  --namespace hacknet-system \
+  --release hacknet \
+  --kind-image-load require
 kubectl get deployments -n hacknet-system
 kubectl get crd \
   stacksnetworks.testing.stacks.org \
+  burnchainpolicies.testing.stacks.org \
   faultcampaigns.testing.stacks.org \
   attacknetruns.testing.stacks.org
 ```
@@ -133,72 +149,38 @@ kubectl get crd \
 Both controller Deployments must become Available. The installer:
 
 - assigns content-derived tags to the local chart-managed images;
-- imports those exact images into every Docker Desktop `kind` node;
-- server-side applies and waits for all three CRDs; and
+- replaces stale mutable tags, imports the selected platform into every Docker
+  Desktop `kind` node, and verifies its CRI runtime image ID;
+- server-side applies and waits for all four CRDs; and
 - performs an atomic Helm upgrade with rollback on failure.
 
-Set `HACKNET_KIND_IMAGE_LOAD=require` to reject a cluster that is not entirely
-Docker-backed `kind`. Use `disabled` only when a registry or external image
-loader already provides immutable references.
+Use `--kind-image-load disabled` only when a registry or external image loader
+already provides immutable references.
 
 ### 5. Run the compatibility doctor
 
 ```bash
-contrib/attacknet/attacknet doctor
+$ATTACKNET doctor
 ```
 
-Do not begin an acceptance or baseline run until it reports `compatible`.
-Use `contrib/attacknet/attacknet doctor --json` for automation.
-
-## First controller smoke
-
-The image-independent smoke uses public BusyBox actors to exercise dependency
-gates, Services, StatefulSets, PVCs, status, and garbage collection:
-
-```bash
-kubectl apply \
-  --namespace hacknet-system \
-  --filename contrib/helm/hacknet/examples/operator-smoke.yaml
-
-kubectl get stacksnetworks,pods,pvc --namespace hacknet-system --watch
-```
-
-Wait until the resource is Ready, then stop the watch with Ctrl-C. In another
-terminal, inspect the reconciled resource:
-
-```bash
-kubectl describe stacksnetwork operator-smoke --namespace hacknet-system
-kubectl get stacksnetwork operator-smoke \
-  --namespace hacknet-system \
-  --output=jsonpath='{.status.phase}{"\n"}'
-```
-
-Success means the phase reaches `Ready` and both actors report ready in
-`.status.actors`. Remove the smoke and confirm its actor PVCs disappear:
-
-```bash
-kubectl delete stacksnetwork operator-smoke --namespace hacknet-system
-kubectl get statefulsets,services,configmaps,pvc \
-  --namespace hacknet-system \
-  --selector=testing.stacks.org/network=operator-smoke
-```
-
-The final query should return no owned resources after Kubernetes garbage
-collection completes.
+Do not begin a run until every v1beta1 API is available. Use
+`$ATTACKNET doctor --output json` for automation.
 
 ## First Stacks smoke
 
-`examples/minimal.yaml` starts Bitcoin Core, a separate burnchain clock, and a
-Stacks follower. Import the locally built Stacks image into every `kind` node
-before applying it:
+`examples/minimal.yaml` declares Bitcoin Core and a Stacks follower;
+`examples/minimal-burnchain-policy.yaml` controls bootstrap and cadence through
+a separate `BurnchainPolicy`. Import the locally built Stacks image into every
+`kind` node before applying both resources:
 
 ```bash
-contrib/helm/hacknet/scripts/load-kind-images.sh \
+$ATTACKNET image load --mode require \
   stacks-core-attacknet:main
 
-kubectl apply \
-  --namespace hacknet-system \
-  --filename contrib/helm/hacknet/examples/minimal.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/minimal-burnchain-policy.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/minimal.yaml
 
 kubectl get stacksnetworks,pods,pvc --namespace hacknet-system --watch
 ```
@@ -244,13 +226,15 @@ that resource's controller owner UID matches the current `StacksNetwork`.
 ### `StacksNetwork`
 
 `StacksNetwork` owns the system under test. Its controller has no Chaos Mesh
-permission. The resource contains global defaults and an explicit actor list;
-each actor can override its image, command, arguments, ports, resources,
-storage, probes, configuration, dependencies, labels, and telemetry settings.
+permission. The normal v1beta1 interface declares Bitcoin nodes, Stacks nodes,
+signer sets, signer enrollment, shared workload policy, telemetry, and probes.
+The operator derives deterministic names, ports, dependencies, and service
+relationships. `rawActors` and bounded `advanced` overrides are conspicuous
+escape hatches for non-standard adversarial workloads, not the normal path.
 
-Configuration has exactly one source:
+Each actor configuration has exactly one source:
 
-- `inline` for public, non-secret regtest configuration;
+- a versioned `generated` profile for routine Bitcoin and follower nodes;
 - `configMapRef` for externally managed configuration; or
 - `secretRef` for keys and tokens.
 
@@ -258,14 +242,27 @@ The operator cannot read Secrets. Kubernetes mounts a referenced Secret
 directly into the actor Pod. Prefer Secret-backed signer and miner
 configuration even in disposable environments.
 
-Configuration, command, argument, environment, and telemetry strings support:
+`spec.defaults.bootstrapPeers` supplies the initial P2P peers inherited by
+generated Stacks node profiles. A profile-local list overrides the shared
+default. Bootstrap configuration must be present before a node initializes its
+PeerDB; adding it after persistent chainstate exists does not retroactively
+make the peer initial.
 
-| Placeholder | Expansion |
-| --- | --- |
-| `${NETWORK}` | `StacksNetwork.metadata.name` |
-| `${NAMESPACE}` | resource namespace |
-| `${ACTOR}` | current actor name |
-| `${SERVICE:actor-name}` | generated Service name for the referenced actor |
+`spec.genesis` is the network-wide genesis contract for generated Stacks node
+profiles. It currently carries the PoX-5 sBTC contracts and bounded initial STX
+balances. Balances are rendered in deterministic address order. Complete node
+configs supplied through `configMapRef` or `secretRef` remain opaque to the
+operator and therefore must reproduce `spec.genesis` exactly; otherwise actors
+can exchange blocks successfully while rejecting them as belonging to another
+genesis chain.
+
+Complete Stacks node and signer configs may use `${SERVICE:actor-name}` for a
+logical actor Service. Stacks node configs may also use `__NODE_IP__`. A small
+immutable wrapper renders these tokens inside the actor Pod, writes the result
+to `/tmp/stacks-attacknet-config.toml`, and then replaces itself with the real
+binary. Unknown logical actors fail closed before startup. This gives
+Secret-backed and ConfigMap-backed configs the same deterministic naming as
+generated profiles without exposing their contents to the operator.
 
 Every actor Pod receives these non-overridable labels:
 
@@ -277,8 +274,8 @@ app.kubernetes.io/managed-by=hacknet-operator
 ```
 
 These labels are the supported selection surface for fault injection and
-evidence. The schema's legacy `companion` role identifies a configured signer
-node; new prose and user-facing names should call it a signer node.
+evidence. A signer's configured Stacks node is called a signer node throughout
+the v1beta1 API and examples.
 
 After every actor rollout is complete, `status.inventoryDigest` binds the
 current generation to the admitted StatefulSet UID/revision, Pod UID, requested
@@ -293,13 +290,27 @@ endpoint before its Pod is Ready. The default, `ready`, keeps bootstrap
 deterministic. This affects DNS discovery and new connections, not established
 sessions, and is not a runtime fault mechanism.
 
+### `BurnchainPolicy`
+
+`BurnchainPolicy` controls one selected Bitcoin actor without coupling Bitcoin
+Core to Stacks progress. It declares bootstrap height, steady cadence,
+pause/resume, destination rotation, bounded flash blocks, and bounded RPC retry.
+Its unprivileged clock process has no Kubernetes credentials and never exits
+Bitcoin Core on RPC failure. Bitcoin forks, partitions, and reconsideration are
+fault mechanisms rather than cadence policy.
+
+The referenced policy is a `StacksNetwork` readiness barrier. Actors are
+created before the policy becomes Ready to avoid a bootstrap cycle, but the
+network does not report Ready until the current policy generation is applied.
+
 ### `FaultCampaign`
 
 `FaultCampaign` is either an inert reusable template (`spec.template: true`) or
-one bounded execution. The run controller resolves exact admitted Pod
-identities and owns cleanup through a finalizer. It removes that finalizer once
-terminal cleanup is durably proven, so completed campaigns cannot strand a
-namespace after the controller itself is removed.
+one bounded graph of stages and fault actions. The fault controller resolves
+exact admitted Pod identities and owns cleanup through a finalizer. Actions in
+a stage are admitted against their aggregate safety impact. Stages can overlap
+using deterministic time, dependency, burn-height, Stacks-height, or trusted
+observation triggers.
 
 Admission snapshots the complete `StacksNetwork` inventory digest. Every later
 reconciliation compares the snapshot with both current status and live Pods.
@@ -314,20 +325,16 @@ Supported native Chaos Mesh resources are `PodChaos`, `NetworkChaos`,
 restricted I/O-pressure Pod from the chart-configured trusted image. Campaigns
 cannot supply that image, executable, shell, or arbitrary arguments.
 
-Apply direct examples only after the referenced network is Ready and the
-environment lease names that network. The public Attacknet lifecycle commands
-manage this lease automatically; direct Hacknet use must claim and release it
-explicitly:
+Apply examples only after the referenced network is Ready. The topology
+controller owns the environment lease and fault/run controllers own mutation
+leases; host processes never claim parallel mutation authority:
 
 ```bash
-KUBE_NAMESPACE=hacknet-system \
-  contrib/attacknet/environment-lock.sh claim attacknet operator fault-campaign
-kubectl apply --filename contrib/helm/hacknet/examples/fault-campaign.json
-kubectl apply --filename contrib/helm/hacknet/examples/fault-campaign-io-pressure.json
-kubectl get faultcampaigns --namespace hacknet-system --watch
-# After all campaigns are terminal with cleanup proven and the network is gone:
-KUBE_NAMESPACE=hacknet-system \
-  contrib/attacknet/environment-lock.sh release attacknet
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/fault-campaign.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/fault-campaign-io-pressure.yaml
+$ATTACKNET watch --namespace hacknet-system FaultCampaign network-partition
 ```
 
 A campaign created without the matching environment lease remains `Pending`
@@ -341,8 +348,14 @@ recovery observations, a campaign terminates `Inconclusive`, never `Passed`.
 
 `AttacknetRun` resolves a finite fault catalog before the first action. It pins
 template identity and generation, network identity and generation, admitted
-actor image digests, seeded decisions, and aggregate budgets in a sealed,
-owner-bound ConfigMap. It creates at most one owned campaign at a time.
+actor image digests, seeded decisions, triggers, dependencies, and aggregate
+budgets in a sealed, owner-bound ConfigMap. Eligible campaign children are
+created deterministically within those budgets. Run-owned campaign children
+share the immutable run UID as their mutation lease and may overlap within the
+run's active-fault and cumulative safety reservations. Standalone campaigns
+remain mutually exclusive. Use one multi-stage campaign when effects require a
+single aggregate admission decision; use overlapping run executions when each
+campaign is independently admitted and the run-level union budget is sufficient.
 
 The run also pins the complete admitted inventory. Unplanned divergence ends
 the run `Inconclusive` and prevents remaining actions from starting. A proven,
@@ -356,7 +369,7 @@ campaigns after the outcome is known and sets `status.finishedAt` only after
 each campaign has proved mutation cleanup and target recovery.
 
 ```bash
-kubectl apply --filename contrib/helm/hacknet/examples/attacknet-run.json
+kubectl apply --filename contrib/helm/hacknet/examples/attacknet-run.yaml
 kubectl get attacknetruns,faultcampaigns \
   --namespace hacknet-system \
   --watch
@@ -398,16 +411,9 @@ credential-free harness Services must be declared explicitly through bounded
 named ports. Attacknet's topology renderer uses this extension for its
 Prometheus endpoint; the generic default adds no Attacknet-specific peer.
 
-For a direct, locally authored `StacksNetwork` that enables probes, import the
-probe image before applying the resource:
-
-```bash
-contrib/helm/hacknet/scripts/load-kind-images.sh \
-  stacks-hacknet-probe:dev
-```
-
-The public Attacknet lifecycle resolves and transports its declared probe image
-as part of the rendered topology.
+The local installer content-tags and imports the chart-selected default probe
+image. A network that explicitly overrides `spec.probe.image` must load or
+publish that exact image separately.
 
 ## Architecture-specific fault boundaries
 
@@ -449,10 +455,10 @@ experiment controller.
 
 | Symptom | First action |
 | --- | --- |
-| Controller image is unavailable | Re-run `build-local.sh`, then `install-local.sh`; Docker Engine and `kind` node image stores are separate. |
-| CRD schema did not update | Inspect managed fields, then use `HACKNET_FORCE_CRD_CONFLICTS=1` once only when deliberately reclaiming ownership. |
-| Helm release is `failed` | Run `helm status hacknet -n hacknet-system`; set `HACKNET_RECOVER_FAILED_RELEASE=1` only after identifying the cause. |
-| Upgrade reports a managed-field conflict | Do not use `kubectl set image`; inspect ownership before considering `HACKNET_FORCE_CONFLICTS=1`. |
+| Controller image is unavailable | Re-run `attacknet image build`, then `attacknet install local`; Docker Engine and `kind` node image stores are separate. |
+| CRD schema did not update | Inspect managed fields, then use `--force-crd-conflicts` once only when deliberately reclaiming ownership. |
+| Helm release is `failed` | Run `helm status hacknet -n hacknet-system`; use `--recover-failed-release` only after identifying the cause. |
+| Upgrade reports a managed-field conflict | Do not use `kubectl set image`; inspect ownership before considering `--force-helm-conflicts`. |
 | New same-named network is `Degraded` | Wait for old-UID garbage collection; if it persists, inspect finalizers and garbage-collector health. Never adopt old children. |
 | Actor Pod remains Pending after node disruption | Inspect PVC node affinity and placement. Local-path storage does not prove cross-node reattachment. |
 | Fault remains `Inconclusive` | Inspect probe availability and effect evidence; Chaos Mesh injection conditions alone are insufficient. |

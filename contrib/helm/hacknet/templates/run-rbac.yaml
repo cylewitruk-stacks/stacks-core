@@ -9,14 +9,14 @@ metadata:
     app.kubernetes.io/component: run-operator
 rules:
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks"]
+    resources: ["stacksnetworks", "burnchainpolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["testing.stacks.org"]
     resources: ["faultcampaigns"]
-    verbs: ["get", "list", "watch", "create", "patch"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: ["testing.stacks.org"]
     resources: ["attacknetruns"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["testing.stacks.org"]
     resources: ["faultcampaigns/status", "attacknetruns/status"]
     verbs: ["get", "patch"]

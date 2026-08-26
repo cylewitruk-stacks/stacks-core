@@ -11,7 +11,7 @@ import (
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
+	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
 
 const evidenceSource = "orchestrator_observed"
@@ -65,8 +65,8 @@ func (c *Collector) Collect(output chan<- prometheus.Metric) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	campaigns := &attacknetv1alpha1.FaultCampaignList{}
-	runs := &attacknetv1alpha1.AttacknetRunList{}
+	campaigns := &attacknetv1beta1.FaultCampaignList{}
+	runs := &attacknetv1beta1.AttacknetRunList{}
 	if err := c.Reader.List(ctx, campaigns); err != nil {
 		output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, 0)
 		return
@@ -85,28 +85,46 @@ func (c *Collector) Collect(output chan<- prometheus.Metric) {
 	output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, boolFloat(success))
 }
 
-func (c *Collector) collectCampaign(output chan<- prometheus.Metric, campaign *attacknetv1alpha1.FaultCampaign) bool {
+func (c *Collector) collectCampaign(output chan<- prometheus.Metric, campaign *attacknetv1beta1.FaultCampaign) bool {
 	phase := campaign.Status.Phase
 	if phase == "" {
 		phase = "Pending"
 	}
 	output <- prometheus.MustNewConstMetric(c.campaignInfo, prometheus.GaugeValue, 1,
-		evidenceSource, campaign.Spec.NetworkRef, campaign.Name, campaign.Spec.Fault.Type, phase,
+		evidenceSource, campaign.Spec.NetworkRef, campaign.Name, "multi-stage", phase,
 		campaign.Status.Reason, strconv.FormatBool(campaign.Spec.Template))
-	for _, target := range campaign.Status.ResolvedTargets {
-		output <- prometheus.MustNewConstMetric(c.campaignTarget, prometheus.GaugeValue, 1,
-			evidenceSource, campaign.Spec.NetworkRef, campaign.Name, target.Actor, target.Role, target.Node)
+	valid := true
+	seenTargets := map[string]bool{}
+	for _, stage := range campaign.Status.Stages {
+		for _, action := range stage.Actions {
+			for _, target := range action.ResolvedTargets {
+				key := target.Actor + "\x00" + target.PodUID
+				if seenTargets[key] {
+					continue
+				}
+				seenTargets[key] = true
+				output <- prometheus.MustNewConstMetric(c.campaignTarget, prometheus.GaugeValue, 1,
+					evidenceSource, campaign.Spec.NetworkRef, campaign.Name, target.Actor, target.Role, target.Node)
+			}
+			valid = c.collectAssertionResults(output, campaign, action.EffectResults) && valid
+			valid = c.collectAssertionResults(output, campaign, action.RecoveryResults) && valid
+		}
+		valid = c.collectAssertionResults(output, campaign, stage.EffectResults) && valid
+		valid = c.collectAssertionResults(output, campaign, stage.RecoveryResults) && valid
 	}
-	effects, effectsValid := decodeResults(campaign.Status.EffectResults)
-	recoveries, recoveriesValid := decodeResults(campaign.Status.RecoveryResults)
-	for _, raw := range append(effects, recoveries...) {
-		output <- prometheus.MustNewConstMetric(c.assertionOutcome, prometheus.GaugeValue, 1,
-			evidenceSource, campaign.Spec.NetworkRef, campaign.Name, raw.Actor, raw.Assertion, raw.Outcome)
-	}
-	return effectsValid && recoveriesValid
+	return valid
 }
 
-func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1alpha1.AttacknetRun) {
+func (c *Collector) collectAssertionResults(output chan<- prometheus.Metric, campaign *attacknetv1beta1.FaultCampaign, values []apixv1.JSON) bool {
+	results, valid := decodeResults(values)
+	for _, result := range results {
+		output <- prometheus.MustNewConstMetric(c.assertionOutcome, prometheus.GaugeValue, 1,
+			evidenceSource, campaign.Spec.NetworkRef, campaign.Name, result.Actor, result.Assertion, result.Outcome)
+	}
+	return valid
+}
+
+func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1beta1.AttacknetRun) {
 	phase := run.Status.Phase
 	if phase == "" {
 		phase = "Pending"
@@ -132,9 +150,10 @@ func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1
 			{"campaignsStarted", float64(usage.CampaignsStarted)},
 			{"campaignsCompleted", float64(usage.CampaignsCompleted)},
 			{"activeFaults", float64(usage.ActiveFaults)},
-			{"wallTimeSeconds", usage.WallTimeSeconds},
-			{"cumulativeFaultSeconds", usage.CumulativeFaultSeconds},
-			{"maximumSignerImpactPercent", usage.MaximumSignerImpactPercent},
+			{"activeCampaigns", float64(usage.ActiveCampaigns)},
+			{"wallTimeSeconds", float64(usage.WallTimeMillis) / 1000},
+			{"cumulativeFaultSeconds", float64(usage.CumulativeFaultMillis) / 1000},
+			{"maximumSignerImpactPercent", float64(usage.MaximumSignerImpactBasisPoints) / 100},
 			{"burnchainFaults", float64(usage.BurnchainFaults)},
 			{"inconclusiveCampaigns", float64(usage.InconclusiveCampaigns)},
 			{"minimizationAttempts", float64(usage.MinimizationAttempts)},

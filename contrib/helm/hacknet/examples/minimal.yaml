@@ -1,182 +1,36 @@
-apiVersion: testing.stacks.org/v1alpha1
+apiVersion: testing.stacks.org/v1beta1
 kind: StacksNetwork
 metadata:
   name: minimal
 spec:
+  probe:
+    enabled: true
   defaults:
     nodeImage: stacks-core-attacknet:main
-    # Docker Desktop kind resolves locally-built images through its internal
-    # registry mirror, which requires a pull-capable policy.
+    signerImage: stacks-core-attacknet:main
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
     imagePullPolicy: IfNotPresent
-    storage:
-      enabled: true
-      size: 1Gi
-  telemetry:
-    enabled: false
-  actors:
-    - name: bitcoin
-      role: burnchain
-      image: bitcoin/bitcoin:25.2
-      imagePullPolicy: IfNotPresent
-      command: [bitcoind]
-      args: [-conf=/etc/stacks/bitcoin.conf, -datadir=/data, -nosettings]
-      config:
-        key: bitcoin.conf
-        inline: |
-          regtest=1
-          printtoconsole=1
-          server=1
-          txindex=1
-          discover=0
-          dns=0
-          dnsseed=0
-          listenonion=0
-          fallbackfee=0.00001
-
-          [regtest]
-          rpcbind=0.0.0.0:18443
-          rpcallowip=0.0.0.0/0
-          rpcuser=devnet
-          rpcpassword=devnet
+    workload:
       storage:
-        size: 2Gi
-
-    # A separate helper owns burn-block cadence. It is deliberately a separate
-    # failure domain from Bitcoin Core and every Stacks actor.
-    - name: bitcoin-miner
-      role: infrastructure
-      image: bitcoin/bitcoin:25.2
-      imagePullPolicy: IfNotPresent
-      command: [sh, /scripts/mine.sh]
-      config:
-        key: mine.sh
-        mountPath: /scripts
-        inline: |
-          #!/bin/sh
-          set -eu
-          bitcoin_cli="bitcoin-cli -regtest -rpcconnect=${SERVICE:bitcoin} -rpcport=18443 -rpcuser=devnet -rpcpassword=devnet"
-          until $bitcoin_cli getblockchaininfo >/dev/null 2>&1; do sleep 1; done
-          $bitcoin_cli createwallet hacknet-faucet >/dev/null 2>&1 || true
-          address="$($bitcoin_cli -rpcwallet=hacknet-faucet getnewaddress)"
-          height="$($bitcoin_cli getblockcount)"
-          if [ "$height" -lt 202 ]; then
-            $bitcoin_cli generatetoaddress "$((202 - height))" "$address" >/dev/null
-          fi
-          # Dependencies need a service_healthy-style milestone, not merely an
-          # open Bitcoin RPC socket. Perl is already present in this image.
-          perl -MIO::Socket::INET -e '
-            my $listener = IO::Socket::INET->new(LocalPort => 18500, Listen => 5, Reuse => 1) or die $!;
-            while (my $client = $listener->accept()) {
-              print $client "ready\n";
-              close $client;
-            }
-          ' &
-          while true; do
-            $bitcoin_cli generatetoaddress 1 "$address" >/dev/null
-            # This is a deployment smoke, not a cadence calibration run. Reach
-            # the configured Nakamoto epochs promptly for local/CI feedback.
-            sleep 5
-          done
-      dependencies:
-        - actor: bitcoin
-          port: 18443
-      ports:
-        - name: bootstrap
-          containerPort: 18500
-      readinessProbe:
-        tcpSocket:
-          port: bootstrap
-        periodSeconds: 2
-      storage:
-        enabled: false
-
-    # This first smoke resource runs current main's production transport, not
-    # the optional libp2p prototype, against the advancing burnchain.
+        enabled: true
+        size: 1Gi
+  burnchain:
+    policyRef:
+      name: minimal
+    nodes:
+      - name: bitcoin
+        config:
+          generated:
+            profile: bitcoin-regtest/v1
+        workload:
+          storage:
+            enabled: true
+            size: 2Gi
+  nodes:
     - name: follower-1
       role: follower
+      burnchainNodeRef: bitcoin
       config:
-        inline: |
-          [node]
-          name = "hacknet-${ACTOR}"
-          rpc_bind = "0.0.0.0:20443"
-          p2p_bind = "0.0.0.0:20444"
-          data_url = "http://127.0.0.1:20443"
-          p2p_address = "127.0.0.1:20444"
-          prometheus_bind = "0.0.0.0:20446"
-          working_dir = "/data/node"
-          seed = "3131313131313131313131313131313131313131313131313131313131313131"
-          local_peer_seed = "3131313131313131313131313131313131313131313131313131313131313131"
-          miner = false
-          stacker = false
-          use_test_genesis_chainstate = true
-          wait_time_for_blocks = 0
-          wait_time_for_microblocks = 0
-          mine_microblocks = false
-
-          [connection_options]
-          public_ip_address = "127.0.0.1:20444"
-          auth_token = "12345"
-
-          [burnchain]
-          chain = "bitcoin"
-          mode = "nakamoto-neon"
-          poll_time_secs = 1
-          magic_bytes = "T3"
-          pox_prepare_length = 5
-          pox_reward_length = 20
-          burn_fee_cap = 20000
-          peer_host = "${SERVICE:bitcoin}"
-          peer_port = 18444
-          rpc_port = 18443
-          rpc_ssl = false
-          username = "devnet"
-          password = "devnet"
-          timeout = 30
-
-          [[burnchain.epochs]]
-          epoch_name = "1.0"
-          start_height = 0
-          [[burnchain.epochs]]
-          epoch_name = "2.0"
-          start_height = 0
-          [[burnchain.epochs]]
-          epoch_name = "2.05"
-          start_height = 203
-          [[burnchain.epochs]]
-          epoch_name = "2.1"
-          start_height = 204
-          [[burnchain.epochs]]
-          epoch_name = "2.2"
-          start_height = 206
-          [[burnchain.epochs]]
-          epoch_name = "2.3"
-          start_height = 207
-          [[burnchain.epochs]]
-          epoch_name = "2.4"
-          start_height = 208
-          [[burnchain.epochs]]
-          epoch_name = "2.5"
-          start_height = 209
-          [[burnchain.epochs]]
-          epoch_name = "3.0"
-          start_height = 223
-          [[burnchain.epochs]]
-          epoch_name = "3.1"
-          start_height = 224
-          [[burnchain.epochs]]
-          epoch_name = "3.2"
-          start_height = 225
-          [[burnchain.epochs]]
-          epoch_name = "3.3"
-          start_height = 226
-          [[burnchain.epochs]]
-          epoch_name = "3.4"
-          start_height = 227
-          [[burnchain.epochs]]
-          epoch_name = "4.0"
-          start_height = 245
-      dependencies:
-        - actor: bitcoin
-          port: 18443
-        - actor: bitcoin-miner
-          port: 18500
+        generated:
+          profile: nakamoto-regtest-node/v1

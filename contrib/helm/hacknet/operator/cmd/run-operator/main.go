@@ -12,7 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
+	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	manageroptions "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/manager"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/orchestratormetrics"
@@ -32,19 +32,23 @@ func main() {
 	scheme := runtime.NewScheme()
 	must(clientgoscheme.AddToScheme(scheme))
 	must(corev1.AddToScheme(scheme))
-	must(attacknetv1alpha1.AddToScheme(scheme))
+	must(attacknetv1beta1.AddToScheme(scheme))
 	mgr, err := options.New(scheme, "run-operator.testing.stacks.org")
 	must(err)
-	faults := &fault.Reconciler{
+	compilationCache, err := fault.NewCompilationCache(128)
+	must(err)
+	faults := &fault.V1Beta1Reconciler{
 		Client:                 mgr.GetClient(),
 		APIReader:              mgr.GetAPIReader(),
 		Scheme:                 mgr.GetScheme(),
+		Observations:           &fault.KubernetesTriggerObservationReader{Reader: mgr.GetAPIReader()},
 		IOPressureImage:        *ioPressureImage,
 		IOPressurePull:         corev1.PullPolicy(*ioPressurePull),
 		IOChaosArchitectures:   stringSet(*ioArchitectures),
 		TimeChaosArchitectures: stringSet(*timeArchitectures),
+		CompilationCache:       compilationCache,
 	}
-	runs := &runcontroller.Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme()}
+	runs := &runcontroller.V1Beta1Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme()}
 	controllermetrics.Registry.MustRegister(orchestratormetrics.NewCollector(mgr.GetClient()))
 	must(faults.SetupWithManager(mgr, options.Concurrency))
 	must(runs.SetupWithManager(mgr, options.Concurrency))

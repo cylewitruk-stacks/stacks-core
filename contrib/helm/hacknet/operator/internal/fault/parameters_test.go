@@ -29,6 +29,7 @@ func TestParameterValidationRejectsUnboundedOrAmbiguousFaults(t *testing.T) {
 		{name: "unsupported IO latency unit", kind: "io", action: "latency", parameters: map[string]any{"volumePath": "/data", "delay": "10us"}},
 		{name: "negative network latency", kind: "network", action: "delay", parameters: map[string]any{"delay": map[string]any{"latency": "-10ms"}}},
 		{name: "unsupported DNS field", kind: "dns", action: "error", parameters: map[string]any{"patterns": []any{"*.invalid"}, "server": "1.1.1.1"}},
+		{name: "DNS wildcard not at end", kind: "dns", action: "error", parameters: map[string]any{"patterns": []any{"*minimal-bitcoin*"}}},
 		{name: "oversized application clock offset", kind: "clock-skew", parameters: map[string]any{"timeOffset": "+25h"}},
 	}
 	for _, test := range tests {

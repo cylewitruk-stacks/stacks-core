@@ -1,0 +1,38 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: follower-1-application-clock-skew
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 3000
+    maxUnavailableMinerBasisPoints: 5000
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: skew-clock
+      faults:
+        - id: follower-clock
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: clock-skew
+            mode: all
+            duration: 20s
+            parameters:
+              timeOffset: -30s
+              clockIds: [CLOCK_REALTIME]
+              containerNames: [actor]
+  effectAssertions:
+    - type: ClockSkewObserved
+      timeoutSeconds: 90
+  recoveryAssertions:
+    - type: ClockSkewCleared
+      timeoutSeconds: 180

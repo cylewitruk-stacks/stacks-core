@@ -1,406 +1,882 @@
-{
-  "apiVersion": "apiextensions.k8s.io/v1",
-  "kind": "CustomResourceDefinition",
-  "metadata": {
-    "name": "faultcampaigns.testing.stacks.org",
-    "labels": {"app.kubernetes.io/name": "hacknet"}
-  },
-  "spec": {
-    "group": "testing.stacks.org",
-    "scope": "Namespaced",
-    "names": {
-      "plural": "faultcampaigns",
-      "singular": "faultcampaign",
-      "kind": "FaultCampaign",
-      "shortNames": ["fcampaign", "fcamp"],
-      "categories": ["all"]
-    },
-    "versions": [{
-      "name": "v1alpha1",
-      "served": true,
-      "storage": true,
-      "additionalPrinterColumns": [
-        {"name": "Phase", "type": "string", "jsonPath": ".status.phase"},
-        {"name": "Network", "type": "string", "jsonPath": ".spec.networkRef"},
-        {"name": "Fault", "type": "string", "jsonPath": ".spec.fault.type"},
-        {"name": "Targets", "type": "integer", "jsonPath": ".status.resolvedTargetCount"},
-        {"name": "Evidence", "type": "string", "jsonPath": ".status.evidenceURI", "priority": 1},
-        {"name": "Age", "type": "date", "jsonPath": ".metadata.creationTimestamp"}
-      ],
-      "subresources": {"status": {}},
-      "schema": {
-        "openAPIV3Schema": {
-          "type": "object",
-          "description": "A bounded, disposable fault experiment against one StacksNetwork. Controllers should add a finalizer before injection and remove it only after recovery is observed.",
-          "required": ["spec"],
-          "properties": {
-            "apiVersion": {"type": "string"},
-            "kind": {"type": "string"},
-            "metadata": {"type": "object"},
-            "spec": {
-              "type": "object",
-              "required": ["networkRef", "target", "fault", "safety"],
-              "properties": {
-                "template": {
-                  "type": "boolean",
-                  "default": false,
-                  "description": "When true, validate but do not inject this campaign; an AttacknetRun may snapshot it into an owned execution child."
-                },
-                "networkRef": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 63,
-                  "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-                },
-                "target": {
-                  "type": "object",
-                  "properties": {
-                    "actors": {
-                      "type": "array",
-                      "minItems": 1,
-                      "maxItems": 20,
-                      "items": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"}
-                    },
-                    "roles": {
-                      "type": "array",
-                      "minItems": 1,
-                      "maxItems": 7,
-                      "items": {"type": "string", "enum": ["burnchain", "miner", "signer", "companion", "follower", "adversary", "infrastructure"]}
-                    }
-                  },
-                  "x-kubernetes-validations": [{
-                    "rule": "has(self.actors) || has(self.roles)",
-                    "message": "target requires at least one actor or role selector"
-                  }]
-                },
-                "fault": {
-                  "type": "object",
-                  "required": ["type", "mode", "duration", "parameters"],
-                  "properties": {
-                    "type": {"type": "string", "enum": ["pod", "network", "dns", "io", "io-pressure", "time", "clock-skew"]},
-                    "action": {
-                      "type": "string",
-                      "enum": ["pod-kill", "pod-failure", "container-kill", "netem", "delay", "loss", "duplicate", "corrupt", "partition", "bandwidth", "error", "random", "latency", "fault", "attrOverride", "mistake", "disk-pressure"]
-                    },
-                    "mode": {"type": "string", "enum": ["one", "all", "fixed", "fixed-percent", "random-max-percent"]},
-                    "value": {
-                      "x-kubernetes-int-or-string": true,
-                      "anyOf": [
-                        {"type": "integer"},
-                        {"type": "string"}
-                      ]
-                    },
-                    "duration": {"type": "string", "pattern": "^[0-9]+(ms|s|m|h)$", "maxLength": 16},
-                    "parameters": {
-                      "type": "object",
-                      "properties": {
-                        "containerNames": {"type": "array", "minItems": 1, "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 63}},
-                        "gracePeriod": {"type": "integer", "minimum": 0, "maximum": 3600},
-                        "direction": {"type": "string", "enum": ["to", "from", "both"]},
-                        "targetDevice": {"type": "string", "minLength": 1, "maxLength": 63},
-                        "device": {"type": "string", "minLength": 1, "maxLength": 63},
-                        "target": {
-                          "type": "object",
-                          "required": ["mode", "selector"],
-                          "properties": {
-                            "mode": {"type": "string", "enum": ["one", "all", "fixed", "fixed-percent", "random-max-percent"]},
-                            "value": {
-                              "x-kubernetes-int-or-string": true,
-                              "anyOf": [
-                                {"type": "integer"},
-                                {"type": "string"}
-                              ]
-                            },
-                            "selector": {
-                              "type": "object",
-                              "properties": {
-                                "namespaces": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 63}},
-                                "labelSelectors": {"type": "object", "maxProperties": 32, "additionalProperties": {"type": "string", "maxLength": 253}},
-                                "annotationSelectors": {"type": "object", "maxProperties": 32, "additionalProperties": {"type": "string", "maxLength": 253}},
-                                "fieldSelectors": {"type": "object", "maxProperties": 32, "additionalProperties": {"type": "string", "maxLength": 253}},
-                                "podPhaseSelectors": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 32}},
-                                "nodes": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 253}},
-                                "expressionSelectors": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "object", "required": ["key", "operator", "values"], "properties": {
-                                  "key": {"type": "string", "minLength": 1, "maxLength": 253},
-                                  "operator": {"type": "string", "enum": ["In", "NotIn", "Exists", "DoesNotExist"]},
-                                  "values": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "minLength": 1, "maxLength": 40}}
-                                }}
-                              }
-                            }
-                          }
-                        }},
-                        "peerTarget": {
-                          "type": "object",
-                          "properties": {
-                            "actors": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"type": "string", "minLength": 1, "maxLength": 40}},
-                            "roles": {"type": "array", "minItems": 1, "maxItems": 7, "items": {"type": "string", "maxLength": 63}},
-                            "mode": {"type": "string", "enum": ["one", "all", "fixed", "fixed-percent", "random-max-percent"]},
-                            "value": {
-                              "x-kubernetes-int-or-string": true,
-                              "anyOf": [{"type": "integer"}, {"type": "string"}]
-                            }
-                          },
-                          "x-kubernetes-validations": [{"rule": "has(self.actors) || has(self.roles)", "message": "peerTarget requires at least one actor or role selector"}]
-                        },
-                        "harnessTarget": {"type": "string", "enum": ["prometheus"]},
-                        "delay": {
-                          "description": "Chaos Mesh Delay object for network faults, or duration string for IOChaos latency. The compiler performs the action-dependent type check.",
-                          "x-kubernetes-preserve-unknown-fields": true
-                        },
-                        "loss": {
-                          "type": "object",
-                          "required": ["loss"],
-                          "properties": {"loss": {"type": "string", "pattern": "^([0-9]|[1-9][0-9]|100)(\\.[0-9]+)?$", "maxLength": 16}, "correlation": {"type": "string", "pattern": "^([0-9]|[1-9][0-9]|100)(\\.[0-9]+)?$", "maxLength": 16}}
-                        },
-                        "duplicate": {
-                          "type": "object",
-                          "required": ["duplicate"],
-                          "properties": {"duplicate": {"type": "string", "pattern": "^([0-9]|[1-9][0-9]|100)(\\.[0-9]+)?$", "maxLength": 16}, "correlation": {"type": "string", "pattern": "^([0-9]|[1-9][0-9]|100)(\\.[0-9]+)?$", "maxLength": 16}}
-                        },
-                        "corrupt": {
-                          "type": "object",
-                          "required": ["corrupt"],
-                          "properties": {"corrupt": {"type": "string", "pattern": "^([0-9]|[1-9][0-9]|100)(\\.[0-9]+)?$", "maxLength": 16}, "correlation": {"type": "string", "pattern": "^([0-9]|[1-9][0-9]|100)(\\.[0-9]+)?$", "maxLength": 16}}
-                        },
-                        "bandwidth": {
-                          "type": "object",
-                          "required": ["rate"],
-                          "properties": {
-                            "rate": {"type": "string", "minLength": 1, "maxLength": 64},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 2147483647},
-                            "buffer": {"type": "integer", "minimum": 1, "maximum": 2147483647},
-                            "peakrate": {"type": "string", "minLength": 1, "maxLength": 64},
-                            "minburst": {"type": "integer", "minimum": 0, "maximum": 2147483647}
-                          }
-                        },
-                        "externalTargets": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 253}},
-                        "patterns": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 253}},
-                        "volumePath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^/"},
-                        "path": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^/"},
-                        "methods": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "enum": ["READ", "WRITE", "FLUSH", "FSYNC", "FDATASYNC", "READDIR", "SYNC", "OPEN", "MKDIR", "MKNOD", "CHOWN", "CHMOD", "UTIMES", "LINK", "UNLINK", "RENAME"]}},
-                        "errno": {"type": "integer", "minimum": 1, "maximum": 4095},
-                        "percent": {"type": "integer", "minimum": 1, "maximum": 100},
-                        "mistake": {
-                          "type": "object",
-                          "properties": {
-                            "filling": {"type": "string", "enum": ["zero", "random"]},
-                            "maxOccurrences": {"type": "integer", "minimum": 1, "maximum": 1000000},
-                            "maxLength": {"type": "integer", "minimum": 1, "maximum": 1073741824}
-                          }
-                        },
-                        "attr": {"type": "object", "minProperties": 1, "maxProperties": 16, "x-kubernetes-preserve-unknown-fields": true},
-                        "timeOffset": {"type": "string", "pattern": "^[+-]?[0-9]+(ms|s|m|h)$", "maxLength": 32},
-                        "clockIds": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "string", "enum": ["CLOCK_REALTIME", "CLOCK_MONOTONIC", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID"]}},
-                        "severity": {"type": "string", "enum": ["low", "medium", "high"]},
-                        "workers": {"type": "integer", "minimum": 1, "maximum": 4},
-                        "bytesMiB": {"type": "integer", "minimum": 16, "maximum": 512},
-                        "writeSizeKiB": {"type": "integer", "minimum": 4, "maximum": 1024},
-                        "minimumLatencyMultiplier": {"type": "number", "minimum": 1.1, "maximum": 20},
-                        "minimumAddedLatencyMs": {"type": "number", "minimum": 0.5, "maximum": 5000}
-                      }
-                    }
-                  },
-                  "x-kubernetes-validations": [
-                    {"rule": "self.mode in ['fixed', 'fixed-percent', 'random-max-percent'] ? has(self.value) : !has(self.value)", "message": "fixed modes require value and one/all modes must omit it"},
-                    {"rule": "self.type in ['time', 'clock-skew'] ? !has(self.action) : has(self.action)", "message": "time and clock-skew faults omit action; every other fault requires it"},
-                    {"rule": "self.type != 'pod' || self.action in ['pod-kill', 'pod-failure', 'container-kill']", "message": "invalid pod fault action"},
-                    {"rule": "self.type != 'network' || self.action in ['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']", "message": "invalid network fault action"},
-                    {"rule": "self.type != 'dns' || self.action in ['error', 'random']", "message": "invalid DNS fault action"},
-                    {"rule": "self.type != 'io' || self.action in ['latency', 'fault', 'attrOverride', 'mistake']", "message": "invalid I/O fault action"},
-                    {"rule": "self.type != 'io-pressure' || self.action == 'disk-pressure'", "message": "invalid I/O-pressure fault action"},
-                    {"rule": "self.type != 'network' || (has(self.parameters.target) ? 1 : 0) + (has(self.parameters.peerTarget) ? 1 : 0) + (has(self.parameters.harnessTarget) ? 1 : 0) + (has(self.parameters.externalTargets) ? 1 : 0) <= 1", "message": "network faults may use only one target form"},
-                    {"rule": "self.type != 'network' || self.action != 'loss' || has(self.parameters.loss)", "message": "network loss requires parameters.loss"},
-                    {"rule": "self.type != 'network' || self.action != 'duplicate' || has(self.parameters.duplicate)", "message": "network duplicate requires parameters.duplicate"},
-                    {"rule": "self.type != 'network' || self.action != 'corrupt' || has(self.parameters.corrupt)", "message": "network corrupt requires parameters.corrupt"},
-                    {"rule": "self.type != 'network' || self.action != 'partition' || has(self.parameters.target) || has(self.parameters.peerTarget) || has(self.parameters.harnessTarget) || has(self.parameters.externalTargets)", "message": "network partition requires peerTarget, harnessTarget, target, or externalTargets"},
-                    {"rule": "self.type != 'network' || self.action != 'bandwidth' || has(self.parameters.bandwidth)", "message": "network bandwidth requires parameters.bandwidth"},
-                    {"rule": "self.type != 'dns' || has(self.parameters.patterns)", "message": "DNS faults require parameters.patterns"},
-                    {"rule": "self.type != 'io' || has(self.parameters.volumePath)", "message": "I/O faults require parameters.volumePath"},
-                    {"rule": "self.type != 'io' || self.action != 'fault' || has(self.parameters.errno)", "message": "I/O fault requires parameters.errno"},
-                    {"rule": "self.type != 'io' || self.action != 'mistake' || has(self.parameters.mistake)", "message": "I/O mistake requires parameters.mistake"},
-                    {"rule": "self.type != 'io' || self.action != 'attrOverride' || has(self.parameters.attr)", "message": "I/O attrOverride requires parameters.attr"},
-                    {"rule": "self.type != 'io-pressure' || has(self.parameters.severity) && has(self.parameters.workers) && has(self.parameters.bytesMiB) && has(self.parameters.writeSizeKiB) && has(self.parameters.minimumLatencyMultiplier) && has(self.parameters.minimumAddedLatencyMs)", "message": "I/O pressure requires a structured bounded resource and evidence profile"},
-                    {"rule": "self.type != 'time' || has(self.parameters.timeOffset)", "message": "time faults require parameters.timeOffset"}
-                    ,{"rule": "self.type != 'clock-skew' || has(self.parameters.timeOffset)", "message": "clock-skew faults require parameters.timeOffset"}
-                  ]
-                },
-                "safety": {
-                  "type": "object",
-                  "properties": {
-                    "maxUnavailableSignerPercent": {"type": "number", "minimum": 0, "maximum": 100, "default": 30},
-                    "maxUnavailableMinerPercent": {"type": "number", "minimum": 0, "maximum": 100, "default": 50},
-                    "allowQuorumLoss": {"type": "boolean", "default": false},
-                    "allowBurnchain": {"type": "boolean", "default": false},
-                    "allowExtendedDuration": {"type": "boolean", "default": false},
-                    "allowExtremeSeverity": {"type": "boolean", "default": false},
-                    "allowMinerMajorityOutage": {"type": "boolean", "default": false},
-                    "allowUnenrolledNetworkTargets": {"type": "boolean", "default": false}
-                  },
-                  "x-kubernetes-validations": [
-                    {"rule": "!has(self.maxUnavailableSignerPercent) || self.maxUnavailableSignerPercent <= 30 || (has(self.allowQuorumLoss) && self.allowQuorumLoss)", "message": "signer impact above 30 percent requires allowQuorumLoss=true"},
-                    {"rule": "!has(self.maxUnavailableMinerPercent) || self.maxUnavailableMinerPercent <= 50 || (has(self.allowMinerMajorityOutage) && self.allowMinerMajorityOutage)", "message": "miner impact above 50 percent requires allowMinerMajorityOutage=true"}
-                  ]
-                },
-                "effectAssertions": {"type": "array", "maxItems": 16, "items": {"type": "object", "required": ["type"], "properties": {
-                  "type": {"type": "string", "enum": ["PodRestarted", "PodUnavailable", "NetworkDegraded", "DNSDegraded", "IODegraded", "IOPressureObserved", "ClockSkewObserved"]},
-                  "actor": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"},
-                  "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600}
-                }}},
-                "recoveryAssertions": {"type": "array", "maxItems": 16, "items": {"type": "object", "required": ["type"], "properties": {
-                  "type": {"type": "string", "enum": ["TargetReady", "NetworkRecovered", "DNSRecovered", "IORecovered", "IOPressureRecovered", "ClockSkewCleared", "ChainProgress"]},
-                  "actor": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$"},
-                  "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600}
-                }}}
-              },
-              "x-kubernetes-validations": [
-                {"rule": "!has(self.target.roles) || !('burnchain' in self.target.roles) || (has(self.safety.allowBurnchain) && self.safety.allowBurnchain)", "message": "burnchain role selection requires allowBurnchain=true"},
-                {"rule": "self.fault.type != 'time' || !has(self.fault.parameters.containerNames) || size(self.fault.parameters.containerNames) <= 1", "message": "TimeChaos may select at most one container per Pod"},
-                {"rule": "self.fault.type != 'clock-skew' || !has(self.fault.parameters.clockIds) || size(self.fault.parameters.clockIds) == 1 && self.fault.parameters.clockIds[0] == 'CLOCK_REALTIME'", "message": "application clock-skew supports only CLOCK_REALTIME"},
-                {"rule": "self.fault.type != 'clock-skew' || !has(self.fault.parameters.containerNames) || size(self.fault.parameters.containerNames) == 1 && self.fault.parameters.containerNames[0] == 'actor'", "message": "application clock-skew must select exactly the actor container"},
-                {"rule": "self.fault.type != 'io-pressure' || has(self.fault.parameters.containerNames) && size(self.fault.parameters.containerNames) == 1 && self.fault.parameters.containerNames[0] == 'actor'", "message": "disk-pressure must select exactly the actor container per Pod"},
-                {"rule": "self.fault.type != 'io-pressure' || has(self.target.actors) && size(self.target.actors) == 1 && (!has(self.target.roles) || size(self.target.roles) == 0)", "message": "disk-pressure must name exactly one actor target"},
-                {"rule": "self.fault.type != 'io-pressure' || duration(self.fault.duration) <= duration('5m')", "message": "disk-pressure duration must not exceed 5m"},
-                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.writeSizeKiB <= self.fault.parameters.bytesMiB * 1024", "message": "disk-pressure write size must not exceed total bytes"},
-                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.severity != 'low' || self.fault.parameters.workers <= 1 && self.fault.parameters.bytesMiB <= 64 && duration(self.fault.duration) <= duration('60s')", "message": "low disk-pressure exceeds its resource or duration profile"},
-                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.severity != 'medium' || self.fault.parameters.workers <= 2 && self.fault.parameters.bytesMiB <= 256 && duration(self.fault.duration) <= duration('180s')", "message": "medium disk-pressure exceeds its resource or duration profile"},
-                {"rule": "self.fault.type != 'io-pressure' || self.fault.parameters.severity != 'high' || (has(self.safety.allowExtremeSeverity) && self.safety.allowExtremeSeverity)", "message": "high disk-pressure severity requires allowExtremeSeverity=true"},
-                {"rule": "(has(self.safety.allowExtendedDuration) && self.safety.allowExtendedDuration) || duration(self.fault.duration) <= duration('10m')", "message": "faults longer than 10m require allowExtendedDuration=true"},
-                {"rule": "duration(self.fault.duration) > duration('0s') && duration(self.fault.duration) <= duration('24h')", "message": "fault duration must be greater than zero and at most 24h"},
-                {"rule": "!has(self.fault.parameters.target) && !has(self.fault.parameters.externalTargets) || (has(self.safety.allowUnenrolledNetworkTargets) && self.safety.allowUnenrolledNetworkTargets)", "message": "raw target or externalTargets require allowUnenrolledNetworkTargets=true"}
-              ]
-            },
-            "status": {
-              "type": "object",
-              "properties": {
-                "observedGeneration": {"type": "integer", "minimum": 0},
-                "phase": {"type": "string", "enum": ["Pending", "Admitted", "Injecting", "Active", "Recovering", "Passed", "Failed", "Inconclusive"]},
-                "reason": {"type": "string", "maxLength": 128},
-                "message": {"type": "string", "maxLength": 4096},
-                "lastTransitionTime": {"type": "string", "format": "date-time"},
-                "templateDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                "admission": {"type": "object", "required": ["networkUid", "networkGeneration", "networkInventory", "compiledDigest", "admittedAt", "signerImpact", "minerImpact"], "properties": {
-                  "networkUid": {"type": "string", "minLength": 1, "maxLength": 128},
-                  "networkGeneration": {"type": "integer", "minimum": 1},
-                  "campaignGeneration": {"type": "integer", "minimum": 1},
-                  "campaignSpecDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "networkInventory": {"type": "object", "required": ["digest", "observedGeneration", "actors"], "properties": {
-                    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                    "observedGeneration": {"type": "integer", "minimum": 1},
-                    "observedAt": {"type": "string", "format": "date-time", "nullable": true},
-                    "resourceVersion": {"type": "string", "nullable": true, "maxLength": 128},
-                    "actors": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "object", "required": ["name", "role", "serviceName", "statefulSetName", "statefulSetUID", "controllerRevision", "podName", "podUID", "requestedImage", "runtimeImageID"], "properties": {
-                      "name": {"type": "string", "maxLength": 40}, "role": {"type": "string", "maxLength": 32},
-                      "serviceName": {"type": "string", "maxLength": 63}, "statefulSetName": {"type": "string", "maxLength": 63},
-                      "statefulSetUID": {"type": "string", "maxLength": 128}, "controllerRevision": {"type": "string", "maxLength": 253},
-                      "podName": {"type": "string", "maxLength": 253}, "podUID": {"type": "string", "maxLength": 128},
-                      "requestedImage": {"type": "string", "maxLength": 2048}, "runtimeImageID": {"type": "string", "maxLength": 4096}
-                    }}}
-                  }},
-                  "compiledDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "admittedAt": {"type": "string", "format": "date-time"},
-                  "signerSetRewardCycle": {"type": "integer", "minimum": 0},
-                  "signerSetTotalWeight": {"type": "integer", "minimum": 1},
-                  "signerSetDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "signerSetObservedFrom": {"type": "string", "minLength": 1, "maxLength": 40},
-                  "signerImpact": {"type": "object", "required": ["totalWeight", "affectedWeight", "percent"], "properties": {
-                    "totalWeight": {"type": "number", "minimum": 0}, "affectedWeight": {"type": "number", "minimum": 0}, "percent": {"type": "number", "minimum": 0, "maximum": 100}
-                  }},
-                  "minerImpact": {"type": "object", "required": ["totalCount", "affectedCount", "percent"], "properties": {
-                    "totalCount": {"type": "integer", "minimum": 0}, "affectedCount": {"type": "integer", "minimum": 0}, "percent": {"type": "number", "minimum": 0, "maximum": 100}
-                  }}
-                }},
-                "resolvedTargetCount": {"type": "integer", "minimum": 0, "maximum": 100},
-                "resolvedTargets": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["actor", "role", "pod", "podUid", "podIP", "node", "restartCount"], "properties": {
-                  "actor": {"type": "string", "maxLength": 40},
-                  "role": {"type": "string", "maxLength": 32},
-                  "pod": {"type": "string", "maxLength": 253},
-                  "podUid": {"type": "string", "minLength": 1, "maxLength": 128},
-                  "podIP": {"type": "string", "minLength": 2, "maxLength": 64},
-                  "node": {"type": "string", "maxLength": 253},
-                  "requestedImage": {"type": "string", "nullable": true, "maxLength": 2048},
-                  "resolvedImageId": {"type": "string", "nullable": true, "maxLength": 4096},
-                  "restartCount": {"type": "integer", "minimum": 0, "maximum": 2147483647}
-                }}},
-                "capabilityEvidence": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["actor", "podUid", "source", "observedAt", "platform", "architecture", "supported", "reason"], "properties": {
-                  "actor": {"type": "string", "minLength": 1, "maxLength": 63},
-                  "podUid": {"type": "string", "minLength": 1, "maxLength": 128},
-                  "source": {"type": "string", "enum": ["attacknet-probe/v1", "attacknet-run-operator/v1"]},
-                  "observedAt": {"type": "string", "format": "date-time"},
-                  "platform": {"type": "string", "minLength": 1, "maxLength": 32},
-                  "architecture": {"type": "string", "minLength": 1, "maxLength": 32},
-                  "supported": {"type": "boolean"},
-                  "reason": {"type": "string", "minLength": 1, "maxLength": 1024}
-                }}},
-                "chaos": {"type": "object", "required": ["kind", "name", "uid", "createdAt"], "properties": {
-                  "kind": {"type": "string", "enum": ["PodChaos", "NetworkChaos", "DNSChaos", "IOChaos", "IOPressurePod", "TimeChaos", "ClockSkewPolicy"]},
-                  "name": {"type": "string", "maxLength": 63},
-                  "uid": {"type": "string", "maxLength": 128},
-                  "createdAt": {"type": "string", "format": "date-time"},
-                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod", "controller-owned-application-clock-policy"]},
-                  "resourceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
-                }},
-                "injectedAt": {"type": "string", "format": "date-time"},
-                "actualInjection": {"type": "object", "properties": {
-                  "allInjectedObserved": {"type": "boolean"},
-                  "chaosResourceVersion": {"type": "string", "maxLength": 128},
-                  "records": {"nullable": true, "x-kubernetes-preserve-unknown-fields": true},
-                  "mechanism": {"type": "string", "enum": ["controller-owned-io-pressure-pod", "controller-owned-application-clock-policy"]},
-                  "podUid": {"type": "string", "maxLength": 128},
-                  "image": {"type": "string", "maxLength": 2048},
-                  "imageID": {"type": "string", "maxLength": 4096},
-                  "node": {"type": "string", "maxLength": 253},
-                  "phase": {"type": "string", "enum": ["Pending", "Running", "Succeeded", "Failed", "Unknown"]},
-                  "targetActor": {"type": "string", "maxLength": 63},
-                  "targetPodUid": {"type": "string", "maxLength": 128},
-                  "pvcClaim": {"type": "string", "maxLength": 253},
-                  "configMapUid": {"type": "string", "maxLength": 128},
-                  "policyName": {"type": "string", "maxLength": 253},
-                  "requestedOffset": {"type": "string", "maxLength": 32},
-                  "observedAt": {"type": "string", "format": "date-time"}
-                }},
-                "probeArtifacts": {"type": "object", "properties": {
-                  "beforeJson": {"type": "string", "maxLength": 131072},
-                  "duringJson": {"type": "string", "maxLength": 131072},
-                  "afterJson": {"type": "string", "maxLength": 131072}
-                }},
-                "effectResults": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["outcome"], "properties": {
-                  "assertion": {"type": "string", "maxLength": 63}, "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]}, "actor": {"type": "string", "maxLength": 63}, "podUid": {"type": "string", "maxLength": 128}, "observedAt": {"type": "string", "format": "date-time"}, "observedValue": {"type": "number"}, "message": {"type": "string", "maxLength": 2048}
-                }}},
-                "recoveryResults": {"type": "array", "maxItems": 100, "items": {"type": "object", "required": ["assertion", "outcome", "actor", "podUid", "observedAt"], "properties": {
-                  "assertion": {"type": "string", "maxLength": 63}, "outcome": {"type": "string", "enum": ["Proven", "Failed", "Inconclusive"]}, "actor": {"type": "string", "maxLength": 63}, "podUid": {"type": "string", "maxLength": 128}, "observedAt": {"type": "string", "format": "date-time"}, "observedValue": {"type": "number"}, "message": {"type": "string", "maxLength": 2048}
-                }}},
-                "cleanup": {"type": "object", "required": ["absent", "allRecovered", "observedAt"], "properties": {
-                  "absent": {"type": "boolean"}, "allRecovered": {"type": "boolean"},
-                  "method": {"type": "string", "enum": ["Normal", "ZeroInjectionFinalizerAbort", "ClockPolicyReset", "ClockPolicyMissing"]},
-                  "zeroInjectionProven": {"type": "boolean"},
-                  "observedAt": {"type": "string", "format": "date-time"}
-                }},
-                "identityDivergence": {"type": "object", "required": ["observedAt", "differences"], "properties": {
-                  "expectedDigest": {"type": "string", "nullable": true, "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "currentDigest": {"type": "string", "nullable": true, "pattern": "^sha256:[0-9a-f]{64}$"},
-                  "observedAt": {"type": "string", "format": "date-time"},
-                  "differences": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "object", "required": ["scope", "field"], "properties": {
-                    "scope": {"type": "string", "maxLength": 63}, "field": {"type": "string", "maxLength": 63},
-                    "expected": {"x-kubernetes-int-or-string": true, "nullable": true}, "current": {"x-kubernetes-int-or-string": true, "nullable": true},
-                    "message": {"type": "string", "maxLength": 1024}
-                  }}}
-                }},
-                "completedAt": {"type": "string", "format": "date-time"},
-                "evidenceURI": {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"},
-                "evidenceDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-                "conditions": {"type": "array", "maxItems": 16, "x-kubernetes-list-type": "map", "x-kubernetes-list-map-keys": ["type"], "items": {"type": "object", "required": ["type", "status", "reason", "message", "lastTransitionTime"], "properties": {
-                  "type": {"type": "string", "maxLength": 128},
-                  "status": {"type": "string", "enum": ["True", "False", "Unknown"]},
-                  "reason": {"type": "string", "maxLength": 128},
-                  "message": {"type": "string", "maxLength": 4096},
-                  "observedGeneration": {"type": "integer", "minimum": 0},
-                  "lastTransitionTime": {"type": "string", "format": "date-time"}
-                }}}
-              }
-            }
-          }
-        }
-      }
-    }]
-  }
-}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: faultcampaigns.testing.stacks.org
+spec:
+  group: testing.stacks.org
+  names:
+    kind: FaultCampaign
+    listKind: FaultCampaignList
+    plural: faultcampaigns
+    singular: faultcampaign
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: FaultCampaign declares one bounded, attributable graph of fault
+          stages.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: FaultCampaignSpec defines staged injection, aggregate safety,
+              and evidence.
+            properties:
+              effectAssertions:
+                items:
+                  description: CampaignAssertion describes one bounded effect or recovery
+                    assertion.
+                  properties:
+                    action:
+                      type: string
+                    actor:
+                      type: string
+                    timeoutSeconds:
+                      format: int32
+                      type: integer
+                    type:
+                      enum:
+                      - PodRestarted
+                      - PodUnavailable
+                      - ContainerRestarted
+                      - TargetReady
+                      - NetworkDegraded
+                      - NetworkRecovered
+                      - DNSDegraded
+                      - DNSRecovered
+                      - IODegraded
+                      - IORecovered
+                      - IOPressureObserved
+                      - IOPressureRecovered
+                      - ClockSkewObserved
+                      - ClockSkewCleared
+                      type: string
+                  required:
+                  - type
+                  type: object
+                type: array
+              networkRef:
+                description: |-
+                  NetworkRef is optional only for an inert, reusable template. AttacknetRun
+                  binds a neutral template to its admitted network in the sealed execution.
+                type: string
+              recoveryAssertions:
+                items:
+                  description: CampaignAssertion describes one bounded effect or recovery
+                    assertion.
+                  properties:
+                    action:
+                      type: string
+                    actor:
+                      type: string
+                    timeoutSeconds:
+                      format: int32
+                      type: integer
+                    type:
+                      enum:
+                      - PodRestarted
+                      - PodUnavailable
+                      - ContainerRestarted
+                      - TargetReady
+                      - NetworkDegraded
+                      - NetworkRecovered
+                      - DNSDegraded
+                      - DNSRecovered
+                      - IODegraded
+                      - IORecovered
+                      - IOPressureObserved
+                      - IOPressureRecovered
+                      - ClockSkewObserved
+                      - ClockSkewCleared
+                      type: string
+                  required:
+                  - type
+                  type: object
+                type: array
+              safety:
+                description: FaultSafety contains aggregate bounds and conspicuous
+                  dangerous-fault opt-ins.
+                properties:
+                  allowBurnchain:
+                    type: boolean
+                  allowExtendedDuration:
+                    type: boolean
+                  allowExtremeSeverity:
+                    type: boolean
+                  allowMinerMajorityOutage:
+                    type: boolean
+                  allowQuorumLoss:
+                    type: boolean
+                  allowUnenrolledNetworkTargets:
+                    type: boolean
+                  maxConcurrentFaults:
+                    format: int32
+                    maximum: 512
+                    minimum: 1
+                    type: integer
+                  maxUnavailableMinerBasisPoints:
+                    format: int32
+                    maximum: 10000
+                    minimum: 0
+                    type: integer
+                  maxUnavailableSignerBasisPoints:
+                    format: int32
+                    maximum: 10000
+                    minimum: 0
+                    type: integer
+                required:
+                - allowBurnchain
+                - allowExtendedDuration
+                - allowExtremeSeverity
+                - allowMinerMajorityOutage
+                - allowQuorumLoss
+                - allowUnenrolledNetworkTargets
+                - maxConcurrentFaults
+                - maxUnavailableMinerBasisPoints
+                - maxUnavailableSignerBasisPoints
+                type: object
+              stages:
+                items:
+                  description: FaultStageSpec groups actions admitted and coordinated
+                    as one bounded stage.
+                  properties:
+                    completionPolicy:
+                      enum:
+                      - all
+                      type: string
+                    effectAssertions:
+                      items:
+                        description: CampaignAssertion describes one bounded effect
+                          or recovery assertion.
+                        properties:
+                          action:
+                            type: string
+                          actor:
+                            type: string
+                          timeoutSeconds:
+                            format: int32
+                            type: integer
+                          type:
+                            enum:
+                            - PodRestarted
+                            - PodUnavailable
+                            - ContainerRestarted
+                            - TargetReady
+                            - NetworkDegraded
+                            - NetworkRecovered
+                            - DNSDegraded
+                            - DNSRecovered
+                            - IODegraded
+                            - IORecovered
+                            - IOPressureObserved
+                            - IOPressureRecovered
+                            - ClockSkewObserved
+                            - ClockSkewCleared
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      type: array
+                    faults:
+                      items:
+                        description: FaultActionSpec defines one fault action within
+                          a stage.
+                        properties:
+                          effectAssertions:
+                            items:
+                              description: CampaignAssertion describes one bounded
+                                effect or recovery assertion.
+                              properties:
+                                action:
+                                  type: string
+                                actor:
+                                  type: string
+                                timeoutSeconds:
+                                  format: int32
+                                  type: integer
+                                type:
+                                  enum:
+                                  - PodRestarted
+                                  - PodUnavailable
+                                  - ContainerRestarted
+                                  - TargetReady
+                                  - NetworkDegraded
+                                  - NetworkRecovered
+                                  - DNSDegraded
+                                  - DNSRecovered
+                                  - IODegraded
+                                  - IORecovered
+                                  - IOPressureObserved
+                                  - IOPressureRecovered
+                                  - ClockSkewObserved
+                                  - ClockSkewCleared
+                                  type: string
+                              required:
+                              - type
+                              type: object
+                            type: array
+                          fault:
+                            description: FaultSpec defines one finite mechanism and
+                              its bounded parameters.
+                            properties:
+                              action:
+                                enum:
+                                - pod-kill
+                                - pod-failure
+                                - container-kill
+                                - netem
+                                - delay
+                                - loss
+                                - duplicate
+                                - corrupt
+                                - partition
+                                - bandwidth
+                                - error
+                                - random
+                                - latency
+                                - fault
+                                - mistake
+                                - attrOverride
+                                - disk-pressure
+                                type: string
+                              duration:
+                                type: string
+                              mode:
+                                enum:
+                                - one
+                                - all
+                                - fixed
+                                - fixed-percent
+                                - random-max-percent
+                                type: string
+                              parameters:
+                                x-kubernetes-preserve-unknown-fields: true
+                              type:
+                                enum:
+                                - pod
+                                - network
+                                - dns
+                                - io
+                                - time
+                                - io-pressure
+                                - clock-skew
+                                type: string
+                              value:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                            required:
+                            - duration
+                            - mode
+                            - type
+                            type: object
+                            x-kubernetes-validations:
+                            - message: fault action must be valid for its type
+                              rule: (self.type == 'pod' && self.action in ['pod-kill',
+                                'pod-failure', 'container-kill']) || (self.type ==
+                                'network' && self.action in ['netem', 'delay', 'loss',
+                                'duplicate', 'corrupt', 'partition', 'bandwidth'])
+                                || (self.type == 'dns' && self.action in ['error',
+                                'random']) || (self.type == 'io' && self.action in
+                                ['latency', 'fault', 'mistake', 'attrOverride']) ||
+                                (self.type == 'io-pressure' && self.action == 'disk-pressure')
+                                || (self.type in ['time', 'clock-skew'] && !has(self.action))
+                            - message: fault value is required only for fixed and
+                                percent modes
+                              rule: (self.mode in ['one', 'all'] && !has(self.value))
+                                || (self.mode in ['fixed', 'fixed-percent', 'random-max-percent']
+                                && has(self.value))
+                          id:
+                            pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                            type: string
+                          recoveryAssertions:
+                            items:
+                              description: CampaignAssertion describes one bounded
+                                effect or recovery assertion.
+                              properties:
+                                action:
+                                  type: string
+                                actor:
+                                  type: string
+                                timeoutSeconds:
+                                  format: int32
+                                  type: integer
+                                type:
+                                  enum:
+                                  - PodRestarted
+                                  - PodUnavailable
+                                  - ContainerRestarted
+                                  - TargetReady
+                                  - NetworkDegraded
+                                  - NetworkRecovered
+                                  - DNSDegraded
+                                  - DNSRecovered
+                                  - IODegraded
+                                  - IORecovered
+                                  - IOPressureObserved
+                                  - IOPressureRecovered
+                                  - ClockSkewObserved
+                                  - ClockSkewCleared
+                                  type: string
+                              required:
+                              - type
+                              type: object
+                            type: array
+                          target:
+                            description: FaultTarget selects enrolled actors by exact
+                              name or bounded role.
+                            properties:
+                              actors:
+                                items:
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                                maxItems: 64
+                                type: array
+                              mode:
+                                enum:
+                                - one
+                                - all
+                                - fixed
+                                - fixed-percent
+                                - random-max-percent
+                                type: string
+                              roles:
+                                items:
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                                maxItems: 16
+                                type: array
+                              value:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                            type: object
+                            x-kubernetes-validations:
+                            - message: target requires actors or roles
+                              rule: (has(self.actors) && self.actors.size() > 0) ||
+                                (has(self.roles) && self.roles.size() > 0)
+                        required:
+                        - fault
+                        - id
+                        - target
+                        type: object
+                      maxItems: 32
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - id
+                      x-kubernetes-list-type: map
+                    id:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                    maxStartSkew:
+                      type: string
+                    recoveryAssertions:
+                      items:
+                        description: CampaignAssertion describes one bounded effect
+                          or recovery assertion.
+                        properties:
+                          action:
+                            type: string
+                          actor:
+                            type: string
+                          timeoutSeconds:
+                            format: int32
+                            type: integer
+                          type:
+                            enum:
+                            - PodRestarted
+                            - PodUnavailable
+                            - ContainerRestarted
+                            - TargetReady
+                            - NetworkDegraded
+                            - NetworkRecovered
+                            - DNSDegraded
+                            - DNSRecovered
+                            - IODegraded
+                            - IORecovered
+                            - IOPressureObserved
+                            - IOPressureRecovered
+                            - ClockSkewObserved
+                            - ClockSkewCleared
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      type: array
+                    trigger:
+                      description: StageTriggerSpec defines the trusted condition
+                        that makes a stage eligible.
+                      properties:
+                        afterCampaignStart:
+                          type: string
+                        afterStage:
+                          description: StageDependency waits for a prior stage to
+                            reach a named durable state.
+                          properties:
+                            delay:
+                              type: string
+                            stage:
+                              type: string
+                            state:
+                              enum:
+                              - Injected
+                              - Effective
+                              - Recovered
+                              - Terminal
+                              type: string
+                          required:
+                          - stage
+                          - state
+                          type: object
+                        burnHeight:
+                          format: int64
+                          type: integer
+                        observation:
+                          description: ObservationTriggerSpec waits for one bounded
+                            trusted observation.
+                          properties:
+                            actor:
+                              type: string
+                            expected:
+                              type: string
+                            timeoutSeconds:
+                              format: int32
+                              type: integer
+                            type:
+                              type: string
+                          required:
+                          - timeoutSeconds
+                          - type
+                          type: object
+                        stacksHeight:
+                          format: int64
+                          type: integer
+                      type: object
+                      x-kubernetes-validations:
+                      - message: at most one stage trigger may be set
+                        rule: '(has(self.afterCampaignStart) ? 1 : 0) + (has(self.afterStage)
+                          ? 1 : 0) + (has(self.burnHeight) ? 1 : 0) + (has(self.stacksHeight)
+                          ? 1 : 0) + (has(self.observation) ? 1 : 0) <= 1'
+                  required:
+                  - faults
+                  - id
+                  type: object
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+              template:
+                type: boolean
+            required:
+            - safety
+            - stages
+            type: object
+            x-kubernetes-validations:
+            - message: executable campaigns require networkRef
+              rule: (has(self.template) && self.template) || (has(self.networkRef)
+                && self.networkRef.size() > 0)
+            - message: burnchain faults require safety.allowBurnchain=true
+              rule: self.safety.allowBurnchain || !self.stages.exists(stage, stage.faults.exists(fault,
+                has(fault.target.roles) && fault.target.roles.exists(role, role ==
+                'burnchain')))
+          status:
+            description: FaultCampaignStatus is the durable campaign state machine
+              and evidence record.
+            properties:
+              activeStageIds:
+                items:
+                  type: string
+                type: array
+              admission:
+                description: CampaignAdmission records the immutable topology and
+                  complete compiled plan.
+                properties:
+                  admittedAt:
+                    format: date-time
+                    type: string
+                  aggregateImpact:
+                    x-kubernetes-preserve-unknown-fields: true
+                  campaignGeneration:
+                    format: int64
+                    type: integer
+                  campaignSpecDigest:
+                    type: string
+                  compiledPlanDigest:
+                    type: string
+                  networkGeneration:
+                    format: int64
+                    type: integer
+                  networkInventory:
+                    description: NetworkInventory is the complete authoritative actor
+                      inventory bound to a run.
+                    properties:
+                      actors:
+                        items:
+                          description: AdmittedActorIdentity is the immutable runtime
+                            identity admitted for one actor.
+                          properties:
+                            controllerRevision:
+                              type: string
+                            name:
+                              type: string
+                            podName:
+                              type: string
+                            podUID:
+                              type: string
+                            requestedImage:
+                              type: string
+                            role:
+                              type: string
+                            runtimeImageID:
+                              type: string
+                            serviceName:
+                              type: string
+                            statefulSetName:
+                              type: string
+                            statefulSetUID:
+                              type: string
+                          required:
+                          - controllerRevision
+                          - name
+                          - podName
+                          - podUID
+                          - requestedImage
+                          - role
+                          - runtimeImageID
+                          - serviceName
+                          - statefulSetName
+                          - statefulSetUID
+                          type: object
+                        type: array
+                      digest:
+                        type: string
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        type: integer
+                      resourceVersion:
+                        type: string
+                    required:
+                    - actors
+                    - digest
+                    - observedGeneration
+                    type: object
+                  networkUid:
+                    type: string
+                  signerSetDigest:
+                    type: string
+                  signerSetObservedFrom:
+                    type: string
+                  signerSetRewardCycle:
+                    format: int64
+                    type: integer
+                  signerSetTotalWeight:
+                    format: int64
+                    type: integer
+                required:
+                - admittedAt
+                - campaignGeneration
+                - campaignSpecDigest
+                - compiledPlanDigest
+                - networkGeneration
+                - networkInventory
+                - networkUid
+                type: object
+              cleanup:
+                description: CleanupEvidence records independently observed cleanup
+                  state.
+                properties:
+                  absent:
+                    type: boolean
+                  allRecovered:
+                    type: boolean
+                  method:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                  zeroInjectionProven:
+                    type: boolean
+                required:
+                - absent
+                - allRecovered
+                - observedAt
+                type: object
+              completedAt:
+                format: date-time
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              evidenceDigest:
+                type: string
+              evidenceURI:
+                type: string
+              identityDivergence:
+                description: IdentityDivergence records an immutable identity mismatch
+                  without retargeting.
+                properties:
+                  currentDigest:
+                    type: string
+                  differences:
+                    items:
+                      description: IdentityDifference describes one bounded inventory
+                        mismatch.
+                      properties:
+                        current:
+                          type: string
+                        expected:
+                          type: string
+                        field:
+                          type: string
+                        message:
+                          type: string
+                        scope:
+                          type: string
+                      required:
+                      - field
+                      type: object
+                    type: array
+                  expectedDigest:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                required:
+                - observedAt
+                type: object
+              lastTransitionTime:
+                format: date-time
+                type: string
+              message:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+              probeArtifacts:
+                additionalProperties:
+                  type: string
+                type: object
+              reason:
+                type: string
+              stages:
+                items:
+                  description: FaultStageStatus records one stage's trigger, injection,
+                    and cleanup state.
+                  properties:
+                    actions:
+                      items:
+                        description: FaultActionStatus records one action's independently
+                          observed lifecycle.
+                        properties:
+                          actualInjection:
+                            x-kubernetes-preserve-unknown-fields: true
+                          capabilityEvidence:
+                            items:
+                              x-kubernetes-preserve-unknown-fields: true
+                            type: array
+                          effectResults:
+                            items:
+                              x-kubernetes-preserve-unknown-fields: true
+                            type: array
+                          id:
+                            type: string
+                          mutation:
+                            description: ChaosReference identifies one exact controller-owned
+                              mutation object.
+                            properties:
+                              actionId:
+                                type: string
+                              createdAt:
+                                format: date-time
+                                type: string
+                              injectedAt:
+                                format: date-time
+                                type: string
+                              kind:
+                                type: string
+                              mechanism:
+                                type: string
+                              name:
+                                type: string
+                              resourceDigest:
+                                type: string
+                              uid:
+                                type: string
+                            required:
+                            - actionId
+                            - kind
+                            - name
+                            type: object
+                          phase:
+                            type: string
+                          reason:
+                            type: string
+                          recoveryResults:
+                            items:
+                              x-kubernetes-preserve-unknown-fields: true
+                            type: array
+                          resolvedTargets:
+                            items:
+                              description: ResolvedTarget pins one selected actor
+                                to its immutable Pod identity.
+                              properties:
+                                actor:
+                                  type: string
+                                node:
+                                  type: string
+                                pod:
+                                  type: string
+                                podIP:
+                                  type: string
+                                podUid:
+                                  type: string
+                                requestedImage:
+                                  type: string
+                                resolvedImageId:
+                                  type: string
+                                restartCount:
+                                  format: int32
+                                  type: integer
+                                role:
+                                  type: string
+                              required:
+                              - actor
+                              - node
+                              - pod
+                              - podIP
+                              - podUid
+                              - requestedImage
+                              - resolvedImageId
+                              - restartCount
+                              - role
+                              type: object
+                            type: array
+                        required:
+                        - id
+                        type: object
+                      type: array
+                    completedAt:
+                      format: date-time
+                      type: string
+                    effectResults:
+                      items:
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                    eligibleAt:
+                      format: date-time
+                      type: string
+                    id:
+                      type: string
+                    observedStartSkew:
+                      type: string
+                    phase:
+                      type: string
+                    reason:
+                      type: string
+                    recoveryResults:
+                      items:
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                    startedAt:
+                      format: date-time
+                      type: string
+                    triggerReceipt:
+                      x-kubernetes-preserve-unknown-fields: true
+                  required:
+                  - id
+                  type: object
+                type: array
+              templateDigest:
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

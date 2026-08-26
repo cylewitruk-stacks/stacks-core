@@ -12,9 +12,10 @@ node. There is no source-mount controller fallback.
 Inspect networks with:
 
   kubectl get stacksnetworks.testing.stacks.org -n {{ include "hacknet.watchNamespace" . }}
+  kubectl get burnchainpolicies.testing.stacks.org -n {{ include "hacknet.watchNamespace" . }}
   kubectl get faultcampaigns.testing.stacks.org,attacknetruns.testing.stacks.org \
     -n {{ include "hacknet.watchNamespace" . }}
 
-No StacksNetwork is created by the chart. Start with the public-image-only
-examples/operator-smoke.yaml, then examples/minimal.yaml after loading a branch
-Stacks image. Never use valuable keys in this test system.
+No StacksNetwork is created by the chart. After loading a branch Stacks image,
+start with examples/minimal-burnchain-policy.yaml and examples/minimal.yaml.
+Never use valuable keys in this test system.

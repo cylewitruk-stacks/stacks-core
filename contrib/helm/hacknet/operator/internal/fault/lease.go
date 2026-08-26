@@ -14,6 +14,16 @@ import (
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 )
 
+const mutationLeaseOwnerKindAnnotation = "testing.stacks.org/mutation-lease-owner-kind"
+
+func mutationLeaseOwner(campaign *attacknetv1alpha1.FaultCampaign) string {
+	kind := campaign.Annotations[mutationLeaseOwnerKindAnnotation]
+	if kind == "" {
+		kind = "faultcampaign"
+	}
+	return kind + ":" + string(campaign.UID)
+}
+
 func (r *Reconciler) isSerializedTurn(ctx context.Context, campaign *attacknetv1alpha1.FaultCampaign) (bool, error) {
 	list := &attacknetv1alpha1.FaultCampaignList{}
 	if err := r.List(ctx, list, client.InNamespace(campaign.Namespace)); err != nil {
@@ -51,7 +61,8 @@ func (r *Reconciler) holdMutationLease(ctx context.Context, campaign *attacknetv
 	key := client.ObjectKey{Namespace: campaign.Namespace, Name: mutationLease}
 	err := r.APIReader.Get(ctx, key, lease)
 	if apierrors.IsNotFound(err) && acquire {
-		lease = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: mutationLease, Namespace: campaign.Namespace}, Data: map[string]string{"network": campaign.Spec.NetworkRef, "owner": "faultcampaign:" + string(campaign.UID), "purpose": "faultcampaign:" + campaign.Name, "token": string(campaign.UID), "acquiredAt": r.now().Format(time.RFC3339)}}
+		owner := mutationLeaseOwner(campaign)
+		lease = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: mutationLease, Namespace: campaign.Namespace}, Data: map[string]string{"network": campaign.Spec.NetworkRef, "owner": owner, "purpose": owner + ":" + campaign.Name, "token": string(campaign.UID), "acquiredAt": r.now().Format(time.RFC3339)}}
 		err = r.Create(ctx, lease)
 		if apierrors.IsAlreadyExists(err) {
 			err = r.APIReader.Get(ctx, key, lease)
@@ -63,7 +74,7 @@ func (r *Reconciler) holdMutationLease(ctx context.Context, campaign *attacknetv
 	if err != nil {
 		return mutationLeaseState{}, err
 	}
-	state.Held = lease.Data["network"] == campaign.Spec.NetworkRef && lease.Data["owner"] == "faultcampaign:"+string(campaign.UID) && lease.Data["token"] == string(campaign.UID)
+	state.Held = lease.Data["network"] == campaign.Spec.NetworkRef && lease.Data["owner"] == mutationLeaseOwner(campaign) && lease.Data["token"] == string(campaign.UID)
 	return state, nil
 }
 
@@ -76,7 +87,7 @@ func (r *Reconciler) releaseMutationLease(ctx context.Context, campaign *attackn
 	if err != nil {
 		return err
 	}
-	if lease.Data["owner"] != "faultcampaign:"+string(campaign.UID) || lease.Data["token"] != string(campaign.UID) {
+	if lease.Data["owner"] != mutationLeaseOwner(campaign) || lease.Data["token"] != string(campaign.UID) {
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, lease))

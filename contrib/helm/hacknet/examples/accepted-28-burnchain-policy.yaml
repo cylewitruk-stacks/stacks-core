@@ -1,0 +1,23 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: BurnchainPolicy
+metadata:
+  name: accepted-28
+spec:
+  networkRef: accepted-28
+  bitcoinNodeRef: bitcoin
+  # Stop before the configured Stacks epoch transitions so protocol actors can
+  # observe and produce the anchor history instead of joining after it.
+  bootstrapHeight: 202
+  cadence: 5s
+  destinationSelection: round-robin
+  destinations:
+    - walletName: attacknet-miner-1
+      address: n2PEoV6Abxnrpzoqqq1TJT5kw8G2dMPpBd
+    - walletName: attacknet-miner-2
+      address: n3BxbFxkvGbF9ANka8TXuihwKZBd9xaJVg
+    - walletName: attacknet-miner-3
+      address: mnZXRioUVq35tsCRk1DSoYUhwWaTGSz7a8
+  rpc:
+    timeout: 5s
+    minimumBackoff: 1s
+    maximumBackoff: 5s

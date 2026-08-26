@@ -1,0 +1,40 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: dns-enrolled-peer-error
+  namespace: hacknet-system
+spec:
+  networkRef: attacknet-telemetry-live
+  safety:
+    maxUnavailableSignerBasisPoints: 3000
+    maxUnavailableMinerBasisPoints: 5000
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: peer-dns-error
+      faults:
+        - id: follower-dns
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: dns
+            action: error
+            mode: all
+            duration: 45s
+            parameters:
+              patterns: [attacknet-telemetry-live-miner-1.hacknet-system.svc.cluster.local]
+              containerNames: [actor, attacknet-probe]
+  effectAssertions:
+    - type: DNSDegraded
+      actor: follower-1
+      timeoutSeconds: 60
+  recoveryAssertions:
+    - type: DNSRecovered
+      actor: follower-1
+      timeoutSeconds: 180

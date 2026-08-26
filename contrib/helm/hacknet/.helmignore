@@ -1,8 +1,8 @@
 .DS_Store
 .git/
 .github/
-operator/__pycache__/
-operator/.pytest_cache/
-operator/test_*.py
+# Source, examples, and developer scripts are not chart payload. Keeping the
+# Go module in Helm release metadata can exceed Kubernetes' 1 MiB Secret limit.
+operator/
+examples/
 scripts/
-

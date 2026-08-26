@@ -427,7 +427,7 @@
       ],
       "plan": false,
       "examples": [
-        "attacknet campaign plan examples/miner-network-delay.json generated/small/manifest.json"
+        "attacknet campaign plan testdata/legacy-v1alpha1/miner-network-delay.json generated/small/manifest.json"
       ],
       "implementation": {
         "visibility": "internal",
@@ -471,7 +471,7 @@
       ],
       "plan": true,
       "examples": [
-        "attacknet campaign run examples/miner-network-delay.json generated/small/manifest.json evidence/campaign --plan"
+        "attacknet campaign run testdata/legacy-v1alpha1/miner-network-delay.json generated/small/manifest.json evidence/campaign --plan"
       ],
       "implementation": {
         "visibility": "internal",
@@ -1123,6 +1123,9 @@
     "release/release-1-a4-evidence.mjs",
     "release/release-1-a4-packet.mjs",
     "release/release-1-a4-verify.mjs",
+    "release/release-1-a5-evidence.mjs",
+    "release/release-1-a5-packet.mjs",
+    "release/release-1-a5-verify.mjs",
     "release/schema-validator.mjs",
     "run-descriptor.mjs",
     "run-ledger.mjs",

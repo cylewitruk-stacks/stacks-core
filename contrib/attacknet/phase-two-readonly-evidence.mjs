@@ -39,7 +39,7 @@ export function captureReadOnlyWalkthrough(outputPath) {
     const help = invoke(['help', 'lifecycle', 'apply']);
     const rendered = invoke(['render', '--miners=1', '--signers=1', '--followers=1', `--output=${temporary}`]);
     const manifest = join(temporary, 'manifest.json');
-    const campaign = join(directory, 'examples/follower-application-clock-skew.json');
+    const campaign = join(directory, 'testdata/legacy-v1alpha1/follower-application-clock-skew.json');
     const fault = join(temporary, 'fault.json');
     const compiled = invoke(['campaign', 'plan', campaign, manifest, fault]);
     const humanPersona = [

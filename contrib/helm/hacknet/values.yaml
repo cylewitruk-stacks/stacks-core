@@ -34,6 +34,24 @@ operator:
     seccompProfile:
       type: RuntimeDefault
 
+# One rootless clock Deployment is created per BurnchainPolicy. Bitcoin Core
+# remains an independently persisted StacksNetwork actor.
+burnchainClock:
+  image:
+    repository: stacks-hacknet-burnchain-clock
+    tag: dev
+    digest: ""
+    pullPolicy: IfNotPresent
+
+# Default sidecar image for explicitly enabled credential-free actor probes.
+# A StacksNetwork may override this image in spec.probe.
+probe:
+  image:
+    repository: stacks-hacknet-probe
+    tag: dev
+    digest: ""
+    pullPolicy: IfNotPresent
+
 # A distinct identity reconciles adversarial runs. The StacksNetwork operator
 # intentionally has no Chaos Mesh permissions; actors have no Kubernetes token.
 runOperator:

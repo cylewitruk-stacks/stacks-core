@@ -11,19 +11,22 @@ kind: Role
 metadata: {name: topology}
 rules:
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks"]
+    resources: ["stacksnetworks", "burnchainpolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks/status"]
+    resources: ["stacksnetworks/status", "burnchainpolicies/status"]
     verbs: ["get", "patch"]
   - apiGroups: ["apps"]
-    resources: ["statefulsets"]
+    resources: ["statefulsets", "deployments"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["configmaps", "services"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -33,14 +36,14 @@ metadata:
   labels: {app.kubernetes.io/component: run-operator}
 rules:
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks"]
+    resources: ["stacksnetworks", "burnchainpolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["testing.stacks.org"]
     resources: ["faultcampaigns"]
-    verbs: ["get", "list", "watch", "create", "patch"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: ["testing.stacks.org"]
     resources: ["attacknetruns"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["testing.stacks.org"]
     resources: ["faultcampaigns/status", "attacknetruns/status"]
     verbs: ["get", "patch"]
@@ -65,17 +68,19 @@ rules:
       - testing.stacks.org
     resources:
       - stacksnetworks
+      - burnchainpolicies
     verbs:
       - get
       - list
       - watch
   - apiGroups: [testing.stacks.org]
-    resources: [stacksnetworks/status]
+    resources: [stacksnetworks/status, burnchainpolicies/status]
     verbs: [get, patch]
   - apiGroups:
       - apps
     resources:
       - statefulsets
+      - deployments
     verbs:
       - get
       - list
@@ -98,6 +103,9 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -106,9 +114,9 @@ metadata:
   labels:
     app.kubernetes.io/component: run-operator
 rules:
-  - {apiGroups: [testing.stacks.org], resources: [stacksnetworks], verbs: [get, list, watch]}
-  - {apiGroups: [testing.stacks.org], resources: [faultcampaigns], verbs: [get, list, watch, create, patch]}
-  - {apiGroups: [testing.stacks.org], resources: [attacknetruns], verbs: [get, list, watch]}
+  - {apiGroups: [testing.stacks.org], resources: [stacksnetworks, burnchainpolicies], verbs: [get, list, watch]}
+  - {apiGroups: [testing.stacks.org], resources: [faultcampaigns], verbs: [get, list, watch, create, patch, delete]}
+  - {apiGroups: [testing.stacks.org], resources: [attacknetruns], verbs: [get, list, watch, patch]}
   - {apiGroups: [testing.stacks.org], resources: [faultcampaigns/status, attacknetruns/status], verbs: [get, patch]}
   - {apiGroups: [""], resources: [configmaps], verbs: [get, list, watch, create, patch, delete]}
   - {apiGroups: [""], resources: [pods], verbs: [get, list, watch, create, delete]}

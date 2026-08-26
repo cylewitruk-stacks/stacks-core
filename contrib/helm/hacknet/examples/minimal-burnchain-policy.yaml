@@ -1,0 +1,20 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: BurnchainPolicy
+metadata:
+  name: minimal
+spec:
+  networkRef: minimal
+  bitcoinNodeRef: bitcoin
+  bootstrapHeight: 245
+  cadence: 5s
+  destinationSelection: fixed
+  fixedDestinationIndex: 0
+  destinations:
+    - walletName: attacknet-faucet
+      # Regtest accepts testnet addresses. No private key is required when the
+      # destination is used only for block generation.
+      address: mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn
+  rpc:
+    timeout: 5s
+    minimumBackoff: 1s
+    maximumBackoff: 5s

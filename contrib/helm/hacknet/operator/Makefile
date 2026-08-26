@@ -8,6 +8,7 @@ fmt:
 
 generate:
 	$(CONTROLLER_GEN) object paths=./api/...
+	$(CONTROLLER_GEN) crd paths=./api/v1beta1 output:crd:artifacts:config=../crds
 
 test:
 	$(GO) test ./...
@@ -23,4 +24,4 @@ test-integration:
 	$(GO) test -tags=integration ./internal/integration -count=1
 
 verify: fmt generate vet test test-race
-	@git diff --exit-code -- api/v1alpha1/zz_generated.deepcopy.go
+	@git diff --exit-code -- api/v1alpha1/zz_generated.deepcopy.go api/v1beta1/zz_generated.deepcopy.go ../crds/testing.stacks.org_*.yaml

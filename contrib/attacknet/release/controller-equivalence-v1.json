@@ -7,7 +7,7 @@
       "domain": "topology",
       "legacy": ["contrib/helm/hacknet/operator/controller.py:validate_network"],
       "go": ["contrib/helm/hacknet/operator/api/v1alpha1", "contrib/helm/hacknet/operator/internal/topology/render.go"],
-      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go", "contrib/helm/hacknet/crds/attacknet-crds.test.mjs"],
+      "tests": ["contrib/helm/hacknet/operator/internal/topology/render_test.go", "contrib/helm/hacknet/operator/api/v1beta1/schema_contract_test.go"],
       "live": []
     },
     {
@@ -191,7 +191,7 @@
       "domain": "api",
       "legacy": ["contrib/helm/hacknet/crds/testing.stacks.org_stacksnetworks.yaml", "contrib/helm/hacknet/crds/testing.stacks.org_faultcampaigns.yaml", "contrib/helm/hacknet/crds/testing.stacks.org_attacknetruns.yaml"],
       "go": ["contrib/helm/hacknet/operator/api/v1alpha1"],
-      "tests": ["contrib/helm/hacknet/crds/attacknet-crds.test.mjs", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
+      "tests": ["contrib/helm/hacknet/operator/api/v1beta1/schema_contract_test.go", "contrib/helm/hacknet/operator/internal/integration/envtest_test.go"],
       "live": ["topology-admitted-inventory"]
     },
     {

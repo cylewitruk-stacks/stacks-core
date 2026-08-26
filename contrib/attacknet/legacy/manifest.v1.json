@@ -1,0 +1,149 @@
+{
+  "schema": "stacks-attacknet-legacy-runtime/v1",
+  "policy": "internal-qualification-only",
+  "entries": [
+    {
+      "path": "attacknet-run-schedule.mjs",
+      "owner": "run-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/run/v1beta1_schedule.go",
+        "contrib/helm/hacknet/operator/internal/run/v1beta1_replay.go"
+      ],
+      "removalGates": [
+        "Go CLI replay and minimization commands replace the Node facade adapters",
+        "v1beta1 replay and minimization live qualification passes"
+      ]
+    },
+    {
+      "path": "burnchain-clock.sh",
+      "owner": "burnchain-clock",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/cmd/burnchain-clock/main.go",
+        "contrib/helm/hacknet/operator/internal/burnchain/clock.go"
+      ],
+      "removalGates": [
+        "legacy topology renderer is retired",
+        "Go clock cadence and wallet-recovery live qualification passes"
+      ]
+    },
+    {
+      "path": "burnchain-policy.sh",
+      "owner": "burnchain-policy-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/burnchainpolicy/reconciler.go",
+        "contrib/helm/hacknet/operator/internal/burnchainpolicy/resources.go"
+      ],
+      "removalGates": [
+        "Go CLI policy submission and observation replace lifecycle dispatch",
+        "pause, resume, cadence and burst live qualification passes"
+      ]
+    },
+    {
+      "path": "campaign-runner.sh",
+      "owner": "fault-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/fault/v1beta1_reconciler.go",
+        "contrib/helm/hacknet/operator/internal/fault/v1beta1_observations.go"
+      ],
+      "removalGates": [
+        "Go CLI campaign submission and watch replace direct execution",
+        "multi-stage injection, recovery and restart live qualification passes"
+      ]
+    },
+    {
+      "path": "campaign-targets.mjs",
+      "owner": "fault-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/inventory/v1beta1.go",
+        "contrib/helm/hacknet/operator/internal/inventory/reader.go"
+      ],
+      "removalGates": [
+        "campaign-runner.sh is removed",
+        "uncached v1beta1 target identity qualification passes"
+      ]
+    },
+    {
+      "path": "chaos-resource.sh",
+      "owner": "fault-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/fault/mutation.go",
+        "contrib/helm/hacknet/operator/internal/fault/v1beta1_reconciler.go"
+      ],
+      "removalGates": [
+        "campaign-runner.sh is removed",
+        "partial-injection rollback and cleanup live qualification passes"
+      ]
+    },
+    {
+      "path": "environment-lock.sh",
+      "owner": "fault-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/fault/lease.go",
+        "contrib/helm/hacknet/operator/internal/fault/v1beta1_reconciler.go"
+      ],
+      "removalGates": [
+        "all direct host-side mutation writers are removed",
+        "overlap and controller-restart lease qualification passes"
+      ]
+    },
+    {
+      "path": "fault-campaign.mjs",
+      "owner": "fault-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/fault/v1beta1_compiler.go",
+        "contrib/helm/hacknet/operator/internal/fault/mechanism.go"
+      ],
+      "removalGates": [
+        "Node campaign plan and direct-run commands are removed from the facade",
+        "all seven mechanisms retain sealed equivalence evidence"
+      ]
+    },
+    {
+      "path": "local-access.sh",
+      "owner": "go-cli",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/attacknetcli/dashboard.go",
+        "contrib/helm/hacknet/operator/internal/attacknetcli/portforward.go"
+      ],
+      "removalGates": [
+        "typed Grafana start, stop and status pass live qualification",
+        "resilient reconnect behavior is implemented or explicitly retired"
+      ]
+    },
+    {
+      "path": "chaos-dashboard.sh",
+      "owner": "go-cli",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/attacknetcli/dashboard.go",
+        "contrib/helm/hacknet/operator/internal/attacknetcli/portforward.go"
+      ],
+      "removalGates": [
+        "typed Chaos Mesh start, stop and status pass live qualification",
+        "authentication and Helm security-mode commands have a declared successor or retirement decision"
+      ]
+    },
+    {
+      "path": "soak-runner.sh",
+      "owner": "run-controller",
+      "disposition": "retained-qualification",
+      "successors": [
+        "contrib/helm/hacknet/operator/internal/run/v1beta1_reconciler.go",
+        "contrib/helm/hacknet/operator/internal/run/v1beta1_schedule.go"
+      ],
+      "removalGates": [
+        "durable soak scenarios are represented as AttacknetRun resources",
+        "Go CLI evidence capture replaces host archive responsibilities"
+      ]
+    }
+  ]
+}

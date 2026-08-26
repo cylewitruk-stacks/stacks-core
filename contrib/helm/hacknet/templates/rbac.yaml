@@ -7,10 +7,10 @@ metadata:
     {{- include "hacknet.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks"]
+    resources: ["stacksnetworks", "burnchainpolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks/status"]
+    resources: ["stacksnetworks/status", "burnchainpolicies/status"]
     verbs: ["get", "patch"]
   - apiGroups: [""]
     resources: ["configmaps", "services"]
@@ -18,8 +18,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["statefulsets"]
+    resources: ["statefulsets", "deployments"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

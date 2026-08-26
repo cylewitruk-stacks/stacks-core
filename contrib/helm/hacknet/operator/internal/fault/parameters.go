@@ -275,6 +275,9 @@ func validateDNSParameters(values map[string]any) error {
 		if len(pattern) > 253 {
 			return errors.New("DNS pattern exceeds 253 characters")
 		}
+		if wildcard := strings.IndexByte(pattern, '*'); wildcard >= 0 && (wildcard != len(pattern)-1 || strings.Count(pattern, "*") != 1) {
+			return fmt.Errorf("DNS pattern %q is unsupported: Chaos Mesh permits one wildcard only at the end", pattern)
+		}
 	}
 	if raw, ok := values["containerNames"]; ok {
 		_, err = stringsValue(raw, "containerNames", true, nil)

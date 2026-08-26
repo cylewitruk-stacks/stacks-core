@@ -8,6 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	testingv1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
+	testingv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
 
 const networkLabel = "testing.stacks.org/network"
@@ -18,6 +19,28 @@ const networkLabel = "testing.stacks.org/network"
 type LiveView struct {
 	Network *testingv1.StacksNetwork
 	Pods    []corev1.Pod
+}
+
+// BetaLiveView is a directly-read v1beta1 network and its actor Pods.
+type BetaLiveView struct {
+	Network *testingv1beta1.StacksNetwork
+	Pods    []corev1.Pod
+}
+
+// ReadBetaLiveView bypasses informer caches for a v1beta1 identity decision.
+func ReadBetaLiveView(ctx context.Context, reader client.Reader, key client.ObjectKey) (BetaLiveView, error) {
+	if reader == nil {
+		return BetaLiveView{}, errors.New("uncached Kubernetes API reader is required")
+	}
+	network := &testingv1beta1.StacksNetwork{}
+	if err := reader.Get(ctx, key, network); err != nil {
+		return BetaLiveView{}, err
+	}
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods, client.InNamespace(key.Namespace), client.MatchingLabels{networkLabel: key.Name}); err != nil {
+		return BetaLiveView{}, err
+	}
+	return BetaLiveView{Network: network, Pods: pods.Items}, nil
 }
 
 // ReadLiveView bypasses informer caches for an identity-sensitive decision.

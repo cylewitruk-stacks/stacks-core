@@ -84,6 +84,35 @@ func evaluateProbeEvidence(campaign *attacknetv1alpha1.FaultCampaign, compiled C
 			return effectReport{}, err
 		}
 	}
+	return evaluateDecodedProbeEvidence(campaign, compiled, targets, phases)
+}
+
+// evaluateDuringProbeEvidence classifies effect evidence before mutation
+// cleanup. Recovery intentionally remains inconclusive until an independent
+// after-fault sample is captured.
+func evaluateDuringProbeEvidence(campaign *attacknetv1alpha1.FaultCampaign, compiled Compiled, targets []attacknetv1alpha1.ResolvedTarget, artifacts map[string]string) (effectReport, error) {
+	definition := mustMechanismForType(campaign.Spec.Fault.Type)
+	if definition.EffectKind == "clock" {
+		return effectReport{}, fmt.Errorf("clock effects require clockInjectionProven")
+	}
+	selected := map[string]bool{}
+	for _, target := range targets {
+		selected[target.Actor] = true
+	}
+	phases := map[string]probePhase{}
+	for _, phase := range []string{"before", "during"} {
+		value, err := decodeProbePhase(artifacts[phase+"Json"], phase, definition.MutationKind, selected)
+		if err != nil {
+			return effectReport{}, err
+		}
+		phases[phase] = value
+	}
+	phases["after"] = probePhase{Phase: "after"}
+	return evaluateDecodedProbeEvidence(campaign, compiled, targets, phases)
+}
+
+func evaluateDecodedProbeEvidence(campaign *attacknetv1alpha1.FaultCampaign, compiled Compiled, targets []attacknetv1alpha1.ResolvedTarget, phases map[string]probePhase) (effectReport, error) {
+	definition := mustMechanismForType(campaign.Spec.Fault.Type)
 	byActor := func(phase string, actor string) []map[string]any {
 		result := []map[string]any{}
 		for _, item := range phases[phase].Observations {
@@ -110,7 +139,7 @@ func evaluateProbeEvidence(campaign *attacknetv1alpha1.FaultCampaign, compiled C
 			case "io-pressure":
 				evaluation = evaluateIOPressure(compiled.Evidence.IOPressure, target.Actor, before, during, after)
 			default:
-				return effectReport{}, fmt.Errorf("unsupported probe evidence kind %s", kind)
+				return effectReport{}, fmt.Errorf("unsupported probe evidence kind %s", definition.MutationKind)
 			}
 			evaluations = append(evaluations, evaluation)
 		}

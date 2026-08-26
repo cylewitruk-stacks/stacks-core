@@ -14,6 +14,11 @@ docker build \
   "${repo_root}/contrib/helm/hacknet/operator"
 
 docker build \
+  --build-arg BINARY=burnchain-clock \
+  --tag stacks-hacknet-burnchain-clock:dev \
+  "${repo_root}/contrib/helm/hacknet/operator"
+
+docker build \
   --tag stacks-hacknet-probe:dev \
   "${repo_root}/contrib/attacknet/probe"
 
