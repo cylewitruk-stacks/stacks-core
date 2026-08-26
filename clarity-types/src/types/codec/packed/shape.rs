@@ -283,9 +283,11 @@ impl<'a> ShapeParser<'a> {
         let mut shift = 0u32;
         loop {
             let byte = self.take_byte()?;
-            let part = usize::from(byte & 0x7f)
-                .checked_shl(shift)
-                .ok_or(PackedValueError::SizeOverflow)?;
+            let group = usize::from(byte & 0x7f);
+            if group > (usize::MAX >> shift) {
+                return Err(PackedValueError::SizeOverflow);
+            }
+            let part = group << shift;
             value = value
                 .checked_add(part)
                 .ok_or(PackedValueError::SizeOverflow)?;

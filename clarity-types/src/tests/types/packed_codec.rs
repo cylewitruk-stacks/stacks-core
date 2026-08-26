@@ -284,6 +284,27 @@ fn value_shape_enforces_depth_and_size_bounds() {
 }
 
 #[test]
+fn value_shape_rejects_varuint_groups_that_exceed_usize() {
+    const TUPLE_SHAPE: u8 = 0x0c;
+    const BOOL_SHAPE: u8 = 0x02;
+
+    let continuation_groups = (usize::BITS - 1) / 7;
+    let final_shift = continuation_groups * 7;
+    let overflowing_group = 1u8 << (usize::BITS - final_shift);
+    let mut overflowing_count = vec![VALUE_SHAPE_VERSION, TUPLE_SHAPE, 0x81];
+    overflowing_count.extend(std::iter::repeat_n(
+        0x80,
+        usize::try_from(continuation_groups - 1).unwrap(),
+    ));
+    overflowing_count.extend([overflowing_group, 1, b'a', BOOL_SHAPE]);
+
+    assert_matches!(
+        ValueShape::from_bytes(&overflowing_count),
+        Err(PackedValueError::SizeOverflow)
+    );
+}
+
+#[test]
 fn canonical_storage_bytes_are_epoch_independent() {
     let value = Value::Tuple(
         TupleData::from_data(vec![
