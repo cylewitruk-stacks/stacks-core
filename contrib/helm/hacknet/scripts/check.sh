@@ -27,11 +27,11 @@ else
   echo "go not installed; skipped controller and bounded I/O-pressure workload tests" >&2
 fi
 node --test "${chart_dir}/security-contract.test.mjs"
-node --check "${chart_dir}/../../attacknet/probe/probe.mjs"
-node --test "${chart_dir}/../../attacknet/probe/probe.test.mjs"
-node --test "${chart_dir}/../../attacknet/io-pressure/image-context.test.mjs"
+node --check "${chart_dir}/../../attacknet/images/probe/probe.mjs"
+node --test "${chart_dir}/../../attacknet/images/probe/probe.test.mjs"
+node --test "${chart_dir}/../../attacknet/images/io-pressure/image-context.test.mjs"
 if [[ "${go_status}" = passed ]]; then
-  (cd "${chart_dir}/../../attacknet/io-pressure" && go test ./...)
+  (cd "${chart_dir}/../../attacknet/images/io-pressure" && go test ./...)
 fi
 
 helm_bin="${HELM_BIN:-helm}"

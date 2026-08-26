@@ -7,7 +7,7 @@ import test from 'node:test';
 
 import {
   initializeDescriptor, readDescriptor, sha256Value, validateDescriptor, writeDescriptor,
-} from '../run-descriptor.mjs';
+} from '../legacy/v1alpha1/runtime/run-descriptor.mjs';
 import {
   finalizeQualification, preflightQualification, qualificationRequired,
 } from './phase-1-qualification.mjs';

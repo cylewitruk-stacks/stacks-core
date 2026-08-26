@@ -326,12 +326,12 @@ network is deliberately left running.
 
 ## Reproduction and seed
 
-Use the canonical `../run-descriptor.mjs` contract documented in
-`../REPRODUCIBILITY.md`. Agent-selected branches use its `choose` command with
-stable, namespaced instruction IDs; the result records the choice index and HMAC
-digest. The descriptor explicitly discloses distributed nondeterminism and can
-derive an integrity-sealed failure-prefix replay without inventing a second run
-identity.
+Use the controller-owned `AttacknetRun` contract documented in
+[`../docs/concepts/reproducibility.md`](../docs/concepts/reproducibility.md).
+The resolved schedule, trigger receipts, admitted inventory, child campaigns,
+and terminal classification are the reproducible record. The seed is an input,
+not a substitute for those observations. Replay and minimization use fresh
+network identities and controller-validated source schedule digests.
 
 ## Integration limits
 

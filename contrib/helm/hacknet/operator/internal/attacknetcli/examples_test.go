@@ -1,6 +1,7 @@
 package attacknetcli
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,7 +10,23 @@ import (
 
 func TestHumanAttacknetExamplesAreStrictV1Beta1YAML(t *testing.T) {
 	directory := filepath.Join("..", "..", "..", "..", "..", "attacknet", "examples")
-	yamlPaths, err := filepath.Glob(filepath.Join(directory, "*.yaml"))
+	var yamlPaths []string
+	var jsonPaths []string
+	err := filepath.WalkDir(directory, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		switch filepath.Ext(path) {
+		case ".yaml", ".yml":
+			yamlPaths = append(yamlPaths, path)
+		case ".json":
+			jsonPaths = append(jsonPaths, path)
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,10 +43,6 @@ func TestHumanAttacknetExamplesAreStrictV1Beta1YAML(t *testing.T) {
 				t.Fatalf("strict v1beta1 validation: %v", err)
 			}
 		})
-	}
-	jsonPaths, err := filepath.Glob(filepath.Join(directory, "*.json"))
-	if err != nil {
-		t.Fatal(err)
 	}
 	for _, path := range jsonPaths {
 		if !strings.HasSuffix(path, ".plan.json") {

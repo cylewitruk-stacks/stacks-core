@@ -180,7 +180,7 @@ test('applied burnchain policy is journaled only after clock acknowledgement', (
   const capture = join(directory, 'policy-event.json');
   const argumentsCapture = join(directory, 'args.json');
   const policy = 'GENERATION=1\nMODE=run\nINTERVAL_SECONDS=20\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
-  const result = spawnSync(join(root, '..', 'burnchain-policy.sh'), ['pause'], {
+  const result = spawnSync(join(root, '..', 'legacy', 'v1alpha1', 'runtime', 'burnchain-policy.sh'), ['pause'], {
     encoding: 'utf8', env: {
       ...process.env,
       ATTACKNET_KUBECTL: kubectl,
@@ -208,7 +208,7 @@ test('exact burnchain bursts retain an inter-block bootstrap cadence and end pau
   const capture = join(directory, 'burst-event.json');
   const argumentsCapture = join(directory, 'args.json');
   const policy = 'GENERATION=4\nMODE=run\nINTERVAL_SECONDS=60\nJITTER_SECONDS=0\nBURST_BLOCKS=0\nBURST_TARGET_HEIGHT=0\nADDRESS_MODE=round-robin\nFIXED_ADDRESS_INDEX=0\n';
-  const result = spawnSync(join(root, '..', 'burnchain-policy.sh'), ['burst', '3', '2'], {
+  const result = spawnSync(join(root, '..', 'legacy', 'v1alpha1', 'runtime', 'burnchain-policy.sh'), ['burst', '3', '2'], {
     encoding: 'utf8', env: {
       ...process.env,
       ATTACKNET_KUBECTL: kubectl,

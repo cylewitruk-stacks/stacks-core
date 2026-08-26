@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "matrixId": "current-old-modified",
+  "targetPlatform": "linux/arm64",
+  "bounds": {"maxProfiles": 4, "maxActors": 28, "maxPhases": 4},
+  "actors": ["miner-1", "miner-2", "miner-3", "signer-1", "signer-node-1"],
+  "defaultProfile": "current",
+  "profiles": {
+    "current": {
+      "source": {"kind": "current", "repository": "../../.."},
+      "image": {
+        "requestedRef": "stacks-core-attacknet:main",
+        "origin": "localBuild",
+        "platforms": ["linux/arm64"]
+      },
+      "build": {
+        "dockerfile": "contrib/attacknet/images/cli/Dockerfile",
+        "cargoProfile": "release-lite",
+        "cargoChef": true,
+        "cargoIncremental": false,
+        "cargoFeatures": ["monitoring_prom", "slog_json", "testing"],
+        "builderImage": "lukemathwalker/cargo-chef:0.1.77-rust-1.96.0-bookworm",
+        "runtimeImage": "debian:bookworm-slim"
+      },
+      "compatibility": {
+        "expectation": "compatible",
+        "basis": "Current source is the control cohort; runtime compatibility is not yet proven."
+      }
+    },
+    "released-4.0.2": {
+      "source": {"kind": "releasedGitRef", "repository": "../../..", "gitRef": "4.0.2"},
+      "image": {
+        "requestedRef": "stacks-core-attacknet:4.0.2",
+        "origin": "prebuilt",
+        "platforms": ["linux/arm64"],
+        "execution": "native"
+      },
+      "compatibility": {
+        "expectation": "unknown",
+        "basis": "The released source and image must be resolved and exercised before acceptance.",
+        "limitations": ["This planning fixture intentionally contains mutable image references."]
+      }
+    },
+    "modified-signer": {
+      "source": {
+        "kind": "localModified",
+        "repository": "../../..",
+        "baseRef": "HEAD",
+        "changeId": "adversarial-signer-experiment"
+      },
+      "image": {
+        "requestedRef": "stacks-core-attacknet:modified-signer",
+        "origin": "localBuild",
+        "platforms": ["linux/arm64"]
+      },
+      "build": {
+        "dockerfile": "contrib/attacknet/images/cli/Dockerfile",
+        "cargoProfile": "release-lite",
+        "cargoChef": true,
+        "cargoIncremental": false,
+        "builderImage": "lukemathwalker/cargo-chef:0.1.77-rust-1.96.0-bookworm",
+        "runtimeImage": "debian:bookworm-slim"
+      },
+      "compatibility": {
+        "expectation": "intentionally-incompatible",
+        "basis": "The local modification is an adversarial hypothesis, not established behavior."
+      }
+    }
+  },
+  "phases": [
+    {
+      "id": "baseline",
+      "kind": "baseline",
+      "assignments": [],
+      "expectedOutcome": "compatible",
+      "hypothesis": "The current cohort reaches the baseline health gates."
+    },
+    {
+      "id": "miner-missed-upgrade",
+      "kind": "missed-upgrade",
+      "inherits": "baseline",
+      "assignments": [{"profile": "released-4.0.2", "actors": ["miner-3"]}],
+      "expectedOutcome": "observe",
+      "hypothesis": "A miner that missed the upgrade must not split or stall the current cohort."
+    },
+    {
+      "id": "miner-completes-upgrade",
+      "kind": "rolling-upgrade",
+      "inherits": "miner-missed-upgrade",
+      "assignments": [{"profile": "current", "actors": ["miner-3"]}],
+      "expectedOutcome": "compatible",
+      "hypothesis": "The lagging miner can rejoin the current cohort without retained stale state."
+    },
+    {
+      "id": "modified-signer",
+      "kind": "modified-actor",
+      "inherits": "baseline",
+      "assignments": [{"profile": "modified-signer", "actors": ["signer-1"]}],
+      "expectedOutcome": "intentional-failure",
+      "hypothesis": "A modified signer remains attributable and cannot falsify orchestrator evidence."
+    }
+  ]
+}

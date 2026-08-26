@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import test from 'node:test';
 
 import {loadInventory} from '../instrumentation/capability-manifest.mjs';
-import {sha256File, sha256Value} from '../run-descriptor.mjs';
+import {sha256File, sha256Value} from '../legacy/v1alpha1/runtime/run-descriptor.mjs';
 import {instrumentationExpectationsFromPlan, renderObservability} from './render.mjs';
 import {readEvents, renderReport} from './report.mjs';
 

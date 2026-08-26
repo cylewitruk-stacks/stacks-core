@@ -23,7 +23,7 @@ function suite(value) {
   return {name, tests, passed, failed};
 }
 
-export function buildOfflineResult({sourceRevision, suites, command = 'contrib/attacknet/check.sh', recordedAt = new Date().toISOString()}) {
+export function buildOfflineResult({sourceRevision, suites, command = 'contrib/attacknet/test/check.sh', recordedAt = new Date().toISOString()}) {
   if (!/^[0-9a-f]{40}$/.test(sourceRevision)) throw new Error('sourceRevision must be an exact commit');
   if (!Array.isArray(suites) || suites.length === 0) throw new Error('at least one observed suite is required');
   if (typeof command !== 'string' || command.length === 0) throw new Error('command must be a non-empty string');

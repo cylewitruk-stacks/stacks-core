@@ -73,7 +73,7 @@ commit-hash self-reference and a hand-authored test claim:
 
 ```bash
 ATTACKNET_OFFLINE_RESULT=/tmp/phase-0-offline-result.json \
-  contrib/attacknet/check.sh
+  contrib/attacknet/test/check.sh
 node contrib/attacknet/release/phase-zero-packet.mjs \
   --offline-result=/tmp/phase-0-offline-result.json \
   --output=.docs/reviews/attacknet-phase-0/packet.json

@@ -47,11 +47,11 @@ func TestLocalImageBuilderUsesExactDockerArguments(t *testing.T) {
 	}
 	wantFirst := Command{Program: "docker", Args: []string{"build", "--build-arg", "BINARY=topology-operator", "--tag", "stacks-hacknet-operator:dev", "/repo/contrib/helm/hacknet/operator"}}
 	assertCommand(t, runner.commands[0], wantFirst)
-	wantIOPressure := []string{"build", "--tag", "stacks-hacknet-io-pressure:dev", "--file", "/repo/contrib/attacknet/io-pressure/Dockerfile", "/repo"}
+	wantIOPressure := []string{"build", "--tag", "stacks-hacknet-io-pressure:dev", "--file", "/repo/contrib/attacknet/images/io-pressure/Dockerfile", "/repo"}
 	if !reflect.DeepEqual(runner.commands[8].Args, wantIOPressure) {
 		t.Fatalf("I/O-pressure build args = %#v, want %#v", runner.commands[8].Args, wantIOPressure)
 	}
-	wantStacks := []string{"build", "--tag", "stacks-core-attacknet:main", "--file", "/repo/contrib/attacknet/Dockerfile", "/repo"}
+	wantStacks := []string{"build", "--tag", "stacks-core-attacknet:main", "--file", "/repo/contrib/attacknet/images/cli/Dockerfile", "/repo"}
 	if !reflect.DeepEqual(runner.commands[12].Args, wantStacks) {
 		t.Fatalf("Stacks build args = %#v, want %#v", runner.commands[12].Args, wantStacks)
 	}

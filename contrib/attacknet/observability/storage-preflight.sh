@@ -8,7 +8,7 @@ set -euo pipefail
 
 KUBECTL="${ATTACKNET_KUBECTL:-kubectl}"
 MIN_FREE_BYTES="${ATTACKNET_OBSERVABILITY_MIN_FREE_BYTES:-2147483648}"
-ATTACKNET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OBSERVABILITY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   echo "usage: $0 [OUTPUT.json]" >&2
@@ -56,7 +56,7 @@ if [ -s "${results_file}" ]; then
     '{ok:false,minimumAvailableBytes:$minimumAvailableBytes,nodes:.,error:"one-or-more-kubelet-summaries-unavailable"}' \
     "${results_file}" >"${evaluation_file}"
   status=1
-elif ! node "${ATTACKNET_DIR}/node-capacity.mjs" "${MIN_FREE_BYTES}" \
+elif ! node "${OBSERVABILITY_DIR}/node-capacity.mjs" "${MIN_FREE_BYTES}" \
   "${summaries[@]}" >"${evaluation_file}"; then
   status=1
 fi

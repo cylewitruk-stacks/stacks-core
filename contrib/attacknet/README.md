@@ -214,8 +214,8 @@ A resource snapshot is not a complete incident bundle. `evidence incident`
 uses admitted Pod names and UIDs, refuses replacement-Pod log attribution, and
 captures bounded owned resources, Events, and log tails with per-artifact
 digests and explicit omissions. Preserve metrics and terminal run artifacts
-separately. Follow [`EVIDENCE.md`](EVIDENCE.md) and
-[`FAILURE-ATTRIBUTION.md`](FAILURE-ATTRIBUTION.md).
+separately. Follow [`evidence.md`](docs/operations/evidence.md) and
+[`failure-attribution.md`](docs/operations/failure-attribution.md).
 
 For local human dashboards:
 
@@ -269,9 +269,9 @@ helm uninstall chaos-mesh -n chaos-mesh
   interface. Use `attacknet commands --json` for the agent-readable contract.
 - Controllers own admission, scheduling, mutation, rollback, recovery, and
   terminal classification. The CLI submits intent and reads status.
-- Shell and JavaScript under this directory are compatibility, qualification,
-  or frozen-evidence internals. They are not a supported operator interface;
-  do not automate against their arguments.
+- The frozen v1alpha1 Node/shell implementation lives under
+  [`legacy/`](legacy/README.md). It is retained only for historical
+  equivalence evidence and is not a supported operator interface.
 - JSON evidence and historical release machinery remain intentionally separate
   from YAML authoring.
 - Actor counts and identities come from `StacksNetwork.status`; harness code
@@ -279,11 +279,11 @@ helm uninstall chaos-mesh -n chaos-mesh
 
 ## Further reading
 
-- [`OPERATIONS.md`](OPERATIONS.md): runtime operations and recovery.
-- [`GO-CLI.md`](GO-CLI.md): typed client contract.
-- [`EVIDENCE.md`](EVIDENCE.md): evidence capture, replay, and minimization.
-- [`DEVELOPMENT.md`](DEVELOPMENT.md): controller and image development.
-- [`ROADMAP.md`](ROADMAP.md): deferred environments and fault mechanisms.
-- [`INSTRUMENTATION.md`](INSTRUMENTATION.md): portable metric contracts.
-- [`ADVERSARIAL-ACTORS.md`](ADVERSARIAL-ACTORS.md): bounded modified actors.
-- [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md): seeds and replay.
+- [`docs/operations/`](docs/operations/README.md): runtime operations and recovery.
+- [`docs/reference/go-cli.md`](docs/reference/go-cli.md): typed client contract.
+- [`docs/operations/evidence.md`](docs/operations/evidence.md): evidence capture, replay, and minimization.
+- [`docs/development/`](docs/development/README.md): controller and image development.
+- [`docs/development/roadmap.md`](docs/development/roadmap.md): deferred environments and fault mechanisms.
+- [`docs/reference/instrumentation.md`](docs/reference/instrumentation.md): portable metric contracts.
+- [`docs/concepts/adversarial-actors.md`](docs/concepts/adversarial-actors.md): bounded modified actors.
+- [`docs/concepts/reproducibility.md`](docs/concepts/reproducibility.md): seeds and replay.
