@@ -1,16 +1,58 @@
 # Attacknet roadmap
 
-This document lists capabilities that are intentionally not part of the
-qualified Release 1 product. They must not be presented as implemented merely
-because Kubernetes or Bitcoin Core exposes a related primitive.
+This roadmap orders capabilities that are not part of the qualified Release 1
+product. A roadmap entry is not an implemented capability merely because
+Kubernetes, Chaos Mesh, Bitcoin Core, or an existing Attacknet API exposes a
+related primitive.
 
-The machine-readable source of truth is
-[`baseline-v1.json`](../../release/baseline-v1.json). Update that baseline
-when roadmap work changes an advertised capability.
+The machine-readable source of truth for advertised capability remains
+[`baseline-v1.json`](../../release/baseline-v1.json). Update that baseline only
+after an amendment is implemented, qualified, and approved.
 
-## Bounded Bitcoin reorganization campaigns
+## Release 1 amendment roadmap
 
-`BurnchainReorg` is planned as a first-class semantic fault, distinct from a
+The amendments below are ordered by expected value and dependency. Trustworthy
+observations and evidence come before stronger faults; autonomous exploration
+comes only after those faults are bounded, attributable, and replayable.
+
+### A8: Trusted observations and forensic completeness
+
+Make the failure oracle and evidence record trustworthy before adding another
+major fault mechanism. The controller currently owns burn-height observations,
+while Stacks-height and arbitrary invariant observations still require a
+trusted observation bridge.
+
+The bridge must provide fresh, identity-bound observations for:
+
+- Bitcoin height, best-block hash, chainwork, chain tips, and fork identity;
+- Stacks height, index block hash, burn view, and equal-height divergence;
+- signer registration, available weight, state freshness, and node drift;
+- proposal receipt, first response, threshold latency, rejection, and
+  unavailable outcomes;
+- miner and signer activity across reward-cycle and epoch boundaries;
+- scenario-defined balances, supply, and transaction confirmation;
+- telemetry-source availability, freshness, and completeness.
+
+Normal teardown must export the complete retained Loki corpus. The incident
+archive must bind logs, metrics, events, admitted Kubernetes state, controller
+status, runtime image identities, seed, and schedule under one run identity.
+Grafana must present the same causal timeline represented by the
+machine-readable evidence.
+
+Definition of done:
+
+- a missing, stale, or identity-mismatched evidence source produces
+  `Inconclusive`, never `Passed`;
+- every assertion has a deliberate negative control proving it can fail;
+- loss of the observation bridge, metrics store, log store, or event exporter
+  is detected rather than appearing healthy;
+- the complete evidence archive is independently digest-verifiable and can be
+  used to reconstruct the run timeline;
+- live qualification proves both a clean baseline and an attributed failure.
+
+### A9: Bounded Bitcoin reorganization campaigns
+
+Implement `BurnchainReorg` as a first-class semantic fault, distinct from a
 process or packet-level Chaos Mesh fault. Bitcoin Core regtest exposes
 `invalidateblock` and `reconsiderblock`, allowing a controlled single-node
 campaign to invalidate a bounded suffix and mine a longer replacement branch.
@@ -21,34 +63,67 @@ seal:
 - original tip, branch hashes, and chainwork;
 - fork parent, depth, replacement length, and mining recipients;
 - current PoX, epoch, and reward-cycle phase;
-- exact RPC requests and acknowledgments;
+- exact RPC requests and acknowledgements;
 - resulting canonical branch;
 - Stacks rollback, divergence, and recovery observations.
 
 Safety budgets must bound fork depth and duration, forbid crossing an
-unspecified epoch/reward boundary, require the mutation lease, and fail closed
-when the observed branch differs from the sealed precondition.
+unspecified epoch or reward boundary, require the mutation lease, and fail
+closed when the observed branch differs from the sealed precondition.
 `reconsiderblock` only removes a local invalidity marker; it is not proof that
 the intended replacement branch remained canonical.
 
-## Multiple Bitcoin followers
+Definition of done:
 
-A single Bitcoin Core process tests Stacks reorg handling but not Bitcoin
-network partitions. The higher-fidelity planned topology gives every Stacks
-node its own Bitcoin follower and joins those followers through an explicit
-regtest P2P graph.
+- effect evidence proves the requested Bitcoin fork actually occurred;
+- Stacks rollback and reprocessing are observed independently;
+- miner and signer behavior during the reorganization is classified;
+- scenario-defined transaction, balance, and supply invariants are checked;
+- recovery proves convergence on the intended Bitcoin and Stacks branches;
+- the same sealed seed and schedule reproduce the campaign on a fresh network.
 
-Campaigns can then partition Bitcoin cohorts, delay propagation, or mine
+### A10: Mixed-version and upgrade-boundary campaigns
+
+Qualify the existing per-actor image support as explicit compatibility and
+missed-upgrade scenarios. Initial scenario families should cover:
+
+- current nodes with previous-release signers, and the inverse;
+- minority and threshold-relevant cohorts that miss an epoch upgrade;
+- gradual signer-set upgrades during a reward cycle;
+- miner upgrades while signers remain old, and the inverse;
+- restart, initial block download, and registration around activation
+  boundaries;
+- modified builds carrying candidate fixes alongside released binaries.
+
+Every run must record the complete version matrix and join each observation to
+the admitted runtime image digest rather than to a mutable image tag.
+
+Definition of done:
+
+- supported version combinations have deterministic, replayable scenarios;
+- incompatibility is distinguished from telemetry loss and harness failure;
+- epoch and reward-boundary placement is sealed in the run ledger;
+- dashboards and evidence identify every actor's exact runtime image;
+- at least one expected-compatible and one expected-incompatible negative
+  control are qualified.
+
+### A11: Multiple Bitcoin followers and split views
+
+A single Bitcoin Core process tests Stacks reorganization handling but not
+Bitcoin network partitions. Build on the typed Bitcoin-node topology and
+Stacks-actor-to-Bitcoin-node bindings so cohorts can follow independent Bitcoin
+nodes joined through an explicit regtest P2P graph.
+
+Campaigns must be able to partition Bitcoin cohorts, delay propagation, or mine
 bounded competing branches under a seeded work schedule. Honest Stacks actors
 may hold genuinely different burnchain views until the Bitcoin graph heals and
 higher-work selection converges.
 
-This requires first-class Stacks-actor-to-Bitcoin-node bindings and per-Bitcoin
-evidence:
+Per-Bitcoin evidence must include:
 
 - height, best-block hash, and chainwork;
 - chain tips and peer graph;
-- header/block receipt timing;
+- header and block receipt timing;
 - the bound Stacks actor's burn-view hash and height.
 
 Effect assertions must prove the requested split on both layers. Recovery must
@@ -57,63 +132,128 @@ converged without an unexplained canonical fork. Local RPC invalidation and a
 distributed consensus split must retain different mechanism labels.
 
 The dashboard must show Bitcoin P2P edges, partition cohorts, per-node branch
-identity/chainwork, bound Stacks burn views, and a common divergence/recovery
-timeline. Evidence must retain the exact partition and mining schedule.
+identity and chainwork, bound Stacks burn views, and a common divergence and
+recovery timeline. Evidence must retain the exact partition and mining
+schedule.
 
-## Fault composition and fuzz mode
+Definition of done:
 
-Once burnchain faults are bounded and attributable, `AttacknetRun` can combine:
+- a small multi-Bitcoin cohort and the one-follower-per-Stacks-node topology
+  both render and reconcile deterministically;
+- partitions and competing branches are bounded by campaign safety policy;
+- split-view effect and full recovery are proven independently on both layers;
+- replay reproduces the admitted P2P graph, work schedule, and partition;
+- teardown retains the complete per-node Bitcoin and Stacks evidence corpus.
 
-- Bitcoin reorganization or view splits;
+### A12: Deterministic adversarial actors
+
+Add testing-only, deterministic behaviors beyond process and network outages.
+Candidate behaviors include:
+
+- selective vote withholding or delay;
+- conflicting or equivocating signer responses;
+- stale-tenure and invalid-parent miner proposals;
+- selective relay and message suppression;
+- malformed, stale, or oversized protocol inputs;
+- deliberately misleading local state reports;
+- behavior activated at an exact burn height, tenure, actor, or message digest.
+
+Cryptographically attributable active probes and per-scenario actor egress
+policy are prerequisites for strong claims about malicious actors. Egress
+should be restricted by default with an explicit, recorded scenario escape
+hatch. A malicious actor must never be the authority on whether its own attack
+succeeded.
+
+Definition of done:
+
+- each behavior is enabled only in an explicitly modified testing image;
+- image, policy, seed, trigger, and target are sealed before execution;
+- independent observations prove both the attempted behavior and its effect;
+- an actor cannot mutate Kubernetes or Attacknet control-plane state;
+- deterministic replay reproduces the behavior without trusting actor logs;
+- probe attribution and egress-policy negative controls pass.
+
+### A13: Seeded fuzzing, corpus management, and reduction
+
+Once burnchain faults and adversarial actors are bounded and attributable,
+`AttacknetRun` can combine:
+
+- Bitcoin reorganizations and view splits;
 - flash-block cadence;
-- epoch/reward-cycle boundary placement;
-- mixed node/signer versions;
+- epoch and reward-cycle boundary placement;
+- mixed node and signer versions;
 - Pod, network, DNS, disk, and application-clock faults;
 - bounded modified actors.
 
-Adaptive agents may choose among admitted templates, but every decision must be
-seeded, ordered, budgeted, and written to the sealed run ledger before
-execution. No agent may issue an unrecorded Bitcoin RPC or raw Kubernetes fault.
+Adaptive agents may choose only among admitted templates. Every decision must
+be seeded, ordered, budgeted, and written to the sealed run ledger before
+execution. No agent may issue an unrecorded Bitcoin RPC or raw Kubernetes
+fault.
 
-## Managed and x86-64 qualification
+The campaign engine must retain novel failures in a corpus, replay each failure
+on a fresh network, and mechanically reduce the schedule. An LLM may prioritize
+likely contributors to reduce unnecessary trials, but every removal must be
+validated by deterministic replay before it is accepted. Cold-start capacity
+reservation must be implemented before long unattended runs so apparatus
+resource exhaustion does not masquerade as a Stacks defect.
+
+Definition of done:
+
+- identical seeds and admitted inputs produce identical run instructions;
+- safety budgets bound signer, miner, burnchain, duration, and concurrency
+  impact;
+- failing runs preserve their environment until forensic capture completes;
+- corpus entries include a replay command, source and image provenance,
+  assertion outcome, and evidence digest;
+- fresh-network replay confirms a failure before reduction begins;
+- mechanical reduction produces a causal candidate without claiming proof from
+  LLM reasoning alone;
+- clean, failed, inconclusive, and harness-failure outcomes are distinguishable.
+
+## Backlog
+
+These items remain valuable but are lower priority than A8 through A13 or rely
+on infrastructure outside the qualified local Release 1 environment.
+
+### Managed and x86-64 qualification
 
 Release 1 is limited to local arm64 `kind`. Future qualification needs an
 external x86-64, multi-node or multi-zone cluster with:
 
 - immutable registry distribution and organization identity integration;
-- native Chaos Mesh IOChaos/TimeChaos verification;
+- native Chaos Mesh IOChaos and TimeChaos verification;
 - autoscaler, maintenance, and worker replacement scenarios;
 - Kubernetes policy and quota admission evidence;
-- realistic control-plane/API-server failure modes.
+- realistic control-plane and API-server failure modes.
 
-This work is externally dependent and remains deferred until such an
-environment is available.
+This work remains deferred until that environment is available.
 
-## Portable storage
+### Portable storage
 
 The local profile uses node-local storage. It proves same-node recovery and
 explicit stranding when a PVC cannot move. It does not prove portable or zonal
 reattachment.
 
-Future work needs a supported CSI implementation and multi-node/multi-zone
+Future work needs a supported CSI implementation and multi-node or multi-zone
 environment to test detach, reattach, node loss, delayed volume binding, and
 chainstate integrity after relocation.
 
-## Controller high availability
+### Controller high availability
 
 Both controllers are intentionally singleton and have no leader election.
 Future HA work must prove lease ownership, handoff during reconciliation,
 finalizer safety, schedule immutability, and absence of duplicate fault
-execution before raising the replica count.
+execution before raising the replica count. This improves long-running
+apparatus resilience but does not directly expand Stacks fault coverage.
 
-## Additional product gaps
+### Operator experience and deployment hardening
 
-The Release 1 baseline also records these unfinished items:
+The following remain product improvements rather than advertised capabilities:
 
-- cold-start capacity reservation beyond current filesystem observation;
-- per-scenario actor egress NetworkPolicy;
-- cryptographically attributable probes against a malicious same-Pod actor;
-- complete Loki corpus export during normal teardown;
-- packaging a Kubernetes client matched to the server version.
+- packaging a Kubernetes client matched to the server version;
+- enterprise registry and identity-provider federation;
+- managed-cluster installation and policy profiles;
+- portable evidence storage and retention policies.
 
-These are product work, not claims that the harness already satisfies.
+They should not delay the local protocol-fault roadmap unless they become a
+prerequisite for truthful qualification.
