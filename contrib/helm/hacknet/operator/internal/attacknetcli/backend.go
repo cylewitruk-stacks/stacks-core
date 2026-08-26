@@ -40,6 +40,13 @@ type PlanningBackend interface {
 	DryRunApply(context.Context, *unstructured.Unstructured, Kind) (*unstructured.Unstructured, error)
 }
 
+// IdentityDeleteBackend deletes only the exact resource instance previously
+// observed by a caller. It prevents name reuse or concurrent replacement from
+// turning a verified teardown into deletion of a different object.
+type IdentityDeleteBackend interface {
+	DeleteExact(context.Context, ResourceRef, types.UID, string) error
+}
+
 // Diagnosis reports cluster and Attacknet API availability without mutation.
 type Diagnosis struct {
 	SchemaVersion string         `json:"schemaVersion"`
@@ -127,6 +134,27 @@ func (backend *KubernetesBackend) Delete(ctx context.Context, ref ResourceRef) e
 	err := backend.dynamic.Resource(ref.Kind.GVR).Namespace(ref.Namespace).Delete(ctx, ref.Name, metav1.DeleteOptions{PropagationPolicy: &policy})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete %s %s/%s: %w", ref.Kind.Name, ref.Namespace, ref.Name, err)
+	}
+	return nil
+}
+
+// DeleteExact requests foreground deletion with API-server-enforced identity
+// and resource-version preconditions.
+func (backend *KubernetesBackend) DeleteExact(
+	ctx context.Context, ref ResourceRef, uid types.UID, resourceVersion string,
+) error {
+	if uid == "" || resourceVersion == "" {
+		return fmt.Errorf("delete %s %s/%s requires UID and resourceVersion", ref.Kind.Name, ref.Namespace, ref.Name)
+	}
+	policy := metav1.DeletePropagationForeground
+	options := metav1.DeleteOptions{
+		PropagationPolicy: &policy,
+		Preconditions: &metav1.Preconditions{
+			UID: &uid, ResourceVersion: &resourceVersion,
+		},
+	}
+	if err := backend.dynamic.Resource(ref.Kind.GVR).Namespace(ref.Namespace).Delete(ctx, ref.Name, options); err != nil {
+		return fmt.Errorf("delete exact %s %s/%s: %w", ref.Kind.Name, ref.Namespace, ref.Name, err)
 	}
 	return nil
 }

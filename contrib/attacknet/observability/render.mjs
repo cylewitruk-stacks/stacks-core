@@ -49,6 +49,41 @@ function containerSecurity() {
 
 const FAMILY_PROVENANCE = new Set(['merged', 'attacknet-patch', 'unavailable']);
 
+/** Convert one Ready v1beta1 StacksNetwork into the renderer's bounded input. */
+export function manifestFromStacksNetwork(resource) {
+  if (resource?.apiVersion !== 'testing.stacks.org/v1beta1' || resource.kind !== 'StacksNetwork') {
+    throw new Error('observability source must be a v1beta1 StacksNetwork');
+  }
+  const {metadata = {}, status = {}} = resource;
+  if (!metadata.name || !metadata.namespace || status.phase !== 'Ready'
+    || status.inventoryReady !== true || status.observedGeneration !== metadata.generation
+    || !/^sha256:[0-9a-f]{64}$/.test(status.inventoryDigest ?? '')
+    || !Array.isArray(status.actors) || status.actors.length === 0) {
+    throw new Error('StacksNetwork lacks a current complete admitted inventory');
+  }
+  const names = new Set();
+  const workloads = status.actors.map(actor => {
+    if (!actor?.name || names.has(actor.name) || !actor.role || !actor.identityReady
+      || !DNS_LABEL.test(actor.serviceName ?? '') || actor.serviceName.length > 63
+      || !actor.image || !/^sha256:[0-9a-f]{64}$/.test(actor.runtimeImageID ?? '')) {
+      throw new Error('StacksNetwork contains an incomplete or duplicate admitted actor');
+    }
+    names.add(actor.name);
+    return {
+      service: actor.name,
+      metricsService: actor.serviceName,
+      role: actor.role,
+      requestedImage: actor.image,
+      instrumentation: {profile: 'unmodified', provenance: 'unavailable'},
+    };
+  });
+  return {network: metadata.name, namespace: metadata.namespace, workloads};
+}
+
+function normalizedManifest(value) {
+  return value?.kind === 'StacksNetwork' ? manifestFromStacksNetwork(value) : value;
+}
+
 export function instrumentationExpectationsFromPlan(plan, manifestPath) {
   if (plan?.schema !== 'stacks-attacknet-phase-1-qualification-plan/v1') {
     throw new Error('instrumentation plan uses an unsupported schema');
@@ -127,7 +162,7 @@ function actorTargets(manifest) {
   const nodes = actors.filter(actor => ['miner', 'companion', 'follower'].includes(actor.role));
   const signers = actors.filter(actor => actor.role === 'signer');
   const target = (actor, port) => {
-    return {targets: [`${stableName(manifest.network, actor.service)}:${port}`], labels: {
+    return {targets: [`${actor.metricsService ?? stableName(manifest.network, actor.service)}:${port}`], labels: {
       attacknet_network: manifest.network,
       attacknet_actor: actor.service,
       attacknet_role: actor.role,
@@ -265,6 +300,13 @@ export function prometheusRules() {
           severity: warning
         annotations:
           summary: The run operator cannot publish authoritative campaign and run state
+      - alert: AttacknetProtocolAssertionTerminalFailure
+        expr: attacknet_run_protocol_assertion{outcome=~"Violated|Inconclusive"} == 1
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: An identity-bound AttacknetRun protocol assertion terminated unsuccessfully
       - alert: AttacknetCorrelatedSignerParticipationLoss
         expr: count(stacks_signer_registered_for_current_reward_cycle == 0) by (attacknet_network) >= 2
         for: 30s
@@ -484,6 +526,24 @@ function service(name, namespace, metadataLabels, ports) {
   return {apiVersion: 'v1', kind: 'Service', metadata: {name, namespace, labels: metadataLabels}, spec: {selector: metadataLabels, ports}};
 }
 
+function lokiIngressPolicy(name, namespace, lokiLabels, alloyWriterLabels, grafanaLabels) {
+  return {
+    apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy',
+    metadata: {name, namespace, labels: lokiLabels},
+    spec: {
+      podSelector: {matchLabels: lokiLabels},
+      policyTypes: ['Ingress'],
+      ingress: [{
+        from: [
+          {podSelector: {matchLabels: alloyWriterLabels}},
+          {podSelector: {matchLabels: grafanaLabels}},
+        ],
+        ports: [{protocol: 'TCP', port: 3100}],
+      }],
+    },
+  };
+}
+
 export function renderObservability(manifest, {
   eventToken,
   prometheusImage = 'prom/prometheus:v3.5.0',
@@ -494,6 +554,7 @@ export function renderObservability(manifest, {
   runOperatorTarget = 'hacknet-run:8080',
   instrumentationExpectations = [],
 } = {}) {
+  manifest = normalizedManifest(manifest);
   const network = manifest.network;
   const namespace = manifest.namespace;
   if (!DNS_LABEL.test(network) || network.length > 63 || !DNS_LABEL.test(namespace) || namespace.length > 63) throw new Error('manifest network and namespace must be DNS labels of at most 63 characters');
@@ -520,6 +581,10 @@ export function renderObservability(manifest, {
   const eventLabels = labels(network, 'events');
   const lokiLabels = labels(network, 'loki');
   const alloyLabels = labels(network, 'alloy');
+  const alloyWriterLabels = {
+    'testing.stacks.org/network': network,
+    'testing.stacks.org/loki-writer': 'true',
+  };
   const names = {
     eventWriter: stableName(network, 'attacknet-event-writer'),
     events: stableName(network, 'attacknet-events'),
@@ -568,6 +633,10 @@ export function renderObservability(manifest, {
         volumes: [{name: 'config', configMap: {name: names.loki}}, {name: 'data', persistentVolumeClaim: {claimName: names.loki}}, {name: 'tmp', emptyDir: {sizeLimit: '128Mi'}}],
       }}}},
     service(names.loki, namespace, lokiLabels, [{name: 'http', port: 3100, targetPort: 'http'}]),
+    lokiIngressPolicy(
+      stableName(network, 'attacknet-loki-ingress'), namespace,
+      lokiLabels, alloyWriterLabels, grafanaLabels,
+    ),
     {apiVersion: 'v1', kind: 'ServiceAccount', metadata: {name: names.alloy, namespace, labels: alloyLabels}, automountServiceAccountToken: false},
     {
       apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'Role', metadata: {name: names.alloy, namespace, labels: alloyLabels},
@@ -584,7 +653,7 @@ export function renderObservability(manifest, {
     configMap(names.alloy, namespace, alloyLabels, {'config.alloy': collectorConfig}),
     {
       apiVersion: 'apps/v1', kind: 'DaemonSet', metadata: {name: names.alloy, namespace, labels: alloyLabels},
-      spec: {selector: {matchLabels: alloyLabels}, updateStrategy: {type: 'RollingUpdate', rollingUpdate: {maxUnavailable: 1}}, template: {metadata: {labels: alloyLabels, annotations: {'testing.stacks.org/config-sha256': digest(collectorConfig)}}, spec: {
+      spec: {selector: {matchLabels: alloyLabels}, updateStrategy: {type: 'RollingUpdate', rollingUpdate: {maxUnavailable: 1}}, template: {metadata: {labels: {...alloyLabels, ...alloyWriterLabels}, annotations: {'testing.stacks.org/config-sha256': digest(collectorConfig)}}, spec: {
         serviceAccountName: names.alloy, automountServiceAccountToken: false, securityContext: podSecurity(473), tolerations: [
           {key: 'node-role.kubernetes.io/control-plane', operator: 'Exists', effect: 'NoSchedule'},
           {key: 'node-role.kubernetes.io/master', operator: 'Exists', effect: 'NoSchedule'},
@@ -612,7 +681,7 @@ export function renderObservability(manifest, {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const manifestPath = process.argv[2];
-  if (!manifestPath) throw new Error('usage: render.mjs MANIFEST [--output=FILE] [--event-token=TOKEN]');
+  if (!manifestPath) throw new Error('usage: render.mjs MANIFEST_OR_STACKSNETWORK [--output=FILE] [--event-token=TOKEN]');
   const output = resolve(option('output', join(ROOT, 'generated', 'observability.json')));
   const tokenOutput = resolve(option('token-output', join(dirname(output), 'event-token')));
   const instrumentationPlanPath = option('instrumentation-plan', undefined);

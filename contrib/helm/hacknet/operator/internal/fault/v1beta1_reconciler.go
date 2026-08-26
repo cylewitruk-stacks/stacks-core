@@ -1369,6 +1369,9 @@ func (r *V1Beta1Reconciler) SetupWithManager(mgr manager.Manager, maxConcurrent 
 	if r.APIReader == nil {
 		return errors.New("v1beta1 FaultCampaign reconciler requires an uncached Kubernetes API reader")
 	}
+	if r.Observations == nil {
+		return errors.New("v1beta1 FaultCampaign reconciler requires trusted protocol observations")
+	}
 	if r.CompilationCache == nil {
 		cache, err := NewCompilationCache(defaultCompilationCacheCapacity)
 		if err != nil {

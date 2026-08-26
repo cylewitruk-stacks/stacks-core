@@ -34,7 +34,7 @@ function fixture() {
   }, null, 2)}\n`);
   writeFileSync(indexPath, indexBytes);
   const archivePath = join(root, 'evidence.tar');
-  execFileSync('tar', ['-cf', archivePath, '-C', bundle, '.']);
+  execFileSync('tar', ['-cf', archivePath, '-C', bundle, '.'], {env: {...process.env, COPYFILE_DISABLE: '1'}});
   return {
     root,
     candidate: {sourceRevision: 'a'.repeat(40), commitPending: false, dirtyPatchDigest: `sha256:${'0'.repeat(64)}`},

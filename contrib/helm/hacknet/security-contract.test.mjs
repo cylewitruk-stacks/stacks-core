@@ -17,10 +17,16 @@ function packageSource(name) {
 const runController = packageSource('run');
 const faultController = packageSource('fault');
 const ownership = readFileSync(join(root, 'operator', 'internal', 'ownership', 'ownership.go'), 'utf8');
+const topologyDeployment = readFileSync(join(root, 'templates', 'deployment.yaml'), 'utf8');
 
 test('run operator owner references are limited to run-domain resources', () => {
   assert.match(ownership, /metav1\.NewControllerRef\(owner, gvk\)/);
   assert.match(runController, /ownership\.Reference\(run, attacknetv1alpha1\.GroupVersion\.WithKind\("AttacknetRun"\)\)/);
   assert.match(faultController, /ownership\.Reference\(campaign, attacknetv1alpha1\.GroupVersion\.WithKind\("FaultCampaign"\)\)/);
   assert.doesNotMatch(`${runController}\n${faultController}`, /ownership\.Reference\(network/);
+});
+
+test('topology Deployment publishes its operator component identity', () => {
+  const metadata = topologyDeployment.slice(0, topologyDeployment.indexOf('\nspec:'));
+  assert.match(metadata, /app\.kubernetes\.io\/component: operator/);
 });

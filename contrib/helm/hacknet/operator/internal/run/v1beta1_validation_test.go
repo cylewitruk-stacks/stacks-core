@@ -3,6 +3,11 @@ package run
 import (
 	"strings"
 	"testing"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
 
 func TestValidateV1Beta1StructureRejectsInvalidRunContracts(t *testing.T) {
@@ -29,6 +34,23 @@ func TestValidateV1Beta1StructureRejectsInvalidRunContracts(t *testing.T) {
 		err := ValidateV1Beta1Structure(run)
 		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 			t.Fatalf("got %v, want replay-mode rejection", err)
+		}
+	})
+	t.Run("malformed protocol assertion", func(t *testing.T) {
+		run, _, _, _, _ := betaScheduleFixture()
+		run.Spec.BaselineAssertions = &attacknetv1beta1.ProtocolAssertionSetSpec{
+			Timeout: metav1.Duration{Duration: time.Minute},
+			Assertions: []attacknetv1beta1.ProtocolAssertionSpec{{
+				ID: "ambiguous",
+				ChainProgress: &attacknetv1beta1.ChainProgressAssertion{
+					Chain: "stacks", Actors: []string{"miner-1"}, Window: metav1.Duration{Duration: 30 * time.Second}, MinimumDelta: 1,
+				},
+				TelemetryCompleteness: &attacknetv1beta1.TelemetryCompletenessAssertion{Actors: []string{"miner-1"}},
+			}},
+		}
+		err := ValidateV1Beta1Structure(run)
+		if err == nil || !strings.Contains(err.Error(), "exactly one") {
+			t.Fatalf("got %v, want ambiguous assertion rejection", err)
 		}
 	})
 }

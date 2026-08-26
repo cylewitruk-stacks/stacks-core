@@ -24,7 +24,7 @@ function suite(value) {
 }
 
 export function buildOfflineResult({sourceRevision, suites, command = 'contrib/attacknet/test/check.sh', recordedAt = new Date().toISOString()}) {
-  if (!/^[0-9a-f]{40}$/.test(sourceRevision)) throw new Error('sourceRevision must be an exact commit');
+  if (!/^[0-9a-f]{40}$/.test(sourceRevision)) throw new Error('sourceRevision must be an exact Git object ID');
   if (!Array.isArray(suites) || suites.length === 0) throw new Error('at least one observed suite is required');
   if (typeof command !== 'string' || command.length === 0) throw new Error('command must be a non-empty string');
   if (typeof recordedAt !== 'string' || !Number.isFinite(Date.parse(recordedAt))) throw new Error('recordedAt must be an ISO timestamp');

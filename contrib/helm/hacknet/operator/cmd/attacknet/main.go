@@ -54,6 +54,13 @@ func main() {
 		}
 		return attacknetcli.NewClientGoIncidentReader(config)
 	}
+	app.LogExportFactory = func() (attacknetcli.RetainedLogExporter, error) {
+		config, err := loadConfig()
+		if err != nil {
+			return nil, err
+		}
+		return attacknetcli.NewClientGoLokiExporter(config)
+	}
 	app.CommandRunner = attacknetcli.ExecCommandRunner{}
 	app.PortForwards = attacknetcli.NewOSPortForwardManager("kubectl", attacknetcli.DefaultPortForwardStateDir())
 	os.Exit(app.Run(ctx, os.Args[1:]))

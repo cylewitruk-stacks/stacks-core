@@ -186,9 +186,12 @@ $ATTACKNET wait --namespace hacknet-system --for terminal \
   AttacknetRun bounded-mixed-faults
 ```
 
-Stacks-height and arbitrary observation triggers remain Pending unless a
-trusted observation reader is configured. Burn-height and controller-owned
-dependency milestones work from uncached, identity-bound Kubernetes status.
+Burn height, Stacks height, and the finite named-observation vocabulary are
+collected by the run operator. Actor metric values remain self-reported, but
+the controller reads them through operator-owned Services between two uncached
+admitted-inventory checks and records an identity-bound source receipt.
+Missing, stale, ambiguous, or replaced sources remain Pending and expire
+`Inconclusive`; they never satisfy a trigger or assertion.
 
 ## Observe and retain evidence
 
@@ -230,21 +233,32 @@ Port-forwards bind loopback only and are tracked by exact process identity.
 
 ## Teardown
 
-Delete runs and campaigns first, then the clock policy and network. Foreground
-deletion waits for controller finalizers and owned-resource cleanup.
+Keep the terminal run until the evidence-safe network teardown has captured
+it. Complete teardown requires the network-scoped observability stack described
+in [`observability/README.md`](observability/README.md); missing or incomplete
+Loki evidence preserves the network. Foreground deletion waits for controller
+finalizers and owned-resource cleanup.
 
 ```bash
 $ATTACKNET delete --namespace hacknet-system --wait \
-  AttacknetRun bounded-mixed-faults
-$ATTACKNET delete --namespace hacknet-system --wait \
   FaultCampaign minimal-follower-restart
 $ATTACKNET delete --namespace hacknet-system --wait BurnchainPolicy minimal
-$ATTACKNET delete --namespace hacknet-system --wait StacksNetwork minimal
+$ATTACKNET teardown --namespace hacknet-system \
+  --output evidence/minimal-teardown \
+  --run bounded-mixed-faults minimal
+$ATTACKNET delete --namespace hacknet-system --wait \
+  AttacknetRun bounded-mixed-faults
 ```
 
-Capture forensic evidence before deletion. Deleting a `StacksNetwork` removes
-its owned actor PVCs. Helm intentionally leaves CRDs installed; do not remove
-them while custom resources remain.
+The teardown command captures an identity-bound incident bundle and complete
+retained Loki interval before deleting the `StacksNetwork`. Any incomplete
+capture preserves the network and its actor PVCs. Direct `delete
+StacksNetwork` is an administrative escape hatch without this evidence
+guarantee. Helm intentionally leaves CRDs installed; do not remove them while
+custom resources remain.
+
+For a network without an `AttacknetRun`, pass the retained experiment start as
+`--start "$RUN_START_RFC3339"` instead of `--run`.
 
 ```bash
 helm uninstall hacknet -n hacknet-system

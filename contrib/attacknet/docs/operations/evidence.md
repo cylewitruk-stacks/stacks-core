@@ -30,10 +30,44 @@ attacknet evidence incident --namespace hacknet-system \
   --output evidence/bounded-mixed-faults attacknet
 ```
 
-The incident bundle binds logs to exact admitted Pod names and UIDs, captures
+The incident bundle binds bounded Kubernetes log tails to exact admitted Pod names and UIDs, captures
 bounded owned resources and Events, records per-artifact digests, and reports
-omissions explicitly. Preserve Prometheus, Loki, the trusted event journal,
-terminal run status, and the controller-owned schedule separately.
+omissions explicitly. It is deliberately not the complete retained log
+corpus.
+
+For normal network teardown, bind the retained run and use the evidence barrier
+instead of deleting the `StacksNetwork` directly:
+
+```bash
+attacknet teardown --namespace hacknet-system \
+  --output evidence/attacknet-teardown \
+  --run bounded-mixed-faults attacknet
+```
+
+The run form derives the interval start from controller-observed status and
+includes the complete `AttacknetRun` object. For a network without a run, use
+`--start "$RUN_START_RFC3339"` instead. `teardown` first captures the incident bundle, then discovers exactly one
+ready identity-labelled Loki Pod through Kubernetes, exports the full selected
+interval with bounded forward pagination, and records Loki build/source
+identity plus artifact digests. The CLI rechecks the exact Service and Pod UID
+before the temporary export is made final and binds the source object into the
+teardown manifest. The teardown manifest and nested incident manifest bind the
+retained artifacts by digest; missing, truncated, or digest-mismatched data
+cannot authorize deletion. Release qualification may add a recursive inventory
+around this product evidence. Only a complete final export permits
+foreground deletion. A source outage, pagination stall, partial file, capture
+omission, or export error preserves the `StacksNetwork` and its PVCs for
+forensics. The interval ends after the incident snapshot unless `--end` is
+explicitly supplied.
+
+The exported actor values and log bodies remain self-reported or untrusted.
+Kubernetes stream labels, admitted identities, controller status, and export
+metadata are orchestrator-observed.
+
+Grafana correlates each protocol assertion with its exact admitted source Pod,
+UID, runtime image, Service, evidence class, and observation timestamp. These
+views aid diagnosis; the controller status and sealed evidence remain the
+release oracle.
 
 Failed or inconclusive campaigns must preserve their network until evidence
 and attribution are complete.
@@ -43,6 +77,7 @@ and attribution are complete.
 An attributable run retains:
 
 - source revision and local patch identity;
+- qualified-tree-bound build and per-node image-admission receipts;
 - requested topology plus network UID and observed generation;
 - admitted actor, Pod, StatefulSet, and runtime image identities;
 - campaign-template identities and the sealed schedule digest;

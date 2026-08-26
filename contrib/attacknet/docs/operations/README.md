@@ -69,17 +69,28 @@ The qualified full protocol shape is
 It requires the referenced ConfigMaps and Secrets. Actor and signer identities
 come from `StacksNetwork.status`; never infer them from names alone.
 
-Delete runs and campaigns before their network:
+Keep the terminal run until the evidence-safe teardown barrier has captured
+it. Install the network-scoped observability resources from
+[`observability/README.md`](../../observability/README.md) before starting an
+evidence-bearing run. Delete standalone campaign templates and policy resources
+first:
 
 ```bash
-$ATTACKNET delete --namespace hacknet-system --wait AttacknetRun bounded-run
 $ATTACKNET delete --namespace hacknet-system --wait FaultCampaign partition
 $ATTACKNET delete --namespace hacknet-system --wait BurnchainPolicy minimal
-$ATTACKNET delete --namespace hacknet-system --wait StacksNetwork minimal
+$ATTACKNET teardown --namespace hacknet-system \
+  --output evidence/minimal-teardown \
+  --run bounded-run minimal
+$ATTACKNET delete --namespace hacknet-system --wait AttacknetRun bounded-run
 ```
 
-Foreground deletion waits for controller finalizers. Deleting a
-`StacksNetwork` deletes actor PVCs; suspension retains them.
+Foreground deletion waits for controller finalizers. Teardown blocks deletion
+until the incident bundle and complete retained Loki interval are exported.
+Direct network deletion bypasses that evidence guarantee. Suspension retains
+actor PVCs.
+
+For a network without an `AttacknetRun`, pass the retained experiment start as
+`--start "$RUN_START_RFC3339"` instead of `--run`.
 
 ## Burnchain cadence
 

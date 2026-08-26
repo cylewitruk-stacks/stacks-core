@@ -165,7 +165,7 @@ export function assembleReleaseOneA3Evidence({
   writeFileSync(indexPath, `${JSON.stringify(archiveIndex(candidateRevision, output), null, 2)}\n`);
   const archiveName = `release-1-a3-evidence-${candidateRevision.slice(0, 12)}.tar.gz`;
   const archivePath = join(output, 'archive', archiveName);
-  execFileSync('tar', ['-czf', archivePath, '-C', output, 'archive-index.json', 'artifacts']);
+  execFileSync('tar', ['-czf', archivePath, '-C', output, 'archive-index.json', 'artifacts'], {env: {...process.env, COPYFILE_DISABLE: '1'}});
   const summary = {
     schema: SUMMARY_SCHEMA,
     candidateRevision,

@@ -17,37 +17,57 @@ comes only after those faults are bounded, attributable, and replayable.
 
 ### A8: Trusted observations and forensic completeness
 
-Make the failure oracle and evidence record trustworthy before adding another
-major fault mechanism. The controller currently owns burn-height observations,
-while Stacks-height and arbitrary invariant observations still require a
-trusted observation bridge.
+Status: implementation candidate, pending staged-tree qualification, one final
+hardware-signed tree binding, and Full-tier dual review.
 
-The bridge must provide fresh, identity-bound observations for:
+Make the failure oracle and evidence record trustworthy before adding another
+major fault mechanism. The A8 candidate adds direct, identity-bound acquisition
+and a finite typed assertion vocabulary for height/progress, cohort agreement,
+signer registration and state freshness, proposal-outcome visibility, and
+telemetry completeness. It also makes complete retained Loki export and a
+bounded incident capture a fail-closed network-deletion barrier.
+
+The initial A8 vocabulary provides fresh, identity-bound observations for:
+
+- Bitcoin and Stacks heights and progress;
+- Bitcoin and Stacks cohort height agreement;
+- signer registration and state freshness;
+- proposal response visibility; and
+- telemetry-source availability, freshness, and completeness.
+
+The following richer protocol evidence remains future work and is not part of
+the A8 candidate claim:
 
 - Bitcoin height, best-block hash, chainwork, chain tips, and fork identity;
 - Stacks height, index block hash, burn view, and equal-height divergence;
-- signer registration, available weight, state freshness, and node drift;
+- signer available weight and node drift;
 - proposal receipt, first response, threshold latency, rejection, and
   unavailable outcomes;
 - miner and signer activity across reward-cycle and epoch boundaries;
-- scenario-defined balances, supply, and transaction confirmation;
-- telemetry-source availability, freshness, and completeness.
+- scenario-defined balances, supply, and transaction confirmation.
 
-Normal teardown must export the complete retained Loki corpus. The incident
-archive must bind logs, metrics, events, admitted Kubernetes state, controller
-status, runtime image identities, seed, and schedule under one run identity.
-Grafana must present the same causal timeline represented by the
-machine-readable evidence.
+Normal teardown exports the complete retained Loki corpus and binds it to the
+incident snapshot, controller status, runtime identities, run interval, and
+artifact digests. Prometheus range export and a single combined archive for all
+stores remain follow-up work; Grafana is a correlated human view and is never
+the release oracle.
+
+The small A8 qualification cohort deliberately remains before the configured
+epoch transitions. Its follower-only actors can prove observation, progress,
+cohort, failure, and recovery semantics, but cannot produce the PoX anchor
+history required for a long-running Nakamoto network. Nakamoto liveness remains
+a separate accepted-topology qualification and is not inferred from A8.
 
 Definition of done:
 
 - a missing, stale, or identity-mismatched evidence source produces
   `Inconclusive`, never `Passed`;
-- every assertion has a deliberate negative control proving it can fail;
+- the qualified assertion classes have deliberate negative controls proving
+  violation and source-loss paths;
 - loss of the observation bridge, metrics store, log store, or event exporter
   is detected rather than appearing healthy;
-- the complete evidence archive is independently digest-verifiable and can be
-  used to reconstruct the run timeline;
+- the complete retained-log and review archives are independently
+  digest-verifiable;
 - live qualification proves both a clean baseline and an attributed failure.
 
 ### A9: Bounded Bitcoin reorganization campaigns

@@ -35,6 +35,7 @@ import (
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolobservation"
 	runcontroller "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/run"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
@@ -312,8 +313,15 @@ func TestRunAndFaultManagersExecuteOneShotCampaignEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	resolver := staticSignerResolver{}
-	faults := &fault.V1Beta1Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme}
-	runs := &runcontroller.V1Beta1Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme, SignerSets: resolver}
+	protocolReader := &protocolobservation.Reader{APIReader: mgr.GetAPIReader()}
+	faults := &fault.V1Beta1Reconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme,
+		Observations: &fault.KubernetesTriggerObservationReader{Reader: mgr.GetAPIReader(), Protocol: protocolReader},
+	}
+	runs := &runcontroller.V1Beta1Reconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme, SignerSets: resolver,
+		Observations: &runcontroller.KubernetesObservationReader{Reader: mgr.GetAPIReader(), Protocol: protocolReader},
+	}
 	if err := faults.SetupWithManager(mgr, 1); err != nil {
 		t.Fatal(err)
 	}

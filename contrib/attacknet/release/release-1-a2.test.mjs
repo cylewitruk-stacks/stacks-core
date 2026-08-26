@@ -61,7 +61,7 @@ function fixture() {
   const archiveDirectory = join(liveRoot, 'archive');
   mkdirSync(archiveDirectory);
   const archivePath = join(archiveDirectory, 'evidence.tar');
-  execFileSync('tar', ['-cf', archivePath, '-C', liveRoot, 'evidence-index.json', ...Object.values(artifacts).map(value => value.archiveEntry)]);
+  execFileSync('tar', ['-cf', archivePath, '-C', liveRoot, 'evidence-index.json', ...Object.values(artifacts).map(value => value.archiveEntry)], {env: {...process.env, COPYFILE_DISABLE: '1'}});
   const summary = {
     schema: 'stacks-attacknet-release-1-a2-live-evidence/v1',
     candidateRevision: candidate.sourceRevision,

@@ -53,6 +53,7 @@ var commandContracts = []CommandContract{
 	{Name: "image load", Purpose: "Load exact local image references into every kind node", SideEffectClass: "local-process-mutation", OutputKinds: []string{"json"}},
 	{Name: "install local", Purpose: "Install immutable local images and the Hacknet chart safely", SideEffectClass: "runtime-mutation", OutputKinds: []string{"json"}},
 	{Name: "evidence incident", Purpose: "Capture a bounded admitted-identity incident bundle", SideEffectClass: "local-filesystem-write", OutputKinds: []string{"json"}},
+	{Name: "teardown", Purpose: "Export complete evidence before deleting one StacksNetwork", SideEffectClass: "runtime-mutation", Controller: false, InputKinds: []string{"StacksNetwork"}, OutputKinds: []string{"json"}},
 }
 
 const maximumCLIInputBytes = 8 << 20
@@ -79,10 +80,14 @@ type App struct {
 	CommandRunner    CommandRunner
 	IncidentReader   IncidentEvidenceReader
 	IncidentFactory  func() (IncidentEvidenceReader, error)
+	LogExporter      RetainedLogExporter
+	LogExportFactory func() (RetainedLogExporter, error)
 	backendOnce      sync.Once
 	backendErr       error
 	incidentOnce     sync.Once
 	incidentErr      error
+	logExportOnce    sync.Once
+	logExportErr     error
 }
 
 // NewLazyApp constructs an application whose Kubernetes clients are created
@@ -137,6 +142,8 @@ func (app *App) Run(ctx context.Context, args []string) int {
 		err = app.runImage(ctx, args[1:])
 	case "install":
 		err = app.runInstall(ctx, args[1:])
+	case "teardown":
+		err = app.runTeardown(ctx, args[1:])
 	default:
 		err = usageError(fmt.Sprintf("unknown command %q", args[0]))
 	}
@@ -567,6 +574,23 @@ func (app *App) requireIncidentReader() (IncidentEvidenceReader, error) {
 		}
 	})
 	return app.IncidentReader, app.incidentErr
+}
+
+func (app *App) requireLogExporter() (RetainedLogExporter, error) {
+	app.logExportOnce.Do(func() {
+		if app.LogExporter != nil {
+			return
+		}
+		if app.LogExportFactory == nil {
+			app.logExportErr = errors.New("Kubernetes retained-log exporter is unavailable")
+			return
+		}
+		app.LogExporter, app.logExportErr = app.LogExportFactory()
+		if app.logExportErr == nil && app.LogExporter == nil {
+			app.logExportErr = errors.New("Kubernetes retained-log exporter factory returned nil")
+		}
+	})
+	return app.LogExporter, app.logExportErr
 }
 
 func (app *App) requireCommandRunner() (CommandRunner, error) {

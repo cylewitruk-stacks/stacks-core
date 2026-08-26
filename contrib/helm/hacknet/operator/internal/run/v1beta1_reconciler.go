@@ -29,6 +29,8 @@ import (
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/ownership"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolassertion"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolobservation"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
@@ -60,6 +62,11 @@ type betaDecision struct {
 	Phase       string    `json:"phase"`
 	CompletedAt time.Time `json:"completedAt"`
 	Source      string    `json:"source"`
+}
+
+type protocolGate struct {
+	Outcome string
+	Reason  string
 }
 
 // Reconcile advances one v1beta1 run through at most one durable status write.
@@ -162,22 +169,57 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 	if usage.WallTimeMillis > int64(schedule.Budgets.MaxWallTimeSeconds)*1000 {
 		return reconcile.Result{}, r.budgetTerminal(ctx, run, next, "WallTimeBudgetExhausted")
 	}
-	if terminalPhase, terminalReason, attribution := betaStopDecision(run, decisions, usage); terminalPhase != "" {
+	terminalPhase, terminalReason, terminalAttribution := betaStopDecision(run, decisions, usage)
+	if terminalPhase != "" && terminalPhase != "Passed" {
 		if terminalPhase == "Paused" {
-			next.Attribution = attribution
+			next.Attribution = terminalAttribution
 			return reconcile.Result{}, r.pauseWithCleanup(ctx, run, next, terminalReason, "")
 		}
-		return reconcile.Result{}, r.finish(ctx, run, next, terminalPhase, terminalReason, attribution)
+		return reconcile.Result{}, r.finish(ctx, run, next, terminalPhase, terminalReason, terminalAttribution)
 	}
-	if int(usage.CampaignsCompleted) == len(schedule.Executions) {
-		return reconcile.Result{}, r.finish(ctx, run, next, "Passed", "ScheduleCompleted", "NotRequired")
+	if betaSuccessStopWaitsForActiveCampaigns(terminalPhase, usage) {
+		// Recovery assertions describe the post-fault network. Preserve and
+		// wait for already-running campaigns to finish their bounded recovery,
+		// while the completed decision prevents any new work from starting.
+		return reconcile.Result{RequeueAfter: 2 * time.Second}, r.patchStatus(
+			ctx,
+			run,
+			betaRunTransition(next, run.Generation, "Running", "StoppingAfterSuccessfulCampaign", "", r.now()),
+		)
 	}
-
 	started := betaStartedExecutions(children)
 	external, err := r.observationReader().Read(ctx, run, live.Network)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	gate, err := r.evaluateProtocolAssertions(
+		&next,
+		schedule,
+		usage,
+		betaHasProvenActiveFault(children),
+		external.Protocol,
+		terminalPhase == "Passed",
+	)
+	if err != nil {
+		return reconcile.Result{}, r.fail(ctx, run, "ProtocolAssertionIntegrityFailed", err)
+	}
+	if gate != nil {
+		switch gate.Outcome {
+		case protocolassertion.OutcomeViolated:
+			return reconcile.Result{}, r.finish(ctx, run, next, "Failed", gate.Reason, "ProtocolAssertion")
+		case protocolassertion.OutcomeInconclusive:
+			return reconcile.Result{}, r.finish(ctx, run, next, "Inconclusive", gate.Reason, "Inconclusive")
+		case protocolassertion.OutcomePending:
+			return reconcile.Result{RequeueAfter: 2 * time.Second}, r.patchStatus(ctx, run, betaRunTransition(next, run.Generation, "Running", gate.Reason, "", r.now()))
+		}
+	}
+	if terminalPhase == "Passed" {
+		return reconcile.Result{}, r.finish(ctx, run, next, terminalPhase, terminalReason, terminalAttribution)
+	}
+	if int(usage.CampaignsCompleted) == len(schedule.Executions) {
+		return reconcile.Result{}, r.finish(ctx, run, next, "Passed", "ScheduleCompleted", "NotRequired")
+	}
+
 	snapshot := trigger.Snapshot{
 		Now: r.now(), StartedAt: run.Status.StartedAt.Time.UTC(), Dependencies: childDependencyObservations(children),
 		BurnHeight: external.BurnHeight, StacksHeight: external.StacksHeight, Observations: external.Observations,
@@ -322,6 +364,79 @@ func (r *V1Beta1Reconciler) prepare(ctx context.Context, run *attacknetv1beta1.A
 	}
 	next.BudgetUsage = &attacknetv1beta1.BudgetUsage{MinimizationAttempts: ternary(run.Spec.Minimization.Enabled, int32(1), int32(0))}
 	return r.patchStatus(ctx, run, betaRunTransition(next, run.Generation, "Preparing", "ResolvedSchedulePersisted", "", r.now()))
+}
+
+func (r *V1Beta1Reconciler) evaluateProtocolAssertions(
+	next *attacknetv1beta1.AttacknetRunStatus,
+	schedule betaSchedule,
+	usage *attacknetv1beta1.BudgetUsage,
+	provenActiveFault bool,
+	snapshot protocolobservation.Snapshot,
+	finishAfterSuccess bool,
+) (*protocolGate, error) {
+	if schedule.Assertions.Baseline == nil && schedule.Assertions.During == nil && schedule.Assertions.Recovery == nil {
+		return nil, nil
+	}
+	if next.ProtocolAssertions == nil {
+		next.ProtocolAssertions = &attacknetv1beta1.ProtocolAssertionsStatus{}
+	}
+	evaluate := func(
+		name string,
+		spec *attacknetv1beta1.ProtocolAssertionSetSpec,
+		status **attacknetv1beta1.ProtocolAssertionSetStatus,
+		blockPending bool,
+	) (*protocolGate, error) {
+		if spec == nil {
+			return nil, nil
+		}
+		observed, err := protocolassertion.EvaluateSet(*spec, *status, snapshot, r.now())
+		if err != nil {
+			return nil, fmt.Errorf("evaluate %s protocol assertions: %w", name, err)
+		}
+		*status = &observed
+		reason := "Protocol" + name + observed.Outcome
+		switch observed.Outcome {
+		case protocolassertion.OutcomeViolated, protocolassertion.OutcomeInconclusive:
+			return &protocolGate{Outcome: observed.Outcome, Reason: reason}, nil
+		case protocolassertion.OutcomePending:
+			if blockPending {
+				return &protocolGate{Outcome: observed.Outcome, Reason: reason}, nil
+			}
+		}
+		return nil, nil
+	}
+	if usage.CampaignsStarted == 0 {
+		gate, err := evaluate("Baseline", schedule.Assertions.Baseline, &next.ProtocolAssertions.Baseline, true)
+		if err != nil || gate != nil {
+			return gate, err
+		}
+	}
+	if provenActiveFault {
+		gate, err := evaluate("During", schedule.Assertions.During, &next.ProtocolAssertions.During, false)
+		if err != nil || gate != nil {
+			return gate, err
+		}
+	}
+	if schedule.Assertions.During != nil && usage.CampaignsStarted > 0 && (usage.ActiveCampaigns == 0 || finishAfterSuccess) {
+		closed, err := protocolassertion.ConcludeUnavailable(
+			*schedule.Assertions.During,
+			next.ProtocolAssertions.During,
+			r.now(),
+			"ActiveFaultEvidenceWindowClosed",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("close during protocol assertions: %w", err)
+		}
+		next.ProtocolAssertions.During = &closed
+		switch closed.Outcome {
+		case protocolassertion.OutcomeViolated, protocolassertion.OutcomeInconclusive:
+			return &protocolGate{Outcome: closed.Outcome, Reason: "ProtocolDuring" + closed.Outcome}, nil
+		}
+	}
+	if int(usage.CampaignsCompleted) == len(schedule.Executions) || finishAfterSuccess {
+		return evaluate("Recovery", schedule.Assertions.Recovery, &next.ProtocolAssertions.Recovery, true)
+	}
+	return nil, nil
 }
 
 func (r *V1Beta1Reconciler) signerSetMatchesSchedule(
@@ -1054,10 +1169,7 @@ func (r *V1Beta1Reconciler) signerResolver() signerset.Resolver {
 	return &signerset.HTTPResolver{}
 }
 func (r *V1Beta1Reconciler) observationReader() ObservationReader {
-	if r.Observations != nil {
-		return r.Observations
-	}
-	return &KubernetesObservationReader{Reader: r.APIReader}
+	return r.Observations
 }
 func (r *V1Beta1Reconciler) now() time.Time {
 	if r.Now != nil {
@@ -1072,6 +1184,26 @@ func betaTerminal(phase string) bool {
 func betaChildMutating(phase string) bool {
 	return phase == "Injecting" || phase == "Active" || phase == "Recovering"
 }
+
+// betaHasProvenActiveFault distinguishes an independently observed fault
+// effect from the wider mutation lifecycle used for conservative budgeting.
+func betaHasProvenActiveFault(children []attacknetv1beta1.FaultCampaign) bool {
+	for _, child := range children {
+		for _, stage := range child.Status.Stages {
+			for _, action := range stage.Actions {
+				if action.Phase == "Active" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func betaSuccessStopWaitsForActiveCampaigns(terminalPhase string, usage *attacknetv1beta1.BudgetUsage) bool {
+	return terminalPhase == "Passed" && usage != nil && usage.ActiveCampaigns > 0
+}
+
 func activeBetaChildren(children []attacknetv1beta1.FaultCampaign) []attacknetv1beta1.FaultCampaign {
 	result := []attacknetv1beta1.FaultCampaign{}
 	for _, child := range children {
@@ -1161,6 +1293,9 @@ func removeString(values []string, value string) []string {
 func (r *V1Beta1Reconciler) SetupWithManager(mgr manager.Manager, maxConcurrent int) error {
 	if r.APIReader == nil {
 		return errors.New("v1beta1 AttacknetRun reconciler requires an uncached Kubernetes API reader")
+	}
+	if r.Observations == nil {
+		return errors.New("v1beta1 AttacknetRun reconciler requires trusted protocol observations")
 	}
 	mapNetwork := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 		list := &attacknetv1beta1.AttacknetRunList{}

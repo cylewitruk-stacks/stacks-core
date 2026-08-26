@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolassertion"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
 )
 
@@ -28,6 +29,18 @@ func ValidateV1Beta1Structure(run *attacknetv1beta1.AttacknetRun) error {
 	}
 	if err := validateBetaRunPolicies(run.Spec.StopPolicy, run.Spec.AttributionPolicy); err != nil {
 		return err
+	}
+	for _, gate := range []struct {
+		name string
+		set  *attacknetv1beta1.ProtocolAssertionSetSpec
+	}{
+		{name: "baseline", set: run.Spec.BaselineAssertions},
+		{name: "during", set: run.Spec.DuringAssertions},
+		{name: "recovery", set: run.Spec.RecoveryAssertions},
+	} {
+		if err := protocolassertion.ValidateStructure(gate.set); err != nil {
+			return fmt.Errorf("%s protocol assertions: %w", gate.name, err)
+		}
 	}
 	if len(run.Spec.CampaignCatalog) == 0 || len(run.Spec.CampaignCatalog) > 256 {
 		return errors.New("campaignCatalog requires between 1 and 256 entries")

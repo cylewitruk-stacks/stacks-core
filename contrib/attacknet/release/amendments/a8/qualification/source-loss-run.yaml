@@ -1,0 +1,57 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a8-source-loss
+  namespace: hacknet-system
+spec:
+  networkRef: a8-qualification
+  seed: a8-source-loss-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - name: source-loss
+      campaignRef: a8-observation-source-loss
+  executions:
+    - id: source-loss
+      campaign: source-loss
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 300
+    maxCumulativeFaultSeconds: 30
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 0
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 1
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: false
+    allowedTerminalStates: [Inconclusive]
+  baselineAssertions:
+    timeout: 30s
+    assertions:
+      - id: telemetry-complete
+        telemetryCompleteness:
+          actors: [follower-1]
+  duringAssertions:
+    timeout: 5s
+    assertions:
+      - id: observation-source-required
+        telemetryCompleteness:
+          actors: [follower-1]
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true
+  minimization:
+    enabled: false
+    strategy: FailurePrefix
+    maxAttempts: 0
+    requireFreshNetwork: true

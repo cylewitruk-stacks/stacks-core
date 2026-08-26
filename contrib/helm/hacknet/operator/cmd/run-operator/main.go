@@ -16,6 +16,7 @@ import (
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	manageroptions "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/manager"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/orchestratormetrics"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolobservation"
 	runcontroller "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/run"
 )
 
@@ -37,18 +38,26 @@ func main() {
 	must(err)
 	compilationCache, err := fault.NewCompilationCache(128)
 	must(err)
+	protocolReader := &protocolobservation.Reader{APIReader: mgr.GetAPIReader()}
 	faults := &fault.V1Beta1Reconciler{
-		Client:                 mgr.GetClient(),
-		APIReader:              mgr.GetAPIReader(),
-		Scheme:                 mgr.GetScheme(),
-		Observations:           &fault.KubernetesTriggerObservationReader{Reader: mgr.GetAPIReader()},
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Observations: &fault.KubernetesTriggerObservationReader{
+			Reader: mgr.GetAPIReader(), Protocol: protocolReader,
+		},
 		IOPressureImage:        *ioPressureImage,
 		IOPressurePull:         corev1.PullPolicy(*ioPressurePull),
 		IOChaosArchitectures:   stringSet(*ioArchitectures),
 		TimeChaosArchitectures: stringSet(*timeArchitectures),
 		CompilationCache:       compilationCache,
 	}
-	runs := &runcontroller.V1Beta1Reconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme()}
+	runs := &runcontroller.V1Beta1Reconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		Observations: &runcontroller.KubernetesObservationReader{
+			Reader: mgr.GetAPIReader(), Protocol: protocolReader,
+		},
+	}
 	controllermetrics.Registry.MustRegister(orchestratormetrics.NewCollector(mgr.GetClient()))
 	must(faults.SetupWithManager(mgr, options.Concurrency))
 	must(runs.SetupWithManager(mgr, options.Concurrency))

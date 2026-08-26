@@ -65,6 +65,6 @@ if [[ -n "${ATTACKNET_OFFLINE_RESULT:-}" ]]; then
   for result in "${RESULT_SUITES[@]}"; do result_args+=("--suite=${result}"); done
   node "${ATTACKNET_DIR}/release/offline-result.mjs" \
     "--output=${ATTACKNET_OFFLINE_RESULT}" \
-    "--source-revision=$(git -C "${REPO_ROOT}" rev-parse HEAD)" \
+    "--source-revision=${ATTACKNET_QUALIFIED_TREE:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}" \
     "${result_args[@]}"
 fi

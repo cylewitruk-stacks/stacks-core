@@ -24,19 +24,21 @@ func (app *App) runImageBuild(ctx context.Context, args []string) error {
 	flags := newFlagSet("image build", app.Stderr)
 	repositoryRoot := flags.String("repo-root", "", "Stacks Core repository root")
 	buildStacks := flags.Bool("stacks", false, "also build the Stacks node image")
+	skipStacker := flags.Bool("skip-stacker", false, "omit the optional stacker image")
 	docker := flags.String("docker", "docker", "Docker-compatible executable")
 	if err := flags.Parse(args); err != nil {
 		return commandUsageError{err.Error()}
 	}
 	if flags.NArg() != 0 || *repositoryRoot == "" {
-		return usageError("usage: attacknet image build --repo-root PATH [--stacks]")
+		return usageError("usage: attacknet image build --repo-root PATH [--stacks] [--skip-stacker]")
 	}
 	runner, err := app.requireCommandRunner()
 	if err != nil {
 		return err
 	}
 	result, err := (LocalImageBuilder{Runner: runner}).Build(ctx, LocalBuildOptions{
-		RepositoryRoot: *repositoryRoot, BuildStacksImage: *buildStacks, DockerProgram: *docker,
+		RepositoryRoot: *repositoryRoot, BuildStacksImage: *buildStacks,
+		SkipStackerImage: *skipStacker, DockerProgram: *docker,
 	})
 	if err != nil {
 		return err

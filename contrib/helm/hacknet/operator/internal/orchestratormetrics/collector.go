@@ -27,6 +27,9 @@ type Collector struct {
 	runInfo           *prometheus.Desc
 	budgetUsage       *prometheus.Desc
 	minimization      *prometheus.Desc
+	protocolAssertion *prometheus.Desc
+	protocolSource    *prometheus.Desc
+	protocolSourceAt  *prometheus.Desc
 	collectionSuccess *prometheus.Desc
 }
 
@@ -46,13 +49,19 @@ func NewCollector(reader client.Reader) *Collector {
 			[]string{"evidence_source", "network", "run", "budget"}, nil),
 		minimization: prometheus.NewDesc("attacknet_run_minimization_outcome", "Trusted terminal ddmin counterfactual classification.",
 			[]string{"evidence_source", "network", "run", "attempt", "candidate_digest", "expected_assertion", "expected_status", "outcome", "reason", "evidence_digest", "causal_minimality_claimed"}, nil),
+		protocolAssertion: prometheus.NewDesc("attacknet_run_protocol_assertion", "Identity-bound run protocol assertion outcome.",
+			[]string{"evidence_source", "network", "run", "gate", "assertion", "type", "outcome", "reason"}, nil),
+		protocolSource: prometheus.NewDesc("attacknet_run_protocol_assertion_source_info", "Exact admitted actor identity used by one protocol assertion observation.",
+			[]string{"evidence_source", "network", "run", "gate", "assertion", "actor", "role", "pod", "pod_uid", "runtime_image_id", "service", "source_evidence_class"}, nil),
+		protocolSourceAt: prometheus.NewDesc("attacknet_run_protocol_assertion_source_observed_timestamp_seconds", "Actor observation timestamp used by one protocol assertion.",
+			[]string{"evidence_source", "network", "run", "gate", "assertion", "actor", "pod_uid"}, nil),
 		collectionSuccess: prometheus.NewDesc("attacknet_orchestrator_metrics_collection_success", "Whether the latest orchestration state collection succeeded.", nil, nil),
 	}
 }
 
 // Describe publishes every descriptor owned by the collector.
 func (c *Collector) Describe(output chan<- *prometheus.Desc) {
-	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.campaignTarget, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.collectionSuccess} {
+	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.campaignTarget, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.collectionSuccess} {
 		output <- descriptor
 	}
 }
@@ -80,7 +89,7 @@ func (c *Collector) Collect(output chan<- prometheus.Metric) {
 		success = c.collectCampaign(output, &campaigns.Items[index]) && success
 	}
 	for index := range runs.Items {
-		c.collectRun(output, &runs.Items[index])
+		success = c.collectRun(output, &runs.Items[index]) && success
 	}
 	output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, boolFloat(success))
 }
@@ -124,7 +133,7 @@ func (c *Collector) collectAssertionResults(output chan<- prometheus.Metric, cam
 	return valid
 }
 
-func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1beta1.AttacknetRun) {
+func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1beta1.AttacknetRun) bool {
 	phase := run.Status.Phase
 	if phase == "" {
 		phase = "Pending"
@@ -170,6 +179,67 @@ func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1
 			classification.ExpectedStatus, classification.Outcome, classification.Reason,
 			classification.EvidenceDigest, strconv.FormatBool(classification.CausalMinimalityClaimed))
 	}
+	if assertions := run.Status.ProtocolAssertions; assertions != nil {
+		return c.collectProtocolAssertions(output, run, "baseline", assertions.Baseline) &&
+			c.collectProtocolAssertions(output, run, "during", assertions.During) &&
+			c.collectProtocolAssertions(output, run, "recovery", assertions.Recovery)
+	}
+	return true
+}
+
+func (c *Collector) collectProtocolAssertions(output chan<- prometheus.Metric, run *attacknetv1beta1.AttacknetRun, gate string, status *attacknetv1beta1.ProtocolAssertionSetStatus) bool {
+	if status == nil {
+		return true
+	}
+	valid := true
+	for _, result := range status.Results {
+		output <- prometheus.MustNewConstMetric(c.protocolAssertion, prometheus.GaugeValue, 1,
+			evidenceSource, run.Spec.NetworkRef, run.Name, gate, result.ID, result.Type, result.Outcome, result.Reason)
+		sources, decoded := decodeProtocolSources(result.Evidence.Raw)
+		valid = decoded && valid
+		for _, source := range sources {
+			output <- prometheus.MustNewConstMetric(c.protocolSource, prometheus.GaugeValue, 1,
+				evidenceSource, run.Spec.NetworkRef, run.Name, gate, result.ID, source.Actor,
+				source.Role, source.PodName, source.PodUID, source.RuntimeImageID,
+				source.ServiceName, source.EvidenceClass)
+			output <- prometheus.MustNewConstMetric(c.protocolSourceAt, prometheus.GaugeValue, float64(source.ObservedAt.UnixNano())/1e9,
+				evidenceSource, run.Spec.NetworkRef, run.Name, gate, result.ID, source.Actor, source.PodUID)
+		}
+	}
+	return valid
+}
+
+type protocolSource struct {
+	Actor          string    `json:"actor"`
+	Role           string    `json:"role"`
+	PodName        string    `json:"podName"`
+	PodUID         string    `json:"podUID"`
+	RuntimeImageID string    `json:"runtimeImageID"`
+	ServiceName    string    `json:"serviceName"`
+	ObservedAt     time.Time `json:"observedAt"`
+	EvidenceClass  string    `json:"evidenceClass"`
+}
+
+type protocolEvidence struct {
+	Sources []protocolSource `json:"sources"`
+}
+
+func decodeProtocolSources(raw []byte) ([]protocolSource, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	value := protocolEvidence{}
+	if json.Unmarshal(raw, &value) != nil {
+		return nil, false
+	}
+	for _, source := range value.Sources {
+		if source.Actor == "" || source.Role == "" || source.PodName == "" ||
+			source.PodUID == "" || source.RuntimeImageID == "" || source.ServiceName == "" ||
+			source.ObservedAt.IsZero() || source.EvidenceClass == "" {
+			return nil, false
+		}
+	}
+	return value.Sources, true
 }
 
 type byteResult struct {

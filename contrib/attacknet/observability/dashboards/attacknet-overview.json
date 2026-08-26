@@ -440,6 +440,32 @@
       "title": "Instrumentation capability declarations",
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true}, "renameByName": {"attacknet_actor": "Actor", "attacknet_role": "Role", "event_dispatch_mode": "Event dispatch", "instrumentation_profile": "Capability profile", "instrumentation_provenance": "Signal provenance", "requested_image": "Requested image"}}}],
       "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Identity-bound baseline, active-fault, and recovery assertion outcomes emitted by the run controller. Violated means a trusted protocol value crossed its bound; Inconclusive means required actor evidence remained unavailable through its deadline. Actor log content cannot create either result.",
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0, "spanNulls": false}, "mappings": [{"options": {"1": {"color": "blue", "text": "observed"}}, "type": "value"}], "max": 1, "min": 0}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 126},
+      "id": 32,
+      "options": {"alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.65, "showValue": "never", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "attacknet_run_protocol_assertion{network=\"$network\"}", "legendFormat": "{{run}} · {{gate}} · {{assertion}} · {{type}} · {{outcome}} · {{reason}}", "refId": "A"}],
+      "title": "Protocol assertion gates (trusted)",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Exact admitted Pod, runtime image, Service, and evidence class used by each trusted protocol assertion. Use these rows to correlate a failed gate with actor logs and runtime state without trusting actor-supplied identity labels.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 135},
+      "id": 33,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [
+        {"expr": "attacknet_run_protocol_assertion_source_info{network=\"$network\"}", "format": "table", "instant": true, "refId": "A"},
+        {"expr": "attacknet_run_protocol_assertion_source_observed_timestamp_seconds{network=\"$network\"}", "format": "table", "instant": true, "refId": "B"}
+      ],
+      "title": "Protocol assertion source identities (trusted)",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"actor": "Actor", "assertion": "Assertion", "gate": "Gate", "pod": "Pod", "pod_uid": "Pod UID", "role": "Role", "run": "Run", "runtime_image_id": "Runtime image ID", "service": "Service", "source_evidence_class": "Evidence class"}}}],
+      "type": "table"
     }
   ],
   "refresh": "5s",

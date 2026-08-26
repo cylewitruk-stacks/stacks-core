@@ -173,13 +173,16 @@ type AttacknetRunSpec struct {
 	// +kubebuilder:validation:MaxItems=1024
 	// +listType=map
 	// +listMapKey=id
-	Executions        []RunExecutionSpec `json:"executions"`
-	Budgets           RunBudgets         `json:"budgets"`
-	StopPolicy        StopPolicy         `json:"stopPolicy"`
-	AttributionPolicy AttributionPolicy  `json:"attributionPolicy"`
-	Replay            ReplaySpec         `json:"replay"`
-	Resume            ResumeSpec         `json:"resume"`
-	Minimization      MinimizationSpec   `json:"minimization"`
+	Executions         []RunExecutionSpec        `json:"executions"`
+	Budgets            RunBudgets                `json:"budgets"`
+	StopPolicy         StopPolicy                `json:"stopPolicy"`
+	AttributionPolicy  AttributionPolicy         `json:"attributionPolicy"`
+	BaselineAssertions *ProtocolAssertionSetSpec `json:"baselineAssertions,omitempty"`
+	DuringAssertions   *ProtocolAssertionSetSpec `json:"duringAssertions,omitempty"`
+	RecoveryAssertions *ProtocolAssertionSetSpec `json:"recoveryAssertions,omitempty"`
+	Replay             ReplaySpec                `json:"replay"`
+	Resume             ResumeSpec                `json:"resume"`
+	Minimization       MinimizationSpec          `json:"minimization"`
 }
 
 // ScheduleReference identifies the immutable controller-owned schedule object.
@@ -263,29 +266,30 @@ type RunCleanup struct {
 
 // AttacknetRunStatus is the durable scheduler and evidence state machine.
 type AttacknetRunStatus struct {
-	ObservedGeneration     int64                   `json:"observedGeneration,omitempty"`
-	Phase                  string                  `json:"phase,omitempty"`
-	Reason                 string                  `json:"reason,omitempty"`
-	Message                string                  `json:"message,omitempty"`
-	LastTransitionTime     *metav1.Time            `json:"lastTransitionTime,omitempty"`
-	StartedAt              *metav1.Time            `json:"startedAt,omitempty"`
-	CompletedAt            *metav1.Time            `json:"completedAt,omitempty"`
-	FinishedAt             *metav1.Time            `json:"finishedAt,omitempty"`
-	ActiveChildren         []ActiveRunChild        `json:"activeChildren,omitempty"`
-	ScheduleRef            *ScheduleReference      `json:"scheduleRef,omitempty"`
-	ScheduleSummary        *ScheduleSummary        `json:"scheduleSummary,omitempty"`
-	ResolvedCampaigns      []ResolvedCampaign      `json:"resolvedCampaigns,omitempty"`
-	Decisions              []apixv1.JSON           `json:"decisions,omitempty"`
-	TriggerReceipts        []apixv1.JSON           `json:"triggerReceipts,omitempty"`
-	BudgetUsage            *BudgetUsage            `json:"budgetUsage,omitempty"`
-	IdentityDivergence     *IdentityDivergence     `json:"identityDivergence,omitempty"`
-	IdentityTransitions    []IdentityTransition    `json:"identityTransitions,omitempty"`
-	Attribution            string                  `json:"attribution,omitempty"`
-	AttributionURI         string                  `json:"attributionURI,omitempty"`
-	ReplayPlanURI          string                  `json:"replayPlanURI,omitempty"`
-	EvidenceURI            string                  `json:"evidenceURI,omitempty"`
-	EvidenceDigest         string                  `json:"evidenceDigest,omitempty"`
-	TerminalClassification *TerminalClassification `json:"terminalClassification,omitempty"`
-	Cleanup                *RunCleanup             `json:"cleanup,omitempty"`
-	Conditions             []metav1.Condition      `json:"conditions,omitempty"`
+	ObservedGeneration     int64                     `json:"observedGeneration,omitempty"`
+	Phase                  string                    `json:"phase,omitempty"`
+	Reason                 string                    `json:"reason,omitempty"`
+	Message                string                    `json:"message,omitempty"`
+	LastTransitionTime     *metav1.Time              `json:"lastTransitionTime,omitempty"`
+	StartedAt              *metav1.Time              `json:"startedAt,omitempty"`
+	CompletedAt            *metav1.Time              `json:"completedAt,omitempty"`
+	FinishedAt             *metav1.Time              `json:"finishedAt,omitempty"`
+	ActiveChildren         []ActiveRunChild          `json:"activeChildren,omitempty"`
+	ScheduleRef            *ScheduleReference        `json:"scheduleRef,omitempty"`
+	ScheduleSummary        *ScheduleSummary          `json:"scheduleSummary,omitempty"`
+	ResolvedCampaigns      []ResolvedCampaign        `json:"resolvedCampaigns,omitempty"`
+	Decisions              []apixv1.JSON             `json:"decisions,omitempty"`
+	TriggerReceipts        []apixv1.JSON             `json:"triggerReceipts,omitempty"`
+	BudgetUsage            *BudgetUsage              `json:"budgetUsage,omitempty"`
+	IdentityDivergence     *IdentityDivergence       `json:"identityDivergence,omitempty"`
+	IdentityTransitions    []IdentityTransition      `json:"identityTransitions,omitempty"`
+	Attribution            string                    `json:"attribution,omitempty"`
+	AttributionURI         string                    `json:"attributionURI,omitempty"`
+	ReplayPlanURI          string                    `json:"replayPlanURI,omitempty"`
+	EvidenceURI            string                    `json:"evidenceURI,omitempty"`
+	EvidenceDigest         string                    `json:"evidenceDigest,omitempty"`
+	TerminalClassification *TerminalClassification   `json:"terminalClassification,omitempty"`
+	Cleanup                *RunCleanup               `json:"cleanup,omitempty"`
+	ProtocolAssertions     *ProtocolAssertionsStatus `json:"protocolAssertions,omitempty"`
+	Conditions             []metav1.Condition        `json:"conditions,omitempty"`
 }

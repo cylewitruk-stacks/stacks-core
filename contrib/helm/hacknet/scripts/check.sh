@@ -67,7 +67,7 @@ if [[ -n "${HACKNET_OFFLINE_RESULT:-}" ]]; then
   fi
   node "${chart_dir}/../../attacknet/release/hacknet-offline-result.mjs" \
     "--output=${HACKNET_OFFLINE_RESULT}" \
-    "--source-revision=$(git -C "${chart_dir}/../../.." rev-parse HEAD)" \
+    "--source-revision=${ATTACKNET_QUALIFIED_TREE:-$(git -C "${chart_dir}/../../.." rev-parse HEAD)}" \
     --required=topology-operator,run-operator,crd-contracts,probe,image-context,chart-contract \
     "${optional[@]}"
 fi

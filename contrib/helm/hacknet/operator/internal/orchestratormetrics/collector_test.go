@@ -22,6 +22,14 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	protocolEvidence, err := json.Marshal(map[string]any{"sources": []any{map[string]any{
+		"actor": "signer-1", "role": "signer", "podName": "network-signer-1-0",
+		"podUID": "pod-uid", "runtimeImageID": "sha256:image", "serviceName": "network-signer-1",
+		"observedAt": "2026-08-26T12:00:00Z", "evidenceClass": "actor_self_reported",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	campaign := &attacknetv1beta1.FaultCampaign{
 		ObjectMeta: metav1.ObjectMeta{Name: "partition", Namespace: "test"},
 		Spec:       attacknetv1beta1.FaultCampaignSpec{NetworkRef: "network"},
@@ -48,6 +56,15 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 				ExpectedAssertion: "ChainProgress", ExpectedStatus: "failed",
 				Outcome: "reproduced", Reason: "ExpectedFailureObserved", EvidenceDigest: "sha256:evidence",
 			},
+			ProtocolAssertions: &attacknetv1beta1.ProtocolAssertionsStatus{
+				Baseline: &attacknetv1beta1.ProtocolAssertionSetStatus{
+					Outcome: "Proven",
+					Results: []attacknetv1beta1.ProtocolAssertionResult{{
+						ID: "telemetry-complete", Type: "TelemetryCompleteness", Outcome: "Proven", Reason: "AssertionSatisfied",
+						Evidence: apixv1.JSON{Raw: protocolEvidence},
+					}},
+				},
+			},
 		},
 	}
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(campaign, run).Build()
@@ -62,13 +79,16 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 		byName[family.GetName()] = len(family.Metric)
 	}
 	want := map[string]int{
-		"attacknet_fault_campaign_info":                     1,
-		"attacknet_fault_campaign_target_info":              1,
-		"attacknet_fault_campaign_assertion_outcome":        1,
-		"attacknet_run_info":                                1,
-		"attacknet_run_budget_usage":                        11,
-		"attacknet_run_minimization_outcome":                1,
-		"attacknet_orchestrator_metrics_collection_success": 1,
+		"attacknet_fault_campaign_info":                                      1,
+		"attacknet_fault_campaign_target_info":                               1,
+		"attacknet_fault_campaign_assertion_outcome":                         1,
+		"attacknet_run_info":                                                 1,
+		"attacknet_run_budget_usage":                                         11,
+		"attacknet_run_minimization_outcome":                                 1,
+		"attacknet_run_protocol_assertion":                                   1,
+		"attacknet_run_protocol_assertion_source_info":                       1,
+		"attacknet_run_protocol_assertion_source_observed_timestamp_seconds": 1,
+		"attacknet_orchestrator_metrics_collection_success":                  1,
 	}
 	for name, count := range want {
 		if byName[name] != count {

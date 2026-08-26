@@ -1,0 +1,23 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: BurnchainPolicy
+metadata:
+  name: a8-qualification
+  namespace: hacknet-system
+spec:
+  networkRef: a8-qualification
+  bitcoinNodeRef: bitcoin
+  # A follower-only observation cohort cannot produce the PoX anchor history
+  # needed at later reward-cycle boundaries. Keep this plumbing qualification
+  # before the configured epoch transitions; full Nakamoto liveness is covered
+  # by the accepted topology rather than inferred from this fixture.
+  bootstrapHeight: 202
+  cadence: 20s
+  destinationSelection: fixed
+  fixedDestinationIndex: 0
+  destinations:
+    - walletName: attacknet-faucet
+      address: mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn
+  rpc:
+    timeout: 5s
+    minimumBackoff: 1s
+    maximumBackoff: 5s

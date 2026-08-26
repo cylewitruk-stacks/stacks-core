@@ -21,6 +21,7 @@ type LocalImage struct {
 type LocalBuildOptions struct {
 	RepositoryRoot   string
 	BuildStacksImage bool
+	SkipStackerImage bool
 	DockerProgram    string
 }
 
@@ -63,7 +64,9 @@ func (builder LocalImageBuilder) Build(ctx context.Context, options LocalBuildOp
 		{purpose: "burnchain-clock", ref: "stacks-hacknet-burnchain-clock:dev", contextDir: operatorRoot, buildArgs: []string{"BINARY=burnchain-clock"}},
 		{purpose: "probe", ref: "stacks-hacknet-probe:dev", contextDir: filepath.Join(options.RepositoryRoot, "contrib", "attacknet", "images", "probe")},
 		{purpose: "io-pressure", ref: "stacks-hacknet-io-pressure:dev", contextDir: options.RepositoryRoot, dockerfile: filepath.Join(options.RepositoryRoot, "contrib", "attacknet", "images", "io-pressure", "Dockerfile")},
-		{purpose: "stacker", ref: "stacks-attacknet-stacker:local", contextDir: filepath.Join(options.RepositoryRoot, "contrib", "attacknet", "images", "stacker")},
+	}
+	if !options.SkipStackerImage {
+		specs = append(specs, localBuildSpec{purpose: "stacker", ref: "stacks-attacknet-stacker:local", contextDir: filepath.Join(options.RepositoryRoot, "contrib", "attacknet", "images", "stacker")})
 	}
 	if options.BuildStacksImage {
 		specs = append(specs, localBuildSpec{purpose: "stacks-core", ref: "stacks-core-attacknet:main", contextDir: options.RepositoryRoot, dockerfile: filepath.Join(options.RepositoryRoot, "contrib", "attacknet", "images", "cli", "Dockerfile")})

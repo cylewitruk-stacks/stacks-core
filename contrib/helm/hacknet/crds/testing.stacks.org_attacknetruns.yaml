@@ -57,6 +57,171 @@ spec:
                 - requireIncidentBundle
                 - requiredOnFailure
                 type: object
+              baselineAssertions:
+                description: |-
+                  ProtocolAssertionSetSpec is a bounded assertion gate with one failure
+                  deadline for missing or unavailable evidence.
+                properties:
+                  assertions:
+                    items:
+                      description: |-
+                        ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
+                        and actor-supplied success predicates are intentionally unsupported.
+                      properties:
+                        chainProgress:
+                          description: |-
+                            ChainProgressAssertion requires every selected actor to advance by at least
+                            MinimumDelta during Window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            minimumDelta:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - chain
+                          - minimumDelta
+                          - window
+                          type: object
+                        cohortAgreement:
+                          description: CohortAgreementAssertion bounds the selected
+                            actors' height spread.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            maximumSpread:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                          required:
+                          - actors
+                          - chain
+                          - maximumSpread
+                          type: object
+                        id:
+                          pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                          type: string
+                        proposalOutcomeVisibility:
+                          description: |-
+                            ProposalOutcomeVisibilityAssertion requires proposal or policy activity to
+                            advance during Window for every selected signer.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumObserved:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - minimumObserved
+                          - window
+                          type: object
+                        signerRegistration:
+                          description: |-
+                            SignerRegistrationAssertion requires a minimum count of selected signers to
+                            report current-cycle registration.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumRegistered:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          required:
+                          - actors
+                          - minimumRegistered
+                          type: object
+                        signerStateFreshness:
+                          description: |-
+                            SignerStateFreshnessAssertion bounds the age of every selected signer's last
+                            state-machine transition.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            maximumAge:
+                              type: string
+                          required:
+                          - actors
+                          - maximumAge
+                          type: object
+                        telemetryCompleteness:
+                          description: |-
+                            TelemetryCompletenessAssertion requires successful collection from every
+                            selected admitted actor in one stable identity window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                          required:
+                          - actors
+                          type: object
+                      required:
+                      - id
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one protocol assertion must be configured
+                        rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
+                          ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
+                          ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
+                          + (has(self.telemetryCompleteness) ? 1 : 0) == 1'
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  timeout:
+                    type: string
+                required:
+                - assertions
+                - timeout
+                type: object
               budgets:
                 description: RunBudgets bound aggregate mutation, duration, concurrency,
                   and ambiguity.
@@ -138,6 +303,171 @@ spec:
                 enum:
                 - dependency-trigger-scheduler/v1
                 type: string
+              duringAssertions:
+                description: |-
+                  ProtocolAssertionSetSpec is a bounded assertion gate with one failure
+                  deadline for missing or unavailable evidence.
+                properties:
+                  assertions:
+                    items:
+                      description: |-
+                        ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
+                        and actor-supplied success predicates are intentionally unsupported.
+                      properties:
+                        chainProgress:
+                          description: |-
+                            ChainProgressAssertion requires every selected actor to advance by at least
+                            MinimumDelta during Window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            minimumDelta:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - chain
+                          - minimumDelta
+                          - window
+                          type: object
+                        cohortAgreement:
+                          description: CohortAgreementAssertion bounds the selected
+                            actors' height spread.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            maximumSpread:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                          required:
+                          - actors
+                          - chain
+                          - maximumSpread
+                          type: object
+                        id:
+                          pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                          type: string
+                        proposalOutcomeVisibility:
+                          description: |-
+                            ProposalOutcomeVisibilityAssertion requires proposal or policy activity to
+                            advance during Window for every selected signer.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumObserved:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - minimumObserved
+                          - window
+                          type: object
+                        signerRegistration:
+                          description: |-
+                            SignerRegistrationAssertion requires a minimum count of selected signers to
+                            report current-cycle registration.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumRegistered:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          required:
+                          - actors
+                          - minimumRegistered
+                          type: object
+                        signerStateFreshness:
+                          description: |-
+                            SignerStateFreshnessAssertion bounds the age of every selected signer's last
+                            state-machine transition.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            maximumAge:
+                              type: string
+                          required:
+                          - actors
+                          - maximumAge
+                          type: object
+                        telemetryCompleteness:
+                          description: |-
+                            TelemetryCompletenessAssertion requires successful collection from every
+                            selected admitted actor in one stable identity window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                          required:
+                          - actors
+                          type: object
+                      required:
+                      - id
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one protocol assertion must be configured
+                        rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
+                          ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
+                          ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
+                          + (has(self.telemetryCompleteness) ? 1 : 0) == 1'
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  timeout:
+                    type: string
+                required:
+                - assertions
+                - timeout
+                type: object
               executions:
                 items:
                   description: RunExecutionSpec identifies one campaign execution
@@ -289,6 +619,171 @@ spec:
                     > 0)'
               networkRef:
                 type: string
+              recoveryAssertions:
+                description: |-
+                  ProtocolAssertionSetSpec is a bounded assertion gate with one failure
+                  deadline for missing or unavailable evidence.
+                properties:
+                  assertions:
+                    items:
+                      description: |-
+                        ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
+                        and actor-supplied success predicates are intentionally unsupported.
+                      properties:
+                        chainProgress:
+                          description: |-
+                            ChainProgressAssertion requires every selected actor to advance by at least
+                            MinimumDelta during Window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            minimumDelta:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - chain
+                          - minimumDelta
+                          - window
+                          type: object
+                        cohortAgreement:
+                          description: CohortAgreementAssertion bounds the selected
+                            actors' height spread.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            maximumSpread:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                          required:
+                          - actors
+                          - chain
+                          - maximumSpread
+                          type: object
+                        id:
+                          pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                          type: string
+                        proposalOutcomeVisibility:
+                          description: |-
+                            ProposalOutcomeVisibilityAssertion requires proposal or policy activity to
+                            advance during Window for every selected signer.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumObserved:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - minimumObserved
+                          - window
+                          type: object
+                        signerRegistration:
+                          description: |-
+                            SignerRegistrationAssertion requires a minimum count of selected signers to
+                            report current-cycle registration.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumRegistered:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          required:
+                          - actors
+                          - minimumRegistered
+                          type: object
+                        signerStateFreshness:
+                          description: |-
+                            SignerStateFreshnessAssertion bounds the age of every selected signer's last
+                            state-machine transition.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            maximumAge:
+                              type: string
+                          required:
+                          - actors
+                          - maximumAge
+                          type: object
+                        telemetryCompleteness:
+                          description: |-
+                            TelemetryCompletenessAssertion requires successful collection from every
+                            selected admitted actor in one stable identity window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                          required:
+                          - actors
+                          type: object
+                      required:
+                      - id
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one protocol assertion must be configured
+                        rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
+                          ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
+                          ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
+                          + (has(self.telemetryCompleteness) ? 1 : 0) == 1'
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  timeout:
+                    type: string
+                required:
+                - assertions
+                - timeout
+                type: object
               replay:
                 description: ReplaySpec pins a run to an immutable prior descriptor
                   and expectation.
@@ -619,6 +1114,170 @@ spec:
                 type: integer
               phase:
                 type: string
+              protocolAssertions:
+                description: ProtocolAssertionsStatus records baseline, active-fault,
+                  and recovery gates.
+                properties:
+                  baseline:
+                    description: ProtocolAssertionSetStatus records one run gate's
+                      bounded state.
+                    properties:
+                      completedAt:
+                        format: date-time
+                        type: string
+                      outcome:
+                        enum:
+                        - Pending
+                        - Proven
+                        - Violated
+                        - Inconclusive
+                        type: string
+                      results:
+                        items:
+                          description: ProtocolAssertionResult records one bounded
+                            evaluator result.
+                          properties:
+                            evidence:
+                              x-kubernetes-preserve-unknown-fields: true
+                            id:
+                              type: string
+                            observedAt:
+                              format: date-time
+                              type: string
+                            outcome:
+                              enum:
+                              - Pending
+                              - Proven
+                              - Violated
+                              - Inconclusive
+                              type: string
+                            reason:
+                              type: string
+                            startedAt:
+                              format: date-time
+                              type: string
+                            type:
+                              type: string
+                          required:
+                          - id
+                          - outcome
+                          - reason
+                          - type
+                          type: object
+                        type: array
+                      startedAt:
+                        format: date-time
+                        type: string
+                    required:
+                    - outcome
+                    type: object
+                  during:
+                    description: ProtocolAssertionSetStatus records one run gate's
+                      bounded state.
+                    properties:
+                      completedAt:
+                        format: date-time
+                        type: string
+                      outcome:
+                        enum:
+                        - Pending
+                        - Proven
+                        - Violated
+                        - Inconclusive
+                        type: string
+                      results:
+                        items:
+                          description: ProtocolAssertionResult records one bounded
+                            evaluator result.
+                          properties:
+                            evidence:
+                              x-kubernetes-preserve-unknown-fields: true
+                            id:
+                              type: string
+                            observedAt:
+                              format: date-time
+                              type: string
+                            outcome:
+                              enum:
+                              - Pending
+                              - Proven
+                              - Violated
+                              - Inconclusive
+                              type: string
+                            reason:
+                              type: string
+                            startedAt:
+                              format: date-time
+                              type: string
+                            type:
+                              type: string
+                          required:
+                          - id
+                          - outcome
+                          - reason
+                          - type
+                          type: object
+                        type: array
+                      startedAt:
+                        format: date-time
+                        type: string
+                    required:
+                    - outcome
+                    type: object
+                  recovery:
+                    description: ProtocolAssertionSetStatus records one run gate's
+                      bounded state.
+                    properties:
+                      completedAt:
+                        format: date-time
+                        type: string
+                      outcome:
+                        enum:
+                        - Pending
+                        - Proven
+                        - Violated
+                        - Inconclusive
+                        type: string
+                      results:
+                        items:
+                          description: ProtocolAssertionResult records one bounded
+                            evaluator result.
+                          properties:
+                            evidence:
+                              x-kubernetes-preserve-unknown-fields: true
+                            id:
+                              type: string
+                            observedAt:
+                              format: date-time
+                              type: string
+                            outcome:
+                              enum:
+                              - Pending
+                              - Proven
+                              - Violated
+                              - Inconclusive
+                              type: string
+                            reason:
+                              type: string
+                            startedAt:
+                              format: date-time
+                              type: string
+                            type:
+                              type: string
+                          required:
+                          - id
+                          - outcome
+                          - reason
+                          - type
+                          type: object
+                        type: array
+                      startedAt:
+                        format: date-time
+                        type: string
+                    required:
+                    - outcome
+                    type: object
+                type: object
               reason:
                 type: string
               replayPlanURI:

@@ -152,6 +152,19 @@ test('dashboards expose capability provenance and treat unavailable series as no
   }
 });
 
+test('overview exposes identity-bound protocol gates and their terminal alert', () => {
+  const overview = readDashboard('attacknet-overview.json');
+  const panel = overview.panels.find(candidate => candidate.title === 'Protocol assertion gates (trusted)');
+  assert.ok(panel);
+  assert.equal(panel.type, 'state-timeline');
+  assert.match(panel.description, /identity-bound/i);
+  assert.match(panel.description, /Inconclusive/);
+  assert.match(JSON.stringify(panel.targets), /attacknet_run_protocol_assertion/);
+  assert.match(JSON.stringify(panel.targets), /\{\{gate\}\}/);
+  assert.match(prometheusRules(), /AttacknetProtocolAssertionTerminalFailure/);
+  assert.match(prometheusRules(), /outcome=~"Violated\|Inconclusive"/);
+});
+
 test('histogram units and counter queries preserve exported metric semantics', () => {
   const counterFamilies = loadInventory().families
     .filter(family => family.type === 'counter')

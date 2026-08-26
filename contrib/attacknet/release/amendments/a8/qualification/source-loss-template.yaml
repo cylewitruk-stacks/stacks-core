@@ -1,0 +1,39 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: a8-observation-source-loss
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+  stages:
+    - id: isolate-observation-source
+      faults:
+        - id: isolate-follower-metrics
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: network
+            action: delay
+            mode: all
+            duration: 20s
+            parameters:
+              direction: both
+              peerTarget:
+                actors: [bitcoin]
+                mode: all
+              delay:
+                latency: 250ms
+                jitter: 25ms
+          effectAssertions:
+            - type: NetworkDegraded
+              actor: follower-1
+              timeoutSeconds: 45
+          recoveryAssertions:
+            - type: NetworkRecovered
+              actor: follower-1
+              timeoutSeconds: 90

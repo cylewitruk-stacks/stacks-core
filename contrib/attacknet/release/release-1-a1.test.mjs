@@ -54,7 +54,7 @@ function fixture() {
   execFileSync('tar', [
     '-cf', archivePath, '-C', liveRoot,
     'evidence-index.json', ...Object.values(artifacts).map(value => value.archiveEntry),
-  ]);
+  ], {env: {...process.env, COPYFILE_DISABLE: '1'}});
   const summary = {
     schema: 'stacks-attacknet-release-1-a1-live-evidence/v1',
     candidateRevision: candidate.sourceRevision,

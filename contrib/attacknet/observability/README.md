@@ -65,20 +65,29 @@ authentication proxy.
 
 ## Render and deploy
 
-Render after the topology manifest exists:
+Render from a current admitted `StacksNetwork` snapshot. This prevents a stale
+hand-written actor list from becoming the monitoring target inventory:
 
 ```bash
-node contrib/attacknet/observability/render.mjs \
-  contrib/attacknet/generated/full/manifest.json \
-  --output=contrib/attacknet/generated/full/observability.json
+$ATTACKNET get --namespace hacknet-system --output json \
+  StacksNetwork minimal > /tmp/minimal-network.json
 
-kubectl apply -f contrib/attacknet/generated/full/observability.json
-kubectl -n hacknet-system rollout status deployment/attacknet-attacknet-events
-kubectl -n hacknet-system rollout status deployment/attacknet-attacknet-prometheus
-kubectl -n hacknet-system rollout status statefulset/attacknet-attacknet-loki
-kubectl -n hacknet-system rollout status daemonset/attacknet-attacknet-alloy
-kubectl -n hacknet-system rollout status deployment/attacknet-attacknet-grafana
+node contrib/attacknet/observability/render.mjs \
+  /tmp/minimal-network.json \
+  --output=/tmp/minimal-observability.json
+
+kubectl apply -f /tmp/minimal-observability.json
+kubectl -n hacknet-system rollout status deployment/minimal-attacknet-events
+kubectl -n hacknet-system rollout status deployment/minimal-attacknet-prometheus
+kubectl -n hacknet-system rollout status statefulset/minimal-attacknet-loki
+kubectl -n hacknet-system rollout status daemonset/minimal-attacknet-alloy
+kubectl -n hacknet-system rollout status deployment/minimal-attacknet-grafana
 ```
+
+The renderer refuses a stale generation, incomplete admitted inventory,
+duplicate actor, missing immutable runtime image, or non-Ready network. Its
+older compact-manifest input remains available for digest-bound instrumentation
+qualification plans.
 
 The standard Helm release exposes these metrics at `hacknet-run:8080`. If the
 release name or service differs, pass the admitted DNS endpoint explicitly as
@@ -88,9 +97,11 @@ targets rather than interpolating them into Prometheus configuration.
 The generated file and adjacent `event-token` contain the writer credential and
 are mode `0600`; treat them as runtime artifacts and do not commit them or
 include them in evidence. Supplying `--event-token=...` makes token management
-external and repeatable. Normal `lifecycle.sh apply` renders and deploys this
-stack by default; set `ATTACKNET_OBSERVABILITY_ENABLED=0` only for a deliberately
-minimal diagnostic run.
+external and repeatable. Apply the generated resources before a run whose
+evidence policy requires metrics or retained logs. The evidence-safe
+`attacknet teardown` command fails closed when a complete Loki export cannot be
+obtained; direct `StacksNetwork` deletion is the explicit administrative
+bypass.
 
 Before applying any observability or protocol workload, lifecycle runs
 `storage-preflight.sh`. It records kubelet stats-summary values for the root and

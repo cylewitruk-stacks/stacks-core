@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolobservation"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
 )
 
@@ -19,6 +20,7 @@ type ObservationSnapshot struct {
 	BurnHeight   *trigger.HeightObservation
 	StacksHeight *trigger.HeightObservation
 	Observations []trigger.Observation
+	Protocol     protocolobservation.Snapshot
 }
 
 // ObservationReader supplies trusted chain and invariant observations without
@@ -27,20 +29,38 @@ type ObservationReader interface {
 	Read(context.Context, *attacknetv1beta1.AttacknetRun, *attacknetv1beta1.StacksNetwork) (ObservationSnapshot, error)
 }
 
-// KubernetesObservationReader reads controller-owned BurnchainPolicy status.
-// Stacks-height and arbitrary observation triggers intentionally remain pending
-// until a trusted observation bridge is injected.
+// KubernetesObservationReader joins controller-owned BurnchainPolicy status
+// with finite, identity-bound actor protocol observations.
 type KubernetesObservationReader struct {
-	Reader client.Reader
+	Reader   client.Reader
+	Protocol *protocolobservation.Reader
 }
 
-// Read returns a fresh, identity-bound burn height when the policy is Ready.
+// Read returns controller-owned burn height and identity-bound protocol
+// observations collected through the shared finite metrics bridge.
 func (r *KubernetesObservationReader) Read(ctx context.Context, run *attacknetv1beta1.AttacknetRun, network *attacknetv1beta1.StacksNetwork) (ObservationSnapshot, error) {
-	if r == nil || r.Reader == nil {
+	if r == nil || r.Reader == nil || r.Protocol == nil {
 		return ObservationSnapshot{}, errors.New("trusted observation reader requires an uncached Kubernetes API reader")
 	}
 	height, err := trigger.ReadBurnchainHeight(ctx, r.Reader, run.Namespace, network)
-	return ObservationSnapshot{BurnHeight: height}, err
+	if err != nil {
+		return ObservationSnapshot{}, err
+	}
+	snapshot, err := r.Protocol.Read(ctx, network)
+	if err != nil {
+		return ObservationSnapshot{
+			BurnHeight: height,
+			Protocol:   protocolobservation.Snapshot{UnavailableReason: protocolobservation.UnavailableIdentity},
+		}, nil
+	}
+	derived, err := protocolobservation.Derive(snapshot)
+	if err != nil {
+		return ObservationSnapshot{}, err
+	}
+	return ObservationSnapshot{
+		BurnHeight: height, StacksHeight: derived.StacksHeight,
+		Observations: derived.Observations, Protocol: snapshot,
+	}, nil
 }
 
 func childDependencyObservations(children []attacknetv1beta1.FaultCampaign) []trigger.DependencyObservation {

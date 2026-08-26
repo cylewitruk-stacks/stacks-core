@@ -57,6 +57,31 @@ func TestLocalImageBuilderUsesExactDockerArguments(t *testing.T) {
 	}
 }
 
+func TestLocalImageBuilderCanOmitOptionalStacker(t *testing.T) {
+	t.Parallel()
+	const imageID = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	runner := &recordingRunner{run: func(command Command) (CommandResult, error) {
+		if reflect.DeepEqual(command.Args[:2], []string{"image", "inspect"}) {
+			return CommandResult{Stdout: imageID + "\n"}, nil
+		}
+		return CommandResult{}, nil
+	}}
+	result, err := (LocalImageBuilder{Runner: runner}).Build(context.Background(), LocalBuildOptions{
+		RepositoryRoot: "/repo", BuildStacksImage: true, SkipStackerImage: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Images) != 6 {
+		t.Fatalf("got %d built images, want 6", len(result.Images))
+	}
+	for _, image := range result.Images {
+		if image.Purpose == "stacker" {
+			t.Fatal("optional stacker image was built")
+		}
+	}
+}
+
 func TestLocalInstallerPreservesSafetyCriticalOrdering(t *testing.T) {
 	t.Parallel()
 	const imageID = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

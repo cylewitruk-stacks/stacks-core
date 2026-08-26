@@ -56,6 +56,9 @@ func TestGeneratedSchemasRetainAdmissionSafetyRules(t *testing.T) {
 	assertValidationRuleContains(t, runSpec.Properties["replay"], "enabled replay requires")
 	assertValidationRuleContains(t, runSpec, "mutually exclusive")
 	assertValidationRuleContains(t, runSpec, "enabled executions exceed")
+	assertionSet := runSpec.Properties["baselineAssertions"]
+	assertion := *assertionSet.Properties["assertions"].Items.Schema
+	assertValidationRuleContains(t, assertion, "exactly one protocol assertion")
 }
 
 func assertValidationRuleContains(t *testing.T, schema apixv1.JSONSchemaProps, fragment string) {

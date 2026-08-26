@@ -6,7 +6,7 @@ import test from 'node:test';
 
 import {loadInventory} from '../instrumentation/capability-manifest.mjs';
 import {sha256File, sha256Value} from '../instrumentation/artifact-digest.mjs';
-import {instrumentationExpectationsFromPlan, renderObservability} from './render.mjs';
+import {instrumentationExpectationsFromPlan, manifestFromStacksNetwork, renderObservability} from './render.mjs';
 import {readEvents, renderReport} from './report.mjs';
 
 const manifest = {
@@ -35,6 +35,50 @@ function render(options = {}) {
     eventToken: 'c'.repeat(64), instrumentationExpectations, ...options,
   });
 }
+
+function labelsFor(network, component) {
+  return {
+    'app.kubernetes.io/name': `attacknet-${component}`,
+    'app.kubernetes.io/part-of': 'stacks-attacknet',
+    'testing.stacks.org/network': network,
+  };
+}
+
+function labelSort(left, right) {
+  return JSON.stringify(left).localeCompare(JSON.stringify(right));
+}
+
+test('renderer consumes only a current complete admitted StacksNetwork inventory', () => {
+  const network = {
+    apiVersion: 'testing.stacks.org/v1beta1', kind: 'StacksNetwork',
+    metadata: {name: 'live-network', namespace: 'hacknet-system', generation: 3},
+    status: {
+      phase: 'Ready', observedGeneration: 3, inventoryReady: true,
+      inventoryDigest: `sha256:${'a'.repeat(64)}`,
+      actors: [{
+        name: 'follower-1', role: 'follower', image: 'stacks:current', serviceName: 'live-network-follower-1',
+        identityReady: true, runtimeImageID: `sha256:${'b'.repeat(64)}`,
+      }],
+    },
+  };
+  const derived = manifestFromStacksNetwork(network);
+  assert.deepEqual(derived.workloads, [{
+    service: 'follower-1', metricsService: 'live-network-follower-1',
+    role: 'follower', requestedImage: 'stacks:current',
+    instrumentation: {profile: 'unmodified', provenance: 'unavailable'},
+  }]);
+  const rendered = renderObservability(network, {eventToken: 'c'.repeat(64)});
+  const prometheus = rendered.items.find(item => item.kind === 'ConfigMap'
+    && item.metadata.name === 'live-network-attacknet-prometheus');
+  assert.deepEqual(JSON.parse(prometheus.data['nodes.json'])[0].targets, ['live-network-follower-1:20446']);
+  network.status.actors[0].serviceName = 'authoritative-follower-service';
+  const renamed = renderObservability(network, {eventToken: 'c'.repeat(64)});
+  const renamedPrometheus = renamed.items.find(item => item.kind === 'ConfigMap'
+    && item.metadata.name === 'live-network-attacknet-prometheus');
+  assert.deepEqual(JSON.parse(renamedPrometheus.data['nodes.json'])[0].targets, ['authoritative-follower-service:20446']);
+  network.status.inventoryReady = false;
+  assert.throws(() => renderObservability(network, {eventToken: 'c'.repeat(64)}), /complete admitted inventory/);
+});
 
 test('render emits actor-labelled scrape targets and restricted credential-free observers', () => {
   const rendered = render();
@@ -124,6 +168,18 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
   const eventContainer = resources.get('Deployment/attacknet-test-attacknet-events').spec.template.spec.containers[0];
   assert.ok(eventContainer.command.includes('--instrumentation-provenance=/opt/attacknet/instrumentation-provenance.json'));
   assert.ok(eventContainer.volumeMounts.some(mount => mount.subPath === 'instrumentation-provenance.json' && mount.readOnly));
+
+  const lokiPolicy = resources.get('NetworkPolicy/attacknet-test-attacknet-loki-ingress');
+  assert.deepEqual(lokiPolicy.spec.podSelector.matchLabels, labelsFor('attacknet-test', 'loki'));
+  assert.deepEqual(lokiPolicy.spec.policyTypes, ['Ingress']);
+  assert.deepEqual(
+    lokiPolicy.spec.ingress[0].from.map(peer => peer.podSelector.matchLabels).sort(labelSort),
+    [
+      {'testing.stacks.org/network': 'attacknet-test', 'testing.stacks.org/loki-writer': 'true'},
+      labelsFor('attacknet-test', 'grafana'),
+    ].sort(labelSort),
+  );
+  assert.deepEqual(lokiPolicy.spec.ingress[0].ports, [{protocol: 'TCP', port: 3100}]);
 });
 
 test('run-controller metrics target is explicit and cannot inject Prometheus config', () => {
@@ -195,6 +251,7 @@ test('render centralizes actor logs with collector-attached Kubernetes identity 
     {apiGroups: [''], resources: ['pods/log'], verbs: ['get']},
   ]);
   const daemonSet = resources.get('DaemonSet/attacknet-test-attacknet-alloy');
+  assert.equal(daemonSet.spec.template.metadata.labels['testing.stacks.org/loki-writer'], 'true');
   assert.equal(daemonSet.spec.template.spec.automountServiceAccountToken, false);
   assert.equal(daemonSet.spec.template.spec.securityContext.runAsNonRoot, true);
   assert.ok(daemonSet.spec.template.spec.volumes.some(volume => volume.name === 'service-account' && volume.projected));
@@ -213,6 +270,12 @@ test('render centralizes actor logs with collector-attached Kubernetes identity 
   assert.equal(logsPanel.datasource.uid, 'attacknet-loki');
   assert.match(logsPanel.description, /actor-self-reported/);
   assert.match(logsPanel.targets[0].expr, /attacknet_actor/);
+  const protocolSources = dashboard.panels.find(panel => panel.id === 33);
+  assert.equal(protocolSources.type, 'table');
+  assert.deepEqual(protocolSources.targets.map(target => target.expr), [
+    'attacknet_run_protocol_assertion_source_info{network="$network"}',
+    'attacknet_run_protocol_assertion_source_observed_timestamp_seconds{network="$network"}',
+  ]);
   const actorDashboard = JSON.parse(grafana.data['attacknet-actor.json']);
   assert.equal(actorDashboard.uid, 'stacks-attacknet-actor');
   const grafanaDeployment = resources.get('Deployment/attacknet-test-attacknet-grafana');

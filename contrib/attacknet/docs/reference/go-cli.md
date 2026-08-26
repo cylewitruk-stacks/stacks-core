@@ -33,6 +33,8 @@ attacknet wait --namespace experiment --for terminal AttacknetRun soak
 attacknet delete --namespace experiment --wait FaultCampaign partition
 attacknet evidence snapshot --namespace experiment --output run.json AttacknetRun soak
 attacknet evidence incident --namespace experiment --output incident network
+attacknet teardown --namespace experiment --output teardown \
+  --run soak network
 attacknet doctor --output json
 attacknet image build --repo-root . --stacks
 attacknet image load --mode require stacks-core-attacknet:main
@@ -60,6 +62,11 @@ whose `observedGeneration` covers the current resource generation. `evidence
 snapshot` explicitly does not claim to be a complete incident bundle.
 `delete --wait` uses foreground deletion and waits for controller finalizers and
 owned-resource garbage collection to remove the requested resource.
+Use `teardown` rather than `delete StacksNetwork` for normal experiment
+shutdown. It makes a complete identity-bound incident capture and retained
+Loki interval export a deletion barrier. Incomplete evidence preserves the
+network and returns a non-zero status; direct `delete` remains an explicit
+administrative escape hatch.
 
 Dashboard access is loopback-only. `dashboard start` resolves exactly one
 Service through the Kubernetes API, starts `kubectl port-forward`, waits for
@@ -105,7 +112,7 @@ and namespace unless `--namespace` is supplied.
 | --- | --- | --- |
 | Strict typed document loading | JSON-only compatibility readers | Controller status mutation |
 | `submit`, `get`, `watch`, `wait`, `delete` | Generated-directory lifecycle wrappers | Bootstrap/readiness state machines |
-| `evidence snapshot`, `evidence incident` | Host ledger and forensic shell collectors | Incident classification and runtime-effect proof |
+| `evidence snapshot`, `evidence incident`, `teardown` | Host ledger and forensic shell collectors | Incident classification and runtime-effect proof |
 | `doctor` API check | Process-output Kubernetes diagnostics | Controller readiness decisions |
 | Generated command contract | The frozen Node command registry | Controller workflow descriptions |
 | `dashboard start`, `status`, `stop` | Shell port-forward supervisors | Chaos Mesh authorization policy |
@@ -122,8 +129,9 @@ compatibility contract.
 
 - The current kind catalog is intentionally closed to the four v1beta1
   resources. Arbitrary Kubernetes apply would bypass the product boundary.
-- `evidence incident` captures Kubernetes state and bounded Pod logs; metrics
-  and external observability stores require separate exports.
+- `evidence incident` captures Kubernetes state and bounded Pod logs;
+  `teardown` additionally exports the complete retained Loki interval before
+  deleting the network. Prometheus range export remains separate.
 - `doctor` checks the cluster and CRDs. Local install and image commands perform
   their own stronger Docker, Helm, kind, and immutable-image checks.
 - Watch output reflects observed Kubernetes ordering and is not a deterministic

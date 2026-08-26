@@ -159,7 +159,7 @@ func newIncidentFixture(t *testing.T, replacement bool) incidentFixture {
 	}
 	network := &attacknetv1beta1.StacksNetwork{
 		TypeMeta:   metav1.TypeMeta{APIVersion: attacknetv1beta1.GroupVersion.String(), Kind: "StacksNetwork"},
-		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: "network-uid", Generation: 3},
+		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: "network-uid", ResourceVersion: "17", Generation: 3},
 		Status:     attacknetv1beta1.StacksNetworkStatus{ObservedGeneration: 3, InventoryReady: true, InventoryDigest: "sha256:inventory", Actors: []attacknetv1beta1.ActorStatus{{Name: "miner", Role: "miner", PodName: "network-miner-0", PodUID: "pod-uid", RuntimeImageID: "docker-pullable://image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}},
 	}
 	networkObject, err := runtime.DefaultUnstructuredConverter.ToUnstructured(network)

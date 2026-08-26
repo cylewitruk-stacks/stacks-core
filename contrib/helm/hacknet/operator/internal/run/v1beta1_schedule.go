@@ -10,6 +10,7 @@ import (
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/canonical"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolassertion"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
 )
 
@@ -28,6 +29,7 @@ type betaSchedule struct {
 	ImageConstraints []imageConstraint           `json:"imageConstraints"`
 	Executions       []betaExecution             `json:"executions"`
 	Budgets          attacknetv1beta1.RunBudgets `json:"budgets"`
+	Assertions       betaProtocolAssertions      `json:"assertions,omitempty"`
 	Replay           betaReplayMetadata          `json:"replay"`
 	Integrity        scheduleIntegrity           `json:"integrity,omitempty"`
 }
@@ -68,6 +70,12 @@ type betaReplayMetadata struct {
 	FreshNetwork         bool   `json:"freshNetwork,omitempty"`
 }
 
+type betaProtocolAssertions struct {
+	Baseline *attacknetv1beta1.ProtocolAssertionSetSpec `json:"baseline,omitempty"`
+	During   *attacknetv1beta1.ProtocolAssertionSetSpec `json:"during,omitempty"`
+	Recovery *attacknetv1beta1.ProtocolAssertionSetSpec `json:"recovery,omitempty"`
+}
+
 func buildBetaSchedule(
 	run *attacknetv1beta1.AttacknetRun,
 	network *attacknetv1beta1.StacksNetwork,
@@ -90,6 +98,19 @@ func buildBetaSchedule(
 	}
 	if err := validateBetaRunPolicies(run.Spec.StopPolicy, run.Spec.AttributionPolicy); err != nil {
 		return betaSchedule{}, err
+	}
+	actorRoles := protocolassertion.ActorRoles(published.Actors)
+	for _, gate := range []struct {
+		name string
+		set  *attacknetv1beta1.ProtocolAssertionSetSpec
+	}{
+		{name: "baseline", set: run.Spec.BaselineAssertions},
+		{name: "during", set: run.Spec.DuringAssertions},
+		{name: "recovery", set: run.Spec.RecoveryAssertions},
+	} {
+		if err := protocolassertion.ValidateSet(gate.set, actorRoles); err != nil {
+			return betaSchedule{}, fmt.Errorf("%s protocol assertions: %w", gate.name, err)
+		}
 	}
 	catalog := make(map[string]attacknetv1beta1.CampaignCatalogEntry, len(run.Spec.CampaignCatalog))
 	for _, entry := range run.Spec.CampaignCatalog {
@@ -225,9 +246,21 @@ func buildBetaSchedule(
 		},
 		CatalogDigest: catalogDigest, ExecutionDigest: executionDigest,
 		ImageConstraints: images, Executions: executions, Budgets: run.Spec.Budgets,
+		Assertions: betaProtocolAssertions{
+			Baseline: copyAssertionSet(run.Spec.BaselineAssertions),
+			During:   copyAssertionSet(run.Spec.DuringAssertions),
+			Recovery: copyAssertionSet(run.Spec.RecoveryAssertions),
+		},
 		Replay: betaReplayMetadata{},
 	}
 	return sealBetaSchedule(schedule)
+}
+
+func copyAssertionSet(value *attacknetv1beta1.ProtocolAssertionSetSpec) *attacknetv1beta1.ProtocolAssertionSetSpec {
+	if value == nil {
+		return nil
+	}
+	return value.DeepCopy()
 }
 
 func sealBetaSchedule(schedule betaSchedule) (betaSchedule, error) {
