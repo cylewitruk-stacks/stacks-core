@@ -32,6 +32,7 @@ use stacks_common::util::hash::hex_bytes;
 fn decode_seed(input: &[u8]) -> Option<Vec<u8>> {
     let encoded = input.strip_prefix(b"hex:")?;
     let encoded = std::str::from_utf8(encoded).ok()?;
+    let encoded = encoded.trim_end_matches(['\r', '\n']);
     hex_bytes(encoded).ok()
 }
 

@@ -97,7 +97,19 @@ pub fn validate_admission(
     epoch: &StacksEpochId,
 ) -> Result<(), PackedValueError> {
     let admitted = if matches!(value, Value::CallableContract(_)) {
-        callable_admitted(value, expected)?
+        // Callable values have storage views that ordinary `admits` deliberately does not model:
+        // exact callable principals and historical trait references. Preserve those views while
+        // delegating the pre-2.1 CallableType and principal rules to Clarity.
+        if *epoch < StacksEpochId::Epoch21
+            && matches!(
+                expected,
+                TypeSignature::CallableType(_) | TypeSignature::PrincipalType
+            )
+        {
+            expected.admits(epoch, value)?
+        } else {
+            callable_admitted(value, expected)?
+        }
     } else {
         expected.admits(epoch, value)?
     };

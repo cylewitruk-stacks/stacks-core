@@ -20,6 +20,7 @@ use std::assert_matches;
 use proptest::prelude::*;
 use stacks_common::types::StacksEpochId;
 
+use crate::errors::ClarityTypeError;
 use crate::representations::{ClarityName, ContractName};
 use crate::types::codec::packed::{
     AdmittedValue, BOUND_PACKED_VALUE_BODY_BYTES, ConsensusLengthValidation,
@@ -625,6 +626,127 @@ fn principal_admission_rejects_trait_qualified_callables() {
         AdmittedValue::new(trait_view, &TypeSignature::PrincipalType, &EPOCH),
         Err(PackedValueError::TypeMismatch)
     );
+}
+
+#[test]
+fn callable_views_respect_the_epoch_2_1_boundary() {
+    let contract = contract(9, "callable-epoch");
+    let trait_id = TraitIdentifier::new(
+        standard_principal(4),
+        ContractName::from_literal("trait-contract"),
+        ClarityName::from_literal("transferable"),
+    );
+    let principal_callable = Value::CallableContract(CallableData {
+        contract_identifier: contract.clone(),
+        trait_identifier: None,
+    });
+    let trait_callable = Value::CallableContract(CallableData {
+        contract_identifier: contract.clone(),
+        trait_identifier: Some(Box::new(trait_id.clone())),
+    });
+    let principal_callable_type = TypeSignature::CallableType(CallableSubtype::Principal(contract));
+    let trait_callable_type = TypeSignature::CallableType(CallableSubtype::Trait(trait_id.clone()));
+    let historical_trait_type = TypeSignature::TraitReferenceType(trait_id);
+
+    for (value, expected) in [
+        (&principal_callable, &principal_callable_type),
+        (&trait_callable, &trait_callable_type),
+    ] {
+        assert_matches!(
+            AdmittedValue::new(value.clone(), expected, &StacksEpochId::Epoch2_05),
+            Err(PackedValueError::ClarityType(
+                ClarityTypeError::UnsupportedTypeInEpoch(_, _)
+            ))
+        );
+        assert!(AdmittedValue::new(value.clone(), expected, &StacksEpochId::Epoch21).is_ok());
+    }
+
+    assert_matches!(
+        AdmittedValue::new(
+            principal_callable.clone(),
+            &TypeSignature::PrincipalType,
+            &StacksEpochId::Epoch2_05,
+        ),
+        Err(PackedValueError::TypeMismatch)
+    );
+    assert!(
+        AdmittedValue::new(
+            principal_callable.clone(),
+            &TypeSignature::PrincipalType,
+            &StacksEpochId::Epoch21,
+        )
+        .is_ok()
+    );
+
+    for epoch in [StacksEpochId::Epoch2_05, StacksEpochId::Epoch21] {
+        assert!(AdmittedValue::new(trait_callable.clone(), &historical_trait_type, &epoch).is_ok());
+    }
+
+    let principal_consensus_len = u32::try_from(
+        principal_callable
+            .serialize_to_vec()
+            .expect("callable must serialize")
+            .len(),
+    )
+    .expect("Clarity value length is bounded");
+    let principal_packed = AdmittedValue::new(
+        principal_callable.clone(),
+        &principal_callable_type,
+        &StacksEpochId::Epoch21,
+    )
+    .unwrap()
+    .encode_packed(principal_consensus_len, ConsensusLengthValidation::Disabled)
+    .unwrap();
+    assert_matches!(
+        principal_packed
+            .as_packed_ref()
+            .decode(&principal_callable_type, &StacksEpochId::Epoch2_05),
+        Err(PackedValueError::ClarityType(
+            ClarityTypeError::UnsupportedTypeInEpoch(_, _)
+        ))
+    );
+    assert_eq!(
+        principal_packed
+            .as_packed_ref()
+            .decode(&principal_callable_type, &StacksEpochId::Epoch21)
+            .unwrap()
+            .value,
+        principal_callable
+    );
+
+    let trait_consensus_len = u32::try_from(
+        trait_callable
+            .serialize_to_vec()
+            .expect("callable must serialize")
+            .len(),
+    )
+    .expect("Clarity value length is bounded");
+    let trait_packed = AdmittedValue::new(
+        trait_callable.clone(),
+        &trait_callable_type,
+        &StacksEpochId::Epoch21,
+    )
+    .unwrap()
+    .encode_packed(trait_consensus_len, ConsensusLengthValidation::Disabled)
+    .unwrap();
+    assert_matches!(
+        trait_packed
+            .as_packed_ref()
+            .decode(&trait_callable_type, &StacksEpochId::Epoch2_05),
+        Err(PackedValueError::ClarityType(
+            ClarityTypeError::UnsupportedTypeInEpoch(_, _)
+        ))
+    );
+    for epoch in [StacksEpochId::Epoch2_05, StacksEpochId::Epoch21] {
+        assert_eq!(
+            trait_packed
+                .as_packed_ref()
+                .decode(&historical_trait_type, &epoch)
+                .unwrap()
+                .value,
+            trait_callable
+        );
+    }
 }
 
 #[test]

@@ -118,7 +118,14 @@ fn body(
                 logical_len,
             ))
         }
-        CallableType(subtype) => callable(bytes, subtype),
+        CallableType(subtype) => {
+            if *epoch < StacksEpochId::Epoch21 {
+                // Preserve Clarity's UnsupportedTypeInEpoch error for this historical boundary.
+                expected.admits_type(epoch, expected)?;
+                return Err(PackedValueError::TypeMismatch);
+            }
+            callable(bytes, subtype)
+        }
         TraitReferenceType(trait_identifier) => trait_callable(bytes, trait_identifier.clone()),
         OptionalType(inner) => {
             let (tag, child) = primitive::split_tag(bytes)?;
