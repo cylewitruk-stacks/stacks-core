@@ -19,7 +19,7 @@ use stacks_common::types::StacksEpochId;
 
 use super::{
     ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue, PackedValueError, ValueShape,
-    directory, layout, primitive, shape,
+    directory, layout, primitive, shape, validate_packed_body_len,
 };
 use crate::types::signatures::CallableSubtype;
 use crate::types::{
@@ -47,6 +47,7 @@ pub fn prefixed_value(
     validation: ConsensusLengthValidation,
 ) -> Result<Vec<u8>, PackedValueError> {
     let body_len = body_len(value)?;
+    validate_packed_body_len(body_len)?;
     let record_len = PACKED_VALUE_HEADER_LEN
         .checked_add(body_len)
         .ok_or(PackedValueError::SizeOverflow)?;

@@ -30,12 +30,12 @@
 //!   the exact consensus serialization without a declared [`crate::types::TypeSignature`].
 
 use std::error::Error;
-use std::fmt;
+use std::{fmt, mem};
 
 use stacks_common::types::StacksEpochId;
 
 use crate::errors::ClarityTypeError;
-use crate::types::{TypeSignature, Value};
+use crate::types::{BOUND_VALUE_SERIALIZATION_BYTES, MAX_VALUE_SIZE, TypeSignature, Value};
 
 mod decode;
 mod directory;
@@ -48,8 +48,37 @@ mod shape;
 /// Number of bytes before a packed V1 value body.
 pub const PACKED_VALUE_HEADER_LEN: usize = 4;
 
+/// Widest offset emitted by the packed directory grammar.
+const MAX_PACKED_OFFSET_BYTES: usize = mem::size_of::<u32>();
+
+/// Width tag and terminal offset contributed once by each packed directory.
+const MAX_PACKED_DIRECTORY_FIXED_BYTES: usize = 1 + MAX_PACKED_OFFSET_BYTES;
+
+/// Maximum directory overhead beyond the bounded consensus representation.
+///
+/// A legal value has at most `MAX_VALUE_SIZE` child edges. Each can require one widest offset and
+/// can root at most one directory. The root can contribute one additional directory.
+const MAX_PACKED_DIRECTORY_OVERHEAD: usize = MAX_VALUE_SIZE as usize
+    * (MAX_PACKED_OFFSET_BYTES + MAX_PACKED_DIRECTORY_FIXED_BYTES)
+    + MAX_PACKED_DIRECTORY_FIXED_BYTES;
+
+/// Conservative upper bound for one packed value body, excluding its common header.
+pub const BOUND_PACKED_VALUE_BODY_BYTES: usize =
+    BOUND_VALUE_SERIALIZATION_BYTES as usize + MAX_PACKED_DIRECTORY_OVERHEAD;
+
 /// Version byte for the active value-shape descriptor grammar.
 pub const VALUE_SHAPE_VERSION: u8 = 1;
+
+/// Reject a packed body that exceeds the format's worst-case expansion bound.
+fn validate_packed_body_len(body_len: usize) -> Result<(), PackedValueError> {
+    if body_len > BOUND_PACKED_VALUE_BODY_BYTES {
+        Err(PackedValueError::InvalidRecord(
+            "packed value body exceeds maximum size",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// A Clarity value proven to conform to its declared storage type.
 ///
@@ -159,13 +188,7 @@ pub struct PackedValueRef<'a> {
 impl<'a> PackedValueRef<'a> {
     /// Parse the common packed record header without decoding its schema-dependent body.
     pub fn parse(bytes: &'a [u8]) -> Result<Self, PackedValueError> {
-        let max_body_len = usize::try_from(crate::types::BOUND_VALUE_SERIALIZATION_BYTES)
-            .map_err(|_| PackedValueError::SizeOverflow)?;
-        if bytes.len().saturating_sub(PACKED_VALUE_HEADER_LEN) > max_body_len {
-            return Err(PackedValueError::InvalidRecord(
-                "packed value body exceeds maximum size",
-            ));
-        }
+        validate_packed_body_len(bytes.len().saturating_sub(PACKED_VALUE_HEADER_LEN))?;
         let header =
             bytes
                 .get(..PACKED_VALUE_HEADER_LEN)

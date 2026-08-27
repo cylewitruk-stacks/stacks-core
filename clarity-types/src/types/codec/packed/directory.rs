@@ -370,7 +370,11 @@ impl<'bytes> Iterator for DirectoryChildren<'_, 'bytes> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Directory, OffsetWidth};
+    use super::{Directory, OffsetWidth, directory_total_len};
+    use crate::types::codec::packed::BOUND_PACKED_VALUE_BODY_BYTES;
+    use crate::types::{
+        BOUND_VALUE_SERIALIZATION_BYTES, ListTypeData, MAX_VALUE_SIZE, TypeSignature,
+    };
 
     #[test]
     fn offset_width_changes_at_integer_boundaries() {
@@ -388,6 +392,23 @@ mod tests {
             OffsetWidth::for_data_len(u16::MAX as usize + 1),
             OffsetWidth::U32
         );
+    }
+
+    #[test]
+    fn physical_bound_covers_a_valid_maximum_optional_list() {
+        let element_type = TypeSignature::new_option(TypeSignature::BoolType).unwrap();
+        let element_size = element_type.size().unwrap();
+        let mut count = MAX_VALUE_SIZE / element_size;
+        while ListTypeData::new_list(element_type.clone(), count).is_err() {
+            count -= 1;
+        }
+
+        // Every active `none` body occupies one byte. At this count, canonical framing selects
+        // four-byte offsets, so the directory crosses the smaller consensus-serialization bound.
+        let count = usize::try_from(count).unwrap();
+        let body_len = 4 + directory_total_len(count, count).unwrap();
+        assert!(body_len > BOUND_VALUE_SERIALIZATION_BYTES as usize);
+        assert!(body_len <= BOUND_PACKED_VALUE_BODY_BYTES);
     }
 
     #[test]

@@ -69,6 +69,16 @@ const SANITIZATION_READ_BOUND: u64 = 15_000_000;
 /// After epoch-2.4, with type sanitization support, the full
 ///  clarity depth limit is supported.
 const UNSANITIZED_DEPTH_CHECK: usize = 16;
+
+/// Select the historical or current value-depth limit used by typed decoding.
+const fn deserialization_depth_limit(sanitize: bool) -> usize {
+    if sanitize {
+        MAX_TYPE_DEPTH as usize
+    } else {
+        UNSANITIZED_DEPTH_CHECK
+    }
+}
+
 /// Initial capacity used when deserializing list/tuple containers; the vector
 /// grows as elements are read. Does not change the accepted serialized length.
 const INITIAL_DESERIALIZATION_CONTAINER_CAPACITY: usize = 1024;
@@ -549,6 +559,7 @@ impl Value {
             expected_type,
             sanitize,
             TupleFieldsBehavior::LEGACY,
+            deserialization_depth_limit(sanitize),
         )
     }
 
@@ -557,6 +568,7 @@ impl Value {
         expected_type: Option<&TypeSignature>,
         sanitize: bool,
         behavior: TupleFieldsBehavior,
+        depth_limit: usize,
     ) -> Result<(Value, u64), SerializationError> {
         let bound_value_serialization_bytes = if sanitize && expected_type.is_some() {
             SANITIZATION_READ_BOUND
@@ -564,8 +576,13 @@ impl Value {
             BOUND_VALUE_SERIALIZATION_BYTES as u64
         };
         let mut bound_reader = BoundReader::from_reader(r, bound_value_serialization_bytes);
-        let value =
-            Value::inner_deserialize_read(&mut bound_reader, expected_type, sanitize, behavior)?;
+        let value = Value::inner_deserialize_read(
+            &mut bound_reader,
+            expected_type,
+            sanitize,
+            behavior,
+            depth_limit,
+        )?;
         let bytes_read = bound_reader.num_read();
         if let Some(expected_type) = expected_type {
             let expect_size = match expected_type.max_serialized_size() {
@@ -595,6 +612,7 @@ impl Value {
         top_expected_type: Option<&TypeSignature>,
         sanitize: bool,
         behavior: TupleFieldsBehavior,
+        depth_limit: usize,
     ) -> Result<Value, SerializationError> {
         use super::Value::*;
 
@@ -603,12 +621,7 @@ impl Value {
         }];
 
         while !stack.is_empty() {
-            let depth_check = if sanitize {
-                MAX_TYPE_DEPTH as usize
-            } else {
-                UNSANITIZED_DEPTH_CHECK
-            };
-            if stack.len() > depth_check {
+            if stack.len() > depth_limit {
                 return Err(ClarityTypeError::TypeSignatureTooDeep.into());
             }
 
@@ -1189,6 +1202,7 @@ impl Value {
             Some(expected),
             epoch.value_sanitizing(),
             TupleFieldsBehavior::from_epoch(epoch),
+            deserialization_depth_limit(epoch.value_sanitizing()),
         )
         .map(|(value, _)| value)
     }
@@ -1234,6 +1248,7 @@ impl Value {
             Some(expected),
             epoch.value_sanitizing(),
             TupleFieldsBehavior::from_epoch(epoch),
+            deserialization_depth_limit(epoch.value_sanitizing()),
         )?;
         if read_count != (input_length as u64) {
             Err(SerializationError::LeftoverBytesInDeserialization)
@@ -1262,6 +1277,7 @@ impl Value {
             None,
             false,
             TupleFieldsBehavior::LEGACY,
+            MAX_TYPE_DEPTH as usize,
         )?;
         if read_count != bytes.len() as u64 {
             Err(SerializationError::LeftoverBytesInDeserialization)

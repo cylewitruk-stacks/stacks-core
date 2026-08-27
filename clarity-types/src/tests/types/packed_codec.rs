@@ -22,8 +22,9 @@ use stacks_common::types::StacksEpochId;
 
 use crate::representations::{ClarityName, ContractName};
 use crate::types::codec::packed::{
-    AdmittedValue, ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue,
-    PackedValueError, PackedValueRef, VALUE_SHAPE_VERSION, ValueShape,
+    AdmittedValue, BOUND_PACKED_VALUE_BODY_BYTES, ConsensusLengthValidation,
+    PACKED_VALUE_HEADER_LEN, PackedValue, PackedValueError, PackedValueRef, VALUE_SHAPE_VERSION,
+    ValueShape,
 };
 use crate::types::signatures::CallableSubtype;
 use crate::types::{
@@ -253,9 +254,12 @@ fn reconstruction_never_exceeds_the_declared_consensus_length() {
 }
 
 #[test]
-fn packed_record_body_cannot_exceed_the_clarity_value_bound() {
-    let oversized_len =
+fn packed_record_body_uses_its_physical_format_bound() {
+    let beyond_consensus_bound =
         PACKED_VALUE_HEADER_LEN + usize::try_from(BOUND_VALUE_SERIALIZATION_BYTES).unwrap() + 1;
+    assert!(PackedValueRef::parse(&vec![0; beyond_consensus_bound]).is_ok());
+
+    let oversized_len = PACKED_VALUE_HEADER_LEN + BOUND_PACKED_VALUE_BODY_BYTES + 1;
     let packed = vec![0; oversized_len];
 
     assert_matches!(
@@ -264,6 +268,24 @@ fn packed_record_body_cannot_exceed_the_clarity_value_bound() {
             "packed value body exceeds maximum size"
         ))
     );
+}
+
+#[test]
+fn untyped_transcoding_supports_the_current_maximum_value_depth() {
+    let mut value = Value::Bool(true);
+    for _ in 1..MAX_TYPE_DEPTH {
+        value = Value::some(value).unwrap();
+    }
+    assert_eq!(value.depth().unwrap(), MAX_TYPE_DEPTH);
+
+    let consensus = value.serialize_to_vec().unwrap();
+    let (packed, shape) = PackedValue::transcode_consensus_with_shape(&consensus).unwrap();
+    let reconstructed = PackedValueRef::parse(packed.as_bytes())
+        .unwrap()
+        .audit_reconstruction(shape.as_bytes())
+        .unwrap();
+
+    assert_eq!(reconstructed, consensus);
 }
 
 #[test]
