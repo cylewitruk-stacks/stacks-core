@@ -172,7 +172,7 @@ impl<'a> ShapeParser<'a> {
 
     /// Parse one recursive shape node while enforcing depth and canonicality limits.
     fn parse_shape(&mut self, depth: u8) -> Result<ActiveShape, PackedValueError> {
-        if depth > crate::types::MAX_TYPE_DEPTH {
+        if depth >= crate::types::MAX_TYPE_DEPTH {
             return Err(PackedValueError::InvalidRecord(
                 "value shape exceeds maximum depth",
             ));

@@ -300,13 +300,23 @@ fn value_shape_enforces_depth_and_size_bounds() {
     const OPTIONAL_SOME_SHAPE: u8 = 0x08;
     const BOOL_SHAPE: u8 = 0x02;
 
-    let mut too_deep = vec![VALUE_SHAPE_VERSION];
-    too_deep.extend(std::iter::repeat_n(
-        OPTIONAL_SOME_SHAPE,
-        usize::from(MAX_TYPE_DEPTH) + 1,
-    ));
-    too_deep.push(BOOL_SHAPE);
-    assert!(ValueShape::from_bytes(&too_deep).is_err());
+    let nested_optional_shape = |wrapper_count| {
+        let mut descriptor = vec![VALUE_SHAPE_VERSION];
+        descriptor.extend(std::iter::repeat_n(OPTIONAL_SOME_SHAPE, wrapper_count));
+        descriptor.push(BOOL_SHAPE);
+        descriptor
+    };
+
+    let maximum_depth = nested_optional_shape(usize::from(MAX_TYPE_DEPTH) - 1);
+    assert!(ValueShape::from_bytes(&maximum_depth).is_ok());
+
+    let too_deep = nested_optional_shape(usize::from(MAX_TYPE_DEPTH));
+    assert_matches!(
+        ValueShape::from_bytes(&too_deep),
+        Err(PackedValueError::InvalidRecord(
+            "value shape exceeds maximum depth"
+        ))
+    );
 
     let oversized = vec![0; MAX_VALUE_SIZE as usize + 1];
     assert!(ValueShape::from_bytes(&oversized).is_err());
