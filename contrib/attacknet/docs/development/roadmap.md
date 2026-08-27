@@ -17,15 +17,18 @@ comes only after those faults are bounded, attributable, and replayable.
 
 ### A8: Trusted observations and forensic completeness
 
-Status: implementation candidate, pending staged-tree qualification, one final
-hardware-signed tree binding, and Full-tier dual review.
+Status: approved for Release 1 on 2026-08-27. The Full-tier gate binds signed
+commit `2481f75b49a44f151847b9f6a3a0139e6af3e4e0`, candidate tree
+`a290da0ae24cbab58eb04dbad325dbaac51fb2e7`, review ID
+`release-1-amendment-a8-trusted-observations`, and packet digest
+`sha256:69211af52d11e9d01af323420ab6f39a92ca9c7582e25a382f7dda5776dd1585`.
 
 Make the failure oracle and evidence record trustworthy before adding another
-major fault mechanism. The A8 candidate adds direct, identity-bound acquisition
-and a finite typed assertion vocabulary for height/progress, cohort agreement,
-signer registration and state freshness, proposal-outcome visibility, and
-telemetry completeness. It also makes complete retained Loki export and a
-bounded incident capture a fail-closed network-deletion barrier.
+major fault mechanism. The approved A8 amendment adds direct, identity-bound
+acquisition and a finite typed assertion vocabulary for height/progress, cohort
+agreement, signer registration and state freshness, proposal-outcome
+visibility, and telemetry completeness. It also makes complete retained Loki
+export and a bounded incident capture a fail-closed network-deletion barrier.
 
 The initial A8 vocabulary provides fresh, identity-bound observations for:
 
@@ -36,7 +39,7 @@ The initial A8 vocabulary provides fresh, identity-bound observations for:
 - telemetry-source availability, freshness, and completeness.
 
 The following richer protocol evidence remains future work and is not part of
-the A8 candidate claim:
+the approved A8 claim:
 
 - Bitcoin height, best-block hash, chainwork, chain tips, and fork identity;
 - Stacks height, index block hash, burn view, and equal-height divergence;
@@ -232,7 +235,7 @@ Definition of done:
 
 ## Backlog
 
-These items remain valuable but are lower priority than A8 through A13 or rely
+These items remain valuable but are lower priority than A9 through A13 or rely
 on infrastructure outside the qualified local Release 1 environment.
 
 ### Managed and x86-64 qualification

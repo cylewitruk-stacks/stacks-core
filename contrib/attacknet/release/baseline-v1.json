@@ -82,6 +82,12 @@
       "path": "contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/policy-reclassification-v2/result.json",
       "digest": "sha256:b0dc93992de793935c282c26c9ec5cc004be2f8b26f7f5102dc8f54fd7d0cdce",
       "status": "passed"
+    },
+    {
+      "id": "release-1-a8-trusted-observations",
+      "path": "contrib/attacknet/evidence-packets/release-1-a8/evidence/summary.json",
+      "digest": "sha256:2eafad8133683dbf523eefff529a06edc0a602283fd7211b8c3fa6e0844fdf9b",
+      "status": "passed"
     }
   ],
   "capabilities": [
@@ -121,6 +127,11 @@
       "evidence": ["fresh-network-ddmin"]
     },
     {
+      "id": "identity-bound-protocol-observations-and-fail-closed-assertions",
+      "status": "supported",
+      "evidence": ["release-1-a8-trusted-observations"]
+    },
+    {
       "id": "native-chaos-mesh-iochaos-arm64",
       "status": "capability-rejected",
       "reason": "Chaos Mesh 2.8.3 ships an x86-only toda helper; use controller-owned io-pressure.",
@@ -158,9 +169,8 @@
     },
     {
       "id": "teardown-centralized-log-corpus-export",
-      "status": "not-done",
-      "reason": "Incident capture retains bounded Kubernetes logs and the trusted event timeline, but normal teardown does not yet export the complete retained Loki corpus.",
-      "evidence": ["deterministic-fault-run"]
+      "status": "supported",
+      "evidence": ["release-1-a8-trusted-observations"]
     },
     {
       "id": "matching-kubernetes-client-packaging",

@@ -119,12 +119,25 @@ test('deferred baseline capabilities require complete structured reopening recor
     ['cold-start-capacity-reservation', 'not-done'],
     ['actor-egress-network-policy', 'not-done'],
     ['cryptographically-attested-active-probes', 'not-done'],
-    ['teardown-centralized-log-corpus-export', 'not-done'],
     ['matching-kubernetes-client-packaging', 'not-done'],
   ]) {
     const capability = baseline.capabilities.find(item => item.id === id);
     assert.equal(capability?.status, status, `${id} was not migrated from the development backlog`);
     assert.ok(capability.reason?.length > 20, `${id} lacks a release-facing limitation reason`);
+  }
+});
+
+test('the baseline advertises approved A8 capabilities from bound evidence', () => {
+  const baseline = load(baselinePath);
+  const evidenceId = 'release-1-a8-trusted-observations';
+  assert.ok(baseline.evidence.some(item => item.id === evidenceId));
+  for (const id of [
+    'identity-bound-protocol-observations-and-fail-closed-assertions',
+    'teardown-centralized-log-corpus-export',
+  ]) {
+    const capability = baseline.capabilities.find(item => item.id === id);
+    assert.equal(capability?.status, 'supported');
+    assert.deepEqual(capability.evidence, [evidenceId]);
   }
 });
 
