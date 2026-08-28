@@ -75,5 +75,5 @@ policy contract, incomplete replacement, or unproved final branch fails closed.
 
 This first version addresses one Bitcoin node. It proves Stacks behavior under
 a canonical reorganization but does not claim simultaneous honest split views.
-The A11 roadmap item adds Bitcoin P2P partitions and multiple followers; it will
+The A10 roadmap item adds Bitcoin P2P partitions and multiple followers; it will
 reuse this node-addressed primitive and its per-node evidence.

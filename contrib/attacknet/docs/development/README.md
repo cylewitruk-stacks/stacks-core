@@ -123,3 +123,17 @@ Live changes must capture admitted state rather than trusting requested YAML.
 Preserve a failing environment until attribution and evidence capture are
 complete, and add a regression assertion for every detector that previously
 failed open.
+
+## Documentation responsibilities
+
+Keep documentation synchronized with each material product change:
+
+- update the development roadmap and release baseline for status and scope;
+- update this guide for architecture and extension-point changes;
+- update the root README and `docs/operations/` for operator workflows;
+- update examples and reference material for CRD or CLI changes; and
+- update observability and evidence guidance when interpretation changes.
+
+Documentation completeness is part of the implementation, not post-release
+cleanup. Routine status recording after an approved amendment remains ordinary
+review and does not require another qualification packet.

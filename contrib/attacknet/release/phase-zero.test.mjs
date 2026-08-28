@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {chmodSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -22,6 +23,7 @@ import {
 import {validateSchema} from './schema-validator.mjs';
 
 const here = new URL('.', import.meta.url).pathname;
+const repositoryRoot = new URL('../../../', import.meta.url).pathname;
 const baselinePath = join(here, 'baseline-v1.json');
 const contractPath = join(here, 'phase-0-contract.json');
 const cleanDigest = `sha256:${createHash('sha256').update('').digest('hex')}`;
@@ -112,7 +114,10 @@ test('deferred baseline capabilities require complete structured reopening recor
   const broken = structuredClone(baseline);
   delete broken.capabilities.find(item => item.id === deferred.id).reopenCondition;
   assert.throws(() => validateBaseline(broken), /reopenCondition/);
-  assert(baseline.capabilities.find(item => item.id === 'multi-bitcoin-and-bounded-reorg-campaigns').status === 'not-done');
+  assert.equal(
+    baseline.capabilities.find(item => item.id === 'multi-bitcoin-follower-split-view-campaigns')?.status,
+    'not-done',
+  );
   assert(baseline.capabilities.some(item => item.id === 'enterprise-registry-and-identity-federation'));
   for (const [id, status] of [
     ['native-chaos-mesh-stresschaos-arm64', 'capability-rejected'],
@@ -139,6 +144,35 @@ test('the baseline advertises approved A8 capabilities from bound evidence', () 
     assert.equal(capability?.status, 'supported');
     assert.deepEqual(capability.evidence, [evidenceId]);
   }
+});
+
+test('the baseline advertises approved A9 capability without claiming A10 split views', () => {
+  const baseline = load(baselinePath);
+  const evidenceId = 'release-1-a9-bounded-bitcoin-reorganizations';
+  const evidence = baseline.evidence.find(item => item.id === evidenceId);
+  assert.deepEqual(evidence, {
+    id: evidenceId,
+    path: 'contrib/attacknet/evidence-packets/release-1-a9/gate-result.json',
+    digest: 'sha256:a1f4794d4a1612e984ee2aa5d3ca819a4d4cdbc1afcd07d4014c989a58330040',
+    status: 'passed',
+  });
+  assert.doesNotThrow(() => execFileSync(
+    'git', ['ls-files', '--error-unmatch', evidence.path],
+    {cwd: repositoryRoot, stdio: 'ignore'},
+  ));
+  const bounded = baseline.capabilities.find(
+    item => item.id === 'bounded-bitcoin-regtest-reorganization-and-flash-campaigns',
+  );
+  assert.equal(bounded?.status, 'supported');
+  assert.deepEqual(bounded.evidence, [evidenceId]);
+  assert.equal(
+    baseline.capabilities.find(item => item.id === 'multi-bitcoin-follower-split-view-campaigns')?.status,
+    'not-done',
+  );
+  assert.equal(validateBaseline(
+    {...baseline, evidence: [evidence], capabilities: [bounded]},
+    {verifyEvidence: true, root: repositoryRoot},
+  ), true);
 });
 
 test('offline result accepts only complete, unique, observed suite results', () => {

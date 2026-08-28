@@ -88,6 +88,12 @@
       "path": "contrib/attacknet/evidence-packets/release-1-a8/evidence/summary.json",
       "digest": "sha256:2eafad8133683dbf523eefff529a06edc0a602283fd7211b8c3fa6e0844fdf9b",
       "status": "passed"
+    },
+    {
+      "id": "release-1-a9-bounded-bitcoin-reorganizations",
+      "path": "contrib/attacknet/evidence-packets/release-1-a9/gate-result.json",
+      "digest": "sha256:a1f4794d4a1612e984ee2aa5d3ca819a4d4cdbc1afcd07d4014c989a58330040",
+      "status": "passed"
     }
   ],
   "capabilities": [
@@ -173,6 +179,11 @@
       "evidence": ["release-1-a8-trusted-observations"]
     },
     {
+      "id": "bounded-bitcoin-regtest-reorganization-and-flash-campaigns",
+      "status": "supported",
+      "evidence": ["release-1-a9-bounded-bitcoin-reorganizations"]
+    },
+    {
       "id": "matching-kubernetes-client-packaging",
       "status": "not-done",
       "reason": "Release 1 diagnoses Kubernetes client/server compatibility but does not package a version-matched kubectl binary; the local operator supplies the client toolchain.",
@@ -201,10 +212,10 @@
       "evidence": ["worker-outage"]
     },
     {
-      "id": "multi-bitcoin-and-bounded-reorg-campaigns",
+      "id": "multi-bitcoin-follower-split-view-campaigns",
       "status": "not-done",
-      "reason": "Required Release 1 productization work in Phases 7 and 8 is not implemented yet; this is not an external deferral.",
-      "evidence": ["measured-300-burn-soak"]
+      "reason": "A9 proves one node-addressed canonical regtest reorganization; multiple Bitcoin followers, Bitcoin P2P partitions, and simultaneous honest split views remain A10 work.",
+      "evidence": ["release-1-a9-bounded-bitcoin-reorganizations"]
     },
     {
       "id": "controller-ha-leader-election",

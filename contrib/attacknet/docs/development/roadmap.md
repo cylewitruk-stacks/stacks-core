@@ -7,7 +7,10 @@ related primitive.
 
 The machine-readable source of truth for advertised capability remains
 [`baseline-v1.json`](../../release/baseline-v1.json). Update that baseline only
-after an amendment is implemented, qualified, and approved.
+after an amendment is implemented, qualified, and approved. Recording the
+already-approved result is ordinary release bookkeeping; it does not require a
+second qualification or review packet unless it expands or reinterprets the
+approved claim.
 
 ## Release 1 amendment roadmap
 
@@ -39,7 +42,8 @@ The initial A8 vocabulary provides fresh, identity-bound observations for:
 - telemetry-source availability, freshness, and completeness.
 
 The following richer protocol evidence remains future work and is not part of
-the approved A8 claim:
+the approved A8 claim. A9 subsequently added bounded Bitcoin branch-mutation
+evidence, but did not retroactively expand A8's scope:
 
 - Bitcoin height, best-block hash, chainwork, chain tips, and fork identity;
 - Stacks height, index block hash, burn view, and equal-height divergence;
@@ -75,16 +79,20 @@ Definition of done:
 
 ### A9: Bounded Bitcoin reorganization campaigns
 
-Status: implementation in progress. A9 is deliberately node-addressed and does
-not depend on A11; simultaneous multi-follower split views remain A11 scope.
+Status: approved for Release 1 on 2026-08-28. The Full-tier gate binds signed
+commit `b93517c0090acfb0943789d6cf82ec40b7ce4357`, candidate tree
+`fd7aecd3b979524cb1c61bb309ecdb65088e05e6`, review ID
+`release-1-amendment-a9-bitcoin-reorganizations`, and packet digest
+`sha256:4f647e1f459400f214b79c32a21577be15df80bfe998811fd1fa9de387f7f4f7`.
+A9 is deliberately node-addressed and does not depend on A10; simultaneous
+multi-follower split views remain A10 scope.
 
-Implement `BurnchainReorg` as a first-class semantic fault, distinct from a
-process or packet-level Chaos Mesh fault. Bitcoin Core regtest exposes
-`invalidateblock` and `reconsiderblock`, allowing a controlled single-node
-campaign to invalidate a bounded suffix and mine a longer replacement branch.
+The approved A9 amendment adds `burnchain-reorg` as a first-class semantic
+fault, distinct from a process or packet-level Chaos Mesh fault. It uses a
+restricted Bitcoin Core regtest worker to replace a bounded suffix with a
+longer, higher-work branch without exposing arbitrary RPC.
 
-The campaign must not expose arbitrary Bitcoin RPC. Its admitted contract must
-seal:
+Its admitted contract seals:
 
 - original tip, branch hashes, and chainwork;
 - fork parent, depth, replacement length, and mining recipients;
@@ -93,47 +101,26 @@ seal:
 - resulting canonical branch;
 - Stacks rollback, divergence, and recovery observations.
 
-Safety budgets must bound fork depth and duration, forbid crossing an
-unspecified epoch or reward boundary, require the mutation lease, and fail
-closed when the observed branch differs from the sealed precondition.
+Safety budgets bound fork depth and duration, forbid crossing an unspecified
+epoch or reward boundary, require the mutation lease, and fail closed when the
+observed branch differs from the sealed precondition.
 `reconsiderblock` only removes a local invalidity marker; it is not proof that
 the intended replacement branch remained canonical.
 
-Definition of done:
+The approved gate establishes that:
 
 - effect evidence proves the requested Bitcoin fork actually occurred;
-- Stacks rollback and reprocessing are observed independently;
-- miner and signer behavior during the reorganization is classified;
-- scenario-defined transaction, balance, and supply invariants are checked;
-- recovery proves convergence on the intended Bitcoin and Stacks branches;
-- the same sealed seed and schedule reproduce the campaign on a fresh network.
+- stale preconditions mutate no Bitcoin branch;
+- Stacks miner, signer, and follower recovery is independently observed;
+- the exact prior cadence policy is restored and a subsequent flash is proven;
+- the same sealed seed and schedule reproduce the admitted outcome class on a
+  fresh network; and
+- complete forensic evidence and clean teardown are independently verified.
 
-### A10: Mixed-version and upgrade-boundary campaigns
+Application-specific transaction, balance, and supply invariants remain future
+scenario assertions and are not part of the bounded A9 claim.
 
-Qualify the existing per-actor image support as explicit compatibility and
-missed-upgrade scenarios. Initial scenario families should cover:
-
-- current nodes with previous-release signers, and the inverse;
-- minority and threshold-relevant cohorts that miss an epoch upgrade;
-- gradual signer-set upgrades during a reward cycle;
-- miner upgrades while signers remain old, and the inverse;
-- restart, initial block download, and registration around activation
-  boundaries;
-- modified builds carrying candidate fixes alongside released binaries.
-
-Every run must record the complete version matrix and join each observation to
-the admitted runtime image digest rather than to a mutable image tag.
-
-Definition of done:
-
-- supported version combinations have deterministic, replayable scenarios;
-- incompatibility is distinguished from telemetry loss and harness failure;
-- epoch and reward-boundary placement is sealed in the run ledger;
-- dashboards and evidence identify every actor's exact runtime image;
-- at least one expected-compatible and one expected-incompatible negative
-  control are qualified.
-
-### A11: Multiple Bitcoin followers and split views
+### A10: Multiple Bitcoin followers and split views
 
 A single Bitcoin Core process tests Stacks reorganization handling but not
 Bitcoin network partitions. Build on the typed Bitcoin-node topology and
@@ -170,6 +157,31 @@ Definition of done:
 - split-view effect and full recovery are proven independently on both layers;
 - replay reproduces the admitted P2P graph, work schedule, and partition;
 - teardown retains the complete per-node Bitcoin and Stacks evidence corpus.
+
+### A11: Mixed-version and upgrade-boundary campaigns
+
+Qualify the existing per-actor image support as explicit compatibility and
+missed-upgrade scenarios. Initial scenario families should cover:
+
+- current nodes with previous-release signers, and the inverse;
+- minority and threshold-relevant cohorts that miss an epoch upgrade;
+- gradual signer-set upgrades during a reward cycle;
+- miner upgrades while signers remain old, and the inverse;
+- restart, initial block download, and registration around activation
+  boundaries;
+- modified builds carrying candidate fixes alongside released binaries.
+
+Every run must record the complete version matrix and join each observation to
+the admitted runtime image digest rather than to a mutable image tag.
+
+Definition of done:
+
+- supported version combinations have deterministic, replayable scenarios;
+- incompatibility is distinguished from telemetry loss and harness failure;
+- epoch and reward-boundary placement is sealed in the run ledger;
+- dashboards and evidence identify every actor's exact runtime image;
+- at least one expected-compatible and one expected-incompatible negative
+  control are qualified.
 
 ### A12: Deterministic adversarial actors
 
