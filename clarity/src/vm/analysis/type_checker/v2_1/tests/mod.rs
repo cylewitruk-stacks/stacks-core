@@ -24,6 +24,7 @@ use rstest_reuse::{self, *};
 use stacks_common::types::StacksEpochId;
 
 use crate::vm::analysis::errors::{StaticCheckError, StaticCheckErrorKind, SyntaxBindingError};
+use crate::vm::analysis::tests::utils::{SingleAnalysisPass, run_single_analysis_pass};
 use crate::vm::analysis::type_checker::v2_1::{MAX_FUNCTION_PARAMETERS, MAX_TRAIT_METHODS};
 use crate::vm::analysis::types::ContractAnalysis;
 use crate::vm::analysis::{mem_type_check as mem_run_analysis, run_analysis};
@@ -33,8 +34,8 @@ use crate::vm::ast::parser::v2::lexer::token::Token;
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::{ExecutionCost, LimitedCostTracker, runtime_cost};
 use crate::vm::database::MemoryBackingStore;
+use crate::vm::resource_limiter::{ResourceBudget, ResourceLimiter};
 use crate::vm::tests::test_clarity_versions;
-use crate::vm::time_tracker::TimeTracker;
 use crate::vm::types::SequenceSubtype::*;
 use crate::vm::types::StringSubtype::*;
 use crate::vm::types::TypeSignature::{BoolType, IntType, PrincipalType, SequenceType, UIntType};
@@ -74,7 +75,7 @@ pub fn mem_type_check(
 
 /// NOTE: runs at latest Clarity version
 fn type_check_helper(exp: &str) -> Result<TypeSignature, StaticCheckError> {
-    mem_type_check(exp).map(|(type_sig_opt, _)| type_sig_opt.unwrap())
+    type_check_helper_version(exp, ClarityVersion::latest(), StacksEpochId::latest())
 }
 
 fn type_check_helper_version(
@@ -82,7 +83,15 @@ fn type_check_helper_version(
     version: ClarityVersion,
     epoch: StacksEpochId,
 ) -> Result<TypeSignature, StaticCheckError> {
-    mem_run_analysis(exp, version, epoch).map(|(type_sig_opt, _)| type_sig_opt.unwrap())
+    let pass = if epoch < StacksEpochId::Epoch21 {
+        SingleAnalysisPass::TypeChecker2_05
+    } else {
+        SingleAnalysisPass::TypeChecker2_1
+    };
+    match run_single_analysis_pass(pass, exp, version, epoch) {
+        Ok(analysis) => Ok(analysis.type_of_final_expression()?.unwrap()),
+        Err(e) => Err(e),
+    }
 }
 
 fn type_check_helper_v1(exp: &str) -> Result<TypeSignature, StaticCheckError> {
@@ -1540,7 +1549,7 @@ fn test_lists() {
         StaticCheckErrorKind::TypeError(Box::new(BoolType), Box::new(buff_type(20))),
         StaticCheckErrorKind::TypeError(Box::new(BoolType), Box::new(IntType)),
         StaticCheckErrorKind::IncorrectArgumentCount(2, 3),
-        StaticCheckErrorKind::UnknownFunction("ynot".to_string()),
+        StaticCheckErrorKind::IllegalOrUnknownFunctionApplication("ynot".to_string()),
         StaticCheckErrorKind::IllegalOrUnknownFunctionApplication("if".to_string()),
         StaticCheckErrorKind::IncorrectArgumentCount(2, 1),
         StaticCheckErrorKind::UnionTypeError(vec![IntType, UIntType], Box::new(BoolType)),
@@ -1595,7 +1604,7 @@ fn test_buff() {
         StaticCheckErrorKind::TypeError(Box::new(BoolType), Box::new(buff_type(20))),
         StaticCheckErrorKind::TypeError(Box::new(BoolType), Box::new(IntType)),
         StaticCheckErrorKind::IncorrectArgumentCount(2, 3),
-        StaticCheckErrorKind::UnknownFunction("ynot".to_string()),
+        StaticCheckErrorKind::IllegalOrUnknownFunctionApplication("ynot".to_string()),
         StaticCheckErrorKind::IllegalOrUnknownFunctionApplication("if".to_string()),
         StaticCheckErrorKind::IncorrectArgumentCount(2, 1),
         StaticCheckErrorKind::UnionTypeError(vec![IntType, UIntType], Box::new(BoolType)),
@@ -4517,7 +4526,9 @@ fn test_clarity2_inner_type_check_type_aborts_when_deadline_elapsed() {
     let mut db = marf.as_analysis_db();
     let mut cost_tracker = LimitedCostTracker::new_free();
     // A zero-duration deadline is already elapsed at the first check.
-    let time_tracker = TimeTracker::from_max_duration(Duration::ZERO);
+    let resource_limiter = ResourceBudget::new()
+        .with_max_duration(Some(Duration::ZERO))
+        .start_tracking();
 
     let result = super::clarity2_inner_type_check_type(
         &mut db,
@@ -4527,12 +4538,12 @@ fn test_clarity2_inner_type_check_type_aborts_when_deadline_elapsed() {
         &BoolType,
         1,
         &mut cost_tracker,
-        &time_tracker,
+        &resource_limiter,
     );
 
     assert!(
-        matches!(result, Err(ref e) if matches!(*e.err, StaticCheckErrorKind::AnalysisTimeExpired)),
-        "expected AnalysisTimeExpired, got {result:?}"
+        matches!(result, Err(ref e) if matches!(*e.err, StaticCheckErrorKind::AnalysisResourceBudgetExceeded(_))),
+        "expected AnalysisResourceBudgetExceeded, got {result:?}"
     );
 }
 
@@ -4586,7 +4597,7 @@ fn test_trait_compliance_cost_error_masking_is_epoch40_gated() {
         let mut db = marf.as_analysis_db();
         let mut tracker = LimitedCostTracker::new_with_limit(epoch, ExecutionCost::ZERO);
         // Unlimited time: the deadline never fires, so only the cost charge can error.
-        let time_tracker = TimeTracker::unlimited();
+        let resource_limiter = ResourceLimiter::unlimited();
         super::clarity2_trait_check_trait_compliance(
             &mut db,
             None,
@@ -4597,7 +4608,7 @@ fn test_trait_compliance_cost_error_masking_is_epoch40_gated() {
             &expected_trait,
             0,
             &mut tracker,
-            &time_tracker,
+            &resource_limiter,
         )
     };
 
@@ -4646,7 +4657,7 @@ fn test_in_contract_trait_entry_metered_from_epoch40() {
             epoch,
             version,
             true,
-            TimeTracker::unlimited(),
+            ResourceLimiter::unlimited(),
         )
         .expect("analysis succeeds")
     };
