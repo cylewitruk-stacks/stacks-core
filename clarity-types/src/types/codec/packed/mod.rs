@@ -23,6 +23,10 @@
 //! minimal-width encodings. Variable-width tuple fields and list elements use an offset directory;
 //! fixed-width children omit it. Integer and Boolean lists use dense homogeneous lanes.
 //!
+//! The complete byte-level grammar is specified in the [packed-format specification][format-spec].
+//!
+//! [format-spec]: https://github.com/stacks-network/stacks-core/blob/main/clarity-types/src/types/codec/packed/README.md
+//!
 //! Two invariants make content-addressed storage safe:
 //!
 //! - Packed bytes depend only on the active [`Value`], never declared bounds or epoch;
