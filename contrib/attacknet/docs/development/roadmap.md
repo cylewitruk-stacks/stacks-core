@@ -75,6 +75,9 @@ Definition of done:
 
 ### A9: Bounded Bitcoin reorganization campaigns
 
+Status: implementation in progress. A9 is deliberately node-addressed and does
+not depend on A11; simultaneous multi-follower split views remain A11 scope.
+
 Implement `BurnchainReorg` as a first-class semantic fault, distinct from a
 process or packet-level Chaos Mesh fault. Bitcoin Core regtest exposes
 `invalidateblock` and `reconsiderblock`, allowing a controlled single-node

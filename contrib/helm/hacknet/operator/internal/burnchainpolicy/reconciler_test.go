@@ -74,7 +74,7 @@ func TestReconcileAppliesClockThenReportsAcknowledgedPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	height := uint64(120)
-	reconciler.StatusReader = fixedStatusReader{status: burnchain.Status{State: "running", BitcoinHeight: &height, PolicyGeneration: &parsed.Generation}}
+	reconciler.StatusReader = fixedStatusReader{status: burnchain.Status{State: "running", BitcoinHeight: &height, PolicyGeneration: &parsed.Generation, PolicyMode: parsed.Mode}}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -97,6 +97,59 @@ func TestReconcileAppliesClockThenReportsAcknowledgedPolicy(t *testing.T) {
 	}
 	if policy.ResourceVersion != resourceVersion {
 		t.Fatal("steady-state observation caused an unnecessary status write")
+	}
+}
+
+func TestPausedPolicyIsNotReadyUntilClockReportsPaused(t *testing.T) {
+	reconciler, request := testReconciler(t)
+	policy := &attacknetv1beta1.BurnchainPolicy{}
+	if err := reconciler.Get(context.Background(), request.NamespacedName, policy); err != nil {
+		t.Fatal(err)
+	}
+	policy.Spec.Paused = true
+	if err := reconciler.Update(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{}
+	if err := reconciler.Get(context.Background(), types.NamespacedName{Namespace: "test", Name: "cadence-clock"}, configMap); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseRuntime(configMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "cadence-clock-1", Namespace: "test", Labels: map[string]string{
+		labelPolicy: "cadence", labelComponent: componentClock,
+	}}, Status: corev1.PodStatus{PodIP: "127.0.0.1", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	if err := reconciler.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	height := uint64(120)
+	reconciler.StatusReader = fixedStatusReader{status: burnchain.Status{State: "running", BitcoinHeight: &height, PolicyGeneration: &parsed.Generation, PolicyMode: burnchain.ModePause}}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Get(context.Background(), request.NamespacedName, policy); err != nil {
+		t.Fatal(err)
+	}
+	if policy.Status.Phase != "Applying" || policy.Status.Reason != "PolicyStateNotAcknowledged" {
+		t.Fatalf("running paused generation reported Ready: %#v", policy.Status)
+	}
+	reconciler.StatusReader = fixedStatusReader{status: burnchain.Status{State: "paused", BitcoinHeight: &height, PolicyGeneration: &parsed.Generation, PolicyMode: burnchain.ModePause}}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Get(context.Background(), request.NamespacedName, policy); err != nil {
+		t.Fatal(err)
+	}
+	if policy.Status.Phase != "Ready" {
+		t.Fatalf("paused clock did not become Ready: %#v", policy.Status)
 	}
 }
 

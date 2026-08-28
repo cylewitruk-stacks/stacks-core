@@ -133,6 +133,13 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, request reconcile.R
 		setAttemptIfChanged(&status, policy.Status, now)
 		return reconcile.Result{RequeueAfter: requeueApplying}, reconciler.updateStatus(ctx, policy, status)
 	}
+	if observed.PolicyMode != runtimePolicy.policy.Mode ||
+		(runtimePolicy.flashID == "" && runtimePolicy.policy.Mode == burnchain.ModePause && observed.State != "paused") {
+		status.Phase, status.Reason, status.Message = "Applying", "PolicyStateNotAcknowledged", fmt.Sprintf("Waiting for runtime policy generation %d to enter %s mode", runtimePolicy.policy.Generation, runtimePolicy.policy.Mode)
+		setReadyCondition(&status, metav1.ConditionFalse, policy.Generation, status.Reason, status.Message)
+		setAttemptIfChanged(&status, policy.Status, now)
+		return reconcile.Result{RequeueAfter: requeueApplying}, reconciler.updateStatus(ctx, policy, status)
+	}
 	wasReady := status.Phase == "Ready" && status.AppliedPolicyDigest == runtimePolicy.digest
 	status.AppliedPolicyDigest = runtimePolicy.digest
 	if observed.State == "degraded" {

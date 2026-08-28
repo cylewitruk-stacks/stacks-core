@@ -43,6 +43,11 @@ func TestCompileV1Beta1DomainTopology(t *testing.T) {
 	if compiled.Spec.Actors[3].SignerWeight == nil || *compiled.Spec.Actors[3].SignerWeight != 10 {
 		t.Fatalf("signer weight was not preserved: %#v", compiled.Spec.Actors[3].SignerWeight)
 	}
+	if compiled.Spec.Actors[2].SignerIndex == nil || *compiled.Spec.Actors[2].SignerIndex != 1 ||
+		compiled.Spec.Actors[2].SignerWeight == nil || *compiled.Spec.Actors[2].SignerWeight != 10 ||
+		compiled.Spec.Actors[2].SignerPublicKey != compiled.Spec.Actors[3].SignerPublicKey {
+		t.Fatalf("signer-node identity was not preserved: %#v", compiled.Spec.Actors[2])
+	}
 }
 
 func TestCompileV1Beta1RejectsAmbiguousAndInvalidTopology(t *testing.T) {

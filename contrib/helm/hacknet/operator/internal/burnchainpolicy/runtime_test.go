@@ -79,6 +79,27 @@ func TestValidatePolicyRequiresCompleteCredentialsAndValidDestinationSelection(t
 	}
 }
 
+func TestValidatePolicyRequiresCompleteProtocolSchedule(t *testing.T) {
+	t.Parallel()
+	policy := validPolicy()
+	policy.Spec.ProtocolSchedule = &attacknetv1beta1.BurnchainProtocolSchedule{
+		Epochs: []attacknetv1beta1.BurnchainEpochBoundary{{Name: "nakamoto", StartHeight: 225}},
+	}
+	if err := validatePolicy(policy); err == nil || !strings.Contains(err.Error(), "both epoch and reward-cycle") {
+		t.Fatalf("expected incomplete schedule failure, got %v", err)
+	}
+	policy.Spec.ProtocolSchedule.RewardCycle = &attacknetv1beta1.BurnchainRewardCycleSchedule{
+		FirstHeight: 0, CycleLength: 20, PrepareLength: 20,
+	}
+	if err := validatePolicy(policy); err == nil || !strings.Contains(err.Error(), "invalid geometry") {
+		t.Fatalf("expected invalid reward-cycle geometry, got %v", err)
+	}
+	policy.Spec.ProtocolSchedule.RewardCycle.PrepareLength = 5
+	if err := validatePolicy(policy); err != nil {
+		t.Fatalf("complete protocol schedule rejected: %v", err)
+	}
+}
+
 func validPolicy() *attacknetv1beta1.BurnchainPolicy {
 	return &attacknetv1beta1.BurnchainPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: "cadence", Namespace: "test", UID: types.UID("policy-uid"), Generation: 1},

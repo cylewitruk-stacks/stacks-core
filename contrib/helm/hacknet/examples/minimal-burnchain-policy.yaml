@@ -14,6 +14,18 @@ spec:
       # Regtest accepts testnet addresses. No private key is required when the
       # destination is used only for block generation.
       address: mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn
+  # The semantic reorg controller uses this declared schedule to reject an
+  # unapproved epoch or reward-cycle crossing. It never scrapes node config.
+  protocolSchedule:
+    epochs:
+      - {name: epoch-2-0, startHeight: 0}
+      - {name: epoch-2-5, startHeight: 203}
+      - {name: epoch-3-0, startHeight: 225}
+      - {name: epoch-3-1, startHeight: 227}
+    rewardCycle:
+      firstHeight: 0
+      cycleLength: 20
+      prepareLength: 5
   rpc:
     timeout: 5s
     minimumBackoff: 1s

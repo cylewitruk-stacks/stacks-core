@@ -31,10 +31,11 @@ var (
 	}
 	runRules = []rbacv1.PolicyRule{
 		rule("testing.stacks.org", []string{"burnchainpolicies", "stacksnetworks"}, readVerbs),
+		rule("testing.stacks.org", []string{"burnchainpolicies"}, []string{"patch"}),
 		rule("testing.stacks.org", []string{"faultcampaigns"}, []string{"create", "delete", "get", "list", "patch", "watch"}),
 		rule("testing.stacks.org", []string{"attacknetruns"}, []string{"get", "list", "patch", "watch"}),
 		rule("testing.stacks.org", []string{"faultcampaigns/status", "attacknetruns/status"}, []string{"get", "patch"}),
-		rule("", []string{"pods"}, []string{"create", "delete", "get", "list", "watch"}),
+		rule("", []string{"pods"}, configMapVerbs),
 		rule("", []string{"configmaps"}, configMapVerbs),
 		rule("chaos-mesh.org", []string{"dnschaos", "iochaos", "networkchaos", "podchaos", "timechaos"}, chaosVerbs),
 	}

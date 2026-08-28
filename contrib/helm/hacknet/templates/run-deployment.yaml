@@ -36,7 +36,11 @@ spec:
       {{- end }}
       containers:
         - name: run-operator
+          {{- if .Values.runOperator.image.digest }}
+          image: "{{ .Values.runOperator.image.repository }}@{{ .Values.runOperator.image.digest }}"
+          {{- else }}
           image: "{{ .Values.runOperator.image.repository }}:{{ .Values.runOperator.image.tag }}"
+          {{- end }}
           imagePullPolicy: {{ .Values.runOperator.image.pullPolicy }}
           args:
             - --watch-namespace={{ include "hacknet.watchNamespace" . }}
@@ -47,6 +51,12 @@ spec:
             - --iochaos-supported-architectures={{ join "," .Values.runOperator.ioChaosSupportedArchitectures }}
             - --timechaos-supported-architectures={{ join "," .Values.runOperator.timeChaosSupportedArchitectures }}
             - --io-pressure-image-pull-policy={{ .Values.runOperator.ioPressureImage.pullPolicy }}
+            - --burnchain-reorg-worker-pull-policy={{ .Values.runOperator.image.pullPolicy }}
+            {{- if .Values.runOperator.image.digest }}
+            - --burnchain-reorg-worker-image={{ .Values.runOperator.image.repository }}@{{ .Values.runOperator.image.digest }}
+            {{- else }}
+            - --burnchain-reorg-worker-image={{ .Values.runOperator.image.repository }}:{{ .Values.runOperator.image.tag }}
+            {{- end }}
             {{- if .Values.runOperator.ioPressureImage.digest }}
             - --io-pressure-image={{ .Values.runOperator.ioPressureImage.repository }}@{{ .Values.runOperator.ioPressureImage.digest }}
             {{- else }}

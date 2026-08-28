@@ -47,6 +47,45 @@ type BurnchainPolicySpec struct {
 	FixedDestinationIndex int32                  `json:"fixedDestinationIndex,omitempty"`
 	Flash                 *BurnchainFlashRequest `json:"flash,omitempty"`
 	RPC                   BurnchainRPCSpec       `json:"rpc,omitempty"`
+	// ProtocolSchedule lets semantic faults prove whether a requested branch
+	// replacement crosses an epoch or reward-cycle boundary.
+	ProtocolSchedule *BurnchainProtocolSchedule `json:"protocolSchedule,omitempty"`
+}
+
+// BurnchainProtocolSchedule describes the finite regtest protocol boundaries
+// relevant to reorganization safety. It is declared by the environment rather
+// than inferred from node configuration text.
+// +kubebuilder:validation:XValidation:rule="self.epochs.size() > 0 && has(self.rewardCycle)",message="protocolSchedule must declare both epoch and reward-cycle geometry"
+type BurnchainProtocolSchedule struct {
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=map
+	// +listMapKey=name
+	Epochs      []BurnchainEpochBoundary      `json:"epochs,omitempty"`
+	RewardCycle *BurnchainRewardCycleSchedule `json:"rewardCycle,omitempty"`
+}
+
+// BurnchainEpochBoundary names one inclusive epoch start height.
+type BurnchainEpochBoundary struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10000000
+	StartHeight int64 `json:"startHeight"`
+}
+
+// BurnchainRewardCycleSchedule defines deterministic reward-cycle geometry.
+// +kubebuilder:validation:XValidation:rule="self.prepareLength < self.cycleLength",message="prepareLength must be less than cycleLength"
+type BurnchainRewardCycleSchedule struct {
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10000000
+	FirstHeight int64 `json:"firstHeight"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000000
+	CycleLength int64 `json:"cycleLength"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1000000
+	PrepareLength int64 `json:"prepareLength"`
 }
 
 // BurnchainDestinationMode controls how the clock chooses a destination.

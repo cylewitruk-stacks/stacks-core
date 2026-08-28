@@ -466,6 +466,17 @@
       "title": "Protocol assertion source identities (trusted)",
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"actor": "Actor", "assertion": "Assertion", "gate": "Gate", "pod": "Pod", "pod_uid": "Pod UID", "role": "Role", "run": "Run", "runtime_image_id": "Runtime image ID", "service": "Service", "source_evidence_class": "Evidence class"}}}],
       "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Orchestrator-observed lifecycle for each typed stage action. Burnchain reorg actions become Active only after the worker proves the replacement branch canonical; Pod existence alone is insufficient.",
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0, "spanNulls": false}, "min": 0, "max": 1}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 144},
+      "id": 34,
+      "options": {"alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.65, "showValue": "never"},
+      "targets": [{"expr": "attacknet_fault_action_info{network=\"$network\"}", "legendFormat": "{{campaign}} · {{stage}}/{{action}} · {{type}} · {{phase}} · {{reason}}", "refId": "A"}],
+      "title": "Typed fault action lifecycle (trusted)",
+      "type": "state-timeline"
     }
   ],
   "refresh": "5s",

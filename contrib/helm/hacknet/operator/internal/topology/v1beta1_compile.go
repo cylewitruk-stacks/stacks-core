@@ -224,7 +224,14 @@ func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attack
 		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, err
 	}
 	index := member.Index
+	weight := float64(member.Weight)
+	// The signer and its co-located Stacks node are one signer-impact unit.
+	// Preserve the complete identity on both compiled actors so canonical
+	// reward-set resolution can deduplicate them by signing key and account for
+	// either actor being targeted by a fault campaign.
 	node.SignerIndex = &index
+	node.SignerWeight = &weight
+	node.SignerPublicKey = member.PublicKey
 	signerConfig, err := compileConfig(network, profileContext{
 		actor:       member.Name,
 		role:        "signer",
@@ -235,7 +242,6 @@ func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attack
 	if err != nil {
 		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, err
 	}
-	weight := float64(member.Weight)
 	signer := attacknetv1alpha1.ActorSpec{
 		Name: member.Name, Role: "signer", SignerIndex: &index,
 		SignerWeight: &weight, SignerPublicKey: member.PublicKey,

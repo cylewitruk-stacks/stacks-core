@@ -27,7 +27,7 @@ type FaultCampaignList struct {
 
 // FaultCampaignSpec defines staged injection, aggregate safety, and evidence.
 // +kubebuilder:validation:XValidation:rule="(has(self.template) && self.template) || (has(self.networkRef) && self.networkRef.size() > 0)",message="executable campaigns require networkRef"
-// +kubebuilder:validation:XValidation:rule="self.safety.allowBurnchain || !self.stages.exists(stage, stage.faults.exists(fault, has(fault.target.roles) && fault.target.roles.exists(role, role == 'burnchain')))",message="burnchain faults require safety.allowBurnchain=true"
+// +kubebuilder:validation:XValidation:rule="self.safety.allowBurnchain || !self.stages.exists(stage, stage.faults.exists(fault, fault.fault.type == 'burnchain-reorg' || (has(fault.target.roles) && fault.target.roles.exists(role, role == 'burnchain'))))",message="burnchain faults require safety.allowBurnchain=true"
 type FaultCampaignSpec struct {
 	Template bool `json:"template,omitempty"`
 	// NetworkRef is optional only for an inert, reusable template. AttacknetRun
@@ -87,6 +87,7 @@ type ObservationTriggerSpec struct {
 }
 
 // FaultActionSpec defines one fault action within a stage.
+// +kubebuilder:validation:XValidation:rule="self.fault.type != 'burnchain-reorg' || (has(self.target.actors) && self.target.actors.size() == 1 && (!has(self.target.roles) || self.target.roles.size() == 0) && self.target.mode == 'one' && !has(self.target.value))",message="burnchain-reorg must target exactly one named Bitcoin actor with mode one and no value"
 type FaultActionSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
 	ID                 string              `json:"id"`
@@ -113,10 +114,11 @@ type FaultTarget struct {
 }
 
 // FaultSpec defines one finite mechanism and its bounded parameters.
-// +kubebuilder:validation:XValidation:rule="(self.type == 'pod' && self.action in ['pod-kill', 'pod-failure', 'container-kill']) || (self.type == 'network' && self.action in ['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']) || (self.type == 'dns' && self.action in ['error', 'random']) || (self.type == 'io' && self.action in ['latency', 'fault', 'mistake', 'attrOverride']) || (self.type == 'io-pressure' && self.action == 'disk-pressure') || (self.type in ['time', 'clock-skew'] && !has(self.action))",message="fault action must be valid for its type"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'pod' && self.action in ['pod-kill', 'pod-failure', 'container-kill']) || (self.type == 'network' && self.action in ['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']) || (self.type == 'dns' && self.action in ['error', 'random']) || (self.type == 'io' && self.action in ['latency', 'fault', 'mistake', 'attrOverride']) || (self.type == 'io-pressure' && self.action == 'disk-pressure') || (self.type in ['time', 'clock-skew', 'burnchain-reorg'] && !has(self.action))",message="fault action must be valid for its type"
 // +kubebuilder:validation:XValidation:rule="(self.mode in ['one', 'all'] && !has(self.value)) || (self.mode in ['fixed', 'fixed-percent', 'random-max-percent'] && has(self.value))",message="fault value is required only for fixed and percent modes"
+// +kubebuilder:validation:XValidation:rule="self.type == 'burnchain-reorg' ? has(self.burnchainReorg) : !has(self.burnchainReorg)",message="burnchainReorg is required only for burnchain-reorg faults"
 type FaultSpec struct {
-	// +kubebuilder:validation:Enum=pod;network;dns;io;time;io-pressure;clock-skew
+	// +kubebuilder:validation:Enum=pod;network;dns;io;time;io-pressure;clock-skew;burnchain-reorg
 	Type string `json:"type"`
 	// +kubebuilder:validation:Enum=pod-kill;pod-failure;container-kill;netem;delay;loss;duplicate;corrupt;partition;bandwidth;error;random;latency;fault;mistake;attrOverride;disk-pressure
 	Action string `json:"action,omitempty"`
@@ -125,6 +127,27 @@ type FaultSpec struct {
 	Value      *intstr.IntOrString `json:"value,omitempty"`
 	Duration   metav1.Duration     `json:"duration"`
 	Parameters apixv1.JSON         `json:"parameters,omitempty"`
+	// BurnchainReorg declares the bounded semantic operation. Raw Bitcoin RPC
+	// methods are intentionally not part of the campaign API.
+	BurnchainReorg *BurnchainReorgFaultSpec `json:"burnchainReorg,omitempty"`
+}
+
+// BurnchainReorgFaultSpec replaces a bounded suffix of one regtest chain.
+// +kubebuilder:validation:XValidation:rule="self.replacementBlocks > self.depth",message="replacementBlocks must exceed depth"
+type BurnchainReorgFaultSpec struct {
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=144
+	Depth int32 `json:"depth"`
+	// ReplacementBlocks must exceed Depth so the replacement branch has more
+	// proof of work after the original invalidity marker is reconsidered.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:validation:Maximum=288
+	ReplacementBlocks int32 `json:"replacementBlocks"`
+	// ReplacementInterval controls the cadence of the replacement branch.
+	ReplacementInterval metav1.Duration `json:"replacementInterval,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=63
+	DestinationIndex int32 `json:"destinationIndex,omitempty"`
 }
 
 // FaultSafety contains aggregate bounds and conspicuous dangerous-fault opt-ins.
@@ -144,11 +167,21 @@ type FaultSafety struct {
 	AllowExtremeSeverity     bool  `json:"allowExtremeSeverity"`
 	AllowMinerMajorityOutage bool  `json:"allowMinerMajorityOutage"`
 	AllowUnenrolledTargets   bool  `json:"allowUnenrolledNetworkTargets"`
+	// MaxBurnchainReorgDepth and MaxBurnchainReplacementBlocks are required
+	// per-campaign ceilings for semantic burnchain reorganization actions.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=144
+	MaxBurnchainReorgDepth int32 `json:"maxBurnchainReorgDepth,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=288
+	MaxBurnchainReplacementBlocks    int32 `json:"maxBurnchainReplacementBlocks,omitempty"`
+	AllowEpochBoundaryCrossing       bool  `json:"allowEpochBoundaryCrossing,omitempty"`
+	AllowRewardCycleBoundaryCrossing bool  `json:"allowRewardCycleBoundaryCrossing,omitempty"`
 }
 
 // CampaignAssertion describes one bounded effect or recovery assertion.
 type CampaignAssertion struct {
-	// +kubebuilder:validation:Enum=PodRestarted;PodUnavailable;ContainerRestarted;TargetReady;NetworkDegraded;NetworkRecovered;DNSDegraded;DNSRecovered;IODegraded;IORecovered;IOPressureObserved;IOPressureRecovered;ClockSkewObserved;ClockSkewCleared
+	// +kubebuilder:validation:Enum=PodRestarted;PodUnavailable;ContainerRestarted;TargetReady;NetworkDegraded;NetworkRecovered;DNSDegraded;DNSRecovered;IODegraded;IORecovered;IOPressureObserved;IOPressureRecovered;ClockSkewObserved;ClockSkewCleared;BurnchainReorgProven;BurnchainPolicyRestored
 	Type           string `json:"type"`
 	Actor          string `json:"actor,omitempty"`
 	Action         string `json:"action,omitempty"`
@@ -194,6 +227,9 @@ type ChaosReference struct {
 	InjectedAt     *metav1.Time `json:"injectedAt,omitempty"`
 	Mechanism      string       `json:"mechanism,omitempty"`
 	ResourceDigest string       `json:"resourceDigest,omitempty"`
+	// RecoveryContract binds cleanup to the exact shared policy state that
+	// existed before mutation.
+	RecoveryContract *apixv1.JSON `json:"recoveryContract,omitempty"`
 }
 
 // FaultActionStatus records one action's independently observed lifecycle.

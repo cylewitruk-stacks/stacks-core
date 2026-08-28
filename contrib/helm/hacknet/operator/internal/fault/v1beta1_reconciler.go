@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"sort"
 	"strings"
@@ -59,6 +60,9 @@ type V1Beta1Reconciler struct {
 	IOChaosArchitectures   map[string]bool
 	TimeChaosArchitectures map[string]bool
 	CompilationCache       *CompilationCache
+	ReorgWorkerImage       string
+	ReorgWorkerPull        corev1.PullPolicy
+	ReorgHTTPClient        *http.Client
 }
 
 // Reconcile advances every eligible stage by one durable transition.
@@ -232,6 +236,12 @@ func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1
 			}
 			shadow := betaShadowCampaign(campaign, stage.ID, action.ID, targets)
 			capabilities := legacy.capabilityEvidence(ctx, shadow, pods, targets)
+			if definition := mustMechanismForType(actionResourceType(action.Resource)); definition.Backend == burnchainReorgBackend {
+				capabilities, err = r.burnchainReorgCapabilities(ctx, campaign, network, action, targets)
+				if err != nil {
+					return reconcile.Result{}, r.failBeta(ctx, campaign, "FaultCapabilityUnavailable", err)
+				}
+			}
 			capabilityJSON := make([]apixv1.JSON, 0, len(capabilities))
 			for _, capability := range capabilities {
 				value, _ := json.Marshal(capability)
@@ -241,7 +251,7 @@ func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1
 				}
 			}
 			definition := mustMechanismForType(actionResourceType(action.Resource))
-			if definition.EffectKind != "pod" {
+			if definition.EffectKind != "pod" && definition.Backend != burnchainReorgBackend {
 				before, probeErr := legacy.captureProbePhase(ctx, shadow, legacyNetwork, pods, targets, Compiled{Resource: action.Resource, Evidence: action.Evidence}, "before", false)
 				if probeErr != nil {
 					return reconcile.Result{}, r.failBeta(ctx, campaign, "ProbeBaselineUnavailable", probeErr)
@@ -496,6 +506,11 @@ func (r *V1Beta1Reconciler) injectBetaStage(ctx context.Context, campaign *attac
 			ActionID: compiled.Actions[index].ID, Kind: kind, Name: object.GetName(),
 			UID: string(object.GetUID()), CreatedAt: &now, Mechanism: kind,
 		}
+		recovery, recoveryErr := betaRecoveryContract(kind, object)
+		if recoveryErr != nil {
+			r.rollbackBetaActions(ctx, campaign, status, append(created, index))
+			return recoveryErr
+		}
 		contract, err := betaMutationContract(kind, object, &status.Actions[index])
 		if err != nil {
 			r.rollbackBetaActions(ctx, campaign, status, append(created, index))
@@ -509,6 +524,7 @@ func (r *V1Beta1Reconciler) injectBetaStage(ctx context.Context, campaign *attac
 			ActionID: compiled.Actions[index].ID, Kind: kind,
 			Name: object.GetName(), UID: string(object.GetUID()), CreatedAt: &now,
 			Mechanism: compiled.Actions[index].Resource.GetKind(), ResourceDigest: digest,
+			RecoveryContract: recovery,
 		}
 		status.Actions[index].Phase, status.Actions[index].Reason = "Injecting", "MutationCreated"
 		created = append(created, index)
@@ -537,6 +553,8 @@ func (r *V1Beta1Reconciler) createBetaMutation(ctx context.Context, campaign *at
 		pod.Labels["testing.stacks.org/stage"] = action.Resource.GetLabels()["testing.stacks.org/stage"]
 		pod.Labels["testing.stacks.org/action"] = action.ID
 		desired = pod
+	case burnchainReorgBackend:
+		return r.createBurnchainReorgMutation(ctx, campaign, network, action, status)
 	case clockPolicyBackend:
 		policy := &corev1.ConfigMap{}
 		name := campaign.Spec.NetworkRef + "-clock-policy"
@@ -638,6 +656,10 @@ func (r *V1Beta1Reconciler) advanceBetaStage(ctx context.Context, campaign *atta
 				continue
 			}
 			if err := r.removeBetaMutation(ctx, campaign, actionSpec, actionStatus); err != nil {
+				if errors.Is(err, errBurnchainReorgWorkerRemovalPending) {
+					allActive, allComplete = false, false
+					continue
+				}
 				return err
 			}
 			actionStatus.Phase, actionStatus.Reason = "Recovering", "DurationElapsed"
@@ -727,6 +749,9 @@ func (r *V1Beta1Reconciler) betaMutationInjected(ctx context.Context, campaign *
 		}
 		return true, nil
 	case *corev1.Pod:
+		if status.Mutation.Kind == "BurnchainReorgWorker" {
+			return r.burnchainReorgInjected(ctx, campaign, spec, status, typed)
+		}
 		return typed.Status.Phase == corev1.PodRunning && containerRunning(typed, "io-pressure"), nil
 	case *unstructured.Unstructured:
 		return conditionTrue(typed, "AllInjected"), nil
@@ -743,7 +768,7 @@ func (r *V1Beta1Reconciler) getBetaMutation(ctx context.Context, campaign *attac
 	switch status.Mutation.Kind {
 	case "ConfigMap", "ClockSkewPolicy":
 		object = &corev1.ConfigMap{}
-	case "Pod", "IOPressurePod":
+	case "Pod", "IOPressurePod", "BurnchainReorgWorker":
 		object = &corev1.Pod{}
 	default:
 		value := &unstructured.Unstructured{}
@@ -778,6 +803,9 @@ func (r *V1Beta1Reconciler) getBetaMutation(ctx context.Context, campaign *attac
 }
 
 func betaMutationContract(kind string, object client.Object, status *attacknetv1beta1.FaultActionStatus) (any, error) {
+	if kind == "BurnchainReorgWorker" {
+		return burnchainReorgPodContract(object)
+	}
 	if kind != "ClockSkewPolicy" {
 		return mutationContract(kind, object)
 	}
@@ -798,7 +826,13 @@ func betaMutationContract(kind string, object client.Object, status *attacknetv1
 func (r *V1Beta1Reconciler) removeBetaMutation(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, spec *attacknetv1beta1.FaultActionSpec, status *attacknetv1beta1.FaultActionStatus) error {
 	object, err := r.getBetaMutation(ctx, campaign, spec, status)
 	if err != nil || object == nil {
+		if status.Mutation != nil && status.Mutation.Kind == "BurnchainReorgWorker" {
+			return r.restoreBurnchainPolicy(ctx, campaign, status)
+		}
 		return err
+	}
+	if status.Mutation.Kind == "BurnchainReorgWorker" {
+		return r.removeBurnchainReorgWorker(ctx, campaign, status, object.(*corev1.Pod))
 	}
 	if policy, ok := object.(*corev1.ConfigMap); ok {
 		base := policy.DeepCopy()
@@ -819,6 +853,9 @@ func (r *V1Beta1Reconciler) betaMutationRecovered(ctx context.Context, campaign 
 		return false, err
 	}
 	if object == nil {
+		if status.Mutation != nil && status.Mutation.Kind == "BurnchainReorgWorker" {
+			return r.burnchainPolicyRecovered(ctx, campaign, status)
+		}
 		return true, nil
 	}
 	if policy, ok := object.(*corev1.ConfigMap); ok {
@@ -834,6 +871,9 @@ func (r *V1Beta1Reconciler) betaMutationRecovered(ctx context.Context, campaign 
 
 func (r *V1Beta1Reconciler) captureBetaDuring(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod, stageID string, spec *attacknetv1beta1.FaultActionSpec, compiled *CompiledAction, status *attacknetv1beta1.FaultActionStatus, campaignStatus *attacknetv1beta1.FaultCampaignStatus) (bool, error) {
 	definition := mustMechanismForType(spec.Fault.Type)
+	if definition.Backend == burnchainReorgBackend {
+		return r.captureBurnchainReorgDuring(ctx, campaign, spec, status)
+	}
 	shadow := betaShadowCampaign(campaign, stageID, status.ID, legacyTargets(status.ResolvedTargets))
 	object, err := r.getBetaMutation(ctx, campaign, spec, status)
 	if err != nil {
@@ -879,6 +919,9 @@ func (r *V1Beta1Reconciler) captureBetaDuring(ctx context.Context, campaign *att
 func (r *V1Beta1Reconciler) captureBetaRecovery(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod, stageID string, spec *attacknetv1beta1.FaultActionSpec, compiled *CompiledAction, status *attacknetv1beta1.FaultActionStatus, campaignStatus *attacknetv1beta1.FaultCampaignStatus) (bool, error) {
 	shadow := betaShadowCampaign(campaign, stageID, status.ID, legacyTargets(status.ResolvedTargets))
 	definition := mustMechanismForType(spec.Fault.Type)
+	if definition.Backend == burnchainReorgBackend {
+		return r.captureBurnchainReorgRecovery(ctx, campaign, status)
+	}
 	manifest := ManifestFromV1Beta1(network)
 	targets, err := ResolveTargets(manifest, compiled.Evidence.SelectedActors, pods)
 	if err != nil {
@@ -1023,8 +1066,14 @@ func (r *V1Beta1Reconciler) reconcileBetaDeletion(ctx context.Context, campaign 
 	if !controllerutil.ContainsFinalizer(campaign, betaFinalizer) {
 		return reconcile.Result{}, nil
 	}
-	if err := r.cleanupAllBeta(ctx, campaign); err != nil {
-		return reconcile.Result{}, err
+	// Terminal cleanup is durable proof that every mutation is absent and every
+	// shared policy is restored. Do not repeat semantic cleanup during a later
+	// deletion: dependencies may already have been removed, and requiring them
+	// again can strand an otherwise-clean campaign finalizer forever.
+	if !betaCleanupComplete(campaign.Status.Cleanup) {
+		if err := r.cleanupAllBeta(ctx, campaign); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 	_ = r.releaseBetaMutationLease(ctx, campaign)
 	base := campaign.DeepCopy()
@@ -1384,7 +1433,7 @@ func (r *V1Beta1Reconciler) SetupWithManager(mgr manager.Manager, maxConcurrent 
 	}); err != nil {
 		return fmt.Errorf("index v1beta1 FaultCampaign networkRef: %w", err)
 	}
-	mapNetwork := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+	campaignRequestsForNetwork := func(ctx context.Context, object client.Object) []reconcile.Request {
 		campaigns := &attacknetv1beta1.FaultCampaignList{}
 		if err := r.List(ctx, campaigns, client.InNamespace(object.GetNamespace()), client.MatchingFields{"spec.networkRef": object.GetName()}); err != nil {
 			return nil
@@ -1394,7 +1443,8 @@ func (r *V1Beta1Reconciler) SetupWithManager(mgr manager.Manager, maxConcurrent 
 			requests[index] = reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&campaigns.Items[index])}
 		}
 		return requests
-	})
+	}
+	mapNetwork := handler.EnqueueRequestsFromMapFunc(campaignRequestsForNetwork)
 	mapLabels := handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
 		name := object.GetLabels()["testing.stacks.org/campaign"]
 		if name == "" {
@@ -1403,7 +1453,15 @@ func (r *V1Beta1Reconciler) SetupWithManager(mgr manager.Manager, maxConcurrent 
 		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: object.GetNamespace(), Name: name}}}
 	})
 	b := builder.ControllerManagedBy(mgr).For(&attacknetv1beta1.FaultCampaign{}).
-		Watches(&attacknetv1beta1.StacksNetwork{}, mapNetwork).Watches(&corev1.Pod{}, mapLabels).
+		Watches(&attacknetv1beta1.StacksNetwork{}, mapNetwork).
+		Watches(&attacknetv1beta1.BurnchainPolicy{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+			policy := object.(*attacknetv1beta1.BurnchainPolicy)
+			network := &attacknetv1beta1.StacksNetwork{}
+			if err := r.Get(ctx, client.ObjectKey{Namespace: policy.Namespace, Name: policy.Spec.NetworkRef}, network); err != nil {
+				return nil
+			}
+			return campaignRequestsForNetwork(ctx, network)
+		})).Watches(&corev1.Pod{}, mapLabels).
 		Watches(&corev1.ConfigMap{}, mapLabels).WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent})
 	for _, definition := range registeredMechanisms() {
 		if definition.Backend != chaosMeshBackend {

@@ -40,6 +40,11 @@ signer registration, signer-state freshness, proposal-outcome visibility, and
 telemetry completeness. Arbitrary PromQL and actor-defined predicates are not
 accepted.
 
+Cohort agreement is fail-fast by default. Recovery gates may set
+`convergenceWindow` to allow a transient spread to converge within a finite
+deadline. The assertion succeeds on the first in-bound observation and fails
+if the spread remains out of bounds when that window expires.
+
 Each gate accepts at most 32 assertions, 64 actors per assertion, and 256
 actor references in total. These bounds keep source-bound status evidence well
 below Kubernetes object-size limits.

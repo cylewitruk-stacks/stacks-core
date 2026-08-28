@@ -60,6 +60,7 @@ runOperator:
   image:
     repository: stacks-hacknet-run-operator
     tag: dev
+    digest: ""
     pullPolicy: IfNotPresent
   imagePullSecrets: []
   logLevel: INFO

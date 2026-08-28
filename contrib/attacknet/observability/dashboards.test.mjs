@@ -165,6 +165,20 @@ test('overview exposes identity-bound protocol gates and their terminal alert', 
   assert.match(prometheusRules(), /outcome=~"Violated\|Inconclusive"/);
 });
 
+test('overview exposes trusted typed fault-action lifecycle state', () => {
+  const overview = readDashboard('attacknet-overview.json');
+  const panel = overview.panels.find(candidate => candidate.title === 'Typed fault action lifecycle (trusted)');
+  assert.ok(panel);
+  assert.equal(panel.type, 'state-timeline');
+  assert.match(panel.description, /orchestrator-observed/i);
+  assert.match(panel.description, /typed stage action/i);
+  const targets = JSON.stringify(panel.targets);
+  assert.match(targets, /attacknet_fault_action_info/);
+  assert.match(targets, /\{\{stage\}\}\/\{\{action\}\}/);
+  assert.match(targets, /\{\{phase\}\}/);
+  assert.match(targets, /\{\{reason\}\}/);
+});
+
 test('histogram units and counter queries preserve exported metric semantics', () => {
   const counterFamilies = loadInventory().families
     .filter(family => family.type === 'counter')

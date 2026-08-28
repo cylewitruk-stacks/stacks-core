@@ -13,6 +13,7 @@ import (
 	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchainworker"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	manageroptions "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/manager"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/orchestratormetrics"
@@ -21,6 +22,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "burnchain-reorg-worker" {
+		os.Exit(burnchainworker.Main())
+	}
 	configureLogging := manageroptions.BindLogging(flag.CommandLine)
 	options := manageroptions.Options{}
 	options.Bind(flag.CommandLine)
@@ -28,6 +32,8 @@ func main() {
 	ioPressurePull := flag.String("io-pressure-image-pull-policy", defaultString(os.Getenv("IO_PRESSURE_IMAGE_PULL_POLICY"), "IfNotPresent"), "I/O-pressure helper image pull policy.")
 	ioArchitectures := flag.String("iochaos-supported-architectures", defaultString(os.Getenv("IOCHAOS_SUPPORTED_ARCHITECTURES"), "x64"), "Comma-separated probe architectures admitted for IOChaos.")
 	timeArchitectures := flag.String("timechaos-supported-architectures", defaultString(os.Getenv("TIMECHAOS_SUPPORTED_ARCHITECTURES"), "x64"), "Comma-separated probe architectures admitted for TimeChaos.")
+	reorgWorkerImage := flag.String("burnchain-reorg-worker-image", os.Getenv("BURNCHAIN_REORG_WORKER_IMAGE"), "Trusted image containing the bounded burnchain reorg worker.")
+	reorgWorkerPull := flag.String("burnchain-reorg-worker-pull-policy", defaultString(os.Getenv("BURNCHAIN_REORG_WORKER_PULL_POLICY"), "IfNotPresent"), "Burnchain reorg worker image pull policy.")
 	flag.Parse()
 	configureLogging()
 	scheme := runtime.NewScheme()
@@ -51,6 +57,8 @@ func main() {
 		IOChaosArchitectures:   stringSet(*ioArchitectures),
 		TimeChaosArchitectures: stringSet(*timeArchitectures),
 		CompilationCache:       compilationCache,
+		ReorgWorkerImage:       *reorgWorkerImage,
+		ReorgWorkerPull:        corev1.PullPolicy(*reorgWorkerPull),
 	}
 	runs := &runcontroller.V1Beta1Reconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),

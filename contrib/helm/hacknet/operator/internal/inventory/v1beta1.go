@@ -58,7 +58,11 @@ func betaNetworkAsLegacy(network *testingv1beta1.StacksNetwork) *testingv1.Stack
 }
 
 func betaDeclaredActors(network *testingv1beta1.StacksNetwork) []testingv1.ActorSpec {
-	result := make([]testingv1.ActorSpec, 0, len(network.Spec.Burnchain.Nodes)+len(network.Spec.Nodes)+len(network.Spec.RawActors))
+	capacity := len(network.Spec.Burnchain.Nodes) + len(network.Spec.Nodes) + len(network.Spec.RawActors)
+	if network.Spec.Enrollment != nil {
+		capacity++
+	}
+	result := make([]testingv1.ActorSpec, 0, capacity)
 	for _, actor := range network.Spec.Burnchain.Nodes {
 		result = append(result, testingv1.ActorSpec{Name: actor.Name, Role: "burnchain"})
 	}
@@ -72,6 +76,9 @@ func betaDeclaredActors(network *testingv1beta1.StacksNetwork) []testingv1.Actor
 				testingv1.ActorSpec{Name: member.Name, Role: "signer"},
 			)
 		}
+	}
+	if network.Spec.Enrollment != nil {
+		result = append(result, testingv1.ActorSpec{Name: network.Spec.Enrollment.Name, Role: "infrastructure"})
 	}
 	for _, actor := range network.Spec.RawActors {
 		result = append(result, testingv1.ActorSpec{Name: actor.Name, Role: actor.Role})

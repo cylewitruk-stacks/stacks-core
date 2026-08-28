@@ -115,6 +115,66 @@ spec:
                 type: string
               paused:
                 type: boolean
+              protocolSchedule:
+                description: |-
+                  ProtocolSchedule lets semantic faults prove whether a requested branch
+                  replacement crosses an epoch or reward-cycle boundary.
+                properties:
+                  epochs:
+                    items:
+                      description: BurnchainEpochBoundary names one inclusive epoch
+                        start height.
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        startHeight:
+                          format: int64
+                          maximum: 10000000
+                          minimum: 0
+                          type: integer
+                      required:
+                      - name
+                      - startHeight
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  rewardCycle:
+                    description: BurnchainRewardCycleSchedule defines deterministic
+                      reward-cycle geometry.
+                    properties:
+                      cycleLength:
+                        format: int64
+                        maximum: 1000000
+                        minimum: 1
+                        type: integer
+                      firstHeight:
+                        format: int64
+                        maximum: 10000000
+                        minimum: 0
+                        type: integer
+                      prepareLength:
+                        format: int64
+                        maximum: 1000000
+                        minimum: 0
+                        type: integer
+                    required:
+                    - cycleLength
+                    - firstHeight
+                    - prepareLength
+                    type: object
+                    x-kubernetes-validations:
+                    - message: prepareLength must be less than cycleLength
+                      rule: self.prepareLength < self.cycleLength
+                type: object
+                x-kubernetes-validations:
+                - message: protocolSchedule must declare both epoch and reward-cycle
+                    geometry
+                  rule: self.epochs.size() > 0 && has(self.rewardCycle)
               rpc:
                 description: BurnchainRPCSpec configures bounded RPC retry behavior.
                 properties:

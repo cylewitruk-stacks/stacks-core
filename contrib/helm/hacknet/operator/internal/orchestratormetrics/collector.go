@@ -23,6 +23,7 @@ type Collector struct {
 
 	campaignInfo      *prometheus.Desc
 	campaignTarget    *prometheus.Desc
+	faultAction       *prometheus.Desc
 	assertionOutcome  *prometheus.Desc
 	runInfo           *prometheus.Desc
 	budgetUsage       *prometheus.Desc
@@ -41,6 +42,8 @@ func NewCollector(reader client.Reader) *Collector {
 			[]string{"evidence_source", "network", "campaign", "type", "phase", "reason", "template"}, nil),
 		campaignTarget: prometheus.NewDesc("attacknet_fault_campaign_target_info", "Exact actor targets admitted for a FaultCampaign.",
 			[]string{"evidence_source", "network", "campaign", "actor", "role", "node"}, nil),
+		faultAction: prometheus.NewDesc("attacknet_fault_action_info", "Current orchestrator-observed state of one typed fault action.",
+			[]string{"evidence_source", "network", "campaign", "stage", "action", "type", "phase", "reason"}, nil),
 		assertionOutcome: prometheus.NewDesc("attacknet_fault_campaign_assertion_outcome", "Trusted effect and recovery assertion outcomes.",
 			[]string{"evidence_source", "network", "campaign", "actor", "assertion", "outcome"}, nil),
 		runInfo: prometheus.NewDesc("attacknet_run_info", "Current orchestrator-observed AttacknetRun state.",
@@ -61,7 +64,7 @@ func NewCollector(reader client.Reader) *Collector {
 
 // Describe publishes every descriptor owned by the collector.
 func (c *Collector) Describe(output chan<- *prometheus.Desc) {
-	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.campaignTarget, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.collectionSuccess} {
+	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.collectionSuccess} {
 		output <- descriptor
 	}
 }
@@ -106,6 +109,13 @@ func (c *Collector) collectCampaign(output chan<- prometheus.Metric, campaign *a
 	seenTargets := map[string]bool{}
 	for _, stage := range campaign.Status.Stages {
 		for _, action := range stage.Actions {
+			faultType := campaignFaultType(campaign, stage.ID, action.ID)
+			actionPhase := action.Phase
+			if actionPhase == "" {
+				actionPhase = "Pending"
+			}
+			output <- prometheus.MustNewConstMetric(c.faultAction, prometheus.GaugeValue, 1,
+				evidenceSource, campaign.Spec.NetworkRef, campaign.Name, stage.ID, action.ID, faultType, actionPhase, action.Reason)
 			for _, target := range action.ResolvedTargets {
 				key := target.Actor + "\x00" + target.PodUID
 				if seenTargets[key] {
@@ -122,6 +132,20 @@ func (c *Collector) collectCampaign(output chan<- prometheus.Metric, campaign *a
 		valid = c.collectAssertionResults(output, campaign, stage.RecoveryResults) && valid
 	}
 	return valid
+}
+
+func campaignFaultType(campaign *attacknetv1beta1.FaultCampaign, stageID, actionID string) string {
+	for _, stage := range campaign.Spec.Stages {
+		if stage.ID != stageID {
+			continue
+		}
+		for _, action := range stage.Faults {
+			if action.ID == actionID {
+				return action.Fault.Type
+			}
+		}
+	}
+	return "unknown"
 }
 
 func (c *Collector) collectAssertionResults(output chan<- prometheus.Metric, campaign *attacknetv1beta1.FaultCampaign, values []apixv1.JSON) bool {

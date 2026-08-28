@@ -171,6 +171,26 @@ func validatePolicy(policy *attacknetv1beta1.BurnchainPolicy) error {
 			return err
 		}
 	}
+	if schedule := policy.Spec.ProtocolSchedule; schedule != nil {
+		if len(schedule.Epochs) == 0 || schedule.RewardCycle == nil {
+			return fmt.Errorf("protocolSchedule must declare both epoch and reward-cycle geometry")
+		}
+		names, heights := map[string]bool{}, map[int64]bool{}
+		for index, epoch := range schedule.Epochs {
+			if epoch.Name == "" || len(epoch.Name) > 63 || epoch.StartHeight < 0 || epoch.StartHeight > maximumBootstrapHeight {
+				return fmt.Errorf("protocolSchedule epoch %d has an invalid name or startHeight", index)
+			}
+			if names[epoch.Name] || heights[epoch.StartHeight] {
+				return fmt.Errorf("protocolSchedule epoch %d duplicates a name or startHeight", index)
+			}
+			names[epoch.Name], heights[epoch.StartHeight] = true, true
+		}
+		if reward := schedule.RewardCycle; reward != nil {
+			if reward.FirstHeight < 0 || reward.FirstHeight > maximumBootstrapHeight || reward.CycleLength < 1 || reward.CycleLength > 1_000_000 || reward.PrepareLength < 0 || reward.PrepareLength >= reward.CycleLength {
+				return fmt.Errorf("protocolSchedule.rewardCycle has invalid geometry")
+			}
+		}
+	}
 	for name, value := range map[string]time.Duration{
 		"rpc.timeout": policy.Spec.RPC.Timeout.Duration, "rpc.minimumBackoff": policy.Spec.RPC.MinimumBackoff.Duration,
 		"rpc.maximumBackoff": policy.Spec.RPC.MaximumBackoff.Duration,

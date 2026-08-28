@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -134,6 +135,38 @@ func TestTopologyManagerPublishesAndWithdrawsAdmittedInventory(t *testing.T) {
 	}
 	if err := direct.Create(ctx, invalidCampaign); !apierrors.IsInvalid(err) {
 		t.Fatalf("API admission accepted an invalid type/action combination: %v", err)
+	}
+	invalidReorg := &attacknetv1beta1.FaultCampaign{
+		ObjectMeta: metav1.ObjectMeta{Name: "invalid-reorg", Namespace: namespace},
+		Spec: attacknetv1beta1.FaultCampaignSpec{
+			NetworkRef: "network",
+			Stages: []attacknetv1beta1.FaultStageSpec{{
+				ID: "reorg",
+				Faults: []attacknetv1beta1.FaultActionSpec{{
+					ID: "replace", Target: attacknetv1beta1.FaultTarget{Actors: []string{"bitcoin-1"}, Mode: "one"},
+					Fault: attacknetv1beta1.FaultSpec{
+						Type: "burnchain-reorg", Mode: "one", Duration: metav1.Duration{Duration: time.Minute},
+						BurnchainReorg: &attacknetv1beta1.BurnchainReorgFaultSpec{Depth: 2, ReplacementBlocks: 2},
+					},
+				}},
+			}},
+			Safety: attacknetv1beta1.FaultSafety{
+				MaxUnavailableSignerBasisPoints: 10_000, MaxUnavailableMinerBasisPoints: 10_000,
+				MaxConcurrentFaults: 1, AllowBurnchain: true, MaxBurnchainReorgDepth: 2,
+				MaxBurnchainReplacementBlocks: 2,
+			},
+		},
+	}
+	if err := direct.Create(ctx, invalidReorg); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted a non-heavier replacement branch: %v", err)
+	}
+	invalidReorgTarget := invalidReorg.DeepCopy()
+	invalidReorgTarget.Name = "invalid-reorg-target"
+	invalidReorgTarget.Spec.Stages[0].Faults[0].Fault.BurnchainReorg.ReplacementBlocks = 3
+	value := intstr.FromInt32(1)
+	invalidReorgTarget.Spec.Stages[0].Faults[0].Target.Value = &value
+	if err := direct.Create(ctx, invalidReorgTarget); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted a valued burnchain-reorg target: %v", err)
 	}
 
 	policy := &attacknetv1beta1.BurnchainPolicy{

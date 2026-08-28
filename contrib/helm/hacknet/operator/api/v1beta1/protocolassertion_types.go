@@ -19,7 +19,9 @@ type ChainProgressAssertion struct {
 	MinimumDelta int64 `json:"minimumDelta"`
 }
 
-// CohortAgreementAssertion bounds the selected actors' height spread.
+// CohortAgreementAssertion bounds the selected actors' height spread. When
+// ConvergenceWindow is set, an excessive spread remains pending until the
+// actors converge or the bounded window expires.
 type CohortAgreementAssertion struct {
 	// +kubebuilder:validation:Enum=burnchain;stacks
 	Chain string `json:"chain"`
@@ -29,6 +31,9 @@ type CohortAgreementAssertion struct {
 	Actors []string `json:"actors"`
 	// +kubebuilder:validation:Minimum=0
 	MaximumSpread int64 `json:"maximumSpread"`
+	// ConvergenceWindow changes the default fail-fast snapshot assertion into
+	// an eventual-convergence assertion with a finite deadline.
+	ConvergenceWindow *metav1.Duration `json:"convergenceWindow,omitempty"`
 }
 
 // SignerRegistrationAssertion requires a minimum count of selected signers to

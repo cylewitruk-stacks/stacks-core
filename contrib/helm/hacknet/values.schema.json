@@ -80,10 +80,11 @@
         "image": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["repository", "tag", "pullPolicy"],
+          "required": ["repository", "tag", "digest", "pullPolicy"],
           "properties": {
             "repository": {"type": "string", "minLength": 1},
             "tag": {"type": "string", "minLength": 1},
+            "digest": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"},
             "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
           }
         },

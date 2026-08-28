@@ -27,6 +27,32 @@ type WalletTransaction struct {
 	Sent bool
 }
 
+// ChainInfo is the canonical Bitcoin branch identity needed by a reorg worker.
+type ChainInfo struct {
+	Chain         string `json:"chain"`
+	Blocks        int64  `json:"blocks"`
+	Headers       int64  `json:"headers"`
+	BestBlockHash string `json:"bestblockhash"`
+	Chainwork     string `json:"chainwork"`
+}
+
+// BlockHeader is the bounded header evidence used to identify a branch.
+type BlockHeader struct {
+	Hash          string `json:"hash"`
+	Height        int64  `json:"height"`
+	PreviousHash  string `json:"previousblockhash,omitempty"`
+	Chainwork     string `json:"chainwork"`
+	Confirmations int64  `json:"confirmations"`
+}
+
+// ChainTip describes one branch returned by getchaintips.
+type ChainTip struct {
+	Height    int64  `json:"height"`
+	Hash      string `json:"hash"`
+	BranchLen int64  `json:"branchlen"`
+	Status    string `json:"status"`
+}
+
 // Bitcoin exposes the bounded Bitcoin Core operations needed by the clock.
 type Bitcoin interface {
 	Height(context.Context) (uint64, error)
@@ -163,6 +189,51 @@ func (client *RPCClient) AbandonTransaction(ctx context.Context, wallet, txID st
 func (client *RPCClient) MineBlock(ctx context.Context, wallet, address string) error {
 	var hashes []string
 	return client.call(ctx, wallet, "generatetoaddress", []any{1, address}, &hashes)
+}
+
+// ChainInfo returns the canonical branch and cumulative work.
+func (client *RPCClient) ChainInfo(ctx context.Context) (ChainInfo, error) {
+	var result ChainInfo
+	return result, client.call(ctx, "", "getblockchaininfo", []any{}, &result)
+}
+
+// BlockHash resolves one canonical height.
+func (client *RPCClient) BlockHash(ctx context.Context, height int64) (string, error) {
+	var result string
+	return result, client.call(ctx, "", "getblockhash", []any{height}, &result)
+}
+
+// BlockHeader returns verbose header evidence for one hash.
+func (client *RPCClient) BlockHeader(ctx context.Context, hash string) (BlockHeader, error) {
+	var result BlockHeader
+	return result, client.call(ctx, "", "getblockheader", []any{hash, true}, &result)
+}
+
+// ChainTips returns all locally known Bitcoin branches.
+func (client *RPCClient) ChainTips(ctx context.Context) ([]ChainTip, error) {
+	var result []ChainTip
+	return result, client.call(ctx, "", "getchaintips", []any{}, &result)
+}
+
+// InvalidateBlock marks one block and its descendants invalid locally.
+func (client *RPCClient) InvalidateBlock(ctx context.Context, hash string) error {
+	return client.call(ctx, "", "invalidateblock", []any{hash}, nil)
+}
+
+// ReconsiderBlock removes a local invalidity marker. It does not prove which
+// branch Bitcoin Core selects afterward.
+func (client *RPCClient) ReconsiderBlock(ctx context.Context, hash string) error {
+	return client.call(ctx, "", "reconsiderblock", []any{hash}, nil)
+}
+
+// GenerateBlocks mines exactly count blocks and returns every generated hash.
+func (client *RPCClient) GenerateBlocks(ctx context.Context, wallet, address string, count int32) ([]string, error) {
+	var hashes []string
+	err := client.call(ctx, wallet, "generatetoaddress", []any{count, address}, &hashes)
+	if err == nil && len(hashes) != int(count) {
+		return nil, fmt.Errorf("generatetoaddress returned %d hashes, want %d", len(hashes), count)
+	}
+	return hashes, err
 }
 
 func (client *RPCClient) call(ctx context.Context, wallet, method string, params, output any) error {

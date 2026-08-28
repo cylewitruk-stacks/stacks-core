@@ -220,6 +220,9 @@ func evaluate(
 		NetworkUID: snapshot.NetworkUID, InventoryDigest: snapshot.InventoryDigest,
 		ObservedAt: snapshot.ObservedAt, Current: current, Sources: sources,
 	}
+	if assertion.CohortAgreement != nil && assertion.CohortAgreement.ConvergenceWindow != nil {
+		return evaluateConvergence(assertion, prior, result, value, now)
+	}
 	if isWindowed(assertion) {
 		if prior.Outcome == OutcomeProven || prior.Outcome == OutcomeViolated {
 			return prior, nil
@@ -271,6 +274,59 @@ func evaluate(
 		return terminalResult(result, OutcomeProven, "AssertionSatisfied", now), nil
 	}
 	return terminalResult(result, OutcomeViolated, "AssertionViolated", now), nil
+}
+
+func evaluateConvergence(
+	assertion attacknetv1beta1.ProtocolAssertionSpec,
+	prior, result attacknetv1beta1.ProtocolAssertionResult,
+	value evidence,
+	now time.Time,
+) (attacknetv1beta1.ProtocolAssertionResult, error) {
+	if prior.Outcome == OutcomeProven || prior.Outcome == OutcomeViolated {
+		return prior, nil
+	}
+	if len(prior.Evidence.Raw) == 0 {
+		value.Baseline = value.Current
+		encoded, err := marshalEvidence(value)
+		if err != nil {
+			return result, err
+		}
+		result.Evidence = encoded
+		if statelessSatisfied(assertion, value.Current) {
+			return terminalResult(result, OutcomeProven, "ConvergenceObserved", now), nil
+		}
+		return result, nil
+	}
+	var first evidence
+	if err := json.Unmarshal(prior.Evidence.Raw, &first); err != nil || len(first.Baseline) == 0 {
+		return result, errors.New("cohort convergence evidence is malformed")
+	}
+	if first.ObservedAt.IsZero() || first.ObservedAt.After(now) {
+		return result, errors.New("cohort convergence observation time is malformed")
+	}
+	if first.NetworkUID != value.NetworkUID ||
+		first.InventoryDigest != value.InventoryDigest ||
+		!sameSourceIdentities(first.Sources, value.Sources) {
+		result.Reason = "ObservationIdentityChanged"
+		result.Evidence = prior.Evidence
+		return result, nil
+	}
+	value.Baseline = first.Baseline
+	// Preserve the first valid observation as the convergence deadline anchor.
+	// Current source timestamps remain available in value.Sources.
+	value.ObservedAt = first.ObservedAt
+	encoded, err := marshalEvidence(value)
+	if err != nil {
+		return result, err
+	}
+	result.Evidence = encoded
+	if statelessSatisfied(assertion, value.Current) {
+		return terminalResult(result, OutcomeProven, "ConvergenceObserved", now), nil
+	}
+	if now.Sub(first.ObservedAt) < assertion.CohortAgreement.ConvergenceWindow.Duration {
+		return result, nil
+	}
+	return terminalResult(result, OutcomeViolated, "ConvergenceDeadlineExceeded", now), nil
 }
 
 func sameSourceIdentities(left, right []protocolobservation.Source) bool {
@@ -436,6 +492,10 @@ func validateBounds(value attacknetv1beta1.ProtocolAssertionSpec, timeout time.D
 	case value.CohortAgreement != nil:
 		if heightMetric(value.CohortAgreement.Chain) == "" || value.CohortAgreement.MaximumSpread < 0 {
 			return errors.New("cohort agreement requires a supported chain and non-negative spread")
+		}
+		if value.CohortAgreement.ConvergenceWindow != nil &&
+			(value.CohortAgreement.ConvergenceWindow.Duration <= 0 || value.CohortAgreement.ConvergenceWindow.Duration > timeout) {
+			return errors.New("cohort convergence window must be positive and within the assertion timeout")
 		}
 	case value.SignerRegistration != nil:
 		if value.SignerRegistration.MinimumRegistered < 1 || int(value.SignerRegistration.MinimumRegistered) > len(value.SignerRegistration.Actors) {

@@ -9,7 +9,8 @@ func TestMechanismRegistryIsCompleteAndRoundTrips(t *testing.T) {
 	want := map[string]string{
 		"pod": "PodChaos", "network": "NetworkChaos", "dns": "DNSChaos",
 		"io": "IOChaos", "time": "TimeChaos", "io-pressure": "IOPressurePod",
-		"clock-skew": "ClockSkewPolicy",
+		"clock-skew":      "ClockSkewPolicy",
+		"burnchain-reorg": "BurnchainReorgWorker",
 	}
 	definitions := registeredMechanisms()
 	if len(definitions) != len(want) {

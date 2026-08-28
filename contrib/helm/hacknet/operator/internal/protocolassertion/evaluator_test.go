@@ -178,6 +178,51 @@ func TestWindowedAssertionsRetainBaselineAndRequireProgress(t *testing.T) {
 	}
 }
 
+func TestCohortConvergenceWaitsForRecoveryWithinBound(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	window := metav1.Duration{Duration: 10 * time.Second}
+	assertion := attacknetv1beta1.ProtocolAssertionSpec{
+		ID: "cohort", CohortAgreement: &attacknetv1beta1.CohortAgreementAssertion{
+			Chain: "burnchain", Actors: []string{"node-1", "node-2"}, MaximumSpread: 0,
+			ConvergenceWindow: &window,
+		},
+	}
+	diverged := assertionSnapshot(now)
+	setGauge(&diverged, "node-2", "stacks_node_burn_block_height", 101)
+	pending, err := EvaluateSet(assertionSet(assertion), nil, diverged, now)
+	if err != nil || pending.Outcome != OutcomePending || pending.Results[0].Reason != "WaitingForEvidence" {
+		t.Fatalf("transient divergence did not remain pending: %#v, %v", pending, err)
+	}
+	converged := assertionSnapshot(now.Add(3 * time.Second))
+	proven, err := EvaluateSet(assertionSet(assertion), &pending, converged, now.Add(3*time.Second))
+	if err != nil || proven.Outcome != OutcomeProven || proven.Results[0].Reason != "ConvergenceObserved" {
+		t.Fatalf("bounded convergence was not proven: %#v, %v", proven, err)
+	}
+}
+
+func TestCohortConvergenceViolatesAtDeadline(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	window := metav1.Duration{Duration: 10 * time.Second}
+	assertion := attacknetv1beta1.ProtocolAssertionSpec{
+		ID: "cohort", CohortAgreement: &attacknetv1beta1.CohortAgreementAssertion{
+			Chain: "burnchain", Actors: []string{"node-1", "node-2"}, MaximumSpread: 0,
+			ConvergenceWindow: &window,
+		},
+	}
+	diverged := assertionSnapshot(now)
+	setGauge(&diverged, "node-2", "stacks_node_burn_block_height", 101)
+	pending, err := EvaluateSet(assertionSet(assertion), nil, diverged, now)
+	if err != nil || pending.Outcome != OutcomePending {
+		t.Fatalf("expected initial convergence observation to remain pending: %#v, %v", pending, err)
+	}
+	late := assertionSnapshot(now.Add(10 * time.Second))
+	setGauge(&late, "node-2", "stacks_node_burn_block_height", 101)
+	violated, err := EvaluateSet(assertionSet(assertion), &pending, late, now.Add(10*time.Second))
+	if err != nil || violated.Outcome != OutcomeViolated || violated.Results[0].Reason != "ConvergenceDeadlineExceeded" {
+		t.Fatalf("persistent divergence did not violate at the deadline: %#v, %v", violated, err)
+	}
+}
+
 func TestWindowStartsWhenBaselineEvidenceBecomesAvailable(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	assertion := attacknetv1beta1.ProtocolAssertionSpec{
@@ -296,6 +341,23 @@ func TestValidateSetRejectsWrongRolesAndBounds(t *testing.T) {
 	set.Timeout.Duration = 0
 	if err := ValidateSet(&set, actors); err == nil {
 		t.Fatal("expected zero timeout to be rejected")
+	}
+}
+
+func TestValidateStructureBoundsCohortConvergenceWindow(t *testing.T) {
+	window := metav1.Duration{Duration: 31 * time.Second}
+	set := assertionSet(attacknetv1beta1.ProtocolAssertionSpec{
+		ID: "cohort", CohortAgreement: &attacknetv1beta1.CohortAgreementAssertion{
+			Chain: "burnchain", Actors: []string{"node-1", "node-2"}, MaximumSpread: 0,
+			ConvergenceWindow: &window,
+		},
+	})
+	if err := ValidateStructure(&set); err == nil || !strings.Contains(err.Error(), "convergence window") {
+		t.Fatalf("convergence window beyond the assertion timeout was accepted: %v", err)
+	}
+	set.Assertions[0].CohortAgreement.ConvergenceWindow.Duration = 30 * time.Second
+	if err := ValidateStructure(&set); err != nil {
+		t.Fatalf("bounded convergence window was rejected: %v", err)
 	}
 }
 

@@ -362,6 +362,40 @@ func TestV1Beta1TerminalCampaignReleasesCleanupFinalizer(t *testing.T) {
 	}
 }
 
+func TestV1Beta1DeletionUsesDurableTerminalCleanupProof(t *testing.T) {
+	scheme := betaFaultScheme(t)
+	now := time.Now().UTC()
+	campaign := betaFaultCampaign("clean-delete", nil)
+	campaign.Finalizers = []string{betaFinalizer}
+	campaign.Status.Phase = "Passed"
+	campaign.Status.Cleanup = &attacknetv1beta1.CleanupEvidence{
+		Absent: true, AllRecovered: true, Method: "TerminalCleanup", ObservedAt: metav1.NewTime(now),
+	}
+	campaign.Status.Stages = []attacknetv1beta1.FaultStageStatus{{
+		ID: "replace-tip", Actions: []attacknetv1beta1.FaultActionStatus{{
+			ID: "replace", Mutation: &attacknetv1beta1.ChaosReference{
+				Kind: "BurnchainReorgWorker", RecoveryContract: &apixv1.JSON{Raw: []byte(
+					`{"policyName":"already-removed","policyUid":"policy-uid","stableSpecDigest":"sha256:missing"}`,
+				)},
+			},
+		}},
+	}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}).
+		WithObjects(campaign).Build()
+	key := client.ObjectKeyFromObject(campaign)
+	if err := kube.Delete(context.Background(), campaign); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &V1Beta1Reconciler{Client: kube, APIReader: kube, Scheme: scheme}
+	if _, err := reconciler.Reconcile(context.Background(), reconcile.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("deletion repeated cleanup against an already-removed policy: %v", err)
+	}
+	if err := kube.Get(context.Background(), key, &attacknetv1beta1.FaultCampaign{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("campaign remained after its proven cleanup finalizer was released: %v", err)
+	}
+}
+
 func TestV1Beta1TemplateNeverRetainsCleanupFinalizer(t *testing.T) {
 	scheme := betaFaultScheme(t)
 	campaign := betaFaultCampaign("template", nil)

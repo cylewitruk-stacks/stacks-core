@@ -98,8 +98,10 @@ spec:
                           - window
                           type: object
                         cohortAgreement:
-                          description: CohortAgreementAssertion bounds the selected
-                            actors' height spread.
+                          description: |-
+                            CohortAgreementAssertion bounds the selected actors' height spread. When
+                            ConvergenceWindow is set, an excessive spread remains pending until the
+                            actors converge or the bounded window expires.
                           properties:
                             actors:
                               items:
@@ -112,6 +114,11 @@ spec:
                               enum:
                               - burnchain
                               - stacks
+                              type: string
+                            convergenceWindow:
+                              description: |-
+                                ConvergenceWindow changes the default fail-fast snapshot assertion into
+                                an eventual-convergence assertion with a finite deadline.
                               type: string
                             maximumSpread:
                               format: int64
@@ -344,8 +351,10 @@ spec:
                           - window
                           type: object
                         cohortAgreement:
-                          description: CohortAgreementAssertion bounds the selected
-                            actors' height spread.
+                          description: |-
+                            CohortAgreementAssertion bounds the selected actors' height spread. When
+                            ConvergenceWindow is set, an excessive spread remains pending until the
+                            actors converge or the bounded window expires.
                           properties:
                             actors:
                               items:
@@ -358,6 +367,11 @@ spec:
                               enum:
                               - burnchain
                               - stacks
+                              type: string
+                            convergenceWindow:
+                              description: |-
+                                ConvergenceWindow changes the default fail-fast snapshot assertion into
+                                an eventual-convergence assertion with a finite deadline.
                               type: string
                             maximumSpread:
                               format: int64
@@ -660,8 +674,10 @@ spec:
                           - window
                           type: object
                         cohortAgreement:
-                          description: CohortAgreementAssertion bounds the selected
-                            actors' height spread.
+                          description: |-
+                            CohortAgreementAssertion bounds the selected actors' height spread. When
+                            ConvergenceWindow is set, an excessive spread remains pending until the
+                            actors converge or the bounded window expires.
                           properties:
                             actors:
                               items:
@@ -674,6 +690,11 @@ spec:
                               enum:
                               - burnchain
                               - stacks
+                              type: string
+                            convergenceWindow:
+                              description: |-
+                                ConvergenceWindow changes the default fail-fast snapshot assertion into
+                                an eventual-convergence assertion with a finite deadline.
                               type: string
                             maximumSpread:
                               format: int64

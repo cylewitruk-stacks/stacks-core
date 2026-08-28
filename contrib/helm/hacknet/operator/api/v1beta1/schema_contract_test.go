@@ -41,14 +41,21 @@ func TestGoTypesMatchGeneratedCRDSchemas(t *testing.T) {
 }
 
 func TestGeneratedSchemasRetainAdmissionSafetyRules(t *testing.T) {
+	burnchainRoot := readCRD(t, "testing.stacks.org_burnchainpolicies.yaml").Spec.Versions[0].Schema.OpenAPIV3Schema
+	protocolSchedule := burnchainRoot.Properties["spec"].Properties["protocolSchedule"]
+	assertValidationRuleContains(t, protocolSchedule, "both epoch and reward-cycle geometry")
+	assertValidationRuleContains(t, protocolSchedule.Properties["rewardCycle"], "prepareLength must be less")
+
 	faultRoot := readCRD(t, "testing.stacks.org_faultcampaigns.yaml").Spec.Versions[0].Schema.OpenAPIV3Schema
 	faultSpec := faultRoot.Properties["spec"]
 	assertValidationRuleContains(t, faultSpec, "allowBurnchain")
 	stage := *faultSpec.Properties["stages"].Items.Schema
 	action := *stage.Properties["faults"].Items.Schema
+	assertValidationRuleContains(t, action, "exactly one named Bitcoin actor")
 	assertValidationRuleContains(t, action.Properties["target"], "target requires actors or roles")
 	assertValidationRuleContains(t, action.Properties["fault"], "fault action must be valid for its type")
 	assertValidationRuleContains(t, action.Properties["fault"], "fault value is required only")
+	assertValidationRuleContains(t, action.Properties["fault"].Properties["burnchainReorg"], "replacementBlocks must exceed depth")
 
 	runRoot := readCRD(t, "testing.stacks.org_attacknetruns.yaml").Spec.Versions[0].Schema.OpenAPIV3Schema
 	runSpec := runRoot.Properties["spec"]

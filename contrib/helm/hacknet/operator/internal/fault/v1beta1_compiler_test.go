@@ -91,6 +91,47 @@ func TestCompileV1Beta1RejectsAssertionForUnknownAction(t *testing.T) {
 	}
 }
 
+func TestCompileV1Beta1BurnchainReorgIsOneSemanticWorker(t *testing.T) {
+	campaign := betaCampaignFixture()
+	campaign.Spec.Stages[0].Faults[0] = attacknetv1beta1.FaultActionSpec{
+		ID: "replace-tip", Target: attacknetv1beta1.FaultTarget{Actors: []string{"bitcoin-1"}, Mode: "one"},
+		Fault: attacknetv1beta1.FaultSpec{
+			Type: "burnchain-reorg", Mode: "one", Duration: metav1.Duration{Duration: time.Minute},
+			BurnchainReorg: &attacknetv1beta1.BurnchainReorgFaultSpec{Depth: 6, ReplacementBlocks: 7, ReplacementInterval: metav1.Duration{Duration: time.Second}},
+		},
+	}
+	campaign.Spec.Safety.AllowBurnchain = true
+	campaign.Spec.Safety.MaxBurnchainReorgDepth = 6
+	campaign.Spec.Safety.MaxBurnchainReplacementBlocks = 7
+	manifest := betaManifestFixture()
+	manifest.Actors = append(manifest.Actors, ManifestActor{Name: "bitcoin-1", Role: "burnchain"})
+	compiled, err := CompileV1Beta1(campaign, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := compiled.Stages[0].Actions[0]
+	if action.Resource.GetKind() != "BurnchainReorgWorker" || len(action.Evidence.SelectedActors) != 1 || action.Evidence.SelectedActors[0] != "bitcoin-1" {
+		t.Fatalf("unexpected semantic worker: %#v", action)
+	}
+}
+
+func TestCompileV1Beta1RejectsOverlappingReorgsOnOneBitcoinPolicy(t *testing.T) {
+	campaign := betaCampaignFixture()
+	campaign.Spec.Stages[0].Faults = []attacknetv1beta1.FaultActionSpec{
+		betaReorgAction("replace-a", "bitcoin-1"), betaReorgAction("replace-b", "bitcoin-1"),
+	}
+	campaign.Spec.Safety.AllowBurnchain = true
+	campaign.Spec.Safety.MaxBurnchainReorgDepth = 2
+	campaign.Spec.Safety.MaxBurnchainReplacementBlocks = 3
+	campaign.Spec.Safety.MaxConcurrentFaults = 2
+	manifest := betaManifestFixture()
+	manifest.Actors = append(manifest.Actors, ManifestActor{Name: "bitcoin-1", Role: "burnchain"})
+	_, err := CompileV1Beta1(campaign, manifest)
+	if err == nil || !strings.Contains(err.Error(), "overlapping burnchain-reorg actions") {
+		t.Fatalf("expected shared burnchain-policy rejection, got %v", err)
+	}
+}
+
 func TestCompileV1Beta1RejectsUnknownAssertionVocabulary(t *testing.T) {
 	campaign := betaCampaignFixture()
 	campaign.Spec.Stages[0].Faults[0].RecoveryAssertions = []attacknetv1beta1.CampaignAssertion{{Type: "ActorReady"}}
@@ -231,6 +272,16 @@ func betaPodAction(id, actor string) attacknetv1beta1.FaultActionSpec {
 		Fault: attacknetv1beta1.FaultSpec{
 			Type: "pod", Action: "pod-failure", Mode: "one",
 			Duration: metav1.Duration{Duration: 30 * time.Second},
+		},
+	}
+}
+
+func betaReorgAction(id, actor string) attacknetv1beta1.FaultActionSpec {
+	return attacknetv1beta1.FaultActionSpec{
+		ID: id, Target: attacknetv1beta1.FaultTarget{Actors: []string{actor}, Mode: "one"},
+		Fault: attacknetv1beta1.FaultSpec{
+			Type: "burnchain-reorg", Mode: "one", Duration: metav1.Duration{Duration: time.Minute},
+			BurnchainReorg: &attacknetv1beta1.BurnchainReorgFaultSpec{Depth: 2, ReplacementBlocks: 3},
 		},
 	}
 }

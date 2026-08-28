@@ -99,6 +99,12 @@ func validateV1Beta1Action(action *attacknetv1beta1.FaultActionSpec, safety atta
 	if err := validateV1Beta1Mode("fault", action.Fault.Mode, action.Fault.Value); err != nil {
 		return err
 	}
+	if action.Fault.Type == "burnchain-reorg" {
+		return validateBurnchainReorgAction(action, safety)
+	}
+	if action.Fault.BurnchainReorg != nil {
+		return errors.New("burnchainReorg is valid only for burnchain-reorg faults")
+	}
 	definition, err := mechanismForType(action.Fault.Type)
 	if err != nil {
 		return err
@@ -131,6 +137,57 @@ func validateV1Beta1Action(action *attacknetv1beta1.FaultActionSpec, safety atta
 		}
 	}
 	return validateV1Beta1ParameterPresence(action, parameters, safety)
+}
+
+func validateBurnchainReorgAction(action *attacknetv1beta1.FaultActionSpec, safety attacknetv1beta1.FaultSafety) error {
+	request := action.Fault.BurnchainReorg
+	if request == nil {
+		return errors.New("burnchain-reorg requires fault.burnchainReorg")
+	}
+	if action.Fault.Action != "" || len(action.Fault.Parameters.Raw) != 0 {
+		return errors.New("burnchain-reorg does not accept action or raw parameters")
+	}
+	if action.Fault.Mode != "one" || action.Fault.Value != nil {
+		return errors.New("burnchain-reorg requires mode one without value")
+	}
+	if len(action.Target.Actors) != 1 || len(action.Target.Roles) != 0 || action.Target.Mode != "one" || action.Target.Value != nil {
+		return errors.New("burnchain-reorg must name exactly one Bitcoin actor with target mode one and no value")
+	}
+	if !safety.AllowBurnchain {
+		return errors.New("burnchain-reorg requires safety.allowBurnchain=true")
+	}
+	duration := action.Fault.Duration.Duration
+	if duration <= 0 || duration > 24*time.Hour {
+		return errors.New("fault.duration must be within 1ns..24h")
+	}
+	if duration > 10*time.Minute && !safety.AllowExtendedDuration {
+		return errors.New("faults longer than 10m require safety.allowExtendedDuration=true")
+	}
+	if duration > time.Hour && !safety.AllowExtremeSeverity {
+		return errors.New("faults longer than 1h require safety.allowExtremeSeverity=true")
+	}
+	if request.Depth < 1 || request.Depth > 144 {
+		return errors.New("burnchainReorg.depth must be within 1..144")
+	}
+	if request.ReplacementBlocks <= request.Depth || request.ReplacementBlocks > 288 {
+		return errors.New("burnchainReorg.replacementBlocks must exceed depth and not exceed 288")
+	}
+	if request.ReplacementInterval.Duration < 0 || request.ReplacementInterval.Duration > time.Hour {
+		return errors.New("burnchainReorg.replacementInterval must be within 0..1h")
+	}
+	if time.Duration(request.ReplacementBlocks-1)*request.ReplacementInterval.Duration > duration {
+		return errors.New("burnchainReorg replacement schedule exceeds fault.duration")
+	}
+	if request.DestinationIndex < 0 || request.DestinationIndex > 63 {
+		return errors.New("burnchainReorg.destinationIndex must be within 0..63")
+	}
+	if safety.MaxBurnchainReorgDepth < request.Depth {
+		return fmt.Errorf("burnchain reorg depth %d exceeds safety maximum %d", request.Depth, safety.MaxBurnchainReorgDepth)
+	}
+	if safety.MaxBurnchainReplacementBlocks < request.ReplacementBlocks {
+		return fmt.Errorf("burnchain replacement blocks %d exceed safety maximum %d", request.ReplacementBlocks, safety.MaxBurnchainReplacementBlocks)
+	}
+	return nil
 }
 
 func validateV1Beta1Mode(field, mode string, value *intstr.IntOrString) error {

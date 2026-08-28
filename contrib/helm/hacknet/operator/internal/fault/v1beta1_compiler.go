@@ -122,6 +122,7 @@ var knownAssertionTypes = map[string]bool{
 	"DNSDegraded": true, "DNSRecovered": true, "IODegraded": true,
 	"IORecovered": true, "IOPressureObserved": true, "IOPressureRecovered": true,
 	"ClockSkewObserved": true, "ClockSkewCleared": true,
+	"BurnchainReorgProven": true, "BurnchainPolicyRestored": true,
 }
 
 func campaignActionCount(stages []attacknetv1beta1.FaultStageSpec) int {
@@ -133,19 +134,21 @@ func campaignActionCount(stages []attacknetv1beta1.FaultStageSpec) int {
 }
 
 func validateSharedMutationCompatibility(compiled []CompiledStage, specs []attacknetv1beta1.FaultStageSpec) error {
-	clockTargets := make([]map[string]string, len(compiled))
+	sharedTargets := make([]map[string]string, len(compiled))
 	for stageIndex := range compiled {
-		clockTargets[stageIndex] = map[string]string{}
+		sharedTargets[stageIndex] = map[string]string{}
 		for _, action := range compiled[stageIndex].Actions {
-			if action.Resource.GetKind() != "ClockSkewPolicy" {
+			kind := action.Resource.GetKind()
+			if kind != "ClockSkewPolicy" && kind != "BurnchainReorgWorker" {
 				continue
 			}
 			for _, actor := range action.Evidence.SelectedActors {
 				owner := compiled[stageIndex].ID + "/" + action.ID
-				if previous, exists := clockTargets[stageIndex][actor]; exists && previous != owner {
-					return fmt.Errorf("overlapping clock-skew actions %s and %s target actor %s through the shared clock policy", previous, owner, actor)
+				key := kind + "\x00" + actor
+				if previous, exists := sharedTargets[stageIndex][key]; exists && previous != owner {
+					return sharedMutationConflict(kind, previous, owner, actor)
 				}
-				clockTargets[stageIndex][actor] = owner
+				sharedTargets[stageIndex][key] = owner
 			}
 		}
 	}
@@ -154,9 +157,10 @@ func validateSharedMutationCompatibility(compiled []CompiledStage, specs []attac
 			if !stagesCanOverlap([]int{left, right}, specs) {
 				continue
 			}
-			for actor, leftOwner := range clockTargets[left] {
-				if rightOwner := clockTargets[right][actor]; rightOwner != "" {
-					return fmt.Errorf("overlapping clock-skew actions %s and %s target actor %s through the shared clock policy", leftOwner, rightOwner, actor)
+			for key, leftOwner := range sharedTargets[left] {
+				if rightOwner := sharedTargets[right][key]; rightOwner != "" {
+					parts := strings.SplitN(key, "\x00", 2)
+					return sharedMutationConflict(parts[0], leftOwner, rightOwner, parts[1])
 				}
 			}
 		}
@@ -164,7 +168,20 @@ func validateSharedMutationCompatibility(compiled []CompiledStage, specs []attac
 	return nil
 }
 
+func sharedMutationConflict(kind, left, right, actor string) error {
+	mechanism := "clock-skew"
+	policy := "clock"
+	if kind == "BurnchainReorgWorker" {
+		mechanism = "burnchain-reorg"
+		policy = "burnchain"
+	}
+	return fmt.Errorf("overlapping %s actions %s and %s target actor %s through the shared %s policy", mechanism, left, right, actor, policy)
+}
+
 func compileV1Beta1Action(campaign *attacknetv1beta1.FaultCampaign, stage *attacknetv1beta1.FaultStageSpec, action *attacknetv1beta1.FaultActionSpec, manifest Manifest) (CompiledAction, error) {
+	if action.Fault.Type == "burnchain-reorg" {
+		return compileBurnchainReorgAction(campaign, stage, action, manifest)
+	}
 	legacy := &attacknetv1alpha1.FaultCampaign{
 		ObjectMeta: metav1.ObjectMeta{Name: mutationName(campaign.Name, stage.ID, action.ID), Namespace: campaign.Namespace},
 		Spec: attacknetv1alpha1.FaultCampaignSpec{
@@ -199,6 +216,44 @@ func compileV1Beta1Action(campaign *attacknetv1beta1.FaultCampaign, stage *attac
 		"testing.stacks.org/action":   action.ID,
 	}))
 	return CompiledAction{ID: action.ID, Resource: compiled.Resource, Evidence: compiled.Evidence}, nil
+}
+
+func compileBurnchainReorgAction(campaign *attacknetv1beta1.FaultCampaign, stage *attacknetv1beta1.FaultStageSpec, action *attacknetv1beta1.FaultActionSpec, manifest Manifest) (CompiledAction, error) {
+	target := attacknetv1alpha1.FaultTarget{Actors: append([]string(nil), action.Target.Actors...)}
+	selected, err := selectActors(target, manifest.Actors)
+	if err != nil {
+		return CompiledAction{}, err
+	}
+	if len(selected) != 1 || selected[0].Role != "burnchain" {
+		return CompiledAction{}, errors.New("burnchain-reorg target must resolve to exactly one burnchain actor")
+	}
+	request := action.Fault.BurnchainReorg
+	resource := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "testing.stacks.org/internal",
+		"kind":       "BurnchainReorgWorker",
+		"metadata": map[string]any{
+			"name":      mutationName(campaign.Name, stage.ID, action.ID),
+			"namespace": campaign.Namespace,
+			"labels": map[string]any{
+				NetworkLabel:                  campaign.Spec.NetworkRef,
+				"testing.stacks.org/campaign": campaign.Name,
+				"testing.stacks.org/stage":    stage.ID,
+				"testing.stacks.org/action":   action.ID,
+			},
+		},
+		"spec": map[string]any{
+			"actor":                          selected[0].Name,
+			"depth":                          int64(request.Depth),
+			"replacementBlocks":              int64(request.ReplacementBlocks),
+			"replacementIntervalNanoseconds": request.ReplacementInterval.Duration.Nanoseconds(),
+			"destinationIndex":               int64(request.DestinationIndex),
+		},
+	}}
+	evidence := Evidence{
+		SelectedActors: []string{selected[0].Name}, MaximumAffectedActors: 1,
+		Safety: attacknetv1alpha1.FaultSafety{AllowBurnchain: true},
+	}
+	return CompiledAction{ID: action.ID, Resource: resource, Evidence: evidence}, nil
 }
 
 func legacyDuration(value time.Duration) string {

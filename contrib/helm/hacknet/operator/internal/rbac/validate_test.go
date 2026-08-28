@@ -39,6 +39,9 @@ rules:
     resources: ["stacksnetworks", "burnchainpolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["testing.stacks.org"]
+    resources: ["burnchainpolicies"]
+    verbs: ["patch"]
+  - apiGroups: ["testing.stacks.org"]
     resources: ["faultcampaigns"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: ["testing.stacks.org"]
@@ -52,7 +55,7 @@ rules:
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: ["chaos-mesh.org"]
     resources: ["podchaos", "networkchaos", "dnschaos", "iochaos", "timechaos"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -115,11 +118,12 @@ metadata:
     app.kubernetes.io/component: run-operator
 rules:
   - {apiGroups: [testing.stacks.org], resources: [stacksnetworks, burnchainpolicies], verbs: [get, list, watch]}
+  - {apiGroups: [testing.stacks.org], resources: [burnchainpolicies], verbs: [patch]}
   - {apiGroups: [testing.stacks.org], resources: [faultcampaigns], verbs: [get, list, watch, create, patch, delete]}
   - {apiGroups: [testing.stacks.org], resources: [attacknetruns], verbs: [get, list, watch, patch]}
   - {apiGroups: [testing.stacks.org], resources: [faultcampaigns/status, attacknetruns/status], verbs: [get, patch]}
   - {apiGroups: [""], resources: [configmaps], verbs: [get, list, watch, create, patch, delete]}
-  - {apiGroups: [""], resources: [pods], verbs: [get, list, watch, create, delete]}
+  - {apiGroups: [""], resources: [pods], verbs: [get, list, watch, create, patch, delete]}
   - {apiGroups: [chaos-mesh.org], resources: [podchaos, networkchaos, dnschaos, iochaos, timechaos], verbs: [get, list, watch, create, delete]}
 `
 
@@ -135,8 +139,8 @@ func TestValidateAcceptsEquivalentYAMLStyles(t *testing.T) {
 
 func TestValidateRejectsRunOperatorTopologyWritesInBlockStyle(t *testing.T) {
 	forbidden := strings.Replace(blockStyleRoles,
-		"  - {apiGroups: [\"\"], resources: [pods], verbs: [get, list, watch, create, delete]}",
-		"  - {apiGroups: [\"\"], resources: [pods], verbs: [get, list, watch, create, delete]}\n  - apiGroups: [apps]\n    resources:\n      - statefulsets\n    verbs: [create]",
+		"  - {apiGroups: [\"\"], resources: [pods], verbs: [get, list, watch, create, patch, delete]}",
+		"  - {apiGroups: [\"\"], resources: [pods], verbs: [get, list, watch, create, patch, delete]}\n  - apiGroups: [apps]\n    resources:\n      - statefulsets\n    verbs: [create]",
 		1,
 	)
 	if err := Validate(strings.NewReader(forbidden)); err == nil || !strings.Contains(err.Error(), "exact least-privilege contract") {

@@ -69,6 +69,8 @@ spec:
                       - IOPressureRecovered
                       - ClockSkewObserved
                       - ClockSkewCleared
+                      - BurnchainReorgProven
+                      - BurnchainPolicyRestored
                       type: string
                   required:
                   - type
@@ -107,6 +109,8 @@ spec:
                       - IOPressureRecovered
                       - ClockSkewObserved
                       - ClockSkewCleared
+                      - BurnchainReorgProven
+                      - BurnchainPolicyRestored
                       type: string
                   required:
                   - type
@@ -118,6 +122,8 @@ spec:
                 properties:
                   allowBurnchain:
                     type: boolean
+                  allowEpochBoundaryCrossing:
+                    type: boolean
                   allowExtendedDuration:
                     type: boolean
                   allowExtremeSeverity:
@@ -126,8 +132,23 @@ spec:
                     type: boolean
                   allowQuorumLoss:
                     type: boolean
+                  allowRewardCycleBoundaryCrossing:
+                    type: boolean
                   allowUnenrolledNetworkTargets:
                     type: boolean
+                  maxBurnchainReorgDepth:
+                    description: |-
+                      MaxBurnchainReorgDepth and MaxBurnchainReplacementBlocks are required
+                      per-campaign ceilings for semantic burnchain reorganization actions.
+                    format: int32
+                    maximum: 144
+                    minimum: 0
+                    type: integer
+                  maxBurnchainReplacementBlocks:
+                    format: int32
+                    maximum: 288
+                    minimum: 0
+                    type: integer
                   maxConcurrentFaults:
                     format: int32
                     maximum: 512
@@ -191,6 +212,8 @@ spec:
                             - IOPressureRecovered
                             - ClockSkewObserved
                             - ClockSkewCleared
+                            - BurnchainReorgProven
+                            - BurnchainPolicyRestored
                             type: string
                         required:
                         - type
@@ -229,6 +252,8 @@ spec:
                                   - IOPressureRecovered
                                   - ClockSkewObserved
                                   - ClockSkewCleared
+                                  - BurnchainReorgProven
+                                  - BurnchainPolicyRestored
                                   type: string
                               required:
                               - type
@@ -258,6 +283,40 @@ spec:
                                 - attrOverride
                                 - disk-pressure
                                 type: string
+                              burnchainReorg:
+                                description: |-
+                                  BurnchainReorg declares the bounded semantic operation. Raw Bitcoin RPC
+                                  methods are intentionally not part of the campaign API.
+                                properties:
+                                  depth:
+                                    format: int32
+                                    maximum: 144
+                                    minimum: 1
+                                    type: integer
+                                  destinationIndex:
+                                    format: int32
+                                    maximum: 63
+                                    minimum: 0
+                                    type: integer
+                                  replacementBlocks:
+                                    description: |-
+                                      ReplacementBlocks must exceed Depth so the replacement branch has more
+                                      proof of work after the original invalidity marker is reconsidered.
+                                    format: int32
+                                    maximum: 288
+                                    minimum: 2
+                                    type: integer
+                                  replacementInterval:
+                                    description: ReplacementInterval controls the
+                                      cadence of the replacement branch.
+                                    type: string
+                                required:
+                                - depth
+                                - replacementBlocks
+                                type: object
+                                x-kubernetes-validations:
+                                - message: replacementBlocks must exceed depth
+                                  rule: self.replacementBlocks > self.depth
                               duration:
                                 type: string
                               mode:
@@ -279,6 +338,7 @@ spec:
                                 - time
                                 - io-pressure
                                 - clock-skew
+                                - burnchain-reorg
                                 type: string
                               value:
                                 anyOf:
@@ -300,12 +360,17 @@ spec:
                                 'random']) || (self.type == 'io' && self.action in
                                 ['latency', 'fault', 'mistake', 'attrOverride']) ||
                                 (self.type == 'io-pressure' && self.action == 'disk-pressure')
-                                || (self.type in ['time', 'clock-skew'] && !has(self.action))
+                                || (self.type in ['time', 'clock-skew', 'burnchain-reorg']
+                                && !has(self.action))
                             - message: fault value is required only for fixed and
                                 percent modes
                               rule: (self.mode in ['one', 'all'] && !has(self.value))
                                 || (self.mode in ['fixed', 'fixed-percent', 'random-max-percent']
                                 && has(self.value))
+                            - message: burnchainReorg is required only for burnchain-reorg
+                                faults
+                              rule: 'self.type == ''burnchain-reorg'' ? has(self.burnchainReorg)
+                                : !has(self.burnchainReorg)'
                           id:
                             pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
                             type: string
@@ -337,6 +402,8 @@ spec:
                                   - IOPressureRecovered
                                   - ClockSkewObserved
                                   - ClockSkewCleared
+                                  - BurnchainReorgProven
+                                  - BurnchainPolicyRestored
                                   type: string
                               required:
                               - type
@@ -383,6 +450,13 @@ spec:
                         - id
                         - target
                         type: object
+                        x-kubernetes-validations:
+                        - message: burnchain-reorg must target exactly one named Bitcoin
+                            actor with mode one and no value
+                          rule: self.fault.type != 'burnchain-reorg' || (has(self.target.actors)
+                            && self.target.actors.size() == 1 && (!has(self.target.roles)
+                            || self.target.roles.size() == 0) && self.target.mode
+                            == 'one' && !has(self.target.value))
                       maxItems: 32
                       minItems: 1
                       type: array
@@ -422,6 +496,8 @@ spec:
                             - IOPressureRecovered
                             - ClockSkewObserved
                             - ClockSkewCleared
+                            - BurnchainReorgProven
+                            - BurnchainPolicyRestored
                             type: string
                         required:
                         - type
@@ -503,8 +579,8 @@ spec:
                 && self.networkRef.size() > 0)
             - message: burnchain faults require safety.allowBurnchain=true
               rule: self.safety.allowBurnchain || !self.stages.exists(stage, stage.faults.exists(fault,
-                has(fault.target.roles) && fault.target.roles.exists(role, role ==
-                'burnchain')))
+                fault.fault.type == 'burnchain-reorg' || (has(fault.target.roles)
+                && fault.target.roles.exists(role, role == 'burnchain'))))
           status:
             description: FaultCampaignStatus is the durable campaign state machine
               and evidence record.
@@ -782,6 +858,11 @@ spec:
                                 type: string
                               name:
                                 type: string
+                              recoveryContract:
+                                description: |-
+                                  RecoveryContract binds cleanup to the exact shared policy state that
+                                  existed before mutation.
+                                x-kubernetes-preserve-unknown-fields: true
                               resourceDigest:
                                 type: string
                               uid:
