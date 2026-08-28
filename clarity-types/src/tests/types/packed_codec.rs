@@ -23,15 +23,15 @@ use stacks_common::types::StacksEpochId;
 use crate::errors::ClarityTypeError;
 use crate::representations::{ClarityName, ContractName};
 use crate::types::codec::packed::{
-    AdmittedValue, BOUND_PACKED_VALUE_BODY_BYTES, ConsensusLengthValidation,
-    PACKED_VALUE_HEADER_LEN, PackedValue, PackedValueError, PackedValueRef, VALUE_SHAPE_VERSION,
-    ValueShape,
+    AdmittedValue, BOUND_PACKED_VALUE_BODY_BYTES, BOUND_VALUE_SHAPE_BYTES,
+    ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue, PackedValueError,
+    PackedValueRef, VALUE_SHAPE_VERSION, ValueShape,
 };
 use crate::types::signatures::CallableSubtype;
 use crate::types::{
-    BOUND_VALUE_SERIALIZATION_BYTES, CallableData, ListTypeData, MAX_TYPE_DEPTH, MAX_VALUE_SIZE,
-    PrincipalData, QualifiedContractIdentifier, SequenceSubtype, StandardPrincipalData,
-    StringSubtype, TraitIdentifier, TupleData, TupleTypeSignature, TypeSignature, Value,
+    BOUND_VALUE_SERIALIZATION_BYTES, CallableData, ListTypeData, MAX_TYPE_DEPTH, PrincipalData,
+    QualifiedContractIdentifier, SequenceSubtype, StandardPrincipalData, StringSubtype,
+    TraitIdentifier, TupleData, TupleTypeSignature, TypeSignature, Value,
 };
 
 const EPOCH: StacksEpochId = StacksEpochId::Epoch40;
@@ -77,6 +77,7 @@ fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8>
         PackedValue::transcode_consensus_with_shape(&consensus).unwrap();
     assert_eq!(transcoded.as_bytes(), packed.as_bytes());
     assert_eq!(transcoded_shape, shape);
+    assert!(shape.as_bytes().len() <= consensus.len() + 1);
     packed.into_bytes()
 }
 
@@ -341,8 +342,13 @@ fn value_shape_enforces_depth_and_size_bounds() {
         ))
     );
 
-    let oversized = vec![0; MAX_VALUE_SIZE as usize + 1];
-    assert!(ValueShape::from_bytes(&oversized).is_err());
+    let oversized = vec![0; BOUND_VALUE_SHAPE_BYTES + 1];
+    assert_matches!(
+        ValueShape::from_bytes(&oversized),
+        Err(PackedValueError::InvalidRecord(
+            "value shape exceeds maximum size"
+        ))
+    );
 }
 
 #[test]
@@ -557,13 +563,9 @@ fn canonical_round_trips_all_runtime_shapes() {
         contract_identifier: contract(5, "implementation"),
         trait_identifier: Some(Box::new(trait_id.clone())),
     });
-    let callable_bytes = assert_canonical_round_trip(
-        callable.clone(),
-        TypeSignature::CallableType(CallableSubtype::Trait(trait_id.clone())),
-    );
-    assert_eq!(
-        callable_bytes,
-        assert_canonical_round_trip(callable, TypeSignature::TraitReferenceType(trait_id))
+    assert_canonical_round_trip(
+        callable,
+        TypeSignature::CallableType(CallableSubtype::Trait(trait_id)),
     );
 }
 
@@ -596,12 +598,28 @@ fn canonical_bytes_ignore_bounds_inactive_branches_and_callable_view() {
         contract_identifier: contract.clone(),
         trait_identifier: None,
     });
-    let principal_bytes = assert_canonical_round_trip(principal, TypeSignature::PrincipalType);
-    let callable_bytes = assert_canonical_round_trip(
-        callable,
-        TypeSignature::CallableType(CallableSubtype::Principal(contract)),
+    assert_eq!(
+        principal.serialize_to_vec().unwrap(),
+        callable.serialize_to_vec().unwrap()
     );
-    assert_eq!(principal_bytes, callable_bytes);
+    assert_eq!(
+        ValueShape::from_value(&principal).unwrap(),
+        ValueShape::from_value(&callable).unwrap()
+    );
+    let principal_bytes = assert_canonical_round_trip(principal, TypeSignature::PrincipalType);
+    let consensus_len = u32::try_from(callable.serialize_to_vec().unwrap().len()).unwrap();
+    let callable_bytes = AdmittedValue::new(callable, &TypeSignature::PrincipalType, &EPOCH)
+        .unwrap()
+        .encode_packed(consensus_len, ConsensusLengthValidation::Enabled)
+        .unwrap();
+    assert_eq!(principal_bytes, callable_bytes.as_bytes());
+    assert_matches!(
+        callable_bytes.as_packed_ref().decode(
+            &TypeSignature::CallableType(CallableSubtype::Principal(contract)),
+            &EPOCH,
+        ),
+        Err(PackedValueError::TypeMismatch)
+    );
 }
 
 #[test]
@@ -629,7 +647,7 @@ fn principal_admission_rejects_trait_qualified_callables() {
 }
 
 #[test]
-fn callable_views_respect_the_epoch_2_1_boundary() {
+fn callable_storage_views_respect_admission_and_the_epoch_2_1_boundary() {
     let contract = contract(9, "callable-epoch");
     let trait_id = TraitIdentifier::new(
         standard_principal(4),
@@ -648,18 +666,43 @@ fn callable_views_respect_the_epoch_2_1_boundary() {
     let trait_callable_type = TypeSignature::CallableType(CallableSubtype::Trait(trait_id.clone()));
     let historical_trait_type = TypeSignature::TraitReferenceType(trait_id);
 
-    for (value, expected) in [
-        (&principal_callable, &principal_callable_type),
-        (&trait_callable, &trait_callable_type),
-    ] {
-        assert_matches!(
-            AdmittedValue::new(value.clone(), expected, &StacksEpochId::Epoch2_05),
-            Err(PackedValueError::ClarityType(
-                ClarityTypeError::UnsupportedTypeInEpoch(_, _)
-            ))
-        );
-        assert!(AdmittedValue::new(value.clone(), expected, &StacksEpochId::Epoch21).is_ok());
-    }
+    assert_matches!(
+        AdmittedValue::new(
+            principal_callable.clone(),
+            &principal_callable_type,
+            &StacksEpochId::Epoch2_05,
+        ),
+        Err(PackedValueError::ClarityType(
+            ClarityTypeError::UnsupportedTypeInEpoch(_, _)
+        ))
+    );
+    assert_matches!(
+        AdmittedValue::new(
+            principal_callable.clone(),
+            &principal_callable_type,
+            &StacksEpochId::Epoch21,
+        ),
+        Err(PackedValueError::TypeMismatch)
+    );
+
+    assert_matches!(
+        AdmittedValue::new(
+            trait_callable.clone(),
+            &trait_callable_type,
+            &StacksEpochId::Epoch2_05,
+        ),
+        Err(PackedValueError::ClarityType(
+            ClarityTypeError::UnsupportedTypeInEpoch(_, _)
+        ))
+    );
+    assert!(
+        AdmittedValue::new(
+            trait_callable.clone(),
+            &trait_callable_type,
+            &StacksEpochId::Epoch21,
+        )
+        .is_ok()
+    );
 
     assert_matches!(
         AdmittedValue::new(
@@ -679,7 +722,10 @@ fn callable_views_respect_the_epoch_2_1_boundary() {
     );
 
     for epoch in [StacksEpochId::Epoch2_05, StacksEpochId::Epoch21] {
-        assert!(AdmittedValue::new(trait_callable.clone(), &historical_trait_type, &epoch).is_ok());
+        assert_matches!(
+            AdmittedValue::new(trait_callable.clone(), &historical_trait_type, &epoch),
+            Err(PackedValueError::TypeMismatch)
+        );
     }
 
     let principal_consensus_len = u32::try_from(
@@ -691,7 +737,7 @@ fn callable_views_respect_the_epoch_2_1_boundary() {
     .expect("Clarity value length is bounded");
     let principal_packed = AdmittedValue::new(
         principal_callable.clone(),
-        &principal_callable_type,
+        &TypeSignature::PrincipalType,
         &StacksEpochId::Epoch21,
     )
     .unwrap()
@@ -705,13 +751,11 @@ fn callable_views_respect_the_epoch_2_1_boundary() {
             ClarityTypeError::UnsupportedTypeInEpoch(_, _)
         ))
     );
-    assert_eq!(
+    assert_matches!(
         principal_packed
             .as_packed_ref()
-            .decode(&principal_callable_type, &StacksEpochId::Epoch21)
-            .unwrap()
-            .value,
-        principal_callable
+            .decode(&principal_callable_type, &StacksEpochId::Epoch21),
+        Err(PackedValueError::TypeMismatch)
     );
 
     let trait_consensus_len = u32::try_from(
@@ -738,15 +782,77 @@ fn callable_views_respect_the_epoch_2_1_boundary() {
         ))
     );
     for epoch in [StacksEpochId::Epoch2_05, StacksEpochId::Epoch21] {
-        assert_eq!(
+        assert_matches!(
             trait_packed
                 .as_packed_ref()
-                .decode(&historical_trait_type, &epoch)
-                .unwrap()
-                .value,
-            trait_callable
+                .decode(&historical_trait_type, &epoch),
+            Err(PackedValueError::TypeMismatch)
         );
     }
+}
+
+#[test]
+fn nested_callable_storage_views_follow_recursive_admission() {
+    let contract = contract(9, "nested-callable");
+    let trait_id = TraitIdentifier::new(
+        standard_principal(4),
+        ContractName::from_literal("trait-contract"),
+        ClarityName::from_literal("transferable"),
+    );
+    let principal_callable = Value::CallableContract(CallableData {
+        contract_identifier: contract.clone(),
+        trait_identifier: None,
+    });
+    let trait_callable = Value::CallableContract(CallableData {
+        contract_identifier: contract.clone(),
+        trait_identifier: Some(Box::new(trait_id.clone())),
+    });
+    let principal_storage_type = TypeSignature::new_option(TypeSignature::PrincipalType).unwrap();
+    let exact_principal_type = TypeSignature::new_option(TypeSignature::CallableType(
+        CallableSubtype::Principal(contract),
+    ))
+    .unwrap();
+    let trait_storage_type = TypeSignature::new_option(TypeSignature::CallableType(
+        CallableSubtype::Trait(trait_id.clone()),
+    ))
+    .unwrap();
+    let historical_trait_type =
+        TypeSignature::new_option(TypeSignature::TraitReferenceType(trait_id)).unwrap();
+
+    let principal_optional = Value::some(principal_callable).unwrap();
+    let principal_len =
+        u32::try_from(principal_optional.serialize_to_vec().unwrap().len()).unwrap();
+    assert_matches!(
+        AdmittedValue::new(principal_optional.clone(), &exact_principal_type, &EPOCH),
+        Err(PackedValueError::TypeMismatch)
+    );
+    let principal_packed = AdmittedValue::new(principal_optional, &principal_storage_type, &EPOCH)
+        .unwrap()
+        .encode_packed(principal_len, ConsensusLengthValidation::Disabled)
+        .unwrap();
+    assert_matches!(
+        principal_packed
+            .as_packed_ref()
+            .decode(&exact_principal_type, &EPOCH),
+        Err(PackedValueError::TypeMismatch)
+    );
+
+    let trait_optional = Value::some(trait_callable).unwrap();
+    let trait_len = u32::try_from(trait_optional.serialize_to_vec().unwrap().len()).unwrap();
+    assert_matches!(
+        AdmittedValue::new(trait_optional.clone(), &historical_trait_type, &EPOCH),
+        Err(PackedValueError::TypeMismatch)
+    );
+    let trait_packed = AdmittedValue::new(trait_optional, &trait_storage_type, &EPOCH)
+        .unwrap()
+        .encode_packed(trait_len, ConsensusLengthValidation::Disabled)
+        .unwrap();
+    assert_matches!(
+        trait_packed
+            .as_packed_ref()
+            .decode(&historical_trait_type, &EPOCH),
+        Err(PackedValueError::TypeMismatch)
+    );
 }
 
 #[test]

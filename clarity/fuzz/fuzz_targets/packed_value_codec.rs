@@ -80,6 +80,7 @@ fn check_consensus(consensus: &[u8], epoch: &StacksEpochId) {
     }
     let (packed, shape) = PackedValue::transcode_consensus_with_shape(consensus)
         .expect("every exactly decoded consensus value must transcode");
+    assert!(shape.as_bytes().len() <= consensus.len() + 1);
     assert_eq!(
         packed
             .as_packed_ref()
@@ -103,6 +104,9 @@ fn check_consensus(consensus: &[u8], epoch: &StacksEpochId) {
         )
         .expect("an admitted value must pack");
     assert_eq!(typed.as_bytes(), packed.as_bytes());
+    // Arbitrary consensus input includes historical unsanitized lists whose cached list schema
+    // omits active tuple fields. Those values deliberately require descriptor-based compatibility
+    // reconstruction. `check_generated` exercises typed decode for self-consistent schema pairs.
     assert_eq!(value_shape.as_bytes(), shape.as_bytes());
 }
 
@@ -206,6 +210,7 @@ fn check_generated(selector: u8, bytes: &[u8], epoch: &StacksEpochId) {
     let shape = ValueShape::from_value(&value).expect("a generated value must have a shape");
     let (packed, transcoded_shape) = PackedValue::transcode_consensus_with_shape(&consensus)
         .expect("a generated value must transcode");
+    assert!(transcoded_shape.as_bytes().len() <= consensus.len() + 1);
     assert_eq!(transcoded_shape.as_bytes(), shape.as_bytes());
     assert_eq!(
         packed

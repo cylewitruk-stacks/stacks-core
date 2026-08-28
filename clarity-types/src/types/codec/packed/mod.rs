@@ -70,6 +70,15 @@ const MAX_PACKED_DIRECTORY_OVERHEAD: usize = MAX_VALUE_SIZE as usize
 pub const BOUND_PACKED_VALUE_BODY_BYTES: usize =
     BOUND_VALUE_SERIALIZATION_BYTES as usize + MAX_PACKED_DIRECTORY_OVERHEAD;
 
+/// Maximum length of one versioned active-shape descriptor.
+///
+/// For a canonical descriptor derived from a legal value, every descriptor node is covered by at
+/// least as many bytes in the corresponding consensus value. Tuple names occur in both streams,
+/// while merged optional, response, and list shapes are shared by the multiple active values whose
+/// consensus bytes cover their children. The descriptor version is the only byte without a
+/// consensus counterpart. Parsers use the same limit as a conservative pre-audit resource ceiling.
+pub const BOUND_VALUE_SHAPE_BYTES: usize = BOUND_VALUE_SERIALIZATION_BYTES as usize + 1;
+
 /// Version byte for the active value-shape descriptor grammar.
 pub const VALUE_SHAPE_VERSION: u8 = 1;
 
@@ -274,7 +283,7 @@ impl ValueShape {
 
     /// Parse and validate one complete versioned descriptor.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PackedValueError> {
-        if bytes.len() > crate::types::MAX_VALUE_SIZE as usize {
+        if bytes.len() > BOUND_VALUE_SHAPE_BYTES {
             return Err(PackedValueError::InvalidRecord(
                 "value shape exceeds maximum size",
             ));

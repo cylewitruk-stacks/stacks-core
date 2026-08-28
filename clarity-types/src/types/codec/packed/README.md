@@ -16,8 +16,9 @@ The format consists of two independent byte streams:
 - an optional active-shape descriptor, used to reconstruct exact consensus bytes without a
   `TypeSignature`.
 
-Typed reads require only the packed value record. Generic reads and integrity audits require both
-streams.
+Ordinary typed reads require only the packed value record. Generic reads, integrity audits, and
+compatibility reads for historical unsanitized values whose cached schema omits active data require
+both streams.
 
 The packed value record has no in-record version byte. Its containing storage format MUST select
 this grammar out of band. The active-shape descriptor has its own Version 1 byte because it can be
@@ -67,9 +68,11 @@ Schema and epoch are admission and decoding inputs, not physical-layout inputs. 
 identical canonical consensus bytes MUST produce identical packed records and identical active-shape
 descriptors.
 
-Encoders MUST emit the one canonical representation described below. Decoders MUST reject
-non-minimal scalar widths, non-minimal directory widths, non-canonical descriptors, trailing bytes,
-invalid padding, and disagreement with the declared logical consensus length.
+Encoders MUST emit the one canonical representation described below. Packed-record decoders MUST
+reject non-minimal scalar and directory widths, trailing bytes, invalid padding, and disagreement
+with the declared logical consensus length. Descriptor parsing enforces its local grammar and
+minimality rules; the full audit defined below additionally proves that a structurally valid
+descriptor is canonical for its packed value.
 
 ## Packed value record
 
@@ -180,19 +183,18 @@ A callable contract MUST use the contract-principal body above. Trait identity i
 it is absent from the callable's consensus bytes. Typed decoding restores callable identity from the
 declared schema:
 
-- `CallableType::Principal(expected_contract)` requires the stored contract to equal
-  `expected_contract` and restores no trait;
 - `CallableType::Trait(expected_trait)` restores `expected_trait`;
-- historical `TraitReferenceType(expected_trait)` restores `expected_trait`; and
 - `PrincipalType` decodes the same bytes as an ordinary contract principal.
 
-Before Epoch 2.1, `CallableType` MUST be rejected as unsupported. Encoding a plain callable through
-a `PrincipalType` view before Epoch 2.1 MUST be rejected as a type mismatch. Exact historical
-`TraitReferenceType` views remain supported across that boundary.
+Typed encoding MUST use Clarity's recursive `TypeSignature::admits` rules. Before Epoch 2.1,
+`CallableType` MUST be rejected as unsupported. A plain callable under `PrincipalType` MUST be
+rejected before Epoch 2.1 and admitted from Epoch 2.1 onward. A trait-qualified callable MUST NOT be
+admitted under `PrincipalType`.
 
-On typed decode, the pre-2.1 rejection applies only to `CallableType`. `PrincipalType` decodes the
-physical body as an ordinary `Value::Principal`, so it has no callable epoch gate.
-`TraitReferenceType` continues to decode as a callable at every supported epoch.
+`CallableType::Principal` and the historical `TraitReferenceType` are not persisted storage schemas
+and MUST be rejected. On typed decode, the pre-2.1 rejection applies to `CallableType::Trait`.
+`PrincipalType` decodes the physical body as an ordinary `Value::Principal`, so it has no callable
+epoch gate.
 
 Schema-free reconstruction always emits the canonical contract-principal consensus bytes. Those
 bytes intentionally contain no trait identity.
@@ -355,8 +357,8 @@ version     := 01
 ```
 
 The descriptor MUST contain exactly one shape with no trailing bytes. Its total length MUST NOT
-exceed `MAX_VALUE_SIZE` (currently 1,048,576 bytes), and its recursive depth MUST NOT exceed
-`MAX_TYPE_DEPTH` (currently 32 nodes including the root).
+exceed `BOUND_VALUE_SHAPE_BYTES` (currently 2,097,153 bytes), and its recursive depth MUST NOT
+exceed `MAX_TYPE_DEPTH` (currently 32 nodes including the root).
 
 ### Shape opcodes
 
@@ -476,7 +478,7 @@ Version 1 enforces the following current Clarity limits:
 | Item | Limit |
 | ---- | ---- |
 | Canonical consensus value | `BOUND_VALUE_SERIALIZATION_BYTES` = 2,097,152 bytes |
-| Active-shape descriptor | `MAX_VALUE_SIZE` = 1,048,576 bytes |
+| Active-shape descriptor | `BOUND_VALUE_SHAPE_BYTES` = 2,097,153 bytes |
 | Active-shape depth | `MAX_TYPE_DEPTH` = 32 |
 | Integer body or lane width | 16 bytes |
 | Packed directory offset | `u32::MAX` |
@@ -492,6 +494,13 @@ BOUND_PACKED_VALUE_BODY_BYTES =
 
 With the current constants, this is 11,534,341 bytes. The four-byte packed record header is not
 included in that bound.
+
+The active-shape bound is one byte larger than the maximum consensus serialization. For a canonical
+descriptor derived from a legal value, every shape node and tuple name is covered by at least as
+many bytes in the corresponding consensus value. Merged optional, response, and list shapes
+describe multiple active values whose combined consensus bytes cover every merged child. The
+descriptor's version byte is its only byte without a consensus counterpart. Parsers apply the same
+bound as a conservative resource ceiling before a full canonicality audit.
 
 ## Golden examples
 

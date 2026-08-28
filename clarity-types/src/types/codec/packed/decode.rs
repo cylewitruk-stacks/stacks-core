@@ -20,6 +20,7 @@ use std::str;
 use stacks_common::types::StacksEpochId;
 
 use super::{DecodedPackedValue, PackedValueError, PackedValueRef, directory, layout, primitive};
+use crate::errors::ClarityTypeError;
 use crate::types::signatures::{CallableSubtype, SequenceSubtype, StringSubtype};
 use crate::types::{
     ASCIIData, CallableData, CharType, ListTypeData, PrincipalData, QualifiedContractIdentifier,
@@ -118,15 +119,19 @@ fn body(
                 logical_len,
             ))
         }
-        CallableType(subtype) => {
-            if *epoch < StacksEpochId::Epoch21 {
-                // Preserve Clarity's UnsupportedTypeInEpoch error for this historical boundary.
-                expected.admits_type(epoch, expected)?;
-                return Err(PackedValueError::TypeMismatch);
-            }
-            callable(bytes, subtype)
+        CallableType(_) if *epoch < StacksEpochId::Epoch21 => {
+            // Preserve Clarity's UnsupportedTypeInEpoch error for this historical boundary.
+            Err(ClarityTypeError::UnsupportedTypeInEpoch(
+                Box::new(expected.clone()),
+                StacksEpochId::Epoch20,
+            )
+            .into())
         }
-        TraitReferenceType(trait_identifier) => trait_callable(bytes, trait_identifier.clone()),
+        CallableType(CallableSubtype::Principal(_)) => Err(PackedValueError::TypeMismatch),
+        CallableType(CallableSubtype::Trait(trait_identifier)) => {
+            trait_callable(bytes, trait_identifier.clone())
+        }
+        TraitReferenceType(_) => Err(PackedValueError::TypeMismatch),
         OptionalType(inner) => {
             let (tag, child) = primitive::split_tag(bytes)?;
             match tag {
@@ -182,28 +187,7 @@ fn contract(bytes: &[u8]) -> Result<(QualifiedContractIdentifier, u32), PackedVa
     Ok((contract, logical_len))
 }
 
-/// Decode a callable contract and restore the identity implied by its callable subtype.
-fn callable(bytes: &[u8], expected: &CallableSubtype) -> Result<(Value, u32), PackedValueError> {
-    let (contract_identifier, logical_len) = contract(bytes)?;
-    let trait_identifier = match expected {
-        CallableSubtype::Principal(expected_contract) => {
-            if contract_identifier != *expected_contract {
-                return Err(PackedValueError::TypeMismatch);
-            }
-            None
-        }
-        CallableSubtype::Trait(trait_identifier) => Some(Box::new(trait_identifier.clone())),
-    };
-    Ok((
-        Value::CallableContract(CallableData {
-            contract_identifier,
-            trait_identifier,
-        }),
-        logical_len,
-    ))
-}
-
-/// Decode a trait-reference callable while restoring its schema-provided trait identifier.
+/// Decode a trait callable while restoring its schema-provided trait identifier.
 fn trait_callable(
     bytes: &[u8],
     trait_identifier: TraitIdentifier,

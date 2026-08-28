@@ -19,7 +19,7 @@
 //! active optional/response/list shapes. It is derived from the value itself; declared bounds and
 //! the current epoch must never influence these bytes.
 
-use super::{PackedValueError, VALUE_SHAPE_VERSION, ValueShape};
+use super::{BOUND_VALUE_SHAPE_BYTES, PackedValueError, VALUE_SHAPE_VERSION, ValueShape};
 use crate::representations::ClarityName;
 use crate::types::{CharType, SequenceData, Value};
 
@@ -121,7 +121,7 @@ pub fn encode_value_shape(value: &Value) -> Result<ValueShape, PackedValueError>
     let mut bytes = Vec::new();
     bytes.push(VALUE_SHAPE_VERSION);
     shape.encode(&mut bytes)?;
-    if bytes.len() > crate::types::MAX_VALUE_SIZE as usize {
+    if bytes.len() > BOUND_VALUE_SHAPE_BYTES {
         return Err(PackedValueError::SizeOverflow);
     }
     Ok(ValueShape(bytes))
@@ -129,7 +129,7 @@ pub fn encode_value_shape(value: &Value) -> Result<ValueShape, PackedValueError>
 
 /// Parse and validate one complete Version 1 active-shape descriptor.
 pub fn parse_value_shape(bytes: &[u8]) -> Result<ActiveShape, PackedValueError> {
-    if bytes.len() > crate::types::MAX_VALUE_SIZE as usize {
+    if bytes.len() > BOUND_VALUE_SHAPE_BYTES {
         return Err(PackedValueError::InvalidRecord(
             "value shape exceeds maximum size",
         ));
@@ -634,5 +634,54 @@ fn encode_varuint(mut value: usize, output: &mut Vec<u8>) -> Result<(), PackedVa
         if value == 0 {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::BOUND_VALUE_SERIALIZATION_BYTES;
+
+    #[test]
+    fn structurally_valid_shape_uses_its_own_stream_bound() {
+        const LIST_ELEMENTS: u8 = 0x0f;
+        const TUPLE: u8 = 0x0c;
+        const BOOL: u8 = 0x02;
+        const ELEMENT_COUNT: usize = 131_070;
+        const NARROW_CONSENSUS_LEN: usize = 8;
+        const WIDE_CONSENSUS_LEN: usize = 14;
+        const ELEMENT_COUNT_VARUINT: [u8; 3] = [0xfe, 0xff, 0x07];
+        const NARROW_SHAPE: [u8; 5] = [TUPLE, 1, 1, b'a', BOOL];
+        const WIDE_SHAPE: [u8; 11] = [TUPLE, 3, 1, b'a', BOOL, 1, b'b', BOOL, 1, b'c', BOOL];
+
+        // This structurally valid descriptor and its corresponding consensus stream fit the
+        // storage-format bounds even though the widened list type would exceed Clarity's smaller
+        // runtime-value bound. The parser therefore applies the descriptor stream's own resource
+        // limit instead of borrowing a limit from an unrelated representation.
+        let consensus_len = 5 + NARROW_CONSENSUS_LEN + (ELEMENT_COUNT - 1) * WIDE_CONSENSUS_LEN;
+        assert!(consensus_len <= BOUND_VALUE_SERIALIZATION_BYTES as usize);
+
+        let mut descriptor = Vec::with_capacity(
+            2 + ELEMENT_COUNT_VARUINT.len()
+                + NARROW_SHAPE.len()
+                + (ELEMENT_COUNT - 1) * WIDE_SHAPE.len(),
+        );
+        descriptor.extend([VALUE_SHAPE_VERSION, LIST_ELEMENTS]);
+        descriptor.extend(ELEMENT_COUNT_VARUINT);
+        descriptor.extend(NARROW_SHAPE);
+        for _ in 1..ELEMENT_COUNT {
+            descriptor.extend(WIDE_SHAPE);
+        }
+        assert!(descriptor.len() > crate::types::MAX_VALUE_SIZE as usize);
+        assert!(descriptor.len() <= BOUND_VALUE_SHAPE_BYTES);
+
+        let shape = parse_value_shape(&descriptor).unwrap();
+        let mut reencoded = vec![VALUE_SHAPE_VERSION];
+        shape.encode(&mut reencoded).unwrap();
+        assert_eq!(reencoded, descriptor);
+        assert_eq!(
+            ValueShape::from_bytes(&descriptor).unwrap().as_bytes(),
+            descriptor
+        );
     }
 }

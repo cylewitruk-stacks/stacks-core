@@ -21,7 +21,6 @@ use super::{
     ConsensusLengthValidation, PACKED_VALUE_HEADER_LEN, PackedValue, PackedValueError, ValueShape,
     directory, layout, primitive, shape, validate_packed_body_len,
 };
-use crate::types::signatures::CallableSubtype;
 use crate::types::{
     CharType, QualifiedContractIdentifier, SequenceData, TupleData, TypeSignature, Value,
 };
@@ -96,45 +95,10 @@ pub fn validate_admission(
     expected: &TypeSignature,
     epoch: &StacksEpochId,
 ) -> Result<(), PackedValueError> {
-    let admitted = if matches!(value, Value::CallableContract(_)) {
-        // Callable values have storage views that ordinary `admits` deliberately does not model:
-        // exact callable principals and historical trait references. Preserve those views while
-        // delegating the pre-2.1 CallableType and principal rules to Clarity.
-        if *epoch < StacksEpochId::Epoch21
-            && matches!(
-                expected,
-                TypeSignature::CallableType(_) | TypeSignature::PrincipalType
-            )
-        {
-            expected.admits(epoch, value)?
-        } else {
-            callable_admitted(value, expected)?
-        }
-    } else {
-        expected.admits(epoch, value)?
-    };
-    if admitted {
+    if expected.admits(epoch, value)? {
         Ok(())
     } else {
         Err(PackedValueError::TypeMismatch)
-    }
-}
-
-/// Check callable admission without allowing the declared callable subtype to affect encoding.
-fn callable_admitted(value: &Value, expected: &TypeSignature) -> Result<bool, PackedValueError> {
-    let Value::CallableContract(callable) = value else {
-        return Ok(false);
-    };
-    match expected {
-        TypeSignature::CallableType(CallableSubtype::Principal(contract)) => {
-            Ok(callable.contract_identifier == *contract && callable.trait_identifier.is_none())
-        }
-        TypeSignature::CallableType(CallableSubtype::Trait(trait_identifier))
-        | TypeSignature::TraitReferenceType(trait_identifier) => {
-            Ok(callable.trait_identifier.as_deref() == Some(trait_identifier))
-        }
-        TypeSignature::PrincipalType => Ok(callable.trait_identifier.is_none()),
-        _ => Ok(false),
     }
 }
 
