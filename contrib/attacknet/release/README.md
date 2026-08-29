@@ -1,14 +1,14 @@
 # Attacknet release records
 
 This directory contains the Release 1 baseline, review contracts, packet
-builders, schemas, and the A1–A9 amendment history. These artifacts bind exact
+builders, schemas, and the A1–A10 amendment history. These artifacts bind exact
 historical revisions and paths; they are intentionally not rearranged by
 repository-hygiene changes.
 
-The latest approved amendment is A9, `bounded Bitcoin reorganization`, at
-signed commit `b93517c0090acfb0943789d6cf82ec40b7ce4357`.
+The latest approved amendment is A10, `multi-Bitcoin split views`, at signed
+commit `2debbcd747b4b406f6d7392515d71b3008da119b`.
 Its Full-tier gate closed against packet digest
-`sha256:4f647e1f459400f214b79c32a21577be15df80bfe998811fd1fa9de387f7f4f7`.
+`sha256:974a46c34186702d5dbfdde13dde895e494d8b593f9c4ac424de25c8f2c7d16d`.
 
 New gated-amendment contracts, packet builders, verifiers, and tests live under
 `amendments/<id>/`; A6 establishes that convention without rewriting the

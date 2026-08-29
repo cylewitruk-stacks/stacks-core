@@ -108,16 +108,33 @@ test('the tracked release baseline is structurally valid and digest substitution
   assert.throws(() => validateBaseline(fixture, {verifyEvidence: true, root}), /evidence digest mismatch/);
 });
 
+test('tracked amendment gate records resolve and match the baseline', () => {
+  const baseline = load(baselinePath);
+  const gateRecords = baseline.evidence.filter(item => item.path.endsWith('/gate-result.json'));
+  assert.ok(gateRecords.length >= 2, 'approved gate records are missing');
+  for (const evidence of gateRecords) {
+    assert.doesNotThrow(() => execFileSync(
+      'git', ['ls-files', '--error-unmatch', evidence.path],
+      {cwd: repositoryRoot, stdio: 'ignore'},
+    ), `${evidence.id} must resolve to a tracked gate record`);
+  }
+  assert.equal(validateBaseline({
+    ...baseline,
+    evidence: gateRecords,
+    capabilities: gateRecords.map((evidence, index) => ({
+      id: `gate-record-${index}`,
+      status: 'supported',
+      evidence: [evidence.id],
+    })),
+  }, {verifyEvidence: true, root: repositoryRoot}), true);
+});
+
 test('deferred baseline capabilities require complete structured reopening records', () => {
   const baseline = load(baselinePath);
   const deferred = baseline.capabilities.find(item => item.status === 'deferred');
   const broken = structuredClone(baseline);
   delete broken.capabilities.find(item => item.id === deferred.id).reopenCondition;
   assert.throws(() => validateBaseline(broken), /reopenCondition/);
-  assert.equal(
-    baseline.capabilities.find(item => item.id === 'multi-bitcoin-follower-split-view-campaigns')?.status,
-    'not-done',
-  );
   assert(baseline.capabilities.some(item => item.id === 'enterprise-registry-and-identity-federation'));
   for (const [id, status] of [
     ['native-chaos-mesh-stresschaos-arm64', 'capability-rejected'],
@@ -146,7 +163,7 @@ test('the baseline advertises approved A8 capabilities from bound evidence', () 
   }
 });
 
-test('the baseline advertises approved A9 capability without claiming A10 split views', () => {
+test('the baseline advertises approved A9 capability from bound evidence', () => {
   const baseline = load(baselinePath);
   const evidenceId = 'release-1-a9-bounded-bitcoin-reorganizations';
   const evidence = baseline.evidence.find(item => item.id === evidenceId);
@@ -165,14 +182,31 @@ test('the baseline advertises approved A9 capability without claiming A10 split 
   );
   assert.equal(bounded?.status, 'supported');
   assert.deepEqual(bounded.evidence, [evidenceId]);
-  assert.equal(
-    baseline.capabilities.find(item => item.id === 'multi-bitcoin-follower-split-view-campaigns')?.status,
-    'not-done',
-  );
   assert.equal(validateBaseline(
     {...baseline, evidence: [evidence], capabilities: [bounded]},
     {verifyEvidence: true, root: repositoryRoot},
   ), true);
+});
+
+test('the baseline advertises approved A10 capability from bound evidence', () => {
+  const baseline = load(baselinePath);
+  const evidenceId = 'release-1-a10-multi-bitcoin-split-views';
+  const evidence = baseline.evidence.find(item => item.id === evidenceId);
+  assert.deepEqual(evidence, {
+    id: evidenceId,
+    path: 'contrib/attacknet/evidence-packets/release-1-a10/gate-result.json',
+    digest: 'sha256:a2e31bee5ea086d9552f0ea7d50ca74600bff6e7c16876db2d8e3047855986ee',
+    status: 'passed',
+  });
+  assert.doesNotThrow(() => execFileSync(
+    'git', ['ls-files', '--error-unmatch', evidence.path],
+    {cwd: repositoryRoot, stdio: 'ignore'},
+  ));
+  const splitViews = baseline.capabilities.find(
+    item => item.id === 'multi-bitcoin-follower-split-view-campaigns',
+  );
+  assert.equal(splitViews?.status, 'supported');
+  assert.deepEqual(splitViews.evidence, [evidenceId]);
 });
 
 test('offline result accepts only complete, unique, observed suite results', () => {

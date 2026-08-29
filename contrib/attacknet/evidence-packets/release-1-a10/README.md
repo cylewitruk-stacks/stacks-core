@@ -13,3 +13,7 @@ The qualification proves an admitted two-node Bitcoin graph, a real competing
 branch under partition, independently observed Bitcoin and Stacks divergence,
 stable recovery, a topology-drift negative control, fresh-network replay, and
 complete teardown.
+
+After approval, [`gate-result.json`](gate-result.json) records the signed
+candidate, review bindings, and external evidence digests used by the Release 1
+baseline without committing the large review archive.

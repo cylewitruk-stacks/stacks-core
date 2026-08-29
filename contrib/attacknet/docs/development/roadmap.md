@@ -122,7 +122,11 @@ scenario assertions and are not part of the bounded A9 claim.
 
 ### A10: Multiple Bitcoin followers and split views
 
-Status: implementation complete; direct audit and qualification in progress.
+Status: approved for Release 1 on 2026-08-29. The Full-tier gate binds signed
+commit `2debbcd747b4b406f6d7392515d71b3008da119b`, candidate tree
+`7c46f087fd50832c976a3c0e41cdbbcaec05f8f5`, review ID
+`release-1-amendment-a10-multi-bitcoin-split-views`, and packet digest
+`sha256:974a46c34186702d5dbfdde13dde895e494d8b593f9c4ac424de25c8f2c7d16d`.
 
 A single Bitcoin Core process tests Stacks reorganization handling but not
 Bitcoin network partitions. Build on the typed Bitcoin-node topology and
@@ -151,7 +155,7 @@ identity and chainwork, bound Stacks burn views, and a common divergence and
 recovery timeline. Evidence must retain the exact partition and mining
 schedule.
 
-Definition of done:
+The approved gate establishes that:
 
 - a small multi-Bitcoin cohort and the one-follower-per-Stacks-node topology
   both render and reconcile deterministically;
