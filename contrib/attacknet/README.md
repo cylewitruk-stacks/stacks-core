@@ -167,6 +167,9 @@ Separate campaigns share one namespace mutation lease. Express intentionally
 concurrent faults as stages/actions in one campaign so their combined signer,
 miner, burnchain, target, and resource impact is visible at admission.
 
+See the [`fault reference`](docs/reference/faults/) for every supported fault
+type, parameter, invariant, assertion, and complete authoring examples.
+
 `AttacknetRun` seals a deterministic execution DAG before creating campaigns.
 It records trigger receipts, enforces aggregate budgets, supports replay and
 resume, and performs removal-only minimization without claiming causal
@@ -296,6 +299,8 @@ helm uninstall chaos-mesh -n chaos-mesh
 
 - [`docs/operations/`](docs/operations/README.md): runtime operations and recovery.
 - [`docs/reference/go-cli.md`](docs/reference/go-cli.md): typed client contract.
+- [`docs/reference/faults/`](docs/reference/faults/): supported fault types,
+  parameters, safety invariants, and examples.
 - [`docs/operations/evidence.md`](docs/operations/evidence.md): evidence capture, replay, and minimization.
 - [`docs/development/`](docs/development/README.md): controller and image development.
 - [`docs/development/roadmap.md`](docs/development/roadmap.md): deferred environments and fault mechanisms.

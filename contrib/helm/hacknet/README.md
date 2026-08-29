@@ -379,6 +379,9 @@ Chaos Mesh `AllInjected` and `AllRecovered` conditions are context, not proof
 that the target experienced the requested effect. Without trusted effect and
 recovery observations, a campaign terminates `Inconclusive`, never `Passed`.
 
+The operator-facing [`fault reference`](../../attacknet/docs/reference/faults/)
+documents every supported type, parameter, invariant, and assertion.
+
 ### `AttacknetRun`
 
 `AttacknetRun` resolves a finite fault catalog before the first action. It pins

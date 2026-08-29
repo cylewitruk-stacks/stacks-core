@@ -10,7 +10,8 @@ material is grouped by audience and responsibility:
   attribution.
 - [`development/`](development/) covers image and controller development plus
   deferred work.
-- [`reference/`](reference/) defines the Go CLI, instrumentation, and clock
+- [`reference/`](reference/) defines the
+  [fault catalog](reference/faults/), Go CLI, instrumentation, and clock
   contracts.
 
 The supported product surface is the typed Go CLI and the
