@@ -133,6 +133,101 @@ func TestMalformedMetricDomainsRemainUnavailableWithoutPanicking(t *testing.T) {
 	}
 }
 
+func TestBranchCohortsProveDivergenceAndStableConvergence(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	snapshot := branchSnapshot(now, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 40), strings.Repeat("4", 40))
+	bitcoinAssertion := attacknetv1beta1.ProtocolAssertionSpec{ID: "bitcoin", BitcoinBranchCohort: &attacknetv1beta1.BranchCohortAssertion{
+		Actors: []string{"bitcoin-a", "bitcoin-b"}, Expectation: attacknetv1beta1.BranchCohortDiverged, MinimumDistinct: 2,
+	}}
+	stacksAssertion := attacknetv1beta1.ProtocolAssertionSpec{ID: "stacks", StacksBurnchainCohort: &attacknetv1beta1.BranchCohortAssertion{
+		Actors: []string{"node-a", "node-b"}, Expectation: attacknetv1beta1.BranchCohortDiverged, MinimumDistinct: 2,
+	}}
+	for _, assertion := range []attacknetv1beta1.ProtocolAssertionSpec{bitcoinAssertion, stacksAssertion} {
+		status, err := EvaluateSet(assertionSet(assertion), nil, snapshot, now)
+		if err != nil || status.Outcome != OutcomeProven {
+			t.Fatalf("%s divergence = %#v, %v", assertion.ID, status, err)
+		}
+	}
+
+	converged := branchSnapshot(now.Add(time.Second), strings.Repeat("9", 64), strings.Repeat("9", 64), strings.Repeat("8", 40), strings.Repeat("8", 40))
+	assertion := attacknetv1beta1.ProtocolAssertionSpec{ID: "converged", BitcoinBranchCohort: &attacknetv1beta1.BranchCohortAssertion{
+		Actors: []string{"bitcoin-a", "bitcoin-b"}, Expectation: attacknetv1beta1.BranchCohortConverged,
+		StableFor: &metav1.Duration{Duration: 5 * time.Second},
+	}}
+	pending, err := EvaluateSet(assertionSet(assertion), nil, converged, now.Add(time.Second))
+	if err != nil || pending.Outcome != OutcomePending {
+		t.Fatalf("initial convergence = %#v, %v", pending, err)
+	}
+	converged.ObservedAt = now.Add(7 * time.Second)
+	for index := range converged.Bitcoin {
+		converged.Bitcoin[index].Source.ObservedAt = converged.ObservedAt
+		converged.Bitcoin[index].BestBlockHash = strings.Repeat("7", 64)
+	}
+	proven, err := EvaluateSet(assertionSet(assertion), &pending, converged, now.Add(7*time.Second))
+	if err != nil || proven.Outcome != OutcomeProven {
+		t.Fatalf("advancing stable convergence = %#v, %v", proven, err)
+	}
+}
+
+func TestBranchCohortDivergenceResetsConvergenceWindow(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	assertion := attacknetv1beta1.ProtocolAssertionSpec{ID: "converged", BitcoinBranchCohort: &attacknetv1beta1.BranchCohortAssertion{
+		Actors: []string{"bitcoin-a", "bitcoin-b"}, Expectation: attacknetv1beta1.BranchCohortConverged,
+		StableFor: &metav1.Duration{Duration: 5 * time.Second},
+	}}
+	initial := branchSnapshot(now, strings.Repeat("1", 64), strings.Repeat("1", 64), strings.Repeat("8", 40), strings.Repeat("8", 40))
+	pending, err := EvaluateSet(assertionSet(assertion), nil, initial, now)
+	if err != nil || pending.Outcome != OutcomePending {
+		t.Fatalf("initial convergence = %#v, %v", pending, err)
+	}
+
+	divergedAt := now.Add(3 * time.Second)
+	diverged := branchSnapshot(divergedAt, strings.Repeat("2", 64), strings.Repeat("3", 64), strings.Repeat("8", 40), strings.Repeat("8", 40))
+	divergedStatus, err := EvaluateSet(assertionSet(assertion), &pending, diverged, divergedAt)
+	if err != nil || divergedStatus.Outcome != OutcomePending || divergedStatus.Results[0].Reason != "WaitingForBranchConvergence" {
+		t.Fatalf("divergence = %#v, %v", divergedStatus, err)
+	}
+
+	reconvergedAt := now.Add(6 * time.Second)
+	reconverged := branchSnapshot(reconvergedAt, strings.Repeat("4", 64), strings.Repeat("4", 64), strings.Repeat("8", 40), strings.Repeat("8", 40))
+	reconvergedStatus, err := EvaluateSet(assertionSet(assertion), &divergedStatus, reconverged, reconvergedAt)
+	if err != nil || reconvergedStatus.Outcome != OutcomePending || reconvergedStatus.Results[0].Reason != "WaitingForStableBranchConvergence" {
+		t.Fatalf("reconvergence window was not reset = %#v, %v", reconvergedStatus, err)
+	}
+}
+
+func TestStacksBranchCohortRequiresBoundBitcoinEvidence(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	snapshot := branchSnapshot(now, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 40), strings.Repeat("4", 40))
+	snapshot.Bitcoin[1].Error = "unavailable"
+	assertion := attacknetv1beta1.ProtocolAssertionSpec{ID: "stacks", StacksBurnchainCohort: &attacknetv1beta1.BranchCohortAssertion{
+		Actors: []string{"node-a", "node-b"}, Expectation: attacknetv1beta1.BranchCohortDiverged,
+	}}
+	status, err := EvaluateSet(assertionSet(assertion), nil, snapshot, now)
+	if err != nil || status.Outcome != OutcomePending || status.Results[0].Reason != "BoundBitcoinObservationUnavailable" {
+		t.Fatalf("missing bound Bitcoin evidence escaped unavailable: %#v, %v", status, err)
+	}
+	snapshot = branchSnapshot(now, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 40), strings.Repeat("4", 40))
+	snapshot.Actors[1].ChainView.BurnBlockHeight--
+	status, err = EvaluateSet(assertionSet(assertion), nil, snapshot, now)
+	if err != nil || status.Outcome != OutcomePending || status.Results[0].Reason != "StacksBurnchainObservationLagging" {
+		t.Fatalf("lagging Stacks burnchain view escaped unavailable: %#v, %v", status, err)
+	}
+}
+
+func TestBranchCohortRejectsTemporallySkewedViews(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	snapshot := branchSnapshot(now, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 40), strings.Repeat("4", 40))
+	snapshot.Bitcoin[0].Source.ObservedAt = now.Add(-maximumBranchObservationSkew - time.Second)
+	assertion := attacknetv1beta1.ProtocolAssertionSpec{ID: "bitcoin", BitcoinBranchCohort: &attacknetv1beta1.BranchCohortAssertion{
+		Actors: []string{"bitcoin-a", "bitcoin-b"}, Expectation: attacknetv1beta1.BranchCohortDiverged,
+	}}
+	status, err := EvaluateSet(assertionSet(assertion), nil, snapshot, now)
+	if err != nil || status.Outcome != OutcomePending || status.Results[0].Reason != "BranchObservationSkewed" {
+		t.Fatalf("temporally disjoint Bitcoin views proved a split: %#v, %v", status, err)
+	}
+}
+
 func TestFutureSignerTimestampIsFiniteViolation(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	assertion := attacknetv1beta1.ProtocolAssertionSpec{ID: "fresh", SignerStateFreshness: &attacknetv1beta1.SignerStateFreshnessAssertion{
@@ -443,6 +538,32 @@ func assertionSnapshot(now time.Time) protocolobservation.Snapshot {
 			"stacks_signer_block_responses_sent":                 1,
 		}),
 	}}
+}
+
+func branchSnapshot(now time.Time, bitcoinA, bitcoinB, stacksA, stacksB string) protocolobservation.Snapshot {
+	topology := &attacknetv1beta1.AdmittedBurnchainTopology{
+		Digest: "sha256:topology",
+		Bindings: []attacknetv1beta1.BurnchainActorBinding{
+			{Actor: "node-a", BitcoinNodeRef: "bitcoin-a"},
+			{Actor: "node-b", BitcoinNodeRef: "bitcoin-b"},
+		},
+	}
+	source := func(actor, role string) protocolobservation.Source {
+		return protocolobservation.Source{Actor: actor, Role: role, PodName: actor + "-0", PodUID: actor + "-uid",
+			RuntimeImageID: "sha256:image", ServiceName: actor, ObservedAt: now,
+			EvidenceClass: protocolobservation.EvidenceActorSelfReported}
+	}
+	return protocolobservation.Snapshot{NetworkUID: "network", InventoryDigest: "sha256:inventory", ObservedAt: now,
+		BurnchainTopology: topology,
+		Actors: []protocolobservation.ActorSnapshot{
+			{Source: source("node-a", "follower"), ChainView: &protocolobservation.StacksChainView{BurnBlockHeight: 50, BurnConsensusHash: stacksA}, ChainObservedAt: now},
+			{Source: source("node-b", "follower"), ChainView: &protocolobservation.StacksChainView{BurnBlockHeight: 50, BurnConsensusHash: stacksB}, ChainObservedAt: now},
+		},
+		Bitcoin: []protocolobservation.BitcoinSnapshot{
+			{Source: source("bitcoin-a", "burnchain"), Height: 50, Headers: 50, BestBlockHash: bitcoinA, Chainwork: strings.Repeat("a", 64)},
+			{Source: source("bitcoin-b", "burnchain"), Height: 50, Headers: 50, BestBlockHash: bitcoinB, Chainwork: strings.Repeat("b", 64)},
+		},
+	}
 }
 
 func actorSnapshot(name, role string, now time.Time, values map[string]float64) protocolobservation.ActorSnapshot {

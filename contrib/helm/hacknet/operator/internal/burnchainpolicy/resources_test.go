@@ -65,6 +65,28 @@ func TestDeploymentDefaultsToGeneratedRegtestCredentials(t *testing.T) {
 	if deployment.Spec.Template.Spec.Containers[0].Env[2].Value != "devnet" || deployment.Spec.Template.Spec.Containers[0].Env[3].Value != "devnet" {
 		t.Fatal("generated regtest defaults must retain devnet credentials")
 	}
+	if value := environmentValue(deployment.Spec.Template.Spec.Containers[0], "BURNCHAIN_MINER_RESERVE_OUTPUTS"); value != "4" {
+		t.Fatalf("default reserve output count = %q, want 4", value)
+	}
+	zero := int32(0)
+	policy.Spec.ReserveOutputs = &zero
+	deployment, err = configuration.deployment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value := environmentValue(deployment.Spec.Template.Spec.Containers[0], "BURNCHAIN_MINER_RESERVE_OUTPUTS"); value != "0" {
+		t.Fatalf("explicit secondary reserve output count = %q, want 0", value)
+	}
+}
+
+// environmentValue returns one literal container environment value.
+func environmentValue(container corev1.Container, name string) string {
+	for _, variable := range container.Env {
+		if variable.Name == name {
+			return variable.Value
+		}
+	}
+	return ""
 }
 
 func TestServiceExposesCredentialFreeMetricsAndStatusEndpoint(t *testing.T) {

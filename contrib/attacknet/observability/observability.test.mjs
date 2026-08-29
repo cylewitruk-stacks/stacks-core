@@ -80,6 +80,35 @@ test('renderer consumes only a current complete admitted StacksNetwork inventory
   assert.throws(() => renderObservability(network, {eventToken: 'c'.repeat(64)}), /complete admitted inventory/);
 });
 
+test('renderer scrapes admitted Bitcoin policy clocks with topology identity', () => {
+  const network = {
+    apiVersion: 'testing.stacks.org/v1beta1', kind: 'StacksNetwork',
+    metadata: {name: 'multi-bitcoin', namespace: 'hacknet-system', generation: 4},
+    status: {
+      phase: 'Ready', observedGeneration: 4, inventoryReady: true,
+      inventoryDigest: `sha256:${'a'.repeat(64)}`,
+      actors: [
+        {name: 'bitcoin-a', role: 'burnchain', image: 'bitcoin:25', serviceName: 'multi-bitcoin-bitcoin-a', identityReady: true, runtimeImageID: `sha256:${'b'.repeat(64)}`},
+        {name: 'follower-a', role: 'follower', image: 'stacks:main', serviceName: 'multi-bitcoin-follower-a', identityReady: true, runtimeImageID: `sha256:${'c'.repeat(64)}`},
+      ],
+      burnchainTopology: {
+        digest: `sha256:${'d'.repeat(64)}`, observedGeneration: 4,
+        nodes: [{name: 'bitcoin-a', policyRef: 'bitcoin-a-policy', policyUID: 'policy-uid', policyServiceName: 'bitcoin-a-policy-clock'}],
+      },
+    },
+  };
+  const rendered = renderObservability(network, {eventToken: 'c'.repeat(64)});
+  const prometheus = rendered.items.find(item => item.kind === 'ConfigMap'
+    && item.metadata.name === 'multi-bitcoin-attacknet-prometheus');
+  const targets = JSON.parse(prometheus.data['burnchains.json']);
+  assert.deepEqual(targets, [{targets: ['bitcoin-a-policy-clock:18500'], labels: {
+    attacknet_network: 'multi-bitcoin', attacknet_actor: 'bitcoin-a', attacknet_role: 'burnchain',
+    burnchain_policy: 'bitcoin-a-policy', burnchain_policy_uid: 'policy-uid',
+    evidence_source: 'actor_self_reported',
+  }}]);
+  assert.match(prometheus.data['prometheus.yml'], /job_name: attacknet-burnchain-clock/);
+});
+
 test('render emits actor-labelled scrape targets and restricted credential-free observers', () => {
   const rendered = render();
   const resources = new Map(rendered.items.map(item => [`${item.kind}/${item.metadata.name}`, item]));

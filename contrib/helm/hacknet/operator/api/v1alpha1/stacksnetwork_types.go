@@ -118,10 +118,13 @@ type ActorPort struct {
 	Protocol      corev1.Protocol `json:"protocol,omitempty"`
 }
 
-// ActorDependency is a startup reachability requirement on another actor.
+// ActorDependency is a startup reachability requirement on one actor or
+// same-namespace Service.
+// +kubebuilder:validation:XValidation:rule="(has(self.actor) ? 1 : 0) + (has(self.service) ? 1 : 0) == 1",message="exactly one actor or service is required"
 type ActorDependency struct {
-	Actor string `json:"actor"`
-	Port  int32  `json:"port"`
+	Actor   string `json:"actor,omitempty"`
+	Service string `json:"service,omitempty"`
+	Port    int32  `json:"port"`
 }
 
 // RuntimePolicySpec mounts one hot-reloadable runtime policy ConfigMap.

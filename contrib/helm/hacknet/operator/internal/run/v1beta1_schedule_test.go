@@ -1,6 +1,8 @@
 package run
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -9,7 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/document"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
 )
 
 func betaScheduleFixture() (*attacknetv1beta1.AttacknetRun, *attacknetv1beta1.StacksNetwork, attacknetv1beta1.NetworkInventory, map[string]*attacknetv1beta1.FaultCampaign, fault.Manifest) {
@@ -84,6 +88,62 @@ func TestBetaScheduleBindsPortableTemplateToAdmittedNetwork(t *testing.T) {
 		if execution.CampaignSpec.Template || execution.CampaignSpec.NetworkRef != run.Spec.NetworkRef {
 			t.Fatalf("portable template was not bound in the sealed execution: %#v", execution.CampaignSpec)
 		}
+	}
+}
+
+func TestBitcoinSplitViewExamplesCompileWithinDeclaredBudgets(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "..", "..")
+	var network attacknetv1beta1.StacksNetwork
+	decodeExample(t, filepath.Join(root, "helm", "hacknet", "examples", "multi-bitcoin.yaml"), &network)
+	network.UID, network.Generation = types.UID("network-uid"), 1
+
+	compiledNetwork, err := topology.CompileV1Beta1(&network)
+	if err != nil {
+		t.Fatalf("compile public multi-Bitcoin topology: %v", err)
+	}
+	manifest := fault.ManifestFromNetwork(compiledNetwork)
+	inventory := attacknetv1beta1.NetworkInventory{
+		Digest: "sha256:" + repeat("a", 64), ObservedGeneration: network.Generation,
+		Actors: make([]attacknetv1beta1.AdmittedActorIdentity, 0, len(compiledNetwork.Spec.Actors)),
+	}
+	for _, actor := range compiledNetwork.Spec.Actors {
+		inventory.Actors = append(inventory.Actors, attacknetv1beta1.AdmittedActorIdentity{
+			Name: actor.Name, Role: actor.Role, RequestedImage: actor.Image,
+			RuntimeImageID: "containerd://sha256:" + repeat("b", 64),
+		})
+	}
+
+	var campaign attacknetv1beta1.FaultCampaign
+	decodeExample(t, filepath.Join(root, "attacknet", "examples", "campaigns", "bitcoin-competing-branches.yaml"), &campaign)
+	campaign.UID, campaign.Generation = types.UID("campaign-uid"), 1
+	var run attacknetv1beta1.AttacknetRun
+	decodeExample(t, filepath.Join(root, "attacknet", "examples", "runs", "bitcoin-split-view.yaml"), &run)
+	run.UID, run.Generation = types.UID("run-uid"), 1
+
+	schedule, err := buildBetaSchedule(&run, &network, inventory, map[string]*attacknetv1beta1.FaultCampaign{campaign.Name: &campaign}, manifest)
+	if err != nil {
+		t.Fatalf("compile public Bitcoin split-view run: %v", err)
+	}
+	if len(schedule.Executions) != 1 || schedule.Executions[0].BurnchainFaults != 2 {
+		t.Fatalf("split-view example resolved unexpected burnchain impact: %#v", schedule.Executions)
+	}
+
+	var delay attacknetv1beta1.FaultCampaign
+	decodeExample(t, filepath.Join(root, "attacknet", "examples", "campaigns", "bitcoin-propagation-delay.yaml"), &delay)
+	delay.Spec.NetworkRef = network.Name
+	if _, err := fault.CompileV1Beta1(&delay, manifest); err != nil {
+		t.Fatalf("compile public Bitcoin propagation-delay campaign: %v", err)
+	}
+}
+
+func decodeExample(t *testing.T, path string, target any) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := document.DecodeOne(data, target); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
 	}
 }
 

@@ -111,22 +111,50 @@ type NetworkDefaults struct {
 	Workload       WorkloadPolicy `json:"workload,omitempty"`
 }
 
+// NamedObjectReference identifies one same-namespace Attacknet resource.
+type NamedObjectReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name string `json:"name"`
+}
+
 // BurnchainTopologySpec declares Bitcoin nodes and the cadence policy they use.
+// +kubebuilder:validation:XValidation:rule="self.nodes.all(node, !has(node.peerRefs) || node.peerRefs.all(peer, peer != node.name && self.nodes.exists(candidate, candidate.name == peer)))",message="Bitcoin peerRefs must identify other declared Bitcoin nodes"
+// +kubebuilder:validation:XValidation:rule="self.nodes.all(node, self.nodes.filter(candidate, (has(candidate.policyRef) ? candidate.policyRef.name : self.policyRef.name) == (has(node.policyRef) ? node.policyRef.name : self.policyRef.name)).size() == 1)",message="each Bitcoin node must resolve to a distinct BurnchainPolicy"
 type BurnchainTopologySpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=32
-	Nodes     []BitcoinNodeSpec           `json:"nodes"`
-	PolicyRef corev1.LocalObjectReference `json:"policyRef"`
+	// +listType=map
+	// +listMapKey=name
+	Nodes     []BitcoinNodeSpec    `json:"nodes"`
+	PolicyRef NamedObjectReference `json:"policyRef"`
 }
 
 // BitcoinNodeSpec declares one independently persisted Bitcoin regtest node.
 type BitcoinNodeSpec struct {
+	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
-	Name      string                    `json:"name"`
-	Image     string                    `json:"image,omitempty"`
-	Config    ConfigSource              `json:"config"`
-	RPCPort   int32                     `json:"rpcPort,omitempty"`
-	P2PPort   int32                     `json:"p2pPort,omitempty"`
+	Name   string       `json:"name"`
+	Image  string       `json:"image,omitempty"`
+	Config ConfigSource `json:"config"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	RPCPort int32 `json:"rpcPort,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	P2PPort int32 `json:"p2pPort,omitempty"`
+	// PeerRefs is the directed persistent Bitcoin P2P graph. References are
+	// rendered as addnode connections and are not startup dependencies.
+	// +kubebuilder:validation:MaxItems=31
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	// +listType=set
+	PeerRefs []string `json:"peerRefs,omitempty"`
+	// PolicyRef selects this node's independent cadence policy. An omitted
+	// value uses spec.burnchain.policyRef for backward-compatible single-node
+	// topologies.
+	PolicyRef *NamedObjectReference     `json:"policyRef,omitempty"`
 	Workload  *WorkloadPolicy           `json:"workload,omitempty"`
 	Advanced  *AdvancedWorkloadOverride `json:"advanced,omitempty"`
 	Suspended bool                      `json:"suspended,omitempty"`
@@ -363,16 +391,48 @@ type ActorStatus struct {
 	IdentityReady              bool   `json:"identityReady,omitempty"`
 }
 
+// AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+// peer and cadence-policy bindings.
+type AdmittedBitcoinNode struct {
+	Name              string   `json:"name"`
+	ServiceName       string   `json:"serviceName"`
+	RPCPort           int32    `json:"rpcPort"`
+	P2PPort           int32    `json:"p2pPort"`
+	PeerRefs          []string `json:"peerRefs,omitempty"`
+	PolicyRef         string   `json:"policyRef"`
+	PolicyUID         string   `json:"policyUID"`
+	PolicyServiceName string   `json:"policyServiceName"`
+}
+
+// BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+// process. Signer processes themselves do not consume Bitcoin RPC.
+type BurnchainActorBinding struct {
+	Actor          string `json:"actor"`
+	BitcoinNodeRef string `json:"bitcoinNodeRef"`
+}
+
+// AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+// follower binding admitted for one observed StacksNetwork generation.
+type AdmittedBurnchainTopology struct {
+	SchemaVersion      string                  `json:"schemaVersion"`
+	Digest             string                  `json:"digest"`
+	ObservedGeneration int64                   `json:"observedGeneration"`
+	ObservedAt         *metav1.Time            `json:"observedAt,omitempty"`
+	Nodes              []AdmittedBitcoinNode   `json:"nodes"`
+	Bindings           []BurnchainActorBinding `json:"bindings,omitempty"`
+}
+
 // StacksNetworkStatus reports reconciled workload and admitted identity state.
 type StacksNetworkStatus struct {
-	ObservedGeneration  int64              `json:"observedGeneration,omitempty"`
-	Phase               string             `json:"phase,omitempty"`
-	DesiredActors       int32              `json:"desiredActors,omitempty"`
-	ReadyActors         int32              `json:"readyActors,omitempty"`
-	ReadySummary        string             `json:"readySummary,omitempty"`
-	InventoryReady      bool               `json:"inventoryReady,omitempty"`
-	InventoryDigest     string             `json:"inventoryDigest,omitempty"`
-	InventoryObservedAt *metav1.Time       `json:"inventoryObservedAt,omitempty"`
-	Actors              []ActorStatus      `json:"actors,omitempty"`
-	Conditions          []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration  int64                      `json:"observedGeneration,omitempty"`
+	Phase               string                     `json:"phase,omitempty"`
+	DesiredActors       int32                      `json:"desiredActors,omitempty"`
+	ReadyActors         int32                      `json:"readyActors,omitempty"`
+	ReadySummary        string                     `json:"readySummary,omitempty"`
+	InventoryReady      bool                       `json:"inventoryReady,omitempty"`
+	InventoryDigest     string                     `json:"inventoryDigest,omitempty"`
+	InventoryObservedAt *metav1.Time               `json:"inventoryObservedAt,omitempty"`
+	BurnchainTopology   *AdmittedBurnchainTopology `json:"burnchainTopology,omitempty"`
+	Actors              []ActorStatus              `json:"actors,omitempty"`
+	Conditions          []metav1.Condition         `json:"conditions,omitempty"`
 }

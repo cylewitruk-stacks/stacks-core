@@ -34,9 +34,16 @@ type BurnchainPolicySpec struct {
 	BitcoinNodeRef string `json:"bitcoinNodeRef"`
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=10000000
-	BootstrapHeight int64           `json:"bootstrapHeight,omitempty"`
-	Cadence         metav1.Duration `json:"cadence"`
-	Paused          bool            `json:"paused,omitempty"`
+	BootstrapHeight int64 `json:"bootstrapHeight,omitempty"`
+	// ReserveOutputs controls the initial coinbase outputs mined by this
+	// policy. Set it to zero on secondary Bitcoin nodes so only one policy
+	// establishes the shared regtest chain.
+	// +kubebuilder:default=4
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10000
+	ReserveOutputs *int32          `json:"reserveOutputs,omitempty"`
+	Cadence        metav1.Duration `json:"cadence"`
+	Paused         bool            `json:"paused,omitempty"`
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=64
 	Destinations []BurnchainDestinationSpec `json:"destinations"`
@@ -133,21 +140,67 @@ type BurnchainRPCSpec struct {
 	PasswordSecretRef *SecretKeyReference `json:"passwordSecretRef,omitempty"`
 }
 
+// BurnchainChainTipStatus is one bounded branch observed by Bitcoin Core.
+type BurnchainChainTipStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	Height int64 `json:"height"`
+	// +kubebuilder:validation:MinLength=64
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[0-9a-fA-F]{64}$`
+	Hash string `json:"hash"`
+	// +kubebuilder:validation:Minimum=0
+	BranchLen int64 `json:"branchLength"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=32
+	Status string `json:"status"`
+}
+
+// BurnchainPeerStatus identifies one currently connected Bitcoin peer.
+type BurnchainPeerStatus struct {
+	// +kubebuilder:validation:Minimum=0
+	ID int64 `json:"id"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=256
+	Address string `json:"address"`
+	Inbound bool   `json:"inbound"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=64
+	ConnectionType string `json:"connectionType"`
+	// LastBlock is Bitcoin Core's Unix timestamp for the latest block message
+	// received from this peer, or zero when none has been observed.
+	// +kubebuilder:validation:Minimum=0
+	LastBlock int64 `json:"lastBlock"`
+	// LastTransaction is Bitcoin Core's Unix timestamp for the latest
+	// transaction message received from this peer, or zero when absent.
+	// +kubebuilder:validation:Minimum=0
+	LastTransaction int64 `json:"lastTransaction"`
+}
+
 // BurnchainPolicyStatus reports applied policy and observed Bitcoin progress.
 type BurnchainPolicyStatus struct {
-	ObservedGeneration     int64              `json:"observedGeneration,omitempty"`
-	AdmittedNetworkUID     string             `json:"admittedNetworkUID,omitempty"`
-	AdmittedBitcoinUID     string             `json:"admittedBitcoinStatefulSetUID,omitempty"`
-	AdmittedBitcoinImageID string             `json:"admittedBitcoinRuntimeImageID,omitempty"`
-	Phase                  string             `json:"phase,omitempty"`
-	Reason                 string             `json:"reason,omitempty"`
-	Message                string             `json:"message,omitempty"`
-	AppliedPolicyDigest    string             `json:"appliedPolicyDigest,omitempty"`
-	AppliedFlashID         string             `json:"appliedFlashId,omitempty"`
-	ObservedHeight         int64              `json:"observedHeight,omitempty"`
-	LastBlockHash          string             `json:"lastBlockHash,omitempty"`
-	LastSuccessAt          *metav1.Time       `json:"lastSuccessAt,omitempty"`
-	LastAttemptAt          *metav1.Time       `json:"lastAttemptAt,omitempty"`
-	ConsecutiveFailures    int32              `json:"consecutiveFailures,omitempty"`
-	Conditions             []metav1.Condition `json:"conditions,omitempty"`
+	ObservedGeneration     int64  `json:"observedGeneration,omitempty"`
+	AdmittedNetworkUID     string `json:"admittedNetworkUID,omitempty"`
+	AdmittedBitcoinUID     string `json:"admittedBitcoinStatefulSetUID,omitempty"`
+	AdmittedBitcoinImageID string `json:"admittedBitcoinRuntimeImageID,omitempty"`
+	Phase                  string `json:"phase,omitempty"`
+	Reason                 string `json:"reason,omitempty"`
+	Message                string `json:"message,omitempty"`
+	AppliedPolicyDigest    string `json:"appliedPolicyDigest,omitempty"`
+	AppliedFlashID         string `json:"appliedFlashId,omitempty"`
+	ObservedHeight         int64  `json:"observedHeight,omitempty"`
+	// +kubebuilder:validation:Pattern=`^$|^[0-9a-fA-F]{64}$`
+	LastBlockHash   string `json:"lastBlockHash,omitempty"`
+	ObservedHeaders int64  `json:"observedHeaders,omitempty"`
+	// +kubebuilder:validation:Pattern=`^$|^[0-9a-fA-F]{64}$`
+	ObservedChainwork string `json:"observedChainwork,omitempty"`
+	// +kubebuilder:validation:MaxItems=32
+	ObservedChainTips []BurnchainChainTipStatus `json:"observedChainTips,omitempty"`
+	// +kubebuilder:validation:MaxItems=128
+	ObservedPeers           []BurnchainPeerStatus `json:"observedPeers,omitempty"`
+	BitcoinObservationAt    *metav1.Time          `json:"bitcoinObservationAt,omitempty"`
+	BitcoinObservationError string                `json:"bitcoinObservationError,omitempty"`
+	LastSuccessAt           *metav1.Time          `json:"lastSuccessAt,omitempty"`
+	LastAttemptAt           *metav1.Time          `json:"lastAttemptAt,omitempty"`
+	ConsecutiveFailures     int32                 `json:"consecutiveFailures,omitempty"`
+	Conditions              []metav1.Condition    `json:"conditions,omitempty"`
 }

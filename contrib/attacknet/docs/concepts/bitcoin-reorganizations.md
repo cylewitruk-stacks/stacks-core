@@ -73,7 +73,9 @@ results separately report `BurnchainReorgProven` and
 `BurnchainPolicyRestored`. A stale approval, changed policy identity, changed
 policy contract, incomplete replacement, or unproved final branch fails closed.
 
-This first version addresses one Bitcoin node. It proves Stacks behavior under
-a canonical reorganization but does not claim simultaneous honest split views.
-The A10 roadmap item adds Bitcoin P2P partitions and multiple followers; it will
-reuse this node-addressed primitive and its per-node evidence.
+The node-addressed mechanism also composes with an admitted multi-Bitcoin graph:
+partition one Bitcoin cohort, run the bounded replacement against the isolated
+node, then remove the partition and assert higher-work convergence. See
+[`bitcoin-split-views.md`](bitcoin-split-views.md). The reorganization worker
+remains one-node-scoped; graph partitioning and cohort assertions stay separate
+so evidence distinguishes local branch mutation from distributed divergence.

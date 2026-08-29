@@ -18,11 +18,12 @@ type AdmittedActorIdentity struct {
 
 // NetworkInventory is the complete authoritative actor inventory bound to a run.
 type NetworkInventory struct {
-	Digest             string                  `json:"digest"`
-	ObservedGeneration int64                   `json:"observedGeneration"`
-	ObservedAt         *metav1.Time            `json:"observedAt,omitempty"`
-	ResourceVersion    string                  `json:"resourceVersion,omitempty"`
-	Actors             []AdmittedActorIdentity `json:"actors"`
+	Digest             string                     `json:"digest"`
+	ObservedGeneration int64                      `json:"observedGeneration"`
+	ObservedAt         *metav1.Time               `json:"observedAt,omitempty"`
+	ResourceVersion    string                     `json:"resourceVersion,omitempty"`
+	BurnchainTopology  *AdmittedBurnchainTopology `json:"burnchainTopology,omitempty"`
+	Actors             []AdmittedActorIdentity    `json:"actors"`
 }
 
 // IdentityDivergence records an immutable identity mismatch without retargeting.

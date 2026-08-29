@@ -42,6 +42,7 @@ const (
 	betaScheduleAnnotation  = "testing.stacks.org/schedule-digest"
 	betaTemplateAnnotation  = "testing.stacks.org/source-template"
 	betaTriggerAnnotation   = "testing.stacks.org/trigger-receipt"
+	betaDependencyRequeue   = 5 * time.Second
 )
 
 // V1Beta1Reconciler executes immutable dependency-triggered run schedules and
@@ -107,10 +108,10 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 		if run.Status.ScheduleRef != nil {
 			phase, reason = "Running", "WaitingForNetworkRecovery"
 		}
-		return reconcile.Result{RequeueAfter: 5 * time.Second}, r.transition(ctx, run, phase, reason, "")
+		return reconcile.Result{RequeueAfter: betaDependencyRequeue}, r.transition(ctx, run, phase, reason, "")
 	}
 	if run.Status.ScheduleRef == nil {
-		return reconcile.Result{}, r.prepare(ctx, run)
+		return r.prepare(ctx, run)
 	}
 	schedule, err := r.store().read(ctx, run, *run.Status.ScheduleRef)
 	if err != nil {
@@ -298,10 +299,10 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 	return reconcile.Result{RequeueAfter: betaNextRequeue(schedule, started, snapshot)}, r.patchStatus(ctx, run, betaRunTransition(next, run.Generation, "Running", reason, "", r.now()))
 }
 
-func (r *V1Beta1Reconciler) prepare(ctx context.Context, run *attacknetv1beta1.AttacknetRun) error {
+func (r *V1Beta1Reconciler) prepare(ctx context.Context, run *attacknetv1beta1.AttacknetRun) (reconcile.Result, error) {
 	live, err := inventory.ReadBetaLiveView(ctx, r.APIReader, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.NetworkRef})
 	if err != nil {
-		return err
+		return reconcile.Result{}, err
 	}
 	published, err := inventory.BetaPublished(live.Network)
 	if err != nil || len(inventory.BetaCompareLive(published, live.Network, live.Pods, nil)) > 0 {
@@ -309,42 +310,42 @@ func (r *V1Beta1Reconciler) prepare(ctx context.Context, run *attacknetv1beta1.A
 		if err != nil {
 			message = err.Error()
 		}
-		return r.transition(ctx, run, "Pending", "NetworkInventoryNotReady", message)
+		return reconcile.Result{RequeueAfter: betaDependencyRequeue}, r.transition(ctx, run, "Pending", "NetworkInventoryNotReady", message)
 	}
 	legacyNetwork, err := topology.CompileV1Beta1(live.Network)
 	if err != nil {
-		return r.fail(ctx, run, "ScheduleAdmissionFailed", err)
+		return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 	}
 	signerSet, err := r.signerResolver().Resolve(ctx, legacyNetwork, live.Pods)
 	if err != nil {
 		var transient *signerset.TransientError
 		if errors.As(err, &transient) {
-			return err
+			return reconcile.Result{RequeueAfter: betaDependencyRequeue}, r.transition(ctx, run, "Pending", "SignerSetObservationPending", transient.Error())
 		}
-		return r.fail(ctx, run, "ScheduleAdmissionFailed", err)
+		return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 	}
 	manifest := canonicalManifest(legacyNetwork, signerSet.WeightsByActor)
 	templates := make(map[string]*attacknetv1beta1.FaultCampaign, len(run.Spec.CampaignCatalog))
 	for _, entry := range run.Spec.CampaignCatalog {
 		source := &attacknetv1beta1.FaultCampaign{}
 		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: entry.CampaignRef}, source); err != nil {
-			return r.fail(ctx, run, "ScheduleAdmissionFailed", err)
+			return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 		}
 		templates[source.Name] = source
 	}
 	schedule, err := buildBetaSchedule(run, live.Network, published, templates, manifest)
 	if err != nil {
-		return r.fail(ctx, run, "ScheduleAdmissionFailed", err)
+		return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 	}
 	if run.Spec.Replay.Enabled || run.Spec.Minimization.Enabled || run.Spec.Resume.Enabled {
 		schedule, err = r.deriveBetaSchedule(ctx, run, schedule, manifest)
 		if err != nil {
-			return r.fail(ctx, run, "ScheduleAdmissionFailed", err)
+			return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 		}
 	}
 	reference, err := r.store().persist(ctx, run, schedule)
 	if err != nil {
-		return r.fail(ctx, run, "ScheduleAdmissionFailed", err)
+		return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 	}
 	now := metav1.NewTime(r.now())
 	next := *run.Status.DeepCopy()
@@ -363,7 +364,7 @@ func (r *V1Beta1Reconciler) prepare(ctx context.Context, run *attacknetv1beta1.A
 		next.ScheduleSummary.SignerSetTotalWeight = ptr(int64(signerSet.ObservedTotalWeight))
 	}
 	next.BudgetUsage = &attacknetv1beta1.BudgetUsage{MinimizationAttempts: ternary(run.Spec.Minimization.Enabled, int32(1), int32(0))}
-	return r.patchStatus(ctx, run, betaRunTransition(next, run.Generation, "Preparing", "ResolvedSchedulePersisted", "", r.now()))
+	return reconcile.Result{}, r.patchStatus(ctx, run, betaRunTransition(next, run.Generation, "Preparing", "ResolvedSchedulePersisted", "", r.now()))
 }
 
 func (r *V1Beta1Reconciler) evaluateProtocolAssertions(

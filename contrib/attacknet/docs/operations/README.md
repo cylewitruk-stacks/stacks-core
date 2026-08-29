@@ -109,6 +109,21 @@ $ATTACKNET burnchain flash --namespace hacknet-system \
 Flash request IDs are idempotency keys. Status distinguishes requested policy,
 observed generation, Bitcoin height, acknowledgement, and errors.
 
+For a multi-Bitcoin network, inspect the admitted graph and every policy before
+starting a campaign:
+
+```bash
+kubectl get stacksnetwork multi-bitcoin --namespace hacknet-system \
+  --output=jsonpath='{.status.burnchainTopology}'
+kubectl get burnchainpolicies --namespace hacknet-system
+```
+
+The topology digest must be present and `inventoryReady` must be true. Each
+Bitcoin policy reports branch, chain-tip, and connected-peer observations from
+its credential-free clock. Use the
+[Bitcoin split-view guide](../concepts/bitcoin-split-views.md) for the composed
+partition and competing-branch workflow.
+
 ## Faults and runs
 
 A `FaultCampaign` contains stages; each stage may contain multiple actions.
@@ -182,7 +197,8 @@ events, and PVCs until root-cause attribution is complete. See
 | --- | --- |
 | Missing v1beta1 API | Run `attacknet doctor`; inspect CRDs and both controller Deployments. |
 | Image pull failure | Rebuild, then use `attacknet image load` for every actor image. |
-| Network Pending | Inspect the referenced `BurnchainPolicy`, Pod status, and Conditions. |
+| Network Pending | Inspect the referenced `BurnchainPolicy`, clock `/readyz`, actor init-container logs, Pod status, and Conditions. |
+| Run Pending on `SignerSetObservationPending` | Check the enrolled Stacks node's chain tip and `/v2/pox`; the controller retries without admitting a schedule. |
 | Campaign waiting | Inspect its admitted inventory, shared mutation lease, and cumulative run budget. |
 | Inconclusive result | Preserve evidence; inspect identity divergence, effect ambiguity, and rollback. |
 | Pod Pending after node loss | Inspect PVC node affinity; portable cross-node CSI is outside Release 1. |

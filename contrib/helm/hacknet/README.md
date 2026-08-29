@@ -249,8 +249,13 @@ PeerDB; adding it after persistent chainstate exists does not retroactively
 make the peer initial.
 
 `spec.genesis` is the network-wide genesis contract for generated Stacks node
-profiles. It currently carries the PoX-5 sBTC contracts and bounded initial STX
-balances. Balances are rendered in deterministic address order. Complete node
+profiles. It carries PoX-5 sBTC contract identifiers and bounded initial STX
+balances; it does not deploy the sBTC contracts. Because `stacks-node` requires
+an Epoch 4 entry, the R1 `nakamoto-regtest-node/v1` profile parks activation at
+reward-phase burn height 1,000,005 instead of exercising it. Use complete ConfigMap- or
+Secret-backed configs only when the environment independently provisions the
+contracts required for an earlier Epoch 4 activation. Balances are rendered in
+deterministic address order. Complete node
 configs supplied through `configMapRef` or `secretRef` remain opaque to the
 operator and therefore must reproduce `spec.genesis` exactly; otherwise actors
 can exchange blocks successfully while rejecting them as belonging to another
@@ -285,6 +290,23 @@ resource versions are reported alongside it but are deliberately excluded from
 the digest. Consumers must wait for `status.inventoryReady: true` and must still
 recheck live Pod identity immediately before a mutation.
 
+For multiple Bitcoin nodes, `spec.burnchain.nodes[].peerRefs` declares directed
+persistent Bitcoin P2P edges. The renderer emits deterministic `addnode`
+settings; it does not turn peer edges into startup gates, so cycles are valid.
+Declare both directions for symmetric reconnect behavior. Each Stacks actor's
+`burnchainNodeRef` identifies the Bitcoin view it follows.
+
+Each Bitcoin node in a multi-node graph must resolve to a distinct
+`BurnchainPolicy`. Set `policyRef` on the node; the network-level
+`spec.burnchain.policyRef` remains the single-node default. Once all actors and
+policies are admitted, `status.burnchainTopology` publishes the normalized peer
+graph, policy names and UIDs, policy Services, actor bindings, and a canonical
+digest. The digest is withheld during partial rollout and excludes timestamps
+network generation, and Kubernetes resource versions; generation remains a
+separate status and admission binding. Fault and run controllers still re-read
+live identities immediately before mutation; status alone is not a freshness
+guarantee.
+
 An actor may set `runtimeExposure: reachable` to publish its headless-Service
 endpoint before its Pod is Ready. The default, `ready`, keeps bootstrap
 deterministic. This affects DNS discovery and new connections, not established
@@ -299,9 +321,22 @@ Its unprivileged clock process has no Kubernetes credentials and never exits
 Bitcoin Core on RPC failure. Bitcoin forks, partitions, and reconsideration are
 fault mechanisms rather than cadence policy.
 
-The referenced policy is a `StacksNetwork` readiness barrier. Actors are
-created before the policy becomes Ready to avoid a bootstrap cycle, but the
-network does not report Ready until the current policy generation is applied.
+The referenced policy is both a Stacks-process startup barrier and a
+`StacksNetwork` readiness barrier. Bitcoin actors start immediately so their
+clocks can bootstrap them. Each bound Stacks actor waits for Bitcoin RPC and
+for the policy clock's `/readyz` Service endpoint, which is published only
+after bootstrap and policy acknowledgement. The network does not report Ready
+until the current policy generation and every actor are Ready.
+For a fresh miner-backed regtest, choose a bootstrap height at or above the
+first mature coinbase output (normally 101) and leave enough blocks before the
+first configured epoch transition for node sync, stacking, signer startup, and
+an initial Stacks tip. The bootstrap height is the actor-release point, not a
+target to place immediately before activation.
+In a follower-only secondary Bitcoin node, use `bootstrapHeight: 0`,
+`reserveOutputs: 0`, and `paused: true`: the node learns the primary branch
+over Bitcoin P2P without an independent clock mining a competing genesis
+suffix. `reserveOutputs` defaults to four for the primary policy so its wallet
+has explicit initial coinbase outputs.
 
 ### `FaultCampaign`
 
@@ -356,6 +391,9 @@ run's active-fault and cumulative safety reservations. Standalone campaigns
 remain mutually exclusive. Use one multi-stage campaign when effects require a
 single aggregate admission decision; use overlapping run executions when each
 campaign is independently admitted and the run-level union budget is sufficient.
+If the canonical signer set is not observable yet, the run remains `Pending`
+with reason `SignerSetObservationPending`; this is dependency state, not a
+failed reconcile or a safety verdict.
 
 The run also pins the complete admitted inventory. Unplanned divergence ends
 the run `Inconclusive` and prevents remaining actions from starting. A proven,

@@ -29,7 +29,6 @@ const (
 	labelPolicy               = "testing.stacks.org/burnchain-policy"
 	labelComponent            = "app.kubernetes.io/component"
 	componentClock            = "burnchain-clock"
-	defaultBitcoinRPCPort     = int32(18443)
 	clockHealthPort           = int32(18500)
 	maximumRuntimeDelay       = uint64(3600)
 	maximumBootstrapHeight    = int64(10_000_000)

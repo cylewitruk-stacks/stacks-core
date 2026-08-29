@@ -27,6 +27,7 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 )
 
 // V1Beta1Reconciler compiles the domain API into the proven workload renderer.
@@ -79,21 +80,23 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 		return reconcile.Result{}, r.updateStatus(ctx, network, degradedV1Beta1Status(network, err))
 	}
 	desired := convertV1Beta1Status(legacyStatus)
-	policy := &attacknetv1beta1.BurnchainPolicy{}
-	policyKey := types.NamespacedName{Namespace: network.Namespace, Name: network.Spec.Burnchain.PolicyRef.Name}
-	if err := r.Get(ctx, policyKey, policy); err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			return reconcile.Result{}, err
+	statusView := network.DeepCopy()
+	statusView.Status = desired
+	policyUIDs, policiesPending, err := r.observeBurnchainPolicies(ctx, network, &desired)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	desired.BurnchainTopology = nil
+	if policyUIDs != nil {
+		graph, graphErr := burnchaintopology.Build(statusView, policyUIDs)
+		if graphErr == nil {
+			desired.BurnchainTopology = graph
+		} else if desired.InventoryReady {
+			markBurnchainPolicyPending(&desired, network.Generation, "BurnchainTopologyNotReady", graphErr.Error())
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, desired)
 		}
-		markBurnchainPolicyPending(&desired, network.Generation, "BurnchainPolicyNotFound", fmt.Sprintf("BurnchainPolicy %s does not exist", policyKey.Name))
-		return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, desired)
 	}
-	if policy.Spec.NetworkRef != network.Name {
-		markBurnchainPolicyPending(&desired, network.Generation, "BurnchainPolicyMismatch", fmt.Sprintf("BurnchainPolicy %s targets network %s", policy.Name, policy.Spec.NetworkRef))
-		return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, desired)
-	}
-	if policy.Status.ObservedGeneration < policy.Generation || policy.Status.Phase != "Ready" {
-		markBurnchainPolicyPending(&desired, network.Generation, "BurnchainPolicyNotReady", fmt.Sprintf("BurnchainPolicy %s phase is %s", policy.Name, policy.Status.Phase))
+	if policiesPending {
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, desired)
 	}
 	telemetryReady, reason, message, err := observeV1Beta1Telemetry(ctx, r.Client, network)
@@ -105,6 +108,50 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, desired)
 	}
 	return reconcile.Result{}, r.updateStatus(ctx, network, desired)
+}
+
+// observeBurnchainPolicies verifies every Bitcoin node's independent cadence
+// policy before the network becomes Ready.
+func (r *V1Beta1Reconciler) observeBurnchainPolicies(ctx context.Context, network *attacknetv1beta1.StacksNetwork, status *attacknetv1beta1.StacksNetworkStatus) (map[string]string, bool, error) {
+	bindings, err := burnchaintopology.PolicyBindings(network)
+	if err != nil {
+		return nil, false, err
+	}
+	names := make([]string, 0, len(bindings))
+	for name := range bindings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	identities := make(map[string]string, len(names))
+	pending := false
+	for _, name := range names {
+		policy := &attacknetv1beta1.BurnchainPolicy{}
+		key := types.NamespacedName{Namespace: network.Namespace, Name: name}
+		if err := r.Get(ctx, key, policy); err != nil {
+			if client.IgnoreNotFound(err) != nil {
+				return nil, false, err
+			}
+			markBurnchainPolicyPending(status, network.Generation, "BurnchainPolicyNotFound", fmt.Sprintf("BurnchainPolicy %s does not exist", name))
+			return nil, true, nil
+		}
+		node := bindings[name]
+		if policy.Spec.NetworkRef != network.Name || policy.Spec.BitcoinNodeRef != node {
+			markBurnchainPolicyPending(status, network.Generation, "BurnchainPolicyMismatch", fmt.Sprintf("BurnchainPolicy %s does not bind network %s Bitcoin node %s", name, network.Name, node))
+			return nil, true, nil
+		}
+		if policy.UID == "" {
+			markBurnchainPolicyPending(status, network.Generation, "BurnchainPolicyIdentityPending", fmt.Sprintf("BurnchainPolicy %s has no admitted UID", name))
+			return nil, true, nil
+		}
+		identities[name] = string(policy.UID)
+		if policy.Status.ObservedGeneration != policy.Generation || policy.Status.Phase != "Ready" {
+			if !pending {
+				markBurnchainPolicyPending(status, network.Generation, "BurnchainPolicyNotReady", fmt.Sprintf("BurnchainPolicy %s phase is %s", policy.Name, policy.Status.Phase))
+			}
+			pending = true
+		}
+	}
+	return identities, pending, nil
 }
 
 func applyV1Beta1RendererDefaults(network *attacknetv1alpha1.StacksNetwork, probeImage string, probePull corev1.PullPolicy) {

@@ -122,6 +122,8 @@ scenario assertions and are not part of the bounded A9 claim.
 
 ### A10: Multiple Bitcoin followers and split views
 
+Status: implementation complete; direct audit and qualification in progress.
+
 A single Bitcoin Core process tests Stacks reorganization handling but not
 Bitcoin network partitions. Build on the typed Bitcoin-node topology and
 Stacks-actor-to-Bitcoin-node bindings so cohorts can follow independent Bitcoin
@@ -136,7 +138,7 @@ Per-Bitcoin evidence must include:
 
 - height, best-block hash, and chainwork;
 - chain tips and peer graph;
-- header and block receipt timing;
+- per-peer block and transaction receipt timing;
 - the bound Stacks actor's burn-view hash and height.
 
 Effect assertions must prove the requested split on both layers. Recovery must

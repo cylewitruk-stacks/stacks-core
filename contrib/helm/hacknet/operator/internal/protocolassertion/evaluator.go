@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	apixv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -19,6 +20,7 @@ import (
 
 const maximumAssertionTimeout = time.Hour
 const maximumObservationAge = 30 * time.Second
+const maximumBranchObservationSkew = 5 * time.Second
 const maximumActorReferences = 256
 
 const (
@@ -39,6 +41,36 @@ type evidence struct {
 	Baseline        map[string]float64           `json:"baseline,omitempty"`
 	Current         map[string]float64           `json:"current,omitempty"`
 	Sources         []protocolobservation.Source `json:"sources,omitempty"`
+}
+
+type branchEvidence struct {
+	NetworkUID          string                            `json:"networkUID"`
+	InventoryDigest     string                            `json:"inventoryDigest"`
+	TopologyDigest      string                            `json:"topologyDigest"`
+	ObservedAt          time.Time                         `json:"observedAt"`
+	Current             map[string]string                 `json:"current"`
+	Bindings            map[string]string                 `json:"bindings,omitempty"`
+	BitcoinObservations map[string]bitcoinBranchEvidence  `json:"bitcoinObservations"`
+	StacksObservations  map[string]stacksBurnViewEvidence `json:"stacksObservations,omitempty"`
+	Sources             []protocolobservation.Source      `json:"sources"`
+	StableSince         *time.Time                        `json:"stableSince,omitempty"`
+}
+
+type bitcoinBranchEvidence struct {
+	Height        int64                                      `json:"height"`
+	Headers       int64                                      `json:"headers"`
+	BestBlockHash string                                     `json:"bestBlockHash"`
+	Chainwork     string                                     `json:"chainwork"`
+	ChainTips     []attacknetv1beta1.BurnchainChainTipStatus `json:"chainTips,omitempty"`
+	Peers         []attacknetv1beta1.BurnchainPeerStatus     `json:"peers,omitempty"`
+	Source        protocolobservation.Source                 `json:"source"`
+}
+
+type stacksBurnViewEvidence struct {
+	BurnBlockHeight   uint64                     `json:"burnBlockHeight"`
+	BurnConsensusHash string                     `json:"burnConsensusHash"`
+	BitcoinNodeRef    string                     `json:"bitcoinNodeRef"`
+	Source            protocolobservation.Source `json:"source"`
 }
 
 type unavailableEvidenceError struct{ reason string }
@@ -207,6 +239,9 @@ func evaluate(
 		started := metav1.NewTime(now)
 		result.StartedAt = &started
 	}
+	if assertion.BitcoinBranchCohort != nil || assertion.StacksBurnchainCohort != nil {
+		return evaluateBranchCohort(assertion, actors, prior, result, snapshot, now)
+	}
 	current, sources, readErr := values(assertion, actors, snapshot, now)
 	if readErr != nil {
 		var unavailable unavailableEvidenceError
@@ -274,6 +309,231 @@ func evaluate(
 		return terminalResult(result, OutcomeProven, "AssertionSatisfied", now), nil
 	}
 	return terminalResult(result, OutcomeViolated, "AssertionViolated", now), nil
+}
+
+func evaluateBranchCohort(
+	assertion attacknetv1beta1.ProtocolAssertionSpec,
+	actors []string,
+	prior, result attacknetv1beta1.ProtocolAssertionResult,
+	snapshot protocolobservation.Snapshot,
+	now time.Time,
+) (attacknetv1beta1.ProtocolAssertionResult, error) {
+	if prior.Outcome == OutcomeProven {
+		return prior, nil
+	}
+	value, unavailable := branchValues(assertion, actors, snapshot, now)
+	if unavailable != "" {
+		result.Reason = unavailable
+		result.Evidence = prior.Evidence
+		return result, nil
+	}
+	distinct := make(map[string]struct{}, len(value.Current))
+	for _, identity := range value.Current {
+		distinct[identity] = struct{}{}
+	}
+	cohort := assertion.BitcoinBranchCohort
+	if cohort == nil {
+		cohort = assertion.StacksBurnchainCohort
+	}
+	if cohort.Expectation == attacknetv1beta1.BranchCohortDiverged {
+		minimum := int(cohort.MinimumDistinct)
+		if minimum == 0 {
+			minimum = 2
+		}
+		var err error
+		result.Evidence, err = marshalBranchEvidence(value)
+		if err != nil {
+			return result, err
+		}
+		if len(distinct) >= minimum {
+			return terminalResult(result, OutcomeProven, "BranchDivergenceObserved", now), nil
+		}
+		result.Reason = "WaitingForBranchDivergence"
+		return result, nil
+	}
+	if len(distinct) != 1 {
+		result.Reason = "WaitingForBranchConvergence"
+		var err error
+		result.Evidence, err = marshalBranchEvidence(value)
+		if err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+	stableFor := time.Duration(0)
+	if cohort.StableFor != nil {
+		stableFor = cohort.StableFor.Duration
+	}
+	stableSince := now
+	if len(prior.Evidence.Raw) != 0 {
+		var previous branchEvidence
+		if err := json.Unmarshal(prior.Evidence.Raw, &previous); err != nil {
+			return result, errors.New("branch cohort evidence is malformed")
+		}
+		if sameBranchCohortScope(previous, value) && previous.StableSince != nil {
+			stableSince = *previous.StableSince
+		}
+	}
+	value.StableSince = &stableSince
+	var err error
+	result.Evidence, err = marshalBranchEvidence(value)
+	if err != nil {
+		return result, err
+	}
+	if now.Sub(stableSince) >= stableFor {
+		return terminalResult(result, OutcomeProven, "BranchConvergenceObserved", now), nil
+	}
+	result.Reason = "WaitingForStableBranchConvergence"
+	return result, nil
+}
+
+func branchValues(assertion attacknetv1beta1.ProtocolAssertionSpec, actors []string, snapshot protocolobservation.Snapshot, now time.Time) (branchEvidence, string) {
+	value := branchEvidence{NetworkUID: snapshot.NetworkUID, InventoryDigest: snapshot.InventoryDigest,
+		ObservedAt: snapshot.ObservedAt, Current: map[string]string{}, Bindings: map[string]string{},
+		BitcoinObservations: map[string]bitcoinBranchEvidence{}, StacksObservations: map[string]stacksBurnViewEvidence{}}
+	if snapshot.UnavailableReason != "" || snapshot.ObservedAt.IsZero() || now.Sub(snapshot.ObservedAt) > maximumObservationAge ||
+		snapshot.ObservedAt.After(now.Add(5*time.Second)) {
+		return value, "IdentityObservationUnavailable"
+	}
+	if snapshot.BurnchainTopology == nil || snapshot.BurnchainTopology.Digest == "" {
+		return value, "BurnchainTopologyUnavailable"
+	}
+	value.TopologyDigest = snapshot.BurnchainTopology.Digest
+	if assertion.BitcoinBranchCohort != nil {
+		for _, actor := range actors {
+			observed, ok := snapshot.BitcoinActor(actor)
+			if !validBitcoinObservation(observed, ok) || !validBranchSource(observed.Source, snapshot.ObservedAt) {
+				return value, "BitcoinBranchObservationUnavailable"
+			}
+			value.Current[actor] = observed.BestBlockHash
+			value.BitcoinObservations[actor] = bitcoinEvidence(observed)
+			value.Sources = append(value.Sources, observed.Source)
+		}
+		if !alignedBranchSources(value.Sources) {
+			return value, "BranchObservationSkewed"
+		}
+		return value, ""
+	}
+	bindings := make(map[string]string, len(snapshot.BurnchainTopology.Bindings))
+	for _, binding := range snapshot.BurnchainTopology.Bindings {
+		bindings[binding.Actor] = binding.BitcoinNodeRef
+	}
+	for _, actor := range actors {
+		observed, ok := snapshot.Actor(actor)
+		stacksSource := observed.Source
+		stacksSource.ObservedAt = observed.ChainObservedAt
+		if !ok || observed.ChainView == nil || observed.ChainError != "" || !fixedHex(observed.ChainView.BurnConsensusHash, 40) ||
+			!validBranchSource(stacksSource, snapshot.ObservedAt) {
+			return value, "StacksBurnchainObservationUnavailable"
+		}
+		bitcoinActor, bound := bindings[actor]
+		bitcoin, available := snapshot.BitcoinActor(bitcoinActor)
+		if !bound || !validBitcoinObservation(bitcoin, available) {
+			return value, "BoundBitcoinObservationUnavailable"
+		}
+		if observed.ChainView.BurnBlockHeight != uint64(bitcoin.Height) {
+			return value, "StacksBurnchainObservationLagging"
+		}
+		value.Current[actor] = observed.ChainView.BurnConsensusHash
+		value.Bindings[actor] = bitcoinActor
+		value.StacksObservations[actor] = stacksBurnViewEvidence{
+			BurnBlockHeight: observed.ChainView.BurnBlockHeight, BurnConsensusHash: observed.ChainView.BurnConsensusHash,
+			BitcoinNodeRef: bitcoinActor, Source: stacksSource,
+		}
+		if _, recorded := value.BitcoinObservations[bitcoinActor]; !recorded {
+			value.BitcoinObservations[bitcoinActor] = bitcoinEvidence(bitcoin)
+			value.Sources = append(value.Sources, bitcoin.Source)
+		}
+		value.Sources = append(value.Sources, stacksSource)
+	}
+	if !alignedBranchSources(value.Sources) {
+		return value, "BranchObservationSkewed"
+	}
+	return value, ""
+}
+
+func validBitcoinObservation(value protocolobservation.BitcoinSnapshot, exists bool) bool {
+	return exists && value.Error == "" && value.Height >= 0 && value.Headers >= value.Height &&
+		fixedHex(value.BestBlockHash, 64) && fixedHex(value.Chainwork, 64)
+}
+
+func validBranchSource(value protocolobservation.Source, snapshotTime time.Time) bool {
+	return value.EvidenceClass == protocolobservation.EvidenceActorSelfReported && !value.ObservedAt.IsZero() &&
+		snapshotTime.Sub(value.ObservedAt) <= maximumObservationAge &&
+		!value.ObservedAt.After(snapshotTime.Add(maximumBranchObservationSkew))
+}
+
+func alignedBranchSources(values []protocolobservation.Source) bool {
+	if len(values) == 0 {
+		return false
+	}
+	earliest, latest := values[0].ObservedAt, values[0].ObservedAt
+	for _, value := range values[1:] {
+		if value.ObservedAt.Before(earliest) {
+			earliest = value.ObservedAt
+		}
+		if value.ObservedAt.After(latest) {
+			latest = value.ObservedAt
+		}
+	}
+	return latest.Sub(earliest) <= maximumBranchObservationSkew
+}
+
+func bitcoinEvidence(value protocolobservation.BitcoinSnapshot) bitcoinBranchEvidence {
+	return bitcoinBranchEvidence{
+		Height: value.Height, Headers: value.Headers, BestBlockHash: value.BestBlockHash, Chainwork: value.Chainwork,
+		ChainTips: append([]attacknetv1beta1.BurnchainChainTipStatus(nil), value.ChainTips...),
+		Peers:     append([]attacknetv1beta1.BurnchainPeerStatus(nil), value.Peers...), Source: value.Source,
+	}
+}
+
+func marshalBranchEvidence(value branchEvidence) (apixv1.JSON, error) {
+	raw, err := json.Marshal(value)
+	return apixv1.JSON{Raw: raw}, err
+}
+
+func sameBranchCohortScope(left, right branchEvidence) bool {
+	return left.NetworkUID == right.NetworkUID &&
+		left.InventoryDigest == right.InventoryDigest &&
+		left.TopologyDigest == right.TopologyDigest &&
+		sameTextKeys(left.Current, right.Current) &&
+		sameTextValues(left.Bindings, right.Bindings)
+}
+
+func sameTextKeys(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key := range left {
+		if _, ok := right[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func sameTextValues(left, right map[string]string) bool {
+	if !sameTextKeys(left, right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func fixedHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range strings.ToLower(value) {
+		if !strings.ContainsRune("0123456789abcdef", character) {
+			return false
+		}
+	}
+	return true
 }
 
 func evaluateConvergence(
@@ -436,6 +696,12 @@ func assertionKind(value attacknetv1beta1.ProtocolAssertionSpec) (string, []stri
 	if value.TelemetryCompleteness != nil {
 		set("TelemetryCompleteness", value.TelemetryCompleteness.Actors)
 	}
+	if value.BitcoinBranchCohort != nil {
+		set("BitcoinBranchCohort", value.BitcoinBranchCohort.Actors)
+	}
+	if value.StacksBurnchainCohort != nil {
+		set("StacksBurnchainCohort", value.StacksBurnchainCohort.Actors)
+	}
 	if kinds != 1 {
 		return "", nil, errors.New("exactly one protocol assertion must be configured")
 	}
@@ -444,7 +710,7 @@ func assertionKind(value attacknetv1beta1.ProtocolAssertionSpec) (string, []stri
 
 func validateActorList(selected []string, kind string) error {
 	minimumActors := 1
-	if kind == "CohortAgreement" {
+	if kind == "CohortAgreement" || kind == "BitcoinBranchCohort" || kind == "StacksBurnchainCohort" {
 		minimumActors = 2
 	}
 	if len(selected) < minimumActors || len(selected) > 64 {
@@ -466,7 +732,13 @@ func validateActorRoles(selected []string, actors map[string]string, kind string
 		if !ok {
 			return fmt.Errorf("actor %q is absent from the admitted inventory", actor)
 		}
-		if !roleSupportsMetrics(role) {
+		if kind == "BitcoinBranchCohort" && role != "burnchain" {
+			return fmt.Errorf("actor %q must have burnchain role for %s", actor, kind)
+		}
+		if kind == "StacksBurnchainCohort" && (role == "signer" || role == "burnchain") {
+			return fmt.Errorf("actor %q must have Stacks node role for %s", actor, kind)
+		}
+		if kind != "BitcoinBranchCohort" && kind != "StacksBurnchainCohort" && !roleSupportsMetrics(role) {
 			return fmt.Errorf("actor %q role %q has no protocol metrics contract", actor, role)
 		}
 		if (kind == "SignerRegistration" || kind == "SignerStateFreshness" || kind == "ProposalOutcomeVisibility") && role != "signer" {
@@ -509,6 +781,31 @@ func validateBounds(value attacknetv1beta1.ProtocolAssertionSpec, timeout time.D
 		if value.ProposalOutcomeVisibility.MinimumObserved < 1 || value.ProposalOutcomeVisibility.Window.Duration <= 0 || value.ProposalOutcomeVisibility.Window.Duration > timeout {
 			return errors.New("proposal outcome visibility requires a positive count and window within timeout")
 		}
+	case value.BitcoinBranchCohort != nil:
+		return validateBranchCohort(value.BitcoinBranchCohort, timeout)
+	case value.StacksBurnchainCohort != nil:
+		return validateBranchCohort(value.StacksBurnchainCohort, timeout)
+	}
+	return nil
+}
+
+func validateBranchCohort(value *attacknetv1beta1.BranchCohortAssertion, timeout time.Duration) error {
+	if value.Expectation != attacknetv1beta1.BranchCohortDiverged && value.Expectation != attacknetv1beta1.BranchCohortConverged {
+		return errors.New("branch cohort expectation must be Diverged or Converged")
+	}
+	if value.Expectation == attacknetv1beta1.BranchCohortDiverged {
+		minimum := value.MinimumDistinct
+		if minimum == 0 {
+			minimum = 2
+		}
+		if minimum < 2 || int(minimum) > len(value.Actors) || value.StableFor != nil {
+			return errors.New("divergence requires minimumDistinct within the actor count and no stableFor")
+		}
+	} else if value.MinimumDistinct != 0 {
+		return errors.New("convergence does not accept minimumDistinct")
+	}
+	if value.StableFor != nil && (value.StableFor.Duration <= 0 || value.StableFor.Duration > timeout) {
+		return errors.New("stableFor must be positive and within the assertion timeout")
 	}
 	return nil
 }

@@ -1,0 +1,55 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a10-split-view
+  namespace: hacknet-system
+spec:
+  networkRef: a10-qualification
+  seed: a10-multi-bitcoin-split-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - {name: split, campaignRef: a10-split-template}
+  executions:
+    - {id: partition-and-reorg, campaign: split}
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 900
+    maxCumulativeFaultSeconds: 120
+    maxActiveFaults: 2
+    maxSignerImpactPercent: 0
+    # The campaign composes one Bitcoin partition with one branch replacement.
+    maxBurnchainFaults: 2
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: PauseForTriage
+    onInconclusive: PauseForTriage
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: true
+    allowedTerminalStates: [Triaged, Remediated, Inconclusive]
+  baselineAssertions:
+    timeout: 180s
+    assertions:
+      - id: bitcoin-baseline
+        bitcoinBranchCohort: {actors: [bitcoin-a, bitcoin-b], expectation: Converged, stableFor: 10s}
+      - id: stacks-baseline
+        stacksBurnchainCohort: {actors: [follower-1, follower-b], expectation: Converged, stableFor: 10s}
+  duringAssertions:
+    timeout: 120s
+    assertions:
+      - id: bitcoin-diverged
+        bitcoinBranchCohort: {actors: [bitcoin-a, bitcoin-b], expectation: Diverged, minimumDistinct: 2}
+      - id: stacks-diverged
+        stacksBurnchainCohort: {actors: [follower-1, follower-b], expectation: Diverged, minimumDistinct: 2}
+  recoveryAssertions:
+    timeout: 300s
+    assertions:
+      - id: bitcoin-converged
+        bitcoinBranchCohort: {actors: [bitcoin-a, bitcoin-b], expectation: Converged, stableFor: 15s}
+      - id: stacks-converged
+        stacksBurnchainCohort: {actors: [follower-1, follower-b], expectation: Converged, stableFor: 15s}
+  replay: {enabled: false, requireSameResolvedImages: true, verifyExpectedFailure: true}
+  resume: {enabled: false, requireSameSeed: true, requireSameResolvedImages: true}
+  minimization: {enabled: false, strategy: FailurePrefix, maxAttempts: 0, requireFreshNetwork: true}

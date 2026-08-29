@@ -34,6 +34,7 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolobservation"
@@ -201,7 +202,7 @@ func TestTopologyManagerPublishesAndWithdrawsAdmittedInventory(t *testing.T) {
 				BitcoinImage: "example.invalid/bitcoin@sha256:" + repeat("a", 64),
 			},
 			Burnchain: attacknetv1beta1.BurnchainTopologySpec{
-				PolicyRef: corev1.LocalObjectReference{Name: policy.Name},
+				PolicyRef: attacknetv1beta1.NamedObjectReference{Name: policy.Name},
 				Nodes: []attacknetv1beta1.BitcoinNodeSpec{{
 					Name:     "bitcoin-1",
 					Config:   attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
@@ -209,6 +210,20 @@ func TestTopologyManagerPublishesAndWithdrawsAdmittedInventory(t *testing.T) {
 				}},
 			},
 		},
+	}
+	invalidPeer := network.DeepCopy()
+	invalidPeer.Name = "invalid-peer"
+	invalidPeer.Spec.Burnchain.Nodes[0].PeerRefs = []string{"missing"}
+	if err := direct.Create(ctx, invalidPeer); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted an unknown Bitcoin peer reference: %v", err)
+	}
+	sharedPolicy := network.DeepCopy()
+	sharedPolicy.Name = "shared-policy"
+	sharedPolicy.Spec.Burnchain.Nodes = append(sharedPolicy.Spec.Burnchain.Nodes, attacknetv1beta1.BitcoinNodeSpec{
+		Name: "bitcoin-2", Config: attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
+	})
+	if err := direct.Create(ctx, sharedPolicy); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted two Bitcoin nodes sharing one cadence policy: %v", err)
 	}
 	if err := direct.Create(ctx, network); err != nil {
 		t.Fatal(err)
@@ -384,7 +399,7 @@ func TestRunAndFaultManagersExecuteOneShotCampaignEndToEnd(t *testing.T) {
 		Spec: attacknetv1beta1.StacksNetworkSpec{
 			Defaults: attacknetv1beta1.NetworkDefaults{NodeImage: requested, SignerImage: requested, BitcoinImage: bitcoinRequested},
 			Burnchain: attacknetv1beta1.BurnchainTopologySpec{
-				PolicyRef: corev1.LocalObjectReference{Name: "clock"},
+				PolicyRef: attacknetv1beta1.NamedObjectReference{Name: "clock"},
 				Nodes: []attacknetv1beta1.BitcoinNodeSpec{{
 					Name: "bitcoin-1", Config: attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
 				}},
@@ -399,6 +414,19 @@ func TestRunAndFaultManagersExecuteOneShotCampaignEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := direct.Get(ctx, client.ObjectKeyFromObject(network), network); err != nil {
+		t.Fatal(err)
+	}
+	policy := &attacknetv1beta1.BurnchainPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "clock", Namespace: namespace},
+		Spec: attacknetv1beta1.BurnchainPolicySpec{
+			NetworkRef: "network", BitcoinNodeRef: "bitcoin-1", Cadence: metav1.Duration{Duration: time.Minute},
+			Destinations: []attacknetv1beta1.BurnchainDestinationSpec{{WalletName: "wallet", Address: "bcrt1qintegration"}},
+		},
+	}
+	if err := direct.Create(ctx, policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := direct.Get(ctx, client.ObjectKeyFromObject(policy), policy); err != nil {
 		t.Fatal(err)
 	}
 	controller, blockDeletion := true, true
@@ -449,6 +477,11 @@ func TestRunAndFaultManagersExecuteOneShotCampaignEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	network.Status = attacknetv1beta1.StacksNetworkStatus{ObservedGeneration: network.Generation, Phase: "Ready", DesiredActors: 2, ReadyActors: 2, InventoryReady: true, Actors: actors}
+	graph, err := burnchaintopology.Build(network, map[string]string{policy.Name: string(policy.UID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.BurnchainTopology = graph
 	setBetaInventoryDigest(t, network)
 	if err := direct.Status().Update(ctx, network); err != nil {
 		t.Fatal(err)

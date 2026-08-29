@@ -255,8 +255,21 @@ function main(argv) {
     console.log(reviewToolingDigest());
     return 0;
   }
+  if (argv[0] === 'verify-packet') {
+    const value = prefix => argv.find(argument => argument.startsWith(prefix))?.slice(prefix.length);
+    const contractPath = value('--contract=');
+    const packetPath = value('--packet=');
+    if (argv.length !== 3 || !contractPath || !packetPath) {
+      console.error('usage: phase-review.mjs verify-packet --contract=PATH --packet=PATH');
+      return 2;
+    }
+    const packet = load(packetPath);
+    validateReviewPacket(load(contractPath), packet);
+    console.log(JSON.stringify({status: 'valid', packetDigest: packet.binding.digest}));
+    return 0;
+  }
   if (argv.length < 3 || argv[0] !== 'gate') {
-    console.error('usage: phase-review.mjs tooling-digest | gate CONTRACT PACKET VERDICT...');
+    console.error('usage: phase-review.mjs tooling-digest | verify-packet --contract=PATH --packet=PATH | gate CONTRACT PACKET VERDICT...');
     return 2;
   }
   const result = evaluatePhaseGate(load(argv[1]), load(argv[2]), argv.slice(3).map(load));

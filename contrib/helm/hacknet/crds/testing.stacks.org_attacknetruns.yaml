@@ -68,6 +68,49 @@ spec:
                         ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
                         and actor-supplied success predicates are intentionally unsupported.
                       properties:
+                        bitcoinBranchCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
                         chainProgress:
                           description: |-
                             ChainProgressAssertion requires every selected actor to advance by at least
@@ -193,6 +236,49 @@ spec:
                           - actors
                           - maximumAge
                           type: object
+                        stacksBurnchainCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
                         telemetryCompleteness:
                           description: |-
                             TelemetryCompletenessAssertion requires successful collection from every
@@ -216,7 +302,9 @@ spec:
                         rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
                           ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
                           ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
-                          + (has(self.telemetryCompleteness) ? 1 : 0) == 1'
+                          + (has(self.telemetryCompleteness) ? 1 : 0) + (has(self.bitcoinBranchCohort)
+                          ? 1 : 0) + (has(self.stacksBurnchainCohort) ? 1 : 0) ==
+                          1'
                     maxItems: 32
                     minItems: 1
                     type: array
@@ -321,6 +409,49 @@ spec:
                         ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
                         and actor-supplied success predicates are intentionally unsupported.
                       properties:
+                        bitcoinBranchCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
                         chainProgress:
                           description: |-
                             ChainProgressAssertion requires every selected actor to advance by at least
@@ -446,6 +577,49 @@ spec:
                           - actors
                           - maximumAge
                           type: object
+                        stacksBurnchainCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
                         telemetryCompleteness:
                           description: |-
                             TelemetryCompletenessAssertion requires successful collection from every
@@ -469,7 +643,9 @@ spec:
                         rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
                           ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
                           ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
-                          + (has(self.telemetryCompleteness) ? 1 : 0) == 1'
+                          + (has(self.telemetryCompleteness) ? 1 : 0) + (has(self.bitcoinBranchCohort)
+                          ? 1 : 0) + (has(self.stacksBurnchainCohort) ? 1 : 0) ==
+                          1'
                     maxItems: 32
                     minItems: 1
                     type: array
@@ -644,6 +820,49 @@ spec:
                         ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
                         and actor-supplied success predicates are intentionally unsupported.
                       properties:
+                        bitcoinBranchCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
                         chainProgress:
                           description: |-
                             ChainProgressAssertion requires every selected actor to advance by at least
@@ -769,6 +988,49 @@ spec:
                           - actors
                           - maximumAge
                           type: object
+                        stacksBurnchainCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
                         telemetryCompleteness:
                           description: |-
                             TelemetryCompletenessAssertion requires successful collection from every
@@ -792,7 +1054,9 @@ spec:
                         rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
                           ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
                           ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
-                          + (has(self.telemetryCompleteness) ? 1 : 0) == 1'
+                          + (has(self.telemetryCompleteness) ? 1 : 0) + (has(self.bitcoinBranchCohort)
+                          ? 1 : 0) + (has(self.stacksBurnchainCohort) ? 1 : 0) ==
+                          1'
                     maxItems: 32
                     minItems: 1
                     type: array
@@ -1403,6 +1667,78 @@ spec:
                           - statefulSetUID
                           type: object
                         type: array
+                      burnchainTopology:
+                        description: |-
+                          AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+                          follower binding admitted for one observed StacksNetwork generation.
+                        properties:
+                          bindings:
+                            items:
+                              description: |-
+                                BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+                                process. Signer processes themselves do not consume Bitcoin RPC.
+                              properties:
+                                actor:
+                                  type: string
+                                bitcoinNodeRef:
+                                  type: string
+                              required:
+                              - actor
+                              - bitcoinNodeRef
+                              type: object
+                            type: array
+                          digest:
+                            type: string
+                          nodes:
+                            items:
+                              description: |-
+                                AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+                                peer and cadence-policy bindings.
+                              properties:
+                                name:
+                                  type: string
+                                p2pPort:
+                                  format: int32
+                                  type: integer
+                                peerRefs:
+                                  items:
+                                    type: string
+                                  type: array
+                                policyRef:
+                                  type: string
+                                policyServiceName:
+                                  type: string
+                                policyUID:
+                                  type: string
+                                rpcPort:
+                                  format: int32
+                                  type: integer
+                                serviceName:
+                                  type: string
+                              required:
+                              - name
+                              - p2pPort
+                              - policyRef
+                              - policyServiceName
+                              - policyUID
+                              - rpcPort
+                              - serviceName
+                              type: object
+                            type: array
+                          observedAt:
+                            format: date-time
+                            type: string
+                          observedGeneration:
+                            format: int64
+                            type: integer
+                          schemaVersion:
+                            type: string
+                        required:
+                        - digest
+                        - nodes
+                        - observedGeneration
+                        - schemaVersion
+                        type: object
                       digest:
                         type: string
                       observedAt:

@@ -12,7 +12,10 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
@@ -42,6 +45,39 @@ type endpointMap map[string]string
 
 func (values endpointMap) MetricsEndpoint(_ string, actor attacknetv1beta1.AdmittedActorIdentity) (string, bool) {
 	value, ok := values[actor.Name]
+	return value, ok
+}
+
+type endpointContract struct{ metrics, info map[string]string }
+
+type replacingPolicyReader struct {
+	client.Reader
+	mu   sync.Mutex
+	gets int
+}
+
+func (r *replacingPolicyReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if err := r.Reader.Get(ctx, key, object, options...); err != nil {
+		return err
+	}
+	if policy, ok := object.(*attacknetv1beta1.BurnchainPolicy); ok {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.gets++
+		if r.gets > 1 {
+			policy.UID = "replacement-policy-uid"
+		}
+	}
+	return nil
+}
+
+func (values endpointContract) MetricsEndpoint(_ string, actor attacknetv1beta1.AdmittedActorIdentity) (string, bool) {
+	value, ok := values.metrics[actor.Name]
+	return value, ok
+}
+
+func (values endpointContract) ChainInfoEndpoint(_ string, actor attacknetv1beta1.AdmittedActorIdentity) (string, bool) {
+	value, ok := values.info[actor.Name]
 	return value, ok
 }
 
@@ -96,6 +132,149 @@ func TestReaderReturnsPartialSnapshotForEndpointFailure(t *testing.T) {
 	}
 	if snapshot.Complete() || len(snapshot.Actors) != 1 || !strings.Contains(snapshot.Actors[0].Error, "HTTP 503") {
 		t.Fatalf("endpoint failure was not retained: %#v", snapshot)
+	}
+}
+
+func TestReaderJoinsStacksAndBitcoinViewsToAdmittedTopology(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	actors := []attacknetv1beta1.AdmittedActorIdentity{
+		{Name: "bitcoin-a", Role: "burnchain", ServiceName: "bitcoin-a", PodName: "bitcoin-a-0", PodUID: "btc-pod", StatefulSetUID: "btc-set", RuntimeImageID: "sha256:" + strings.Repeat("a", 64)},
+		{Name: "follower-a", Role: "follower", ServiceName: "follower-a", PodName: "follower-a-0", PodUID: "stacks-pod", RuntimeImageID: "sha256:" + strings.Repeat("b", 64)},
+	}
+	topology := &attacknetv1beta1.AdmittedBurnchainTopology{
+		Digest: "sha256:" + strings.Repeat("c", 64), ObservedGeneration: 1,
+		Nodes:    []attacknetv1beta1.AdmittedBitcoinNode{{Name: "bitcoin-a", PolicyRef: "policy-a", PolicyUID: "policy-uid"}},
+		Bindings: []attacknetv1beta1.BurnchainActorBinding{{Actor: "follower-a", BitcoinNodeRef: "bitcoin-a"}},
+	}
+	view := IdentityView{NetworkUID: "network-uid", InventoryDigest: "sha256:inventory", Namespace: "test", Actors: actors, BurnchainTopology: topology}
+	scheme := runtime.NewScheme()
+	if err := attacknetv1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	policy := &attacknetv1beta1.BurnchainPolicy{ObjectMeta: metav1.ObjectMeta{Name: "policy-a", Namespace: "test", UID: "policy-uid", Generation: 1},
+		Spec: attacknetv1beta1.BurnchainPolicySpec{NetworkRef: "network", BitcoinNodeRef: "bitcoin-a"}, Status: attacknetv1beta1.BurnchainPolicyStatus{
+			ObservedGeneration: 1, Phase: "Ready",
+			AdmittedNetworkUID: "network-uid", AdmittedBitcoinUID: "btc-set", AdmittedBitcoinImageID: "sha256:" + strings.Repeat("a", 64),
+			ObservedHeight: 250, ObservedHeaders: 250, LastBlockHash: strings.Repeat("1", 64), ObservedChainwork: strings.Repeat("2", 64),
+			BitcoinObservationAt: &metav1.Time{Time: now}, ObservedPeers: []attacknetv1beta1.BurnchainPeerStatus{{ID: 1, Address: "bitcoin-b:18444"}},
+		}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).Build()
+	reader := &Reader{APIReader: kube,
+		Identities: &identitySequence{values: []IdentityView{view, view}}, Now: func() time.Time { return now },
+		Endpoints: endpointContract{metrics: map[string]string{"follower-a": "http://actor/metrics"}, info: map[string]string{"follower-a": "http://actor/v2/info"}},
+		HTTP: httpDoer(func(request *http.Request) (*http.Response, error) {
+			body := "# TYPE stacks_node_stacks_tip_height gauge\nstacks_node_stacks_tip_height 12\n"
+			if request.URL.Path == "/v2/info" {
+				body = `{"burn_block_height":250,"pox_consensus":"` + strings.Repeat("3", 40) + `","stacks_tip_height":12,"stacks_tip":"` + strings.Repeat("4", 64) + `","stacks_tip_consensus_hash":"` + strings.Repeat("5", 40) + `","is_fully_synced":true}`
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+		})}
+	network := &attacknetv1beta1.StacksNetwork{ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: "network-uid"}}
+	snapshot, err := reader.Read(context.Background(), network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Actors[0].ChainView == nil || snapshot.Actors[0].ChainView.BurnBlockHeight != 250 {
+		t.Fatalf("Stacks chain view not retained: %#v", snapshot.Actors[0])
+	}
+	bitcoin, ok := snapshot.BitcoinActor("bitcoin-a")
+	if !ok || bitcoin.Error != "" || bitcoin.BestBlockHash != strings.Repeat("1", 64) || len(bitcoin.Peers) != 1 {
+		t.Fatalf("Bitcoin view not identity-bound: %#v", bitcoin)
+	}
+	if err := kube.Delete(context.Background(), policy); err != nil {
+		t.Fatal(err)
+	}
+	replacement := policy.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.UID = "replacement-policy-uid"
+	if err := kube.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	reader.Identities = &identitySequence{values: []IdentityView{view, view}}
+	if _, err = reader.Read(context.Background(), network); err == nil || !strings.Contains(err.Error(), "admitted identity changed") {
+		t.Fatalf("replacement policy was not rejected against the admitted graph: %v", err)
+	}
+}
+
+func TestReaderRejectsBurnchainPolicyReplacementDuringCollection(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	bitcoin := attacknetv1beta1.AdmittedActorIdentity{
+		Name: "bitcoin-a", Role: "burnchain", StatefulSetUID: "btc-set",
+		RuntimeImageID: "sha256:" + strings.Repeat("a", 64),
+	}
+	topology := &attacknetv1beta1.AdmittedBurnchainTopology{
+		Digest: "sha256:" + strings.Repeat("c", 64), ObservedGeneration: 1,
+		Nodes: []attacknetv1beta1.AdmittedBitcoinNode{{Name: "bitcoin-a", PolicyRef: "policy-a", PolicyUID: "policy-uid"}},
+	}
+	view := IdentityView{
+		NetworkUID: "network-uid", InventoryDigest: "sha256:inventory", Namespace: "test",
+		Actors: []attacknetv1beta1.AdmittedActorIdentity{bitcoin}, BurnchainTopology: topology,
+	}
+	scheme := runtime.NewScheme()
+	if err := attacknetv1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	policy := &attacknetv1beta1.BurnchainPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "policy-a", Namespace: "test", UID: "policy-uid", Generation: 1},
+		Spec:       attacknetv1beta1.BurnchainPolicySpec{NetworkRef: "network", BitcoinNodeRef: "bitcoin-a"},
+		Status: attacknetv1beta1.BurnchainPolicyStatus{
+			ObservedGeneration: 1, Phase: "Ready", AdmittedNetworkUID: "network-uid",
+			AdmittedBitcoinUID: "btc-set", AdmittedBitcoinImageID: bitcoin.RuntimeImageID,
+			ObservedHeight: 250, ObservedHeaders: 250, LastBlockHash: strings.Repeat("1", 64),
+			ObservedChainwork: strings.Repeat("2", 64), BitcoinObservationAt: &metav1.Time{Time: now},
+		},
+	}
+	direct := &replacingPolicyReader{Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).Build()}
+	reader := &Reader{
+		APIReader: direct, Identities: &identitySequence{values: []IdentityView{view, view}},
+		Now: func() time.Time { return now },
+	}
+	network := &attacknetv1beta1.StacksNetwork{ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: "network-uid"}}
+	if _, err := reader.Read(context.Background(), network); err == nil || !strings.Contains(err.Error(), "identity changed during collection") {
+		t.Fatalf("BurnchainPolicy replacement during observation was accepted: %v", err)
+	}
+}
+
+func TestReaderCollectsStacksChainViewsConcurrently(t *testing.T) {
+	identities := []attacknetv1beta1.AdmittedActorIdentity{
+		{Name: "follower-a", Role: "follower"},
+		{Name: "follower-b", Role: "follower"},
+	}
+	actors := []ActorSnapshot{
+		{Source: Source{Actor: "follower-a"}},
+		{Source: Source{Actor: "follower-b"}},
+	}
+	started := make(chan struct{}, len(actors))
+	release := make(chan struct{})
+	go func() {
+		for range actors {
+			<-started
+		}
+		close(release)
+	}()
+	reader := &Reader{
+		Endpoints: endpointContract{info: map[string]string{
+			"follower-a": "http://actor-a/v2/info",
+			"follower-b": "http://actor-b/v2/info",
+		}},
+		HTTP: httpDoer(func(request *http.Request) (*http.Response, error) {
+			started <- struct{}{}
+			select {
+			case <-release:
+			case <-request.Context().Done():
+				return nil, request.Context().Err()
+			}
+			body := `{"burn_block_height":250,"pox_consensus":"` + strings.Repeat("3", 40) + `","stacks_tip_height":12,"stacks_tip":"` + strings.Repeat("4", 64) + `","stacks_tip_consensus_hash":"` + strings.Repeat("5", 40) + `","is_fully_synced":true}`
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+		}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	reader.collectChainViews(ctx, "test", identities, actors)
+	for _, actor := range actors {
+		if actor.ChainView == nil || actor.ChainError != "" {
+			t.Fatalf("concurrent chain observation was not retained: %#v", actor)
+		}
 	}
 }
 

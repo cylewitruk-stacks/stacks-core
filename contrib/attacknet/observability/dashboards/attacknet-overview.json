@@ -477,6 +477,80 @@
       "targets": [{"expr": "attacknet_fault_action_info{network=\"$network\"}", "legendFormat": "{{campaign}} · {{stage}}/{{action}} · {{type}} · {{phase}} · {{reason}}", "refId": "A"}],
       "title": "Typed fault action lifecycle (trusted)",
       "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Canonical height reported by each admitted Bitcoin policy clock. Height is separate from branch identity and cumulative work because those signals have different scales.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}}, "overrides": []},
+      "gridPos": {"h": 9, "w": 6, "x": 0, "y": 152},
+      "id": 35,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "attacknet_burnchain_clock_bitcoin_height{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "{{attacknet_actor}}", "refId": "A"}],
+      "title": "Bitcoin heights",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Connected peer and locally-known branch-tip counts for each admitted Bitcoin node. Use with the branch-cohort panel to distinguish transport isolation from an actual competing branch.",
+      "fieldConfig": {"defaults": {"color": {"mode": "continuous-BlPu"}, "min": 0}, "overrides": []},
+      "gridPos": {"h": 9, "w": 6, "x": 6, "y": 152},
+      "id": 36,
+      "options": {"displayMode": "gradient", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true},
+      "targets": [
+        {"expr": "attacknet_burnchain_clock_connected_peers{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "peers {{attacknet_actor}}", "refId": "A"},
+        {"expr": "attacknet_burnchain_clock_chain_tips{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "tips {{attacknet_actor}}", "refId": "B"}
+      ],
+      "title": "Bitcoin graph health",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "A bounded 52-bit visualization fingerprint of each full best-block hash. Equal values indicate the same branch; full hashes remain in protocol evidence and are never metric labels.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}}, "overrides": []},
+      "gridPos": {"h": 9, "w": 6, "x": 12, "y": 152},
+      "id": 37,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "attacknet_burnchain_clock_branch_fingerprint{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "{{attacknet_actor}}", "refId": "A"}],
+      "title": "Bitcoin branch fingerprints",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Base-2 logarithm of cumulative work. It is suitable for cohort visualization only; exact 256-bit chainwork remains in structured assertion evidence.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}}, "overrides": []},
+      "gridPos": {"h": 9, "w": 6, "x": 18, "y": 152},
+      "id": 38,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "attacknet_burnchain_clock_chainwork_log2{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "{{attacknet_actor}}", "refId": "A"}],
+      "title": "Bitcoin cumulative work (log2)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Bounded 52-bit visualization fingerprints from identity-bound, actor-self-reported Stacks /v2/info observations used by each run gate. Equal values indicate the same burn view; full consensus hashes and exact heights remain in structured protocol evidence.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "spanNulls": false}}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 161},
+      "id": 39,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "attacknet_run_stacks_burn_view_fingerprint{network=\"$network\",actor=~\"$actor\"}", "legendFormat": "{{run}} · {{gate}} · {{actor}} → {{bitcoin_node}}", "refId": "A"}],
+      "title": "Bound Stacks burn-view fingerprints",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Trusted topology-operator view of Bitcoin nodes, directed persistent P2P edges, and Stacks actor bindings. Compare this intended graph with actor-reported peer counts and branch state during partitions.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 170},
+      "id": 40,
+      "options": {"cellHeight": "sm", "footer": {"countRows": true, "fields": "", "reducer": ["count"], "show": true}, "showHeader": true},
+      "targets": [
+        {"expr": "attacknet_burnchain_node_info{network=\"$network\"}", "format": "table", "instant": true, "refId": "A"},
+        {"expr": "attacknet_burnchain_topology_edge_info{network=\"$network\"}", "format": "table", "instant": true, "refId": "B"},
+        {"expr": "attacknet_burnchain_actor_binding_info{network=\"$network\"}", "format": "table", "instant": true, "refId": "C"}
+      ],
+      "title": "Admitted Bitcoin graph and Stacks bindings (trusted)",
+      "transformations": [{"id": "merge", "options": {}}, {"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"actor": "Stacks actor", "bitcoin_node": "Bitcoin node", "policy": "Policy", "policy_service": "Policy service", "policy_uid": "Policy UID", "service": "Bitcoin service", "source": "Edge source", "target": "Edge target"}}}],
+      "type": "table"
     }
   ],
   "refresh": "5s",

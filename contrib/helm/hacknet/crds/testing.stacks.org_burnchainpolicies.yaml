@@ -175,6 +175,16 @@ spec:
                 - message: protocolSchedule must declare both epoch and reward-cycle
                     geometry
                   rule: self.epochs.size() > 0 && has(self.rewardCycle)
+              reserveOutputs:
+                default: 4
+                description: |-
+                  ReserveOutputs controls the initial coinbase outputs mined by this
+                  policy. Set it to zero on secondary Bitcoin nodes so only one policy
+                  establishes the shared regtest chain.
+                format: int32
+                maximum: 10000
+                minimum: 0
+                type: integer
               rpc:
                 description: BurnchainRPCSpec configures bounded RPC retry behavior.
                 properties:
@@ -236,6 +246,11 @@ spec:
               appliedFlashId:
                 type: string
               appliedPolicyDigest:
+                type: string
+              bitcoinObservationAt:
+                format: date-time
+                type: string
+              bitcoinObservationError:
                 type: string
               conditions:
                 items:
@@ -300,18 +315,98 @@ spec:
                 format: date-time
                 type: string
               lastBlockHash:
+                pattern: ^$|^[0-9a-fA-F]{64}$
                 type: string
               lastSuccessAt:
                 format: date-time
                 type: string
               message:
                 type: string
+              observedChainTips:
+                items:
+                  description: BurnchainChainTipStatus is one bounded branch observed
+                    by Bitcoin Core.
+                  properties:
+                    branchLength:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    hash:
+                      maxLength: 64
+                      minLength: 64
+                      pattern: ^[0-9a-fA-F]{64}$
+                      type: string
+                    height:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    status:
+                      maxLength: 32
+                      minLength: 1
+                      type: string
+                  required:
+                  - branchLength
+                  - hash
+                  - height
+                  - status
+                  type: object
+                maxItems: 32
+                type: array
+              observedChainwork:
+                pattern: ^$|^[0-9a-fA-F]{64}$
+                type: string
               observedGeneration:
+                format: int64
+                type: integer
+              observedHeaders:
                 format: int64
                 type: integer
               observedHeight:
                 format: int64
                 type: integer
+              observedPeers:
+                items:
+                  description: BurnchainPeerStatus identifies one currently connected
+                    Bitcoin peer.
+                  properties:
+                    address:
+                      maxLength: 256
+                      minLength: 1
+                      type: string
+                    connectionType:
+                      maxLength: 64
+                      minLength: 1
+                      type: string
+                    id:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    inbound:
+                      type: boolean
+                    lastBlock:
+                      description: |-
+                        LastBlock is Bitcoin Core's Unix timestamp for the latest block message
+                        received from this peer, or zero when none has been observed.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    lastTransaction:
+                      description: |-
+                        LastTransaction is Bitcoin Core's Unix timestamp for the latest
+                        transaction message received from this peer, or zero when absent.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                  required:
+                  - address
+                  - connectionType
+                  - id
+                  - inbound
+                  - lastBlock
+                  - lastTransaction
+                  type: object
+                maxItems: 128
+                type: array
               phase:
                 type: string
               reason:

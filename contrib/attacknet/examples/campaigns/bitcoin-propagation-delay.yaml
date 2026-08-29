@@ -1,0 +1,34 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: bitcoin-propagation-delay
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowBurnchain: true
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: delay-bitcoin-edge
+      faults:
+        - id: delay-bitcoin-a-to-b
+          target:
+            actors: [bitcoin-a]
+            mode: all
+          fault:
+            type: network
+            action: delay
+            mode: all
+            duration: 30s
+            parameters:
+              direction: both
+              peerTarget:
+                actors: [bitcoin-b]
+                mode: all
+              delay:
+                latency: 750ms
+                correlation: "0"
+                jitter: 100ms

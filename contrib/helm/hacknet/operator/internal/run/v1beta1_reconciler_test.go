@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -15,8 +16,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/canonical"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
 )
 
@@ -24,6 +29,12 @@ type staticObservationReader struct{ snapshot ObservationSnapshot }
 
 func (r staticObservationReader) Read(context.Context, *attacknetv1beta1.AttacknetRun, *attacknetv1beta1.StacksNetwork) (ObservationSnapshot, error) {
 	return r.snapshot, nil
+}
+
+type errorSignerResolver struct{ err error }
+
+func (resolver errorSignerResolver) Resolve(context.Context, *attacknetv1alpha1.StacksNetwork, []corev1.Pod) (signerset.Result, error) {
+	return signerset.Result{}, resolver.err
 }
 
 type staleCampaignListReader struct {
@@ -46,7 +57,7 @@ func TestBetaReconcilerResumesDAGFromDurableChildState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	network, pod := betaLiveNetworkFixture()
+	network, minerPod, bitcoinPod := betaLiveNetworkFixture(t)
 	run.Spec.NetworkRef = network.Name
 	schedule.Network.Name = network.Name
 	schedule.Network.UID = string(network.UID)
@@ -70,7 +81,7 @@ func TestBetaReconcilerResumesDAGFromDurableChildState(t *testing.T) {
 	_ = attacknetv1beta1.AddToScheme(scheme)
 	kube := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.AttacknetRun{}, &attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(run, network, pod).Build()
+		WithObjects(run, network, minerPod, bitcoinPod).Build()
 	store := betaScheduleStore{writer: kube, reader: kube}
 	reference, err := store.persist(context.Background(), run, schedule)
 	if err != nil {
@@ -154,6 +165,37 @@ func TestBetaReconcilerResumesDAGFromDurableChildState(t *testing.T) {
 	}
 	if len(storedRun.Status.Decisions) != 1 || len(storedRun.Status.TriggerReceipts) != 2 || len(storedRun.Status.ActiveChildren) != 1 {
 		t.Fatalf("durable decisions/receipts/active set are incomplete: %#v", storedRun.Status)
+	}
+}
+
+func TestBetaReconcilerReportsTransientSignerSetObservationAsPending(t *testing.T) {
+	run, _, _, templates, _ := betaScheduleFixture()
+	run.Finalizers = []string{betaRunFinalizer}
+	network, stacksPod, bitcoinPod := betaLiveNetworkFixture(t)
+	run.Spec.NetworkRef = network.Name
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = attacknetv1beta1.AddToScheme(scheme)
+	objects := []client.Object{run, network, stacksPod, bitcoinPod, templates["partition"]}
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&attacknetv1beta1.AttacknetRun{}, &attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
+		WithObjects(objects...).Build()
+	transient := &signerset.TransientError{Err: errors.New("HTTP 404: No such chain tip")}
+	reconciler := &V1Beta1Reconciler{Client: kube, APIReader: kube, Scheme: scheme, SignerSets: errorSignerResolver{err: transient}}
+	result, err := reconciler.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: run.Namespace, Name: run.Name}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != betaDependencyRequeue {
+		t.Fatalf("transient observation requeue = %s, want %s", result.RequeueAfter, betaDependencyRequeue)
+	}
+	updated := &attacknetv1beta1.AttacknetRun{}
+	if err := kube.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: run.Name}, updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != "Pending" || updated.Status.Reason != "SignerSetObservationPending" || updated.Status.Message != transient.Error() {
+		t.Fatalf("transient signer-set observation was not reported truthfully: %#v", updated.Status)
 	}
 }
 
@@ -304,14 +346,16 @@ func TestBetaDependencyEffectiveAcceptsProvenControllerEvidence(t *testing.T) {
 	}
 }
 
-func betaLiveNetworkFixture() (*attacknetv1beta1.StacksNetwork, *corev1.Pod) {
+func betaLiveNetworkFixture(t *testing.T) (*attacknetv1beta1.StacksNetwork, *corev1.Pod, *corev1.Pod) {
+	t.Helper()
 	imageID := "containerd://sha256:" + repeat("a", 64)
+	bitcoinImageID := "containerd://sha256:" + repeat("b", 64)
 	network := &attacknetv1beta1.StacksNetwork{
 		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: "network-uid", Generation: 3, ResourceVersion: "1"},
 		Spec: attacknetv1beta1.StacksNetworkSpec{
 			Defaults: attacknetv1beta1.NetworkDefaults{NodeImage: "stacks:test", BitcoinImage: "bitcoin:test"},
 			Burnchain: attacknetv1beta1.BurnchainTopologySpec{
-				PolicyRef: corev1.LocalObjectReference{Name: "burnchain-policy"},
+				PolicyRef: attacknetv1beta1.NamedObjectReference{Name: "burnchain-policy"},
 				Nodes: []attacknetv1beta1.BitcoinNodeSpec{{
 					Name: "bitcoin-1", Config: attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
 				}},
@@ -323,23 +367,56 @@ func betaLiveNetworkFixture() (*attacknetv1beta1.StacksNetwork, *corev1.Pod) {
 		},
 		Status: attacknetv1beta1.StacksNetworkStatus{
 			Phase: "Ready", ObservedGeneration: 3, InventoryReady: true,
-			InventoryDigest: "sha256:6c0e760de34bc3e4877a126557f98f2f1b78bf94c8755147a07396130ce63cff",
 			Actors: []attacknetv1beta1.ActorStatus{{
-				Name: "miner-1", Role: "miner", ResourceName: "demo-miner-1", Image: "stacks:test",
+				Name: "bitcoin-1", Role: "burnchain", ResourceName: "demo-bitcoin-1", Image: "bitcoin:test",
+				Ready: true, ReadyReplicas: 1, UpdatedReplicas: 1, Generation: 1, ObservedGeneration: 1,
+				CurrentRevision: "btc-rev-1", UpdateRevision: "btc-rev-1", ServiceName: "demo-bitcoin-1", StatefulSetUID: "btc-sts-1",
+				PodName: "demo-bitcoin-1-0", PodUID: "btc-pod-1", RuntimeImageID: bitcoinImageID, IdentityReady: true,
+			}, {
+				Name: "miner-1", Role: "follower", ResourceName: "demo-miner-1", Image: "stacks:test",
 				Ready: true, ReadyReplicas: 1, UpdatedReplicas: 1, Generation: 1, ObservedGeneration: 1,
 				CurrentRevision: "rev-1", UpdateRevision: "rev-1", ServiceName: "demo-miner-1", StatefulSetUID: "sts-1",
 				PodName: "demo-miner-1-0", PodUID: "pod-1", RuntimeImageID: imageID, IdentityReady: true,
 			}},
 		},
 	}
-	pod := &corev1.Pod{
+	legacy := &attacknetv1alpha1.StacksNetwork{
+		ObjectMeta: *network.ObjectMeta.DeepCopy(),
+		Spec: attacknetv1alpha1.StacksNetworkSpec{Actors: []attacknetv1alpha1.ActorSpec{
+			{Name: "bitcoin-1", Role: "burnchain"}, {Name: "miner-1", Role: "follower"},
+		}},
+		Status: attacknetv1alpha1.StacksNetworkStatus{ObservedGeneration: 3, InventoryReady: true, Actors: []attacknetv1alpha1.ActorStatus{
+			{Name: "bitcoin-1", Role: "burnchain", ResourceName: "demo-bitcoin-1", Image: "bitcoin:test", ServiceName: "demo-bitcoin-1", StatefulSetUID: "btc-sts-1", CurrentRevision: "btc-rev-1", PodName: "demo-bitcoin-1-0", PodUID: "btc-pod-1", RuntimeImageID: bitcoinImageID, IdentityReady: true},
+			{Name: "miner-1", Role: "follower", ResourceName: "demo-miner-1", Image: "stacks:test", ServiceName: "demo-miner-1", StatefulSetUID: "sts-1", CurrentRevision: "rev-1", PodName: "demo-miner-1-0", PodUID: "pod-1", RuntimeImageID: imageID, IdentityReady: true},
+		}},
+	}
+	payload, err := inventory.Build(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.InventoryDigest, err = inventory.Digest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.BurnchainTopology, err = burnchaintopology.Build(network, map[string]string{"burnchain-policy": "clock-uid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo-miner-1-0", Namespace: "test", UID: "pod-1", Labels: map[string]string{"testing.stacks.org/network": "network", "testing.stacks.org/actor": "miner-1"}},
 		Status:     corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "actor", ImageID: imageID}}},
 	}
-	return network, pod
+	bitcoinPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo-bitcoin-1-0", Namespace: "test", UID: "btc-pod-1", Labels: map[string]string{"testing.stacks.org/network": "network", "testing.stacks.org/actor": "bitcoin-1"}},
+		Status:     corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "actor", ImageID: bitcoinImageID}}},
+	}
+	return network, minerPod, bitcoinPod
 }
 
 func networkInventory(network *attacknetv1beta1.StacksNetwork) *attacknetv1beta1.NetworkInventory {
-	actor := network.Status.Actors[0]
-	return &attacknetv1beta1.NetworkInventory{Digest: network.Status.InventoryDigest, ObservedGeneration: network.Generation, Actors: []attacknetv1beta1.AdmittedActorIdentity{{Name: actor.Name, Role: actor.Role, ServiceName: actor.ServiceName, StatefulSetName: actor.ResourceName, StatefulSetUID: actor.StatefulSetUID, ControllerRevision: actor.CurrentRevision, PodName: actor.PodName, PodUID: actor.PodUID, RequestedImage: actor.Image, RuntimeImageID: actor.RuntimeImageID}}}
+	result, err := inventory.BetaPublished(network)
+	if err != nil {
+		panic(err)
+	}
+	return &result
 }

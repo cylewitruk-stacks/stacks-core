@@ -5,9 +5,9 @@ metadata:
 spec:
   networkRef: accepted-28
   bitcoinNodeRef: bitcoin
-  # Stop before the configured Stacks epoch transitions so protocol actors can
-  # observe and produce the anchor history instead of joining after it.
-  bootstrapHeight: 202
+  # Release actors once funding is mature, leaving the pre-epoch interval for
+  # sync, stacking, signer startup, and the first Stacks blocks.
+  bootstrapHeight: 101
   cadence: 5s
   destinationSelection: round-robin
   destinations:

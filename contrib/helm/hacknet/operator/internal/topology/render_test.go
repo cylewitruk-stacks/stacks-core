@@ -224,6 +224,12 @@ func TestRenderRejectsAmbiguousSourcesUnknownDependenciesAndBadPorts(t *testing.
 		{name: "unexposed dependency port", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
 			network.Spec.Actors[1].Dependencies = []attacknetv1alpha1.ActorDependency{{Actor: "signer-1", Port: 1}}
 		}},
+		{name: "ambiguous dependency target", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
+			network.Spec.Actors[1].Dependencies = []attacknetv1alpha1.ActorDependency{{Actor: "signer-1", Service: "clock-clock", Port: 30000}}
+		}},
+		{name: "invalid dependency service", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
+			network.Spec.Actors[1].Dependencies = []attacknetv1alpha1.ActorDependency{{Service: "Bad_Service", Port: 18500}}
+		}},
 		{name: "duplicate port", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
 			network.Spec.Actors[1].Ports = []attacknetv1alpha1.ActorPort{{Name: "rpc", ContainerPort: 1}, {Name: "rpc", ContainerPort: 2}}
 		}},
@@ -244,6 +250,20 @@ func TestRenderRejectsAmbiguousSourcesUnknownDependenciesAndBadPorts(t *testing.
 				t.Fatal("invalid network rendered")
 			}
 		})
+	}
+}
+
+func TestRenderSameNamespaceServiceDependency(t *testing.T) {
+	network := testNetwork()
+	network.Spec.Actors[1].Dependencies = []attacknetv1alpha1.ActorDependency{{Service: "clock-clock", Port: 18500}}
+	resources, err := Render(network, testScheme(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statefulSet := resources.StatefulSets[1]
+	command := strings.Join(statefulSet.Spec.Template.Spec.InitContainers[0].Command, " ")
+	if !strings.Contains(command, "nc -z clock-clock 18500") {
+		t.Fatalf("Service dependency command = %q", command)
 	}
 }
 

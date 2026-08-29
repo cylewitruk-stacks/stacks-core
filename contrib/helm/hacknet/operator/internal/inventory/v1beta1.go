@@ -1,8 +1,11 @@
 package inventory
 
 import (
+	"fmt"
+
 	testingv1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	testingv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -14,6 +17,15 @@ func BetaPublished(network *testingv1beta1.StacksNetwork) (testingv1beta1.Networ
 	published, err := Published(legacy)
 	if err != nil {
 		return testingv1beta1.NetworkInventory{}, err
+	}
+	if len(network.Spec.Burnchain.Nodes) > 0 {
+		graph, err := burnchaintopology.Published(network)
+		if err != nil {
+			return testingv1beta1.NetworkInventory{}, err
+		}
+		result := betaInventory(published)
+		result.BurnchainTopology = graph
+		return result, nil
 	}
 	return betaInventory(published), nil
 }
@@ -30,7 +42,25 @@ func BetaCompareLive(expected testingv1beta1.NetworkInventory, network *testingv
 			Current: difference.Current, Message: difference.Message,
 		}
 	}
+	if len(network.Spec.Burnchain.Nodes) > 0 || expected.BurnchainTopology != nil {
+		current, err := burnchaintopology.Published(network)
+		if err != nil {
+			result = append(result, testingv1beta1.IdentityDifference{Scope: "burnchainTopology", Field: "digest", Expected: burnchainDigest(expected.BurnchainTopology), Message: err.Error()})
+		} else if expected.BurnchainTopology == nil || expected.BurnchainTopology.Digest != current.Digest {
+			result = append(result, testingv1beta1.IdentityDifference{
+				Scope: "burnchainTopology", Field: "digest", Expected: burnchainDigest(expected.BurnchainTopology),
+				Current: current.Digest, Message: fmt.Sprintf("admitted burnchain topology changed from %s to %s", burnchainDigest(expected.BurnchainTopology), current.Digest),
+			})
+		}
+	}
 	return result
+}
+
+func burnchainDigest(value *testingv1beta1.AdmittedBurnchainTopology) string {
+	if value == nil {
+		return ""
+	}
+	return value.Digest
 }
 
 func betaNetworkAsLegacy(network *testingv1beta1.StacksNetwork) *testingv1.StacksNetwork {

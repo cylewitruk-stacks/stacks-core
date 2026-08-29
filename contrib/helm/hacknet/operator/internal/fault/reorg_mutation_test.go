@@ -19,6 +19,7 @@ import (
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchain"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchainworker"
 )
 
@@ -88,9 +89,16 @@ func TestBurnchainReorgWorkerPausesAndRestoresExactPolicy(t *testing.T) {
 	}
 	network := &attacknetv1beta1.StacksNetwork{
 		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test"},
-		Spec:       attacknetv1beta1.StacksNetworkSpec{Defaults: attacknetv1beta1.NetworkDefaults{}, Burnchain: attacknetv1beta1.BurnchainTopologySpec{PolicyRef: corev1.LocalObjectReference{Name: "clock"}, Nodes: []attacknetv1beta1.BitcoinNodeSpec{{Name: "bitcoin-1", RPCPort: 18443}}}},
-		Status:     attacknetv1beta1.StacksNetworkStatus{Actors: []attacknetv1beta1.ActorStatus{{Name: "bitcoin-1", Role: "burnchain", ServiceName: "network-bitcoin-1"}}},
+		Spec:       attacknetv1beta1.StacksNetworkSpec{Defaults: attacknetv1beta1.NetworkDefaults{}, Burnchain: attacknetv1beta1.BurnchainTopologySpec{PolicyRef: attacknetv1beta1.NamedObjectReference{Name: "clock"}, Nodes: []attacknetv1beta1.BitcoinNodeSpec{{Name: "bitcoin-1", RPCPort: 18443}}}},
+		Status: attacknetv1beta1.StacksNetworkStatus{Actors: []attacknetv1beta1.ActorStatus{{
+			Name: "bitcoin-1", Role: "burnchain", ServiceName: "network-bitcoin-1", IdentityReady: true,
+		}}},
 	}
+	graph, err := burnchaintopology.Build(network, map[string]string{"clock": "policy-uid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.BurnchainTopology = graph
 	resource := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "testing.stacks.org/internal", "kind": "BurnchainReorgWorker",
 		"metadata": map[string]any{"name": "campaign-reorg-replace", "namespace": "test", "labels": map[string]any{"testing.stacks.org/stage": "reorg"}},

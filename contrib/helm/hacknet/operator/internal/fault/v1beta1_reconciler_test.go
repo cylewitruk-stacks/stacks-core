@@ -25,6 +25,7 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
 )
@@ -92,7 +93,7 @@ func TestV1Beta1CampaignInjectsDistinctMechanismsConcurrentlyAndResumes(t *testi
 	}
 	base := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject()).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject()).Build()
 	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: campaign.Namespace, Name: campaign.Name}}
 	if err := base.Create(context.Background(), campaign); err != nil {
 		t.Fatal(err)
@@ -130,7 +131,7 @@ func TestV1Beta1EffectAssertionRetriesUntilObserved(t *testing.T) {
 	campaign.Spec.EffectAssertions = []attacknetv1beta1.CampaignAssertion{{Type: "DNSDegraded", Action: "dns", TimeoutSeconds: 30}}
 	base := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject(), campaign).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
 	probe := &betaProbeClient{calls: map[string]int{}, effectAtCall: 2}
 	reconcile := func() {
@@ -182,7 +183,7 @@ func TestV1Beta1EffectAssertionBecomesInconclusiveAtDeadline(t *testing.T) {
 	campaign.Spec.EffectAssertions = []attacknetv1beta1.CampaignAssertion{{Type: "DNSDegraded", Action: "dns", TimeoutSeconds: 1}}
 	base := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject(), campaign).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
 	probe := &betaProbeClient{calls: map[string]int{}, effectAtCall: 999}
 	reconcile := func() {
@@ -230,7 +231,7 @@ func TestV1Beta1UnsafeAggregateFailsBeforeMutation(t *testing.T) {
 	campaign.Spec.Safety.MaxConcurrentFaults = 1
 	base := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject(), campaign).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
 	reconcileBetaUntil(t, base, scheme, request, &now, 2)
 	assertBetaPhase(t, base, request.NamespacedName, "Failed")
@@ -253,7 +254,7 @@ func TestV1Beta1PartialInjectionRollsBackCreatedMutations(t *testing.T) {
 	})
 	underlying := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject(), campaign).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
 	failing := &failKindClient{Client: underlying, kind: "DNSChaos"}
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
 	for index := 0; index < 3; index++ {
@@ -277,7 +278,7 @@ func TestV1Beta1AdmissionChangeCleansMutationFromDurableStatus(t *testing.T) {
 	campaign := betaFaultCampaign("spec-change", []attacknetv1beta1.FaultActionSpec{betaChaosAction("network", "network", "delay")})
 	base := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject(), campaign).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
 	reconcileBetaUntil(t, base, scheme, request, &now, 3)
 
@@ -309,7 +310,7 @@ func TestV1Beta1FinalizerCleansMutationBeforeCampaignDeletion(t *testing.T) {
 	campaign := betaFaultCampaign("delete", []attacknetv1beta1.FaultActionSpec{betaChaosAction("network", "network", "delay")})
 	base := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject(), campaign).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
 	reconcileBetaUntil(t, base, scheme, request, &now, 3)
 
@@ -490,7 +491,7 @@ func TestV1Beta1ObservationSourceFailureDoesNotLosePriorInjection(t *testing.T) 
 	}}
 	base := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
-		WithObjects(network, pods[0], pods[1], environmentLeaseObject(), campaign).Build()
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
 	for index := 0; index < 3; index++ {
 		reconciler := betaFaultReconciler(base, base, scheme, &now)
@@ -643,7 +644,7 @@ func betaFaultNetwork(t *testing.T) (*attacknetv1beta1.StacksNetwork, []*corev1.
 		Spec: attacknetv1beta1.StacksNetworkSpec{
 			Defaults: attacknetv1beta1.NetworkDefaults{NodeImage: "node:test", SignerImage: "signer:test", BitcoinImage: "bitcoin:test"},
 			Burnchain: attacknetv1beta1.BurnchainTopologySpec{
-				PolicyRef: corev1.LocalObjectReference{Name: "clock"},
+				PolicyRef: attacknetv1beta1.NamedObjectReference{Name: "clock"},
 				Nodes:     []attacknetv1beta1.BitcoinNodeSpec{{Name: "bitcoin-1", Config: betaConfig("bitcoin")}},
 			},
 			Nodes: []attacknetv1beta1.StacksNodeSpec{{Name: "miner-1", Role: attacknetv1beta1.StacksNodeMiner, BurnchainNodeRef: "bitcoin-1", Config: betaConfig("miner")}},
@@ -679,6 +680,10 @@ func betaFaultNetwork(t *testing.T) (*attacknetv1beta1.StacksNetwork, []*corev1.
 	if err != nil {
 		t.Fatal(err)
 	}
+	network.Status.BurnchainTopology, err = burnchaintopology.Build(network, map[string]string{"clock": "clock-uid"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "network-miner-1-0", Namespace: "test", UID: "pod-uid", Labels: map[string]string{NetworkLabel: "network", ActorLabel: "miner-1", RoleLabel: "miner"}},
 		Spec:       corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{Name: "actor", Image: "node:test"}}},
@@ -690,6 +695,36 @@ func betaFaultNetwork(t *testing.T) (*attacknetv1beta1.StacksNetwork, []*corev1.
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.2", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}, ContainerStatuses: []corev1.ContainerStatus{{Name: "actor", Ready: true, ImageID: bitcoinImageID}}},
 	}
 	return network, []*corev1.Pod{pod, bitcoinPod}
+}
+
+func betaFaultPolicy(network *attacknetv1beta1.StacksNetwork) *attacknetv1beta1.BurnchainPolicy {
+	return &attacknetv1beta1.BurnchainPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "clock", Namespace: network.Namespace, UID: "clock-uid"},
+		Spec: attacknetv1beta1.BurnchainPolicySpec{
+			NetworkRef: network.Name, BitcoinNodeRef: "bitcoin-1",
+		},
+	}
+}
+
+func TestV1Beta1IdentityCheckRejectsLiveBurnchainPolicyReplacement(t *testing.T) {
+	scheme := betaFaultScheme(t)
+	network, podPointers := betaFaultNetwork(t)
+	expected, err := inventory.BetaPublished(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := betaFaultPolicy(network)
+	replacement.UID = "replacement-clock-uid"
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(replacement).Build()
+	reconciler := &V1Beta1Reconciler{APIReader: reader}
+	pods := []corev1.Pod{*podPointers[0], *podPointers[1]}
+	differences, err := reconciler.betaIdentityDifferences(context.Background(), expected, network, pods, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(differences) != 1 || differences[0].Scope != "burnchainPolicy/bitcoin-1" || differences[0].Current != "replacement-clock-uid" {
+		t.Fatalf("live BurnchainPolicy replacement was not isolated: %#v", differences)
+	}
 }
 
 func betaConfig(name string) attacknetv1beta1.ConfigSource {

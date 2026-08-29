@@ -1196,13 +1196,43 @@ spec:
                         image:
                           type: string
                         name:
+                          maxLength: 63
                           pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
                           type: string
                         p2pPort:
                           format: int32
+                          maximum: 65535
+                          minimum: 1
                           type: integer
+                        peerRefs:
+                          description: |-
+                            PeerRefs is the directed persistent Bitcoin P2P graph. References are
+                            rendered as addnode connections and are not startup dependencies.
+                          items:
+                            maxLength: 63
+                            pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                            type: string
+                          maxItems: 31
+                          type: array
+                          x-kubernetes-list-type: set
+                        policyRef:
+                          description: |-
+                            PolicyRef selects this node's independent cadence policy. An omitted
+                            value uses spec.burnchain.policyRef for backward-compatible single-node
+                            topologies.
+                          properties:
+                            name:
+                              maxLength: 63
+                              minLength: 1
+                              pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                              type: string
+                          required:
+                          - name
+                          type: object
                         rpcPort:
                           format: int32
+                          maximum: 65535
+                          minimum: 1
                           type: integer
                         suspended:
                           type: boolean
@@ -2674,26 +2704,34 @@ spec:
                     maxItems: 32
                     minItems: 1
                     type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                   policyRef:
-                    description: |-
-                      LocalObjectReference contains enough information to let you locate the
-                      referenced object inside the same namespace.
+                    description: NamedObjectReference identifies one same-namespace
+                      Attacknet resource.
                     properties:
                       name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
                         type: string
+                    required:
+                    - name
                     type: object
-                    x-kubernetes-map-type: atomic
                 required:
                 - nodes
                 - policyRef
                 type: object
+                x-kubernetes-validations:
+                - message: Bitcoin peerRefs must identify other declared Bitcoin nodes
+                  rule: self.nodes.all(node, !has(node.peerRefs) || node.peerRefs.all(peer,
+                    peer != node.name && self.nodes.exists(candidate, candidate.name
+                    == peer)))
+                - message: each Bitcoin node must resolve to a distinct BurnchainPolicy
+                  rule: 'self.nodes.all(node, self.nodes.filter(candidate, (has(candidate.policyRef)
+                    ? candidate.policyRef.name : self.policyRef.name) == (has(node.policyRef)
+                    ? node.policyRef.name : self.policyRef.name)).size() == 1)'
               defaults:
                 description: NetworkDefaults contains shared images and workload defaults.
                 properties:
@@ -17629,6 +17667,78 @@ spec:
                   - role
                   type: object
                 type: array
+              burnchainTopology:
+                description: |-
+                  AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+                  follower binding admitted for one observed StacksNetwork generation.
+                properties:
+                  bindings:
+                    items:
+                      description: |-
+                        BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+                        process. Signer processes themselves do not consume Bitcoin RPC.
+                      properties:
+                        actor:
+                          type: string
+                        bitcoinNodeRef:
+                          type: string
+                      required:
+                      - actor
+                      - bitcoinNodeRef
+                      type: object
+                    type: array
+                  digest:
+                    type: string
+                  nodes:
+                    items:
+                      description: |-
+                        AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+                        peer and cadence-policy bindings.
+                      properties:
+                        name:
+                          type: string
+                        p2pPort:
+                          format: int32
+                          type: integer
+                        peerRefs:
+                          items:
+                            type: string
+                          type: array
+                        policyRef:
+                          type: string
+                        policyServiceName:
+                          type: string
+                        policyUID:
+                          type: string
+                        rpcPort:
+                          format: int32
+                          type: integer
+                        serviceName:
+                          type: string
+                      required:
+                      - name
+                      - p2pPort
+                      - policyRef
+                      - policyServiceName
+                      - policyUID
+                      - rpcPort
+                      - serviceName
+                      type: object
+                    type: array
+                  observedAt:
+                    format: date-time
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  schemaVersion:
+                    type: string
+                required:
+                - digest
+                - nodes
+                - observedGeneration
+                - schemaVersion
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

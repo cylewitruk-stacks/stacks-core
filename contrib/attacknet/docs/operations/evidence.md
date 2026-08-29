@@ -98,6 +98,7 @@ reused as its own counterfactual. See
 | Network/DNS | Controlled before/during/after probes observe impairment and recovery |
 | `io-pressure` | Trusted FSYNC probe crosses both configured latency thresholds, then recovers |
 | `clock-skew` | Selected process clock shifts relative to a control actor, then returns |
+| Bitcoin split view | Bitcoin cohorts report distinct full tips while their bound Stacks cohorts report distinct burn views; both later converge stably |
 
 A campaign ends `Inconclusive` when injection is reported but trusted effect
 evidence is missing. Cleanup must prove recovery and resource absence. Forced
@@ -111,6 +112,12 @@ cadence-aware window, cohort agreement, exact actor readiness, signer
 registration and freshness when instrumented, unexpected Pod disruption, and
 counter resets. Burn and Stacks heights are separate signals because their
 cadences differ.
+
+For multi-Bitcoin runs, retain `StacksNetwork.status.burnchainTopology`, every
+`BurnchainPolicy.status` branch and peer observation, and protocol assertion
+evidence. Metric fingerprints are diagnostic only; full best-block hashes,
+chainwork, chain tips, Stacks consensus hashes, binding identities, and source
+timestamps in structured status are the review evidence.
 
 A terminal run is not a cleanup receipt. Consumers must also require
 `status.cleanup.required=true` and `status.cleanup.completed=true` before

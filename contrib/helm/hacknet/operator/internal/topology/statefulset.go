@@ -128,7 +128,11 @@ func (c actorContext) statefulSet() (*appsv1.StatefulSet, error) {
 	if len(actor.Dependencies) > 0 {
 		checks := make([]string, 0, len(actor.Dependencies))
 		for _, dependency := range actor.Dependencies {
-			checks = append(checks, fmt.Sprintf("until nc -z %s %d; do sleep 1; done", c.services[dependency.Actor], dependency.Port))
+			host := dependency.Service
+			if dependency.Actor != "" {
+				host = c.services[dependency.Actor]
+			}
+			checks = append(checks, fmt.Sprintf("until nc -z %s %d; do sleep 1; done", host, dependency.Port))
 		}
 		initContainers = append(initContainers, corev1.Container{Name: "wait-for-dependencies", Image: defaultString(defaults.DependencyImage, "busybox:1.36.1"), Command: []string{"sh", "-ec", strings.Join(checks, "; ")}, SecurityContext: restrictedSecurityContext(true)})
 	}

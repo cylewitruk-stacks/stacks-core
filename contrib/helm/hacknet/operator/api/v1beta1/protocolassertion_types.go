@@ -78,9 +78,38 @@ type TelemetryCompletenessAssertion struct {
 	Actors []string `json:"actors"`
 }
 
+// BranchCohortExpectation selects divergence or convergence proof.
+// +kubebuilder:validation:Enum=Diverged;Converged
+type BranchCohortExpectation string
+
+const (
+	// BranchCohortDiverged requires multiple distinct branch identities.
+	BranchCohortDiverged BranchCohortExpectation = "Diverged"
+	// BranchCohortConverged requires one stable branch identity.
+	BranchCohortConverged BranchCohortExpectation = "Converged"
+)
+
+// BranchCohortAssertion proves finite branch divergence or convergence.
+// +kubebuilder:validation:XValidation:rule="self.expectation == 'Diverged' ? !has(self.stableFor) : !has(self.minimumDistinct)",message="stableFor applies only to Converged and minimumDistinct applies only to Diverged"
+// +kubebuilder:validation:XValidation:rule="!has(self.minimumDistinct) || self.minimumDistinct <= self.actors.size()",message="minimumDistinct cannot exceed the selected actor count"
+type BranchCohortAssertion struct {
+	// +kubebuilder:validation:MinItems=2
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=set
+	Actors      []string                `json:"actors"`
+	Expectation BranchCohortExpectation `json:"expectation"`
+	// MinimumDistinct defaults to two and applies only to Diverged.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:validation:Maximum=32
+	MinimumDistinct int32 `json:"minimumDistinct,omitempty"`
+	// StableFor requires the selected cohort to remain converged for this duration.
+	// The shared branch may advance while convergence remains continuous.
+	StableFor *metav1.Duration `json:"stableFor,omitempty"`
+}
+
 // ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
 // and actor-supplied success predicates are intentionally unsupported.
-// +kubebuilder:validation:XValidation:rule="(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement) ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness) ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0) + (has(self.telemetryCompleteness) ? 1 : 0) == 1",message="exactly one protocol assertion must be configured"
+// +kubebuilder:validation:XValidation:rule="(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement) ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness) ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0) + (has(self.telemetryCompleteness) ? 1 : 0) + (has(self.bitcoinBranchCohort) ? 1 : 0) + (has(self.stacksBurnchainCohort) ? 1 : 0) == 1",message="exactly one protocol assertion must be configured"
 type ProtocolAssertionSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
 	ID                        string                              `json:"id"`
@@ -90,6 +119,8 @@ type ProtocolAssertionSpec struct {
 	SignerStateFreshness      *SignerStateFreshnessAssertion      `json:"signerStateFreshness,omitempty"`
 	ProposalOutcomeVisibility *ProposalOutcomeVisibilityAssertion `json:"proposalOutcomeVisibility,omitempty"`
 	TelemetryCompleteness     *TelemetryCompletenessAssertion     `json:"telemetryCompleteness,omitempty"`
+	BitcoinBranchCohort       *BranchCohortAssertion              `json:"bitcoinBranchCohort,omitempty"`
+	StacksBurnchainCohort     *BranchCohortAssertion              `json:"stacksBurnchainCohort,omitempty"`
 }
 
 // ProtocolAssertionSetSpec is a bounded assertion gate with one failure

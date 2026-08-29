@@ -2,9 +2,18 @@ package burnchain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
+)
+
+const (
+	observationTimeout   = 2 * time.Second
+	maximumObservedTips  = 32
+	maximumObservedPeers = 128
 )
 
 // Wallet binds a watch-only Bitcoin wallet to its mining destination.
@@ -22,6 +31,7 @@ type Config struct {
 	// BootstrapHeight is reached idempotently before policy-controlled mining.
 	BootstrapHeight uint64
 	// ReserveOutputs mines this many initial outputs to each configured address.
+	// Zero disables reserve mining for a secondary Bitcoin node.
 	ReserveOutputs uint64
 	// RetryInitial is the first Bitcoin RPC backoff duration.
 	RetryInitial time.Duration
@@ -76,7 +86,7 @@ func (clock *Clock) Run(ctx context.Context) error {
 	if err := clock.validate(); err != nil {
 		return err
 	}
-	clock.writeStatus("starting", nil, "bitcoin-rpc")
+	clock.writeStatus(ctx, "starting", nil, "bitcoin-rpc")
 	if err := clock.retry(ctx, "wait for Bitcoin RPC", func() error {
 		_, err := clock.Bitcoin.Height(ctx)
 		return err
@@ -106,7 +116,7 @@ func (clock *Clock) Run(ctx context.Context) error {
 			return err
 		}
 		if err := clock.applyPolicy(height); err != nil {
-			clock.writeStatus("degraded", &height, "invalid-policy")
+			clock.writeStatus(ctx, "degraded", &height, "invalid-policy")
 			clock.logError("Policy projection is invalid; retaining the last admitted generation", err)
 			if !clock.wait(ctx, clock.Config.PausedPollInterval) {
 				break
@@ -114,14 +124,14 @@ func (clock *Clock) Run(ctx context.Context) error {
 			continue
 		}
 		if clock.policy.Mode == ModePause && !clock.forceBlock && clock.burstRemaining == 0 {
-			clock.writeStatus("paused", &height, fmt.Sprintf("policy-generation-%d", clock.policy.Generation))
+			clock.writeStatus(ctx, "paused", &height, fmt.Sprintf("policy-generation-%d", clock.policy.Generation))
 			if !clock.wait(ctx, clock.Config.PausedPollInterval) {
 				break
 			}
 			continue
 		}
 		if err := clock.reconcileAfterRestart(ctx, false); err != nil {
-			clock.writeStatus("degraded", &height, "wallet-transaction-reconciliation")
+			clock.writeStatus(ctx, "degraded", &height, "wallet-transaction-reconciliation")
 			clock.logError("Could not reconcile wallets after Bitcoin restart", err)
 			if !clock.wait(ctx, clock.Config.RetryInitial) {
 				break
@@ -138,7 +148,7 @@ func (clock *Clock) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		clock.writeStatus("running", &height, "mined-to-"+wallet.Address)
+		clock.writeStatus(ctx, "running", &height, "mined-to-"+wallet.Address)
 		clock.Logger.Info("Mined Bitcoin block", "height", height, "address", wallet.Address)
 		clock.forceBlock = false
 		if clock.burstRemaining > 0 {
@@ -151,11 +161,11 @@ func (clock *Clock) Run(ctx context.Context) error {
 		if clock.policy.JitterSeconds > 0 && clock.Random != nil {
 			delay += time.Duration(clock.Random.Uint64N(clock.policy.JitterSeconds+1)) * time.Second
 		}
-		if !clock.wait(ctx, delay) {
+		if !clock.waitCadence(ctx, delay) {
 			break
 		}
 	}
-	clock.writeStatus("stopped", nil, "terminated")
+	clock.writeStatus(ctx, "stopped", nil, "terminated")
 	return nil
 }
 
@@ -180,9 +190,6 @@ func (clock *Clock) validate() error {
 		}
 		seenWallets[wallet.Name] = true
 		seenAddresses[wallet.Address] = true
-	}
-	if clock.Config.ReserveOutputs == 0 {
-		clock.Config.ReserveOutputs = 4
 	}
 	if clock.Config.RetryInitial <= 0 {
 		clock.Config.RetryInitial = time.Second
@@ -257,7 +264,7 @@ func (clock *Clock) bootstrap(ctx context.Context) error {
 		}
 		height++
 	}
-	clock.writeStatus("running", &height, "bootstrapped")
+	clock.writeStatus(ctx, "running", &height, "bootstrapped")
 	clock.Logger.Info("Bitcoin regtest clock ready", "height", height)
 	return nil
 }
@@ -329,7 +336,7 @@ func (clock *Clock) retry(ctx context.Context, operation string, call func() err
 		if err := call(); err == nil {
 			return nil
 		} else {
-			clock.writeStatus("degraded", nil, "bitcoin-rpc-retry")
+			clock.writeStatus(ctx, "degraded", nil, "bitcoin-rpc-retry")
 			clock.logError(operation+" failed; retrying", err, "delay", delay)
 		}
 		if !clock.wait(ctx, delay) {
@@ -360,8 +367,41 @@ func (clock *Clock) wait(ctx context.Context, duration time.Duration) bool {
 	}
 }
 
-func (clock *Clock) writeStatus(state string, height *uint64, detail string) {
-	status := Status{State: state, BitcoinHeight: height, Detail: detail, UpdatedAt: time.Now()}
+// waitCadence keeps branch observations fresh without changing the requested
+// mining deadline. This matters when cadence exceeds the observation TTL.
+func (clock *Clock) waitCadence(ctx context.Context, duration time.Duration) bool {
+	if duration <= 0 {
+		return true
+	}
+	interval := clock.Config.PausedPollInterval
+	if interval <= 0 || interval > time.Second {
+		interval = time.Second
+	}
+	deadline := time.NewTimer(duration)
+	ticker := time.NewTicker(interval)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case event := <-clock.Events:
+			if event == EventMineOne {
+				clock.forceBlock = true
+			}
+			return true
+		case <-deadline.C:
+			return true
+		case <-ticker.C:
+			clock.writeStatus(ctx, "running", nil, "cadence-wait")
+		}
+	}
+}
+
+func (clock *Clock) writeStatus(ctx context.Context, state string, height *uint64, detail string) {
+	status := Status{State: state, BitcoinHeight: height, Detail: detail}
+	clock.observe(ctx, &status)
+	status.UpdatedAt = time.Now().UTC()
 	if clock.policyApplied {
 		status.PolicyGeneration = &clock.policy.Generation
 		status.PolicyMode = clock.policy.Mode
@@ -371,6 +411,90 @@ func (clock *Clock) writeStatus(state string, height *uint64, detail string) {
 	if err := clock.Statuses.Write(status); err != nil {
 		clock.logError("Could not persist burnchain status", err)
 	}
+}
+
+func (clock *Clock) observe(ctx context.Context, status *Status) {
+	observer, ok := clock.Bitcoin.(Observer)
+	if !ok {
+		return
+	}
+	observationContext, cancel := context.WithTimeout(ctx, observationTimeout)
+	defer cancel()
+	info, err := observer.ChainInfo(observationContext)
+	if err != nil {
+		status.ObservationError = "chain-info-unavailable"
+		return
+	}
+	tips, err := observer.ChainTips(observationContext)
+	if err != nil {
+		status.ObservationError = "chain-tips-unavailable"
+		return
+	}
+	if len(tips) > maximumObservedTips {
+		status.ObservationError = "chain-tips-limit-exceeded"
+		return
+	}
+	sort.Slice(tips, func(left, right int) bool { return tips[left].Hash < tips[right].Hash })
+	peers, err := observer.PeerInfo(observationContext)
+	if err != nil {
+		status.ObservationError = "peer-info-unavailable"
+		return
+	}
+	if len(peers) > maximumObservedPeers {
+		status.ObservationError = "peer-info-limit-exceeded"
+		return
+	}
+	if err := validateObservation(info, tips, peers); err != nil {
+		status.ObservationError = err.Error()
+		return
+	}
+	height := uint64(info.Blocks)
+	status.BitcoinHeight = &height
+	sort.Slice(peers, func(left, right int) bool {
+		if peers[left].Address != peers[right].Address {
+			return peers[left].Address < peers[right].Address
+		}
+		return peers[left].ID < peers[right].ID
+	})
+	status.ChainInfo = &info
+	status.ChainTips = tips
+	status.Peers = peers
+}
+
+func validateObservation(info ChainInfo, tips []ChainTip, peers []PeerInfo) error {
+	if info.Chain != "regtest" || info.Blocks < 0 || info.Headers < info.Blocks ||
+		!fixedHex(info.BestBlockHash, 64) || !fixedHex(info.Chainwork, 64) {
+		return errors.New("chain-info-invalid")
+	}
+	seenTips := make(map[string]struct{}, len(tips))
+	for _, tip := range tips {
+		if tip.Height < 0 || tip.BranchLen < 0 || !fixedHex(tip.Hash, 64) || len(tip.Status) == 0 || len(tip.Status) > 32 {
+			return errors.New("chain-tip-invalid")
+		}
+		if _, duplicate := seenTips[tip.Hash]; duplicate {
+			return errors.New("chain-tip-duplicate")
+		}
+		seenTips[tip.Hash] = struct{}{}
+	}
+	for _, peer := range peers {
+		if peer.ID < 0 || len(peer.Address) == 0 || len(peer.Address) > 256 || len(peer.ConnectionType) == 0 || len(peer.ConnectionType) > 64 ||
+			peer.LastBlock < 0 || peer.LastTransaction < 0 {
+			return errors.New("peer-info-invalid")
+		}
+	}
+	return nil
+}
+
+func fixedHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range strings.ToLower(value) {
+		if !strings.ContainsRune("0123456789abcdef", character) {
+			return false
+		}
+	}
+	return true
 }
 
 func (clock *Clock) logError(message string, err error, attributes ...any) {

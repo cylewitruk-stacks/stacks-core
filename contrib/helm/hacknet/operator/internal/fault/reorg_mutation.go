@@ -26,6 +26,7 @@ import (
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchain"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchainworker"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/canonical"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/ownership"
@@ -71,17 +72,21 @@ func (r *V1Beta1Reconciler) burnchainReorgCapabilities(ctx context.Context, camp
 }
 
 func (r *V1Beta1Reconciler) readReorgPolicy(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, action CompiledAction) (*attacknetv1beta1.BurnchainPolicy, burnchain.BoundaryAssessment, error) {
-	policy := &attacknetv1beta1.BurnchainPolicy{}
-	name := network.Spec.Burnchain.PolicyRef.Name
-	if name == "" {
-		return nil, burnchain.BoundaryAssessment{}, errors.New("StacksNetwork has no burnchain policyRef")
+	actor, _, _ := unstructured.NestedString(action.Resource.Object, "spec", "actor")
+	name, err := burnchaintopology.PolicyName(network, actor)
+	if err != nil {
+		return nil, burnchain.BoundaryAssessment{}, err
 	}
+	policy := &attacknetv1beta1.BurnchainPolicy{}
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: campaign.Namespace, Name: name}, policy); err != nil {
 		return nil, burnchain.BoundaryAssessment{}, fmt.Errorf("read BurnchainPolicy %s: %w", name, err)
 	}
-	actor, _, _ := unstructured.NestedString(action.Resource.Object, "spec", "actor")
-	if policy.Spec.NetworkRef != network.Name || policy.Spec.BitcoinNodeRef != actor {
-		return nil, burnchain.BoundaryAssessment{}, fmt.Errorf("BurnchainPolicy %s does not bind target %s", name, actor)
+	admitted, err := burnchaintopology.Published(network)
+	if err != nil {
+		return nil, burnchain.BoundaryAssessment{}, fmt.Errorf("read admitted burnchain topology: %w", err)
+	}
+	if err := burnchaintopology.VerifyPolicyIdentity(admitted, network.Name, actor, policy); err != nil {
+		return nil, burnchain.BoundaryAssessment{}, err
 	}
 	if policy.Status.ObservedGeneration != policy.Generation || policy.Status.Phase != "Ready" {
 		return nil, burnchain.BoundaryAssessment{}, fmt.Errorf("BurnchainPolicy %s is not Ready at generation %d", name, policy.Generation)
@@ -242,8 +247,9 @@ func (r *V1Beta1Reconciler) readExistingReorgPolicy(ctx context.Context, campaig
 	if controllerOwnerUID(pod) != string(campaign.UID) {
 		return nil, errors.New("refusing to adopt burnchain reorg worker not owned by the campaign")
 	}
-	policyName := network.Spec.Burnchain.PolicyRef.Name
-	if policyName == "" || pod.Annotations[reorgPolicyNameAnnotation] != policyName {
+	actor, _, _ := unstructured.NestedString(action.Resource.Object, "spec", "actor")
+	policyName, err := burnchaintopology.PolicyName(network, actor)
+	if err != nil || pod.Annotations[reorgPolicyNameAnnotation] != policyName {
 		return nil, errors.New("existing reorg worker does not bind the admitted burnchain policy")
 	}
 	policy := &attacknetv1beta1.BurnchainPolicy{}
@@ -257,7 +263,6 @@ func (r *V1Beta1Reconciler) readExistingReorgPolicy(ctx context.Context, campaig
 	if err := validateReorgPolicyContract(policy, contract); err != nil {
 		return nil, err
 	}
-	actor, _, _ := unstructured.NestedString(action.Resource.Object, "spec", "actor")
 	originalPaused, err := strconv.ParseBool(pod.Annotations[reorgOriginalPauseAnnotation])
 	if err != nil {
 		return nil, errors.New("existing reorg worker has an invalid original pause contract")

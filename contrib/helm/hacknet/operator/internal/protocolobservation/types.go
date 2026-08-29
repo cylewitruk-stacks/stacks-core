@@ -8,6 +8,8 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
+
+	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
 
 const (
@@ -36,20 +38,60 @@ type Source struct {
 
 // ActorSnapshot contains one actor's bounded Prometheus metric families.
 type ActorSnapshot struct {
-	Source   Source
-	Families map[string]*dto.MetricFamily
-	Error    string
+	Source          Source
+	Families        map[string]*dto.MetricFamily
+	ChainView       *StacksChainView
+	ChainObservedAt time.Time
+	ChainError      string
+	Error           string
+}
+
+// StacksChainView is the bounded /v2/info identity for one Stacks actor.
+type StacksChainView struct {
+	BurnBlockHeight     uint64 `json:"burnBlockHeight"`
+	BurnConsensusHash   string `json:"burnConsensusHash"`
+	StacksTipHeight     uint64 `json:"stacksTipHeight"`
+	StacksTip           string `json:"stacksTip"`
+	StacksConsensusHash string `json:"stacksConsensusHash"`
+	FullySynced         bool   `json:"fullySynced"`
+}
+
+// BitcoinSnapshot is one identity-bound BurnchainPolicy observation.
+type BitcoinSnapshot struct {
+	Source         Source                                     `json:"source"`
+	PolicyName     string                                     `json:"policyName"`
+	TopologyDigest string                                     `json:"topologyDigest"`
+	Height         int64                                      `json:"height"`
+	Headers        int64                                      `json:"headers"`
+	BestBlockHash  string                                     `json:"bestBlockHash"`
+	Chainwork      string                                     `json:"chainwork"`
+	ChainTips      []attacknetv1beta1.BurnchainChainTipStatus `json:"chainTips,omitempty"`
+	Peers          []attacknetv1beta1.BurnchainPeerStatus     `json:"peers,omitempty"`
+	Error          string                                     `json:"error,omitempty"`
 }
 
 // Snapshot is one inventory-bound cohort observation.
 type Snapshot struct {
-	NetworkUID      string
-	InventoryDigest string
-	ObservedAt      time.Time
-	Actors          []ActorSnapshot
+	NetworkUID        string
+	InventoryDigest   string
+	ObservedAt        time.Time
+	Actors            []ActorSnapshot
+	Bitcoin           []BitcoinSnapshot
+	BurnchainTopology *attacknetv1beta1.AdmittedBurnchainTopology
 	// UnavailableReason is a bounded controller-origin reason emitted when no
 	// stable identity-bound snapshot could be collected.
 	UnavailableReason string
+}
+
+// BitcoinActor returns one exact Bitcoin observation.
+func (s Snapshot) BitcoinActor(name string) (BitcoinSnapshot, bool) {
+	index := sort.Search(len(s.Bitcoin), func(index int) bool {
+		return s.Bitcoin[index].Source.Actor >= name
+	})
+	if index >= len(s.Bitcoin) || s.Bitcoin[index].Source.Actor != name {
+		return BitcoinSnapshot{}, false
+	}
+	return s.Bitcoin[index], true
 }
 
 // Actor returns one exact actor observation.

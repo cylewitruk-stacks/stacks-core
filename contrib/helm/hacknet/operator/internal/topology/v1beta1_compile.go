@@ -13,6 +13,7 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 )
 
 // CompileV1Beta1 converts the domain topology to the proven A4 workload model.
@@ -32,13 +33,21 @@ func CompileV1Beta1(network *attacknetv1beta1.StacksNetwork) (*attacknetv1alpha1
 			Probe:     compileProbe(network.Spec.Probe),
 		},
 	}
-	bitcoinServices := make(map[string]struct{}, len(network.Spec.Burnchain.Nodes))
+	bitcoinServices := make(map[string]string, len(network.Spec.Burnchain.Nodes))
+	bitcoinNodes := make(map[string]attacknetv1beta1.BitcoinNodeSpec, len(network.Spec.Burnchain.Nodes))
+	for _, node := range network.Spec.Burnchain.Nodes {
+		bitcoinNodes[node.Name] = node
+	}
 	for i := range network.Spec.Burnchain.Nodes {
-		actor, err := compileBitcoinActor(network, &network.Spec.Burnchain.Nodes[i])
+		actor, err := compileBitcoinActor(network, &network.Spec.Burnchain.Nodes[i], bitcoinNodes)
 		if err != nil {
 			return nil, err
 		}
-		bitcoinServices[actor.Name] = struct{}{}
+		policyName, err := burnchaintopology.PolicyName(network, actor.Name)
+		if err != nil {
+			return nil, err
+		}
+		bitcoinServices[actor.Name] = burnchaintopology.PolicyServiceName(policyName)
 		compiled.Spec.Actors = append(compiled.Spec.Actors, actor)
 	}
 	for i := range network.Spec.Nodes {
@@ -139,27 +148,32 @@ func compileDefaults(value attacknetv1beta1.NetworkDefaults) attacknetv1alpha1.S
 	}
 }
 
-func compileBitcoinActor(network *attacknetv1beta1.StacksNetwork, node *attacknetv1beta1.BitcoinNodeSpec) (attacknetv1alpha1.ActorSpec, error) {
+func compileBitcoinActor(network *attacknetv1beta1.StacksNetwork, node *attacknetv1beta1.BitcoinNodeSpec, nodes map[string]attacknetv1beta1.BitcoinNodeSpec) (attacknetv1alpha1.ActorSpec, error) {
+	rpcPort := burnchaintopology.EffectiveRPCPort(*node)
+	p2pPort := burnchaintopology.EffectiveP2PPort(*node)
 	config, err := compileConfig(network, profileContext{
-		actor: node.Name,
-		role:  "burnchain",
+		actor: node.Name, role: "burnchain",
+		burnchainRPCPort: rpcPort, burnchainP2PPort: p2pPort,
 	}, node.Config)
 	if err != nil {
 		return attacknetv1alpha1.ActorSpec{}, err
 	}
-	rpcPort := node.RPCPort
-	if rpcPort == 0 {
-		rpcPort = 18443
+	args := []string{
+		"-conf=" + strings.TrimRight(config.MountPath, "/") + "/" + config.Key,
+		"-datadir=/data", "-nosettings", fmt.Sprintf("-rpcport=%d", rpcPort), fmt.Sprintf("-port=%d", p2pPort),
 	}
-	p2pPort := node.P2PPort
-	if p2pPort == 0 {
-		p2pPort = 18444
+	peers := append([]string(nil), node.PeerRefs...)
+	sort.Strings(peers)
+	for _, peer := range peers {
+		peerNode := nodes[peer]
+		peerPort := burnchaintopology.EffectiveP2PPort(peerNode)
+		args = append(args, fmt.Sprintf("-addnode=${SERVICE:%s}:%d", peer, peerPort))
 	}
 	actor := attacknetv1alpha1.ActorSpec{
 		Name: node.Name, Role: "burnchain", Suspended: node.Suspended,
 		Image: node.Image, Config: config,
 		Command: []string{"bitcoind"},
-		Args:    []string{"-conf=" + strings.TrimRight(config.MountPath, "/") + "/" + config.Key, "-datadir=/data", "-nosettings"},
+		Args:    args,
 		Ports: []attacknetv1alpha1.ActorPort{
 			{Name: "rpc", ContainerPort: rpcPort, ServicePort: rpcPort, Protocol: corev1.ProtocolTCP},
 			{Name: "p2p", ContainerPort: p2pPort, ServicePort: p2pPort, Protocol: corev1.ProtocolTCP},
@@ -170,17 +184,21 @@ func compileBitcoinActor(network *attacknetv1beta1.StacksNetwork, node *attackne
 	return actor, nil
 }
 
-func compileStacksNodeActor(network *attacknetv1beta1.StacksNetwork, node *attacknetv1beta1.StacksNodeSpec, bitcoinNodes map[string]struct{}, signerName string, signerIndex int32) (attacknetv1alpha1.ActorSpec, error) {
-	if _, ok := bitcoinNodes[node.BurnchainNodeRef]; !ok {
+func compileStacksNodeActor(network *attacknetv1beta1.StacksNetwork, node *attacknetv1beta1.StacksNodeSpec, bitcoinNodes map[string]string, signerName string, signerIndex int32) (attacknetv1alpha1.ActorSpec, error) {
+	policyService, ok := bitcoinNodes[node.BurnchainNodeRef]
+	if !ok {
 		return attacknetv1alpha1.ActorSpec{}, fmt.Errorf("node %q references unknown burnchain node %q", node.Name, node.BurnchainNodeRef)
 	}
+	bitcoinNode := bitcoinNodeByName(network, node.BurnchainNodeRef)
 	config, err := compileConfig(network, profileContext{
-		actor:           node.Name,
-		role:            string(node.Role),
-		burnchainNode:   node.BurnchainNodeRef,
-		signerName:      signerName,
-		signerIndex:     signerIndex,
-		eventDispatcher: "queued",
+		actor:            node.Name,
+		role:             string(node.Role),
+		burnchainNode:    node.BurnchainNodeRef,
+		signerName:       signerName,
+		signerIndex:      signerIndex,
+		eventDispatcher:  "queued",
+		burnchainRPCPort: burnchaintopology.EffectiveRPCPort(bitcoinNode),
+		burnchainP2PPort: burnchaintopology.EffectiveP2PPort(bitcoinNode),
 	}, node.Config)
 	if err != nil {
 		return attacknetv1alpha1.ActorSpec{}, err
@@ -197,7 +215,10 @@ func compileStacksNodeActor(network *attacknetv1beta1.StacksNetwork, node *attac
 			{Name: "p2p", ContainerPort: 20444, ServicePort: 20444, Protocol: corev1.ProtocolTCP},
 			{Name: "metrics", ContainerPort: 20446, ServicePort: 20446, Protocol: corev1.ProtocolTCP},
 		},
-		Dependencies:    []attacknetv1alpha1.ActorDependency{{Actor: node.BurnchainNodeRef, Port: 18443}},
+		Dependencies: []attacknetv1alpha1.ActorDependency{
+			{Actor: node.BurnchainNodeRef, Port: burnchaintopology.EffectiveRPCPort(bitcoinNode)},
+			{Service: policyService, Port: 18500},
+		},
 		RuntimeExposure: "reachable",
 		Env: []corev1.EnvVar{
 			{Name: "STACKS_ATTACKNET_CONFIG_TEMPLATE", Value: actorConfigPath(config)},
@@ -217,7 +238,7 @@ func compileStacksNodeActor(network *attacknetv1beta1.StacksNetwork, node *attac
 	return actor, nil
 }
 
-func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attacknetv1beta1.SignerMemberSpec, bitcoinNodes map[string]struct{}) (attacknetv1alpha1.ActorSpec, attacknetv1alpha1.ActorSpec, error) {
+func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attacknetv1beta1.SignerMemberSpec, bitcoinNodes map[string]string) (attacknetv1alpha1.ActorSpec, attacknetv1alpha1.ActorSpec, error) {
 	nodeSpec := attacknetv1beta1.StacksNodeSpec{Name: member.NodeName, Role: attacknetv1beta1.StacksNodeFollower, Image: member.NodeImage, BurnchainNodeRef: member.BurnchainNodeRef, Config: member.NodeConfig, Workload: member.NodeWorkload, Advanced: member.NodeAdvanced, Suspended: member.Suspended}
 	node, err := compileStacksNodeActor(network, &nodeSpec, bitcoinNodes, member.Name, member.Index)
 	if err != nil {
@@ -279,7 +300,7 @@ func compileRawActor(network *attacknetv1beta1.StacksNetwork, raw *attacknetv1be
 	}
 	dependencies := make([]attacknetv1alpha1.ActorDependency, 0, len(raw.Dependencies))
 	for _, dependency := range raw.Dependencies {
-		dependencies = append(dependencies, attacknetv1alpha1.ActorDependency(dependency))
+		dependencies = append(dependencies, attacknetv1alpha1.ActorDependency{Actor: dependency.Actor, Port: dependency.Port})
 	}
 	actor := attacknetv1alpha1.ActorSpec{Name: raw.Name, Role: raw.Role, Image: raw.Image, Suspended: raw.Suspended, Config: config, Ports: ports, Dependencies: dependencies}
 	applyWorkload(&actor, raw.Workload)
@@ -288,13 +309,15 @@ func compileRawActor(network *attacknetv1beta1.StacksNetwork, raw *attacknetv1be
 }
 
 type profileContext struct {
-	actor           string
-	role            string
-	burnchainNode   string
-	signerName      string
-	signerNode      string
-	signerIndex     int32
-	eventDispatcher string
+	actor            string
+	role             string
+	burnchainNode    string
+	signerName       string
+	signerNode       string
+	signerIndex      int32
+	eventDispatcher  string
+	burnchainRPCPort int32
+	burnchainP2PPort int32
 }
 
 func actorConfigPath(config *attacknetv1alpha1.ActorConfig) string {
@@ -356,7 +379,7 @@ func renderGeneratedProfile(network *attacknetv1beta1.StacksNetwork, context pro
 		if generated.Seed != "" || len(generated.BootstrapPeers) > 0 || generated.EventDispatcher != "" {
 			return nil, "", fmt.Errorf("actor %q bitcoin profile does not accept node-profile overlays", context.actor)
 		}
-		return map[string]string{"bitcoin.conf": bitcoinRegtestConfig()}, "bitcoin.conf", nil
+		return map[string]string{"bitcoin.conf": bitcoinRegtestConfig(context.burnchainRPCPort)}, "bitcoin.conf", nil
 	case "nakamoto-regtest-node/v1":
 		if context.burnchainNode == "" {
 			return nil, "", fmt.Errorf("actor %q node profile requires a burnchain node", context.actor)
@@ -370,8 +393,8 @@ func renderGeneratedProfile(network *attacknetv1beta1.StacksNetwork, context pro
 	}
 }
 
-func bitcoinRegtestConfig() string {
-	return "regtest=1\nprinttoconsole=1\nserver=1\ntxindex=1\ndiscover=0\ndns=0\ndnsseed=0\nlistenonion=0\nfallbackfee=0.00001\n\n[regtest]\nrpcbind=0.0.0.0:18443\nrpcallowip=0.0.0.0/0\nrpcuser=devnet\nrpcpassword=devnet\n"
+func bitcoinRegtestConfig(rpcPort int32) string {
+	return fmt.Sprintf("regtest=1\nprinttoconsole=1\nserver=1\ntxindex=1\ndiscover=0\ndns=1\ndnsseed=0\nlistenonion=0\nfallbackfee=0.00001\n\n[regtest]\nrpcbind=0.0.0.0:%d\nrpcallowip=0.0.0.0/0\nrpcuser=devnet\nrpcpassword=devnet\n", rpcPort)
 }
 
 const configureActorScript = `#!/bin/bash
@@ -483,7 +506,7 @@ epoch_name = "3.4"
 start_height = 227
 [[burnchain.epochs]]
 epoch_name = "4.0"
-start_height = 245
+start_height = 1000005
 `
 
 func nakamotoNodeConfig(network *attacknetv1beta1.StacksNetwork, context profileContext, generated attacknetv1beta1.GeneratedConfigSpec) string {
@@ -514,7 +537,16 @@ func nakamotoNodeConfig(network *attacknetv1beta1.StacksNetwork, context profile
 	if context.signerName != "" {
 		observer = fmt.Sprintf("\n[[events_observer]]\nendpoint = \"${SERVICE:%s}:30000\"\nevents_keys = [\"stackerdb\", \"block_proposal\", \"burn_blocks\"]\n", context.signerName)
 	}
-	return fmt.Sprintf("[node]\nname = %q\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = %q\nlocal_peer_seed = %q\nminer = %t\nstacker = %t\nevent_dispatcher_blocking = %t\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\n%s\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n%s\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:%s}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\n%s%s", "attacknet-"+context.actor, seed, seed, miner, stacker, dispatch == "blocking", bootstrapLine, observer, context.burnchainNode, nakamotoEpochs, renderStacksGenesis(network.Spec.Genesis))
+	return fmt.Sprintf("[node]\nname = %q\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = %q\nlocal_peer_seed = %q\nminer = %t\nstacker = %t\nevent_dispatcher_blocking = %t\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\n%s\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n%s\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:%s}\"\npeer_port = %d\nrpc_port = %d\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\n%s%s", "attacknet-"+context.actor, seed, seed, miner, stacker, dispatch == "blocking", bootstrapLine, observer, context.burnchainNode, context.burnchainP2PPort, context.burnchainRPCPort, nakamotoEpochs, renderStacksGenesis(network.Spec.Genesis))
+}
+
+func bitcoinNodeByName(network *attacknetv1beta1.StacksNetwork, name string) attacknetv1beta1.BitcoinNodeSpec {
+	for _, node := range network.Spec.Burnchain.Nodes {
+		if node.Name == name {
+			return node
+		}
+	}
+	return attacknetv1beta1.BitcoinNodeSpec{}
 }
 
 func renderStacksGenesis(genesis *attacknetv1beta1.StacksGenesisSpec) string {
@@ -632,11 +664,8 @@ func validateV1Beta1Network(network *attacknetv1beta1.StacksNetwork) error {
 	if network.Name == "" || network.Namespace == "" || network.UID == "" {
 		return fmt.Errorf("metadata.name, metadata.namespace, and metadata.uid are required")
 	}
-	if len(network.Spec.Burnchain.Nodes) == 0 {
-		return fmt.Errorf("spec.burnchain.nodes must not be empty")
-	}
-	if network.Spec.Burnchain.PolicyRef.Name == "" {
-		return fmt.Errorf("spec.burnchain.policyRef.name is required")
+	if err := burnchaintopology.Validate(network); err != nil {
+		return err
 	}
 	if genesis := network.Spec.Genesis; genesis != nil {
 		if genesis.PoX5 != nil && (genesis.PoX5.SbtcContract == "" || genesis.PoX5.SbtcRegistryContract == "") {

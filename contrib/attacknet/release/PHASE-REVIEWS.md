@@ -89,6 +89,16 @@ use v2.
 4. Give each reviewer the complete packet and every inventory item. A reduced
    packet records non-applicable full-tier material explicitly in its matrix;
    it does not silently omit it.
+   Before review, validate the packet against its declared contract with the
+   verifier from the candidate revision:
+
+   ```bash
+   node contrib/attacknet/release/phase-review.mjs verify-packet \
+     --contract=/path/to/contract.json --packet=/path/to/packet.json
+   ```
+
+   This checks the packet structure and bindings. Reviewers still independently
+   recompute inventory and archive digests from the referenced material.
 5. Record each result using `review-verdict.schema.json`. A reviewer must list
    every inspected inventory ID and any omission. Silence, a scoped approval,
    or a review of another digest cannot close a phase.

@@ -220,6 +220,22 @@ test('the phase gate requires two complete approvals over the exact contract and
   assert.throws(() => evaluatePhaseGate(contract, packet, [codex, incomplete]), /did not review/);
 });
 
+test('the packet verifier CLI validates the declared contract and packet', () => {
+  const contract = load(contractPath);
+  const packet = sealedPacket(contract);
+  const directory = mkdtempSync(join(tmpdir(), 'attacknet-packet-verifier-'));
+  const localContract = join(directory, 'contract.json');
+  const localPacket = join(directory, 'packet.json');
+  writeFileSync(localContract, `${JSON.stringify(contract)}\n`);
+  writeFileSync(localPacket, `${JSON.stringify(packet)}\n`);
+  const output = JSON.parse(execFileSync(process.execPath, [
+    join(here, 'phase-review.mjs'), 'verify-packet',
+    `--contract=${localContract}`, `--packet=${localPacket}`,
+  ], {encoding: 'utf8'}));
+  assert.equal(output.status, 'valid');
+  assert.equal(output.packetDigest, packet.binding.digest);
+});
+
 test('v1 approvals remain verifiable while v2 makes review IDs mandatory', () => {
   const historical = load(contractPath);
   const historicalPacket = sealedPacket(historical);

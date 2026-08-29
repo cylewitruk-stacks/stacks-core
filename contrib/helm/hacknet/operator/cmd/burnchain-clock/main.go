@@ -97,7 +97,7 @@ func configure() (runtimeConfig, error) {
 	if err != nil {
 		return runtimeConfig{}, err
 	}
-	reserve, err := boundedUint("BURNCHAIN_MINER_RESERVE_OUTPUTS", 4, 1, 10_000)
+	reserve, err := boundedUint("BURNCHAIN_MINER_RESERVE_OUTPUTS", 4, 0, 10_000)
 	if err != nil {
 		return runtimeConfig{}, err
 	}
@@ -217,10 +217,27 @@ func healthServer(address string, statuses statusSource) *http.Server {
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
 		_ = json.NewEncoder(writer).Encode(status)
 	})
+	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet && request.Method != http.MethodHead {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		status, observed := statuses.Snapshot()
+		if !clockReady(status, observed) {
+			http.Error(writer, "clock not ready", http.StatusServiceUnavailable)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+	})
 	return &http.Server{
 		Addr: address, Handler: mux, ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second,
 	}
+}
+
+func clockReady(status burnchain.Status, observed bool) bool {
+	return observed && status.PolicyGeneration != nil && status.BitcoinHeight != nil &&
+		status.ObservationError == "" && (status.State == "running" || status.State == "paused")
 }
 
 func csv(name string) ([]string, error) {

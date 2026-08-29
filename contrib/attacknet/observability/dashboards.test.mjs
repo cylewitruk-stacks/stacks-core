@@ -123,6 +123,42 @@ test('dashboards cover the complete Workstream M contract without conflating cha
   assert.doesNotMatch(stacksQueries, /stacks_node_burn_block_height/);
 });
 
+test('multi-Bitcoin panels keep height, branch identity, work, and graph health on separate scales', () => {
+  const overview = readDashboard('attacknet-overview.json');
+  const expected = new Map([
+    ['Bitcoin heights', 'attacknet_burnchain_clock_bitcoin_height'],
+    ['Bitcoin graph health', 'attacknet_burnchain_clock_connected_peers'],
+    ['Bitcoin branch fingerprints', 'attacknet_burnchain_clock_branch_fingerprint'],
+    ['Bitcoin cumulative work (log2)', 'attacknet_burnchain_clock_chainwork_log2'],
+  ]);
+  for (const [title, metric] of expected) {
+    const panel = overview.panels.find(candidate => candidate.title === title);
+    assert.ok(panel, `missing ${title}`);
+    const queries = JSON.stringify(panel.targets);
+    assert.match(queries, new RegExp(metric));
+    for (const other of expected.values()) {
+      if (other !== metric && title !== 'Bitcoin graph health') assert.doesNotMatch(queries, new RegExp(other));
+    }
+  }
+  const graph = overview.panels.find(panel => panel.title === 'Bitcoin graph health');
+  assert.match(JSON.stringify(graph.targets), /attacknet_burnchain_clock_chain_tips/);
+
+  const admitted = overview.panels.find(panel => panel.title === 'Admitted Bitcoin graph and Stacks bindings (trusted)');
+  assert.ok(admitted);
+  assert.equal(admitted.type, 'table');
+  const admittedQueries = JSON.stringify(admitted.targets);
+  assert.match(admittedQueries, /attacknet_burnchain_node_info/);
+  assert.match(admittedQueries, /attacknet_burnchain_topology_edge_info/);
+  assert.match(admittedQueries, /attacknet_burnchain_actor_binding_info/);
+  assert.match(admitted.description, /trusted topology-operator/i);
+  assert.deepEqual(admitted.transformations.map(transformation => transformation.id), ['merge', 'organize']);
+
+  const stacksBurnViews = overview.panels.find(panel => panel.title === 'Bound Stacks burn-view fingerprints');
+  assert.ok(stacksBurnViews);
+  assert.match(JSON.stringify(stacksBurnViews.targets), /attacknet_run_stacks_burn_view_fingerprint/);
+  assert.match(stacksBurnViews.description, /full consensus hashes.*structured protocol evidence/i);
+});
+
 test('Prometheus instrumentation rules resolve every family, label, and value through the inventory', () => {
   const inventory = loadInventory();
   assert.equal(validatePrometheusRulesAgainstInventory(prometheusRules(), inventory), true);

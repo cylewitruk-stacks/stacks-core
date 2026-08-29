@@ -1,8 +1,6 @@
 package burnchainpolicy
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -17,6 +15,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/ownership"
 )
 
@@ -68,13 +67,14 @@ func (configuration resourceConfig) deployment() (*appsv1.Deployment, error) {
 			{Name: "BITCOIN_RPC_USER", Value: "devnet"}, {Name: "BITCOIN_RPC_PASSWORD", Value: "devnet"},
 			{Name: "MINER_WALLETS", Value: strings.Join(wallets, ",")}, {Name: "MINER_BTC_ADDRS", Value: strings.Join(addresses, ",")},
 			{Name: "BURNCHAIN_BOOTSTRAP_HEIGHT", Value: strconv.FormatInt(configuration.Policy.Spec.BootstrapHeight, 10)},
+			{Name: "BURNCHAIN_MINER_RESERVE_OUTPUTS", Value: strconv.FormatInt(reserveOutputs(configuration.Policy), 10)},
 			{Name: "BURNCHAIN_RANDOM_SEED", Value: strconv.FormatUint(deterministicSeed(string(configuration.Policy.UID)), 10)},
 			{Name: "BURNCHAIN_RPC_TIMEOUT_SECONDS", Value: strconv.FormatUint(rpcTimeout, 10)},
 			{Name: "BURNCHAIN_RETRY_INITIAL_SECONDS", Value: strconv.FormatUint(minimumBackoff, 10)},
 			{Name: "BURNCHAIN_RETRY_MAXIMUM_SECONDS", Value: strconv.FormatUint(maximumBackoff, 10)},
 		},
 		Ports:          []corev1.ContainerPort{{Name: "health", ContainerPort: clockHealthPort, Protocol: corev1.ProtocolTCP}},
-		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/status", Port: intstrFromInt32(clockHealthPort)}}, PeriodSeconds: 2, TimeoutSeconds: 1, FailureThreshold: 15},
+		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstrFromInt32(clockHealthPort)}}, PeriodSeconds: 2, TimeoutSeconds: 1, FailureThreshold: 15},
 		LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromInt32(clockHealthPort)}}, PeriodSeconds: 10, TimeoutSeconds: 2, FailureThreshold: 3},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("24Mi")},
@@ -123,6 +123,14 @@ func (configuration resourceConfig) deployment() (*appsv1.Deployment, error) {
 	return deployment, nil
 }
 
+// reserveOutputs preserves the default for objects constructed outside API defaulting.
+func reserveOutputs(policy *attacknetv1beta1.BurnchainPolicy) int64 {
+	if policy.Spec.ReserveOutputs == nil {
+		return 4
+	}
+	return int64(*policy.Spec.ReserveOutputs)
+}
+
 func (configuration resourceConfig) service() (*corev1.Service, error) {
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: configuration.resourceName(), Namespace: configuration.Policy.Namespace, Labels: configuration.labels()},
@@ -138,12 +146,7 @@ func (configuration resourceConfig) service() (*corev1.Service, error) {
 }
 
 func (configuration resourceConfig) resourceName() string {
-	candidate := configuration.Policy.Name + "-clock"
-	if len(candidate) <= 63 {
-		return candidate
-	}
-	digest := sha256.Sum256([]byte(candidate))
-	return strings.TrimRight(candidate[:54], "-") + "-" + hex.EncodeToString(digest[:4])
+	return burnchaintopology.PolicyServiceName(configuration.Policy.Name)
 }
 
 func (configuration resourceConfig) labels() map[string]string {

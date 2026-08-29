@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -37,7 +38,10 @@ func TestCompileV1Beta1DomainTopology(t *testing.T) {
 	if compiled.Spec.Actors[1].Dependencies[0].Actor != "bitcoin-1" {
 		t.Fatalf("miner burnchain dependency was not compiled: %#v", compiled.Spec.Actors[1].Dependencies)
 	}
-	if compiled.Spec.Actors[2].Dependencies[1].Actor != "signer-1" {
+	if compiled.Spec.Actors[1].Dependencies[1].Service != "clock-clock" || compiled.Spec.Actors[1].Dependencies[1].Port != 18500 {
+		t.Fatalf("miner burnchain policy barrier was not compiled: %#v", compiled.Spec.Actors[1].Dependencies)
+	}
+	if compiled.Spec.Actors[2].Dependencies[2].Actor != "signer-1" {
 		t.Fatalf("signer-node event dependency was not compiled: %#v", compiled.Spec.Actors[2].Dependencies)
 	}
 	if compiled.Spec.Actors[3].SignerWeight == nil || *compiled.Spec.Actors[3].SignerWeight != 10 {
@@ -91,10 +95,11 @@ func TestCompileV1Beta1RejectsAmbiguousAndInvalidTopology(t *testing.T) {
 func TestMarkBurnchainPolicyPendingPreservesInventoryButWithdrawsReady(t *testing.T) {
 	status := attacknetv1beta1.StacksNetworkStatus{
 		Phase: "Ready", InventoryReady: true, InventoryDigest: "sha256:inventory",
-		Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, ObservedGeneration: 4, Reason: "AllActorsReady"}},
+		BurnchainTopology: &attacknetv1beta1.AdmittedBurnchainTopology{Digest: "sha256:graph"},
+		Conditions:        []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, ObservedGeneration: 4, Reason: "AllActorsReady"}},
 	}
 	markBurnchainPolicyPending(&status, 4, "BurnchainPolicyNotReady", "bootstrap is running")
-	if status.Phase != "Pending" || !status.InventoryReady || status.InventoryDigest != "sha256:inventory" {
+	if status.Phase != "Pending" || !status.InventoryReady || status.InventoryDigest != "sha256:inventory" || status.BurnchainTopology == nil || status.BurnchainTopology.Digest != "sha256:graph" {
 		t.Fatalf("policy barrier corrupted admitted workload identity: %#v", status)
 	}
 	ready := findCondition(status.Conditions, "Ready")
@@ -114,6 +119,8 @@ func findCondition(conditions []metav1.Condition, kind string) *metav1.Condition
 
 func TestCompileV1Beta1GeneratedProfiles(t *testing.T) {
 	network := betaNetworkFixture()
+	network.Spec.Burnchain.Nodes[0].RPCPort = 19443
+	network.Spec.Burnchain.Nodes[0].P2PPort = 19444
 	network.Spec.Burnchain.Nodes[0].Config = attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}}
 	network.Spec.Nodes[0].Role = attacknetv1beta1.StacksNodeFollower
 	network.Spec.Nodes[0].Config = attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{
@@ -127,6 +134,15 @@ func TestCompileV1Beta1GeneratedProfiles(t *testing.T) {
 	if compiled.Spec.Actors[0].Config.Files["bitcoin.conf"] == "" || compiled.Spec.Actors[1].Config.Files["config.toml"] == "" {
 		t.Fatal("generated profiles did not produce complete config files")
 	}
+	bitcoinConfig := compiled.Spec.Actors[0].Config.Files["bitcoin.conf"]
+	if !strings.Contains(bitcoinConfig, "dns=1\n") || !strings.Contains(bitcoinConfig, "dnsseed=0\n") || strings.Contains(bitcoinConfig, "dns=0\n") {
+		t.Fatalf("generated Bitcoin config must resolve Kubernetes addnode Services without enabling DNS seeding:\n%s", bitcoinConfig)
+	}
+	if !strings.Contains(bitcoinConfig, "rpcbind=0.0.0.0:19443\n") ||
+		!slices.Contains(compiled.Spec.Actors[0].Args, "-rpcport=19443") ||
+		!slices.Contains(compiled.Spec.Actors[0].Args, "-port=19444") {
+		t.Fatalf("generated Bitcoin profile did not apply custom RPC/P2P ports: config=%q args=%v", bitcoinConfig, compiled.Spec.Actors[0].Args)
+	}
 	if compiled.Spec.Actors[1].Config.Key != "config.toml" || compiled.Spec.Actors[3].Config.Key != "config.toml" {
 		t.Fatalf("config keys do not match executable command paths: node=%q signer=%q", compiled.Spec.Actors[1].Config.Key, compiled.Spec.Actors[3].Config.Key)
 	}
@@ -134,12 +150,21 @@ func TestCompileV1Beta1GeneratedProfiles(t *testing.T) {
 	for _, expected := range []string{
 		`p2p_address = "__NODE_IP__:20444"`,
 		`public_ip_address = "__NODE_IP__:20444"`,
-		`epoch_name = "4.0"`,
+		`epoch_name = "3.4"`,
+		`start_height = 1000005`,
 		"private_neighbors = true",
+		"peer_port = 19444",
+		"rpc_port = 19443",
 	} {
 		if !strings.Contains(nodeConfig, expected) {
 			t.Fatalf("generated node config lacks %q:\n%s", expected, nodeConfig)
 		}
+	}
+	if compiled.Spec.Actors[1].Dependencies[0].Port != 19443 {
+		t.Fatalf("Stacks node waits on Bitcoin RPC port %d, want 19443", compiled.Spec.Actors[1].Dependencies[0].Port)
+	}
+	if strings.Contains(nodeConfig, "start_height = 245") {
+		t.Fatal("the default generated profile activated Epoch 4 without provisioning its sBTC contracts")
 	}
 	if len(compiled.Spec.Actors[1].Command) == 0 || !strings.Contains(strings.Join(compiled.Spec.Actors[1].Command, " "), "__NODE_IP__") {
 		t.Fatal("generated node profile does not fail-closed while resolving its advertised Pod address")
@@ -293,8 +318,9 @@ func TestCompileV1Beta1SignerEnrollmentRejectsManagedEnvironmentOverride(t *test
 func TestCompileV1Beta1GeneratedProfileUsesSelectedBurnchain(t *testing.T) {
 	network := betaNetworkFixture()
 	network.Spec.Burnchain.Nodes = append(network.Spec.Burnchain.Nodes, attacknetv1beta1.BitcoinNodeSpec{
-		Name:   "bitcoin-2",
-		Config: attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
+		Name:      "bitcoin-2",
+		PolicyRef: &attacknetv1beta1.NamedObjectReference{Name: "clock-2"},
+		Config:    attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
 	})
 	network.Spec.Nodes[0].BurnchainNodeRef = "bitcoin-2"
 	network.Spec.Nodes[0].Role = attacknetv1beta1.StacksNodeFollower
@@ -308,6 +334,33 @@ func TestCompileV1Beta1GeneratedProfileUsesSelectedBurnchain(t *testing.T) {
 	config := compiled.Spec.Actors[2].Config.Files["config.toml"]
 	if !strings.Contains(config, `peer_host = "${SERVICE:bitcoin-2}"`) || strings.Contains(config, `peer_host = "${SERVICE:bitcoin-1}"`) {
 		t.Fatalf("generated node config did not use selected burnchain node:\n%s", config)
+	}
+}
+
+func TestCompileV1Beta1RendersDeterministicBitcoinPeerGraph(t *testing.T) {
+	network := betaNetworkFixture()
+	network.Spec.Burnchain.Nodes[0].PeerRefs = []string{"bitcoin-3", "bitcoin-2"}
+	network.Spec.Burnchain.Nodes = append(network.Spec.Burnchain.Nodes,
+		attacknetv1beta1.BitcoinNodeSpec{
+			Name: "bitcoin-2", P2PPort: 19444, PolicyRef: &attacknetv1beta1.NamedObjectReference{Name: "clock-2"},
+			Config: attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
+		},
+		attacknetv1beta1.BitcoinNodeSpec{
+			Name: "bitcoin-3", PolicyRef: &attacknetv1beta1.NamedObjectReference{Name: "clock-3"},
+			Config: attacknetv1beta1.ConfigSource{Generated: &attacknetv1beta1.GeneratedConfigSpec{Profile: "bitcoin-regtest/v1"}},
+		},
+	)
+	compiled, err := CompileV1Beta1(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := compiled.Spec.Actors[0].Args
+	want := []string{"-addnode=${SERVICE:bitcoin-2}:19444", "-addnode=${SERVICE:bitcoin-3}:18444"}
+	if len(args) < 2 || !slices.Equal(args[len(args)-2:], want) {
+		t.Fatalf("Bitcoin peers are not deterministic: got %#v want suffix %#v", args, want)
+	}
+	if len(compiled.Spec.Actors[0].Dependencies) != 0 {
+		t.Fatal("Bitcoin P2P links must not become cyclic startup dependencies")
 	}
 }
 
@@ -439,7 +492,7 @@ func betaNetworkFixture() *attacknetv1beta1.StacksNetwork {
 		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: types.UID("network-uid")},
 		Spec: attacknetv1beta1.StacksNetworkSpec{
 			Defaults:   attacknetv1beta1.NetworkDefaults{NodeImage: "node:current", SignerImage: "signer:current", BitcoinImage: "bitcoin:current", ImagePullPolicy: corev1.PullIfNotPresent},
-			Burnchain:  attacknetv1beta1.BurnchainTopologySpec{PolicyRef: corev1.LocalObjectReference{Name: "clock"}, Nodes: []attacknetv1beta1.BitcoinNodeSpec{{Name: "bitcoin-1", Config: configMap("bitcoin-config")}}},
+			Burnchain:  attacknetv1beta1.BurnchainTopologySpec{PolicyRef: attacknetv1beta1.NamedObjectReference{Name: "clock"}, Nodes: []attacknetv1beta1.BitcoinNodeSpec{{Name: "bitcoin-1", Config: configMap("bitcoin-config")}}},
 			Nodes:      []attacknetv1beta1.StacksNodeSpec{{Name: "miner-1", Role: attacknetv1beta1.StacksNodeMiner, BurnchainNodeRef: "bitcoin-1", Config: configMap("miner-config")}},
 			SignerSets: []attacknetv1beta1.SignerSetSpec{{Name: "set-1", Members: []attacknetv1beta1.SignerMemberSpec{{Name: "signer-1", NodeName: "signer-node-1", Index: 1, Weight: 10, BurnchainNodeRef: "bitcoin-1", SignerConfig: attacknetv1beta1.ConfigSource{SecretRef: &attacknetv1beta1.ConfigObjectRef{Name: "signer-secret", Key: "config.toml"}}, NodeConfig: configMap("signer-node-config")}}}},
 			RawActors:  []attacknetv1beta1.RawActorSpec{{Name: "observer", Role: "infrastructure", Image: "observer:current", Advanced: &attacknetv1beta1.AdvancedWorkloadOverride{Command: []string{"observer"}}}},

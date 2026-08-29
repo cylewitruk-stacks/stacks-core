@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -50,6 +51,25 @@ type fakeBitcoin struct {
 	walletsLoaded  map[string]bool
 	requireLoaded  bool
 	lastUptime     *uint64
+}
+
+type observingBitcoin struct {
+	*fakeBitcoin
+	info  ChainInfo
+	tips  []ChainTip
+	peers []PeerInfo
+}
+
+func (bitcoin *observingBitcoin) ChainInfo(context.Context) (ChainInfo, error) {
+	return bitcoin.info, nil
+}
+
+func (bitcoin *observingBitcoin) ChainTips(context.Context) ([]ChainTip, error) {
+	return append([]ChainTip(nil), bitcoin.tips...), nil
+}
+
+func (bitcoin *observingBitcoin) PeerInfo(context.Context) ([]PeerInfo, error) {
+	return append([]PeerInfo(nil), bitcoin.peers...), nil
 }
 
 func (bitcoin *fakeBitcoin) Height(context.Context) (uint64, error) {
@@ -129,6 +149,66 @@ func (bitcoin *fakeBitcoin) MineBlock(_ context.Context, wallet, address string)
 	return nil
 }
 
+func TestClockObservationIsCompleteBoundedAndSorted(t *testing.T) {
+	bitcoin := &observingBitcoin{
+		fakeBitcoin: &fakeBitcoin{},
+		info:        ChainInfo{Chain: "regtest", Blocks: 10, Headers: 10, BestBlockHash: strings.Repeat("a", 64), Chainwork: strings.Repeat("b", 64)},
+		tips: []ChainTip{
+			{Height: 9, Hash: strings.Repeat("d", 64), BranchLen: 1, Status: "valid-fork"},
+			{Height: 10, Hash: strings.Repeat("c", 64), Status: "active"},
+		},
+		peers: []PeerInfo{
+			{ID: 2, Address: "node-b:18444", ConnectionType: "manual"},
+			{ID: 1, Address: "node-a:18444", ConnectionType: "manual"},
+		},
+	}
+	clock := Clock{Bitcoin: bitcoin}
+	status := Status{}
+	clock.observe(context.Background(), &status)
+	if status.ObservationError != "" || status.ChainInfo == nil || status.ChainTips[0].Hash != strings.Repeat("c", 64) || status.Peers[0].ID != 1 {
+		t.Fatalf("complete observation was not normalized: %#v", status)
+	}
+
+	bitcoin.peers[0].Address = strings.Repeat("x", 257)
+	status = Status{}
+	clock.observe(context.Background(), &status)
+	if status.ObservationError != "peer-info-invalid" || status.ChainInfo != nil || len(status.ChainTips) != 0 || len(status.Peers) != 0 {
+		t.Fatalf("invalid partial observation escaped: %#v", status)
+	}
+}
+
+func TestCadenceWaitRefreshesBranchObservation(t *testing.T) {
+	bitcoin := &observingBitcoin{fakeBitcoin: &fakeBitcoin{}, info: ChainInfo{
+		Chain: "regtest", Blocks: 10, Headers: 10, BestBlockHash: strings.Repeat("a", 64), Chainwork: strings.Repeat("b", 64),
+	}}
+	statuses := &recordingStatuses{}
+	clock := Clock{Bitcoin: bitcoin, Statuses: statuses, Config: Config{PausedPollInterval: time.Millisecond}}
+	if !clock.waitCadence(context.Background(), 5*time.Millisecond) {
+		t.Fatal("cadence wait ended early")
+	}
+	statuses.mu.Lock()
+	defer statuses.mu.Unlock()
+	if len(statuses.statuses) == 0 || statuses.statuses[len(statuses.statuses)-1].ChainInfo == nil {
+		t.Fatalf("cadence wait did not refresh the branch observation: %#v", statuses.statuses)
+	}
+}
+
+func TestCadenceWaitRemainsPolicyInterruptible(t *testing.T) {
+	events := make(chan Event, 1)
+	clock := Clock{Events: events, Config: Config{PausedPollInterval: time.Hour}}
+	events <- EventMineOne
+	started := time.Now()
+	if !clock.waitCadence(context.Background(), time.Hour) {
+		t.Fatal("cadence wait unexpectedly stopped")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("cadence wait did not react promptly to the event")
+	}
+	if !clock.forceBlock {
+		t.Fatal("mine-one event did not survive cadence interruption")
+	}
+}
+
 func TestClockBootstrapAndExactBurstAreIdempotent(t *testing.T) {
 	t.Parallel()
 	bitcoin := &fakeBitcoin{height: 0, transactions: map[string][]WalletTransaction{}, inMempool: map[string]bool{}}
@@ -159,6 +239,29 @@ func TestClockBootstrapAndExactBurstAreIdempotent(t *testing.T) {
 		if bitcoin.mined[index] != want {
 			t.Fatalf("reserve destination %d = %#v, want %#v", index, bitcoin.mined[index], want)
 		}
+	}
+}
+
+func TestClockAllowsSecondaryNodeWithoutReserveMining(t *testing.T) {
+	t.Parallel()
+	bitcoin := &fakeBitcoin{height: 0, transactions: map[string][]WalletTransaction{}, inMempool: map[string]bool{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	statuses := &recordingStatuses{onWrite: func(status Status) {
+		if status.State == "paused" {
+			cancel()
+		}
+	}}
+	clock := testClock(bitcoin, statuses, Policy{Generation: 1, Mode: ModePause, AddressMode: AddressRoundRobin})
+	clock.Config.BootstrapHeight = 0
+	clock.Config.ReserveOutputs = 0
+	if err := clock.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	bitcoin.mu.Lock()
+	defer bitcoin.mu.Unlock()
+	if bitcoin.height != 0 || len(bitcoin.mined) != 0 {
+		t.Fatalf("secondary policy mutated the shared chain: height=%d mined=%d", bitcoin.height, len(bitcoin.mined))
 	}
 }
 

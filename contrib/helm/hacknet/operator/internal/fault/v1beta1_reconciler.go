@@ -30,6 +30,7 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/canonical"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/ownership"
@@ -207,7 +208,11 @@ func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1
 	if err != nil {
 		return reconcile.Result{RequeueAfter: 2 * time.Second}, r.transitionBeta(ctx, campaign, "Pending", "NetworkInventoryNotReady", err.Error())
 	}
-	if differences := inventory.BetaCompareLive(published, network, pods, nil); len(differences) > 0 {
+	differences, err := r.betaIdentityDifferences(ctx, published, network, pods, nil)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if len(differences) > 0 {
 		return reconcile.Result{RequeueAfter: 2 * time.Second}, r.transitionBeta(ctx, campaign, "Pending", "NetworkInventoryNotReady", "published inventory does not match live Pods")
 	}
 	// Standalone campaigns hold an exclusive lease. Children admitted by one
@@ -491,7 +496,12 @@ func (r *V1Beta1Reconciler) injectBetaStage(ctx context.Context, campaign *attac
 			r.rollbackBetaActions(ctx, campaign, status, created)
 			return err
 		}
-		if differences := inventory.BetaCompareLive(campaign.Status.Admission.NetworkInventory, fresh.Network, fresh.Pods, nil); len(differences) > 0 {
+		differences, compareErr := r.betaIdentityDifferences(ctx, campaign.Status.Admission.NetworkInventory, fresh.Network, fresh.Pods, nil)
+		if compareErr != nil {
+			r.rollbackBetaActions(ctx, campaign, status, created)
+			return compareErr
+		}
+		if len(differences) > 0 {
 			r.rollbackBetaActions(ctx, campaign, status, created)
 			return errors.New("network identity changed immediately before mutation")
 		}
@@ -1003,7 +1013,10 @@ func (r *V1Beta1Reconciler) rollbackBetaActions(ctx context.Context, campaign *a
 
 func (r *V1Beta1Reconciler) enforceBetaIdentity(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod) (bool, error) {
 	allowed := betaAllowedPodChanges(campaign)
-	differences := inventory.BetaCompareLive(campaign.Status.Admission.NetworkInventory, network, pods, allowed)
+	differences, err := r.betaIdentityDifferences(ctx, campaign.Status.Admission.NetworkInventory, network, pods, allowed)
+	if err != nil {
+		return false, err
+	}
 	if len(differences) == 0 {
 		return false, nil
 	}
@@ -1024,6 +1037,40 @@ func (r *V1Beta1Reconciler) enforceBetaIdentity(ctx context.Context, campaign *a
 		message += "; cleanup remains pending: " + truncate(cleanupErr.Error(), 500)
 	}
 	return true, r.patchBetaStatus(ctx, campaign, betaStatusTransition(next, campaign.Generation, "Inconclusive", "TargetIdentityDiverged", message, r.now()))
+}
+
+func (r *V1Beta1Reconciler) betaIdentityDifferences(
+	ctx context.Context,
+	expected attacknetv1beta1.NetworkInventory,
+	network *attacknetv1beta1.StacksNetwork,
+	pods []corev1.Pod,
+	allowedPodChanges map[string]struct{},
+) ([]attacknetv1beta1.IdentityDifference, error) {
+	differences := inventory.BetaCompareLive(expected, network, pods, allowedPodChanges)
+	if expected.BurnchainTopology == nil {
+		return differences, nil
+	}
+	for _, node := range expected.BurnchainTopology.Nodes {
+		policy := &attacknetv1beta1.BurnchainPolicy{}
+		key := client.ObjectKey{Namespace: network.Namespace, Name: node.PolicyRef}
+		if err := r.APIReader.Get(ctx, key, policy); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("read admitted BurnchainPolicy %q: %w", node.PolicyRef, err)
+			}
+			differences = append(differences, attacknetv1beta1.IdentityDifference{
+				Scope: "burnchainPolicy/" + node.Name, Field: "uid", Expected: node.PolicyUID,
+				Message: fmt.Sprintf("admitted BurnchainPolicy %q no longer exists", node.PolicyRef),
+			})
+			continue
+		}
+		if err := burnchaintopology.VerifyPolicyIdentity(expected.BurnchainTopology, network.Name, node.Name, policy); err != nil {
+			differences = append(differences, attacknetv1beta1.IdentityDifference{
+				Scope: "burnchainPolicy/" + node.Name, Field: "identity", Expected: node.PolicyUID,
+				Current: string(policy.UID), Message: err.Error(),
+			})
+		}
+	}
+	return differences, nil
 }
 
 func betaAllowedPodChanges(campaign *attacknetv1beta1.FaultCampaign) map[string]struct{} {

@@ -1,0 +1,34 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: BurnchainPolicy
+metadata:
+  name: a10-bitcoin-a
+  namespace: hacknet-system
+spec:
+  networkRef: a10-qualification
+  bitcoinNodeRef: bitcoin-a
+  # Release Stacks actors after the first regtest coinbase output is mature,
+  # leaving the remaining pre-epoch interval for protocol bootstrap.
+  bootstrapHeight: 101
+  reserveOutputs: 4
+  cadence: 5s
+  destinationSelection: fixed
+  fixedDestinationIndex: 0
+  destinations:
+    - {walletName: attacknet-miner-1, address: n2PEoV6Abxnrpzoqqq1TJT5kw8G2dMPpBd}
+  protocolSchedule:
+    epochs:
+      - {name: epoch-2-0, startHeight: 0}
+      - {name: epoch-2-05, startHeight: 203}
+      - {name: epoch-2-1, startHeight: 204}
+      - {name: epoch-2-2, startHeight: 206}
+      - {name: epoch-2-3, startHeight: 207}
+      - {name: epoch-2-4, startHeight: 208}
+      - {name: epoch-2-5, startHeight: 209}
+      - {name: epoch-3-0, startHeight: 223}
+      - {name: epoch-3-1, startHeight: 224}
+      - {name: epoch-3-2, startHeight: 225}
+      - {name: epoch-3-3, startHeight: 226}
+      - {name: epoch-3-4, startHeight: 227}
+      - {name: epoch-4-0, startHeight: 1000005}
+    rewardCycle: {firstHeight: 0, cycleLength: 20, prepareLength: 5}
+  rpc: {timeout: 5s, minimumBackoff: 1s, maximumBackoff: 5s}

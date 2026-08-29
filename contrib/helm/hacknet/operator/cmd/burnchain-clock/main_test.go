@@ -57,6 +57,11 @@ func TestHealthServerIsMinimalAndMethodRestricted(t *testing.T) {
 		t.Fatalf("empty status response = %d", unavailable.Code)
 	}
 	height, generation := uint64(240), uint64(3)
+	starting := httptest.NewRecorder()
+	server.Handler.ServeHTTP(starting, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if starting.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty readiness response = %d", starting.Code)
+	}
 	if err := recorder.Write(burnchain.Status{State: "paused", BitcoinHeight: &height, PolicyGeneration: &generation}); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +69,16 @@ func TestHealthServerIsMinimalAndMethodRestricted(t *testing.T) {
 	server.Handler.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/status", nil))
 	if status.Code != http.StatusOK || status.Body.String() == "" {
 		t.Fatalf("status response = %d %q", status.Code, status.Body.String())
+	}
+	ready := httptest.NewRecorder()
+	server.Handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("ready response = %d %q", ready.Code, ready.Body.String())
+	}
+	if !clockReady(burnchain.Status{State: "running", BitcoinHeight: &height, PolicyGeneration: &generation}, true) ||
+		clockReady(burnchain.Status{State: "starting", BitcoinHeight: &height, PolicyGeneration: &generation}, true) ||
+		clockReady(burnchain.Status{State: "running", BitcoinHeight: &height}, true) {
+		t.Fatal("clock readiness accepted an incomplete bootstrap or rejected an admitted clock")
 	}
 	metrics := httptest.NewRecorder()
 	server.Handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))

@@ -103,6 +103,18 @@ func validateNetwork(network *attacknetv1alpha1.StacksNetwork) error {
 	for index := range network.Spec.Actors {
 		actor := &network.Spec.Actors[index]
 		for _, dependency := range actor.Dependencies {
+			if dependency.Port < 1 || dependency.Port > 65535 {
+				return fmt.Errorf("actor %q dependency has invalid port %d", actor.Name, dependency.Port)
+			}
+			if (dependency.Actor == "") == (dependency.Service == "") {
+				return fmt.Errorf("actor %q dependency requires exactly one actor or service", actor.Name)
+			}
+			if dependency.Service != "" {
+				if problems := validation.IsDNS1123Subdomain(dependency.Service); len(problems) > 0 {
+					return fmt.Errorf("actor %q dependency has invalid Service %q: %s", actor.Name, dependency.Service, strings.Join(problems, "; "))
+				}
+				continue
+			}
 			target, exists := actors[dependency.Actor]
 			if !exists {
 				return fmt.Errorf("actor %q depends on unknown actor %q", actor.Name, dependency.Actor)

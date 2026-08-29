@@ -77,7 +77,15 @@ export function manifestFromStacksNetwork(resource) {
       instrumentation: {profile: 'unmodified', provenance: 'unavailable'},
     };
   });
-  return {network: metadata.name, namespace: metadata.namespace, workloads};
+  const burnchainTopology = status.burnchainTopology;
+  if (burnchainTopology !== undefined && (!/^sha256:[0-9a-f]{64}$/.test(burnchainTopology?.digest ?? '')
+    || burnchainTopology.observedGeneration !== metadata.generation || !Array.isArray(burnchainTopology.nodes))) {
+    throw new Error('StacksNetwork contains an incomplete admitted burnchain topology');
+  }
+  if (burnchainTopology?.nodes.some(node => !node?.name || !node?.policyRef || !node?.policyUID || !node?.policyServiceName)) {
+    throw new Error('StacksNetwork contains an incomplete admitted Bitcoin policy identity');
+  }
+  return {network: metadata.name, namespace: metadata.namespace, workloads, burnchainTopology};
 }
 
 function normalizedManifest(value) {
@@ -176,6 +184,17 @@ function actorTargets(manifest) {
   return {
     nodes: nodes.map(actor => target(actor, 20446)),
     signers: signers.map(actor => target(actor, 31000)),
+    burnchains: (manifest.burnchainTopology?.nodes ?? []).map(node => ({
+      targets: [`${node.policyServiceName}:18500`],
+      labels: {
+        attacknet_network: manifest.network,
+        attacknet_actor: node.name,
+        attacknet_role: 'burnchain',
+        burnchain_policy: node.policyRef,
+        burnchain_policy_uid: node.policyUID,
+        evidence_source: 'actor_self_reported',
+      },
+    })),
   };
 }
 
@@ -213,6 +232,13 @@ scrape_configs:
     body_size_limit: 16MB
     file_sd_configs:
       - files: [/etc/prometheus/targets/signers.json]
+        refresh_interval: 30s
+  - job_name: attacknet-burnchain-clock
+    honor_labels: false
+    scrape_timeout: 3s
+    sample_limit: 1000
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/burnchains.json]
         refresh_interval: 30s
   - job_name: attacknet-orchestrator-events
     honor_labels: false
@@ -575,6 +601,7 @@ export function renderObservability(manifest, {
   const collectorConfig = alloyConfig(manifest);
   const nodeTargets = `${JSON.stringify(targetData.nodes, null, 2)}\n`;
   const signerTargets = `${JSON.stringify(targetData.signers, null, 2)}\n`;
+  const burnchainTargets = `${JSON.stringify(targetData.burnchains, null, 2)}\n`;
   const datasource = grafanaDatasource(network);
   const promLabels = labels(network, 'prometheus');
   const grafanaLabels = labels(network, 'grafana');
@@ -613,13 +640,14 @@ export function renderObservability(manifest, {
       'attacknet.rules.yml': promRules,
       'nodes.json': nodeTargets,
       'signers.json': signerTargets,
+      'burnchains.json': burnchainTargets,
     }),
     {apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: {name: names.prometheus, namespace, labels: promLabels}, spec: {accessModes: ['ReadWriteOnce'], resources: {requests: {storage: '2Gi'}}}},
     {
       apiVersion: 'apps/v1', kind: 'Deployment', metadata: {name: names.prometheus, namespace, labels: promLabels},
-      spec: {replicas: 1, selector: {matchLabels: promLabels}, strategy: {type: 'Recreate'}, template: {metadata: {labels: promLabels, annotations: {'testing.stacks.org/config-sha256': digest(promConfig, promRules, nodeTargets, signerTargets)}}, spec: {
+      spec: {replicas: 1, selector: {matchLabels: promLabels}, strategy: {type: 'Recreate'}, template: {metadata: {labels: promLabels, annotations: {'testing.stacks.org/config-sha256': digest(promConfig, promRules, nodeTargets, signerTargets, burnchainTargets)}}, spec: {
         automountServiceAccountToken: false, securityContext: podSecurity(65534),
-        containers: [{name: 'prometheus', image: prometheusImage, imagePullPolicy: 'IfNotPresent', args: ['--config.file=/etc/prometheus/prometheus.yml', '--storage.tsdb.path=/prometheus', '--storage.tsdb.retention.time=7d', '--web.enable-lifecycle'], ports: [{name: 'http', containerPort: 9090}], securityContext: containerSecurity(), resources: {requests: {cpu: '100m', memory: '256Mi'}, limits: {cpu: '2', memory: '2Gi'}}, readinessProbe: {httpGet: {path: '/-/ready', port: 'http'}, periodSeconds: 5}, volumeMounts: [{name: 'config', mountPath: '/etc/prometheus/prometheus.yml', subPath: 'prometheus.yml', readOnly: true}, {name: 'config', mountPath: '/etc/prometheus/attacknet.rules.yml', subPath: 'attacknet.rules.yml', readOnly: true}, {name: 'config', mountPath: '/etc/prometheus/targets/nodes.json', subPath: 'nodes.json', readOnly: true}, {name: 'config', mountPath: '/etc/prometheus/targets/signers.json', subPath: 'signers.json', readOnly: true}, {name: 'data', mountPath: '/prometheus'}, {name: 'tmp', mountPath: '/tmp'}]}],
+        containers: [{name: 'prometheus', image: prometheusImage, imagePullPolicy: 'IfNotPresent', args: ['--config.file=/etc/prometheus/prometheus.yml', '--storage.tsdb.path=/prometheus', '--storage.tsdb.retention.time=7d', '--web.enable-lifecycle'], ports: [{name: 'http', containerPort: 9090}], securityContext: containerSecurity(), resources: {requests: {cpu: '100m', memory: '256Mi'}, limits: {cpu: '2', memory: '2Gi'}}, readinessProbe: {httpGet: {path: '/-/ready', port: 'http'}, periodSeconds: 5}, volumeMounts: [{name: 'config', mountPath: '/etc/prometheus/prometheus.yml', subPath: 'prometheus.yml', readOnly: true}, {name: 'config', mountPath: '/etc/prometheus/attacknet.rules.yml', subPath: 'attacknet.rules.yml', readOnly: true}, {name: 'config', mountPath: '/etc/prometheus/targets/nodes.json', subPath: 'nodes.json', readOnly: true}, {name: 'config', mountPath: '/etc/prometheus/targets/signers.json', subPath: 'signers.json', readOnly: true}, {name: 'config', mountPath: '/etc/prometheus/targets/burnchains.json', subPath: 'burnchains.json', readOnly: true}, {name: 'data', mountPath: '/prometheus'}, {name: 'tmp', mountPath: '/tmp'}]}],
         volumes: [{name: 'config', configMap: {name: names.prometheus}}, {name: 'data', persistentVolumeClaim: {claimName: names.prometheus}}, {name: 'tmp', emptyDir: {}}],
       }}}},
     service(names.prometheus, namespace, promLabels, [{name: 'http', port: 9090, targetPort: 'http'}]),

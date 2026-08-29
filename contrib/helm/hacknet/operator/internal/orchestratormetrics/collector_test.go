@@ -22,6 +22,19 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	branchEvidence, err := json.Marshal(map[string]any{
+		"sources": []any{map[string]any{
+			"actor": "miner-1", "role": "miner", "podName": "network-miner-1-0",
+			"podUID": "miner-pod-uid", "runtimeImageID": "sha256:miner-image", "serviceName": "network-miner-1",
+			"observedAt": "2026-08-26T12:00:01Z", "evidenceClass": "actor_self_reported",
+		}},
+		"stacksObservations": map[string]any{"miner-1": map[string]any{
+			"burnBlockHeight": 31, "burnConsensusHash": "123456789abcdeffedcba9876543210012345678", "bitcoinNodeRef": "bitcoin-a",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	protocolEvidence, err := json.Marshal(map[string]any{"sources": []any{map[string]any{
 		"actor": "signer-1", "role": "signer", "podName": "network-signer-1-0",
 		"podUID": "pod-uid", "runtimeImageID": "sha256:image", "serviceName": "network-signer-1",
@@ -62,12 +75,26 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 					Results: []attacknetv1beta1.ProtocolAssertionResult{{
 						ID: "telemetry-complete", Type: "TelemetryCompleteness", Outcome: "Proven", Reason: "AssertionSatisfied",
 						Evidence: apixv1.JSON{Raw: protocolEvidence},
+					}, {
+						ID: "stacks-views", Type: "StacksBurnchainCohort", Outcome: "Proven", Reason: "BranchDivergenceObserved",
+						Evidence: apixv1.JSON{Raw: branchEvidence},
 					}},
 				},
 			},
 		},
 	}
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(campaign, run).Build()
+	network := &attacknetv1beta1.StacksNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test"},
+		Status: attacknetv1beta1.StacksNetworkStatus{BurnchainTopology: &attacknetv1beta1.AdmittedBurnchainTopology{
+			Digest: "sha256:topology", ObservedGeneration: 7,
+			Nodes: []attacknetv1beta1.AdmittedBitcoinNode{
+				{Name: "bitcoin-a", ServiceName: "network-bitcoin-a", PolicyRef: "policy-a", PolicyUID: "uid-a", PolicyServiceName: "network-policy-a", PeerRefs: []string{"bitcoin-b"}},
+				{Name: "bitcoin-b", ServiceName: "network-bitcoin-b", PolicyRef: "policy-b", PolicyUID: "uid-b", PolicyServiceName: "network-policy-b", PeerRefs: []string{"bitcoin-a"}},
+			},
+			Bindings: []attacknetv1beta1.BurnchainActorBinding{{Actor: "miner-1", BitcoinNodeRef: "bitcoin-a"}},
+		}},
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(campaign, run, network).Build()
 	registry := prometheus.NewPedanticRegistry()
 	registry.MustRegister(NewCollector(reader))
 	families, err := registry.Gather()
@@ -85,14 +112,32 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 		"attacknet_run_info":                                                 1,
 		"attacknet_run_budget_usage":                                         11,
 		"attacknet_run_minimization_outcome":                                 1,
-		"attacknet_run_protocol_assertion":                                   1,
-		"attacknet_run_protocol_assertion_source_info":                       1,
-		"attacknet_run_protocol_assertion_source_observed_timestamp_seconds": 1,
+		"attacknet_run_protocol_assertion":                                   2,
+		"attacknet_run_protocol_assertion_source_info":                       2,
+		"attacknet_run_protocol_assertion_source_observed_timestamp_seconds": 2,
+		"attacknet_run_stacks_burn_view_height":                              1,
+		"attacknet_run_stacks_burn_view_fingerprint":                         1,
+		"attacknet_burnchain_topology_info":                                  1,
+		"attacknet_burnchain_topology_observed_generation":                   1,
+		"attacknet_burnchain_node_info":                                      2,
+		"attacknet_burnchain_topology_edge_info":                             2,
+		"attacknet_burnchain_actor_binding_info":                             1,
 		"attacknet_orchestrator_metrics_collection_success":                  1,
 	}
 	for name, count := range want {
 		if byName[name] != count {
 			t.Fatalf("metric family %s has %d samples, want %d; all=%v", name, byName[name], count, byName)
+		}
+	}
+	for _, family := range families {
+		if family.GetName() != "attacknet_run_stacks_burn_view_fingerprint" {
+			continue
+		}
+		labels := family.Metric[0].GetLabel()
+		for _, label := range labels {
+			if label.GetName() == "evidence_source" && label.GetValue() != actorEvidenceSource {
+				t.Fatalf("Stacks burn-view value was mislabeled as %q evidence", label.GetValue())
+			}
 		}
 	}
 }
@@ -136,4 +181,13 @@ func TestCollectorWatchdogFailsClosedOnMalformedEvidence(t *testing.T) {
 		}
 	}
 	t.Fatal("collection watchdog metric is absent")
+}
+
+func TestProvenStacksBurnViewRequiresBoundedEvidence(t *testing.T) {
+	if _, ok := decodeStacksBurnViews("StacksBurnchainCohort", "Proven", []byte(`{"stacksObservations":{}}`)); ok {
+		t.Fatal("a proven Stacks burn-view assertion accepted empty evidence")
+	}
+	if _, ok := decodeStacksBurnViews("StacksBurnchainCohort", "Pending", []byte(`{"stacksObservations":{}}`)); !ok {
+		t.Fatal("a pending Stacks burn-view assertion rejected an unavailable observation")
+	}
 }

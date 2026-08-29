@@ -24,6 +24,7 @@ import (
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchain"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 )
 
@@ -81,11 +82,15 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, request reconcile.R
 	if err != nil {
 		return reconciler.recordFailure(ctx, policy, now, "InvalidPolicy", err)
 	}
-	bitcoinPort := defaultBitcoinRPCPort
+	bitcoinPort := int32(0)
 	for _, node := range network.Spec.Burnchain.Nodes {
-		if node.Name == policy.Spec.BitcoinNodeRef && node.RPCPort > 0 {
-			bitcoinPort = node.RPCPort
+		if node.Name == policy.Spec.BitcoinNodeRef {
+			bitcoinPort = burnchaintopology.EffectiveRPCPort(node)
+			break
 		}
+	}
+	if bitcoinPort == 0 {
+		return reconciler.recordFailure(ctx, policy, now, "InvalidTopology", errors.New("admitted Bitcoin node disappeared from topology"))
 	}
 	configuration := resourceConfig{
 		Image: reconciler.ClockImage, ImagePullPolicy: reconciler.ClockImagePull,
@@ -120,6 +125,32 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, request reconcile.R
 			return reconciler.recordFailure(ctx, policy, now, "InvalidClockStatus", fmt.Errorf("observed Bitcoin height exceeds the supported status range"))
 		}
 		status.ObservedHeight = int64(*observed.BitcoinHeight)
+	}
+	if observed != nil {
+		status.BitcoinObservationError = observed.ObservationError
+		if observed.ChainInfo != nil {
+			status.ObservedHeight = observed.ChainInfo.Blocks
+			status.ObservedHeaders = observed.ChainInfo.Headers
+			status.LastBlockHash = observed.ChainInfo.BestBlockHash
+			status.ObservedChainwork = observed.ChainInfo.Chainwork
+			observedAt := metav1.NewTime(observed.UpdatedAt.UTC())
+			status.BitcoinObservationAt = &observedAt
+		}
+		if observed.ChainInfo != nil {
+			status.ObservedChainTips = make([]attacknetv1beta1.BurnchainChainTipStatus, 0, len(observed.ChainTips))
+			for _, tip := range observed.ChainTips {
+				status.ObservedChainTips = append(status.ObservedChainTips, attacknetv1beta1.BurnchainChainTipStatus{
+					Height: tip.Height, Hash: tip.Hash, BranchLen: tip.BranchLen, Status: tip.Status,
+				})
+			}
+			status.ObservedPeers = make([]attacknetv1beta1.BurnchainPeerStatus, 0, len(observed.Peers))
+			for _, peer := range observed.Peers {
+				status.ObservedPeers = append(status.ObservedPeers, attacknetv1beta1.BurnchainPeerStatus{
+					ID: peer.ID, Address: peer.Address, Inbound: peer.Inbound, ConnectionType: peer.ConnectionType,
+					LastBlock: peer.LastBlock, LastTransaction: peer.LastTransaction,
+				})
+			}
+		}
 	}
 	if observationErr != nil {
 		status.Phase, status.Reason, status.Message = "Applying", "ClockStatusUnavailable", boundedMessage(observationErr.Error())
@@ -182,8 +213,12 @@ func (reconciler *Reconciler) admitNetwork(ctx context.Context, policy *attackne
 	if !network.DeletionTimestamp.IsZero() || network.Status.ObservedGeneration != network.Generation {
 		return nil, nil, fmt.Errorf("StacksNetwork %s has not observed its current generation", network.Name)
 	}
-	if network.Spec.Burnchain.PolicyRef.Name != policy.Name {
-		return nil, nil, fmt.Errorf("StacksNetwork %s burnchain policyRef does not select %s", network.Name, policy.Name)
+	policyName, err := burnchaintopology.PolicyName(network, policy.Spec.BitcoinNodeRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	if policyName != policy.Name {
+		return nil, nil, fmt.Errorf("StacksNetwork %s Bitcoin node %s selects BurnchainPolicy %s, not %s", network.Name, policy.Spec.BitcoinNodeRef, policyName, policy.Name)
 	}
 	for index := range network.Status.Actors {
 		actor := &network.Status.Actors[index]
@@ -217,15 +252,15 @@ func (reconciler *Reconciler) observeClock(ctx context.Context, policy *attackne
 	var candidate *corev1.Pod
 	for index := range pods.Items {
 		pod := &pods.Items[index]
-		if pod.DeletionTimestamp.IsZero() && podReady(pod) {
+		if pod.DeletionTimestamp.IsZero() && pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
 			if candidate != nil {
 				return nil, fmt.Errorf("multiple Ready clock Pods exist")
 			}
 			candidate = pod
 		}
 	}
-	if candidate == nil || candidate.Status.PodIP == "" {
-		return nil, fmt.Errorf("clock Pod is not Ready")
+	if candidate == nil {
+		return nil, fmt.Errorf("clock Pod is not running")
 	}
 	status, err := reconciler.StatusReader.Read(ctx, candidate.Status.PodIP)
 	if err != nil {

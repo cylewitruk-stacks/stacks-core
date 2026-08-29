@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,7 +21,7 @@ func TestReadBurnchainHeightRequiresFreshIdentityBoundPolicy(t *testing.T) {
 	network := &attacknetv1beta1.StacksNetwork{
 		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: types.UID("network-uid")},
 		Spec: attacknetv1beta1.StacksNetworkSpec{Burnchain: attacknetv1beta1.BurnchainTopologySpec{
-			PolicyRef: corev1.LocalObjectReference{Name: "clock"},
+			PolicyRef: attacknetv1beta1.NamedObjectReference{Name: "clock"},
 		}},
 	}
 	policy := &attacknetv1beta1.BurnchainPolicy{

@@ -53,6 +53,23 @@ type ChainTip struct {
 	Status    string `json:"status"`
 }
 
+// PeerInfo is the bounded transport identity returned by getpeerinfo.
+type PeerInfo struct {
+	ID              int64  `json:"id"`
+	Address         string `json:"addr"`
+	Inbound         bool   `json:"inbound"`
+	ConnectionType  string `json:"connection_type"`
+	LastBlock       int64  `json:"last_block"`
+	LastTransaction int64  `json:"last_transaction"`
+}
+
+// Observer exposes read-only Bitcoin branch and transport observations.
+type Observer interface {
+	ChainInfo(context.Context) (ChainInfo, error)
+	ChainTips(context.Context) ([]ChainTip, error)
+	PeerInfo(context.Context) ([]PeerInfo, error)
+}
+
 // Bitcoin exposes the bounded Bitcoin Core operations needed by the clock.
 type Bitcoin interface {
 	Height(context.Context) (uint64, error)
@@ -213,6 +230,12 @@ func (client *RPCClient) BlockHeader(ctx context.Context, hash string) (BlockHea
 func (client *RPCClient) ChainTips(ctx context.Context) ([]ChainTip, error) {
 	var result []ChainTip
 	return result, client.call(ctx, "", "getchaintips", []any{}, &result)
+}
+
+// PeerInfo returns bounded identities for currently connected Bitcoin peers.
+func (client *RPCClient) PeerInfo(ctx context.Context) ([]PeerInfo, error) {
+	var result []PeerInfo
+	return result, client.call(ctx, "", "getpeerinfo", []any{}, &result)
 }
 
 // InvalidateBlock marks one block and its descendants invalid locally.

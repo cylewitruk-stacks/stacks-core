@@ -15,6 +15,14 @@ type Status struct {
 	State string `json:"state"`
 	// BitcoinHeight is the last observed canonical height.
 	BitcoinHeight *uint64 `json:"bitcoinHeight,omitempty"`
+	// ChainInfo identifies the currently selected Bitcoin branch.
+	ChainInfo *ChainInfo `json:"chainInfo,omitempty"`
+	// ChainTips contains the bounded locally-known Bitcoin branch set.
+	ChainTips []ChainTip `json:"chainTips,omitempty"`
+	// Peers contains the bounded currently-connected Bitcoin peer set.
+	Peers []PeerInfo `json:"peers,omitempty"`
+	// ObservationError explains why branch evidence is unavailable.
+	ObservationError string `json:"observationError,omitempty"`
 	// PolicyGeneration is the last applied immutable generation.
 	PolicyGeneration *uint64 `json:"policyGeneration,omitempty"`
 	// PolicyMode is the currently applied continuous-mining mode.
@@ -43,7 +51,7 @@ type StatusRecorder struct {
 // Write records the observation before forwarding it to the optional delegate.
 func (recorder *StatusRecorder) Write(status Status) error {
 	recorder.mutex.Lock()
-	if status.State == "running" && status.BitcoinHeight != nil {
+	if status.ObservationError == "" && (status.ChainInfo != nil || (status.State == "running" && status.BitcoinHeight != nil)) {
 		succeeded := status.UpdatedAt
 		status.LastSuccessAt = &succeeded
 	} else if recorder.status.LastSuccessAt != nil {

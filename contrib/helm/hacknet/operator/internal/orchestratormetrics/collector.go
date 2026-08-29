@@ -4,6 +4,7 @@ package orchestratormetrics
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"time"
 
@@ -14,24 +15,34 @@ import (
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
 
-const evidenceSource = "orchestrator_observed"
+const (
+	evidenceSource      = "orchestrator_observed"
+	actorEvidenceSource = "actor_self_reported"
+)
 
 // Collector reads cached controller state and exposes the finite Attacknet
 // campaign/run metric contract used by dashboards and evidence collection.
 type Collector struct {
 	Reader client.Reader
 
-	campaignInfo      *prometheus.Desc
-	campaignTarget    *prometheus.Desc
-	faultAction       *prometheus.Desc
-	assertionOutcome  *prometheus.Desc
-	runInfo           *prometheus.Desc
-	budgetUsage       *prometheus.Desc
-	minimization      *prometheus.Desc
-	protocolAssertion *prometheus.Desc
-	protocolSource    *prometheus.Desc
-	protocolSourceAt  *prometheus.Desc
-	collectionSuccess *prometheus.Desc
+	campaignInfo        *prometheus.Desc
+	campaignTarget      *prometheus.Desc
+	faultAction         *prometheus.Desc
+	assertionOutcome    *prometheus.Desc
+	runInfo             *prometheus.Desc
+	budgetUsage         *prometheus.Desc
+	minimization        *prometheus.Desc
+	protocolAssertion   *prometheus.Desc
+	protocolSource      *prometheus.Desc
+	protocolSourceAt    *prometheus.Desc
+	stacksBurnHeight    *prometheus.Desc
+	stacksBurnView      *prometheus.Desc
+	burnchainTopology   *prometheus.Desc
+	burnchainGeneration *prometheus.Desc
+	bitcoinNode         *prometheus.Desc
+	bitcoinEdge         *prometheus.Desc
+	burnchainBinding    *prometheus.Desc
+	collectionSuccess   *prometheus.Desc
 }
 
 // NewCollector constructs an Attacknet orchestration collector.
@@ -58,13 +69,27 @@ func NewCollector(reader client.Reader) *Collector {
 			[]string{"evidence_source", "network", "run", "gate", "assertion", "actor", "role", "pod", "pod_uid", "runtime_image_id", "service", "source_evidence_class"}, nil),
 		protocolSourceAt: prometheus.NewDesc("attacknet_run_protocol_assertion_source_observed_timestamp_seconds", "Actor observation timestamp used by one protocol assertion.",
 			[]string{"evidence_source", "network", "run", "gate", "assertion", "actor", "pod_uid"}, nil),
+		stacksBurnHeight: prometheus.NewDesc("attacknet_run_stacks_burn_view_height", "Burn height in one identity-bound Stacks actor branch observation.",
+			[]string{"evidence_source", "network", "run", "gate", "assertion", "actor", "bitcoin_node"}, nil),
+		stacksBurnView: prometheus.NewDesc("attacknet_run_stacks_burn_view_fingerprint", "Exact 52-bit visualization fingerprint of one identity-bound Stacks burn consensus hash; full hashes remain in evidence.",
+			[]string{"evidence_source", "network", "run", "gate", "assertion", "actor", "bitcoin_node"}, nil),
+		burnchainTopology: prometheus.NewDesc("attacknet_burnchain_topology_info", "Current complete Bitcoin topology admitted by the topology operator.",
+			[]string{"evidence_source", "network"}, nil),
+		burnchainGeneration: prometheus.NewDesc("attacknet_burnchain_topology_observed_generation", "StacksNetwork generation represented by the admitted Bitcoin topology.",
+			[]string{"evidence_source", "network"}, nil),
+		bitcoinNode: prometheus.NewDesc("attacknet_burnchain_node_info", "Bitcoin node and cadence-policy identity admitted by the topology operator.",
+			[]string{"evidence_source", "network", "bitcoin_node", "service", "policy", "policy_uid", "policy_service"}, nil),
+		bitcoinEdge: prometheus.NewDesc("attacknet_burnchain_topology_edge_info", "Directed persistent Bitcoin P2P edge admitted by the topology operator.",
+			[]string{"evidence_source", "network", "source", "target"}, nil),
+		burnchainBinding: prometheus.NewDesc("attacknet_burnchain_actor_binding_info", "Stacks actor to Bitcoin node binding admitted by the topology operator.",
+			[]string{"evidence_source", "network", "actor", "bitcoin_node"}, nil),
 		collectionSuccess: prometheus.NewDesc("attacknet_orchestrator_metrics_collection_success", "Whether the latest orchestration state collection succeeded.", nil, nil),
 	}
 }
 
 // Describe publishes every descriptor owned by the collector.
 func (c *Collector) Describe(output chan<- *prometheus.Desc) {
-	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.collectionSuccess} {
+	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.stacksBurnHeight, c.stacksBurnView, c.burnchainTopology, c.burnchainGeneration, c.bitcoinNode, c.bitcoinEdge, c.burnchainBinding, c.collectionSuccess} {
 		output <- descriptor
 	}
 }
@@ -79,11 +104,16 @@ func (c *Collector) Collect(output chan<- prometheus.Metric) {
 	defer cancel()
 	campaigns := &attacknetv1beta1.FaultCampaignList{}
 	runs := &attacknetv1beta1.AttacknetRunList{}
+	networks := &attacknetv1beta1.StacksNetworkList{}
 	if err := c.Reader.List(ctx, campaigns); err != nil {
 		output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, 0)
 		return
 	}
 	if err := c.Reader.List(ctx, runs); err != nil {
+		output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, 0)
+		return
+	}
+	if err := c.Reader.List(ctx, networks); err != nil {
 		output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, 0)
 		return
 	}
@@ -94,7 +124,34 @@ func (c *Collector) Collect(output chan<- prometheus.Metric) {
 	for index := range runs.Items {
 		success = c.collectRun(output, &runs.Items[index]) && success
 	}
+	for index := range networks.Items {
+		c.collectNetwork(output, &networks.Items[index])
+	}
 	output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, boolFloat(success))
+}
+
+func (c *Collector) collectNetwork(output chan<- prometheus.Metric, network *attacknetv1beta1.StacksNetwork) {
+	topology := network.Status.BurnchainTopology
+	if topology == nil || topology.Digest == "" {
+		return
+	}
+	output <- prometheus.MustNewConstMetric(c.burnchainTopology, prometheus.GaugeValue, 1,
+		evidenceSource, network.Name)
+	output <- prometheus.MustNewConstMetric(c.burnchainGeneration, prometheus.GaugeValue, float64(topology.ObservedGeneration),
+		evidenceSource, network.Name)
+	for _, node := range topology.Nodes {
+		output <- prometheus.MustNewConstMetric(c.bitcoinNode, prometheus.GaugeValue, 1,
+			evidenceSource, network.Name, node.Name, node.ServiceName, node.PolicyRef,
+			node.PolicyUID, node.PolicyServiceName)
+		for _, peer := range node.PeerRefs {
+			output <- prometheus.MustNewConstMetric(c.bitcoinEdge, prometheus.GaugeValue, 1,
+				evidenceSource, network.Name, node.Name, peer)
+		}
+	}
+	for _, binding := range topology.Bindings {
+		output <- prometheus.MustNewConstMetric(c.burnchainBinding, prometheus.GaugeValue, 1,
+			evidenceSource, network.Name, binding.Actor, binding.BitcoinNodeRef)
+	}
 }
 
 func (c *Collector) collectCampaign(output chan<- prometheus.Metric, campaign *attacknetv1beta1.FaultCampaign) bool {
@@ -229,6 +286,14 @@ func (c *Collector) collectProtocolAssertions(output chan<- prometheus.Metric, r
 			output <- prometheus.MustNewConstMetric(c.protocolSourceAt, prometheus.GaugeValue, float64(source.ObservedAt.UnixNano())/1e9,
 				evidenceSource, run.Spec.NetworkRef, run.Name, gate, result.ID, source.Actor, source.PodUID)
 		}
+		views, decoded := decodeStacksBurnViews(result.Type, result.Outcome, result.Evidence.Raw)
+		valid = decoded && valid
+		for _, view := range views {
+			output <- prometheus.MustNewConstMetric(c.stacksBurnHeight, prometheus.GaugeValue, float64(view.BurnBlockHeight),
+				actorEvidenceSource, run.Spec.NetworkRef, run.Name, gate, result.ID, view.Actor, view.BitcoinNodeRef)
+			output <- prometheus.MustNewConstMetric(c.stacksBurnView, prometheus.GaugeValue, float64(view.Fingerprint),
+				actorEvidenceSource, run.Spec.NetworkRef, run.Name, gate, result.ID, view.Actor, view.BitcoinNodeRef)
+		}
 	}
 	return valid
 }
@@ -246,6 +311,70 @@ type protocolSource struct {
 
 type protocolEvidence struct {
 	Sources []protocolSource `json:"sources"`
+}
+
+type stacksBurnView struct {
+	Actor           string
+	BitcoinNodeRef  string
+	BurnBlockHeight uint64
+	Fingerprint     uint64
+}
+
+type stacksBurnViewValue struct {
+	BurnBlockHeight   uint64 `json:"burnBlockHeight"`
+	BurnConsensusHash string `json:"burnConsensusHash"`
+	BitcoinNodeRef    string `json:"bitcoinNodeRef"`
+}
+
+type stacksBranchEvidence struct {
+	StacksObservations map[string]stacksBurnViewValue `json:"stacksObservations"`
+}
+
+func decodeStacksBurnViews(assertionType, outcome string, raw []byte) ([]stacksBurnView, bool) {
+	if assertionType != "StacksBurnchainCohort" {
+		return nil, true
+	}
+	if len(raw) == 0 {
+		return nil, outcome != "Proven"
+	}
+	value := stacksBranchEvidence{}
+	if json.Unmarshal(raw, &value) != nil {
+		return nil, false
+	}
+	actors := make([]string, 0, len(value.StacksObservations))
+	for actor := range value.StacksObservations {
+		actors = append(actors, actor)
+	}
+	if outcome == "Proven" && len(actors) == 0 {
+		return nil, false
+	}
+	sort.Strings(actors)
+	views := make([]stacksBurnView, 0, len(actors))
+	for _, actor := range actors {
+		observed := value.StacksObservations[actor]
+		if actor == "" || observed.BitcoinNodeRef == "" || !fixedLowerHex(observed.BurnConsensusHash, 40) {
+			return nil, false
+		}
+		fingerprint, err := strconv.ParseUint(observed.BurnConsensusHash[:13], 16, 52)
+		if err != nil {
+			return nil, false
+		}
+		views = append(views, stacksBurnView{Actor: actor, BitcoinNodeRef: observed.BitcoinNodeRef,
+			BurnBlockHeight: observed.BurnBlockHeight, Fingerprint: fingerprint})
+	}
+	return views, true
+}
+
+func fixedLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeProtocolSources(raw []byte) ([]protocolSource, bool) {
