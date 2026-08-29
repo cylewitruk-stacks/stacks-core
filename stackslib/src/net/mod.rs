@@ -102,6 +102,8 @@ pub mod poll;
 pub mod prune;
 pub mod relay;
 pub mod rpc;
+pub mod rpc_bridge;
+pub mod rpc_services;
 pub mod server;
 pub mod stackerdb;
 pub mod unsolicited;

@@ -184,6 +184,7 @@ fn spawn_peer(
     config: Config,
 ) -> JoinHandle<()> {
     this.bind(p2p_sock, rpc_sock).unwrap();
+
     let server_thread = thread::spawn(move || {
         // create estimators, metric instances for RPC handler
         let cost_estimator = config
@@ -526,6 +527,26 @@ impl Node {
             HashMap::new(),
             epochs,
         );
+
+        let mut p2p_net = p2p_net;
+
+        let axum_rpc_server = self.config.node.axum_rpc_bind_addr().and_then(|bind_addr| {
+            match stacks_rpc::prepare_axum_rpc_server(crate::make_axum_rpc_config(
+                &self.config,
+                bind_addr,
+                None,
+            )) {
+                Ok((server, endpoints)) => {
+                    p2p_net.install_rpc_endpoints(endpoints);
+                    Some(server)
+                }
+                Err(e) => {
+                    warn!("Failed to prepare experimental Axum RPC server: {e:?}");
+                    None
+                }
+            }
+        });
+
         let _join_handle = spawn_peer(
             self.config.is_mainnet(),
             self.config.burnchain.chain_id,
@@ -541,6 +562,12 @@ impl Node {
             1000,
             self.config.clone(),
         );
+
+        if let Some(server) = axum_rpc_server {
+            if let Err(e) = server.spawn() {
+                error!("Failed to spawn experimental Axum RPC server: {e}");
+            }
+        }
 
         info!("Start HTTP server on: {}", &self.config.node.rpc_bind);
         info!("Start P2P server on: {}", &self.config.node.p2p_bind);

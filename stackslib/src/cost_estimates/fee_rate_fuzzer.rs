@@ -16,7 +16,7 @@ pub struct FeeRateFuzzer<UnderlyingEstimator: FeeEstimator> {
     underlying: UnderlyingEstimator,
     /// Creator function for a new random generator. For prod, use `thread_rng`. For test,
     /// pass in a contrived generator.
-    rng_creator: Box<dyn Fn() -> Box<dyn RngCore>>,
+    rng_creator: Box<dyn Fn() -> Box<dyn RngCore> + Send + Sync>,
     /// The fuzzed rate will be `R * (1 + alpha)`, where `R` is the original rate, and `alpha` is a
     /// random number in `[-uniform_fuzz_fraction, uniform_fuzz_fraction]`.
     /// Note: Must be `0 <= uniform_fuzz_fraction < 1`.
@@ -46,7 +46,7 @@ impl<UnderlyingEstimator: FeeEstimator> FeeRateFuzzer<UnderlyingEstimator> {
     /// factory function, so that the test is repeatable.
     pub fn new_custom_creator(
         underlying: UnderlyingEstimator,
-        rng_creator: Box<dyn Fn() -> Box<dyn RngCore>>,
+        rng_creator: Box<dyn Fn() -> Box<dyn RngCore> + Send + Sync>,
         uniform_fuzz_fraction: f64,
     ) -> FeeRateFuzzer<UnderlyingEstimator> {
         assert!(0.0 <= uniform_fuzz_fraction && uniform_fuzz_fraction < 1.0);

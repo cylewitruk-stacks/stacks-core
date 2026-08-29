@@ -28,6 +28,9 @@ extern crate slog;
 
 pub use stacks_common::util;
 use stacks_common::util::hash::hex_bytes;
+use stacks_rpc::config::{
+    AxumRpcConfig, ChainstateReadSpec, FeeEstimationSpec, MempoolReadSpec, ReadOnlyCallSpec,
+};
 
 pub mod monitoring;
 
@@ -45,6 +48,10 @@ pub mod syncctl;
 pub mod tenure;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 use std::{env, panic, process};
 
 use backtrace::Backtrace;
@@ -70,6 +77,51 @@ pub use self::run_loop::{helium, neon};
 pub use self::tenure::Tenure;
 use crate::neon_node::{BlockMinerThread, TipCandidate};
 use crate::run_loop::boot_nakamoto;
+
+pub fn make_axum_rpc_config(
+    config: &Config,
+    bind_addr: SocketAddr,
+    shutdown_signal: Option<Arc<AtomicBool>>,
+) -> AxumRpcConfig {
+    let burnchain = config.get_burnchain();
+    let chainstate_path = config.get_chainstate_path_str();
+    let fee_estimation = match (
+        config.make_cost_estimator(),
+        config.make_fee_estimator(),
+        config.make_cost_metric(),
+    ) {
+        (Some(cost_estimator), Some(fee_estimator), Some(cost_metric)) => Some(FeeEstimationSpec {
+            cost_estimator,
+            fee_estimator,
+            cost_metric,
+        }),
+        _ => None,
+    };
+    AxumRpcConfig {
+        bind_addr,
+        auth_token: config.connection_options.auth_token.clone(),
+        shutdown_signal,
+        chainstate_read: ChainstateReadSpec {
+            mainnet: config.is_mainnet(),
+            chain_id: config.burnchain.chain_id,
+            chainstate_path: chainstate_path.clone(),
+            sortition_db_path: config.get_burn_db_file_path(),
+            marf_opts: Some(config.node.get_marf_opts()),
+            burnchain,
+            txindex: config.node.txindex,
+            read_only_call: ReadOnlyCallSpec {
+                maximum_argument_bytes: config.connection_options.maximum_call_argument_size,
+                cost_limit: config.connection_options.read_only_call_limit.clone(),
+                max_execution_time: Duration::from_secs(
+                    config.connection_options.read_only_max_execution_time_secs,
+                ),
+                max_memory_bytes: config.connection_options.read_only_call_max_mem_bytes,
+            },
+        },
+        mempool_read: MempoolReadSpec { chainstate_path },
+        fee_estimation,
+    }
+}
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_arch = "arm")))]
 #[global_allocator]

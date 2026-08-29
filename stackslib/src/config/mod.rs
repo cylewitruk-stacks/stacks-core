@@ -2113,6 +2113,9 @@ pub struct NodeConfig {
     /// ---
     /// @default: `"0.0.0.0:20443"`
     pub rpc_bind: String,
+    /// Optional IPv4 address and port for the experimental Axum HTTP RPC server.
+    /// When unset, the Axum RPC PoC is disabled.
+    pub axum_rpc_bind: Option<String>,
     /// The IPv4 address and port (e.g., "0.0.0.0:20444") on which the node's P2P
     /// networking service should bind and listen for incoming connections from other peers.
     /// ---
@@ -2614,6 +2617,7 @@ impl Default for NodeConfig {
             seed: seed.to_vec(),
             working_dir: format!("/tmp/{testnet_id}"),
             rpc_bind: format!("0.0.0.0:{rpc_port}"),
+            axum_rpc_bind: None,
             p2p_bind: format!("0.0.0.0:{p2p_port}"),
             data_url: format!("http://127.0.0.1:{rpc_port}"),
             p2p_address: format!("127.0.0.1:{rpc_port}"),
@@ -2667,6 +2671,18 @@ impl NodeConfig {
                 error!("Could not parse node.rpc_bind configuration setting as SocketAddr: {e}");
             })
             .ok()
+    }
+
+    pub fn axum_rpc_bind_addr(&self) -> Option<SocketAddr> {
+        self.axum_rpc_bind.as_ref().and_then(|bind| {
+            SocketAddr::from_str(bind)
+                .inspect_err(|e| {
+                    error!(
+                        "Could not parse node.axum_rpc_bind configuration setting as SocketAddr: {e}"
+                    );
+                })
+                .ok()
+        })
     }
 
     pub fn p2p_bind_addr(&self) -> Option<SocketAddr> {
@@ -4142,6 +4158,7 @@ pub struct NodeConfigFile {
     pub deny_nodes: Option<String>,
     pub working_dir: Option<String>,
     pub rpc_bind: Option<String>,
+    pub axum_rpc_bind: Option<String>,
     pub p2p_bind: Option<String>,
     pub p2p_address: Option<String>,
     pub data_url: Option<String>,
@@ -4216,6 +4233,7 @@ impl NodeConfigFile {
             working_dir: std::env::var("STACKS_WORKING_DIR")
                 .unwrap_or(self.working_dir.unwrap_or(default_node_config.working_dir)),
             rpc_bind: rpc_bind.clone(),
+            axum_rpc_bind: self.axum_rpc_bind.or(default_node_config.axum_rpc_bind),
             p2p_bind: self.p2p_bind.unwrap_or(default_node_config.p2p_bind),
             p2p_address: self.p2p_address.unwrap_or(rpc_bind.clone()),
             bootstrap_node: vec![],

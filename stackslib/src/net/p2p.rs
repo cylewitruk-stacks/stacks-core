@@ -56,10 +56,13 @@ use crate::net::mempool::MempoolSync;
 use crate::net::neighbors::*;
 use crate::net::poll::{NetworkPollState, NetworkState};
 use crate::net::relay::{RelayerStats, *};
+use crate::net::rpc_bridge::{BlockProposalQuery, MempoolQuery, RpcEndpoints};
 use crate::net::server::*;
 use crate::net::stackerdb::{StackerDBConfig, StackerDBSync, StackerDBTx, StackerDBs};
-use crate::net::{Error as net_error, Neighbor, NeighborKey, *};
+use crate::net::{rpc_services, Error as net_error, Neighbor, NeighborKey, *};
 use crate::util_lib::db::{DBConn, DBTx, Error as db_error};
+
+const AXUM_RPC_BRIDGE_DRAIN_LIMIT: usize = 32;
 
 /// inter-thread request to send a p2p message from another thread in this program.
 #[derive(Debug)]
@@ -657,6 +660,9 @@ pub struct PeerNetwork {
     /// Address and height of the neighbor that reported the highest Stacks block height
     /// via RPC responses
     pub highest_stacks_neighbor: Option<(SocketAddr, u64)>,
+
+    /// Experimental Axum RPC endpoints owned by the P2P thread.
+    rpc_endpoints: Option<RpcEndpoints>,
 }
 
 impl PeerNetwork {
@@ -815,6 +821,8 @@ impl PeerNetwork {
             block_proposal_thread: None,
 
             highest_stacks_neighbor: None,
+
+            rpc_endpoints: None,
         };
 
         network.init_block_downloader();
@@ -825,6 +833,98 @@ impl PeerNetwork {
 
     pub fn set_proposal_thread(&mut self, thread: JoinHandle<()>) {
         self.block_proposal_thread = Some(thread);
+    }
+
+    pub fn install_rpc_endpoints(&mut self, endpoints: RpcEndpoints) {
+        self.rpc_endpoints = Some(endpoints);
+    }
+
+    fn drain_axum_rpc_requests(
+        &mut self,
+        sortdb: &SortitionDB,
+        chainstate: &mut StacksChainState,
+        mempool: &mut MemPoolDB,
+        handler_args: &RPCHandlerArgs,
+        ibd: bool,
+    ) -> Vec<StacksMessageType> {
+        let Some(endpoints) = self.rpc_endpoints.take() else {
+            return vec![];
+        };
+
+        endpoints
+            .snapshot
+            .publish(rpc_services::get_node_state_snapshot(
+                self,
+                chainstate,
+                handler_args.exit_at_block_height,
+                &handler_args.genesis_chainstate_hash,
+                ibd,
+            ));
+
+        let mut remaining = AXUM_RPC_BRIDGE_DRAIN_LIMIT;
+        let mut relay_messages = vec![];
+
+        while remaining > 0 {
+            let mut made_progress = false;
+
+            if remaining > 0 {
+                match endpoints.block_proposal.try_recv() {
+                    Ok(BlockProposalQuery::Validate { proposal, reply }) => {
+                        remaining -= 1;
+                        made_progress = true;
+                        let result = rpc_services::start_block_proposal_validation(
+                            self,
+                            sortdb,
+                            chainstate,
+                            handler_args,
+                            proposal,
+                        );
+                        let _ = reply.try_send(result);
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+                }
+            }
+
+            if remaining > 0 {
+                match endpoints.mempool.try_recv() {
+                    Ok(MempoolQuery::SubmitTransaction {
+                        transaction,
+                        attachment,
+                        reply,
+                    }) => {
+                        remaining -= 1;
+                        made_progress = true;
+                        let result = rpc_services::submit_transaction(
+                            self,
+                            sortdb,
+                            chainstate,
+                            mempool,
+                            handler_args,
+                            &transaction,
+                            attachment.as_ref(),
+                        );
+                        if matches!(
+                            &result,
+                            Ok(rpc_services::TransactionSubmission {
+                                status: rpc_services::TransactionSubmissionStatus::Accepted,
+                                ..
+                            })
+                        ) {
+                            relay_messages.push(StacksMessageType::Transaction(transaction));
+                        }
+                        let _ = reply.try_send(result);
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+                }
+            }
+
+            if !made_progress {
+                break;
+            }
+        }
+
+        self.rpc_endpoints = Some(endpoints);
+        relay_messages
     }
 
     pub fn is_proposal_thread_running(&mut self) -> bool {
@@ -5534,6 +5634,10 @@ impl PeerNetwork {
         // update PoX view, before handling any HTTP connections
         self.refresh_sortition_view(sortdb)
             .expect("FATAL: failed to refresh sortition view from sortition DB");
+
+        let axum_stacks_msgs =
+            self.drain_axum_rpc_requests(sortdb, chainstate, mempool, handler_args, ibd);
+        network_result.consume_http_uploads(axum_stacks_msgs);
 
         // This operation needs to be performed before any early return:
         // Events are being parsed and dispatched here once and we want to
