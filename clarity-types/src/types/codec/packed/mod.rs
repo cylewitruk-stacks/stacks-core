@@ -154,11 +154,19 @@ pub struct PackedValue {
 
 impl PackedValue {
     /// Transcode one exact self-describing consensus value into canonical packed storage.
+    ///
+    /// Historical unsanitized values can contain active data omitted by a cached read schema. The
+    /// resulting record preserves that data, but typed decoding under the narrower schema is not
+    /// guaranteed. Call [`Self::transcode_consensus_with_shape`] when the caller needs the
+    /// descriptor required for schema-free compatibility reconstruction.
     pub fn transcode_consensus(consensus: &[u8]) -> Result<Self, PackedValueError> {
         encode::transcode(consensus)
     }
 
     /// Transcode consensus bytes and derive their schema-free reconstruction metadata.
+    ///
+    /// The returned descriptor allows exact reconstruction when a historical unsanitized value
+    /// cannot be decoded directly under its cached read schema.
     pub fn transcode_consensus_with_shape(
         consensus: &[u8],
     ) -> Result<(Self, ValueShape), PackedValueError> {
@@ -233,16 +241,10 @@ impl<'a> PackedValueRef<'a> {
         decode::value(self, expected, epoch)
     }
 
-    /// Structurally validate this record under a declared read schema.
-    pub fn validate(
-        self,
-        expected: &TypeSignature,
-        epoch: &StacksEpochId,
-    ) -> Result<(), PackedValueError> {
-        self.decode(expected, epoch).map(|_| ())
-    }
-
     /// Reconstruct exact consensus bytes using an active-shape descriptor.
+    ///
+    /// This checks framing and the declared logical length, but does not prove that the output is a
+    /// valid bounded Clarity value. Use [`Self::audit_reconstruction`] for untrusted records.
     pub fn reconstruct_consensus(self, descriptor: &[u8]) -> Result<Vec<u8>, PackedValueError> {
         reconstruct::reconstruct_consensus(self, descriptor)
     }

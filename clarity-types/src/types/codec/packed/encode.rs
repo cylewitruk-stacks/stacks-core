@@ -77,7 +77,8 @@ pub fn prefixed_value(
 ///
 /// This correctness-first implementation materializes one bounded Clarity value. The migration API
 /// remains streaming at row granularity; a direct cursor implementation can replace this without
-/// changing the format.
+/// changing the format. Historical unsanitized values may require descriptor-based reconstruction
+/// instead of direct typed decoding under their cached schema.
 pub fn transcode(consensus: &[u8]) -> Result<PackedValue, PackedValueError> {
     let value = deserialize_canonical_consensus(consensus)?;
     let consensus_byte_len =
@@ -363,6 +364,9 @@ fn list(list: &crate::types::ListData, output: &mut Vec<u8>) -> Result<(), Packe
 }
 
 /// Transcode one exact consensus value into canonical packed bytes and its descriptor.
+///
+/// The descriptor preserves active data omitted by historical cached schemas and enables exact
+/// schema-free compatibility reconstruction.
 pub fn transcode_with_shape(
     consensus: &[u8],
 ) -> Result<(PackedValue, ValueShape), PackedValueError> {

@@ -54,7 +54,6 @@ fn assert_canonical_round_trip(value: Value, expected: TypeSignature) -> Vec<u8>
     let packed = admitted
         .encode_packed(consensus_len, ConsensusLengthValidation::Enabled)
         .unwrap();
-    packed.as_packed_ref().validate(&expected, &EPOCH).unwrap();
     let decoded = packed.as_packed_ref().decode(&expected, &EPOCH).unwrap();
     assert_eq!(&decoded.value, admitted.value());
     assert_eq!(decoded.value.serialize_to_vec().unwrap(), consensus);

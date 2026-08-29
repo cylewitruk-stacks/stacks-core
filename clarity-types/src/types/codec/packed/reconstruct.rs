@@ -25,8 +25,9 @@ use crate::types::serialization::TypePrefix;
 /// Structurally reconstruct exact consensus bytes without a declared schema.
 ///
 /// This bounded pass validates record framing, shape grammar, scalar encodings, and the declared
-/// logical length. Call [`PackedValueRef::audit_reconstruction`] to additionally prove that the
-/// payload and shape are their canonical representations of the reconstructed value.
+/// logical length. It does not prove that the output deserializes as a valid bounded Clarity value.
+/// Call [`PackedValueRef::audit_reconstruction`] to establish that property and additionally prove
+/// that the payload and shape are their canonical representations of the reconstructed value.
 pub fn reconstruct_consensus(
     packed: PackedValueRef<'_>,
     descriptor: &[u8],

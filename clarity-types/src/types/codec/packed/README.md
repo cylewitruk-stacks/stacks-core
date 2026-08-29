@@ -451,6 +451,11 @@ The expected schema provides omitted tuple names, declared bounds, inactive wrap
 element types, and callable trait identity. It MUST NOT change the physical interpretation selected
 by the canonical active value.
 
+Schema-free transcoding preserves the complete active value. Historical unsanitized values can
+contain data omitted by their cached read schema, so direct typed decoding is not guaranteed for
+those records. Such compatibility reads require the active-shape descriptor and schema-free
+reconstruction before applying the legacy sanitizing typed deserializer.
+
 ## Schema-free reconstruction and audit
 
 Schema-free reconstruction receives a complete packed record and active-shape descriptor. It MUST
@@ -458,8 +463,10 @@ validate both grammars and reconstruct exactly the canonical Clarity consensus b
 the pair.
 
 Structural reconstruction alone proves that the pair is well framed and produces the declared
-logical length. It does not prove that the descriptor is the most specific canonical descriptor for
-those bytes.
+logical length. It does not prove that the reconstructed bytes deserialize as a valid bounded
+Clarity value or that the descriptor is the most specific canonical descriptor for those bytes.
+Consumers handling untrusted or possibly corrupt records MUST use the full canonical audit before
+hashing, serving, or otherwise relying on the reconstructed bytes.
 
 A full canonical audit MUST additionally:
 
