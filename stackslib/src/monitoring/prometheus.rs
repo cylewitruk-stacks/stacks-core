@@ -263,13 +263,13 @@ lazy_static! {
 
     pub static ref SIGNER_COORDINATOR_ROUNDS: IntCounterVec = register_int_counter_vec!(
         "stacks_node_signer_coordinator_rounds_total",
-        "Legacy signer-coordinator rounds by lifecycle event and bounded outcome",
+        "libsigner v0 signer-coordinator rounds by lifecycle event and bounded outcome",
         &["event", "outcome"]
     ).unwrap();
 
     pub static ref SIGNER_RESPONSE_WEIGHT: IntCounterVec = register_int_counter_vec!(
         "stacks_node_signer_response_weight_total",
-        "Signer response weight added per legacy coordinator accumulation round; unavailable_classified is an overlapping subset of rejected_effective",
+        "Signer response weight added per libsigner v0 coordinator accumulation round; unavailable_classified is an overlapping subset of rejected_effective",
         &["classification"]
     ).unwrap();
 

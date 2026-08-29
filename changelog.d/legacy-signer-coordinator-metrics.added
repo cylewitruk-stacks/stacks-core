@@ -1,1 +1,0 @@
-Added the `stacks_node_signer_coordinator_rounds_total`, `stacks_node_signer_response_weight_total`, and `stacks_node_signer_coordinator_milestone_seconds` Prometheus metrics and operator documentation for the legacy signer coordinator.

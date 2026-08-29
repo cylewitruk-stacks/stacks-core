@@ -508,7 +508,7 @@ define_named_enum!(SignerCoordinatorMilestoneOutcome {
     Rejected("rejected"),
 });
 
-/// Increment a legacy signer-coordinator round lifecycle event.
+/// Increment a `libsigner` v0 signer-coordinator round lifecycle event.
 #[allow(unused_variables)]
 pub fn increment_signer_coordinator_round(
     event: SignerCoordinatorRoundEvent,

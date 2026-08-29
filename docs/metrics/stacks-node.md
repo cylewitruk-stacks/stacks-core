@@ -1,6 +1,6 @@
 # `stacks-node` metrics
 
-## Legacy signer coordinator
+## `libsigner` v0 signer coordinator
 
 These metrics expose the node miner's existing StackerDB-based signing round.
 They are available when the node is built with the `monitoring_prom` feature
@@ -37,8 +37,8 @@ sum by (outcome) (
 
 ### `stacks_node_signer_response_weight_total`
 
-Adds the configured signer weight when the legacy listener adds a response to
-the current accumulation round.
+Adds the configured signer weight when the `libsigner` v0 listener adds a
+response to the current accumulation round.
 
 - `approved`: weight added to `total_weight_approved`
 - `rejected_effective`: weight added to `total_weight_rejected`
@@ -46,11 +46,11 @@ the current accumulation round.
   whose signed reason is `ConnectivityIssues`, `NoSortitionView`, or
   `NoSignerConsensus`
 
-The overlapping classification is deliberate. Current legacy behavior still
-counts unavailable weight as rejection weight. This metric does not discount,
-renormalize, or otherwise change that arithmetic. `InvalidTenureExtend` is not
-classified as unavailable because the current reason represents both genuine
-policy verdicts and some RPC failures.
+The overlapping classification is deliberate. The current `libsigner` v0
+behavior still counts unavailable weight as rejection weight. This metric does
+not discount, renormalize, or otherwise change that arithmetic.
+`InvalidTenureExtend` is not classified as unavailable because the current
+reason represents both genuine policy verdicts and some RPC failures.
 
 Rejection timeouts clear the round's rejection accumulator before the proposal
 is resent. A signer that rejects again can therefore contribute weight again,

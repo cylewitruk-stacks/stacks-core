@@ -61,7 +61,7 @@ pub static TEST_IGNORE_SIGNERS: LazyLock<TestFlag<bool>> = LazyLock::new(TestFla
 pub static EVENT_RECEIVER_POLL: Duration = Duration::from_millis(500);
 
 /// Return whether a rejection says the signer could not produce a validity
-/// decision. This classification is observational only: the legacy
+/// decision. This classification is observational only: the `libsigner` v0
 /// coordinator still counts all rejection weight exactly as before.
 fn is_unavailable_rejection(reason: &RejectReason) -> bool {
     matches!(
