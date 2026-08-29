@@ -262,14 +262,14 @@ lazy_static! {
     ).unwrap();
 
     pub static ref SIGNER_COORDINATOR_ROUNDS: IntCounterVec = register_int_counter_vec!(
-        "stacks_node_signer_coordinator_rounds",
+        "stacks_node_signer_coordinator_rounds_total",
         "Legacy signer-coordinator rounds by lifecycle event and bounded outcome",
         &["event", "outcome"]
     ).unwrap();
 
     pub static ref SIGNER_RESPONSE_WEIGHT: IntCounterVec = register_int_counter_vec!(
-        "stacks_node_signer_response_weight",
-        "Unique signer response weight observed by the legacy coordinator; unavailable_classified is an overlapping subset of rejected_effective",
+        "stacks_node_signer_response_weight_total",
+        "Signer response weight added per legacy coordinator accumulation round; unavailable_classified is an overlapping subset of rejected_effective",
         &["classification"]
     ).unwrap();
 
@@ -277,7 +277,11 @@ lazy_static! {
         register_histogram_vec!(
             histogram_opts!(
                 "stacks_node_signer_coordinator_milestone_seconds",
-                "Elapsed seconds from proposal publication to a bounded signer-coordinator milestone"
+                "Elapsed seconds to a bounded signer-coordinator milestone",
+                vec![
+                    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                    20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 300.0, 600.0, 900.0,
+                ]
             ),
             &["milestone", "outcome"]
         )

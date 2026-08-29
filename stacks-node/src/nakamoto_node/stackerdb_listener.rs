@@ -157,7 +157,7 @@ pub struct BlockStatus {
     pub total_weight_rejected: u32,
     /// Per-txid rejection tracking from signers
     pub failed_txids: HashMap<Txid, FailedTxInfo>,
-    /// Round-scoped, observation-only response timing state.
+    /// Proposal-scoped, observation-only response timing state.
     response_metrics: SignerResponseMetricsState,
 }
 

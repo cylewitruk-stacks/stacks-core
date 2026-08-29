@@ -500,6 +500,7 @@ define_named_enum!(SignerResponseWeightClassification {
 define_named_enum!(SignerCoordinatorMilestone {
     ProposalToFirstResponse("proposal_to_first_response"),
     ProposalToThreshold("proposal_to_threshold"),
+    RoundToThreshold("round_to_threshold"),
 });
 
 define_named_enum!(SignerCoordinatorMilestoneOutcome {
@@ -519,7 +520,7 @@ pub fn increment_signer_coordinator_round(
         .inc();
 }
 
-/// Add unique signer weight to a bounded response classification.
+/// Add signer weight to a bounded response classification for one accumulation round.
 #[allow(unused_variables)]
 pub fn add_signer_response_weight(classification: SignerResponseWeightClassification, weight: u32) {
     #[cfg(feature = "monitoring_prom")]
@@ -528,7 +529,7 @@ pub fn add_signer_response_weight(classification: SignerResponseWeightClassifica
         .inc_by(i64::from(weight));
 }
 
-/// Observe elapsed seconds from proposal publication to a bounded round milestone.
+/// Observe elapsed seconds to a bounded signer-coordinator milestone.
 #[allow(unused_variables)]
 pub fn observe_signer_coordinator_milestone(
     milestone: SignerCoordinatorMilestone,
@@ -539,6 +540,24 @@ pub fn observe_signer_coordinator_milestone(
     prometheus::SIGNER_COORDINATOR_MILESTONE_SECONDS
         .with_label_values(&[milestone.get_name_str(), outcome.get_name_str()])
         .observe(elapsed.as_secs_f64());
+}
+
+/// Observe paired proposal-wide and round-scoped threshold latencies.
+pub fn observe_signer_coordinator_threshold_milestones(
+    outcome: SignerCoordinatorMilestoneOutcome,
+    proposal_elapsed: std::time::Duration,
+    round_elapsed: std::time::Duration,
+) {
+    observe_signer_coordinator_milestone(
+        SignerCoordinatorMilestone::ProposalToThreshold,
+        outcome.clone(),
+        proposal_elapsed,
+    );
+    observe_signer_coordinator_milestone(
+        SignerCoordinatorMilestone::RoundToThreshold,
+        outcome,
+        round_elapsed,
+    );
 }
 
 // Increment the counter for the given miner stop reason.
@@ -570,8 +589,8 @@ mod signer_coordinator_metric_tests {
     };
     use super::{
         add_signer_response_weight, increment_signer_coordinator_round,
-        observe_signer_coordinator_milestone, SignerCoordinatorMilestone,
-        SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent,
+        observe_signer_coordinator_milestone, observe_signer_coordinator_threshold_milestones,
+        SignerCoordinatorMilestone, SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent,
         SignerCoordinatorRoundOutcome, SignerResponseWeightClassification,
     };
 
@@ -605,19 +624,49 @@ mod signer_coordinator_metric_tests {
             .with_label_values(&["proposal_to_first_response", "approved"]);
         let threshold = SIGNER_COORDINATOR_MILESTONE_SECONDS
             .with_label_values(&["proposal_to_threshold", "rejected"]);
+        let round_threshold = SIGNER_COORDINATOR_MILESTONE_SECONDS
+            .with_label_values(&["round_to_threshold", "rejected"]);
         let first_response_before = first_response.get_sample_count();
-        let count_before = threshold.get_sample_count();
+        let threshold_before = threshold.get_sample_count();
+        let round_threshold_before = round_threshold.get_sample_count();
+        let threshold_sum_before = threshold.get_sample_sum();
+        let round_threshold_sum_before = round_threshold.get_sample_sum();
         observe_signer_coordinator_milestone(
             SignerCoordinatorMilestone::ProposalToFirstResponse,
             SignerCoordinatorMilestoneOutcome::Approved,
             Duration::from_millis(25),
         );
-        observe_signer_coordinator_milestone(
-            SignerCoordinatorMilestone::ProposalToThreshold,
+        observe_signer_coordinator_threshold_milestones(
             SignerCoordinatorMilestoneOutcome::Rejected,
             Duration::from_millis(250),
+            Duration::from_millis(100),
         );
         assert_eq!(first_response.get_sample_count(), first_response_before + 1);
-        assert_eq!(threshold.get_sample_count(), count_before + 1);
+        assert_eq!(threshold.get_sample_count(), threshold_before + 1);
+        assert_eq!(
+            round_threshold.get_sample_count(),
+            round_threshold_before + 1
+        );
+        assert!((threshold.get_sample_sum() - threshold_sum_before - 0.25).abs() < 1e-12);
+        assert!(
+            (round_threshold.get_sample_sum() - round_threshold_sum_before - 0.1).abs() < 1e-12
+        );
+
+        let metric_families = ::prometheus::gather();
+        assert!(metric_families
+            .iter()
+            .any(|family| family.get_name() == "stacks_node_signer_coordinator_rounds_total"));
+        assert!(metric_families
+            .iter()
+            .any(|family| family.get_name() == "stacks_node_signer_response_weight_total"));
+        let milestone_family = metric_families
+            .iter()
+            .find(|family| family.get_name() == "stacks_node_signer_coordinator_milestone_seconds")
+            .expect("missing signer coordinator milestone metric");
+        let buckets = milestone_family.get_metric()[0]
+            .get_histogram()
+            .get_bucket();
+        assert_eq!(buckets.first().unwrap().get_upper_bound(), 0.005);
+        assert_eq!(buckets.last().unwrap().get_upper_bound(), 900.0);
     }
 }

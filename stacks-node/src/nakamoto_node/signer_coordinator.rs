@@ -33,9 +33,8 @@ use stacks::chainstate::stacks::Error as ChainstateError;
 use stacks::codec::StacksMessageCodec;
 use stacks::libstackerdb::StackerDBChunkData;
 use stacks::monitoring::{
-    increment_signer_coordinator_round, observe_signer_coordinator_milestone,
-    SignerCoordinatorMilestone, SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent,
-    SignerCoordinatorRoundOutcome,
+    increment_signer_coordinator_round, observe_signer_coordinator_threshold_milestones,
+    SignerCoordinatorMilestoneOutcome, SignerCoordinatorRoundEvent, SignerCoordinatorRoundOutcome,
 };
 use stacks::net::stackerdb::StackerDBs;
 use stacks::types::chainstate::{StacksBlockId, StacksPrivateKey, StacksPublicKey};
@@ -304,18 +303,21 @@ impl SignerCoordinator {
         };
 
         let block_proposal_message = SignerMessageV0::BlockProposal(block_proposal);
+        // Keep the proposal-wide metric timer separate from the rejection timer below:
+        // publication and retry latency belong in proposal-to-response measurements,
+        // but must not alter timeout behavior.
+        let metric_proposal_started_at = Instant::now();
+        // The initial proposal and round share an exact start so subtracting paired
+        // threshold observations measures only time before a retry round.
+        let mut metric_round_started_at = metric_proposal_started_at;
 
         loop {
             debug!("Sending block proposal message to signers";
                 "signer_signature_hash" => %block.header.signer_signature_hash(),
             );
-            // Keep the metric timer separate from the rejection timer below:
-            // publication latency belongs in proposal-to-response measurements,
-            // but must not alter timeout behavior.
-            let metric_round_started_at = Instant::now();
             self.stackerdb_comms.begin_proposal_publication(
                 &block.header.signer_signature_hash(),
-                metric_round_started_at,
+                metric_proposal_started_at,
             );
             let publication_result = Self::send_miners_message::<SignerMessageV0>(
                 &self.message_key,
@@ -369,6 +371,7 @@ impl SignerCoordinator {
                 chain_state,
                 sortdb,
                 counters,
+                metric_proposal_started_at,
                 metric_round_started_at,
             );
 
@@ -394,6 +397,7 @@ impl SignerCoordinator {
             match res {
                 Err(NakamotoNodeError::SignatureTimeout) => {
                     info!("Block proposal signing process timed out, resending the same proposal");
+                    metric_round_started_at = Instant::now();
                     continue;
                 }
                 _ => return res,
@@ -414,6 +418,7 @@ impl SignerCoordinator {
         chain_state: &mut StacksChainState,
         sortdb: &SortitionDB,
         counters: &Counters,
+        metric_proposal_started_at: Instant,
         metric_round_started_at: Instant,
     ) -> Result<Vec<MessageSignature>, NakamotoNodeError> {
         // the amount of current rejections (used to eventually modify the timeout)
@@ -477,10 +482,10 @@ impl SignerCoordinator {
                     {
                         debug!("SignCoordinator: Found signatures in relayed block");
                         counters.bump_naka_signer_pushed_blocks();
-                        observe_signer_coordinator_milestone(
-                            SignerCoordinatorMilestone::ProposalToThreshold,
+                        Self::observe_threshold_milestones(
                             SignerCoordinatorMilestoneOutcome::Approved,
-                            metric_round_started_at.elapsed(),
+                            metric_proposal_started_at,
+                            metric_round_started_at,
                         );
                         return Ok(stored_block.header.signer_signature);
                     }
@@ -521,10 +526,10 @@ impl SignerCoordinator {
                             error!("Nakamoto miner produced a non-nakamoto block");
                             return Err(NakamotoNodeError::UnexpectedChainState);
                         };
-                        observe_signer_coordinator_milestone(
-                            SignerCoordinatorMilestone::ProposalToThreshold,
+                        Self::observe_threshold_milestones(
                             SignerCoordinatorMilestoneOutcome::Approved,
-                            metric_round_started_at.elapsed(),
+                            metric_proposal_started_at,
+                            metric_round_started_at,
                         );
                         return Ok(stored_block.signer_signature);
                     } else if &highest_stacks_block_id != parent_block_id {
@@ -572,10 +577,10 @@ impl SignerCoordinator {
                     "signer_signature_hash" => %block_signer_sighash,
                 );
                 counters.bump_naka_rejected_blocks();
-                observe_signer_coordinator_milestone(
-                    SignerCoordinatorMilestone::ProposalToThreshold,
+                Self::observe_threshold_milestones(
                     SignerCoordinatorMilestoneOutcome::Rejected,
-                    metric_round_started_at.elapsed(),
+                    metric_proposal_started_at,
+                    metric_round_started_at,
                 );
 
                 // Only act on failed txids that a blocking minority (>30% weight) agrees on
@@ -602,10 +607,10 @@ impl SignerCoordinator {
                 info!("Received enough signatures, block accepted";
                     "signer_signature_hash" => %block_signer_sighash,
                 );
-                observe_signer_coordinator_milestone(
-                    SignerCoordinatorMilestone::ProposalToThreshold,
+                Self::observe_threshold_milestones(
                     SignerCoordinatorMilestoneOutcome::Approved,
-                    metric_round_started_at.elapsed(),
+                    metric_proposal_started_at,
+                    metric_round_started_at,
                 );
                 return Ok(block_status.gathered_signatures.values().cloned().collect());
             } else if rejections_timer.elapsed() > *rejections_timeout {
@@ -624,6 +629,20 @@ impl SignerCoordinator {
                 continue;
             }
         }
+    }
+
+    /// Record proposal-wide and current-round threshold latency at one instant.
+    fn observe_threshold_milestones(
+        outcome: SignerCoordinatorMilestoneOutcome,
+        proposal_started_at: Instant,
+        round_started_at: Instant,
+    ) {
+        let threshold_reached_at = Instant::now();
+        observe_signer_coordinator_threshold_milestones(
+            outcome,
+            threshold_reached_at.duration_since(proposal_started_at),
+            threshold_reached_at.duration_since(round_started_at),
+        );
     }
 
     /// Get the timestamp at which at least 70% of the signing power should be
