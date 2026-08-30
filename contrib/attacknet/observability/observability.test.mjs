@@ -165,6 +165,8 @@ test('render emits actor-labelled scrape targets and restricted credential-free 
   assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /stacks_signer_policy_evaluations_total/);
   assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /stacks_node_nakamoto_block_transfers_total/);
   assert.match(prometheus.data['attacknet.rules.yml'], /AttacknetInstrumentationAbsentM21[\s\S]*?stacks_node_signer_coordinator_milestone_seconds_count\)/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /attacknet_actor_version_capability_info\{capability="M21"\}/);
+  assert.match(prometheus.data['attacknet.rules.yml'], /unless on \(attacknet_network, attacknet_actor\) count by \(attacknet_network, attacknet_actor\) \(attacknet_actor_version_info\)/);
   assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /instrumentation_m19_provenance/);
   assert.doesNotMatch(prometheus.data['attacknet.rules.yml'], /instrumentation_provenance!="unavailable"/);
 

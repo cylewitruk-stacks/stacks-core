@@ -1,0 +1,70 @@
+schemaVersion: stacks-attacknet-version-plan/v1
+matrixId: stable-with-candidate
+platform: linux/arm64
+
+profiles:
+  - name: stable
+    source:
+      kind: remoteGit
+      repository: https://github.com/stacks-network/stacks-core.git
+      ref: 4.0.2
+    image: stacks-core-attacknet:matrix-stable
+    build:
+      dockerfile: contrib/attacknet/images/cli/Dockerfile
+      dockerfileScope: host
+      context: .
+    expectation: compatible
+
+  - name: candidate
+    source:
+      kind: localGit
+      repository: .
+      ref: HEAD
+    image: stacks-core-attacknet:matrix-candidate
+    build:
+      dockerfile: contrib/attacknet/images/cli/Dockerfile
+      dockerfileScope: host
+      context: .
+    capabilities: [M01, M02, M03, M04, M05, M06, M07, M08, M09]
+    expectation: unknown
+
+actors:
+  - {name: miner-current, role: miner}
+  - {name: miner-previous, role: miner}
+  - {name: signer-node-current, role: signer-node}
+  - {name: signer-current, role: signer}
+  - {name: signer-node-previous, role: signer-node}
+  - {name: signer-previous, role: signer}
+
+assignment:
+  defaultProfile: stable
+  seed: stable-with-candidate-2026-08
+  overrides:
+    - {actor: miner-current, profile: candidate}
+  weighted:
+    - {profile: candidate, basisPoints: 3000, roles: [signer]}
+
+upgrade:
+  name: roll-candidate
+  networkRef: mixed-versions
+  rollbackOnFailure: true
+  safety:
+    maxParallelActors: 1
+    maxSignerWeightPercent: 70
+    maxMinerPercent: 50
+  stages:
+    - name: miner
+      stableFor: 30s
+      deadline: 5m
+      actors:
+        - {actor: miner-previous, profile: candidate}
+    - name: signer-node
+      stableFor: 30s
+      deadline: 5m
+      actors:
+        - {actor: signer-node-previous, profile: candidate}
+    - name: signer
+      stableFor: 1m
+      deadline: 8m
+      actors:
+        - {actor: signer-previous, profile: candidate}

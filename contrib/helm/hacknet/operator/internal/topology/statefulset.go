@@ -125,6 +125,23 @@ func (c actorContext) statefulSet() (*appsv1.StatefulSet, error) {
 		volumes = append(volumes, corev1.Volume{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
 	}
 	initContainers := []corev1.Container{}
+	if actor.Config != nil && actor.Config.ExpectedDigest != "" {
+		mount, ok := mountedActorConfig(containers[0])
+		if !ok {
+			return nil, fmt.Errorf("actor %q declares an expected config digest without a mounted config", actor.Name)
+		}
+		initContainers = append(initContainers, corev1.Container{
+			Name:    "verify-config-digest",
+			Image:   defaultString(defaults.DependencyImage, "busybox:1.36.1"),
+			Command: []string{"sh", "-ec", `set -- $(sha256sum "$CONFIG_PATH"); actual="sha256:$1"; if [ "$actual" != "$EXPECTED_CONFIG_DIGEST" ]; then echo "mounted actor configuration digest mismatch" >&2; exit 1; fi`},
+			Env: []corev1.EnvVar{
+				{Name: "CONFIG_PATH", Value: actorConfigPath(actor.Config)},
+				{Name: "EXPECTED_CONFIG_DIGEST", Value: actor.Config.ExpectedDigest},
+			},
+			SecurityContext: restrictedSecurityContext(true),
+			VolumeMounts:    []corev1.VolumeMount{mount},
+		})
+	}
 	if len(actor.Dependencies) > 0 {
 		checks := make([]string, 0, len(actor.Dependencies))
 		for _, dependency := range actor.Dependencies {
@@ -206,6 +223,15 @@ func (c actorContext) statefulSet() (*appsv1.StatefulSet, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+func mountedActorConfig(container corev1.Container) (corev1.VolumeMount, bool) {
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == "actor-config" || mount.Name == "generated-config" {
+			return *mount.DeepCopy(), true
+		}
+	}
+	return corev1.VolumeMount{}, false
 }
 
 func resourceValue(value *corev1.ResourceRequirements) corev1.ResourceRequirements {

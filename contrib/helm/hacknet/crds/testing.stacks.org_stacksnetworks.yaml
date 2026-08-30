@@ -1148,6 +1148,12 @@ spec:
                               required:
                               - name
                               type: object
+                            expectedDigest:
+                              description: |-
+                                ExpectedDigest makes the actor fail closed before startup when the
+                                mounted ConfigMap or Secret key differs from the prepared bytes.
+                              pattern: ^sha256:[0-9a-f]{64}$
+                              type: string
                             generated:
                               description: GeneratedConfigSpec selects a versioned
                                 deterministic config profile.
@@ -7943,6 +7949,12 @@ spec:
                           required:
                           - name
                           type: object
+                        expectedDigest:
+                          description: |-
+                            ExpectedDigest makes the actor fail closed before startup when the
+                            mounted ConfigMap or Secret key differs from the prepared bytes.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
                         generated:
                           description: GeneratedConfigSpec selects a versioned deterministic
                             config profile.
@@ -10664,6 +10676,12 @@ spec:
                           required:
                           - name
                           type: object
+                        expectedDigest:
+                          description: |-
+                            ExpectedDigest makes the actor fail closed before startup when the
+                            mounted ConfigMap or Secret key differs from the prepared bytes.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
                         generated:
                           description: GeneratedConfigSpec selects a versioned deterministic
                             config profile.
@@ -13332,6 +13350,12 @@ spec:
                                 required:
                                 - name
                                 type: object
+                              expectedDigest:
+                                description: |-
+                                  ExpectedDigest makes the actor fail closed before startup when the
+                                  mounted ConfigMap or Secret key differs from the prepared bytes.
+                                pattern: ^sha256:[0-9a-f]{64}$
+                                type: string
                               generated:
                                 description: GeneratedConfigSpec selects a versioned
                                   deterministic config profile.
@@ -15948,6 +15972,12 @@ spec:
                                 required:
                                 - name
                                 type: object
+                              expectedDigest:
+                                description: |-
+                                  ExpectedDigest makes the actor fail closed before startup when the
+                                  mounted ConfigMap or Secret key differs from the prepared bytes.
+                                pattern: ^sha256:[0-9a-f]{64}$
+                                type: string
                               generated:
                                 description: GeneratedConfigSpec selects a versioned
                                   deterministic config profile.
@@ -17618,6 +17648,8 @@ spec:
                   description: ActorStatus reports rollout and immutable runtime identity
                     for one actor.
                   properties:
+                    configDigest:
+                      type: string
                     currentRevision:
                       type: string
                     generation:

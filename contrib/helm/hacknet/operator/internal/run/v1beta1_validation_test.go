@@ -53,4 +53,28 @@ func TestValidateV1Beta1StructureRejectsInvalidRunContracts(t *testing.T) {
 			t.Fatalf("got %v, want ambiguous assertion rejection", err)
 		}
 	})
+	t.Run("multiple persistent upgrade overlays", func(t *testing.T) {
+		run, _, _, _, _ := betaScheduleFixture()
+		run.Spec.UpgradeCatalog = []attacknetv1beta1.UpgradeCatalogEntry{{Name: "upgrade", UpgradeRef: "upgrade-template"}}
+		run.Spec.Executions = []attacknetv1beta1.RunExecutionSpec{
+			{ID: "upgrade-one", Upgrade: "upgrade"},
+			{ID: "upgrade-two", Upgrade: "upgrade"},
+		}
+		err := ValidateV1Beta1Structure(run)
+		if err == nil || !strings.Contains(err.Error(), "one UpgradeCampaign execution") {
+			t.Fatalf("got %v, want persistent-overlay rejection", err)
+		}
+	})
+	t.Run("upgrade dependencies are terminal", func(t *testing.T) {
+		run, _, _, _, _ := betaScheduleFixture()
+		run.Spec.UpgradeCatalog = []attacknetv1beta1.UpgradeCatalogEntry{{Name: "upgrade", UpgradeRef: "upgrade-template"}}
+		run.Spec.Executions = []attacknetv1beta1.RunExecutionSpec{
+			{ID: "upgrade", Upgrade: "upgrade"},
+			{ID: "fault", Campaign: run.Spec.CampaignCatalog[0].Name, DependsOn: []attacknetv1beta1.RunExecutionDependency{{Execution: "upgrade", State: "Recovered"}}},
+		}
+		err := ValidateV1Beta1Structure(run)
+		if err == nil || !strings.Contains(err.Error(), "at Terminal") {
+			t.Fatalf("got %v, want unsupported transition rejection", err)
+		}
+	})
 }

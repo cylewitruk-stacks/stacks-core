@@ -14,6 +14,7 @@ type Command struct {
 	Program string
 	Args    []string
 	Stdin   io.Reader
+	Dir     string
 }
 
 // CommandResult contains the captured output of one process invocation.
@@ -51,6 +52,7 @@ func (ExecCommandRunner) Run(ctx context.Context, command Command) (CommandResul
 	}
 	process := exec.CommandContext(ctx, command.Program, command.Args...)
 	process.Stdin = command.Stdin
+	process.Dir = command.Dir
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	process.Stdout = &stdout

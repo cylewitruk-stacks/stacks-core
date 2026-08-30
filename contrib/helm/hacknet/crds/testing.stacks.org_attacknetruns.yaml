@@ -389,7 +389,6 @@ spec:
                   - name
                   type: object
                 maxItems: 256
-                minItems: 1
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -726,10 +725,15 @@ spec:
                         rule: '(has(self.afterRunStart) ? 1 : 0) + (has(self.burnHeight)
                           ? 1 : 0) + (has(self.stacksHeight) ? 1 : 0) + (has(self.observation)
                           ? 1 : 0) <= 1'
+                    upgrade:
+                      type: string
                   required:
-                  - campaign
                   - id
                   type: object
+                  x-kubernetes-validations:
+                  - message: exactly one campaign or upgrade is required
+                    rule: '(has(self.campaign) ? 1 : 0) + (has(self.upgrade) ? 1 :
+                      0) == 1'
                 maxItems: 1024
                 minItems: 1
                 type: array
@@ -1158,10 +1162,34 @@ spec:
                 - onInconclusive
                 - onSuccess
                 type: object
+              upgradeCatalog:
+                items:
+                  description: UpgradeCatalogEntry binds a logical name to an immutable
+                    upgrade template.
+                  properties:
+                    expectedGeneration:
+                      format: int64
+                      type: integer
+                    expectedSpecDigest:
+                      type: string
+                    expectedUID:
+                      type: string
+                    name:
+                      type: string
+                    upgradeRef:
+                      type: string
+                  required:
+                  - name
+                  - upgradeRef
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
             required:
             - attributionPolicy
             - budgets
-            - campaignCatalog
             - executions
             - minimization
             - networkRef
@@ -1177,6 +1205,9 @@ spec:
             - message: enabled executions exceed maxCampaigns budget
               rule: self.executions.filter(execution, !has(execution.enabled) || execution.enabled).size()
                 <= self.budgets.maxCampaigns
+            - message: at least one fault or upgrade catalog entry is required
+              rule: '(has(self.campaignCatalog) ? size(self.campaignCatalog) : 0)
+                + (has(self.upgradeCatalog) ? size(self.upgradeCatalog) : 0) > 0'
           status:
             description: AttacknetRunStatus is the durable scheduler and evidence
               state machine.
@@ -1187,6 +1218,8 @@ spec:
                     child.
                   properties:
                     executionId:
+                      type: string
+                    kind:
                       type: string
                     name:
                       type: string
@@ -1572,6 +1605,8 @@ spec:
                   description: ResolvedCampaign records immutable source-template
                     identity.
                   properties:
+                    kind:
+                      type: string
                     name:
                       type: string
                     sourceGeneration:
@@ -1634,6 +1669,8 @@ spec:
                           description: AdmittedActorIdentity is the immutable runtime
                             identity admitted for one actor.
                           properties:
+                            configDigest:
+                              type: string
                             controllerRevision:
                               type: string
                             name:

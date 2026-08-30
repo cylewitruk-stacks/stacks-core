@@ -225,6 +225,10 @@ type ConfigSource struct {
 	Generated    *GeneratedConfigSpec `json:"generated,omitempty"`
 	ConfigMapRef *ConfigObjectRef     `json:"configMapRef,omitempty"`
 	SecretRef    *ConfigObjectRef     `json:"secretRef,omitempty"`
+	// ExpectedDigest makes the actor fail closed before startup when the
+	// mounted ConfigMap or Secret key differs from the prepared bytes.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	ExpectedDigest string `json:"expectedDigest,omitempty"`
 }
 
 // GeneratedConfigSpec selects a versioned deterministic config profile.
@@ -388,6 +392,7 @@ type ActorStatus struct {
 	PodUID                     string `json:"podUID,omitempty"`
 	PodResourceVersion         string `json:"podResourceVersion,omitempty"`
 	RuntimeImageID             string `json:"runtimeImageID,omitempty"`
+	ConfigDigest               string `json:"configDigest,omitempty"`
 	IdentityReady              bool   `json:"identityReady,omitempty"`
 }
 

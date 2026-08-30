@@ -17,7 +17,8 @@ func TestReadBurnchainHeightRequiresFreshIdentityBoundPolicy(t *testing.T) {
 	if err := attacknetv1beta1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	now := metav1.NewTime(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))
+	policyAppliedAt := metav1.NewTime(time.Date(2026, 8, 25, 9, 0, 0, 0, time.UTC))
+	observedAt := metav1.NewTime(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))
 	network := &attacknetv1beta1.StacksNetwork{
 		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: types.UID("network-uid")},
 		Spec: attacknetv1beta1.StacksNetworkSpec{Burnchain: attacknetv1beta1.BurnchainTopologySpec{
@@ -28,7 +29,7 @@ func TestReadBurnchainHeightRequiresFreshIdentityBoundPolicy(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "clock", Namespace: "test", UID: types.UID("clock-uid"), Generation: 3, ResourceVersion: "7"},
 		Status: attacknetv1beta1.BurnchainPolicyStatus{
 			Phase: "Ready", ObservedGeneration: 3, AdmittedNetworkUID: "network-uid",
-			ObservedHeight: 412, LastSuccessAt: &now,
+			ObservedHeight: 412, LastSuccessAt: &policyAppliedAt, BitcoinObservationAt: &observedAt,
 		},
 	}
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(network, policy).Build()
@@ -36,10 +37,25 @@ func TestReadBurnchainHeightRequiresFreshIdentityBoundPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observed == nil || observed.Height != 412 || !observed.Source.Trusted || observed.Source.UID != "clock-uid" {
+	if observed == nil || observed.Height != 412 || !observed.ObservedAt.Equal(observedAt.Time) ||
+		!observed.Source.Trusted || observed.Source.UID != "clock-uid" {
 		t.Fatalf("unexpected observation: %#v", observed)
 	}
+	policy.Status.BitcoinObservationAt = nil
+	reader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).Build()
+	observed, err = ReadBurnchainHeight(t.Context(), reader, "test", network)
+	if err != nil || observed != nil {
+		t.Fatalf("policy without a current Bitcoin observation produced %#v, err %v", observed, err)
+	}
+	policy.Status.BitcoinObservationAt = &observedAt
+	policy.Status.BitcoinObservationError = "RPC unavailable"
+	reader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).Build()
+	observed, err = ReadBurnchainHeight(t.Context(), reader, "test", network)
+	if err != nil || observed != nil {
+		t.Fatalf("failed Bitcoin observation produced %#v, err %v", observed, err)
+	}
 
+	policy.Status.BitcoinObservationError = ""
 	policy.Status.AdmittedNetworkUID = "replacement"
 	reader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy).Build()
 	observed, err = ReadBurnchainHeight(t.Context(), reader, "test", network)

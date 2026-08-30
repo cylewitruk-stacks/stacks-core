@@ -413,16 +413,18 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
-      "description": "Render-time aggregate profile from the actor scrape target plus exact per-family provenance from the orchestrator-owned metadata metric. unavailable means Workstream M panels should be empty and must not be read as zero. mixed means applicable families have more than one exact provenance. These declarations must still match the sealed capability manifest and admitted runtime-image evidence.",
+      "description": "Render-time instrumentation declarations plus the immutable static or rolling version profile joined by the controllers. unavailable means Workstream M panels should be empty and must not be read as zero. Revision, config digest, provenance digest, admitted runtime image, and the sealed capability manifest must agree before interpreting protocol behavior.",
       "fieldConfig": {"defaults": {}, "overrides": []},
       "gridPos": {"h": 6, "w": 24, "x": 0, "y": 105},
       "id": 27,
       "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
       "targets": [
         {"expr": "max by (attacknet_actor,attacknet_role,requested_image,instrumentation_profile,instrumentation_provenance,event_dispatch_mode) (up{attacknet_network=\"$network\",attacknet_actor=\"$actor\"})", "format": "table", "instant": true, "refId": "A"},
-        {"expr": "max by (attacknet_actor,attacknet_role,family,provenance,evidence_source) (attacknet_instrumentation_family_provenance{attacknet_network=\"$network\",attacknet_actor=\"$actor\"})", "format": "table", "instant": true, "refId": "B"}
+        {"expr": "max by (attacknet_actor,attacknet_role,family,provenance,evidence_source) (attacknet_instrumentation_family_provenance{attacknet_network=\"$network\",attacknet_actor=\"$actor\"})", "format": "table", "instant": true, "refId": "B"},
+        {"expr": "attacknet_actor_version_info{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "format": "table", "instant": true, "refId": "C"},
+        {"expr": "attacknet_actor_version_capability_info{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "format": "table", "instant": true, "refId": "D"}
       ],
-      "title": "Instrumentation capability declaration",
+      "title": "Instrumentation capability and version declaration",
       "type": "table"
     }
   ],

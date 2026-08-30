@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
@@ -79,6 +80,26 @@ func CompileV1Beta1(network *attacknetv1beta1.StacksNetwork) (*attacknetv1alpha1
 		compiled.Spec.Actors = append(compiled.Spec.Actors, actor)
 	}
 	return compiled, nil
+}
+
+// ValidateV1Beta1 validates both the typed topology and the compiled workload
+// model without requiring API-server-assigned metadata. It uses a placeholder
+// for the chart-owned probe image so offline CLI validation applies the same
+// port and workload invariants as reconciliation.
+func ValidateV1Beta1(network *attacknetv1beta1.StacksNetwork) error {
+	if network == nil {
+		return fmt.Errorf("network is required")
+	}
+	candidate := network.DeepCopy()
+	if candidate.UID == "" {
+		candidate.UID = types.UID("offline-validation")
+	}
+	compiled, err := CompileV1Beta1(candidate)
+	if err != nil {
+		return err
+	}
+	applyV1Beta1RendererDefaults(compiled, "attacknet.invalid/trusted-probe:validation", corev1.PullIfNotPresent)
+	return validateNetwork(compiled)
 }
 
 func compileSignerEnrollment(enrollment *attacknetv1beta1.SignerEnrollmentSpec) attacknetv1alpha1.ActorSpec {
@@ -358,10 +379,13 @@ func compileConfig(network *attacknetv1beta1.StacksNetwork, context profileConte
 		}
 	}
 	if source.ConfigMapRef != nil {
-		return &attacknetv1alpha1.ActorConfig{Key: defaultKey(source.ConfigMapRef.Key), MountPath: mountPath(source.ConfigMapRef.MountPath), ConfigMapRef: &corev1.LocalObjectReference{Name: source.ConfigMapRef.Name}}, nil
+		return &attacknetv1alpha1.ActorConfig{Key: defaultKey(source.ConfigMapRef.Key), MountPath: mountPath(source.ConfigMapRef.MountPath), ConfigMapRef: &corev1.LocalObjectReference{Name: source.ConfigMapRef.Name}, ExpectedDigest: source.ExpectedDigest}, nil
 	}
 	if source.SecretRef != nil {
-		return &attacknetv1alpha1.ActorConfig{Key: defaultKey(source.SecretRef.Key), MountPath: mountPath(source.SecretRef.MountPath), SecretRef: &corev1.LocalObjectReference{Name: source.SecretRef.Name}}, nil
+		return &attacknetv1alpha1.ActorConfig{Key: defaultKey(source.SecretRef.Key), MountPath: mountPath(source.SecretRef.MountPath), SecretRef: &corev1.LocalObjectReference{Name: source.SecretRef.Name}, ExpectedDigest: source.ExpectedDigest}, nil
+	}
+	if source.ExpectedDigest != "" {
+		return nil, fmt.Errorf("actor %q generated config cannot declare an external expected digest", context.actor)
 	}
 	files, key, err := renderGeneratedProfile(network, context, *source.Generated)
 	if err != nil {

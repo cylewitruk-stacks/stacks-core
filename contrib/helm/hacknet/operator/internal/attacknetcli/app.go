@@ -51,6 +51,10 @@ var commandContracts = []CommandContract{
 	{Name: "burnchain flash", Purpose: "Submit one idempotent bounded burnchain flash request", SideEffectClass: "runtime-mutation", Controller: false, InputKinds: []string{"BurnchainPolicy"}},
 	{Name: "image build", Purpose: "Build the local Attacknet image set and resolve immutable IDs", SideEffectClass: "local-process-mutation", OutputKinds: []string{"json"}},
 	{Name: "image load", Purpose: "Load exact local image references into every kind node", SideEffectClass: "local-process-mutation", OutputKinds: []string{"json"}},
+	{Name: "version prepare", Purpose: "Resolve and build an immutable mixed-version descriptor", SideEffectClass: "local-process-mutation", InputKinds: []string{"VersionPlan"}, OutputKinds: []string{"json"}},
+	{Name: "version load", Purpose: "Import every sealed profile image into all local kind nodes", SideEffectClass: "local-process-mutation", InputKinds: []string{"VersionDescriptor"}, OutputKinds: []string{"json"}},
+	{Name: "version render-static", Purpose: "Apply a sealed profile assignment to a StacksNetwork", SideEffectClass: "local-read", InputKinds: []string{"VersionDescriptor", "StacksNetwork"}, OutputKinds: []string{"yaml", "json"}},
+	{Name: "version render-upgrade", Purpose: "Render a sealed descriptor as an UpgradeCampaign", SideEffectClass: "local-read", InputKinds: []string{"VersionDescriptor"}, OutputKinds: []string{"yaml", "json"}},
 	{Name: "install local", Purpose: "Install immutable local images and the Hacknet chart safely", SideEffectClass: "runtime-mutation", OutputKinds: []string{"json"}},
 	{Name: "evidence incident", Purpose: "Capture a bounded admitted-identity incident bundle", SideEffectClass: "local-filesystem-write", OutputKinds: []string{"json"}},
 	{Name: "teardown", Purpose: "Export complete evidence before deleting one StacksNetwork", SideEffectClass: "runtime-mutation", Controller: false, InputKinds: []string{"StacksNetwork"}, OutputKinds: []string{"json"}},
@@ -140,6 +144,8 @@ func (app *App) Run(ctx context.Context, args []string) int {
 		err = app.runBurnchain(ctx, args[1:])
 	case "image":
 		err = app.runImage(ctx, args[1:])
+	case "version":
+		err = app.runVersion(ctx, args[1:])
 	case "install":
 		err = app.runInstall(ctx, args[1:])
 	case "teardown":

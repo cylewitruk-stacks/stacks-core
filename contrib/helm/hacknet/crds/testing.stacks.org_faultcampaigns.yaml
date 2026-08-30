@@ -617,6 +617,8 @@ spec:
                           description: AdmittedActorIdentity is the immutable runtime
                             identity admitted for one actor.
                           properties:
+                            configDigest:
+                              type: string
                             controllerRevision:
                               type: string
                             name:

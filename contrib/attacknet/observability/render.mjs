@@ -295,7 +295,7 @@ export function prometheusRules() {
       ? `${family.family}_count` : family.family);
     const roles = family.roles.join('|');
     return `      - alert: AttacknetInstrumentationAbsent${family.id}
-        expr: ((count by (attacknet_network, attacknet_actor) (attacknet_instrumentation_family_provenance{family="${family.id}",provenance=~"merged|attacknet-patch",attacknet_role=~"${roles}",evidence_source="orchestrator_observed"} == 1) and on (attacknet_network, attacknet_actor) count by (attacknet_network, attacknet_actor) (up{attacknet_role=~"${roles}"} == 1)) unless on (attacknet_network, attacknet_actor) count by (attacknet_network, attacknet_actor) (${sample})) > 0
+        expr: (((count by (attacknet_network, attacknet_actor) (attacknet_actor_version_capability_info{capability="${family.id}"} == 1) and on (attacknet_network, attacknet_actor) count by (attacknet_network, attacknet_actor) (up{attacknet_role=~"${roles}"} == 1)) or ((count by (attacknet_network, attacknet_actor) (attacknet_instrumentation_family_provenance{family="${family.id}",provenance=~"merged|attacknet-patch",attacknet_role=~"${roles}",evidence_source="orchestrator_observed"} == 1) and on (attacknet_network, attacknet_actor) count by (attacknet_network, attacknet_actor) (up{attacknet_role=~"${roles}"} == 1)) unless on (attacknet_network, attacknet_actor) count by (attacknet_network, attacknet_actor) (attacknet_actor_version_info))) unless on (attacknet_network, attacknet_actor) count by (attacknet_network, attacknet_actor) (${sample})) > 0
         for: 30s
         labels:
           severity: warning

@@ -7,10 +7,12 @@ observability, or evidence machinery. Operators should begin with the root
 ## Architecture boundaries
 
 - Helm installs and upgrades the namespaced control plane.
-- The topology reconciler owns `StacksNetwork`, actor ConfigMaps, Services,
-  StatefulSets, admitted inventory, and network status. It cannot inject faults.
+- The topology operator owns `StacksNetwork`, actor ConfigMaps, Services,
+  StatefulSets, admitted inventory, and network status. Its
+  `UpgradeCampaign` reconciler advances rollout status while topology alone
+  applies the cumulative workload overlay. It cannot inject faults.
 - The run operator owns `BurnchainPolicy`, `FaultCampaign`, `AttacknetRun`,
-  immutable schedules, and bounded fault resources.
+  immutable schedules, bounded fault resources, and run-owned upgrade children.
 - Bitcoin Core and the Stacks-blind burnchain clock are separate failure
   domains.
 - Actor Pods have no Kubernetes service-account token.
@@ -75,6 +77,13 @@ modified-actor build inputs live under [`../../examples/`](../../examples/README
 Production images must not carry runtime adversary switches; modified behavior
 belongs in separately built, provenance-bound images. See
 [`../concepts/adversarial-actors.md`](../concepts/adversarial-actors.md).
+The arbitrary-revision and upgrade-boundary workflow is documented in
+[`Mixed-version networks and upgrades`](../concepts/mixed-version-images.md);
+its release scope is specified in
+[`R1A11 mixed-version and upgrade-boundary campaigns`](issues/r1/r1a11-mixed-version-upgrade-campaigns.md).
+
+Release-scoped implementation plans live under [`issues/`](issues/). These are
+planning artifacts, not release-gate contracts.
 
 ## Controller development
 

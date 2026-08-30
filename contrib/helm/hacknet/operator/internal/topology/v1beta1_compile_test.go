@@ -200,6 +200,7 @@ func TestCompileV1Beta1RequiresSecretBackedMinerAndSignerConfigs(t *testing.T) {
 
 func TestCompileV1Beta1ExternalNodeConfigUsesOpaqueRuntimeTemplateWrapper(t *testing.T) {
 	network := betaNetworkFixture()
+	network.Spec.Nodes[0].Config.ExpectedDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	compiled, err := CompileV1Beta1(network)
 	if err != nil {
 		t.Fatal(err)
@@ -210,6 +211,9 @@ func TestCompileV1Beta1ExternalNodeConfigUsesOpaqueRuntimeTemplateWrapper(t *tes
 	}
 	if len(compiled.Spec.Actors[1].Env) != 2 || compiled.Spec.Actors[1].Env[0].Name != "STACKS_ATTACKNET_CONFIG_TEMPLATE" || compiled.Spec.Actors[1].Env[0].Value != "/etc/stacks/config.toml" || compiled.Spec.Actors[1].Env[1].Name != "STACKS_ATTACKNET_SERVICE_MAP" {
 		t.Fatalf("external node config lacks its logical Service map: %#v", compiled.Spec.Actors[1].Env)
+	}
+	if compiled.Spec.Actors[1].Config.ExpectedDigest != network.Spec.Nodes[0].Config.ExpectedDigest {
+		t.Fatal("external configuration digest was dropped during v1beta1 compilation")
 	}
 	for _, expected := range []string{"bitcoin-1=${SERVICE:bitcoin-1}", "miner-1=${SERVICE:miner-1}", "signer-node-1=${SERVICE:signer-node-1}"} {
 		if !strings.Contains(compiled.Spec.Actors[1].Env[1].Value, expected) {

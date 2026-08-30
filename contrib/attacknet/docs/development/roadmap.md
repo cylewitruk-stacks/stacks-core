@@ -166,8 +166,24 @@ The approved gate establishes that:
 
 ### A11: Mixed-version and upgrade-boundary campaigns
 
+Status: implementation in progress. Typed source preparation, deterministic
+assignments, static rendering, `UpgradeCampaign` orchestration, configuration
+digest verification, and cohort observability pass offline verification. Live
+kind qualification and the amendment review packet remain open.
+
 Qualify the existing per-actor image support as explicit compatibility and
-missed-upgrade scenarios. Initial scenario families should cover:
+missed-upgrade scenarios. Source profiles must accept arbitrary released tags,
+commit SHAs, branches, local worktrees, and repositories or forks. Mutable refs
+such as `main` are authoring conveniences only: preparation resolves them once
+to an immutable commit and image identity before admission or replay.
+
+Assignments may be explicit or deterministically selected from a seeded,
+bounded distribution. This supports experiments such as one current-`main`
+actor in a predominantly previous-release network, or one candidate fork revision in a
+predominantly upstream-`main` network. The exact actor assignment is sealed
+before any workload starts.
+
+Initial scenario families should cover:
 
 - current nodes with previous-release signers, and the inverse;
 - minority and threshold-relevant cohorts that miss an epoch upgrade;
@@ -177,14 +193,29 @@ missed-upgrade scenarios. Initial scenario families should cover:
   boundaries;
 - modified builds carrying candidate fixes alongside released binaries.
 
-Every run must record the complete version matrix and join each observation to
-the admitted runtime image digest rather than to a mutable image tag.
+Git resolution and image building remain a client-side preparation workflow.
+Kubernetes controllers must not clone arbitrary repositories or execute their
+build scripts. Static matrices use existing per-actor image fields; in-place
+upgrades require a typed topology-transition contract rather than direct
+StatefulSet patches or an ordinary fault action.
+
+Every run must record the complete source, build, configuration, and version
+matrix and join each observation to the admitted runtime image digest rather
+than to a mutable ref or image tag. See the
+[`R1A11 implementation specification`](issues/r1/r1a11-mixed-version-upgrade-campaigns.md).
 
 Definition of done:
 
 - supported version combinations have deterministic, replayable scenarios;
+- arbitrary remote or local Git refs resolve to sealed commits before build;
+- explicit and seeded weighted actor assignments reproduce exactly;
+- source, dirty patch, build inputs, image, configuration, and runtime identity
+  remain joined for every actor;
+- controllers never fetch or compile user-selected source;
 - incompatibility is distinguished from telemetry loss and harness failure;
 - epoch and reward-boundary placement is sealed in the run ledger;
+- static missed-upgrade and bounded in-place upgrade scenarios are both
+  supported without bypassing topology ownership or identity checks;
 - dashboards and evidence identify every actor's exact runtime image;
 - at least one expected-compatible and one expected-incompatible negative
   control are qualified.

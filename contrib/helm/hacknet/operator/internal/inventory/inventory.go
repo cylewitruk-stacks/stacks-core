@@ -20,7 +20,10 @@ const (
 	SchemaVersion = "stacks-network-admitted-inventory/v1"
 )
 
-var runtimeDigestPattern = regexp.MustCompile(`sha256:[0-9a-f]{64}`)
+var (
+	runtimeDigestPattern = regexp.MustCompile(`sha256:[0-9a-f]{64}`)
+	exactDigestPattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+)
 
 // Payload is the canonical input to the admitted-inventory digest.
 type Payload struct {
@@ -31,6 +34,7 @@ type Payload struct {
 
 // digestActor is the stable actor projection included in the inventory digest.
 type digestActor struct {
+	ConfigDigest       string `json:"configDigest,omitempty"`
 	ControllerRevision string `json:"controllerRevision"`
 	Name               string `json:"name"`
 	PodName            string `json:"podName"`
@@ -87,6 +91,7 @@ func Build(network *testingv1.StacksNetwork) (Payload, error) {
 			StatefulSetUID: status.StatefulSetUID, ControllerRevision: status.CurrentRevision,
 			PodName: status.PodName, PodUID: status.PodUID,
 			RequestedImage: status.Image, RuntimeImageID: status.RuntimeImageID,
+			ConfigDigest: status.ConfigDigest,
 		}
 		if err := validateIdentity(identity); err != nil {
 			return Payload{}, fmt.Errorf("StacksNetwork actor %s: %w", actor.Name, err)
@@ -180,6 +185,7 @@ func compareIncompleteStatus(expected testingv1.NetworkInventory, network *testi
 			StatefulSetName: status.ResourceName, StatefulSetUID: status.StatefulSetUID,
 			ControllerRevision: status.CurrentRevision, PodName: status.PodName,
 			PodUID: status.PodUID, RequestedImage: status.Image, RuntimeImageID: status.RuntimeImageID,
+			ConfigDigest: status.ConfigDigest,
 		}
 		differences = append(differences, compareActor(actor, observed, allowed)...)
 	}
@@ -201,6 +207,7 @@ func compareActor(expected, observed testingv1.AdmittedActorIdentity, allowed ma
 		{"podUID", expected.PodUID, observed.PodUID, true},
 		{"requestedImage", expected.RequestedImage, observed.RequestedImage, false},
 		{"runtimeImageID", expected.RuntimeImageID, observed.RuntimeImageID, false},
+		{"configDigest", expected.ConfigDigest, observed.ConfigDigest, false},
 	}
 	differences := make([]testingv1.IdentityDifference, 0)
 	for _, pair := range pairs {
@@ -256,6 +263,26 @@ func HasImmutableImageID(value string) bool {
 	return runtimeDigestPattern.MatchString(value)
 }
 
+// ImmutableImageID extracts one unambiguous SHA-256 identity from a runtime
+// image reference.
+func ImmutableImageID(value string) (string, bool) {
+	matches := runtimeDigestPattern.FindAllString(value, -1)
+	if len(matches) != 1 || !exactDigestPattern.MatchString(matches[0]) {
+		return "", false
+	}
+	return matches[0], true
+}
+
+// RuntimeImageMatches reports whether a Kubernetes runtime image identity
+// contains exactly the expected immutable SHA-256 identity.
+func RuntimeImageMatches(value, expected string) bool {
+	if !exactDigestPattern.MatchString(expected) {
+		return false
+	}
+	actual, ok := ImmutableImageID(value)
+	return ok && actual == expected
+}
+
 func identitiesByName(actors []testingv1.AdmittedActorIdentity) map[string]testingv1.AdmittedActorIdentity {
 	result := make(map[string]testingv1.AdmittedActorIdentity, len(actors))
 	for _, actor := range actors {
@@ -280,12 +307,15 @@ func validateIdentity(identity testingv1.AdmittedActorIdentity) error {
 	if !HasImmutableImageID(identity.RuntimeImageID) {
 		return errors.New("admitted identity lacks an immutable runtime image ID")
 	}
+	if identity.ConfigDigest != "" && !exactDigestPattern.MatchString(identity.ConfigDigest) {
+		return errors.New("admitted identity has an invalid configuration digest")
+	}
 	return nil
 }
 
 func toDigestActor(actor testingv1.AdmittedActorIdentity) digestActor {
 	return digestActor{
-		ControllerRevision: actor.ControllerRevision, Name: actor.Name,
+		ConfigDigest: actor.ConfigDigest, ControllerRevision: actor.ControllerRevision, Name: actor.Name,
 		PodName: actor.PodName, PodUID: actor.PodUID, RequestedImage: actor.RequestedImage,
 		Role: actor.Role, RuntimeImageID: actor.RuntimeImageID, ServiceName: actor.ServiceName,
 		StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,
@@ -294,7 +324,7 @@ func toDigestActor(actor testingv1.AdmittedActorIdentity) digestActor {
 
 func fromDigestActor(actor digestActor) testingv1.AdmittedActorIdentity {
 	return testingv1.AdmittedActorIdentity{
-		ControllerRevision: actor.ControllerRevision, Name: actor.Name,
+		ConfigDigest: actor.ConfigDigest, ControllerRevision: actor.ControllerRevision, Name: actor.Name,
 		PodName: actor.PodName, PodUID: actor.PodUID, RequestedImage: actor.RequestedImage,
 		Role: actor.Role, RuntimeImageID: actor.RuntimeImageID, ServiceName: actor.ServiceName,
 		StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,

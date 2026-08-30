@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
@@ -75,7 +76,8 @@ func validateNetwork(network *attacknetv1alpha1.StacksNetwork) error {
 			}
 		}
 		ports := map[string]bool{}
-		portNumbers := map[string]bool{}
+		containerPorts := map[string]bool{}
+		servicePorts := map[string]bool{}
 		for _, port := range effectivePorts(actor) {
 			if port.Name == "" || len(port.Name) > 15 || len(validation.IsDNS1123Label(port.Name)) > 0 || port.ContainerPort < 1 || port.ServicePort < 1 {
 				return fmt.Errorf("actor %q has an invalid port", actor.Name)
@@ -83,15 +85,25 @@ func validateNetwork(network *attacknetv1alpha1.StacksNetwork) error {
 			if ports[port.Name] {
 				return fmt.Errorf("actor %q declares duplicate port %q", actor.Name, port.Name)
 			}
-			numberKey := fmt.Sprintf("%d/%s", port.ContainerPort, port.Protocol)
-			if portNumbers[numberKey] {
-				return fmt.Errorf("actor %q declares duplicate container port %s", actor.Name, numberKey)
+			containerKey := fmt.Sprintf("%d/%s", port.ContainerPort, port.Protocol)
+			if containerPorts[containerKey] {
+				return fmt.Errorf("actor %q declares duplicate container port %s", actor.Name, containerKey)
+			}
+			serviceKey := fmt.Sprintf("%d/%s", port.ServicePort, port.Protocol)
+			if servicePorts[serviceKey] {
+				return fmt.Errorf("actor %q declares duplicate service port %s", actor.Name, serviceKey)
 			}
 			ports[port.Name] = true
-			portNumbers[numberKey] = true
+			containerPorts[containerKey] = true
+			servicePorts[serviceKey] = true
 		}
-		if boolValue(probeSettings(network, actor).Enabled, false) && ports["probe"] {
-			return fmt.Errorf("actor %q reserves port name probe for the trusted probe sidecar", actor.Name)
+		if boolValue(probeSettings(network, actor).Enabled, false) {
+			if ports["probe"] {
+				return fmt.Errorf("actor %q reserves port name probe for the trusted probe sidecar", actor.Name)
+			}
+			if servicePorts[fmt.Sprintf("%d/%s", 18080, corev1.ProtocolTCP)] {
+				return fmt.Errorf("actor %q reserves TCP service port 18080 for the trusted probe sidecar", actor.Name)
+			}
 		}
 		if boolValue(telemetrySettings(network, actor).Enabled, false) && telemetrySettings(network, actor).ExporterEndpoint == "" {
 			return fmt.Errorf("actor %q enables telemetry without exporterEndpoint", actor.Name)

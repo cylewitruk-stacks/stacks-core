@@ -38,6 +38,10 @@ attacknet teardown --namespace experiment --output teardown \
 attacknet doctor --output json
 attacknet image build --repo-root . --stacks
 attacknet image load --mode require stacks-core-attacknet:main
+attacknet version prepare --file matrix.yaml --workspace .attacknet/versions --recipe-root . --output descriptor.json
+attacknet version load --descriptor descriptor.json --mode require
+attacknet version render-static --descriptor descriptor.json --network network.yaml
+attacknet version render-upgrade --descriptor descriptor.json --namespace experiment --template=true
 attacknet install local --chart-dir contrib/helm/hacknet --kind-image-load require
 attacknet dashboard start --target grafana --namespace experiment
 attacknet dashboard start --target chaos
@@ -53,8 +57,11 @@ Options precede positional `KIND NAME` arguments. Kind names and plurals are
 accepted for reads; submitted documents require canonical Kubernetes Kind
 spelling and `testing.stacks.org/v1beta1`.
 
-`submit` rejects duplicate/unknown fields, multiple documents, status,
-server-assigned metadata, owner references, and finalizers. It uses
+`validate` and `submit` reject duplicate/unknown fields, multiple documents,
+status, server-assigned metadata, owner references, finalizers, and
+`StacksNetwork` declarations that violate compiled workload invariants. They use
+the same topology validator as reconciliation, so reserved probe ports and other
+render-time conflicts fail before API-server mutation. `submit` uses
 server-side apply without force ownership takeover. `submit --dry-run` uses
 Kubernetes server-side dry-run as a machine-readable admission plan; it does
 not claim that a controller workflow executed. `wait` only accepts status
@@ -91,9 +98,22 @@ local image IDs. `image load` derives each selected platform's runtime config
 digest from the exported archive, replaces an existing mutable tag, imports it
 into every discovered kind-on-Docker node, and verifies the resulting CRI image
 ID. `install local` content-tags all five chart-selected images, optionally
-loads them, applies CRDs explicitly, waits for `Established`, and then performs
-a Helm 3 atomic or Helm 4 rollback-on-failure install. Conflict takeover and
-failed-release recovery are conspicuous opt-ins.
+loads them, requires the five pinned Chaos Mesh APIs, applies all five Attacknet
+CRDs explicitly, waits for `Established`, and then performs a Helm 3 atomic or
+Helm 4 rollback-on-failure install. Conflict takeover and failed-release
+recovery are conspicuous opt-ins.
+
+`version prepare` strictly decodes a YAML plan, resolves remote or local Git
+inputs to exact commits, seals dirty and untracked local content, builds or
+pulls profile images for one explicit platform, smoke-checks optional raw
+configuration, and writes a canonical descriptor. `version load` imports every
+descriptor image into all kind nodes and emits a descriptor-bound receipt.
+Host-scoped Dockerfiles are resolved beneath the explicit recipe root, hashed,
+and applied to the selected source context; source-scoped Dockerfiles remain
+available for revisions that carry their own build recipe.
+The render commands apply the same explicit assignment either to a static
+`StacksNetwork` or to a typed staged `UpgradeCampaign`. No version command
+implicitly submits Kubernetes state.
 
 `convert` is an offline compatibility aid for v1alpha1 single-fault
 `FaultCampaign` and serial `AttacknetRun` resources. It preserves safety limits
@@ -127,7 +147,7 @@ compatibility contract.
 
 ## Known risks and follow-up
 
-- The current kind catalog is intentionally closed to the four v1beta1
+- The current kind catalog is intentionally closed to the five v1beta1
   resources. Arbitrary Kubernetes apply would bypass the product boundary.
 - `evidence incident` captures Kubernetes state and bounded Pod logs;
   `teardown` additionally exports the complete retained Loki interval before

@@ -276,7 +276,7 @@ func (r *Reconciler) buildStatus(ctx context.Context, network *attacknetv1alpha1
 		}
 		podIdentityReady := pod != nil && podReady(pod) && container != nil && container.Ready && pod.UID != "" && runtimeImagePattern.MatchString(runtimeImageID)
 		identityReady := isReady && podIdentityReady && statefulSet.UID != "" && statefulSet.Status.CurrentRevision != ""
-		status := attacknetv1alpha1.ActorStatus{Name: actor.Name, Role: actor.Role, ResourceName: name, Image: actorImage(network, actor), Ready: isReady, ReadyReplicas: statefulSet.Status.ReadyReplicas, UpdatedReplicas: statefulSet.Status.UpdatedReplicas, Generation: statefulSet.Generation, ObservedGeneration: statefulSet.Status.ObservedGeneration, CurrentRevision: statefulSet.Status.CurrentRevision, UpdateRevision: statefulSet.Status.UpdateRevision, ServiceName: name, StatefulSetUID: string(statefulSet.UID), StatefulSetResourceVersion: statefulSet.ResourceVersion, RuntimeImageID: runtimeImageID, IdentityReady: identityReady}
+		status := attacknetv1alpha1.ActorStatus{Name: actor.Name, Role: actor.Role, ResourceName: name, Image: actorImage(network, actor), Ready: isReady, ReadyReplicas: statefulSet.Status.ReadyReplicas, UpdatedReplicas: statefulSet.Status.UpdatedReplicas, Generation: statefulSet.Generation, ObservedGeneration: statefulSet.Status.ObservedGeneration, CurrentRevision: statefulSet.Status.CurrentRevision, UpdateRevision: statefulSet.Status.UpdateRevision, ServiceName: name, StatefulSetUID: string(statefulSet.UID), StatefulSetResourceVersion: statefulSet.ResourceVersion, RuntimeImageID: runtimeImageID, ConfigDigest: actorConfigDigest(actor), IdentityReady: identityReady}
 		if pod != nil {
 			status.PodName = pod.Name
 			status.PodUID = string(pod.UID)
@@ -318,6 +318,13 @@ func (r *Reconciler) buildStatus(ctx context.Context, network *attacknetv1alpha1
 		}
 	}
 	return status, nil
+}
+
+func actorConfigDigest(actor *attacknetv1alpha1.ActorSpec) string {
+	if actor.Config == nil {
+		return ""
+	}
+	return actor.Config.ExpectedDigest
 }
 
 func (r *Reconciler) degradedStatus(network *attacknetv1alpha1.StacksNetwork, reconcileError error) attacknetv1alpha1.StacksNetworkStatus {

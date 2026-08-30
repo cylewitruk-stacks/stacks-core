@@ -108,6 +108,8 @@ type ActorConfig struct {
 	MountPath    string                       `json:"mountPath,omitempty"`
 	ConfigMapRef *corev1.LocalObjectReference `json:"configMapRef,omitempty"`
 	SecretRef    *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	// ExpectedDigest is checked inside the Pod before the actor starts.
+	ExpectedDigest string `json:"expectedDigest,omitempty"`
 }
 
 // ActorPort exposes one container and optional service port.
@@ -191,6 +193,7 @@ type ActorStatus struct {
 	PodUID                     string `json:"podUID,omitempty"`
 	PodResourceVersion         string `json:"podResourceVersion,omitempty"`
 	RuntimeImageID             string `json:"runtimeImageID,omitempty"`
+	ConfigDigest               string `json:"configDigest,omitempty"`
 	IdentityReady              bool   `json:"identityReady,omitempty"`
 }
 

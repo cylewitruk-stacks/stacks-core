@@ -42,10 +42,21 @@ func ValidateV1Beta1Structure(run *attacknetv1beta1.AttacknetRun) error {
 			return fmt.Errorf("%s protocol assertions: %w", gate.name, err)
 		}
 	}
-	if len(run.Spec.CampaignCatalog) == 0 || len(run.Spec.CampaignCatalog) > 256 {
-		return errors.New("campaignCatalog requires between 1 and 256 entries")
+	if len(run.Spec.CampaignCatalog) > 256 || len(run.Spec.UpgradeCatalog) > 64 || len(run.Spec.CampaignCatalog)+len(run.Spec.UpgradeCatalog) == 0 {
+		return errors.New("run requires a bounded fault or upgrade catalog")
 	}
-	catalog := make(map[string]struct{}, len(run.Spec.CampaignCatalog))
+	catalog := make(map[string]struct{}, len(run.Spec.CampaignCatalog)+len(run.Spec.UpgradeCatalog))
+	upgradeAliases := make(map[string]struct{}, len(run.Spec.UpgradeCatalog))
+	for _, entry := range run.Spec.UpgradeCatalog {
+		if entry.Name == "" || entry.UpgradeRef == "" {
+			return errors.New("upgrade catalog names and references must be non-empty")
+		}
+		if _, duplicate := catalog[entry.Name]; duplicate {
+			return fmt.Errorf("duplicate catalog alias %q", entry.Name)
+		}
+		catalog[entry.Name] = struct{}{}
+		upgradeAliases[entry.Name] = struct{}{}
+	}
 	for _, entry := range run.Spec.CampaignCatalog {
 		if entry.Name == "" || entry.CampaignRef == "" {
 			return errors.New("campaign catalog names and references must be non-empty")
@@ -61,20 +72,28 @@ func ValidateV1Beta1Structure(run *attacknetv1beta1.AttacknetRun) error {
 	executions := make(map[string]int, len(run.Spec.Executions))
 	enabled := make(map[string]bool, len(run.Spec.Executions))
 	enabledCount := int32(0)
+	enabledUpgradeCount := 0
 	for index, execution := range run.Spec.Executions {
-		if execution.ID == "" || execution.Campaign == "" {
+		alias := execution.Campaign
+		if execution.Upgrade != "" {
+			alias = execution.Upgrade
+		}
+		if execution.ID == "" || alias == "" || (execution.Campaign != "" && execution.Upgrade != "") {
 			return errors.New("execution IDs and campaign aliases must be non-empty")
 		}
 		if _, duplicate := executions[execution.ID]; duplicate {
 			return fmt.Errorf("duplicate execution ID %q", execution.ID)
 		}
-		if _, found := catalog[execution.Campaign]; !found {
-			return fmt.Errorf("execution %q references unknown campaign alias %q", execution.ID, execution.Campaign)
+		if _, found := catalog[alias]; !found {
+			return fmt.Errorf("execution %q references unknown campaign alias %q (or upgrade alias)", execution.ID, alias)
 		}
 		executions[execution.ID] = index
 		enabled[execution.ID] = execution.Enabled == nil || *execution.Enabled
 		if enabled[execution.ID] {
 			enabledCount++
+			if execution.Upgrade != "" {
+				enabledUpgradeCount++
+			}
 		}
 		if _, err := trigger.ForRunExecution(execution); err != nil {
 			return err
@@ -82,6 +101,9 @@ func ValidateV1Beta1Structure(run *attacknetv1beta1.AttacknetRun) error {
 	}
 	if enabledCount == 0 {
 		return errors.New("run resolves to no enabled executions")
+	}
+	if enabledUpgradeCount > 1 {
+		return errors.New("a run supports one UpgradeCampaign execution; express rollout batches as stages in that campaign")
 	}
 	if enabledCount > run.Spec.Budgets.MaxCampaigns {
 		return fmt.Errorf("enabled execution count %d exceeds maxCampaigns budget %d", enabledCount, run.Spec.Budgets.MaxCampaigns)
@@ -97,6 +119,10 @@ func ValidateV1Beta1Structure(run *attacknetv1beta1.AttacknetRun) error {
 			}
 			if !enabled[dependency.Execution] {
 				return fmt.Errorf("execution %q depends on disabled execution %q", execution.ID, dependency.Execution)
+			}
+			dependencyExecution := run.Spec.Executions[dependencyIndex]
+			if _, isUpgrade := upgradeAliases[dependencyExecution.Upgrade]; isUpgrade && dependency.State != "Terminal" {
+				return fmt.Errorf("execution %q must wait for upgrade execution %q at Terminal", execution.ID, dependency.Execution)
 			}
 		}
 	}

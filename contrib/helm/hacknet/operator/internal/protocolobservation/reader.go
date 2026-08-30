@@ -182,7 +182,10 @@ func (r *Reader) Read(ctx context.Context, network *attacknetv1beta1.StacksNetwo
 	}
 	return Snapshot{
 		NetworkUID: before.NetworkUID, InventoryDigest: before.InventoryDigest,
-		ObservedAt: r.now(), Actors: actors, Bitcoin: bitcoin,
+		// All actor metric sources use the collection-start boundary. Retaining
+		// that same timestamp on the enclosing snapshot makes the cohort an
+		// explicit identity-bound observation and ages it conservatively.
+		ObservedAt: startedAt, Actors: actors, Bitcoin: bitcoin,
 		BurnchainTopology: before.BurnchainTopology,
 	}, nil
 }

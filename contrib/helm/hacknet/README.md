@@ -27,13 +27,14 @@ accounts:
 - the topology operator reconciles `StacksNetwork` resources into ConfigMaps,
   Services, StatefulSets, PVCs, and optional telemetry/probe sidecars, and
   reconciles `BurnchainPolicy` resources into externally steerable clock
-  workloads;
+  workloads; it also applies sealed `UpgradeCampaign` overlays while remaining
+  the only actor-workload writer;
 - the run operator reconciles `FaultCampaign` and `AttacknetRun` resources and
   has narrowly scoped permissions for supported Chaos Mesh resources; and
 - both controllers expose health and Prometheus endpoints through namespaced
   Services.
 
-The local installer applies all four CRDs before running Helm so an existing
+The local installer applies all five CRDs before running Helm so an existing
 installation receives schema updates. Helm intentionally leaves those CRDs
 installed when the release is removed.
 
@@ -143,7 +144,8 @@ kubectl get crd \
   stacksnetworks.testing.stacks.org \
   burnchainpolicies.testing.stacks.org \
   faultcampaigns.testing.stacks.org \
-  attacknetruns.testing.stacks.org
+  attacknetruns.testing.stacks.org \
+  upgradecampaigns.testing.stacks.org
 ```
 
 Both controller Deployments must become Available. The installer:
@@ -151,7 +153,8 @@ Both controller Deployments must become Available. The installer:
 - assigns content-derived tags to the local chart-managed images;
 - replaces stale mutable tags, imports the selected platform into every Docker
   Desktop `kind` node, and verifies its CRI runtime image ID;
-- server-side applies and waits for all four CRDs; and
+- verifies that the five required Chaos Mesh APIs are installed;
+- server-side applies and waits for all five CRDs; and
 - performs an atomic Helm upgrade with rollback on failure.
 
 Use `--kind-image-load disabled` only when a registry or external image loader
@@ -432,8 +435,10 @@ reading it.
 `spec.probe.enabled` is false by default. When enabled, each actor receives a
 credential-free `attacknet-probe` sidecar on Pod port `18080`. The actor
 Service publishes that port so enrolled peers can perform bounded throughput
-observations. The API is intentionally unauthenticated; do not expose actor
-Services outside the isolated test network. The bounded probe API can observe:
+observations. Actor-defined port name `probe` and TCP service port `18080` are
+therefore reserved and rejected before workload mutation. The API is
+intentionally unauthenticated; do not expose actor Services outside the
+isolated test network. The bounded probe API can observe:
 
 - enrolled TCP endpoints and latency;
 - a selected DNS name plus a fixed cluster control;

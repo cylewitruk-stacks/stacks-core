@@ -120,6 +120,24 @@ func TestTopologyManagerPublishesAndWithdrawsAdmittedInventory(t *testing.T) {
 	if err := direct.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
 		t.Fatal(err)
 	}
+	invalidUpgrade := &attacknetv1beta1.UpgradeCampaign{
+		ObjectMeta: metav1.ObjectMeta{Name: "invalid-upgrade", Namespace: namespace},
+		Spec: attacknetv1beta1.UpgradeCampaignSpec{
+			NetworkRef: "network",
+			Profiles: []attacknetv1beta1.UpgradeProfileSpec{{
+				Name: "candidate", SourceKind: "prebuilt", Image: "candidate:sealed",
+				ImageID: "sha256:" + strings.Repeat("a", 64), ProvenanceDigest: "sha256:" + strings.Repeat("b", 64), ConfigDigest: "sha256:" + strings.Repeat("c", 64),
+			}},
+			Stages: []attacknetv1beta1.UpgradeStageSpec{{
+				Name: "invalid", Assignments: []attacknetv1beta1.UpgradeAssignment{{Actor: "miner-1", Profile: "candidate"}},
+				StableFor: metav1.Duration{Duration: time.Minute}, Deadline: metav1.Duration{Duration: time.Minute},
+			}},
+			Safety: attacknetv1beta1.UpgradeSafetySpec{MaxParallelActors: 1, MaxSignerWeightPercent: 100, MaxMinerPercent: 100},
+		},
+	}
+	if err := direct.Create(ctx, invalidUpgrade); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted an upgrade whose stable window equals its deadline: %v", err)
+	}
 	invalidCampaign := &attacknetv1beta1.FaultCampaign{
 		ObjectMeta: metav1.ObjectMeta{Name: "invalid-admission", Namespace: namespace},
 		Spec: attacknetv1beta1.FaultCampaignSpec{

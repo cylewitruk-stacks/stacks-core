@@ -57,7 +57,11 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 		logger.Error(err, "v1beta1 environment lease admission failed")
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, degradedV1Beta1Status(network, err))
 	}
-	compiled, err := CompileV1Beta1(network)
+	effectiveNetwork, err := r.networkWithUpgradeOverlay(ctx, network)
+	var compiled *attacknetv1alpha1.StacksNetwork
+	if err == nil {
+		compiled, err = CompileV1Beta1(effectiveNetwork)
+	}
 	if err == nil {
 		applyV1Beta1RendererDefaults(compiled, r.ProbeImage, r.ProbeImagePull)
 	}
@@ -251,7 +255,8 @@ func convertV1Beta1Status(source attacknetv1alpha1.StacksNetworkStatus) attackne
 			UpdateRevision: actor.UpdateRevision, ServiceName: actor.ServiceName,
 			StatefulSetUID: actor.StatefulSetUID, StatefulSetResourceVersion: actor.StatefulSetResourceVersion,
 			PodName: actor.PodName, PodUID: actor.PodUID, PodResourceVersion: actor.PodResourceVersion,
-			RuntimeImageID: actor.RuntimeImageID, IdentityReady: actor.IdentityReady,
+			RuntimeImageID: actor.RuntimeImageID, ConfigDigest: actor.ConfigDigest,
+			IdentityReady: actor.IdentityReady,
 		})
 	}
 	return attacknetv1beta1.StacksNetworkStatus{
@@ -326,6 +331,13 @@ func (r *V1Beta1Reconciler) SetupWithManager(mgr manager.Manager, maxConcurrent 
 				return nil
 			}
 			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: policy.Namespace, Name: policy.Spec.NetworkRef}}}
+		})).
+		Watches(&attacknetv1beta1.UpgradeCampaign{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+			campaign, ok := object.(*attacknetv1beta1.UpgradeCampaign)
+			if !ok || campaign.Spec.NetworkRef == "" {
+				return nil
+			}
+			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: campaign.Namespace, Name: campaign.Spec.NetworkRef}}}
 		})).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 			name := object.GetLabels()[networkLabel]

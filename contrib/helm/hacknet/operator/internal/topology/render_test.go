@@ -64,6 +64,36 @@ func TestRenderPreservesSecurityStorageAndDependencies(t *testing.T) {
 	}
 }
 
+func TestRenderVerifiesSealedExternalConfigurationBeforeActorStartup(t *testing.T) {
+	network := testNetwork()
+	network.Spec.Actors[1].Config = &attacknetv1alpha1.ActorConfig{
+		ConfigMapRef:   &corev1.LocalObjectReference{Name: "sealed-miner-config"},
+		Key:            "config.toml",
+		MountPath:      "/etc/stacks",
+		ExpectedDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	resources, err := Render(network, testScheme(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var miner *appsv1.StatefulSet
+	for _, statefulSet := range resources.StatefulSets {
+		if statefulSet.Labels[actorLabel] == "miner-1" {
+			miner = statefulSet
+		}
+	}
+	if miner == nil || len(miner.Spec.Template.Spec.InitContainers) != 2 {
+		t.Fatalf("config verifier was not rendered before dependency gating: %#v", miner)
+	}
+	verifier := miner.Spec.Template.Spec.InitContainers[0]
+	if verifier.Name != "verify-config-digest" || len(verifier.VolumeMounts) != 1 || verifier.VolumeMounts[0].Name != "actor-config" || verifier.SecurityContext == nil || verifier.SecurityContext.ReadOnlyRootFilesystem == nil || !*verifier.SecurityContext.ReadOnlyRootFilesystem {
+		t.Fatalf("config verifier does not preserve its restricted, credential-free mount contract: %#v", verifier)
+	}
+	if len(verifier.Env) != 2 || verifier.Env[0].Value != "/etc/stacks/config.toml" || !strings.Contains(strings.Join(verifier.Command, " "), "sha256sum") {
+		t.Fatalf("config verifier does not bind the mounted file: %#v", verifier)
+	}
+}
+
 func TestRenderMakesStableKubernetesDefaultsExplicit(t *testing.T) {
 	resources, err := Render(testNetwork(), testScheme(t))
 	if err != nil {
@@ -236,10 +266,18 @@ func TestRenderRejectsAmbiguousSourcesUnknownDependenciesAndBadPorts(t *testing.
 		{name: "duplicate port number", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
 			network.Spec.Actors[1].Ports = []attacknetv1alpha1.ActorPort{{Name: "rpc", ContainerPort: 1}, {Name: "p2p", ContainerPort: 1}}
 		}},
+		{name: "duplicate service port number", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
+			network.Spec.Actors[1].Ports = []attacknetv1alpha1.ActorPort{{Name: "rpc", ContainerPort: 1, ServicePort: 3}, {Name: "p2p", ContainerPort: 2, ServicePort: 3}}
+		}},
 		{name: "reserved probe port", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
 			enabled := true
 			network.Spec.Probe = &attacknetv1alpha1.ProbeSpec{Enabled: &enabled, Image: "probe:test"}
 			network.Spec.Actors[1].Ports = []attacknetv1alpha1.ActorPort{{Name: "probe", ContainerPort: 18080}}
+		}},
+		{name: "reserved probe service port", mutate: func(network *attacknetv1alpha1.StacksNetwork) {
+			enabled := true
+			network.Spec.Probe = &attacknetv1alpha1.ProbeSpec{Enabled: &enabled, Image: "probe:test"}
+			network.Spec.Actors[1].Ports = []attacknetv1alpha1.ActorPort{{Name: "health", ContainerPort: 8080, ServicePort: 18080}}
 		}},
 	}
 	for _, test := range tests {

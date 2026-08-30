@@ -33,11 +33,22 @@ type CampaignCatalogEntry struct {
 	ExpectedSpecDigest string `json:"expectedSpecDigest,omitempty"`
 }
 
+// UpgradeCatalogEntry binds a logical name to an immutable upgrade template.
+type UpgradeCatalogEntry struct {
+	Name               string `json:"name"`
+	UpgradeRef         string `json:"upgradeRef"`
+	ExpectedUID        string `json:"expectedUID,omitempty"`
+	ExpectedGeneration *int64 `json:"expectedGeneration,omitempty"`
+	ExpectedSpecDigest string `json:"expectedSpecDigest,omitempty"`
+}
+
 // RunExecutionSpec identifies one campaign execution in the schedule DAG.
+// +kubebuilder:validation:XValidation:rule="(has(self.campaign) ? 1 : 0) + (has(self.upgrade) ? 1 : 0) == 1",message="exactly one campaign or upgrade is required"
 type RunExecutionSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
 	ID        string                   `json:"id"`
-	Campaign  string                   `json:"campaign"`
+	Campaign  string                   `json:"campaign,omitempty"`
+	Upgrade   string                   `json:"upgrade,omitempty"`
 	Trigger   RunTriggerSpec           `json:"trigger,omitempty"`
 	DependsOn []RunExecutionDependency `json:"dependsOn,omitempty"`
 	Enabled   *bool                    `json:"enabled,omitempty"`
@@ -159,16 +170,20 @@ type MinimizationSpec struct {
 // AttacknetRunSpec defines a finite schedule and its safety/evidence policy.
 // +kubebuilder:validation:XValidation:rule="(self.replay.enabled ? 1 : 0) + (self.resume.enabled ? 1 : 0) + (self.minimization.enabled ? 1 : 0) <= 1",message="replay, resume, and minimization are mutually exclusive"
 // +kubebuilder:validation:XValidation:rule="self.executions.filter(execution, !has(execution.enabled) || execution.enabled).size() <= self.budgets.maxCampaigns",message="enabled executions exceed maxCampaigns budget"
+// +kubebuilder:validation:XValidation:rule="(has(self.campaignCatalog) ? size(self.campaignCatalog) : 0) + (has(self.upgradeCatalog) ? size(self.upgradeCatalog) : 0) > 0",message="at least one fault or upgrade catalog entry is required"
 type AttacknetRunSpec struct {
 	NetworkRef string `json:"networkRef"`
 	Seed       string `json:"seed"`
 	// +kubebuilder:validation:Enum=dependency-trigger-scheduler/v1
 	DecisionAlgorithm string `json:"decisionAlgorithm,omitempty"`
-	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=256
 	// +listType=map
 	// +listMapKey=name
-	CampaignCatalog []CampaignCatalogEntry `json:"campaignCatalog"`
+	CampaignCatalog []CampaignCatalogEntry `json:"campaignCatalog,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
+	// +listType=map
+	// +listMapKey=name
+	UpgradeCatalog []UpgradeCatalogEntry `json:"upgradeCatalog,omitempty"`
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=1024
 	// +listType=map
@@ -212,6 +227,7 @@ type ScheduleSummary struct {
 // ActiveRunChild identifies one currently executing campaign child.
 type ActiveRunChild struct {
 	ExecutionID string       `json:"executionId"`
+	Kind        string       `json:"kind,omitempty"`
 	Name        string       `json:"name"`
 	UID         string       `json:"uid"`
 	StartedAt   *metav1.Time `json:"startedAt,omitempty"`
@@ -220,6 +236,7 @@ type ActiveRunChild struct {
 // ResolvedCampaign records immutable source-template identity.
 type ResolvedCampaign struct {
 	Name             string `json:"name"`
+	Kind             string `json:"kind,omitempty"`
 	SourceName       string `json:"sourceName"`
 	SourceUID        string `json:"sourceUID"`
 	SourceGeneration int64  `json:"sourceGeneration"`

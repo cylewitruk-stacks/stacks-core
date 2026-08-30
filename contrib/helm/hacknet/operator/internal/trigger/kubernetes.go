@@ -29,12 +29,13 @@ func ReadBurnchainHeight(ctx context.Context, reader client.Reader, namespace st
 		return nil, err
 	}
 	if policy.Status.Phase != "Ready" || policy.Status.ObservedGeneration != policy.Generation ||
-		policy.Status.AdmittedNetworkUID != string(network.UID) || policy.Status.LastSuccessAt == nil {
+		policy.Status.AdmittedNetworkUID != string(network.UID) || policy.Status.BitcoinObservationAt == nil ||
+		policy.Status.BitcoinObservationError != "" {
 		return nil, nil
 	}
 	return &HeightObservation{
 		Height:     policy.Status.ObservedHeight,
-		ObservedAt: policy.Status.LastSuccessAt.Time.UTC(),
+		ObservedAt: policy.Status.BitcoinObservationAt.Time.UTC(),
 		Source: Source{
 			Kind: "BurnchainPolicy", Namespace: policy.Namespace, Name: policy.Name,
 			UID: string(policy.UID), ResourceVersion: policy.ResourceVersion, Trusted: true,

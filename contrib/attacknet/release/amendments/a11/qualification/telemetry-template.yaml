@@ -1,0 +1,29 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: a11-telemetry-template
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+  stages:
+    - id: unreachable-after-baseline
+      faults:
+        - id: inert-delay
+          target: {actors: [follower-1], mode: all}
+          fault:
+            type: network
+            action: delay
+            mode: all
+            duration: 1s
+            parameters:
+              direction: both
+              peerTarget: {actors: [bitcoin], mode: all}
+              delay: {latency: 1ms, jitter: 0ms}
+          effectAssertions:
+            - {type: NetworkDegraded, actor: follower-1, timeoutSeconds: 10}
+          recoveryAssertions:
+            - {type: NetworkRecovered, actor: follower-1, timeoutSeconds: 30}

@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/versionmatrix"
 )
 
 func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
@@ -152,6 +153,53 @@ func TestCollectorFailsClosedWithoutAReader(t *testing.T) {
 	if len(families) != 1 || families[0].GetName() != "attacknet_orchestrator_metrics_collection_success" || families[0].Metric[0].Gauge.GetValue() != 0 {
 		t.Fatalf("nil reader did not expose a failed collection watchdog: %#v", families)
 	}
+}
+
+func TestCollectorEmitsOneActuallyAdmittedVersionPerActor(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := attacknetv1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	manifest, err := json.Marshal(versionmatrix.RuntimeManifest{
+		SchemaVersion: "stacks-attacknet-runtime-version-manifest/v1", DescriptorDigest: digest,
+		Profiles:    []versionmatrix.RuntimeProfile{{Name: "base", SourceKind: "prebuilt", Image: "stacks:base", ImageID: digest, ProvenanceDigest: digest, ConfigDigest: digest, Capabilities: []string{"M01"}}},
+		Assignments: []versionmatrix.RuntimeAssignment{{Actor: "miner-1", Profile: "base", ConfigDigest: digest}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	network := &attacknetv1beta1.StacksNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", Annotations: map[string]string{versionmatrix.RuntimeManifestAnnotation: string(manifest)}},
+		Status:     attacknetv1beta1.StacksNetworkStatus{Actors: []attacknetv1beta1.ActorStatus{{Name: "miner-1", Image: "stacks:next", RuntimeImageID: "containerd://" + digest}}},
+	}
+	upgrade := &attacknetv1beta1.UpgradeCampaign{
+		ObjectMeta: metav1.ObjectMeta{Name: "roll", Namespace: "test"},
+		Spec:       attacknetv1beta1.UpgradeCampaignSpec{NetworkRef: "network", Profiles: []attacknetv1beta1.UpgradeProfileSpec{{Name: "next", SourceKind: "localGit", Image: "stacks:next", ImageID: digest, ProvenanceDigest: digest, ConfigDigest: digest, Capabilities: []string{"M02"}}}},
+		Status:     attacknetv1beta1.UpgradeCampaignStatus{Phase: "Passed", BaselineInventory: &attacknetv1beta1.NetworkInventory{Digest: digest}, AppliedAssignments: []attacknetv1beta1.UpgradeAssignment{{Actor: "miner-1", Profile: "next"}}},
+	}
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(NewCollector(fake.NewClientBuilder().WithScheme(scheme).WithObjects(network, upgrade).Build()))
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "attacknet_actor_version_info" {
+			continue
+		}
+		labels := map[string]string{}
+		if len(family.Metric) == 1 {
+			for _, label := range family.Metric[0].GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+		}
+		if len(family.Metric) != 1 || labels["profile"] != "next" || labels["campaign"] != "roll" {
+			t.Fatalf("version series did not replace stale static profile: %#v", family.Metric)
+		}
+		return
+	}
+	t.Fatal("actor version metric is absent")
 }
 
 func TestCollectorWatchdogFailsClosedOnMalformedEvidence(t *testing.T) {

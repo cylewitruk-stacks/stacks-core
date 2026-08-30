@@ -1,18 +1,18 @@
 package attacknetcli
 
 import (
-	"archive/tar"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/imagearchive"
 )
 
 // KindImageLoadMode controls whether a non-kind cluster skips or fails local
@@ -101,10 +101,11 @@ type KindImageLoadResult struct {
 
 // KindImageLoadOptions controls standalone kind image loading.
 type KindImageLoadOptions struct {
-	Mode           KindImageLoadMode
-	DockerProgram  string
-	KubectlProgram string
-	Now            func() time.Time
+	Mode               KindImageLoadMode
+	DockerProgram      string
+	KubectlProgram     string
+	Now                func() time.Time
+	ExpectedRuntimeIDs map[string]string
 }
 
 // KindImageLoader imports exact local image references into every kind node.
@@ -163,11 +164,14 @@ func (installer LocalInstaller) Install(ctx context.Context, options LocalInstal
 	if options.ForceHelmConflicts && helmMajor(helmVersion) != "4" {
 		return LocalInstallResult{}, fmt.Errorf("Helm --force-conflicts requires Helm 4; detected %q", helmVersion)
 	}
-	images, err := installer.resolveImages(ctx, options)
-	if err != nil {
+	if err := installer.rejectFailedRelease(ctx, options); err != nil {
 		return LocalInstallResult{}, err
 	}
-	if err := installer.rejectFailedRelease(ctx, options); err != nil {
+	if err := installer.requireChaosMeshAPIs(ctx, options); err != nil {
+		return LocalInstallResult{}, err
+	}
+	images, err := installer.resolveImages(ctx, options)
+	if err != nil {
 		return LocalInstallResult{}, err
 	}
 	load := KindImageLoadResult{SchemaVersion: "stacks-attacknet-kind-image-load/v1", Outcome: "Disabled", Nodes: []KindNode{}, Images: []KindImageImport{}}
@@ -342,7 +346,13 @@ func (installer LocalInstaller) ensureNamespace(ctx context.Context, options Loc
 }
 
 func (installer LocalInstaller) applyCRDs(ctx context.Context, options LocalInstallOptions) error {
-	crds := []string{"testing.stacks.org_stacksnetworks.yaml", "testing.stacks.org_burnchainpolicies.yaml", "testing.stacks.org_faultcampaigns.yaml", "testing.stacks.org_attacknetruns.yaml"}
+	crds := []string{
+		"testing.stacks.org_stacksnetworks.yaml",
+		"testing.stacks.org_burnchainpolicies.yaml",
+		"testing.stacks.org_faultcampaigns.yaml",
+		"testing.stacks.org_attacknetruns.yaml",
+		"testing.stacks.org_upgradecampaigns.yaml",
+	}
 	for _, crd := range crds {
 		args := []string{"apply", "--server-side", "--field-manager=hacknet-local-installer"}
 		if options.ForceCRDConflicts {
@@ -353,9 +363,31 @@ func (installer LocalInstaller) applyCRDs(ctx context.Context, options LocalInst
 			return fmt.Errorf("apply CRD %s: %w", crd, err)
 		}
 	}
-	args := []string{"wait", "--for=condition=Established", "--timeout=60s", "crd/stacksnetworks.testing.stacks.org", "crd/burnchainpolicies.testing.stacks.org", "crd/faultcampaigns.testing.stacks.org", "crd/attacknetruns.testing.stacks.org"}
+	args := []string{
+		"wait", "--for=condition=Established", "--timeout=60s",
+		"crd/stacksnetworks.testing.stacks.org",
+		"crd/burnchainpolicies.testing.stacks.org",
+		"crd/faultcampaigns.testing.stacks.org",
+		"crd/attacknetruns.testing.stacks.org",
+		"crd/upgradecampaigns.testing.stacks.org",
+	}
 	if _, err := installer.Runner.Run(ctx, Command{Program: options.KubectlProgram, Args: args}); err != nil {
 		return fmt.Errorf("wait for Attacknet CRDs: %w", err)
+	}
+	return nil
+}
+
+func (installer LocalInstaller) requireChaosMeshAPIs(ctx context.Context, options LocalInstallOptions) error {
+	for _, crd := range []string{
+		"podchaos.chaos-mesh.org",
+		"networkchaos.chaos-mesh.org",
+		"dnschaos.chaos-mesh.org",
+		"iochaos.chaos-mesh.org",
+		"timechaos.chaos-mesh.org",
+	} {
+		if _, err := installer.Runner.Run(ctx, Command{Program: options.KubectlProgram, Args: []string{"get", "crd", crd}}); err != nil {
+			return fmt.Errorf("required Chaos Mesh CRD %s is unavailable; install pinned Chaos Mesh before Attacknet: %w", crd, err)
+		}
 	}
 	return nil
 }
@@ -482,14 +514,31 @@ func (loader KindImageLoader) Load(ctx context.Context, options KindImageLoadOpt
 		return KindImageLoadResult{}, fmt.Errorf("close image archive: %w", err)
 	}
 	defer os.Remove(archive)
-	args := []string{"save", "--platform", platform, "--output", archive}
-	args = append(args, refs...)
-	if _, err := loader.Runner.Run(ctx, Command{Program: options.DockerProgram, Args: args}); err != nil {
-		return KindImageLoadResult{}, fmt.Errorf("export local images: %w", err)
-	}
-	runtimeIDs, err := exportedPlatformImageIDs(archive, refs)
+	archiveRefs, aliases, err := loader.archiveReferences(ctx, options.DockerProgram, refs)
 	if err != nil {
 		return KindImageLoadResult{}, err
+	}
+	args := []string{"save", "--platform", platform, "--output", archive}
+	args = append(args, archiveRefs...)
+	_, saveErr := loader.Runner.Run(ctx, Command{Program: options.DockerProgram, Args: args})
+	cleanupErr := loader.removeHostAliases(ctx, options.DockerProgram, aliases)
+	if saveErr != nil {
+		return KindImageLoadResult{}, fmt.Errorf("export local images: %w", saveErr)
+	}
+	if cleanupErr != nil {
+		return KindImageLoadResult{}, cleanupErr
+	}
+	archiveExpected := make(map[string]string, len(archiveRefs))
+	for _, ref := range refs {
+		archiveExpected[archiveReference(ref, aliases)] = options.ExpectedRuntimeIDs[ref]
+	}
+	archiveIDs, err := imagearchive.PlatformConfigIDs(archive, archiveRefs, archiveExpected)
+	if err != nil {
+		return KindImageLoadResult{}, err
+	}
+	runtimeIDs := make(map[string]string, len(refs))
+	for _, ref := range refs {
+		runtimeIDs[ref] = archiveIDs[archiveReference(ref, aliases)]
 	}
 	for _, node := range receipt.Nodes {
 		if _, err := loader.Runner.Run(ctx, Command{Program: options.DockerProgram, Args: []string{"container", "inspect", node.Name}}); err != nil {
@@ -502,8 +551,8 @@ func (loader KindImageLoader) Load(ctx context.Context, options KindImageLoadOpt
 		// containerd does not replace an existing named image during import.
 		// Remove only the requested tags first so a successful import cannot be
 		// mistaken for an update while kubelet continues selecting stale bytes.
-		for _, ref := range refs {
-			normalized := normalizeDockerReference(ref)
+		for _, ref := range append(append([]string(nil), refs...), aliasReferences(aliases)...) {
+			normalized := imagearchive.NormalizeReference(ref)
 			if !retained[normalized] {
 				continue
 			}
@@ -530,7 +579,18 @@ func (loader KindImageLoader) Load(ctx context.Context, options KindImageLoadOpt
 			return KindImageLoadResult{}, err
 		}
 		for _, ref := range refs {
-			normalized := normalizeDockerReference(ref)
+			normalized := imagearchive.NormalizeReference(ref)
+			if alias := archiveReference(ref, aliases); alias != ref && retained[imagearchive.NormalizeReference(alias)] {
+				if _, err := loader.Runner.Run(ctx, Command{Program: options.DockerProgram, Args: []string{
+					"exec", node.Name, "ctr", "-n", "k8s.io", "images", "tag", imagearchive.NormalizeReference(alias), normalized,
+				}}); err != nil {
+					return KindImageLoadResult{}, fmt.Errorf("tag digest-only image %s on kind node %s: %w", normalized, node.Name, err)
+				}
+				retained, err = loader.kindImageNames(ctx, options.DockerProgram, node.Name)
+				if err != nil {
+					return KindImageLoadResult{}, err
+				}
+			}
 			if !retained[normalized] {
 				return KindImageLoadResult{}, fmt.Errorf("kind node %s did not retain %s", node.Name, normalized)
 			}
@@ -552,71 +612,68 @@ func (loader KindImageLoader) Load(ctx context.Context, options KindImageLoadOpt
 			}
 			receipt.Images = append(receipt.Images, KindImageImport{Node: node.Name, RequestedRef: ref, ImportedRef: normalized, RuntimeImageID: runtimeIDs[ref], Verified: true})
 		}
+		for _, alias := range aliasReferences(aliases) {
+			if _, err := loader.Runner.Run(ctx, Command{Program: options.DockerProgram, Args: []string{
+				"exec", node.Name, "ctr", "-n", "k8s.io", "images", "rm", imagearchive.NormalizeReference(alias),
+			}}); err != nil {
+				return KindImageLoadResult{}, fmt.Errorf("remove temporary image alias on kind node %s: %w", node.Name, err)
+			}
+		}
 	}
 	receipt.Outcome = "Loaded"
 	receipt.CapturedAt = options.Now().UTC().Format(time.RFC3339Nano)
 	return receipt, nil
 }
 
-type dockerArchiveManifestEntry struct {
-	Config   string   `json:"Config"`
-	RepoTags []string `json:"RepoTags"`
+type imageAlias struct {
+	Original  string
+	Temporary string
 }
 
-func exportedPlatformImageIDs(archive string, refs []string) (map[string]string, error) {
-	file, err := os.Open(archive)
-	if err != nil {
-		return nil, fmt.Errorf("open exported image archive: %w", err)
-	}
-	defer file.Close()
-	reader := tar.NewReader(file)
-	var manifest []dockerArchiveManifestEntry
-	for {
-		header, err := reader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read exported image archive: %w", err)
-		}
-		if path.Clean(header.Name) != "manifest.json" {
+func (loader KindImageLoader) archiveReferences(ctx context.Context, docker string, refs []string) ([]string, []imageAlias, error) {
+	archiveRefs := make([]string, 0, len(refs))
+	aliases := make([]imageAlias, 0)
+	for _, ref := range refs {
+		if !strings.Contains(ref, "@sha256:") {
+			archiveRefs = append(archiveRefs, ref)
 			continue
 		}
-		if header.Size < 1 || header.Size > 16<<20 {
-			return nil, fmt.Errorf("exported image manifest has invalid size %d", header.Size)
+		hash := sha256.Sum256([]byte(ref))
+		alias := fmt.Sprintf("attacknet-kind-import:%x", hash[:8])
+		if _, err := loader.Runner.Run(ctx, Command{Program: docker, Args: []string{"tag", ref, alias}}); err != nil {
+			_ = loader.removeHostAliases(ctx, docker, aliases)
+			return nil, nil, fmt.Errorf("create temporary image alias for %s: %w", ref, err)
 		}
-		if err := json.NewDecoder(io.LimitReader(reader, header.Size)).Decode(&manifest); err != nil {
-			return nil, fmt.Errorf("decode exported image manifest: %w", err)
-		}
-		break
+		aliases = append(aliases, imageAlias{Original: ref, Temporary: alias})
+		archiveRefs = append(archiveRefs, alias)
 	}
-	if len(manifest) == 0 {
-		return nil, fmt.Errorf("exported image archive has no Docker manifest")
-	}
-	byReference := map[string]string{}
-	for _, entry := range manifest {
-		config := strings.TrimSuffix(path.Base(entry.Config), ".json")
-		imageID := "sha256:" + config
-		if !immutableImageIDPattern.MatchString(imageID) {
-			return nil, fmt.Errorf("exported image config %q is not an immutable digest", entry.Config)
-		}
-		for _, ref := range entry.RepoTags {
-			normalized := normalizeDockerReference(ref)
-			if previous := byReference[normalized]; previous != "" && previous != imageID {
-				return nil, fmt.Errorf("exported image reference %s resolves to multiple runtime image IDs", normalized)
-			}
-			byReference[normalized] = imageID
+	return archiveRefs, aliases, nil
+}
+
+func (loader KindImageLoader) removeHostAliases(ctx context.Context, docker string, aliases []imageAlias) error {
+	for _, alias := range aliases {
+		if _, err := loader.Runner.Run(ctx, Command{Program: docker, Args: []string{"image", "rm", alias.Temporary}}); err != nil {
+			return fmt.Errorf("remove temporary host image alias %s: %w", alias.Temporary, err)
 		}
 	}
-	result := make(map[string]string, len(refs))
-	for _, ref := range refs {
-		imageID := byReference[normalizeDockerReference(ref)]
-		if imageID == "" {
-			return nil, fmt.Errorf("exported image archive does not bind %s to a platform config", ref)
+	return nil
+}
+
+func archiveReference(ref string, aliases []imageAlias) string {
+	for _, alias := range aliases {
+		if alias.Original == ref {
+			return alias.Temporary
 		}
-		result[ref] = imageID
 	}
-	return result, nil
+	return ref
+}
+
+func aliasReferences(aliases []imageAlias) []string {
+	refs := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		refs = append(refs, alias.Temporary)
+	}
+	return refs
 }
 
 func (loader KindImageLoader) kindImageNames(ctx context.Context, docker, node string) (map[string]bool, error) {
@@ -637,15 +694,4 @@ func (loader KindImageLoader) kindImageNames(ctx context.Context, docker, node s
 
 func isKindDockerProvider(providerID, node string) bool {
 	return strings.HasPrefix(providerID, "kind://docker/") && strings.HasSuffix(providerID, "/"+node)
-}
-
-func normalizeDockerReference(ref string) string {
-	if !strings.Contains(ref, "/") {
-		return "docker.io/library/" + ref
-	}
-	first := strings.SplitN(ref, "/", 2)[0]
-	if strings.ContainsAny(first, ".:") || first == "localhost" {
-		return ref
-	}
-	return "docker.io/" + ref
 }

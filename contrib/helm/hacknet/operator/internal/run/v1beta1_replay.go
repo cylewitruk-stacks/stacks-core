@@ -98,6 +98,15 @@ func rebindBetaExecutionNetwork(executions []betaExecution, network string) erro
 		return errors.New("replay target network is required")
 	}
 	for index := range executions {
+		if executions[index].UpgradeSpec != nil {
+			executions[index].UpgradeSpec.NetworkRef = network
+			digest, err := canonical.ArtifactDigest(executions[index].UpgradeSpec)
+			if err != nil {
+				return err
+			}
+			executions[index].CampaignSpecDigest = digest
+			continue
+		}
 		executions[index].CampaignSpec.NetworkRef = network
 		digest, err := canonical.ArtifactDigest(executions[index].CampaignSpec)
 		if err != nil {
@@ -110,6 +119,9 @@ func rebindBetaExecutionNetwork(executions []betaExecution, network string) erro
 
 func recomputeBetaExecutionBudgets(executions []betaExecution, manifest fault.Manifest, budgets attacknetv1beta1.RunBudgets) error {
 	for index := range executions {
+		if executions[index].UpgradeSpec != nil {
+			continue
+		}
 		campaign := &attacknetv1beta1.FaultCampaign{
 			ObjectMeta: metav1.ObjectMeta{Name: executions[index].Source.Name, UID: types.UID(executions[index].Source.UID)},
 			Spec:       *executions[index].CampaignSpec.DeepCopy(),
@@ -227,6 +239,9 @@ func minimizedBetaExecutions(source []betaExecution, retained []attacknetv1beta1
 			return nil, errors.New("minimization may not reorder source executions")
 		}
 		seen[rule.ExecutionID], previous = true, order[rule.ExecutionID]
+		if execution.UpgradeSpec != nil {
+			return nil, fmt.Errorf("execution %q is an upgrade; minimization removes fault material only", execution.ID)
+		}
 		modified, changed, err := minimizeBetaCampaign(execution.CampaignSpec, rule)
 		if err != nil {
 			return nil, fmt.Errorf("execution %q: %w", execution.ID, err)

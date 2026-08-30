@@ -25,7 +25,9 @@ ARG STACKS_NODE_VERSION="attacknet-dev"
 ARG GIT_BRANCH="unknown"
 ARG GIT_COMMIT="unknown"
 ARG ATTACKNET_CARGO_FEATURES="monitoring_prom,slog_json"
+ARG ATTACKNET_BUILD_CACHE_KEY="default"
 ENV CARGO_INCREMENTAL=0
+ENV CARGO_TARGET_DIR="/src/target/${ATTACKNET_BUILD_CACHE_KEY}"
 
 WORKDIR /src
 COPY --from=planner /src/recipe.json recipe.json
@@ -53,7 +55,7 @@ RUN --mount=type=cache,id=stacks-attacknet-cargo,target=/usr/local/cargo/registr
     && command -v strip \
     && install -d /out/runtime/bin /out/debug/usr/lib/debug/bin \
     && for binary in stacks-node stacks-signer stacks-inspect; do \
-        install -m 0755 "/src/target/release-lite/${binary}" "/out/runtime/bin/${binary}"; \
+        install -m 0755 "${CARGO_TARGET_DIR}/release-lite/${binary}" "/out/runtime/bin/${binary}"; \
         objcopy --only-keep-debug \
             "/out/runtime/bin/${binary}" \
             "/out/debug/usr/lib/debug/bin/${binary}.debug"; \

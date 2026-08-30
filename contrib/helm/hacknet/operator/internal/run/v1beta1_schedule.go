@@ -12,6 +12,7 @@ import (
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolassertion"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/upgrade"
 )
 
 const (
@@ -50,11 +51,13 @@ type betaScheduleNetwork struct {
 
 type betaExecution struct {
 	ID                      string                                    `json:"id"`
+	Kind                    string                                    `json:"kind"`
 	CampaignAlias           string                                    `json:"campaignAlias"`
 	Source                  sourceIdentity                            `json:"source"`
 	Trigger                 attacknetv1beta1.RunTriggerSpec           `json:"trigger"`
 	Dependencies            []attacknetv1beta1.RunExecutionDependency `json:"dependencies,omitempty"`
 	CampaignSpec            attacknetv1beta1.FaultCampaignSpec        `json:"campaignSpec"`
+	UpgradeSpec             *attacknetv1beta1.UpgradeCampaignSpec     `json:"upgradeSpec,omitempty"`
 	CampaignSpecDigest      string                                    `json:"campaignSpecDigest"`
 	MaximumActiveFaults     int32                                     `json:"maximumActiveFaults"`
 	FaultDurationMillis     int64                                     `json:"faultDurationMillis"`
@@ -82,7 +85,12 @@ func buildBetaSchedule(
 	published attacknetv1beta1.NetworkInventory,
 	templates map[string]*attacknetv1beta1.FaultCampaign,
 	manifest fault.Manifest,
+	upgradeTemplateSets ...map[string]*attacknetv1beta1.UpgradeCampaign,
 ) (betaSchedule, error) {
+	upgradeTemplates := map[string]*attacknetv1beta1.UpgradeCampaign{}
+	if len(upgradeTemplateSets) > 0 && upgradeTemplateSets[0] != nil {
+		upgradeTemplates = upgradeTemplateSets[0]
+	}
 	if err := ValidateV1Beta1Structure(run); err != nil {
 		return betaSchedule{}, err
 	}
@@ -122,14 +130,31 @@ func buildBetaSchedule(
 		}
 		catalog[entry.Name] = entry
 	}
-	if len(catalog) == 0 {
+	upgradeCatalog := make(map[string]attacknetv1beta1.UpgradeCatalogEntry, len(run.Spec.UpgradeCatalog))
+	for _, entry := range run.Spec.UpgradeCatalog {
+		if entry.Name == "" || entry.UpgradeRef == "" {
+			return betaSchedule{}, errors.New("upgrade catalog names and references must be non-empty")
+		}
+		if _, duplicate := catalog[entry.Name]; duplicate {
+			return betaSchedule{}, fmt.Errorf("catalog alias %q is used by both fault and upgrade entries", entry.Name)
+		}
+		if _, duplicate := upgradeCatalog[entry.Name]; duplicate {
+			return betaSchedule{}, fmt.Errorf("duplicate upgrade alias %q", entry.Name)
+		}
+		upgradeCatalog[entry.Name] = entry
+	}
+	if len(catalog)+len(upgradeCatalog) == 0 {
 		return betaSchedule{}, errors.New("campaign catalog must not be empty")
 	}
 
 	executionIDs := make(map[string]int, len(run.Spec.Executions))
 	enabledExecutions := make(map[string]bool, len(run.Spec.Executions))
 	for index, execution := range run.Spec.Executions {
-		if execution.ID == "" || execution.Campaign == "" {
+		alias := execution.Campaign
+		if execution.Upgrade != "" {
+			alias = execution.Upgrade
+		}
+		if execution.ID == "" || alias == "" || (execution.Campaign != "" && execution.Upgrade != "") {
 			return betaSchedule{}, errors.New("execution IDs and campaign aliases must be non-empty")
 		}
 		if _, duplicate := executionIDs[execution.ID]; duplicate {
@@ -164,9 +189,46 @@ func buildBetaSchedule(
 				return betaSchedule{}, fmt.Errorf("execution %q dependency state must be Injected, Effective, Recovered, or Terminal", execution.ID)
 			}
 		}
-		entry, found := catalog[execution.Campaign]
-		if !found {
-			return betaSchedule{}, fmt.Errorf("execution %q references unknown campaign alias %q", execution.ID, execution.Campaign)
+		entry, faultFound := catalog[execution.Campaign]
+		upgradeEntry, upgradeFound := upgradeCatalog[execution.Upgrade]
+		if !faultFound && !upgradeFound {
+			return betaSchedule{}, fmt.Errorf("execution %q references an unknown catalog alias", execution.ID)
+		}
+		if upgradeFound {
+			source := upgradeTemplates[upgradeEntry.UpgradeRef]
+			if source == nil || !source.Spec.Template {
+				return betaSchedule{}, fmt.Errorf("upgrade source %q is absent or is not a template", upgradeEntry.UpgradeRef)
+			}
+			if source.Spec.NetworkRef != "" && source.Spec.NetworkRef != run.Spec.NetworkRef {
+				return betaSchedule{}, fmt.Errorf("upgrade source %q targets another network", source.Name)
+			}
+			spec := *source.Spec.DeepCopy()
+			spec.Template = false
+			spec.NetworkRef = run.Spec.NetworkRef
+			resolved := source.DeepCopy()
+			resolved.Spec = spec
+			if err := upgrade.Validate(resolved, network); err != nil {
+				return betaSchedule{}, fmt.Errorf("compile upgrade %q: %w", source.Name, err)
+			}
+			sourceDigest, err := canonical.ArtifactDigest(source.Spec)
+			if err != nil {
+				return betaSchedule{}, err
+			}
+			if upgradeEntry.ExpectedUID != "" && upgradeEntry.ExpectedUID != string(source.UID) || upgradeEntry.ExpectedGeneration != nil && *upgradeEntry.ExpectedGeneration != source.Generation || upgradeEntry.ExpectedSpecDigest != "" && upgradeEntry.ExpectedSpecDigest != sourceDigest {
+				return betaSchedule{}, fmt.Errorf("upgrade %q identity constraint does not match", upgradeEntry.Name)
+			}
+			specDigest, err := canonical.ArtifactDigest(spec)
+			if err != nil {
+				return betaSchedule{}, err
+			}
+			executions = append(executions, betaExecution{
+				ID: execution.ID, Kind: "UpgradeCampaign", CampaignAlias: execution.Upgrade,
+				Source:  sourceIdentity{Name: source.Name, UID: string(source.UID), Generation: source.Generation, SpecDigest: sourceDigest},
+				Trigger: *execution.Trigger.DeepCopy(), Dependencies: append([]attacknetv1beta1.RunExecutionDependency(nil), execution.DependsOn...),
+				UpgradeSpec: &spec, CampaignSpecDigest: specDigest,
+				SignerImpactBasisPoints: spec.Safety.MaxSignerWeightPercent * 100,
+			})
+			continue
 		}
 		source := templates[entry.CampaignRef]
 		if source == nil || !source.Spec.Template {
@@ -202,7 +264,7 @@ func buildBetaSchedule(
 			return betaSchedule{}, err
 		}
 		executions = append(executions, betaExecution{
-			ID: execution.ID, CampaignAlias: execution.Campaign,
+			ID: execution.ID, Kind: "FaultCampaign", CampaignAlias: execution.Campaign,
 			Source:  sourceIdentity{Name: source.Name, UID: string(source.UID), Generation: source.Generation, SpecDigest: sourceDigest},
 			Trigger: *execution.Trigger.DeepCopy(), Dependencies: append([]attacknetv1beta1.RunExecutionDependency(nil), execution.DependsOn...),
 			CampaignSpec: campaignSpec, CampaignSpecDigest: campaignDigest,
@@ -225,7 +287,10 @@ func buildBetaSchedule(
 	if err := validateBetaCrossExecutionCompatibility(executions, clockTargets); err != nil {
 		return betaSchedule{}, err
 	}
-	catalogDigest, err := canonical.ArtifactDigest(normalizedBetaCatalog(run.Spec.CampaignCatalog))
+	catalogDigest, err := canonical.ArtifactDigest(struct {
+		Faults   []attacknetv1beta1.CampaignCatalogEntry `json:"faults"`
+		Upgrades []attacknetv1beta1.UpgradeCatalogEntry  `json:"upgrades"`
+	}{normalizedBetaCatalog(run.Spec.CampaignCatalog), normalizedBetaUpgradeCatalog(run.Spec.UpgradeCatalog)})
 	if err != nil {
 		return betaSchedule{}, err
 	}
@@ -450,6 +515,12 @@ func betaImageConstraints(inventory attacknetv1beta1.NetworkInventory) []imageCo
 func normalizedBetaCatalog(value []attacknetv1beta1.CampaignCatalogEntry) []attacknetv1beta1.CampaignCatalogEntry {
 	result := append([]attacknetv1beta1.CampaignCatalogEntry(nil), value...)
 	sort.Slice(result, func(left, right int) bool { return result[left].Name < result[right].Name })
+	return result
+}
+
+func normalizedBetaUpgradeCatalog(value []attacknetv1beta1.UpgradeCatalogEntry) []attacknetv1beta1.UpgradeCatalogEntry {
+	result := append([]attacknetv1beta1.UpgradeCatalogEntry(nil), value...)
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 

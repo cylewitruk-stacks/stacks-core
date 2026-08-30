@@ -3,8 +3,10 @@ package attacknetcli
 import (
 	"archive/tar"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"reflect"
@@ -110,6 +112,19 @@ func TestLocalInstallerPreservesSafetyCriticalOrdering(t *testing.T) {
 	}
 	assertBefore(t, runner.commands, "docker image tag", "kubectl apply")
 	assertBefore(t, runner.commands, "kubectl wait", "helm upgrade")
+	var appliedCRDs []string
+	for _, command := range runner.commands {
+		if command.Program == "kubectl" && len(command.Args) > 0 && command.Args[0] == "apply" {
+			appliedCRDs = append(appliedCRDs, command.Args[len(command.Args)-1])
+		}
+	}
+	if len(appliedCRDs) != 5 || !strings.HasSuffix(appliedCRDs[4], "testing.stacks.org_upgradecampaigns.yaml") {
+		t.Fatalf("applied CRDs = %#v, want five including UpgradeCampaign", appliedCRDs)
+	}
+	wait := findCommand(t, runner.commands, "kubectl", "wait")
+	if !contains(wait.Args, "crd/upgradecampaigns.testing.stacks.org") {
+		t.Fatalf("CRD readiness wait omits UpgradeCampaign: %#v", wait.Args)
+	}
 	helm := findCommand(t, runner.commands, "helm", "upgrade")
 	joined := strings.Join(helm.Args, " ")
 	for _, required := range []string{"--atomic", "--wait", "operator.image.tag=local-0123456789abcdef", "runOperator.ioPressureImage.tag=local-0123456789abcdef", "probe.image.tag=local-0123456789abcdef"} {
@@ -125,6 +140,38 @@ func TestLocalInstallerPreservesSafetyCriticalOrdering(t *testing.T) {
 	for _, command := range runner.commands {
 		if command.Program == "kubectl" && len(command.Args) > 0 && command.Args[0] == "apply" && contains(command.Args, "--force-conflicts") {
 			t.Fatalf("CRD apply unexpectedly forced conflicts: %#v", command.Args)
+		}
+	}
+}
+
+func TestLocalInstallerRejectsMissingChaosMeshBeforeClusterMutation(t *testing.T) {
+	t.Parallel()
+	const imageID = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	runner := &recordingRunner{run: func(command Command) (CommandResult, error) {
+		switch {
+		case command.Program == "helm" && command.Args[0] == "version":
+			return CommandResult{Stdout: "v4.0.0"}, nil
+		case command.Program == "docker" && len(command.Args) > 1 && command.Args[1] == "inspect":
+			return CommandResult{Stdout: imageID}, nil
+		case command.Program == "helm" && command.Args[0] == "status":
+			return CommandResult{Stderr: "Error: release: not found"}, errors.New("exit 1")
+		case command.Program == "kubectl" && len(command.Args) >= 2 &&
+			reflect.DeepEqual(command.Args[:2], []string{"get", "crd"}):
+			return CommandResult{Stderr: "NotFound"}, errors.New("exit 1")
+		default:
+			return CommandResult{}, nil
+		}
+	}}
+	_, err := (LocalInstaller{Runner: runner}).Install(context.Background(), LocalInstallOptions{
+		ChartDir: "/chart", KindImageLoad: KindImageLoadDisabled,
+	})
+	if err == nil || !strings.Contains(err.Error(), "required Chaos Mesh CRD") {
+		t.Fatalf("got %v, want missing Chaos Mesh failure", err)
+	}
+	for _, command := range runner.commands {
+		if command.Program == "kubectl" && len(command.Args) > 0 &&
+			(command.Args[0] == "apply" || command.Args[0] == "create" || command.Args[0] == "annotate") {
+			t.Fatalf("cluster mutated after dependency failure: %#v", command)
 		}
 	}
 }
@@ -345,6 +392,52 @@ func TestKindImageLoaderRejectsStaleCRIImageIdentity(t *testing.T) {
 	}
 }
 
+func TestKindImageLoaderBindsAndTagsDigestOnlyArchive(t *testing.T) {
+	t.Parallel()
+	const imageID = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const ref = "example/stable@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const normalized = "docker.io/example/stable@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	hash := sha256.Sum256([]byte(ref))
+	alias := fmt.Sprintf("docker.io/library/attacknet-kind-import:%x", hash[:8])
+	nodes := `{"items":[{"metadata":{"name":"cluster-worker"},"spec":{"providerID":"kind://docker/cluster/cluster-worker"},"status":{"nodeInfo":{"operatingSystem":"linux","architecture":"arm64"}}}]}`
+	lists, tags := 0, 0
+	runner := &recordingRunner{run: func(command Command) (CommandResult, error) {
+		switch {
+		case command.Program == "kubectl":
+			return CommandResult{Stdout: nodes}, nil
+		case command.Program == "docker" && len(command.Args) > 0 && command.Args[0] == "save":
+			writeTestImageArchive(t, optionValue(command.Args, "--output"), ref, imageID)
+			return CommandResult{}, nil
+		case command.Program == "docker" && len(command.Args) >= 7 && command.Args[0] == "exec" && command.Args[len(command.Args)-2] == "ls":
+			lists++
+			if lists == 1 {
+				return CommandResult{Stdout: normalized + "\n"}, nil
+			}
+			if lists == 2 {
+				return CommandResult{Stdout: alias + "\n"}, nil
+			}
+			return CommandResult{Stdout: alias + "\n" + normalized + "\n"}, nil
+		case command.Program == "docker" && len(command.Args) > 0 && command.Args[0] == "exec" && contains(command.Args, "tag"):
+			tags++
+			return CommandResult{}, nil
+		case command.Program == "docker" && contains(command.Args, "inspecti"):
+			return CommandResult{Stdout: `{"status":{"id":"` + imageID + `"}}`}, nil
+		default:
+			return CommandResult{}, nil
+		}
+	}}
+	receipt, err := (KindImageLoader{Runner: runner}).Load(context.Background(), KindImageLoadOptions{
+		Mode: KindImageLoadRequire, DockerProgram: "docker", KubectlProgram: "kubectl",
+		ExpectedRuntimeIDs: map[string]string{ref: imageID},
+	}, []string{ref})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tags != 1 || len(receipt.Images) != 1 || receipt.Images[0].RuntimeImageID != imageID {
+		t.Fatalf("digest-only archive was not tagged and verified: tags=%d receipt=%#v", tags, receipt)
+	}
+}
+
 func optionValue(arguments []string, option string) string {
 	for index := 0; index+1 < len(arguments); index++ {
 		if arguments[index] == option {
@@ -361,8 +454,12 @@ func writeTestImageArchive(t *testing.T, target, ref, imageID string) {
 		t.Fatal(err)
 	}
 	writer := tar.NewWriter(file)
-	manifest, err := json.Marshal([]dockerArchiveManifestEntry{{
-		Config: "blobs/sha256/" + strings.TrimPrefix(imageID, "sha256:"), RepoTags: []string{ref},
+	var tags []string
+	if !strings.Contains(ref, "@sha256:") {
+		tags = []string{ref}
+	}
+	manifest, err := json.Marshal([]map[string]any{{
+		"Config": "blobs/sha256/" + strings.TrimPrefix(imageID, "sha256:"), "RepoTags": tags,
 	}})
 	if err != nil {
 		t.Fatal(err)

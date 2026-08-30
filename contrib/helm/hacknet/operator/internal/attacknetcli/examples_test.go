@@ -11,6 +11,7 @@ import (
 func TestHumanAttacknetExamplesAreStrictV1Beta1YAML(t *testing.T) {
 	directory := filepath.Join("..", "..", "..", "..", "..", "attacknet", "examples")
 	var yamlPaths []string
+	var planPaths []string
 	var jsonPaths []string
 	err := filepath.WalkDir(directory, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -21,7 +22,11 @@ func TestHumanAttacknetExamplesAreStrictV1Beta1YAML(t *testing.T) {
 		}
 		switch filepath.Ext(path) {
 		case ".yaml", ".yml":
-			yamlPaths = append(yamlPaths, path)
+			if strings.HasSuffix(path, ".plan.yaml") || strings.HasSuffix(path, ".plan.yml") {
+				planPaths = append(planPaths, path)
+			} else {
+				yamlPaths = append(yamlPaths, path)
+			}
 		case ".json":
 			jsonPaths = append(jsonPaths, path)
 		}
@@ -29,6 +34,20 @@ func TestHumanAttacknetExamplesAreStrictV1Beta1YAML(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(planPaths) == 0 {
+		t.Fatal("found no version-plan YAML examples")
+	}
+	for _, path := range planPaths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := decodeVersionPlan(data); err != nil {
+				t.Fatalf("strict version-plan validation: %v", err)
+			}
+		})
 	}
 	if len(yamlPaths) < 12 {
 		t.Fatalf("found %d YAML examples, want at least 12", len(yamlPaths))

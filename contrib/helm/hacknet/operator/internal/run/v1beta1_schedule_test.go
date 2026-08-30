@@ -77,6 +77,35 @@ func TestBetaScheduleRoundTripPinsDAGAndTemplates(t *testing.T) {
 	}
 }
 
+func TestBetaScheduleComposesUpgradeAndFaultExecutions(t *testing.T) {
+	run, network, admitted, templates, manifest := betaScheduleFixture()
+	network.Spec.Nodes = []attacknetv1beta1.StacksNodeSpec{{Name: "miner-1", Role: attacknetv1beta1.StacksNodeMiner}}
+	upgrade := &attacknetv1beta1.UpgradeCampaign{
+		ObjectMeta: metav1.ObjectMeta{Name: "upgrade", UID: types.UID("upgrade-template"), Generation: 1},
+		Spec: attacknetv1beta1.UpgradeCampaignSpec{
+			Template: true, NetworkRef: "network",
+			Profiles: []attacknetv1beta1.UpgradeProfileSpec{{Name: "next", Image: "node:next", ImageID: "sha256:" + repeat("c", 64), ProvenanceDigest: "sha256:" + repeat("d", 64), ConfigDigest: "sha256:" + repeat("e", 64), SourceKind: "prebuilt"}},
+			Stages:   []attacknetv1beta1.UpgradeStageSpec{{Name: "miner", StableFor: metav1.Duration{Duration: time.Second}, Deadline: metav1.Duration{Duration: time.Minute}, Assignments: []attacknetv1beta1.UpgradeAssignment{{Actor: "miner-1", Profile: "next"}}}},
+			Safety:   attacknetv1beta1.UpgradeSafetySpec{MaxParallelActors: 1, MaxMinerPercent: 100}, RollbackOnFailure: true,
+		},
+	}
+	run.Spec.UpgradeCatalog = []attacknetv1beta1.UpgradeCatalogEntry{{Name: "next", UpgradeRef: "upgrade"}}
+	run.Spec.Executions = []attacknetv1beta1.RunExecutionSpec{
+		{ID: "upgrade", Upgrade: "next"},
+		{ID: "partition", Campaign: "partition", DependsOn: []attacknetv1beta1.RunExecutionDependency{{Execution: "upgrade", State: "Terminal"}}},
+	}
+	schedule, err := buildBetaSchedule(run, network, admitted, templates, manifest, map[string]*attacknetv1beta1.UpgradeCampaign{"upgrade": upgrade})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedule.Executions[0].Kind != "UpgradeCampaign" || schedule.Executions[0].UpgradeSpec == nil || schedule.Executions[1].Kind != "FaultCampaign" {
+		t.Fatalf("mixed schedule lost typed children: %#v", schedule.Executions)
+	}
+	if schedule.Executions[0].CampaignSpecDigest == "" || schedule.Executions[0].Source.SpecDigest == "" {
+		t.Fatal("upgrade execution was not immutably bound")
+	}
+}
+
 func TestBetaScheduleBindsPortableTemplateToAdmittedNetwork(t *testing.T) {
 	run, network, admitted, templates, manifest := betaScheduleFixture()
 	templates["partition"].Spec.NetworkRef = ""

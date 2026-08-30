@@ -11,10 +11,13 @@ kind: Role
 metadata: {name: topology}
 rules:
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks", "burnchainpolicies"]
+    resources: ["stacksnetworks", "burnchainpolicies", "upgradecampaigns"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks/status", "burnchainpolicies/status"]
+    resources: ["upgradecampaigns"]
+    verbs: ["patch"]
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["stacksnetworks/status", "burnchainpolicies/status", "upgradecampaigns/status"]
     verbs: ["get", "patch"]
   - apiGroups: ["apps"]
     resources: ["statefulsets", "deployments"]
@@ -42,13 +45,13 @@ rules:
     resources: ["burnchainpolicies"]
     verbs: ["patch"]
   - apiGroups: ["testing.stacks.org"]
-    resources: ["faultcampaigns"]
+    resources: ["faultcampaigns", "upgradecampaigns"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: ["testing.stacks.org"]
     resources: ["attacknetruns"]
     verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["testing.stacks.org"]
-    resources: ["faultcampaigns/status", "attacknetruns/status"]
+    resources: ["faultcampaigns/status", "upgradecampaigns/status", "attacknetruns/status"]
     verbs: ["get", "patch"]
   - apiGroups: [""]
     resources: ["configmaps"]
@@ -72,12 +75,16 @@ rules:
     resources:
       - stacksnetworks
       - burnchainpolicies
+      - upgradecampaigns
     verbs:
       - get
       - list
       - watch
   - apiGroups: [testing.stacks.org]
-    resources: [stacksnetworks/status, burnchainpolicies/status]
+    resources: [upgradecampaigns]
+    verbs: [patch]
+  - apiGroups: [testing.stacks.org]
+    resources: [stacksnetworks/status, burnchainpolicies/status, upgradecampaigns/status]
     verbs: [get, patch]
   - apiGroups:
       - apps
@@ -119,9 +126,9 @@ metadata:
 rules:
   - {apiGroups: [testing.stacks.org], resources: [stacksnetworks, burnchainpolicies], verbs: [get, list, watch]}
   - {apiGroups: [testing.stacks.org], resources: [burnchainpolicies], verbs: [patch]}
-  - {apiGroups: [testing.stacks.org], resources: [faultcampaigns], verbs: [get, list, watch, create, patch, delete]}
+  - {apiGroups: [testing.stacks.org], resources: [faultcampaigns, upgradecampaigns], verbs: [get, list, watch, create, patch, delete]}
   - {apiGroups: [testing.stacks.org], resources: [attacknetruns], verbs: [get, list, watch, patch]}
-  - {apiGroups: [testing.stacks.org], resources: [faultcampaigns/status, attacknetruns/status], verbs: [get, patch]}
+  - {apiGroups: [testing.stacks.org], resources: [faultcampaigns/status, upgradecampaigns/status, attacknetruns/status], verbs: [get, patch]}
   - {apiGroups: [""], resources: [configmaps], verbs: [get, list, watch, create, patch, delete]}
   - {apiGroups: [""], resources: [pods], verbs: [get, list, watch, create, patch, delete]}
   - {apiGroups: [chaos-mesh.org], resources: [podchaos, networkchaos, dnschaos, iochaos, timechaos], verbs: [get, list, watch, create, delete]}

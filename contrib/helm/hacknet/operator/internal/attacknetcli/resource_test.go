@@ -117,6 +117,40 @@ spec:
 	}
 }
 
+func TestDecodeSubmissionRejectsTopologyRenderConflict(t *testing.T) {
+	input := `apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: invalid-probe-port
+spec:
+  probe:
+    enabled: true
+  defaults:
+    bitcoinImage: bitcoin:regtest
+  burnchain:
+    policyRef: {name: clock}
+    nodes:
+      - name: bitcoin
+        config: {generated: {profile: bitcoin-regtest/v1}}
+  rawActors:
+    - name: observer
+      role: infrastructure
+      image: busybox:stable
+      ports:
+        - name: metrics
+          containerPort: 19090
+          servicePort: 18080
+          protocol: TCP
+      advanced:
+        command: [sleep]
+        args: ["3600"]
+`
+	_, _, err := DecodeSubmission([]byte(input), "experiment")
+	if err == nil || !strings.Contains(err.Error(), "reserves TCP service port 18080") {
+		t.Fatalf("got %v, want compiled topology rejection", err)
+	}
+}
+
 func TestDecodeSubmissionHonorsAnExplicitDocumentNamespace(t *testing.T) {
 	input := strings.Replace(policyYAML, "name: clock", "name: clock\n  namespace: other", 1)
 	object, _, err := DecodeSubmission([]byte(input), "experiment")
@@ -130,7 +164,7 @@ func TestDecodeSubmissionHonorsAnExplicitDocumentNamespace(t *testing.T) {
 
 func TestLookupKindCatalogIsClosed(t *testing.T) {
 	kinds := Kinds()
-	if len(kinds) != 4 {
+	if len(kinds) != 5 {
 		t.Fatalf("got %d kinds", len(kinds))
 	}
 	for _, kind := range kinds {

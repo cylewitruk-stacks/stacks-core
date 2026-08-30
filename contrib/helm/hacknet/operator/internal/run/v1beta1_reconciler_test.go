@@ -331,6 +331,127 @@ func TestBetaRunAllowsOnlyDurablyActivePodKillIdentityTransitions(t *testing.T) 
 	}
 }
 
+func TestUpgradeIdentityAuthorizationCoversOnlyTheSealedTransition(t *testing.T) {
+	baselineConfig := "sha256:" + repeat("c", 64)
+	candidateConfig := "sha256:" + repeat("d", 64)
+	expected := attacknetv1beta1.NetworkInventory{Actors: []attacknetv1beta1.AdmittedActorIdentity{{
+		Name: "miner-1", Role: "miner", ServiceName: "network-miner-1", StatefulSetName: "network-miner-1",
+		StatefulSetUID: "sts-uid", ControllerRevision: "old-revision", PodName: "old-pod", PodUID: "old-uid",
+		RequestedImage: "stable:sealed", RuntimeImageID: "containerd://sha256:" + repeat("a", 64),
+		ConfigDigest: baselineConfig,
+	}}}
+	imageID := "sha256:" + repeat("b", 64)
+	network := &attacknetv1beta1.StacksNetwork{ObjectMeta: metav1.ObjectMeta{Name: "network"}, Status: attacknetv1beta1.StacksNetworkStatus{Actors: []attacknetv1beta1.ActorStatus{{
+		Name: "miner-1", Role: "miner", ServiceName: "network-miner-1", ResourceName: "network-miner-1",
+		StatefulSetUID: "sts-uid", CurrentRevision: "new-revision", PodName: "new-pod", PodUID: "new-uid",
+		Image: "candidate:sealed", RuntimeImageID: "containerd://" + imageID,
+		ConfigDigest: candidateConfig,
+	}}}}
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "new-pod", UID: "new-uid", Labels: map[string]string{
+		"testing.stacks.org/network": "network", "testing.stacks.org/actor": "miner-1",
+	}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "actor", Image: "candidate:sealed"}}}, Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "actor", ImageID: "containerd://" + imageID}}}}
+	encoded := `{"miner-1":{"image":"candidate:sealed","imageID":"` + imageID + `","configDigest":"` + candidateConfig + `"}}`
+	child := attacknetv1beta1.FaultCampaign{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		betaChildKindAnnotation: "UpgradeCampaign", betaUpgradeImagesAnnotation: encoded,
+	}}}
+	child.Status.Phase = "Running"
+	if err := applyTransitionalUpgradeIdentities(&expected, network, []corev1.Pod{pod}, []attacknetv1beta1.FaultCampaign{child}); err != nil {
+		t.Fatal(err)
+	}
+	actor := expected.Actors[0]
+	if actor.RequestedImage != "candidate:sealed" || actor.RuntimeImageID != "containerd://"+imageID || actor.ConfigDigest != candidateConfig || actor.PodUID != "new-uid" || actor.ControllerRevision != "new-revision" {
+		t.Fatalf("sealed transition was not authorized exactly: %#v", actor)
+	}
+	network.Status.Actors[0].Image = "substituted:latest"
+	baseline := expected.DeepCopy()
+	baseline.Actors[0].RequestedImage = "stable:sealed"
+	if err := applyTransitionalUpgradeIdentities(baseline, network, nil, []attacknetv1beta1.FaultCampaign{child}); err != nil {
+		t.Fatal(err)
+	}
+	if baseline.Actors[0].RequestedImage != "stable:sealed" {
+		t.Fatal("an unsealed requested image was authorized")
+	}
+}
+
+func TestRollingBackUpgradeAcceptsOnlySealedTransitionEndpoints(t *testing.T) {
+	stableID := "sha256:" + repeat("a", 64)
+	candidateID := "sha256:" + repeat("b", 64)
+	thirdID := "sha256:" + repeat("e", 64)
+	stableConfig := "sha256:" + repeat("c", 64)
+	candidateConfig := "sha256:" + repeat("d", 64)
+	baselineActor := attacknetv1beta1.AdmittedActorIdentity{
+		Name: "signer-node-1", RequestedImage: "stable:sealed", RuntimeImageID: "containerd://" + stableID,
+		ConfigDigest: stableConfig, PodName: "stable-pod", PodUID: "stable-uid",
+	}
+	child := attacknetv1beta1.FaultCampaign{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		betaChildKindAnnotation:       "UpgradeCampaign",
+		betaUpgradeImagesAnnotation:   `{"signer-node-1":{"image":"candidate:sealed","imageID":"` + candidateID + `","configDigest":"` + candidateConfig + `"}}`,
+		betaUpgradeBaselineAnnotation: `{"signer-node-1":{"image":"stable:sealed","imageID":"` + stableID + `","configDigest":"` + stableConfig + `"}}`,
+	}}, Status: attacknetv1beta1.FaultCampaignStatus{Phase: "RollingBack"}}
+
+	assertEndpoint := func(image, imageID, config string, accepted bool) {
+		t.Helper()
+		expected := attacknetv1beta1.NetworkInventory{Actors: []attacknetv1beta1.AdmittedActorIdentity{baselineActor}}
+		network := &attacknetv1beta1.StacksNetwork{ObjectMeta: metav1.ObjectMeta{Name: "network"}, Status: attacknetv1beta1.StacksNetworkStatus{Actors: []attacknetv1beta1.ActorStatus{{
+			Name: "signer-node-1", Image: image, RuntimeImageID: "containerd://" + imageID, ConfigDigest: config,
+			PodName: "live-pod", PodUID: "live-uid",
+		}}}}
+		pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "live-pod", UID: "live-uid", Labels: map[string]string{
+			"testing.stacks.org/network": "network", "testing.stacks.org/actor": "signer-node-1",
+		}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "actor", Image: image}}},
+			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "actor", ImageID: "containerd://" + imageID}}}}
+		if err := applyTransitionalUpgradeIdentities(&expected, network, []corev1.Pod{pod}, []attacknetv1beta1.FaultCampaign{child}); err != nil {
+			t.Fatal(err)
+		}
+		if accepted && (expected.Actors[0].RequestedImage != image || expected.Actors[0].RuntimeImageID != "containerd://"+imageID || expected.Actors[0].ConfigDigest != config) {
+			t.Fatalf("sealed rollback endpoint was not accepted: %#v", expected.Actors[0])
+		}
+		if !accepted && expected.Actors[0].RequestedImage != baselineActor.RequestedImage {
+			t.Fatalf("unsealed rollback endpoint was accepted: %#v", expected.Actors[0])
+		}
+	}
+
+	assertEndpoint("candidate:sealed", candidateID, candidateConfig, true)
+	assertEndpoint("stable:sealed", stableID, stableConfig, true)
+	assertEndpoint("substituted:latest", thirdID, candidateConfig, false)
+}
+
+func TestAuthorizedUpgradeRejectsAConfigurationSubstitution(t *testing.T) {
+	expected := attacknetv1beta1.NetworkInventory{Digest: "sha256:" + repeat("a", 64), Actors: []attacknetv1beta1.AdmittedActorIdentity{{
+		Name: "miner-1", RequestedImage: "stable:sealed", RuntimeImageID: "containerd://sha256:" + repeat("a", 64),
+	}}}
+	imageID := "sha256:" + repeat("b", 64)
+	expectedConfig := "sha256:" + repeat("c", 64)
+	current := attacknetv1beta1.NetworkInventory{Digest: "sha256:" + repeat("d", 64), Actors: []attacknetv1beta1.AdmittedActorIdentity{{
+		Name: "miner-1", RequestedImage: "candidate:sealed", RuntimeImageID: "containerd://" + imageID,
+		ConfigDigest: "sha256:" + repeat("e", 64),
+	}}}
+	encoded := `{"miner-1":{"image":"candidate:sealed","imageID":"` + imageID + `","configDigest":"` + expectedConfig + `"}}`
+	child := attacknetv1beta1.FaultCampaign{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		betaChildKindAnnotation: "UpgradeCampaign", betaUpgradeImagesAnnotation: encoded,
+	}}}
+	child.Status.Phase = "Running"
+	changed, err := applyAuthorizedUpgradeIdentities(&expected, current, []attacknetv1beta1.FaultCampaign{child})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 0 || expected.Digest == current.Digest || expected.Actors[0].ConfigDigest != "" {
+		t.Fatalf("substituted config was authorized: changed=%v expected=%#v", changed, expected)
+	}
+}
+
+func TestUpgradeIdentityAuthorizationDoesNotRewriteDigestWithoutUpgrade(t *testing.T) {
+	expected := attacknetv1beta1.NetworkInventory{Digest: "sha256:" + repeat("a", 64)}
+	current := attacknetv1beta1.NetworkInventory{Digest: "sha256:" + repeat("b", 64)}
+	changed, err := applyAuthorizedUpgradeIdentities(&expected, current, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 0 || expected.Digest == current.Digest {
+		t.Fatalf("an empty upgrade authorization rewrote fault-transition identity: changed=%v expected=%s", changed, expected.Digest)
+	}
+}
+
 func TestBetaDependencyEffectiveAcceptsProvenControllerEvidence(t *testing.T) {
 	observed := time.Unix(50, 0).UTC()
 	raw, err := betaJSON(map[string]any{"outcome": "Proven", "observedAt": observed})
@@ -343,6 +464,45 @@ func TestBetaDependencyEffectiveAcceptsProvenControllerEvidence(t *testing.T) {
 	got, ok := childEffectiveAt(child)
 	if !ok || !got.Equal(observed) {
 		t.Fatalf("Proven effect evidence was not recognized: at=%v ok=%t", got, ok)
+	}
+}
+
+func TestResolvedUpgradeAuthorizationsPreserveFailureAndRecognizeRollback(t *testing.T) {
+	child := attacknetv1beta1.FaultCampaign{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			betaChildKindAnnotation:       "UpgradeCampaign",
+			betaUpgradeImagesAnnotation:   `{"miner-1":{"image":"stacks:next","imageID":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`,
+			betaUpgradeBaselineAnnotation: `{"miner-1":{"image":"stacks:base","imageID":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`,
+		}},
+		Status: attacknetv1beta1.FaultCampaignStatus{Phase: "Failed"},
+	}
+	allowed, err := resolvedUpgradeAuthorizations([]attacknetv1beta1.FaultCampaign{child})
+	if err != nil || allowed["miner-1"].Image != "stacks:next" {
+		t.Fatalf("failed rollout was not retained for triage: allowed=%#v err=%v", allowed, err)
+	}
+	child.Status.Cleanup = &attacknetv1beta1.CleanupEvidence{AllRecovered: true}
+	allowed, err = resolvedUpgradeAuthorizations([]attacknetv1beta1.FaultCampaign{child})
+	if err != nil || allowed["miner-1"].Image != "stacks:base" {
+		t.Fatalf("completed rollback did not restore baseline authorization: allowed=%#v err=%v", allowed, err)
+	}
+}
+
+func TestUpgradeAuthorizationSealsOverrideOrInheritedConfig(t *testing.T) {
+	baseDigest := "sha256:" + repeat("c", 64)
+	overrideDigest := "sha256:" + repeat("d", 64)
+	baseline := &attacknetv1beta1.NetworkInventory{Actors: []attacknetv1beta1.AdmittedActorIdentity{
+		{Name: "miner-1", ConfigDigest: baseDigest}, {Name: "follower-1"},
+	}}
+	spec := attacknetv1beta1.UpgradeCampaignSpec{
+		Profiles: []attacknetv1beta1.UpgradeProfileSpec{{Name: "next", Image: "stacks:next", ImageID: "sha256:" + repeat("b", 64)}},
+		Stages: []attacknetv1beta1.UpgradeStageSpec{{Assignments: []attacknetv1beta1.UpgradeAssignment{
+			{Actor: "miner-1", Profile: "next"},
+			{Actor: "follower-1", Profile: "next", Config: &attacknetv1beta1.ConfigSource{ExpectedDigest: overrideDigest}},
+		}}},
+	}
+	authorizations := betaUpgradeImages(spec, baseline)
+	if authorizations["miner-1"].ConfigDigest != baseDigest || authorizations["follower-1"].ConfigDigest != overrideDigest {
+		t.Fatalf("effective configuration was not sealed: %#v", authorizations)
 	}
 }
 

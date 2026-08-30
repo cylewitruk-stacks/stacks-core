@@ -81,7 +81,8 @@ func betaNetworkAsLegacy(network *testingv1beta1.StacksNetwork) *testingv1.Stack
 			ServiceName: actor.ServiceName, StatefulSetUID: actor.StatefulSetUID,
 			StatefulSetResourceVersion: actor.StatefulSetResourceVersion, PodName: actor.PodName,
 			PodUID: actor.PodUID, PodResourceVersion: actor.PodResourceVersion,
-			RuntimeImageID: actor.RuntimeImageID, IdentityReady: actor.IdentityReady,
+			RuntimeImageID: actor.RuntimeImageID, ConfigDigest: actor.ConfigDigest,
+			IdentityReady: actor.IdentityReady,
 		})
 	}
 	return legacy
@@ -128,6 +129,7 @@ func betaInventory(value testingv1.NetworkInventory) testingv1beta1.NetworkInven
 			StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,
 			ControllerRevision: actor.ControllerRevision, PodName: actor.PodName, PodUID: actor.PodUID,
 			RequestedImage: actor.RequestedImage, RuntimeImageID: actor.RuntimeImageID,
+			ConfigDigest: actor.ConfigDigest,
 		}
 	}
 	return result
@@ -145,6 +147,7 @@ func legacyInventory(value testingv1beta1.NetworkInventory) testingv1.NetworkInv
 			StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,
 			ControllerRevision: actor.ControllerRevision, PodName: actor.PodName, PodUID: actor.PodUID,
 			RequestedImage: actor.RequestedImage, RuntimeImageID: actor.RuntimeImageID,
+			ConfigDigest: actor.ConfigDigest,
 		}
 	}
 	return result

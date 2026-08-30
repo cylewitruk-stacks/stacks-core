@@ -70,6 +70,39 @@ func TestPublishedSortsActorsAndExcludesObservationMetadata(t *testing.T) {
 	}
 }
 
+func TestConfigDigestIsAnOptionalAdmittedIdentity(t *testing.T) {
+	network := readyNetwork()
+	payload, err := Build(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutConfig, err := Digest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.Actors[0].ConfigDigest = "sha256:" + repeat("c", 64)
+	payload, err = Build(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withConfig, err := Digest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withConfig == withoutConfig {
+		t.Fatal("config identity did not change the admitted inventory digest")
+	}
+	network.Status.InventoryDigest = withConfig
+	expected, err := Published(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.Actors[0].ConfigDigest = "sha256:" + repeat("d", 64)
+	if differences := CompareLive(expected, network, nil, nil); !hasDifference(differences, "configDigest") {
+		t.Fatalf("config substitution was not detected: %#v", differences)
+	}
+}
+
 func TestCompareLiveAllowsOnlySelectedPodIdentity(t *testing.T) {
 	network := readyNetwork()
 	payload, _ := Build(network)
@@ -106,6 +139,27 @@ func TestCompareLiveAllowsSelectedPodToBeTemporarilyAbsent(t *testing.T) {
 	}
 	if differences := CompareLive(expected, network, pods, nil); len(differences) == 0 {
 		t.Fatalf("unapproved Pod absence was not detected: %#v", differences)
+	}
+}
+
+func TestRuntimeImageMatchesOneExactDigest(t *testing.T) {
+	digest := "sha256:" + repeat("a", 64)
+	if !RuntimeImageMatches("containerd://registry.example/stacks@"+digest, digest) {
+		t.Fatal("exact runtime digest was rejected")
+	}
+	if actual, ok := ImmutableImageID("containerd://registry.example/stacks@" + digest); !ok || actual != digest {
+		t.Fatalf("runtime digest extraction returned %q, %t", actual, ok)
+	}
+	for _, test := range []struct {
+		value, expected string
+	}{
+		{"containerd://sha256:" + repeat("b", 64), digest},
+		{"containerd://" + digest + "+sha256:" + repeat("b", 64), digest},
+		{"containerd://" + digest, "not-a-digest"},
+	} {
+		if RuntimeImageMatches(test.value, test.expected) {
+			t.Fatalf("ambiguous or invalid identity was accepted: value=%q expected=%q", test.value, test.expected)
+		}
 	}
 }
 
@@ -154,4 +208,13 @@ func repeat(value string, count int) string {
 		result += value
 	}
 	return result
+}
+
+func hasDifference(differences []testingv1.IdentityDifference, field string) bool {
+	for _, difference := range differences {
+		if difference.Field == field {
+			return true
+		}
+	}
+	return false
 }

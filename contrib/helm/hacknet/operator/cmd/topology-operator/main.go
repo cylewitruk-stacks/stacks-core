@@ -18,7 +18,9 @@ import (
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchainpolicy"
 	manageroptions "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/manager"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolobservation"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/upgrade"
 )
 
 func main() {
@@ -46,6 +48,11 @@ func main() {
 		ProbeImage: *probeImage, ProbeImagePull: probePullPolicy,
 	}
 	must(reconciler.SetupWithManager(mgr, options.Concurrency))
+	upgradeReconciler := &upgrade.Reconciler{
+		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+		Observations: &protocolobservation.Reader{APIReader: mgr.GetAPIReader()},
+	}
+	must(upgradeReconciler.SetupWithManager(mgr, options.Concurrency))
 	pullPolicy, err := imagePullPolicy(*clockImagePull)
 	must(err)
 	transport := http.DefaultTransport.(*http.Transport).Clone()

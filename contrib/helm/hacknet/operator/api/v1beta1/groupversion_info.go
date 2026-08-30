@@ -27,6 +27,7 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&StacksNetwork{}, &StacksNetworkList{},
 		&BurnchainPolicy{}, &BurnchainPolicyList{},
 		&FaultCampaign{}, &FaultCampaignList{},
+		&UpgradeCampaign{}, &UpgradeCampaignList{},
 		&AttacknetRun{}, &AttacknetRunList{},
 	)
 	metav1.AddToGroupVersion(scheme, GroupVersion)

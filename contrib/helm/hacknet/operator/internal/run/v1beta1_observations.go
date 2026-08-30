@@ -71,7 +71,11 @@ func childDependencyObservations(children []attacknetv1beta1.FaultCampaign) []tr
 		if executionID == "" {
 			continue
 		}
-		source := trigger.Source{Kind: "FaultCampaign", Namespace: child.Namespace, Name: child.Name, UID: string(child.UID), ResourceVersion: child.ResourceVersion, Trusted: true}
+		kind := child.Annotations[betaChildKindAnnotation]
+		if kind == "" {
+			kind = "FaultCampaign"
+		}
+		source := trigger.Source{Kind: kind, Namespace: child.Namespace, Name: child.Name, UID: string(child.UID), ResourceVersion: child.ResourceVersion, Trusted: true}
 		observation := trigger.DependencyObservation{ID: executionID, Source: source}
 		startedAt := child.CreationTimestamp.Time.UTC()
 		if startedAt.IsZero() {

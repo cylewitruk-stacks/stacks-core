@@ -4,8 +4,8 @@ The root [`README.md`](../README.md) is the operator quickstart. Supporting
 material is grouped by audience and responsibility:
 
 - [`concepts/`](concepts/) explains scheduling, minimization, reproducibility,
-  mixed versions, Bitcoin reorganizations and split views, and adversarial
-  actors.
+  [mixed versions and rolling upgrades](concepts/mixed-version-images.md),
+  Bitcoin reorganizations and split views, and adversarial actors.
 - [`operations/`](operations/) covers runtime operation, evidence, and failure
   attribution.
 - [`development/`](development/) covers image and controller development plus

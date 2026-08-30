@@ -95,9 +95,10 @@ $ATTACKNET image load --mode require \
 
 The typed installer resolves every control-plane image to an immutable local
 Docker ID, content-tags it, imports it into every `kind` node, and verifies the
-selected platform's CRI runtime image ID. It then applies the four v1beta1 CRDs
-explicitly and performs an atomic Helm install. Actor images are loaded
-separately because a `StacksNetwork`, not the chart, selects them.
+selected platform's CRI runtime image ID. It verifies all five required Chaos
+Mesh APIs, applies the five v1beta1 Attacknet CRDs explicitly, and performs an
+atomic Helm install. Actor images are loaded separately because a
+`StacksNetwork`, not the chart, selects them.
 Actor Pods never receive Kubernetes service-account credentials.
 
 ```bash
@@ -107,6 +108,11 @@ $ATTACKNET doctor
 
 Do not start a run until both controller Deployments are Available and the
 doctor reports every v1beta1 API available. Use `--output json` for automation.
+
+To mix releases, branches, forks, local modifications, or prebuilt images, use
+the [`mixed-version workflow`](docs/concepts/mixed-version-images.md). It seals
+source, build, image, configuration, deterministic actor assignments, and
+optional rolling stages before Kubernetes admission.
 
 ## First network
 

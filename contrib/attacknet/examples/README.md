@@ -8,12 +8,18 @@ Examples are grouped by intent:
 - [`campaigns/`](campaigns/) contains single `FaultCampaign` scenarios.
 - [`runs/`](runs/) contains scheduled or minimization-oriented `AttacknetRun`
   inputs.
-- [`matrices/`](matrices/) contains machine-consumed image and version plans.
+- [`matrices/`](matrices/) contains human-authored source, image, configuration,
+  assignment, and upgrade plans.
 
-The `*.plan.json` files are intentionally JSON: they are machine-consumed
-image-build and mixed-version planning inputs, not Kubernetes resources.
-Runtime evidence, generated manifests, digests, and replay descriptors also
-remain canonical JSON.
+Version plans are YAML because operators author them. `attacknet version
+prepare` produces canonical, digest-bound JSON descriptors; runtime evidence,
+generated receipts, and replay descriptors also remain canonical JSON.
+
+[`matrices/stable-with-candidate.plan.yaml`](matrices/stable-with-candidate.plan.yaml)
+mixes a released remote ref with the current local checkout and defines a
+bounded three-stage rollout. [`matrices/raw-config-fallback.plan.yaml`](matrices/raw-config-fallback.plan.yaml)
+shows the optional Secret-backed compatibility escape hatch. Its private
+config file is intentionally not included in the repository.
 
 The multi-Bitcoin example is composed from six single-document resources:
 

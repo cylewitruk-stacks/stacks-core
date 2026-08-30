@@ -115,6 +115,48 @@ func TestReaderCollectsMetricsBetweenStableIdentityChecks(t *testing.T) {
 	}
 }
 
+func TestReaderUsesOneCollectionBoundaryForActorMetrics(t *testing.T) {
+	actor := attacknetv1beta1.AdmittedActorIdentity{
+		Name: "miner-1", Role: "miner", ServiceName: "network-miner-1",
+		PodName: "miner-1-0", PodUID: "pod-miner", RuntimeImageID: strings.Repeat("a", 64),
+	}
+	view := IdentityView{
+		NetworkUID: "network-uid", InventoryDigest: "sha256:inventory", Namespace: "test",
+		Actors: []attacknetv1beta1.AdmittedActorIdentity{actor},
+	}
+	base := time.Unix(100, 0).UTC()
+	tick := 0
+	reader := &Reader{
+		Identities: &identitySequence{values: []IdentityView{view, view}},
+		Endpoints:  endpointMap{"miner-1": "http://metrics/miner"},
+		Now: func() time.Time {
+			observed := base.Add(time.Duration(tick) * time.Second)
+			tick++
+			return observed
+		},
+		HTTP: httpDoer(func(*http.Request) (*http.Response, error) {
+			body := "# TYPE stacks_node_stacks_tip_height gauge\nstacks_node_stacks_tip_height 12\n"
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+		}),
+	}
+	network := &attacknetv1beta1.StacksNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test", UID: types.UID("network-uid")},
+	}
+	snapshot, err := reader.Read(context.Background(), network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tick < 2 {
+		t.Fatal("test did not exercise distinct start and completion clock reads")
+	}
+	if len(snapshot.Actors) != 1 || !snapshot.Actors[0].Source.ObservedAt.Equal(snapshot.ObservedAt) {
+		t.Fatalf("actor source and snapshot use different collection boundaries: %#v", snapshot)
+	}
+	if !snapshot.ObservedAt.Equal(base) {
+		t.Fatalf("snapshot boundary = %s, want collection start %s", snapshot.ObservedAt, base)
+	}
+}
+
 func TestReaderReturnsPartialSnapshotForEndpointFailure(t *testing.T) {
 	actor := attacknetv1beta1.AdmittedActorIdentity{Name: "miner-1", Role: "miner", ServiceName: "miner", PodName: "miner-0", PodUID: "pod", RuntimeImageID: strings.Repeat("a", 64)}
 	view := IdentityView{NetworkUID: "uid", InventoryDigest: "digest", Namespace: "test", Actors: []attacknetv1beta1.AdmittedActorIdentity{actor}}

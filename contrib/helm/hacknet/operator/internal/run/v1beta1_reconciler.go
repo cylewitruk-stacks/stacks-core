@@ -37,12 +37,16 @@ import (
 )
 
 const (
-	betaRunFinalizer        = "testing.stacks.org/attacknet-run-v1beta1-cleanup"
-	betaExecutionAnnotation = "testing.stacks.org/execution-id"
-	betaScheduleAnnotation  = "testing.stacks.org/schedule-digest"
-	betaTemplateAnnotation  = "testing.stacks.org/source-template"
-	betaTriggerAnnotation   = "testing.stacks.org/trigger-receipt"
-	betaDependencyRequeue   = 5 * time.Second
+	betaRunFinalizer              = "testing.stacks.org/attacknet-run-v1beta1-cleanup"
+	betaExecutionAnnotation       = "testing.stacks.org/execution-id"
+	betaScheduleAnnotation        = "testing.stacks.org/schedule-digest"
+	betaTemplateAnnotation        = "testing.stacks.org/source-template"
+	betaTriggerAnnotation         = "testing.stacks.org/trigger-receipt"
+	betaChildKindAnnotation       = "testing.stacks.org/child-kind"
+	betaSpecDigestAnnotation      = "testing.stacks.org/execution-spec-digest"
+	betaUpgradeImagesAnnotation   = "testing.stacks.org/upgrade-images"
+	betaUpgradeBaselineAnnotation = "testing.stacks.org/upgrade-baseline-images"
+	betaDependencyRequeue         = 5 * time.Second
 )
 
 // V1Beta1Reconciler executes immutable dependency-triggered run schedules and
@@ -57,12 +61,13 @@ type V1Beta1Reconciler struct {
 }
 
 type betaDecision struct {
-	ExecutionID string    `json:"executionId"`
-	Child       string    `json:"child"`
-	ChildUID    string    `json:"childUid"`
-	Phase       string    `json:"phase"`
-	CompletedAt time.Time `json:"completedAt"`
-	Source      string    `json:"source"`
+	ExecutionID string       `json:"executionId"`
+	Child       string       `json:"child"`
+	ChildUID    string       `json:"childUid"`
+	Phase       string       `json:"phase"`
+	CompletedAt time.Time    `json:"completedAt"`
+	Source      string       `json:"source"`
+	Evidence    *apixv1.JSON `json:"evidence,omitempty"`
 }
 
 type protocolGate struct {
@@ -140,7 +145,7 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 	}
 
 	next := *run.Status.DeepCopy()
-	if err := r.recordCompletedChildren(&next, children, schedule, completed); err != nil {
+	if err := r.recordCompletedChildren(ctx, &next, children, schedule, completed); err != nil {
 		return reconcile.Result{}, r.fail(ctx, run, "DecisionIntegrityFailed", err)
 	}
 	next.TriggerReceipts, err = betaTriggerReceipts(children, schedule)
@@ -333,7 +338,15 @@ func (r *V1Beta1Reconciler) prepare(ctx context.Context, run *attacknetv1beta1.A
 		}
 		templates[source.Name] = source
 	}
-	schedule, err := buildBetaSchedule(run, live.Network, published, templates, manifest)
+	upgradeTemplates := make(map[string]*attacknetv1beta1.UpgradeCampaign, len(run.Spec.UpgradeCatalog))
+	for _, entry := range run.Spec.UpgradeCatalog {
+		source := &attacknetv1beta1.UpgradeCampaign{}
+		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: entry.UpgradeRef}, source); err != nil {
+			return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
+		}
+		upgradeTemplates[source.Name] = source
+	}
+	schedule, err := buildBetaSchedule(run, live.Network, published, templates, manifest, upgradeTemplates)
 	if err != nil {
 		return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 	}
@@ -468,6 +481,9 @@ func (r *V1Beta1Reconciler) createExecution(
 	scheduleDigest string,
 	receipt apixv1.JSON,
 ) (*attacknetv1beta1.FaultCampaign, error) {
+	if execution.Kind == "UpgradeCampaign" {
+		return r.createUpgradeExecution(ctx, run, execution, scheduleDigest, receipt)
+	}
 	desired := &attacknetv1beta1.FaultCampaign{
 		TypeMeta: metav1.TypeMeta{APIVersion: attacknetv1beta1.GroupVersion.String(), Kind: "FaultCampaign"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -479,6 +495,8 @@ func (r *V1Beta1Reconciler) createExecution(
 				"testing.stacks.org/source-template-uid":        execution.Source.UID,
 				"testing.stacks.org/source-template-generation": fmt.Sprint(execution.Source.Generation),
 				"testing.stacks.org/source-template-digest":     execution.Source.SpecDigest,
+				betaChildKindAnnotation:                         "FaultCampaign",
+				betaSpecDigestAnnotation:                        execution.CampaignSpecDigest,
 			},
 			OwnerReferences: []metav1.OwnerReference{ownership.Reference(run, attacknetv1beta1.GroupVersion.WithKind("AttacknetRun"))},
 		},
@@ -497,6 +515,143 @@ func (r *V1Beta1Reconciler) createExecution(
 		return nil, fmt.Errorf("refusing to adopt FaultCampaign %s with different ownership or execution inputs", desired.Name)
 	}
 	return observed, nil
+}
+
+func (r *V1Beta1Reconciler) createUpgradeExecution(ctx context.Context, run *attacknetv1beta1.AttacknetRun, execution betaExecution, scheduleDigest string, receipt apixv1.JSON) (*attacknetv1beta1.FaultCampaign, error) {
+	if execution.UpgradeSpec == nil {
+		return nil, errors.New("upgrade execution has no spec")
+	}
+	upgradeImages, err := json.Marshal(betaUpgradeImages(*execution.UpgradeSpec, &run.Status.ScheduleSummary.NetworkInventory))
+	if err != nil {
+		return nil, err
+	}
+	desired := &attacknetv1beta1.UpgradeCampaign{
+		TypeMeta: metav1.TypeMeta{APIVersion: attacknetv1beta1.GroupVersion.String(), Kind: "UpgradeCampaign"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: betaChildName(run.Name, execution.ID), Namespace: run.Namespace,
+			Labels: map[string]string{fault.NetworkLabel: run.Spec.NetworkRef, "testing.stacks.org/run": run.Name},
+			Annotations: map[string]string{
+				betaExecutionAnnotation: execution.ID, betaScheduleAnnotation: scheduleDigest,
+				betaTemplateAnnotation: execution.Source.Name, betaTriggerAnnotation: string(receipt.Raw),
+				"testing.stacks.org/source-template-uid":        execution.Source.UID,
+				"testing.stacks.org/source-template-generation": fmt.Sprint(execution.Source.Generation),
+				"testing.stacks.org/source-template-digest":     execution.Source.SpecDigest,
+				betaChildKindAnnotation:                         "UpgradeCampaign",
+				betaSpecDigestAnnotation:                        execution.CampaignSpecDigest,
+				betaUpgradeImagesAnnotation:                     string(upgradeImages),
+			},
+			OwnerReferences: []metav1.OwnerReference{ownership.Reference(run, attacknetv1beta1.GroupVersion.WithKind("AttacknetRun"))},
+		},
+		Spec: *execution.UpgradeSpec.DeepCopy(),
+	}
+	if err := r.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
+		return nil, err
+	}
+	observed := &attacknetv1beta1.UpgradeCampaign{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), observed); err != nil {
+		return nil, err
+	}
+	if !betaUpgradeExecutionMatches(run, desired, observed) {
+		return nil, fmt.Errorf("refusing to adopt UpgradeCampaign %s with different ownership or execution inputs", desired.Name)
+	}
+	return normalizeUpgradeChild(observed), nil
+}
+
+type betaUpgradeImage struct {
+	Image        string `json:"image"`
+	ImageID      string `json:"imageID"`
+	ConfigDigest string `json:"configDigest,omitempty"`
+}
+
+func betaUpgradeImages(spec attacknetv1beta1.UpgradeCampaignSpec, baseline *attacknetv1beta1.NetworkInventory) map[string]betaUpgradeImage {
+	profiles := map[string]attacknetv1beta1.UpgradeProfileSpec{}
+	for _, profile := range spec.Profiles {
+		profiles[profile.Name] = profile
+	}
+	result := map[string]betaUpgradeImage{}
+	for _, stage := range spec.Stages {
+		for _, assignment := range stage.Assignments {
+			profile := profiles[assignment.Profile]
+			result[assignment.Actor] = betaUpgradeImage{
+				Image: profile.Image, ImageID: profile.ImageID,
+				ConfigDigest: upgradeConfigDigest(assignment, baseline),
+			}
+		}
+	}
+	return result
+}
+
+func upgradeConfigDigest(assignment attacknetv1beta1.UpgradeAssignment, baseline *attacknetv1beta1.NetworkInventory) string {
+	if assignment.Config != nil {
+		return assignment.Config.ExpectedDigest
+	}
+	if baseline != nil {
+		for _, actor := range baseline.Actors {
+			if actor.Name == assignment.Actor {
+				return actor.ConfigDigest
+			}
+		}
+	}
+	return ""
+}
+
+func betaUpgradeExecutionMatches(run *attacknetv1beta1.AttacknetRun, desired, observed *attacknetv1beta1.UpgradeCampaign) bool {
+	if desired.Name != observed.Name || !reflect.DeepEqual(desired.Spec, observed.Spec) {
+		return false
+	}
+	owner := metav1.GetControllerOf(observed)
+	if owner == nil || owner.UID != run.UID || owner.APIVersion != attacknetv1beta1.GroupVersion.String() || owner.Kind != "AttacknetRun" {
+		return false
+	}
+	for key, value := range desired.Annotations {
+		if observed.Annotations[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeUpgradeChild(source *attacknetv1beta1.UpgradeCampaign) *attacknetv1beta1.FaultCampaign {
+	child := &attacknetv1beta1.FaultCampaign{ObjectMeta: *source.ObjectMeta.DeepCopy()}
+	if child.Annotations == nil {
+		child.Annotations = map[string]string{}
+	}
+	profiles := map[string]attacknetv1beta1.UpgradeProfileSpec{}
+	for _, profile := range source.Spec.Profiles {
+		profiles[profile.Name] = profile
+	}
+	applied := map[string]betaUpgradeImage{}
+	for _, assignment := range source.Status.AppliedAssignments {
+		profile := profiles[assignment.Profile]
+		applied[assignment.Actor] = betaUpgradeImage{
+			Image: profile.Image, ImageID: profile.ImageID,
+			ConfigDigest: upgradeConfigDigest(assignment, source.Status.BaselineInventory),
+		}
+	}
+	if encoded, err := json.Marshal(applied); err == nil {
+		child.Annotations[betaUpgradeImagesAnnotation] = string(encoded)
+	}
+	baseline := map[string]betaUpgradeImage{}
+	if source.Status.BaselineInventory != nil {
+		for _, actor := range source.Status.BaselineInventory.Actors {
+			imageID, _ := inventory.ImmutableImageID(actor.RuntimeImageID)
+			baseline[actor.Name] = betaUpgradeImage{
+				Image: actor.RequestedImage, ImageID: imageID,
+				ConfigDigest: actor.ConfigDigest,
+			}
+		}
+	}
+	if encoded, err := json.Marshal(baseline); err == nil {
+		child.Annotations[betaUpgradeBaselineAnnotation] = string(encoded)
+	}
+	child.Status.ObservedGeneration = source.Status.ObservedGeneration
+	child.Status.Phase, child.Status.Reason, child.Status.Message = source.Status.Phase, source.Status.Reason, source.Status.Message
+	child.Status.LastTransitionTime, child.Status.CompletedAt = source.Status.LastTransitionTime, source.Status.CompletedAt
+	if source.Status.RollbackComplete {
+		now := metav1.Now()
+		child.Status.Cleanup = &attacknetv1beta1.CleanupEvidence{Absent: true, AllRecovered: true, Method: "upgrade-rollback", ObservedAt: now}
+	}
+	return child
 }
 
 func betaTriggerReceipts(children []attacknetv1beta1.FaultCampaign, schedule betaSchedule) ([]apixv1.JSON, error) {
@@ -546,7 +701,7 @@ func betaExecutionMatches(run *attacknetv1beta1.AttacknetRun, desired, observed 
 	return true
 }
 
-func (r *V1Beta1Reconciler) recordCompletedChildren(next *attacknetv1beta1.AttacknetRunStatus, children []attacknetv1beta1.FaultCampaign, schedule betaSchedule, completed map[string]bool) error {
+func (r *V1Beta1Reconciler) recordCompletedChildren(ctx context.Context, next *attacknetv1beta1.AttacknetRunStatus, children []attacknetv1beta1.FaultCampaign, schedule betaSchedule, completed map[string]bool) error {
 	known := make(map[string]betaExecution, len(schedule.Executions))
 	for _, execution := range schedule.Executions {
 		known[execution.ID] = execution
@@ -566,6 +721,20 @@ func (r *V1Beta1Reconciler) recordCompletedChildren(next *attacknetv1beta1.Attac
 			at = child.Status.CompletedAt.Time.UTC()
 		}
 		decision := betaDecision{ExecutionID: id, Child: child.Name, ChildUID: string(child.UID), Phase: child.Status.Phase, CompletedAt: at, Source: child.Annotations[betaTemplateAnnotation]}
+		if child.Annotations[betaChildKindAnnotation] == "UpgradeCampaign" {
+			upgrade := &attacknetv1beta1.UpgradeCampaign{}
+			if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(child), upgrade); err != nil {
+				return fmt.Errorf("read completed upgrade evidence: %w", err)
+			}
+			evidence, err := betaJSON(struct {
+				Kind   string                                 `json:"kind"`
+				Status attacknetv1beta1.UpgradeCampaignStatus `json:"status"`
+			}{Kind: "UpgradeCampaign", Status: *upgrade.Status.DeepCopy()})
+			if err != nil {
+				return err
+			}
+			decision.Evidence = &evidence
+		}
 		value, err := betaJSON(decision)
 		if err != nil {
 			return err
@@ -587,8 +756,15 @@ func betaBudgetUsage(children []attacknetv1beta1.FaultCampaign, schedule betaSch
 			return nil, fmt.Errorf("owned campaign %s has unknown or duplicate execution binding", child.Name)
 		}
 		seen[id] = true
-		digest, err := canonical.ArtifactDigest(child.Spec)
-		if err != nil || digest != execution.CampaignSpecDigest || child.Annotations[betaScheduleAnnotation] != schedule.Integrity.Digest {
+		digest := child.Annotations[betaSpecDigestAnnotation]
+		if child.Annotations[betaChildKindAnnotation] != "UpgradeCampaign" {
+			var err error
+			digest, err = canonical.ArtifactDigest(child.Spec)
+			if err != nil {
+				return nil, fmt.Errorf("digest owned campaign %s: %w", child.Name, err)
+			}
+		}
+		if digest != execution.CampaignSpecDigest || child.Annotations[betaScheduleAnnotation] != schedule.Integrity.Digest {
 			return nil, fmt.Errorf("owned campaign %s differs from immutable schedule", child.Name)
 		}
 		usage.Campaigns++
@@ -684,11 +860,25 @@ func (r *V1Beta1Reconciler) enforceIdentity(ctx context.Context, run *attacknetv
 	if run.Status.ScheduleSummary == nil {
 		return false, r.fail(ctx, run, "ScheduleIntegrityFailed", errors.New("schedule summary is absent"))
 	}
-	expected := run.Status.ScheduleSummary.NetworkInventory
+	baseline := *run.Status.ScheduleSummary.NetworkInventory.DeepCopy()
+	expected := *baseline.DeepCopy()
+	previousDigest := expected.Digest
+	var upgradeActors []string
+	if err := applyTransitionalUpgradeIdentities(&expected, network, pods, children); err != nil {
+		return false, r.fail(ctx, run, "UpgradeIdentityChanged", err)
+	}
+	current, currentErr := inventory.BetaPublished(network)
+	if currentErr == nil {
+		var applyErr error
+		upgradeActors, applyErr = applyAuthorizedUpgradeIdentities(&expected, current, children)
+		if applyErr != nil {
+			return false, r.fail(ctx, run, "UpgradeIdentityChanged", applyErr)
+		}
+	}
 	allowed := betaAllowedPodTransitions(children, completed)
 	differences := inventory.BetaCompareLive(expected, network, pods, allowed)
 	if len(differences) > 0 {
-		freshNetwork, freshChildren, freshDifferences, stable, err := r.recheckIdentitySnapshot(ctx, run, expected, completed)
+		freshNetwork, freshChildren, freshDifferences, stable, err := r.recheckIdentitySnapshot(ctx, run, baseline, completed)
 		if err != nil {
 			return false, err
 		}
@@ -711,6 +901,14 @@ func (r *V1Beta1Reconciler) enforceIdentity(ctx context.Context, run *attacknetv
 		next.IdentityDivergence = &attacknetv1beta1.IdentityDivergence{ExpectedDigest: expected.Digest, CurrentDigest: network.Status.InventoryDigest, ObservedAt: now, Differences: differences}
 		return true, r.finish(ctx, run, next, "Inconclusive", "TargetIdentityDiverged", "Inconclusive")
 	}
+	if len(upgradeActors) > 0 && currentErr == nil && current.Digest != previousDigest {
+		now := metav1.NewTime(r.now())
+		next := *run.Status.DeepCopy()
+		next.ScheduleSummary.NetworkInventory = current
+		sort.Strings(upgradeActors)
+		next.IdentityTransitions = append(next.IdentityTransitions, attacknetv1beta1.IdentityTransition{Campaign: "topology-owned-upgrade", Actors: upgradeActors, PreviousDigest: previousDigest, CurrentDigest: current.Digest, ObservedAt: now})
+		return true, r.patchStatus(ctx, run, betaRunTransition(next, run.Generation, "Running", "ExpectedUpgradeIdentityTransition", "", r.now()))
+	}
 	if len(allowed) > 0 && network.Status.InventoryReady && network.Status.InventoryDigest != expected.Digest {
 		current, err := inventory.BetaPublished(network)
 		if err != nil {
@@ -730,6 +928,207 @@ func (r *V1Beta1Reconciler) enforceIdentity(ctx context.Context, run *attacknetv
 	return false, nil
 }
 
+func applyAuthorizedUpgradeIdentities(expected *attacknetv1beta1.NetworkInventory, current attacknetv1beta1.NetworkInventory, children []attacknetv1beta1.FaultCampaign) ([]string, error) {
+	allowed, err := resolvedUpgradeAuthorizations(children)
+	if err != nil {
+		return nil, err
+	}
+	if len(allowed) == 0 {
+		return nil, nil
+	}
+	currentByName := map[string]attacknetv1beta1.AdmittedActorIdentity{}
+	for _, actor := range current.Actors {
+		currentByName[actor.Name] = actor
+	}
+	changed := []string{}
+	matched := false
+	for index := range expected.Actors {
+		authorization, ok := allowed[expected.Actors[index].Name]
+		if !ok {
+			continue
+		}
+		observed, ok := currentByName[expected.Actors[index].Name]
+		if !ok || observed.RequestedImage != authorization.Image || !inventory.RuntimeImageMatches(observed.RuntimeImageID, authorization.ImageID) || observed.ConfigDigest != authorization.ConfigDigest {
+			continue
+		}
+		matched = true
+		if expected.Actors[index].RuntimeImageID != observed.RuntimeImageID || expected.Actors[index].RequestedImage != observed.RequestedImage || expected.Actors[index].ConfigDigest != observed.ConfigDigest {
+			changed = append(changed, observed.Name)
+		}
+		expected.Actors[index] = observed
+	}
+	if matched {
+		expected.Digest = current.Digest
+		expected.ResourceVersion = current.ResourceVersion
+		expected.ObservedAt = current.ObservedAt
+	}
+	return changed, nil
+}
+
+func resolvedUpgradeAuthorizations(children []attacknetv1beta1.FaultCampaign) (map[string]betaUpgradeImage, error) {
+	allowed := map[string]betaUpgradeImage{}
+	transitions, err := resolvedUpgradeIdentityTransitions(children)
+	if err != nil {
+		return nil, err
+	}
+	for actor, transition := range transitions {
+		allowed[actor] = transition.preferred
+	}
+	return allowed, nil
+}
+
+// betaUpgradeIdentityTransition distinguishes the desired terminal identity
+// from temporary immutable endpoints accepted while workloads converge.
+type betaUpgradeIdentityTransition struct {
+	preferred betaUpgradeImage
+	accepted  []betaUpgradeImage
+}
+
+// resolvedUpgradeIdentityTransitions returns the terminal identity and every
+// immutable endpoint permitted during an active transition.
+func resolvedUpgradeIdentityTransitions(children []attacknetv1beta1.FaultCampaign) (map[string]betaUpgradeIdentityTransition, error) {
+	allowed := map[string]betaUpgradeIdentityTransition{}
+	for index := range children {
+		child := &children[index]
+		if child.Annotations[betaChildKindAnnotation] != "UpgradeCampaign" {
+			continue
+		}
+		targets, err := decodeUpgradeAuthorizations(child, betaUpgradeImagesAnnotation)
+		if err != nil {
+			return nil, err
+		}
+		baselines := map[string]betaUpgradeImage{}
+		usesBaseline := child.Status.Phase == "RollingBack" || child.Status.Cleanup != nil && child.Status.Cleanup.AllRecovered
+		if usesBaseline {
+			baselines, err = decodeUpgradeAuthorizations(child, betaUpgradeBaselineAnnotation)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for actor, target := range targets {
+			transition := betaUpgradeIdentityTransition{preferred: target, accepted: []betaUpgradeImage{target}}
+			if baseline, ok := baselines[actor]; ok && usesBaseline {
+				transition.preferred = baseline
+				transition.accepted = []betaUpgradeImage{baseline}
+				if child.Status.Phase == "RollingBack" {
+					// A StatefulSet rollback is asynchronous. Both sealed endpoints
+					// remain valid until every Pod has returned to the baseline.
+					transition.accepted = append(transition.accepted, target)
+				}
+			}
+			allowed[actor] = transition
+		}
+	}
+	return allowed, nil
+}
+
+// decodeUpgradeAuthorizations validates one controller-sealed identity map.
+func decodeUpgradeAuthorizations(child *attacknetv1beta1.FaultCampaign, annotation string) (map[string]betaUpgradeImage, error) {
+	values := map[string]betaUpgradeImage{}
+	if err := json.Unmarshal([]byte(child.Annotations[annotation]), &values); err != nil {
+		return nil, fmt.Errorf("upgrade child %s has invalid image authorization", child.Name)
+	}
+	for actor, value := range values {
+		if value.Image == "" || !inventory.RuntimeImageMatches(value.ImageID, value.ImageID) || value.ConfigDigest != "" && !inventory.RuntimeImageMatches(value.ConfigDigest, value.ConfigDigest) {
+			return nil, fmt.Errorf("upgrade child %s has incomplete identity authorization for actor %s", child.Name, actor)
+		}
+	}
+	return values, nil
+}
+
+func applyTransitionalUpgradeIdentities(expected *attacknetv1beta1.NetworkInventory, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod, children []attacknetv1beta1.FaultCampaign) error {
+	allowed, err := resolvedUpgradeIdentityTransitions(children)
+	if err != nil {
+		return err
+	}
+	statuses := map[string]attacknetv1beta1.ActorStatus{}
+	for _, status := range network.Status.Actors {
+		statuses[status.Name] = status
+	}
+	livePods := map[string]corev1.Pod{}
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil && pod.Labels["testing.stacks.org/network"] == network.Name {
+			livePods[pod.Labels["testing.stacks.org/actor"]] = pod
+		}
+	}
+	for index := range expected.Actors {
+		transition, ok := allowed[expected.Actors[index].Name]
+		if !ok {
+			continue
+		}
+		status, statusOK := statuses[expected.Actors[index].Name]
+		if _, matched := matchingStatusAuthorization(status, statusOK, transition.accepted); matched {
+			expected.Actors[index].RequestedImage = status.Image
+			expected.Actors[index].ConfigDigest = status.ConfigDigest
+			if status.CurrentRevision != "" {
+				expected.Actors[index].ControllerRevision = status.CurrentRevision
+			}
+			if status.PodName != "" {
+				expected.Actors[index].PodName = status.PodName
+			}
+			if status.PodUID != "" {
+				expected.Actors[index].PodUID = status.PodUID
+			}
+			if status.RuntimeImageID != "" {
+				expected.Actors[index].RuntimeImageID = status.RuntimeImageID
+			}
+		}
+		pod, podOK := livePods[expected.Actors[index].Name]
+		if !podOK {
+			continue
+		}
+		for _, container := range pod.Spec.Containers {
+			authorization, matched := matchingPodAuthorization(container, pod.Status.ContainerStatuses, transition.accepted)
+			if !matched {
+				continue
+			}
+			expected.Actors[index].RequestedImage = authorization.Image
+			expected.Actors[index].ConfigDigest = authorization.ConfigDigest
+			expected.Actors[index].PodName, expected.Actors[index].PodUID = pod.Name, string(pod.UID)
+			for _, containerStatus := range pod.Status.ContainerStatuses {
+				if containerStatus.Name == "actor" && inventory.RuntimeImageMatches(containerStatus.ImageID, authorization.ImageID) {
+					expected.Actors[index].RuntimeImageID = containerStatus.ImageID
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// matchingStatusAuthorization selects an immutable endpoint represented by
+// topology status.
+func matchingStatusAuthorization(status attacknetv1beta1.ActorStatus, present bool, accepted []betaUpgradeImage) (betaUpgradeImage, bool) {
+	if !present {
+		return betaUpgradeImage{}, false
+	}
+	for _, authorization := range accepted {
+		if status.Image == authorization.Image && status.ConfigDigest == authorization.ConfigDigest &&
+			(status.RuntimeImageID == "" || inventory.RuntimeImageMatches(status.RuntimeImageID, authorization.ImageID)) {
+			return authorization, true
+		}
+	}
+	return betaUpgradeImage{}, false
+}
+
+// matchingPodAuthorization selects an immutable endpoint represented by one
+// admitted actor container.
+func matchingPodAuthorization(container corev1.Container, statuses []corev1.ContainerStatus, accepted []betaUpgradeImage) (betaUpgradeImage, bool) {
+	if container.Name != "actor" {
+		return betaUpgradeImage{}, false
+	}
+	for _, authorization := range accepted {
+		if container.Image != authorization.Image {
+			continue
+		}
+		for _, status := range statuses {
+			if status.Name == "actor" && inventory.RuntimeImageMatches(status.ImageID, authorization.ImageID) {
+				return authorization, true
+			}
+		}
+	}
+	return betaUpgradeImage{}, false
+}
+
 func (r *V1Beta1Reconciler) recheckIdentitySnapshot(
 	ctx context.Context,
 	run *attacknetv1beta1.AttacknetRun,
@@ -741,6 +1140,7 @@ func (r *V1Beta1Reconciler) recheckIdentitySnapshot(
 		return nil, nil, nil, false, err
 	}
 	beforeAllowed := betaAllowedPodTransitions(before, completed)
+	beforeUpgrades := betaUpgradeAuthorizations(before)
 	live, err := inventory.ReadBetaLiveView(ctx, r.APIReader, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.NetworkRef})
 	if err != nil {
 		return nil, nil, nil, false, err
@@ -750,11 +1150,33 @@ func (r *V1Beta1Reconciler) recheckIdentitySnapshot(
 		return nil, nil, nil, false, err
 	}
 	afterAllowed := betaAllowedPodTransitions(after, completed)
-	if !reflect.DeepEqual(beforeAllowed, afterAllowed) {
+	afterUpgrades := betaUpgradeAuthorizations(after)
+	if !reflect.DeepEqual(beforeAllowed, afterAllowed) || !reflect.DeepEqual(beforeUpgrades, afterUpgrades) {
 		return live.Network, after, nil, false, nil
+	}
+	current, err := inventory.BetaPublished(live.Network)
+	if err := applyTransitionalUpgradeIdentities(&expected, live.Network, live.Pods, after); err != nil {
+		return nil, nil, nil, false, err
+	}
+	if err == nil {
+		if _, err := applyAuthorizedUpgradeIdentities(&expected, current, after); err != nil {
+			return nil, nil, nil, false, err
+		}
 	}
 	differences := inventory.BetaCompareLive(expected, live.Network, live.Pods, afterAllowed)
 	return live.Network, after, differences, true, nil
+}
+
+func betaUpgradeAuthorizations(children []attacknetv1beta1.FaultCampaign) map[string]string {
+	result := map[string]string{}
+	for index := range children {
+		child := &children[index]
+		if child.Annotations[betaChildKindAnnotation] != "UpgradeCampaign" {
+			continue
+		}
+		result[child.Name] = child.Status.Phase + "\x00" + child.Annotations[betaUpgradeImagesAnnotation] + "\x00" + child.Annotations[betaUpgradeBaselineAnnotation]
+	}
+	return result
 }
 
 func betaIdentityContext(children []attacknetv1beta1.FaultCampaign, completed map[string]bool) string {
@@ -782,6 +1204,14 @@ func betaAllowedPodTransitions(children []attacknetv1beta1.FaultCampaign, comple
 	allowed := map[string]struct{}{}
 	for index := range children {
 		child := &children[index]
+		if child.Annotations[betaChildKindAnnotation] == "UpgradeCampaign" && !completed[child.Annotations[betaExecutionAnnotation]] && (child.Status.Phase == "Running" || child.Status.Phase == "RollingBack") {
+			if upgrades, err := resolvedUpgradeAuthorizations([]attacknetv1beta1.FaultCampaign{*child}); err == nil {
+				for actor := range upgrades {
+					allowed[actor] = struct{}{}
+				}
+			}
+			continue
+		}
 		if completed[child.Annotations[betaExecutionAnnotation]] {
 			continue
 		}
@@ -828,7 +1258,7 @@ func (r *V1Beta1Reconciler) reconcileDeletion(ctx context.Context, run *attackne
 	if len(children) > 0 {
 		for index := range children {
 			if children[index].DeletionTimestamp.IsZero() {
-				if err := r.Delete(ctx, &children[index]); err != nil && !apierrors.IsNotFound(err) {
+				if err := r.deleteChild(ctx, &children[index]); err != nil && !apierrors.IsNotFound(err) {
 					return reconcile.Result{}, err
 				}
 			}
@@ -1065,14 +1495,21 @@ func (r *V1Beta1Reconciler) pauseWithCleanup(
 func (r *V1Beta1Reconciler) requestChildCleanup(ctx context.Context, children []attacknetv1beta1.FaultCampaign) error {
 	for index := range children {
 		child := &children[index]
-		if betaTerminal(child.Status.Phase) || !child.DeletionTimestamp.IsZero() {
+		if (child.Annotations[betaChildKindAnnotation] != "UpgradeCampaign" && betaTerminal(child.Status.Phase)) || !child.DeletionTimestamp.IsZero() {
 			continue
 		}
-		if err := r.Delete(ctx, child); err != nil && !apierrors.IsNotFound(err) {
+		if err := r.deleteChild(ctx, child); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 	}
 	return nil
+}
+
+func (r *V1Beta1Reconciler) deleteChild(ctx context.Context, child *attacknetv1beta1.FaultCampaign) error {
+	if child.Annotations[betaChildKindAnnotation] == "UpgradeCampaign" {
+		return r.Delete(ctx, &attacknetv1beta1.UpgradeCampaign{ObjectMeta: *child.ObjectMeta.DeepCopy()})
+	}
+	return r.Delete(ctx, child)
 }
 func (r *V1Beta1Reconciler) transition(ctx context.Context, run *attacknetv1beta1.AttacknetRun, phase, reason, message string) error {
 	return r.patchStatus(ctx, run, betaRunTransition(run.Status, run.Generation, phase, reason, message, r.now()))
@@ -1125,13 +1562,46 @@ func (r *V1Beta1Reconciler) children(ctx context.Context, run *attacknetv1beta1.
 			seen[current.Name] = struct{}{}
 		}
 	}
+	upgrades := &attacknetv1beta1.UpgradeCampaignList{}
+	if err := r.APIReader.List(ctx, upgrades, client.InNamespace(run.Namespace)); err != nil {
+		return nil, err
+	}
+	for index := range upgrades.Items {
+		item := &upgrades.Items[index]
+		if !betaUpgradeOwnedByRun(item, run) {
+			continue
+		}
+		current := &attacknetv1beta1.UpgradeCampaign{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(item), current); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		if betaUpgradeOwnedByRun(current, run) {
+			result = append(result, *normalizeUpgradeChild(current))
+			seen[current.Name] = struct{}{}
+		}
+	}
 	if run.DeletionTimestamp.IsZero() {
 		for _, active := range run.Status.ActiveChildren {
 			if _, ok := seen[active.Name]; ok {
 				continue
 			}
-			current := &attacknetv1beta1.FaultCampaign{}
 			key := types.NamespacedName{Namespace: run.Namespace, Name: active.Name}
+			if active.Kind == "UpgradeCampaign" {
+				current := &attacknetv1beta1.UpgradeCampaign{}
+				if err := r.APIReader.Get(ctx, key, current); err != nil {
+					return nil, fmt.Errorf("read active child %s: %w", active.Name, err)
+				}
+				if string(current.UID) != active.UID || !betaUpgradeOwnedByRun(current, run) {
+					return nil, fmt.Errorf("active child %s no longer matches its run-owned identity", active.Name)
+				}
+				result = append(result, *normalizeUpgradeChild(current))
+				seen[current.Name] = struct{}{}
+				continue
+			}
+			current := &attacknetv1beta1.FaultCampaign{}
 			if err := r.APIReader.Get(ctx, key, current); err != nil {
 				return nil, fmt.Errorf("read active child %s: %w", active.Name, err)
 			}
@@ -1143,6 +1613,11 @@ func (r *V1Beta1Reconciler) children(ctx context.Context, run *attacknetv1beta1.
 		}
 	}
 	return result, nil
+}
+
+func betaUpgradeOwnedByRun(child *attacknetv1beta1.UpgradeCampaign, run *attacknetv1beta1.AttacknetRun) bool {
+	owner := metav1.GetControllerOf(child)
+	return owner != nil && owner.UID == run.UID && owner.APIVersion == attacknetv1beta1.GroupVersion.String() && owner.Kind == "AttacknetRun"
 }
 
 func betaOwnedByRun(child *attacknetv1beta1.FaultCampaign, run *attacknetv1beta1.AttacknetRun) bool {
@@ -1230,13 +1705,13 @@ func betaActiveStatus(children []attacknetv1beta1.FaultCampaign) []attacknetv1be
 		if betaTerminal(child.Status.Phase) {
 			continue
 		}
-		result = append(result, attacknetv1beta1.ActiveRunChild{ExecutionID: child.Annotations[betaExecutionAnnotation], Name: child.Name, UID: string(child.UID), StartedAt: child.Status.LastTransitionTime})
+		result = append(result, attacknetv1beta1.ActiveRunChild{ExecutionID: child.Annotations[betaExecutionAnnotation], Kind: child.Annotations[betaChildKindAnnotation], Name: child.Name, UID: string(child.UID), StartedAt: child.Status.LastTransitionTime})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].ExecutionID < result[j].ExecutionID })
 	return result
 }
 func upsertBetaResolved(values []attacknetv1beta1.ResolvedCampaign, execution betaExecution) []attacknetv1beta1.ResolvedCampaign {
-	value := attacknetv1beta1.ResolvedCampaign{Name: execution.CampaignAlias, SourceName: execution.Source.Name, SourceUID: execution.Source.UID, SourceGeneration: execution.Source.Generation, SpecDigest: execution.Source.SpecDigest}
+	value := attacknetv1beta1.ResolvedCampaign{Name: execution.CampaignAlias, Kind: execution.Kind, SourceName: execution.Source.Name, SourceUID: execution.Source.UID, SourceGeneration: execution.Source.Generation, SpecDigest: execution.Source.SpecDigest}
 	for i := range values {
 		if values[i].Name == value.Name {
 			values[i] = value
@@ -1314,5 +1789,5 @@ func (r *V1Beta1Reconciler) SetupWithManager(mgr manager.Manager, maxConcurrent 
 	}); err != nil {
 		return err
 	}
-	return builder.ControllerManagedBy(mgr).For(&attacknetv1beta1.AttacknetRun{}).Owns(&corev1.ConfigMap{}).Owns(&attacknetv1beta1.FaultCampaign{}).Watches(&attacknetv1beta1.StacksNetwork{}, mapNetwork).WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent}).Complete(r)
+	return builder.ControllerManagedBy(mgr).For(&attacknetv1beta1.AttacknetRun{}).Owns(&corev1.ConfigMap{}).Owns(&attacknetv1beta1.FaultCampaign{}).Owns(&attacknetv1beta1.UpgradeCampaign{}).Watches(&attacknetv1beta1.StacksNetwork{}, mapNetwork).WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrent}).Complete(r)
 }

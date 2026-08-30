@@ -14,6 +14,7 @@ type AdmittedActorIdentity struct {
 	PodUID             string `json:"podUID"`
 	RequestedImage     string `json:"requestedImage"`
 	RuntimeImageID     string `json:"runtimeImageID"`
+	ConfigDigest       string `json:"configDigest,omitempty"`
 }
 
 // NetworkInventory is the complete authoritative actor inventory bound to a run.

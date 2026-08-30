@@ -13,6 +13,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/versionmatrix"
 )
 
 const (
@@ -26,6 +28,9 @@ type Collector struct {
 	Reader client.Reader
 
 	campaignInfo        *prometheus.Desc
+	upgradeInfo         *prometheus.Desc
+	actorVersion        *prometheus.Desc
+	versionCapability   *prometheus.Desc
 	campaignTarget      *prometheus.Desc
 	faultAction         *prometheus.Desc
 	assertionOutcome    *prometheus.Desc
@@ -51,6 +56,12 @@ func NewCollector(reader client.Reader) *Collector {
 		Reader: reader,
 		campaignInfo: prometheus.NewDesc("attacknet_fault_campaign_info", "Current orchestrator-observed FaultCampaign state.",
 			[]string{"evidence_source", "network", "campaign", "type", "phase", "reason", "template"}, nil),
+		upgradeInfo: prometheus.NewDesc("attacknet_upgrade_campaign_info", "Current topology-owned UpgradeCampaign state.",
+			[]string{"evidence_source", "network", "campaign", "phase", "reason", "stage", "template"}, nil),
+		actorVersion: prometheus.NewDesc("attacknet_actor_version_info", "Static or rolling actor version identity joined to immutable provenance.",
+			[]string{"evidence_source", "attacknet_network", "campaign", "attacknet_actor", "profile", "source_kind", "revision", "image", "runtime_image_id", "provenance_digest", "config_digest", "expectation"}, nil),
+		versionCapability: prometheus.NewDesc("attacknet_actor_version_capability_info", "Finite instrumentation capability declared by one actor version profile.",
+			[]string{"evidence_source", "attacknet_network", "attacknet_actor", "profile", "capability"}, nil),
 		campaignTarget: prometheus.NewDesc("attacknet_fault_campaign_target_info", "Exact actor targets admitted for a FaultCampaign.",
 			[]string{"evidence_source", "network", "campaign", "actor", "role", "node"}, nil),
 		faultAction: prometheus.NewDesc("attacknet_fault_action_info", "Current orchestrator-observed state of one typed fault action.",
@@ -89,7 +100,7 @@ func NewCollector(reader client.Reader) *Collector {
 
 // Describe publishes every descriptor owned by the collector.
 func (c *Collector) Describe(output chan<- *prometheus.Desc) {
-	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.stacksBurnHeight, c.stacksBurnView, c.burnchainTopology, c.burnchainGeneration, c.bitcoinNode, c.bitcoinEdge, c.burnchainBinding, c.collectionSuccess} {
+	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.upgradeInfo, c.actorVersion, c.versionCapability, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.stacksBurnHeight, c.stacksBurnView, c.burnchainTopology, c.burnchainGeneration, c.bitcoinNode, c.bitcoinEdge, c.burnchainBinding, c.collectionSuccess} {
 		output <- descriptor
 	}
 }
@@ -103,9 +114,14 @@ func (c *Collector) Collect(output chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	campaigns := &attacknetv1beta1.FaultCampaignList{}
+	upgrades := &attacknetv1beta1.UpgradeCampaignList{}
 	runs := &attacknetv1beta1.AttacknetRunList{}
 	networks := &attacknetv1beta1.StacksNetworkList{}
 	if err := c.Reader.List(ctx, campaigns); err != nil {
+		output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, 0)
+		return
+	}
+	if err := c.Reader.List(ctx, upgrades); err != nil {
 		output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, 0)
 		return
 	}
@@ -121,19 +137,80 @@ func (c *Collector) Collect(output chan<- prometheus.Metric) {
 	for index := range campaigns.Items {
 		success = c.collectCampaign(output, &campaigns.Items[index]) && success
 	}
+	for index := range upgrades.Items {
+		c.collectUpgrade(output, &upgrades.Items[index])
+	}
 	for index := range runs.Items {
 		success = c.collectRun(output, &runs.Items[index]) && success
 	}
 	for index := range networks.Items {
-		c.collectNetwork(output, &networks.Items[index])
+		success = c.collectNetwork(output, &networks.Items[index], upgrades.Items) && success
 	}
 	output <- prometheus.MustNewConstMetric(c.collectionSuccess, prometheus.GaugeValue, boolFloat(success))
 }
 
-func (c *Collector) collectNetwork(output chan<- prometheus.Metric, network *attacknetv1beta1.StacksNetwork) {
+func (c *Collector) collectNetwork(output chan<- prometheus.Metric, network *attacknetv1beta1.StacksNetwork, upgrades []attacknetv1beta1.UpgradeCampaign) bool {
+	versions := map[string]actorVersionSample{}
+	if encoded := network.Annotations[versionmatrix.RuntimeManifestAnnotation]; encoded != "" {
+		manifest, err := versionmatrix.ParseRuntimeManifest(encoded)
+		if err != nil {
+			return false
+		}
+		profiles := map[string]versionmatrix.RuntimeProfile{}
+		for _, profile := range manifest.Profiles {
+			profiles[profile.Name] = profile
+		}
+		actors := map[string]attacknetv1beta1.ActorStatus{}
+		for _, actor := range network.Status.Actors {
+			actors[actor.Name] = actor
+		}
+		for _, assignment := range manifest.Assignments {
+			profile, profileOK := profiles[assignment.Profile]
+			actor, actorOK := actors[assignment.Actor]
+			if !profileOK || !actorOK {
+				return false
+			}
+			versions[assignment.Actor] = actorVersionSample{campaign: "static", profile: profile.Name, sourceKind: profile.SourceKind, revision: profile.Revision, image: profile.Image, runtimeImageID: actor.RuntimeImageID, provenanceDigest: profile.ProvenanceDigest, configDigest: assignment.ConfigDigest, expectation: profile.Expectation, capabilities: profile.Capabilities}
+		}
+	}
+	statuses := map[string]attacknetv1beta1.ActorStatus{}
+	for _, actor := range network.Status.Actors {
+		statuses[actor.Name] = actor
+	}
+	for index := range upgrades {
+		campaign := &upgrades[index]
+		if campaign.Spec.Template || campaign.Spec.NetworkRef != network.Name || !upgradeVersionActive(campaign) {
+			continue
+		}
+		profiles := map[string]attacknetv1beta1.UpgradeProfileSpec{}
+		for _, profile := range campaign.Spec.Profiles {
+			profiles[profile.Name] = profile
+		}
+		for _, assignment := range campaign.Status.AppliedAssignments {
+			profile, profileOK := profiles[assignment.Profile]
+			actor, actorOK := statuses[assignment.Actor]
+			if !profileOK || !actorOK || actor.Image != profile.Image || !inventory.RuntimeImageMatches(actor.RuntimeImageID, profile.ImageID) {
+				continue
+			}
+			configDigest := ""
+			if assignment.Config != nil && assignment.Config.ExpectedDigest != "" {
+				configDigest = assignment.Config.ExpectedDigest
+			}
+			versions[assignment.Actor] = actorVersionSample{campaign: campaign.Name, profile: profile.Name, sourceKind: profile.SourceKind, revision: profile.Revision, image: profile.Image, runtimeImageID: actor.RuntimeImageID, provenanceDigest: profile.ProvenanceDigest, configDigest: configDigest, expectation: profile.Expectation, capabilities: profile.Capabilities}
+		}
+	}
+	actors := make([]string, 0, len(versions))
+	for actor := range versions {
+		actors = append(actors, actor)
+	}
+	sort.Strings(actors)
+	for _, actor := range actors {
+		version := versions[actor]
+		c.emitActorVersion(output, network.Name, version.campaign, actor, version.profile, version.sourceKind, version.revision, version.image, version.runtimeImageID, version.provenanceDigest, version.configDigest, version.expectation, version.capabilities)
+	}
 	topology := network.Status.BurnchainTopology
 	if topology == nil || topology.Digest == "" {
-		return
+		return true
 	}
 	output <- prometheus.MustNewConstMetric(c.burnchainTopology, prometheus.GaugeValue, 1,
 		evidenceSource, network.Name)
@@ -151,6 +228,47 @@ func (c *Collector) collectNetwork(output chan<- prometheus.Metric, network *att
 	for _, binding := range topology.Bindings {
 		output <- prometheus.MustNewConstMetric(c.burnchainBinding, prometheus.GaugeValue, 1,
 			evidenceSource, network.Name, binding.Actor, binding.BitcoinNodeRef)
+	}
+	return true
+}
+
+func (c *Collector) collectUpgrade(output chan<- prometheus.Metric, campaign *attacknetv1beta1.UpgradeCampaign) {
+	phase := campaign.Status.Phase
+	if phase == "" {
+		phase = "Pending"
+	}
+	stage := ""
+	if campaign.Status.CurrentStage >= 0 && int(campaign.Status.CurrentStage) < len(campaign.Spec.Stages) {
+		stage = campaign.Spec.Stages[campaign.Status.CurrentStage].Name
+	}
+	output <- prometheus.MustNewConstMetric(c.upgradeInfo, prometheus.GaugeValue, 1,
+		evidenceSource, campaign.Spec.NetworkRef, campaign.Name, phase, campaign.Status.Reason, stage, strconv.FormatBool(campaign.Spec.Template))
+}
+
+type actorVersionSample struct {
+	campaign, profile, sourceKind, revision, image, runtimeImageID string
+	provenanceDigest, configDigest, expectation                    string
+	capabilities                                                   []string
+}
+
+func upgradeVersionActive(campaign *attacknetv1beta1.UpgradeCampaign) bool {
+	switch campaign.Status.Phase {
+	case "Running", "Passed":
+		return true
+	case "Failed", "Inconclusive":
+		return campaign.Status.BaselineInventory != nil && !campaign.Status.RollbackComplete
+	default:
+		return false
+	}
+}
+
+func (c *Collector) emitActorVersion(output chan<- prometheus.Metric, network, campaign, actor, profile, sourceKind, revision, image, runtimeImageID, provenanceDigest, configDigest, expectation string, capabilities []string) {
+	output <- prometheus.MustNewConstMetric(c.actorVersion, prometheus.GaugeValue, 1,
+		evidenceSource, network, campaign, actor, profile, sourceKind, revision, image,
+		runtimeImageID, provenanceDigest, configDigest, expectation)
+	for _, capability := range capabilities {
+		output <- prometheus.MustNewConstMetric(c.versionCapability, prometheus.GaugeValue, 1,
+			evidenceSource, network, actor, profile, capability)
 	}
 }
 

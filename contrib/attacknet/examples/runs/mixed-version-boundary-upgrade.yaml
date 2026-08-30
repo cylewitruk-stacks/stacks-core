@@ -1,0 +1,46 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: mixed-version-boundary-upgrade
+spec:
+  networkRef: mixed-versions
+  seed: mixed-version-boundary-upgrade-2026-08
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  upgradeCatalog:
+    - name: candidate
+      upgradeRef: roll-candidate
+  executions:
+    - id: roll-candidate
+      upgrade: candidate
+      trigger:
+        burnHeight: 250
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 2700
+    maxCumulativeFaultSeconds: 1
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 70
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 1
+  stopPolicy:
+    onCampaignFailure: PauseForTriage
+    onInconclusive: PauseForTriage
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: true
+    allowedTerminalStates: [Triaged, Remediated, Inconclusive]
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true
+  minimization:
+    enabled: false
+    strategy: DeltaDebug
+    maxAttempts: 0
+    requireFreshNetwork: true

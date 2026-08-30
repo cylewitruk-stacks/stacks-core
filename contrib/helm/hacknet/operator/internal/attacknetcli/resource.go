@@ -21,6 +21,8 @@ import (
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/document"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	attacknetrun "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/run"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/upgrade"
 )
 
 // Kind describes one public Attacknet resource kind.
@@ -37,6 +39,7 @@ var resourceKinds = []Kind{
 	newKind("StacksNetwork", "stacksnetworks", func() runtime.Object { return &attacknetv1beta1.StacksNetwork{} }),
 	newKind("BurnchainPolicy", "burnchainpolicies", func() runtime.Object { return &attacknetv1beta1.BurnchainPolicy{} }),
 	newTerminalKind("FaultCampaign", "faultcampaigns", []string{"Passed", "Failed", "Inconclusive"}, func() runtime.Object { return &attacknetv1beta1.FaultCampaign{} }),
+	newTerminalKind("UpgradeCampaign", "upgradecampaigns", []string{"Passed", "Failed", "Inconclusive"}, func() runtime.Object { return &attacknetv1beta1.UpgradeCampaign{} }),
 	newTerminalKind("AttacknetRun", "attacknetruns", []string{"Passed", "Failed", "Inconclusive"}, func() runtime.Object { return &attacknetv1beta1.AttacknetRun{} }),
 }
 
@@ -126,6 +129,11 @@ func DecodeSubmission(data []byte, defaultNamespace string) (*unstructured.Unstr
 		return nil, Kind{}, err
 	}
 	metadata.SetNamespace(resolveNamespace(metadata.GetNamespace(), defaultNamespace))
+	if network, ok := object.(*attacknetv1beta1.StacksNetwork); ok {
+		if err := topology.ValidateV1Beta1(network); err != nil {
+			return nil, Kind{}, fmt.Errorf("validate %s topology: %w", kind.Name, err)
+		}
+	}
 
 	value, err := runtime.DefaultUnstructuredConverter.ToUnstructured(object)
 	if err != nil {
@@ -153,6 +161,8 @@ func validateSubmissionStructure(object runtime.Object) error {
 		return fault.ValidateV1Beta1Structure(resource)
 	case *attacknetv1beta1.AttacknetRun:
 		return attacknetrun.ValidateV1Beta1Structure(resource)
+	case *attacknetv1beta1.UpgradeCampaign:
+		return upgrade.ValidateStructure(resource)
 	default:
 		return nil
 	}

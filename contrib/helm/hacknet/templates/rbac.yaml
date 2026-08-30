@@ -7,10 +7,13 @@ metadata:
     {{- include "hacknet.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks", "burnchainpolicies"]
+    resources: ["stacksnetworks", "burnchainpolicies", "upgradecampaigns"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["testing.stacks.org"]
-    resources: ["stacksnetworks/status", "burnchainpolicies/status"]
+    resources: ["upgradecampaigns"]
+    verbs: ["patch"]
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["stacksnetworks/status", "burnchainpolicies/status", "upgradecampaigns/status"]
     verbs: ["get", "patch"]
   - apiGroups: [""]
     resources: ["configmaps", "services"]

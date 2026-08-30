@@ -25,6 +25,7 @@ func TestGoTypesMatchGeneratedCRDSchemas(t *testing.T) {
 		{"testing.stacks.org_stacksnetworks.yaml", StacksNetworkSpec{}, StacksNetworkStatus{}},
 		{"testing.stacks.org_burnchainpolicies.yaml", BurnchainPolicySpec{}, BurnchainPolicyStatus{}},
 		{"testing.stacks.org_faultcampaigns.yaml", FaultCampaignSpec{}, FaultCampaignStatus{}},
+		{"testing.stacks.org_upgradecampaigns.yaml", UpgradeCampaignSpec{}, UpgradeCampaignStatus{}},
 		{"testing.stacks.org_attacknetruns.yaml", AttacknetRunSpec{}, AttacknetRunStatus{}},
 	}
 	for _, test := range tests {

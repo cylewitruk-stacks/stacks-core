@@ -428,16 +428,18 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
-      "description": "Render-time aggregate profile for each reachable endpoint plus exact per-family provenance from the orchestrator-owned metadata metric. unavailable means missing Workstream M series are an expected capability gap, never a healthy zero. mixed means the actor's applicable families have more than one exact provenance. Verify these declarations against the sealed capability manifest, admitted Pod UID, and runtime image evidence.",
+      "description": "Render-time instrumentation declarations plus the immutable static or rolling version profile observed by the controllers. unavailable means missing Workstream M series are an expected capability gap, represented by an empty result rather than a healthy zero. A declared A11 profile supersedes the original scrape-profile expectation for absence alerts. Verify these declarations against the sealed capability manifest, admitted Pod UID, revision, config, provenance, and runtime image evidence.",
       "fieldConfig": {"defaults": {}, "overrides": []},
       "gridPos": {"h": 7, "w": 24, "x": 0, "y": 119},
       "id": 31,
       "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
       "targets": [
         {"expr": "max by (attacknet_actor,attacknet_role,requested_image,instrumentation_profile,instrumentation_provenance,event_dispatch_mode) (up{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"})", "format": "table", "instant": true, "refId": "A"},
-        {"expr": "max by (attacknet_actor,attacknet_role,family,provenance,evidence_source) (attacknet_instrumentation_family_provenance{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"})", "format": "table", "instant": true, "refId": "B"}
+        {"expr": "max by (attacknet_actor,attacknet_role,family,provenance,evidence_source) (attacknet_instrumentation_family_provenance{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"})", "format": "table", "instant": true, "refId": "B"},
+        {"expr": "attacknet_actor_version_info{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "format": "table", "instant": true, "refId": "C"},
+        {"expr": "attacknet_actor_version_capability_info{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "format": "table", "instant": true, "refId": "D"}
       ],
-      "title": "Instrumentation capability declarations",
+      "title": "Instrumentation capability and version declarations",
       "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true}, "renameByName": {"attacknet_actor": "Actor", "attacknet_role": "Role", "event_dispatch_mode": "Event dispatch", "instrumentation_profile": "Capability profile", "instrumentation_provenance": "Signal provenance", "requested_image": "Requested image"}}}],
       "type": "table"
     },
@@ -551,6 +553,17 @@
       "title": "Admitted Bitcoin graph and Stacks bindings (trusted)",
       "transformations": [{"id": "merge", "options": {}}, {"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"actor": "Stacks actor", "bitcoin_node": "Bitcoin node", "policy": "Policy", "policy_service": "Policy service", "policy_uid": "Policy UID", "service": "Bitcoin service", "source": "Edge source", "target": "Edge target"}}}],
       "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Topology-owned rolling upgrade state. Each labelled transition is joined to the immutable version and runtime-image tables above; Failed and Inconclusive campaigns roll back before reaching a terminal phase.",
+      "fieldConfig": {"defaults": {"custom": {"fillOpacity": 70, "lineWidth": 0, "spanNulls": false}, "mappings": [{"options": {"1": {"color": "blue", "text": "observed"}}, "type": "value"}], "max": 1, "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 180},
+      "id": 41,
+      "options": {"alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.65, "showValue": "never", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "attacknet_upgrade_campaign_info{network=\"$network\",template=\"false\"}", "legendFormat": "{{campaign}} · {{stage}} · {{phase}} · {{reason}}", "refId": "A"}],
+      "title": "Rolling upgrade lifecycle (trusted)",
+      "type": "state-timeline"
     }
   ],
   "refresh": "5s",

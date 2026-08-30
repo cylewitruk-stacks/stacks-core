@@ -22,8 +22,9 @@ var (
 	chaosVerbs     = []string{"create", "delete", "get", "list", "watch"}
 	configMapVerbs = []string{"create", "delete", "get", "list", "patch", "watch"}
 	topologyRules  = []rbacv1.PolicyRule{
-		rule("testing.stacks.org", []string{"stacksnetworks", "burnchainpolicies"}, readVerbs),
-		rule("testing.stacks.org", []string{"stacksnetworks/status", "burnchainpolicies/status"}, []string{"get", "patch"}),
+		rule("testing.stacks.org", []string{"stacksnetworks", "burnchainpolicies", "upgradecampaigns"}, readVerbs),
+		rule("testing.stacks.org", []string{"upgradecampaigns"}, []string{"patch"}),
+		rule("testing.stacks.org", []string{"stacksnetworks/status", "burnchainpolicies/status", "upgradecampaigns/status"}, []string{"get", "patch"}),
 		rule("", []string{"configmaps", "services"}, configMapVerbs),
 		rule("", []string{"pods"}, readVerbs),
 		rule("discovery.k8s.io", []string{"endpointslices"}, readVerbs),
@@ -32,9 +33,9 @@ var (
 	runRules = []rbacv1.PolicyRule{
 		rule("testing.stacks.org", []string{"burnchainpolicies", "stacksnetworks"}, readVerbs),
 		rule("testing.stacks.org", []string{"burnchainpolicies"}, []string{"patch"}),
-		rule("testing.stacks.org", []string{"faultcampaigns"}, []string{"create", "delete", "get", "list", "patch", "watch"}),
+		rule("testing.stacks.org", []string{"faultcampaigns", "upgradecampaigns"}, []string{"create", "delete", "get", "list", "patch", "watch"}),
 		rule("testing.stacks.org", []string{"attacknetruns"}, []string{"get", "list", "patch", "watch"}),
-		rule("testing.stacks.org", []string{"faultcampaigns/status", "attacknetruns/status"}, []string{"get", "patch"}),
+		rule("testing.stacks.org", []string{"faultcampaigns/status", "upgradecampaigns/status", "attacknetruns/status"}, []string{"get", "patch"}),
 		rule("", []string{"pods"}, configMapVerbs),
 		rule("", []string{"configmaps"}, configMapVerbs),
 		rule("chaos-mesh.org", []string{"dnschaos", "iochaos", "networkchaos", "podchaos", "timechaos"}, chaosVerbs),
