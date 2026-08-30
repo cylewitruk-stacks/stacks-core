@@ -1,0 +1,1 @@
+Added the `stacks_node_nakamoto_block_transfers_total` Prometheus metric and operator documentation for Nakamoto block propagation.

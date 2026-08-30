@@ -24,6 +24,10 @@ use stacks_common::types::net::PeerHost;
 use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoStagingBlocksConn};
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::Error as ChainError;
+use crate::monitoring::{
+    add_nakamoto_block_transfers, NakamotoBlockTransferDirection, NakamotoBlockTransferOutcome,
+    NakamotoBlockTransferSource,
+};
 use crate::net::http::{
     parse_bytes, Error, HttpChunkGenerator, HttpContentType, HttpNotFound, HttpRequest,
     HttpRequestContents, HttpRequestPreamble, HttpResponse, HttpResponseContents,
@@ -58,6 +62,17 @@ pub struct NakamotoBlockStream {
     pub staging_db_conn: NakamotoStagingBlocksConn,
     /// rowid of the block
     pub rowid: i64,
+    /// whether the completed transfer was already recorded for this block
+    transfer_completed: bool,
+}
+
+fn mark_rpc_serve_completed(transfer_completed: &mut bool, bytes_read: usize) -> bool {
+    if bytes_read != 0 || *transfer_completed {
+        return false;
+    }
+
+    *transfer_completed = true;
+    true
 }
 
 impl NakamotoBlockStream {
@@ -82,6 +97,7 @@ impl NakamotoBlockStream {
             total_bytes: 0,
             staging_db_conn: db_conn,
             rowid,
+            transfer_completed: false,
         })
     }
 
@@ -103,6 +119,7 @@ impl NakamotoBlockStream {
         self.offset = 0;
         self.total_bytes = 0;
         self.rowid = rowid;
+        self.transfer_completed = false;
         Ok(())
     }
 }
@@ -280,7 +297,32 @@ impl HttpChunkGenerator for NakamotoBlockStream {
         self.offset += num_read as u64;
         self.total_bytes += num_read as u64;
 
+        if mark_rpc_serve_completed(&mut self.transfer_completed, num_read) {
+            add_nakamoto_block_transfers(
+                NakamotoBlockTransferDirection::Sent,
+                NakamotoBlockTransferSource::RpcServe,
+                NakamotoBlockTransferOutcome::Completed,
+                1,
+            );
+        }
+
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_serve_completion_is_recorded_once_per_stream() {
+        let mut completed = false;
+
+        assert!(!mark_rpc_serve_completed(&mut completed, 4096));
+        assert!(mark_rpc_serve_completed(&mut completed, 0));
+        assert!(!mark_rpc_serve_completed(&mut completed, 0));
+
+        assert!(completed);
     }
 }
 

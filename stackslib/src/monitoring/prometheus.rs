@@ -39,6 +39,12 @@ lazy_static! {
         "Total number of Stacks blocks received"
     )).unwrap();
 
+    pub static ref NAKAMOTO_BLOCK_TRANSFERS: IntCounterVec = register_int_counter_vec!(
+        "stacks_node_nakamoto_block_transfers_total",
+        "Nakamoto block transfers by bounded direction, source, and outcome",
+        &["direction", "source", "outcome"]
+    ).unwrap();
+
     pub static ref STX_MICRO_BLOCKS_RECEIVED_COUNTER: IntCounter = register_int_counter!(opts!(
         "stacks_node_stx_micro_blocks_received_total",
         "Total number of Stacks micro blocks received"
