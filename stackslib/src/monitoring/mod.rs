@@ -129,6 +129,9 @@ fn test_nakamoto_block_transfer_counter_uses_bounded_labels() {
     );
 
     assert_eq!(counter.get(), before + 3);
+    assert!(::prometheus::gather()
+        .iter()
+        .any(|family| family.get_name() == "stacks_node_nakamoto_block_transfers_total"));
 }
 
 pub fn increment_stx_micro_blocks_received_counter() {

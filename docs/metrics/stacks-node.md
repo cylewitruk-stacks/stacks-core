@@ -50,7 +50,8 @@ that handoff failed.
 An HTTP-served block is counted when its stream reaches EOF. A per-stream flag
 prevents repeated empty chunk polls from incrementing the counter more than
 once. Resetting a tenure stream for its next block also resets that flag, so
-each completely served block contributes one observation.
+each completely generated block stream contributes one observation. This does
+not claim that pending bytes reached the client before a disconnect.
 
 ## PromQL examples
 

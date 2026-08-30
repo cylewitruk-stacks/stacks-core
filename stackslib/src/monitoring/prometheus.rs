@@ -40,7 +40,7 @@ lazy_static! {
     )).unwrap();
 
     pub static ref NAKAMOTO_BLOCK_TRANSFERS: IntCounterVec = register_int_counter_vec!(
-        "stacks_node_nakamoto_block_transfers",
+        "stacks_node_nakamoto_block_transfers_total",
         "Nakamoto block transfers by bounded direction, source, and outcome",
         &["direction", "source", "outcome"]
     ).unwrap();

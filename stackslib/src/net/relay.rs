@@ -568,7 +568,12 @@ pub enum BlockAcceptResponse {
 
 fn transfer_source(
     obtained_method: NakamotoBlockObtainMethod,
+    is_shadow_block: bool,
 ) -> Option<NakamotoBlockTransferSource> {
+    if is_shadow_block {
+        return None;
+    }
+
     match obtained_method {
         NakamotoBlockObtainMethod::Pushed => Some(NakamotoBlockTransferSource::P2pPush),
         NakamotoBlockObtainMethod::Downloaded => Some(NakamotoBlockTransferSource::TenureDownload),
@@ -595,19 +600,29 @@ mod transfer_metric_tests {
     #[test]
     fn transfer_source_excludes_non_network_blocks() {
         assert_eq!(
-            transfer_source(NakamotoBlockObtainMethod::Pushed),
+            transfer_source(NakamotoBlockObtainMethod::Pushed, false),
             Some(NakamotoBlockTransferSource::P2pPush)
         );
         assert_eq!(
-            transfer_source(NakamotoBlockObtainMethod::Downloaded),
+            transfer_source(NakamotoBlockObtainMethod::Downloaded, false),
             Some(NakamotoBlockTransferSource::TenureDownload)
         );
         assert_eq!(
-            transfer_source(NakamotoBlockObtainMethod::Uploaded),
+            transfer_source(NakamotoBlockObtainMethod::Uploaded, false),
             Some(NakamotoBlockTransferSource::RpcUpload)
         );
-        assert_eq!(transfer_source(NakamotoBlockObtainMethod::Mined), None);
-        assert_eq!(transfer_source(NakamotoBlockObtainMethod::Shadow), None);
+        assert_eq!(
+            transfer_source(NakamotoBlockObtainMethod::Mined, false),
+            None
+        );
+        assert_eq!(
+            transfer_source(NakamotoBlockObtainMethod::Shadow, false),
+            None
+        );
+        assert_eq!(
+            transfer_source(NakamotoBlockObtainMethod::Downloaded, true),
+            None
+        );
     }
 
     #[test]
@@ -993,7 +1008,7 @@ impl Relayer {
             force_broadcast,
         );
 
-        if let Some(source) = transfer_source(obtained_method) {
+        if let Some(source) = transfer_source(obtained_method, block.is_shadow_block()) {
             add_nakamoto_block_transfers(
                 NakamotoBlockTransferDirection::Received,
                 source,
