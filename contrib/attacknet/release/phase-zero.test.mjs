@@ -152,7 +152,17 @@ test('deferred baseline capabilities require complete structured reopening recor
 test('the baseline advertises approved A8 capabilities from bound evidence', () => {
   const baseline = load(baselinePath);
   const evidenceId = 'release-1-a8-trusted-observations';
-  assert.ok(baseline.evidence.some(item => item.id === evidenceId));
+  const evidence = baseline.evidence.find(item => item.id === evidenceId);
+  assert.deepEqual(evidence, {
+    id: evidenceId,
+    path: 'contrib/attacknet/evidence-packets/release-1-a8/gate-result.json',
+    digest: 'sha256:9c0387afa5b4152f716b231a49bfae55af53d12bc518a9f007b939d10f303b2b',
+    status: 'passed',
+  });
+  assert.doesNotThrow(() => execFileSync(
+    'git', ['ls-files', '--error-unmatch', evidence.path],
+    {cwd: repositoryRoot, stdio: 'ignore'},
+  ));
   for (const id of [
     'identity-bound-protocol-observations-and-fail-closed-assertions',
     'teardown-centralized-log-corpus-export',
@@ -161,6 +171,11 @@ test('the baseline advertises approved A8 capabilities from bound evidence', () 
     assert.equal(capability?.status, 'supported');
     assert.deepEqual(capability.evidence, [evidenceId]);
   }
+  assert.equal(validateBaseline({
+    ...baseline,
+    evidence: [evidence],
+    capabilities: baseline.capabilities.filter(capability => capability.evidence.includes(evidenceId)),
+  }, {verifyEvidence: true, root: repositoryRoot}), true);
 });
 
 test('the baseline advertises approved A9 capability from bound evidence', () => {
@@ -207,6 +222,33 @@ test('the baseline advertises approved A10 capability from bound evidence', () =
   );
   assert.equal(splitViews?.status, 'supported');
   assert.deepEqual(splitViews.evidence, [evidenceId]);
+});
+
+test('the baseline advertises approved A11 capabilities from bound evidence', () => {
+  const baseline = load(baselinePath);
+  const evidenceId = 'release-1-a11-mixed-version-upgrades';
+  const evidence = baseline.evidence.find(item => item.id === evidenceId);
+  assert.deepEqual(evidence, {
+    id: evidenceId,
+    path: 'contrib/attacknet/evidence-packets/release-1-a11/gate-result.json',
+    digest: 'sha256:fbae9eb6a8393fe4a766830b6f08d55c99ea3a085194d764eed995b314449f70',
+    status: 'passed',
+  });
+  assert.doesNotThrow(() => execFileSync(
+    'git', ['ls-files', '--error-unmatch', evidence.path],
+    {cwd: repositoryRoot, stdio: 'ignore'},
+  ));
+  const capabilities = [
+    'immutable-mixed-version-source-configuration-and-assignment-matrices',
+    'topology-owned-boundary-aware-upgrade-campaigns',
+  ].map(id => baseline.capabilities.find(item => item.id === id));
+  for (const capability of capabilities) {
+    assert.equal(capability?.status, 'supported');
+    assert.deepEqual(capability.evidence, [evidenceId]);
+  }
+  assert.equal(validateBaseline({
+    ...baseline, evidence: [evidence], capabilities,
+  }, {verifyEvidence: true, root: repositoryRoot}), true);
 });
 
 test('offline result accepts only complete, unique, observed suite results', () => {

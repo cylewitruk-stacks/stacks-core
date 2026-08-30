@@ -124,6 +124,60 @@ its credential-free clock. Use the
 [Bitcoin split-view guide](../concepts/bitcoin-split-views.md) for the composed
 partition and competing-branch workflow.
 
+## Mixed versions and rolling upgrades
+
+Resolve and build selected releases, branches, forks, local changes, or
+immutable prebuilt images on the operator workstation. Controllers never clone
+or build source. Keep the generated descriptor and import receipt; they are the
+source of truth for assignment and replay.
+
+```bash
+$ATTACKNET version prepare \
+  --file contrib/attacknet/examples/matrices/stable-with-candidate.plan.yaml \
+  --workspace .attacknet/version-workspace \
+  --recipe-root . \
+  --output .attacknet/stable-with-candidate.json
+$ATTACKNET version load \
+  --descriptor .attacknet/stable-with-candidate.json \
+  --mode require > .attacknet/stable-with-candidate-import.json
+```
+
+For a static missed-upgrade cohort, apply the sealed assignments before
+submitting the network:
+
+```bash
+$ATTACKNET version render-static \
+  --descriptor .attacknet/stable-with-candidate.json \
+  --network contrib/helm/hacknet/examples/mixed-versions.yaml \
+  > .attacknet/mixed-network.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file .attacknet/mixed-network.yaml
+```
+
+For an in-place rollout, render an inert `UpgradeCampaign` template and let an
+`AttacknetRun` schedule it. Do not patch actor StatefulSets or substitute a
+mutable image tag; the topology operator is the only workload writer.
+
+```bash
+$ATTACKNET version render-upgrade \
+  --descriptor .attacknet/stable-with-candidate.json \
+  --namespace hacknet-system \
+  --template=true > .attacknet/roll-candidate.yaml
+$ATTACKNET submit --file .attacknet/roll-candidate.yaml
+$ATTACKNET submit \
+  --file contrib/attacknet/examples/runs/mixed-version-boundary-upgrade.yaml
+$ATTACKNET wait --namespace hacknet-system --for terminal \
+  AttacknetRun mixed-version-boundary-upgrade
+```
+
+Inspect the terminal run decision, the child `UpgradeCampaign` while it exists,
+and `StacksNetwork.status` inventory transitions before teardown. A profile's
+compatibility expectation is a hypothesis, not a verdict. Configuration smoke
+failure, startup failure, missing telemetry, assertion violation, and harness
+identity drift remain separate outcomes. See the
+[mixed-version guide](../concepts/mixed-version-images.md) for plan fields,
+configuration fallback, safety limits, and direct-campaign operation.
+
 ## Faults and runs
 
 A `FaultCampaign` contains stages; each stage may contain multiple actions.
@@ -200,6 +254,11 @@ events, and PVCs until root-cause attribution is complete. See
 | Network Pending | Inspect the referenced `BurnchainPolicy`, clock `/readyz`, actor init-container logs, Pod status, and Conditions. |
 | Run Pending on `SignerSetObservationPending` | Check the enrolled Stacks node's chain tip and `/v2/pox`; the controller retries without admitting a schedule. |
 | Campaign waiting | Inspect its admitted inventory, shared mutation lease, and cumulative run budget. |
+| Version preparation fails | Preserve its diagnostic. Source drift and `ConfigurationUnsupported` occur before Kubernetes mutation and do not establish protocol incompatibility. |
+| Upgrade remains Pending | Inspect network readiness, the admitted inventory, `UpgradeLeaseHeld`, and profile image/configuration identities. |
+| Upgrade reports `StartupIncompatible` | Compare requested and admitted image and configuration digests, then inspect actor and init-container logs before attributing a protocol defect. |
+| Upgrade is `Inconclusive` | Preserve the descriptor, import receipt, campaign status, and incident bundle; `TelemetryUnavailable` and `ProtocolAssertionInconclusive` are not incompatibility verdicts. |
+| Upgrade is rolling back | Wait for `rollbackComplete: true`; do not delete or patch its StatefulSets during controller-owned rollback. |
 | Inconclusive result | Preserve evidence; inspect identity divergence, effect ambiguity, and rollback. |
 | Pod Pending after node loss | Inspect PVC node affinity; portable cross-node CSI is outside Release 1. |
 | Unsupported native fault | Use `io-pressure` or application `clock-skew`; do not bypass capability admission. |

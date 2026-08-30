@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "stacks-attacknet-release-gate-result/v1",
+  "reviewId": "release-1-amendment-a11-mixed-version-upgrades",
+  "status": "Approved for Release 1 mixed-version and upgrade orchestration amendment A11 scope",
+  "sourceRevision": "f116da2964cab6e41896d27792cd74a2f9a333e0",
+  "candidateTree": "1ac9c5e6f60ee8d1dbb6e1447272ec830e393d92",
+  "packetDigest": "sha256:03e794fdee383cbcd78eb573a5dc36880796c48cec251d22e480dc1ea2321ff7",
+  "contractDigest": "sha256:0b2fb2bc5fbed32c9b39c0d27011ab3755b4f2afec453d6e245d69c8c2092288",
+  "reviewPacketFileDigest": "sha256:e643c2e981cfd59f422a9a5590eeacf9e25edb7acc16d192b04c804031988a32",
+  "verdictFileDigests": {
+    "Codex": "sha256:20d1a35e1289c98405f1a428f37c17b0462dd0caaf6fcbcf91209eaafe5f8807",
+    "Claude Opus 5": "sha256:b6946585c123fa0ebfe41398a6006b2e509e55e87d79cf9783dc845d3b722cba"
+  },
+  "evidenceSummaryDigest": "sha256:8f7cfa42d2620922b7262f1c0241db9fbbb4d35f8793f5343cc87881870db2bb",
+  "evidenceArchiveDigest": "sha256:9aad4990605084f860286fa1cfab4e160b15c19b85bcdfea8e27658624cce4e3"
+}

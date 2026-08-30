@@ -315,8 +315,7 @@ the profile and outcome vocabularies.
 
 ### Phase 2: Preparation pipeline
 
-Status: implemented and verified offline; live image preparation remains in
-Phase 5 qualification.
+Status: complete. Offline verification and live image preparation both passed.
 
 Implement typed YAML decoding, Git resolution, content-addressed worktrees,
 build/import receipts, configuration smokes, explicit assignments, and seeded
@@ -324,7 +323,8 @@ distribution. Emit one immutable canonical JSON matrix descriptor.
 
 ### Phase 3: Static mixed-version qualification
 
-Status: implemented; live qualification pending.
+Status: complete. The admitted static cohort contained distinct released and
+candidate runtime image identities.
 
 Render `StacksNetwork` YAML from the descriptor, bind expected profiles to
 admitted runtime identities, add dashboards and evidence, and qualify static
@@ -332,8 +332,8 @@ missed-upgrade scenarios.
 
 ### Phase 4: Typed upgrade orchestration
 
-Status: implemented and verified offline; live identity, rollback, and replay
-qualification pending.
+Status: complete. Live identity transitions, staged rollout, rollback, and
+fresh-network replay passed.
 
 Record the architecture decision, implement the selected topology-owned
 transition API and controller, integrate it into the run DAG, and prove safety,
@@ -341,7 +341,10 @@ rollback, identity transitions, resume, and replay.
 
 ### Phase 5: Boundary scenarios and release evidence
 
-Status: pending live qualification and candidate-bound evidence.
+Status: complete. The signed candidate
+`f116da2964cab6e41896d27792cd74a2f9a333e0` was approved as
+`release-1-amendment-a11-mixed-version-upgrades`; the review packet digest is
+`sha256:03e794fdee383cbcd78eb573a5dc36880796c48cec251d22e480dc1ea2321ff7`.
 
 Run compatible and incompatible controls at sealed boundaries, retain complete
 forensics, update operator documentation and the Release 1 baseline, and

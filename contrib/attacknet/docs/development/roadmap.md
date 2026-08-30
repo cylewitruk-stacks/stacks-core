@@ -166,10 +166,13 @@ The approved gate establishes that:
 
 ### A11: Mixed-version and upgrade-boundary campaigns
 
-Status: implementation in progress. Typed source preparation, deterministic
-assignments, static rendering, `UpgradeCampaign` orchestration, configuration
-digest verification, and cohort observability pass offline verification. Live
-kind qualification and the amendment review packet remain open.
+Status: approved as
+`release-1-amendment-a11-mixed-version-upgrades`. The hardware-signed candidate
+is `f116da2964cab6e41896d27792cd74a2f9a333e0`; its approved packet digest is
+`sha256:03e794fdee383cbcd78eb573a5dc36880796c48cec251d22e480dc1ea2321ff7`.
+The gate qualified static mixed-version admission, boundary-aware staged
+upgrades, rollback convergence, and a fresh same-seed replay on the local
+three-node arm64 kind profile.
 
 Qualify the existing per-actor image support as explicit compatibility and
 missed-upgrade scenarios. Source profiles must accept arbitrary released tags,

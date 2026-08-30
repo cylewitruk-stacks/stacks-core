@@ -385,6 +385,57 @@ recovery observations, a campaign terminates `Inconclusive`, never `Passed`.
 The operator-facing [`fault reference`](../../attacknet/docs/reference/faults/)
 documents every supported type, parameter, invariant, and assertion.
 
+### `UpgradeCampaign`
+
+`UpgradeCampaign` declares one bounded, topology-owned image and configuration
+transition. Profiles carry immutable image, provenance, configuration, source,
+revision, instrumentation-capability, and compatibility-expectation fields.
+Ordered stages assign profiles to logical actors and bound parallel actors,
+signer weight, miner percentage, stage deadlines, stable windows, and optional
+protocol assertions.
+
+The topology operator reconciles the resulting overlays and remains the only
+StatefulSet writer. The upgrade controller records the admitted baseline,
+current inventory, applied assignments, and every authorized before/after
+identity digest. An unexpected network UID or workload identity change fails
+closed; it is not accepted as part of the rollout.
+
+Render profiles on the host, import every image into each kind node, and submit
+an inert template for `AttacknetRun` scheduling:
+
+```bash
+$ATTACKNET version prepare \
+  --file contrib/attacknet/examples/matrices/stable-with-candidate.plan.yaml \
+  --workspace .attacknet/version-workspace \
+  --recipe-root . \
+  --output .attacknet/stable-with-candidate.json
+$ATTACKNET version load \
+  --descriptor .attacknet/stable-with-candidate.json --mode require \
+  > .attacknet/stable-with-candidate-import.json
+$ATTACKNET version render-upgrade \
+  --descriptor .attacknet/stable-with-candidate.json \
+  --namespace hacknet-system --template=true \
+  > .attacknet/roll-candidate.yaml
+$ATTACKNET submit --file .attacknet/roll-candidate.yaml
+```
+
+Use `--template=false` only for a deliberately standalone rollout. One
+`AttacknetRun` may execute one upgrade campaign; express rollout batches as its
+ordered stages. With `rollbackOnFailure: true`, a failed or inconclusive stage
+restores the admitted baseline before terminal status and sets
+`rollbackComplete`. Without it, the failed deployment remains available for
+triage until campaign deletion invokes finalizer-owned rollback. A successful
+standalone campaign likewise retains the upgraded overlay until deletion; wait
+for foreground deletion rather than manually reverting workloads.
+
+`StartupIncompatible` means assigned actors did not become Ready with the
+expected image and configuration before the deadline. `TelemetryUnavailable`
+and `ProtocolAssertionInconclusive` terminate as `Inconclusive` and never prove
+version incompatibility. Preserve the descriptor, image-import receipt,
+campaign status, and incident evidence before cleanup. The complete workflow is
+documented in the
+[`mixed-version guide`](../../attacknet/docs/concepts/mixed-version-images.md).
+
 ### `AttacknetRun`
 
 `AttacknetRun` resolves a finite fault catalog before the first action. It pins
@@ -505,6 +556,9 @@ experiment controller.
 | CRD schema did not update | Inspect managed fields, then use `--force-crd-conflicts` once only when deliberately reclaiming ownership. |
 | Helm release is `failed` | Run `helm status hacknet -n hacknet-system`; use `--recover-failed-release` only after identifying the cause. |
 | Upgrade reports a managed-field conflict | Do not use `kubectl set image`; inspect ownership before considering `--force-helm-conflicts`. |
+| Upgrade waits in `Pending` | Inspect `UpgradeLeaseHeld`, network readiness, admitted inventory, and profile image/configuration identities. |
+| Upgrade misses its deadline | Distinguish `StartupIncompatible`, telemetry loss, assertion failure, and identity drift before attributing a version defect. |
+| Upgrade is rolling back | Wait for `rollbackComplete: true` or foreground deletion; never patch topology-owned StatefulSets. |
 | New same-named network is `Degraded` | Wait for old-UID garbage collection; if it persists, inspect finalizers and garbage-collector health. Never adopt old children. |
 | Actor Pod remains Pending after node disruption | Inspect PVC node affinity and placement. Local-path storage does not prove cross-node reattachment. |
 | Fault remains `Inconclusive` | Inspect probe availability and effect evidence; Chaos Mesh injection conditions alone are insufficient. |

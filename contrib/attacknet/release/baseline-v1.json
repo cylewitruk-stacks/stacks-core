@@ -85,8 +85,8 @@
     },
     {
       "id": "release-1-a8-trusted-observations",
-      "path": "contrib/attacknet/evidence-packets/release-1-a8/evidence/summary.json",
-      "digest": "sha256:2eafad8133683dbf523eefff529a06edc0a602283fd7211b8c3fa6e0844fdf9b",
+      "path": "contrib/attacknet/evidence-packets/release-1-a8/gate-result.json",
+      "digest": "sha256:9c0387afa5b4152f716b231a49bfae55af53d12bc518a9f007b939d10f303b2b",
       "status": "passed"
     },
     {
@@ -99,6 +99,12 @@
       "id": "release-1-a10-multi-bitcoin-split-views",
       "path": "contrib/attacknet/evidence-packets/release-1-a10/gate-result.json",
       "digest": "sha256:a2e31bee5ea086d9552f0ea7d50ca74600bff6e7c16876db2d8e3047855986ee",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a11-mixed-version-upgrades",
+      "path": "contrib/attacknet/evidence-packets/release-1-a11/gate-result.json",
+      "digest": "sha256:fbae9eb6a8393fe4a766830b6f08d55c99ea3a085194d764eed995b314449f70",
       "status": "passed"
     }
   ],
@@ -221,6 +227,16 @@
       "id": "multi-bitcoin-follower-split-view-campaigns",
       "status": "supported",
       "evidence": ["release-1-a10-multi-bitcoin-split-views"]
+    },
+    {
+      "id": "immutable-mixed-version-source-configuration-and-assignment-matrices",
+      "status": "supported",
+      "evidence": ["release-1-a11-mixed-version-upgrades"]
+    },
+    {
+      "id": "topology-owned-boundary-aware-upgrade-campaigns",
+      "status": "supported",
+      "evidence": ["release-1-a11-mixed-version-upgrades"]
     },
     {
       "id": "controller-ha-leader-election",
