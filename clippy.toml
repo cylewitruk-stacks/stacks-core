@@ -1,0 +1,21 @@
+# Workspace-wide clippy configuration.
+#
+# Clippy walks up from each crate's manifest directory, so this single file
+# applies to every workspace member.
+#
+# Each threshold below is set to the current worst offender in the tree, so the
+# lint still fires for anything new that is worse than what we already have.
+# These are meant to be ratcheted back down toward clippy's defaults over time,
+# not left as-is.
+
+# Default: 128. Chainstate/net error enums nest each other (`net::Error` embeds
+# `ClarityError`, `burnchain_error`, `marf_error`, `HttpErr`), so they land just
+# over the default. Largest today: 336 bytes.
+large-error-threshold = 344
+
+# Default: 7. Largest today: 22 (block-processing and miner entry points).
+too-many-arguments-threshold = 22
+
+# Default: 250. The remaining offenders are the epoch2.x block-download and
+# relay entry points, which return 5- and 7-tuples of collections.
+type-complexity-threshold = 900
