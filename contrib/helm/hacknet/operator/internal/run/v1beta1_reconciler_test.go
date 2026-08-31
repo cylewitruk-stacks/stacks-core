@@ -22,7 +22,6 @@ import (
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/canonical"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
-	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
 )
 
 type staticObservationReader struct{ snapshot ObservationSnapshot }
@@ -63,11 +62,7 @@ func TestBetaReconcilerResumesDAGFromDurableChildState(t *testing.T) {
 	schedule.Network.UID = string(network.UID)
 	schedule.Network.Generation = network.Generation
 	schedule.Network.Inventory = *networkInventory(network)
-	legacyNetwork, err := topology.CompileV1Beta1(network)
-	if err != nil {
-		t.Fatal(err)
-	}
-	schedule.Network.ManifestDigest, err = canonical.ArtifactDigest(canonicalManifest(legacyNetwork, map[string]float64{}))
+	schedule.Network.ManifestDigest, err = canonical.ArtifactDigest(canonicalBetaManifest(network, map[string]float64{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,6 +224,9 @@ func TestBetaTerminalRunReleasesCleanupFinalizer(t *testing.T) {
 	run.Status.Cleanup = &attacknetv1beta1.RunCleanup{
 		Required: true, Completed: true, CompletedAt: &now, Message: "all owned child campaigns proved cleanup",
 	}
+	// A child deleted through its cleanup finalizer is expected to be absent
+	// while its last active receipt is still present on the terminal run.
+	run.Status.ActiveChildren = []attacknetv1beta1.ActiveRunChild{{Name: "cleaned-child", UID: "cleaned-child-uid"}}
 	scheme := runtime.NewScheme()
 	_ = attacknetv1beta1.AddToScheme(scheme)
 	kube := fake.NewClientBuilder().WithScheme(scheme).

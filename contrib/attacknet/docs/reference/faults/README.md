@@ -17,6 +17,7 @@ the mutation, verifies its effect, cleans it up, and verifies recovery.
 | [`io-pressure`](io-pressure.md) | Controller-owned restricted Pod | `disk-pressure` | Portable pressure on an actor PVC |
 | [`clock-skew`](clock-skew.md) | Controller-owned clock policy | Action omitted | Portable application wall-clock skew |
 | [`burnchain-reorg`](burnchain-reorg.md) | Controller-owned regtest worker | Action omitted | Bounded Bitcoin branch replacement |
+| [`signer-behavior`](signer-behavior.md) | Controller-owned observation session | `withhold`, `delay`, `suppress-peer-responses` | Deterministic testing-only signer behavior |
 
 ## Backends and trust
 
@@ -34,6 +35,8 @@ portably or safely enough for Release 1:
   instrumented actor image.
 - `burnchain-reorg` uses a closed, typed Bitcoin regtest RPC client and a
   policy pause/restore handshake. It is not an arbitrary RPC facility.
+- `signer-behavior` observes a signer policy already admitted by the topology
+  operator. It never rewrites a StatefulSet or activates behavior dynamically.
 
 All backends use the same identity pinning, aggregate safety, evidence, cleanup,
 and terminal classification. Missing or ambiguous proof produces
@@ -177,6 +180,7 @@ is in scope.
 | I/O | `IODegraded`, `IOPressureObserved` | `IORecovered`, `IOPressureRecovered` |
 | Clock | `ClockSkewObserved` | `ClockSkewCleared` |
 | Burnchain | `BurnchainReorgProven` | `BurnchainPolicyRestored` |
+| Signer behavior | `SignerBehaviorObserved` | `SignerBehaviorWindowClosed` |
 
 A mutation reporting success is not sufficient. Attacknet reports `Passed`
 only after required effects, recovery, and cleanup are independently proven.

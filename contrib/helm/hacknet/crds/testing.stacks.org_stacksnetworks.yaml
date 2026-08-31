@@ -12242,6 +12242,204 @@ spec:
                         description: SignerMemberSpec binds one signer process to
                           one configured Stacks node.
                         properties:
+                          adversarial:
+                            description: |-
+                              Adversarial enables one bounded testing-only signer behavior. The signer
+                              image must be set explicitly and implement the declared profile.
+                            properties:
+                              behavior:
+                                enum:
+                                - withhold
+                                - delay
+                                - suppress-peer-responses
+                                type: string
+                              delay:
+                                type: string
+                              egress:
+                                description: AdversarialEgressSpec controls actor
+                                  egress independently from behavior.
+                                properties:
+                                  allowUnrestricted:
+                                    description: |-
+                                      AllowUnrestricted is the conspicuous opt-in required by the unrestricted
+                                      profile. It is recorded in admitted identity and release evidence.
+                                    type: boolean
+                                  profile:
+                                    enum:
+                                    - restricted
+                                    - unrestricted
+                                    type: string
+                                required:
+                                - profile
+                                type: object
+                                x-kubernetes-validations:
+                                - message: unrestricted egress requires allowUnrestricted=true
+                                    and restricted egress forbids it
+                                  rule: 'self.profile == ''unrestricted'' ? (has(self.allowUnrestricted)
+                                    && self.allowUnrestricted) : (!has(self.allowUnrestricted)
+                                    || !self.allowUnrestricted)'
+                              maxEvaluations:
+                                description: MaxEvaluations bounds retained selector
+                                  decisions, including non-matches.
+                                format: int32
+                                maximum: 65536
+                                minimum: 1
+                                type: integer
+                              maxMatches:
+                                format: int32
+                                maximum: 1024
+                                minimum: 1
+                                type: integer
+                              observer:
+                                description: AdversarialObserverSpec configures the
+                                  separate trusted observation actor.
+                                properties:
+                                  image:
+                                    description: Image must identify the bounded Attacknet
+                                      probe implementation.
+                                    minLength: 1
+                                    type: string
+                                  imagePullPolicy:
+                                    description: PullPolicy describes a policy for
+                                      if/when to pull a container image
+                                    type: string
+                                  resources:
+                                    description: ResourceRequirements describes the
+                                      compute resource requirements.
+                                    properties:
+                                      claims:
+                                        description: |-
+                                          Claims lists the names of resources, defined in spec.resourceClaims,
+                                          that are used by this container.
+
+                                          This field depends on the
+                                          DynamicResourceAllocation feature gate.
+
+                                          This field is immutable. It can only be set for containers.
+                                        items:
+                                          description: ResourceClaim references one
+                                            entry in PodSpec.ResourceClaims.
+                                          properties:
+                                            name:
+                                              description: |-
+                                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                                the Pod where this field is used. It makes that resource available
+                                                inside a container.
+                                              type: string
+                                            request:
+                                              description: |-
+                                                Request is the name chosen for a request in the referenced claim.
+                                                If empty, everything from the claim is made available, otherwise
+                                                only the result of this request.
+                                              type: string
+                                          required:
+                                          - name
+                                          type: object
+                                        type: array
+                                        x-kubernetes-list-map-keys:
+                                        - name
+                                        x-kubernetes-list-type: map
+                                      limits:
+                                        additionalProperties:
+                                          anyOf:
+                                          - type: integer
+                                          - type: string
+                                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                          x-kubernetes-int-or-string: true
+                                        description: |-
+                                          Limits describes the maximum amount of compute resources allowed.
+                                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                        type: object
+                                      requests:
+                                        additionalProperties:
+                                          anyOf:
+                                          - type: integer
+                                          - type: string
+                                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                          x-kubernetes-int-or-string: true
+                                        description: |-
+                                          Requests describes the minimum amount of compute resources required.
+                                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                                        type: object
+                                    type: object
+                                required:
+                                - image
+                                type: object
+                              patchDigest:
+                                description: |-
+                                  PatchDigest identifies the exact testing-only source patch used to build
+                                  the explicitly selected signer image.
+                                pattern: ^sha256:[0-9a-f]{64}$
+                                type: string
+                              profile:
+                                enum:
+                                - stacks-signer-testing/v1
+                                type: string
+                              selector:
+                                description: |-
+                                  AdversarialProposalSelector deterministically selects protocol messages.
+                                  Every configured predicate must match.
+                                properties:
+                                  everyNth:
+                                    format: int32
+                                    maximum: 1024
+                                    minimum: 1
+                                    type: integer
+                                  maxStacksHeight:
+                                    format: int64
+                                    minimum: 1
+                                    type: integer
+                                  minStacksHeight:
+                                    format: int64
+                                    minimum: 1
+                                    type: integer
+                                  proposalHashPrefix:
+                                    pattern: ^[0-9a-f]{2,32}$
+                                    type: string
+                                  seedOffset:
+                                    description: |-
+                                      SeedOffset is reduced modulo everyNth and permits seeded cohorts to use
+                                      distinct deterministic ordinals.
+                                    format: int32
+                                    maximum: 1023
+                                    minimum: 0
+                                    type: integer
+                                type: object
+                                x-kubernetes-validations:
+                                - message: minimum Stacks height cannot exceed maximum
+                                  rule: '!has(self.minStacksHeight) || !has(self.maxStacksHeight)
+                                    || self.minStacksHeight <= self.maxStacksHeight'
+                                - message: seedOffset requires everyNth
+                                  rule: has(self.everyNth) || !has(self.seedOffset)
+                                    || self.seedOffset == 0
+                                - message: seedOffset must be smaller than everyNth
+                                  rule: '!has(self.everyNth) || !has(self.seedOffset)
+                                    || self.seedOffset < self.everyNth'
+                            required:
+                            - behavior
+                            - egress
+                            - maxEvaluations
+                            - maxMatches
+                            - observer
+                            - patchDigest
+                            - profile
+                            type: object
+                            x-kubernetes-validations:
+                            - message: delay behavior requires delay within 1ms..120s
+                              rule: self.behavior != 'delay' || (has(self.delay) &&
+                                duration(self.delay) >= duration('1ms') && duration(self.delay)
+                                <= duration('120s'))
+                            - message: delay is valid only for delay behavior
+                              rule: self.behavior == 'delay' || !has(self.delay)
+                            - message: suppress-peer-responses supports only proposalHashPrefix
+                                selection
+                              rule: self.behavior != 'suppress-peer-responses' ||
+                                (!has(self.selector.minStacksHeight) && !has(self.selector.maxStacksHeight)
+                                && !has(self.selector.everyNth))
+                            - message: maxMatches cannot exceed maxEvaluations
+                              rule: self.maxMatches <= self.maxEvaluations
                           burnchainNodeRef:
                             type: string
                           index:
@@ -17648,9 +17846,15 @@ spec:
                   description: ActorStatus reports rollout and immutable runtime identity
                     for one actor.
                   properties:
+                    adversarialEgressProfile:
+                      type: string
+                    adversarialPolicyDigest:
+                      type: string
                     configDigest:
                       type: string
                     currentRevision:
+                      type: string
+                    egressPolicyDigest:
                       type: string
                     generation:
                       format: int64

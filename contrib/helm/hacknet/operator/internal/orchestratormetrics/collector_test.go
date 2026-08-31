@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/versionmatrix"
 )
 
@@ -153,6 +154,51 @@ func TestCollectorFailsClosedWithoutAReader(t *testing.T) {
 	if len(families) != 1 || families[0].GetName() != "attacknet_orchestrator_metrics_collection_success" || families[0].Metric[0].Gauge.GetValue() != 0 {
 		t.Fatalf("nil reader did not expose a failed collection watchdog: %#v", families)
 	}
+}
+
+func TestCollectorExportsOnlyIdentityBoundAdversarialPolicy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := attacknetv1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	policy := &attacknetv1beta1.AdversarialSignerPolicy{
+		Profile: "stacks-signer-testing/v1", Behavior: "withhold", MaxMatches: 1, MaxEvaluations: 8,
+		PatchDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Observer:    attacknetv1beta1.AdversarialObserverSpec{Image: "probe:test"},
+		Egress:      attacknetv1beta1.AdversarialEgressSpec{Profile: "restricted"},
+	}
+	network := &attacknetv1beta1.StacksNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "network", Namespace: "test"},
+		Spec:       attacknetv1beta1.StacksNetworkSpec{SignerSets: []attacknetv1beta1.SignerSetSpec{{Name: "active", Members: []attacknetv1beta1.SignerMemberSpec{{Name: "signer-1", Adversarial: policy}}}}},
+	}
+	_, digest, err := adversarial.ResolveSigner(network, "signer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.Actors = []attacknetv1beta1.ActorStatus{
+		{Name: "signer-1", IdentityReady: true, AdversarialPolicyDigest: digest, AdversarialEgressProfile: "restricted", EgressPolicyDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{Name: "signer-1-observer", IdentityReady: true, AdversarialPolicyDigest: digest},
+	}
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(NewCollector(fake.NewClientBuilder().WithScheme(scheme).WithObjects(network).Build()))
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() != "attacknet_adversarial_policy_info" {
+			continue
+		}
+		labels := map[string]string{}
+		for _, label := range family.Metric[0].GetLabel() {
+			labels[label.GetName()] = label.GetValue()
+		}
+		if labels["behavior"] != "withhold" || labels["egress_profile"] != "restricted" || labels["egress_policy_digest"] == "" || labels["observer_ready"] != "true" || labels["policy_digest"] != digest {
+			t.Fatalf("adversarial metric was not identity-bound: %#v", labels)
+		}
+		return
+	}
+	t.Fatal("adversarial policy metric is absent")
 }
 
 func TestCollectorEmitsOneActuallyAdmittedVersionPerActor(t *testing.T) {

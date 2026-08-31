@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -27,10 +28,20 @@ import (
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
 )
 
 var sharedBetaProbe = &betaProbeClient{calls: map[string]int{}}
+
+type fixedBetaSignerResolver struct {
+	result signerset.Result
+	err    error
+}
+
+func (resolver *fixedBetaSignerResolver) Resolve(context.Context, *attacknetv1alpha1.StacksNetwork, []corev1.Pod) (signerset.Result, error) {
+	return resolver.result, resolver.err
+}
 
 type betaProbeClient struct {
 	mu           sync.Mutex
@@ -119,6 +130,145 @@ func TestV1Beta1CampaignInjectsDistinctMechanismsConcurrentlyAndResumes(t *testi
 	now = now.Add(2 * time.Minute)
 	reconcileBetaUntil(t, base, scheme, request, &now, 3)
 	assertBetaPhase(t, base, request.NamespacedName, "Passed")
+}
+
+func TestV1Beta1AdmissionBindsCanonicalSignerSet(t *testing.T) {
+	resetBetaProbe()
+	scheme := betaFaultScheme(t)
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	network, pods := betaFaultNetwork(t)
+	campaign := betaFaultCampaign("signer-set-binding", []attacknetv1beta1.FaultActionSpec{
+		betaChaosAction("network", "network", "delay"),
+	})
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
+		WithObjects(network, pods[0], pods[1], betaFaultPolicy(network), environmentLeaseObject(), campaign).Build()
+	resolver := &fixedBetaSignerResolver{result: signerset.Result{
+		HasSigners: true, RewardCycle: 44, ObservedTotalWeight: 8,
+		WeightsByActor: map[string]float64{"signer-1": 3, "signer-node-1": 3}, SignerSetDigest: "sha256:" + strings.Repeat("c", 64),
+		ObservedFrom: "miner-1", WeightsMatch: true,
+	}}
+	controller := betaFaultReconciler(base, base, scheme, &now)
+	controller.SignerSets = resolver
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
+	for range 2 {
+		if _, err := controller.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	admitted := &attacknetv1beta1.FaultCampaign{}
+	if err := base.Get(context.Background(), request.NamespacedName, admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Status.Admission == nil || admitted.Status.Admission.SignerSetDigest != resolver.result.SignerSetDigest ||
+		admitted.Status.Admission.SignerSetObservedFrom != "miner-1" || admitted.Status.Admission.SignerSetRewardCycle == nil ||
+		*admitted.Status.Admission.SignerSetRewardCycle != 44 || admitted.Status.Admission.SignerSetTotalWeight == nil ||
+		*admitted.Status.Admission.SignerSetTotalWeight != 8 ||
+		!reflect.DeepEqual(admitted.Status.Admission.SignerWeightsByActor, map[string]int64{"signer-1": 3, "signer-node-1": 3}) {
+		t.Fatalf("canonical signer-set receipt was not persisted: %#v", admitted.Status.Admission)
+	}
+
+	resolver.result.SignerSetDigest = "sha256:" + strings.Repeat("d", 64)
+	if _, err := controller.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	assertBetaPhase(t, base, request.NamespacedName, "Failed")
+	if err := base.Get(context.Background(), request.NamespacedName, admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Status.Reason != "AdmissionInputChanged" {
+		t.Fatalf("changed signer set must fail the admitted campaign, got %s", admitted.Status.Reason)
+	}
+	if !strings.Contains(admitted.Status.Message, "canonical signer-set digest changed after admission") ||
+		!strings.Contains(admitted.Status.Message, strings.Repeat("c", 64)) ||
+		!strings.Contains(admitted.Status.Message, strings.Repeat("d", 64)) {
+		t.Fatalf("signer-set drift diagnostic is not attributable: %q", admitted.Status.Message)
+	}
+}
+
+func TestV1Beta1RecoveryUsesAdmissionBoundSignerWeights(t *testing.T) {
+	network, pods := betaFaultNetwork(t)
+	campaign := betaFaultCampaign("recover-without-current-reward-set", []attacknetv1beta1.FaultActionSpec{
+		betaChaosAction("network", "network", "delay"),
+	})
+	campaign.Status.Admission = &attacknetv1beta1.CampaignAdmission{
+		SignerSetRewardCycle: ptr(int64(44)), SignerSetTotalWeight: ptr(int64(8)),
+		SignerSetDigest: "sha256:" + strings.Repeat("c", 64), SignerSetObservedFrom: "miner-1",
+		SignerWeightsByActor: map[string]int64{"signer-1": 3, "signer-node-1": 3},
+	}
+	campaign.Status.Stages = []attacknetv1beta1.FaultStageStatus{{
+		ID: "first", Actions: []attacknetv1beta1.FaultActionStatus{{ID: "network", Phase: "Recovering"}},
+	}}
+	controller := &V1Beta1Reconciler{SignerSets: &fixedBetaSignerResolver{err: &signerset.TransientError{Err: errors.New("reward set unavailable")}}}
+	livePods := []corev1.Pod{*pods[0], *pods[1]}
+	resolved, manifest, err := controller.resolveBetaCampaignSignerSet(context.Background(), campaign, network, livePods)
+	if err != nil {
+		t.Fatalf("recovery incorrectly depended on a later reward-set read: %v", err)
+	}
+	if resolved.SignerSetDigest != campaign.Status.Admission.SignerSetDigest ||
+		resolved.WeightsByActor["signer-1"] != 3 || manifest.Network != network.Name {
+		t.Fatalf("recovery did not reconstruct the admission-bound signer set: %#v %#v", resolved, manifest)
+	}
+	campaign.Status.Stages[0].Actions[0].Phase = "Active"
+	if _, _, err := controller.resolveBetaCampaignSignerSet(context.Background(), campaign, network, livePods); err == nil {
+		t.Fatal("active execution accepted an unavailable live reward set")
+	}
+}
+
+func TestV1Beta1PolicyDriftAfterAdmissionIsClassifiedAsInputChange(t *testing.T) {
+	resetBetaProbe()
+	scheme := betaFaultScheme(t)
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	network, campaign, _, objects := adversarialObservationFixture(t)
+	objects = append(objects, betaFaultPolicy(network), environmentLeaseObject(), campaign)
+	base := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&attacknetv1beta1.FaultCampaign{}, &attacknetv1beta1.StacksNetwork{}).
+		WithObjects(objects...).Build()
+	controller := betaFaultReconciler(base, base, scheme, &now)
+	controller.Probes = newSignedBehaviorProbe(t, now,
+		campaign.Spec.Stages[0].Faults[0].Fault.SignerBehavior.PolicyDigest)
+	controller.SignerSets = &fixedBetaSignerResolver{result: signerset.Result{
+		HasSigners: true, RewardCycle: 44, ObservedTotalWeight: 1,
+		WeightsByActor:  map[string]float64{"signer-1": 1},
+		SignerSetDigest: "sha256:" + strings.Repeat("c", 64),
+		ObservedFrom:    "signer-node-1", WeightsMatch: true,
+	}}
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(campaign)}
+	for range 2 {
+		if _, err := controller.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	admitted := &attacknetv1beta1.FaultCampaign{}
+	if err := base.Get(context.Background(), request.NamespacedName, admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Status.Admission == nil {
+		t.Fatalf("campaign was not admitted: %#v", admitted.Status)
+	}
+
+	currentNetwork := &attacknetv1beta1.StacksNetwork{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(network), currentNetwork); err != nil {
+		t.Fatal(err)
+	}
+	for index := range currentNetwork.Status.Actors {
+		if currentNetwork.Status.Actors[index].Name == "signer-1" {
+			currentNetwork.Status.Actors[index].AdversarialPolicyDigest = "sha256:" + strings.Repeat("d", 64)
+		}
+	}
+	if err := base.Status().Update(context.Background(), currentNetwork); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(context.Background(), request.NamespacedName, admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Status.Phase != "Failed" || admitted.Status.Reason != "AdmissionInputChanged" ||
+		!strings.Contains(admitted.Status.Message, "policy digest") {
+		t.Fatalf("post-admission policy drift was misclassified: %#v", admitted.Status)
+	}
 }
 
 func TestV1Beta1EffectAssertionRetriesUntilObserved(t *testing.T) {
@@ -507,11 +657,49 @@ func TestV1Beta1ObservationSourceFailureDoesNotLosePriorInjection(t *testing.T) 
 	if current.Status.Stages[0].Phase != "Injecting" || current.Status.Stages[1].Reason != "TriggerObservationUnavailable" {
 		t.Fatalf("stage status did not preserve injection and observation retry: %#v", current.Status.Stages)
 	}
+	if !strings.Contains(current.Status.Message, "observation backend unavailable") {
+		t.Fatalf("observation failure was not diagnosable: %q", current.Status.Message)
+	}
 	object := &unstructured.Unstructured{}
 	object.SetGroupVersionKind(schema.GroupVersionKind{Group: "chaos-mesh.org", Version: "v1alpha1", Kind: "NetworkChaos"})
 	if err := base.Get(context.Background(), client.ObjectKey{Namespace: "test", Name: mutationName("source-error", "immediate", "network")}, object); err != nil {
 		t.Fatalf("prior stage mutation was lost: %v", err)
 	}
+}
+
+func TestV1Beta1TriggerSnapshotUsesPostCollectionTime(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	campaign := betaFaultCampaign("post-collection-time", nil)
+	height := int64(100)
+	campaign.Spec.Stages = []attacknetv1beta1.FaultStageSpec{{
+		ID: "height", Trigger: attacknetv1beta1.StageTriggerSpec{StacksHeight: &height},
+	}}
+	campaign.Status.Admission = &attacknetv1beta1.CampaignAdmission{AdmittedAt: metav1.NewTime(now.Add(-time.Minute))}
+	reconciler := &V1Beta1Reconciler{
+		Now:          func() time.Time { return now },
+		Observations: advancingTriggerReader{now: &now, height: height},
+	}
+	decision, err := reconciler.evaluateBetaStage(context.Background(), campaign, &attacknetv1beta1.StacksNetwork{}, "height")
+	if err != nil {
+		t.Fatalf("evaluate height collected after reconciliation start: %v", err)
+	}
+	if !decision.Eligible || decision.Receipt == nil || len(decision.Receipt.Evidence) != 1 ||
+		decision.Receipt.Evidence[0].ObservedHeight == nil || *decision.Receipt.Evidence[0].ObservedHeight != height {
+		t.Fatalf("fresh height was not eligible: %#v", decision)
+	}
+}
+
+type advancingTriggerReader struct {
+	now    *time.Time
+	height int64
+}
+
+func (reader advancingTriggerReader) ReadTriggerSnapshot(context.Context, *attacknetv1beta1.FaultCampaign, *attacknetv1beta1.StacksNetwork) (trigger.Snapshot, error) {
+	*reader.now = reader.now.Add(time.Second)
+	return trigger.Snapshot{StacksHeight: &trigger.HeightObservation{
+		Height: reader.height, ObservedAt: *reader.now,
+		Source: trigger.Source{Kind: "ProtocolObservation", Name: "network", UID: "inventory", Trusted: true},
+	}}, nil
 }
 
 type failingTriggerReader struct{}

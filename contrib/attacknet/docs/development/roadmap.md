@@ -225,6 +225,10 @@ Definition of done:
 
 ### A12: Deterministic adversarial actors
 
+Status: implementation in progress. The bounded R1A12 scope, trust model,
+phases, and qualification contract are defined in the
+[`R1A12 implementation specification`](issues/r1/r1a12-deterministic-adversarial-actors.md).
+
 Add testing-only, deterministic behaviors beyond process and network outages.
 Candidate behaviors include:
 

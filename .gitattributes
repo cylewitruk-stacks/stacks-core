@@ -9,3 +9,4 @@ legacy/* linguist-vendored
 # artifact. Blank context lines therefore contain the mandatory unified-diff
 # context marker, which is data rather than source trailing whitespace.
 contrib/attacknet/instrumentation/workstream-m.patch whitespace=-blank-at-eol
+contrib/attacknet/test/fixtures/adversaries/*.patch whitespace=-blank-at-eol

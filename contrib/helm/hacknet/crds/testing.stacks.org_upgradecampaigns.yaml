@@ -627,9 +627,15 @@ spec:
                       description: AdmittedActorIdentity is the immutable runtime
                         identity admitted for one actor.
                       properties:
+                        adversarialEgressProfile:
+                          type: string
+                        adversarialPolicyDigest:
+                          type: string
                         configDigest:
                           type: string
                         controllerRevision:
+                          type: string
+                        egressPolicyDigest:
                           type: string
                         name:
                           type: string
@@ -818,9 +824,15 @@ spec:
                       description: AdmittedActorIdentity is the immutable runtime
                         identity admitted for one actor.
                       properties:
+                        adversarialEgressProfile:
+                          type: string
+                        adversarialPolicyDigest:
+                          type: string
                         configDigest:
                           type: string
                         controllerRevision:
+                          type: string
+                        egressPolicyDigest:
                           type: string
                         name:
                           type: string

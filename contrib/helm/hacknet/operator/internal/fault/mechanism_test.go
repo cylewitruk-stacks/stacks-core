@@ -11,6 +11,7 @@ func TestMechanismRegistryIsCompleteAndRoundTrips(t *testing.T) {
 		"io": "IOChaos", "time": "TimeChaos", "io-pressure": "IOPressurePod",
 		"clock-skew":      "ClockSkewPolicy",
 		"burnchain-reorg": "BurnchainReorgWorker",
+		"signer-behavior": "SignerBehaviorSession",
 	}
 	definitions := registeredMechanisms()
 	if len(definitions) != len(want) {

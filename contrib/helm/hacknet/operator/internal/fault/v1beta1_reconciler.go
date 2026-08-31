@@ -30,10 +30,13 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/canonical"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/ownership"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
 )
 
@@ -64,6 +67,7 @@ type V1Beta1Reconciler struct {
 	ReorgWorkerImage       string
 	ReorgWorkerPull        corev1.PullPolicy
 	ReorgHTTPClient        *http.Client
+	SignerSets             signerset.Resolver
 }
 
 // Reconcile advances every eligible stage by one durable transition.
@@ -106,15 +110,33 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 	if campaign.Status.Admission == nil && (!live.Network.Status.InventoryReady || live.Network.Status.ObservedGeneration != live.Network.Generation) {
 		return reconcile.Result{RequeueAfter: 2 * time.Second}, r.transitionBeta(ctx, campaign, "Pending", "NetworkInventoryNotReady", "the current network generation has no complete admitted inventory")
 	}
-	manifest := ManifestFromV1Beta1(live.Network)
+	signerSet, manifest, err := r.resolveBetaCampaignSignerSet(ctx, campaign, live.Network, live.Pods)
+	if err != nil {
+		var transient *signerset.TransientError
+		if errors.As(err, &transient) {
+			if campaign.Status.Admission == nil {
+				return reconcile.Result{RequeueAfter: 2 * time.Second}, r.transitionBeta(ctx, campaign, "Pending", "SignerSetObservationPending", transient.Error())
+			}
+			return reconcile.Result{}, err
+		}
+		reason := "SignerSetAdmissionFailed"
+		if campaign.Status.Admission != nil {
+			reason = "SignerSetChangedAfterAdmission"
+		}
+		return reconcile.Result{}, r.failBeta(ctx, campaign, reason, err)
+	}
 	compiled, err := r.compileBetaCampaign(campaign, manifest)
 	if err != nil {
-		return reconcile.Result{}, r.failBeta(ctx, campaign, "CampaignInvalid", err)
+		reason := "CampaignInvalid"
+		if campaign.Status.Admission != nil {
+			reason = "AdmissionInputChanged"
+		}
+		return reconcile.Result{}, r.failBeta(ctx, campaign, reason, err)
 	}
 	if campaign.Status.Admission == nil {
-		return r.admitBeta(ctx, campaign, live.Network, live.Pods, manifest, compiled)
+		return r.admitBeta(ctx, campaign, live.Network, live.Pods, manifest, compiled, signerSet)
 	}
-	if err := r.verifyBetaAdmission(campaign, live.Network, compiled); err != nil {
+	if err := r.verifyBetaAdmission(campaign, live.Network, compiled, signerSet); err != nil {
 		return reconcile.Result{}, r.failBeta(ctx, campaign, "AdmissionInputChanged", err)
 	}
 	lease, err := r.legacyRuntime().holdMutationLease(ctx, betaLeaseCampaign(campaign), false)
@@ -128,6 +150,80 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 		return reconcile.Result{}, err
 	}
 	return r.advanceBeta(ctx, campaign, live.Network, live.Pods, compiled)
+}
+
+func (r *V1Beta1Reconciler) resolveBetaCampaignSignerSet(
+	ctx context.Context,
+	campaign *attacknetv1beta1.FaultCampaign,
+	network *attacknetv1beta1.StacksNetwork,
+	pods []corev1.Pod,
+) (signerset.Result, Manifest, error) {
+	if betaRecoveryUsesAdmittedSignerSet(campaign) {
+		resolved, err := betaAdmittedSignerSet(campaign.Status.Admission)
+		if err != nil {
+			return signerset.Result{}, Manifest{}, err
+		}
+		return resolved, applyCanonicalWeights(ManifestFromV1Beta1(network), resolved.WeightsByActor), nil
+	}
+	return r.resolveBetaSignerSet(ctx, network, pods)
+}
+
+func betaRecoveryUsesAdmittedSignerSet(campaign *attacknetv1beta1.FaultCampaign) bool {
+	admission := campaign.Status.Admission
+	if admission == nil || admission.SignerSetDigest == "" || admission.SignerSetRewardCycle == nil ||
+		admission.SignerSetTotalWeight == nil || len(admission.SignerWeightsByActor) == 0 {
+		return false
+	}
+	seen := false
+	for _, stage := range campaign.Status.Stages {
+		for _, action := range stage.Actions {
+			seen = true
+			switch action.Phase {
+			case "Recovering", "Completed", "Failed", "Inconclusive":
+			default:
+				return false
+			}
+		}
+	}
+	return seen
+}
+
+func betaAdmittedSignerSet(admission *attacknetv1beta1.CampaignAdmission) (signerset.Result, error) {
+	if admission == nil || admission.SignerSetDigest == "" || admission.SignerSetRewardCycle == nil ||
+		admission.SignerSetTotalWeight == nil || len(admission.SignerWeightsByActor) == 0 {
+		return signerset.Result{}, errors.New("campaign admission lacks canonical signer weights")
+	}
+	weights := make(map[string]float64, len(admission.SignerWeightsByActor))
+	for actor, weight := range admission.SignerWeightsByActor {
+		if actor == "" || weight <= 0 || weight > 9_007_199_254_740_991 {
+			return signerset.Result{}, fmt.Errorf("campaign admission has an invalid canonical weight for actor %q", actor)
+		}
+		weights[actor] = float64(weight)
+	}
+	return signerset.Result{
+		WeightsByActor: weights, HasSigners: true, RewardCycle: *admission.SignerSetRewardCycle,
+		ObservedTotalWeight: float64(*admission.SignerSetTotalWeight),
+		CanonicalThreshold:  float64((*admission.SignerSetTotalWeight*7 + 9) / 10),
+		SignerSetDigest:     admission.SignerSetDigest,
+		ObservedFrom:        admission.SignerSetObservedFrom,
+		WeightsMatch:        true,
+	}, nil
+}
+
+func (r *V1Beta1Reconciler) resolveBetaSignerSet(
+	ctx context.Context,
+	network *attacknetv1beta1.StacksNetwork,
+	pods []corev1.Pod,
+) (signerset.Result, Manifest, error) {
+	legacyNetwork, err := topology.CompileV1Beta1(network)
+	if err != nil {
+		return signerset.Result{}, Manifest{}, err
+	}
+	resolved, err := r.signerResolver().Resolve(ctx, legacyNetwork, pods)
+	if err != nil {
+		return signerset.Result{}, Manifest{}, err
+	}
+	return resolved, applyCanonicalWeights(ManifestFromV1Beta1(network), resolved.WeightsByActor), nil
 }
 
 func (r *V1Beta1Reconciler) compileBetaCampaign(campaign *attacknetv1beta1.FaultCampaign, manifest Manifest) (CompiledCampaign, error) {
@@ -147,15 +243,19 @@ func (r *V1Beta1Reconciler) forgetBetaCompilation(campaign *attacknetv1beta1.Fau
 func ManifestFromV1Beta1(network *attacknetv1beta1.StacksNetwork) Manifest {
 	indexes := map[string]int32{}
 	weights := map[string]float64{}
+	behaviors := map[string]string{}
 	for _, set := range network.Spec.SignerSets {
 		for _, member := range set.Members {
 			indexes[member.Name], indexes[member.NodeName] = member.Index, member.Index
 			weights[member.Name] = float64(member.Weight)
+			if member.Adversarial != nil {
+				behaviors[member.Name] = member.Adversarial.Behavior
+			}
 		}
 	}
 	actors := make([]ManifestActor, 0, len(network.Status.Actors))
 	for _, actor := range network.Status.Actors {
-		item := ManifestActor{Name: actor.Name, Role: actor.Role}
+		item := ManifestActor{Name: actor.Name, Role: actor.Role, AdversarialPolicyDigest: actor.AdversarialPolicyDigest}
 		if value, ok := indexes[actor.Name]; ok {
 			index := value
 			item.SignerIndex = &index
@@ -164,6 +264,7 @@ func ManifestFromV1Beta1(network *attacknetv1beta1.StacksNetwork) Manifest {
 			weight := value
 			item.SignerWeight = &weight
 		}
+		item.AdversarialBehavior = behaviors[actor.Name]
 		actors = append(actors, item)
 	}
 	sort.Slice(actors, func(i, j int) bool { return actors[i].Name < actors[j].Name })
@@ -203,7 +304,7 @@ func betaProbeNetwork(network *attacknetv1beta1.StacksNetwork) *attacknetv1alpha
 	return result
 }
 
-func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod, manifest Manifest, compiled CompiledCampaign) (reconcile.Result, error) {
+func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod, manifest Manifest, compiled CompiledCampaign, signerSet signerset.Result) (reconcile.Result, error) {
 	published, err := inventory.BetaPublished(network)
 	if err != nil {
 		return reconcile.Result{RequeueAfter: 2 * time.Second}, r.transitionBeta(ctx, campaign, "Pending", "NetworkInventoryNotReady", err.Error())
@@ -241,8 +342,14 @@ func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1
 			}
 			shadow := betaShadowCampaign(campaign, stage.ID, action.ID, targets)
 			capabilities := legacy.capabilityEvidence(ctx, shadow, pods, targets)
-			if definition := mustMechanismForType(actionResourceType(action.Resource)); definition.Backend == burnchainReorgBackend {
+			definition := mustMechanismForType(actionResourceType(action.Resource))
+			if definition.Backend == burnchainReorgBackend {
 				capabilities, err = r.burnchainReorgCapabilities(ctx, campaign, network, action, targets)
+				if err != nil {
+					return reconcile.Result{}, r.failBeta(ctx, campaign, "FaultCapabilityUnavailable", err)
+				}
+			} else if definition.Backend == signerBehaviorBackend {
+				capabilities, err = r.signerBehaviorCapabilities(ctx, network, betaActionSpec(campaign, stage.ID, action.ID), targets)
 				if err != nil {
 					return reconcile.Result{}, r.failBeta(ctx, campaign, "FaultCapabilityUnavailable", err)
 				}
@@ -255,8 +362,29 @@ func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1
 					return reconcile.Result{}, r.failBeta(ctx, campaign, "FaultCapabilityUnavailable", fmt.Errorf("stage %s action %s actor %s: %s", stage.ID, action.ID, capability.Actor, capability.Reason))
 				}
 			}
-			definition := mustMechanismForType(actionResourceType(action.Resource))
-			if definition.EffectKind != "pod" && definition.Backend != burnchainReorgBackend {
+			if definition.Backend == signerBehaviorBackend {
+				spec := betaActionSpec(campaign, stage.ID, action.ID)
+				for _, target := range targets {
+					sample, sampleErr := r.captureSignerBehavior(ctx, campaign, network, spec, target, "")
+					if sampleErr != nil {
+						return reconcile.Result{}, r.failBeta(ctx, campaign, "ProbeBaselineUnavailable", fmt.Errorf("stage %s action %s actor %s: %w", stage.ID, action.ID, target.Actor, sampleErr))
+					}
+					policy, _, policyErr := adversarial.ResolveSigner(network, target.Actor)
+					if policyErr != nil {
+						return reconcile.Result{}, r.failBeta(ctx, campaign, "FaultCapabilityUnavailable", policyErr)
+					}
+					if sample.SessionActive {
+						return reconcile.Result{}, r.failBeta(ctx, campaign, "BehaviorSessionAlreadyActive", fmt.Errorf("stage %s action %s actor %s already reports an active behavior session", stage.ID, action.ID, target.Actor))
+					}
+					if sample.Matches >= int64(policy.MaxMatches) {
+						return reconcile.Result{}, r.failBeta(ctx, campaign, "PolicyMatchBudgetExhausted", fmt.Errorf("stage %s action %s actor %s already consumed all %d configured matches", stage.ID, action.ID, target.Actor, policy.MaxMatches))
+					}
+					if sample.Evaluations >= int64(policy.MaxEvaluations) {
+						return reconcile.Result{}, r.failBeta(ctx, campaign, "PolicyEvaluationBudgetExhausted", fmt.Errorf("stage %s action %s actor %s already consumed all %d configured evaluations", stage.ID, action.ID, target.Actor, policy.MaxEvaluations))
+					}
+					probeArtifacts[signerBehaviorArtifactKey(stage.ID, action.ID, "before", target.Actor)] = sample.Raw
+				}
+			} else if definition.EffectKind != "pod" && definition.Backend != burnchainReorgBackend {
 				before, probeErr := legacy.captureProbePhase(ctx, shadow, legacyNetwork, pods, targets, Compiled{Resource: action.Resource, Evidence: action.Evidence}, "before", false)
 				if probeErr != nil {
 					return reconcile.Result{}, r.failBeta(ctx, campaign, "ProbeBaselineUnavailable", probeErr)
@@ -292,13 +420,26 @@ func (r *V1Beta1Reconciler) admitBeta(ctx context.Context, campaign *attacknetv1
 		NetworkInventory: published, CampaignGeneration: campaign.Generation,
 		CampaignSpecDigest: specDigest, CompiledPlanDigest: planDigest,
 		AdmittedAt: now, AggregateImpact: &impact,
+		SignerSetDigest: signerSet.SignerSetDigest, SignerSetObservedFrom: signerSet.ObservedFrom,
+	}
+	if signerSet.HasSigners {
+		weights := make(map[string]int64, len(signerSet.WeightsByActor))
+		for actor, weight := range signerSet.WeightsByActor {
+			if weight <= 0 || weight > 9_007_199_254_740_991 || float64(int64(weight)) != weight {
+				return reconcile.Result{}, fmt.Errorf("canonical signer weight for actor %q is not a positive safe integer", actor)
+			}
+			weights[actor] = int64(weight)
+		}
+		next.Admission.SignerSetRewardCycle = ptr(signerSet.RewardCycle)
+		next.Admission.SignerSetTotalWeight = ptr(int64(signerSet.ObservedTotalWeight))
+		next.Admission.SignerWeightsByActor = weights
 	}
 	next.Stages = stages
 	next.ProbeArtifacts = probeArtifacts
 	return reconcile.Result{Requeue: true}, r.patchBetaStatus(ctx, campaign, betaStatusTransition(next, campaign.Generation, "Admitted", "SafetyPolicySatisfied", "", r.now()))
 }
 
-func (r *V1Beta1Reconciler) verifyBetaAdmission(campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, compiled CompiledCampaign) error {
+func (r *V1Beta1Reconciler) verifyBetaAdmission(campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, compiled CompiledCampaign, signerSet signerset.Result) error {
 	specDigest, err := canonical.ArtifactDigest(campaign.Spec)
 	if err != nil {
 		return err
@@ -308,10 +449,32 @@ func (r *V1Beta1Reconciler) verifyBetaAdmission(campaign *attacknetv1beta1.Fault
 		return err
 	}
 	admission := campaign.Status.Admission
-	if admission.NetworkUID != string(network.UID) || admission.NetworkGeneration != network.Generation ||
-		admission.CampaignGeneration != campaign.Generation || admission.CampaignSpecDigest != specDigest ||
-		admission.CompiledPlanDigest != planDigest {
-		return errors.New("campaign specification, compiled plan, or admitted network changed")
+	if admission == nil {
+		return errors.New("campaign admission receipt is missing")
+	}
+	if admission.NetworkUID != string(network.UID) {
+		return fmt.Errorf("admitted network UID changed from %q to %q", admission.NetworkUID, network.UID)
+	}
+	if admission.NetworkGeneration != network.Generation {
+		return fmt.Errorf("admitted network generation changed from %d to %d", admission.NetworkGeneration, network.Generation)
+	}
+	if admission.CampaignGeneration != campaign.Generation {
+		return fmt.Errorf("admitted campaign generation changed from %d to %d", admission.CampaignGeneration, campaign.Generation)
+	}
+	if admission.CampaignSpecDigest != specDigest {
+		return fmt.Errorf("admitted campaign specification digest changed from %s to %s", admission.CampaignSpecDigest, specDigest)
+	}
+	if admission.SignerSetDigest == "" {
+		return errors.New("admission receipt lacks a canonical signer-set digest")
+	}
+	// Check the signer set before the compiled plan because canonical weights
+	// are an input to that plan. Reporting the originating drift keeps an
+	// expected reward-cycle transition distinguishable from plan corruption.
+	if admission.SignerSetDigest != signerSet.SignerSetDigest {
+		return fmt.Errorf("canonical signer-set digest changed after admission from %s to %s (observed reward cycle %d from %s)", admission.SignerSetDigest, signerSet.SignerSetDigest, signerSet.RewardCycle, signerSet.ObservedFrom)
+	}
+	if admission.CompiledPlanDigest != planDigest {
+		return fmt.Errorf("admitted compiled-plan digest changed from %s to %s", admission.CompiledPlanDigest, planDigest)
 	}
 	return nil
 }
@@ -329,6 +492,7 @@ func compiledCampaignDigest(compiled CompiledCampaign) (string, error) {
 func (r *V1Beta1Reconciler) advanceBeta(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod, compiled CompiledCampaign) (reconcile.Result, error) {
 	next := *campaign.Status.DeepCopy()
 	requeueAfter := 2 * time.Second
+	observationMessage := ""
 	for stageIndex := range next.Stages {
 		stage := &next.Stages[stageIndex]
 		compiledStage := compiled.Stages[stageIndex]
@@ -340,6 +504,9 @@ func (r *V1Beta1Reconciler) advanceBeta(ctx context.Context, campaign *attacknet
 				// errors therefore describe an unavailable or malformed observation
 				// source and must not be converted into a safety verdict.
 				stage.Reason = "TriggerObservationUnavailable"
+				if observationMessage == "" {
+					observationMessage = truncate(fmt.Sprintf("stage %s: %v", stage.ID, err), 1000)
+				}
 				continue
 			}
 			if decision.Expired {
@@ -349,6 +516,7 @@ func (r *V1Beta1Reconciler) advanceBeta(ctx context.Context, campaign *attacknet
 				continue
 			}
 			if !decision.Eligible {
+				stage.Reason = decision.Reason
 				if decision.RequeueAt != nil {
 					wait := time.Until(*decision.RequeueAt)
 					if wait > 0 && wait < requeueAfter {
@@ -406,7 +574,7 @@ func (r *V1Beta1Reconciler) advanceBeta(ctx context.Context, campaign *attacknet
 			Absent: true, AllRecovered: true, Method: "TerminalCleanup", ObservedAt: completed,
 		}
 	}
-	if err := r.patchBetaStatus(ctx, campaign, betaStatusTransition(next, campaign.Generation, phase, reason, "", r.now())); err != nil {
+	if err := r.patchBetaStatus(ctx, campaign, betaStatusTransition(next, campaign.Generation, phase, reason, observationMessage, r.now())); err != nil {
 		return reconcile.Result{}, err
 	}
 	if betaTerminalPhases[phase] {
@@ -434,15 +602,20 @@ func (r *V1Beta1Reconciler) evaluateBetaStage(ctx context.Context, campaign *att
 	if err != nil {
 		return trigger.Decision{}, err
 	}
-	snapshot := trigger.Snapshot{StartedAt: campaign.Status.Admission.AdmittedAt.Time, Now: r.now()}
+	snapshot := trigger.Snapshot{StartedAt: campaign.Status.Admission.AdmittedAt.Time}
 	needsObservationSource := stageCopy.Trigger.BurnHeight != nil || stageCopy.Trigger.StacksHeight != nil || stageCopy.Trigger.Observation != nil
 	if r.Observations != nil && needsObservationSource {
 		observed, readErr := r.Observations.ReadTriggerSnapshot(ctx, campaign, network)
 		if readErr != nil {
 			return trigger.Decision{}, readErr
 		}
-		observed.StartedAt, observed.Now = snapshot.StartedAt, snapshot.Now
+		// Collection timestamps are necessarily later than the instant at which
+		// collection starts. Sample Now only after the reader returns so fresh
+		// observations cannot be rejected as originating in the future.
+		observed.StartedAt, observed.Now = snapshot.StartedAt, r.now()
 		snapshot = observed
+	} else {
+		snapshot.Now = r.now()
 	}
 	snapshot.Dependencies = betaDependencyObservations(campaign)
 	return trigger.Evaluate(spec, snapshot)
@@ -565,6 +738,8 @@ func (r *V1Beta1Reconciler) createBetaMutation(ctx context.Context, campaign *at
 		desired = pod
 	case burnchainReorgBackend:
 		return r.createBurnchainReorgMutation(ctx, campaign, network, action, status)
+	case signerBehaviorBackend:
+		return r.activateSignerBehaviorSession(ctx, campaign, action, status)
 	case clockPolicyBackend:
 		policy := &corev1.ConfigMap{}
 		name := campaign.Spec.NetworkRef + "-clock-policy"
@@ -665,6 +840,14 @@ func (r *V1Beta1Reconciler) advanceBetaStage(ctx context.Context, campaign *atta
 			if actionStatus.Mutation == nil || actionStatus.Mutation.InjectedAt == nil || r.now().Sub(actionStatus.Mutation.InjectedAt.Time) < actionSpec.Fault.Duration.Duration {
 				continue
 			}
+			// A signer session mutates an existing watched Pod. Persist the
+			// recovery phase before removing its annotation so a Pod event cannot
+			// race campaign-cache propagation and fabricate contract drift.
+			if actionStatus.Mutation.Kind == "SignerBehaviorSession" {
+				actionStatus.Phase, actionStatus.Reason = "Recovering", "DurationElapsed"
+				allActive = false
+				continue
+			}
 			if err := r.removeBetaMutation(ctx, campaign, actionSpec, actionStatus); err != nil {
 				if errors.Is(err, errBurnchainReorgWorkerRemovalPending) {
 					allActive, allComplete = false, false
@@ -679,6 +862,13 @@ func (r *V1Beta1Reconciler) advanceBetaStage(ctx context.Context, campaign *atta
 			recovered, err := r.betaMutationRecovered(ctx, campaign, actionSpec, actionStatus)
 			if err != nil {
 				return err
+			}
+			if !recovered && actionStatus.Mutation != nil && actionStatus.Mutation.Kind == "SignerBehaviorSession" {
+				if err := r.removeBetaMutation(ctx, campaign, actionSpec, actionStatus); err != nil {
+					return err
+				}
+				allComplete = false
+				continue
 			}
 			if recovered {
 				proven, evidenceErr := r.captureBetaRecovery(ctx, campaign, network, pods, status.ID, actionSpec, &compiled.Actions[index], actionStatus, campaignStatus)
@@ -759,6 +949,9 @@ func (r *V1Beta1Reconciler) betaMutationInjected(ctx context.Context, campaign *
 		}
 		return true, nil
 	case *corev1.Pod:
+		if status.Mutation.Kind == "SignerBehaviorSession" {
+			return signerBehaviorSessionMatches(typed.Annotations[adversarial.SessionAnnotation], campaign, spec, status)
+		}
 		if status.Mutation.Kind == "BurnchainReorgWorker" {
 			return r.burnchainReorgInjected(ctx, campaign, spec, status, typed)
 		}
@@ -778,7 +971,7 @@ func (r *V1Beta1Reconciler) getBetaMutation(ctx context.Context, campaign *attac
 	switch status.Mutation.Kind {
 	case "ConfigMap", "ClockSkewPolicy":
 		object = &corev1.ConfigMap{}
-	case "Pod", "IOPressurePod", "BurnchainReorgWorker":
+	case "Pod", "IOPressurePod", "BurnchainReorgWorker", "SignerBehaviorSession":
 		object = &corev1.Pod{}
 	default:
 		value := &unstructured.Unstructured{}
@@ -795,7 +988,7 @@ func (r *V1Beta1Reconciler) getBetaMutation(ctx context.Context, campaign *attac
 	if string(object.GetUID()) != status.Mutation.UID {
 		return nil, errors.New("admitted mutation UID changed")
 	}
-	if !(status.Mutation.Kind == "ClockSkewPolicy" && status.Phase == "Recovering") {
+	if betaMutationContractRequired(status.Mutation.Kind, status.Phase) {
 		contract, contractErr := betaMutationContract(status.Mutation.Kind, object, status)
 		if contractErr != nil {
 			return nil, contractErr
@@ -812,9 +1005,32 @@ func (r *V1Beta1Reconciler) getBetaMutation(ctx context.Context, campaign *attac
 	return object, nil
 }
 
+func betaMutationContractRequired(kind, phase string) bool {
+	switch kind {
+	case "ClockSkewPolicy", "SignerBehaviorSession":
+		// These mechanisms mutate a shared object and deliberately restore its
+		// contract during recovery. Once recovery begins, cleanup must remain
+		// idempotent even if evidence subsequently times out.
+		return phase == "Injecting" || phase == "Active"
+	default:
+		return true
+	}
+}
+
 func betaMutationContract(kind string, object client.Object, status *attacknetv1beta1.FaultActionStatus) (any, error) {
 	if kind == "BurnchainReorgWorker" {
 		return burnchainReorgPodContract(object)
+	}
+	if kind == "SignerBehaviorSession" {
+		pod, ok := object.(*corev1.Pod)
+		if !ok {
+			return nil, fmt.Errorf("SignerBehaviorSession mutation is %T, want Pod", object)
+		}
+		return map[string]any{
+			"uid": pod.UID, "name": pod.Name, "namespace": pod.Namespace,
+			"network": pod.Labels[NetworkLabel], "actor": pod.Labels[ActorLabel],
+			"session": pod.Annotations[adversarial.SessionAnnotation],
+		}, nil
 	}
 	if kind != "ClockSkewPolicy" {
 		return mutationContract(kind, object)
@@ -844,7 +1060,12 @@ func (r *V1Beta1Reconciler) removeBetaMutation(ctx context.Context, campaign *at
 	if status.Mutation.Kind == "BurnchainReorgWorker" {
 		return r.removeBurnchainReorgWorker(ctx, campaign, status, object.(*corev1.Pod))
 	}
-	if policy, ok := object.(*corev1.ConfigMap); ok {
+	if pod, ok := object.(*corev1.Pod); ok && status.Mutation.Kind == "SignerBehaviorSession" {
+		base := pod.DeepCopy()
+		delete(pod.Annotations, adversarial.SessionAnnotation)
+		return r.Patch(ctx, pod, client.MergeFrom(base))
+	}
+	if policy, ok := object.(*corev1.ConfigMap); ok && status.Mutation.Kind == "ClockSkewPolicy" {
 		base := policy.DeepCopy()
 		for _, target := range status.ResolvedTargets {
 			policy.Data[target.Actor] = clockPolicyZero
@@ -868,7 +1089,10 @@ func (r *V1Beta1Reconciler) betaMutationRecovered(ctx context.Context, campaign 
 		}
 		return true, nil
 	}
-	if policy, ok := object.(*corev1.ConfigMap); ok {
+	if pod, ok := object.(*corev1.Pod); ok && status.Mutation != nil && status.Mutation.Kind == "SignerBehaviorSession" {
+		return pod.Annotations[adversarial.SessionAnnotation] == "", nil
+	}
+	if policy, ok := object.(*corev1.ConfigMap); ok && status.Mutation.Kind == "ClockSkewPolicy" {
 		for _, target := range status.ResolvedTargets {
 			if policy.Data[target.Actor] != clockPolicyZero {
 				return false, nil
@@ -879,10 +1103,91 @@ func (r *V1Beta1Reconciler) betaMutationRecovered(ctx context.Context, campaign 
 	return mutationRecovered(object), nil
 }
 
+func signerBehaviorSession(campaign *attacknetv1beta1.FaultCampaign, action CompiledAction, status *attacknetv1beta1.FaultActionStatus) (string, error) {
+	spec, found, err := unstructured.NestedMap(action.Resource.Object, "spec")
+	if err != nil || !found {
+		return "", errors.New("compiled signer-behavior session has no spec")
+	}
+	actionName, _ := spec["action"].(string)
+	policyDigest, _ := spec["policyDigest"].(string)
+	actorsRaw, _ := spec["actors"].([]any)
+	actors := make([]string, 0, len(actorsRaw))
+	for _, raw := range actorsRaw {
+		actor, ok := raw.(string)
+		if !ok || actor == "" {
+			return "", errors.New("compiled signer-behavior session contains an invalid actor")
+		}
+		actors = append(actors, actor)
+	}
+	if len(actors) != 1 || len(status.ResolvedTargets) != 1 || actors[0] != status.ResolvedTargets[0].Actor {
+		return "", errors.New("compiled signer-behavior session must bind exactly one resolved signer")
+	}
+	payload, err := canonical.Marshal(signerBehaviorSessionDocument{
+		Action: actionName, Actor: actors[0], CampaignUID: string(campaign.UID),
+		PolicyDigest: policyDigest, SchemaVersion: adversarial.SessionSchemaV1,
+	})
+	return string(payload), err
+}
+
+func signerBehaviorSessionMatches(raw string, campaign *attacknetv1beta1.FaultCampaign, spec *attacknetv1beta1.FaultActionSpec, status *attacknetv1beta1.FaultActionStatus) (bool, error) {
+	if len(status.ResolvedTargets) != 1 || spec == nil || spec.Fault.SignerBehavior == nil {
+		return false, errors.New("signer-behavior session lacks one resolved target and typed policy")
+	}
+	var session signerBehaviorSessionDocument
+	if err := json.Unmarshal([]byte(raw), &session); err != nil {
+		return false, nil
+	}
+	target := status.ResolvedTargets[0]
+	return session.SchemaVersion == adversarial.SessionSchemaV1 && session.Action == spec.Fault.Action &&
+		session.Actor == target.Actor && session.CampaignUID == string(campaign.UID) &&
+		session.PolicyDigest == spec.Fault.SignerBehavior.PolicyDigest, nil
+}
+
+func (r *V1Beta1Reconciler) activateSignerBehaviorSession(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, action CompiledAction, status *attacknetv1beta1.FaultActionStatus) (*corev1.Pod, error) {
+	if len(status.ResolvedTargets) != 1 {
+		return nil, errors.New("signer-behavior activation requires exactly one resolved signer")
+	}
+	target := status.ResolvedTargets[0]
+	pod := &corev1.Pod{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: campaign.Namespace, Name: target.Pod}, pod); err != nil {
+		return nil, err
+	}
+	if string(pod.UID) != target.PodUID || pod.Labels[NetworkLabel] != campaign.Spec.NetworkRef ||
+		pod.Labels[ActorLabel] != target.Actor || !podIsReady(*pod) {
+		return nil, errors.New("signer-behavior target Pod identity is not singular and Ready")
+	}
+	if pod.Annotations[adversarial.SessionAnnotation] != "" {
+		return nil, errors.New("signer-behavior target Pod already carries an active session")
+	}
+	payload, err := signerBehaviorSession(campaign, action, status)
+	if err != nil {
+		return nil, err
+	}
+	base := pod.DeepCopy()
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[adversarial.SessionAnnotation] = payload
+	if err := r.Patch(ctx, pod, client.MergeFrom(base)); err != nil {
+		return nil, err
+	}
+	observed := &corev1.Pod{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(pod), observed); err != nil {
+		return nil, err
+	}
+	if string(observed.UID) != target.PodUID || observed.Annotations[adversarial.SessionAnnotation] != payload {
+		return nil, errors.New("signer-behavior session annotation was not admitted on the target Pod")
+	}
+	return observed, nil
+}
+
 func (r *V1Beta1Reconciler) captureBetaDuring(ctx context.Context, campaign *attacknetv1beta1.FaultCampaign, network *attacknetv1beta1.StacksNetwork, pods []corev1.Pod, stageID string, spec *attacknetv1beta1.FaultActionSpec, compiled *CompiledAction, status *attacknetv1beta1.FaultActionStatus, campaignStatus *attacknetv1beta1.FaultCampaignStatus) (bool, error) {
 	definition := mustMechanismForType(spec.Fault.Type)
 	if definition.Backend == burnchainReorgBackend {
 		return r.captureBurnchainReorgDuring(ctx, campaign, spec, status)
+	}
+	if definition.Backend == signerBehaviorBackend {
+		return r.captureSignerBehaviorDuring(ctx, campaign, network, stageID, spec, status, campaignStatus)
 	}
 	shadow := betaShadowCampaign(campaign, stageID, status.ID, legacyTargets(status.ResolvedTargets))
 	object, err := r.getBetaMutation(ctx, campaign, spec, status)
@@ -931,6 +1236,9 @@ func (r *V1Beta1Reconciler) captureBetaRecovery(ctx context.Context, campaign *a
 	definition := mustMechanismForType(spec.Fault.Type)
 	if definition.Backend == burnchainReorgBackend {
 		return r.captureBurnchainReorgRecovery(ctx, campaign, status)
+	}
+	if definition.Backend == signerBehaviorBackend {
+		return r.captureSignerBehaviorRecovery(ctx, campaign, network, stageID, spec, status, campaignStatus)
 	}
 	manifest := ManifestFromV1Beta1(network)
 	targets, err := ResolveTargets(manifest, compiled.Evidence.SelectedActors, pods)
@@ -1247,6 +1555,13 @@ func (r *V1Beta1Reconciler) legacyRuntime() *Reconciler {
 		IOPressureImage: r.IOPressureImage, IOPressurePull: r.IOPressurePull,
 		IOChaosArchitectures: r.IOChaosArchitectures, TimeChaosArchitectures: r.TimeChaosArchitectures,
 	}
+}
+
+func (r *V1Beta1Reconciler) signerResolver() signerset.Resolver {
+	if r.SignerSets != nil {
+		return r.SignerSets
+	}
+	return &signerset.HTTPResolver{}
 }
 
 func (r *V1Beta1Reconciler) now() time.Time {

@@ -426,6 +426,31 @@
       ],
       "title": "Instrumentation capability and version declaration",
       "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Admitted testing-only policy and isolated observer state from the topology operator. Empty is expected for ordinary actors.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 111},
+      "id": 28,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["count"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_adversarial_policy_info{network=\"$network\",actor=\"$actor\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Adversarial policy identity (trusted)",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Testing-only policy evaluation and match counters from the selected signer. Actor-controlled telemetry can support diagnosis but cannot establish protocol impact.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "fillOpacity": 25, "lineWidth": 1, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 111},
+      "id": 29,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "rate(stacks_signer_attacknet_policy_matches_total{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}[5m])", "legendFormat": "match rate · {{behavior}}", "refId": "A"},
+        {"expr": "stacks_signer_attacknet_policy_evaluations{attacknet_network=\"$network\",attacknet_actor=\"$actor\"}", "legendFormat": "evaluations · {{behavior}}", "refId": "B"}
+      ],
+      "title": "Deterministic policy state (self-reported)",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

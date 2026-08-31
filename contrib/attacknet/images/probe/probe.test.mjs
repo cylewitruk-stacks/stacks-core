@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
+import {createPublicKey, verify as verifyBytes} from 'node:crypto';
 import {mkdtempSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
 
 import {
-  RESPONSE_SCHEMA, clockObservation, createContext, createServer, dispatchProbe,
+  ATTESTATION_SCHEMA, RESPONSE_SCHEMA, clockObservation, createContext, createServer, dispatchProbe,
   dnsObservation, ioObservation, parsePeerMap, processClockObservation, systemObservation,
+  signerBehaviorObservation,
 } from './probe.mjs';
 
 function context(overrides = {}) {
@@ -161,12 +163,47 @@ test('system observation exposes the probe runtime architecture without acceptin
     /unsupported system field/);
 });
 
+test('signer-behavior observation reads only the bounded testing counter', async () => {
+  const httpGet = (_destination, callback) => {
+    const outgoing = new EventEmitter();
+    outgoing.destroy = error => outgoing.emit('error', error);
+    queueMicrotask(() => {
+      const response = new EventEmitter();
+      response.statusCode = 200;
+      callback(response);
+      response.emit('data', Buffer.from('stacks_signer_attacknet_policy_matches_total{behavior="withhold"} 3\nstacks_signer_attacknet_policy_evaluations{behavior="withhold"} 7\nstacks_signer_attacknet_policy_session_active{behavior="withhold"} 1\n'));
+      response.emit('end');
+    });
+    return outgoing;
+  };
+  const result = await signerBehaviorObservation({
+    peer: 'signer-node-1', port: 'metrics', behavior: 'withhold',
+  }, context({httpGet}));
+  assert.equal(result.policyMatches, 3);
+  assert.equal(result.policyEvaluations, 7);
+  assert.equal(result.sessionActive, true);
+  assert.equal(result.contentTrust, 'actor-self-reported');
+  assert.equal(Number.isInteger(result.sampleWindowMs), true);
+  await assert.rejects(() => signerBehaviorObservation({
+    peer: 'signer-node-1', port: 'metrics', behavior: 'arbitrary',
+  }, context({httpGet})), /not supported/);
+});
+
 test('response contract wraps evaluator-compatible observations', async () => {
-  const result = await dispatchProbe({kind: 'clock'}, context({now: () => 1234000, monotonic: () => 5000000000n}));
+  const result = await dispatchProbe({kind: 'clock', nonce: 'qualified-nonce-001'}, context({now: () => 1234000, monotonic: () => 5000000000n}));
   assert.equal(result.schemaVersion, RESPONSE_SCHEMA);
   assert.equal(result.actor, 'signer-node-1');
   assert.equal(result.kind, 'clock');
   assert.equal(result.observation.probe, 'clock');
+  assert.equal(result.nonce, 'qualified-nonce-001');
+  assert.equal(result.attestation.schemaVersion, ATTESTATION_SCHEMA);
+  const signedPayload = Buffer.from(result.attestation.signedPayload, 'base64');
+  const {attestation: _attestation, ...unsigned} = result;
+  assert.deepEqual(JSON.parse(signedPayload), unsigned, 'signed payload differs from response');
+  assert.equal(verifyBytes(null, signedPayload, createPublicKey({
+    key: Buffer.from(result.attestation.publicKey, 'base64'), type: 'spki', format: 'der',
+  }), Buffer.from(result.attestation.signature, 'base64')), true);
+  await assert.rejects(() => dispatchProbe({kind: 'clock', nonce: 'short'}, context()), /nonce/);
   await assert.rejects(() => dispatchProbe({kind: 'clock', command: 'date'}, context()), /unsupported clock field/);
 });
 
@@ -177,6 +214,9 @@ test('HTTP API exposes only health and the bounded probe dispatcher', async () =
   try {
     const health = await fetch(`http://127.0.0.1:${address.port}/healthz`);
     assert.equal(health.status, 200);
+    const identity = await (await fetch(`http://127.0.0.1:${address.port}/v1/identity`)).json();
+    assert.equal(identity.schemaVersion, ATTESTATION_SCHEMA);
+    assert.match(identity.keyId, /^sha256:[0-9a-f]{64}$/);
     const payload = await fetch(`http://127.0.0.1:${address.port}/v1/payload?bytes=4096`);
     assert.equal(payload.status, 200);
     assert.equal((await payload.arrayBuffer()).byteLength, 4096);

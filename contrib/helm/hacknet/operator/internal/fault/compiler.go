@@ -25,9 +25,11 @@ const (
 
 // ManifestActor is one declared network actor used for selection and safety accounting.
 type ManifestActor struct {
-	Name, Role   string
-	SignerIndex  *int32
-	SignerWeight *float64
+	Name, Role              string
+	SignerIndex             *int32
+	SignerWeight            *float64
+	AdversarialPolicyDigest string
+	AdversarialBehavior     string
 }
 
 // Manifest is the canonical campaign compilation view of a StacksNetwork.
@@ -72,7 +74,7 @@ type Compiled struct {
 func ManifestFromNetwork(network *attacknetv1alpha1.StacksNetwork) Manifest {
 	actors := make([]ManifestActor, len(network.Spec.Actors))
 	for index, actor := range network.Spec.Actors {
-		actors[index] = ManifestActor{Name: actor.Name, Role: actor.Role, SignerIndex: actor.SignerIndex, SignerWeight: actor.SignerWeight}
+		actors[index] = ManifestActor{Name: actor.Name, Role: actor.Role, SignerIndex: actor.SignerIndex, SignerWeight: actor.SignerWeight, AdversarialPolicyDigest: actor.AdversarialPolicyDigest}
 	}
 	return Manifest{Network: network.Name, Namespace: network.Namespace, Actors: actors}
 }
@@ -251,12 +253,7 @@ func normalizeMode(spec attacknetv1alpha1.FaultSpec, candidates int) (int, strin
 }
 
 func weightedImpact(selected, all []ManifestActor, maximum int) SignerImpact {
-	weights, affected := map[int32]float64{}, map[int32]float64{}
-	for _, actor := range all {
-		if actor.SignerIndex != nil && actor.SignerWeight != nil {
-			weights[*actor.SignerIndex] = *actor.SignerWeight
-		}
-	}
+	weights, affected := signerWeights(all), map[int32]float64{}
 	for _, actor := range selected {
 		if actor.SignerIndex != nil && actor.SignerWeight != nil {
 			affected[*actor.SignerIndex] = *actor.SignerWeight
@@ -283,6 +280,18 @@ func weightedImpact(selected, all []ManifestActor, maximum int) SignerImpact {
 		percent = changed * 100 / total
 	}
 	return SignerImpact{TotalWeight: total, AffectedWeight: changed, Percent: percent}
+}
+
+// signerWeights collapses the signer and its bound Stacks node into the one
+// consensus-weight unit represented by their shared signer index.
+func signerWeights(actors []ManifestActor) map[int32]float64 {
+	weights := map[int32]float64{}
+	for _, actor := range actors {
+		if actor.SignerIndex != nil && actor.SignerWeight != nil {
+			weights[*actor.SignerIndex] = *actor.SignerWeight
+		}
+	}
+	return weights
 }
 
 func countedImpact(selected, all []ManifestActor, maximum int, role string) MinerImpact {

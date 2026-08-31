@@ -40,6 +40,7 @@ var commandContracts = []CommandContract{
 	{Name: "watch", Purpose: "Stream resource observations without making decisions", SideEffectClass: "runtime-read", OutputKinds: []string{"jsonl"}},
 	{Name: "wait", Purpose: "Wait for a fresh controller-owned phase or condition", SideEffectClass: "runtime-read", OutputKinds: []string{"yaml", "json"}},
 	{Name: "evidence snapshot", Purpose: "Capture one digest-bound resource/status snapshot", SideEffectClass: "local-filesystem-write", OutputKinds: []string{"json"}},
+	{Name: "evidence verify-signer-report", Purpose: "Verify one signed adversarial-signer observer report", SideEffectClass: "local-read", InputKinds: []string{"SignedSignerReport"}, OutputKinds: []string{"json"}},
 	{Name: "doctor", Purpose: "Check Kubernetes and Attacknet v1beta1 API availability", SideEffectClass: "runtime-read", OutputKinds: []string{"text", "json"}},
 	{Name: "dashboard start", Purpose: "Start a loopback-only Grafana or Chaos Mesh port-forward", SideEffectClass: "local-process-mutation", OutputKinds: []string{"json"}},
 	{Name: "dashboard stop", Purpose: "Stop one owned dashboard port-forward", SideEffectClass: "local-process-mutation", OutputKinds: []string{"json"}},
@@ -415,13 +416,16 @@ func (app *App) runWait(ctx context.Context, args []string) error {
 
 func (app *App) runEvidence(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return usageError("usage: attacknet evidence snapshot|incident [OPTIONS]")
+		return usageError("usage: attacknet evidence snapshot|incident|verify-signer-report [OPTIONS]")
 	}
 	if args[0] == "incident" {
 		return app.runIncidentEvidence(ctx, args[1:])
 	}
+	if args[0] == "verify-signer-report" {
+		return app.runVerifySignerReport(args[1:])
+	}
 	if args[0] != "snapshot" {
-		return usageError("usage: attacknet evidence snapshot|incident [OPTIONS]")
+		return usageError("usage: attacknet evidence snapshot|incident|verify-signer-report [OPTIONS]")
 	}
 	flags := newFlagSet("evidence snapshot", app.Stderr)
 	namespace := flags.String("namespace", app.DefaultNamespace, "resource namespace")

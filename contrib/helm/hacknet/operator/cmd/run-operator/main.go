@@ -19,6 +19,7 @@ import (
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/orchestratormetrics"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolobservation"
 	runcontroller "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/run"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/signerset"
 )
 
 func main() {
@@ -45,6 +46,7 @@ func main() {
 	compilationCache, err := fault.NewCompilationCache(128)
 	must(err)
 	protocolReader := &protocolobservation.Reader{APIReader: mgr.GetAPIReader()}
+	signerSets := &signerset.HTTPResolver{}
 	faults := &fault.V1Beta1Reconciler{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
@@ -59,12 +61,14 @@ func main() {
 		CompilationCache:       compilationCache,
 		ReorgWorkerImage:       *reorgWorkerImage,
 		ReorgWorkerPull:        corev1.PullPolicy(*reorgWorkerPull),
+		SignerSets:             signerSets,
 	}
 	runs := &runcontroller.V1Beta1Reconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
 		Observations: &runcontroller.KubernetesObservationReader{
 			Reader: mgr.GetAPIReader(), Protocol: protocolReader,
 		},
+		SignerSets: signerSets,
 	}
 	controllermetrics.Registry.MustRegister(orchestratormetrics.NewCollector(mgr.GetClient()))
 	must(faults.SetupWithManager(mgr, options.Concurrency))

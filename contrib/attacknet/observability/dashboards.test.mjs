@@ -215,6 +215,21 @@ test('overview exposes trusted typed fault-action lifecycle state', () => {
   assert.match(targets, /\{\{reason\}\}/);
 });
 
+test('dashboards separate admitted adversarial policy from actor-reported attempts', () => {
+  for (const dashboard of [readDashboard('attacknet-overview.json'), readDashboard('attacknet-actor.json')]) {
+    const admitted = dashboard.panels.find(panel => panel.title.includes('Adversarial') || panel.title.includes('adversarial'));
+    const attempts = dashboard.panels.find(panel => panel.title === 'Deterministic policy state (self-reported)');
+    assert.ok(admitted, `${dashboard.uid} lacks admitted adversarial identity`);
+    assert.ok(attempts, `${dashboard.uid} lacks deterministic policy attempts`);
+    assert.match(JSON.stringify(admitted.targets), /attacknet_adversarial_policy_info/);
+    assert.match(admitted.description, /(?:operator|orchestration state)/i);
+    assert.match(JSON.stringify(attempts.targets), /stacks_signer_attacknet_policy_matches_total/);
+    assert.match(JSON.stringify(attempts.targets), /stacks_signer_attacknet_policy_evaluations/);
+    assert.match(attempts.description, /self-reported|actor-controlled/i);
+    assert.match(attempts.description, /cannot|not .* impact/i);
+  }
+});
+
 test('histogram units and counter queries preserve exported metric semantics', () => {
   const counterFamilies = loadInventory().families
     .filter(family => family.type === 'counter')

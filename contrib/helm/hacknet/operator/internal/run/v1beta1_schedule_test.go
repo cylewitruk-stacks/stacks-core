@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/document"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/topology"
@@ -120,6 +121,59 @@ func TestBetaScheduleBindsPortableTemplateToAdmittedNetwork(t *testing.T) {
 	}
 }
 
+func TestBetaScheduleRoundTripPreservesSignerBehaviorContract(t *testing.T) {
+	run, network, admitted, _, _ := betaScheduleFixture()
+	policy := &attacknetv1beta1.AdversarialSignerPolicy{
+		Profile: adversarial.ProfileV1, Behavior: "withhold", MaxMatches: 1, MaxEvaluations: 8,
+		PatchDigest: "sha256:" + repeat("c", 64),
+		Observer:    attacknetv1beta1.AdversarialObserverSpec{Image: "probe:test"},
+		Egress:      attacknetv1beta1.AdversarialEgressSpec{Profile: "restricted"},
+	}
+	network.Spec.SignerSets = []attacknetv1beta1.SignerSetSpec{{Name: "active", Members: []attacknetv1beta1.SignerMemberSpec{{Name: "signer-1", NodeName: "signer-node-1", Index: 1, Weight: 1, Adversarial: policy}}}}
+	_, policyDigest, err := adversarial.ResolveSigner(network, "signer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.Actors = []attacknetv1beta1.ActorStatus{{
+		Name: "signer-1", Role: "signer", AdversarialPolicyDigest: policyDigest,
+	}}
+	template := &attacknetv1beta1.FaultCampaign{
+		ObjectMeta: metav1.ObjectMeta{Name: "withhold", Namespace: "test", UID: types.UID("withhold-template"), Generation: 1},
+		Spec: attacknetv1beta1.FaultCampaignSpec{
+			Template: true, NetworkRef: "network",
+			Stages: []attacknetv1beta1.FaultStageSpec{{ID: "observe", Faults: []attacknetv1beta1.FaultActionSpec{{
+				ID: "signer", Target: attacknetv1beta1.FaultTarget{Actors: []string{"signer-1"}, Mode: "all"},
+				Fault: attacknetv1beta1.FaultSpec{Type: "signer-behavior", Action: "withhold", Mode: "all", Duration: metav1.Duration{Duration: 10 * time.Second}, SignerBehavior: &attacknetv1beta1.SignerBehaviorFaultSpec{PolicyDigest: policyDigest}},
+			}}}},
+			Safety: attacknetv1beta1.FaultSafety{MaxConcurrentFaults: 1, MaxUnavailableSignerBasisPoints: 10_000},
+		},
+	}
+	run.Spec.CampaignCatalog = []attacknetv1beta1.CampaignCatalogEntry{{Name: "withhold", CampaignRef: "withhold"}}
+	run.Spec.Executions = []attacknetv1beta1.RunExecutionSpec{{ID: "withhold", Campaign: "withhold"}}
+	run.Spec.Budgets.MaxCampaigns = 1
+	run.Spec.Budgets.MaxSignerImpactPercent = 100
+	manifest := canonicalBetaManifest(network, map[string]float64{"signer-1": 1})
+	if manifest.Actors[0].AdversarialBehavior != "withhold" || manifest.Actors[0].AdversarialPolicyDigest != policyDigest {
+		t.Fatalf("v1beta1 manifest lost adversarial policy: %#v", manifest.Actors[0])
+	}
+	schedule, err := buildBetaSchedule(run, network, admitted, map[string]*attacknetv1beta1.FaultCampaign{"withhold": template}, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := encodeBetaSchedule(schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeBetaSchedule(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faultSpec := decoded.Executions[0].CampaignSpec.Stages[0].Faults[0].Fault
+	if faultSpec.SignerBehavior == nil || faultSpec.SignerBehavior.PolicyDigest != policyDigest || faultSpec.Action != "withhold" {
+		t.Fatalf("sealed schedule lost signer behavior identity: %#v", faultSpec)
+	}
+}
+
 func TestBitcoinSplitViewExamplesCompileWithinDeclaredBudgets(t *testing.T) {
 	root := filepath.Join("..", "..", "..", "..", "..")
 	var network attacknetv1beta1.StacksNetwork
@@ -162,6 +216,57 @@ func TestBitcoinSplitViewExamplesCompileWithinDeclaredBudgets(t *testing.T) {
 	delay.Spec.NetworkRef = network.Name
 	if _, err := fault.CompileV1Beta1(&delay, manifest); err != nil {
 		t.Fatalf("compile public Bitcoin propagation-delay campaign: %v", err)
+	}
+}
+
+func TestAdversarialSignerExamplesBindOneCanonicalPolicy(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "..", "..")
+	var network attacknetv1beta1.StacksNetwork
+	decodeExample(t, filepath.Join(root, "helm", "hacknet", "examples", "adversarial-signer.yaml"), &network)
+	var campaign attacknetv1beta1.FaultCampaign
+	decodeExample(t, filepath.Join(root, "attacknet", "examples", "campaigns", "signer-withhold-window.yaml"), &campaign)
+	_, digest, err := adversarial.ResolveSigner(&network, "signer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := campaign.Spec.Stages[0].Faults[0].Fault.SignerBehavior
+	if bound == nil || bound.PolicyDigest != digest {
+		t.Fatalf("campaign digest %v does not bind rendered signer policy %s", bound, digest)
+	}
+}
+
+func TestA12QualificationCampaignsBindCanonicalPolicies(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "..", "..")
+	qualification := filepath.Join(root, "attacknet", "release", "amendments", "a12", "qualification")
+	var network attacknetv1beta1.StacksNetwork
+	decodeExample(t, filepath.Join(qualification, "network.yaml"), &network)
+
+	loadCampaign := func(name string) attacknetv1beta1.FaultCampaign {
+		t.Helper()
+		var campaign attacknetv1beta1.FaultCampaign
+		decodeExample(t, filepath.Join(qualification, name), &campaign)
+		if !campaign.Spec.Template || campaign.Spec.NetworkRef != "" {
+			t.Fatalf("%s must remain an inert campaign template", name)
+		}
+		return campaign
+	}
+	boundDigest := func(campaign attacknetv1beta1.FaultCampaign) string {
+		t.Helper()
+		return campaign.Spec.Stages[0].Faults[0].Fault.SignerBehavior.PolicyDigest
+	}
+	below := boundDigest(loadCampaign("below-quorum-campaign.yaml"))
+	quorum := boundDigest(loadCampaign("quorum-loss-campaign.yaml"))
+	for _, expected := range []struct {
+		signer string
+		digest string
+	}{{"signer-1", below}, {"signer-2", quorum}, {"signer-3", quorum}} {
+		_, digest, err := adversarial.ResolveSigner(&network, expected.signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest != expected.digest {
+			t.Fatalf("%s campaign digest %s does not bind policy %s", expected.signer, expected.digest, digest)
+		}
 	}
 }
 

@@ -138,6 +138,11 @@ func (in *ActorSpec) DeepCopyInto(out *ActorSpec) {
 		*out = make([]ActorDependency, len(*in))
 		copy(*out, *in)
 	}
+	if in.EgressPeers != nil {
+		in, out := &in.EgressPeers, &out.EgressPeers
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Storage != nil {
 		in, out := &in.Storage, &out.Storage
 		*out = new(StorageSpec)

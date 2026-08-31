@@ -3,6 +3,7 @@ package topology
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 )
 
@@ -62,11 +64,14 @@ func CompileV1Beta1(network *attacknetv1beta1.StacksNetwork) (*attacknetv1alpha1
 		set := &network.Spec.SignerSets[setIndex]
 		for memberIndex := range set.Members {
 			member := &set.Members[memberIndex]
-			node, signer, err := compileSignerMember(network, member, bitcoinServices)
+			node, signer, observer, err := compileSignerMember(network, member, bitcoinServices)
 			if err != nil {
 				return nil, err
 			}
 			compiled.Spec.Actors = append(compiled.Spec.Actors, node, signer)
+			if observer != nil {
+				compiled.Spec.Actors = append(compiled.Spec.Actors, *observer)
+			}
 		}
 	}
 	if network.Spec.Enrollment != nil {
@@ -259,11 +264,11 @@ func compileStacksNodeActor(network *attacknetv1beta1.StacksNetwork, node *attac
 	return actor, nil
 }
 
-func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attacknetv1beta1.SignerMemberSpec, bitcoinNodes map[string]string) (attacknetv1alpha1.ActorSpec, attacknetv1alpha1.ActorSpec, error) {
+func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attacknetv1beta1.SignerMemberSpec, bitcoinNodes map[string]string) (attacknetv1alpha1.ActorSpec, attacknetv1alpha1.ActorSpec, *attacknetv1alpha1.ActorSpec, error) {
 	nodeSpec := attacknetv1beta1.StacksNodeSpec{Name: member.NodeName, Role: attacknetv1beta1.StacksNodeFollower, Image: member.NodeImage, BurnchainNodeRef: member.BurnchainNodeRef, Config: member.NodeConfig, Workload: member.NodeWorkload, Advanced: member.NodeAdvanced, Suspended: member.Suspended}
 	node, err := compileStacksNodeActor(network, &nodeSpec, bitcoinNodes, member.Name, member.Index)
 	if err != nil {
-		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, err
+		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, nil, err
 	}
 	index := member.Index
 	weight := float64(member.Weight)
@@ -282,7 +287,7 @@ func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attack
 		signerIndex: member.Index,
 	}, member.SignerConfig)
 	if err != nil {
-		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, err
+		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, nil, err
 	}
 	signer := attacknetv1alpha1.ActorSpec{
 		Name: member.Name, Role: "signer", SignerIndex: &index,
@@ -293,6 +298,10 @@ func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attack
 			{Name: "events", ContainerPort: 30000, ServicePort: 30000, Protocol: corev1.ProtocolTCP},
 			{Name: "metrics", ContainerPort: 31000, ServicePort: 31000, Protocol: corev1.ProtocolTCP},
 		},
+		// The node waits for the signer event endpoint, so making the reverse
+		// relationship a startup dependency would deadlock. It remains an
+		// explicit, actor-scoped egress relationship for restricted policies.
+		EgressPeers: []string{member.NodeName},
 		Env: []corev1.EnvVar{
 			{Name: "STACKS_ATTACKNET_CONFIG_TEMPLATE", Value: actorConfigPath(signerConfig)},
 			{Name: "STACKS_ATTACKNET_SERVICE_MAP", Value: serviceMapTemplate(network)},
@@ -303,8 +312,88 @@ func compileSignerMember(network *attacknetv1beta1.StacksNetwork, member *attack
 	signer.Command = []string{"/bin/bash", "-ceu", configureActorScript, "--", "stacks-signer", "run", "--config", "/tmp/stacks-attacknet-config.toml"}
 	applyWorkload(&signer, member.SignerWorkload)
 	applyAdvanced(&signer, member.SignerAdvanced)
-	return node, signer, nil
+	if member.Adversarial == nil {
+		return node, signer, nil, nil
+	}
+	policy, err := adversarial.Normalize(member.Adversarial)
+	if err != nil {
+		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, nil, fmt.Errorf("signer %q adversarial policy: %w", member.Name, err)
+	}
+	encoded, err := adversarial.Encode(policy)
+	if err != nil {
+		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, nil, err
+	}
+	digest, err := adversarial.Digest(policy)
+	if err != nil {
+		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, nil, err
+	}
+	signer.Env = append(signer.Env,
+		corev1.EnvVar{Name: "STACKS_SIGNER_ATTACKNET_POLICY", Value: encoded},
+		corev1.EnvVar{Name: "STACKS_SIGNER_ATTACKNET_POLICY_DIGEST", Value: digest},
+	)
+	if signer.Labels == nil {
+		signer.Labels = map[string]string{}
+	}
+	signer.Labels["testing.stacks.org/adversarial"] = "true"
+	signer.Labels["testing.stacks.org/egress-profile"] = member.Adversarial.Egress.Profile
+	signer.AdversarialPolicyDigest = digest
+	signer.AdversarialEgressProfile = member.Adversarial.Egress.Profile
+	observer, err := compileAdversarialObserver(network, member, digest)
+	if err != nil {
+		return attacknetv1alpha1.ActorSpec{}, attacknetv1alpha1.ActorSpec{}, nil, err
+	}
+	return node, signer, &observer, nil
 }
+
+func compileAdversarialObserver(network *attacknetv1beta1.StacksNetwork, member *attacknetv1beta1.SignerMemberSpec, policyDigest string) (attacknetv1alpha1.ActorSpec, error) {
+	name := adversarial.ObserverName(member.Name)
+	peers := map[string]any{
+		member.Name:     map[string]any{"host": "${SERVICE:" + member.Name + "}", "ports": map[string]int32{"events": 30000, "metrics": 31000}},
+		member.NodeName: map[string]any{"host": "${SERVICE:" + member.NodeName + "}", "ports": map[string]int32{"p2p": 20444, "rpc": 20443, "metrics": 20446}},
+	}
+	encodedPeers, err := json.Marshal(peers)
+	if err != nil {
+		return attacknetv1alpha1.ActorSpec{}, fmt.Errorf("encode adversarial observer peers: %w", err)
+	}
+	disabled := false
+	runAs := int64(65532)
+	return attacknetv1alpha1.ActorSpec{
+		Name: name, Role: "observer", Image: member.Adversarial.Observer.Image,
+		ImagePullPolicy: member.Adversarial.Observer.ImagePullPolicy,
+		RuntimeExposure: "ready", AdversarialPolicyDigest: policyDigest,
+		AdversarialEgressProfile: "restricted",
+		Ports:                    []attacknetv1alpha1.ActorPort{{Name: "probe", ContainerPort: 18080, ServicePort: 18080, Protocol: corev1.ProtocolTCP}},
+		Dependencies:             []attacknetv1alpha1.ActorDependency{{Actor: member.Name, Port: 30000}, {Actor: member.NodeName, Port: 20443}},
+		Env: []corev1.EnvVar{
+			{Name: "PROBE_ACTOR", Value: name},
+			{Name: "PROBE_PORT", Value: "18080"},
+			{Name: "PROBE_DATA_ROOT", Value: "/data"},
+			{Name: "PROBE_DNS_CONTROL", Value: "kubernetes.default.svc.cluster.local"},
+			{Name: "PROBE_PEERS_JSON", Value: string(encodedPeers)},
+			{Name: "PROBE_ADVERSARIAL_TARGET", Value: member.Name},
+			{Name: "PROBE_ADVERSARIAL_POLICY_DIGEST", Value: policyDigest},
+		},
+		Storage: &attacknetv1alpha1.StorageSpec{Enabled: &disabled, MountPath: "/data"},
+		// The observer image is itself the bounded probe server. Disable the
+		// ordinary actor probe sidecar so one Pod never contains a second
+		// observation identity or collides on the reserved probe port.
+		Probe:     &attacknetv1alpha1.ProbeSpec{Enabled: &disabled},
+		Resources: copyResourceRequirements(member.Adversarial.Observer.Resources),
+		ContainerSecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: boolPointer(false), ReadOnlyRootFilesystem: boolPointer(true),
+			RunAsNonRoot: boolPointer(true), RunAsUser: &runAs, RunAsGroup: &runAs,
+			Capabilities:   &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Labels: map[string]string{
+			"testing.stacks.org/adversarial-observer": "true",
+			"testing.stacks.org/egress-profile":       "restricted",
+			"testing.stacks.org/observes-actor":       member.Name,
+		},
+	}, nil
+}
+
+func boolPointer(value bool) *bool { return &value }
 
 func compileRawActor(network *attacknetv1beta1.StacksNetwork, raw *attacknetv1beta1.RawActorSpec) (attacknetv1alpha1.ActorSpec, error) {
 	var config *attacknetv1alpha1.ActorConfig
@@ -472,6 +561,9 @@ func serviceMapTemplate(network *attacknetv1beta1.StacksNetwork) string {
 	for _, set := range network.Spec.SignerSets {
 		for _, member := range set.Members {
 			names = append(names, member.Name, member.NodeName)
+			if member.Adversarial != nil {
+				names = append(names, adversarial.ObserverName(member.Name))
+			}
 		}
 	}
 	if network.Spec.Enrollment != nil {
@@ -754,6 +846,25 @@ func validateV1Beta1Network(network *attacknetv1beta1.StacksNetwork) error {
 			indexes[member.Index] = member.Name
 			if member.Weight <= 0 {
 				return fmt.Errorf("signer %q weight must be positive", member.Name)
+			}
+			if member.Adversarial != nil {
+				if member.SignerImage == "" {
+					return fmt.Errorf("adversarial signer %q requires an explicit signerImage", member.Name)
+				}
+				if _, err := adversarial.Normalize(member.Adversarial); err != nil {
+					return fmt.Errorf("signer %q adversarial policy: %w", member.Name, err)
+				}
+				observerName := adversarial.ObserverName(member.Name)
+				if err := addName(observerName, "adversarial observer"); err != nil {
+					return err
+				}
+				if member.SignerAdvanced != nil {
+					for _, variable := range member.SignerAdvanced.Env {
+						if variable.Name == "STACKS_SIGNER_ATTACKNET_POLICY" || variable.Name == "STACKS_SIGNER_ATTACKNET_POLICY_DIGEST" {
+							return fmt.Errorf("adversarial signer %q cannot override managed environment %q", member.Name, variable.Name)
+						}
+					}
+				}
 			}
 		}
 	}

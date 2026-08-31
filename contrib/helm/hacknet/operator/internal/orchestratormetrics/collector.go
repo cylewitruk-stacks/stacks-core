@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/inventory"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/versionmatrix"
 )
@@ -30,6 +31,7 @@ type Collector struct {
 	campaignInfo        *prometheus.Desc
 	upgradeInfo         *prometheus.Desc
 	actorVersion        *prometheus.Desc
+	adversarialPolicy   *prometheus.Desc
 	versionCapability   *prometheus.Desc
 	campaignTarget      *prometheus.Desc
 	faultAction         *prometheus.Desc
@@ -60,6 +62,8 @@ func NewCollector(reader client.Reader) *Collector {
 			[]string{"evidence_source", "network", "campaign", "phase", "reason", "stage", "template"}, nil),
 		actorVersion: prometheus.NewDesc("attacknet_actor_version_info", "Static or rolling actor version identity joined to immutable provenance.",
 			[]string{"evidence_source", "attacknet_network", "campaign", "attacknet_actor", "profile", "source_kind", "revision", "image", "runtime_image_id", "provenance_digest", "config_digest", "expectation"}, nil),
+		adversarialPolicy: prometheus.NewDesc("attacknet_adversarial_policy_info", "Admitted testing-only signer policy and isolated observer identity.",
+			[]string{"evidence_source", "network", "actor", "behavior", "policy_digest", "egress_profile", "egress_policy_digest", "observer", "observer_ready"}, nil),
 		versionCapability: prometheus.NewDesc("attacknet_actor_version_capability_info", "Finite instrumentation capability declared by one actor version profile.",
 			[]string{"evidence_source", "attacknet_network", "attacknet_actor", "profile", "capability"}, nil),
 		campaignTarget: prometheus.NewDesc("attacknet_fault_campaign_target_info", "Exact actor targets admitted for a FaultCampaign.",
@@ -100,7 +104,7 @@ func NewCollector(reader client.Reader) *Collector {
 
 // Describe publishes every descriptor owned by the collector.
 func (c *Collector) Describe(output chan<- *prometheus.Desc) {
-	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.upgradeInfo, c.actorVersion, c.versionCapability, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.stacksBurnHeight, c.stacksBurnView, c.burnchainTopology, c.burnchainGeneration, c.bitcoinNode, c.bitcoinEdge, c.burnchainBinding, c.collectionSuccess} {
+	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.upgradeInfo, c.actorVersion, c.adversarialPolicy, c.versionCapability, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.stacksBurnHeight, c.stacksBurnView, c.burnchainTopology, c.burnchainGeneration, c.bitcoinNode, c.bitcoinEdge, c.burnchainBinding, c.collectionSuccess} {
 		output <- descriptor
 	}
 }
@@ -176,6 +180,26 @@ func (c *Collector) collectNetwork(output chan<- prometheus.Metric, network *att
 	statuses := map[string]attacknetv1beta1.ActorStatus{}
 	for _, actor := range network.Status.Actors {
 		statuses[actor.Name] = actor
+	}
+	for _, set := range network.Spec.SignerSets {
+		for _, member := range set.Members {
+			if member.Adversarial == nil {
+				continue
+			}
+			policy, digest, err := adversarial.ResolveSigner(network, member.Name)
+			if err != nil {
+				return false
+			}
+			signer, signerOK := statuses[member.Name]
+			observerName := adversarial.ObserverName(member.Name)
+			observer, observerOK := statuses[observerName]
+			if !signerOK || !signer.IdentityReady || signer.AdversarialPolicyDigest != digest || signer.AdversarialEgressProfile != member.Adversarial.Egress.Profile || !observerOK || observer.AdversarialPolicyDigest != digest {
+				return false
+			}
+			output <- prometheus.MustNewConstMetric(c.adversarialPolicy, prometheus.GaugeValue, 1,
+				evidenceSource, network.Name, member.Name, policy.Behavior, digest,
+				member.Adversarial.Egress.Profile, signer.EgressPolicyDigest, observerName, strconv.FormatBool(observer.IdentityReady))
+		}
 	}
 	for index := range upgrades {
 		campaign := &upgrades[index]

@@ -1,0 +1,73 @@
+# Build signer-adversarial:r1a12 with the deterministic testing patch, build
+# attacknet-probe:r1a12 from contrib/attacknet/images/probe, and create the
+# referenced complete-config and enrollment Secrets before applying.
+apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: adversarial-signer
+spec:
+  defaults:
+    nodeImage: stacks-core-attacknet:main
+    signerImage: stacks-core-attacknet:main
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
+    imagePullPolicy: IfNotPresent
+    workload:
+      storage: {enabled: true, size: 2Gi}
+  burnchain:
+    policyRef: {name: adversarial-signer}
+    nodes:
+      - name: bitcoin
+        config: {generated: {profile: bitcoin-regtest/v1}}
+  nodes:
+    - name: miner-1
+      role: miner
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: adversarial-signer-miner-1, key: config.toml}}
+  signerSets:
+    - name: active
+      members:
+        - name: signer-1
+          nodeName: signer-node-1
+          index: 1
+          weight: 1
+          burnchainNodeRef: bitcoin
+          signerImage: signer-adversarial:r1a12
+          signerConfig: {secretRef: {name: adversarial-signer-signer-1, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+          adversarial:
+            profile: stacks-signer-testing/v1
+            behavior: withhold
+            selector:
+              minStacksHeight: 12
+              maxStacksHeight: 50
+              everyNth: 2
+            maxMatches: 2
+            maxEvaluations: 32
+            patchDigest: sha256:4a24941d86f164b81a9681cf00a61a8117a170e0ad2cdd67989ae3f15b3c44b4
+            observer:
+              image: attacknet-probe:r1a12
+              imagePullPolicy: IfNotPresent
+            egress: {profile: restricted}
+        - name: signer-2
+          nodeName: signer-node-2
+          index: 2
+          weight: 1
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: adversarial-signer-signer-2, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+        - name: signer-3
+          nodeName: signer-node-3
+          index: 3
+          weight: 1
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: adversarial-signer-signer-3, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+  enrollment:
+    name: stacker
+    image: stacks-attacknet-stacker:local
+    nodeRef: miner-1
+    credentialsSecretRef:
+      name: adversarial-signer-stacker
+      keysKey: private-keys
+      addressesKey: addresses

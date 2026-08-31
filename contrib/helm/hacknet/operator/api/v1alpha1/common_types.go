@@ -4,17 +4,20 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // AdmittedActorIdentity is the immutable runtime identity admitted for one actor.
 type AdmittedActorIdentity struct {
-	Name               string `json:"name"`
-	Role               string `json:"role"`
-	ServiceName        string `json:"serviceName"`
-	StatefulSetName    string `json:"statefulSetName"`
-	StatefulSetUID     string `json:"statefulSetUID"`
-	ControllerRevision string `json:"controllerRevision"`
-	PodName            string `json:"podName"`
-	PodUID             string `json:"podUID"`
-	RequestedImage     string `json:"requestedImage"`
-	RuntimeImageID     string `json:"runtimeImageID"`
-	ConfigDigest       string `json:"configDigest,omitempty"`
+	Name                     string `json:"name"`
+	Role                     string `json:"role"`
+	ServiceName              string `json:"serviceName"`
+	StatefulSetName          string `json:"statefulSetName"`
+	StatefulSetUID           string `json:"statefulSetUID"`
+	ControllerRevision       string `json:"controllerRevision"`
+	PodName                  string `json:"podName"`
+	PodUID                   string `json:"podUID"`
+	RequestedImage           string `json:"requestedImage"`
+	RuntimeImageID           string `json:"runtimeImageID"`
+	ConfigDigest             string `json:"configDigest,omitempty"`
+	AdversarialPolicyDigest  string `json:"adversarialPolicyDigest,omitempty"`
+	AdversarialEgressProfile string `json:"adversarialEgressProfile,omitempty"`
+	EgressPolicyDigest       string `json:"egressPolicyDigest,omitempty"`
 }
 
 // NetworkInventory is the complete authoritative actor inventory bound to a run.

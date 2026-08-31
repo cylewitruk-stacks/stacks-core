@@ -155,6 +155,25 @@ func TestTopologyManagerPublishesAndWithdrawsAdmittedInventory(t *testing.T) {
 	if err := direct.Create(ctx, invalidCampaign); !apierrors.IsInvalid(err) {
 		t.Fatalf("API admission accepted an invalid type/action combination: %v", err)
 	}
+	invalidSignerBehavior := &attacknetv1beta1.FaultCampaign{
+		ObjectMeta: metav1.ObjectMeta{Name: "invalid-signer-behavior-target", Namespace: namespace},
+		Spec: attacknetv1beta1.FaultCampaignSpec{
+			NetworkRef: "network",
+			Stages: []attacknetv1beta1.FaultStageSpec{{
+				ID: "behavior", Faults: []attacknetv1beta1.FaultActionSpec{{
+					ID: "withhold", Target: attacknetv1beta1.FaultTarget{Roles: []string{"signer"}, Mode: "all"},
+					Fault: attacknetv1beta1.FaultSpec{
+						Type: "signer-behavior", Action: "withhold", Mode: "all", Duration: metav1.Duration{Duration: time.Minute},
+						SignerBehavior: &attacknetv1beta1.SignerBehaviorFaultSpec{PolicyDigest: "sha256:" + strings.Repeat("a", 64)},
+					},
+				}},
+			}},
+			Safety: attacknetv1beta1.FaultSafety{MaxUnavailableSignerBasisPoints: 10_000, MaxUnavailableMinerBasisPoints: 10_000, MaxConcurrentFaults: 1},
+		},
+	}
+	if err := direct.Create(ctx, invalidSignerBehavior); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted a non-attributable signer-behavior role target: %v", err)
+	}
 	invalidReorg := &attacknetv1beta1.FaultCampaign{
 		ObjectMeta: metav1.ObjectMeta{Name: "invalid-reorg", Namespace: namespace},
 		Spec: attacknetv1beta1.FaultCampaignSpec{
@@ -235,6 +254,35 @@ func TestTopologyManagerPublishesAndWithdrawsAdmittedInventory(t *testing.T) {
 	if err := direct.Create(ctx, invalidPeer); !apierrors.IsInvalid(err) {
 		t.Fatalf("API admission accepted an unknown Bitcoin peer reference: %v", err)
 	}
+	invalidAdversarial := network.DeepCopy()
+	invalidAdversarial.Name = "invalid-adversarial-selector"
+	everyNth := int32(2)
+	invalidAdversarial.Spec.SignerSets = []attacknetv1beta1.SignerSetSpec{{
+		Name: "active",
+		Members: []attacknetv1beta1.SignerMemberSpec{{
+			Name: "signer-1", NodeName: "signer-node-1", Index: 1, Weight: 1,
+			BurnchainNodeRef: "bitcoin-1", SignerImage: "example.invalid/signer:test",
+			SignerConfig: attacknetv1beta1.ConfigSource{ConfigMapRef: &attacknetv1beta1.ConfigObjectRef{Name: "signer-config"}},
+			NodeConfig:   attacknetv1beta1.ConfigSource{ConfigMapRef: &attacknetv1beta1.ConfigObjectRef{Name: "node-config"}},
+			Adversarial: &attacknetv1beta1.AdversarialSignerPolicy{
+				Profile: "stacks-signer-testing/v1", Behavior: "withhold", MaxMatches: 1, MaxEvaluations: 8,
+				PatchDigest: "sha256:" + repeat("b", 64),
+				Selector:    attacknetv1beta1.AdversarialProposalSelector{EveryNth: &everyNth, SeedOffset: 2},
+				Observer:    attacknetv1beta1.AdversarialObserverSpec{Image: "example.invalid/probe:test"},
+				Egress:      attacknetv1beta1.AdversarialEgressSpec{Profile: "restricted"},
+			},
+		}},
+	}}
+	if err := direct.Create(ctx, invalidAdversarial); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted seedOffset >= everyNth: %v", err)
+	}
+	invalidEgress := invalidAdversarial.DeepCopy()
+	invalidEgress.Name = "invalid-adversarial-egress"
+	invalidEgress.Spec.SignerSets[0].Members[0].Adversarial.Selector.SeedOffset = 0
+	invalidEgress.Spec.SignerSets[0].Members[0].Adversarial.Egress.Profile = "unrestricted"
+	if err := direct.Create(ctx, invalidEgress); !apierrors.IsInvalid(err) {
+		t.Fatalf("API admission accepted unrestricted adversarial egress without opt-in: %v", err)
+	}
 	sharedPolicy := network.DeepCopy()
 	sharedPolicy.Name = "shared-policy"
 	sharedPolicy.Spec.Burnchain.Nodes = append(sharedPolicy.Spec.Burnchain.Nodes, attacknetv1beta1.BitcoinNodeSpec{
@@ -264,8 +312,15 @@ func TestTopologyManagerPublishesAndWithdrawsAdmittedInventory(t *testing.T) {
 	}
 	statefulSetVersion, serviceVersion := statefulSet.ResourceVersion, service.ResourceVersion
 	directReconciler := &topology.V1Beta1Reconciler{Client: direct, APIReader: direct, Scheme: scheme}
-	if _, err := directReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: network.Name}}); err != nil {
-		t.Fatal(err)
+	var reconcileErr error
+	eventuallyWithDiagnostic(t, 10*time.Second, func() bool {
+		_, reconcileErr = directReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: network.Name}})
+		return !apierrors.IsConflict(reconcileErr)
+	}, func() string {
+		return fmt.Sprintf("idempotent reconcile remained in a status-update conflict: %v", reconcileErr)
+	})
+	if reconcileErr != nil {
+		t.Fatal(reconcileErr)
 	}
 	if err := direct.Get(ctx, client.ObjectKeyFromObject(statefulSet), statefulSet); err != nil {
 		t.Fatal(err)
@@ -383,6 +438,7 @@ func TestRunAndFaultManagersExecuteOneShotCampaignEndToEnd(t *testing.T) {
 	faults := &fault.V1Beta1Reconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme,
 		Observations: &fault.KubernetesTriggerObservationReader{Reader: mgr.GetAPIReader(), Protocol: protocolReader},
+		SignerSets:   resolver,
 	}
 	runs := &runcontroller.V1Beta1Reconciler{
 		Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme, SignerSets: resolver,

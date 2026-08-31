@@ -15,6 +15,7 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 )
 
 func TestCompileV1Beta1DomainTopology(t *testing.T) {
@@ -90,6 +91,115 @@ func TestCompileV1Beta1RejectsAmbiguousAndInvalidTopology(t *testing.T) {
 			t.Fatal("unmarked raw actor was accepted")
 		}
 	})
+}
+
+func TestCompileV1Beta1AdversarialSignerBindsPolicyObserverAndEgress(t *testing.T) {
+	network := betaNetworkFixture()
+	member := &network.Spec.SignerSets[0].Members[0]
+	member.SignerImage = "signer:testing"
+	everyNth := int32(2)
+	member.Adversarial = &attacknetv1beta1.AdversarialSignerPolicy{
+		Profile: "stacks-signer-testing/v1", Behavior: "withhold", MaxMatches: 3, MaxEvaluations: 32,
+		PatchDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Selector:    attacknetv1beta1.AdversarialProposalSelector{EveryNth: &everyNth},
+		Observer:    attacknetv1beta1.AdversarialObserverSpec{Image: "probe:testing", ImagePullPolicy: corev1.PullIfNotPresent},
+		Egress:      attacknetv1beta1.AdversarialEgressSpec{Profile: "restricted"},
+	}
+	compiled, err := CompileV1Beta1(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compiled.Spec.Actors) != 6 {
+		t.Fatalf("got %d actors, want the original five plus isolated observer", len(compiled.Spec.Actors))
+	}
+	signer, observer := compiled.Spec.Actors[3], compiled.Spec.Actors[4]
+	if signer.AdversarialPolicyDigest == "" || observer.AdversarialPolicyDigest != signer.AdversarialPolicyDigest {
+		t.Fatalf("policy identity was not shared: signer=%q observer=%q", signer.AdversarialPolicyDigest, observer.AdversarialPolicyDigest)
+	}
+	if observer.Role != "observer" || observer.Name != "signer-1-observer" || observer.Image != "probe:testing" {
+		t.Fatalf("isolated observer was not compiled: %#v", observer)
+	}
+	if observer.Probe == nil || observer.Probe.Enabled == nil || *observer.Probe.Enabled {
+		t.Fatal("isolated observer must not receive a second trusted-probe sidecar")
+	}
+	if signer.Labels[egressProfileLabel] != "restricted" || observer.Labels[egressProfileLabel] != "restricted" {
+		t.Fatal("restricted egress profile was not attached to both untrusted and observing actors")
+	}
+	if len(signer.Dependencies) != 0 || len(signer.EgressPeers) != 1 || signer.EgressPeers[0] != member.NodeName {
+		t.Fatalf("signer egress must permit its node without creating a cyclic startup dependency: %#v", signer)
+	}
+	policyJSON, policyDigest := "", ""
+	for _, environment := range signer.Env {
+		switch environment.Name {
+		case "STACKS_SIGNER_ATTACKNET_POLICY":
+			policyJSON = environment.Value
+		case "STACKS_SIGNER_ATTACKNET_POLICY_DIGEST":
+			policyDigest = environment.Value
+		}
+	}
+	if policyJSON == "" || policyDigest != signer.AdversarialPolicyDigest {
+		t.Fatal("managed policy environment is not bound to admitted identity")
+	}
+	resources, err := Render(compiled, testScheme(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources.NetworkPolicies) != 2 {
+		t.Fatalf("got %d egress policies, want signer and observer", len(resources.NetworkPolicies))
+	}
+	var signerPolicyFound bool
+	for _, policy := range resources.NetworkPolicies {
+		if policy.Name != network.Name+"-"+member.Name {
+			continue
+		}
+		signerPolicyFound = true
+		if len(policy.Spec.Egress) != 2 || policy.Spec.Egress[0].To[0].PodSelector.MatchLabels[actorLabel] != member.NodeName {
+			t.Fatalf("restricted signer policy does not permit only its declared node plus DNS: %#v", policy.Spec.Egress)
+		}
+	}
+	if !signerPolicyFound {
+		t.Fatal("restricted signer NetworkPolicy was not rendered")
+	}
+	var signerSessionFound bool
+	for _, statefulSet := range resources.StatefulSets {
+		if statefulSet.Name != network.Name+"-"+member.Name {
+			continue
+		}
+		signerSessionFound = true
+		actor := statefulSet.Spec.Template.Spec.Containers[0]
+		var sessionEnv, sessionMount bool
+		for _, environment := range actor.Env {
+			sessionEnv = sessionEnv || environment.Name == "STACKS_SIGNER_ATTACKNET_SESSION" && environment.Value == adversarial.SessionFilePath
+		}
+		for _, mount := range actor.VolumeMounts {
+			sessionMount = sessionMount || mount.Name == "adversarial-session" && mount.MountPath == adversarial.SessionMountPath && mount.ReadOnly
+		}
+		var sessionVolume bool
+		for _, volume := range statefulSet.Spec.Template.Spec.Volumes {
+			if volume.Name != "adversarial-session" || volume.DownwardAPI == nil || len(volume.DownwardAPI.Items) != 1 {
+				continue
+			}
+			item := volume.DownwardAPI.Items[0]
+			sessionVolume = item.Path == "session.json" && item.FieldRef != nil && item.FieldRef.FieldPath == "metadata.annotations['"+adversarial.SessionAnnotation+"']"
+		}
+		if !sessionEnv || !sessionMount || !sessionVolume {
+			t.Fatalf("adversarial session channel is incomplete: env=%t mount=%t volume=%t", sessionEnv, sessionMount, sessionVolume)
+		}
+	}
+	if !signerSessionFound {
+		t.Fatal("adversarial signer StatefulSet was not rendered")
+	}
+	for _, statefulSet := range resources.StatefulSets {
+		if statefulSet.Labels["testing.stacks.org/adversarial-observer"] != "true" {
+			continue
+		}
+		containers := statefulSet.Spec.Template.Spec.Containers
+		if len(containers) != 1 || containers[0].Name != "actor" {
+			t.Fatalf("observer Pod contains unexpected sidecars: %#v", containers)
+		}
+		return
+	}
+	t.Fatal("adversarial observer StatefulSet was not rendered")
 }
 
 func TestMarkBurnchainPolicyPendingPreservesInventoryButWithdrawsReady(t *testing.T) {

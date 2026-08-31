@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 )
 
 func (c actorContext) statefulSet() (*appsv1.StatefulSet, error) {
@@ -35,11 +36,12 @@ func (c actorContext) statefulSet() (*appsv1.StatefulSet, error) {
 		args[index] = value
 	}
 	hashPayload := struct {
-		Config        *attacknetv1alpha1.ActorConfig   `json:"config"`
-		Telemetry     *attacknetv1alpha1.TelemetrySpec `json:"telemetry"`
-		Probe         *attacknetv1alpha1.ProbeSpec     `json:"probe"`
-		Command, Args []string
-	}{Config: actor.Config, Command: command, Args: args}
+		Config                  *attacknetv1alpha1.ActorConfig   `json:"config"`
+		Telemetry               *attacknetv1alpha1.TelemetrySpec `json:"telemetry"`
+		Probe                   *attacknetv1alpha1.ProbeSpec     `json:"probe"`
+		Command, Args           []string
+		AdversarialPolicyDigest string `json:"adversarialPolicyDigest,omitempty"`
+	}{Config: actor.Config, Command: command, Args: args, AdversarialPolicyDigest: actor.AdversarialPolicyDigest}
 	if boolValue(telemetry.Enabled, false) {
 		hashPayload.Telemetry = &telemetry
 	}
@@ -84,6 +86,22 @@ func (c actorContext) statefulSet() (*appsv1.StatefulSet, error) {
 	}
 	main.LivenessProbe, main.StartupProbe = actor.LivenessProbe, actor.StartupProbe
 	volumes := []corev1.Volume{}
+	if actor.Role == "signer" && actor.AdversarialPolicyDigest != "" {
+		main.Env = append(main.Env, corev1.EnvVar{
+			Name: "STACKS_SIGNER_ATTACKNET_SESSION", Value: adversarial.SessionFilePath,
+		})
+		main.VolumeMounts = append(main.VolumeMounts, corev1.VolumeMount{
+			Name: "adversarial-session", MountPath: adversarial.SessionMountPath, ReadOnly: true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "adversarial-session",
+			VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{Items: []corev1.DownwardAPIVolumeFile{{
+				Path: "session.json", FieldRef: &corev1.ObjectFieldSelector{
+					APIVersion: "v1", FieldPath: "metadata.annotations['" + adversarial.SessionAnnotation + "']",
+				},
+			}}}},
+		})
+	}
 	if source, mount := c.configVolume(); source != nil {
 		volumes = append(volumes, *source)
 		main.VolumeMounts = append(main.VolumeMounts, *mount)

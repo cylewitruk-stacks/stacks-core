@@ -256,7 +256,10 @@ func convertV1Beta1Status(source attacknetv1alpha1.StacksNetworkStatus) attackne
 			StatefulSetUID: actor.StatefulSetUID, StatefulSetResourceVersion: actor.StatefulSetResourceVersion,
 			PodName: actor.PodName, PodUID: actor.PodUID, PodResourceVersion: actor.PodResourceVersion,
 			RuntimeImageID: actor.RuntimeImageID, ConfigDigest: actor.ConfigDigest,
-			IdentityReady: actor.IdentityReady,
+			AdversarialPolicyDigest:  actor.AdversarialPolicyDigest,
+			AdversarialEgressProfile: actor.AdversarialEgressProfile,
+			EgressPolicyDigest:       actor.EgressPolicyDigest,
+			IdentityReady:            actor.IdentityReady,
 		})
 	}
 	return attacknetv1beta1.StacksNetworkStatus{
@@ -270,6 +273,14 @@ func convertV1Beta1Status(source attacknetv1alpha1.StacksNetworkStatus) attackne
 
 func degradedV1Beta1Status(network *attacknetv1beta1.StacksNetwork, reconcileError error) attacknetv1beta1.StacksNetworkStatus {
 	desired := int32(len(network.Spec.Burnchain.Nodes) + len(network.Spec.Nodes) + len(network.Spec.RawActors))
+	for _, set := range network.Spec.SignerSets {
+		for _, member := range set.Members {
+			desired += 2
+			if member.Adversarial != nil {
+				desired++
+			}
+		}
+	}
 	if network.Spec.Enrollment != nil {
 		desired++
 	}

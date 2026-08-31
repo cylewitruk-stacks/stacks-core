@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -11,6 +12,8 @@ import (
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
+
+var sha256Pattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // ValidateV1Beta1Structure validates campaign-local invariants that do not
 // require an admitted network inventory. The CLI and compiler share this gate.
@@ -102,8 +105,14 @@ func validateV1Beta1Action(action *attacknetv1beta1.FaultActionSpec, safety atta
 	if action.Fault.Type == "burnchain-reorg" {
 		return validateBurnchainReorgAction(action, safety)
 	}
+	if action.Fault.Type == "signer-behavior" {
+		return validateSignerBehaviorAction(action, safety)
+	}
 	if action.Fault.BurnchainReorg != nil {
 		return errors.New("burnchainReorg is valid only for burnchain-reorg faults")
+	}
+	if action.Fault.SignerBehavior != nil {
+		return errors.New("signerBehavior is valid only for signer-behavior faults")
 	}
 	definition, err := mechanismForType(action.Fault.Type)
 	if err != nil {
@@ -137,6 +146,34 @@ func validateV1Beta1Action(action *attacknetv1beta1.FaultActionSpec, safety atta
 		}
 	}
 	return validateV1Beta1ParameterPresence(action, parameters, safety)
+}
+
+func validateSignerBehaviorAction(action *attacknetv1beta1.FaultActionSpec, safety attacknetv1beta1.FaultSafety) error {
+	if action.Fault.SignerBehavior == nil {
+		return errors.New("signer-behavior requires fault.signerBehavior")
+	}
+	if action.Fault.BurnchainReorg != nil || len(action.Fault.Parameters.Raw) != 0 {
+		return errors.New("signer-behavior does not accept burnchainReorg or raw parameters")
+	}
+	if action.Fault.Mode != "all" || action.Fault.Value != nil {
+		return errors.New("signer-behavior requires mode all without value")
+	}
+	if len(action.Target.Actors) != 1 || len(action.Target.Roles) != 0 || action.Target.Mode != "all" || action.Target.Value != nil {
+		return errors.New("signer-behavior must name exactly one signer with target mode all and no value")
+	}
+	definition, _ := mechanismForType("signer-behavior")
+	if !definition.AllowedActions[action.Fault.Action] {
+		return fmt.Errorf("unsupported signer-behavior action %q", action.Fault.Action)
+	}
+	if !sha256Pattern.MatchString(action.Fault.SignerBehavior.PolicyDigest) {
+		return errors.New("signerBehavior.policyDigest must be an immutable sha256 digest")
+	}
+	duration := action.Fault.Duration.Duration
+	if duration <= 0 || duration > 10*time.Minute {
+		return errors.New("signer-behavior duration must be within 1ns..10m")
+	}
+	_ = safety
+	return nil
 }
 
 func validateBurnchainReorgAction(action *attacknetv1beta1.FaultActionSpec, safety attacknetv1beta1.FaultSafety) error {

@@ -97,11 +97,13 @@ FROM ${RUNTIME_IMAGE}
 ARG STACKS_NODE_VERSION="attacknet-dev"
 ARG GIT_BRANCH="unknown"
 ARG GIT_COMMIT="unknown"
+ARG ATTACKNET_CARGO_FEATURES="monitoring_prom,slog_json"
 LABEL org.opencontainers.image.title="Stacks Attacknet node tools" \
       org.opencontainers.image.version="${STACKS_NODE_VERSION}" \
       org.opencontainers.image.revision="${GIT_COMMIT}" \
       org.stacks.attacknet.git-branch="${GIT_BRANCH}" \
       org.stacks.attacknet.cargo-profile="release-lite" \
+      org.stacks.attacknet.cargo-features="${ATTACKNET_CARGO_FEATURES}" \
       org.stacks.attacknet.debug-symbols="external"
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl libfaketime \

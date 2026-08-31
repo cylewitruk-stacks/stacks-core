@@ -210,6 +210,16 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 		return reconcile.Result{}, r.fail(ctx, run, "ProtocolAssertionIntegrityFailed", err)
 	}
 	if gate != nil {
+		if betaProtocolStopWaitsForActiveCampaigns(gate, usage) {
+			// Preserve the protocol verdict immediately, but let already-running
+			// bounded campaigns finish their recovery and durable evidence. No
+			// further executions are scheduled while this branch is active.
+			return reconcile.Result{RequeueAfter: 2 * time.Second}, r.patchStatus(
+				ctx,
+				run,
+				betaRunTransition(next, run.Generation, "Running", gate.Reason+"WaitingForCampaignRecovery", "", r.now()),
+			)
+		}
 		switch gate.Outcome {
 		case protocolassertion.OutcomeViolated:
 			return reconcile.Result{}, r.finish(ctx, run, next, "Failed", gate.Reason, "ProtocolAssertion")
@@ -329,7 +339,7 @@ func (r *V1Beta1Reconciler) prepare(ctx context.Context, run *attacknetv1beta1.A
 		}
 		return reconcile.Result{}, r.fail(ctx, run, "ScheduleAdmissionFailed", err)
 	}
-	manifest := canonicalManifest(legacyNetwork, signerSet.WeightsByActor)
+	manifest := canonicalBetaManifest(live.Network, signerSet.WeightsByActor)
 	templates := make(map[string]*attacknetv1beta1.FaultCampaign, len(run.Spec.CampaignCatalog))
 	for _, entry := range run.Spec.CampaignCatalog {
 		source := &attacknetv1beta1.FaultCampaign{}
@@ -419,6 +429,18 @@ func (r *V1Beta1Reconciler) evaluateProtocolAssertions(
 		}
 		return nil, nil
 	}
+	if during := next.ProtocolAssertions.During; during != nil &&
+		(during.Outcome == protocolassertion.OutcomeViolated || during.Outcome == protocolassertion.OutcomeInconclusive) {
+		retained := &protocolGate{Outcome: during.Outcome, Reason: "ProtocolDuring" + during.Outcome}
+		if usage.ActiveCampaigns > 0 {
+			return retained, nil
+		}
+		gate, err := evaluate("Recovery", schedule.Assertions.Recovery, &next.ProtocolAssertions.Recovery, true)
+		if err != nil || gate != nil {
+			return gate, err
+		}
+		return retained, nil
+	}
 	if usage.CampaignsStarted == 0 {
 		gate, err := evaluate("Baseline", schedule.Assertions.Baseline, &next.ProtocolAssertions.Baseline, true)
 		if err != nil || gate != nil {
@@ -467,11 +489,15 @@ func (r *V1Beta1Reconciler) signerSetMatchesSchedule(
 	if err != nil {
 		return false, err
 	}
-	digest, err := canonical.ArtifactDigest(canonicalManifest(legacyNetwork, resolved.WeightsByActor))
+	digest, err := canonical.ArtifactDigest(canonicalBetaManifest(network, resolved.WeightsByActor))
 	if err != nil {
 		return false, err
 	}
 	return digest == schedule.Network.ManifestDigest, nil
+}
+
+func canonicalBetaManifest(network *attacknetv1beta1.StacksNetwork, weights map[string]float64) fault.Manifest {
+	return manifestWithSignerWeights(fault.ManifestFromV1Beta1(network), weights)
 }
 
 func (r *V1Beta1Reconciler) createExecution(
@@ -1583,7 +1609,12 @@ func (r *V1Beta1Reconciler) children(ctx context.Context, run *attacknetv1beta1.
 			seen[current.Name] = struct{}{}
 		}
 	}
-	if run.DeletionTimestamp.IsZero() {
+	// Terminal reconciliation deletes non-terminal children to invoke their
+	// cleanup finalizers. Once a child has proved cleanup it disappears, so a
+	// terminal run must not reinterpret its durable active-child receipt as an
+	// unexpected identity loss. Before terminal transition the receipt remains
+	// load-bearing and a missing child still fails closed.
+	if run.DeletionTimestamp.IsZero() && !betaTerminal(run.Status.Phase) {
 		for _, active := range run.Status.ActiveChildren {
 			if _, ok := seen[active.Name]; ok {
 				continue
@@ -1678,6 +1709,13 @@ func betaHasProvenActiveFault(children []attacknetv1beta1.FaultCampaign) bool {
 
 func betaSuccessStopWaitsForActiveCampaigns(terminalPhase string, usage *attacknetv1beta1.BudgetUsage) bool {
 	return terminalPhase == "Passed" && usage != nil && usage.ActiveCampaigns > 0
+}
+
+func betaProtocolStopWaitsForActiveCampaigns(gate *protocolGate, usage *attacknetv1beta1.BudgetUsage) bool {
+	if gate == nil || usage == nil || usage.ActiveCampaigns == 0 {
+		return false
+	}
+	return gate.Outcome == protocolassertion.OutcomeViolated || gate.Outcome == protocolassertion.OutcomeInconclusive
 }
 
 func activeBetaChildren(children []attacknetv1beta1.FaultCampaign) []attacknetv1beta1.FaultCampaign {

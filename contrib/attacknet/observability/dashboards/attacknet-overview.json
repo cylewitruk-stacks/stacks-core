@@ -564,6 +564,32 @@
       "targets": [{"expr": "attacknet_upgrade_campaign_info{network=\"$network\",template=\"false\"}", "legendFormat": "{{campaign}} · {{stage}} · {{phase}} · {{reason}}", "refId": "A"}],
       "title": "Rolling upgrade lifecycle (trusted)",
       "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Topology-operator-observed testing policy, immutable policy digest, requested egress profile, and isolated observer readiness. This is admitted orchestration state, not a claim that the signer executed the behavior.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 14, "x": 0, "y": 188},
+      "id": 42,
+      "options": {"cellHeight": "sm", "footer": {"countRows": true, "fields": "", "reducer": ["count"], "show": true}, "showHeader": true},
+      "targets": [{"expr": "attacknet_adversarial_policy_info{network=\"$network\",actor=~\"$actor\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Admitted adversarial signer policies (trusted)",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "evidence_source": true, "instance": true, "job": true, "network": true}, "renameByName": {"actor": "Signer", "behavior": "Behavior", "egress_policy_digest": "Egress policy digest", "egress_profile": "Egress", "observer": "Observer", "observer_ready": "Observer ready", "policy_digest": "Policy digest"}}}],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Testing-only signer counters transported through the normal metrics endpoint. Values are actor-self-reported and show bounded evaluations and matches only; they do not establish impact or recovery. Use trusted campaign assertions and protocol gates.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "fillOpacity": 25, "lineWidth": 1, "showPoints": "never", "spanNulls": false}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 10, "x": 14, "y": 188},
+      "id": 43,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "rate(stacks_signer_attacknet_policy_matches_total{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}[5m])", "legendFormat": "match rate · {{attacknet_actor}} · {{behavior}}", "refId": "A"},
+        {"expr": "stacks_signer_attacknet_policy_evaluations{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "legendFormat": "evaluations · {{attacknet_actor}} · {{behavior}}", "refId": "B"}
+      ],
+      "title": "Deterministic policy state (self-reported)",
+      "type": "timeseries"
     }
   ],
   "refresh": "5s",

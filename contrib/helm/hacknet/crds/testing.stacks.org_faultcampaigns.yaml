@@ -71,6 +71,8 @@ spec:
                       - ClockSkewCleared
                       - BurnchainReorgProven
                       - BurnchainPolicyRestored
+                      - SignerBehaviorObserved
+                      - SignerBehaviorWindowClosed
                       type: string
                   required:
                   - type
@@ -111,6 +113,8 @@ spec:
                       - ClockSkewCleared
                       - BurnchainReorgProven
                       - BurnchainPolicyRestored
+                      - SignerBehaviorObserved
+                      - SignerBehaviorWindowClosed
                       type: string
                   required:
                   - type
@@ -214,6 +218,8 @@ spec:
                             - ClockSkewCleared
                             - BurnchainReorgProven
                             - BurnchainPolicyRestored
+                            - SignerBehaviorObserved
+                            - SignerBehaviorWindowClosed
                             type: string
                         required:
                         - type
@@ -254,6 +260,8 @@ spec:
                                   - ClockSkewCleared
                                   - BurnchainReorgProven
                                   - BurnchainPolicyRestored
+                                  - SignerBehaviorObserved
+                                  - SignerBehaviorWindowClosed
                                   type: string
                               required:
                               - type
@@ -282,6 +290,8 @@ spec:
                                 - mistake
                                 - attrOverride
                                 - disk-pressure
+                                - withhold
+                                - suppress-peer-responses
                                 type: string
                               burnchainReorg:
                                 description: |-
@@ -329,6 +339,17 @@ spec:
                                 type: string
                               parameters:
                                 x-kubernetes-preserve-unknown-fields: true
+                              signerBehavior:
+                                description: |-
+                                  SignerBehavior binds an observation window to one immutable policy that
+                                  was already admitted with the signer workload by the topology operator.
+                                properties:
+                                  policyDigest:
+                                    pattern: ^sha256:[0-9a-f]{64}$
+                                    type: string
+                                required:
+                                - policyDigest
+                                type: object
                               type:
                                 enum:
                                 - pod
@@ -339,6 +360,7 @@ spec:
                                 - io-pressure
                                 - clock-skew
                                 - burnchain-reorg
+                                - signer-behavior
                                 type: string
                               value:
                                 anyOf:
@@ -360,6 +382,8 @@ spec:
                                 'random']) || (self.type == 'io' && self.action in
                                 ['latency', 'fault', 'mistake', 'attrOverride']) ||
                                 (self.type == 'io-pressure' && self.action == 'disk-pressure')
+                                || (self.type == 'signer-behavior' && self.action
+                                in ['withhold', 'delay', 'suppress-peer-responses'])
                                 || (self.type in ['time', 'clock-skew', 'burnchain-reorg']
                                 && !has(self.action))
                             - message: fault value is required only for fixed and
@@ -371,6 +395,10 @@ spec:
                                 faults
                               rule: 'self.type == ''burnchain-reorg'' ? has(self.burnchainReorg)
                                 : !has(self.burnchainReorg)'
+                            - message: signerBehavior is required only for signer-behavior
+                                faults
+                              rule: 'self.type == ''signer-behavior'' ? has(self.signerBehavior)
+                                : !has(self.signerBehavior)'
                           id:
                             pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
                             type: string
@@ -404,6 +432,8 @@ spec:
                                   - ClockSkewCleared
                                   - BurnchainReorgProven
                                   - BurnchainPolicyRestored
+                                  - SignerBehaviorObserved
+                                  - SignerBehaviorWindowClosed
                                   type: string
                               required:
                               - type
@@ -457,6 +487,12 @@ spec:
                             && self.target.actors.size() == 1 && (!has(self.target.roles)
                             || self.target.roles.size() == 0) && self.target.mode
                             == 'one' && !has(self.target.value))
+                        - message: signer-behavior must target exactly one named signer
+                            with mode all and no value
+                          rule: self.fault.type != 'signer-behavior' || (has(self.target.actors)
+                            && self.target.actors.size() == 1 && (!has(self.target.roles)
+                            || self.target.roles.size() == 0) && self.target.mode
+                            == 'all' && !has(self.target.value))
                       maxItems: 32
                       minItems: 1
                       type: array
@@ -498,6 +534,8 @@ spec:
                             - ClockSkewCleared
                             - BurnchainReorgProven
                             - BurnchainPolicyRestored
+                            - SignerBehaviorObserved
+                            - SignerBehaviorWindowClosed
                             type: string
                         required:
                         - type
@@ -617,9 +655,15 @@ spec:
                           description: AdmittedActorIdentity is the immutable runtime
                             identity admitted for one actor.
                           properties:
+                            adversarialEgressProfile:
+                              type: string
+                            adversarialPolicyDigest:
+                              type: string
                             configDigest:
                               type: string
                             controllerRevision:
+                              type: string
+                            egressPolicyDigest:
                               type: string
                             name:
                               type: string
@@ -751,6 +795,14 @@ spec:
                   signerSetTotalWeight:
                     format: int64
                     type: integer
+                  signerWeightsByActor:
+                    additionalProperties:
+                      format: int64
+                      type: integer
+                    description: |-
+                      SignerWeightsByActor retains the canonical admission weights needed to
+                      finish recovery when a later reward-set observation is unavailable.
+                    type: object
                 required:
                 - admittedAt
                 - campaignGeneration

@@ -29,6 +29,7 @@ var (
 		rule("", []string{"pods"}, readVerbs),
 		rule("discovery.k8s.io", []string{"endpointslices"}, readVerbs),
 		rule("apps", []string{"statefulsets", "deployments"}, configMapVerbs),
+		rule("networking.k8s.io", []string{"networkpolicies"}, configMapVerbs),
 	}
 	runRules = []rbacv1.PolicyRule{
 		rule("testing.stacks.org", []string{"burnchainpolicies", "stacksnetworks"}, readVerbs),

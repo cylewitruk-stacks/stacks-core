@@ -21,6 +21,14 @@ configs supplied by Secret must reproduce that genesis contract exactly.
 `mixed-versions.yaml` demonstrates per-actor images and also requires the named
 complete-config Secrets plus a compatible `BurnchainPolicy`.
 
+`adversarial-signer-policy.yaml` and `adversarial-signer.yaml` demonstrate a
+three-signer cohort with one explicitly patched testing signer and its separate
+signed observer. The example records the exact testing patch and policy
+digests, restricts both actors' egress, and requires the named private config
+and enrollment Secrets. Submit the matching
+[`signer-withhold-window.yaml`](../../attacknet/examples/campaigns/signer-withhold-window.yaml)
+before the policy's Stacks-height window opens.
+
 `multi-bitcoin.yaml` demonstrates two Bitcoin nodes with persistent directed
 peer edges and one Stacks follower bound to each Bitcoin node. Apply
 `multi-bitcoin-policy-a.yaml` and `multi-bitcoin-policy-b.yaml` first. The

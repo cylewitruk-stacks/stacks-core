@@ -24,6 +24,23 @@ func TestCompileV1Beta1EnforcesAggregateSignerSafety(t *testing.T) {
 	}
 }
 
+func TestCompileV1Beta1CountsSignerAndBoundNodeAsOneWeightUnit(t *testing.T) {
+	campaign := betaCampaignFixture()
+	manifest := betaManifestFixture()
+	index, weight := int32(1), 1.0
+	manifest.Actors = append(manifest.Actors, ManifestActor{
+		Name: "signer-node-1", Role: "companion", SignerIndex: &index, SignerWeight: &weight,
+	})
+	compiled, err := CompileV1Beta1(campaign, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	impact := compiled.AggregateImpact
+	if impact.SignerTotalWeight != 5 || impact.SignerAffectedWeight != 1 || impact.SignerAffectedBasisPoints != 2_000 {
+		t.Fatalf("bound signer node was double-counted in aggregate safety: %#v", impact)
+	}
+}
+
 func TestCompileV1Beta1TerminalBarrierPermitsSequentialStages(t *testing.T) {
 	campaign := betaCampaignFixture()
 	campaign.Spec.Stages = append(campaign.Spec.Stages, attacknetv1beta1.FaultStageSpec{
@@ -175,6 +192,69 @@ func TestCompileV1Beta1MaximumSchemaShape(t *testing.T) {
 	}
 }
 
+func TestCompileV1Beta1SignerBehaviorBindsAdmittedPolicyAndWeight(t *testing.T) {
+	manifest := betaManifestFixture()
+	policyDigest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for index := range manifest.Actors {
+		if manifest.Actors[index].Name == "signer-1" {
+			manifest.Actors[index].AdversarialPolicyDigest = policyDigest
+			manifest.Actors[index].AdversarialBehavior = "withhold"
+		}
+	}
+	campaign := betaCampaignFixture()
+	campaign.Spec.Stages[0].Faults = []attacknetv1beta1.FaultActionSpec{{
+		ID: "withhold", Target: attacknetv1beta1.FaultTarget{Actors: []string{"signer-1"}, Mode: "all"},
+		Fault: attacknetv1beta1.FaultSpec{Type: "signer-behavior", Action: "withhold", Mode: "all", Duration: metav1.Duration{Duration: 30 * time.Second}, SignerBehavior: &attacknetv1beta1.SignerBehaviorFaultSpec{PolicyDigest: policyDigest}},
+	}}
+	campaign.Spec.Safety.MaxUnavailableSignerBasisPoints = 10_000
+	compiled, err := CompileV1Beta1(campaign, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := compiled.Stages[0].Actions[0]
+	if action.Resource.GetKind() != "SignerBehaviorSession" || action.Evidence.SelectedActors[0] != "signer-1" || action.Evidence.SignerImpact.AffectedWeight <= 0 {
+		t.Fatalf("unexpected signer behavior compilation: %#v", action)
+	}
+	for index := range manifest.Actors {
+		if manifest.Actors[index].Name == "signer-1" {
+			manifest.Actors[index].AdversarialPolicyDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		}
+	}
+	if _, err := CompileV1Beta1(campaign, manifest); err == nil || !strings.Contains(err.Error(), "policy digest") {
+		t.Fatalf("policy drift was accepted: %v", err)
+	}
+	for index := range manifest.Actors {
+		if manifest.Actors[index].Name == "signer-1" {
+			manifest.Actors[index].AdversarialPolicyDigest = policyDigest
+			manifest.Actors[index].AdversarialBehavior = "delay"
+		}
+	}
+	if _, err := CompileV1Beta1(campaign, manifest); err == nil || !strings.Contains(err.Error(), "policy behavior") {
+		t.Fatalf("policy action drift was accepted: %v", err)
+	}
+}
+
+func TestCompileV1Beta1RequiresOneSignerPerBehaviorAction(t *testing.T) {
+	policyDigest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	weight := 1.0
+	manifest := Manifest{Network: "network"}
+	actors := make([]string, 2)
+	for index := range actors {
+		actors[index] = fmt.Sprintf("signer-%02d", index)
+		manifest.Actors = append(manifest.Actors, ManifestActor{Name: actors[index], Role: "signer", SignerWeight: &weight, AdversarialPolicyDigest: policyDigest, AdversarialBehavior: "withhold"})
+	}
+	campaign := betaCampaignFixture()
+	campaign.Spec.NetworkRef = manifest.Network
+	campaign.Spec.Stages[0].Faults = []attacknetv1beta1.FaultActionSpec{{
+		ID: "withhold", Target: attacknetv1beta1.FaultTarget{Actors: actors, Mode: "all"},
+		Fault: attacknetv1beta1.FaultSpec{Type: "signer-behavior", Action: "withhold", Mode: "all", Duration: metav1.Duration{Duration: 30 * time.Second}, SignerBehavior: &attacknetv1beta1.SignerBehaviorFaultSpec{PolicyDigest: policyDigest}},
+	}}
+	campaign.Spec.Safety.MaxUnavailableSignerBasisPoints = 10_000
+	if _, err := CompileV1Beta1(campaign, manifest); err == nil || !strings.Contains(err.Error(), "exactly one signer") {
+		t.Fatalf("multi-signer behavior action was accepted: %v", err)
+	}
+}
+
 func TestMaximumAggregateImpactMatchesExhaustiveReference(t *testing.T) {
 	campaign := betaCampaignFixture()
 	campaign.Spec.Stages = append(campaign.Spec.Stages,
@@ -208,13 +288,17 @@ func exhaustiveAggregateImpact(compiled []CompiledStage, specs []attacknetv1beta
 			continue
 		}
 		impact := AggregateImpact{}
+		weights := map[int32]float64{}
 		for _, actor := range manifest.Actors {
 			if actor.SignerIndex != nil && actor.SignerWeight != nil {
-				impact.SignerTotalWeight += *actor.SignerWeight
+				weights[*actor.SignerIndex] = *actor.SignerWeight
 			}
 			if actor.Role == "miner" {
 				impact.MinerTotalCount++
 			}
+		}
+		for _, weight := range weights {
+			impact.SignerTotalWeight += weight
 		}
 		for _, index := range indexes {
 			impact.PotentiallyOverlappingStages = append(impact.PotentiallyOverlappingStages, compiled[index].ID)

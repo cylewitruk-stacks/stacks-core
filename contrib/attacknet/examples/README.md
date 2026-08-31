@@ -11,6 +11,14 @@ Examples are grouped by intent:
 - [`matrices/`](matrices/) contains human-authored source, image, configuration,
   assignment, and upgrade plans.
 
+[`campaigns/signer-withhold-window.yaml`](campaigns/signer-withhold-window.yaml)
+observes one deterministic testing signer declared by
+[`../../helm/hacknet/examples/adversarial-signer.yaml`](../../helm/hacknet/examples/adversarial-signer.yaml).
+Apply the accompanying burnchain policy and network first, then submit the
+campaign before its Stacks-height trigger. Its signed report proves a bounded
+testing-policy attempt; network impact still requires independent protocol
+assertions.
+
 Version plans are YAML because operators author them. `attacknet version
 prepare` produces canonical, digest-bound JSON descriptors; runtime evidence,
 generated receipts, and replay descriptors also remain canonical JSON.

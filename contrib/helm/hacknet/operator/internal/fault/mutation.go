@@ -407,6 +407,9 @@ func injectionReason(kind string) string {
 	if kind == "ClockSkewPolicy" {
 		return "ClockPolicyApplied"
 	}
+	if kind == "SignerBehaviorSession" {
+		return "BehaviorSessionActivated"
+	}
 	if kind == "IOPressurePod" {
 		return "PressurePodCreated"
 	}

@@ -33,6 +33,10 @@ attacknet wait --namespace experiment --for terminal AttacknetRun soak
 attacknet delete --namespace experiment --wait FaultCampaign partition
 attacknet evidence snapshot --namespace experiment --output run.json AttacknetRun soak
 attacknet evidence incident --namespace experiment --output incident network
+attacknet evidence verify-signer-report --file report.json \
+  --actor signer-1-observer --target signer-1 \
+  --policy-digest sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --nonce 0123456789abcdef0123456789abcdef
 attacknet teardown --namespace experiment --output teardown \
   --run soak network
 attacknet doctor --output json
@@ -92,6 +96,12 @@ concurrency, artifact count, per-artifact bytes, total bytes, resource count,
 event count, and log lines are all bounded. Replacement-Pod logs are omitted
 instead of being misattributed. The collector records observations and errors;
 it does not decide whether an experiment passed.
+
+`evidence verify-signer-report` is an offline cryptographic verifier for an
+R1A12 observer report. It binds the report envelope and signed payload to the
+expected observer, target, policy, challenge nonce, optional key identity, and
+optional RFC3339 time bounds. It validates provenance only; the observed
+signer counter remains actor-self-reported and requires protocol corroboration.
 
 `image build` executes Docker directly without a shell and emits immutable
 local image IDs. `image load` derives each selected platform's runtime config

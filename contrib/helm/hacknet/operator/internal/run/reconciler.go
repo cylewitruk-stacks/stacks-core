@@ -719,7 +719,10 @@ func (r *Reconciler) signerResolver() signerset.Resolver {
 }
 
 func canonicalManifest(network *attacknetv1alpha1.StacksNetwork, weights map[string]float64) fault.Manifest {
-	manifest := fault.ManifestFromNetwork(network)
+	return manifestWithSignerWeights(fault.ManifestFromNetwork(network), weights)
+}
+
+func manifestWithSignerWeights(manifest fault.Manifest, weights map[string]float64) fault.Manifest {
 	for index := range manifest.Actors {
 		if weight, ok := weights[manifest.Actors[index].Name]; ok {
 			manifest.Actors[index].SignerWeight = ptr(weight)

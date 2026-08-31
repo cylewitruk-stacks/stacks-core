@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,14 +36,15 @@ var placeholderPattern = regexp.MustCompile(`\$\{(NETWORK|NAMESPACE|ACTOR|SERVIC
 
 // ResourceSet contains the desired objects for one StacksNetwork.
 type ResourceSet struct {
-	ConfigMaps   []*corev1.ConfigMap   `json:"configmaps"`
-	Services     []*corev1.Service     `json:"services"`
-	StatefulSets []*appsv1.StatefulSet `json:"statefulsets"`
+	ConfigMaps      []*corev1.ConfigMap           `json:"configmaps"`
+	Services        []*corev1.Service             `json:"services"`
+	StatefulSets    []*appsv1.StatefulSet         `json:"statefulsets"`
+	NetworkPolicies []*networkingv1.NetworkPolicy `json:"networkPolicies,omitempty"`
 }
 
 // Objects returns every desired object in deterministic apply order.
 func (r ResourceSet) Objects() []client.Object {
-	objects := make([]client.Object, 0, len(r.ConfigMaps)+len(r.Services)+len(r.StatefulSets))
+	objects := make([]client.Object, 0, len(r.ConfigMaps)+len(r.Services)+len(r.StatefulSets)+len(r.NetworkPolicies))
 	for _, object := range r.ConfigMaps {
 		objects = append(objects, object)
 	}
@@ -50,6 +52,9 @@ func (r ResourceSet) Objects() []client.Object {
 		objects = append(objects, object)
 	}
 	for _, object := range r.StatefulSets {
+		objects = append(objects, object)
+	}
+	for _, object := range r.NetworkPolicies {
 		objects = append(objects, object)
 	}
 	return objects
@@ -94,6 +99,13 @@ func Render(network *attacknetv1alpha1.StacksNetwork, scheme *runtime.Scheme) (R
 		}
 		result.Services = append(result.Services, service)
 		result.StatefulSets = append(result.StatefulSets, statefulSet)
+		policy, err := ctx.egressPolicy()
+		if err != nil {
+			return ResourceSet{}, err
+		}
+		if policy != nil {
+			result.NetworkPolicies = append(result.NetworkPolicies, policy)
+		}
 	}
 	return result, nil
 }

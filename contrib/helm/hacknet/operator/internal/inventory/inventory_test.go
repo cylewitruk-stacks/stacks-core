@@ -103,6 +103,32 @@ func TestConfigDigestIsAnOptionalAdmittedIdentity(t *testing.T) {
 	}
 }
 
+func TestRestrictedEgressPolicyIsPartOfAdmittedIdentity(t *testing.T) {
+	network := readyNetwork()
+	policyDigest := "sha256:" + repeat("c", 64)
+	network.Spec.Actors[0].AdversarialPolicyDigest = "sha256:" + repeat("b", 64)
+	network.Spec.Actors[0].AdversarialEgressProfile = "restricted"
+	network.Status.Actors[0].AdversarialPolicyDigest = network.Spec.Actors[0].AdversarialPolicyDigest
+	network.Status.Actors[0].AdversarialEgressProfile = "restricted"
+	network.Status.Actors[0].EgressPolicyDigest = policyDigest
+	payload, err := Build(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.InventoryDigest, err = Digest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := Published(network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	network.Status.Actors[0].EgressPolicyDigest = "sha256:" + repeat("d", 64)
+	if differences := CompareLive(expected, network, nil, nil); !hasDifference(differences, "egressPolicyDigest") {
+		t.Fatalf("egress policy substitution was not detected: %#v", differences)
+	}
+}
+
 func TestCompareLiveAllowsOnlySelectedPodIdentity(t *testing.T) {
 	network := readyNetwork()
 	payload, _ := Build(network)

@@ -18,7 +18,10 @@ import (
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
 
-const maximumCampaignStages = 16
+const (
+	maximumCampaignStages              = 16
+	maximumSignerBehaviorTargetWindows = 32
+)
 
 var stageIDPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
 
@@ -64,6 +67,7 @@ func CompileV1Beta1(campaign *attacknetv1beta1.FaultCampaign, manifest Manifest)
 		return CompiledCampaign{}, fmt.Errorf("networkRef %s does not match manifest %s", campaign.Spec.NetworkRef, manifest.Network)
 	}
 	stages := make([]CompiledStage, 0, len(campaign.Spec.Stages))
+	signerBehaviorTargetWindows := 0
 	for stageIndex := range campaign.Spec.Stages {
 		stage := &campaign.Spec.Stages[stageIndex]
 		compiled := CompiledStage{ID: stage.ID, Trigger: *stage.Trigger.DeepCopy()}
@@ -74,6 +78,12 @@ func CompileV1Beta1(campaign *attacknetv1beta1.FaultCampaign, manifest Manifest)
 				return CompiledCampaign{}, fmt.Errorf("stage %q action %q: %w", stage.ID, action.ID, err)
 			}
 			compiled.Actions = append(compiled.Actions, item)
+			if action.Fault.Type == "signer-behavior" {
+				signerBehaviorTargetWindows += len(item.Evidence.SelectedActors)
+				if signerBehaviorTargetWindows > maximumSignerBehaviorTargetWindows {
+					return CompiledCampaign{}, fmt.Errorf("signer-behavior target windows %d exceed bounded status-evidence maximum %d", signerBehaviorTargetWindows, maximumSignerBehaviorTargetWindows)
+				}
+			}
 		}
 		stages = append(stages, compiled)
 	}
@@ -123,6 +133,7 @@ var knownAssertionTypes = map[string]bool{
 	"IORecovered": true, "IOPressureObserved": true, "IOPressureRecovered": true,
 	"ClockSkewObserved": true, "ClockSkewCleared": true,
 	"BurnchainReorgProven": true, "BurnchainPolicyRestored": true,
+	"SignerBehaviorObserved": true, "SignerBehaviorWindowClosed": true,
 }
 
 func campaignActionCount(stages []attacknetv1beta1.FaultStageSpec) int {
@@ -182,6 +193,9 @@ func compileV1Beta1Action(campaign *attacknetv1beta1.FaultCampaign, stage *attac
 	if action.Fault.Type == "burnchain-reorg" {
 		return compileBurnchainReorgAction(campaign, stage, action, manifest)
 	}
+	if action.Fault.Type == "signer-behavior" {
+		return compileSignerBehaviorAction(campaign, stage, action, manifest)
+	}
 	legacy := &attacknetv1alpha1.FaultCampaign{
 		ObjectMeta: metav1.ObjectMeta{Name: mutationName(campaign.Name, stage.ID, action.ID), Namespace: campaign.Namespace},
 		Spec: attacknetv1alpha1.FaultCampaignSpec{
@@ -216,6 +230,53 @@ func compileV1Beta1Action(campaign *attacknetv1beta1.FaultCampaign, stage *attac
 		"testing.stacks.org/action":   action.ID,
 	}))
 	return CompiledAction{ID: action.ID, Resource: compiled.Resource, Evidence: compiled.Evidence}, nil
+}
+
+func compileSignerBehaviorAction(campaign *attacknetv1beta1.FaultCampaign, stage *attacknetv1beta1.FaultStageSpec, action *attacknetv1beta1.FaultActionSpec, manifest Manifest) (CompiledAction, error) {
+	target := attacknetv1alpha1.FaultTarget{Actors: append([]string(nil), action.Target.Actors...), Roles: append([]string(nil), action.Target.Roles...)}
+	selected, err := selectActors(target, manifest.Actors)
+	if err != nil {
+		return CompiledAction{}, err
+	}
+	if len(selected) != 1 {
+		return CompiledAction{}, errors.New("signer-behavior must resolve exactly one signer per independently attributable action")
+	}
+	names := make([]string, 0, len(selected))
+	for _, actor := range selected {
+		if actor.Role != "signer" {
+			return CompiledAction{}, fmt.Errorf("signer-behavior target %s has role %s, want signer", actor.Name, actor.Role)
+		}
+		if actor.AdversarialPolicyDigest != action.Fault.SignerBehavior.PolicyDigest {
+			return CompiledAction{}, fmt.Errorf("signer-behavior target %s policy digest does not match the requested digest", actor.Name)
+		}
+		if actor.AdversarialBehavior != action.Fault.Action {
+			return CompiledAction{}, fmt.Errorf("signer-behavior target %s policy behavior %q does not match requested action %q", actor.Name, actor.AdversarialBehavior, action.Fault.Action)
+		}
+		names = append(names, actor.Name)
+	}
+	sort.Strings(names)
+	resource := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "testing.stacks.org/internal", "kind": "SignerBehaviorSession",
+		"metadata": map[string]any{"name": mutationName(campaign.Name, stage.ID, action.ID), "namespace": campaign.Namespace, "labels": map[string]any{
+			NetworkLabel: campaign.Spec.NetworkRef, "testing.stacks.org/campaign": campaign.Name, "testing.stacks.org/stage": stage.ID, "testing.stacks.org/action": action.ID,
+		}},
+		"spec": map[string]any{"action": action.Fault.Action, "policyDigest": action.Fault.SignerBehavior.PolicyDigest, "actors": stringSliceAny(names)},
+	}}
+	evidence := Evidence{SelectedActors: names, MaximumAffectedActors: len(names)}
+	selectedActors := make([]ManifestActor, 0, len(names))
+	for _, actor := range selected {
+		selectedActors = append(selectedActors, actor)
+	}
+	evidence.SignerImpact = weightedImpact(selectedActors, manifest.Actors, len(names))
+	return CompiledAction{ID: action.ID, Resource: resource, Evidence: evidence}, nil
+}
+
+func stringSliceAny(values []string) []any {
+	result := make([]any, len(values))
+	for index, value := range values {
+		result[index] = value
+	}
+	return result
 }
 
 func compileBurnchainReorgAction(campaign *attacknetv1beta1.FaultCampaign, stage *attacknetv1beta1.FaultStageSpec, action *attacknetv1beta1.FaultActionSpec, manifest Manifest) (CompiledAction, error) {
@@ -328,10 +389,10 @@ func validateStageDependencies(stages []attacknetv1beta1.FaultStageSpec, indexes
 
 func maximumAggregateImpact(compiled []CompiledStage, specs []attacknetv1beta1.FaultStageSpec, manifest Manifest) AggregateImpact {
 	maximum := AggregateImpact{}
+	for _, weight := range signerWeights(manifest.Actors) {
+		maximum.SignerTotalWeight += weight
+	}
 	for _, actor := range manifest.Actors {
-		if actor.SignerIndex != nil && actor.SignerWeight != nil {
-			maximum.SignerTotalWeight += *actor.SignerWeight
-		}
 		if actor.Role == "miner" {
 			maximum.MinerTotalCount++
 		}

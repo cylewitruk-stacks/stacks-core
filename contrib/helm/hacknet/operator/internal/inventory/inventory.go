@@ -34,17 +34,20 @@ type Payload struct {
 
 // digestActor is the stable actor projection included in the inventory digest.
 type digestActor struct {
-	ConfigDigest       string `json:"configDigest,omitempty"`
-	ControllerRevision string `json:"controllerRevision"`
-	Name               string `json:"name"`
-	PodName            string `json:"podName"`
-	PodUID             string `json:"podUID"`
-	RequestedImage     string `json:"requestedImage"`
-	Role               string `json:"role"`
-	RuntimeImageID     string `json:"runtimeImageID"`
-	ServiceName        string `json:"serviceName"`
-	StatefulSetName    string `json:"statefulSetName"`
-	StatefulSetUID     string `json:"statefulSetUID"`
+	AdversarialEgressProfile string `json:"adversarialEgressProfile,omitempty"`
+	AdversarialPolicyDigest  string `json:"adversarialPolicyDigest,omitempty"`
+	ConfigDigest             string `json:"configDigest,omitempty"`
+	ControllerRevision       string `json:"controllerRevision"`
+	EgressPolicyDigest       string `json:"egressPolicyDigest,omitempty"`
+	Name                     string `json:"name"`
+	PodName                  string `json:"podName"`
+	PodUID                   string `json:"podUID"`
+	RequestedImage           string `json:"requestedImage"`
+	Role                     string `json:"role"`
+	RuntimeImageID           string `json:"runtimeImageID"`
+	ServiceName              string `json:"serviceName"`
+	StatefulSetName          string `json:"statefulSetName"`
+	StatefulSetUID           string `json:"statefulSetUID"`
 }
 
 // Digest returns the versioned SHA-256 digest for a complete payload.
@@ -85,13 +88,17 @@ func Build(network *testingv1.StacksNetwork) (Payload, error) {
 		if !ok || !status.IdentityReady || status.Role != actor.Role {
 			return Payload{}, fmt.Errorf("StacksNetwork actor %s lacks a complete admitted identity", actor.Name)
 		}
+		if status.AdversarialPolicyDigest != actor.AdversarialPolicyDigest || status.AdversarialEgressProfile != actor.AdversarialEgressProfile {
+			return Payload{}, fmt.Errorf("StacksNetwork actor %s adversarial identity does not match the compiled workload", actor.Name)
+		}
 		identity := testingv1.AdmittedActorIdentity{
 			Name: actor.Name, Role: actor.Role,
 			ServiceName: status.ServiceName, StatefulSetName: status.ResourceName,
 			StatefulSetUID: status.StatefulSetUID, ControllerRevision: status.CurrentRevision,
 			PodName: status.PodName, PodUID: status.PodUID,
 			RequestedImage: status.Image, RuntimeImageID: status.RuntimeImageID,
-			ConfigDigest: status.ConfigDigest,
+			ConfigDigest: status.ConfigDigest, AdversarialPolicyDigest: status.AdversarialPolicyDigest,
+			AdversarialEgressProfile: status.AdversarialEgressProfile, EgressPolicyDigest: status.EgressPolicyDigest,
 		}
 		if err := validateIdentity(identity); err != nil {
 			return Payload{}, fmt.Errorf("StacksNetwork actor %s: %w", actor.Name, err)
@@ -185,7 +192,8 @@ func compareIncompleteStatus(expected testingv1.NetworkInventory, network *testi
 			StatefulSetName: status.ResourceName, StatefulSetUID: status.StatefulSetUID,
 			ControllerRevision: status.CurrentRevision, PodName: status.PodName,
 			PodUID: status.PodUID, RequestedImage: status.Image, RuntimeImageID: status.RuntimeImageID,
-			ConfigDigest: status.ConfigDigest,
+			ConfigDigest: status.ConfigDigest, AdversarialPolicyDigest: status.AdversarialPolicyDigest,
+			AdversarialEgressProfile: status.AdversarialEgressProfile, EgressPolicyDigest: status.EgressPolicyDigest,
 		}
 		differences = append(differences, compareActor(actor, observed, allowed)...)
 	}
@@ -208,6 +216,9 @@ func compareActor(expected, observed testingv1.AdmittedActorIdentity, allowed ma
 		{"requestedImage", expected.RequestedImage, observed.RequestedImage, false},
 		{"runtimeImageID", expected.RuntimeImageID, observed.RuntimeImageID, false},
 		{"configDigest", expected.ConfigDigest, observed.ConfigDigest, false},
+		{"adversarialPolicyDigest", expected.AdversarialPolicyDigest, observed.AdversarialPolicyDigest, false},
+		{"adversarialEgressProfile", expected.AdversarialEgressProfile, observed.AdversarialEgressProfile, false},
+		{"egressPolicyDigest", expected.EgressPolicyDigest, observed.EgressPolicyDigest, false},
 	}
 	differences := make([]testingv1.IdentityDifference, 0)
 	for _, pair := range pairs {
@@ -310,12 +321,34 @@ func validateIdentity(identity testingv1.AdmittedActorIdentity) error {
 	if identity.ConfigDigest != "" && !exactDigestPattern.MatchString(identity.ConfigDigest) {
 		return errors.New("admitted identity has an invalid configuration digest")
 	}
+	if identity.AdversarialPolicyDigest != "" && !exactDigestPattern.MatchString(identity.AdversarialPolicyDigest) {
+		return errors.New("admitted identity has an invalid adversarial policy digest")
+	}
+	switch identity.AdversarialEgressProfile {
+	case "":
+		if identity.EgressPolicyDigest != "" {
+			return errors.New("admitted identity has an egress policy digest without an adversarial egress profile")
+		}
+	case "restricted":
+		if !exactDigestPattern.MatchString(identity.EgressPolicyDigest) {
+			return errors.New("restricted admitted identity lacks a valid egress policy digest")
+		}
+	case "unrestricted":
+		if identity.EgressPolicyDigest != "" {
+			return errors.New("unrestricted admitted identity must not name an egress NetworkPolicy digest")
+		}
+	default:
+		return fmt.Errorf("admitted identity has unsupported adversarial egress profile %q", identity.AdversarialEgressProfile)
+	}
 	return nil
 }
 
 func toDigestActor(actor testingv1.AdmittedActorIdentity) digestActor {
 	return digestActor{
-		ConfigDigest: actor.ConfigDigest, ControllerRevision: actor.ControllerRevision, Name: actor.Name,
+		AdversarialEgressProfile: actor.AdversarialEgressProfile,
+		AdversarialPolicyDigest:  actor.AdversarialPolicyDigest,
+		EgressPolicyDigest:       actor.EgressPolicyDigest,
+		ConfigDigest:             actor.ConfigDigest, ControllerRevision: actor.ControllerRevision, Name: actor.Name,
 		PodName: actor.PodName, PodUID: actor.PodUID, RequestedImage: actor.RequestedImage,
 		Role: actor.Role, RuntimeImageID: actor.RuntimeImageID, ServiceName: actor.ServiceName,
 		StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,
@@ -324,7 +357,10 @@ func toDigestActor(actor testingv1.AdmittedActorIdentity) digestActor {
 
 func fromDigestActor(actor digestActor) testingv1.AdmittedActorIdentity {
 	return testingv1.AdmittedActorIdentity{
-		ConfigDigest: actor.ConfigDigest, ControllerRevision: actor.ControllerRevision, Name: actor.Name,
+		AdversarialEgressProfile: actor.AdversarialEgressProfile,
+		AdversarialPolicyDigest:  actor.AdversarialPolicyDigest,
+		EgressPolicyDigest:       actor.EgressPolicyDigest,
+		ConfigDigest:             actor.ConfigDigest, ControllerRevision: actor.ControllerRevision, Name: actor.Name,
 		PodName: actor.PodName, PodUID: actor.PodUID, RequestedImage: actor.RequestedImage,
 		Role: actor.Role, RuntimeImageID: actor.RuntimeImageID, ServiceName: actor.ServiceName,
 		StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,

@@ -5,6 +5,7 @@ import (
 
 	testingv1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 	testingv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/adversarial"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/burnchaintopology"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -82,7 +83,10 @@ func betaNetworkAsLegacy(network *testingv1beta1.StacksNetwork) *testingv1.Stack
 			StatefulSetResourceVersion: actor.StatefulSetResourceVersion, PodName: actor.PodName,
 			PodUID: actor.PodUID, PodResourceVersion: actor.PodResourceVersion,
 			RuntimeImageID: actor.RuntimeImageID, ConfigDigest: actor.ConfigDigest,
-			IdentityReady: actor.IdentityReady,
+			AdversarialPolicyDigest:  actor.AdversarialPolicyDigest,
+			AdversarialEgressProfile: actor.AdversarialEgressProfile,
+			EgressPolicyDigest:       actor.EgressPolicyDigest,
+			IdentityReady:            actor.IdentityReady,
 		})
 	}
 	return legacy
@@ -104,8 +108,11 @@ func betaDeclaredActors(network *testingv1beta1.StacksNetwork) []testingv1.Actor
 		for _, member := range set.Members {
 			result = append(result,
 				testingv1.ActorSpec{Name: member.NodeName, Role: "companion"},
-				testingv1.ActorSpec{Name: member.Name, Role: "signer"},
+				testingv1.ActorSpec{Name: member.Name, Role: "signer", AdversarialPolicyDigest: actorPolicyDigest(member), AdversarialEgressProfile: actorEgressProfile(member)},
 			)
+			if member.Adversarial != nil {
+				result = append(result, testingv1.ActorSpec{Name: adversarial.ObserverName(member.Name), Role: "observer", AdversarialPolicyDigest: actorPolicyDigest(member), AdversarialEgressProfile: "restricted"})
+			}
 		}
 	}
 	if network.Spec.Enrollment != nil {
@@ -129,7 +136,8 @@ func betaInventory(value testingv1.NetworkInventory) testingv1beta1.NetworkInven
 			StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,
 			ControllerRevision: actor.ControllerRevision, PodName: actor.PodName, PodUID: actor.PodUID,
 			RequestedImage: actor.RequestedImage, RuntimeImageID: actor.RuntimeImageID,
-			ConfigDigest: actor.ConfigDigest,
+			ConfigDigest: actor.ConfigDigest, AdversarialPolicyDigest: actor.AdversarialPolicyDigest,
+			AdversarialEgressProfile: actor.AdversarialEgressProfile, EgressPolicyDigest: actor.EgressPolicyDigest,
 		}
 	}
 	return result
@@ -147,8 +155,28 @@ func legacyInventory(value testingv1beta1.NetworkInventory) testingv1.NetworkInv
 			StatefulSetName: actor.StatefulSetName, StatefulSetUID: actor.StatefulSetUID,
 			ControllerRevision: actor.ControllerRevision, PodName: actor.PodName, PodUID: actor.PodUID,
 			RequestedImage: actor.RequestedImage, RuntimeImageID: actor.RuntimeImageID,
-			ConfigDigest: actor.ConfigDigest,
+			ConfigDigest: actor.ConfigDigest, AdversarialPolicyDigest: actor.AdversarialPolicyDigest,
+			AdversarialEgressProfile: actor.AdversarialEgressProfile, EgressPolicyDigest: actor.EgressPolicyDigest,
 		}
 	}
 	return result
+}
+
+func actorPolicyDigest(member testingv1beta1.SignerMemberSpec) string {
+	if member.Adversarial == nil {
+		return ""
+	}
+	policy, err := adversarial.Normalize(member.Adversarial)
+	if err != nil {
+		return ""
+	}
+	digest, _ := adversarial.Digest(policy)
+	return digest
+}
+
+func actorEgressProfile(member testingv1beta1.SignerMemberSpec) string {
+	if member.Adversarial == nil {
+		return ""
+	}
+	return member.Adversarial.Egress.Profile
 }

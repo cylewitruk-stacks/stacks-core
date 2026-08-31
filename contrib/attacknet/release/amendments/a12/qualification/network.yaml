@@ -1,0 +1,108 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: a12-adversarial
+  namespace: hacknet-system
+spec:
+  probe: {enabled: true}
+  defaults:
+    nodeImage: stacks-core-attacknet:a11-candidate
+    signerImage: stacks-core-attacknet:a11-candidate
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
+    imagePullPolicy: IfNotPresent
+    bootstrapPeers:
+      - 034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444
+    workload:
+      storage: {enabled: true, size: 1Gi}
+      resources:
+        requests: {cpu: 50m, memory: 128Mi}
+        limits: {cpu: "2", memory: 2Gi}
+  genesis:
+    pox5:
+      sbtcContract: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token
+      sbtcRegistryContract: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry
+    balances:
+      - {address: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H, amount: 10000000000000000}
+      - {address: ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z, amount: 10000000000000000}
+      - {address: ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551, amount: 10000000000000000}
+  burnchain:
+    policyRef: {name: a12-adversarial}
+    nodes:
+      - name: bitcoin
+        config: {generated: {profile: bitcoin-regtest/v1}}
+        workload: {storage: {enabled: true, size: 2Gi}}
+  nodes:
+    - name: miner-1
+      role: miner
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: a12-miner-config, key: config.toml}}
+    - name: follower-1
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+  signerSets:
+    - name: active
+      members:
+        - name: signer-1
+          nodeName: signer-node-1
+          index: 1
+          weight: 1
+          publicKey: 035249137286c077ccee65ecc43e724b9b9e5a588e3d7f51e3b62f9624c2a49e46
+          burnchainNodeRef: bitcoin
+          signerImage: stacks-signer-adversarial:r1a12
+          signerConfig: {secretRef: {name: a12-signer-1, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+          adversarial:
+            profile: stacks-signer-testing/v1
+            behavior: withhold
+            selector: {minStacksHeight: 150}
+            maxMatches: 2
+            maxEvaluations: 512
+            patchDigest: sha256:4a24941d86f164b81a9681cf00a61a8117a170e0ad2cdd67989ae3f15b3c44b4
+            observer: {image: stacks-hacknet-probe:dev, imagePullPolicy: IfNotPresent}
+            egress: {profile: restricted}
+        - name: signer-2
+          nodeName: signer-node-2
+          index: 2
+          weight: 3
+          publicKey: 031a4d9f4903da97498945a4e01a5023a1d53bc96ad670bfe03adf8a06c52e6380
+          burnchainNodeRef: bitcoin
+          signerImage: stacks-signer-adversarial:r1a12
+          signerConfig: {secretRef: {name: a12-signer-2, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+          adversarial:
+            profile: stacks-signer-testing/v1
+            behavior: withhold
+            selector: {minStacksHeight: 180}
+            maxMatches: 20
+            maxEvaluations: 768
+            patchDigest: sha256:4a24941d86f164b81a9681cf00a61a8117a170e0ad2cdd67989ae3f15b3c44b4
+            observer: {image: stacks-hacknet-probe:dev, imagePullPolicy: IfNotPresent}
+            egress: {profile: restricted}
+        - name: signer-3
+          nodeName: signer-node-3
+          index: 3
+          weight: 4
+          publicKey: 02007311430123d4cad97f4f7e86e023b28143130a18099ecf094d36fef0f6135c
+          burnchainNodeRef: bitcoin
+          signerImage: stacks-signer-adversarial:r1a12
+          signerConfig: {secretRef: {name: a12-signer-3, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+          adversarial:
+            profile: stacks-signer-testing/v1
+            behavior: withhold
+            selector: {minStacksHeight: 180}
+            maxMatches: 20
+            maxEvaluations: 768
+            patchDigest: sha256:4a24941d86f164b81a9681cf00a61a8117a170e0ad2cdd67989ae3f15b3c44b4
+            observer: {image: stacks-hacknet-probe:dev, imagePullPolicy: IfNotPresent}
+            egress: {profile: restricted}
+  enrollment:
+    name: stacker
+    image: stacks-attacknet-stacker:local
+    nodeRef: miner-1
+    credentialsSecretRef:
+      name: a12-stacker-credentials
+      keysKey: private-keys
+      addressesKey: addresses

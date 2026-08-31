@@ -106,6 +106,77 @@ func TestSuccessStopWaitsForConcurrentCampaignRecovery(t *testing.T) {
 	}
 }
 
+func TestProtocolStopWaitsForActiveCampaignEvidenceAndRecovery(t *testing.T) {
+	active := &attacknetv1beta1.BudgetUsage{ActiveCampaigns: 1}
+	for _, outcome := range []string{protocolassertion.OutcomeViolated, protocolassertion.OutcomeInconclusive} {
+		if !betaProtocolStopWaitsForActiveCampaigns(&protocolGate{Outcome: outcome}, active) {
+			t.Fatalf("protocol outcome %s discarded an active campaign before recovery evidence", outcome)
+		}
+	}
+	for _, test := range []struct {
+		name  string
+		gate  *protocolGate
+		usage *attacknetv1beta1.BudgetUsage
+	}{
+		{name: "pending is not terminal", gate: &protocolGate{Outcome: protocolassertion.OutcomePending}, usage: active},
+		{name: "no active campaign", gate: &protocolGate{Outcome: protocolassertion.OutcomeViolated}, usage: &attacknetv1beta1.BudgetUsage{}},
+		{name: "nil gate", usage: active},
+		{name: "nil usage", gate: &protocolGate{Outcome: protocolassertion.OutcomeViolated}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if betaProtocolStopWaitsForActiveCampaigns(test.gate, test.usage) {
+				t.Fatal("protocol stop waited without an active terminal campaign")
+			}
+		})
+	}
+}
+
+func TestRecordedProtocolViolationBlocksFurtherSchedulingUntilRecovery(t *testing.T) {
+	reconciler := &V1Beta1Reconciler{}
+	next := attacknetv1beta1.AttacknetRunStatus{ProtocolAssertions: &attacknetv1beta1.ProtocolAssertionsStatus{
+		During: &attacknetv1beta1.ProtocolAssertionSetStatus{Outcome: protocolassertion.OutcomeViolated},
+	}}
+	gate, err := reconciler.evaluateProtocolAssertions(
+		&next,
+		betaSchedule{Assertions: betaProtocolAssertions{During: &attacknetv1beta1.ProtocolAssertionSetSpec{}}},
+		&attacknetv1beta1.BudgetUsage{CampaignsStarted: 1, ActiveCampaigns: 1},
+		false,
+		protocolobservation.Snapshot{},
+		false,
+	)
+	if err != nil || gate == nil || gate.Outcome != protocolassertion.OutcomeViolated || gate.Reason != "ProtocolDuringViolated" {
+		t.Fatalf("durable protocol violation was not retained as the scheduling barrier: gate=%#v err=%v", gate, err)
+	}
+}
+
+func TestRecordedProtocolViolationStillRequiresProtocolRecovery(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	reconciler := &V1Beta1Reconciler{Now: func() time.Time { return now }}
+	next := attacknetv1beta1.AttacknetRunStatus{ProtocolAssertions: &attacknetv1beta1.ProtocolAssertionsStatus{
+		During: &attacknetv1beta1.ProtocolAssertionSetStatus{Outcome: protocolassertion.OutcomeViolated},
+	}}
+	recovery := &attacknetv1beta1.ProtocolAssertionSetSpec{
+		Assertions: []attacknetv1beta1.ProtocolAssertionSpec{{
+			ID: "complete", TelemetryCompleteness: &attacknetv1beta1.TelemetryCompletenessAssertion{Actors: []string{"node-1"}},
+		}},
+	}
+	snapshot := protocolobservation.Snapshot{ObservedAt: now, Actors: []protocolobservation.ActorSnapshot{{
+		Source: protocolobservation.Source{Actor: "node-1", ObservedAt: now, EvidenceClass: protocolobservation.EvidenceActorSelfReported},
+	}}}
+	gate, err := reconciler.evaluateProtocolAssertions(
+		&next,
+		betaSchedule{Assertions: betaProtocolAssertions{Recovery: recovery}},
+		&attacknetv1beta1.BudgetUsage{CampaignsStarted: 1, CampaignsCompleted: 1},
+		false,
+		snapshot,
+		false,
+	)
+	if err != nil || gate == nil || gate.Outcome != protocolassertion.OutcomeViolated ||
+		next.ProtocolAssertions.Recovery == nil || next.ProtocolAssertions.Recovery.Outcome != protocolassertion.OutcomeProven {
+		t.Fatalf("retained violation bypassed protocol recovery: gate=%#v status=%#v err=%v", gate, next.ProtocolAssertions, err)
+	}
+}
+
 func TestProvenActiveFaultExcludesInjectionAndRecoveryTransitions(t *testing.T) {
 	campaign := attacknetv1beta1.FaultCampaign{Status: attacknetv1beta1.FaultCampaignStatus{
 		Stages: []attacknetv1beta1.FaultStageStatus{{

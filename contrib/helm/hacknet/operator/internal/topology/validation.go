@@ -2,6 +2,7 @@ package topology
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -9,6 +10,8 @@ import (
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
 )
+
+var exactSHA256Pattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 func validateNetwork(network *attacknetv1alpha1.StacksNetwork) error {
 	if network.Name == "" || network.Namespace == "" || network.UID == "" {
@@ -18,7 +21,7 @@ func validateNetwork(network *attacknetv1alpha1.StacksNetwork) error {
 		return fmt.Errorf("spec.actors must contain between 1 and 100 actors")
 	}
 	actors := map[string]*attacknetv1alpha1.ActorSpec{}
-	validRoles := map[string]bool{"burnchain": true, "miner": true, "signer": true, "companion": true, "follower": true, "adversary": true, "infrastructure": true}
+	validRoles := map[string]bool{"burnchain": true, "miner": true, "signer": true, "companion": true, "follower": true, "adversary": true, "infrastructure": true, "observer": true}
 	for index := range network.Spec.Actors {
 		actor := &network.Spec.Actors[index]
 		if actor.Name == "" || len(actor.Name) > 40 || len(validation.IsDNS1123Label(actor.Name)) > 0 {
@@ -74,6 +77,21 @@ func validateNetwork(network *attacknetv1alpha1.StacksNetwork) error {
 			if len(name) > 63 || len(validation.IsDNS1123Label(name)) > 0 {
 				return fmt.Errorf("actor %q has invalid runtime policy ConfigMap name", actor.Name)
 			}
+		}
+		if actor.AdversarialPolicyDigest != "" && !exactSHA256Pattern.MatchString(actor.AdversarialPolicyDigest) {
+			return fmt.Errorf("actor %q has malformed adversarial policy digest", actor.Name)
+		}
+		switch actor.AdversarialEgressProfile {
+		case "":
+			if actor.AdversarialPolicyDigest != "" {
+				return fmt.Errorf("actor %q has an adversarial policy without an egress profile", actor.Name)
+			}
+		case "restricted", "unrestricted":
+			if actor.AdversarialPolicyDigest == "" {
+				return fmt.Errorf("actor %q has an adversarial egress profile without a policy digest", actor.Name)
+			}
+		default:
+			return fmt.Errorf("actor %q has unsupported adversarial egress profile %q", actor.Name, actor.AdversarialEgressProfile)
 		}
 		ports := map[string]bool{}
 		containerPorts := map[string]bool{}

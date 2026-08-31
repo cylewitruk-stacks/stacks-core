@@ -88,6 +88,7 @@ type ObservationTriggerSpec struct {
 
 // FaultActionSpec defines one fault action within a stage.
 // +kubebuilder:validation:XValidation:rule="self.fault.type != 'burnchain-reorg' || (has(self.target.actors) && self.target.actors.size() == 1 && (!has(self.target.roles) || self.target.roles.size() == 0) && self.target.mode == 'one' && !has(self.target.value))",message="burnchain-reorg must target exactly one named Bitcoin actor with mode one and no value"
+// +kubebuilder:validation:XValidation:rule="self.fault.type != 'signer-behavior' || (has(self.target.actors) && self.target.actors.size() == 1 && (!has(self.target.roles) || self.target.roles.size() == 0) && self.target.mode == 'all' && !has(self.target.value))",message="signer-behavior must target exactly one named signer with mode all and no value"
 type FaultActionSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
 	ID                 string              `json:"id"`
@@ -114,13 +115,14 @@ type FaultTarget struct {
 }
 
 // FaultSpec defines one finite mechanism and its bounded parameters.
-// +kubebuilder:validation:XValidation:rule="(self.type == 'pod' && self.action in ['pod-kill', 'pod-failure', 'container-kill']) || (self.type == 'network' && self.action in ['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']) || (self.type == 'dns' && self.action in ['error', 'random']) || (self.type == 'io' && self.action in ['latency', 'fault', 'mistake', 'attrOverride']) || (self.type == 'io-pressure' && self.action == 'disk-pressure') || (self.type in ['time', 'clock-skew', 'burnchain-reorg'] && !has(self.action))",message="fault action must be valid for its type"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'pod' && self.action in ['pod-kill', 'pod-failure', 'container-kill']) || (self.type == 'network' && self.action in ['netem', 'delay', 'loss', 'duplicate', 'corrupt', 'partition', 'bandwidth']) || (self.type == 'dns' && self.action in ['error', 'random']) || (self.type == 'io' && self.action in ['latency', 'fault', 'mistake', 'attrOverride']) || (self.type == 'io-pressure' && self.action == 'disk-pressure') || (self.type == 'signer-behavior' && self.action in ['withhold', 'delay', 'suppress-peer-responses']) || (self.type in ['time', 'clock-skew', 'burnchain-reorg'] && !has(self.action))",message="fault action must be valid for its type"
 // +kubebuilder:validation:XValidation:rule="(self.mode in ['one', 'all'] && !has(self.value)) || (self.mode in ['fixed', 'fixed-percent', 'random-max-percent'] && has(self.value))",message="fault value is required only for fixed and percent modes"
 // +kubebuilder:validation:XValidation:rule="self.type == 'burnchain-reorg' ? has(self.burnchainReorg) : !has(self.burnchainReorg)",message="burnchainReorg is required only for burnchain-reorg faults"
+// +kubebuilder:validation:XValidation:rule="self.type == 'signer-behavior' ? has(self.signerBehavior) : !has(self.signerBehavior)",message="signerBehavior is required only for signer-behavior faults"
 type FaultSpec struct {
-	// +kubebuilder:validation:Enum=pod;network;dns;io;time;io-pressure;clock-skew;burnchain-reorg
+	// +kubebuilder:validation:Enum=pod;network;dns;io;time;io-pressure;clock-skew;burnchain-reorg;signer-behavior
 	Type string `json:"type"`
-	// +kubebuilder:validation:Enum=pod-kill;pod-failure;container-kill;netem;delay;loss;duplicate;corrupt;partition;bandwidth;error;random;latency;fault;mistake;attrOverride;disk-pressure
+	// +kubebuilder:validation:Enum=pod-kill;pod-failure;container-kill;netem;delay;loss;duplicate;corrupt;partition;bandwidth;error;random;latency;fault;mistake;attrOverride;disk-pressure;withhold;suppress-peer-responses
 	Action string `json:"action,omitempty"`
 	// +kubebuilder:validation:Enum=one;all;fixed;fixed-percent;random-max-percent
 	Mode       string              `json:"mode"`
@@ -130,6 +132,15 @@ type FaultSpec struct {
 	// BurnchainReorg declares the bounded semantic operation. Raw Bitcoin RPC
 	// methods are intentionally not part of the campaign API.
 	BurnchainReorg *BurnchainReorgFaultSpec `json:"burnchainReorg,omitempty"`
+	// SignerBehavior binds an observation window to one immutable policy that
+	// was already admitted with the signer workload by the topology operator.
+	SignerBehavior *SignerBehaviorFaultSpec `json:"signerBehavior,omitempty"`
+}
+
+// SignerBehaviorFaultSpec binds a campaign action to a preconfigured signer.
+type SignerBehaviorFaultSpec struct {
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	PolicyDigest string `json:"policyDigest"`
 }
 
 // BurnchainReorgFaultSpec replaces a bounded suffix of one regtest chain.
@@ -181,7 +192,7 @@ type FaultSafety struct {
 
 // CampaignAssertion describes one bounded effect or recovery assertion.
 type CampaignAssertion struct {
-	// +kubebuilder:validation:Enum=PodRestarted;PodUnavailable;ContainerRestarted;TargetReady;NetworkDegraded;NetworkRecovered;DNSDegraded;DNSRecovered;IODegraded;IORecovered;IOPressureObserved;IOPressureRecovered;ClockSkewObserved;ClockSkewCleared;BurnchainReorgProven;BurnchainPolicyRestored
+	// +kubebuilder:validation:Enum=PodRestarted;PodUnavailable;ContainerRestarted;TargetReady;NetworkDegraded;NetworkRecovered;DNSDegraded;DNSRecovered;IODegraded;IORecovered;IOPressureObserved;IOPressureRecovered;ClockSkewObserved;ClockSkewCleared;BurnchainReorgProven;BurnchainPolicyRestored;SignerBehaviorObserved;SignerBehaviorWindowClosed
 	Type           string `json:"type"`
 	Actor          string `json:"actor,omitempty"`
 	Action         string `json:"action,omitempty"`
@@ -214,7 +225,10 @@ type CampaignAdmission struct {
 	SignerSetTotalWeight  *int64           `json:"signerSetTotalWeight,omitempty"`
 	SignerSetDigest       string           `json:"signerSetDigest,omitempty"`
 	SignerSetObservedFrom string           `json:"signerSetObservedFrom,omitempty"`
-	AggregateImpact       *apixv1.JSON     `json:"aggregateImpact,omitempty"`
+	// SignerWeightsByActor retains the canonical admission weights needed to
+	// finish recovery when a later reward-set observation is unavailable.
+	SignerWeightsByActor map[string]int64 `json:"signerWeightsByActor,omitempty"`
+	AggregateImpact      *apixv1.JSON     `json:"aggregateImpact,omitempty"`
 }
 
 // ChaosReference identifies one exact controller-owned mutation object.

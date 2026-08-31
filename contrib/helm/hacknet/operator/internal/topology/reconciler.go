@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -71,7 +72,7 @@ func (r *Reconciler) applyAndPrune(ctx context.Context, network *attacknetv1alph
 			return err
 		}
 	}
-	desired := map[string]map[string]struct{}{"ConfigMap": {}, "Service": {}, "StatefulSet": {}}
+	desired := map[string]map[string]struct{}{"ConfigMap": {}, "Service": {}, "StatefulSet": {}, "NetworkPolicy": {}}
 	for _, object := range resources.ConfigMaps {
 		desired["ConfigMap"][object.Name] = struct{}{}
 	}
@@ -81,11 +82,14 @@ func (r *Reconciler) applyAndPrune(ctx context.Context, network *attacknetv1alph
 	for _, object := range resources.StatefulSets {
 		desired["StatefulSet"][object.Name] = struct{}{}
 	}
+	for _, object := range resources.NetworkPolicies {
+		desired["NetworkPolicy"][object.Name] = struct{}{}
+	}
 	selector := client.MatchingLabels{managedByLabel: managedByValue, networkLabel: network.Name}
 	lists := []struct {
 		kind string
 		list client.ObjectList
-	}{{"ConfigMap", &corev1.ConfigMapList{}}, {"Service", &corev1.ServiceList{}}, {"StatefulSet", &appsv1.StatefulSetList{}}}
+	}{{"ConfigMap", &corev1.ConfigMapList{}}, {"Service", &corev1.ServiceList{}}, {"StatefulSet", &appsv1.StatefulSetList{}}, {"NetworkPolicy", &networkingv1.NetworkPolicyList{}}}
 	for _, item := range lists {
 		if err := r.List(ctx, item.list, client.InNamespace(network.Namespace), selector); err != nil {
 			return fmt.Errorf("list managed %s: %w", item.kind, err)
@@ -101,6 +105,10 @@ func (r *Reconciler) applyAndPrune(ctx context.Context, network *attacknetv1alph
 				objects = append(objects, &list.Items[index])
 			}
 		case *appsv1.StatefulSetList:
+			for index := range list.Items {
+				objects = append(objects, &list.Items[index])
+			}
+		case *networkingv1.NetworkPolicyList:
 			for index := range list.Items {
 				objects = append(objects, &list.Items[index])
 			}
@@ -184,6 +192,9 @@ func mergeManagedObject(current, desired client.Object) error {
 		existing.Spec.RevisionHistoryLimit = wanted.Spec.RevisionHistoryLimit
 		existing.Spec.PersistentVolumeClaimRetentionPolicy = wanted.Spec.PersistentVolumeClaimRetentionPolicy
 		existing.Spec.MinReadySeconds = wanted.Spec.MinReadySeconds
+	case *networkingv1.NetworkPolicy:
+		wanted := desired.(*networkingv1.NetworkPolicy)
+		existing.Spec = *wanted.Spec.DeepCopy()
 	default:
 		return fmt.Errorf("unsupported managed object type %T", current)
 	}
@@ -275,8 +286,12 @@ func (r *Reconciler) buildStatus(ctx context.Context, network *attacknetv1alpha1
 			runtimeImageID = container.ImageID
 		}
 		podIdentityReady := pod != nil && podReady(pod) && container != nil && container.Ready && pod.UID != "" && runtimeImagePattern.MatchString(runtimeImageID)
-		identityReady := isReady && podIdentityReady && statefulSet.UID != "" && statefulSet.Status.CurrentRevision != ""
-		status := attacknetv1alpha1.ActorStatus{Name: actor.Name, Role: actor.Role, ResourceName: name, Image: actorImage(network, actor), Ready: isReady, ReadyReplicas: statefulSet.Status.ReadyReplicas, UpdatedReplicas: statefulSet.Status.UpdatedReplicas, Generation: statefulSet.Generation, ObservedGeneration: statefulSet.Status.ObservedGeneration, CurrentRevision: statefulSet.Status.CurrentRevision, UpdateRevision: statefulSet.Status.UpdateRevision, ServiceName: name, StatefulSetUID: string(statefulSet.UID), StatefulSetResourceVersion: statefulSet.ResourceVersion, RuntimeImageID: runtimeImageID, ConfigDigest: actorConfigDigest(actor), IdentityReady: identityReady}
+		egressDigest, egressReady, err := r.observedEgressPolicy(ctx, network, actor, name)
+		if err != nil {
+			return attacknetv1alpha1.StacksNetworkStatus{}, err
+		}
+		identityReady := isReady && podIdentityReady && egressReady && statefulSet.UID != "" && statefulSet.Status.CurrentRevision != ""
+		status := attacknetv1alpha1.ActorStatus{Name: actor.Name, Role: actor.Role, ResourceName: name, Image: actorImage(network, actor), Ready: isReady, ReadyReplicas: statefulSet.Status.ReadyReplicas, UpdatedReplicas: statefulSet.Status.UpdatedReplicas, Generation: statefulSet.Generation, ObservedGeneration: statefulSet.Status.ObservedGeneration, CurrentRevision: statefulSet.Status.CurrentRevision, UpdateRevision: statefulSet.Status.UpdateRevision, ServiceName: name, StatefulSetUID: string(statefulSet.UID), StatefulSetResourceVersion: statefulSet.ResourceVersion, RuntimeImageID: runtimeImageID, ConfigDigest: actorConfigDigest(actor), AdversarialPolicyDigest: actor.AdversarialPolicyDigest, AdversarialEgressProfile: actor.AdversarialEgressProfile, EgressPolicyDigest: egressDigest, IdentityReady: identityReady}
 		if pod != nil {
 			status.PodName = pod.Name
 			status.PodUID = string(pod.UID)
@@ -318,6 +333,36 @@ func (r *Reconciler) buildStatus(ctx context.Context, network *attacknetv1alpha1
 		}
 	}
 	return status, nil
+}
+
+func (r *Reconciler) observedEgressPolicy(ctx context.Context, network *attacknetv1alpha1.StacksNetwork, actor *attacknetv1alpha1.ActorSpec, name string) (string, bool, error) {
+	switch actor.AdversarialEgressProfile {
+	case "":
+		return "", true, nil
+	case "unrestricted":
+		return "", true, nil
+	case "restricted":
+	default:
+		return "", false, fmt.Errorf("actor %q has unsupported admitted egress profile %q", actor.Name, actor.AdversarialEgressProfile)
+	}
+	policy := &networkingv1.NetworkPolicy{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: network.Namespace, Name: name}, policy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("get egress NetworkPolicy %s: %w", name, err)
+	}
+	if err := assertOwned(network, policy); err != nil {
+		return "", false, err
+	}
+	digest, err := egressPolicyDigest(policy)
+	if err != nil {
+		return "", false, err
+	}
+	if policy.Annotations[egressPolicyDigestAnnotation] != digest {
+		return "", false, fmt.Errorf("egress NetworkPolicy %s digest annotation does not match admitted spec", name)
+	}
+	return digest, true, nil
 }
 
 func actorConfigDigest(actor *attacknetv1alpha1.ActorSpec) string {

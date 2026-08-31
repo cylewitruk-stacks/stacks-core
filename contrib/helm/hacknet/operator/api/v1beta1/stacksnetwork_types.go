@@ -216,7 +216,78 @@ type SignerMemberSpec struct {
 	NodeWorkload     *WorkloadPolicy           `json:"nodeWorkload,omitempty"`
 	SignerAdvanced   *AdvancedWorkloadOverride `json:"signerAdvanced,omitempty"`
 	NodeAdvanced     *AdvancedWorkloadOverride `json:"nodeAdvanced,omitempty"`
-	Suspended        bool                      `json:"suspended,omitempty"`
+	// Adversarial enables one bounded testing-only signer behavior. The signer
+	// image must be set explicitly and implement the declared profile.
+	Adversarial *AdversarialSignerPolicy `json:"adversarial,omitempty"`
+	Suspended   bool                     `json:"suspended,omitempty"`
+}
+
+// AdversarialSignerPolicy declares one immutable testing-image behavior.
+// +kubebuilder:validation:XValidation:rule="self.behavior != 'delay' || (has(self.delay) && duration(self.delay) >= duration('1ms') && duration(self.delay) <= duration('120s'))",message="delay behavior requires delay within 1ms..120s"
+// +kubebuilder:validation:XValidation:rule="self.behavior == 'delay' || !has(self.delay)",message="delay is valid only for delay behavior"
+// +kubebuilder:validation:XValidation:rule="self.behavior != 'suppress-peer-responses' || (!has(self.selector.minStacksHeight) && !has(self.selector.maxStacksHeight) && !has(self.selector.everyNth))",message="suppress-peer-responses supports only proposalHashPrefix selection"
+// +kubebuilder:validation:XValidation:rule="self.maxMatches <= self.maxEvaluations",message="maxMatches cannot exceed maxEvaluations"
+type AdversarialSignerPolicy struct {
+	// +kubebuilder:validation:Enum=stacks-signer-testing/v1
+	Profile string `json:"profile"`
+	// +kubebuilder:validation:Enum=withhold;delay;suppress-peer-responses
+	Behavior string                      `json:"behavior"`
+	Selector AdversarialProposalSelector `json:"selector,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1024
+	MaxMatches int32 `json:"maxMatches"`
+	// MaxEvaluations bounds retained selector decisions, including non-matches.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65536
+	MaxEvaluations int32            `json:"maxEvaluations"`
+	Delay          *metav1.Duration `json:"delay,omitempty"`
+	// PatchDigest identifies the exact testing-only source patch used to build
+	// the explicitly selected signer image.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	PatchDigest string                  `json:"patchDigest"`
+	Observer    AdversarialObserverSpec `json:"observer"`
+	Egress      AdversarialEgressSpec   `json:"egress"`
+}
+
+// AdversarialProposalSelector deterministically selects protocol messages.
+// Every configured predicate must match.
+// +kubebuilder:validation:XValidation:rule="!has(self.minStacksHeight) || !has(self.maxStacksHeight) || self.minStacksHeight <= self.maxStacksHeight",message="minimum Stacks height cannot exceed maximum"
+// +kubebuilder:validation:XValidation:rule="has(self.everyNth) || !has(self.seedOffset) || self.seedOffset == 0",message="seedOffset requires everyNth"
+// +kubebuilder:validation:XValidation:rule="!has(self.everyNth) || !has(self.seedOffset) || self.seedOffset < self.everyNth",message="seedOffset must be smaller than everyNth"
+type AdversarialProposalSelector struct {
+	// +kubebuilder:validation:Minimum=1
+	MinStacksHeight *int64 `json:"minStacksHeight,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	MaxStacksHeight *int64 `json:"maxStacksHeight,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1024
+	EveryNth *int32 `json:"everyNth,omitempty"`
+	// SeedOffset is reduced modulo everyNth and permits seeded cohorts to use
+	// distinct deterministic ordinals.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1023
+	SeedOffset int32 `json:"seedOffset,omitempty"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{2,32}$`
+	ProposalHashPrefix string `json:"proposalHashPrefix,omitempty"`
+}
+
+// AdversarialObserverSpec configures the separate trusted observation actor.
+type AdversarialObserverSpec struct {
+	// Image must identify the bounded Attacknet probe implementation.
+	// +kubebuilder:validation:MinLength=1
+	Image           string                       `json:"image"`
+	ImagePullPolicy corev1.PullPolicy            `json:"imagePullPolicy,omitempty"`
+	Resources       *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// AdversarialEgressSpec controls actor egress independently from behavior.
+// +kubebuilder:validation:XValidation:rule="self.profile == 'unrestricted' ? (has(self.allowUnrestricted) && self.allowUnrestricted) : (!has(self.allowUnrestricted) || !self.allowUnrestricted)",message="unrestricted egress requires allowUnrestricted=true and restricted egress forbids it"
+type AdversarialEgressSpec struct {
+	// +kubebuilder:validation:Enum=restricted;unrestricted
+	Profile string `json:"profile"`
+	// AllowUnrestricted is the conspicuous opt-in required by the unrestricted
+	// profile. It is recorded in admitted identity and release evidence.
+	AllowUnrestricted bool `json:"allowUnrestricted,omitempty"`
 }
 
 // ConfigSource selects one generated profile or complete mounted config object.
@@ -393,6 +464,9 @@ type ActorStatus struct {
 	PodResourceVersion         string `json:"podResourceVersion,omitempty"`
 	RuntimeImageID             string `json:"runtimeImageID,omitempty"`
 	ConfigDigest               string `json:"configDigest,omitempty"`
+	AdversarialPolicyDigest    string `json:"adversarialPolicyDigest,omitempty"`
+	AdversarialEgressProfile   string `json:"adversarialEgressProfile,omitempty"`
+	EgressPolicyDigest         string `json:"egressPolicyDigest,omitempty"`
 	IdentityReady              bool   `json:"identityReady,omitempty"`
 }
 

@@ -138,20 +138,23 @@ type RuntimePolicySpec struct {
 
 // ActorSpec defines one logical network actor and its Kubernetes workload.
 type ActorSpec struct {
-	Name                          string                            `json:"name"`
-	Role                          string                            `json:"role"`
-	Suspended                     bool                              `json:"suspended,omitempty"`
-	SignerIndex                   *int32                            `json:"signerIndex,omitempty"`
-	SignerWeight                  *float64                          `json:"signerWeight,omitempty"`
-	SignerPublicKey               string                            `json:"signerPublicKey,omitempty"`
-	Image                         string                            `json:"image,omitempty"`
-	ImagePullPolicy               corev1.PullPolicy                 `json:"imagePullPolicy,omitempty"`
-	Command                       []string                          `json:"command,omitempty"`
-	Args                          []string                          `json:"args,omitempty"`
-	Config                        *ActorConfig                      `json:"config,omitempty"`
-	Env                           []corev1.EnvVar                   `json:"env,omitempty"`
-	Ports                         []ActorPort                       `json:"ports,omitempty"`
-	Dependencies                  []ActorDependency                 `json:"dependencies,omitempty"`
+	Name            string            `json:"name"`
+	Role            string            `json:"role"`
+	Suspended       bool              `json:"suspended,omitempty"`
+	SignerIndex     *int32            `json:"signerIndex,omitempty"`
+	SignerWeight    *float64          `json:"signerWeight,omitempty"`
+	SignerPublicKey string            `json:"signerPublicKey,omitempty"`
+	Image           string            `json:"image,omitempty"`
+	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
+	Command         []string          `json:"command,omitempty"`
+	Args            []string          `json:"args,omitempty"`
+	Config          *ActorConfig      `json:"config,omitempty"`
+	Env             []corev1.EnvVar   `json:"env,omitempty"`
+	Ports           []ActorPort       `json:"ports,omitempty"`
+	Dependencies    []ActorDependency `json:"dependencies,omitempty"`
+	// EgressPeers permits actor-scoped traffic without adding a startup gate.
+	// This keeps cyclic protocol relationships distinct from bootstrap order.
+	EgressPeers                   []string                          `json:"egressPeers,omitempty"`
 	RuntimeExposure               string                            `json:"runtimeExposure,omitempty"`
 	Storage                       *StorageSpec                      `json:"storage,omitempty"`
 	Resources                     *corev1.ResourceRequirements      `json:"resources,omitempty"`
@@ -171,6 +174,11 @@ type ActorSpec struct {
 	Probe                         *ProbeSpec                        `json:"probe,omitempty"`
 	Labels                        map[string]string                 `json:"labels,omitempty"`
 	Annotations                   map[string]string                 `json:"annotations,omitempty"`
+	// AdversarialPolicyDigest binds a normalized testing-only behavior policy
+	// into the workload revision and admitted runtime identity.
+	AdversarialPolicyDigest string `json:"adversarialPolicyDigest,omitempty"`
+	// AdversarialEgressProfile records the declared network boundary.
+	AdversarialEgressProfile string `json:"adversarialEgressProfile,omitempty"`
 }
 
 // ActorStatus reports rollout and immutable runtime identity for one actor.
@@ -194,6 +202,9 @@ type ActorStatus struct {
 	PodResourceVersion         string `json:"podResourceVersion,omitempty"`
 	RuntimeImageID             string `json:"runtimeImageID,omitempty"`
 	ConfigDigest               string `json:"configDigest,omitempty"`
+	AdversarialPolicyDigest    string `json:"adversarialPolicyDigest,omitempty"`
+	AdversarialEgressProfile   string `json:"adversarialEgressProfile,omitempty"`
+	EgressPolicyDigest         string `json:"egressPolicyDigest,omitempty"`
 	IdentityReady              bool   `json:"identityReady,omitempty"`
 }
 

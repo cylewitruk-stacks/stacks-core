@@ -1,0 +1,47 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a12-quorum-loss
+  namespace: hacknet-system
+spec:
+  networkRef: a12-adversarial
+  seed: a12-quorum-loss-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - {name: quorum-loss, campaignRef: a12-quorum-loss-template}
+  executions:
+    - {id: deliberate-quorum-loss, campaign: quorum-loss}
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 600
+    maxCumulativeFaultSeconds: 150
+    maxActiveFaults: 2
+    maxSignerImpactPercent: 88
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: false
+    allowedTerminalStates: [Inconclusive]
+  baselineAssertions:
+    timeout: 60s
+    assertions:
+      - id: telemetry-complete
+        telemetryCompleteness: {actors: [miner-1, follower-1, signer-node-2, signer-node-3, signer-2, signer-3]}
+      - id: stacks-progresses
+        chainProgress: {chain: stacks, actors: [miner-1, follower-1, signer-node-2, signer-node-3], window: 15s, minimumDelta: 1}
+  duringAssertions:
+    timeout: 30s
+    assertions:
+      - id: telemetry-during
+        telemetryCompleteness: {actors: [miner-1, follower-1, signer-node-2, signer-node-3, signer-2, signer-3]}
+      - id: stacks-must-progress
+        chainProgress: {chain: stacks, actors: [miner-1, follower-1, signer-node-2, signer-node-3], window: 15s, minimumDelta: 1}
+  replay: {enabled: false, requireSameResolvedImages: true, verifyExpectedFailure: true}
+  resume: {enabled: false, requireSameSeed: true, requireSameResolvedImages: true}
+  minimization: {enabled: false, strategy: FailurePrefix, maxAttempts: 0, requireFreshNetwork: true}

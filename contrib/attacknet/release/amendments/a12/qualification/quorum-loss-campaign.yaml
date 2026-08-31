@@ -1,0 +1,47 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: a12-quorum-loss-template
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 8750
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 2
+    allowQuorumLoss: true
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: deliberate-quorum-loss
+      trigger: {stacksHeight: 175}
+      faults:
+        - id: signer-2-withhold
+          target: {actors: [signer-2], mode: all}
+          fault:
+            type: signer-behavior
+            action: withhold
+            mode: all
+            duration: 75s
+            signerBehavior:
+              policyDigest: sha256:dcc3dd791d9335a3dffa4eea63194a8a0c21f568466f3bbc593454f8470f2137
+          effectAssertions:
+            - {type: SignerBehaviorObserved, actor: signer-2, timeoutSeconds: 90}
+          recoveryAssertions:
+            - {type: SignerBehaviorWindowClosed, actor: signer-2, timeoutSeconds: 180}
+        - id: signer-3-withhold
+          target: {actors: [signer-3], mode: all}
+          fault:
+            type: signer-behavior
+            action: withhold
+            mode: all
+            duration: 75s
+            signerBehavior:
+              policyDigest: sha256:dcc3dd791d9335a3dffa4eea63194a8a0c21f568466f3bbc593454f8470f2137
+          effectAssertions:
+            - {type: SignerBehaviorObserved, actor: signer-3, timeoutSeconds: 90}
+          recoveryAssertions:
+            - {type: SignerBehaviorWindowClosed, actor: signer-3, timeoutSeconds: 180}

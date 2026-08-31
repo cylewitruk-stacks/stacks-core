@@ -17,6 +17,7 @@ const (
 	clockPolicyBackend    mutationBackend = "clock-policy"
 	ioPressureBackend     mutationBackend = "io-pressure"
 	burnchainReorgBackend mutationBackend = "burnchain-reorg"
+	signerBehaviorBackend mutationBackend = "signer-behavior-session"
 )
 
 // capabilityKind identifies the admission-time platform contract for a fault.
@@ -29,6 +30,7 @@ const (
 	clockPolicyCapabilityKind capabilityKind = "clock-policy"
 	ioPressureCapability      capabilityKind = "io-pressure"
 	burnchainReorgCapability  capabilityKind = "burnchain-reorg"
+	signerBehaviorCapability  capabilityKind = "signer-behavior"
 )
 
 type parameterValidator func(string, map[string]any, attacknetv1alpha1.FaultSafety, time.Duration, Manifest) (parameterResult, error)
@@ -55,6 +57,7 @@ var mechanismRegistry = mustMechanismRegistry([]mechanism{
 	{FaultType: "io-pressure", MutationKind: "IOPressurePod", ProbeKind: "io", EffectKind: "io-pressure", Backend: ioPressureBackend, Capability: ioPressureCapability, AllowedActions: stringSet("disk-pressure"), Parameters: ioPressureParameterValidator},
 	{FaultType: "clock-skew", MutationKind: "ClockSkewPolicy", ProbeKind: "clock", EffectKind: "clock", Backend: clockPolicyBackend, Capability: clockPolicyCapabilityKind, Parameters: clockSkewParameterValidator},
 	{FaultType: "burnchain-reorg", MutationKind: "BurnchainReorgWorker", EffectKind: "burnchain-reorg", Backend: burnchainReorgBackend, Capability: burnchainReorgCapability, Parameters: burnchainReorgParameterValidator},
+	{FaultType: "signer-behavior", MutationKind: "SignerBehaviorSession", ProbeKind: "signer-behavior", EffectKind: "signer-behavior", Backend: signerBehaviorBackend, Capability: noCapability, AllowedActions: stringSet("withhold", "delay", "suppress-peer-responses"), Parameters: signerBehaviorParameterValidator},
 })
 
 func mustMechanismRegistry(definitions []mechanism) map[string]mechanism {
@@ -96,7 +99,7 @@ func mustMechanismRegistry(definitions []mechanism) map[string]mechanism {
 
 func validMutationBackend(backend mutationBackend) bool {
 	switch backend {
-	case chaosMeshBackend, clockPolicyBackend, ioPressureBackend, burnchainReorgBackend:
+	case chaosMeshBackend, clockPolicyBackend, ioPressureBackend, burnchainReorgBackend, signerBehaviorBackend:
 		return true
 	default:
 		return false
@@ -105,7 +108,7 @@ func validMutationBackend(backend mutationBackend) bool {
 
 func validCapabilityKind(kind capabilityKind) bool {
 	switch kind {
-	case noCapability, ioChaosCapability, timeChaosCapability, clockPolicyCapabilityKind, ioPressureCapability, burnchainReorgCapability:
+	case noCapability, ioChaosCapability, timeChaosCapability, clockPolicyCapabilityKind, ioPressureCapability, burnchainReorgCapability, signerBehaviorCapability:
 		return true
 	default:
 		return false
@@ -114,7 +117,7 @@ func validCapabilityKind(kind capabilityKind) bool {
 
 func validEffectKind(kind string) bool {
 	switch kind {
-	case "pod", "network", "dns", "io", "io-pressure", "clock", "burnchain-reorg":
+	case "pod", "network", "dns", "io", "io-pressure", "clock", "burnchain-reorg", "signer-behavior":
 		return true
 	default:
 		return false
@@ -128,9 +131,16 @@ func burnchainReorgParameterValidator(_ string, values map[string]any, _ attackn
 	return parameterResult{Parameters: map[string]any{}}, nil
 }
 
+func signerBehaviorParameterValidator(_ string, values map[string]any, _ attacknetv1alpha1.FaultSafety, _ time.Duration, _ Manifest) (parameterResult, error) {
+	if len(values) != 0 {
+		return parameterResult{}, fmt.Errorf("signer-behavior does not accept raw parameters")
+	}
+	return parameterResult{Parameters: map[string]any{}}, nil
+}
+
 func validProbeKind(kind string) bool {
 	switch kind {
-	case "", "network", "dns", "io", "clock":
+	case "", "network", "dns", "io", "clock", "signer-behavior":
 		return true
 	default:
 		return false

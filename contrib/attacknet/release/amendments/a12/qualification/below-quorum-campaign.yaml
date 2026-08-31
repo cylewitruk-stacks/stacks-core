@@ -1,0 +1,34 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: a12-below-quorum-template
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 2000
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: bounded-withholding
+      trigger: {stacksHeight: 145}
+      faults:
+        - id: signer-1-withhold
+          target: {actors: [signer-1], mode: all}
+          fault:
+            type: signer-behavior
+            action: withhold
+            mode: all
+            duration: 75s
+            signerBehavior:
+              policyDigest: sha256:0988a0e12d98e1f89bbe3213c89373ca103a075bad8240e1420ed83d4eda883e
+          effectAssertions:
+            - {type: SignerBehaviorObserved, actor: signer-1, timeoutSeconds: 90}
+          recoveryAssertions:
+            - {type: SignerBehaviorWindowClosed, actor: signer-1, timeoutSeconds: 180}

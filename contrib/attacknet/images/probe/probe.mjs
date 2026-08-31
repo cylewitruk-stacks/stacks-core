@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import {createHash} from 'node:crypto';
+import {createHash, generateKeyPairSync, sign as signBytes} from 'node:crypto';
 import {promises as dns} from 'node:dns';
 import {promises as fs} from 'node:fs';
 import http from 'node:http';
@@ -9,6 +9,7 @@ import {join, resolve} from 'node:path';
 import {performance} from 'node:perf_hooks';
 
 export const RESPONSE_SCHEMA = 'stacks-attacknet-probe-response/v1';
+export const ATTESTATION_SCHEMA = 'stacks-attacknet-probe-attestation/v1';
 
 const ACTOR_RE = /^[a-z]([-a-z0-9]*[a-z0-9])?$/;
 const PORT_RE = /^[a-z]([-a-z0-9]*[a-z0-9])?$/;
@@ -19,6 +20,31 @@ const MAX_IO_BYTES = 1024 * 1024;
 const MAX_METRICS_BYTES = 512 * 1024;
 const MAX_THROUGHPUT_BYTES = 1024 * 1024;
 const PROCESS_WALL_CLOCK_METRIC = 'stacks_node_process_wall_clock_seconds';
+const ATTACKNET_POLICY_METRIC = 'stacks_signer_attacknet_policy_matches_total';
+const ATTACKNET_POLICY_EVALUATIONS_METRIC = 'stacks_signer_attacknet_policy_evaluations';
+const ATTACKNET_POLICY_SESSION_METRIC = 'stacks_signer_attacknet_policy_session_active';
+const SIGNER_BEHAVIORS = new Set(['withhold', 'delay', 'suppress-peer-responses']);
+const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+
+function createAttestor() {
+  const {privateKey, publicKey} = generateKeyPairSync('ed25519');
+  const publicKeyBytes = publicKey.export({type: 'spki', format: 'der'});
+  return {
+    keyId: digest(publicKeyBytes),
+    publicKey: publicKeyBytes.toString('base64'),
+    sign(payload) {
+      const signedPayload = Buffer.from(JSON.stringify(payload));
+      return {
+        schemaVersion: ATTESTATION_SCHEMA,
+        algorithm: 'Ed25519',
+        keyId: digest(publicKeyBytes),
+        publicKey: publicKeyBytes.toString('base64'),
+        signedPayload: signedPayload.toString('base64'),
+        signature: signBytes(null, signedPayload, privateKey).toString('base64'),
+      };
+    },
+  };
+}
 
 function boundedInteger(value, name, minimum, maximum, fallback) {
   const selected = value === undefined ? fallback : value;
@@ -329,6 +355,40 @@ export async function processClockObservation(request, context) {
   };
 }
 
+function policyMetricValue(text, metric, behavior) {
+  if (!SIGNER_BEHAVIORS.has(behavior)) throw new Error('behavior is not supported');
+  const prefix = `${metric}{behavior="${behavior}"} `;
+  const lines = text.split('\n').filter(line => line.startsWith(prefix));
+  if (lines.length !== 1) throw new Error(`metrics response must contain exactly one ${metric} sample for ${behavior}`);
+  const value = Number(lines[0].slice(prefix.length).trim());
+  if (!Number.isInteger(value) || value < 0 || value > 1e12) throw new Error(`${metric} sample is not a bounded integer`);
+  return value;
+}
+
+// signerBehaviorObservation independently scrapes the testing-only signer
+// counter through an enrolled endpoint. The signed report proves observer
+// provenance; the metric content remains explicitly actor self-reported.
+export async function signerBehaviorObservation(request, context) {
+  const peer = namedPeer(context.peers, request.peer);
+  const port = namedPort(peer, request.port);
+  const before = performance.now();
+  const metrics = await getText({
+    host: peer.host, port, path: '/metrics', timeoutMs: 2000,
+  }, context.httpGet);
+  const matches = policyMetricValue(metrics, ATTACKNET_POLICY_METRIC, request.behavior);
+  const evaluations = policyMetricValue(metrics, ATTACKNET_POLICY_EVALUATIONS_METRIC, request.behavior);
+  const session = policyMetricValue(metrics, ATTACKNET_POLICY_SESSION_METRIC, request.behavior);
+  if (session > 1) throw new Error('signer behavior session metric must be 0 or 1');
+  return {
+    actor: context.actor, probe: 'signer-behavior', status: 'ok',
+    targetActor: request.peer, behavior: request.behavior, policyMatches: matches,
+    policyEvaluations: evaluations, sessionActive: session === 1,
+    // Signed reports use the cross-runtime canonical JSON contract, which
+    // deliberately permits integers only.
+    contentTrust: 'actor-self-reported', sampleWindowMs: Math.round(performance.now() - before),
+  };
+}
+
 export async function systemObservation(_request, context) {
   return {
     actor: context.actor, probe: 'system', status: 'ok',
@@ -342,6 +402,7 @@ export function createContext(environment = process.env, overrides = {}) {
   const requestedDataRoot = environment.PROBE_DATA_ROOT || '/target-data';
   if (!requestedDataRoot.startsWith('/')) throw new Error('PROBE_DATA_ROOT must be absolute');
   const dataRoot = resolve(requestedDataRoot);
+  const attestor = overrides.attestor ?? createAttestor();
   return {
     actor,
     peers: parsePeerMap(environment.PROBE_PEERS_JSON),
@@ -355,20 +416,24 @@ export function createContext(environment = process.env, overrides = {}) {
     monotonic: overrides.monotonic ?? process.hrtime.bigint,
     platform: overrides.platform ?? process.platform,
     architecture: overrides.architecture ?? process.arch,
+    attestor,
+    adversarialTarget: environment.PROBE_ADVERSARIAL_TARGET || '',
+    adversarialPolicyDigest: environment.PROBE_ADVERSARIAL_POLICY_DIGEST || '',
   };
 }
 
 export async function dispatchProbe(request, context) {
   if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('request must be a JSON object');
   const allowed = {
-    network: new Set(['kind', 'peer', 'port', 'attempts', 'timeoutMs', 'throughputBytes']),
-    dns: new Set(['kind', 'peer']),
-    io: new Set(['kind', 'operation', 'file', 'bytes', 'attempts']),
-    clock: new Set(['kind', 'control']),
-    processClock: new Set(['kind', 'peer', 'port', 'metric', 'control']),
-    system: new Set(['kind']),
+    network: new Set(['kind', 'peer', 'port', 'attempts', 'timeoutMs', 'throughputBytes', 'nonce']),
+    dns: new Set(['kind', 'peer', 'nonce']),
+    io: new Set(['kind', 'operation', 'file', 'bytes', 'attempts', 'nonce']),
+    clock: new Set(['kind', 'control', 'nonce']),
+    processClock: new Set(['kind', 'peer', 'port', 'metric', 'control', 'nonce']),
+    signerBehavior: new Set(['kind', 'peer', 'port', 'behavior', 'nonce']),
+    system: new Set(['kind', 'nonce']),
   }[request.kind];
-  if (!allowed) throw new Error('kind must be network, dns, io, clock, processClock, or system');
+  if (!allowed) throw new Error('kind must be network, dns, io, clock, processClock, signerBehavior, or system');
   exactRequestFields(request, allowed);
   const observation = await ({
     network: networkObservation,
@@ -376,15 +441,23 @@ export async function dispatchProbe(request, context) {
     io: ioObservation,
     clock: clockObservation,
     processClock: processClockObservation,
+    signerBehavior: signerBehaviorObservation,
     system: systemObservation,
   }[request.kind](request, context));
-  return {
+  if (request.nonce !== undefined && !NONCE_RE.test(request.nonce)) {
+    throw new Error('nonce must contain 16..128 URL-safe characters');
+  }
+  const payload = {
     schemaVersion: RESPONSE_SCHEMA,
     actor: context.actor,
     kind: request.kind,
+    nonce: request.nonce ?? '',
     observedAt: new Date(context.now()).toISOString(),
+    targetActor: context.adversarialTarget,
+    policyDigest: context.adversarialPolicyDigest,
     observation,
   };
+  return {...payload, attestation: context.attestor.sign(payload)};
 }
 
 async function readBody(request) {
@@ -412,6 +485,18 @@ export function createServer(context) {
         return;
       }
       const url = new URL(request.url, 'http://attacknet-probe.invalid');
+      if (request.method === 'GET' && url.pathname === '/v1/identity') {
+        send(response, 200, {
+          schemaVersion: ATTESTATION_SCHEMA,
+          actor: context.actor,
+          targetActor: context.adversarialTarget,
+          policyDigest: context.adversarialPolicyDigest,
+          algorithm: 'Ed25519',
+          keyId: context.attestor.keyId,
+          publicKey: context.attestor.publicKey,
+        });
+        return;
+      }
       if (request.method === 'GET' && url.pathname === '/v1/payload') {
         if ([...url.searchParams.keys()].some(key => key !== 'bytes')) throw new Error('unsupported payload parameter');
         const bytes = boundedInteger(Number(url.searchParams.get('bytes')), 'bytes', 4096, MAX_THROUGHPUT_BYTES);
