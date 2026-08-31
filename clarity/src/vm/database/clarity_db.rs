@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//! High-level Clarity state access and typed value persistence.
+
 use stacks_common::consts::{
     BITCOIN_REGTEST_FIRST_BLOCK_HASH, BITCOIN_REGTEST_FIRST_BLOCK_HEIGHT,
     BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP, FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH,
@@ -37,7 +39,7 @@ use crate::vm::database::structures::{
     ClarityDeserializable, ClaritySerializable, DataMapMetadata, DataVariableMetadata,
     FungibleTokenMetadata, NonFungibleTokenMetadata, STXBalance, STXBalanceSnapshot,
 };
-use crate::vm::database::{ClarityBackingStore, RollbackWrapper};
+use crate::vm::database::{ClarityBackingStore, RollbackWrapper, TypedValueData};
 use crate::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 use crate::vm::representations::ClarityName;
 use crate::vm::types::serialization::NONE_SERIALIZATION_LEN;
@@ -582,36 +584,57 @@ impl<'a> ClarityDatabase<'a> {
         value: Value,
         epoch: &StacksEpochId,
     ) -> Result<u64, VmExecutionError> {
+        let expected = TypeSignature::type_of(&value)?;
+        self.put_value_with_type_and_size(key, value, &expected, epoch)
+    }
+
+    /// Store a Clarity value, admitting its sanitized form when typed storage requires it.
+    pub fn put_value_with_type_and_size(
+        &mut self,
+        key: &str,
+        value: Value,
+        expected: &TypeSignature,
+        epoch: &StacksEpochId,
+    ) -> Result<u64, VmExecutionError> {
         let sanitize = epoch.value_sanitizing();
         let mut pre_sanitized_size = None;
 
-        let serialized = if sanitize {
+        let stored_value = if sanitize {
+            // Preserve the existing consensus serialization behavior. Sanitization has
+            // historically used the value's actual type; declared-type admission happens after
+            // sanitization when the backing store requires a typed value.
+            let sanitization_type = TypeSignature::type_of(&value)?;
             let value_size = value
                 .serialized_size()
                 .map_err(|e| VmInternalError::Expect(e.to_string()))?
                 as u64;
 
             let (sanitized_value, did_sanitize) =
-                Value::sanitize_value(epoch, &TypeSignature::type_of(&value)?, value)
+                Value::sanitize_value(epoch, &sanitization_type, value)
                     .ok_or_else(|| RuntimeCheckErrorKind::CouldNotDetermineType)?;
             // if data needed to be sanitized *charge* for the unsanitized cost
             if did_sanitize {
                 pre_sanitized_size = Some(value_size);
             }
             sanitized_value
-                .serialize_to_vec()
-                .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?
         } else {
             value
-                .serialize_to_vec()
-                .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?
         };
 
-        let size = serialized.len() as u64;
-        let hex_serialized = to_hex(serialized.as_slice());
-        self.store.put_data(key, &hex_serialized)?;
-
-        Ok(pre_sanitized_size.unwrap_or(size))
+        if self.store.stores_typed_values() {
+            let typed = TypedValueData::prepare(stored_value, expected, epoch)?;
+            let size = u64::from(typed.consensus_byte_len());
+            self.store.put_typed_value(key, typed)?;
+            Ok(pre_sanitized_size.unwrap_or(size))
+        } else {
+            let serialized = stored_value
+                .serialize_to_vec()
+                .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?;
+            let size = serialized.len() as u64;
+            let hex_serialized = to_hex(serialized.as_slice());
+            self.store.put_data(key, &hex_serialized)?;
+            Ok(pre_sanitized_size.unwrap_or(size))
+        }
     }
 
     pub fn get_value(
@@ -1764,7 +1787,8 @@ impl ClarityDatabase<'_> {
             variable_name,
         );
 
-        let size = self.put_value_with_size(&key, value, epoch)?;
+        let size =
+            self.put_value_with_type_and_size(&key, value, &variable_descriptor.value_type, epoch)?;
 
         Ok(ValueResult {
             value: Value::Bool(true),
@@ -2125,7 +2149,8 @@ impl ClarityDatabase<'_> {
         }
 
         let placed_value = Value::some(value)?;
-        let placed_size = self.put_value_with_size(&key, placed_value, epoch)?;
+        let placed_size =
+            self.put_value_with_type_and_size(&key, placed_value, &stored_type, epoch)?;
 
         Ok(ValueResult {
             value: Value::Bool(true),
@@ -2174,7 +2199,7 @@ impl ClarityDatabase<'_> {
             });
         }
 
-        self.put_value(&key, Value::none(), epoch)?;
+        self.put_value_with_type_and_size(&key, Value::none(), &stored_type, epoch)?;
 
         Ok(ValueResult {
             value: Value::Bool(true),
@@ -2450,7 +2475,8 @@ impl ClarityDatabase<'_> {
         );
 
         let value = Value::some(Value::Principal(principal.clone()))?;
-        self.put_value(&key, value, epoch)?;
+        let stored_type = TypeSignature::new_option(TypeSignature::PrincipalType)?;
+        self.put_value_with_type_and_size(&key, value, &stored_type, epoch)?;
 
         Ok(())
     }
@@ -2480,7 +2506,8 @@ impl ClarityDatabase<'_> {
                 .map_err(|_| VmInternalError::Expect("IOError filling byte buffer.".into()))?,
         );
 
-        self.put_value(&key, Value::none(), epoch)?;
+        let stored_type = TypeSignature::new_option(TypeSignature::PrincipalType)?;
+        self.put_value_with_type_and_size(&key, Value::none(), &stored_type, epoch)?;
         Ok(())
     }
 }
