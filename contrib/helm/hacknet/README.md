@@ -315,6 +315,33 @@ endpoint before its Pod is Ready. The default, `ready`, keeps bootstrap
 deterministic. This affects DNS discovery and new connections, not established
 sessions, and is not a runtime fault mechanism.
 
+#### Deterministic adversarial signers
+
+A v1beta1 signer member may declare a bounded `adversarial` policy only with an
+explicit signer image and observer image. The signer image must be a separately
+built testing artifact containing the matching policy implementation; the
+operator cannot turn a normal signer image adversarial. The policy is inert
+until an identity-bound `signer-behavior` campaign session activates it through
+the managed read-only Downward API contract.
+
+The default `restricted` egress profile creates a topology-owned default-deny
+`NetworkPolicy` allowing only declared protocol peers and cluster DNS. The
+observer runs in its own Pod and network namespace, receives no service-account
+token, and signs nonce-bound reports. Its admitted image, Pod UID, target
+identity, policy digest, and public key remain pinned throughout the window.
+Actor counters remain self-reported, so signed transport proves a bounded
+attempt rather than protocol harm; run-level assertions provide the independent
+network verdict.
+
+Start with
+[`adversarial-signer.yaml`](examples/adversarial-signer.yaml) and
+[`adversarial-signer-policy.yaml`](examples/adversarial-signer-policy.yaml),
+then submit the
+[`signer-withhold-window.yaml`](../../attacknet/examples/campaigns/signer-withhold-window.yaml)
+campaign. The complete bounds, actions, evidence model, and recovery semantics
+are in the [`signer-behavior` fault
+reference](../../attacknet/docs/reference/faults/signer-behavior.md).
+
 ### `BurnchainPolicy`
 
 `BurnchainPolicy` controls one selected Bitcoin actor without coupling Bitcoin

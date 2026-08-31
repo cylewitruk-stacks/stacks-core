@@ -155,8 +155,17 @@ Validate its structure with:
 
 ```bash
 node contrib/attacknet/release/baseline.mjs validate \
-  contrib/attacknet/release/baseline-v1.json
+  contrib/attacknet/release/baseline-v1.json \
+  --verify-evidence --root=.
 ```
+
+Every baseline entry resolves to a small tracked gate record, so this command
+works in a clean clone. The foundation record binds the eight historical
+evidence items reviewed in Phase 0; amendment records bind the signed
+candidate, packet, both verdicts, and external evidence digests. These tracked
+attestations make the release claim portable without placing large live and
+incident archives in Git. Retain those external archives under their recorded
+digests when raw forensic replay is required.
 
 Release amendments use the digest-bound review contract documented in
 [`../../release/PHASE-REVIEWS.md`](../../release/PHASE-REVIEWS.md). Passing tests without a

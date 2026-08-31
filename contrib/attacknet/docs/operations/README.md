@@ -180,6 +180,38 @@ configuration fallback, safety limits, and direct-campaign operation.
 
 ## Faults and runs
 
+### Deterministic adversarial signers
+
+Adversarial behavior belongs in a separately built testing image, never a
+runtime switch in a normal signer. Build and retain the testing image's source,
+patch, feature, recipe, and OCI digests; then submit the typed topology and
+campaign examples:
+
+```bash
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/adversarial-signer-policy.yaml
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/helm/hacknet/examples/adversarial-signer.yaml
+$ATTACKNET wait --namespace hacknet-system --for condition=Ready \
+  StacksNetwork adversarial-signer
+$ATTACKNET submit --namespace hacknet-system \
+  --file contrib/attacknet/examples/campaigns/signer-withhold-window.yaml
+```
+
+The topology must use an explicit testing signer image and observer image. The
+default `restricted` profile installs topology-owned default-deny egress with
+only declared peers and DNS; `unrestricted` is a conspicuous, recorded escape
+hatch. A campaign activates only the policy already bound into admitted
+identity. It cannot make a normal image adversarial.
+
+Observer signatures establish transport and observer identity, not the truth
+of actor-supplied counters. Interpret `SignerBehaviorObserved` as a bounded
+attempt and require independent protocol assertions before attributing network
+impact. Missing, forged, replayed, or identity-shifted reports are
+`Inconclusive`, never `Passed`. See [Deliberately modified
+actors](../concepts/adversarial-actors.md) and the [`signer-behavior` fault
+reference](../reference/faults/signer-behavior.md).
+
 A `FaultCampaign` contains stages; each stage may contain multiple actions.
 The controller admits the union of potentially overlapping signer weight,
 miners, burnchain actors, resources, and mechanisms. A partial injection must

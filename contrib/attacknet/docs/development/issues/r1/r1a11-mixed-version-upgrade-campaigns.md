@@ -2,10 +2,17 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Implementation in progress; offline controller and CLI verification complete |
+| Status | Approved on 2026-08-30 |
 | Release | R1 |
 | Amendment | A11 |
-| Product claim | Not supported until qualified and recorded in the Release 1 baseline |
+| Product claim | Supported within the bounded source, assignment, and upgrade model below |
+
+The gate approved signed commit
+`f116da2964cab6e41896d27792cd74a2f9a333e0`, candidate tree
+`1ac9c5e6f60ee8d1dbb6e1447272ec830e393d92`, and packet digest
+`sha256:03e794fdee383cbcd78eb573a5dc36880796c48cec251d22e480dc1ea2321ff7`.
+The tracked [gate result](../../../../evidence-packets/release-1-a11/gate-result.json)
+preserves the exact review and external-evidence bindings.
 
 ## What and why
 

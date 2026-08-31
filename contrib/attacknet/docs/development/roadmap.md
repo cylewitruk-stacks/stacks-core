@@ -225,26 +225,49 @@ Definition of done:
 
 ### A12: Deterministic adversarial actors
 
-Status: implementation in progress. The bounded R1A12 scope, trust model,
-phases, and qualification contract are defined in the
+Status: approved for Release 1 on 2026-08-31. The Full-tier gate binds signed
+commit `6a6ea8363012173fc614fe8ddb40daa0695feddd`, candidate tree
+`fe1580785298a0382900f8aff06fc7bb79965bd8`, review ID
+`release-1-amendment-a12-deterministic-adversarial-actors`, and packet digest
+`sha256:a734ee009c8881d9acc77bad6bdb8cc849e2573523618fd8cf7d680dc82c1d96`.
+The bounded scope and implementation record are in the
 [`R1A12 implementation specification`](issues/r1/r1a12-deterministic-adversarial-actors.md).
 
-Add testing-only, deterministic behaviors beyond process and network outages.
-Candidate behaviors include:
+The approved testing-only signer behaviors are:
 
 - selective vote withholding or delay;
+- selective suppression of peer signer responses;
+- deterministic selection by height, hash prefix, seeded ordinal, and bounded
+  match/evaluation counts.
+
+Conflicting or equivocating responses, stale-tenure or invalid-parent miner
+proposals, malformed or oversized protocol inputs, and misleading state
+reports remain future behavior-specific work. They are not implied by A12.
+
+The approved A12 gate establishes:
+
+- testing behavior is absent from normal signer images and inert until an
+  identity-bound campaign session activates it;
+- topology-owned default-deny egress permits only declared peers and DNS;
+- a separately scheduled observer signs nonce-bound reports and identity drift
+  or report forgery can never produce `Passed`;
+- below-quorum withholding preserves progress while deliberate quorum loss is
+  classified as a protocol violation despite successful fault injection; and
+- fresh-network replay preserves the bounded policy outcome without claiming
+  deterministic P2P selection, transport ordering, timing, hashes, or logs.
+
+Future adversarial behavior families may include:
+
 - conflicting or equivocating signer responses;
 - stale-tenure and invalid-parent miner proposals;
-- selective relay and message suppression;
 - malformed, stale, or oversized protocol inputs;
 - deliberately misleading local state reports;
 - behavior activated at an exact burn height, tenure, actor, or message digest.
 
-Cryptographically attributable active probes and per-scenario actor egress
-policy are prerequisites for strong claims about malicious actors. Egress
-should be restricted by default with an explicit, recorded scenario escape
-hatch. A malicious actor must never be the authority on whether its own attack
-succeeded.
+The qualified observer and restricted egress profile satisfy the initial
+attribution and containment prerequisites. The actor's own counters remain
+self-reported, so protocol consequences still require independent assertions;
+a malicious actor is never the authority on whether its attack succeeded.
 
 Definition of done:
 

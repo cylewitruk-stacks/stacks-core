@@ -87,7 +87,7 @@ function approval(reviewer, packet, overrides = {}) {
 
 test('the tracked release baseline is structurally valid and digest substitution is detected', () => {
   const baseline = load(baselinePath);
-  assert.equal(validateBaseline(baseline), true);
+  assert.equal(validateBaseline(baseline, {verifyEvidence: true, root: repositoryRoot}), true);
   assert.equal(
     [...baseline.evidence, ...baseline.capabilities].some(item => item.id.includes('compose')),
     false,
@@ -108,10 +108,10 @@ test('the tracked release baseline is structurally valid and digest substitution
   assert.throws(() => validateBaseline(fixture, {verifyEvidence: true, root}), /evidence digest mismatch/);
 });
 
-test('tracked amendment gate records resolve and match the baseline', () => {
+test('every baseline claim resolves to a tracked gate record', () => {
   const baseline = load(baselinePath);
   const gateRecords = baseline.evidence.filter(item => item.path.endsWith('/gate-result.json'));
-  assert.ok(gateRecords.length >= 2, 'approved gate records are missing');
+  assert.equal(gateRecords.length, baseline.evidence.length, 'a baseline claim bypasses a gate record');
   for (const evidence of gateRecords) {
     assert.doesNotThrow(() => execFileSync(
       'git', ['ls-files', '--error-unmatch', evidence.path],
@@ -129,6 +129,20 @@ test('tracked amendment gate records resolve and match the baseline', () => {
   }, {verifyEvidence: true, root: repositoryRoot}), true);
 });
 
+test('the Release 1 foundation record binds every historical evidence claim', () => {
+  const baseline = load(baselinePath);
+  const foundationPath = 'contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json';
+  const historical = baseline.evidence.filter(item => item.path === foundationPath);
+  assert.equal(historical.length, 8);
+  const gate = load(join(repositoryRoot, foundationPath));
+  assert.equal(gate.reviewId, 'release-1-phase-0-foundation');
+  assert.equal(gate.packetDigest, 'sha256:0593c085758d6dce64763123ab99d6034d9fd417001e7820fe82399d098aca1f');
+  assert.deepEqual(
+    gate.historicalEvidence.map(item => item.id).sort(),
+    historical.map(item => item.id).sort(),
+  );
+});
+
 test('deferred baseline capabilities require complete structured reopening records', () => {
   const baseline = load(baselinePath);
   const deferred = baseline.capabilities.find(item => item.status === 'deferred');
@@ -139,7 +153,6 @@ test('deferred baseline capabilities require complete structured reopening recor
   for (const [id, status] of [
     ['native-chaos-mesh-stresschaos-arm64', 'capability-rejected'],
     ['cold-start-capacity-reservation', 'not-done'],
-    ['actor-egress-network-policy', 'not-done'],
     ['cryptographically-attested-active-probes', 'not-done'],
     ['matching-kubernetes-client-packaging', 'not-done'],
   ]) {
@@ -241,6 +254,30 @@ test('the baseline advertises approved A11 capabilities from bound evidence', ()
   const capabilities = [
     'immutable-mixed-version-source-configuration-and-assignment-matrices',
     'topology-owned-boundary-aware-upgrade-campaigns',
+  ].map(id => baseline.capabilities.find(item => item.id === id));
+  for (const capability of capabilities) {
+    assert.equal(capability?.status, 'supported');
+    assert.deepEqual(capability.evidence, [evidenceId]);
+  }
+  assert.equal(validateBaseline({
+    ...baseline, evidence: [evidence], capabilities,
+  }, {verifyEvidence: true, root: repositoryRoot}), true);
+});
+
+test('the baseline advertises approved A12 capabilities from bound evidence', () => {
+  const baseline = load(baselinePath);
+  const evidenceId = 'release-1-a12-deterministic-adversarial-actors';
+  const evidence = baseline.evidence.find(item => item.id === evidenceId);
+  assert.deepEqual(evidence, {
+    id: evidenceId,
+    path: 'contrib/attacknet/evidence-packets/release-1-a12/gate-result.json',
+    digest: 'sha256:becaee92c7115d436acc9c669cae161138e2ccc54ed186886c01f0ff5f415e15',
+    status: 'passed',
+  });
+  const capabilities = [
+    'actor-egress-network-policy',
+    'bounded-deterministic-adversarial-signer-behaviors',
+    'cryptographically-attributed-adversarial-signer-observations',
   ].map(id => baseline.capabilities.find(item => item.id === id));
   for (const capability of capabilities) {
     assert.equal(capability?.status, 'supported');

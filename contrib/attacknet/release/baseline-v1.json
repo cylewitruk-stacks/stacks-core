@@ -37,50 +37,50 @@
   "evidence": [
     {
       "id": "measured-300-burn-soak",
-      "path": "contrib/attacknet/evidence/final-soak-20260815T232258Z/verified-soak-300/result.json",
-      "digest": "sha256:2536353a7f40ee0c0062e722628bdd61ae29852f0985c3813f3925f8c39792e5",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
       "id": "deterministic-fault-run",
-      "path": "contrib/attacknet/evidence/final-soak-20260815T232258Z/verified-fault-run.json",
-      "digest": "sha256:09fb15e515ed307f13b98b2572ebd6dcbb6b0c010de423da1a1f3c700ba7ca21",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
       "id": "mixed-current-release-modified",
-      "path": "contrib/attacknet/evidence/mixed-current-release-modified-20260816/matrix-proof/result.json",
-      "digest": "sha256:a9bc55bc71ce25e0917c081bd19a1b1535fc71e660b30268e507f4d759fdddeb",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
       "id": "worker-outage",
-      "path": "contrib/attacknet/evidence/worker-outage-recovery-20260815T192000Z/result.json",
-      "digest": "sha256:e03678c59795093a2b36f7ad9ce43aa0c680364d31883f8262957c49932a095b",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
       "id": "application-clock",
-      "path": "contrib/attacknet/evidence/application-clock-k8s-20260816T1134Z/acceptance.json",
-      "digest": "sha256:a51332c8170c56b0131094b85c3dd2e2b7ad922ac7f0ef232c0932eefa89ee01",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
       "id": "local-path-pvc-recovery",
-      "path": "contrib/attacknet/evidence/pvc-node-affinity-recovery-20260815T190500Z/result.json",
-      "digest": "sha256:5a91c8f5a0a884b45fe7dad472f54b1b08c7df6487ce100d861e9239e252fefa",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
       "id": "signer-partition-negative-control",
-      "path": "contrib/attacknet/evidence/signer-partition-stall-negative-control-20260816/result.json",
-      "digest": "sha256:0b7e1cc3cac2a510b9385261e8d64aa32913430a9b66295265a6f35dd7565102",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
       "id": "fresh-network-ddmin",
-      "path": "contrib/attacknet/evidence/ddmin-live-r5-20260815T214626Z/ddmin/policy-reclassification-v2/result.json",
-      "digest": "sha256:b0dc93992de793935c282c26c9ec5cc004be2f8b26f7f5102dc8f54fd7d0cdce",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
       "status": "passed"
     },
     {
@@ -105,6 +105,12 @@
       "id": "release-1-a11-mixed-version-upgrades",
       "path": "contrib/attacknet/evidence-packets/release-1-a11/gate-result.json",
       "digest": "sha256:fbae9eb6a8393fe4a766830b6f08d55c99ea3a085194d764eed995b314449f70",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a12-deterministic-adversarial-actors",
+      "path": "contrib/attacknet/evidence-packets/release-1-a12/gate-result.json",
+      "digest": "sha256:becaee92c7115d436acc9c669cae161138e2ccc54ed186886c01f0ff5f415e15",
       "status": "passed"
     }
   ],
@@ -175,15 +181,14 @@
     },
     {
       "id": "actor-egress-network-policy",
-      "status": "not-done",
-      "reason": "The isolated kind profile enables private_neighbors for RFC1918 Pod networking and does not yet install per-scenario egress NetworkPolicy; it is not a production deployment profile.",
-      "evidence": ["measured-300-burn-soak"]
+      "status": "supported",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
     },
     {
       "id": "cryptographically-attested-active-probes",
       "status": "not-done",
-      "reason": "Same-Pod active probes are process-isolated and Kubernetes-identified but are not cryptographically attributable against a malicious actor sharing the network namespace.",
-      "evidence": ["deterministic-fault-run"]
+      "reason": "A12 signs independent adversarial-signer observer reports, but generic same-Pod network, DNS, I/O, and clock probe payloads are not cryptographically attested.",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
     },
     {
       "id": "teardown-centralized-log-corpus-export",
@@ -237,6 +242,16 @@
       "id": "topology-owned-boundary-aware-upgrade-campaigns",
       "status": "supported",
       "evidence": ["release-1-a11-mixed-version-upgrades"]
+    },
+    {
+      "id": "bounded-deterministic-adversarial-signer-behaviors",
+      "status": "supported",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
+    },
+    {
+      "id": "cryptographically-attributed-adversarial-signer-observations",
+      "status": "supported",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
     },
     {
       "id": "controller-ha-leader-election",

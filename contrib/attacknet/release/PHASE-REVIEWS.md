@@ -58,11 +58,18 @@ use v2.
 
 ## Packet lifecycle
 
-1. For a gated change, freeze the candidate commit. The packet builder derives the exact `HEAD`,
+1. Before asking for a hardware signature, run all offline checks and the
+   amendment's packet preflight against the unsigned candidate. New packet
+   assemblers must expose a non-approvable preflight that validates the complete
+   scope allowlist, inventory, evidence inputs, and reproduction commands.
+   Resolve packet and documentation defects before signing. Automation must not
+   modify repository or global Git identity, signing, or author configuration.
+2. Freeze one hardware-signed candidate only after preflight passes. The packet
+   builder derives the exact `HEAD`,
    tracked diff, and untracked-file digest directly from Git. There is no
    `--committed` override: a packet with `candidate.commitPending=true` can be
    inspected, but the machine gate refuses to approve its phase.
-2. Populate the phase contract's complete, non-empty `requiredInventory` in a packet that
+3. Populate the phase contract's complete, non-empty `requiredInventory` in a packet that
    follows `review-packet.schema.json`. Hash files byte-for-byte and build the
    packet's `sourceDigest` and `evidenceDigest` from their respective immutable
    inventories. Each scoped inventory is projected to
@@ -74,7 +81,7 @@ use v2.
    such as `properties`, `items`, and `pattern` also require their explicit
    compatible `type`; unsupported or ambiguous schema changes therefore stop
    packet validation instead of silently weakening it.
-3. Bind `contractDigest` to the exact contract and set `binding.digest` to the
+4. Bind `contractDigest` to the exact contract and set `binding.digest` to the
    SHA-256 digest of canonical packet JSON with the entire `binding` member
    omitted. Canonical JSON preserves array order; sorts object keys in
    ascending UTF-16 code-unit order; uses JSON string escaping and JSON's
@@ -86,7 +93,7 @@ use v2.
    `node contrib/attacknet/release/phase-review.mjs tooling-digest`. A mismatch
    means the reviewer must use the verifier from the packet's candidate
    revision; it is not evidence that the packet was tampered with.
-4. Give each reviewer the complete packet and every inventory item. A reduced
+5. Give each reviewer the complete packet and every inventory item. A reduced
    packet records non-applicable full-tier material explicitly in its matrix;
    it does not silently omit it.
    Before review, validate the packet against its declared contract with the
@@ -99,10 +106,10 @@ use v2.
 
    This checks the packet structure and bindings. Reviewers still independently
    recompute inventory and archive digests from the referenced material.
-5. Record each result using `review-verdict.schema.json`. A reviewer must list
+6. Record each result using `review-verdict.schema.json`. A reviewer must list
    every inspected inventory ID and any omission. Silence, a scoped approval,
    or a review of another digest cannot close a phase.
-6. Evaluate the records:
+7. Evaluate the records:
 
    ```bash
    node contrib/attacknet/release/phase-review.mjs gate \
@@ -116,6 +123,15 @@ packet and both review records in an external review archive after the signed
 candidate commit exists. The examples below use the locally ignored
 `.docs/reviews/attacknet-phase-N/` scratch path; those files are not repository
 artifacts. Until then, use `In review`; never mint a placeholder approval.
+
+Live qualification should bind the smallest complete runtime-input contract,
+not incidental documentation or packet-tooling bytes. A later change may reuse
+live evidence only when the amendment verifier proves that every changed path
+is allowlisted as non-runtime, the sealed runtime-input digest is unchanged,
+and evidence acquisition and interpretation are unchanged. Re-run offline
+checks and rebuild the packet. If an existing contract binds the whole Git
+tree, finish all packet and documentation preflight before its live run rather
+than repeatedly requalifying documentation-only corrections.
 
 For Phase 0, first record the actual successful offline run, then generate the
 immutable review packet outside the candidate commit. This avoids both a
@@ -194,12 +210,12 @@ Phase 0 and Phase 1 packets predate the field and retain their approved v1
 layout. Absolute
 workstation paths and parent traversal are rejected.
 
-`baseline.mjs validate --verify-evidence` reads reference artifacts and checks
-their byte digests. A mutation negative control changes fixture bytes and proves
-that validation fails. The evidence directory is intentionally outside the ordinary
-tracked source surface because it can be large; the baseline manifest is the
-tracked integrity and capability index. Archive the referenced bundles before
-discarding a local cluster or workstation.
+`baseline.mjs validate --verify-evidence` reads every tracked gate record and
+checks its byte digest. A mutation negative control changes fixture bytes and
+proves that validation fails. Gate records bind external live-evidence and
+archive digests; the large evidence directories remain outside the ordinary
+tracked source surface. Archive those bundles before discarding a local
+cluster or workstation.
 
 ## Trust boundary
 

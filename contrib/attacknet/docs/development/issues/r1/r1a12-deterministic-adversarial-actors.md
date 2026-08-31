@@ -5,9 +5,16 @@
 | Field | Value |
 | --- | --- |
 | Amendment | R1A12 |
-| State | Implementation in progress |
+| State | Approved on 2026-08-31 |
 | Review tier | Full |
-| Product claim | Not supported until live qualification and dual review |
+| Product claim | Supported within the bounded behavior and trust model below |
+
+The gate approved signed commit
+`6a6ea8363012173fc614fe8ddb40daa0695feddd`, candidate tree
+`fe1580785298a0382900f8aff06fc7bb79965bd8`, and packet digest
+`sha256:a734ee009c8881d9acc77bad6bdb8cc849e2573523618fd8cf7d680dc82c1d96`.
+The tracked [gate result](../../../../evidence-packets/release-1-a12/gate-result.json)
+preserves the exact review and external-evidence bindings.
 
 ## Objective
 
