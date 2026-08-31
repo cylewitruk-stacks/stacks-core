@@ -62,6 +62,16 @@ runs:
       with:
         tools: nextest, grcov
 
+    # Build grcov-excl, which the test jobs run before grcov to fence test-only
+    # code off from the coverage report. Built once here for the same reason the
+    # other tools are staged below.
+    - name: Build grcov-excl
+      if: |
+        inputs.action == 'create'
+      shell: bash
+      run: |
+        cargo build --release --locked --manifest-path contrib/tools/grcov-excl/Cargo.toml
+
     # Stage the tool binaries so they are uploaded with the artifact. The many
     # parallel test jobs restore them from there instead of each downloading
     # from GitHub Releases, which rate-limits the runners' shared IPs (429)
@@ -72,6 +82,7 @@ runs:
       run: |
         mkdir -p ci-tools
         cp "$(command -v cargo-nextest)" "$(command -v grcov)" ci-tools/
+        cp contrib/tools/grcov-excl/target/release/grcov-excl ci-tools/
 
     # Install mold linker and clang (faster than default)      
     - name: Install mold Linker (and clang)

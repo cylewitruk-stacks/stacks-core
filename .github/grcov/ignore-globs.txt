@@ -1,0 +1,46 @@
+# Paths grcov must drop from the coverage report entirely.
+#
+# One glob per line; `#` comments and blank lines are ignored. Patterns use
+# globset syntax (brace alternates supported), matched against paths relative to
+# the repository root.
+#
+# Consumed by:
+#   - .github/actions/run-tests/action.yml  (turned into `grcov --ignore` flags)
+#   - contrib/tools/grcov-excl              (to know which files it must police)
+#
+# Test code that lives *inside* a non-ignored file is handled separately, by the
+# GRCOV_EXCL_START / GRCOV_EXCL_STOP markers that grcov-excl maintains.
+
+# Outside the source tree
+../*
+/*
+
+# Non-source directories
+.github/**
+.vscode/**
+changelog.d/**
+contrib/**
+**/.cargo/**
+
+# Test and benchmark code.
+#
+# Spell the singular and plural forms out. globset drops the empty branch of a
+# brace alternate, so the `**/test{,s}/**` these replaced matched `tests/` but
+# never `test/`, and likewise for `test.rs` and `*_test.rs`.
+**/benches/**
+**/test/**
+**/tests/**
+**/test.rs
+**/tests.rs
+**/*_test.rs
+**/*_tests.rs
+
+# Non-Rust files
+**/*.clar
+**/*.json
+**/*.md
+**/*.sha256
+**/*.snap
+**/*.toml
+**/*.txt
+**/*.yml
