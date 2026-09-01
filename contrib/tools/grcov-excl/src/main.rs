@@ -42,7 +42,7 @@ use clap::Parser;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use filter::Excluded;
-use scan::Scan;
+use scan::{ModDecl, Scan};
 
 #[derive(Parser)]
 #[command(
@@ -107,8 +107,9 @@ fn main() {
 
 fn run(args: Args) -> Result<()> {
     let ignore = load_globs(&args.root.join(&args.ignore_globs))?;
+    let roots = crate_roots(&args.root)?;
     let mut files = collect_files(&args.root, &ignore)?;
-    let whole_file = test_only_module_files(&args.root, &files, &ignore);
+    let whole_file = test_only_module_files(&args.root, &files, &ignore, &roots)?;
 
     let mut violations: BTreeMap<PathBuf, Vec<Violation>> = BTreeMap::new();
     for file in &files {
@@ -154,7 +155,7 @@ fn run(args: Args) -> Result<()> {
     // important, since nothing is committed for a human to review -- no
     // production line excluded that should not be.
     let files = collect_files(&args.root, &ignore)?;
-    let whole_file = test_only_module_files(&args.root, &files, &ignore);
+    let whole_file = test_only_module_files(&args.root, &files, &ignore, &roots)?;
     verify_all(&files, &whole_file, &args)?;
 
     // Print the totals: a sudden move in these is the signal that something
@@ -421,11 +422,15 @@ fn merge_spans(spans: Vec<Span>, lines: &[String]) -> Vec<Span> {
 
 /// Files that exist only to hold test code, reached through a test-only
 /// `mod ..;` declaration, plus everything those files declare in turn.
+///
+/// A declaration that cannot be resolved to a file is an error rather than a
+/// silent skip: it would mean a test module quietly staying in the report.
 fn test_only_module_files(
     root: &Path,
     files: &[SourceFile],
     ignore: &GlobSet,
-) -> BTreeSet<PathBuf> {
+    roots: &BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>> {
     let by_path: BTreeMap<&Path, &SourceFile> =
         files.iter().map(|f| (f.rel.as_path(), f)).collect();
 
@@ -434,8 +439,14 @@ fn test_only_module_files(
 
     for file in files {
         for decl in file.scan.mod_decls.iter().filter(|d| d.test_only) {
-            if let Some(target) = resolve_mod(root, &file.rel, &decl.name, decl.path.as_deref()) {
+            if let Some(target) = resolve_mod(root, &file.rel, decl, roots) {
                 queue.push_back(target);
+            } else if !decl.may_be_absent {
+                anyhow::bail!(
+                    "cannot find the file for test-only `mod {};` in {}",
+                    decl.name,
+                    file.rel.display()
+                );
             }
         }
     }
@@ -450,32 +461,156 @@ fn test_only_module_files(
             continue;
         };
         for decl in &file.scan.mod_decls {
-            if let Some(child) = resolve_mod(root, &target, &decl.name, decl.path.as_deref()) {
+            if let Some(child) = resolve_mod(root, &target, decl, roots) {
                 queue.push_back(child);
+            } else if !decl.may_be_absent {
+                anyhow::bail!(
+                    "cannot find the file for `mod {};` under test-only {}",
+                    decl.name,
+                    target.display()
+                );
             }
         }
     }
-    found
+    Ok(found)
 }
 
 /// Map a `mod name;` declaration to the file that holds its body.
-fn resolve_mod(root: &Path, parent: &Path, name: &str, path: Option<&str>) -> Option<PathBuf> {
+fn resolve_mod(
+    root: &Path,
+    parent: &Path,
+    decl: &ModDecl,
+    roots: &BTreeSet<PathBuf>,
+) -> Option<PathBuf> {
     let dir = parent.parent()?;
-    // `foo.rs` keeps its children in `foo/`; `mod.rs`, `lib.rs` and `main.rs`
-    // keep theirs alongside them.
-    let child_dir = match parent.file_stem()?.to_str()? {
-        "mod" | "lib" | "main" => dir.to_path_buf(),
-        stem => dir.join(stem),
-    };
 
-    let candidates = match path {
-        Some(p) => vec![child_dir.join(p), dir.join(p)],
+    // A crate root and a `mod.rs` keep their children alongside them; any other
+    // file keeps them in a directory named after it. Crate roots come from the
+    // Cargo manifests rather than from the file name, because this workspace has
+    // several that are not called `lib.rs` -- `libcommon.rs`, `libclarity.rs`,
+    // `libsigner.rs`, `libstackerdb.rs`. Guessing here would be worse than
+    // useless: picking the wrong base can silently resolve to an unrelated file
+    // and mark the whole of it test-only.
+    let stem = parent.file_stem()?.to_str()?;
+    let base = if stem == "mod" || roots.contains(parent) {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    // Each enclosing inline module adds a directory level, so a `mod helpers;`
+    // inside `mod support { .. }` in `foo.rs` lives at `foo/support/helpers.rs`.
+    let base = decl
+        .inline_path
+        .iter()
+        .fold(base, |acc, segment| acc.join(segment));
+
+    let candidates = match decl.path.as_deref() {
+        Some(p) => vec![base.join(p), dir.join(p)],
         None => vec![
-            child_dir.join(format!("{name}.rs")),
-            child_dir.join(name).join("mod.rs"),
+            base.join(format!("{}.rs", decl.name)),
+            base.join(&decl.name).join("mod.rs"),
         ],
     };
-    candidates.into_iter().find(|c| root.join(c).is_file())
+    candidates
+        .into_iter()
+        .find(|candidate| root.join(candidate).is_file())
+}
+
+/// Every crate root in the repository, following Cargo's target discovery.
+///
+/// Manifests are found by walking the tree rather than by asking Cargo, so
+/// packages excluded from the workspace -- the `fuzz` crates, the tools under
+/// `contrib/` -- are covered too.
+fn crate_roots(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut roots = BTreeSet::new();
+    for entry in ignore::WalkBuilder::new(root).build() {
+        let entry = entry?;
+        if entry.file_name() != "Cargo.toml" {
+            continue;
+        }
+        let path = entry.path();
+        let rel_dir = path
+            .parent()
+            .and_then(|p| p.strip_prefix(root).ok())
+            .unwrap_or(Path::new(""))
+            .to_path_buf();
+        let text =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        // `toml::Value`'s `FromStr` parses a bare value, not a document, so a
+        // manifest has to be read as a `Table`.
+        let manifest: toml::Table = text
+            .parse()
+            .with_context(|| format!("parsing {}", path.display()))?;
+
+        for target in package_roots(&manifest, &root.join(&rel_dir)) {
+            let rel = rel_dir.join(target);
+            if root.join(&rel).is_file() {
+                roots.insert(rel);
+            }
+        }
+    }
+    Ok(roots)
+}
+
+/// The library and binary target paths one manifest declares or implies,
+/// relative to the package directory.
+///
+/// Only lib and bin targets matter here. Tests, benches and examples live under
+/// paths the coverage report ignores outright, so nothing is ever resolved
+/// relative to them.
+fn package_roots(manifest: &toml::Table, package_dir: &Path) -> Vec<PathBuf> {
+    let flag = |key: &str| {
+        manifest
+            .get("package")
+            .and_then(|p| p.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true)
+    };
+    let mut targets = Vec::new();
+
+    match manifest.get("lib") {
+        // An explicit `[lib] path` replaces `src/lib.rs`; it does not add to it.
+        Some(lib) => targets.push(
+            lib.get("path")
+                .and_then(toml::Value::as_str)
+                .map(clean_path)
+                .unwrap_or_else(|| PathBuf::from("src/lib.rs")),
+        ),
+        None if flag("autolib") => targets.push(PathBuf::from("src/lib.rs")),
+        None => {}
+    }
+
+    let declared = manifest.get("bin").and_then(toml::Value::as_array);
+    for bin in declared.into_iter().flatten() {
+        if let Some(p) = bin.get("path").and_then(toml::Value::as_str) {
+            targets.push(clean_path(p));
+        } else if let Some(name) = bin.get("name").and_then(toml::Value::as_str) {
+            targets.push(PathBuf::from(format!("src/bin/{name}.rs")));
+        }
+    }
+
+    if flag("autobins") {
+        // Cargo discovers `src/main.rs`, `src/bin/*.rs` and `src/bin/*/main.rs`
+        // without any `[[bin]]` section.
+        targets.push(PathBuf::from("src/main.rs"));
+        if let Ok(dir) = fs::read_dir(package_dir.join("src/bin")) {
+            for child in dir.flatten() {
+                let name = child.file_name();
+                let name = Path::new(&name);
+                if name.extension().is_some_and(|e| e == "rs") {
+                    targets.push(Path::new("src/bin").join(name));
+                } else {
+                    targets.push(Path::new("src/bin").join(name).join("main.rs"));
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Manifest paths may be written as `./src/foo.rs`.
+fn clean_path(raw: &str) -> PathBuf {
+    PathBuf::from(raw.trim_start_matches("./"))
 }
 
 fn collect_files(root: &Path, ignore: &GlobSet) -> Result<Vec<SourceFile>> {
@@ -656,46 +791,29 @@ mod tests {
         assert_eq!((merged[1].start, merged[1].end), (8, 8));
     }
 
-    #[test]
-    fn module_paths_resolve_relative_to_the_owning_file() {
+    fn decl(name: &str) -> ModDecl {
+        ModDecl {
+            name: name.to_string(),
+            path: None,
+            test_only: false,
+            inline_path: Vec::new(),
+            may_be_absent: false,
+        }
+    }
+
+    /// Build a throwaway package. A minimal manifest is added unless the
+    /// caller supplies one, since crate roots now come from the manifests.
+    fn tree(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        for rel in [
-            "src/lib.rs",
-            "src/sibling.rs",
-            "src/parent.rs",
-            "src/parent/child.rs",
-            "src/parent/dir_child/mod.rs",
-        ] {
-            let path = root.join(rel);
+        for rel in files {
+            let path = dir.path().join(rel);
             fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
             fs::write(&path, "").expect("write");
         }
-
-        // `lib.rs` keeps its children alongside it ..
-        assert_eq!(
-            resolve_mod(root, Path::new("src/lib.rs"), "sibling", None),
-            Some(PathBuf::from("src/sibling.rs"))
-        );
-        // .. while `parent.rs` keeps its children in `parent/`, as a file ..
-        assert_eq!(
-            resolve_mod(root, Path::new("src/parent.rs"), "child", None),
-            Some(PathBuf::from("src/parent/child.rs"))
-        );
-        // .. or as a directory module.
-        assert_eq!(
-            resolve_mod(root, Path::new("src/parent.rs"), "dir_child", None),
-            Some(PathBuf::from("src/parent/dir_child/mod.rs"))
-        );
-        // A `#[path = ".."]` override wins.
-        assert_eq!(
-            resolve_mod(root, Path::new("src/lib.rs"), "renamed", Some("sibling.rs")),
-            Some(PathBuf::from("src/sibling.rs"))
-        );
-        assert_eq!(
-            resolve_mod(root, Path::new("src/lib.rs"), "absent", None),
-            None
-        );
+        if !files.contains(&"Cargo.toml") {
+            fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").expect("write");
+        }
+        dir
     }
 
     fn source_file(src: &str) -> SourceFile {
@@ -753,6 +871,249 @@ mod tests {
             complaint.contains("test-only lines still counted"),
             "{complaint}"
         );
+    }
+
+    /// `resolve_mod` against a workspace whose crate roots are only the
+    /// conventional ones.
+    fn resolve_mod_t(root: &Path, parent: &Path, decl: &ModDecl) -> Option<PathBuf> {
+        resolve_mod(root, parent, decl, &crate_roots(root).expect("manifests"))
+    }
+
+    #[test]
+    fn module_paths_resolve_relative_to_the_owning_file() {
+        let dir = tree(&[
+            "src/lib.rs",
+            "src/sibling.rs",
+            "src/parent.rs",
+            "src/parent/child.rs",
+            "src/parent/dir_child/mod.rs",
+        ]);
+        let root = dir.path();
+
+        // `lib.rs` keeps its children alongside it ..
+        assert_eq!(
+            resolve_mod_t(root, Path::new("src/lib.rs"), &decl("sibling")),
+            Some(PathBuf::from("src/sibling.rs"))
+        );
+        // .. while `parent.rs` keeps its children in `parent/`, as a file ..
+        assert_eq!(
+            resolve_mod_t(root, Path::new("src/parent.rs"), &decl("child")),
+            Some(PathBuf::from("src/parent/child.rs"))
+        );
+        // .. or as a directory module.
+        assert_eq!(
+            resolve_mod_t(root, Path::new("src/parent.rs"), &decl("dir_child")),
+            Some(PathBuf::from("src/parent/dir_child/mod.rs"))
+        );
+        // A `#[path = ".."]` override wins.
+        let mut renamed = decl("renamed");
+        renamed.path = Some("sibling.rs".to_string());
+        assert_eq!(
+            resolve_mod_t(root, Path::new("src/lib.rs"), &renamed),
+            Some(PathBuf::from("src/sibling.rs"))
+        );
+        assert_eq!(
+            resolve_mod_t(root, Path::new("src/lib.rs"), &decl("absent")),
+            None
+        );
+    }
+
+    #[test]
+    fn an_inline_module_adds_a_directory_level() {
+        let dir = tree(&["src/lib.rs", "src/support/helpers.rs"]);
+        let mut nested = decl("helpers");
+        nested.inline_path = vec!["support".to_string()];
+        assert_eq!(
+            resolve_mod_t(dir.path(), Path::new("src/lib.rs"), &nested),
+            Some(PathBuf::from("src/support/helpers.rs"))
+        );
+    }
+
+    #[test]
+    fn a_declaration_inherits_the_gate_of_an_enclosing_inline_module() {
+        // `mod helpers;` carries no attribute of its own, but everything inside
+        // a `#[cfg(test)] mod` is test-only regardless.
+        let parsed =
+            syn::parse_file("#[cfg(test)]\nmod support {\n    mod helpers;\n}\nmod prod_mod;\n")
+                .expect("parses");
+        let decls = scan::scan(&parsed).mod_decls;
+
+        let helpers = decls.iter().find(|d| d.name == "helpers").expect("found");
+        assert!(helpers.test_only, "must inherit the ancestor's gate");
+        assert_eq!(helpers.inline_path, vec!["support".to_string()]);
+
+        let prod = decls.iter().find(|d| d.name == "prod_mod").expect("found");
+        assert!(!prod.test_only, "a sibling outside the gate is unaffected");
+        assert!(prod.inline_path.is_empty());
+    }
+
+    #[test]
+    fn inline_module_context_does_not_leak_to_later_siblings() {
+        let parsed =
+            syn::parse_file("#[cfg(test)]\nmod a { mod inner_a; }\nmod b { mod inner_b; }\n")
+                .expect("parses");
+        let decls = scan::scan(&parsed).mod_decls;
+
+        let inner_b = decls.iter().find(|d| d.name == "inner_b").expect("found");
+        assert!(
+            !inner_b.test_only,
+            "the gate must be popped with the module"
+        );
+        assert_eq!(inner_b.inline_path, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn a_crate_root_is_read_from_the_manifest_not_guessed() {
+        let dir = tree(&["Cargo.toml", "src/libcommon.rs", "src/tests/mod.rs"]);
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"c\"\n\n[lib]\npath = \"./src/libcommon.rs\"\n",
+        )
+        .expect("write");
+
+        let roots = crate_roots(dir.path()).expect("manifests");
+        assert!(
+            roots.contains(Path::new("src/libcommon.rs")),
+            "a `[lib] path` root must be recognised: {roots:?}"
+        );
+        assert_eq!(
+            resolve_mod(
+                dir.path(),
+                Path::new("src/libcommon.rs"),
+                &decl("tests"),
+                &roots
+            ),
+            Some(PathBuf::from("src/tests/mod.rs"))
+        );
+    }
+
+    #[test]
+    fn an_ordinary_module_never_falls_back_to_an_unrelated_sibling() {
+        // `src/foo.rs` is not a crate root, so `mod helper;` means
+        // `src/foo/helper.rs` and nothing else. Resolving to the unrelated
+        // `src/helper.rs` would mark a whole production file test-only.
+        let dir = tree(&["Cargo.toml", "src/lib.rs", "src/foo.rs", "src/helper.rs"]);
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").expect("write");
+
+        assert_eq!(
+            resolve_mod_t(dir.path(), Path::new("src/foo.rs"), &decl("helper")),
+            None,
+            "must not fall back to src/helper.rs"
+        );
+    }
+
+    #[test]
+    fn a_module_gated_on_an_optional_feature_may_have_no_file() {
+        // `cfg` stripping happens before modules are loaded, so this is valid
+        // Rust with no `optional_tests.rs` anywhere.
+        let parsed = syn::parse_file(
+            "#[cfg(all(test, feature = \"optional-tests\"))]\nmod optional_tests;\n\
+             #[cfg(test)]\nmod tests;\n",
+        )
+        .expect("parses");
+        let decls = scan::scan(&parsed).mod_decls;
+
+        let optional = decls
+            .iter()
+            .find(|d| d.name == "optional_tests")
+            .expect("found");
+        assert!(optional.test_only, "still test-only ..");
+        assert!(optional.may_be_absent, ".. but allowed to have no file");
+
+        let plain = decls.iter().find(|d| d.name == "tests").expect("found");
+        assert!(
+            !plain.may_be_absent,
+            "an unconditional #[cfg(test)] must resolve"
+        );
+    }
+
+    #[test]
+    fn conditional_context_is_inherited_and_popped() {
+        let parsed = syn::parse_file(
+            "#[cfg(all(test, feature = \"x\"))]\nmod outer { mod inner; }\n\
+             #[cfg(test)]\nmod plain { mod inner2; }\n",
+        )
+        .expect("parses");
+        let decls = scan::scan(&parsed).mod_decls;
+
+        assert!(
+            decls
+                .iter()
+                .find(|d| d.name == "inner")
+                .expect("found")
+                .may_be_absent,
+            "inherits the optional gate"
+        );
+        assert!(
+            !decls
+                .iter()
+                .find(|d| d.name == "inner2")
+                .expect("found")
+                .may_be_absent,
+            "context must be popped between siblings"
+        );
+    }
+
+    #[test]
+    fn an_implicit_binary_under_src_bin_is_a_crate_root() {
+        // Cargo discovers these with no `[[bin]]` section at all, so a
+        // `mod helper;` in `tool.rs` means `src/bin/helper.rs`.
+        let dir = tree(&[
+            "Cargo.toml",
+            "src/lib.rs",
+            "src/bin/tool.rs",
+            "src/bin/helper.rs",
+            "src/bin/nested/main.rs",
+        ]);
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"c\"\n").expect("write");
+
+        let roots = crate_roots(dir.path()).expect("manifests");
+        assert!(roots.contains(Path::new("src/bin/tool.rs")), "{roots:?}");
+        assert!(
+            roots.contains(Path::new("src/bin/nested/main.rs")),
+            "{roots:?}"
+        );
+        assert_eq!(
+            resolve_mod(
+                dir.path(),
+                Path::new("src/bin/tool.rs"),
+                &decl("helper"),
+                &roots
+            ),
+            Some(PathBuf::from("src/bin/helper.rs"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_lib_path_displaces_src_lib_rs() {
+        // `[lib] path` replaces the conventional root rather than adding to it.
+        // Treating a leftover `src/lib.rs` as a root too could resolve a module
+        // to the wrong file and mark all of it test-only.
+        let dir = tree(&["Cargo.toml", "src/libcommon.rs", "src/lib.rs"]);
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"c\"\n\n[lib]\npath = \"./src/libcommon.rs\"\n",
+        )
+        .expect("write");
+
+        let roots = crate_roots(dir.path()).expect("manifests");
+        assert!(roots.contains(Path::new("src/libcommon.rs")), "{roots:?}");
+        assert!(
+            !roots.contains(Path::new("src/lib.rs")),
+            "src/lib.rs is not a root here: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn autobins_and_autolib_false_suppress_discovery() {
+        let dir = tree(&["Cargo.toml", "src/lib.rs", "src/main.rs"]);
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"c\"\nautolib = false\nautobins = false\n",
+        )
+        .expect("write");
+
+        assert!(crate_roots(dir.path()).expect("manifests").is_empty());
     }
 
     #[test]

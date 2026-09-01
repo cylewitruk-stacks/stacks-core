@@ -36,7 +36,17 @@ pub struct ModDecl {
     pub name: String,
     /// Value of a `#[path = ".."]` attribute, if present.
     pub path: Option<String>,
+    /// True if the declaration is gated test-only, or sits inside an inline
+    /// module that is. Everything under a test-only module is test-only,
+    /// whether or not the declaration repeats the gate.
     pub test_only: bool,
+    /// Enclosing inline modules, outermost first. Each one adds a directory
+    /// level to where the declared module's file lives.
+    pub inline_path: Vec<String>,
+    /// True when the declaration, or an inline module containing it, is gated
+    /// on something that may be off in the coverage build. Such a module is
+    /// allowed to have no backing file at all.
+    pub may_be_absent: bool,
 }
 
 #[derive(Default)]
@@ -67,6 +77,13 @@ pub fn scan(file: &syn::File) -> Scan {
 #[derive(Default)]
 struct Visitor {
     scan: Scan,
+    /// Inline modules currently being visited, outermost first.
+    inline_path: Vec<String>,
+    /// How many of those are gated test-only.
+    test_only_ancestors: usize,
+    /// How many of those are gated on something that may be off in the
+    /// coverage build.
+    conditional_ancestors: usize,
 }
 
 impl Visitor {
@@ -106,12 +123,35 @@ impl<'ast> Visit<'ast> for Visitor {
                 self.scan.mod_decls.push(ModDecl {
                     name: m.ident.to_string(),
                     path: path_attr(&m.attrs),
-                    test_only: gate::test_only(&m.attrs).is_some(),
+                    test_only: gate::test_only(&m.attrs).is_some() || self.test_only_ancestors > 0,
+                    inline_path: self.inline_path.clone(),
+                    may_be_absent: !gate::always_present_in_test_build(&m.attrs)
+                        || self.conditional_ancestors > 0,
                 });
             }
         }
         self.record(attrs, item.span(), kind);
         visit::visit_item(self, item);
+    }
+
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        if m.content.is_none() {
+            visit::visit_item_mod(self, m);
+            return;
+        }
+        // Track the enclosing inline module so that declarations inside it
+        // inherit its gate and resolve against the right directory.
+        let gated = gate::test_only(&m.attrs).is_some();
+        let conditional = !gate::always_present_in_test_build(&m.attrs);
+        self.inline_path.push(m.ident.to_string());
+        self.test_only_ancestors += usize::from(gated);
+        self.conditional_ancestors += usize::from(conditional);
+
+        visit::visit_item_mod(self, m);
+
+        self.conditional_ancestors -= usize::from(conditional);
+        self.test_only_ancestors -= usize::from(gated);
+        self.inline_path.pop();
     }
 
     fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {

@@ -90,7 +90,32 @@ with closure initializers and types whose `derive`s expand to real code.
 
 Whole files reached only through a test-only `mod name;` — and their submodules
 in turn — get an unterminated marker on their first item, which excludes the
-file to its end.
+file to its end. A declaration inherits the gate of an enclosing inline module,
+so `#[cfg(test)] mod support { mod helpers; }` pulls in `helpers` even though
+the inner declaration carries no attribute of its own.
+
+Resolving a declaration to its file accounts for two things beyond the obvious
+`foo.rs` → `foo/`. Each enclosing inline module adds a directory level. And a
+crate root is not always named `lib.rs` here — `libcommon.rs`, `libclarity.rs`,
+`libsigner.rs` and `libstackerdb.rs` are all roots — so roots are worked out
+from the Cargo manifests rather than guessed from the file name: `[lib] path`
+and `[[bin]]` entries, plus the targets Cargo discovers on its own (`src/lib.rs`,
+`src/main.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`), honouring `autolib` and
+`autobins`. An explicit `[lib] path` replaces `src/lib.rs` rather than adding to
+it. Guessing would be worse than useless: choosing the wrong base directory can
+resolve to an unrelated file and mark the whole of it test-only, which nothing
+downstream would catch.
+
+Manifests are found by walking the tree, not by asking Cargo, so packages held
+outside the workspace — the `fuzz` crates, the tools under `contrib/` — are
+covered too.
+
+A test-only declaration that resolves to nothing is an error rather than a
+silent skip — it would mean a test module quietly staying in the report. The
+exception is a declaration whose `cfg` is not certain to be active in the
+coverage build, such as `#[cfg(all(test, feature = "extra"))] mod extra_tests;`.
+`cfg` stripping happens before modules are loaded, so that is valid Rust with no
+file behind it, and it is passed over rather than treated as an error.
 
 ## Placement rules
 

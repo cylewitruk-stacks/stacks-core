@@ -28,6 +28,7 @@ contrib/**
 # brace alternate, so the `**/test{,s}/**` these replaced matched `tests/` but
 # never `test/`, and likewise for `test.rs` and `*_test.rs`.
 **/benches/**
+**/examples/**
 **/test/**
 **/tests/**
 **/test.rs

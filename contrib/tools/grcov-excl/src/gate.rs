@@ -35,14 +35,26 @@ impl Tri {
     }
 }
 
-/// Evaluate `meta` with `test` and `feature = "testing"` forced off and every
-/// other flag left unknown. A `False` result proves the item cannot exist
-/// outside a test build.
-fn eval(meta: &syn::Meta) -> Tri {
+/// Which build configuration a predicate is being evaluated against.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Build {
+    /// A normal build: `test` is off, and so is `feature = "testing"`.
+    NonTest,
+    /// The instrumented test build coverage is collected from: `test` is on,
+    /// but whether any given feature is enabled is not known here.
+    Test,
+}
+
+/// Evaluate `meta` against `build`, leaving every flag the configuration does
+/// not pin down as unknown.
+fn eval(meta: &syn::Meta, build: Build) -> Tri {
     match meta {
         syn::Meta::Path(path) => {
             if path.is_ident("test") {
-                Tri::False
+                match build {
+                    Build::NonTest => Tri::False,
+                    Build::Test => Tri::True,
+                }
             } else {
                 Tri::Unknown
             }
@@ -54,10 +66,11 @@ fn eval(meta: &syn::Meta) -> Tri {
                     syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. })
                         if s.value() == "testing"
                 );
-            if is_testing_feature {
-                Tri::False
-            } else {
-                Tri::Unknown
+            match (is_testing_feature, build) {
+                (true, Build::NonTest) => Tri::False,
+                // The coverage build may or may not turn `testing` on, so in a
+                // test build it stays unknown.
+                _ => Tri::Unknown,
             }
         }
         syn::Meta::List(list) => {
@@ -66,7 +79,7 @@ fn eval(meta: &syn::Meta) -> Tri {
             ) else {
                 return Tri::Unknown;
             };
-            let vals: Vec<Tri> = inner.iter().map(eval).collect();
+            let vals: Vec<Tri> = inner.iter().map(|m| eval(m, build)).collect();
 
             if list.path.is_ident("all") {
                 if vals.contains(&Tri::False) {
@@ -91,6 +104,42 @@ fn eval(meta: &syn::Meta) -> Tri {
             }
         }
     }
+}
+
+/// Whether the item is certain to be compiled into the instrumented test build.
+///
+/// A `mod name;` is only guaranteed to have a backing file when it is; Rust is
+/// happy for `#[cfg(all(test, feature = "extra"))] mod extra_tests;` to point at
+/// nothing when that feature is off, because `cfg` stripping happens before
+/// modules are loaded. Anything less than certain must not be treated as a
+/// missing file.
+pub fn always_present_in_test_build(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().all(|attr| {
+        // `cfg_attr` can expand to a further `cfg`, as in
+        // `#[cfg_attr(test, cfg(feature = "extra"))]`. Reading through the
+        // expansion is more than this needs, so any `cfg_attr` carrying a
+        // nested `cfg` is treated as leaving presence undecided.
+        if attr.path().is_ident("cfg_attr") {
+            let syn::Meta::List(list) = &attr.meta else {
+                return true;
+            };
+            return !list
+                .tokens
+                .clone()
+                .into_iter()
+                .any(|token| matches!(&token, proc_macro2::TokenTree::Ident(i) if i == "cfg"));
+        }
+        if !attr.path().is_ident("cfg") {
+            return true;
+        }
+        let syn::Meta::List(list) = &attr.meta else {
+            return true;
+        };
+        match list.parse_args::<syn::Meta>() {
+            Ok(inner) => eval(&inner, Build::Test) == Tri::True,
+            Err(_) => false,
+        }
+    })
 }
 
 /// Why an item exists only in test builds, if it does.
@@ -129,7 +178,7 @@ fn test_only_cfg(attrs: &[syn::Attribute]) -> Option<String> {
             return None;
         };
         let inner = list.parse_args::<syn::Meta>().ok()?;
-        (eval(&inner) == Tri::False).then(|| {
+        (eval(&inner, Build::NonTest) == Tri::False).then(|| {
             format!(
                 "cfg({})",
                 quote::quote!(#inner).to_string().replace(' ', "")
@@ -210,6 +259,43 @@ mod tests {
             "#[other::template] fn f() {}",
         ] {
             assert_eq!(gate_of(src), None, "should not be test-only: {src}");
+        }
+    }
+
+    #[test]
+    fn presence_in_a_test_build_is_only_claimed_when_it_is_certain() {
+        // An unconditional test gate means the module must exist ..
+        assert!(always_present_in_test_build(&attrs_of(
+            "#[cfg(test)] fn f() {}"
+        )));
+        assert!(always_present_in_test_build(&attrs_of(
+            r#"#[cfg(any(test, feature = "testing"))] fn f() {}"#
+        )));
+        assert!(always_present_in_test_build(&attrs_of("fn f() {}")));
+
+        // .. while an optional feature means it need not, because `cfg`
+        // stripping happens before modules are loaded.
+        assert!(!always_present_in_test_build(&attrs_of(
+            r#"#[cfg(all(test, feature = "extra"))] fn f() {}"#
+        )));
+        assert!(!always_present_in_test_build(&attrs_of(
+            r#"#[cfg(target_os = "linux")] fn f() {}"#
+        )));
+    }
+
+    #[test]
+    fn a_cfg_attr_that_can_introduce_a_cfg_leaves_presence_undecided() {
+        assert!(!always_present_in_test_build(&attrs_of(
+            "#[cfg(test)]\n#[cfg_attr(test, cfg(feature = \"extra\"))]\nfn f() {}"
+        )));
+        // The forms actually used in this repository expand to lint and test
+        // attributes, never to a `cfg`, so they must not be penalised.
+        for src in [
+            "#[cfg(test)]\n#[cfg_attr(test, mutants::skip)]\nfn f() {}",
+            "#[cfg(test)]\n#[cfg_attr(test, allow(dead_code))]\nfn f() {}",
+            "#[cfg(test)]\n#[cfg_attr(test, pinny::tag(slow))]\nfn f() {}",
+        ] {
+            assert!(always_present_in_test_build(&attrs_of(src)), "{src}");
         }
     }
 
