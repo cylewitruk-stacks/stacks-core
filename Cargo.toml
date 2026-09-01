@@ -21,7 +21,7 @@ members = [
     "contrib/marf-squash",
 ]
 
-exclude = ["contrib/tools/config-docs-generator"]
+exclude = ["contrib/tools/config-docs-generator", "contrib/tools/grcov-excl"]
 
 [workspace.dependencies]
 # Local dependencies

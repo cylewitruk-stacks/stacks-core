@@ -1,0 +1,19 @@
+[package]
+name = "grcov-excl"
+version = "0.1.0"
+edition = "2021"
+description = "Maintains grcov coverage-exclusion markers around test-only code"
+publish = false
+
+[dependencies]
+anyhow = "1.0.99"
+clap = { version = "4.5.44", features = ["derive"] }
+globset = "0.4.16"
+ignore = "0.4.23"
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+quote = "1.0.47"
+syn = { version = "2.0.119", features = ["full", "visit", "extra-traits", "parsing", "printing"] }
+toml = "1.1.2"
+
+[dev-dependencies]
+tempfile = "3.20.0"

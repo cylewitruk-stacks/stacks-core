@@ -208,37 +208,57 @@ runs:
     ### Generate and upload code coverage artifact
     ############################################################################
 
+    # Fence test-only code off from the coverage report
+    #
+    # Whole files are dropped by grcov's --ignore globs, but test code that
+    # shares a file with production code -- inline `#[cfg(test)] mod tests`,
+    # test-only helpers, fault injection -- can only be excluded with
+    # GRCOV_EXCL_START / GRCOV_EXCL_STOP markers. grcov-excl finds those regions
+    # and writes the markers into the working copy that grcov is about to read.
+    #
+    # The markers are appended to existing lines rather than inserted on lines of
+    # their own, so every line number still matches the source the tests were
+    # compiled from. That is what makes it safe to run this after the build, and
+    # it keeps Coveralls rendering against the right lines of the committed
+    # source. Because the markers are regenerated from the code on every run,
+    # there is nothing committed to the repository that can drift.
+    - name: Apply Coverage Exclusion Markers
+      if: inputs.upload-code-coverage == 'true'
+      shell: bash
+      run: |
+        grcov-excl --root . --fix
+
     # Generate code coverage using grcov
+    #   - --ignore globs come from .github/grcov/ignore-globs.txt, which
+    #     grcov-excl reads too so the two agree on which files are reported
     # Resulting coverage filenames must be unique, so use test-name input to name the file
     - name: Run grcov
       if: inputs.upload-code-coverage == 'true'
       shell: bash
       run: |
+        # Default IFS makes `read` strip surrounding whitespace for us
+        IGNORE_ARGS=()
+        while read -r glob || [[ -n "$glob" ]]; do
+          [[ -z "$glob" || "$glob" == \#* ]] && continue
+          IGNORE_ARGS+=(--ignore "$glob")
+        done < .github/grcov/ignore-globs.txt
+
+        if [[ ${#IGNORE_ARGS[@]} -eq 0 ]]; then
+          echo "::error::No ignore globs read from .github/grcov/ignore-globs.txt"
+          exit 1
+        fi
+
         grcov . \
           -b ${{ inputs.debug-binary-path }} \
           -s . \
           -t lcov \
           --branch \
           --ignore-not-existing \
-          --ignore "../*" \
-          --ignore "/*" \
-          --ignore ".github/**" \
-          --ignore ".vscode/**" \
-          --ignore "changelog.d/**" \
-          --ignore "contrib/**" \
-          --ignore "**/.cargo/**" \
-          --ignore "**/benches/**" \
-          --ignore "**/test{,s}/**" \
-          --ignore "**/test{,s}.rs" \
-          --ignore "**/*_test{,s}.rs" \
-          --ignore "**/*.clar" \
-          --ignore "**/*.json" \
-          --ignore "**/*.md" \
-          --ignore "**/*.sha256" \
-          --ignore "**/*.snap" \
-          --ignore "**/*.toml" \
-          --ignore "**/*.txt" \
-          --ignore "**/*.yml" \
+          "${IGNORE_ARGS[@]}" \
+          --excl-start 'GRCOV_EXCL_START' \
+          --excl-stop 'GRCOV_EXCL_STOP' \
+          --excl-br-start 'GRCOV_EXCL_START' \
+          --excl-br-stop 'GRCOV_EXCL_STOP' \
           -o lcov_${{ steps.generate-sanitized-file-name.outputs.file-name }}.info \
         || exit 1
 
