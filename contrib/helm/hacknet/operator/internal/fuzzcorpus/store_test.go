@@ -406,7 +406,7 @@ func TestCorpusLockRecoversOnlyPrivatePendingWrites(t *testing.T) {
 func TestJournalResumesVerifiedHashChainAndRejectsCorruption(t *testing.T) {
 	store := openTestStore(t)
 	session := "sha256:" + strings.Repeat("c", 64)
-	journal, err := store.OpenJournal(session)
+	journal, err := store.OpenOrCreateJournal(session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,6 +440,25 @@ func TestJournalResumesVerifiedHashChainAndRejectsCorruption(t *testing.T) {
 	}
 }
 
+func TestOpenJournalDoesNotCreateUnknownSession(t *testing.T) {
+	store := openTestStore(t)
+	session := "sha256:" + strings.Repeat("e", 64)
+	sessionRoot := filepath.Join(store.Root(), "sessions", strings.TrimPrefix(session, "sha256:"))
+
+	if _, err := store.OpenJournal(session); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("opening an unknown session returned %v", err)
+	}
+	if _, err := os.Stat(sessionRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only open created an unknown session directory: %v", err)
+	}
+	if _, err := store.OpenOrCreateJournal(session); err != nil {
+		t.Fatalf("explicit journal creation failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionRoot, "journal")); err != nil {
+		t.Fatalf("explicit journal creation did not create its directory: %v", err)
+	}
+}
+
 func TestVerifyRejectsMissingJournalArtifact(t *testing.T) {
 	store := openTestStore(t)
 	reference, err := store.PutObject("descriptor", "application/json", []byte("{}"))
@@ -447,7 +466,7 @@ func TestVerifyRejectsMissingJournalArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := "sha256:" + strings.Repeat("d", 64)
-	journal, err := store.OpenJournal(session)
+	journal, err := store.OpenOrCreateJournal(session)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -166,7 +166,7 @@ func (engine *Engine) ExecuteCorpus(
 	if requestReference.Digest != result.RequestDigest {
 		return result, errors.New("corpus execution request digest changed during retention")
 	}
-	journal, err := engine.Store.OpenJournal(result.RequestDigest)
+	journal, err := engine.Store.OpenOrCreateJournal(result.RequestDigest)
 	if err != nil {
 		return result, err
 	}
@@ -238,7 +238,7 @@ func (engine *Engine) ExecuteCorpus(
 		}
 		var reduction *fuzzreduce.Result
 		if reduce && finalClass == "ConfirmedNetworkFailure" {
-			reduction, _, err = engine.reduce(ctx, journal, descriptor, entry.TrialOrdinal, observed, classification)
+			reduction, err = engine.reduce(ctx, journal, descriptor, entry.TrialOrdinal, observed, classification)
 			if err != nil {
 				return result, err
 			}
@@ -314,7 +314,7 @@ func (engine *Engine) Run(ctx context.Context, descriptor fuzzplan.Descriptor) (
 		return err
 	}
 	defer lock.Release()
-	journal, err := engine.Store.OpenJournal(descriptor.Digest)
+	journal, err := engine.Store.OpenOrCreateJournal(descriptor.Digest)
 	if err != nil {
 		return err
 	}
@@ -402,7 +402,6 @@ func (engine *Engine) Run(ctx context.Context, descriptor fuzzplan.Descriptor) (
 		if err != nil {
 			return err
 		}
-		attempts := []ObservedAttempt{source}
 		finalClass := classification.Class
 		if classification.Class == "NetworkFailureCandidate" {
 			matches := int32(0)
@@ -411,7 +410,7 @@ func (engine *Engine) Run(ctx context.Context, descriptor fuzzplan.Descriptor) (
 					return err
 				}
 				confirmationID := "confirm-" + strconv.Itoa(int(attempt))
-				confirmed, observed, runErr := engine.executeAttempt(
+				_, observed, runErr := engine.executeAttempt(
 					ctx, journal, descriptor, trial.Ordinal, attemptOptions{
 						ID: confirmationID, Kind: "Confirmation", Source: &source,
 					},
@@ -419,7 +418,6 @@ func (engine *Engine) Run(ctx context.Context, descriptor fuzzplan.Descriptor) (
 				if runErr != nil {
 					return runErr
 				}
-				attempts = append(attempts, confirmed)
 				if observed.Class == "NetworkFailureCandidate" &&
 					observed.Fingerprint == classification.Fingerprint {
 					matches++
@@ -440,16 +438,15 @@ func (engine *Engine) Run(ctx context.Context, descriptor fuzzplan.Descriptor) (
 		}
 		var reduction *fuzzreduce.Result
 		if finalClass == "ConfirmedNetworkFailure" && descriptor.Reduction.Enabled {
-			result, reducedAttempts, reduceErr := engine.reduce(
+			result, reduceErr := engine.reduce(
 				ctx, journal, descriptor, trial.Ordinal, source, classification,
 			)
 			if reduceErr != nil {
 				return reduceErr
 			}
 			reduction = result
-			attempts = append(attempts, reducedAttempts...)
 		}
-		attempts, err = engine.capturedAttempts(journal.Records(), trial.Ordinal)
+		attempts, err := engine.capturedAttempts(journal.Records(), trial.Ordinal)
 		if err != nil {
 			return err
 		}
@@ -1100,12 +1097,12 @@ func (engine *Engine) reduce(
 	ordinal int32,
 	source ObservedAttempt,
 	classification Classification,
-) (*fuzzreduce.Result, []ObservedAttempt, error) {
+) (*fuzzreduce.Result, error) {
 	materialized, err := fuzzplan.MaterializeTrial(
 		descriptor, ordinal, "source", "Source", descriptor.Network.Template.Namespace,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	campaigns := map[string]attacknetv1beta1.FaultCampaignSpec{}
 	for _, template := range descriptor.Templates {
@@ -1117,36 +1114,35 @@ func (engine *Engine) reduce(
 	if err != nil {
 		// Mixed-version schedules remain valuable corpus entries, but automatic
 		// removal would change version context rather than only fault material.
-		return nil, nil, nil
+		return nil, nil
 	}
 	reducer, err := fuzzreduce.New(reductionSource, descriptor.Reduction.MaxAttempts)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := engine.reconcileReductionTeardown(ctx, journal, ordinal); err != nil {
-		return nil, nil, engine.harnessFailed(journal, "ReductionTeardownFailed", err)
+		return nil, engine.harnessFailed(journal, "ReductionTeardownFailed", err)
 	}
 	if err := engine.restoreReduction(journal.Records(), reducer, ordinal); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if !hasTrialRecord(journal.Records(), "ReductionStarted", ordinal) {
 		if _, err := journal.Append(fuzzcorpus.JournalRecord{
 			Kind: "ReductionStarted", Phase: "Reducing", TrialOrdinal: ordinal,
 		}); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
 	reductionCtx, cancel, err := engine.reductionContext(
 		ctx, journal.Records(), ordinal, descriptor.Reduction.MaxDuration.Duration,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer cancel()
-	attempts := []ObservedAttempt{}
 	retained, err := engine.capturedAttempts(journal.Records(), ordinal)
 	if err != nil {
-		return nil, attempts, err
+		return nil, err
 	}
 	var evidenceUsed int64
 	for _, attempt := range retained {
@@ -1162,7 +1158,7 @@ func (engine *Engine) reduce(
 		candidate, err := reducer.Next()
 		if err != nil || candidate == nil {
 			if err != nil {
-				return nil, attempts, err
+				return nil, err
 			}
 			break
 		}
@@ -1170,7 +1166,7 @@ func (engine *Engine) reduce(
 			"reduction-candidate", "application/json", candidate,
 		)
 		if err != nil {
-			return nil, attempts, err
+			return nil, err
 		}
 		attemptID := fmt.Sprintf("reduce-%03d", candidate.Attempt)
 		if _, err := journal.Append(fuzzcorpus.JournalRecord{
@@ -1178,13 +1174,13 @@ func (engine *Engine) reduce(
 			TrialOrdinal: ordinal, AttemptID: attemptID,
 			Artifacts: []fuzzcorpus.ObjectReference{candidateReference},
 		}); err != nil {
-			return nil, attempts, err
+			return nil, err
 		}
 		if err := engine.verifyResidualCapacity(reductionCtx, journal, descriptor, ordinal); err != nil {
 			if errors.Is(reductionCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 				break
 			}
-			return nil, attempts, err
+			return nil, err
 		}
 		observed, result, err := engine.executeAttempt(
 			reductionCtx, journal, descriptor, ordinal, attemptOptions{
@@ -1196,9 +1192,8 @@ func (engine *Engine) reduce(
 			if errors.Is(reductionCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 				break
 			}
-			return nil, attempts, err
+			return nil, err
 		}
-		attempts = append(attempts, observed)
 		evidenceUsed += artifactBytes(observed.Artifacts)
 		outcome := fuzzreduce.OutcomeNotReproduced
 		switch {
@@ -1208,24 +1203,24 @@ func (engine *Engine) reduce(
 			outcome = fuzzreduce.OutcomeInconclusive
 		}
 		if err := reducer.Record(outcome); err != nil {
-			return nil, attempts, err
+			return nil, err
 		}
 		outcomeReference, err := engine.Store.PutCanonicalObject(
 			"reduction-outcome", "application/json",
 			fuzzreduce.Attempt{Candidate: *candidate, Outcome: outcome},
 		)
 		if err != nil {
-			return nil, attempts, err
+			return nil, err
 		}
 		if _, err := journal.Append(fuzzcorpus.JournalRecord{
 			Kind: "ReductionOutcomeRecorded", Phase: "Reducing",
 			TrialOrdinal: ordinal, AttemptID: attemptID,
 			Artifacts: []fuzzcorpus.ObjectReference{outcomeReference},
 		}); err != nil {
-			return nil, attempts, err
+			return nil, err
 		}
 		if err := engine.teardownAttempt(reductionCtx, journal, ordinal, observed); err != nil {
-			return nil, attempts, engine.harnessFailed(journal, "ReductionTeardownFailed", err)
+			return nil, engine.harnessFailed(journal, "ReductionTeardownFailed", err)
 		}
 	}
 	result := reducer.Result()
@@ -1233,15 +1228,15 @@ func (engine *Engine) reduce(
 		"reduction-graph", "application/json", result,
 	)
 	if err != nil {
-		return nil, attempts, err
+		return nil, err
 	}
 	if _, err := journal.Append(fuzzcorpus.JournalRecord{
 		Kind: "ReductionComplete", Phase: "Classified", TrialOrdinal: ordinal,
 		Artifacts: []fuzzcorpus.ObjectReference{reference},
 	}); err != nil {
-		return nil, attempts, err
+		return nil, err
 	}
-	return &result, attempts, nil
+	return &result, nil
 }
 
 // reconcileReductionTeardown completes cleanup journaled before a crash.

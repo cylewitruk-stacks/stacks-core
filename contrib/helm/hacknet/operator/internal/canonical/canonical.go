@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 )
 
 const maximumJSONSafeInteger int64 = 9_007_199_254_740_991
@@ -76,16 +75,6 @@ func ArtifactDigest(value any) (string, error) {
 	}
 	sum := sha256.Sum256(encoded)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
-}
-
-// Decode parses bounded arbitrary JSON while retaining exact integer spelling.
-func Decode(data []byte, destination any) error {
-	decoder := json.NewDecoder(io.LimitReader(bytes.NewReader(data), int64(len(data))+1))
-	decoder.UseNumber()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	return nil
 }
 
 func validate(value any, path string, allowExactInt64 bool) error {

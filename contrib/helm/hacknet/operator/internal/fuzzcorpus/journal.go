@@ -23,14 +23,26 @@ type Journal struct {
 
 // OpenJournal verifies and opens one session journal.
 func (store *Store) OpenJournal(sessionDigest string) (*Journal, error) {
+	return store.openJournal(sessionDigest, false)
+}
+
+// OpenOrCreateJournal verifies and opens a session journal, creating it when
+// the caller is starting a verified session.
+func (store *Store) OpenOrCreateJournal(sessionDigest string) (*Journal, error) {
+	return store.openJournal(sessionDigest, true)
+}
+
+func (store *Store) openJournal(sessionDigest string, create bool) (*Journal, error) {
 	if !digestPattern.MatchString(sessionDigest) {
 		return nil, errors.New("session digest must be SHA-256")
 	}
 	root := filepath.Join(
 		store.root, "sessions", strings.TrimPrefix(sessionDigest, "sha256:"), "journal",
 	)
-	if err := os.MkdirAll(root, 0o750); err != nil {
-		return nil, err
+	if create {
+		if err := os.MkdirAll(root, 0o750); err != nil {
+			return nil, err
+		}
 	}
 	journal := &Journal{store: store, root: root}
 	entries, err := os.ReadDir(root)

@@ -373,13 +373,16 @@ prerequisite for truthful qualification.
 
 ### A13 maintenance follow-ups
 
-The A13 review recorded three non-blocking cleanup items:
+Completed on 2026-09-02 under ordinary review:
 
-- remove dead pre-reassignment `attempts` appends in the session engine;
-- validate a journal digest before creating its session directory so a typo
-  cannot leave an empty directory; and
-- evaluate the pre-existing unused `canonical.Decode` helper and remove it if
-  no planned caller needs it.
+- removed the dead pre-reassignment `attempts` collections in the session
+  engine; durable journal reconstruction remains the sole source used for
+  persistence and teardown;
+- split read-only journal opening from explicit create-or-open behavior, so a
+  mistyped session digest cannot create an empty directory through status,
+  resume, or verification; and
+- removed the unused `canonical.Decode` helper after confirming that no
+  production, test, or planned A13 path calls it.
 
-These do not affect the approved A13 behavior or evidence and require ordinary
-review unless a future change alters runtime or evidence semantics.
+These maintenance changes do not alter the approved A13 runtime or evidence
+semantics.

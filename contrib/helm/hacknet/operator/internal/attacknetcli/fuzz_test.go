@@ -412,7 +412,7 @@ func TestFuzzResumeFindsExactlyOneDescriptorAmongAdvisoryArtifacts(t *testing.T)
 			for range test.descriptorCopies {
 				artifacts = append(artifacts, descriptorReference)
 			}
-			journal, err := store.OpenJournal(descriptor.Digest)
+			journal, err := store.OpenOrCreateJournal(descriptor.Digest)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -892,7 +892,7 @@ func TestFuzzStatusReturnsVerifiedReportCapacityAndCorpusState(t *testing.T) {
 	if err != nil || store.PutReportPointer(session, report) != nil {
 		t.Fatalf("retain report: %v", err)
 	}
-	journal, err := store.OpenJournal(session)
+	journal, err := store.OpenOrCreateJournal(session)
 	if err != nil {
 		t.Fatal(err)
 	}
