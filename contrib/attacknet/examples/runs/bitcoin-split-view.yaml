@@ -1,0 +1,81 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: bitcoin-split-view
+  namespace: hacknet-system
+spec:
+  networkRef: multi-bitcoin
+  seed: bitcoin-split-view-a10
+  campaignCatalog:
+    - name: competing-branches
+      campaignRef: bitcoin-competing-branches
+  executions:
+    - id: split-bitcoin-view
+      campaign: competing-branches
+      trigger:
+        afterRunStart: 5s
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 900
+    maxCumulativeFaultSeconds: 180
+    maxActiveFaults: 2
+    maxSignerImpactPercent: 0
+    # The campaign composes one Bitcoin partition with one branch replacement.
+    maxBurnchainFaults: 2
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: PauseForTriage
+    onInconclusive: PauseForTriage
+    onBudgetExhausted: Stop
+    onSuccess: Continue
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: true
+    allowedTerminalStates: [Triaged, Remediated, Inconclusive]
+  baselineAssertions:
+    timeout: 120s
+    assertions:
+      - id: bitcoin-baseline
+        bitcoinBranchCohort:
+          actors: [bitcoin-a, bitcoin-b]
+          expectation: Converged
+          stableFor: 10s
+      - id: stacks-baseline
+        stacksBurnchainCohort:
+          actors: [follower-a, follower-b]
+          expectation: Converged
+          stableFor: 10s
+  duringAssertions:
+    timeout: 120s
+    assertions:
+      - id: bitcoin-diverged
+        bitcoinBranchCohort:
+          actors: [bitcoin-a, bitcoin-b]
+          expectation: Diverged
+          minimumDistinct: 2
+      - id: stacks-diverged
+        stacksBurnchainCohort:
+          actors: [follower-a, follower-b]
+          expectation: Diverged
+          minimumDistinct: 2
+  recoveryAssertions:
+    timeout: 240s
+    assertions:
+      - id: bitcoin-converged
+        bitcoinBranchCohort:
+          actors: [bitcoin-a, bitcoin-b]
+          expectation: Converged
+          stableFor: 15s
+      - id: stacks-converged
+        stacksBurnchainCohort:
+          actors: [follower-a, follower-b]
+          expectation: Converged
+          stableFor: 15s
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true

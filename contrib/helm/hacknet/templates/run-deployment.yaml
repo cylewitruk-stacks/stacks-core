@@ -1,0 +1,117 @@
+{{- if .Values.runOperator.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hacknet.runOperatorName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: run-operator
+spec:
+  replicas: {{ .Values.runOperator.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "hacknet.runOperatorSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hacknet.runOperatorSelectorLabels" . | nindent 8 }}
+        {{- with .Values.runOperator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.runOperator.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "hacknet.runServiceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.runOperator.podSecurityContext | nindent 8 }}
+      {{- with .Values.runOperator.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: run-operator
+          {{- if .Values.runOperator.image.digest }}
+          image: "{{ .Values.runOperator.image.repository }}@{{ .Values.runOperator.image.digest }}"
+          {{- else }}
+          image: "{{ .Values.runOperator.image.repository }}:{{ .Values.runOperator.image.tag }}"
+          {{- end }}
+          imagePullPolicy: {{ .Values.runOperator.image.pullPolicy }}
+          args:
+            - --watch-namespace={{ include "hacknet.watchNamespace" . }}
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --max-concurrent-reconciles=1
+            - --zap-log-level={{ lower .Values.runOperator.logLevel }}
+            - --iochaos-supported-architectures={{ join "," .Values.runOperator.ioChaosSupportedArchitectures }}
+            - --timechaos-supported-architectures={{ join "," .Values.runOperator.timeChaosSupportedArchitectures }}
+            - --io-pressure-image-pull-policy={{ .Values.runOperator.ioPressureImage.pullPolicy }}
+            - --burnchain-reorg-worker-pull-policy={{ .Values.runOperator.image.pullPolicy }}
+            {{- if .Values.runOperator.image.digest }}
+            - --burnchain-reorg-worker-image={{ .Values.runOperator.image.repository }}@{{ .Values.runOperator.image.digest }}
+            {{- else }}
+            - --burnchain-reorg-worker-image={{ .Values.runOperator.image.repository }}:{{ .Values.runOperator.image.tag }}
+            {{- end }}
+            {{- if .Values.runOperator.ioPressureImage.digest }}
+            - --io-pressure-image={{ .Values.runOperator.ioPressureImage.repository }}@{{ .Values.runOperator.ioPressureImage.digest }}
+            {{- else }}
+            - --io-pressure-image={{ .Values.runOperator.ioPressureImage.repository }}:{{ .Values.runOperator.ioPressureImage.tag }}
+            {{- end }}
+          securityContext:
+            {{- toYaml .Values.runOperator.securityContext | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet: {path: /readyz, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.runOperator.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: {{ .Values.serviceAccount.tokenExpirationSeconds }}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items: [{key: ca.crt, path: ca.crt}]
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef: {apiVersion: v1, fieldPath: metadata.namespace}
+      {{- with .Values.runOperator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.runOperator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.runOperator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

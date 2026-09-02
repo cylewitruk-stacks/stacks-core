@@ -1,0 +1,48 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "hacknet.fullname" . }}
+  namespace: {{ include "hacknet.watchNamespace" . }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["stacksnetworks", "burnchainpolicies", "upgradecampaigns"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["upgradecampaigns"]
+    verbs: ["patch"]
+  - apiGroups: ["testing.stacks.org"]
+    resources: ["stacksnetworks/status", "burnchainpolicies/status", "upgradecampaigns/status"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "hacknet.fullname" . }}
+  namespace: {{ include "hacknet.watchNamespace" . }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hacknet.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "hacknet.fullname" . }}

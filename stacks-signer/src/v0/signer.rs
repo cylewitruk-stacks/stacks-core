@@ -360,6 +360,7 @@ impl SignerTrait<SignerMessage> for Signer {
             self.proposal_config.tenure_last_block_proposal_timeout,
             &mut self.last_capitulate_miner_view,
         );
+        self.update_global_state_metrics(current_reward_cycle);
 
         if prior_state != self.local_state_machine {
             let version = self.get_signer_protocol_version();
@@ -404,6 +405,8 @@ impl SignerTrait<SignerMessage> for Signer {
         }
 
         self.handle_event_match(stacks_client, sortition_state, event, current_reward_cycle);
+
+        self.update_global_state_metrics(current_reward_cycle);
 
         self.check_submitted_block_proposal();
         self.check_pending_block_validations(stacks_client);
@@ -452,6 +455,17 @@ impl SignerTrait<SignerMessage> for Signer {
 }
 
 impl Signer {
+    fn update_global_state_metrics(&self, current_reward_cycle: u64) {
+        // A signer process can briefly host current and next reward-cycle
+        // instances. Export only the current one through the unlabelled gauges
+        // so the next instance cannot overwrite operational readiness.
+        if self.reward_cycle == current_reward_cycle {
+            crate::monitoring::actions::update_global_state_agreement(
+                self.global_state_evaluator.agreement_snapshot(),
+            );
+        }
+    }
+
     /// Determine this signers response to a proposed block
     /// Returns a BlockResponse if we have already validated the block
     /// Returns None otherwise

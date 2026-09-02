@@ -1,0 +1,98 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: bounded-mixed-faults
+  namespace: hacknet-system
+spec:
+  networkRef: attacknet
+  seed: overnight-20260825-001
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - name: mixed-disruption
+      campaignRef: mixed-peer-disruption
+    - name: disk-pressure
+      campaignRef: pressure-follower-disk
+  executions:
+    - id: peer-disruption
+      campaign: mixed-disruption
+      trigger:
+        stacksHeight: 1
+    - id: disk-pressure
+      campaign: disk-pressure
+      trigger:
+        afterRunStart: 20s
+  budgets:
+    maxCampaigns: 2
+    maxWallTimeSeconds: 1800
+    maxCumulativeFaultSeconds: 180
+    maxActiveFaults: 3
+    maxSignerImpactPercent: 30
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: PauseForTriage
+    onInconclusive: PauseForTriage
+    onBudgetExhausted: Stop
+    onSuccess: Continue
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: true
+    allowedTerminalStates: [Triaged, Remediated, Inconclusive]
+  baselineAssertions:
+    timeout: 120s
+    assertions:
+      - id: telemetry-complete
+        telemetryCompleteness:
+          actors: [miner-1, miner-2, signer-1, signer-2]
+      - id: burnchain-progress
+        chainProgress:
+          chain: burnchain
+          actors: [miner-1, miner-2]
+          window: 75s
+          minimumDelta: 1
+      - id: stacks-cohort-agrees
+        cohortAgreement:
+          chain: stacks
+          actors: [miner-1, miner-2]
+          maximumSpread: 1
+      - id: signers-registered
+        signerRegistration:
+          actors: [signer-1, signer-2]
+          minimumRegistered: 2
+  duringAssertions:
+    timeout: 30s
+    assertions:
+      - id: telemetry-remains-complete
+        telemetryCompleteness:
+          actors: [miner-1, miner-2, signer-1, signer-2]
+      - id: burnchain-cohort-remains-bounded
+        cohortAgreement:
+          chain: burnchain
+          actors: [miner-1, miner-2]
+          maximumSpread: 1
+  recoveryAssertions:
+    timeout: 120s
+    assertions:
+      - id: stacks-progress-recovers
+        chainProgress:
+          chain: stacks
+          actors: [miner-1, miner-2]
+          window: 30s
+          minimumDelta: 1
+      - id: signers-remain-registered
+        signerRegistration:
+          actors: [signer-1, signer-2]
+          minimumRegistered: 2
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true
+  minimization:
+    enabled: false
+    strategy: FailurePrefix
+    maxAttempts: 0
+    requireFreshNetwork: true

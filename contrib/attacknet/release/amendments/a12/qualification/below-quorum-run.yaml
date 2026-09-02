@@ -1,0 +1,58 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a12-below-quorum
+  namespace: hacknet-system
+spec:
+  networkRef: a12-adversarial
+  seed: a12-below-quorum-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - {name: below-quorum, campaignRef: a12-below-quorum-template}
+  executions:
+    - {id: bounded-withholding, campaign: below-quorum}
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 600
+    maxCumulativeFaultSeconds: 75
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 20
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: false
+    allowedTerminalStates: [Inconclusive]
+  baselineAssertions:
+    timeout: 60s
+    assertions:
+      - id: telemetry-complete
+        telemetryCompleteness: {actors: [miner-1, follower-1, signer-node-1, signer-1]}
+      - id: stacks-progresses
+        chainProgress: {chain: stacks, actors: [miner-1, follower-1, signer-node-1], window: 15s, minimumDelta: 1}
+      - id: signer-registered
+        signerRegistration: {actors: [signer-1], minimumRegistered: 1}
+  duringAssertions:
+    timeout: 60s
+    assertions:
+      - id: telemetry-during
+        telemetryCompleteness: {actors: [miner-1, follower-1, signer-node-1, signer-1]}
+      - id: stacks-progresses-with-bounded-withholding
+        chainProgress: {chain: stacks, actors: [miner-1, follower-1, signer-node-1], window: 20s, minimumDelta: 1}
+  recoveryAssertions:
+    timeout: 75s
+    assertions:
+      - id: telemetry-recovers
+        telemetryCompleteness: {actors: [miner-1, follower-1, signer-node-1, signer-1]}
+      - id: stacks-progresses-after-window
+        chainProgress: {chain: stacks, actors: [miner-1, follower-1, signer-node-1], window: 20s, minimumDelta: 1}
+      - id: signer-remains-registered
+        signerRegistration: {actors: [signer-1], minimumRegistered: 1}
+  replay: {enabled: false, requireSameResolvedImages: true, verifyExpectedFailure: true}
+  resume: {enabled: false, requireSameSeed: true, requireSameResolvedImages: true}
+  minimization: {enabled: false, strategy: FailurePrefix, maxAttempts: 0, requireFreshNetwork: true}

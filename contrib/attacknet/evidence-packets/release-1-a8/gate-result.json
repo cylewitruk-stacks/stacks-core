@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "stacks-attacknet-release-gate-result/v1",
+  "reviewId": "release-1-amendment-a8-trusted-observations",
+  "status": "Approved for Release 1 trusted-observation and forensic-completeness amendment A8 scope",
+  "sourceRevision": "2481f75b49a44f151847b9f6a3a0139e6af3e4e0",
+  "candidateTree": "a290da0ae24cbab58eb04dbad325dbaac51fb2e7",
+  "packetDigest": "sha256:69211af52d11e9d01af323420ab6f39a92ca9c7582e25a382f7dda5776dd1585",
+  "contractDigest": "sha256:e64264e4fc11bc95afacf515b055e778b108d963bb893f6d94688bdf56bda98f",
+  "reviewPacketFileDigest": "sha256:1528f149564dbcb10de545701603e2a096ea98d937c867c7d6383823fa019b43",
+  "verdictFileDigests": {
+    "Codex": "sha256:1df2f2cb2de501af3fab1ba80175a2f4dac8100d6d2e76faf3b5feb472de3902",
+    "Claude Opus 5": "sha256:a1386dfd0f64b15c656aa1a9c4d799b33ac16f308a720f26bdb54c3f3c537201"
+  },
+  "evidenceSummaryDigest": "sha256:2eafad8133683dbf523eefff529a06edc0a602283fd7211b8c3fa6e0844fdf9b",
+  "evidenceArchiveDigest": "sha256:060b3072eb205cc89be300f3fa6ac0c877302787c083db94c5858bcadb8527c4"
+}

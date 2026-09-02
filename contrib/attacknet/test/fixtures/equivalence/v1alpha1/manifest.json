@@ -1,0 +1,48 @@
+{
+  "schema": "stacks-attacknet-v1alpha1-equivalence-fixtures/v1",
+  "origin": {
+    "runtimeRevision": "52e0d2812c514cad29d9fd2603eb2b8b3d93b0c3",
+    "topologyOracle": "contrib/attacknet/legacy/v1alpha1/runtime/topology.mjs",
+    "faultOracle": "contrib/attacknet/legacy/v1alpha1/runtime/fault-campaign.mjs",
+    "workloadRevision": "f8a853a0f21c9edebec92398fb56500ae10e1a22",
+    "workloadOracle": "contrib/helm/hacknet/operator/controller.py"
+  },
+  "entries": [
+    {
+      "path": "fault-compiler.json",
+      "digest": "sha256:205da335511b01d8bdacfd2ad8ef99b04c561ddd3f08dfb98dfe91e9434e2232"
+    },
+    {
+      "path": "topology/baseline-probes.expected.json",
+      "digest": "sha256:50de781e98a6390a122d8bcd642cc1494d9b340b441c78fe98fed7e2551a33cf"
+    },
+    {
+      "path": "topology/baseline-probes.input.json",
+      "digest": "sha256:534f95a7ca4d9e0afcbeadeeeda36f61548d258ad3cd9833d4122e47b0b9cb33"
+    },
+    {
+      "path": "topology/multi-actor-probes.expected.json",
+      "digest": "sha256:806099ea93d56f3396ebacef72b1691b45a271220a0dff75d7ec55cabebcde7e"
+    },
+    {
+      "path": "topology/multi-actor-probes.input.json",
+      "digest": "sha256:b7506c6c803eb970650043457e7fc56a1f6a32c346374937a8d4832df25233ee"
+    },
+    {
+      "path": "topology/probes-disabled.expected.json",
+      "digest": "sha256:6f8311542aee66b9aafb7484ded7d341ad90c216800f591ee50fa49c5c87632b"
+    },
+    {
+      "path": "topology/probes-disabled.input.json",
+      "digest": "sha256:c60f5b2d361ff18f3b4913e80c95962ca4c9c45622c0920fcf60287cb6cf8bdb"
+    },
+    {
+      "path": "topology/storage-disabled.expected.json",
+      "digest": "sha256:8b0ae07a41897b11225ccc45b0e6b0c6a9c4a9ac5102cc4e9aab3927689fc711"
+    },
+    {
+      "path": "topology/storage-disabled.input.json",
+      "digest": "sha256:9375b2d64b1cae7a3a0f791f788b48b7f80c9584df4bcc05885fcbb76c18a97e"
+    }
+  ]
+}

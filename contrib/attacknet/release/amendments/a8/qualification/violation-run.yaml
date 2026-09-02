@@ -1,0 +1,60 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a8-protocol-violation
+  namespace: hacknet-system
+spec:
+  networkRef: a8-qualification
+  seed: a8-protocol-violation-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - name: benign
+      campaignRef: a8-benign-delay
+  executions:
+    - id: benign-delay
+      campaign: benign
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 300
+    maxCumulativeFaultSeconds: 30
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 0
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: false
+    allowedTerminalStates: [Inconclusive]
+  baselineAssertions:
+    timeout: 30s
+    assertions:
+      - id: telemetry-complete
+        telemetryCompleteness:
+          actors: [follower-1]
+  recoveryAssertions:
+    timeout: 15s
+    assertions:
+      - id: stacks-must-progress
+        chainProgress:
+          chain: stacks
+          actors: [follower-1]
+          window: 5s
+          minimumDelta: 1
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true
+  minimization:
+    enabled: false
+    strategy: FailurePrefix
+    maxAttempts: 0
+    requireFreshNetwork: true

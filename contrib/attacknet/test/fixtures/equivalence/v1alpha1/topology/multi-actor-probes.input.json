@@ -1,0 +1,1356 @@
+{
+  "apiVersion": "testing.stacks.org/v1alpha1",
+  "kind": "StacksNetwork",
+  "metadata": {
+    "name": "equivalence",
+    "namespace": "attacknet-equivalence",
+    "labels": {
+      "testing.stacks.org/profile": "mainnet-legacy-transport"
+    }
+  },
+  "spec": {
+    "defaults": {
+      "nodeImage": "stacks-core-attacknet:main",
+      "imagePullPolicy": "IfNotPresent",
+      "storage": {
+        "enabled": true,
+        "size": "2Gi"
+      }
+    },
+    "telemetry": {
+      "enabled": false
+    },
+    "probe": {
+      "enabled": true,
+      "image": "stacks-hacknet-probe:dev",
+      "imagePullPolicy": "IfNotPresent",
+      "additionalServices": [
+        {
+          "name": "attacknet-prometheus",
+          "serviceName": "equivalence-attacknet-prometheus",
+          "ports": [
+            {
+              "name": "http",
+              "port": 9090
+            }
+          ]
+        }
+      ]
+    },
+    "actors": [
+      {
+        "name": "bitcoin",
+        "role": "burnchain",
+        "image": "bitcoin/bitcoin:25.2",
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+          "bitcoind"
+        ],
+        "args": [
+          "-conf=/home/bitcoin/.bitcoin/bitcoin.conf",
+          "-datadir=/home/bitcoin/.bitcoin",
+          "-nosettings"
+        ],
+        "config": {
+          "files": {
+            "bitcoin.conf": "regtest=1\n\n[regtest]\nprinttoconsole=1\ndisablewallet=0\ntxindex=1\ndiscover=0\ndns=0\ndnsseed=0\nlistenonion=0\nserver=1\nrest=1\nrpcbind=0.0.0.0:18443\nrpcallowip=0.0.0.0/0\nrpcallowip=::/0\nrpcuser=devnet\nrpcpassword=devnet\naddresstype=legacy\nchangetype=legacy\nfallbackfee=0.00001\n# Never carry a block commit made against the pre-restart miner view into the\n# resumed process. The restarted node must submit a fresh commit using its\n# persisted active VRF registration before the helper mines another block.\npersistmempool=0\n# The watch-only miner wallets retain unconfirmed transaction history. Do not\n# let loading them republish pre-restart block commits after the empty mempool\n# check; stacks-node submits each newly constructed raw commit explicitly.\nwalletbroadcast=0\n"
+          },
+          "key": "bitcoin.conf",
+          "mountPath": "/home/bitcoin/.bitcoin"
+        },
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 18443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 18444
+          }
+        ],
+        "readinessProbe": {
+          "exec": {
+            "command": [
+              "bitcoin-cli",
+              "-regtest",
+              "-rpcuser=devnet",
+              "-rpcpassword=devnet",
+              "getblockchaininfo"
+            ]
+          },
+          "periodSeconds": 3,
+          "failureThreshold": 90
+        },
+        "storage": {
+          "enabled": true,
+          "size": "4Gi",
+          "mountPath": "/home/bitcoin/.bitcoin/regtest"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "2",
+            "memory": "2Gi"
+          }
+        }
+      },
+      {
+        "name": "bitcoin-miner",
+        "role": "infrastructure",
+        "image": "bitcoin/bitcoin:25.2",
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+          "/bin/bash",
+          "/opt/attacknet/burnchain-clock.sh"
+        ],
+        "config": {
+          "files": {
+            "burnchain-clock.sh": "#!/bin/bash\nset -uo pipefail\n\n# Deliberately Stacks-blind Bitcoin regtest clock. It owns only idempotent\n# burnchain setup and block production.  Readiness, protocol fixtures, and\n# acceptance assertions belong to observers/policy and can never terminate\n# this process or implicitly stop Bitcoin.\n\nBTC_CLI=(\"${BITCOIN_CLI_BIN:-bitcoin-cli}\" -regtest -rpcconnect=\"${BITCOIN_RPC_HOST:-bitcoin}\" \\\n  -rpcuser=\"${BITCOIN_RPC_USER:-devnet}\" -rpcpassword=\"${BITCOIN_RPC_PASSWORD:-devnet}\")\nPOLICY_FILE=\"${BURNCHAIN_POLICY_FILE:-/run/hacknet-policy/policy.env}\"\nSTATUS_FILE=\"${BURNCHAIN_STATUS_FILE:-/tmp/hacknet-burnchain-clock.env}\"\nDEFAULT_INTERVAL_SECONDS=\"${BURNCHAIN_DEFAULT_INTERVAL_SECONDS:-60}\"\nMAX_INTERVAL_SECONDS=\"${BURNCHAIN_MAX_INTERVAL_SECONDS:-3600}\"\nrunning=true\nforce_block=false\napplied_generation=\"\"\nburst_remaining=0\naddress_cursor=0\nhealth_pid=\"\"\nsleep_pid=\"\"\nlast_bitcoin_uptime=\"\"\n\nlog() { printf '%s %s\\n' \"$(date -u +%FT%TZ)\" \"$*\"; }\n\nwrite_status() {\n  local state=\"$1\" height=\"${2:-unknown}\" detail=\"${3:-}\"\n  local tmp=\"${STATUS_FILE}.tmp\"\n  printf 'state=%s\\nbitcoin_height=%s\\npolicy_generation=%s\\ndetail=%s\\nupdated_at=%s\\n' \\\n    \"${state}\" \"${height}\" \"${applied_generation:-unknown}\" \"${detail}\" \"$(date +%s)\" >\"${tmp}\"\n  mv \"${tmp}\" \"${STATUS_FILE}\"\n}\n\nbtc_until_success() {\n  local delay=1 output\n  while [ \"${running}\" = true ]; do\n    if output=\"$(\"${BTC_CLI[@]}\" \"$@\" 2>&1)\"; then\n      printf '%s\\n' \"${output}\"\n      return 0\n    fi\n    write_status degraded unknown \"bitcoin-rpc-retry\"\n    log \"Bitcoin RPC unavailable; retrying in ${delay}s: ${output}\" >&2\n    sleep \"${delay}\" || true\n    if [ \"${delay}\" -lt 10 ]; then delay=$((delay + 1)); fi\n  done\n  return 1\n}\n\npolicy_value() {\n  local key=\"$1\" fallback=\"$2\" value=\"\"\n  if [ -r \"${POLICY_FILE}\" ]; then\n    value=\"$(sed -n \"s/^${key}=//p\" \"${POLICY_FILE}\" 2>/dev/null | tail -1)\"\n  fi\n  printf '%s\\n' \"${value:-${fallback}}\"\n}\n\nread_policy() {\n  local current_height\n  policy_mode=\"$(policy_value MODE run)\"\n  policy_interval=\"$(policy_value INTERVAL_SECONDS \"${DEFAULT_INTERVAL_SECONDS}\")\"\n  policy_jitter=\"$(policy_value JITTER_SECONDS 0)\"\n  policy_generation=\"$(policy_value GENERATION 0)\"\n  policy_burst=\"$(policy_value BURST_BLOCKS 0)\"\n  policy_burst_target=\"$(policy_value BURST_TARGET_HEIGHT 0)\"\n  policy_address_mode=\"$(policy_value ADDRESS_MODE round-robin)\"\n  policy_fixed_index=\"$(policy_value FIXED_ADDRESS_INDEX 0)\"\n\n  [[ \"${policy_mode}\" =~ ^(run|pause)$ ]] || policy_mode=run\n  [[ \"${policy_interval}\" =~ ^[0-9]+$ ]] || policy_interval=\"${DEFAULT_INTERVAL_SECONDS}\"\n  [[ \"${policy_jitter}\" =~ ^[0-9]+$ ]] || policy_jitter=0\n  [[ \"${policy_generation}\" =~ ^[0-9]+$ ]] || policy_generation=0\n  [[ \"${policy_burst}\" =~ ^[0-9]+$ ]] || policy_burst=0\n  [[ \"${policy_burst_target}\" =~ ^[0-9]+$ ]] || policy_burst_target=0\n  [[ \"${policy_fixed_index}\" =~ ^[0-9]+$ ]] || policy_fixed_index=0\n  if [ \"${policy_interval}\" -gt \"${MAX_INTERVAL_SECONDS}\" ]; then policy_interval=\"${MAX_INTERVAL_SECONDS}\"; fi\n  if [ \"${policy_jitter}\" -gt \"${MAX_INTERVAL_SECONDS}\" ]; then policy_jitter=\"${MAX_INTERVAL_SECONDS}\"; fi\n  [[ \"${policy_address_mode}\" =~ ^(round-robin|fixed)$ ]] || policy_address_mode=round-robin\n\n  if [ \"${policy_generation}\" != \"${applied_generation}\" ]; then\n    if [ \"${policy_burst_target}\" -gt 0 ]; then\n      current_height=\"$(btc_until_success getblockcount)\" || return 1\n      if [ \"${current_height}\" -lt \"${policy_burst_target}\" ]; then\n        burst_remaining=$((policy_burst_target - current_height))\n      else\n        # A burst is a desired target, not an edge-triggered command. Reusing\n        # the same projected generation after a process/Pod restart must not\n        # mine the requested count a second time.\n        burst_remaining=0\n      fi\n    else\n      # Backward-compatible fallback for an older rendered policy. New\n      # orchestrators always publish BURST_TARGET_HEIGHT for exact bursts.\n      burst_remaining=\"${policy_burst}\"\n    fi\n    applied_generation=\"${policy_generation}\"\n    log \"Applied burnchain policy generation=${policy_generation} mode=${policy_mode} interval=${policy_interval}s jitter=${policy_jitter}s burst=${policy_burst} target=${policy_burst_target} remaining=${burst_remaining} addressMode=${policy_address_mode}\"\n  fi\n}\n\nensure_wallets() {\n  local index wallet\n  while [ \"${running}\" = true ]; do\n    wallet_setup_ok=true\n    for index in \"${!miner_wallets[@]}\"; do\n      wallet=\"${miner_wallets[$index]}\"\n      if ! \"${BTC_CLI[@]}\" -named createwallet wallet_name=\"${wallet}\" \\\n        disable_private_keys=true descriptors=true load_on_startup=true >/dev/null 2>&1; then\n        \"${BTC_CLI[@]}\" loadwallet \"${wallet}\" >/dev/null 2>&1 || true\n      fi\n      if ! \"${BTC_CLI[@]}\" -rpcwallet=\"${wallet}\" getwalletinfo >/dev/null 2>&1; then\n        wallet_setup_ok=false\n        break\n      fi\n    done\n    if [ \"${wallet_setup_ok}\" = true ]; then return 0; fi\n    write_status degraded unknown wallet-setup-retry\n    log \"Bitcoin wallet setup incomplete; retrying\" >&2\n    sleep 2 || true\n  done\n}\n\n# `persistmempool=0` deliberately prevents a pre-restart block commit from\n# being mined after Bitcoin Core comes back.  The watch-only wallets still\n# retain those transactions, however, and Bitcoin Core then hides their\n# confirmed inputs from `listunspent` until the absent transactions are\n# explicitly abandoned.  Reconcile that split brain before every block.  A\n# transaction that is still in the authoritative mempool is never touched.\nwallet_transaction_txids() {\n  local wallet=\"$1\"\n  \"${BTC_CLI[@]}\" -rpcwallet=\"${wallet}\" listtransactions '*' 5000 0 true |\n    sed -nE 's/^[[:space:]]*\"txid\": \"([0-9a-f]{64})\",?$/\\1/p' |\n    awk '!seen[$0]++'\n}\n\nreconcile_inactive_wallet_transactions() {\n  local wallet txid txids transaction confirmations\n  for wallet in \"${miner_wallets[@]}\"; do\n    if ! txids=\"$(wallet_transaction_txids \"${wallet}\")\"; then\n      log \"Could not enumerate inactive transactions in ${wallet}\" >&2\n      return 1\n    fi\n    while IFS= read -r txid; do\n      [ -n \"${txid}\" ] || continue\n      if ! transaction=\"$(\"${BTC_CLI[@]}\" -rpcwallet=\"${wallet}\" gettransaction \"${txid}\" true)\"; then\n        log \"Could not inspect wallet transaction ${txid} in ${wallet}\" >&2\n        return 1\n      fi\n      confirmations=\"$(printf '%s\\n' \"${transaction}\" |\n        sed -nE 's/^[[:space:]]*\"confirmations\": (-?[0-9]+),?$/\\1/p' | head -1)\"\n      [ \"${confirmations}\" = 0 ] || continue\n      printf '%s\\n' \"${transaction}\" | grep -q '\"category\": \"send\"' || continue\n      if printf '%s\\n' \"${transaction}\" | grep -q '\"abandoned\": true'; then\n        continue\n      fi\n      if \"${BTC_CLI[@]}\" getmempoolentry \"${txid}\" >/dev/null 2>&1; then\n        continue\n      fi\n      if \"${BTC_CLI[@]}\" -rpcwallet=\"${wallet}\" abandontransaction \"${txid}\" >/dev/null 2>&1; then\n        log \"Abandoned inactive transaction ${txid} in ${wallet} after mempool reset\"\n      else\n        log \"Could not abandon inactive transaction ${txid} in ${wallet}\" >&2\n        return 1\n      fi\n    done <<<\"${txids}\"\n  done\n}\n\nreconcile_if_bitcoin_restarted() {\n  local current_uptime\n  current_uptime=\"$(btc_until_success uptime)\" || return 1\n  if [ -z \"${last_bitcoin_uptime}\" ] || [ \"${current_uptime}\" -lt \"${last_bitcoin_uptime}\" ]; then\n    reconcile_inactive_wallet_transactions || return 1\n    log \"Reconciled miner wallets against Bitcoin mempool at uptime ${current_uptime}s\"\n  fi\n  last_bitcoin_uptime=\"${current_uptime}\"\n}\n\nmine_to_address() {\n  local address=\"$1\" wallet=\"${miner_wallets[0]}\"\n  btc_until_success -rpcwallet=\"${wallet}\" generatetoaddress 1 \"${address}\" >/dev/null\n}\n\nbootstrap_regtest() {\n  local height index reserve\n  height=\"$(btc_until_success getblockcount)\" || return\n  if [ \"${height}\" -eq 0 ]; then\n    reserve=\"${BURNCHAIN_MINER_RESERVE_OUTPUTS:-4}\"\n    [[ \"${reserve}\" =~ ^[1-9][0-9]*$ ]] || reserve=4\n    for index in \"${!miner_addresses[@]}\"; do\n      for ((output = 0; output < reserve; output++)); do\n        mine_to_address \"${miner_addresses[$index]}\"\n      done\n    done\n    height=\"$(btc_until_success getblockcount)\" || return\n  fi\n  while [ \"${running}\" = true ] && [ \"${height}\" -lt \"${BURNCHAIN_BOOTSTRAP_HEIGHT:-202}\" ]; do\n    mine_to_address \"${miner_addresses[0]}\"\n    height=$((height + 1))\n  done\n  write_status running \"${height}\" bootstrapped\n  log \"Bitcoin regtest clock ready at height ${height}\"\n}\n\nselect_address() {\n  local count=\"${#miner_addresses[@]}\" index\n  if [ \"${policy_address_mode}\" = fixed ]; then\n    index=$((policy_fixed_index % count))\n  else\n    index=$((address_cursor % count))\n    address_cursor=$((address_cursor + 1))\n  fi\n  selected_address=\"${miner_addresses[$index]}\"\n}\n\nensure_health_server() {\n  if [ -n \"${health_pid}\" ] && kill -0 \"${health_pid}\" 2>/dev/null; then return; fi\n  perl -MIO::Socket::INET -MIO::Select -e '\n    my $listener = IO::Socket::INET->new(LocalPort => $ENV{BURNCHAIN_HEALTH_PORT} || 18500, Listen => 16, Reuse => 1) or die $!;\n    while (my $client = $listener->accept()) {\n      # Read one bounded HTTP request before closing.  Responding immediately\n      # after accept() can race the kubelet request write and reset the socket,\n      # producing intermittent readLoopPeek failures despite a healthy clock.\n      my $request = \"\";\n      my $reader = IO::Select->new($client);\n      while (length($request) < 8192 && $request !~ /\\r?\\n\\r?\\n/) {\n        last unless $reader->can_read(1);\n        my $count = sysread($client, my $chunk, 1024);\n        last unless defined($count) && $count > 0;\n        $request .= $chunk;\n      }\n      unless ($request =~ /\\r?\\n\\r?\\n/) {\n        close $client;\n        next;\n      }\n      print $client \"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 3\\r\\nConnection: close\\r\\n\\r\\nok\\n\";\n      close $client;\n    }\n  ' &\n  health_pid=\"$!\"\n}\n\npolicy_sleep() {\n  local delay=\"$1\"\n  sleep \"${delay}\" &\n  sleep_pid=\"$!\"\n  wait \"${sleep_pid}\" 2>/dev/null || true\n  sleep_pid=\"\"\n}\n\nstop() {\n  running=false\n  [ -z \"${sleep_pid}\" ] || kill \"${sleep_pid}\" 2>/dev/null || true\n  [ -z \"${health_pid}\" ] || kill \"${health_pid}\" 2>/dev/null || true\n}\nrequest_block() { force_block=true; }\nwake_for_policy() {\n  # Bash defers a trap while it synchronously waits for an external `sleep`.\n  # Use a wait builtin around a tracked child so USR2 runs immediately and can\n  # end the old cadence interval before the next policy read.\n  [ -z \"${sleep_pid}\" ] || kill \"${sleep_pid}\" 2>/dev/null || true\n}\nmain() {\n  local address delay height\n  trap stop TERM INT\n  trap request_block USR1\n  trap wake_for_policy USR2\n\n  IFS=',' read -ra miner_wallets <<<\"${MINER_WALLETS:?MINER_WALLETS is required}\"\n  IFS=',' read -ra miner_addresses <<<\"${MINER_BTC_ADDRS:?MINER_BTC_ADDRS is required}\"\n  if [ \"${#miner_wallets[@]}\" -eq 0 ] || [ \"${#miner_wallets[@]}\" -ne \"${#miner_addresses[@]}\" ]; then\n    log \"MINER_WALLETS and MINER_BTC_ADDRS must contain the same non-zero number of entries\" >&2\n    while true; do write_status degraded unknown invalid-address-inventory; sleep 60; done\n  fi\n\n  write_status starting unknown bitcoin-rpc\n  btc_until_success -rpcwait getblockchaininfo >/dev/null || return 0\n  ensure_wallets\n  while ! reconcile_if_bitcoin_restarted; do\n    write_status degraded unknown wallet-transaction-reconciliation\n    sleep 2 || true\n  done\n  bootstrap_regtest\n  ensure_health_server\n\n  while [ \"${running}\" = true ]; do\n    ensure_health_server\n    read_policy\n    height=\"$(btc_until_success getblockcount)\" || break\n    if [ \"${policy_mode}\" = pause ] && [ \"${force_block}\" = false ] && [ \"${burst_remaining}\" -eq 0 ]; then\n      write_status paused \"${height}\" \"policy-generation-${applied_generation}\"\n      sleep 1 || true\n      continue\n    fi\n\n    if ! reconcile_if_bitcoin_restarted; then\n      write_status degraded \"${height}\" wallet-transaction-reconciliation\n      sleep 2 || true\n      continue\n    fi\n    select_address\n    address=\"${selected_address}\"\n    if mine_to_address \"${address}\"; then\n      height=\"$(btc_until_success getblockcount)\" || break\n      write_status running \"${height}\" \"mined-to-${address}\"\n      log \"Mined Bitcoin block ${height} to ${address}\"\n    fi\n    force_block=false\n    if [ \"${burst_remaining}\" -gt 0 ]; then\n      burst_remaining=$((burst_remaining - 1))\n      # Exact-height bootstrap phases still need wall-clock room for Stacks\n      # transactions, node processing, and signer registration between Bitcoin\n      # blocks. Skip the delay after the final block so the clock acknowledges\n      # the paused barrier promptly.\n      if [ \"${burst_remaining}\" -gt 0 ]; then\n        delay=\"${policy_interval}\"\n        if [ \"${policy_jitter}\" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi\n        policy_sleep \"${delay}\"\n      fi\n      continue\n    fi\n    delay=\"${policy_interval}\"\n    if [ \"${policy_jitter}\" -gt 0 ]; then delay=$((delay + RANDOM % (policy_jitter + 1))); fi\n    policy_sleep \"${delay}\"\n  done\n\n  write_status stopped \"${height:-unknown}\" terminated\n  wait \"${health_pid}\" 2>/dev/null || true\n}\n\nif [ \"${BASH_SOURCE[0]}\" = \"$0\" ]; then\n  main \"$@\"\nfi\n"
+          },
+          "key": "burnchain-clock.sh",
+          "mountPath": "/opt/attacknet"
+        },
+        "env": [
+          {
+            "name": "BITCOIN_RPC_HOST",
+            "value": "${SERVICE:bitcoin}"
+          },
+          {
+            "name": "MINER_WALLETS",
+            "value": "attacknet-miner-1,attacknet-miner-2,attacknet-miner-3"
+          },
+          {
+            "name": "MINER_BTC_ADDRS",
+            "value": "n2PEoV6Abxnrpzoqqq1TJT5kw8G2dMPpBd,n3BxbFxkvGbF9ANka8TXuihwKZBd9xaJVg,mnZXRioUVq35tsCRk1DSoYUhwWaTGSz7a8"
+          },
+          {
+            "name": "BURNCHAIN_DEFAULT_INTERVAL_SECONDS",
+            "value": "20"
+          }
+        ],
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-burnchain-policy"
+          },
+          "mountPath": "/run/hacknet-policy"
+        },
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          }
+        ],
+        "ports": [
+          {
+            "name": "bootstrap",
+            "containerPort": 18500
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/",
+            "port": "bootstrap"
+          },
+          "periodSeconds": 2,
+          "failureThreshold": 60
+        },
+        "storage": {
+          "enabled": false
+        },
+        "resources": {
+          "requests": {
+            "cpu": "20m",
+            "memory": "64Mi"
+          },
+          "limits": {
+            "cpu": "1",
+            "memory": "512Mi"
+          }
+        }
+      },
+      {
+        "name": "stacker",
+        "role": "infrastructure",
+        "image": "stacks-attacknet-stacker:local",
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+          "npx",
+          "tsx",
+          "/stacker/stacking.ts"
+        ],
+        "env": [
+          {
+            "name": "STACKS_CORE_RPC_HOST",
+            "value": "${SERVICE:miner-1}"
+          },
+          {
+            "name": "STACKS_CORE_RPC_PORT",
+            "value": "20443"
+          },
+          {
+            "name": "STACKING_KEYS",
+            "value": "41634762d89dfa09133a4a8e9c1378d0161d29cd0a9433b51f1e3d32947a73dc01,9bfecf16c9c12792589dd2b843f850d5b89b81a04f8ab91c083bdf6709fbefee01,3ec0ca5770a356d6cd1a9bfcbf6cd151eb1bd85c388cc00648ec4ef5853fdb7401"
+          },
+          {
+            "name": "STACKING_ADDRESSES",
+            "value": "ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H,ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z,ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551"
+          },
+          {
+            "name": "STACKING_CYCLES",
+            "value": "12"
+          },
+          {
+            "name": "POX5_STACKING_CYCLES",
+            "value": "96"
+          },
+          {
+            "name": "POX5_RENEWAL_WINDOW_CYCLES",
+            "value": "48"
+          },
+          {
+            "name": "STACKING_INTERVAL",
+            "value": "2"
+          },
+          {
+            "name": "EPOCH_4_FIXTURE_DEPLOY_HEIGHT",
+            "value": "223"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "miner-1",
+            "port": 20443
+          }
+        ],
+        "readinessProbe": {
+          "exec": {
+            "command": [
+              "test",
+              "-s",
+              "/tmp/attacknet-stacker-status.json"
+            ]
+          },
+          "periodSeconds": 2,
+          "failureThreshold": 60
+        },
+        "storage": {
+          "enabled": false
+        },
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "1",
+            "memory": "1Gi"
+          }
+        }
+      },
+      {
+        "name": "miner-1",
+        "role": "miner",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "stacks-node",
+          "start",
+          "--config",
+          "/tmp/stacks-attacknet-config.toml"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-miner-1\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"1111111111111111111111111111111111111111111111111111111111111111\"\nlocal_peer_seed = \"1111111111111111111111111111111111111111111111111111111111111111\"\nminer = true\nstacker = true\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82@${SERVICE:follower-1}:20444,0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555@${SERVICE:follower-2}:20444\"\n\n[miner]\nfirst_attempt_time_ms = 1000\nsubsequent_attempt_time_ms = 2000\nblock_commit_delay_ms = 1000\nmining_key = \"19ec1c3e31d139c989a23a27eac60d1abfad5277d3ae9604242514c738258efa01\"\nblock_reward_recipient = \"STQM73RQC4EX0A07KWG1J5ECZJYBZS4SJ4ERC6WN\"\nactivated_vrf_key_path = \"/data/node/activated-vrf-key.json\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\nwallet_name = \"attacknet-miner-1\"\nlocal_mining_public_key = \"044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1\"\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/miner-1"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      },
+      {
+        "name": "miner-2",
+        "role": "miner",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "/bin/bash",
+          "/etc/stacks/join-after-nakamoto.sh"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-miner-2\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"1212121212121212121212121212121212121212121212121212121212121212\"\nlocal_peer_seed = \"1212121212121212121212121212121212121212121212121212121212121212\"\nminer = true\nstacker = true\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82@${SERVICE:follower-1}:20444,0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555@${SERVICE:follower-2}:20444,034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444\"\n\n[miner]\nfirst_attempt_time_ms = 1000\nsubsequent_attempt_time_ms = 2000\nblock_commit_delay_ms = 1000\nmining_key = \"616161616161616161616161616161616161616161616161616161616161616101\"\nblock_reward_recipient = \"STQM73RQC4EX0A07KWG1J5ECZJYBZS4SJ4ERC6WN\"\nactivated_vrf_key_path = \"/data/node/activated-vrf-key.json\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\nwallet_name = \"attacknet-miner-2\"\nlocal_mining_public_key = \"046360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7eb1c2784a65901538479361e94c0a2597973adef0836a6a7eddf50b7997c88a3\"\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n",
+            "join-after-nakamoto.sh": "#!/bin/bash\nset -euo pipefail\n\nsource_host=\"${NAKAMOTO_SOURCE_HOST:-miner-1}\"\nactivation_height=\"${NAKAMOTO_ACTIVATION_HEIGHT:-223}\"\n\nwhile true; do\n  response=\"$(curl --fail --silent --max-time 2 \"http://${source_host}:20443/v2/info\" || true)\"\n  burn_height=\"$(sed -n 's/.*\"burn_block_height\":\\([0-9][0-9]*\\).*/\\1/p' <<<\"${response}\")\"\n  if [ -n \"${burn_height}\" ] && [ \"${burn_height}\" -ge \"${activation_height}\" ]; then\n    echo \"Joining as an additional miner after Nakamoto activation at burn height ${burn_height}\"\n    exec stacks-node start --config \"${STACKS_ATTACKNET_CONFIG:-/etc/stacks/config.toml}\"\n  fi\n  sleep 1\ndone\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "NAKAMOTO_SOURCE_HOST",
+            "value": "${SERVICE:miner-1}"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/miner-2"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          },
+          {
+            "actor": "miner-1",
+            "port": 20443
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      },
+      {
+        "name": "miner-3",
+        "role": "miner",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "/bin/bash",
+          "/etc/stacks/join-after-nakamoto.sh"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-miner-3\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"1313131313131313131313131313131313131313131313131313131313131313\"\nlocal_peer_seed = \"1313131313131313131313131313131313131313131313131313131313131313\"\nminer = true\nstacker = true\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555@${SERVICE:follower-2}:20444,034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444,036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82@${SERVICE:follower-1}:20444\"\n\n[miner]\nfirst_attempt_time_ms = 1000\nsubsequent_attempt_time_ms = 2000\nblock_commit_delay_ms = 1000\nmining_key = \"626262626262626262626262626262626262626262626262626262626262626201\"\nblock_reward_recipient = \"STQM73RQC4EX0A07KWG1J5ECZJYBZS4SJ4ERC6WN\"\nactivated_vrf_key_path = \"/data/node/activated-vrf-key.json\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\nwallet_name = \"attacknet-miner-3\"\nlocal_mining_public_key = \"041d16453b3ab3132acb0a5bc16cc49690d819a585267a15cd5a064e2a0ad40599b6d846ca00fd42d38558d26a5ec4b91ae19bd68c5ab01497e0b57f52a2e0d5ef\"\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n",
+            "join-after-nakamoto.sh": "#!/bin/bash\nset -euo pipefail\n\nsource_host=\"${NAKAMOTO_SOURCE_HOST:-miner-1}\"\nactivation_height=\"${NAKAMOTO_ACTIVATION_HEIGHT:-223}\"\n\nwhile true; do\n  response=\"$(curl --fail --silent --max-time 2 \"http://${source_host}:20443/v2/info\" || true)\"\n  burn_height=\"$(sed -n 's/.*\"burn_block_height\":\\([0-9][0-9]*\\).*/\\1/p' <<<\"${response}\")\"\n  if [ -n \"${burn_height}\" ] && [ \"${burn_height}\" -ge \"${activation_height}\" ]; then\n    echo \"Joining as an additional miner after Nakamoto activation at burn height ${burn_height}\"\n    exec stacks-node start --config \"${STACKS_ATTACKNET_CONFIG:-/etc/stacks/config.toml}\"\n  fi\n  sleep 1\ndone\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "NAKAMOTO_SOURCE_HOST",
+            "value": "${SERVICE:miner-1}"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/miner-3"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          },
+          {
+            "actor": "miner-1",
+            "port": 20443
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      },
+      {
+        "name": "signer-node-1",
+        "role": "companion",
+        "signerIndex": 1,
+        "signerWeight": 1,
+        "signerPublicKey": "035249137286c077ccee65ecc43e724b9b9e5a588e3d7f51e3b62f9624c2a49e46",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "stacks-node",
+          "start",
+          "--config",
+          "/tmp/stacks-attacknet-config.toml"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-signer-node-1\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"2121212121212121212121212121212121212121212121212121212121212121\"\nlocal_peer_seed = \"2121212121212121212121212121212121212121212121212121212121212121\"\nminer = false\nstacker = true\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444,036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82@${SERVICE:follower-1}:20444,0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555@${SERVICE:follower-2}:20444\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[[events_observer]]\nendpoint = \"${SERVICE:signer-1}:30000\"\nevents_keys = [\"stackerdb\", \"block_proposal\", \"burn_blocks\"]\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/signer-node-1"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          },
+          {
+            "actor": "miner-1",
+            "port": 20443
+          },
+          {
+            "actor": "signer-1",
+            "port": 30000
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      },
+      {
+        "name": "signer-1",
+        "role": "signer",
+        "signerIndex": 1,
+        "signerWeight": 1,
+        "signerPublicKey": "035249137286c077ccee65ecc43e724b9b9e5a588e3d7f51e3b62f9624c2a49e46",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+          "stacks-signer",
+          "run",
+          "--config",
+          "/etc/stacks/signer.toml"
+        ],
+        "runtimeExposure": "reachable",
+        "config": {
+          "files": {
+            "signer.toml": "stacks_private_key = \"41634762d89dfa09133a4a8e9c1378d0161d29cd0a9433b51f1e3d32947a73dc01\"\nnode_host = \"${SERVICE:signer-node-1}:20443\"\nendpoint = \"0.0.0.0:30000\"\nnetwork = \"testnet\"\nauth_password = \"12345\"\ndb_path = \"/data/signer.sqlite\"\nmetrics_endpoint = \"0.0.0.0:31000\"\nevent_timeout_ms = 250\n"
+          },
+          "key": "signer.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          }
+        ],
+        "dependencies": [],
+        "ports": [
+          {
+            "name": "events",
+            "containerPort": 30000
+          },
+          {
+            "name": "metrics",
+            "containerPort": 31000
+          }
+        ],
+        "readinessProbe": {
+          "exec": {
+            "command": [
+              "/bin/sh",
+              "-c",
+              "metrics=$(curl --fail --silent http://127.0.0.1:31000/metrics) && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_runloop_ready 1$' && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_registered_for_current_reward_cycle 1$'"
+            ]
+          },
+          "periodSeconds": 2,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "512Mi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "2",
+            "memory": "2Gi"
+          }
+        }
+      },
+      {
+        "name": "signer-node-2",
+        "role": "companion",
+        "signerIndex": 2,
+        "signerWeight": 3,
+        "signerPublicKey": "031a4d9f4903da97498945a4e01a5023a1d53bc96ad670bfe03adf8a06c52e6380",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "stacks-node",
+          "start",
+          "--config",
+          "/tmp/stacks-attacknet-config.toml"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-signer-node-2\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"2222222222222222222222222222222222222222222222222222222222222222\"\nlocal_peer_seed = \"2222222222222222222222222222222222222222222222222222222222222222\"\nminer = false\nstacker = true\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82@${SERVICE:follower-1}:20444,0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555@${SERVICE:follower-2}:20444,034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[[events_observer]]\nendpoint = \"${SERVICE:signer-2}:30000\"\nevents_keys = [\"stackerdb\", \"block_proposal\", \"burn_blocks\"]\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/signer-node-2"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          },
+          {
+            "actor": "miner-1",
+            "port": 20443
+          },
+          {
+            "actor": "signer-2",
+            "port": 30000
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      },
+      {
+        "name": "signer-2",
+        "role": "signer",
+        "signerIndex": 2,
+        "signerWeight": 3,
+        "signerPublicKey": "031a4d9f4903da97498945a4e01a5023a1d53bc96ad670bfe03adf8a06c52e6380",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+          "stacks-signer",
+          "run",
+          "--config",
+          "/etc/stacks/signer.toml"
+        ],
+        "runtimeExposure": "reachable",
+        "config": {
+          "files": {
+            "signer.toml": "stacks_private_key = \"9bfecf16c9c12792589dd2b843f850d5b89b81a04f8ab91c083bdf6709fbefee01\"\nnode_host = \"${SERVICE:signer-node-2}:20443\"\nendpoint = \"0.0.0.0:30000\"\nnetwork = \"testnet\"\nauth_password = \"12345\"\ndb_path = \"/data/signer.sqlite\"\nmetrics_endpoint = \"0.0.0.0:31000\"\nevent_timeout_ms = 250\n"
+          },
+          "key": "signer.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          }
+        ],
+        "dependencies": [],
+        "ports": [
+          {
+            "name": "events",
+            "containerPort": 30000
+          },
+          {
+            "name": "metrics",
+            "containerPort": 31000
+          }
+        ],
+        "readinessProbe": {
+          "exec": {
+            "command": [
+              "/bin/sh",
+              "-c",
+              "metrics=$(curl --fail --silent http://127.0.0.1:31000/metrics) && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_runloop_ready 1$' && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_registered_for_current_reward_cycle 1$'"
+            ]
+          },
+          "periodSeconds": 2,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "512Mi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "2",
+            "memory": "2Gi"
+          }
+        }
+      },
+      {
+        "name": "signer-node-3",
+        "role": "companion",
+        "signerIndex": 3,
+        "signerWeight": 4,
+        "signerPublicKey": "02007311430123d4cad97f4f7e86e023b28143130a18099ecf094d36fef0f6135c",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "stacks-node",
+          "start",
+          "--config",
+          "/tmp/stacks-attacknet-config.toml"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-signer-node-3\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"2323232323232323232323232323232323232323232323232323232323232323\"\nlocal_peer_seed = \"2323232323232323232323232323232323232323232323232323232323232323\"\nminer = false\nstacker = true\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555@${SERVICE:follower-2}:20444,034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444,036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82@${SERVICE:follower-1}:20444\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[[events_observer]]\nendpoint = \"${SERVICE:signer-3}:30000\"\nevents_keys = [\"stackerdb\", \"block_proposal\", \"burn_blocks\"]\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/signer-node-3"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          },
+          {
+            "actor": "miner-1",
+            "port": 20443
+          },
+          {
+            "actor": "signer-3",
+            "port": 30000
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      },
+      {
+        "name": "signer-3",
+        "role": "signer",
+        "signerIndex": 3,
+        "signerWeight": 4,
+        "signerPublicKey": "02007311430123d4cad97f4f7e86e023b28143130a18099ecf094d36fef0f6135c",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+          "stacks-signer",
+          "run",
+          "--config",
+          "/etc/stacks/signer.toml"
+        ],
+        "runtimeExposure": "reachable",
+        "config": {
+          "files": {
+            "signer.toml": "stacks_private_key = \"3ec0ca5770a356d6cd1a9bfcbf6cd151eb1bd85c388cc00648ec4ef5853fdb7401\"\nnode_host = \"${SERVICE:signer-node-3}:20443\"\nendpoint = \"0.0.0.0:30000\"\nnetwork = \"testnet\"\nauth_password = \"12345\"\ndb_path = \"/data/signer.sqlite\"\nmetrics_endpoint = \"0.0.0.0:31000\"\nevent_timeout_ms = 250\n"
+          },
+          "key": "signer.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          }
+        ],
+        "dependencies": [],
+        "ports": [
+          {
+            "name": "events",
+            "containerPort": 30000
+          },
+          {
+            "name": "metrics",
+            "containerPort": 31000
+          }
+        ],
+        "readinessProbe": {
+          "exec": {
+            "command": [
+              "/bin/sh",
+              "-c",
+              "metrics=$(curl --fail --silent http://127.0.0.1:31000/metrics) && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_runloop_ready 1$' && printf '%s\\n' \"$metrics\" | grep -q '^stacks_signer_registered_for_current_reward_cycle 1$'"
+            ]
+          },
+          "periodSeconds": 2,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "512Mi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "2",
+            "memory": "2Gi"
+          }
+        }
+      },
+      {
+        "name": "follower-1",
+        "role": "follower",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "stacks-node",
+          "start",
+          "--config",
+          "/tmp/stacks-attacknet-config.toml"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-follower-1\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"3131313131313131313131313131313131313131313131313131313131313131\"\nlocal_peer_seed = \"3131313131313131313131313131313131313131313131313131313131313131\"\nminer = false\nstacker = false\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444,0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555@${SERVICE:follower-2}:20444\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/follower-1"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          },
+          {
+            "actor": "miner-1",
+            "port": 20443
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      },
+      {
+        "name": "follower-2",
+        "role": "follower",
+        "image": "stacks-core-attacknet:main",
+        "imagePullPolicy": "IfNotPresent",
+        "runtimeExposure": "reachable",
+        "command": [
+          "/bin/bash",
+          "/etc/stacks/configure-node.sh",
+          "stacks-node",
+          "start",
+          "--config",
+          "/tmp/stacks-attacknet-config.toml"
+        ],
+        "config": {
+          "files": {
+            "config.toml": "[node]\nname = \"attacknet-follower-2\"\nrpc_bind = \"0.0.0.0:20443\"\np2p_bind = \"0.0.0.0:20444\"\ndata_url = \"http://__NODE_IP__:20443\"\np2p_address = \"__NODE_IP__:20444\"\nprometheus_bind = \"0.0.0.0:20446\"\nworking_dir = \"/data/node\"\nseed = \"3232323232323232323232323232323232323232323232323232323232323232\"\nlocal_peer_seed = \"3232323232323232323232323232323232323232323232323232323232323232\"\nminer = false\nstacker = false\nevent_dispatcher_blocking = false\nevent_dispatcher_queue_size = 1000\nuse_test_genesis_chainstate = true\npox_5_sbtc_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token\"\npox_5_sbtc_registry_contract = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry\"\npox_sync_sample_secs = 0\nwait_time_for_blocks = 0\nwait_time_for_microblocks = 0\nmine_microblocks = false\nbootstrap_node = \"036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82@${SERVICE:follower-1}:20444,034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444\"\n\n[connection_options]\npublic_ip_address = \"__NODE_IP__:20444\"\nprivate_neighbors = true\n# The burnchain is intentionally time-compressed. Keep discovery and block\n# inventory scans proportionally faster than their mainnet defaults while the\n# StackerDB state machine continues to enforce the same authorization rules.\nwalk_interval = 5\ninv_sync_interval = 5\ndownload_interval = 1\nauth_token = \"12345\"\n\n[burnchain]\nchain = \"bitcoin\"\nmode = \"nakamoto-neon\"\npoll_time_secs = 1\nmagic_bytes = \"T3\"\npox_prepare_length = 5\npox_reward_length = 20\nburn_fee_cap = 20000\npeer_host = \"${SERVICE:bitcoin}\"\npeer_port = 18444\nrpc_port = 18443\nrpc_ssl = false\nusername = \"devnet\"\npassword = \"devnet\"\ntimeout = 30\n\n[[burnchain.epochs]]\nepoch_name = \"1.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.0\"\nstart_height = 0\n\n[[burnchain.epochs]]\nepoch_name = \"2.05\"\nstart_height = 203\n\n[[burnchain.epochs]]\nepoch_name = \"2.1\"\nstart_height = 204\n\n[[burnchain.epochs]]\nepoch_name = \"2.2\"\nstart_height = 206\n\n[[burnchain.epochs]]\nepoch_name = \"2.3\"\nstart_height = 207\n\n[[burnchain.epochs]]\nepoch_name = \"2.4\"\nstart_height = 208\n\n[[burnchain.epochs]]\nepoch_name = \"2.5\"\nstart_height = 209\n\n[[burnchain.epochs]]\nepoch_name = \"3.0\"\nstart_height = 223\n\n[[burnchain.epochs]]\nepoch_name = \"3.1\"\nstart_height = 224\n\n[[burnchain.epochs]]\nepoch_name = \"3.2\"\nstart_height = 225\n\n[[burnchain.epochs]]\nepoch_name = \"3.3\"\nstart_height = 226\n\n[[burnchain.epochs]]\nepoch_name = \"3.4\"\nstart_height = 227\n\n[[burnchain.epochs]]\nepoch_name = \"4.0\"\nstart_height = 245\n\n[[ustx_balance]]\naddress = \"ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z\"\namount = 10000000000000000\n\n[[ustx_balance]]\naddress = \"ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551\"\namount = 10000000000000000\n",
+            "configure-node.sh": "#!/bin/bash\nset -euo pipefail\n\ntemplate=\"${STACKS_ATTACKNET_CONFIG_TEMPLATE:-/etc/stacks/config.toml}\"\nrendered=\"${STACKS_ATTACKNET_CONFIG:-/tmp/stacks-attacknet-config.toml}\"\nnode_ip=\"${STACKS_ATTACKNET_NODE_IP:-}\"\n\nif [ -z \"${node_ip}\" ]; then\n  node_ip=\"$(hostname -i | awk '{ print $1 }')\"\nfi\n\nif ! awk -v ip=\"${node_ip}\" 'BEGIN {\n  count = split(ip, octets, \".\")\n  if (count != 4) exit 1\n  for (i = 1; i <= 4; i++) {\n    if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) exit 1\n  }\n}' </dev/null; then\n  echo \"could not derive a numeric IPv4 address for this actor: ${node_ip:-empty}\" >&2\n  exit 1\nfi\n\ntemporary=\"${rendered}.tmp.$$\"\ntrap 'rm -f \"${temporary}\"' EXIT\nsed \"s/__NODE_IP__/${node_ip}/g\" \"${template}\" >\"${temporary}\"\nmv \"${temporary}\" \"${rendered}\"\ntrap - EXIT\nexport STACKS_ATTACKNET_CONFIG=\"${rendered}\"\nexec \"$@\"\n"
+          },
+          "key": "config.toml",
+          "mountPath": "/etc/stacks"
+        },
+        "env": [
+          {
+            "name": "RUST_LOG",
+            "value": "info"
+          },
+          {
+            "name": "LD_PRELOAD",
+            "value": "/usr/lib/stacks-attacknet/libfaketime.so.1"
+          },
+          {
+            "name": "FAKETIME_TIMESTAMP_FILE",
+            "value": "/run/attacknet-clock/follower-2"
+          },
+          {
+            "name": "FAKETIME_DONT_FAKE_MONOTONIC",
+            "value": "1"
+          },
+          {
+            "name": "FAKETIME_NO_CACHE",
+            "value": "1"
+          }
+        ],
+        "dependencies": [
+          {
+            "actor": "bitcoin",
+            "port": 18443
+          },
+          {
+            "actor": "bitcoin-miner",
+            "port": 18500
+          },
+          {
+            "actor": "miner-1",
+            "port": 20443
+          }
+        ],
+        "ports": [
+          {
+            "name": "rpc",
+            "containerPort": 20443
+          },
+          {
+            "name": "p2p",
+            "containerPort": 20444
+          },
+          {
+            "name": "metrics",
+            "containerPort": 20446
+          }
+        ],
+        "readinessProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 90
+        },
+        "startupProbe": {
+          "httpGet": {
+            "path": "/v2/info",
+            "port": "rpc"
+          },
+          "periodSeconds": 5,
+          "failureThreshold": 180
+        },
+        "storage": {
+          "enabled": true,
+          "size": "2Gi",
+          "mountPath": "/data"
+        },
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          },
+          "limits": {
+            "cpu": "4",
+            "memory": "4Gi"
+          }
+        },
+        "runtimePolicy": {
+          "configMapRef": {
+            "name": "equivalence-clock-policy"
+          },
+          "mountPath": "/run/attacknet-clock"
+        }
+      }
+    ]
+  }
+}

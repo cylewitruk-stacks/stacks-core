@@ -1,0 +1,55 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: ddmin-live-source
+  namespace: hacknet-system
+spec:
+  networkRef: attacknet-ddmin-live
+  seed: ddmin-live-negative-control-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - name: pod-kill
+      campaignRef: ddmin-live-pod-template
+    - name: tcp-duplicate-negative
+      campaignRef: ddmin-live-network-negative-template
+  executions:
+    - id: irrelevant-pod-kill
+      campaign: pod-kill
+      enabled: true
+    - id: tcp-duplicate-negative
+      campaign: tcp-duplicate-negative
+      enabled: true
+      dependsOn:
+        - execution: irrelevant-pod-kill
+          state: Terminal
+          delay: 0s
+  budgets:
+    maxCampaigns: 2
+    maxWallTimeSeconds: 1200
+    maxCumulativeFaultSeconds: 30
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 30
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Continue
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: true
+    allowedTerminalStates: [Triaged, Remediated, Inconclusive]
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true
+  minimization:
+    enabled: false
+    strategy: FailurePrefix
+    maxAttempts: 0
+    requireFreshNetwork: true

@@ -381,6 +381,7 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         } else {
             self.state = State::RegisteredSigners;
         }
+        self.update_registration_metrics();
         Ok(())
     }
 
@@ -444,7 +445,20 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         } else {
             self.state = State::RegisteredSigners;
         }
+        self.update_registration_metrics();
         Ok(())
+    }
+
+    fn update_registration_metrics(&self) {
+        let Some(reward_cycle_info) = self.current_reward_cycle_info else {
+            crate::monitoring::actions::update_reward_cycle_registration(false, false);
+            return;
+        };
+        let current = reward_cycle_info.reward_cycle;
+        crate::monitoring::actions::update_reward_cycle_registration(
+            Self::is_registered_for_cycle(&self.stacks_signers, current),
+            Self::is_registered_for_cycle(&self.stacks_signers, current.saturating_add(1)),
+        );
     }
 
     fn is_configured_for_cycle(
@@ -581,6 +595,7 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug>
                 }
                 return None;
             }
+            crate::monitoring::actions::update_runloop_ready(true);
         } else if let Some(SignerEvent::NewBurnBlock { burn_height, .. }) = event {
             if let Err(e) = self.refresh_runloop(burn_height) {
                 error!("Failed to refresh signer runloop: {e}.");

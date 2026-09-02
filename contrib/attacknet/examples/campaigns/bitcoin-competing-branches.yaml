@@ -1,0 +1,62 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: bitcoin-competing-branches
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 2
+    allowBurnchain: true
+    allowUnenrolledNetworkTargets: false
+    maxBurnchainReorgDepth: 2
+    maxBurnchainReplacementBlocks: 3
+    allowEpochBoundaryCrossing: false
+    allowRewardCycleBoundaryCrossing: false
+  stages:
+    - id: isolate-bitcoin-b
+      faults:
+        - id: partition-bitcoin-peers
+          target:
+            actors: [bitcoin-b]
+            mode: all
+          fault:
+            type: network
+            action: partition
+            mode: all
+            duration: 90s
+            parameters:
+              direction: both
+              peerTarget:
+                actors: [bitcoin-a]
+                mode: all
+    - id: replace-isolated-tip
+      trigger:
+        afterStage:
+          stage: isolate-bitcoin-b
+          state: Effective
+          delay: 2s
+      faults:
+        - id: reorg-bitcoin-b
+          target:
+            actors: [bitcoin-b]
+            mode: one
+          fault:
+            type: burnchain-reorg
+            mode: one
+            duration: 30s
+            burnchainReorg:
+              depth: 2
+              replacementBlocks: 3
+              replacementInterval: 1s
+              destinationIndex: 0
+          effectAssertions:
+            - type: BurnchainReorgProven
+              actor: bitcoin-b
+              timeoutSeconds: 120
+          recoveryAssertions:
+            - type: BurnchainPolicyRestored
+              actor: bitcoin-b
+              timeoutSeconds: 120

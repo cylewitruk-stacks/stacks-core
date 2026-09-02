@@ -1,0 +1,59 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a9-reorg-replay
+  namespace: hacknet-system
+spec:
+  networkRef: a9-replay
+  seed: a9-two-for-three-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - {name: reorg, campaignRef: a9-reorg-template}
+  executions:
+    - {id: canonical-reorg, campaign: reorg}
+  budgets: {maxCampaigns: 1, maxWallTimeSeconds: 600, maxCumulativeFaultSeconds: 30, maxActiveFaults: 1, maxSignerImpactPercent: 0, maxBurnchainFaults: 1, maxInconclusiveCampaigns: 0}
+  stopPolicy: {onCampaignFailure: PauseForTriage, onInconclusive: PauseForTriage, onBudgetExhausted: Stop, onSuccess: Stop}
+  attributionPolicy: {requiredOnFailure: true, requireIncidentBundle: true, allowedTerminalStates: [Triaged, Remediated, Inconclusive]}
+  baselineAssertions:
+    timeout: 60s
+    assertions:
+      - id: telemetry-complete
+        telemetryCompleteness: {actors: [miner-1, signer-node-1, signer-1, follower-1]}
+      - id: burnchain-progress
+        chainProgress: {chain: burnchain, actors: [miner-1, signer-node-1, follower-1], window: 15s, minimumDelta: 1}
+      - id: stacks-agreement
+        cohortAgreement: {chain: stacks, actors: [miner-1, signer-node-1, follower-1], maximumSpread: 1}
+      - id: signer-registered
+        signerRegistration: {actors: [signer-1], minimumRegistered: 1}
+  duringAssertions:
+    timeout: 60s
+    assertions:
+      - id: telemetry-during
+        telemetryCompleteness: {actors: [miner-1, signer-node-1, signer-1, follower-1]}
+      - id: burnchain-bounded
+        cohortAgreement: {chain: burnchain, actors: [miner-1, signer-node-1, follower-1], maximumSpread: 2}
+  recoveryAssertions:
+    timeout: 90s
+    assertions:
+      - id: telemetry-recovers
+        telemetryCompleteness: {actors: [miner-1, signer-node-1, signer-1, follower-1]}
+      - id: burnchain-converges
+        cohortAgreement: {chain: burnchain, actors: [miner-1, signer-node-1, follower-1], maximumSpread: 0, convergenceWindow: 30s}
+      - id: stacks-converges
+        cohortAgreement: {chain: stacks, actors: [miner-1, signer-node-1, follower-1], maximumSpread: 1}
+      - id: stacks-progresses
+        chainProgress: {chain: stacks, actors: [miner-1, signer-node-1, follower-1], window: 45s, minimumDelta: 1}
+      - id: signer-remains-registered
+        signerRegistration: {actors: [signer-1], minimumRegistered: 1}
+      - id: signer-votes
+        proposalOutcomeVisibility: {actors: [signer-1], window: 45s, minimumObserved: 1}
+  replay:
+    enabled: true
+    sourceRunRef: a9-reorg
+    descriptorURI: k8s://attacknetruns/a9-reorg/resolved-schedule
+    descriptorDigest: __SOURCE_SCHEDULE_DIGEST__
+    attemptId: a9-fresh-network-replay
+    requireSameResolvedImages: true
+    verifyExpectedFailure: false
+  resume: {enabled: false, requireSameSeed: true, requireSameResolvedImages: true}
+  minimization: {enabled: false, strategy: FailurePrefix, maxAttempts: 0, requireFreshNetwork: true}

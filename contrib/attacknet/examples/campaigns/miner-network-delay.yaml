@@ -1,0 +1,33 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: miner-2-network-delay
+spec:
+  networkRef: attacknet
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 5000
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: delay-miner
+      faults:
+        - id: miner-delay
+          target:
+            actors: [miner-2]
+            mode: all
+          fault:
+            type: network
+            action: delay
+            mode: all
+            duration: 45s
+            parameters:
+              delay:
+                latency: 750ms
+                correlation: "50"
+                jitter: 200ms

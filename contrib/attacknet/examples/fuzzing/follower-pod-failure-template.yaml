@@ -1,0 +1,29 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: fuzz-follower-pod-failure
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: restart-follower
+      faults:
+        - id: pod-failure
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: pod
+            action: pod-failure
+            mode: all
+            duration: 30s
+            parameters: {}

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "stacks-attacknet-phase-review-contract/v1",
+  "phase": 2,
+  "releaseScope": "Release 1",
+  "tier": "Reduced",
+  "requiredReviewers": [
+    "Codex",
+    "Claude Opus 5"
+  ],
+  "requirements": [
+    "versioned-command-registry",
+    "consistent-command-facade",
+    "truthful-environment-doctor",
+    "hermetic-offline-verification",
+    "human-live-usability",
+    "agent-live-usability",
+    "cadence-aware-recovery-proof",
+    "portable-self-identifying-review-evidence"
+  ],
+  "requiredInventory": [
+    "candidate:contrib/attacknet/README.md",
+    "candidate:contrib/attacknet/attacknet",
+    "candidate:contrib/attacknet/campaign-runner.sh",
+    "candidate:contrib/attacknet/command-contract.cjs",
+    "candidate:contrib/attacknet/command-registry.v1.json",
+    "candidate:contrib/attacknet/command-surface.test.mjs",
+    "candidate:contrib/attacknet/doctor.mjs",
+    "candidate:contrib/attacknet/doctor.test.mjs",
+    "candidate:contrib/attacknet/evidence-packets/phase-2/README.md",
+    "candidate:contrib/attacknet/phase-two-readonly-evidence.mjs",
+    "candidate:contrib/attacknet/progress-window.test.mjs",
+    "candidate:contrib/attacknet/release/PHASE-REVIEWS.md",
+    "candidate:contrib/attacknet/release/phase-2-contract.json",
+    "candidate:contrib/attacknet/release/phase-one-packet.mjs",
+    "candidate:contrib/attacknet/release/phase-review.mjs",
+    "candidate:contrib/attacknet/release/phase-two-packet.mjs",
+    "candidate:contrib/attacknet/release/phase-two.test.mjs",
+    "candidate:contrib/attacknet/release/phase-zero.test.mjs",
+    "candidate:contrib/attacknet/release/review-packet.schema.json",
+    "test:offline-check",
+    "evidence:archive-index",
+    "evidence:archive",
+    "evidence:live-summary",
+    "evidence:doctor",
+    "evidence:human-workflow",
+    "evidence:agent-workflow",
+    "evidence:clean-teardown"
+  ]
+}

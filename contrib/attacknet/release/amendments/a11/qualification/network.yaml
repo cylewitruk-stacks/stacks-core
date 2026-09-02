@@ -1,0 +1,89 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: a11-upgrade
+  namespace: hacknet-system
+spec:
+  probe:
+    enabled: true
+  defaults:
+    nodeImage: stacks-core-attacknet:main
+    signerImage: stacks-core-attacknet:main
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
+    imagePullPolicy: IfNotPresent
+    bootstrapPeers:
+      - 034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@${SERVICE:miner-1}:20444
+    workload:
+      storage: {enabled: true, size: 1Gi}
+      resources:
+        requests: {cpu: 50m, memory: 128Mi}
+        limits: {cpu: "2", memory: 2Gi}
+  genesis:
+    pox5:
+      sbtcContract: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token
+      sbtcRegistryContract: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry
+    balances:
+      - {address: ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H, amount: 10000000000000000}
+  burnchain:
+    policyRef: {name: a11-policy}
+    nodes:
+      - name: bitcoin
+        config: {generated: {profile: bitcoin-regtest/v1}}
+        workload: {storage: {enabled: true, size: 2Gi}}
+  nodes:
+    - name: miner-1
+      role: miner
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: a11-miner-config, key: config.toml}}
+    - name: follower-1
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+    - name: follower-2
+      role: follower
+      burnchainNodeRef: bitcoin
+      config: {generated: {profile: nakamoto-regtest-node/v1}}
+  signerSets:
+    - name: active
+      members:
+        - name: signer-1
+          nodeName: signer-node-1
+          index: 1
+          weight: 1
+          publicKey: 035249137286c077ccee65ecc43e724b9b9e5a588e3d7f51e3b62f9624c2a49e46
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: a11-signer-config, key: signer.toml}}
+          nodeConfig: {generated: {profile: nakamoto-regtest-node/v1}}
+  enrollment:
+    name: stacker
+    image: stacks-attacknet-stacker:local
+    nodeRef: miner-1
+    credentialsSecretRef:
+      name: a11-stacker-credentials
+      keysKey: private-keys
+      addressesKey: addresses
+  rawActors:
+    - name: telemetry-dark
+      role: follower
+      image: busybox:1.36.1
+      config:
+        configMapRef:
+          name: a11-telemetry-dark-config
+          key: config
+          mountPath: /etc/attacknet
+      workload: {storage: {enabled: false}}
+      advanced:
+        command: [sleep]
+        args: ["3600"]
+        readinessProbe:
+          exec: {command: ["true"]}
+          periodSeconds: 2
+          failureThreshold: 30
+        containerSecurityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65532
+          seccompProfile: {type: RuntimeDefault}

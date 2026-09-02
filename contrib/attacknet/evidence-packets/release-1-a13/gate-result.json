@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "stacks-attacknet-release-gate-result/v1",
+  "reviewId": "release-1-amendment-a13-seeded-fuzzing-corpus-reduction",
+  "status": "Approved for Release 1 seeded fuzzing, corpus, and reduction amendment A13 scope",
+  "sourceRevision": "82efd989d71836322286d870cdb82be49c9db364",
+  "candidateTree": "319b06f4cc009c63d72992d36bff696970197fb5",
+  "packetDigest": "sha256:eeb4601eec1a186edb6d69c5f7f66b3abe1f7048bc82f9036f2e28c752787727",
+  "contractDigest": "sha256:150c41d83572df379e3067d73912385b95b704da4ea5a854e06eb1facd3bf118",
+  "reviewPacketFileDigest": "sha256:f09292f5b6619b008284a58dddf73b70f56ecdaacbdd7c57ac9d40db1317f2af",
+  "verdictFileDigests": {
+    "Codex": "sha256:ab2953e7b17fa4adc596dd1ece751c351102bac12a82367e4bd63a06a3483ba9",
+    "Claude Opus 5": "sha256:f2ba8558ee4ed04ada403b6b0addfd972d42f2dddcd416eaced19da3c24a057a"
+  },
+  "evidenceSummaryDigest": "sha256:565d8632a41955835807011dc968a71a5e89532d1540f9fbbbb51eab05733e52",
+  "evidenceArchiveDigest": "sha256:3ab743ec5907838eee294c9ad2467670c0a5310a8895af61200633f081d7a4d8"
+}

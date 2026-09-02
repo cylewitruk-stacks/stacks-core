@@ -1,0 +1,35 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: signer-withhold-window
+spec:
+  networkRef: adversarial-signer
+  safety:
+    maxUnavailableSignerBasisPoints: 3400
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: observe-withholding
+      trigger: {stacksHeight: 10}
+      faults:
+        - id: signer-1-withhold
+          target:
+            actors: [signer-1]
+            mode: all
+          fault:
+            type: signer-behavior
+            action: withhold
+            mode: all
+            duration: 45s
+            signerBehavior:
+              policyDigest: sha256:cb9888b8697fd5492a54d70582330db44064689c24f7c51c80d27ab2e47ac64d
+          effectAssertions:
+            - {type: SignerBehaviorObserved, actor: signer-1, timeoutSeconds: 60}
+          recoveryAssertions:
+            - {type: SignerBehaviorWindowClosed, actor: signer-1, timeoutSeconds: 60}

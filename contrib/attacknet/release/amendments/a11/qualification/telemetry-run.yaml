@@ -1,0 +1,38 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a11-telemetry-control
+  namespace: hacknet-system
+spec:
+  networkRef: a11-static
+  seed: a11-telemetry-control-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - {name: telemetry, campaignRef: a11-telemetry-template}
+  executions:
+    - {id: telemetry, campaign: telemetry}
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 180
+    maxCumulativeFaultSeconds: 5
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 0
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 1
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: false
+    requireIncidentBundle: false
+    allowedTerminalStates: [Inconclusive]
+  baselineAssertions:
+    timeout: 15s
+    assertions:
+      - id: telemetry-required
+        telemetryCompleteness: {actors: [telemetry-dark]}
+  replay: {enabled: false, requireSameResolvedImages: true, verifyExpectedFailure: true}
+  resume: {enabled: false, requireSameSeed: true, requireSameResolvedImages: true}
+  minimization: {enabled: false, strategy: FailurePrefix, maxAttempts: 0, requireFreshNetwork: true}

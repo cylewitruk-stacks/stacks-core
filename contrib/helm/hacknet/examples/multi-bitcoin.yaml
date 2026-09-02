@@ -1,0 +1,44 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: multi-bitcoin
+  namespace: hacknet-system
+spec:
+  defaults:
+    nodeImage: stacks-core-attacknet:main
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
+    imagePullPolicy: IfNotPresent
+    workload:
+      storage:
+        enabled: true
+        size: 1Gi
+  burnchain:
+    policyRef:
+      name: bitcoin-a-policy
+    nodes:
+      - name: bitcoin-a
+        peerRefs: [bitcoin-b]
+        config:
+          generated:
+            profile: bitcoin-regtest/v1
+      - name: bitcoin-b
+        peerRefs: [bitcoin-a]
+        policyRef:
+          name: bitcoin-b-policy
+        config:
+          generated:
+            profile: bitcoin-regtest/v1
+  nodes:
+    - name: follower-a
+      role: follower
+      burnchainNodeRef: bitcoin-a
+      config:
+        generated:
+          profile: nakamoto-regtest-node/v1
+    - name: follower-b
+      role: follower
+      burnchainNodeRef: bitcoin-b
+      config:
+        generated:
+          profile: nakamoto-regtest-node/v1

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "stacks-attacknet-release-gate-result/v1",
+  "reviewId": "release-1-amendment-a10-multi-bitcoin-split-views",
+  "status": "Approved for Release 1 multi-Bitcoin split-view amendment A10 scope",
+  "sourceRevision": "2debbcd747b4b406f6d7392515d71b3008da119b",
+  "candidateTree": "7c46f087fd50832c976a3c0e41cdbbcaec05f8f5",
+  "packetDigest": "sha256:974a46c34186702d5dbfdde13dde895e494d8b593f9c4ac424de25c8f2c7d16d",
+  "contractDigest": "sha256:ccfe2bc22fc9715c0e305c2dd8093dbe6a3c58e751d3f176826af018f48d272e",
+  "reviewPacketFileDigest": "sha256:418b86c46641553facb28b34e1508d50be0ea2db1e8f1a1c9871424d07eb0c45",
+  "verdictFileDigests": {
+    "Codex": "sha256:236dfc8ad4366013b2360c9aa3c25c030ed461ade4a5545ecb648b87a6d6711c",
+    "Claude Opus 5": "sha256:77dd1c3c027c8f33aa9a4f87d5394db567fb106ca2bb38715951d97b493c0b9d"
+  },
+  "evidenceSummaryDigest": "sha256:d1850ae64362483f93bf39b03571bc55c569746615e8d7fd13d400b19742657f",
+  "evidenceArchiveDigest": "sha256:fc894c84d100baf3ec3110c5abf5bd2fbadaebb241cba7268e42721cf3643f12"
+}

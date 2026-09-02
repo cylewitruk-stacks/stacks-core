@@ -1,0 +1,1910 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: attacknetruns.testing.stacks.org
+spec:
+  group: testing.stacks.org
+  names:
+    kind: AttacknetRun
+    listKind: AttacknetRunList
+    plural: attacknetruns
+    singular: attacknetrun
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: AttacknetRun declares a finite reproducible schedule of FaultCampaigns.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AttacknetRunSpec defines a finite schedule and its safety/evidence
+              policy.
+            properties:
+              attributionPolicy:
+                description: AttributionPolicy requires attributable evidence for
+                  adverse outcomes.
+                properties:
+                  allowedTerminalStates:
+                    items:
+                      type: string
+                    type: array
+                  requireIncidentBundle:
+                    type: boolean
+                  requiredOnFailure:
+                    type: boolean
+                required:
+                - allowedTerminalStates
+                - requireIncidentBundle
+                - requiredOnFailure
+                type: object
+              baselineAssertions:
+                description: |-
+                  ProtocolAssertionSetSpec is a bounded assertion gate with one failure
+                  deadline for missing or unavailable evidence.
+                properties:
+                  assertions:
+                    items:
+                      description: |-
+                        ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
+                        and actor-supplied success predicates are intentionally unsupported.
+                      properties:
+                        bitcoinBranchCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
+                        chainProgress:
+                          description: |-
+                            ChainProgressAssertion requires every selected actor to advance by at least
+                            MinimumDelta during Window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            minimumDelta:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - chain
+                          - minimumDelta
+                          - window
+                          type: object
+                        cohortAgreement:
+                          description: |-
+                            CohortAgreementAssertion bounds the selected actors' height spread. When
+                            ConvergenceWindow is set, an excessive spread remains pending until the
+                            actors converge or the bounded window expires.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            convergenceWindow:
+                              description: |-
+                                ConvergenceWindow changes the default fail-fast snapshot assertion into
+                                an eventual-convergence assertion with a finite deadline.
+                              type: string
+                            maximumSpread:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                          required:
+                          - actors
+                          - chain
+                          - maximumSpread
+                          type: object
+                        id:
+                          pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                          type: string
+                        proposalOutcomeVisibility:
+                          description: |-
+                            ProposalOutcomeVisibilityAssertion requires proposal or policy activity to
+                            advance during Window for every selected signer.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumObserved:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - minimumObserved
+                          - window
+                          type: object
+                        signerRegistration:
+                          description: |-
+                            SignerRegistrationAssertion requires a minimum count of selected signers to
+                            report current-cycle registration.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumRegistered:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          required:
+                          - actors
+                          - minimumRegistered
+                          type: object
+                        signerStateFreshness:
+                          description: |-
+                            SignerStateFreshnessAssertion bounds the age of every selected signer's last
+                            state-machine transition.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            maximumAge:
+                              type: string
+                          required:
+                          - actors
+                          - maximumAge
+                          type: object
+                        stacksBurnchainCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
+                        telemetryCompleteness:
+                          description: |-
+                            TelemetryCompletenessAssertion requires successful collection from every
+                            selected admitted actor in one stable identity window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                          required:
+                          - actors
+                          type: object
+                      required:
+                      - id
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one protocol assertion must be configured
+                        rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
+                          ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
+                          ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
+                          + (has(self.telemetryCompleteness) ? 1 : 0) + (has(self.bitcoinBranchCohort)
+                          ? 1 : 0) + (has(self.stacksBurnchainCohort) ? 1 : 0) ==
+                          1'
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  timeout:
+                    type: string
+                required:
+                - assertions
+                - timeout
+                type: object
+              budgets:
+                description: RunBudgets bound aggregate mutation, duration, concurrency,
+                  and ambiguity.
+                properties:
+                  maxActiveFaults:
+                    format: int32
+                    maximum: 512
+                    minimum: 1
+                    type: integer
+                  maxBurnchainFaults:
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
+                  maxCampaigns:
+                    format: int32
+                    maximum: 1024
+                    minimum: 1
+                    type: integer
+                  maxCumulativeFaultSeconds:
+                    format: int32
+                    maximum: 604800
+                    minimum: 1
+                    type: integer
+                  maxInconclusiveCampaigns:
+                    format: int32
+                    maximum: 64
+                    minimum: 0
+                    type: integer
+                  maxSignerImpactPercent:
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  maxWallTimeSeconds:
+                    format: int32
+                    maximum: 604800
+                    minimum: 1
+                    type: integer
+                required:
+                - maxActiveFaults
+                - maxBurnchainFaults
+                - maxCampaigns
+                - maxCumulativeFaultSeconds
+                - maxInconclusiveCampaigns
+                - maxSignerImpactPercent
+                - maxWallTimeSeconds
+                type: object
+                x-kubernetes-validations:
+                - message: maxCumulativeFaultSeconds cannot exceed maxWallTimeSeconds
+                  rule: self.maxCumulativeFaultSeconds <= self.maxWallTimeSeconds
+              campaignCatalog:
+                items:
+                  description: CampaignCatalogEntry binds a logical name to an immutable
+                    campaign template.
+                  properties:
+                    campaignRef:
+                      type: string
+                    expectedGeneration:
+                      format: int64
+                      type: integer
+                    expectedSpecDigest:
+                      type: string
+                    expectedUID:
+                      type: string
+                    name:
+                      type: string
+                  required:
+                  - campaignRef
+                  - name
+                  type: object
+                maxItems: 256
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              decisionAlgorithm:
+                enum:
+                - dependency-trigger-scheduler/v1
+                type: string
+              duringAssertions:
+                description: |-
+                  ProtocolAssertionSetSpec is a bounded assertion gate with one failure
+                  deadline for missing or unavailable evidence.
+                properties:
+                  assertions:
+                    items:
+                      description: |-
+                        ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
+                        and actor-supplied success predicates are intentionally unsupported.
+                      properties:
+                        bitcoinBranchCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
+                        chainProgress:
+                          description: |-
+                            ChainProgressAssertion requires every selected actor to advance by at least
+                            MinimumDelta during Window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            minimumDelta:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - chain
+                          - minimumDelta
+                          - window
+                          type: object
+                        cohortAgreement:
+                          description: |-
+                            CohortAgreementAssertion bounds the selected actors' height spread. When
+                            ConvergenceWindow is set, an excessive spread remains pending until the
+                            actors converge or the bounded window expires.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            convergenceWindow:
+                              description: |-
+                                ConvergenceWindow changes the default fail-fast snapshot assertion into
+                                an eventual-convergence assertion with a finite deadline.
+                              type: string
+                            maximumSpread:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                          required:
+                          - actors
+                          - chain
+                          - maximumSpread
+                          type: object
+                        id:
+                          pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                          type: string
+                        proposalOutcomeVisibility:
+                          description: |-
+                            ProposalOutcomeVisibilityAssertion requires proposal or policy activity to
+                            advance during Window for every selected signer.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumObserved:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - minimumObserved
+                          - window
+                          type: object
+                        signerRegistration:
+                          description: |-
+                            SignerRegistrationAssertion requires a minimum count of selected signers to
+                            report current-cycle registration.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumRegistered:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          required:
+                          - actors
+                          - minimumRegistered
+                          type: object
+                        signerStateFreshness:
+                          description: |-
+                            SignerStateFreshnessAssertion bounds the age of every selected signer's last
+                            state-machine transition.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            maximumAge:
+                              type: string
+                          required:
+                          - actors
+                          - maximumAge
+                          type: object
+                        stacksBurnchainCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
+                        telemetryCompleteness:
+                          description: |-
+                            TelemetryCompletenessAssertion requires successful collection from every
+                            selected admitted actor in one stable identity window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                          required:
+                          - actors
+                          type: object
+                      required:
+                      - id
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one protocol assertion must be configured
+                        rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
+                          ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
+                          ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
+                          + (has(self.telemetryCompleteness) ? 1 : 0) + (has(self.bitcoinBranchCohort)
+                          ? 1 : 0) + (has(self.stacksBurnchainCohort) ? 1 : 0) ==
+                          1'
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  timeout:
+                    type: string
+                required:
+                - assertions
+                - timeout
+                type: object
+              executions:
+                items:
+                  description: RunExecutionSpec identifies one campaign execution
+                    in the schedule DAG.
+                  properties:
+                    campaign:
+                      type: string
+                    dependsOn:
+                      items:
+                        description: RunExecutionDependency waits for another execution
+                          to reach a named state.
+                        properties:
+                          delay:
+                            type: string
+                          execution:
+                            type: string
+                          state:
+                            enum:
+                            - Injected
+                            - Effective
+                            - Recovered
+                            - Terminal
+                            type: string
+                        required:
+                        - execution
+                        - state
+                        type: object
+                      type: array
+                    enabled:
+                      type: boolean
+                    id:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                    trigger:
+                      description: RunTriggerSpec defines a trusted condition that
+                        makes an execution eligible.
+                      properties:
+                        afterRunStart:
+                          type: string
+                        burnHeight:
+                          format: int64
+                          type: integer
+                        observation:
+                          description: ObservationTriggerSpec waits for one bounded
+                            trusted observation.
+                          properties:
+                            actor:
+                              type: string
+                            expected:
+                              type: string
+                            timeoutSeconds:
+                              format: int32
+                              type: integer
+                            type:
+                              type: string
+                          required:
+                          - timeoutSeconds
+                          - type
+                          type: object
+                        stacksHeight:
+                          format: int64
+                          type: integer
+                      type: object
+                      x-kubernetes-validations:
+                      - message: at most one run trigger may be set
+                        rule: '(has(self.afterRunStart) ? 1 : 0) + (has(self.burnHeight)
+                          ? 1 : 0) + (has(self.stacksHeight) ? 1 : 0) + (has(self.observation)
+                          ? 1 : 0) <= 1'
+                    upgrade:
+                      type: string
+                  required:
+                  - id
+                  type: object
+                  x-kubernetes-validations:
+                  - message: exactly one campaign or upgrade is required
+                    rule: '(has(self.campaign) ? 1 : 0) + (has(self.upgrade) ? 1 :
+                      0) == 1'
+                maxItems: 1024
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+              fuzzProvenance:
+                description: |-
+                  FuzzProvenance binds a generated run to one immutable local session
+                  decision. It records provenance only and grants no mutation authority.
+                properties:
+                  attemptId:
+                    pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                    type: string
+                  attemptKind:
+                    enum:
+                    - Source
+                    - Confirmation
+                    - Reduction
+                    type: string
+                  decisionDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  planDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  sessionDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  trialOrdinal:
+                    format: int32
+                    maximum: 256
+                    minimum: 1
+                    type: integer
+                required:
+                - attemptId
+                - attemptKind
+                - decisionDigest
+                - planDigest
+                - sessionDigest
+                - trialOrdinal
+                type: object
+              minimization:
+                description: MinimizationSpec describes one bounded, fresh-network
+                  delta-debug attempt.
+                properties:
+                  attemptId:
+                    type: string
+                  candidateDigest:
+                    description: |-
+                      CandidateDigest identifies the canonical retained removal instructions.
+                      The admitted fresh-network schedule is reported separately by scheduleRef.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  enabled:
+                    type: boolean
+                  expectedAssertion:
+                    type: string
+                  expectedStatus:
+                    type: string
+                  maxAttempts:
+                    format: int32
+                    type: integer
+                  requireFreshNetwork:
+                    type: boolean
+                  retained:
+                    items:
+                      description: RetainedExecution describes one removal-only minimization
+                        candidate.
+                      properties:
+                        executionId:
+                          type: string
+                        removedActions:
+                          items:
+                            type: string
+                          type: array
+                        removedParameters:
+                          items:
+                            type: string
+                          type: array
+                        removedStages:
+                          items:
+                            type: string
+                          type: array
+                        removedTargets:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - executionId
+                      type: object
+                    type: array
+                  sourceRunRef:
+                    type: string
+                  sourceScheduleDigest:
+                    type: string
+                  strategy:
+                    enum:
+                    - DeltaDebug
+                    - FailurePrefix
+                    type: string
+                required:
+                - enabled
+                - maxAttempts
+                - requireFreshNetwork
+                - strategy
+                type: object
+                x-kubernetes-validations:
+                - message: disabled minimization requires maxAttempts=0
+                  rule: self.enabled || self.maxAttempts == 0
+                - message: enabled minimization requires one bounded fresh-network
+                    DeltaDebug attempt and immutable source, candidate, and expectation
+                    fields
+                  rule: '!self.enabled || (self.strategy == ''DeltaDebug'' && self.maxAttempts
+                    == 1 && self.requireFreshNetwork && has(self.sourceRunRef) &&
+                    has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.candidateDigest)
+                    && has(self.expectedAssertion) && has(self.expectedStatus) &&
+                    has(self.retained) && self.retained.size() > 0)'
+              networkRef:
+                type: string
+              recoveryAssertions:
+                description: |-
+                  ProtocolAssertionSetSpec is a bounded assertion gate with one failure
+                  deadline for missing or unavailable evidence.
+                properties:
+                  assertions:
+                    items:
+                      description: |-
+                        ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
+                        and actor-supplied success predicates are intentionally unsupported.
+                      properties:
+                        bitcoinBranchCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
+                        chainProgress:
+                          description: |-
+                            ChainProgressAssertion requires every selected actor to advance by at least
+                            MinimumDelta during Window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            minimumDelta:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - chain
+                          - minimumDelta
+                          - window
+                          type: object
+                        cohortAgreement:
+                          description: |-
+                            CohortAgreementAssertion bounds the selected actors' height spread. When
+                            ConvergenceWindow is set, an excessive spread remains pending until the
+                            actors converge or the bounded window expires.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            chain:
+                              enum:
+                              - burnchain
+                              - stacks
+                              type: string
+                            convergenceWindow:
+                              description: |-
+                                ConvergenceWindow changes the default fail-fast snapshot assertion into
+                                an eventual-convergence assertion with a finite deadline.
+                              type: string
+                            maximumSpread:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                          required:
+                          - actors
+                          - chain
+                          - maximumSpread
+                          type: object
+                        id:
+                          pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                          type: string
+                        proposalOutcomeVisibility:
+                          description: |-
+                            ProposalOutcomeVisibilityAssertion requires proposal or policy activity to
+                            advance during Window for every selected signer.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumObserved:
+                              format: int64
+                              minimum: 1
+                              type: integer
+                            window:
+                              type: string
+                          required:
+                          - actors
+                          - minimumObserved
+                          - window
+                          type: object
+                        signerRegistration:
+                          description: |-
+                            SignerRegistrationAssertion requires a minimum count of selected signers to
+                            report current-cycle registration.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            minimumRegistered:
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          required:
+                          - actors
+                          - minimumRegistered
+                          type: object
+                        signerStateFreshness:
+                          description: |-
+                            SignerStateFreshnessAssertion bounds the age of every selected signer's last
+                            state-machine transition.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                            maximumAge:
+                              type: string
+                          required:
+                          - actors
+                          - maximumAge
+                          type: object
+                        stacksBurnchainCohort:
+                          description: BranchCohortAssertion proves finite branch
+                            divergence or convergence.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 32
+                              minItems: 2
+                              type: array
+                              x-kubernetes-list-type: set
+                            expectation:
+                              description: BranchCohortExpectation selects divergence
+                                or convergence proof.
+                              enum:
+                              - Diverged
+                              - Converged
+                              type: string
+                            minimumDistinct:
+                              description: MinimumDistinct defaults to two and applies
+                                only to Diverged.
+                              format: int32
+                              maximum: 32
+                              minimum: 2
+                              type: integer
+                            stableFor:
+                              description: |-
+                                StableFor requires the selected cohort to remain converged for this duration.
+                                The shared branch may advance while convergence remains continuous.
+                              type: string
+                          required:
+                          - actors
+                          - expectation
+                          type: object
+                          x-kubernetes-validations:
+                          - message: stableFor applies only to Converged and minimumDistinct
+                              applies only to Diverged
+                            rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                              : !has(self.minimumDistinct)'
+                          - message: minimumDistinct cannot exceed the selected actor
+                              count
+                            rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                              <= self.actors.size()'
+                        telemetryCompleteness:
+                          description: |-
+                            TelemetryCompletenessAssertion requires successful collection from every
+                            selected admitted actor in one stable identity window.
+                          properties:
+                            actors:
+                              items:
+                                type: string
+                              maxItems: 64
+                              minItems: 1
+                              type: array
+                              x-kubernetes-list-type: set
+                          required:
+                          - actors
+                          type: object
+                      required:
+                      - id
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one protocol assertion must be configured
+                        rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
+                          ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0) + (has(self.signerStateFreshness)
+                          ? 1 : 0) + (has(self.proposalOutcomeVisibility) ? 1 : 0)
+                          + (has(self.telemetryCompleteness) ? 1 : 0) + (has(self.bitcoinBranchCohort)
+                          ? 1 : 0) + (has(self.stacksBurnchainCohort) ? 1 : 0) ==
+                          1'
+                    maxItems: 32
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  timeout:
+                    type: string
+                required:
+                - assertions
+                - timeout
+                type: object
+              replay:
+                description: ReplaySpec pins a run to an immutable prior descriptor
+                  and expectation.
+                properties:
+                  attemptId:
+                    type: string
+                  descriptorDigest:
+                    type: string
+                  descriptorURI:
+                    type: string
+                  enabled:
+                    type: boolean
+                  expectedAssertion:
+                    type: string
+                  expectedStatus:
+                    type: string
+                  requireSameResolvedImages:
+                    type: boolean
+                  sourceRunRef:
+                    type: string
+                  verifyExpectedFailure:
+                    type: boolean
+                required:
+                - enabled
+                - requireSameResolvedImages
+                - verifyExpectedFailure
+                type: object
+                x-kubernetes-validations:
+                - message: enabled replay requires immutable source, descriptor, attempt,
+                    and expected-failure fields
+                  rule: '!self.enabled || (has(self.sourceRunRef) && has(self.descriptorURI)
+                    && has(self.descriptorDigest) && has(self.attemptId) && (!self.verifyExpectedFailure
+                    || (has(self.expectedAssertion) && has(self.expectedStatus))))'
+              resume:
+                description: ResumeSpec identifies a prior run execution boundary
+                  to resume after.
+                properties:
+                  afterExecutionId:
+                    type: string
+                  enabled:
+                    type: boolean
+                  requireSameResolvedImages:
+                    type: boolean
+                  requireSameSeed:
+                    type: boolean
+                  sourceRunRef:
+                    type: string
+                required:
+                - enabled
+                - requireSameResolvedImages
+                - requireSameSeed
+                type: object
+                x-kubernetes-validations:
+                - message: enabled resume requires sourceRunRef and afterExecutionId
+                  rule: '!self.enabled || (has(self.sourceRunRef) && has(self.afterExecutionId))'
+              seed:
+                type: string
+              stopPolicy:
+                description: StopPolicy defines terminal handling for each campaign
+                  outcome.
+                properties:
+                  onBudgetExhausted:
+                    enum:
+                    - Stop
+                    - Pause
+                    type: string
+                  onCampaignFailure:
+                    enum:
+                    - Continue
+                    - Stop
+                    - PauseForTriage
+                    type: string
+                  onInconclusive:
+                    enum:
+                    - Continue
+                    - Stop
+                    - PauseForTriage
+                    type: string
+                  onSuccess:
+                    enum:
+                    - Continue
+                    - Stop
+                    type: string
+                required:
+                - onBudgetExhausted
+                - onCampaignFailure
+                - onInconclusive
+                - onSuccess
+                type: object
+              upgradeCatalog:
+                items:
+                  description: UpgradeCatalogEntry binds a logical name to an immutable
+                    upgrade template.
+                  properties:
+                    expectedGeneration:
+                      format: int64
+                      type: integer
+                    expectedSpecDigest:
+                      type: string
+                    expectedUID:
+                      type: string
+                    name:
+                      type: string
+                    upgradeRef:
+                      type: string
+                  required:
+                  - name
+                  - upgradeRef
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            required:
+            - attributionPolicy
+            - budgets
+            - executions
+            - minimization
+            - networkRef
+            - replay
+            - resume
+            - seed
+            - stopPolicy
+            type: object
+            x-kubernetes-validations:
+            - message: replay, resume, and minimization are mutually exclusive
+              rule: '(self.replay.enabled ? 1 : 0) + (self.resume.enabled ? 1 : 0)
+                + (self.minimization.enabled ? 1 : 0) <= 1'
+            - message: enabled executions exceed maxCampaigns budget
+              rule: self.executions.filter(execution, !has(execution.enabled) || execution.enabled).size()
+                <= self.budgets.maxCampaigns
+            - message: at least one fault or upgrade catalog entry is required
+              rule: '(has(self.campaignCatalog) ? size(self.campaignCatalog) : 0)
+                + (has(self.upgradeCatalog) ? size(self.upgradeCatalog) : 0) > 0'
+          status:
+            description: AttacknetRunStatus is the durable scheduler and evidence
+              state machine.
+            properties:
+              activeChildren:
+                items:
+                  description: ActiveRunChild identifies one currently executing campaign
+                    child.
+                  properties:
+                    executionId:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    startedAt:
+                      format: date-time
+                      type: string
+                    uid:
+                      type: string
+                  required:
+                  - executionId
+                  - name
+                  - uid
+                  type: object
+                type: array
+              attribution:
+                type: string
+              attributionURI:
+                type: string
+              budgetUsage:
+                description: BudgetUsage reports aggregate consumption of sealed run
+                  budgets.
+                properties:
+                  activeCampaigns:
+                    format: int32
+                    type: integer
+                  activeFaults:
+                    format: int32
+                    type: integer
+                  burnchainFaults:
+                    format: int32
+                    type: integer
+                  campaigns:
+                    format: int32
+                    type: integer
+                  campaignsCompleted:
+                    format: int32
+                    type: integer
+                  campaignsStarted:
+                    format: int32
+                    type: integer
+                  cumulativeFaultMillis:
+                    format: int64
+                    type: integer
+                  inconclusiveCampaigns:
+                    format: int32
+                    type: integer
+                  maximumSignerImpactBasisPoints:
+                    format: int32
+                    type: integer
+                  minimizationAttempts:
+                    format: int32
+                    type: integer
+                  wallTimeMillis:
+                    format: int64
+                    type: integer
+                type: object
+              cleanup:
+                description: RunCleanup reports cleanup completeness independently
+                  from run outcome.
+                properties:
+                  completed:
+                    type: boolean
+                  completedAt:
+                    format: date-time
+                    type: string
+                  message:
+                    type: string
+                  required:
+                    type: boolean
+                required:
+                - completed
+                - required
+                type: object
+              completedAt:
+                format: date-time
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              decisions:
+                items:
+                  x-kubernetes-preserve-unknown-fields: true
+                type: array
+              evidenceDigest:
+                type: string
+              evidenceURI:
+                type: string
+              finishedAt:
+                format: date-time
+                type: string
+              identityDivergence:
+                description: IdentityDivergence records an immutable identity mismatch
+                  without retargeting.
+                properties:
+                  currentDigest:
+                    type: string
+                  differences:
+                    items:
+                      description: IdentityDifference describes one bounded inventory
+                        mismatch.
+                      properties:
+                        current:
+                          type: string
+                        expected:
+                          type: string
+                        field:
+                          type: string
+                        message:
+                          type: string
+                        scope:
+                          type: string
+                      required:
+                      - field
+                      type: object
+                    type: array
+                  expectedDigest:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                required:
+                - observedAt
+                type: object
+              identityTransitions:
+                items:
+                  description: IdentityTransition records an explicitly permitted
+                    Pod identity replacement.
+                  properties:
+                    actors:
+                      items:
+                        type: string
+                      type: array
+                    campaign:
+                      type: string
+                    currentDigest:
+                      type: string
+                    observedAt:
+                      format: date-time
+                      type: string
+                    previousDigest:
+                      type: string
+                  required:
+                  - actors
+                  - campaign
+                  - currentDigest
+                  - observedAt
+                  - previousDigest
+                  type: object
+                type: array
+              lastTransitionTime:
+                format: date-time
+                type: string
+              message:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+              protocolAssertions:
+                description: ProtocolAssertionsStatus records baseline, active-fault,
+                  and recovery gates.
+                properties:
+                  baseline:
+                    description: ProtocolAssertionSetStatus records one run gate's
+                      bounded state.
+                    properties:
+                      completedAt:
+                        format: date-time
+                        type: string
+                      outcome:
+                        enum:
+                        - Pending
+                        - Proven
+                        - Violated
+                        - Inconclusive
+                        type: string
+                      results:
+                        items:
+                          description: ProtocolAssertionResult records one bounded
+                            evaluator result.
+                          properties:
+                            evidence:
+                              x-kubernetes-preserve-unknown-fields: true
+                            id:
+                              type: string
+                            observedAt:
+                              format: date-time
+                              type: string
+                            outcome:
+                              enum:
+                              - Pending
+                              - Proven
+                              - Violated
+                              - Inconclusive
+                              type: string
+                            reason:
+                              type: string
+                            startedAt:
+                              format: date-time
+                              type: string
+                            type:
+                              type: string
+                          required:
+                          - id
+                          - outcome
+                          - reason
+                          - type
+                          type: object
+                        type: array
+                      startedAt:
+                        format: date-time
+                        type: string
+                    required:
+                    - outcome
+                    type: object
+                  during:
+                    description: ProtocolAssertionSetStatus records one run gate's
+                      bounded state.
+                    properties:
+                      completedAt:
+                        format: date-time
+                        type: string
+                      outcome:
+                        enum:
+                        - Pending
+                        - Proven
+                        - Violated
+                        - Inconclusive
+                        type: string
+                      results:
+                        items:
+                          description: ProtocolAssertionResult records one bounded
+                            evaluator result.
+                          properties:
+                            evidence:
+                              x-kubernetes-preserve-unknown-fields: true
+                            id:
+                              type: string
+                            observedAt:
+                              format: date-time
+                              type: string
+                            outcome:
+                              enum:
+                              - Pending
+                              - Proven
+                              - Violated
+                              - Inconclusive
+                              type: string
+                            reason:
+                              type: string
+                            startedAt:
+                              format: date-time
+                              type: string
+                            type:
+                              type: string
+                          required:
+                          - id
+                          - outcome
+                          - reason
+                          - type
+                          type: object
+                        type: array
+                      startedAt:
+                        format: date-time
+                        type: string
+                    required:
+                    - outcome
+                    type: object
+                  recovery:
+                    description: ProtocolAssertionSetStatus records one run gate's
+                      bounded state.
+                    properties:
+                      completedAt:
+                        format: date-time
+                        type: string
+                      outcome:
+                        enum:
+                        - Pending
+                        - Proven
+                        - Violated
+                        - Inconclusive
+                        type: string
+                      results:
+                        items:
+                          description: ProtocolAssertionResult records one bounded
+                            evaluator result.
+                          properties:
+                            evidence:
+                              x-kubernetes-preserve-unknown-fields: true
+                            id:
+                              type: string
+                            observedAt:
+                              format: date-time
+                              type: string
+                            outcome:
+                              enum:
+                              - Pending
+                              - Proven
+                              - Violated
+                              - Inconclusive
+                              type: string
+                            reason:
+                              type: string
+                            startedAt:
+                              format: date-time
+                              type: string
+                            type:
+                              type: string
+                          required:
+                          - id
+                          - outcome
+                          - reason
+                          - type
+                          type: object
+                        type: array
+                      startedAt:
+                        format: date-time
+                        type: string
+                    required:
+                    - outcome
+                    type: object
+                type: object
+              reason:
+                type: string
+              replayPlanURI:
+                type: string
+              resolvedCampaigns:
+                items:
+                  description: ResolvedCampaign records immutable source-template
+                    identity.
+                  properties:
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    sourceGeneration:
+                      format: int64
+                      type: integer
+                    sourceName:
+                      type: string
+                    sourceUID:
+                      type: string
+                    specDigest:
+                      type: string
+                  required:
+                  - name
+                  - sourceGeneration
+                  - sourceName
+                  - sourceUID
+                  - specDigest
+                  type: object
+                type: array
+              scheduleRef:
+                description: ScheduleReference identifies the immutable controller-owned
+                  schedule object.
+                properties:
+                  digest:
+                    type: string
+                  name:
+                    type: string
+                  runGeneration:
+                    format: int64
+                    type: integer
+                  runSpecDigest:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - digest
+                - name
+                - runGeneration
+                - runSpecDigest
+                - uid
+                type: object
+              scheduleSummary:
+                description: ScheduleSummary records immutable topology and schedule
+                  admission facts.
+                properties:
+                  executions:
+                    format: int32
+                    type: integer
+                  manifestDigest:
+                    type: string
+                  networkGeneration:
+                    format: int64
+                    type: integer
+                  networkInventory:
+                    description: NetworkInventory is the complete authoritative actor
+                      inventory bound to a run.
+                    properties:
+                      actors:
+                        items:
+                          description: AdmittedActorIdentity is the immutable runtime
+                            identity admitted for one actor.
+                          properties:
+                            adversarialEgressProfile:
+                              type: string
+                            adversarialPolicyDigest:
+                              type: string
+                            configDigest:
+                              type: string
+                            controllerRevision:
+                              type: string
+                            egressPolicyDigest:
+                              type: string
+                            name:
+                              type: string
+                            podName:
+                              type: string
+                            podUID:
+                              type: string
+                            requestedImage:
+                              type: string
+                            role:
+                              type: string
+                            runtimeImageID:
+                              type: string
+                            serviceName:
+                              type: string
+                            statefulSetName:
+                              type: string
+                            statefulSetUID:
+                              type: string
+                          required:
+                          - controllerRevision
+                          - name
+                          - podName
+                          - podUID
+                          - requestedImage
+                          - role
+                          - runtimeImageID
+                          - serviceName
+                          - statefulSetName
+                          - statefulSetUID
+                          type: object
+                        type: array
+                      burnchainTopology:
+                        description: |-
+                          AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+                          follower binding admitted for one observed StacksNetwork generation.
+                        properties:
+                          bindings:
+                            items:
+                              description: |-
+                                BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+                                process. Signer processes themselves do not consume Bitcoin RPC.
+                              properties:
+                                actor:
+                                  type: string
+                                bitcoinNodeRef:
+                                  type: string
+                              required:
+                              - actor
+                              - bitcoinNodeRef
+                              type: object
+                            type: array
+                          digest:
+                            type: string
+                          nodes:
+                            items:
+                              description: |-
+                                AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+                                peer and cadence-policy bindings.
+                              properties:
+                                name:
+                                  type: string
+                                p2pPort:
+                                  format: int32
+                                  type: integer
+                                peerRefs:
+                                  items:
+                                    type: string
+                                  type: array
+                                policyRef:
+                                  type: string
+                                policyServiceName:
+                                  type: string
+                                policyUID:
+                                  type: string
+                                rpcPort:
+                                  format: int32
+                                  type: integer
+                                serviceName:
+                                  type: string
+                              required:
+                              - name
+                              - p2pPort
+                              - policyRef
+                              - policyServiceName
+                              - policyUID
+                              - rpcPort
+                              - serviceName
+                              type: object
+                            type: array
+                          observedAt:
+                            format: date-time
+                            type: string
+                          observedGeneration:
+                            format: int64
+                            type: integer
+                          schemaVersion:
+                            type: string
+                        required:
+                        - digest
+                        - nodes
+                        - observedGeneration
+                        - schemaVersion
+                        type: object
+                      digest:
+                        type: string
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        type: integer
+                      resourceVersion:
+                        type: string
+                    required:
+                    - actors
+                    - digest
+                    - observedGeneration
+                    type: object
+                  networkUid:
+                    type: string
+                  replay:
+                    type: boolean
+                  schemaVersion:
+                    type: string
+                  signerSetDigest:
+                    type: string
+                  signerSetObservedFrom:
+                    type: string
+                  signerSetRewardCycle:
+                    format: int64
+                    type: integer
+                  signerSetTotalWeight:
+                    format: int64
+                    type: integer
+                required:
+                - executions
+                - manifestDigest
+                - networkGeneration
+                - networkInventory
+                - networkUid
+                - replay
+                - schemaVersion
+                type: object
+              startedAt:
+                format: date-time
+                type: string
+              terminalClassification:
+                description: TerminalClassification records expected-versus-observed
+                  replay evidence.
+                properties:
+                  attemptId:
+                    type: string
+                  candidateDigest:
+                    type: string
+                  causalMinimalityClaimed:
+                    type: boolean
+                  evidenceDigest:
+                    type: string
+                  evidenceURI:
+                    type: string
+                  expectedAssertion:
+                    type: string
+                  expectedStatus:
+                    type: string
+                  observationCount:
+                    format: int32
+                    type: integer
+                  observations:
+                    items:
+                      x-kubernetes-preserve-unknown-fields: true
+                    type: array
+                  outcome:
+                    type: string
+                  reason:
+                    type: string
+                type: object
+              triggerReceipts:
+                items:
+                  x-kubernetes-preserve-unknown-fields: true
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

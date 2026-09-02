@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stacks.org/schemas/attacknet-phase-review-packet-v1.json",
+  "title": "Stacks Attacknet phase review packet v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "toolingDigest", "contractDigest", "phase", "tier", "candidate", "sourceDigest", "evidenceDigest", "requirements", "inventory", "matrix", "compatibility", "limitations", "reproduction", "binding"],
+  "properties": {
+    "schemaVersion": {"const": "stacks-attacknet-phase-review-packet/v1"},
+    "toolingDigest": {"$ref": "#/$defs/digest"},
+    "contractDigest": {"$ref": "#/$defs/digest"},
+    "phase": {"type": "integer", "minimum": 0},
+    "tier": {"enum": ["Reduced", "Full"]},
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceRevision", "commitPending", "dirtyPatchDigest"],
+      "properties": {
+        "sourceRevision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "commitPending": {"type": "boolean"},
+        "dirtyPatchDigest": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "sourceDigest": {"$ref": "#/$defs/digest"},
+    "evidenceDigest": {"$ref": "#/$defs/digest"},
+    "evidenceRoot": {"type": "string", "minLength": 1},
+    "requirements": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "inventory": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "path", "digest"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["source", "document", "analysis", "instructions", "diff", "evidence", "test"]},
+          "path": {"type": "string", "minLength": 1},
+          "digest": {"$ref": "#/$defs/digest"}
+        }
+      }
+    },
+    "matrix": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["requirement", "status", "evidence"],
+        "properties": {
+          "requirement": {"type": "string", "minLength": 1},
+          "status": {"enum": ["satisfied", "failed", "not-applicable"]},
+          "evidence": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runtimeBehaviorChanged", "kubernetesResourcesChanged", "evidenceInterpretationChanged", "notes"],
+      "properties": {
+        "runtimeBehaviorChanged": {"type": "boolean"},
+        "kubernetesResourcesChanged": {"type": "boolean"},
+        "evidenceInterpretationChanged": {"type": "boolean"},
+        "notes": {"type": "string", "minLength": 1}
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "disposition"],
+        "properties": {"id": {"type": "string", "minLength": 1}, "disposition": {"type": "string", "minLength": 1}}
+      }
+    },
+    "reproduction": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {"algorithm": {"const": "sha256"}, "digest": {"$ref": "#/$defs/digest"}}
+    }
+  },
+  "$defs": {"digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+}

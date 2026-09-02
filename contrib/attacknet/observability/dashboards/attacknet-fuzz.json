@@ -1,0 +1,276 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Network overview",
+      "tooltip": "Return to network, fault, and recovery diagnostics",
+      "type": "link",
+      "url": "/d/stacks-attacknet-overview/stacks-attacknet-network-faults-and-recovery"
+    },
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Actor drill-down",
+      "tooltip": "Inspect the selected actor during a fuzz attempt",
+      "type": "link",
+      "url": "/d/stacks-attacknet-actor/stacks-attacknet-actor-drill-down"
+    }
+  ],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Controller-observed fuzz runs that reached Passed. This is live orchestration state; the digest-bound session report remains authoritative after teardown.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\",phase=\"Passed\"}) or vector(0)", "refId": "A"}],
+      "title": "Clean terminal runs",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Controller-observed failed runs. Inspect attribution and protocol gates before treating a failure as a Stacks-network defect.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\",phase=\"Failed\"}) or vector(0)", "refId": "A"}],
+      "title": "Failed terminal runs",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Fresh-network confirmation runs currently known to the run controller. Semantic fingerprints remain in corpus evidence and are intentionally not Prometheus labels.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\",attempt_kind=\"Confirmation\"}) or vector(0)", "refId": "A"}],
+      "title": "Confirmation attempts",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Removal-only reduction attempts observed by the run controller. The content-addressed reduction graph is authoritative; this count is a live operational view.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\",attempt_kind=\"Reduction\"}) or vector(0)", "refId": "A"}],
+      "title": "Reduction attempts",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Controller-observed Inconclusive runs. Missing, conflicting, or identity-divergent evidence is never counted as a pass.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 11,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\",phase=\"Inconclusive\"}) or vector(0)", "refId": "A"}],
+      "title": "Inconclusive runs",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Non-passing controller runs attributed outside protocol assertions. Pre-run capacity and corpus failures appear only in the verified CLI status and static report.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 12,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count((attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\",phase!=\"Passed\"}) and on (network,run) (attacknet_run_info{attribution!=\"ProtocolAssertion\"})) or vector(0)", "refId": "A"}],
+      "title": "Harness-attributed runs",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Trusted run-controller lifecycle grouped by bounded session, trial, attempt, phase, and reason. Missing series are not interpreted as a healthy result.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 4},
+      "id": 5,
+      "options": {"alignValue": "left", "legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "mergeValues": true, "rowHeight": 0.9, "showValue": "always", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\"}", "legendFormat": "trial {{trial}} {{attempt_kind}}/{{attempt}} {{phase}} ({{reason}})", "refId": "A"}],
+      "title": "Fuzz trial and attempt lifecycle (trusted)",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Controller-owned protocol assertion gates for fuzz-generated runs. Violated or Inconclusive results prevent a successful experiment classification.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "id": 6,
+      "options": {"alignValue": "left", "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.9, "showValue": "always", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "attacknet_run_protocol_assertion{network=\"$network\",gate=~\"baseline|during|recovery\"} and on (network,run) attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\"}", "legendFormat": "{{run}} {{gate}}/{{assertion}} {{outcome}}", "refId": "A"}],
+      "title": "Protocol assertion gates (trusted)",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Current controller-observed budget use for fuzz-generated runs. Capacity-admission headroom and physical escrow identities are retained in the static session report rather than exported as high-churn labels.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "id": 7,
+      "options": {"displayMode": "gradient", "minVizHeight": 10, "minVizWidth": 0, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true, "sizing": "auto", "valueMode": "color"},
+      "targets": [{"expr": "attacknet_run_budget_usage{network=\"$network\"} and on (network,run) attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\"}", "legendFormat": "{{run}} {{budget}}", "refId": "A"}],
+      "title": "Run safety-budget use",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "All typed fault actions for the selected fresh network, observed by the controller. Fresh attempt networks are isolated, so this reveals mechanism, stage, phase, and reason without trusting actor output.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+      "id": 8,
+      "options": {"alignValue": "left", "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true}, "mergeValues": true, "rowHeight": 0.9, "showValue": "always", "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"expr": "attacknet_fault_action_info{network=\"$network\"}", "legendFormat": "{{campaign}} {{stage}}/{{action}} {{type}} {{phase}}", "refId": "A"}],
+      "title": "Generated typed fault lifecycle (trusted)",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Trusted minimization classifications emitted by the run controller. The full candidate and reduction graph remain in the content-addressed corpus.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+      "id": 9,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_run_minimization_outcome{network=\"$network\"} and on (network,run) attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Reduction outcomes (trusted)",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "attacknet-loki"},
+      "description": "Raw actor log content for the selected network and actor. Kubernetes labels are collector-attached, but every log body is adversarial and untrusted; use it for diagnosis, never terminal classification.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 29},
+      "id": 10,
+      "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
+      "targets": [{"datasource": {"type": "loki", "uid": "attacknet-loki"}, "editorMode": "code", "expr": "{attacknet_network=\"$network\",attacknet_actor=~\"$actor\"}", "queryType": "range", "refId": "A"}],
+      "title": "Fuzz-session actor logs (untrusted content)",
+      "type": "logs"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Current immutable schedule digest and run attribution. Use `attacknet fuzz status` for the verified static report and content-addressed corpus links.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 39},
+      "id": 13,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_run_info{network=\"$network\"} and on (network,run) attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Schedule, phase, and attribution (trusted)",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Admitted immutable actor image assignments for mixed-version trials. Requested tags are shown only alongside runtime image IDs.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 39},
+      "id": 14,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"expr": "attacknet_actor_version_info{attacknet_network=\"$network\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Admitted version cohorts (trusted)",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Orchestrator collection health. A zero means the live dashboard is incomplete; preserve the environment and use the verified static status/corpus interfaces.",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 46},
+      "id": 15,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "attacknet_orchestrator_metrics_collection_success", "refId": "A"}],
+      "title": "Trusted observation pipeline",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+      "description": "Identity-bound burn heights observed during protocol gates. Declared boundary schedules and exact crossings are retained in corpus evidence, not inferred from this visualization.",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 4, "w": 18, "x": 6, "y": 46},
+      "id": 16,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "attacknet_run_stacks_burn_view_height{network=\"$network\"} and on (network,run) attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\",trial=~\"$trial\"}", "legendFormat": "{{run}} {{gate}}/{{actor}}", "refId": "A"}],
+      "title": "Burnchain boundary context (trusted)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 41,
+  "tags": ["stacks", "attacknet", "fuzz"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+        "definition": "label_values(attacknet_fuzz_run_info, network)",
+        "includeAll": false,
+        "label": "Network",
+        "name": "network",
+        "options": [],
+        "query": {"query": "label_values(attacknet_fuzz_run_info, network)", "refId": "PrometheusVariableQueryEditor-FuzzNetwork"},
+        "refresh": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+        "definition": "label_values(attacknet_fuzz_run_info{network=\"$network\"}, session)",
+        "includeAll": true,
+        "label": "Session",
+        "multi": true,
+        "name": "session",
+        "options": [],
+        "query": {"query": "label_values(attacknet_fuzz_run_info{network=\"$network\"}, session)", "refId": "PrometheusVariableQueryEditor-FuzzSession"},
+        "refresh": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+        "definition": "label_values(attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\"}, trial)",
+        "includeAll": true,
+        "label": "Trial",
+        "multi": true,
+        "name": "trial",
+        "options": [],
+        "query": {"query": "label_values(attacknet_fuzz_run_info{network=\"$network\",session=~\"$session\"}, trial)", "refId": "PrometheusVariableQueryEditor-FuzzTrial"},
+        "refresh": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "attacknet-prometheus"},
+        "definition": "label_values(up{attacknet_network=\"$network\",attacknet_actor!=\"\"}, attacknet_actor)",
+        "includeAll": true,
+        "label": "Actor",
+        "multi": true,
+        "name": "actor",
+        "options": [],
+        "query": {"query": "label_values(up{attacknet_network=\"$network\",attacknet_actor!=\"\"}, attacknet_actor)", "refId": "PrometheusVariableQueryEditor-FuzzActor"},
+        "refresh": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-2h", "to": "now"},
+  "timezone": "browser",
+  "title": "Stacks Attacknet: Fuzz Sessions",
+  "uid": "stacks-attacknet-fuzz",
+  "version": 1
+}

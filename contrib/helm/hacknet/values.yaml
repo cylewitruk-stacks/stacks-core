@@ -1,0 +1,125 @@
+nameOverride: ""
+fullnameOverride: ""
+
+operator:
+  replicaCount: 1
+  image:
+    repository: stacks-hacknet-operator
+    tag: dev
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  logLevel: INFO
+  resources:
+    requests:
+      cpu: 25m
+      memory: 48Mi
+    limits:
+      cpu: 250m
+      memory: 192Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+# One rootless clock Deployment is created per BurnchainPolicy. Bitcoin Core
+# remains an independently persisted StacksNetwork actor.
+burnchainClock:
+  image:
+    repository: stacks-hacknet-burnchain-clock
+    tag: dev
+    digest: ""
+    pullPolicy: IfNotPresent
+
+# Default sidecar image for explicitly enabled credential-free actor probes.
+# A StacksNetwork may override this image in spec.probe.
+probe:
+  image:
+    repository: stacks-hacknet-probe
+    tag: dev
+    digest: ""
+    pullPolicy: IfNotPresent
+
+# A distinct identity reconciles adversarial runs. The StacksNetwork operator
+# intentionally has no Chaos Mesh permissions; actors have no Kubernetes token.
+runOperator:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: stacks-hacknet-run-operator
+    tag: dev
+    digest: ""
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  logLevel: INFO
+  # Chaos Mesh v2.8.3 ships an x86-64-only toda helper. IOChaos admission
+  # fails closed for targets on other architectures. Extend this allow-list
+  # only after the installed helper has been verified on that architecture.
+  ioChaosSupportedArchitectures: ["x64"]
+  # TimeChaos 2.8.3 did not shift a Rust process clock on the local arm64 kind
+  # cluster and wedged its daemon on a separate Node-process canary. Extend
+  # this allow-list only after a bounded effect-and-recovery canary succeeds.
+  timeChaosSupportedArchitectures: ["x64"]
+  # Trusted controller-selected workload for bounded data-PVC pressure. A
+  # FaultCampaign cannot override this image, command, arguments, or caps.
+  ioPressureImage:
+    repository: stacks-hacknet-io-pressure
+    tag: dev
+    # Registry deployments should prefer an immutable sha256 digest. When set,
+    # it takes precedence over tag.
+    digest: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 25m
+      memory: 48Mi
+    limits:
+      cpu: 250m
+      memory: 192Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+runServiceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # Kubernetes rotates the projected token before this lifetime elapses. The
+  # minimum is useful for a deterministic local rotation smoke test.
+  tokenExpirationSeconds: 3600
+
+# The first version is intentionally namespace-scoped. Leave empty to watch
+# the Helm release namespace. Cross-namespace operation requires different
+# RBAC and is deliberately not enabled by this chart.
+watchNamespace: ""

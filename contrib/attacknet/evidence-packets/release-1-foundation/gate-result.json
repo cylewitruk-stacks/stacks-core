@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "stacks-attacknet-release-gate-result/v1",
+  "reviewId": "release-1-phase-0-foundation",
+  "status": "Approved for Release 1 scope",
+  "sourceRevision": "307393762da99c8fce0d5bc97bc5f684ee68ff7f",
+  "candidateTree": "ea2c6957d075ed97b2ac0e0d711ba2ec3fe4b0c9",
+  "packetDigest": "sha256:0593c085758d6dce64763123ab99d6034d9fd417001e7820fe82399d098aca1f",
+  "contractDigest": "sha256:e22c5714477414316e8bc71e160b5a39f1bf888842896555eec58f7979026e73",
+  "reviewPacketFileDigest": "sha256:f11832ed7e99e5c27fd58285e23b0a575758802b59c56a940fa386850f5c069a",
+  "verdictFileDigests": {
+    "Codex": "sha256:13dec664bf661f70a59f6c34592d76060effada88dcb60a593f8109fad6b6a50",
+    "Claude Opus 5": "sha256:49c7bb0b4fc086018f546ee40b5bcbd91c5a381c4d5f45af2d01a32bcb790995"
+  },
+  "evidenceDigest": "sha256:96697c3fc500fe2fdc765ab774a7a545f5408931f653eb07f002a6e7b0a97a5b",
+  "historicalEvidence": [
+    {
+      "id": "measured-300-burn-soak",
+      "digest": "sha256:2536353a7f40ee0c0062e722628bdd61ae29852f0985c3813f3925f8c39792e5"
+    },
+    {
+      "id": "deterministic-fault-run",
+      "digest": "sha256:09fb15e515ed307f13b98b2572ebd6dcbb6b0c010de423da1a1f3c700ba7ca21"
+    },
+    {
+      "id": "mixed-current-release-modified",
+      "digest": "sha256:a9bc55bc71ce25e0917c081bd19a1b1535fc71e660b30268e507f4d759fdddeb"
+    },
+    {
+      "id": "worker-outage",
+      "digest": "sha256:e03678c59795093a2b36f7ad9ce43aa0c680364d31883f8262957c49932a095b"
+    },
+    {
+      "id": "application-clock",
+      "digest": "sha256:a51332c8170c56b0131094b85c3dd2e2b7ad922ac7f0ef232c0932eefa89ee01"
+    },
+    {
+      "id": "local-path-pvc-recovery",
+      "digest": "sha256:5a91c8f5a0a884b45fe7dad472f54b1b08c7df6487ce100d861e9239e252fefa"
+    },
+    {
+      "id": "signer-partition-negative-control",
+      "digest": "sha256:0b7e1cc3cac2a510b9385261e8d64aa32913430a9b66295265a6f35dd7565102"
+    },
+    {
+      "id": "fresh-network-ddmin",
+      "digest": "sha256:b0dc93992de793935c282c26c9ec5cc004be2f8b26f7f5102dc8f54fd7d0cdce"
+    }
+  ],
+  "limitation": "The historical raw evidence remains in external content-addressed custody; this tracked record binds what the dual-approved Phase 0 packet reviewed."
+}

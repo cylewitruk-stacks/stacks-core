@@ -1,0 +1,36 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: minimal
+spec:
+  probe:
+    enabled: true
+  defaults:
+    nodeImage: stacks-core-attacknet:main
+    signerImage: stacks-core-attacknet:main
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
+    imagePullPolicy: IfNotPresent
+    workload:
+      storage:
+        enabled: true
+        size: 1Gi
+  burnchain:
+    policyRef:
+      name: minimal
+    nodes:
+      - name: bitcoin
+        config:
+          generated:
+            profile: bitcoin-regtest/v1
+        workload:
+          storage:
+            enabled: true
+            size: 2Gi
+  nodes:
+    - name: follower-1
+      role: follower
+      burnchainNodeRef: bitcoin
+      config:
+        generated:
+          profile: nakamoto-regtest-node/v1

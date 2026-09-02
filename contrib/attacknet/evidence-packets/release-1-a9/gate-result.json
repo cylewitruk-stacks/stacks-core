@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "stacks-attacknet-release-gate-result/v1",
+  "reviewId": "release-1-amendment-a9-bitcoin-reorganizations",
+  "status": "Approved for Release 1 bounded Bitcoin reorganization amendment A9 scope",
+  "sourceRevision": "b93517c0090acfb0943789d6cf82ec40b7ce4357",
+  "candidateTree": "fd7aecd3b979524cb1c61bb309ecdb65088e05e6",
+  "packetDigest": "sha256:4f647e1f459400f214b79c32a21577be15df80bfe998811fd1fa9de387f7f4f7",
+  "contractDigest": "sha256:d6f2e98d9676b1fa32355d0f9f633707ba51828c99e233551acb462145e2f2a4",
+  "reviewPacketFileDigest": "sha256:b77f6325c5a6402d07433b02f8e48204aab99a92a70e0df63d2ba29ea6c7dc71",
+  "verdictFileDigests": {
+    "Codex": "sha256:6cf995c9275f3b7524619c5865731e279fbc6cfea0362b78afa852d3cf8978f9",
+    "Claude Opus 5": "sha256:fcd81fdbe2e91190b303d2fd41a0fbc0f7f1bf691ffbaa50af9f891b348d33c6"
+  },
+  "evidenceSummaryDigest": "sha256:96e1faa08c1658ffab32c3a6fe1daf667fef4a7bcdb2475e551287ca7f1a49cf",
+  "evidenceArchiveDigest": "sha256:4654138a60ce8a77e9b639dde60c3c811de6297be1845fb7751c362d63299304"
+}

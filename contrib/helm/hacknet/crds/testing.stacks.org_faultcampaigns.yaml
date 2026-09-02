@@ -1,0 +1,1089 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: faultcampaigns.testing.stacks.org
+spec:
+  group: testing.stacks.org
+  names:
+    kind: FaultCampaign
+    listKind: FaultCampaignList
+    plural: faultcampaigns
+    singular: faultcampaign
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: FaultCampaign declares one bounded, attributable graph of fault
+          stages.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: FaultCampaignSpec defines staged injection, aggregate safety,
+              and evidence.
+            properties:
+              effectAssertions:
+                items:
+                  description: CampaignAssertion describes one bounded effect or recovery
+                    assertion.
+                  properties:
+                    action:
+                      type: string
+                    actor:
+                      type: string
+                    timeoutSeconds:
+                      format: int32
+                      type: integer
+                    type:
+                      enum:
+                      - PodRestarted
+                      - PodUnavailable
+                      - ContainerRestarted
+                      - TargetReady
+                      - NetworkDegraded
+                      - NetworkRecovered
+                      - DNSDegraded
+                      - DNSRecovered
+                      - IODegraded
+                      - IORecovered
+                      - IOPressureObserved
+                      - IOPressureRecovered
+                      - ClockSkewObserved
+                      - ClockSkewCleared
+                      - BurnchainReorgProven
+                      - BurnchainPolicyRestored
+                      - SignerBehaviorObserved
+                      - SignerBehaviorWindowClosed
+                      type: string
+                  required:
+                  - type
+                  type: object
+                type: array
+              networkRef:
+                description: |-
+                  NetworkRef is optional only for an inert, reusable template. AttacknetRun
+                  binds a neutral template to its admitted network in the sealed execution.
+                type: string
+              recoveryAssertions:
+                items:
+                  description: CampaignAssertion describes one bounded effect or recovery
+                    assertion.
+                  properties:
+                    action:
+                      type: string
+                    actor:
+                      type: string
+                    timeoutSeconds:
+                      format: int32
+                      type: integer
+                    type:
+                      enum:
+                      - PodRestarted
+                      - PodUnavailable
+                      - ContainerRestarted
+                      - TargetReady
+                      - NetworkDegraded
+                      - NetworkRecovered
+                      - DNSDegraded
+                      - DNSRecovered
+                      - IODegraded
+                      - IORecovered
+                      - IOPressureObserved
+                      - IOPressureRecovered
+                      - ClockSkewObserved
+                      - ClockSkewCleared
+                      - BurnchainReorgProven
+                      - BurnchainPolicyRestored
+                      - SignerBehaviorObserved
+                      - SignerBehaviorWindowClosed
+                      type: string
+                  required:
+                  - type
+                  type: object
+                type: array
+              safety:
+                description: FaultSafety contains aggregate bounds and conspicuous
+                  dangerous-fault opt-ins.
+                properties:
+                  allowBurnchain:
+                    type: boolean
+                  allowEpochBoundaryCrossing:
+                    type: boolean
+                  allowExtendedDuration:
+                    type: boolean
+                  allowExtremeSeverity:
+                    type: boolean
+                  allowMinerMajorityOutage:
+                    type: boolean
+                  allowQuorumLoss:
+                    type: boolean
+                  allowRewardCycleBoundaryCrossing:
+                    type: boolean
+                  allowUnenrolledNetworkTargets:
+                    type: boolean
+                  maxBurnchainReorgDepth:
+                    description: |-
+                      MaxBurnchainReorgDepth and MaxBurnchainReplacementBlocks are required
+                      per-campaign ceilings for semantic burnchain reorganization actions.
+                    format: int32
+                    maximum: 144
+                    minimum: 0
+                    type: integer
+                  maxBurnchainReplacementBlocks:
+                    format: int32
+                    maximum: 288
+                    minimum: 0
+                    type: integer
+                  maxConcurrentFaults:
+                    format: int32
+                    maximum: 512
+                    minimum: 1
+                    type: integer
+                  maxUnavailableMinerBasisPoints:
+                    format: int32
+                    maximum: 10000
+                    minimum: 0
+                    type: integer
+                  maxUnavailableSignerBasisPoints:
+                    format: int32
+                    maximum: 10000
+                    minimum: 0
+                    type: integer
+                required:
+                - allowBurnchain
+                - allowExtendedDuration
+                - allowExtremeSeverity
+                - allowMinerMajorityOutage
+                - allowQuorumLoss
+                - allowUnenrolledNetworkTargets
+                - maxConcurrentFaults
+                - maxUnavailableMinerBasisPoints
+                - maxUnavailableSignerBasisPoints
+                type: object
+              stages:
+                items:
+                  description: FaultStageSpec groups actions admitted and coordinated
+                    as one bounded stage.
+                  properties:
+                    completionPolicy:
+                      enum:
+                      - all
+                      type: string
+                    effectAssertions:
+                      items:
+                        description: CampaignAssertion describes one bounded effect
+                          or recovery assertion.
+                        properties:
+                          action:
+                            type: string
+                          actor:
+                            type: string
+                          timeoutSeconds:
+                            format: int32
+                            type: integer
+                          type:
+                            enum:
+                            - PodRestarted
+                            - PodUnavailable
+                            - ContainerRestarted
+                            - TargetReady
+                            - NetworkDegraded
+                            - NetworkRecovered
+                            - DNSDegraded
+                            - DNSRecovered
+                            - IODegraded
+                            - IORecovered
+                            - IOPressureObserved
+                            - IOPressureRecovered
+                            - ClockSkewObserved
+                            - ClockSkewCleared
+                            - BurnchainReorgProven
+                            - BurnchainPolicyRestored
+                            - SignerBehaviorObserved
+                            - SignerBehaviorWindowClosed
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      type: array
+                    faults:
+                      items:
+                        description: FaultActionSpec defines one fault action within
+                          a stage.
+                        properties:
+                          effectAssertions:
+                            items:
+                              description: CampaignAssertion describes one bounded
+                                effect or recovery assertion.
+                              properties:
+                                action:
+                                  type: string
+                                actor:
+                                  type: string
+                                timeoutSeconds:
+                                  format: int32
+                                  type: integer
+                                type:
+                                  enum:
+                                  - PodRestarted
+                                  - PodUnavailable
+                                  - ContainerRestarted
+                                  - TargetReady
+                                  - NetworkDegraded
+                                  - NetworkRecovered
+                                  - DNSDegraded
+                                  - DNSRecovered
+                                  - IODegraded
+                                  - IORecovered
+                                  - IOPressureObserved
+                                  - IOPressureRecovered
+                                  - ClockSkewObserved
+                                  - ClockSkewCleared
+                                  - BurnchainReorgProven
+                                  - BurnchainPolicyRestored
+                                  - SignerBehaviorObserved
+                                  - SignerBehaviorWindowClosed
+                                  type: string
+                              required:
+                              - type
+                              type: object
+                            type: array
+                          fault:
+                            description: FaultSpec defines one finite mechanism and
+                              its bounded parameters.
+                            properties:
+                              action:
+                                enum:
+                                - pod-kill
+                                - pod-failure
+                                - container-kill
+                                - netem
+                                - delay
+                                - loss
+                                - duplicate
+                                - corrupt
+                                - partition
+                                - bandwidth
+                                - error
+                                - random
+                                - latency
+                                - fault
+                                - mistake
+                                - attrOverride
+                                - disk-pressure
+                                - withhold
+                                - suppress-peer-responses
+                                type: string
+                              burnchainReorg:
+                                description: |-
+                                  BurnchainReorg declares the bounded semantic operation. Raw Bitcoin RPC
+                                  methods are intentionally not part of the campaign API.
+                                properties:
+                                  depth:
+                                    format: int32
+                                    maximum: 144
+                                    minimum: 1
+                                    type: integer
+                                  destinationIndex:
+                                    format: int32
+                                    maximum: 63
+                                    minimum: 0
+                                    type: integer
+                                  replacementBlocks:
+                                    description: |-
+                                      ReplacementBlocks must exceed Depth so the replacement branch has more
+                                      proof of work after the original invalidity marker is reconsidered.
+                                    format: int32
+                                    maximum: 288
+                                    minimum: 2
+                                    type: integer
+                                  replacementInterval:
+                                    description: ReplacementInterval controls the
+                                      cadence of the replacement branch.
+                                    type: string
+                                required:
+                                - depth
+                                - replacementBlocks
+                                type: object
+                                x-kubernetes-validations:
+                                - message: replacementBlocks must exceed depth
+                                  rule: self.replacementBlocks > self.depth
+                              duration:
+                                type: string
+                              mode:
+                                enum:
+                                - one
+                                - all
+                                - fixed
+                                - fixed-percent
+                                - random-max-percent
+                                type: string
+                              parameters:
+                                x-kubernetes-preserve-unknown-fields: true
+                              signerBehavior:
+                                description: |-
+                                  SignerBehavior binds an observation window to one immutable policy that
+                                  was already admitted with the signer workload by the topology operator.
+                                properties:
+                                  policyDigest:
+                                    pattern: ^sha256:[0-9a-f]{64}$
+                                    type: string
+                                required:
+                                - policyDigest
+                                type: object
+                              type:
+                                enum:
+                                - pod
+                                - network
+                                - dns
+                                - io
+                                - time
+                                - io-pressure
+                                - clock-skew
+                                - burnchain-reorg
+                                - signer-behavior
+                                type: string
+                              value:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                            required:
+                            - duration
+                            - mode
+                            - type
+                            type: object
+                            x-kubernetes-validations:
+                            - message: fault action must be valid for its type
+                              rule: (self.type == 'pod' && self.action in ['pod-kill',
+                                'pod-failure', 'container-kill']) || (self.type ==
+                                'network' && self.action in ['netem', 'delay', 'loss',
+                                'duplicate', 'corrupt', 'partition', 'bandwidth'])
+                                || (self.type == 'dns' && self.action in ['error',
+                                'random']) || (self.type == 'io' && self.action in
+                                ['latency', 'fault', 'mistake', 'attrOverride']) ||
+                                (self.type == 'io-pressure' && self.action == 'disk-pressure')
+                                || (self.type == 'signer-behavior' && self.action
+                                in ['withhold', 'delay', 'suppress-peer-responses'])
+                                || (self.type in ['time', 'clock-skew', 'burnchain-reorg']
+                                && !has(self.action))
+                            - message: fault value is required only for fixed and
+                                percent modes
+                              rule: (self.mode in ['one', 'all'] && !has(self.value))
+                                || (self.mode in ['fixed', 'fixed-percent', 'random-max-percent']
+                                && has(self.value))
+                            - message: burnchainReorg is required only for burnchain-reorg
+                                faults
+                              rule: 'self.type == ''burnchain-reorg'' ? has(self.burnchainReorg)
+                                : !has(self.burnchainReorg)'
+                            - message: signerBehavior is required only for signer-behavior
+                                faults
+                              rule: 'self.type == ''signer-behavior'' ? has(self.signerBehavior)
+                                : !has(self.signerBehavior)'
+                          id:
+                            pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                            type: string
+                          recoveryAssertions:
+                            items:
+                              description: CampaignAssertion describes one bounded
+                                effect or recovery assertion.
+                              properties:
+                                action:
+                                  type: string
+                                actor:
+                                  type: string
+                                timeoutSeconds:
+                                  format: int32
+                                  type: integer
+                                type:
+                                  enum:
+                                  - PodRestarted
+                                  - PodUnavailable
+                                  - ContainerRestarted
+                                  - TargetReady
+                                  - NetworkDegraded
+                                  - NetworkRecovered
+                                  - DNSDegraded
+                                  - DNSRecovered
+                                  - IODegraded
+                                  - IORecovered
+                                  - IOPressureObserved
+                                  - IOPressureRecovered
+                                  - ClockSkewObserved
+                                  - ClockSkewCleared
+                                  - BurnchainReorgProven
+                                  - BurnchainPolicyRestored
+                                  - SignerBehaviorObserved
+                                  - SignerBehaviorWindowClosed
+                                  type: string
+                              required:
+                              - type
+                              type: object
+                            type: array
+                          target:
+                            description: FaultTarget selects enrolled actors by exact
+                              name or bounded role.
+                            properties:
+                              actors:
+                                items:
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                                maxItems: 64
+                                type: array
+                              mode:
+                                enum:
+                                - one
+                                - all
+                                - fixed
+                                - fixed-percent
+                                - random-max-percent
+                                type: string
+                              roles:
+                                items:
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                                maxItems: 16
+                                type: array
+                              value:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                            type: object
+                            x-kubernetes-validations:
+                            - message: target requires actors or roles
+                              rule: (has(self.actors) && self.actors.size() > 0) ||
+                                (has(self.roles) && self.roles.size() > 0)
+                        required:
+                        - fault
+                        - id
+                        - target
+                        type: object
+                        x-kubernetes-validations:
+                        - message: burnchain-reorg must target exactly one named Bitcoin
+                            actor with mode one and no value
+                          rule: self.fault.type != 'burnchain-reorg' || (has(self.target.actors)
+                            && self.target.actors.size() == 1 && (!has(self.target.roles)
+                            || self.target.roles.size() == 0) && self.target.mode
+                            == 'one' && !has(self.target.value))
+                        - message: signer-behavior must target exactly one named signer
+                            with mode all and no value
+                          rule: self.fault.type != 'signer-behavior' || (has(self.target.actors)
+                            && self.target.actors.size() == 1 && (!has(self.target.roles)
+                            || self.target.roles.size() == 0) && self.target.mode
+                            == 'all' && !has(self.target.value))
+                      maxItems: 32
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - id
+                      x-kubernetes-list-type: map
+                    id:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                    maxStartSkew:
+                      type: string
+                    recoveryAssertions:
+                      items:
+                        description: CampaignAssertion describes one bounded effect
+                          or recovery assertion.
+                        properties:
+                          action:
+                            type: string
+                          actor:
+                            type: string
+                          timeoutSeconds:
+                            format: int32
+                            type: integer
+                          type:
+                            enum:
+                            - PodRestarted
+                            - PodUnavailable
+                            - ContainerRestarted
+                            - TargetReady
+                            - NetworkDegraded
+                            - NetworkRecovered
+                            - DNSDegraded
+                            - DNSRecovered
+                            - IODegraded
+                            - IORecovered
+                            - IOPressureObserved
+                            - IOPressureRecovered
+                            - ClockSkewObserved
+                            - ClockSkewCleared
+                            - BurnchainReorgProven
+                            - BurnchainPolicyRestored
+                            - SignerBehaviorObserved
+                            - SignerBehaviorWindowClosed
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      type: array
+                    trigger:
+                      description: StageTriggerSpec defines the trusted condition
+                        that makes a stage eligible.
+                      properties:
+                        afterCampaignStart:
+                          type: string
+                        afterStage:
+                          description: StageDependency waits for a prior stage to
+                            reach a named durable state.
+                          properties:
+                            delay:
+                              type: string
+                            stage:
+                              type: string
+                            state:
+                              enum:
+                              - Injected
+                              - Effective
+                              - Recovered
+                              - Terminal
+                              type: string
+                          required:
+                          - stage
+                          - state
+                          type: object
+                        burnHeight:
+                          format: int64
+                          type: integer
+                        observation:
+                          description: ObservationTriggerSpec waits for one bounded
+                            trusted observation.
+                          properties:
+                            actor:
+                              type: string
+                            expected:
+                              type: string
+                            timeoutSeconds:
+                              format: int32
+                              type: integer
+                            type:
+                              type: string
+                          required:
+                          - timeoutSeconds
+                          - type
+                          type: object
+                        stacksHeight:
+                          format: int64
+                          type: integer
+                      type: object
+                      x-kubernetes-validations:
+                      - message: at most one stage trigger may be set
+                        rule: '(has(self.afterCampaignStart) ? 1 : 0) + (has(self.afterStage)
+                          ? 1 : 0) + (has(self.burnHeight) ? 1 : 0) + (has(self.stacksHeight)
+                          ? 1 : 0) + (has(self.observation) ? 1 : 0) <= 1'
+                  required:
+                  - faults
+                  - id
+                  type: object
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - id
+                x-kubernetes-list-type: map
+              template:
+                type: boolean
+            required:
+            - safety
+            - stages
+            type: object
+            x-kubernetes-validations:
+            - message: executable campaigns require networkRef
+              rule: (has(self.template) && self.template) || (has(self.networkRef)
+                && self.networkRef.size() > 0)
+            - message: burnchain faults require safety.allowBurnchain=true
+              rule: self.safety.allowBurnchain || !self.stages.exists(stage, stage.faults.exists(fault,
+                fault.fault.type == 'burnchain-reorg' || (has(fault.target.roles)
+                && fault.target.roles.exists(role, role == 'burnchain'))))
+          status:
+            description: FaultCampaignStatus is the durable campaign state machine
+              and evidence record.
+            properties:
+              activeStageIds:
+                items:
+                  type: string
+                type: array
+              admission:
+                description: CampaignAdmission records the immutable topology and
+                  complete compiled plan.
+                properties:
+                  admittedAt:
+                    format: date-time
+                    type: string
+                  aggregateImpact:
+                    x-kubernetes-preserve-unknown-fields: true
+                  campaignGeneration:
+                    format: int64
+                    type: integer
+                  campaignSpecDigest:
+                    type: string
+                  compiledPlanDigest:
+                    type: string
+                  networkGeneration:
+                    format: int64
+                    type: integer
+                  networkInventory:
+                    description: NetworkInventory is the complete authoritative actor
+                      inventory bound to a run.
+                    properties:
+                      actors:
+                        items:
+                          description: AdmittedActorIdentity is the immutable runtime
+                            identity admitted for one actor.
+                          properties:
+                            adversarialEgressProfile:
+                              type: string
+                            adversarialPolicyDigest:
+                              type: string
+                            configDigest:
+                              type: string
+                            controllerRevision:
+                              type: string
+                            egressPolicyDigest:
+                              type: string
+                            name:
+                              type: string
+                            podName:
+                              type: string
+                            podUID:
+                              type: string
+                            requestedImage:
+                              type: string
+                            role:
+                              type: string
+                            runtimeImageID:
+                              type: string
+                            serviceName:
+                              type: string
+                            statefulSetName:
+                              type: string
+                            statefulSetUID:
+                              type: string
+                          required:
+                          - controllerRevision
+                          - name
+                          - podName
+                          - podUID
+                          - requestedImage
+                          - role
+                          - runtimeImageID
+                          - serviceName
+                          - statefulSetName
+                          - statefulSetUID
+                          type: object
+                        type: array
+                      burnchainTopology:
+                        description: |-
+                          AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+                          follower binding admitted for one observed StacksNetwork generation.
+                        properties:
+                          bindings:
+                            items:
+                              description: |-
+                                BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+                                process. Signer processes themselves do not consume Bitcoin RPC.
+                              properties:
+                                actor:
+                                  type: string
+                                bitcoinNodeRef:
+                                  type: string
+                              required:
+                              - actor
+                              - bitcoinNodeRef
+                              type: object
+                            type: array
+                          digest:
+                            type: string
+                          nodes:
+                            items:
+                              description: |-
+                                AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+                                peer and cadence-policy bindings.
+                              properties:
+                                name:
+                                  type: string
+                                p2pPort:
+                                  format: int32
+                                  type: integer
+                                peerRefs:
+                                  items:
+                                    type: string
+                                  type: array
+                                policyRef:
+                                  type: string
+                                policyServiceName:
+                                  type: string
+                                policyUID:
+                                  type: string
+                                rpcPort:
+                                  format: int32
+                                  type: integer
+                                serviceName:
+                                  type: string
+                              required:
+                              - name
+                              - p2pPort
+                              - policyRef
+                              - policyServiceName
+                              - policyUID
+                              - rpcPort
+                              - serviceName
+                              type: object
+                            type: array
+                          observedAt:
+                            format: date-time
+                            type: string
+                          observedGeneration:
+                            format: int64
+                            type: integer
+                          schemaVersion:
+                            type: string
+                        required:
+                        - digest
+                        - nodes
+                        - observedGeneration
+                        - schemaVersion
+                        type: object
+                      digest:
+                        type: string
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        type: integer
+                      resourceVersion:
+                        type: string
+                    required:
+                    - actors
+                    - digest
+                    - observedGeneration
+                    type: object
+                  networkUid:
+                    type: string
+                  signerSetDigest:
+                    type: string
+                  signerSetObservedFrom:
+                    type: string
+                  signerSetRewardCycle:
+                    format: int64
+                    type: integer
+                  signerSetTotalWeight:
+                    format: int64
+                    type: integer
+                  signerWeightsByActor:
+                    additionalProperties:
+                      format: int64
+                      type: integer
+                    description: |-
+                      SignerWeightsByActor retains the canonical admission weights needed to
+                      finish recovery when a later reward-set observation is unavailable.
+                    type: object
+                required:
+                - admittedAt
+                - campaignGeneration
+                - campaignSpecDigest
+                - compiledPlanDigest
+                - networkGeneration
+                - networkInventory
+                - networkUid
+                type: object
+              cleanup:
+                description: CleanupEvidence records independently observed cleanup
+                  state.
+                properties:
+                  absent:
+                    type: boolean
+                  allRecovered:
+                    type: boolean
+                  method:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                  zeroInjectionProven:
+                    type: boolean
+                required:
+                - absent
+                - allRecovered
+                - observedAt
+                type: object
+              completedAt:
+                format: date-time
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              evidenceDigest:
+                type: string
+              evidenceURI:
+                type: string
+              identityDivergence:
+                description: IdentityDivergence records an immutable identity mismatch
+                  without retargeting.
+                properties:
+                  currentDigest:
+                    type: string
+                  differences:
+                    items:
+                      description: IdentityDifference describes one bounded inventory
+                        mismatch.
+                      properties:
+                        current:
+                          type: string
+                        expected:
+                          type: string
+                        field:
+                          type: string
+                        message:
+                          type: string
+                        scope:
+                          type: string
+                      required:
+                      - field
+                      type: object
+                    type: array
+                  expectedDigest:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                required:
+                - observedAt
+                type: object
+              lastTransitionTime:
+                format: date-time
+                type: string
+              message:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+              probeArtifacts:
+                additionalProperties:
+                  type: string
+                type: object
+              reason:
+                type: string
+              stages:
+                items:
+                  description: FaultStageStatus records one stage's trigger, injection,
+                    and cleanup state.
+                  properties:
+                    actions:
+                      items:
+                        description: FaultActionStatus records one action's independently
+                          observed lifecycle.
+                        properties:
+                          actualInjection:
+                            x-kubernetes-preserve-unknown-fields: true
+                          capabilityEvidence:
+                            items:
+                              x-kubernetes-preserve-unknown-fields: true
+                            type: array
+                          effectResults:
+                            items:
+                              x-kubernetes-preserve-unknown-fields: true
+                            type: array
+                          id:
+                            type: string
+                          mutation:
+                            description: ChaosReference identifies one exact controller-owned
+                              mutation object.
+                            properties:
+                              actionId:
+                                type: string
+                              createdAt:
+                                format: date-time
+                                type: string
+                              injectedAt:
+                                format: date-time
+                                type: string
+                              kind:
+                                type: string
+                              mechanism:
+                                type: string
+                              name:
+                                type: string
+                              recoveryContract:
+                                description: |-
+                                  RecoveryContract binds cleanup to the exact shared policy state that
+                                  existed before mutation.
+                                x-kubernetes-preserve-unknown-fields: true
+                              resourceDigest:
+                                type: string
+                              uid:
+                                type: string
+                            required:
+                            - actionId
+                            - kind
+                            - name
+                            type: object
+                          phase:
+                            type: string
+                          reason:
+                            type: string
+                          recoveryResults:
+                            items:
+                              x-kubernetes-preserve-unknown-fields: true
+                            type: array
+                          resolvedTargets:
+                            items:
+                              description: ResolvedTarget pins one selected actor
+                                to its immutable Pod identity.
+                              properties:
+                                actor:
+                                  type: string
+                                node:
+                                  type: string
+                                pod:
+                                  type: string
+                                podIP:
+                                  type: string
+                                podUid:
+                                  type: string
+                                requestedImage:
+                                  type: string
+                                resolvedImageId:
+                                  type: string
+                                restartCount:
+                                  format: int32
+                                  type: integer
+                                role:
+                                  type: string
+                              required:
+                              - actor
+                              - node
+                              - pod
+                              - podIP
+                              - podUid
+                              - requestedImage
+                              - resolvedImageId
+                              - restartCount
+                              - role
+                              type: object
+                            type: array
+                        required:
+                        - id
+                        type: object
+                      type: array
+                    completedAt:
+                      format: date-time
+                      type: string
+                    effectResults:
+                      items:
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                    eligibleAt:
+                      format: date-time
+                      type: string
+                    id:
+                      type: string
+                    observedStartSkew:
+                      type: string
+                    phase:
+                      type: string
+                    reason:
+                      type: string
+                    recoveryResults:
+                      items:
+                        x-kubernetes-preserve-unknown-fields: true
+                      type: array
+                    startedAt:
+                      format: date-time
+                      type: string
+                    triggerReceipt:
+                      x-kubernetes-preserve-unknown-fields: true
+                  required:
+                  - id
+                  type: object
+                type: array
+              templateDigest:
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

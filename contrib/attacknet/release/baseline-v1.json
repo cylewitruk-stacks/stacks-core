@@ -1,0 +1,300 @@
+{
+  "schemaVersion": "stacks-attacknet-release-baseline/v1",
+  "acceptedAt": "2026-08-16T12:00:00.000Z",
+  "acceptedExecution": {
+    "sourceRevision": "ffb82cc33505cf17602b32e6b4dcfd7f1b24e686",
+    "dirtyPatchDigest": "sha256:52f0bee9bdc98c8db766c07f4e2bce20c66a55c1e5916bea9d45430bdae80f15",
+    "topology": {
+      "backend": "kubernetes-kind",
+      "architecture": "arm64",
+      "controlPlanes": 1,
+      "workers": 2,
+      "protocolActors": 28,
+      "workloads": 31,
+      "miners": 3,
+      "signers": 10,
+      "companions": 10,
+      "followers": 5,
+      "manifestDigest": "sha256:46dc6b55520b3b6eea2644b2de047ae9c3ccc3db63972eec59c24e94170b9ac8"
+    },
+    "observedProgress": {
+      "burnHeight": {"start": 503, "end": 803, "delta": 300},
+      "stacksHeight": {"start": 302, "end": 597, "delta": 295}
+    }
+  },
+  "offlineVerification": {
+    "sourceRevision": "e1515979a2dbce6e9de0d842b249d229901a0cc8",
+    "recordedAt": "2026-08-18T11:08:00.000Z",
+    "command": "contrib/attacknet/check.sh",
+    "suites": [
+      {"name": "attacknet-node", "tests": 196, "passed": 196, "failed": 0},
+      {"name": "observability-node", "tests": 40, "passed": 40, "failed": 0},
+      {"name": "release-node", "tests": 9, "passed": 9, "failed": 0},
+      {"name": "event-bridge-python", "tests": 10, "passed": 10, "failed": 0},
+      {"name": "offline-operator-workloads", "tests": 31, "passed": 31, "failed": 0}
+    ]
+  },
+  "evidence": [
+    {
+      "id": "measured-300-burn-soak",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "deterministic-fault-run",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "mixed-current-release-modified",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "worker-outage",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "application-clock",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "local-path-pvc-recovery",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "signer-partition-negative-control",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "fresh-network-ddmin",
+      "path": "contrib/attacknet/evidence-packets/release-1-foundation/gate-result.json",
+      "digest": "sha256:4d6fd09f57e625676ff2af27b2e1686daa41c6e01cc1d0c9ed866509fae49146",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a8-trusted-observations",
+      "path": "contrib/attacknet/evidence-packets/release-1-a8/gate-result.json",
+      "digest": "sha256:9c0387afa5b4152f716b231a49bfae55af53d12bc518a9f007b939d10f303b2b",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a9-bounded-bitcoin-reorganizations",
+      "path": "contrib/attacknet/evidence-packets/release-1-a9/gate-result.json",
+      "digest": "sha256:a1f4794d4a1612e984ee2aa5d3ca819a4d4cdbc1afcd07d4014c989a58330040",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a10-multi-bitcoin-split-views",
+      "path": "contrib/attacknet/evidence-packets/release-1-a10/gate-result.json",
+      "digest": "sha256:a2e31bee5ea086d9552f0ea7d50ca74600bff6e7c16876db2d8e3047855986ee",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a11-mixed-version-upgrades",
+      "path": "contrib/attacknet/evidence-packets/release-1-a11/gate-result.json",
+      "digest": "sha256:fbae9eb6a8393fe4a766830b6f08d55c99ea3a085194d764eed995b314449f70",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a12-deterministic-adversarial-actors",
+      "path": "contrib/attacknet/evidence-packets/release-1-a12/gate-result.json",
+      "digest": "sha256:becaee92c7115d436acc9c669cae161138e2ccc54ed186886c01f0ff5f415e15",
+      "status": "passed"
+    },
+    {
+      "id": "release-1-a13-seeded-fuzzing-corpus-reduction",
+      "path": "contrib/attacknet/evidence-packets/release-1-a13/gate-result.json",
+      "digest": "sha256:c855723b3e4467adb4cbbbea2d140d61af365ca87290cce489b7d990ece481e9",
+      "status": "passed"
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "local-kind-arm64-full-topology",
+      "status": "supported",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "measured-300-new-burn-block-soak",
+      "status": "supported",
+      "evidence": ["measured-300-burn-soak", "deterministic-fault-run"]
+    },
+    {
+      "id": "mixed-current-release-modified-actors",
+      "status": "supported",
+      "evidence": ["mixed-current-release-modified"]
+    },
+    {
+      "id": "pod-network-dns-and-controller-owned-io-faults",
+      "status": "supported",
+      "evidence": ["deterministic-fault-run", "signer-partition-negative-control"]
+    },
+    {
+      "id": "application-realtime-skew",
+      "status": "supported",
+      "evidence": ["application-clock"]
+    },
+    {
+      "id": "local-path-same-node-recovery-and-stranding",
+      "status": "supported",
+      "evidence": ["local-path-pvc-recovery", "worker-outage"]
+    },
+    {
+      "id": "fresh-network-replay-and-removal-only-ddmin",
+      "status": "supported",
+      "evidence": ["fresh-network-ddmin", "release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "identity-bound-protocol-observations-and-fail-closed-assertions",
+      "status": "supported",
+      "evidence": ["release-1-a8-trusted-observations"]
+    },
+    {
+      "id": "native-chaos-mesh-iochaos-arm64",
+      "status": "capability-rejected",
+      "reason": "Chaos Mesh 2.8.3 ships an x86-only toda helper; use controller-owned io-pressure.",
+      "evidence": ["deterministic-fault-run"]
+    },
+    {
+      "id": "native-chaos-mesh-timechaos-arm64",
+      "status": "capability-rejected",
+      "reason": "The installed helper did not produce truthful, fail-safe effect evidence; use application realtime skew.",
+      "evidence": ["application-clock"]
+    },
+    {
+      "id": "native-chaos-mesh-stresschaos-arm64",
+      "status": "capability-rejected",
+      "reason": "Chaos Mesh 2.8.3 StressChaos did not preserve the admitted custom stress-ng contract on this platform; Release 1 must use the bounded controller-owned I/O-pressure helper and must not advertise native StressChaos disk pressure.",
+      "evidence": ["deterministic-fault-run"]
+    },
+    {
+      "id": "cold-start-storage-reservation",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "image-filesystem-reservation",
+      "status": "not-done",
+      "reason": "A13 admission-gates and rechecks image-filesystem headroom before each attempt, but does not reserve those bytes; a concurrent or large image pull can still exhaust the image filesystem.",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "actor-egress-network-policy",
+      "status": "supported",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
+    },
+    {
+      "id": "cryptographically-attested-active-probes",
+      "status": "not-done",
+      "reason": "A12 signs independent adversarial-signer observer reports, but generic same-Pod network, DNS, I/O, and clock probe payloads are not cryptographically attested.",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
+    },
+    {
+      "id": "teardown-centralized-log-corpus-export",
+      "status": "supported",
+      "evidence": ["release-1-a8-trusted-observations"]
+    },
+    {
+      "id": "bounded-bitcoin-regtest-reorganization-and-flash-campaigns",
+      "status": "supported",
+      "evidence": ["release-1-a9-bounded-bitcoin-reorganizations"]
+    },
+    {
+      "id": "matching-kubernetes-client-packaging",
+      "status": "not-done",
+      "reason": "Release 1 diagnoses Kubernetes client/server compatibility but does not package a version-matched kubectl binary; the local operator supplies the client toolchain.",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "portable-csi-cross-node-reattachment",
+      "status": "deferred",
+      "reason": "The local kind profile has node-local storage only.",
+      "unavailableDependency": "A portable CSI implementation and multi-node storage environment are unavailable in the local kind profile.",
+      "affectedRequirement": "Cross-node persistent-volume reattachment and multi-zone recovery qualification.",
+      "currentCapability": "Local-path same-node recovery and explicit node-stranding behavior are proven.",
+      "risk": "Release 1 does not establish recovery semantics for portable or zonal storage.",
+      "reopenCondition": "A supported portable CSI and multi-node or multi-zone test cluster are available.",
+      "evidence": ["local-path-pvc-recovery"]
+    },
+    {
+      "id": "managed-cluster-x86-and-multi-zone-qualification",
+      "status": "deferred",
+      "reason": "External cluster, architecture, registry, and CSI dependencies are outside Release 1.",
+      "unavailableDependency": "No managed x86-64 multi-zone cluster is available to this Release 1 qualification.",
+      "affectedRequirement": "Managed-cluster admission, autoscaler, maintenance, native x86 Chaos helpers, and multi-zone behavior.",
+      "currentCapability": "A three-node arm64 Docker Desktop kind cluster is qualified.",
+      "risk": "Managed-cluster and x86-specific behavior may differ from the local evidence.",
+      "reopenCondition": "Managed x86-64 workers with the target storage and cluster policies are available.",
+      "evidence": ["worker-outage"]
+    },
+    {
+      "id": "multi-bitcoin-follower-split-view-campaigns",
+      "status": "supported",
+      "evidence": ["release-1-a10-multi-bitcoin-split-views"]
+    },
+    {
+      "id": "immutable-mixed-version-source-configuration-and-assignment-matrices",
+      "status": "supported",
+      "evidence": ["release-1-a11-mixed-version-upgrades"]
+    },
+    {
+      "id": "topology-owned-boundary-aware-upgrade-campaigns",
+      "status": "supported",
+      "evidence": ["release-1-a11-mixed-version-upgrades"]
+    },
+    {
+      "id": "bounded-deterministic-adversarial-signer-behaviors",
+      "status": "supported",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
+    },
+    {
+      "id": "cryptographically-attributed-adversarial-signer-observations",
+      "status": "supported",
+      "evidence": ["release-1-a12-deterministic-adversarial-actors"]
+    },
+    {
+      "id": "finite-seeded-fuzz-session-planning-and-resume",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "content-addressed-failure-corpus-confirmation-and-replay",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "deterministic-hierarchical-removal-only-reduction",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "controller-ha-leader-election",
+      "status": "not-done",
+      "reason": "Release 1 deliberately runs singleton controllers; HA is future implementation work, not an unavailable external dependency.",
+      "evidence": ["measured-300-burn-soak"]
+    },
+    {
+      "id": "enterprise-registry-and-identity-federation",
+      "status": "deferred",
+      "reason": "Enterprise registry federation and organization identity-provider integration require external infrastructure not available for Release 1.",
+      "unavailableDependency": "An enterprise/private registry and organization identity provider are unavailable.",
+      "affectedRequirement": "Enterprise artifact federation and organization-authenticated access qualification.",
+      "currentCapability": "Release 1 supports immutable GHCR digests and exact local revision builds with provenance.",
+      "risk": "Private-registry policy, federation, and enterprise identity integration are unqualified.",
+      "reopenCondition": "A representative private registry and organization identity-provider environment are available.",
+      "evidence": ["mixed-current-release-modified"]
+    }
+  ]
+}

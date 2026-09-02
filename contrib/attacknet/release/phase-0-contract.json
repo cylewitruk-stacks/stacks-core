@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "stacks-attacknet-phase-review-contract/v1",
+  "phase": 0,
+  "releaseScope": "Release 1",
+  "tier": "Reduced",
+  "requiredReviewers": ["Codex", "Claude Opus 5"],
+  "requirements": [
+    "machine-readable-baseline",
+    "truthful-primary-readmes",
+    "digest-bound-dual-review-gate",
+    "immutable-evidence-verification",
+    "clean-offline-verification"
+  ],
+  "requiredInventory": [
+    "source:baseline-validator",
+    "source:review-gate",
+    "source:schema-validator",
+    "source:packet-builder",
+    "source:offline-result",
+    "source:offline-check",
+    "source:contract-schema",
+    "source:packet-schema",
+    "source:verdict-schema",
+    "source:phase-contract",
+    "source:phase-zero-tests",
+    "evidence:baseline-manifest",
+    "document:review-contract",
+    "document:attacknet-readme",
+    "document:hacknet-readme",
+    "document:phase-handoff",
+    "evidence:accepted-soak",
+    "evidence:accepted-fault-run",
+    "evidence:accepted-mixed-version",
+    "evidence:accepted-worker-outage",
+    "evidence:accepted-clock",
+    "evidence:accepted-pvc",
+    "evidence:accepted-negative-control",
+    "evidence:accepted-ddmin",
+    "test:attacknet-offline-check",
+    "analysis:compatibility-and-limitations",
+    "instructions:reproduction"
+  ]
+}

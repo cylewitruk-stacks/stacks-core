@@ -1,0 +1,23 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: BurnchainPolicy
+metadata:
+  name: accepted-28
+spec:
+  networkRef: accepted-28
+  bitcoinNodeRef: bitcoin
+  # Release actors once funding is mature, leaving the pre-epoch interval for
+  # sync, stacking, signer startup, and the first Stacks blocks.
+  bootstrapHeight: 101
+  cadence: 5s
+  destinationSelection: round-robin
+  destinations:
+    - walletName: attacknet-miner-1
+      address: n2PEoV6Abxnrpzoqqq1TJT5kw8G2dMPpBd
+    - walletName: attacknet-miner-2
+      address: n3BxbFxkvGbF9ANka8TXuihwKZBd9xaJVg
+    - walletName: attacknet-miner-3
+      address: mnZXRioUVq35tsCRk1DSoYUhwWaTGSz7a8
+  rpc:
+    timeout: 5s
+    minimumBackoff: 1s
+    maximumBackoff: 5s

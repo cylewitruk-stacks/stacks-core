@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "stacks-attacknet-phase-review-contract/v2",
+  "reviewId": "release-1-amendment-a6-repository-hygiene",
+  "phase": 2,
+  "releaseScope": "Release 1 repository-hygiene amendment A6",
+  "tier": "Reduced",
+  "requiredReviewers": [
+    "Codex",
+    "Claude Opus 5"
+  ],
+  "requirements": [
+    "single-signed-commit-directly-on-approved-a5-with-exact-diff",
+    "one-small-public-root-organized-by-stable-product-responsibility",
+    "unsupported-v1alpha1-node-and-shell-runtime-is-frozen-and-not-publicly-dispatched",
+    "canonical-go-cli-controller-and-image-build-paths-remain-functional",
+    "examples-documentation-tests-and-configurations-have-owned-discoverable-locations",
+    "repository-boundary-and-legacy-equivalence-contracts-fail-closed",
+    "clean-operator-attacknet-hacknet-and-helm-offline-verification",
+    "portable-self-identifying-review-evidence"
+  ],
+  "requiredInventory": [
+    "candidate:contrib/attacknet/README.md",
+    "candidate:contrib/attacknet/docs/README.md",
+    "candidate:contrib/attacknet/config/README.md",
+    "candidate:contrib/attacknet/images/README.md",
+    "candidate:contrib/attacknet/test/README.md",
+    "candidate:contrib/attacknet/test/check.sh",
+    "candidate:contrib/attacknet/test/contracts/repository-boundary.test.mjs",
+    "candidate:contrib/attacknet/test/equivalence/fault-compiler-equivalence.test.mjs",
+    "candidate:contrib/attacknet/test/equivalence/topology-render-equivalence.test.mjs",
+    "candidate:contrib/attacknet/legacy/README.md",
+    "candidate:contrib/attacknet/legacy/v1alpha1/manifest.v1.json",
+    "candidate:contrib/attacknet/release/README.md",
+    "candidate:contrib/attacknet/release/amendments/a6/contract.json",
+    "candidate:contrib/attacknet/release/amendments/a6/evidence.mjs",
+    "candidate:contrib/attacknet/release/amendments/a6/packet.mjs",
+    "candidate:contrib/attacknet/release/amendments/a6/verify.mjs",
+    "candidate:contrib/attacknet/release/amendments/a6/a6.test.mjs",
+    "candidate:contrib/attacknet/evidence-packets/release-1-a6/README.md",
+    "candidate:contrib/helm/hacknet/operator/internal/attacknetcli/examples_test.go",
+    "candidate:contrib/helm/hacknet/scripts/build-local.sh",
+    "candidate:contrib/helm/hacknet/scripts/check.sh",
+    "candidate:contrib/helm/hacknet/operator/internal/attacknetcli/local_images.go",
+    "diff:candidate-repository-hygiene",
+    "test:attacknet-check",
+    "test:hacknet-check",
+    "evidence:verification",
+    "evidence:archive-index",
+    "evidence:archive",
+    "evidence:summary"
+  ]
+}

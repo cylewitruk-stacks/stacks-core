@@ -1,0 +1,30 @@
+{
+  "schema": "stacks-attacknet-instrumentation-inventory/v1",
+  "inventoryVersion": "workstream-m/1",
+  "processResetSemantics": "Counters and histograms reset when the exporting process restarts; gauges disappear when the process is not scraped.",
+  "forbiddenLabels": ["block_hash", "transaction_id", "peer_id", "public_key", "address", "url", "error"],
+  "families": [
+    {"id":"M01","family":"stacks_signer_runloop_ready","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M02","family":"stacks_signer_registered_for_current_reward_cycle","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M03","family":"stacks_signer_registered_for_next_reward_cycle","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M04","family":"stacks_signer_state_burn_block_height","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M05","family":"stacks_signer_state_last_changed_timestamp_seconds","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M06","family":"stacks_signer_companion_burn_block_height","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M07","family":"stacks_signer_pending_block_validations","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M08","family":"stacks_signer_global_state_available","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M09","family":"stacks_signer_global_state_total_weight","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M10","family":"stacks_signer_global_state_known_weight","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M11","family":"stacks_signer_global_state_maximum_view_weight","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M12","family":"stacks_signer_global_state_evaluator_threshold_weight","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M13","family":"stacks_signer_global_state_canonical_threshold_weight","type":"gauge","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M1"},
+    {"id":"M14","family":"stacks_signer_block_proposals_received","exportedSample":"stacks_signer_block_proposals_received","type":"counter","roles":["signer"],"labels":{},"maxSeriesPerProcess":1,"workstream":"M2","requiredProvenance":"merged","note":"This family predates Workstream M and is not supplied by the carried patch."},
+    {"id":"M15","family":"stacks_signer_policy_evaluations","type":"counter","roles":["signer"],"labels":{"classification":["proceed","verdict_reject","unavailable"],"action":["continue","reject"]},"validTuples":[["proceed","continue"],["verdict_reject","reject"],["unavailable","reject"]],"maxSeriesPerProcess":3,"workstream":"M2"},
+    {"id":"M16","family":"stacks_signer_policy_rejections","type":"counter","roles":["signer"],"labels":{"reason":["validation_failed","connectivity_issues","rejected_in_prior_round","no_sortition_view","sortition_view_mismatch","testing_directive","reorg_not_allowed","invalid_bitvec","pubkey_hash_mismatch","invalid_miner","not_latest_sortition_winner","invalid_parent_block","duplicate_block_found","invalid_tenure_extend","irrecoverable_pubkey_hash","no_signer_consensus","consensus_hash_mismatch","problematic_transactions","unknown","not_rejected"]},"maxSeriesPerProcess":20,"workstream":"M2"},
+    {"id":"M17","family":"stacks_signer_block_validation_lifecycle","type":"counter","roles":["signer"],"labels":{"event":["submitted","accepted","rejected","retried","expired"],"reason":["none","bad_block_hash","bad_transaction","invalid_block","chainstate_error","unknown_parent","non_canonical_tenure","no_such_tenure","invalid_transaction_replay","invalid_parent_block","invalid_timestamp","network_chain_mismatch","not_found_error","problematic_transaction"]},"validTupleRule":"none outside rejected; rejected uses one ValidateRejectCode","maxSeriesPerProcess":17,"workstream":"M2"},
+    {"id":"M18","family":"stacks_signer_block_response_deliveries","type":"counter","roles":["signer"],"labels":{"response_type":["accepted","rejected"],"outcome":["sent","failed"]},"maxSeriesPerProcess":4,"workstream":"M2"},
+    {"id":"M19","family":"stacks_node_signer_coordinator_rounds","type":"counter","roles":["miner"],"labels":{"event":["started","completed"],"outcome":["pending","approved","rejected","timeout","burnchain_tip_changed","stacks_tip_changed","error"]},"validTupleRule":"started/pending or completed/terminal","maxSeriesPerProcess":7,"workstream":"M3"},
+    {"id":"M20","family":"stacks_node_signer_response_weight","type":"counter","roles":["miner"],"labels":{"classification":["approved","rejected_effective","unavailable_classified"]},"maxSeriesPerProcess":3,"workstream":"M3"},
+    {"id":"M21","family":"stacks_node_signer_coordinator_milestone_seconds","type":"histogram","roles":["miner"],"labels":{"milestone":["proposal_to_first_response","proposal_to_threshold"],"outcome":["approved","rejected"]},"maxSeriesPerProcess":4,"workstream":"M3"},
+    {"id":"M22","family":"stacks_node_nakamoto_block_transfers","type":"counter","roles":["miner","companion","follower"],"labels":{"direction":["received","sent"],"source":["p2p_push","tenure_download","rpc_upload","p2p_relay","rpc_serve"],"outcome":["accepted","duplicate","rejected","error","queued","completed","failed"]},"validTupleRule":"received sources use four ingress outcomes; relay uses queued|failed; rpc_serve uses completed","maxSeriesPerProcess":15,"workstream":"M4"}
+  ]
+}

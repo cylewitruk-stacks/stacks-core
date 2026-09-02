@@ -1,0 +1,34 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: a9-reorg-template
+  namespace: hacknet-system
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowBurnchain: true
+    maxBurnchainReorgDepth: 2
+    maxBurnchainReplacementBlocks: 3
+    allowEpochBoundaryCrossing: true
+    allowRewardCycleBoundaryCrossing: true
+  stages:
+    - id: replace-tip
+      faults:
+        - id: replace-two-with-three
+          target: {actors: [bitcoin], mode: one}
+          fault:
+            type: burnchain-reorg
+            mode: one
+            duration: 15s
+            burnchainReorg:
+              depth: 2
+              replacementBlocks: 3
+              replacementInterval: 1s
+              destinationIndex: 0
+          effectAssertions:
+            - {type: BurnchainReorgProven, actor: bitcoin, timeoutSeconds: 120}
+          recoveryAssertions:
+            - {type: BurnchainPolicyRestored, actor: bitcoin, timeoutSeconds: 120}

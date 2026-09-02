@@ -1,0 +1,44 @@
+schemaVersion: stacks-attacknet-version-plan/v1
+matrixId: historical-config-fallback
+platform: linux/arm64
+
+profiles:
+  - name: historical-signer
+    source:
+      kind: prebuilt
+    image: registry.example/stacks-signer@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    expectation: unknown
+
+actors:
+  - {name: signer-1, role: signer}
+
+configurations:
+  - actor: signer-1
+    profile: historical-signer
+    configuration:
+      file: ./private/historical-signer.toml
+      secret: true
+      smokeCommand: [stacks-signer, run, --config, /attacknet/config]
+      source:
+        secretRef:
+          name: historical-signer-config
+          key: signer.toml
+          mountPath: /etc/stacks
+
+assignment:
+  defaultProfile: historical-signer
+
+upgrade:
+  name: historical-signer-rollout
+  networkRef: experiment
+  rollbackOnFailure: true
+  safety:
+    maxParallelActors: 1
+    maxSignerWeightPercent: 40
+    maxMinerPercent: 0
+  stages:
+    - name: signer-1
+      stableFor: 1m
+      deadline: 8m
+      actors:
+        - {actor: signer-1, profile: historical-signer}

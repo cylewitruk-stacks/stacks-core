@@ -1,0 +1,79 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: AttacknetRun
+metadata:
+  name: a8-baseline
+  namespace: hacknet-system
+spec:
+  networkRef: a8-qualification
+  seed: a8-baseline-v1
+  decisionAlgorithm: dependency-trigger-scheduler/v1
+  campaignCatalog:
+    - name: benign
+      campaignRef: a8-benign-delay
+  executions:
+    - id: benign-delay
+      campaign: benign
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 300
+    maxCumulativeFaultSeconds: 30
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 0
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 0
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Stop
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: false
+    allowedTerminalStates: [Inconclusive]
+  baselineAssertions:
+    timeout: 45s
+    assertions:
+      - id: telemetry-complete
+        telemetryCompleteness:
+          actors: [follower-1, follower-2]
+      - id: burnchain-cohort-agrees
+        cohortAgreement:
+          chain: burnchain
+          actors: [follower-1, follower-2]
+          maximumSpread: 1
+      - id: burnchain-progress
+        chainProgress:
+          chain: burnchain
+          actors: [follower-1, follower-2]
+          window: 25s
+          minimumDelta: 1
+  recoveryAssertions:
+    timeout: 45s
+    assertions:
+      - id: telemetry-recovers
+        telemetryCompleteness:
+          actors: [follower-1, follower-2]
+      - id: burnchain-cohort-recovers
+        cohortAgreement:
+          chain: burnchain
+          actors: [follower-1, follower-2]
+          maximumSpread: 1
+      - id: burnchain-progress-recovers
+        chainProgress:
+          chain: burnchain
+          actors: [follower-1, follower-2]
+          window: 25s
+          minimumDelta: 1
+  replay:
+    enabled: false
+    requireSameResolvedImages: true
+    verifyExpectedFailure: true
+  resume:
+    enabled: false
+    requireSameSeed: true
+    requireSameResolvedImages: true
+  minimization:
+    enabled: false
+    strategy: FailurePrefix
+    maxAttempts: 0
+    requireFreshNetwork: true

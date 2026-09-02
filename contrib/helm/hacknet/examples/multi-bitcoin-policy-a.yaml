@@ -1,0 +1,22 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: BurnchainPolicy
+metadata:
+  name: bitcoin-a-policy
+  namespace: hacknet-system
+spec:
+  networkRef: multi-bitcoin
+  bitcoinNodeRef: bitcoin-a
+  bootstrapHeight: 245
+  reserveOutputs: 4
+  cadence: 5s
+  destinationSelection: fixed
+  fixedDestinationIndex: 0
+  destinations:
+    - walletName: attacknet-a
+      address: mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn
+  protocolSchedule:
+    epochs:
+      - {name: epoch-2-0, startHeight: 0}
+      - {name: epoch-3-0, startHeight: 225}
+      - {name: epoch-3-1, startHeight: 227}
+    rewardCycle: {firstHeight: 0, cycleLength: 20, prepareLength: 5}

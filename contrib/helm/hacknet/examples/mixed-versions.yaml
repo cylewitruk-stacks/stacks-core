@@ -1,0 +1,61 @@
+# Create the referenced complete-config Secrets and a BurnchainPolicy named
+# mixed-versions before expecting this network to become Ready.
+apiVersion: testing.stacks.org/v1beta1
+kind: StacksNetwork
+metadata:
+  name: mixed-versions
+spec:
+  defaults:
+    nodeImage: stacks-core-attacknet:main
+    signerImage: stacks-core-attacknet:main
+    bitcoinImage: bitcoin/bitcoin:25.2
+    dependencyImage: busybox:1.36.1
+    imagePullPolicy: IfNotPresent
+    workload:
+      storage: {enabled: true, size: 5Gi}
+  telemetry:
+    enabled: true
+    exporterEndpoint: http://telemetry-federation:4318
+    tokenSecretRef: {name: hacknet-federation-token, key: token}
+  burnchain:
+    policyRef: {name: mixed-versions}
+    nodes:
+      - name: bitcoin
+        config: {generated: {profile: bitcoin-regtest/v1}}
+  nodes:
+    - name: miner-current
+      role: miner
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: miner-current-config, key: config.toml}}
+    - name: miner-previous
+      role: miner
+      image: stacks-core-4.0.2:local
+      burnchainNodeRef: bitcoin
+      config: {secretRef: {name: miner-previous-config, key: config.toml}}
+  signerSets:
+    - name: mixed
+      members:
+        - name: signer-current
+          nodeName: signer-node-current
+          index: 1
+          weight: 7
+          burnchainNodeRef: bitcoin
+          signerConfig: {secretRef: {name: signer-current-config, key: signer.toml}}
+          nodeConfig: {secretRef: {name: signer-node-current-config, key: config.toml}}
+        - name: signer-previous
+          nodeName: signer-node-previous
+          index: 2
+          weight: 3
+          burnchainNodeRef: bitcoin
+          signerImage: stacks-core-4.0.2:local
+          nodeImage: stacks-core-4.0.2:local
+          signerConfig: {secretRef: {name: signer-previous-config, key: signer.toml}}
+          nodeConfig: {secretRef: {name: signer-node-previous-config, key: config.toml}}
+  rawActors:
+    - name: adversary-1
+      role: adversary
+      image: stacks-core-adversary:double-proposal
+      config: {secretRef: {name: adversary-1-config, key: config.toml}}
+      advanced:
+        labels:
+          testing.stacks.org/behavior: double-proposal

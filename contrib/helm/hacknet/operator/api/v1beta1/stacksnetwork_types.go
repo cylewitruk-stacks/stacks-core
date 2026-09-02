@@ -1,0 +1,517 @@
+package v1beta1
+
+import (
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// StacksNetwork declares one disposable Stacks network as a domain topology.
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+type StacksNetwork struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   StacksNetworkSpec   `json:"spec"`
+	Status StacksNetworkStatus `json:"status,omitempty"`
+}
+
+// StacksNetworkList contains StacksNetwork objects.
+// +kubebuilder:object:root=true
+type StacksNetworkList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []StacksNetwork `json:"items"`
+}
+
+// StacksNetworkSpec defines the burnchain, Stacks nodes, and signer sets.
+type StacksNetworkSpec struct {
+	Suspended bool                  `json:"suspended,omitempty"`
+	Defaults  NetworkDefaults       `json:"defaults,omitempty"`
+	Genesis   *StacksGenesisSpec    `json:"genesis,omitempty"`
+	Burnchain BurnchainTopologySpec `json:"burnchain"`
+	// +kubebuilder:validation:MaxItems=100
+	Nodes []StacksNodeSpec `json:"nodes,omitempty"`
+	// +kubebuilder:validation:MaxItems=32
+	SignerSets []SignerSetSpec       `json:"signerSets,omitempty"`
+	Enrollment *SignerEnrollmentSpec `json:"enrollment,omitempty"`
+	// +kubebuilder:validation:MaxItems=100
+	RawActors       []RawActorSpec   `json:"rawActors,omitempty"`
+	Telemetry       *TelemetrySpec   `json:"telemetry,omitempty"`
+	Probe           *ProbeSpec       `json:"probe,omitempty"`
+	SuspensionGrace *metav1.Duration `json:"suspensionGrace,omitempty"`
+}
+
+// StacksGenesisSpec defines network-wide genesis values which every generated
+// Stacks node profile must render identically.
+type StacksGenesisSpec struct {
+	PoX5 *PoX5GenesisSpec `json:"pox5,omitempty"`
+	// +kubebuilder:validation:MaxItems=1000
+	// +listType=map
+	// +listMapKey=address
+	Balances []GenesisBalanceSpec `json:"balances,omitempty"`
+}
+
+// PoX5GenesisSpec identifies the sBTC contracts activated by PoX-5.
+type PoX5GenesisSpec struct {
+	SbtcContract         string `json:"sbtcContract"`
+	SbtcRegistryContract string `json:"sbtcRegistryContract"`
+}
+
+// GenesisBalanceSpec assigns one account's initial micro-STX balance.
+type GenesisBalanceSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	Address string `json:"address"`
+	// +kubebuilder:validation:Minimum=1
+	Amount int64 `json:"amount"`
+}
+
+// SignerEnrollmentSpec declares the one-shot client that enrolls signer keys
+// and renews their stacking commitments for the disposable network.
+type SignerEnrollmentSpec struct {
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name    string `json:"name"`
+	Image   string `json:"image"`
+	NodeRef string `json:"nodeRef"`
+	// CredentialsSecretRef supplies STACKING_KEYS and STACKING_ADDRESSES from
+	// separate keys without granting the topology operator Secret read access.
+	CredentialsSecretRef SignerEnrollmentSecretRef `json:"credentialsSecretRef"`
+	// +kubebuilder:validation:Minimum=1
+	StackingCycles int32 `json:"stackingCycles,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	PoX5StackingCycles int32 `json:"pox5StackingCycles,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	PoX5RenewalWindowCycles int32 `json:"pox5RenewalWindowCycles,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	IntervalSeconds int32                     `json:"intervalSeconds,omitempty"`
+	Workload        *WorkloadPolicy           `json:"workload,omitempty"`
+	Advanced        *AdvancedWorkloadOverride `json:"advanced,omitempty"`
+}
+
+// SignerEnrollmentSecretRef identifies the two credential lists used by the
+// enrollment client.
+type SignerEnrollmentSecretRef struct {
+	Name         string `json:"name"`
+	KeysKey      string `json:"keysKey"`
+	AddressesKey string `json:"addressesKey"`
+}
+
+// NetworkDefaults contains shared images and workload defaults.
+type NetworkDefaults struct {
+	NodeImage        string                        `json:"nodeImage"`
+	SignerImage      string                        `json:"signerImage"`
+	BitcoinImage     string                        `json:"bitcoinImage"`
+	DependencyImage  string                        `json:"dependencyImage,omitempty"`
+	ImagePullPolicy  corev1.PullPolicy             `json:"imagePullPolicy,omitempty"`
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+	// BootstrapPeers supplies the default legacy P2P bootstrap inventory for
+	// generated Stacks node profiles. A profile-local list overrides it.
+	// +kubebuilder:validation:MaxItems=64
+	BootstrapPeers []string       `json:"bootstrapPeers,omitempty"`
+	Workload       WorkloadPolicy `json:"workload,omitempty"`
+}
+
+// NamedObjectReference identifies one same-namespace Attacknet resource.
+type NamedObjectReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name string `json:"name"`
+}
+
+// BurnchainTopologySpec declares Bitcoin nodes and the cadence policy they use.
+// +kubebuilder:validation:XValidation:rule="self.nodes.all(node, !has(node.peerRefs) || node.peerRefs.all(peer, peer != node.name && self.nodes.exists(candidate, candidate.name == peer)))",message="Bitcoin peerRefs must identify other declared Bitcoin nodes"
+// +kubebuilder:validation:XValidation:rule="self.nodes.all(node, self.nodes.filter(candidate, (has(candidate.policyRef) ? candidate.policyRef.name : self.policyRef.name) == (has(node.policyRef) ? node.policyRef.name : self.policyRef.name)).size() == 1)",message="each Bitcoin node must resolve to a distinct BurnchainPolicy"
+type BurnchainTopologySpec struct {
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	// +listType=map
+	// +listMapKey=name
+	Nodes     []BitcoinNodeSpec    `json:"nodes"`
+	PolicyRef NamedObjectReference `json:"policyRef"`
+}
+
+// BitcoinNodeSpec declares one independently persisted Bitcoin regtest node.
+type BitcoinNodeSpec struct {
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name   string       `json:"name"`
+	Image  string       `json:"image,omitempty"`
+	Config ConfigSource `json:"config"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	RPCPort int32 `json:"rpcPort,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	P2PPort int32 `json:"p2pPort,omitempty"`
+	// PeerRefs is the directed persistent Bitcoin P2P graph. References are
+	// rendered as addnode connections and are not startup dependencies.
+	// +kubebuilder:validation:MaxItems=31
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	// +listType=set
+	PeerRefs []string `json:"peerRefs,omitempty"`
+	// PolicyRef selects this node's independent cadence policy. An omitted
+	// value uses spec.burnchain.policyRef for backward-compatible single-node
+	// topologies.
+	PolicyRef *NamedObjectReference     `json:"policyRef,omitempty"`
+	Workload  *WorkloadPolicy           `json:"workload,omitempty"`
+	Advanced  *AdvancedWorkloadOverride `json:"advanced,omitempty"`
+	Suspended bool                      `json:"suspended,omitempty"`
+}
+
+// StacksNodeRole is the protocol role of a Stacks node process.
+// +kubebuilder:validation:Enum=miner;follower;adversary
+type StacksNodeRole string
+
+const (
+	// StacksNodeMiner produces Stacks blocks.
+	StacksNodeMiner StacksNodeRole = "miner"
+	// StacksNodeFollower follows and relays the canonical chain.
+	StacksNodeFollower StacksNodeRole = "follower"
+	// StacksNodeAdversary runs an explicitly modified Stacks node.
+	StacksNodeAdversary StacksNodeRole = "adversary"
+)
+
+// StacksNodeSpec declares one standalone miner, follower, or adversarial node.
+type StacksNodeSpec struct {
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name             string                    `json:"name"`
+	Role             StacksNodeRole            `json:"role"`
+	Image            string                    `json:"image,omitempty"`
+	BurnchainNodeRef string                    `json:"burnchainNodeRef"`
+	Config           ConfigSource              `json:"config"`
+	Workload         *WorkloadPolicy           `json:"workload,omitempty"`
+	Advanced         *AdvancedWorkloadOverride `json:"advanced,omitempty"`
+	Suspended        bool                      `json:"suspended,omitempty"`
+}
+
+// SignerSetSpec declares one signer cohort and its configured Stacks nodes.
+type SignerSetSpec struct {
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=100
+	Members []SignerMemberSpec `json:"members"`
+}
+
+// SignerMemberSpec binds one signer process to one configured Stacks node.
+type SignerMemberSpec struct {
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name string `json:"name"`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	NodeName string `json:"nodeName"`
+	// +kubebuilder:validation:Minimum=1
+	Index int32 `json:"index"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=9007199254740991
+	Weight           int64                     `json:"weight"`
+	PublicKey        string                    `json:"publicKey,omitempty"`
+	BurnchainNodeRef string                    `json:"burnchainNodeRef"`
+	SignerImage      string                    `json:"signerImage,omitempty"`
+	NodeImage        string                    `json:"nodeImage,omitempty"`
+	SignerConfig     ConfigSource              `json:"signerConfig"`
+	NodeConfig       ConfigSource              `json:"nodeConfig"`
+	SignerWorkload   *WorkloadPolicy           `json:"signerWorkload,omitempty"`
+	NodeWorkload     *WorkloadPolicy           `json:"nodeWorkload,omitempty"`
+	SignerAdvanced   *AdvancedWorkloadOverride `json:"signerAdvanced,omitempty"`
+	NodeAdvanced     *AdvancedWorkloadOverride `json:"nodeAdvanced,omitempty"`
+	// Adversarial enables one bounded testing-only signer behavior. The signer
+	// image must be set explicitly and implement the declared profile.
+	Adversarial *AdversarialSignerPolicy `json:"adversarial,omitempty"`
+	Suspended   bool                     `json:"suspended,omitempty"`
+}
+
+// AdversarialSignerPolicy declares one immutable testing-image behavior.
+// +kubebuilder:validation:XValidation:rule="self.behavior != 'delay' || (has(self.delay) && duration(self.delay) >= duration('1ms') && duration(self.delay) <= duration('120s'))",message="delay behavior requires delay within 1ms..120s"
+// +kubebuilder:validation:XValidation:rule="self.behavior == 'delay' || !has(self.delay)",message="delay is valid only for delay behavior"
+// +kubebuilder:validation:XValidation:rule="self.behavior != 'suppress-peer-responses' || (!has(self.selector.minStacksHeight) && !has(self.selector.maxStacksHeight) && !has(self.selector.everyNth))",message="suppress-peer-responses supports only proposalHashPrefix selection"
+// +kubebuilder:validation:XValidation:rule="self.maxMatches <= self.maxEvaluations",message="maxMatches cannot exceed maxEvaluations"
+type AdversarialSignerPolicy struct {
+	// +kubebuilder:validation:Enum=stacks-signer-testing/v1
+	Profile string `json:"profile"`
+	// +kubebuilder:validation:Enum=withhold;delay;suppress-peer-responses
+	Behavior string                      `json:"behavior"`
+	Selector AdversarialProposalSelector `json:"selector,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1024
+	MaxMatches int32 `json:"maxMatches"`
+	// MaxEvaluations bounds retained selector decisions, including non-matches.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65536
+	MaxEvaluations int32            `json:"maxEvaluations"`
+	Delay          *metav1.Duration `json:"delay,omitempty"`
+	// PatchDigest identifies the exact testing-only source patch used to build
+	// the explicitly selected signer image.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	PatchDigest string                  `json:"patchDigest"`
+	Observer    AdversarialObserverSpec `json:"observer"`
+	Egress      AdversarialEgressSpec   `json:"egress"`
+}
+
+// AdversarialProposalSelector deterministically selects protocol messages.
+// Every configured predicate must match.
+// +kubebuilder:validation:XValidation:rule="!has(self.minStacksHeight) || !has(self.maxStacksHeight) || self.minStacksHeight <= self.maxStacksHeight",message="minimum Stacks height cannot exceed maximum"
+// +kubebuilder:validation:XValidation:rule="has(self.everyNth) || !has(self.seedOffset) || self.seedOffset == 0",message="seedOffset requires everyNth"
+// +kubebuilder:validation:XValidation:rule="!has(self.everyNth) || !has(self.seedOffset) || self.seedOffset < self.everyNth",message="seedOffset must be smaller than everyNth"
+type AdversarialProposalSelector struct {
+	// +kubebuilder:validation:Minimum=1
+	MinStacksHeight *int64 `json:"minStacksHeight,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	MaxStacksHeight *int64 `json:"maxStacksHeight,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1024
+	EveryNth *int32 `json:"everyNth,omitempty"`
+	// SeedOffset is reduced modulo everyNth and permits seeded cohorts to use
+	// distinct deterministic ordinals.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1023
+	SeedOffset int32 `json:"seedOffset,omitempty"`
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{2,32}$`
+	ProposalHashPrefix string `json:"proposalHashPrefix,omitempty"`
+}
+
+// AdversarialObserverSpec configures the separate trusted observation actor.
+type AdversarialObserverSpec struct {
+	// Image must identify the bounded Attacknet probe implementation.
+	// +kubebuilder:validation:MinLength=1
+	Image           string                       `json:"image"`
+	ImagePullPolicy corev1.PullPolicy            `json:"imagePullPolicy,omitempty"`
+	Resources       *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// AdversarialEgressSpec controls actor egress independently from behavior.
+// +kubebuilder:validation:XValidation:rule="self.profile == 'unrestricted' ? (has(self.allowUnrestricted) && self.allowUnrestricted) : (!has(self.allowUnrestricted) || !self.allowUnrestricted)",message="unrestricted egress requires allowUnrestricted=true and restricted egress forbids it"
+type AdversarialEgressSpec struct {
+	// +kubebuilder:validation:Enum=restricted;unrestricted
+	Profile string `json:"profile"`
+	// AllowUnrestricted is the conspicuous opt-in required by the unrestricted
+	// profile. It is recorded in admitted identity and release evidence.
+	AllowUnrestricted bool `json:"allowUnrestricted,omitempty"`
+}
+
+// ConfigSource selects one generated profile or complete mounted config object.
+// +kubebuilder:validation:XValidation:rule="(has(self.generated) ? 1 : 0) + (has(self.configMapRef) ? 1 : 0) + (has(self.secretRef) ? 1 : 0) == 1",message="exactly one config source is required"
+type ConfigSource struct {
+	Generated    *GeneratedConfigSpec `json:"generated,omitempty"`
+	ConfigMapRef *ConfigObjectRef     `json:"configMapRef,omitempty"`
+	SecretRef    *ConfigObjectRef     `json:"secretRef,omitempty"`
+	// ExpectedDigest makes the actor fail closed before startup when the
+	// mounted ConfigMap or Secret key differs from the prepared bytes.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	ExpectedDigest string `json:"expectedDigest,omitempty"`
+}
+
+// GeneratedConfigSpec selects a versioned deterministic config profile.
+type GeneratedConfigSpec struct {
+	// +kubebuilder:validation:Enum=bitcoin-regtest/v1;nakamoto-regtest-node/v1
+	Profile string `json:"profile"`
+	// Seed optionally pins the deterministic node identity used by the node
+	// profile. Mining and signer secrets require a complete Secret-backed config.
+	Seed string `json:"seed,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
+	BootstrapPeers []string `json:"bootstrapPeers,omitempty"`
+	// +kubebuilder:validation:Enum=queued;blocking
+	EventDispatcher string `json:"eventDispatcher,omitempty"`
+}
+
+// ConfigObjectRef identifies a complete config file in a ConfigMap or Secret.
+type ConfigObjectRef struct {
+	Name      string `json:"name"`
+	Key       string `json:"key,omitempty"`
+	MountPath string `json:"mountPath,omitempty"`
+}
+
+// WorkloadPolicy contains safe resource, storage, and placement controls.
+type WorkloadPolicy struct {
+	Storage                       *StorageSpec                      `json:"storage,omitempty"`
+	Resources                     *corev1.ResourceRequirements      `json:"resources,omitempty"`
+	NodeSelector                  map[string]string                 `json:"nodeSelector,omitempty"`
+	Affinity                      *corev1.Affinity                  `json:"affinity,omitempty"`
+	Tolerations                   []corev1.Toleration               `json:"tolerations,omitempty"`
+	TopologySpreadConstraints     []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+	TerminationGracePeriodSeconds *int64                            `json:"terminationGracePeriodSeconds,omitempty"`
+	RuntimeExposure               string                            `json:"runtimeExposure,omitempty"`
+	Telemetry                     *TelemetrySpec                    `json:"telemetry,omitempty"`
+	Probe                         *ProbeSpec                        `json:"probe,omitempty"`
+}
+
+// AdvancedWorkloadOverride exposes bounded Pod controls for unusual actors.
+type AdvancedWorkloadOverride struct {
+	Command                  []string                   `json:"command,omitempty"`
+	Args                     []string                   `json:"args,omitempty"`
+	Env                      []corev1.EnvVar            `json:"env,omitempty"`
+	WorkingDir               string                     `json:"workingDir,omitempty"`
+	ReadinessProbe           *corev1.Probe              `json:"readinessProbe,omitempty"`
+	LivenessProbe            *corev1.Probe              `json:"livenessProbe,omitempty"`
+	StartupProbe             *corev1.Probe              `json:"startupProbe,omitempty"`
+	PodSecurityContext       *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
+	ContainerSecurityContext *corev1.SecurityContext    `json:"containerSecurityContext,omitempty"`
+	Labels                   map[string]string          `json:"labels,omitempty"`
+	Annotations              map[string]string          `json:"annotations,omitempty"`
+}
+
+// RawActorSpec is the explicit escape hatch for non-standard adversarial actors.
+type RawActorSpec struct {
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name         string                    `json:"name"`
+	Role         string                    `json:"role"`
+	Image        string                    `json:"image"`
+	Config       *ConfigSource             `json:"config,omitempty"`
+	Ports        []ActorPort               `json:"ports,omitempty"`
+	Dependencies []ActorDependency         `json:"dependencies,omitempty"`
+	Workload     *WorkloadPolicy           `json:"workload,omitempty"`
+	Advanced     *AdvancedWorkloadOverride `json:"advanced"`
+	Suspended    bool                      `json:"suspended,omitempty"`
+}
+
+// StorageSpec configures one actor's persistent data volume.
+type StorageSpec struct {
+	Enabled          *bool                               `json:"enabled,omitempty"`
+	Size             string                              `json:"size,omitempty"`
+	MountPath        string                              `json:"mountPath,omitempty"`
+	StorageClassName *string                             `json:"storageClassName,omitempty"`
+	AccessModes      []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+}
+
+// TelemetrySpec configures the optional per-actor OpenTelemetry collector.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.exporterEndpoint) && self.exporterEndpoint.size() > 0 && has(self.exporterServiceRef))",message="enabled telemetry requires exporterEndpoint and exporterServiceRef"
+type TelemetrySpec struct {
+	Enabled          *bool                        `json:"enabled,omitempty"`
+	Image            string                       `json:"image,omitempty"`
+	ImagePullPolicy  corev1.PullPolicy            `json:"imagePullPolicy,omitempty"`
+	Resources        *corev1.ResourceRequirements `json:"resources,omitempty"`
+	MetricsPort      int32                        `json:"metricsPort,omitempty"`
+	ExporterEndpoint string                       `json:"exporterEndpoint,omitempty"`
+	// ExporterServiceRef binds the exporter endpoint to one same-namespace
+	// Kubernetes Service whose ready endpoints gate network readiness.
+	ExporterServiceRef *TelemetryExporterServiceReference `json:"exporterServiceRef,omitempty"`
+	TokenSecretRef     *SecretKeyReference                `json:"tokenSecretRef,omitempty"`
+}
+
+// TelemetryExporterServiceReference identifies the in-cluster service and
+// service port which must be available before telemetry is considered ready.
+type TelemetryExporterServiceReference struct {
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	Name string `json:"name"`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,13}[a-z0-9])?$`
+	PortName string `json:"portName"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+}
+
+// SecretKeyReference identifies one key in a Secret.
+type SecretKeyReference struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
+// ProbeSpec configures the optional credential-free active-probe sidecar.
+type ProbeSpec struct {
+	Enabled            *bool                        `json:"enabled,omitempty"`
+	Image              string                       `json:"image,omitempty"`
+	ImagePullPolicy    corev1.PullPolicy            `json:"imagePullPolicy,omitempty"`
+	Resources          *corev1.ResourceRequirements `json:"resources,omitempty"`
+	AdditionalServices []ProbeService               `json:"additionalServices,omitempty"`
+}
+
+// ProbeService describes one explicitly trusted service visible to probes.
+type ProbeService struct {
+	Name        string      `json:"name"`
+	ServiceName string      `json:"serviceName"`
+	Ports       []ProbePort `json:"ports"`
+}
+
+// ProbePort describes one trusted service port.
+type ProbePort struct {
+	Name string `json:"name"`
+	Port int32  `json:"port"`
+}
+
+// ActorPort exposes one raw actor container and optional service port.
+type ActorPort struct {
+	Name          string          `json:"name"`
+	ContainerPort int32           `json:"containerPort"`
+	ServicePort   int32           `json:"servicePort,omitempty"`
+	Protocol      corev1.Protocol `json:"protocol,omitempty"`
+}
+
+// ActorDependency is a raw actor startup requirement on another actor.
+type ActorDependency struct {
+	Actor string `json:"actor"`
+	Port  int32  `json:"port"`
+}
+
+// ActorStatus reports rollout and immutable runtime identity for one actor.
+type ActorStatus struct {
+	Name                       string `json:"name"`
+	Role                       string `json:"role"`
+	ResourceName               string `json:"resourceName"`
+	Image                      string `json:"image,omitempty"`
+	Ready                      bool   `json:"ready"`
+	ReadyReplicas              int32  `json:"readyReplicas,omitempty"`
+	UpdatedReplicas            int32  `json:"updatedReplicas,omitempty"`
+	Generation                 int64  `json:"generation,omitempty"`
+	ObservedGeneration         int64  `json:"observedGeneration,omitempty"`
+	CurrentRevision            string `json:"currentRevision,omitempty"`
+	UpdateRevision             string `json:"updateRevision,omitempty"`
+	ServiceName                string `json:"serviceName,omitempty"`
+	StatefulSetUID             string `json:"statefulSetUID,omitempty"`
+	StatefulSetResourceVersion string `json:"statefulSetResourceVersion,omitempty"`
+	PodName                    string `json:"podName,omitempty"`
+	PodUID                     string `json:"podUID,omitempty"`
+	PodResourceVersion         string `json:"podResourceVersion,omitempty"`
+	RuntimeImageID             string `json:"runtimeImageID,omitempty"`
+	ConfigDigest               string `json:"configDigest,omitempty"`
+	AdversarialPolicyDigest    string `json:"adversarialPolicyDigest,omitempty"`
+	AdversarialEgressProfile   string `json:"adversarialEgressProfile,omitempty"`
+	EgressPolicyDigest         string `json:"egressPolicyDigest,omitempty"`
+	IdentityReady              bool   `json:"identityReady,omitempty"`
+}
+
+// AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+// peer and cadence-policy bindings.
+type AdmittedBitcoinNode struct {
+	Name              string   `json:"name"`
+	ServiceName       string   `json:"serviceName"`
+	RPCPort           int32    `json:"rpcPort"`
+	P2PPort           int32    `json:"p2pPort"`
+	PeerRefs          []string `json:"peerRefs,omitempty"`
+	PolicyRef         string   `json:"policyRef"`
+	PolicyUID         string   `json:"policyUID"`
+	PolicyServiceName string   `json:"policyServiceName"`
+}
+
+// BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+// process. Signer processes themselves do not consume Bitcoin RPC.
+type BurnchainActorBinding struct {
+	Actor          string `json:"actor"`
+	BitcoinNodeRef string `json:"bitcoinNodeRef"`
+}
+
+// AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+// follower binding admitted for one observed StacksNetwork generation.
+type AdmittedBurnchainTopology struct {
+	SchemaVersion      string                  `json:"schemaVersion"`
+	Digest             string                  `json:"digest"`
+	ObservedGeneration int64                   `json:"observedGeneration"`
+	ObservedAt         *metav1.Time            `json:"observedAt,omitempty"`
+	Nodes              []AdmittedBitcoinNode   `json:"nodes"`
+	Bindings           []BurnchainActorBinding `json:"bindings,omitempty"`
+}
+
+// StacksNetworkStatus reports reconciled workload and admitted identity state.
+type StacksNetworkStatus struct {
+	ObservedGeneration  int64                      `json:"observedGeneration,omitempty"`
+	Phase               string                     `json:"phase,omitempty"`
+	DesiredActors       int32                      `json:"desiredActors,omitempty"`
+	ReadyActors         int32                      `json:"readyActors,omitempty"`
+	ReadySummary        string                     `json:"readySummary,omitempty"`
+	InventoryReady      bool                       `json:"inventoryReady,omitempty"`
+	InventoryDigest     string                     `json:"inventoryDigest,omitempty"`
+	InventoryObservedAt *metav1.Time               `json:"inventoryObservedAt,omitempty"`
+	BurnchainTopology   *AdmittedBurnchainTopology `json:"burnchainTopology,omitempty"`
+	Actors              []ActorStatus              `json:"actors,omitempty"`
+	Conditions          []metav1.Condition         `json:"conditions,omitempty"`
+}

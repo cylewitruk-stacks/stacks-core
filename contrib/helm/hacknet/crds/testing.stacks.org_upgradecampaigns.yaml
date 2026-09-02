@@ -1,0 +1,1072 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: upgradecampaigns.testing.stacks.org
+spec:
+  group: testing.stacks.org
+  names:
+    kind: UpgradeCampaign
+    listKind: UpgradeCampaignList
+    plural: upgradecampaigns
+    singular: upgradecampaign
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: UpgradeCampaign declares one bounded, topology-owned actor image
+          transition.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              UpgradeCampaignSpec defines immutable profiles and ordered rollout stages.
+              Profile references are checked by the reconciler because a nested CEL join
+              over the schema maxima exceeds the Kubernetes API-server cost budget.
+            properties:
+              networkRef:
+                type: string
+              profiles:
+                items:
+                  description: UpgradeProfileSpec binds a logical version to immutable
+                    preparation evidence.
+                  properties:
+                    capabilities:
+                      items:
+                        type: string
+                      maxItems: 21
+                      type: array
+                      x-kubernetes-list-type: set
+                      x-kubernetes-validations:
+                      - message: capabilities must name portable instrumentation families
+                        rule: self.all(c, c in ['M01','M02','M03','M04','M05','M06','M07','M08','M09','M10','M11','M12','M13','M15','M16','M17','M18','M19','M20','M21','M22'])
+                    configDigest:
+                      description: ConfigDigest binds the version-specific configuration
+                        smoke result.
+                      pattern: ^sha256:[0-9a-f]{64}$
+                      type: string
+                    expectation:
+                      enum:
+                      - compatible
+                      - incompatible
+                      - unknown
+                      - intentionally-incompatible
+                      type: string
+                    image:
+                      description: Image is a pullable or locally imported immutable
+                        assignment reference.
+                      type: string
+                    imageID:
+                      pattern: ^sha256:[0-9a-f]{64}$
+                      type: string
+                    name:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                    provenanceDigest:
+                      pattern: ^sha256:[0-9a-f]{64}$
+                      type: string
+                    revision:
+                      pattern: ^$|^[0-9a-f]{40}$
+                      type: string
+                    sourceKind:
+                      enum:
+                      - remoteGit
+                      - localGit
+                      - prebuilt
+                      type: string
+                  required:
+                  - configDigest
+                  - image
+                  - imageID
+                  - name
+                  - provenanceDigest
+                  - sourceKind
+                  type: object
+                maxItems: 32
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              rollbackOnFailure:
+                description: |-
+                  RollbackOnFailure restores the campaign's admitted baseline before the
+                  terminal Failed phase is reported.
+                type: boolean
+              safety:
+                description: UpgradeSafetySpec bounds concurrent protocol-role impact.
+                properties:
+                  maxMinerPercent:
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  maxParallelActors:
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                  maxSignerWeightPercent:
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                required:
+                - maxMinerPercent
+                - maxParallelActors
+                - maxSignerWeightPercent
+                type: object
+              stages:
+                items:
+                  description: UpgradeStageSpec is one bounded parallel replacement
+                    batch.
+                  properties:
+                    assertions:
+                      description: |-
+                        Assertions are trusted protocol gates evaluated after the assigned actors
+                        are admitted and Ready, and before the stage stability timer can advance.
+                      properties:
+                        assertions:
+                          items:
+                            description: |-
+                              ProtocolAssertionSpec is one finite protocol assertion. Arbitrary queries
+                              and actor-supplied success predicates are intentionally unsupported.
+                            properties:
+                              bitcoinBranchCohort:
+                                description: BranchCohortAssertion proves finite branch
+                                  divergence or convergence.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 32
+                                    minItems: 2
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                  expectation:
+                                    description: BranchCohortExpectation selects divergence
+                                      or convergence proof.
+                                    enum:
+                                    - Diverged
+                                    - Converged
+                                    type: string
+                                  minimumDistinct:
+                                    description: MinimumDistinct defaults to two and
+                                      applies only to Diverged.
+                                    format: int32
+                                    maximum: 32
+                                    minimum: 2
+                                    type: integer
+                                  stableFor:
+                                    description: |-
+                                      StableFor requires the selected cohort to remain converged for this duration.
+                                      The shared branch may advance while convergence remains continuous.
+                                    type: string
+                                required:
+                                - actors
+                                - expectation
+                                type: object
+                                x-kubernetes-validations:
+                                - message: stableFor applies only to Converged and
+                                    minimumDistinct applies only to Diverged
+                                  rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                                    : !has(self.minimumDistinct)'
+                                - message: minimumDistinct cannot exceed the selected
+                                    actor count
+                                  rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                                    <= self.actors.size()'
+                              chainProgress:
+                                description: |-
+                                  ChainProgressAssertion requires every selected actor to advance by at least
+                                  MinimumDelta during Window.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                  chain:
+                                    enum:
+                                    - burnchain
+                                    - stacks
+                                    type: string
+                                  minimumDelta:
+                                    format: int64
+                                    minimum: 1
+                                    type: integer
+                                  window:
+                                    type: string
+                                required:
+                                - actors
+                                - chain
+                                - minimumDelta
+                                - window
+                                type: object
+                              cohortAgreement:
+                                description: |-
+                                  CohortAgreementAssertion bounds the selected actors' height spread. When
+                                  ConvergenceWindow is set, an excessive spread remains pending until the
+                                  actors converge or the bounded window expires.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    minItems: 2
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                  chain:
+                                    enum:
+                                    - burnchain
+                                    - stacks
+                                    type: string
+                                  convergenceWindow:
+                                    description: |-
+                                      ConvergenceWindow changes the default fail-fast snapshot assertion into
+                                      an eventual-convergence assertion with a finite deadline.
+                                    type: string
+                                  maximumSpread:
+                                    format: int64
+                                    minimum: 0
+                                    type: integer
+                                required:
+                                - actors
+                                - chain
+                                - maximumSpread
+                                type: object
+                              id:
+                                pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                                type: string
+                              proposalOutcomeVisibility:
+                                description: |-
+                                  ProposalOutcomeVisibilityAssertion requires proposal or policy activity to
+                                  advance during Window for every selected signer.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                  minimumObserved:
+                                    format: int64
+                                    minimum: 1
+                                    type: integer
+                                  window:
+                                    type: string
+                                required:
+                                - actors
+                                - minimumObserved
+                                - window
+                                type: object
+                              signerRegistration:
+                                description: |-
+                                  SignerRegistrationAssertion requires a minimum count of selected signers to
+                                  report current-cycle registration.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                  minimumRegistered:
+                                    format: int32
+                                    minimum: 1
+                                    type: integer
+                                required:
+                                - actors
+                                - minimumRegistered
+                                type: object
+                              signerStateFreshness:
+                                description: |-
+                                  SignerStateFreshnessAssertion bounds the age of every selected signer's last
+                                  state-machine transition.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                  maximumAge:
+                                    type: string
+                                required:
+                                - actors
+                                - maximumAge
+                                type: object
+                              stacksBurnchainCohort:
+                                description: BranchCohortAssertion proves finite branch
+                                  divergence or convergence.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 32
+                                    minItems: 2
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                  expectation:
+                                    description: BranchCohortExpectation selects divergence
+                                      or convergence proof.
+                                    enum:
+                                    - Diverged
+                                    - Converged
+                                    type: string
+                                  minimumDistinct:
+                                    description: MinimumDistinct defaults to two and
+                                      applies only to Diverged.
+                                    format: int32
+                                    maximum: 32
+                                    minimum: 2
+                                    type: integer
+                                  stableFor:
+                                    description: |-
+                                      StableFor requires the selected cohort to remain converged for this duration.
+                                      The shared branch may advance while convergence remains continuous.
+                                    type: string
+                                required:
+                                - actors
+                                - expectation
+                                type: object
+                                x-kubernetes-validations:
+                                - message: stableFor applies only to Converged and
+                                    minimumDistinct applies only to Diverged
+                                  rule: 'self.expectation == ''Diverged'' ? !has(self.stableFor)
+                                    : !has(self.minimumDistinct)'
+                                - message: minimumDistinct cannot exceed the selected
+                                    actor count
+                                  rule: '!has(self.minimumDistinct) || self.minimumDistinct
+                                    <= self.actors.size()'
+                              telemetryCompleteness:
+                                description: |-
+                                  TelemetryCompletenessAssertion requires successful collection from every
+                                  selected admitted actor in one stable identity window.
+                                properties:
+                                  actors:
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    minItems: 1
+                                    type: array
+                                    x-kubernetes-list-type: set
+                                required:
+                                - actors
+                                type: object
+                            required:
+                            - id
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one protocol assertion must be configured
+                              rule: '(has(self.chainProgress) ? 1 : 0) + (has(self.cohortAgreement)
+                                ? 1 : 0) + (has(self.signerRegistration) ? 1 : 0)
+                                + (has(self.signerStateFreshness) ? 1 : 0) + (has(self.proposalOutcomeVisibility)
+                                ? 1 : 0) + (has(self.telemetryCompleteness) ? 1 :
+                                0) + (has(self.bitcoinBranchCohort) ? 1 : 0) + (has(self.stacksBurnchainCohort)
+                                ? 1 : 0) == 1'
+                          maxItems: 32
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-map-keys:
+                          - id
+                          x-kubernetes-list-type: map
+                        timeout:
+                          type: string
+                      required:
+                      - assertions
+                      - timeout
+                      type: object
+                    assignments:
+                      items:
+                        description: UpgradeAssignment selects the profile for one
+                          logical actor.
+                        properties:
+                          actor:
+                            pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                            type: string
+                          config:
+                            description: |-
+                              Config optionally replaces the actor's configuration for this version.
+                              Omission preserves the StacksNetwork configuration; a ConfigMap or Secret
+                              source is the compatibility escape hatch for arbitrary historical builds.
+                            properties:
+                              configMapRef:
+                                description: ConfigObjectRef identifies a complete
+                                  config file in a ConfigMap or Secret.
+                                properties:
+                                  key:
+                                    type: string
+                                  mountPath:
+                                    type: string
+                                  name:
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              expectedDigest:
+                                description: |-
+                                  ExpectedDigest makes the actor fail closed before startup when the
+                                  mounted ConfigMap or Secret key differs from the prepared bytes.
+                                pattern: ^sha256:[0-9a-f]{64}$
+                                type: string
+                              generated:
+                                description: GeneratedConfigSpec selects a versioned
+                                  deterministic config profile.
+                                properties:
+                                  bootstrapPeers:
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    type: array
+                                  eventDispatcher:
+                                    enum:
+                                    - queued
+                                    - blocking
+                                    type: string
+                                  profile:
+                                    enum:
+                                    - bitcoin-regtest/v1
+                                    - nakamoto-regtest-node/v1
+                                    type: string
+                                  seed:
+                                    description: |-
+                                      Seed optionally pins the deterministic node identity used by the node
+                                      profile. Mining and signer secrets require a complete Secret-backed config.
+                                    type: string
+                                required:
+                                - profile
+                                type: object
+                              secretRef:
+                                description: ConfigObjectRef identifies a complete
+                                  config file in a ConfigMap or Secret.
+                                properties:
+                                  key:
+                                    type: string
+                                  mountPath:
+                                    type: string
+                                  name:
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one config source is required
+                              rule: '(has(self.generated) ? 1 : 0) + (has(self.configMapRef)
+                                ? 1 : 0) + (has(self.secretRef) ? 1 : 0) == 1'
+                          profile:
+                            pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                            type: string
+                        required:
+                        - actor
+                        - profile
+                        type: object
+                      maxItems: 100
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - actor
+                      x-kubernetes-list-type: map
+                    deadline:
+                      description: Deadline bounds the complete stage, including replacement
+                        and stability.
+                      type: string
+                    name:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                    stableFor:
+                      description: StableFor is the continuous Ready interval required
+                        before advancement.
+                      type: string
+                  required:
+                  - assignments
+                  - deadline
+                  - name
+                  - stableFor
+                  type: object
+                  x-kubernetes-validations:
+                  - message: stage requires 0 <= stableFor < deadline
+                    rule: duration(self.stableFor) >= duration('0s') && duration(self.deadline)
+                      > duration(self.stableFor)
+                maxItems: 64
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              template:
+                type: boolean
+            required:
+            - networkRef
+            - profiles
+            - rollbackOnFailure
+            - safety
+            - stages
+            type: object
+          status:
+            description: UpgradeCampaignStatus is the durable rollout and rollback
+              state machine.
+            properties:
+              appliedAssignments:
+                items:
+                  description: UpgradeAssignment selects the profile for one logical
+                    actor.
+                  properties:
+                    actor:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                    config:
+                      description: |-
+                        Config optionally replaces the actor's configuration for this version.
+                        Omission preserves the StacksNetwork configuration; a ConfigMap or Secret
+                        source is the compatibility escape hatch for arbitrary historical builds.
+                      properties:
+                        configMapRef:
+                          description: ConfigObjectRef identifies a complete config
+                            file in a ConfigMap or Secret.
+                          properties:
+                            key:
+                              type: string
+                            mountPath:
+                              type: string
+                            name:
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        expectedDigest:
+                          description: |-
+                            ExpectedDigest makes the actor fail closed before startup when the
+                            mounted ConfigMap or Secret key differs from the prepared bytes.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
+                        generated:
+                          description: GeneratedConfigSpec selects a versioned deterministic
+                            config profile.
+                          properties:
+                            bootstrapPeers:
+                              items:
+                                type: string
+                              maxItems: 64
+                              type: array
+                            eventDispatcher:
+                              enum:
+                              - queued
+                              - blocking
+                              type: string
+                            profile:
+                              enum:
+                              - bitcoin-regtest/v1
+                              - nakamoto-regtest-node/v1
+                              type: string
+                            seed:
+                              description: |-
+                                Seed optionally pins the deterministic node identity used by the node
+                                profile. Mining and signer secrets require a complete Secret-backed config.
+                              type: string
+                          required:
+                          - profile
+                          type: object
+                        secretRef:
+                          description: ConfigObjectRef identifies a complete config
+                            file in a ConfigMap or Secret.
+                          properties:
+                            key:
+                              type: string
+                            mountPath:
+                              type: string
+                            name:
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one config source is required
+                        rule: '(has(self.generated) ? 1 : 0) + (has(self.configMapRef)
+                          ? 1 : 0) + (has(self.secretRef) ? 1 : 0) == 1'
+                    profile:
+                      pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                      type: string
+                  required:
+                  - actor
+                  - profile
+                  type: object
+                maxItems: 100
+                type: array
+              baselineInventory:
+                description: NetworkInventory is the complete authoritative actor
+                  inventory bound to a run.
+                properties:
+                  actors:
+                    items:
+                      description: AdmittedActorIdentity is the immutable runtime
+                        identity admitted for one actor.
+                      properties:
+                        adversarialEgressProfile:
+                          type: string
+                        adversarialPolicyDigest:
+                          type: string
+                        configDigest:
+                          type: string
+                        controllerRevision:
+                          type: string
+                        egressPolicyDigest:
+                          type: string
+                        name:
+                          type: string
+                        podName:
+                          type: string
+                        podUID:
+                          type: string
+                        requestedImage:
+                          type: string
+                        role:
+                          type: string
+                        runtimeImageID:
+                          type: string
+                        serviceName:
+                          type: string
+                        statefulSetName:
+                          type: string
+                        statefulSetUID:
+                          type: string
+                      required:
+                      - controllerRevision
+                      - name
+                      - podName
+                      - podUID
+                      - requestedImage
+                      - role
+                      - runtimeImageID
+                      - serviceName
+                      - statefulSetName
+                      - statefulSetUID
+                      type: object
+                    type: array
+                  burnchainTopology:
+                    description: |-
+                      AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+                      follower binding admitted for one observed StacksNetwork generation.
+                    properties:
+                      bindings:
+                        items:
+                          description: |-
+                            BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+                            process. Signer processes themselves do not consume Bitcoin RPC.
+                          properties:
+                            actor:
+                              type: string
+                            bitcoinNodeRef:
+                              type: string
+                          required:
+                          - actor
+                          - bitcoinNodeRef
+                          type: object
+                        type: array
+                      digest:
+                        type: string
+                      nodes:
+                        items:
+                          description: |-
+                            AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+                            peer and cadence-policy bindings.
+                          properties:
+                            name:
+                              type: string
+                            p2pPort:
+                              format: int32
+                              type: integer
+                            peerRefs:
+                              items:
+                                type: string
+                              type: array
+                            policyRef:
+                              type: string
+                            policyServiceName:
+                              type: string
+                            policyUID:
+                              type: string
+                            rpcPort:
+                              format: int32
+                              type: integer
+                            serviceName:
+                              type: string
+                          required:
+                          - name
+                          - p2pPort
+                          - policyRef
+                          - policyServiceName
+                          - policyUID
+                          - rpcPort
+                          - serviceName
+                          type: object
+                        type: array
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        type: integer
+                      schemaVersion:
+                        type: string
+                    required:
+                    - digest
+                    - nodes
+                    - observedGeneration
+                    - schemaVersion
+                    type: object
+                  digest:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  resourceVersion:
+                    type: string
+                required:
+                - actors
+                - digest
+                - observedGeneration
+                type: object
+              completedAt:
+                format: date-time
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 16
+                type: array
+              currentInventory:
+                description: NetworkInventory is the complete authoritative actor
+                  inventory bound to a run.
+                properties:
+                  actors:
+                    items:
+                      description: AdmittedActorIdentity is the immutable runtime
+                        identity admitted for one actor.
+                      properties:
+                        adversarialEgressProfile:
+                          type: string
+                        adversarialPolicyDigest:
+                          type: string
+                        configDigest:
+                          type: string
+                        controllerRevision:
+                          type: string
+                        egressPolicyDigest:
+                          type: string
+                        name:
+                          type: string
+                        podName:
+                          type: string
+                        podUID:
+                          type: string
+                        requestedImage:
+                          type: string
+                        role:
+                          type: string
+                        runtimeImageID:
+                          type: string
+                        serviceName:
+                          type: string
+                        statefulSetName:
+                          type: string
+                        statefulSetUID:
+                          type: string
+                      required:
+                      - controllerRevision
+                      - name
+                      - podName
+                      - podUID
+                      - requestedImage
+                      - role
+                      - runtimeImageID
+                      - serviceName
+                      - statefulSetName
+                      - statefulSetUID
+                      type: object
+                    type: array
+                  burnchainTopology:
+                    description: |-
+                      AdmittedBurnchainTopology is the reproducible Bitcoin graph and Stacks
+                      follower binding admitted for one observed StacksNetwork generation.
+                    properties:
+                      bindings:
+                        items:
+                          description: |-
+                            BurnchainActorBinding records the Bitcoin node selected by one Stacks node
+                            process. Signer processes themselves do not consume Bitcoin RPC.
+                          properties:
+                            actor:
+                              type: string
+                            bitcoinNodeRef:
+                              type: string
+                          required:
+                          - actor
+                          - bitcoinNodeRef
+                          type: object
+                        type: array
+                      digest:
+                        type: string
+                      nodes:
+                        items:
+                          description: |-
+                            AdmittedBitcoinNode records one normalized Bitcoin service and its declared
+                            peer and cadence-policy bindings.
+                          properties:
+                            name:
+                              type: string
+                            p2pPort:
+                              format: int32
+                              type: integer
+                            peerRefs:
+                              items:
+                                type: string
+                              type: array
+                            policyRef:
+                              type: string
+                            policyServiceName:
+                              type: string
+                            policyUID:
+                              type: string
+                            rpcPort:
+                              format: int32
+                              type: integer
+                            serviceName:
+                              type: string
+                          required:
+                          - name
+                          - p2pPort
+                          - policyRef
+                          - policyServiceName
+                          - policyUID
+                          - rpcPort
+                          - serviceName
+                          type: object
+                        type: array
+                      observedAt:
+                        format: date-time
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        type: integer
+                      schemaVersion:
+                        type: string
+                    required:
+                    - digest
+                    - nodes
+                    - observedGeneration
+                    - schemaVersion
+                    type: object
+                  digest:
+                    type: string
+                  observedAt:
+                    format: date-time
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  resourceVersion:
+                    type: string
+                required:
+                - actors
+                - digest
+                - observedGeneration
+                type: object
+              currentStage:
+                format: int32
+                type: integer
+              identityTransitions:
+                items:
+                  description: IdentityTransition records an explicitly permitted
+                    Pod identity replacement.
+                  properties:
+                    actors:
+                      items:
+                        type: string
+                      type: array
+                    campaign:
+                      type: string
+                    currentDigest:
+                      type: string
+                    observedAt:
+                      format: date-time
+                      type: string
+                    previousDigest:
+                      type: string
+                  required:
+                  - actors
+                  - campaign
+                  - currentDigest
+                  - observedAt
+                  - previousDigest
+                  type: object
+                maxItems: 256
+                type: array
+              lastTransitionTime:
+                format: date-time
+                type: string
+              message:
+                type: string
+              networkUID:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                type: string
+              reason:
+                type: string
+              rollbackComplete:
+                type: boolean
+              rollbackTerminalPhase:
+                description: |-
+                  RollbackTerminalPhase preserves Failed versus Inconclusive while a
+                  rollback is in progress.
+                type: string
+              stageAssertions:
+                description: ProtocolAssertionSetStatus records one run gate's bounded
+                  state.
+                properties:
+                  completedAt:
+                    format: date-time
+                    type: string
+                  outcome:
+                    enum:
+                    - Pending
+                    - Proven
+                    - Violated
+                    - Inconclusive
+                    type: string
+                  results:
+                    items:
+                      description: ProtocolAssertionResult records one bounded evaluator
+                        result.
+                      properties:
+                        evidence:
+                          x-kubernetes-preserve-unknown-fields: true
+                        id:
+                          type: string
+                        observedAt:
+                          format: date-time
+                          type: string
+                        outcome:
+                          enum:
+                          - Pending
+                          - Proven
+                          - Violated
+                          - Inconclusive
+                          type: string
+                        reason:
+                          type: string
+                        startedAt:
+                          format: date-time
+                          type: string
+                        type:
+                          type: string
+                      required:
+                      - id
+                      - outcome
+                      - reason
+                      - type
+                      type: object
+                    type: array
+                  startedAt:
+                    format: date-time
+                    type: string
+                required:
+                - outcome
+                type: object
+              stageReadySince:
+                format: date-time
+                type: string
+              stageStartedAt:
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,40 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: telemetry-prometheus-partition
+  namespace: hacknet-system
+spec:
+  networkRef: attacknet-telemetry-live
+  safety:
+    maxUnavailableSignerBasisPoints: 3000
+    maxUnavailableMinerBasisPoints: 5000
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: partition-prometheus
+      faults:
+        - id: follower-partition
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: network
+            action: partition
+            mode: all
+            duration: 45s
+            parameters:
+              direction: both
+              harnessTarget: prometheus
+  effectAssertions:
+    - type: NetworkDegraded
+      actor: follower-1
+      timeoutSeconds: 60
+  recoveryAssertions:
+    - type: NetworkRecovered
+      actor: follower-1
+      timeoutSeconds: 180

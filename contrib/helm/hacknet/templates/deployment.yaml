@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hacknet.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+spec:
+  replicas: {{ .Values.operator.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "hacknet.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hacknet.selectorLabels" . | nindent 8 }}
+        {{- with .Values.operator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.operator.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "hacknet.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.operator.podSecurityContext | nindent 8 }}
+      {{- with .Values.operator.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: operator
+          image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          args:
+            - --watch-namespace={{ include "hacknet.watchNamespace" . }}
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --max-concurrent-reconciles=1
+            - --zap-log-level={{ lower .Values.operator.logLevel }}
+            {{- if .Values.burnchainClock.image.digest }}
+            - --burnchain-clock-image={{ .Values.burnchainClock.image.repository }}@{{ .Values.burnchainClock.image.digest }}
+            {{- else }}
+            - --burnchain-clock-image={{ .Values.burnchainClock.image.repository }}:{{ .Values.burnchainClock.image.tag }}
+            {{- end }}
+            - --burnchain-clock-image-pull-policy={{ .Values.burnchainClock.image.pullPolicy }}
+            {{- if .Values.probe.image.digest }}
+            - --probe-image={{ .Values.probe.image.repository }}@{{ .Values.probe.image.digest }}
+            {{- else }}
+            - --probe-image={{ .Values.probe.image.repository }}:{{ .Values.probe.image.tag }}
+            {{- end }}
+            - --probe-image-pull-policy={{ .Values.probe.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.operator.securityContext | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: {{ .Values.serviceAccount.tokenExpirationSeconds }}
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

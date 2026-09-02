@@ -1,0 +1,842 @@
+diff --git a/stacks-signer/src/lib.rs b/stacks-signer/src/lib.rs
+index ae6bfc47ec..be184dff0a 100644
+--- a/stacks-signer/src/lib.rs
++++ b/stacks-signer/src/lib.rs
+@@ -132,6 +132,8 @@ impl<S: Signer<T> + Send + 'static, T: SignerEventTrait + 'static> SpawnedSigner
+         );
+         let (res_send, res_recv) = channel();
+         let ev = SignerEventReceiver::new(config.network.is_mainnet());
++        #[cfg(feature = "testing")]
++        crate::v0::signer::initialize_attacknet_policy_observation();
+         crate::monitoring::actions::start_serving_monitoring_metrics(config.clone()).ok();
+         let runloop = RunLoop::new(config.clone());
+         let mut signer: RunLoopSigner<S, T> = libsigner::Signer::new(runloop, ev, res_send);
+diff --git a/stacks-signer/src/monitoring/mod.rs b/stacks-signer/src/monitoring/mod.rs
+index 55e4f57c7d..ff50af6afd 100644
+--- a/stacks-signer/src/monitoring/mod.rs
++++ b/stacks-signer/src/monitoring/mod.rs
+@@ -104,6 +104,31 @@ pub mod actions {
+         BLOCK_PROPOSALS_RECEIVED.inc();
+     }
+ 
++    /// Record one bounded testing-only Attacknet policy match.
++    #[cfg(feature = "testing")]
++    pub fn increment_attacknet_policy_match(behavior: &str) {
++        ATTACKNET_POLICY_MATCHES
++            .with_label_values(&[behavior])
++            .inc();
++    }
++
++    /// Record the bounded testing-only Attacknet policy evaluation count.
++    #[cfg(feature = "testing")]
++    pub fn set_attacknet_policy_evaluations(behavior: &str, evaluations: u32) {
++        let _ = ATTACKNET_POLICY_MATCHES.with_label_values(&[behavior]);
++        ATTACKNET_POLICY_EVALUATIONS
++            .with_label_values(&[behavior])
++            .set(i64::from(evaluations));
++    }
++
++    /// Record whether the testing-only Attacknet behavior session is active.
++    #[cfg(feature = "testing")]
++    pub fn set_attacknet_policy_session_active(behavior: &str, active: bool) {
++        ATTACKNET_POLICY_SESSION_ACTIVE
++            .with_label_values(&[behavior])
++            .set(i64::from(active));
++    }
++
+     /// Increment the block pre-commit sent counter
+     pub fn increment_block_pre_commits_sent() {
+         BLOCK_PRE_COMMITS_SENT.inc();
+@@ -244,6 +269,18 @@ pub mod actions {
+     /// Increment the number of block proposals received
+     pub fn increment_block_proposals_received() {}
+ 
++    /// No-op Attacknet policy metric when Prometheus is disabled.
++    #[cfg(feature = "testing")]
++    pub fn increment_attacknet_policy_match(_behavior: &str) {}
++
++    /// No-op Attacknet policy evaluation metric when Prometheus is disabled.
++    #[cfg(feature = "testing")]
++    pub fn set_attacknet_policy_evaluations(_behavior: &str, _evaluations: u32) {}
++
++    /// No-op Attacknet session metric when Prometheus is disabled.
++    #[cfg(feature = "testing")]
++    pub fn set_attacknet_policy_session_active(_behavior: &str, _active: bool) {}
++
+     /// Increment the block pre-commits sent counter
+     pub fn increment_block_pre_commits_sent() {}
+ 
+@@ -299,7 +336,9 @@ pub mod actions {
+     /// This will only serve the metrics if the `monitoring_prom` feature is enabled.
+     pub fn start_serving_monitoring_metrics(config: GlobalConfig) -> Result<(), String> {
+         if config.metrics_endpoint.is_some() {
+-            info!("`metrics_endpoint` is configured for the signer, but the monitoring_prom feature is not enabled. Not starting monitoring metrics server.");
++            info!(
++                "`metrics_endpoint` is configured for the signer, but the monitoring_prom feature is not enabled. Not starting monitoring metrics server."
++            );
+         }
+         Ok(())
+     }
+diff --git a/stacks-signer/src/monitoring/prometheus.rs b/stacks-signer/src/monitoring/prometheus.rs
+index 4e1a2eb71d..93b7e6a159 100644
+--- a/stacks-signer/src/monitoring/prometheus.rs
++++ b/stacks-signer/src/monitoring/prometheus.rs
+@@ -19,8 +19,8 @@ use std::sync::Mutex;
+ use lazy_static::lazy_static;
+ use prometheus::{
+     gather, histogram_opts, opts, register_histogram_vec, register_int_counter,
+-    register_int_counter_vec, register_int_gauge, Encoder, HistogramVec, IntCounter, IntCounterVec,
+-    IntGauge, TextEncoder,
++    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, Encoder, HistogramVec,
++    IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
+ };
+ 
+ use crate::v0::signer_state::LocalStateMachine;
+@@ -48,6 +48,27 @@ lazy_static! {
+         "The number of block proposals received by the signer"
+     ))
+     .unwrap();
++    #[cfg(feature = "testing")]
++    pub static ref ATTACKNET_POLICY_MATCHES: IntCounterVec = register_int_counter_vec!(
++        "stacks_signer_attacknet_policy_matches_total",
++        "Testing-only count of proposals selected by a bounded Attacknet signer policy",
++        &["behavior"]
++    )
++    .unwrap();
++    #[cfg(feature = "testing")]
++    pub static ref ATTACKNET_POLICY_EVALUATIONS: IntGaugeVec = register_int_gauge_vec!(
++        "stacks_signer_attacknet_policy_evaluations",
++        "Testing-only bounded number of unique proposal decisions retained by an Attacknet signer policy",
++        &["behavior"]
++    )
++    .unwrap();
++    #[cfg(feature = "testing")]
++    pub static ref ATTACKNET_POLICY_SESSION_ACTIVE: IntGaugeVec = register_int_gauge_vec!(
++        "stacks_signer_attacknet_policy_session_active",
++        "Whether a bounded testing-only Attacknet signer behavior session is active",
++        &["behavior"]
++    )
++    .unwrap();
+     pub static ref BLOCK_PRE_COMMITS_SENT: IntCounter = register_int_counter!(opts!(
+         "stacks_signer_block_pre_commits_sent",
+         "The number of block pre-commits sent by the signer"
+diff --git a/stacks-signer/src/v0/signer.rs b/stacks-signer/src/v0/signer.rs
+index e458d8fe34..79de6c0e95 100644
+--- a/stacks-signer/src/v0/signer.rs
++++ b/stacks-signer/src/v0/signer.rs
+@@ -13,10 +13,16 @@
+ // You should have received a copy of the GNU General Public License
+ // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ use std::collections::HashMap;
++#[cfg(feature = "testing")]
++use std::collections::HashSet;
+ use std::fmt::Debug;
++#[cfg(feature = "testing")]
++use std::fs;
+ use std::sync::mpsc::Sender;
+ #[cfg(any(test, feature = "testing"))]
+ use std::sync::LazyLock;
++#[cfg(feature = "testing")]
++use std::sync::{Mutex, OnceLock};
+ use std::time::{Duration, Instant, SystemTime};
+ 
+ use blockstack_lib::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};
+@@ -28,7 +34,7 @@ use blockstack_lib::util_lib::db::Error as DBError;
+ use clarity::codec::read_next;
+ use clarity::types::chainstate::{StacksBlockId, StacksPrivateKey};
+ use clarity::types::{PrivateKey, StacksEpochId};
+-use clarity::util::hash::{MerkleHashFunc, Sha512Trunc256Sum};
++use clarity::util::hash::{MerkleHashFunc, Sha256Sum, Sha512Trunc256Sum};
+ use clarity::util::secp256k1::Secp256k1PublicKey;
+ #[cfg(any(test, feature = "testing"))]
+ use clarity::util::sleep_ms;
+@@ -205,6 +211,383 @@ impl<const N: usize> RecentlyProcessedBlocks<N> {
+     }
+ }
+ 
++#[cfg(feature = "testing")]
++const ATTACKNET_POLICY_PROFILE: &str = "stacks-signer-testing/v1";
++
++#[cfg(feature = "testing")]
++const ATTACKNET_POLICY_ALGORITHM: &str = "stacks-signer-adversarial-selector/v1";
++
++#[cfg(feature = "testing")]
++#[derive(Debug, serde::Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct AttacknetSelector {
++    #[serde(default)]
++    every_nth: u32,
++    max_stacks_height: Option<u64>,
++    min_stacks_height: Option<u64>,
++    #[serde(default)]
++    proposal_hash_prefix: String,
++    #[serde(default)]
++    seed_offset: u32,
++}
++
++#[cfg(feature = "testing")]
++#[derive(Debug, serde::Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct AttacknetPolicy {
++    algorithm: String,
++    behavior: String,
++    #[serde(default)]
++    delay_millis: u64,
++    max_evaluations: u32,
++    max_matches: u32,
++    patch_digest: String,
++    profile: String,
++    selector: AttacknetSelector,
++    #[serde(skip)]
++    managed_digest: String,
++}
++
++#[cfg(feature = "testing")]
++#[derive(Debug, serde::Deserialize)]
++#[serde(deny_unknown_fields, rename_all = "camelCase")]
++struct AttacknetSession {
++    action: String,
++    actor: String,
++    campaign_uid: String,
++    policy_digest: String,
++    schema_version: String,
++}
++
++#[cfg(feature = "testing")]
++#[derive(Default)]
++struct AttacknetPolicyState {
++    decisions: HashMap<String, bool>,
++    delayed_responses: HashSet<String>,
++    evaluated: u32,
++    matched: u32,
++    ordinal: u64,
++    seen: HashSet<String>,
++}
++
++#[cfg(feature = "testing")]
++static ATTACKNET_POLICY: LazyLock<Option<AttacknetPolicy>> = LazyLock::new(|| {
++    let Ok(raw) = std::env::var("STACKS_SIGNER_ATTACKNET_POLICY") else {
++        return None;
++    };
++    let declared_digest = std::env::var("STACKS_SIGNER_ATTACKNET_POLICY_DIGEST")
++        .expect("STACKS_SIGNER_ATTACKNET_POLICY requires its managed digest");
++    let actual_digest = format!("sha256:{}", Sha256Sum::from_data(raw.as_bytes()));
++    assert_eq!(
++        declared_digest, actual_digest,
++        "STACKS_SIGNER_ATTACKNET_POLICY digest mismatch"
++    );
++    let mut policy: AttacknetPolicy =
++        serde_json::from_str(&raw).expect("invalid STACKS_SIGNER_ATTACKNET_POLICY JSON");
++    policy.managed_digest = declared_digest;
++    validate_attacknet_policy(&policy).expect("invalid STACKS_SIGNER_ATTACKNET_POLICY contract");
++    Some(policy)
++});
++
++#[cfg(feature = "testing")]
++fn validate_attacknet_policy(policy: &AttacknetPolicy) -> Result<(), &'static str> {
++    if policy.profile != ATTACKNET_POLICY_PROFILE {
++        return Err("unsupported profile");
++    }
++    if policy.algorithm != ATTACKNET_POLICY_ALGORITHM {
++        return Err("unsupported selector algorithm");
++    }
++    if !(1..=1024).contains(&policy.max_matches) {
++        return Err("maxMatches is out of bounds");
++    }
++    if policy.max_evaluations < policy.max_matches || policy.max_evaluations > 65_536 {
++        return Err("maxEvaluations is out of bounds");
++    }
++    let Some(patch_digest) = policy.patch_digest.strip_prefix("sha256:") else {
++        return Err("patchDigest is malformed");
++    };
++    if patch_digest.len() != 64
++        || !patch_digest
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    {
++        return Err("patchDigest is malformed");
++    }
++    if !matches!(
++        policy.behavior.as_str(),
++        "withhold" | "delay" | "suppress-peer-responses"
++    ) {
++        return Err("unsupported behavior");
++    }
++    let selector = &policy.selector;
++    if selector.every_nth > 1024 {
++        return Err("everyNth is out of bounds");
++    }
++    if selector.every_nth == 0 && selector.seed_offset != 0 {
++        return Err("seedOffset requires everyNth");
++    }
++    if selector.every_nth > 0 && selector.seed_offset >= selector.every_nth {
++        return Err("seedOffset must be less than everyNth");
++    }
++    if selector.min_stacks_height == Some(0)
++        || selector.max_stacks_height == Some(0)
++        || selector
++            .min_stacks_height
++            .zip(selector.max_stacks_height)
++            .is_some_and(|(minimum, maximum)| minimum > maximum)
++    {
++        return Err("Stacks height window is invalid");
++    }
++    if !selector.proposal_hash_prefix.is_empty()
++        && (!(2..=32).contains(&selector.proposal_hash_prefix.len())
++            || !selector
++                .proposal_hash_prefix
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
++    {
++        return Err("proposalHashPrefix is malformed");
++    }
++    if policy.behavior == "delay" {
++        if !(1..=120_000).contains(&policy.delay_millis) {
++            return Err("delay is out of bounds");
++        }
++    } else if policy.delay_millis != 0 {
++        return Err("delay is valid only for delay behavior");
++    }
++    if policy.behavior == "suppress-peer-responses"
++        && (selector.min_stacks_height.is_some()
++            || selector.max_stacks_height.is_some()
++            || selector.every_nth != 0)
++    {
++        return Err("peer suppression supports only hash-prefix selection");
++    }
++    Ok(())
++}
++
++#[cfg(feature = "testing")]
++static ATTACKNET_POLICY_STATE: LazyLock<Mutex<AttacknetPolicyState>> =
++    LazyLock::new(|| Mutex::new(AttacknetPolicyState::default()));
++
++#[cfg(feature = "testing")]
++static ATTACKNET_POLICY_OBSERVATION_STARTED: OnceLock<()> = OnceLock::new();
++
++#[cfg(feature = "testing")]
++fn validate_attacknet_session(policy: &AttacknetPolicy, actor: &str, raw: &str) -> bool {
++    if raw.len() > 1024 || actor.is_empty() {
++        return false;
++    }
++    let Ok(session) = serde_json::from_str::<AttacknetSession>(raw) else {
++        return false;
++    };
++    session.schema_version == "stacks-attacknet-signer-behavior-session/v1"
++        && session.action == policy.behavior
++        && session.actor == actor
++        && !session.campaign_uid.is_empty()
++        && session.policy_digest == policy.managed_digest
++}
++
++#[cfg(feature = "testing")]
++/// Validate one possibly absent projected session value.
++fn attacknet_session_value_is_active(
++    policy: &AttacknetPolicy,
++    raw: Option<&str>,
++    actor: Option<&str>,
++) -> bool {
++    raw.zip(actor)
++        .is_some_and(|(raw, actor)| validate_attacknet_session(policy, actor, raw.trim()))
++}
++
++#[cfg(feature = "testing")]
++/// Read the projected session contract and publish its current active state.
++fn read_attacknet_session(policy: &AttacknetPolicy) -> bool {
++    let raw = std::env::var("STACKS_SIGNER_ATTACKNET_SESSION")
++        .ok()
++        .and_then(|path| fs::read_to_string(path).ok());
++    let actor = std::env::var("HACKNET_ACTOR").ok();
++    let active = attacknet_session_value_is_active(policy, raw.as_deref(), actor.as_deref());
++    crate::monitoring::actions::set_attacknet_policy_session_active(&policy.behavior, active);
++    active
++}
++
++#[cfg(feature = "testing")]
++/// Check the session at a protocol decision point.
++fn attacknet_session_is_active(policy: &AttacknetPolicy) -> bool {
++    read_attacknet_session(policy)
++}
++
++#[cfg(feature = "testing")]
++/// Refresh session evidence even when the fault suppresses protocol traffic.
++fn start_attacknet_session_monitor(policy: &'static AttacknetPolicy) {
++    std::thread::Builder::new()
++        .name("attacknet-session-monitor".into())
++        .spawn(move || loop {
++            read_attacknet_session(policy);
++            std::thread::sleep(Duration::from_millis(500));
++        })
++        .expect("failed to start Attacknet session monitor");
++}
++
++#[cfg(feature = "testing")]
++fn attacknet_policy_match(hash: &str, height: Option<u64>) -> bool {
++    let Some(policy) = ATTACKNET_POLICY.as_ref() else {
++        return false;
++    };
++    let mut state = ATTACKNET_POLICY_STATE
++        .lock()
++        .expect("Attacknet policy state lock poisoned");
++    attacknet_policy_match_with(policy, &mut state, hash, height)
++}
++
++#[cfg(feature = "testing")]
++fn attacknet_policy_match_with(
++    policy: &AttacknetPolicy,
++    state: &mut AttacknetPolicyState,
++    hash: &str,
++    height: Option<u64>,
++) -> bool {
++    if let Some(selected) = state.decisions.get(hash) {
++        return *selected;
++    }
++    if state.evaluated >= policy.max_evaluations || state.matched >= policy.max_matches {
++        return false;
++    }
++    state.evaluated += 1;
++    crate::monitoring::actions::set_attacknet_policy_evaluations(&policy.behavior, state.evaluated);
++    if state.seen.insert(hash.to_owned()) {
++        state.ordinal = state.ordinal.saturating_add(1);
++    }
++    let selector = &policy.selector;
++    let in_height_window = match height {
++        Some(value) => {
++            selector
++                .min_stacks_height
++                .is_none_or(|minimum| value >= minimum)
++                && selector
++                    .max_stacks_height
++                    .is_none_or(|maximum| value <= maximum)
++        }
++        None => selector.min_stacks_height.is_none() && selector.max_stacks_height.is_none(),
++    };
++    let prefix_matches = selector.proposal_hash_prefix.is_empty()
++        || hash.starts_with(&selector.proposal_hash_prefix);
++    let ordinal_matches = selector.every_nth == 0
++        || (state.ordinal + u64::from(selector.seed_offset) - 1) % u64::from(selector.every_nth)
++            == 0;
++    let selected =
++        in_height_window && prefix_matches && ordinal_matches && state.matched < policy.max_matches;
++    if selected {
++        state.matched += 1;
++        crate::monitoring::actions::increment_attacknet_policy_match(&policy.behavior);
++    }
++    state.decisions.insert(hash.to_owned(), selected);
++    selected
++}
++
++#[cfg(feature = "testing")]
++fn apply_attacknet_proposal_policy(block_proposal: &BlockProposal) -> bool {
++    let Some(policy) = ATTACKNET_POLICY.as_ref() else {
++        return false;
++    };
++    if policy.behavior == "suppress-peer-responses" {
++        return false;
++    }
++    if !attacknet_session_is_active(policy) {
++        return false;
++    }
++    let hash = block_proposal
++        .block
++        .header
++        .signer_signature_hash()
++        .to_string();
++    if !attacknet_policy_match(&hash, Some(block_proposal.block.header.chain_length)) {
++        return false;
++    }
++    warn!("ATTACKNET TEST POLICY MATCHED BLOCK PROPOSAL";
++        "behavior" => policy.behavior.as_str(),
++        "signer_signature_hash" => hash,
++        "block_height" => block_proposal.block.header.chain_length,
++    );
++    proposal_is_withheld(policy, true)
++}
++
++#[cfg(feature = "testing")]
++fn proposal_is_withheld(policy: &AttacknetPolicy, selected: bool) -> bool {
++    selected && policy.behavior == "withhold"
++}
++
++#[cfg(feature = "testing")]
++fn attacknet_response_delay(block_response: &BlockResponse) -> Option<Duration> {
++    let policy = ATTACKNET_POLICY.as_ref()?;
++    if policy.behavior != "delay" || !attacknet_session_is_active(policy) {
++        return None;
++    }
++    let hash = block_response.get_signer_signature_hash().to_string();
++    let mut state = ATTACKNET_POLICY_STATE
++        .lock()
++        .expect("Attacknet policy state lock poisoned");
++    let delay = attacknet_response_delay_with(policy, &mut state, &hash)?;
++    warn!("ATTACKNET TEST POLICY DELAYING FIRST BLOCK RESPONSE";
++        "behavior" => policy.behavior.as_str(),
++        "signer_signature_hash" => hash,
++        "delay_millis" => policy.delay_millis,
++    );
++    Some(delay)
++}
++
++#[cfg(feature = "testing")]
++fn attacknet_response_delay_with(
++    policy: &AttacknetPolicy,
++    state: &mut AttacknetPolicyState,
++    hash: &str,
++) -> Option<Duration> {
++    if policy.behavior != "delay"
++        || state.decisions.get(hash) != Some(&true)
++        || !state.delayed_responses.insert(hash.to_owned())
++    {
++        return None;
++    }
++    Some(Duration::from_millis(policy.delay_millis))
++}
++
++#[cfg(feature = "testing")]
++fn apply_attacknet_peer_response_policy(block_response: &BlockResponse) -> bool {
++    let Some(policy) = ATTACKNET_POLICY.as_ref() else {
++        return false;
++    };
++    if policy.behavior != "suppress-peer-responses" || !attacknet_session_is_active(policy) {
++        return false;
++    }
++    let hash = block_response.get_signer_signature_hash().to_string();
++    let selected = attacknet_policy_match(&hash, None);
++    if selected {
++        warn!("ATTACKNET TEST POLICY SUPPRESSED PEER RESPONSE";
++            "behavior" => policy.behavior.as_str(),
++            "signer_signature_hash" => hash,
++        );
++    }
++    peer_response_is_suppressed(policy, selected)
++}
++
++#[cfg(feature = "testing")]
++fn peer_response_is_suppressed(policy: &AttacknetPolicy, selected: bool) -> bool {
++    selected && policy.behavior == "suppress-peer-responses"
++}
++
++#[cfg(feature = "testing")]
++/// Initialize bounded policy metrics and the independent session monitor.
++pub(crate) fn initialize_attacknet_policy_observation() {
++    ATTACKNET_POLICY_OBSERVATION_STARTED.get_or_init(|| {
++        if let Some(policy) = ATTACKNET_POLICY.as_ref() {
++            crate::monitoring::actions::set_attacknet_policy_evaluations(&policy.behavior, 0);
++            crate::monitoring::actions::set_attacknet_policy_session_active(
++                &policy.behavior,
++                false,
++            );
++            start_attacknet_session_monitor(policy);
++        }
++    });
++}
++
+ impl SignerTrait<SignerMessage> for Signer {
+     /// Create a new signer from the given configuration
+     fn new(stacks_client: &StacksClient, signer_config: SignerConfig) -> Self {
+@@ -216,6 +599,15 @@ impl SignerTrait<SignerMessage> for Signer {
+ 
+         debug!("Reward cycle #{} {mode}", signer_config.reward_cycle);
+ 
++        #[cfg(feature = "testing")]
++        if let Some(policy) = ATTACKNET_POLICY.as_ref() {
++            warn!("ATTACKNET TEST POLICY ACTIVE";
++                "behavior" => policy.behavior.as_str(),
++                "profile" => policy.profile.as_str(),
++                "patch_digest" => policy.patch_digest.as_str(),
++            );
++        }
++
+         let mut signer_db =
+             SignerDb::new(&signer_config.db_path).expect("Failed to connect to signer Db");
+         let proposal_config = ProposalEvalConfig::from(&signer_config);
+@@ -552,6 +944,10 @@ impl Signer {
+                     }
+                     match message {
+                         SignerMessage::BlockResponse(block_response) => {
++                            #[cfg(feature = "testing")]
++                            if apply_attacknet_peer_response_policy(block_response) {
++                                continue;
++                            }
+                             #[cfg(any(test, feature = "testing"))]
+                             if self.test_ignore_all_block_responses(block_response) {
+                                 continue;
+@@ -590,6 +986,10 @@ impl Signer {
+                 for message in messages {
+                     match message {
+                         SignerMessage::BlockProposal(block_proposal) => {
++                            #[cfg(feature = "testing")]
++                            if apply_attacknet_proposal_policy(block_proposal) {
++                                continue;
++                            }
+                             #[cfg(any(test, feature = "testing"))]
+                             if self.test_ignore_all_block_proposals(block_proposal) {
+                                 continue;
+@@ -618,7 +1018,9 @@ impl Signer {
+                             let epoch = match stacks_client.get_node_epoch() {
+                                 Ok(epoch) => epoch,
+                                 Err(e) => {
+-                                    warn!("{self}: Failed to determine node epoch. Cannot mock sign: {e}");
++                                    warn!(
++                                        "{self}: Failed to determine node epoch. Cannot mock sign: {e}"
++                                    );
+                                     continue;
+                                 }
+                             };
+@@ -705,7 +1107,9 @@ impl Signer {
+                 }
+ 
+                 let Some(signer_sighash) = signer_sighash else {
+-                    debug!("{self}: received a new block event for a pre-nakamoto block, no processing necessary");
++                    debug!(
++                        "{self}: received a new block event for a pre-nakamoto block, no processing necessary"
++                    );
+                     return;
+                 };
+                 self.recently_processed.add_block(block_id.clone());
+@@ -1041,6 +1445,10 @@ impl Signer {
+ 
+     #[cfg(any(test, feature = "testing"))]
+     fn send_block_response(&mut self, block: &NakamotoBlock, block_response: BlockResponse) {
++        #[cfg(feature = "testing")]
++        if let Some(delay) = attacknet_response_delay(&block_response) {
++            std::thread::sleep(delay);
++        }
+         if self.test_skip_block_response_broadcast(&block_response) {
+             return;
+         }
+@@ -1339,7 +1747,8 @@ impl Signer {
+             // We should not do anything further as we do not know what our response should be and we do not change our votes on rejected
+             // blocks unless we receive a new block proposal for it and the reject reason allows us to reconsider.
+             debug!(
+-                "{self}: Received a pre-commit for a block that we have not determined to be valid: {:?}. Doing nothing...", block_info.valid
++                "{self}: Received a pre-commit for a block that we have not determined to be valid: {:?}. Doing nothing...",
++                block_info.valid
+             );
+             return;
+         }
+@@ -1400,7 +1809,9 @@ impl Signer {
+         {
+             Ok(conflicts) => conflicts,
+             Err(e) => {
+-                warn!("{self}: Failed to query the signed blocks. Refusing to sign block {block_hash}: {e:?}");
++                warn!(
++                    "{self}: Failed to query the signed blocks. Refusing to sign block {block_hash}: {e:?}"
++                );
+                 return;
+             }
+         };
+@@ -1827,7 +2238,7 @@ impl Signer {
+                     return Some(self.create_block_rejection(
+                         RejectReason::SortitionViewMismatch,
+                         proposed_block,
+-                    ))
++                    ));
+                 }
+                 Err(e) => {
+                     warn!("{self}: Error checking block proposal: {e}";
+@@ -1919,7 +2330,9 @@ impl Signer {
+         // For mutability reasons, we need to take the block_info out of the map and add it back after processing
+         let Some(mut block_info) = self.block_lookup_by_reward_cycle(signer_signature_hash) else {
+             // We have not seen this block before. Why are we getting a response for it?
+-            debug!("{self}: Received a block validate response for a block we have are not tracking. Ignoring...");
++            debug!(
++                "{self}: Received a block validate response for a block we have are not tracking. Ignoring..."
++            );
+             return;
+         };
+ 
+@@ -2007,7 +2420,9 @@ impl Signer {
+         }
+         let Some(mut block_info) = self.block_lookup_by_reward_cycle(signer_signature_hash) else {
+             // We have not seen this block before. Why are we getting a response for it?
+-            debug!("{self}: Received a block validate response for a block we are not tracking. Ignoring...");
++            debug!(
++                "{self}: Received a block validate response for a block we are not tracking. Ignoring..."
++            );
+             return;
+         };
+         if block_info.valid.is_some() {
+@@ -2612,7 +3027,9 @@ impl Signer {
+                     });
+                 return;
+             } else {
+-                debug!("{self}: Cannot confirm that we have processed parent, but we've waited proposal_wait_for_parent_time, will submit proposal");
++                debug!(
++                    "{self}: Cannot confirm that we have processed parent, but we've waited proposal_wait_for_parent_time, will submit proposal"
++                );
+             }
+         }
+         match stacks_client.submit_block_for_validation(
+@@ -2741,3 +3158,171 @@ fn should_reevaluate_reject_reason(block_info: &BlockInfo) -> bool {
+         false
+     }
+ }
++
++#[cfg(all(test, feature = "testing"))]
++mod attacknet_policy_tests {
++    use std::time::Duration;
++
++    use super::{
++        attacknet_policy_match_with, attacknet_response_delay_with,
++        attacknet_session_value_is_active, peer_response_is_suppressed, proposal_is_withheld,
++        validate_attacknet_policy, validate_attacknet_session, AttacknetPolicy,
++        AttacknetPolicyState,
++    };
++
++    fn policy() -> AttacknetPolicy {
++        serde_json::from_str(
++            r#"{
++            "algorithm":"stacks-signer-adversarial-selector/v1",
++            "behavior":"withhold",
++            "maxEvaluations":8,
++            "maxMatches":2,
++            "patchDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++            "profile":"stacks-signer-testing/v1",
++            "selector":{"everyNth":2,"minStacksHeight":10,"proposalHashPrefix":"ab","seedOffset":0}
++        }"#,
++        )
++        .unwrap()
++    }
++
++    #[test]
++    fn selector_is_deterministic_and_bounded() {
++        let policy = policy();
++        let mut state = AttacknetPolicyState::default();
++        assert!(attacknet_policy_match_with(
++            &policy,
++            &mut state,
++            "ab00",
++            Some(10)
++        ));
++        assert!(attacknet_policy_match_with(
++            &policy,
++            &mut state,
++            "ab00",
++            Some(10)
++        ));
++        assert!(!attacknet_policy_match_with(
++            &policy,
++            &mut state,
++            "ab01",
++            Some(10)
++        ));
++        assert!(attacknet_policy_match_with(
++            &policy,
++            &mut state,
++            "ab02",
++            Some(11)
++        ));
++        assert!(!attacknet_policy_match_with(
++            &policy,
++            &mut state,
++            "ab04",
++            Some(12)
++        ));
++        assert!(!attacknet_policy_match_with(
++            &policy,
++            &mut state,
++            "ff06",
++            Some(12)
++        ));
++        assert!(!attacknet_policy_match_with(
++            &policy,
++            &mut state,
++            "ab08",
++            Some(9)
++        ));
++    }
++
++    #[test]
++    fn policy_rejects_unknown_fields() {
++        let source = r#"{
++            "algorithm":"stacks-signer-adversarial-selector/v1",
++            "behavior":"withhold",
++            "maxEvaluations":8,
++            "maxMatches":1,
++            "patchDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++            "profile":"stacks-signer-testing/v1",
++            "selector":{},
++            "command":"arbitrary"
++        }"#;
++        assert!(serde_json::from_str::<AttacknetPolicy>(source).is_err());
++    }
++
++    #[test]
++    fn policy_contract_rejects_malformed_bounded_fields() {
++        let mut value = policy();
++        assert!(validate_attacknet_policy(&value).is_ok());
++        value.patch_digest = "sha256:UPPER".into();
++        assert!(validate_attacknet_policy(&value).is_err());
++        value = policy();
++        value.selector.proposal_hash_prefix = "a".into();
++        assert!(validate_attacknet_policy(&value).is_err());
++        value = policy();
++        value.selector.max_stacks_height = Some(9);
++        assert!(validate_attacknet_policy(&value).is_err());
++        value = policy();
++        value.max_evaluations = 1;
++        assert!(validate_attacknet_policy(&value).is_err());
++    }
++
++    #[test]
++    fn behaviors_are_disjoint_and_delay_only_the_first_response() {
++        let mut value = policy();
++        assert!(proposal_is_withheld(&value, true));
++        assert!(!peer_response_is_suppressed(&value, true));
++
++        value.behavior = "delay".into();
++        value.delay_millis = 25;
++        let mut state = AttacknetPolicyState::default();
++        state.decisions.insert("ab00".into(), true);
++        assert_eq!(
++            attacknet_response_delay_with(&value, &mut state, "ab00"),
++            Some(Duration::from_millis(25))
++        );
++        assert_eq!(
++            attacknet_response_delay_with(&value, &mut state, "ab00"),
++            None
++        );
++        assert!(!proposal_is_withheld(&value, true));
++
++        value.behavior = "suppress-peer-responses".into();
++        value.delay_millis = 0;
++        assert!(peer_response_is_suppressed(&value, true));
++        assert!(!proposal_is_withheld(&value, true));
++    }
++
++    #[test]
++    fn session_must_bind_actor_action_policy_and_campaign() {
++        let mut value = policy();
++        value.managed_digest =
++            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
++        let valid = r#"{"action":"withhold","actor":"signer-1","campaignUid":"campaign-uid","policyDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schemaVersion":"stacks-attacknet-signer-behavior-session/v1"}"#;
++        assert!(validate_attacknet_session(&value, "signer-1", valid));
++        assert!(!validate_attacknet_session(&value, "signer-2", valid));
++        assert!(!validate_attacknet_session(
++            &value,
++            "signer-1",
++            &valid.replace("withhold", "delay")
++        ));
++        assert!(!validate_attacknet_session(
++            &value,
++            "signer-1",
++            &valid.replace("campaign-uid", "")
++        ));
++        assert!(!validate_attacknet_session(
++            &value,
++            "signer-1",
++            &valid.replace('b', "c")
++        ));
++        assert!(attacknet_session_value_is_active(
++            &value,
++            Some(valid),
++            Some("signer-1")
++        ));
++        assert!(!attacknet_session_value_is_active(
++            &value,
++            None,
++            Some("signer-1")
++        ));
++    }
++}

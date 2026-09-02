@@ -1,0 +1,18 @@
+{{- if .Values.runOperator.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hacknet.runOperatorName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hacknet.labels" . | nindent 4 }}
+    app.kubernetes.io/component: run-operator
+spec:
+  selector:
+    {{- include "hacknet.runOperatorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

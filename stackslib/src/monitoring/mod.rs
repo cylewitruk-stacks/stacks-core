@@ -42,6 +42,16 @@ pub fn increment_rpc_calls_counter() {
     prometheus::RPC_CALL_COUNTER.inc();
 }
 
+/// Sample the wall clock from inside the Stacks process. In addition to
+/// ordinary clock-drift monitoring, this makes process-scoped clock-fault
+/// experiments observable without mistaking a sidecar's clock for the
+/// application's clock.
+pub fn sample_process_wall_clock_time() {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::PROCESS_WALL_CLOCK_TIME
+        .set(stacks_common::util::get_epoch_time_ms() as f64 / 1000.0);
+}
+
 #[allow(unused_mut)]
 pub fn instrument_http_request_handler<F, R>(
     conv_http: &mut ConversationHttp,
@@ -68,6 +78,12 @@ where
 pub fn increment_stx_blocks_received_counter() {
     #[cfg(feature = "monitoring_prom")]
     prometheus::STX_BLOCKS_RECEIVED_COUNTER.inc();
+}
+
+#[allow(unused_variables)]
+pub fn increment_nakamoto_blocks_received_counter(count: usize) {
+    #[cfg(feature = "monitoring_prom")]
+    prometheus::NAKAMOTO_BLOCKS_RECEIVED_COUNTER.inc_by(i64::try_from(count).unwrap_or(i64::MAX));
 }
 
 pub fn increment_stx_micro_blocks_received_counter() {

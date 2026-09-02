@@ -1,0 +1,29 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: signer-node-1-failure
+spec:
+  networkRef: attacknet
+  safety:
+    maxUnavailableSignerBasisPoints: 3000
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: stop-node
+      faults:
+        - id: node-failure
+          target:
+            actors: [signer-node-1]
+            mode: all
+          fault:
+            type: pod
+            action: pod-failure
+            mode: all
+            duration: 30s
+            parameters: {}

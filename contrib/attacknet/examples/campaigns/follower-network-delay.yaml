@@ -1,0 +1,37 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: follower-1-network-delay
+spec:
+  networkRef: attacknet
+  safety:
+    maxUnavailableSignerBasisPoints: 3000
+    maxUnavailableMinerBasisPoints: 5000
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: delay-peer-traffic
+      faults:
+        - id: follower-delay
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: network
+            action: delay
+            mode: all
+            duration: 15s
+            parameters:
+              direction: both
+              peerTarget:
+                actors: [miner-1]
+                mode: all
+              delay:
+                latency: 250ms
+                correlation: "0"
+                jitter: 25ms

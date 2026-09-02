@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "stacks-attacknet-release-gate-result/v1",
+  "reviewId": "release-1-amendment-a12-deterministic-adversarial-actors",
+  "status": "Approved for Release 1 deterministic adversarial actors amendment A12 scope",
+  "sourceRevision": "6a6ea8363012173fc614fe8ddb40daa0695feddd",
+  "candidateTree": "fe1580785298a0382900f8aff06fc7bb79965bd8",
+  "packetDigest": "sha256:a734ee009c8881d9acc77bad6bdb8cc849e2573523618fd8cf7d680dc82c1d96",
+  "contractDigest": "sha256:6c01d056d57a277f20d0345058b65823dae3b98ec7ea05086bbbf93ae963bf93",
+  "reviewPacketFileDigest": "sha256:79bda31ae640e86072999ac10ec177f8531adb44ed7a79b5afb5e7818e5c1e51",
+  "verdictFileDigests": {
+    "Codex": "sha256:19f7732b596bcb5bf34e3b0b7fc92de9394f051539b0c9e848f8cf64bb2b6e7e",
+    "Claude Opus 5": "sha256:7d5ba85e26e26e7efc65e43feb52b52ed4b2828e5fac1ded935bf18758a8c5e9"
+  },
+  "evidenceSummaryDigest": "sha256:0e6baf5b89ef5af28cfddb7105b2eba433d00110f7c69a22e75a897aa4c929b3",
+  "evidenceArchiveDigest": "sha256:aa3cbc5417aaed4e3db741d1418dc8deaf5b65c0b73b4a08c33bad00300fbdf8"
+}

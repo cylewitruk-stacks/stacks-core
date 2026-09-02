@@ -61,6 +61,7 @@ pub mod actions {
     use crate::monitoring::prometheus::*;
     use crate::monitoring::{SignerAgreementStateChangeReason, SignerAgreementStateConflict};
     use crate::v0::signer_state::LocalStateMachine;
+    use libsigner::v0::signer_state::GlobalStateAgreementSnapshot;
 
     /// Update stacks tip height gauge
     pub fn update_stacks_tip_height(height: i64) {
@@ -70,6 +71,18 @@ pub mod actions {
     /// Update the current reward cycle
     pub fn update_reward_cycle(reward_cycle: i64) {
         CURRENT_REWARD_CYCLE.set(reward_cycle);
+    }
+
+    /// Record whether the outer signer runloop has initialized successfully.
+    pub fn update_runloop_ready(ready: bool) {
+        SIGNER_RUNLOOP_READY.set(i64::from(ready));
+    }
+
+    /// Record whether this process can participate in the current and next
+    /// reward cycles. Runloop initialization alone does not imply either.
+    pub fn update_reward_cycle_registration(current: bool, next: bool) {
+        SIGNER_REGISTERED_CURRENT_REWARD_CYCLE.set(i64::from(current));
+        SIGNER_REGISTERED_NEXT_REWARD_CYCLE.set(i64::from(next));
     }
 
     /// Increment the block validation responses counter
@@ -162,6 +175,20 @@ pub mod actions {
             .inc();
     }
 
+    /// Record the current reward-cycle global-state support. Values are kept
+    /// as separate bounded gauges so a lifecycle gate can fail closed without
+    /// inferring agreement from proposal/rejection counters.
+    pub fn update_global_state_agreement(snapshot: GlobalStateAgreementSnapshot) {
+        SIGNER_GLOBAL_STATE_AVAILABLE.set(i64::from(snapshot.global_state_available));
+        SIGNER_GLOBAL_STATE_TOTAL_WEIGHT.set(i64::from(snapshot.total_weight));
+        SIGNER_GLOBAL_STATE_KNOWN_WEIGHT.set(i64::from(snapshot.known_weight));
+        SIGNER_GLOBAL_STATE_MAXIMUM_VIEW_WEIGHT.set(i64::from(snapshot.maximum_state_view_weight));
+        SIGNER_GLOBAL_STATE_EVALUATOR_THRESHOLD_WEIGHT
+            .set(i64::from(snapshot.evaluator_threshold_weight));
+        SIGNER_GLOBAL_STATE_CANONICAL_THRESHOLD_WEIGHT
+            .set(i64::from(snapshot.canonical_threshold_weight));
+    }
+
     /// Record the time (seconds) taken for a signer to agree with the signer set
     pub fn record_signer_agreement_capitulation_latency(latency_s: u64) {
         SIGNER_AGREEMENT_CAPITULATION_LATENCIES_HISTOGRAM
@@ -201,6 +228,12 @@ pub mod actions {
 
     /// Update the current reward cycle
     pub fn update_reward_cycle(_reward_cycle: i64) {}
+
+    /// Record whether the outer signer runloop has initialized successfully.
+    pub fn update_runloop_ready(_ready: bool) {}
+
+    /// No-op reward-cycle registration metrics when Prometheus is disabled.
+    pub fn update_reward_cycle_registration(_current: bool, _next: bool) {}
 
     /// Increment the block validation responses counter
     pub fn increment_block_validation_responses(_accepted: bool) {}
@@ -252,6 +285,12 @@ pub mod actions {
 
     /// Increment signer agreement state conflict counter
     pub fn increment_signer_agreement_state_conflict(_conflict: SignerAgreementStateConflict) {}
+
+    /// No-op global state support metrics when Prometheus is disabled.
+    pub fn update_global_state_agreement(
+        _snapshot: libsigner::v0::signer_state::GlobalStateAgreementSnapshot,
+    ) {
+    }
 
     /// Record the time (seconds) taken for a signer to agree with the signer set
     pub fn record_signer_agreement_capitulation_latency(_latency_s: u64) {}

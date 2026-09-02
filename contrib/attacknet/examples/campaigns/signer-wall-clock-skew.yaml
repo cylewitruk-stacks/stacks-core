@@ -1,0 +1,30 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: signer-1-wall-clock-skew
+spec:
+  networkRef: attacknet
+  safety:
+    maxUnavailableSignerBasisPoints: 3000
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: signer-time-skew
+      faults:
+        - id: signer-clock
+          target:
+            actors: [signer-1]
+            mode: all
+          fault:
+            type: time
+            mode: all
+            duration: 30s
+            parameters:
+              timeOffset: -30s
+              clockIds: [CLOCK_REALTIME]

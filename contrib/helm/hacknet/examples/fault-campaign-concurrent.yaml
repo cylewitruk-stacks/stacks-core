@@ -1,0 +1,68 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: minimal-concurrent-peer-disruption
+spec:
+  networkRef: minimal
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 2
+  stages:
+    - id: delay-burnchain-path
+      maxStartSkew: 2s
+      faults:
+        - id: follower-delay
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: network
+            action: delay
+            mode: all
+            duration: 12s
+            parameters:
+              direction: both
+              peerTarget:
+                actors: [bitcoin]
+                mode: all
+              delay:
+                latency: 750ms
+                jitter: 100ms
+                correlation: "25"
+          effectAssertions:
+            - type: NetworkDegraded
+              actor: follower-1
+              timeoutSeconds: 60
+          recoveryAssertions:
+            - type: NetworkRecovered
+              actor: follower-1
+              timeoutSeconds: 180
+    - id: disrupt-burnchain-dns
+      trigger:
+        afterStage:
+          stage: delay-burnchain-path
+          state: Effective
+          delay: 1s
+      maxStartSkew: 2s
+      faults:
+        - id: follower-dns
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: dns
+            action: error
+            mode: all
+            duration: 5s
+            parameters:
+              patterns: [minimal-bitcoin.*]
+              containerNames: [actor, attacknet-probe]
+          effectAssertions:
+            - type: DNSDegraded
+              actor: follower-1
+              timeoutSeconds: 60
+          recoveryAssertions:
+            - type: DNSRecovered
+              actor: follower-1
+              timeoutSeconds: 180

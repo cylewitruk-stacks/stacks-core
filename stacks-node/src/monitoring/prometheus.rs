@@ -47,6 +47,10 @@ pub fn start_serving_prometheus_metrics(bind_address: String) -> Result<(), Moni
 async fn accept(stream: TcpStream) -> http_types::Result<()> {
     debug!("Handle Prometheus polling ({})", stream.peer_addr()?);
     async_h1::accept(stream.clone(), |_| async {
+        // This sample deliberately happens in the node process and on every
+        // scrape. A collector or sidecar clock cannot reveal process-scoped
+        // TimeChaos injection.
+        stacks::monitoring::sample_process_wall_clock_time();
         let encoder = TextEncoder::new();
         let metric_families = gather();
         let mut buffer = vec![];

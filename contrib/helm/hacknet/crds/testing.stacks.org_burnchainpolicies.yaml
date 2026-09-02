@@ -1,0 +1,421 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: burnchainpolicies.testing.stacks.org
+spec:
+  group: testing.stacks.org
+  names:
+    kind: BurnchainPolicy
+    listKind: BurnchainPolicyList
+    plural: burnchainpolicies
+    singular: burnchainpolicy
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: BurnchainPolicy declares externally controlled Bitcoin regtest
+          mining policy.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: BurnchainPolicySpec defines bootstrap and steady-state block
+              production.
+            properties:
+              bitcoinNodeRef:
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+              bootstrapHeight:
+                format: int64
+                maximum: 10000000
+                minimum: 0
+                type: integer
+              cadence:
+                type: string
+              destinationSelection:
+                default: round-robin
+                description: BurnchainDestinationMode controls how the clock chooses
+                  a destination.
+                enum:
+                - round-robin
+                - fixed
+                type: string
+              destinations:
+                items:
+                  description: BurnchainDestinationSpec binds one watch-only wallet
+                    to a mining address.
+                  properties:
+                    address:
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^[^,\r\n]+$
+                      type: string
+                    walletName:
+                      maxLength: 128
+                      minLength: 1
+                      pattern: ^[^,\r\n]+$
+                      type: string
+                  required:
+                  - address
+                  - walletName
+                  type: object
+                maxItems: 64
+                minItems: 1
+                type: array
+              fixedDestinationIndex:
+                format: int32
+                maximum: 63
+                minimum: 0
+                type: integer
+              flash:
+                description: BurnchainFlashRequest is one idempotent bounded multi-block
+                  request.
+                properties:
+                  blocks:
+                    format: int32
+                    maximum: 10000
+                    minimum: 1
+                    type: integer
+                  id:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  interval:
+                    type: string
+                required:
+                - blocks
+                - id
+                type: object
+              networkRef:
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+              paused:
+                type: boolean
+              protocolSchedule:
+                description: |-
+                  ProtocolSchedule lets semantic faults prove whether a requested branch
+                  replacement crosses an epoch or reward-cycle boundary.
+                properties:
+                  epochs:
+                    items:
+                      description: BurnchainEpochBoundary names one inclusive epoch
+                        start height.
+                      properties:
+                        name:
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        startHeight:
+                          format: int64
+                          maximum: 10000000
+                          minimum: 0
+                          type: integer
+                      required:
+                      - name
+                      - startHeight
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  rewardCycle:
+                    description: BurnchainRewardCycleSchedule defines deterministic
+                      reward-cycle geometry.
+                    properties:
+                      cycleLength:
+                        format: int64
+                        maximum: 1000000
+                        minimum: 1
+                        type: integer
+                      firstHeight:
+                        format: int64
+                        maximum: 10000000
+                        minimum: 0
+                        type: integer
+                      prepareLength:
+                        format: int64
+                        maximum: 1000000
+                        minimum: 0
+                        type: integer
+                    required:
+                    - cycleLength
+                    - firstHeight
+                    - prepareLength
+                    type: object
+                    x-kubernetes-validations:
+                    - message: prepareLength must be less than cycleLength
+                      rule: self.prepareLength < self.cycleLength
+                type: object
+                x-kubernetes-validations:
+                - message: protocolSchedule must declare both epoch and reward-cycle
+                    geometry
+                  rule: self.epochs.size() > 0 && has(self.rewardCycle)
+              reserveOutputs:
+                default: 4
+                description: |-
+                  ReserveOutputs controls the initial coinbase outputs mined by this
+                  policy. Set it to zero on secondary Bitcoin nodes so only one policy
+                  establishes the shared regtest chain.
+                format: int32
+                maximum: 10000
+                minimum: 0
+                type: integer
+              rpc:
+                description: BurnchainRPCSpec configures bounded RPC retry behavior.
+                properties:
+                  maximumBackoff:
+                    type: string
+                  minimumBackoff:
+                    type: string
+                  passwordSecretRef:
+                    description: SecretKeyReference identifies one key in a Secret.
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  timeout:
+                    type: string
+                  usernameSecretRef:
+                    description: SecretKeyReference identifies one key in a Secret.
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: usernameSecretRef and passwordSecretRef must be configured
+                    together
+                  rule: has(self.usernameSecretRef) == has(self.passwordSecretRef)
+            required:
+            - bitcoinNodeRef
+            - cadence
+            - destinations
+            - networkRef
+            type: object
+            x-kubernetes-validations:
+            - message: fixedDestinationIndex must select a destination only in fixed
+                mode
+              rule: 'self.destinationSelection == ''fixed'' ? (!has(self.fixedDestinationIndex)
+                || self.fixedDestinationIndex < size(self.destinations)) : (!has(self.fixedDestinationIndex)
+                || self.fixedDestinationIndex == 0)'
+          status:
+            description: BurnchainPolicyStatus reports applied policy and observed
+              Bitcoin progress.
+            properties:
+              admittedBitcoinRuntimeImageID:
+                type: string
+              admittedBitcoinStatefulSetUID:
+                type: string
+              admittedNetworkUID:
+                type: string
+              appliedFlashId:
+                type: string
+              appliedPolicyDigest:
+                type: string
+              bitcoinObservationAt:
+                format: date-time
+                type: string
+              bitcoinObservationError:
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              consecutiveFailures:
+                format: int32
+                type: integer
+              lastAttemptAt:
+                format: date-time
+                type: string
+              lastBlockHash:
+                pattern: ^$|^[0-9a-fA-F]{64}$
+                type: string
+              lastSuccessAt:
+                format: date-time
+                type: string
+              message:
+                type: string
+              observedChainTips:
+                items:
+                  description: BurnchainChainTipStatus is one bounded branch observed
+                    by Bitcoin Core.
+                  properties:
+                    branchLength:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    hash:
+                      maxLength: 64
+                      minLength: 64
+                      pattern: ^[0-9a-fA-F]{64}$
+                      type: string
+                    height:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    status:
+                      maxLength: 32
+                      minLength: 1
+                      type: string
+                  required:
+                  - branchLength
+                  - hash
+                  - height
+                  - status
+                  type: object
+                maxItems: 32
+                type: array
+              observedChainwork:
+                pattern: ^$|^[0-9a-fA-F]{64}$
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              observedHeaders:
+                format: int64
+                type: integer
+              observedHeight:
+                format: int64
+                type: integer
+              observedPeers:
+                items:
+                  description: BurnchainPeerStatus identifies one currently connected
+                    Bitcoin peer.
+                  properties:
+                    address:
+                      maxLength: 256
+                      minLength: 1
+                      type: string
+                    connectionType:
+                      maxLength: 64
+                      minLength: 1
+                      type: string
+                    id:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    inbound:
+                      type: boolean
+                    lastBlock:
+                      description: |-
+                        LastBlock is Bitcoin Core's Unix timestamp for the latest block message
+                        received from this peer, or zero when none has been observed.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    lastTransaction:
+                      description: |-
+                        LastTransaction is Bitcoin Core's Unix timestamp for the latest
+                        transaction message received from this peer, or zero when absent.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                  required:
+                  - address
+                  - connectionType
+                  - id
+                  - inbound
+                  - lastBlock
+                  - lastTransaction
+                  type: object
+                maxItems: 128
+                type: array
+              phase:
+                type: string
+              reason:
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
