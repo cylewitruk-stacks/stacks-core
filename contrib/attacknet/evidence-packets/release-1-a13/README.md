@@ -1,10 +1,9 @@
 # Release 1 Amendment A13 evidence
 
-The review packet for R1A13 is assembled here after the final hardware-signed
-candidate is created. Large qualification artifacts remain in the external,
-digest-bound review bundle rather than Git.
+Amendment A13 is approved. The tracked
+[`gate-result.json`](gate-result.json) binds its signed revision, review packet,
+contract, both reviewer verdicts, evidence summary, and external archive.
+Large qualification and corpus artifacts remain external and content-addressed.
 
-Expected tracked artifact after approval:
-
-- `gate-result.json` — compact binding of the signed candidate, packet,
-  reviewers, and external evidence archive.
+The amendment contract is
+[`contract.json`](../../release/amendments/a13/contract.json).

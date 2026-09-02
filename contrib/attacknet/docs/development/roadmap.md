@@ -280,12 +280,15 @@ Definition of done:
 
 ### A13: Seeded fuzzing, corpus management, and reduction
 
-Status: implementation and qualification in progress. The bounded scope,
-architecture, implementation phases, and qualification contract are in the
-[`R1A13 implementation specification`](issues/r1/r1a13-seeded-fuzzing-corpus-reduction.md).
+Status: approved for Release 1 on 2026-09-02. The Full-tier gate binds signed
+commit `82efd989d71836322286d870cdb82be49c9db364`, candidate tree
+`319b06f4cc009c63d72992d36bff696970197fb5`, review ID
+`release-1-amendment-a13-seeded-fuzzing-corpus-reduction`, and packet digest
+`sha256:eeb4601eec1a186edb6d69c5f7f66b3abe1f7048bc82f9036f2e28c752787727`.
+The bounded scope, architecture, implementation record, and qualification are
+in the [`R1A13 implementation specification`](issues/r1/r1a13-seeded-fuzzing-corpus-reduction.md).
 
-Once burnchain faults and adversarial actors are bounded and attributable,
-`AttacknetRun` can combine:
+The approved planner composes:
 
 - Bitcoin reorganizations and view splits;
 - flash-block cadence;
@@ -299,14 +302,15 @@ be seeded, ordered, budgeted, and written to the sealed run ledger before
 execution. No agent may issue an unrecorded Bitcoin RPC or raw Kubernetes
 fault.
 
-The campaign engine must retain novel failures in a corpus, replay each failure
-on a fresh network, and mechanically reduce the schedule. An LLM may prioritize
-likely contributors to reduce unnecessary trials, but every removal must be
-validated by deterministic replay before it is accepted. Cold-start capacity
-reservation must be implemented before long unattended runs so apparatus
-resource exhaustion does not masquerade as a Stacks defect.
+The campaign engine retains novel failures in a corpus, replays each failure on
+a fresh network, and mechanically reduces the schedule. An LLM may prioritize
+likely contributors to reduce unnecessary trials, but every removal is
+validated by deterministic replay before it is accepted. Physical storage and
+cold-start write-burst escrow prevent unproven storage headroom from being
+misclassified as a Stacks defect. Image-filesystem headroom is admission-gated
+and rechecked between attempts, but remains unreserved.
 
-Definition of done:
+The approved gate establishes:
 
 - identical seeds and admitted inputs produce identical run instructions;
 - safety budgets bound signer, miner, burnchain, duration, and concurrency
@@ -315,8 +319,8 @@ Definition of done:
 - corpus entries include a replay command, source and image provenance,
   assertion outcome, and evidence digest;
 - fresh-network replay confirms a failure before reduction begins;
-- mechanical reduction produces a causal candidate without claiming proof from
-  LLM reasoning alone;
+- mechanical reduction produces a smaller confirmed reproducer without
+  claiming causal minimality or accepting proof from LLM reasoning alone;
 - clean, failed, inconclusive, and harness-failure outcomes are distinguishable.
 
 ## Backlog
@@ -366,3 +370,16 @@ The following remain product improvements rather than advertised capabilities:
 
 They should not delay the local protocol-fault roadmap unless they become a
 prerequisite for truthful qualification.
+
+### A13 maintenance follow-ups
+
+The A13 review recorded three non-blocking cleanup items:
+
+- remove dead pre-reassignment `attempts` appends in the session engine;
+- validate a journal digest before creating its session directory so a typo
+  cannot leave an empty directory; and
+- evaluate the pre-existing unused `canonical.Decode` helper and remove it if
+  no planned caller needs it.
+
+These do not affect the approved A13 behavior or evidence and require ordinary
+review unless a future change alters runtime or evidence semantics.

@@ -5,9 +5,18 @@
 | Field | Value |
 | --- | --- |
 | Amendment | R1A13 |
-| State | Implementation complete; release qualification in progress |
-| Expected review tier | Full |
-| Product claim | Not supported until implementation and qualification complete |
+| State | Approved for Release 1 on 2026-09-02 |
+| Review tier | Full |
+| Product claim | Supported within the local three-node arm64 `kind` scope |
+
+The gate approved signed commit
+`82efd989d71836322286d870cdb82be49c9db364`, candidate tree
+`319b06f4cc009c63d72992d36bff696970197fb5`, and packet digest
+`sha256:eeb4601eec1a186edb6d69c5f7f66b3abe1f7048bc82f9036f2e28c752787727`
+under review ID
+`release-1-amendment-a13-seeded-fuzzing-corpus-reduction`. The tracked
+[`gate-result.json`](../../../../evidence-packets/release-1-a13/gate-result.json)
+binds both complete direct-read verdicts and the external evidence archive.
 
 ## Objective
 
@@ -327,9 +336,11 @@ sealed.
 
 ## Capacity admission and cooperative reservation
 
-A13 closes the Release 1 `cold-start-capacity-reservation` gap for the
-qualified dedicated local profile. It must not describe this as a portable
-cloud-storage guarantee.
+A13 closes the Release 1 `cold-start-storage-reservation` gap for the qualified
+dedicated local profile. It physically reserves storage and the cold-start
+write burst, but only admission-gates and rechecks image-filesystem headroom.
+Image-filesystem bytes remain unreserved, and this must not be described as a
+portable cloud-storage or image-filesystem reservation guarantee.
 
 Before unattended execution, the session engine:
 
@@ -642,9 +653,10 @@ is clearly labeled.
 
 ## Implementation phases
 
-Implementation status as of 2026-08-31: Phases 1 through 5 are implemented and
-pass their focused unit, race, strict-document, and compatibility-vector
-tests. Phase 6 is in live qualification. Qualification has already found and
+Implementation status as of 2026-09-02: Phases 1 through 6 are implemented,
+qualified, and approved. Focused unit, race, strict-document,
+compatibility-vector, envtest, Helm, RBAC, and whole-product tests pass.
+Qualification found and
 remediated capacity-escrow scheduler bypass, taint placement, renderer image-ID
 parsing, workload-name length, API-invalid inert run controls, unsupported run
 policy defaults, actor-dependent suspension status, namespace drift, and
@@ -738,7 +750,11 @@ convergence. The final control requires 15 blocks over 60 seconds: normal
 2-second cadence has twice that budget while the bounded acknowledged pause
 cannot satisfy it.
 Each finding failed closed without being classified as a Stacks defect. The
-Full-tier live qualification and review gate remain open.
+final Full-tier qualification passed all ten live assertions, retained a
+portable corpus with eight entries and 663 objects, and left no owned network,
+run, campaign, policy, PVC, Lease, or reservation resource. Codex and Claude
+Opus 5 reviewed all 109 packet inventory items directly with no omissions and
+approved the exact signed candidate.
 
 ### Phase 1: contracts and pure planner
 

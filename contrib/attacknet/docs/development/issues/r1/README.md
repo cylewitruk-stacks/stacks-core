@@ -4,16 +4,14 @@ Release 1 issue documents are grouped by amendment and listed in recommended
 implementation order. Amendment status remains authoritative in the
 [`roadmap`](../../roadmap.md).
 
-## Planned
+## Approved
 
 ### R1A13: Seeded fuzzing, corpus management, and reduction
 
 - [`r1a13-seeded-fuzzing-corpus-reduction.md`](r1a13-seeded-fuzzing-corpus-reduction.md):
-  implementation-ready design for deterministic planning, resumable sessions,
-  capacity admission, portable failure corpora, fresh-network confirmation,
-  and mechanical reduction.
-
-## Approved
+  approved deterministic planning, resumable sessions, capacity admission,
+  portable failure corpora, fresh-network confirmation, and hierarchical
+  removal-only reduction.
 
 ### R1A12: Deterministic adversarial actors
 

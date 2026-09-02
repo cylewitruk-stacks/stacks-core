@@ -1,14 +1,14 @@
 # Attacknet release records
 
 This directory contains the Release 1 baseline, review contracts, packet
-builders, schemas, and the A1–A12 amendment history. These artifacts bind exact
+builders, schemas, and the A1–A13 amendment history. These artifacts bind exact
 historical revisions and paths; they are intentionally not rearranged by
 repository-hygiene changes.
 
-The latest approved amendment is A12, `deterministic adversarial actors`, at
-signed commit `6a6ea8363012173fc614fe8ddb40daa0695feddd`.
+The latest approved amendment is A13, `seeded fuzzing, corpus, and reduction`,
+at signed commit `82efd989d71836322286d870cdb82be49c9db364`.
 Its Full-tier gate closed against packet digest
-`sha256:a734ee009c8881d9acc77bad6bdb8cc849e2573523618fd8cf7d680dc82c1d96`.
+`sha256:eeb4601eec1a186edb6d69c5f7f66b3abe1f7048bc82f9036f2e28c752787727`.
 
 The baseline points to small tracked gate records rather than ignored live
 evidence directories. The Release 1 foundation record binds the historical

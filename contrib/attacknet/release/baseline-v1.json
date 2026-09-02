@@ -112,6 +112,12 @@
       "path": "contrib/attacknet/evidence-packets/release-1-a12/gate-result.json",
       "digest": "sha256:becaee92c7115d436acc9c669cae161138e2ccc54ed186886c01f0ff5f415e15",
       "status": "passed"
+    },
+    {
+      "id": "release-1-a13-seeded-fuzzing-corpus-reduction",
+      "path": "contrib/attacknet/evidence-packets/release-1-a13/gate-result.json",
+      "digest": "sha256:c855723b3e4467adb4cbbbea2d140d61af365ca87290cce489b7d990ece481e9",
+      "status": "passed"
     }
   ],
   "capabilities": [
@@ -148,7 +154,7 @@
     {
       "id": "fresh-network-replay-and-removal-only-ddmin",
       "status": "supported",
-      "evidence": ["fresh-network-ddmin"]
+      "evidence": ["fresh-network-ddmin", "release-1-a13-seeded-fuzzing-corpus-reduction"]
     },
     {
       "id": "identity-bound-protocol-observations-and-fail-closed-assertions",
@@ -174,10 +180,15 @@
       "evidence": ["deterministic-fault-run"]
     },
     {
-      "id": "cold-start-capacity-reservation",
+      "id": "cold-start-storage-reservation",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "image-filesystem-reservation",
       "status": "not-done",
-      "reason": "The local capacity preflight observes current kubelet filesystems but does not reserve the subsequent image, PVC, and cold-start write burst; operators must provision headroom outside the harness.",
-      "evidence": ["measured-300-burn-soak"]
+      "reason": "A13 admission-gates and rechecks image-filesystem headroom before each attempt, but does not reserve those bytes; a concurrent or large image pull can still exhaust the image filesystem.",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
     },
     {
       "id": "actor-egress-network-policy",
@@ -252,6 +263,21 @@
       "id": "cryptographically-attributed-adversarial-signer-observations",
       "status": "supported",
       "evidence": ["release-1-a12-deterministic-adversarial-actors"]
+    },
+    {
+      "id": "finite-seeded-fuzz-session-planning-and-resume",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "content-addressed-failure-corpus-confirmation-and-replay",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
+    },
+    {
+      "id": "deterministic-hierarchical-removal-only-reduction",
+      "status": "supported",
+      "evidence": ["release-1-a13-seeded-fuzzing-corpus-reduction"]
     },
     {
       "id": "controller-ha-leader-election",

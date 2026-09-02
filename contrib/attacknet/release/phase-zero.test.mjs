@@ -152,8 +152,8 @@ test('deferred baseline capabilities require complete structured reopening recor
   assert(baseline.capabilities.some(item => item.id === 'enterprise-registry-and-identity-federation'));
   for (const [id, status] of [
     ['native-chaos-mesh-stresschaos-arm64', 'capability-rejected'],
-    ['cold-start-capacity-reservation', 'not-done'],
     ['cryptographically-attested-active-probes', 'not-done'],
+    ['image-filesystem-reservation', 'not-done'],
     ['matching-kubernetes-client-packaging', 'not-done'],
   ]) {
     const capability = baseline.capabilities.find(item => item.id === id);
@@ -278,6 +278,35 @@ test('the baseline advertises approved A12 capabilities from bound evidence', ()
     'actor-egress-network-policy',
     'bounded-deterministic-adversarial-signer-behaviors',
     'cryptographically-attributed-adversarial-signer-observations',
+  ].map(id => baseline.capabilities.find(item => item.id === id));
+  for (const capability of capabilities) {
+    assert.equal(capability?.status, 'supported');
+    assert.deepEqual(capability.evidence, [evidenceId]);
+  }
+  assert.equal(validateBaseline({
+    ...baseline, evidence: [evidence], capabilities,
+  }, {verifyEvidence: true, root: repositoryRoot}), true);
+});
+
+test('the baseline advertises approved A13 capabilities from bound evidence', () => {
+  const baseline = load(baselinePath);
+  const evidenceId = 'release-1-a13-seeded-fuzzing-corpus-reduction';
+  const evidence = baseline.evidence.find(item => item.id === evidenceId);
+  assert.deepEqual(evidence, {
+    id: evidenceId,
+    path: 'contrib/attacknet/evidence-packets/release-1-a13/gate-result.json',
+    digest: 'sha256:c855723b3e4467adb4cbbbea2d140d61af365ca87290cce489b7d990ece481e9',
+    status: 'passed',
+  });
+  assert.doesNotThrow(() => execFileSync(
+    'git', ['ls-files', '--error-unmatch', evidence.path],
+    {cwd: repositoryRoot, stdio: 'ignore'},
+  ));
+  const capabilities = [
+    'cold-start-storage-reservation',
+    'finite-seeded-fuzz-session-planning-and-resume',
+    'content-addressed-failure-corpus-confirmation-and-replay',
+    'deterministic-hierarchical-removal-only-reduction',
   ].map(id => baseline.capabilities.find(item => item.id === id));
   for (const capability of capabilities) {
     assert.equal(capability?.status, 'supported');

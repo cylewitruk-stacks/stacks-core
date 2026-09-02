@@ -294,6 +294,10 @@ events, and PVCs until root-cause attribution is complete. See
 | Upgrade reports `StartupIncompatible` | Compare requested and admitted image and configuration digests, then inspect actor and init-container logs before attributing a protocol defect. |
 | Upgrade is `Inconclusive` | Preserve the descriptor, import receipt, campaign status, and incident bundle; `TelemetryUnavailable` and `ProtocolAssertionInconclusive` are not incompatibility verdicts. |
 | Upgrade is rolling back | Wait for `rollbackComplete: true`; do not delete or patch its StatefulSets during controller-owned rollback. |
+| Fuzz planning reports source drift | Re-plan only after intentionally reviewing the changed template or policy identity and specification. |
+| Fuzz run reports `CapacityUnavailable` | Preserve the capacity receipt and provide real local headroom; no experiment network was created. |
+| Fuzz client was interrupted | Use `fuzz resume` with the recorded session digest and same corpus; do not create a replacement session. |
+| Corpus verification fails | Stop replay and reduction, preserve the corpus, and inspect the named missing or substituted object. |
 | Inconclusive result | Preserve evidence; inspect identity divergence, effect ambiguity, and rollback. |
 | Pod Pending after node loss | Inspect PVC node affinity; portable cross-node CSI is outside Release 1. |
 | Unsupported native fault | Use `io-pressure` or application `clock-skew`; do not bypass capability admission. |

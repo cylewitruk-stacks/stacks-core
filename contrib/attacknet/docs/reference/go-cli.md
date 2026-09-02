@@ -154,6 +154,12 @@ operators. See the
 [fuzz-session operator guide](../operations/fuzzing.md) for the ownership,
 capacity, corpus, and replay contracts.
 
+The fuzz seed deterministically selects and orders admitted orchestration
+inputs. It does not seed Kubernetes, the Stacks P2P implementation, message
+timing, block production internals, or actor-local random generators. Replay
+compares trusted semantic classifications rather than requiring byte-identical
+runtime traces.
+
 `convert` is an offline compatibility aid for v1alpha1 single-fault
 `FaultCampaign` and serial `AttacknetRun` resources. It preserves safety limits
 and turns serial delays into explicit terminal dependencies. It refuses

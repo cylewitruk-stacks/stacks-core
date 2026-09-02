@@ -10,6 +10,19 @@ Kubernetes mutation, Bitcoin RPC, or fault parameters to an agent. The planner
 selects only operator-created `FaultCampaign` and `UpgradeCampaign` templates;
 their normal admission rules and safety budgets remain authoritative.
 
+This workflow is approved for the Release 1 local three-node arm64 `kind`
+profile. The exact capability and evidence binding is recorded in the
+[`Release 1 baseline`](../../release/baseline-v1.json).
+
+## Determinism boundary
+
+The seed, immutable descriptor, admitted templates, and retained advisory input
+determine byte-identical run instructions. They do not determine Kubernetes
+scheduling, P2P peer selection, message ordering, network timing, block hashes,
+or actor-internal random generators. Reproduction therefore means a fresh run
+reached the same trusted semantic classification—not that logs, timestamps, or
+packet traces matched byte-for-byte.
+
 ## Prerequisites
 
 Use the qualified three-node local `kind` profile. Install Attacknet and Chaos
@@ -45,6 +58,25 @@ path with `ATTACKNET_OBSERVABILITY_RENDERER` only when the client is invoked
 outside the repository root. `ATTACKNET_RUN_OPERATOR_TARGET` changes the
 in-cluster run-controller metric target when a non-default release name is
 intentional.
+
+## Before running unattended
+
+1. Run `$ATTACKNET doctor --output json` and require a clean result.
+2. Verify the active kubeconfig context and confirm it is the disposable local
+   cluster.
+3. Verify an existing corpus with `$ATTACKNET corpus verify`; use an empty
+   dedicated directory for a new corpus.
+4. Submit and inspect only inert campaign templates with `spec.template: true`.
+5. Compile the plan, then run `fuzz run --dry-run` and review its source
+   resources, decision receipts, safety budgets, and contingent attempt bounds.
+6. Confirm the declared capacity headroom is available. The run physically
+   reserves storage and cold-start write-burst escrow before creating a
+   network. Image-filesystem headroom is admission-gated and rechecked before
+   every attempt, but is not reserved; avoid concurrent image pulls.
+
+Keep the corpus directory. It contains the journal and immutable objects needed
+for status, resume, replay, and reduction; copying only the session digest is
+not sufficient.
 
 ## Run the example
 
@@ -121,6 +153,11 @@ capacity reservations, and immutable report pointer. It does not infer state
 from names. The session Lease and capacity escrow are created in the source
 network template's namespace, independent of the kube-context default. A
 completed command is idempotent.
+
+If the client exits, do not start the descriptor as a new session. The active
+`AttacknetRun` continues under its controller. Re-run `fuzz resume` with the
+recorded session digest and the same corpus; it verifies the hash-chained
+journal and exact Kubernetes identities before continuing.
 
 `fuzz status` verifies the corpus before returning the decoded static report,
 its immutable object reference, the capacity-admission receipt and headroom
@@ -226,3 +263,16 @@ expecting Prometheus labels. Semantic fingerprints, seeds, and digests remain
 in the corpus and static JSON report. Actor logs are untrusted supporting
 material; controller status and identity-bound evidence remain the
 classification source.
+
+## Troubleshooting
+
+| Symptom | First action |
+| --- | --- |
+| Planning reports source drift | Re-read the named template or policy UID, generation, and specification. Re-plan intentionally; do not weaken the digest check. |
+| Run reports `CapacityUnavailable` | Preserve the receipt, free or provision real local storage, then begin a new session. No experiment network was created. |
+| Session reports an owned local lock | Run `fuzz lock status`; break it only after externally proving the exact recorded process is stale. |
+| Session reports an owned Kubernetes Lease | Run `fuzz lease status`; use every observed precondition when explicitly breaking a stale Lease. |
+| Resume reports identity or journal drift | Preserve the corpus and cluster. Do not reconstruct state from resource names or edit the journal. |
+| Result is `NotReproduced` | Retain both source and replay evidence. Automatic reduction is deliberately not started. |
+| Result is `Inconclusive` or `HarnessFailed` | Treat it as apparatus evidence, not a Stacks defect. Inspect omissions, identities, capacity, controllers, and evidence services. |
+| Corpus verification fails | Stop reuse immediately and preserve the directory for forensic inspection; do not regenerate or overwrite immutable objects. |

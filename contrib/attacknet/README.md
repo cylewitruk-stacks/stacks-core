@@ -20,6 +20,12 @@ controller-HA qualification. Native Chaos Mesh `IOChaos` and `TimeChaos` are
 not supported on arm64; use Attacknet's `io-pressure` and `clock-skew`
 mechanisms. See [`release/baseline-v1.json`](release/baseline-v1.json).
 
+Release 1 includes finite seeded fuzz sessions, crash-safe resume,
+content-addressed failure retention, fresh-network confirmation, corpus-only
+replay, and bounded hierarchical removal-only reduction. The seed determines
+the explicit orchestration plan; it does not make distributed execution,
+network timing, block hashes, or actor-internal randomness deterministic.
+
 ## Prerequisites
 
 Run commands from the repository root.
