@@ -5,10 +5,30 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/version"
 	discoveryfake "k8s.io/client-go/discovery/fake"
 	kubetesting "k8s.io/client-go/testing"
 )
+
+func TestExactSuspensionPatchBindsUIDAndSpecGeneration(t *testing.T) {
+	patch, err := exactSuspensionPatch(types.UID("network-uid"), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"op":"test","path":"/metadata/uid","value":"network-uid"},` +
+		`{"op":"test","path":"/metadata/generation","value":7},` +
+		`{"op":"add","path":"/spec/suspended","value":true}]`
+	if string(patch) != want {
+		t.Fatalf("suspension patch = %s, want %s", patch, want)
+	}
+	if _, err := exactSuspensionPatch("", 7); err == nil {
+		t.Fatal("empty UID was accepted")
+	}
+	if _, err := exactSuspensionPatch("network-uid", 0); err == nil {
+		t.Fatal("zero generation was accepted")
+	}
+}
 
 func TestDiagnoseUsesClosedKindCatalog(t *testing.T) {
 	resources := make([]metav1.APIResource, 0, len(resourceKinds))

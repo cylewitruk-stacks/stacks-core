@@ -27,6 +27,18 @@
       "tooltip": "Open the Loki query workspace for raw actor logs",
       "type": "link",
       "url": "/explore"
+    },
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Fuzz sessions",
+      "tooltip": "Inspect deterministic trials, confirmation, reduction, and trusted protocol outcomes",
+      "type": "link",
+      "url": "/d/stacks-attacknet-fuzz/stacks-attacknet-fuzz-sessions"
     }
   ],
   "panels": [

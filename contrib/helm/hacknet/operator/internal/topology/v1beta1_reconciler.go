@@ -53,9 +53,11 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 	if !network.DeletionTimestamp.IsZero() {
 		return reconcile.Result{}, nil
 	}
-	if err := r.ensureEnvironmentLease(ctx, network); err != nil {
-		logger.Error(err, "v1beta1 environment lease admission failed")
-		return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, degradedV1Beta1Status(network, err))
+	if !network.Spec.Suspended {
+		if err := r.ensureEnvironmentLease(ctx, network); err != nil {
+			logger.Error(err, "v1beta1 environment lease admission failed")
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, degradedV1Beta1Status(network, err))
+		}
 	}
 	effectiveNetwork, err := r.networkWithUpgradeOverlay(ctx, network)
 	var compiled *attacknetv1alpha1.StacksNetwork
@@ -84,6 +86,29 @@ func (r *V1Beta1Reconciler) Reconcile(ctx context.Context, request reconcile.Req
 		return reconcile.Result{}, r.updateStatus(ctx, network, degradedV1Beta1Status(network, err))
 	}
 	desired := convertV1Beta1Status(legacyStatus)
+	// Suspension intentionally removes every actor Pod. BurnchainPolicy and
+	// telemetry readiness therefore become unavailable by construction and
+	// must not overwrite the renderer's authoritative Suspended phase. The
+	// admitted identities are withdrawn and rebuilt when the network resumes.
+	if network.Spec.Suspended {
+		desired.BurnchainTopology = nil
+		released, releaseErr := r.releaseEnvironmentLeaseWhenQuiescent(ctx, network)
+		if releaseErr != nil {
+			logger.Error(releaseErr, "v1beta1 suspended environment lease release failed")
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, r.updateStatus(ctx, network, degradedV1Beta1Status(network, releaseErr))
+		}
+		if !released {
+			desired.Phase = "Suspending"
+			meta.SetStatusCondition(&desired.Conditions, metav1.Condition{
+				Type: "Ready", Status: metav1.ConditionFalse,
+				ObservedGeneration: network.Generation,
+				Reason:             "ActorTerminationPending",
+				Message:            "Waiting for every actor Pod to terminate before releasing the environment lease",
+			})
+			return reconcile.Result{RequeueAfter: time.Second}, r.updateStatus(ctx, network, desired)
+		}
+		return reconcile.Result{}, r.updateStatus(ctx, network, desired)
+	}
 	statusView := network.DeepCopy()
 	statusView.Status = desired
 	policyUIDs, policiesPending, err := r.observeBurnchainPolicies(ctx, network, &desired)
@@ -212,6 +237,56 @@ func (r *V1Beta1Reconciler) ensureEnvironmentLease(ctx context.Context, network 
 		return fmt.Errorf("environment lease data does not match StacksNetwork %s UID %s", network.Name, network.UID)
 	}
 	return nil
+}
+
+// releaseEnvironmentLeaseWhenQuiescent relinquishes the namespace-wide
+// active-environment barrier only after an uncached read proves that the
+// suspended network has no remaining actor Pods. The StacksNetwork itself is
+// retained so replay evidence can continue to reference its immutable UID.
+func (r *V1Beta1Reconciler) releaseEnvironmentLeaseWhenQuiescent(
+	ctx context.Context, network *attacknetv1beta1.StacksNetwork,
+) (bool, error) {
+	if r.APIReader == nil {
+		return false, errors.New("v1beta1 topology reconciler requires an uncached Kubernetes API reader")
+	}
+	lease := &corev1.ConfigMap{}
+	key := types.NamespacedName{Namespace: network.Namespace, Name: environmentLeaseName}
+	leaseErr := r.APIReader.Get(ctx, key, lease)
+	if client.IgnoreNotFound(leaseErr) != nil {
+		return false, fmt.Errorf("read environment lease before suspension: %w", leaseErr)
+	}
+	owned := leaseErr == nil && environmentLeaseOwnedBy(lease, network)
+
+	pods := &corev1.PodList{}
+	if err := r.APIReader.List(
+		ctx, pods, client.InNamespace(network.Namespace),
+		client.MatchingLabels{managedByLabel: managedByValue, networkLabel: network.Name},
+	); err != nil {
+		return false, fmt.Errorf("list actor Pods before environment lease release: %w", err)
+	}
+	if len(pods.Items) != 0 {
+		if !owned {
+			return false, errors.New("suspended network still has actor Pods but does not own the environment lease")
+		}
+		return false, nil
+	}
+	if leaseErr != nil || !owned {
+		return true, nil
+	}
+	if lease.Data["network"] != network.Name || lease.Data["token"] != string(network.UID) {
+		return false, errors.New("owned environment lease data does not match the suspended network")
+	}
+	uid := lease.UID
+	if err := r.Delete(ctx, lease, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil && !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("release suspended environment lease: %w", err)
+	}
+	return true, nil
+}
+
+func environmentLeaseOwnedBy(lease *corev1.ConfigMap, network *attacknetv1beta1.StacksNetwork) bool {
+	owner := metav1.GetControllerOf(lease)
+	return owner != nil && owner.UID == network.UID && owner.Kind == "StacksNetwork" &&
+		owner.APIVersion == attacknetv1beta1.GroupVersion.String()
 }
 
 func ownerUID(owner *metav1.OwnerReference) string {

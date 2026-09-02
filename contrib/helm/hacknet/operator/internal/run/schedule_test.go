@@ -7,6 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	attacknetv1alpha1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1alpha1"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/canonical"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fault"
 )
 
@@ -51,18 +52,8 @@ func TestMinimizationIsRemovalOnlyAndRequiresFreshImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	network.UID = "fresh-network"
-	reduced := source
-	reduced.Actions = reduced.Actions[:1]
-	reorder(reduced.Actions)
-	reduced.Budgets, err = resolvedBudgets(reduced.Actions, reduced.Budgets.Limits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reduced, err = sealAndValidate(reduced)
-	if err != nil {
-		t.Fatal(err)
-	}
-	run.Spec.Minimization = attacknetv1alpha1.MinimizationSpec{Enabled: true, Strategy: "DeltaDebug", MaxAttempts: 1, RequireFreshNetwork: true, Retained: []attacknetv1alpha1.RetainedInstruction{{InstructionID: "one"}}, SourceScheduleDigest: source.Integrity.Digest, CandidateScheduleDigest: reduced.Integrity.Digest}
+	retained := []attacknetv1alpha1.RetainedInstruction{{InstructionID: "one"}}
+	run.Spec.Minimization = attacknetv1alpha1.MinimizationSpec{Enabled: true, Strategy: "DeltaDebug", MaxAttempts: 1, RequireFreshNetwork: true, Retained: retained, SourceScheduleDigest: source.Integrity.Digest, CandidateDigest: retainedDigest(t, retained)}
 	candidate, err := applyReplay(source, run, network, inventory, fault.ManifestFromNetwork(network), templates, true)
 	if err != nil {
 		t.Fatal(err)
@@ -110,14 +101,25 @@ func TestMinimizationRejectsUnknownOrNonMaterialRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	network.UID = "fresh"
-	run.Spec.Minimization = attacknetv1alpha1.MinimizationSpec{Enabled: true, Strategy: "DeltaDebug", MaxAttempts: 1, RequireFreshNetwork: true, SourceScheduleDigest: source.Integrity.Digest, CandidateScheduleDigest: source.Integrity.Digest, Retained: []attacknetv1alpha1.RetainedInstruction{{InstructionID: "one"}, {InstructionID: "two"}}}
+	retained := []attacknetv1alpha1.RetainedInstruction{{InstructionID: "one"}, {InstructionID: "two"}}
+	run.Spec.Minimization = attacknetv1alpha1.MinimizationSpec{Enabled: true, Strategy: "DeltaDebug", MaxAttempts: 1, RequireFreshNetwork: true, SourceScheduleDigest: source.Integrity.Digest, CandidateDigest: retainedDigest(t, retained), Retained: retained}
 	if _, err := applyReplay(source, run, network, inventory, fault.ManifestFromNetwork(network), templates, true); err == nil {
 		t.Fatal("non-material minimization was accepted")
 	}
 	run.Spec.Minimization.Retained = []attacknetv1alpha1.RetainedInstruction{{InstructionID: "missing"}}
+	run.Spec.Minimization.CandidateDigest = retainedDigest(t, run.Spec.Minimization.Retained)
 	if _, err := applyReplay(source, run, network, inventory, fault.ManifestFromNetwork(network), templates, true); err == nil {
 		t.Fatal("unknown minimization instruction was accepted")
 	}
+}
+
+func retainedDigest(t *testing.T, value any) string {
+	t.Helper()
+	digest, err := canonical.Digest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
 }
 
 func repeat(value string, count int) string {

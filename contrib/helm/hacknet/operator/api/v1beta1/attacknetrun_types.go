@@ -151,20 +151,41 @@ type RetainedExecution struct {
 
 // MinimizationSpec describes one bounded, fresh-network delta-debug attempt.
 // +kubebuilder:validation:XValidation:rule="self.enabled || self.maxAttempts == 0",message="disabled minimization requires maxAttempts=0"
-// +kubebuilder:validation:XValidation:rule="!self.enabled || (self.strategy == 'DeltaDebug' && self.maxAttempts == 1 && self.requireFreshNetwork && has(self.sourceRunRef) && has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.expectedAssertion) && has(self.expectedStatus) && has(self.retained) && self.retained.size() > 0)",message="enabled minimization requires one bounded fresh-network DeltaDebug attempt and immutable source and expectation fields"
+// +kubebuilder:validation:XValidation:rule="!self.enabled || (self.strategy == 'DeltaDebug' && self.maxAttempts == 1 && self.requireFreshNetwork && has(self.sourceRunRef) && has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.candidateDigest) && has(self.expectedAssertion) && has(self.expectedStatus) && has(self.retained) && self.retained.size() > 0)",message="enabled minimization requires one bounded fresh-network DeltaDebug attempt and immutable source, candidate, and expectation fields"
 type MinimizationSpec struct {
 	Enabled bool `json:"enabled"`
 	// +kubebuilder:validation:Enum=DeltaDebug;FailurePrefix
-	Strategy                string              `json:"strategy"`
-	MaxAttempts             int32               `json:"maxAttempts"`
-	RequireFreshNetwork     bool                `json:"requireFreshNetwork"`
-	SourceRunRef            string              `json:"sourceRunRef,omitempty"`
-	SourceScheduleDigest    string              `json:"sourceScheduleDigest,omitempty"`
-	AttemptID               string              `json:"attemptId,omitempty"`
-	CandidateScheduleDigest string              `json:"candidateScheduleDigest,omitempty"`
-	ExpectedAssertion       string              `json:"expectedAssertion,omitempty"`
-	ExpectedStatus          string              `json:"expectedStatus,omitempty"`
-	Retained                []RetainedExecution `json:"retained,omitempty"`
+	Strategy             string `json:"strategy"`
+	MaxAttempts          int32  `json:"maxAttempts"`
+	RequireFreshNetwork  bool   `json:"requireFreshNetwork"`
+	SourceRunRef         string `json:"sourceRunRef,omitempty"`
+	SourceScheduleDigest string `json:"sourceScheduleDigest,omitempty"`
+	AttemptID            string `json:"attemptId,omitempty"`
+	// CandidateDigest identifies the canonical retained removal instructions.
+	// The admitted fresh-network schedule is reported separately by scheduleRef.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	CandidateDigest   string              `json:"candidateDigest,omitempty"`
+	ExpectedAssertion string              `json:"expectedAssertion,omitempty"`
+	ExpectedStatus    string              `json:"expectedStatus,omitempty"`
+	Retained          []RetainedExecution `json:"retained,omitempty"`
+}
+
+// FuzzProvenance binds a generated run to one immutable local session
+// decision. It records provenance only and grants no mutation authority.
+type FuzzProvenance struct {
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	SessionDigest string `json:"sessionDigest"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=256
+	TrialOrdinal int32 `json:"trialOrdinal"`
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	PlanDigest string `json:"planDigest"`
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	DecisionDigest string `json:"decisionDigest"`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`
+	AttemptID string `json:"attemptId"`
+	// +kubebuilder:validation:Enum=Source;Confirmation;Reduction
+	AttemptKind string `json:"attemptKind"`
 }
 
 // AttacknetRunSpec defines a finite schedule and its safety/evidence policy.
@@ -198,6 +219,7 @@ type AttacknetRunSpec struct {
 	Replay             ReplaySpec                `json:"replay"`
 	Resume             ResumeSpec                `json:"resume"`
 	Minimization       MinimizationSpec          `json:"minimization"`
+	FuzzProvenance     *FuzzProvenance           `json:"fuzzProvenance,omitempty"`
 }
 
 // ScheduleReference identifies the immutable controller-owned schedule object.
@@ -261,7 +283,7 @@ type BudgetUsage struct {
 // TerminalClassification records expected-versus-observed replay evidence.
 type TerminalClassification struct {
 	AttemptID               string        `json:"attemptId,omitempty"`
-	CandidateScheduleDigest string        `json:"candidateScheduleDigest,omitempty"`
+	CandidateDigest         string        `json:"candidateDigest,omitempty"`
 	ExpectedAssertion       string        `json:"expectedAssertion,omitempty"`
 	ExpectedStatus          string        `json:"expectedStatus,omitempty"`
 	Outcome                 string        `json:"outcome,omitempty"`

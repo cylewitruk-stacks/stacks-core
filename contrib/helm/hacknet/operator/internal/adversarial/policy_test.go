@@ -55,6 +55,29 @@ func TestNormalizeAndDigestAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestDigestCompatibilityVector(t *testing.T) {
+	minimum := int64(1)
+	value := &attacknetv1beta1.AdversarialSignerPolicy{
+		Profile: ProfileV1, Behavior: "withhold", MaxMatches: 2, MaxEvaluations: 512,
+		PatchDigest: "sha256:4a24941d86f164b81a9681cf00a61a8117a170e0ad2cdd67989ae3f15b3c44b4",
+		Selector:    attacknetv1beta1.AdversarialProposalSelector{MinStacksHeight: &minimum},
+		Observer:    attacknetv1beta1.AdversarialObserverSpec{Image: "probe:test"},
+		Egress:      attacknetv1beta1.AdversarialEgressSpec{Profile: "restricted"},
+	}
+	policy, err := Normalize(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := Digest(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expected = "sha256:001f1de4c48eba8a2023070deb668b4ef8a1ead728d00886d8898621e1f76c1b"
+	if digest != expected {
+		t.Fatalf("policy digest changed: %s != %s", digest, expected)
+	}
+}
+
 func TestNormalizeRejectsUnsafeOrAmbiguousPolicies(t *testing.T) {
 	tests := []struct {
 		name string

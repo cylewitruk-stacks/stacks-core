@@ -24,6 +24,9 @@ local images/Helm/port-forwards, and captures bounded evidence. Retired shell
 and Node implementations are absent from the current product tree; pinned Git
 revisions and immutable fixtures preserve historical qualification evidence.
 
+For finite seeded exploration, fresh-network confirmation, corpus replay, and
+bounded removal-only reduction, use the [fuzz-session guide](fuzzing.md).
+
 ## Control-plane lifecycle
 
 Build and install exact local images:

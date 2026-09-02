@@ -182,11 +182,15 @@ func Build(network *attacknetv1beta1.StacksNetwork, policyUIDs map[string]string
 // PolicyServiceName returns the stable Service name for one policy clock.
 func PolicyServiceName(policyName string) string {
 	candidate := policyName + "-clock"
-	if len(candidate) <= 63 {
+	// The same name is used by the clock Deployment. Its ReplicaSet appends a
+	// ten-character hash in a DNS-label-valued Pod label, so keep the base at
+	// 52 bytes.
+	const limit = 52
+	if len(candidate) <= limit {
 		return candidate
 	}
 	digest := sha256.Sum256([]byte(candidate))
-	return strings.TrimRight(candidate[:54], "-") + "-" + hex.EncodeToString(digest[:4])
+	return strings.TrimRight(candidate[:limit-9], "-") + "-" + hex.EncodeToString(digest[:4])
 }
 
 // Published verifies that status contains the graph derived from the current

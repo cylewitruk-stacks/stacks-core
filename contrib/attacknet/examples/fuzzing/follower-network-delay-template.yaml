@@ -1,0 +1,35 @@
+apiVersion: testing.stacks.org/v1beta1
+kind: FaultCampaign
+metadata:
+  name: fuzz-follower-network-delay
+spec:
+  template: true
+  safety:
+    maxUnavailableSignerBasisPoints: 0
+    maxUnavailableMinerBasisPoints: 0
+    maxConcurrentFaults: 1
+    allowQuorumLoss: false
+    allowBurnchain: false
+    allowExtendedDuration: false
+    allowExtremeSeverity: false
+    allowMinerMajorityOutage: false
+    allowUnenrolledNetworkTargets: false
+  stages:
+    - id: delay-follower
+      faults:
+        - id: peer-delay
+          target:
+            actors: [follower-1]
+            mode: all
+          fault:
+            type: network
+            action: delay
+            mode: all
+            duration: 15s
+            parameters:
+              direction: both
+              harnessTarget: prometheus
+              delay:
+                latency: 250ms
+                correlation: "0"
+                jitter: 25ms

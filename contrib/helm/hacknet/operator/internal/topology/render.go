@@ -112,11 +112,16 @@ func Render(network *attacknetv1alpha1.StacksNetwork, scheme *runtime.Scheme) (R
 
 func stableName(network, actor string) string {
 	candidate := network + "-" + actor
-	if len(candidate) <= 63 {
+	// StatefulSet controller revisions append "-" plus a ten-character hash
+	// and store the result in a DNS-label-valued Pod label. Keep the shared
+	// actor resource name within 52 bytes so every derived identity remains
+	// admissible.
+	const limit = 52
+	if len(candidate) <= limit {
 		return candidate
 	}
 	digest := sha256.Sum256([]byte(candidate))
-	return strings.TrimRight(candidate[:54], "-") + "-" + hex.EncodeToString(digest[:4])
+	return strings.TrimRight(candidate[:limit-9], "-") + "-" + hex.EncodeToString(digest[:4])
 }
 
 func boolValue(value *bool, fallback bool) bool {

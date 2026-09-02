@@ -314,6 +314,11 @@ func applyReplay(source resolvedSchedule, run *attacknetv1alpha1.AttacknetRun, n
 		if run.Spec.Minimization.Strategy != "DeltaDebug" || run.Spec.Minimization.MaxAttempts != 1 || !run.Spec.Minimization.RequireFreshNetwork {
 			return resolvedSchedule{}, errors.New("minimization must be one bounded fresh-network DeltaDebug attempt")
 		}
+		if err := validateReductionCandidateDigest(
+			run.Spec.Minimization.Retained, run.Spec.Minimization.CandidateDigest,
+		); err != nil {
+			return resolvedSchedule{}, err
+		}
 		retained := map[string]attacknetv1alpha1.RetainedInstruction{}
 		priorOrder := -1
 		sourceOrder := map[string]int{}
@@ -401,11 +406,8 @@ func applyReplay(source resolvedSchedule, run *attacknetv1alpha1.AttacknetRun, n
 		if err != nil {
 			return resolvedSchedule{}, err
 		}
-		if candidate.Integrity.Digest != run.Spec.Minimization.CandidateScheduleDigest {
-			return resolvedSchedule{}, fmt.Errorf("minimization candidateScheduleDigest %s does not match permitted source removals %s", run.Spec.Minimization.CandidateScheduleDigest, candidate.Integrity.Digest)
-		}
 		source = candidate
-		replayMetadata = map[string]any{"enabled": true, "strategy": "deterministic-hierarchical-ddmin/v1", "sourceScheduleDigest": run.Spec.Minimization.SourceScheduleDigest, "candidateScheduleDigest": run.Spec.Minimization.CandidateScheduleDigest, "attemptId": run.Spec.Minimization.AttemptID, "sourceNetwork": originalNetwork, "disclosure": "This is a permitted removal-only counterfactual on a fresh network; it does not establish causal minimality."}
+		replayMetadata = map[string]any{"enabled": true, "strategy": "deterministic-hierarchical-ddmin/v1", "sourceScheduleDigest": run.Spec.Minimization.SourceScheduleDigest, "candidateDigest": run.Spec.Minimization.CandidateDigest, "attemptId": run.Spec.Minimization.AttemptID, "sourceNetwork": originalNetwork, "disclosure": "This is a permitted removal-only counterfactual on a fresh network; it does not establish causal minimality."}
 	}
 	source.Network.UID = string(network.UID)
 	source.Network.Generation = network.Generation

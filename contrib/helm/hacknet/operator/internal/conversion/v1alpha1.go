@@ -250,8 +250,8 @@ func convertMinimization(source attacknetv1alpha1.MinimizationSpec) attacknetv1b
 		Enabled: source.Enabled, Strategy: source.Strategy, MaxAttempts: source.MaxAttempts,
 		RequireFreshNetwork: source.RequireFreshNetwork, SourceRunRef: source.SourceRunRef,
 		SourceScheduleDigest: source.SourceScheduleDigest, AttemptID: source.AttemptID,
-		CandidateScheduleDigest: source.CandidateScheduleDigest,
-		ExpectedAssertion:       source.ExpectedAssertion, ExpectedStatus: source.ExpectedStatus,
+		CandidateDigest:   source.CandidateDigest,
+		ExpectedAssertion: source.ExpectedAssertion, ExpectedStatus: source.ExpectedStatus,
 	}
 	for _, retained := range source.Retained {
 		result.Retained = append(result.Retained, attacknetv1beta1.RetainedExecution{

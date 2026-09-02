@@ -37,6 +37,7 @@ type Collector struct {
 	faultAction         *prometheus.Desc
 	assertionOutcome    *prometheus.Desc
 	runInfo             *prometheus.Desc
+	fuzzRunInfo         *prometheus.Desc
 	budgetUsage         *prometheus.Desc
 	minimization        *prometheus.Desc
 	protocolAssertion   *prometheus.Desc
@@ -74,6 +75,8 @@ func NewCollector(reader client.Reader) *Collector {
 			[]string{"evidence_source", "network", "campaign", "actor", "assertion", "outcome"}, nil),
 		runInfo: prometheus.NewDesc("attacknet_run_info", "Current orchestrator-observed AttacknetRun state.",
 			[]string{"evidence_source", "network", "run", "phase", "reason", "attribution", "replay", "minimization", "schedule_digest"}, nil),
+		fuzzRunInfo: prometheus.NewDesc("attacknet_fuzz_run_info", "Bounded fuzz-session identity and current controller-observed run state.",
+			[]string{"evidence_source", "network", "run", "session", "trial", "attempt", "attempt_kind", "phase", "reason"}, nil),
 		budgetUsage: prometheus.NewDesc("attacknet_run_budget_usage", "Current AttacknetRun budget consumption.",
 			[]string{"evidence_source", "network", "run", "budget"}, nil),
 		minimization: prometheus.NewDesc("attacknet_run_minimization_outcome", "Trusted terminal ddmin counterfactual classification.",
@@ -104,7 +107,7 @@ func NewCollector(reader client.Reader) *Collector {
 
 // Describe publishes every descriptor owned by the collector.
 func (c *Collector) Describe(output chan<- *prometheus.Desc) {
-	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.upgradeInfo, c.actorVersion, c.adversarialPolicy, c.versionCapability, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.stacksBurnHeight, c.stacksBurnView, c.burnchainTopology, c.burnchainGeneration, c.bitcoinNode, c.bitcoinEdge, c.burnchainBinding, c.collectionSuccess} {
+	for _, descriptor := range []*prometheus.Desc{c.campaignInfo, c.upgradeInfo, c.actorVersion, c.adversarialPolicy, c.versionCapability, c.campaignTarget, c.faultAction, c.assertionOutcome, c.runInfo, c.fuzzRunInfo, c.budgetUsage, c.minimization, c.protocolAssertion, c.protocolSource, c.protocolSourceAt, c.stacksBurnHeight, c.stacksBurnView, c.burnchainTopology, c.burnchainGeneration, c.bitcoinNode, c.bitcoinEdge, c.burnchainBinding, c.collectionSuccess} {
 		output <- descriptor
 	}
 }
@@ -373,6 +376,12 @@ func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1
 	output <- prometheus.MustNewConstMetric(c.runInfo, prometheus.GaugeValue, 1,
 		evidenceSource, run.Spec.NetworkRef, run.Name, phase, run.Status.Reason, attribution,
 		strconv.FormatBool(replay), strconv.FormatBool(run.Spec.Minimization.Enabled), scheduleDigest)
+	if provenance := run.Spec.FuzzProvenance; provenance != nil {
+		output <- prometheus.MustNewConstMetric(c.fuzzRunInfo, prometheus.GaugeValue, 1,
+			evidenceSource, run.Spec.NetworkRef, run.Name,
+			run.Labels["testing.stacks.org/fuzz-session"], strconv.Itoa(int(provenance.TrialOrdinal)),
+			provenance.AttemptID, provenance.AttemptKind, phase, run.Status.Reason)
+	}
 	if usage := run.Status.BudgetUsage; usage != nil {
 		values := []struct {
 			name  string
@@ -398,7 +407,7 @@ func (c *Collector) collectRun(output chan<- prometheus.Metric, run *attacknetv1
 	if classification := run.Status.TerminalClassification; classification != nil {
 		output <- prometheus.MustNewConstMetric(c.minimization, prometheus.GaugeValue, 1,
 			evidenceSource, run.Spec.NetworkRef, run.Name, classification.AttemptID,
-			classification.CandidateScheduleDigest, classification.ExpectedAssertion,
+			classification.CandidateDigest, classification.ExpectedAssertion,
 			classification.ExpectedStatus, classification.Outcome, classification.Reason,
 			classification.EvidenceDigest, strconv.FormatBool(classification.CausalMinimalityClaimed))
 	}

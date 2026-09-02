@@ -28,7 +28,7 @@ func TestTerminalClassificationFailsClosedOnMissingAndConflictingEvidence(t *tes
 }
 
 func TestTerminalClassificationBoundsStoredEvidence(t *testing.T) {
-	run := &attacknetv1alpha1.AttacknetRun{ObjectMeta: metav1.ObjectMeta{Name: "ddmin", UID: types.UID("run-uid")}, Spec: attacknetv1alpha1.AttacknetRunSpec{Minimization: attacknetv1alpha1.MinimizationSpec{Enabled: true, AttemptID: "attempt", CandidateScheduleDigest: "sha256:" + repeat("c", 64), ExpectedAssertion: "TargetReady", ExpectedStatus: "Failed"}}, Status: attacknetv1alpha1.AttacknetRunStatus{ScheduleRef: &attacknetv1alpha1.ScheduleReference{Digest: "sha256:" + repeat("d", 64)}}}
+	run := &attacknetv1alpha1.AttacknetRun{ObjectMeta: metav1.ObjectMeta{Name: "ddmin", UID: types.UID("run-uid")}, Spec: attacknetv1alpha1.AttacknetRunSpec{Minimization: attacknetv1alpha1.MinimizationSpec{Enabled: true, AttemptID: "attempt", CandidateDigest: "sha256:" + repeat("c", 64), ExpectedAssertion: "TargetReady", ExpectedStatus: "Failed"}}, Status: attacknetv1alpha1.AttacknetRunStatus{ScheduleRef: &attacknetv1alpha1.ScheduleReference{Digest: "sha256:" + repeat("d", 64)}}}
 	results := make([]apixv1.JSON, 257)
 	for index := range results {
 		results[index] = jsonResult(t, "TargetReady", "Failed")

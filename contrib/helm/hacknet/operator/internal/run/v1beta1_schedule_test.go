@@ -51,6 +51,13 @@ func betaScheduleFixture() (*attacknetv1beta1.AttacknetRun, *attacknetv1beta1.St
 
 func TestBetaScheduleRoundTripPinsDAGAndTemplates(t *testing.T) {
 	run, network, admitted, templates, manifest := betaScheduleFixture()
+	run.Labels = map[string]string{"testing.stacks.org/fuzz-session": "session"}
+	run.Spec.FuzzProvenance = &attacknetv1beta1.FuzzProvenance{
+		SessionDigest: "sha256:" + repeat("c", 64), TrialOrdinal: 2,
+		PlanDigest:     "sha256:" + repeat("d", 64),
+		DecisionDigest: "sha256:" + repeat("e", 64),
+		AttemptID:      "source", AttemptKind: "Source",
+	}
 	schedule, err := buildBetaSchedule(run, network, admitted, templates, manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -60,6 +67,10 @@ func TestBetaScheduleRoundTripPinsDAGAndTemplates(t *testing.T) {
 	}
 	if schedule.Network.ManifestDigest == "" {
 		t.Fatal("schedule did not bind the admitted manifest")
+	}
+	if schedule.Run.FuzzProvenance == nil ||
+		schedule.Run.FuzzProvenance.DecisionDigest != run.Spec.FuzzProvenance.DecisionDigest {
+		t.Fatal("schedule did not bind fuzz provenance")
 	}
 	encoded, err := encodeBetaSchedule(schedule)
 	if err != nil {
@@ -75,6 +86,29 @@ func TestBetaScheduleRoundTripPinsDAGAndTemplates(t *testing.T) {
 	encoded[len(encoded)/2] ^= 0xff
 	if _, err := decodeBetaSchedule(encoded); err == nil {
 		t.Fatal("corrupt beta schedule decoded")
+	}
+}
+
+func TestValidateFuzzProvenanceFailsClosed(t *testing.T) {
+	run, _, _, _, _ := betaScheduleFixture()
+	run.Labels = map[string]string{"testing.stacks.org/fuzz-session": "session"}
+	run.Spec.FuzzProvenance = &attacknetv1beta1.FuzzProvenance{
+		SessionDigest: "sha256:" + repeat("a", 64), TrialOrdinal: 1,
+		PlanDigest:     "sha256:" + repeat("b", 64),
+		DecisionDigest: "sha256:" + repeat("c", 64),
+		AttemptID:      "source", AttemptKind: "Source",
+	}
+	if err := ValidateV1Beta1Structure(run); err != nil {
+		t.Fatal(err)
+	}
+	delete(run.Labels, "testing.stacks.org/fuzz-session")
+	if err := ValidateV1Beta1Structure(run); err == nil {
+		t.Fatal("fuzz provenance without its bounded session label was accepted")
+	}
+	run.Labels["testing.stacks.org/fuzz-session"] = "session"
+	run.Spec.FuzzProvenance.DecisionDigest = "mutable"
+	if err := ValidateV1Beta1Structure(run); err == nil {
+		t.Fatal("invalid fuzz provenance was accepted")
 	}
 }
 
@@ -294,11 +328,44 @@ func TestBetaScheduleRejectsInvalidPolicies(t *testing.T) {
 	}
 }
 
-func TestBetaReplayRejectsChangedSourceTemplateIdentity(t *testing.T) {
-	source := []betaExecution{{ID: "one", Source: sourceIdentity{Name: "template", UID: "old", Generation: 1, SpecDigest: "sha256:old"}}}
-	candidate := []betaExecution{{ID: "one", Source: sourceIdentity{Name: "template", UID: "new", Generation: 2, SpecDigest: "sha256:new"}}}
-	if err := validateBetaSourceTemplates(source, candidate); err == nil {
-		t.Fatal("replay accepted a changed source template identity")
+func TestBetaReplayAllowsFreshIdentityWithSameTemplateSpec(t *testing.T) {
+	source := []betaExecution{{
+		ID: "one", Kind: "FaultCampaign", CampaignAlias: "template",
+		Source: sourceIdentity{Name: "source-template", UID: "old", Generation: 1, SpecDigest: "sha256:same"},
+	}}
+	candidate := []betaExecution{{
+		ID: "one", Kind: "FaultCampaign", CampaignAlias: "template",
+		Source: sourceIdentity{Name: "fresh-template", UID: "new", Generation: 1, SpecDigest: "sha256:same"},
+	}}
+	if err := validateBetaSourceTemplates(source, candidate); err != nil {
+		t.Fatalf("replay rejected a fresh template with the same immutable spec: %v", err)
+	}
+}
+
+func TestBetaReplayRejectsTemplateSpecDriftAndMissingAlias(t *testing.T) {
+	source := []betaExecution{{
+		ID: "one", Kind: "FaultCampaign", CampaignAlias: "template",
+		Source: sourceIdentity{Name: "source-template", UID: "old", Generation: 1, SpecDigest: "sha256:source"},
+	}}
+	tests := []struct {
+		name      string
+		candidate []betaExecution
+	}{
+		{name: "spec drift", candidate: []betaExecution{{
+			ID: "one", Kind: "FaultCampaign", CampaignAlias: "template",
+			Source: sourceIdentity{Name: "fresh-template", UID: "new", Generation: 1, SpecDigest: "sha256:changed"},
+		}}},
+		{name: "missing alias", candidate: []betaExecution{{
+			ID: "one", Kind: "FaultCampaign", CampaignAlias: "other",
+			Source: sourceIdentity{Name: "fresh-template", UID: "new", Generation: 1, SpecDigest: "sha256:source"},
+		}}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if err := validateBetaSourceTemplates(source, testCase.candidate); err == nil {
+				t.Fatal("replay accepted template drift")
+			}
+		})
 	}
 }
 

@@ -3,11 +3,16 @@ package run
 import (
 	"errors"
 	"fmt"
+	"regexp"
+
+	kubevalidation "k8s.io/apimachinery/pkg/util/validation"
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/protocolassertion"
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/trigger"
 )
+
+var fuzzDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // ValidateV1Beta1Structure validates run-local invariants without reading
 // campaign templates, admitted identities, or prior run state.
@@ -21,13 +26,19 @@ func ValidateV1Beta1Structure(run *attacknetv1beta1.AttacknetRun) error {
 	if run.Spec.DecisionAlgorithm != "" && run.Spec.DecisionAlgorithm != betaDecisionAlgorithm {
 		return fmt.Errorf("unsupported decision algorithm %q", run.Spec.DecisionAlgorithm)
 	}
+	if err := validateFuzzProvenance(
+		run.Spec.FuzzProvenance,
+		run.Labels["testing.stacks.org/fuzz-session"],
+	); err != nil {
+		return err
+	}
 	if err := validateBetaRunBudgets(run.Spec.Budgets); err != nil {
 		return err
 	}
 	if run.Spec.Budgets.MaxCumulativeFaultSeconds > run.Spec.Budgets.MaxWallTimeSeconds {
 		return errors.New("maxCumulativeFaultSeconds cannot exceed maxWallTimeSeconds")
 	}
-	if err := validateBetaRunPolicies(run.Spec.StopPolicy, run.Spec.AttributionPolicy); err != nil {
+	if err := ValidatePolicies(run.Spec.StopPolicy, run.Spec.AttributionPolicy); err != nil {
 		return err
 	}
 	for _, gate := range []struct {
@@ -129,6 +140,24 @@ func ValidateV1Beta1Structure(run *attacknetv1beta1.AttacknetRun) error {
 	return validateV1Beta1ReplayModes(run.Spec)
 }
 
+func validateFuzzProvenance(value *attacknetv1beta1.FuzzProvenance, sessionID string) error {
+	if value == nil {
+		return nil
+	}
+	if !fuzzDigestPattern.MatchString(value.SessionDigest) ||
+		!fuzzDigestPattern.MatchString(value.PlanDigest) ||
+		!fuzzDigestPattern.MatchString(value.DecisionDigest) ||
+		value.TrialOrdinal < 1 || value.TrialOrdinal > 256 ||
+		len(kubevalidation.IsDNS1123Label(sessionID)) != 0 ||
+		len(kubevalidation.IsDNS1123Label(value.AttemptID)) != 0 ||
+		value.AttemptKind != "Source" &&
+			value.AttemptKind != "Confirmation" &&
+			value.AttemptKind != "Reduction" {
+		return errors.New("fuzzProvenance contains invalid or incomplete immutable identity")
+	}
+	return nil
+}
+
 func validateV1Beta1ReplayModes(spec attacknetv1beta1.AttacknetRunSpec) error {
 	enabled := 0
 	for _, value := range []bool{spec.Replay.Enabled, spec.Resume.Enabled, spec.Minimization.Enabled} {
@@ -159,11 +188,14 @@ func validateV1Beta1ReplayModes(spec attacknetv1beta1.AttacknetRunSpec) error {
 	if spec.Minimization.Strategy != "DeltaDebug" || spec.Minimization.MaxAttempts != 1 || !spec.Minimization.RequireFreshNetwork {
 		return errors.New("minimization must be one bounded fresh-network DeltaDebug attempt")
 	}
-	if spec.Minimization.SourceRunRef == "" || spec.Minimization.SourceScheduleDigest == "" || spec.Minimization.AttemptID == "" || spec.Minimization.ExpectedAssertion == "" || spec.Minimization.ExpectedStatus == "" {
-		return errors.New("enabled minimization requires source run, schedule, attempt, and expected outcome")
+	if spec.Minimization.SourceRunRef == "" || spec.Minimization.SourceScheduleDigest == "" || spec.Minimization.AttemptID == "" || spec.Minimization.CandidateDigest == "" || spec.Minimization.ExpectedAssertion == "" || spec.Minimization.ExpectedStatus == "" {
+		return errors.New("enabled minimization requires source run, schedule, candidate, attempt, and expected outcome")
 	}
 	if len(spec.Minimization.Retained) == 0 {
 		return errors.New("enabled minimization requires at least one retained execution")
+	}
+	if err := validateReductionCandidateDigest(spec.Minimization.Retained, spec.Minimization.CandidateDigest); err != nil {
+		return err
 	}
 	return nil
 }

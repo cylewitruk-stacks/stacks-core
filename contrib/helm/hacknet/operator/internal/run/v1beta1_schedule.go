@@ -36,9 +36,10 @@ type betaSchedule struct {
 }
 
 type betaScheduleRun struct {
-	Name              string `json:"name"`
-	Seed              string `json:"seed"`
-	DecisionAlgorithm string `json:"decisionAlgorithm"`
+	Name              string                           `json:"name"`
+	Seed              string                           `json:"seed"`
+	DecisionAlgorithm string                           `json:"decisionAlgorithm"`
+	FuzzProvenance    *attacknetv1beta1.FuzzProvenance `json:"fuzzProvenance,omitempty"`
 }
 
 type betaScheduleNetwork struct {
@@ -70,6 +71,7 @@ type betaReplayMetadata struct {
 	Strategy             string `json:"strategy,omitempty"`
 	SourceRunRef         string `json:"sourceRunRef,omitempty"`
 	SourceScheduleDigest string `json:"sourceScheduleDigest,omitempty"`
+	CandidateDigest      string `json:"candidateDigest,omitempty"`
 	FreshNetwork         bool   `json:"freshNetwork,omitempty"`
 }
 
@@ -104,7 +106,7 @@ func buildBetaSchedule(
 	if err := validateBetaRunBudgets(run.Spec.Budgets); err != nil {
 		return betaSchedule{}, err
 	}
-	if err := validateBetaRunPolicies(run.Spec.StopPolicy, run.Spec.AttributionPolicy); err != nil {
+	if err := ValidatePolicies(run.Spec.StopPolicy, run.Spec.AttributionPolicy); err != nil {
 		return betaSchedule{}, err
 	}
 	actorRoles := protocolassertion.ActorRoles(published.Actors)
@@ -304,7 +306,10 @@ func buildBetaSchedule(
 	}
 	schedule := betaSchedule{
 		SchemaVersion: betaScheduleSchema,
-		Run:           betaScheduleRun{Name: run.Name, Seed: run.Spec.Seed, DecisionAlgorithm: algorithm},
+		Run: betaScheduleRun{
+			Name: run.Name, Seed: run.Spec.Seed, DecisionAlgorithm: algorithm,
+			FuzzProvenance: copyFuzzProvenance(run.Spec.FuzzProvenance),
+		},
 		Network: betaScheduleNetwork{
 			Name: network.Name, UID: string(network.UID), Generation: network.Generation,
 			Inventory: published, ManifestDigest: manifestDigest,
@@ -319,6 +324,14 @@ func buildBetaSchedule(
 		Replay: betaReplayMetadata{},
 	}
 	return sealBetaSchedule(schedule)
+}
+
+func copyFuzzProvenance(value *attacknetv1beta1.FuzzProvenance) *attacknetv1beta1.FuzzProvenance {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	return &result
 }
 
 func copyAssertionSet(value *attacknetv1beta1.ProtocolAssertionSetSpec) *attacknetv1beta1.ProtocolAssertionSetSpec {
@@ -374,7 +387,8 @@ func validateBetaRunBudgets(value attacknetv1beta1.RunBudgets) error {
 	return nil
 }
 
-func validateBetaRunPolicies(stop attacknetv1beta1.StopPolicy, attribution attacknetv1beta1.AttributionPolicy) error {
+// ValidatePolicies checks the reusable stop and attribution policy contract.
+func ValidatePolicies(stop attacknetv1beta1.StopPolicy, attribution attacknetv1beta1.AttributionPolicy) error {
 	if stop.OnCampaignFailure != "Continue" && stop.OnCampaignFailure != "Stop" && stop.OnCampaignFailure != "PauseForTriage" {
 		return errors.New("onCampaignFailure must be Continue, Stop, or PauseForTriage")
 	}

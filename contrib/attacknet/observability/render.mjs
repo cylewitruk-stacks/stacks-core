@@ -25,14 +25,14 @@ function labels(network, component) {
   return {'app.kubernetes.io/name': `attacknet-${component}`, 'app.kubernetes.io/part-of': 'stacks-attacknet', 'testing.stacks.org/network': network};
 }
 
-// Keep target names identical to the hacknet operator's stable_name(). This is
-// load-bearing for long experiment/actor names: the manifest stores logical
-// names while Kubernetes sees the bounded child-resource name.
-function stableName(network, actor) {
+// Keep target names identical to the hacknet operator's stable_name(). The
+// default 52-byte bound leaves room for controller-generated revision hashes
+// in DNS-label-valued Pod labels.
+function stableName(network, actor, limit = 52) {
   const candidate = `${network}-${actor}`;
-  if (candidate.length <= 63) return candidate;
+  if (candidate.length <= limit) return candidate;
   const digest = createHash('sha256').update(candidate).digest('hex').slice(0, 8);
-  return `${candidate.slice(0, 54).replace(/-+$/, '')}-${digest}`;
+  return `${candidate.slice(0, limit - 9).replace(/-+$/, '')}-${digest}`;
 }
 
 function digest(...values) {
@@ -45,6 +45,10 @@ function podSecurity(uid) {
 
 function containerSecurity() {
   return {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ['ALL']}};
+}
+
+function hasImmutableRuntimeImage(value) {
+  return typeof value === 'string' && (value.match(/sha256:[0-9a-f]{64}/g) ?? []).length === 1;
 }
 
 const FAMILY_PROVENANCE = new Set(['merged', 'attacknet-patch', 'unavailable']);
@@ -65,7 +69,7 @@ export function manifestFromStacksNetwork(resource) {
   const workloads = status.actors.map(actor => {
     if (!actor?.name || names.has(actor.name) || !actor.role || !actor.identityReady
       || !DNS_LABEL.test(actor.serviceName ?? '') || actor.serviceName.length > 63
-      || !actor.image || !/^sha256:[0-9a-f]{64}$/.test(actor.runtimeImageID ?? '')) {
+      || !actor.image || !hasImmutableRuntimeImage(actor.runtimeImageID)) {
       throw new Error('StacksNetwork contains an incomplete or duplicate admitted actor');
     }
     names.add(actor.name);
@@ -511,14 +515,14 @@ loki.write "attacknet" {
 `;
 }
 
-function grafanaDatasource(network) {
+function grafanaDatasource(network, prometheusServiceName = stableName(network, 'attacknet-prometheus')) {
   return `apiVersion: 1
 datasources:
   - name: Attacknet Prometheus
     uid: attacknet-prometheus
     type: prometheus
     access: proxy
-    url: http://${stableName(network, 'attacknet-prometheus')}:9090
+    url: http://${prometheusServiceName}:9090
     isDefault: true
     editable: false
   - name: Attacknet Loki
@@ -578,6 +582,7 @@ export function renderObservability(manifest, {
   lokiImage = 'grafana/loki:3.5.3',
   alloyImage = 'grafana/alloy:v1.10.0',
   runOperatorTarget = 'hacknet-run:8080',
+  prometheusServiceName,
   instrumentationExpectations = [],
 } = {}) {
   manifest = normalizedManifest(manifest);
@@ -587,6 +592,10 @@ export function renderObservability(manifest, {
   if (!/^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?:[1-9][0-9]{0,4}$/.test(runOperatorTarget)) {
     throw new Error('runOperatorTarget must be a bounded DNS name and TCP port');
   }
+  if (prometheusServiceName !== undefined
+    && (!DNS_LABEL.test(prometheusServiceName) || prometheusServiceName.length > 63)) {
+    throw new Error('prometheusServiceName must be a DNS label of at most 63 characters');
+  }
   const token = eventToken ?? randomBytes(32).toString('hex');
   if (token.length < 32) throw new Error('eventToken must contain at least 32 characters');
   const provenanceData = instrumentationProvenance(manifest, instrumentationExpectations);
@@ -594,6 +603,7 @@ export function renderObservability(manifest, {
   const targetData = actorTargets(manifest);
   const overview = readFileSync(join(ROOT, 'dashboards', 'attacknet-overview.json'), 'utf8');
   const actorDashboard = readFileSync(join(ROOT, 'dashboards', 'attacknet-actor.json'), 'utf8');
+  const fuzzDashboard = readFileSync(join(ROOT, 'dashboards', 'attacknet-fuzz.json'), 'utf8');
   const eventSource = readFileSync(join(ROOT, 'event_bridge.py'), 'utf8');
   const promConfig = prometheusConfig(manifest, runOperatorTarget);
   const promRules = prometheusRules();
@@ -602,7 +612,8 @@ export function renderObservability(manifest, {
   const nodeTargets = `${JSON.stringify(targetData.nodes, null, 2)}\n`;
   const signerTargets = `${JSON.stringify(targetData.signers, null, 2)}\n`;
   const burnchainTargets = `${JSON.stringify(targetData.burnchains, null, 2)}\n`;
-  const datasource = grafanaDatasource(network);
+  const effectivePrometheusServiceName = prometheusServiceName ?? stableName(network, 'attacknet-prometheus');
+  const datasource = grafanaDatasource(network, effectivePrometheusServiceName);
   const promLabels = labels(network, 'prometheus');
   const grafanaLabels = labels(network, 'grafana');
   const eventLabels = labels(network, 'events');
@@ -615,9 +626,11 @@ export function renderObservability(manifest, {
   const names = {
     eventWriter: stableName(network, 'attacknet-event-writer'),
     events: stableName(network, 'attacknet-events'),
-    prometheus: stableName(network, 'attacknet-prometheus'),
+    prometheus: effectivePrometheusServiceName,
     grafana: stableName(network, 'attacknet-grafana'),
-    loki: stableName(network, 'attacknet-loki'),
+    // StatefulSet adds "-<10-character-hash>" as a label value. Keep the
+    // base at 52 bytes so controller-revision-hash remains DNS-label valid.
+    loki: stableName(network, 'attacknet-loki', 52),
     alloy: stableName(network, 'attacknet-alloy'),
   };
   const resources = [
@@ -694,12 +707,13 @@ export function renderObservability(manifest, {
       'dashboards.yaml': grafanaDashboards,
       'attacknet-overview.json': overview,
       'attacknet-actor.json': actorDashboard,
+      'attacknet-fuzz.json': fuzzDashboard,
     }),
     {
       apiVersion: 'apps/v1', kind: 'Deployment', metadata: {name: names.grafana, namespace, labels: grafanaLabels},
-      spec: {replicas: 1, selector: {matchLabels: grafanaLabels}, template: {metadata: {labels: grafanaLabels, annotations: {'testing.stacks.org/config-sha256': digest(datasource, grafanaDashboards, overview, actorDashboard)}}, spec: {
+      spec: {replicas: 1, selector: {matchLabels: grafanaLabels}, template: {metadata: {labels: grafanaLabels, annotations: {'testing.stacks.org/config-sha256': digest(datasource, grafanaDashboards, overview, actorDashboard, fuzzDashboard)}}, spec: {
         automountServiceAccountToken: false, securityContext: podSecurity(472),
-        containers: [{name: 'grafana', image: grafanaImage, imagePullPolicy: 'IfNotPresent', env: [{name: 'GF_AUTH_ANONYMOUS_ENABLED', value: 'true'}, {name: 'GF_AUTH_ANONYMOUS_ORG_ROLE', value: 'Viewer'}, {name: 'GF_AUTH_DISABLE_LOGIN_FORM', value: 'true'}, {name: 'GF_USERS_ALLOW_SIGN_UP', value: 'false'}, {name: 'GF_PATHS_DATA', value: '/var/lib/grafana/data'}], ports: [{name: 'http', containerPort: 3000}], securityContext: containerSecurity(), resources: {requests: {cpu: '50m', memory: '128Mi'}, limits: {cpu: '1', memory: '1Gi'}}, readinessProbe: {httpGet: {path: '/api/health', port: 'http'}, periodSeconds: 5}, volumeMounts: [{name: 'config', mountPath: '/etc/grafana/provisioning/datasources/datasource.yaml', subPath: 'datasource.yaml', readOnly: true}, {name: 'config', mountPath: '/etc/grafana/provisioning/dashboards/dashboards.yaml', subPath: 'dashboards.yaml', readOnly: true}, {name: 'config', mountPath: '/var/lib/grafana/dashboards/attacknet-overview.json', subPath: 'attacknet-overview.json', readOnly: true}, {name: 'config', mountPath: '/var/lib/grafana/dashboards/attacknet-actor.json', subPath: 'attacknet-actor.json', readOnly: true}, {name: 'data', mountPath: '/var/lib/grafana/data'}, {name: 'tmp', mountPath: '/tmp'}]}],
+        containers: [{name: 'grafana', image: grafanaImage, imagePullPolicy: 'IfNotPresent', env: [{name: 'GF_AUTH_ANONYMOUS_ENABLED', value: 'true'}, {name: 'GF_AUTH_ANONYMOUS_ORG_ROLE', value: 'Viewer'}, {name: 'GF_AUTH_DISABLE_LOGIN_FORM', value: 'true'}, {name: 'GF_USERS_ALLOW_SIGN_UP', value: 'false'}, {name: 'GF_PATHS_DATA', value: '/var/lib/grafana/data'}], ports: [{name: 'http', containerPort: 3000}], securityContext: containerSecurity(), resources: {requests: {cpu: '50m', memory: '128Mi'}, limits: {cpu: '1', memory: '1Gi'}}, readinessProbe: {httpGet: {path: '/api/health', port: 'http'}, periodSeconds: 5}, volumeMounts: [{name: 'config', mountPath: '/etc/grafana/provisioning/datasources/datasource.yaml', subPath: 'datasource.yaml', readOnly: true}, {name: 'config', mountPath: '/etc/grafana/provisioning/dashboards/dashboards.yaml', subPath: 'dashboards.yaml', readOnly: true}, {name: 'config', mountPath: '/var/lib/grafana/dashboards/attacknet-overview.json', subPath: 'attacknet-overview.json', readOnly: true}, {name: 'config', mountPath: '/var/lib/grafana/dashboards/attacknet-actor.json', subPath: 'attacknet-actor.json', readOnly: true}, {name: 'config', mountPath: '/var/lib/grafana/dashboards/attacknet-fuzz.json', subPath: 'attacknet-fuzz.json', readOnly: true}, {name: 'data', mountPath: '/var/lib/grafana/data'}, {name: 'tmp', mountPath: '/tmp'}]}],
         volumes: [{name: 'config', configMap: {name: names.grafana}}, {name: 'data', emptyDir: {}}, {name: 'tmp', emptyDir: {}}],
       }}}},
     service(names.grafana, namespace, grafanaLabels, [{name: 'http', port: 3000, targetPort: 'http'}]),
@@ -709,9 +723,20 @@ export function renderObservability(manifest, {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const manifestPath = process.argv[2];
-  if (!manifestPath) throw new Error('usage: render.mjs MANIFEST_OR_STACKSNETWORK [--output=FILE] [--event-token=TOKEN]');
+  if (!manifestPath) throw new Error('usage: render.mjs MANIFEST_OR_STACKSNETWORK [--output=FILE] [--event-token=TOKEN|--event-token-file=FILE]');
   const output = resolve(option('output', join(ROOT, 'generated', 'observability.json')));
   const tokenOutput = resolve(option('token-output', join(dirname(output), 'event-token')));
+  const tokenValue = option('event-token', undefined);
+  const tokenFile = option('event-token-file', undefined);
+  if (tokenValue !== undefined && tokenFile !== undefined) {
+    throw new Error('event-token and event-token-file are mutually exclusive');
+  }
+  const eventToken = tokenFile === undefined
+    ? tokenValue
+    : readFileSync(resolve(tokenFile), 'utf8').trim();
+  if (tokenFile !== undefined && eventToken.length === 0) {
+    throw new Error('event-token-file is empty');
+  }
   const instrumentationPlanPath = option('instrumentation-plan', undefined);
   const instrumentationExpectations = instrumentationPlanPath
     ? instrumentationExpectationsFromPlan(
@@ -720,13 +745,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     )
     : [];
   const resource = renderObservability(JSON.parse(readFileSync(manifestPath, 'utf8')), {
-    eventToken: option('event-token', undefined),
+    eventToken,
     prometheusImage: option('prometheus-image', 'prom/prometheus:v3.5.0'),
     grafanaImage: option('grafana-image', 'grafana/grafana:12.1.0'),
     pythonImage: option('python-image', 'python:3.13-alpine'),
     lokiImage: option('loki-image', 'grafana/loki:3.5.3'),
     alloyImage: option('alloy-image', 'grafana/alloy:v1.10.0'),
     runOperatorTarget: option('run-operator-target', 'hacknet-run:8080'),
+    prometheusServiceName: option('prometheus-service-name', undefined),
     instrumentationExpectations,
   });
   mkdirSync(dirname(output), {recursive: true});

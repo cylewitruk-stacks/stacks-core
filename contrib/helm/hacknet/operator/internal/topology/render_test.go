@@ -194,8 +194,23 @@ func TestRenderProbeIsOptInAndCredentialFree(t *testing.T) {
 
 func TestStableNameIsDeterministicAndBounded(t *testing.T) {
 	name := stableName(strings.Repeat("n", 40), strings.Repeat("a", 40))
-	if len(name) > 63 || name != stableName(strings.Repeat("n", 40), strings.Repeat("a", 40)) {
+	if len(name) > 52 || len(name+"-1234567890") > 63 ||
+		name != stableName(strings.Repeat("n", 40), strings.Repeat("a", 40)) {
 		t.Fatalf("invalid stable name %q", name)
+	}
+}
+
+func TestRenderLeavesRoomForStatefulSetRevisionHashes(t *testing.T) {
+	network := testNetwork()
+	network.Name = strings.Repeat("n", 63)
+	resources, err := Render(network, testScheme(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statefulSet := range resources.StatefulSets {
+		if len(statefulSet.Name) > 52 || len(statefulSet.Name+"-1234567890") > 63 {
+			t.Fatalf("StatefulSet name leaves no revision-hash room: %q", statefulSet.Name)
+		}
 	}
 }
 

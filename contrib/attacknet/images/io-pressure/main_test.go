@@ -24,6 +24,49 @@ func TestBoundsAndScratchNamespace(t *testing.T) {
 	if !scratchPattern.MatchString("/data/.attacknet-io-pressure-uid-campaign-123") {
 		t.Fatal("controller-owned scratch path rejected")
 	}
+	if !escrowPattern.MatchString("/data/.attacknet-capacity-escrow-0123456789ab") ||
+		escrowPattern.MatchString("/tmp/.attacknet-capacity-escrow-0123456789ab") {
+		t.Fatal("capacity escrow namespace is not exact")
+	}
+}
+
+func TestWriteEscrowFileIsAtomicAndResumable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "escrow")
+	const size = int64(1 << 20)
+	if err := writeEscrowFile(path, size); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != size {
+		t.Fatalf("published escrow = %#v, %v", info, err)
+	}
+	if _, err := os.Lstat(path + ".partial"); !os.IsNotExist(err) {
+		t.Fatalf("partial escrow survived publication: %v", err)
+	}
+	if err := writeEscrowFile(path, size); err != nil {
+		t.Fatalf("exact escrow was not resumable: %v", err)
+	}
+	if err := os.Truncate(path, size-1); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEscrowFile(path, size); err == nil {
+		t.Fatal("mismatched existing escrow was adopted")
+	}
+	sparse := filepath.Join(t.TempDir(), "sparse")
+	file, err := os.Create(sparse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(size); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEscrowFile(sparse, size); err == nil {
+		t.Fatal("sparse existing escrow was adopted")
+	}
 }
 
 func TestWorkerUsesAnUnlinkedFileAndStops(t *testing.T) {

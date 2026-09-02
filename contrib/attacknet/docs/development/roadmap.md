@@ -280,7 +280,7 @@ Definition of done:
 
 ### A13: Seeded fuzzing, corpus management, and reduction
 
-Status: design drafted; implementation not started. The bounded scope,
+Status: implementation and qualification in progress. The bounded scope,
 architecture, implementation phases, and qualification contract are in the
 [`R1A13 implementation specification`](issues/r1/r1a13-seeded-fuzzing-corpus-reduction.md).
 

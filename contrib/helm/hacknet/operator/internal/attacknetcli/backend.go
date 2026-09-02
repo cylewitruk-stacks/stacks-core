@@ -3,6 +3,7 @@ package attacknetcli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,6 +34,18 @@ type Backend interface {
 	Diagnose(context.Context) (Diagnosis, error)
 }
 
+// CreationBackend creates a resource without adopting or modifying an
+// existing object with the same name.
+type CreationBackend interface {
+	Create(context.Context, *unstructured.Unstructured, Kind) (*unstructured.Unstructured, error)
+}
+
+// ExactSuspensionBackend suspends one StacksNetwork only while its immutable
+// UID and last observed resource version still match.
+type ExactSuspensionBackend interface {
+	SuspendExact(context.Context, ResourceRef, types.UID, int64) (*unstructured.Unstructured, error)
+}
+
 // PlanningBackend can ask Kubernetes admission to evaluate an apply without
 // persisting it. Controllers do not reconcile dry-run objects, so this proves
 // schema/admission compatibility rather than runtime success.
@@ -45,6 +58,14 @@ type PlanningBackend interface {
 // turning a verified teardown into deletion of a different object.
 type IdentityDeleteBackend interface {
 	DeleteExact(context.Context, ResourceRef, types.UID, string) error
+}
+
+// UIDDeleteBackend deletes a mutable controller-owned resource only when its
+// immutable API-server identity still matches. Resource versions are
+// intentionally excluded because status reconciliation legitimately changes
+// them between the final read and the delete request.
+type UIDDeleteBackend interface {
+	DeleteUID(context.Context, ResourceRef, types.UID) error
 }
 
 // Diagnosis reports cluster and Attacknet API availability without mutation.
@@ -89,6 +110,58 @@ func NewKubernetesBackend(config *rest.Config) (*KubernetesBackend, error) {
 // Apply uses server-side apply without force ownership takeover.
 func (backend *KubernetesBackend) Apply(ctx context.Context, object *unstructured.Unstructured, kind Kind) (*unstructured.Unstructured, error) {
 	return backend.apply(ctx, object, kind, nil)
+}
+
+// Create creates one resource and returns AlreadyExists without modifying the
+// object already using that name.
+func (backend *KubernetesBackend) Create(
+	ctx context.Context, object *unstructured.Unstructured, kind Kind,
+) (*unstructured.Unstructured, error) {
+	if object == nil {
+		return nil, fmt.Errorf("resource is required")
+	}
+	result, err := backend.dynamic.Resource(kind.GVR).Namespace(object.GetNamespace()).Create(
+		ctx, object, metav1.CreateOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create %s %s/%s: %w",
+			kind.Name, object.GetNamespace(), object.GetName(), err,
+		)
+	}
+	return result, nil
+}
+
+// SuspendExact uses atomic JSON-patch tests to prevent name reuse or concurrent
+// spec drift from applying suspension to a different admitted network.
+func (backend *KubernetesBackend) SuspendExact(
+	ctx context.Context,
+	ref ResourceRef,
+	uid types.UID,
+	generation int64,
+) (*unstructured.Unstructured, error) {
+	patch, err := exactSuspensionPatch(uid, generation)
+	if err != nil {
+		return nil, fmt.Errorf("suspend %s %s/%s: %w", ref.Kind.Name, ref.Namespace, ref.Name, err)
+	}
+	result, err := backend.dynamic.Resource(ref.Kind.GVR).Namespace(ref.Namespace).Patch(
+		ctx, ref.Name, types.JSONPatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("suspend exact %s %s/%s: %w", ref.Kind.Name, ref.Namespace, ref.Name, err)
+	}
+	return result, nil
+}
+
+func exactSuspensionPatch(uid types.UID, generation int64) ([]byte, error) {
+	if uid == "" || generation < 1 {
+		return nil, errors.New("UID and generation are required")
+	}
+	return json.Marshal([]map[string]any{
+		{"op": "test", "path": "/metadata/uid", "value": string(uid)},
+		{"op": "test", "path": "/metadata/generation", "value": generation},
+		{"op": "add", "path": "/spec/suspended", "value": true},
+	})
 }
 
 // DryRunApply performs server-side apply admission without persistence.
@@ -157,6 +230,31 @@ func (backend *KubernetesBackend) DeleteExact(
 		return fmt.Errorf("delete exact %s %s/%s: %w", ref.Kind.Name, ref.Namespace, ref.Name, err)
 	}
 	return nil
+}
+
+// DeleteUID requests foreground deletion with an API-server-enforced UID
+// precondition. It is appropriate for controller-owned resources whose status
+// continues to advance after their identity has been sealed.
+func (backend *KubernetesBackend) DeleteUID(
+	ctx context.Context, ref ResourceRef, uid types.UID,
+) error {
+	if uid == "" {
+		return fmt.Errorf("delete %s %s/%s requires UID", ref.Kind.Name, ref.Namespace, ref.Name)
+	}
+	options := uidBoundDeleteOptions(uid, metav1.DeletePropagationForeground)
+	if err := backend.dynamic.Resource(ref.Kind.GVR).Namespace(ref.Namespace).Delete(ctx, ref.Name, options); err != nil {
+		return fmt.Errorf("delete UID-bound %s %s/%s: %w", ref.Kind.Name, ref.Namespace, ref.Name, err)
+	}
+	return nil
+}
+
+// uidBoundDeleteOptions protects deletion from name reuse while permitting
+// normal controller status updates between the identity read and deletion.
+func uidBoundDeleteOptions(uid types.UID, propagation metav1.DeletionPropagation) metav1.DeleteOptions {
+	return metav1.DeleteOptions{
+		PropagationPolicy: &propagation,
+		Preconditions:     &metav1.Preconditions{UID: &uid},
+	}
 }
 
 // Watch streams updates for exactly one named resource.

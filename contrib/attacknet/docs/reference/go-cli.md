@@ -54,6 +54,16 @@ attacknet dashboard stop --target grafana
 attacknet burnchain pause --namespace experiment clock
 attacknet burnchain cadence --namespace experiment --interval 2s clock
 attacknet burnchain flash --namespace experiment --blocks 3 --request-id manual-3 clock
+attacknet fuzz plan --namespace experiment --file plan.yaml --output session.json
+attacknet fuzz run --descriptor session.json --corpus /tmp/attacknet-corpus --dry-run
+attacknet fuzz run --descriptor session.json --corpus /tmp/attacknet-corpus
+attacknet fuzz resume --session sha256:SESSION_DIGEST --corpus /tmp/attacknet-corpus
+attacknet fuzz status --session sha256:SESSION_DIGEST --corpus /tmp/attacknet-corpus --output json
+attacknet corpus verify --corpus /tmp/attacknet-corpus
+attacknet corpus replay --corpus /tmp/attacknet-corpus \
+  --entry sha256:ENTRY_DIGEST --attempt-id operator-replay-1 sha256:FINGERPRINT
+attacknet reduce --corpus /tmp/attacknet-corpus \
+  --entry sha256:ENTRY_DIGEST --attempt-id operator-reduce-1 sha256:FINGERPRINT
 attacknet commands --json
 ```
 
@@ -125,6 +135,25 @@ The render commands apply the same explicit assignment either to a static
 `StacksNetwork` or to a typed staged `UpgradeCampaign`. No version command
 implicitly submits Kubernetes state.
 
+`fuzz plan` resolves an operator-authored YAML plan and existing inert campaign
+templates into one immutable descriptor. The initial `fuzz run` revalidates the
+sealed source identities and specifications before mutation, then creates
+exact, attempt-local inert campaign clones for each `AttacknetRun`. `resume`
+uses their journaled identities and retained materialized specifications rather
+than re-reading the planning namespace. Both commands use only ordinary typed
+controller APIs, a single-writer corpus lock, an exact Kubernetes Lease, and
+qualified physical capacity escrow. `corpus replay` and `reduce` always create
+fresh networks from retained corpus inputs, so the original planning templates
+need not remain installed. They require exact entry and attempt identities;
+`--dry-run` emits deterministic source resources and contingent bounds without
+constructing the mutation runtime. Neither advisory rankings nor actor logs can
+decide a terminal classification. `fuzz status` verifies and decodes the
+content-addressed session report and capacity receipt, and returns corpus
+integrity, matching entries, and preservation warnings for agents and human
+operators. See the
+[fuzz-session operator guide](../operations/fuzzing.md) for the ownership,
+capacity, corpus, and replay contracts.
+
 `convert` is an offline compatibility aid for v1alpha1 single-fault
 `FaultCampaign` and serial `AttacknetRun` resources. It preserves safety limits
 and turns serial delays into explicit terminal dependencies. It refuses
@@ -148,6 +177,7 @@ and namespace unless `--namespace` is supplied.
 | `dashboard start`, `status`, `stop` | Shell port-forward supervisors | Chaos Mesh authorization policy |
 | `image build`, `image load`, `install local` | Shell image/build/install helpers | Workload reconciliation and image admission |
 | `burnchain status`, `pause`, `resume`, `cadence`, `flash` | Shell clock-policy mutation | Clock execution and acknowledgement |
+| `fuzz`, `corpus`, `reduce` | No supported predecessor | Fault admission, protocol assertions, and terminal classification |
 
 The Go binary is the supported public surface. The retired shell and Node
 implementations are not shipped in the current tree; digest-verified

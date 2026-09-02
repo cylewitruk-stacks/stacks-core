@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/document"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fuzzplan"
 )
 
 func TestHumanAttacknetExamplesAreStrictV1Beta1YAML(t *testing.T) {
@@ -44,7 +47,15 @@ func TestHumanAttacknetExamplesAreStrictV1Beta1YAML(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := decodeVersionPlan(data); err != nil {
+			if strings.Contains(filepath.ToSlash(path), "/fuzzing/") {
+				var plan fuzzplan.Plan
+				if err := document.DecodeOne(data, &plan); err != nil {
+					t.Fatalf("strict fuzz-plan decoding: %v", err)
+				}
+				if err := fuzzplan.ValidatePlan(plan); err != nil {
+					t.Fatalf("strict fuzz-plan validation: %v", err)
+				}
+			} else if _, err := decodeVersionPlan(data); err != nil {
 				t.Fatalf("strict version-plan validation: %v", err)
 			}
 		})

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import {mkdtempSync, writeFileSync} from 'node:fs';
+import {mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
+import {spawnSync} from 'node:child_process';
 import test from 'node:test';
+import {fileURLToPath} from 'node:url';
 
 import {loadInventory} from '../instrumentation/capability-manifest.mjs';
 import {sha256File, sha256Value} from '../instrumentation/artifact-digest.mjs';
@@ -48,6 +50,67 @@ function labelSort(left, right) {
   return JSON.stringify(left).localeCompare(JSON.stringify(right));
 }
 
+test('renderer CLI accepts the event credential through a private file', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'attacknet-render-token-'));
+  const networkPath = join(directory, 'network.json');
+  const outputPath = join(directory, 'resources.json');
+  const tokenPath = join(directory, 'token');
+  const tokenOutput = join(directory, 'rendered-token');
+  const token = 'f'.repeat(64);
+  const network = {
+    apiVersion: 'testing.stacks.org/v1beta1', kind: 'StacksNetwork',
+    metadata: {name: 'token-network', namespace: 'hacknet-system', generation: 1},
+    status: {
+      phase: 'Ready', observedGeneration: 1, inventoryReady: true,
+      inventoryDigest: `sha256:${'a'.repeat(64)}`,
+      actors: [{
+        name: 'follower-1', role: 'follower', image: 'stacks:test',
+        serviceName: 'token-network-follower-1', identityReady: true,
+        runtimeImageID: `sha256:${'b'.repeat(64)}`,
+      }],
+    },
+  };
+  writeFileSync(networkPath, `${JSON.stringify(network)}\n`, {mode: 0o600});
+  writeFileSync(tokenPath, `${token}\n`, {mode: 0o600});
+  const renderer = join(dirname(fileURLToPath(import.meta.url)), 'render.mjs');
+  const result = spawnSync(process.execPath, [renderer, networkPath,
+    `--output=${outputPath}`, `--token-output=${tokenOutput}`, `--event-token-file=${tokenPath}`,
+  ], {encoding: 'utf8'});
+  assert.equal(result.status, 0, result.stderr);
+  const resources = JSON.parse(readFileSync(outputPath, 'utf8'));
+  const secret = resources.items.find(item => item.kind === 'Secret');
+  assert.equal(secret.stringData.token, token);
+  assert.equal(readFileSync(tokenOutput, 'utf8'), `${token}\n`);
+  const ambiguous = spawnSync(process.execPath, [renderer, networkPath,
+    `--output=${outputPath}`, `--event-token=${token}`, `--event-token-file=${tokenPath}`,
+  ], {encoding: 'utf8'});
+  assert.notEqual(ambiguous.status, 0);
+  assert.match(ambiguous.stderr, /mutually exclusive/);
+});
+
+test('renderer uses the planner-owned Prometheus service name consistently', () => {
+  const rendered = render({prometheusServiceName: 'planner-owned-prometheus'});
+  const service = rendered.items.find(item => item.kind === 'Service'
+    && item.metadata.labels['app.kubernetes.io/name'] === 'attacknet-prometheus');
+  assert.equal(service.metadata.name, 'planner-owned-prometheus');
+  const grafana = rendered.items.find(item => item.kind === 'ConfigMap'
+    && item.metadata.labels['app.kubernetes.io/name'] === 'attacknet-grafana');
+  assert.match(grafana.data['datasource.yaml'], /http:\/\/planner-owned-prometheus:9090/);
+  assert.throws(() => render({prometheusServiceName: 'Invalid_Name'}), /DNS label/);
+});
+
+test('renderer leaves room for workload-controller revision hashes', () => {
+  const longManifest = {...manifest, network: 'n'.repeat(63)};
+  const rendered = renderObservability(longManifest, {
+    eventToken: 'c'.repeat(64), instrumentationExpectations,
+  });
+  for (const item of rendered.items.filter(resource =>
+    ['Deployment', 'StatefulSet', 'DaemonSet'].includes(resource.kind))) {
+    assert.ok(item.metadata.name.length <= 52, `${item.kind}/${item.metadata.name}`);
+    assert.ok(`${item.metadata.name}-1234567890`.length <= 63, item.metadata.name);
+  }
+});
+
 test('renderer consumes only a current complete admitted StacksNetwork inventory', () => {
   const network = {
     apiVersion: 'testing.stacks.org/v1beta1', kind: 'StacksNetwork',
@@ -57,7 +120,7 @@ test('renderer consumes only a current complete admitted StacksNetwork inventory
       inventoryDigest: `sha256:${'a'.repeat(64)}`,
       actors: [{
         name: 'follower-1', role: 'follower', image: 'stacks:current', serviceName: 'live-network-follower-1',
-        identityReady: true, runtimeImageID: `sha256:${'b'.repeat(64)}`,
+        identityReady: true, runtimeImageID: `docker.io/example/stacks@sha256:${'b'.repeat(64)}`,
       }],
     },
   };
@@ -78,6 +141,9 @@ test('renderer consumes only a current complete admitted StacksNetwork inventory
   assert.deepEqual(JSON.parse(renamedPrometheus.data['nodes.json'])[0].targets, ['authoritative-follower-service:20446']);
   network.status.inventoryReady = false;
   assert.throws(() => renderObservability(network, {eventToken: 'c'.repeat(64)}), /complete admitted inventory/);
+  network.status.inventoryReady = true;
+  network.status.actors[0].runtimeImageID = `sha256:${'b'.repeat(64)}@sha256:${'c'.repeat(64)}`;
+  assert.throws(() => renderObservability(network, {eventToken: 'c'.repeat(64)}), /incomplete or duplicate admitted actor/);
 });
 
 test('renderer scrapes admitted Bitcoin policy clocks with topology identity', () => {
@@ -296,6 +362,7 @@ test('render centralizes actor logs with collector-attached Kubernetes identity 
   assert.match(datasource, /uid: attacknet-loki/);
   const grafana = resources.get('ConfigMap/attacknet-test-attacknet-grafana');
   assert.ok(grafana.data['attacknet-actor.json']);
+  assert.ok(grafana.data['attacknet-fuzz.json']);
   const dashboard = JSON.parse(grafana.data['attacknet-overview.json']);
   const logsPanel = dashboard.panels.find(panel => panel.type === 'logs');
   assert.equal(logsPanel.datasource.uid, 'attacknet-loki');
@@ -312,6 +379,8 @@ test('render centralizes actor logs with collector-attached Kubernetes identity 
   const grafanaDeployment = resources.get('Deployment/attacknet-test-attacknet-grafana');
   assert.ok(grafanaDeployment.spec.template.spec.containers[0].volumeMounts.some(
     mount => mount.mountPath.endsWith('/attacknet-actor.json') && mount.readOnly === true));
+  assert.ok(grafanaDeployment.spec.template.spec.containers[0].volumeMounts.some(
+    mount => mount.mountPath.endsWith('/attacknet-fuzz.json') && mount.readOnly === true));
 });
 
 test('render resolves long logical actor names exactly like bounded Kubernetes children', () => {
@@ -322,6 +391,8 @@ test('render resolves long logical actor names exactly like bounded Kubernetes c
   };
   const rendered = renderObservability(longManifest, {eventToken: 'c'.repeat(64)});
   for (const item of rendered.items) assert.ok(item.metadata.name.length <= 63, item.metadata.name);
+  const lokiStatefulSet = rendered.items.find(item => item.kind === 'StatefulSet');
+  assert.ok(lokiStatefulSet.metadata.name.length <= 52, lokiStatefulSet.metadata.name);
   const prometheus = rendered.items.find(item => item.kind === 'ConfigMap' && item.metadata.labels['app.kubernetes.io/name'] === 'attacknet-prometheus');
   const target = JSON.parse(prometheus.data['nodes.json'])[0].targets[0].split(':')[0];
   assert.ok(target.length <= 63);

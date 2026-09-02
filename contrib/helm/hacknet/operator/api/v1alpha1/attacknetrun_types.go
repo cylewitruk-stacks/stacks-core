@@ -98,17 +98,17 @@ type RetainedInstruction struct {
 
 // MinimizationSpec describes one bounded, fresh-network delta-debug attempt.
 type MinimizationSpec struct {
-	Enabled                 bool                  `json:"enabled"`
-	Strategy                string                `json:"strategy"`
-	MaxAttempts             int32                 `json:"maxAttempts"`
-	RequireFreshNetwork     bool                  `json:"requireFreshNetwork"`
-	SourceRunRef            string                `json:"sourceRunRef,omitempty"`
-	SourceScheduleDigest    string                `json:"sourceScheduleDigest,omitempty"`
-	AttemptID               string                `json:"attemptId,omitempty"`
-	CandidateScheduleDigest string                `json:"candidateScheduleDigest,omitempty"`
-	ExpectedAssertion       string                `json:"expectedAssertion,omitempty"`
-	ExpectedStatus          string                `json:"expectedStatus,omitempty"`
-	Retained                []RetainedInstruction `json:"retained,omitempty"`
+	Enabled              bool                  `json:"enabled"`
+	Strategy             string                `json:"strategy"`
+	MaxAttempts          int32                 `json:"maxAttempts"`
+	RequireFreshNetwork  bool                  `json:"requireFreshNetwork"`
+	SourceRunRef         string                `json:"sourceRunRef,omitempty"`
+	SourceScheduleDigest string                `json:"sourceScheduleDigest,omitempty"`
+	AttemptID            string                `json:"attemptId,omitempty"`
+	CandidateDigest      string                `json:"candidateDigest,omitempty"`
+	ExpectedAssertion    string                `json:"expectedAssertion,omitempty"`
+	ExpectedStatus       string                `json:"expectedStatus,omitempty"`
+	Retained             []RetainedInstruction `json:"retained,omitempty"`
 }
 
 // AttacknetRunSpec defines a finite schedule and its safety/evidence policy.
@@ -184,7 +184,7 @@ type BudgetUsage struct {
 // TerminalClassification records expected-versus-observed replay/minimization evidence.
 type TerminalClassification struct {
 	AttemptID               string        `json:"attemptId,omitempty"`
-	CandidateScheduleDigest string        `json:"candidateScheduleDigest,omitempty"`
+	CandidateDigest         string        `json:"candidateDigest,omitempty"`
 	ExpectedAssertion       string        `json:"expectedAssertion,omitempty"`
 	ExpectedStatus          string        `json:"expectedStatus,omitempty"`
 	Outcome                 string        `json:"outcome,omitempty"`

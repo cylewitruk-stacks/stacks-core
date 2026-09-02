@@ -6,8 +6,8 @@ material is grouped by audience and responsibility:
 - [`concepts/`](concepts/) explains scheduling, minimization, reproducibility,
   [mixed versions and rolling upgrades](concepts/mixed-version-images.md),
   Bitcoin reorganizations and split views, and adversarial actors.
-- [`operations/`](operations/) covers runtime operation, evidence, and failure
-  attribution.
+- [`operations/`](operations/) covers runtime operation, evidence, failure
+  attribution, and [seeded fuzz sessions](operations/fuzzing.md).
 - [`development/`](development/) covers image and controller development plus
   deferred work.
 - [`reference/`](reference/) defines the

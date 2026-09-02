@@ -49,6 +49,31 @@ test('network and actor dashboards satisfy provisioning and drill-down contract'
   assert.equal(actor.templating.list.find(variable => variable.name === 'actor').multi, false);
 });
 
+test('fuzz dashboard exposes bounded trusted session state without fingerprint labels', () => {
+  const dashboard = readDashboard('attacknet-fuzz.json');
+  validateDashboard(dashboard);
+  const text = JSON.stringify(dashboard);
+  assert.match(text, /attacknet_fuzz_run_info/);
+  assert.match(text, /attacknet_run_protocol_assertion/);
+  assert.match(text, /attacknet_run_budget_usage/);
+  assert.match(text, /attacknet_run_minimization_outcome/);
+  assert.match(text, /content-addressed corpus/i);
+  assert.doesNotMatch(text, /semantic_fingerprint|session_digest|decision_digest/);
+  assert.ok(dashboard.templating.list.some(variable => variable.name === 'session'));
+  assert.ok(dashboard.templating.list.some(variable => variable.name === 'trial'));
+  assert.ok(dashboard.panels.some(panel => panel.type === 'state-timeline'));
+  assert.ok(dashboard.panels.some(panel => panel.type === 'logs'));
+  for (const title of [
+    'Clean terminal runs', 'Failed terminal runs', 'Inconclusive runs', 'Harness-attributed runs',
+    'Schedule, phase, and attribution (trusted)', 'Admitted version cohorts (trusted)',
+    'Trusted observation pipeline', 'Burnchain boundary context (trusted)',
+  ]) assert.ok(dashboard.panels.some(panel => panel.title === title), `missing fuzz panel ${title}`);
+  assert.match(text, /attacknet_actor_version_info/);
+  assert.match(text, /attacknet_orchestrator_metrics_collection_success/);
+  assert.match(text, /attacknet_run_stacks_burn_view_height/);
+  assert.match(text, /attacknet fuzz status/);
+});
+
 test('dashboards distinguish trusted orchestration evidence from actor self-reports', () => {
   for (const dashboard of [readDashboard('attacknet-overview.json'), readDashboard('attacknet-actor.json')]) {
     const text = JSON.stringify(dashboard);

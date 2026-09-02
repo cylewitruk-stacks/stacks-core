@@ -805,7 +805,7 @@ func upsertResolved(values []attacknetv1alpha1.ResolvedCampaign, value attacknet
 func classify(run *attacknetv1alpha1.AttacknetRun, children []attacknetv1alpha1.FaultCampaign) *attacknetv1alpha1.TerminalClassification {
 	expectedAssertion, expectedStatus, attempt, candidateDigest := "", "", "", ""
 	if run.Spec.Minimization.Enabled {
-		expectedAssertion, expectedStatus, attempt, candidateDigest = run.Spec.Minimization.ExpectedAssertion, run.Spec.Minimization.ExpectedStatus, run.Spec.Minimization.AttemptID, run.Spec.Minimization.CandidateScheduleDigest
+		expectedAssertion, expectedStatus, attempt, candidateDigest = run.Spec.Minimization.ExpectedAssertion, run.Spec.Minimization.ExpectedStatus, run.Spec.Minimization.AttemptID, run.Spec.Minimization.CandidateDigest
 	} else if run.Spec.Replay.Enabled && run.Spec.Replay.VerifyExpectedFailure {
 		expectedAssertion, expectedStatus, attempt, candidateDigest = run.Spec.Replay.ExpectedAssertion, run.Spec.Replay.ExpectedStatus, run.Spec.Replay.AttemptID, run.Spec.Replay.DescriptorDigest
 	} else {
@@ -860,7 +860,7 @@ func classify(run *attacknetv1alpha1.AttacknetRun, children []attacknetv1alpha1.
 		scheduleDigest = run.Status.ScheduleRef.Digest
 	}
 	digest, _ := canonical.ArtifactDigest(map[string]any{"runUID": string(run.UID), "scheduleDigest": scheduleDigest, "attemptId": attempt, "expectedAssertion": expectedAssertion, "expectedStatus": expectedStatus, "evidence": evidence})
-	return &attacknetv1alpha1.TerminalClassification{AttemptID: attempt, CandidateScheduleDigest: candidateDigest, ExpectedAssertion: expectedAssertion, ExpectedStatus: expectedStatus, Outcome: outcome, Reason: reason, ObservationCount: int32(len(matching)), Observations: stored, EvidenceDigest: digest, EvidenceURI: fmt.Sprintf("k8s://attacknetruns/%s/terminal-assertion-evidence", run.Name), CausalMinimalityClaimed: false}
+	return &attacknetv1alpha1.TerminalClassification{AttemptID: attempt, CandidateDigest: candidateDigest, ExpectedAssertion: expectedAssertion, ExpectedStatus: expectedStatus, Outcome: outcome, Reason: reason, ObservationCount: int32(len(matching)), Observations: stored, EvidenceDigest: digest, EvidenceURI: fmt.Sprintf("k8s://attacknetruns/%s/terminal-assertion-evidence", run.Name), CausalMinimalityClaimed: false}
 }
 
 func decodeJSONValues(values []apixv1.JSON) []map[string]any {

@@ -2,6 +2,7 @@ package burnchaintopology
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -9,6 +10,14 @@ import (
 
 	attacknetv1beta1 "github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/api/v1beta1"
 )
+
+func TestPolicyServiceNameLeavesRoomForDeploymentRevisionHash(t *testing.T) {
+	name := PolicyServiceName(strings.Repeat("p", 63))
+	if len(name) > 52 || len(name+"-1234567890") > 63 ||
+		name != PolicyServiceName(strings.Repeat("p", 63)) {
+		t.Fatalf("invalid stable policy workload name %q", name)
+	}
+}
 
 func topologyFixture() *attacknetv1beta1.StacksNetwork {
 	now := metav1.Now()

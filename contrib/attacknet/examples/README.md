@@ -10,6 +10,9 @@ Examples are grouped by intent:
   inputs.
 - [`matrices/`](matrices/) contains human-authored source, image, configuration,
   assignment, and upgrade plans.
+- [`fuzzing/`](fuzzing/) contains inert campaign templates and a finite seeded
+  local-kind session plan. See the
+  [operator guide](../docs/operations/fuzzing.md) before running it unattended.
 
 [`campaigns/signer-withhold-window.yaml`](campaigns/signer-withhold-window.yaml)
 observes one deterministic testing signer declared by

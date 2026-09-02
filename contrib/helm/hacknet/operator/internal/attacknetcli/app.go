@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/conversion"
+	"github.com/stacks-network/stacks-core/contrib/helm/hacknet/operator/internal/fuzzsession"
 )
 
 // CommandContract is the generated human/agent contract for one CLI command.
@@ -59,6 +60,19 @@ var commandContracts = []CommandContract{
 	{Name: "install local", Purpose: "Install immutable local images and the Hacknet chart safely", SideEffectClass: "runtime-mutation", OutputKinds: []string{"json"}},
 	{Name: "evidence incident", Purpose: "Capture a bounded admitted-identity incident bundle", SideEffectClass: "local-filesystem-write", OutputKinds: []string{"json"}},
 	{Name: "teardown", Purpose: "Export complete evidence before deleting one StacksNetwork", SideEffectClass: "runtime-mutation", Controller: false, InputKinds: []string{"StacksNetwork"}, OutputKinds: []string{"json"}},
+	{Name: "fuzz plan", Purpose: "Resolve and compile one finite deterministic fuzz session", SideEffectClass: "runtime-read", InputKinds: []string{"FuzzPlan"}, OutputKinds: []string{"json"}},
+	{Name: "fuzz run", Purpose: "Execute one finite descriptor through ordinary controller APIs", SideEffectClass: "runtime-mutation", Controller: false, InputKinds: []string{"FuzzDescriptor"}, OutputKinds: []string{"json"}},
+	{Name: "fuzz resume", Purpose: "Resume one exact journaled fuzz session", SideEffectClass: "runtime-mutation", Controller: false, InputKinds: []string{"FuzzDescriptor"}, OutputKinds: []string{"json"}},
+	{Name: "fuzz status", Purpose: "Read one verified local fuzz-session journal", SideEffectClass: "local-read", OutputKinds: []string{"json"}},
+	{Name: "fuzz lock status", Purpose: "Inspect the exact local corpus writer lock", SideEffectClass: "local-read", OutputKinds: []string{"json"}},
+	{Name: "fuzz lock break", Purpose: "Break one exact stale corpus lock and retain an audit receipt", SideEffectClass: "local-filesystem-write", OutputKinds: []string{"json"}},
+	{Name: "fuzz lease status", Purpose: "Inspect the exact cluster fuzz-session Lease", SideEffectClass: "runtime-read", OutputKinds: []string{"json"}},
+	{Name: "fuzz lease break", Purpose: "Break one exact stale session Lease with retained audit receipts", SideEffectClass: "runtime-mutation", Controller: false, OutputKinds: []string{"json"}},
+	{Name: "corpus list", Purpose: "List verified semantic corpus entries", SideEffectClass: "local-read", OutputKinds: []string{"json"}},
+	{Name: "corpus show", Purpose: "Read verified entries for one semantic fingerprint", SideEffectClass: "local-read", OutputKinds: []string{"json"}},
+	{Name: "corpus verify", Purpose: "Verify the complete content-addressed corpus", SideEffectClass: "local-read", OutputKinds: []string{"json"}},
+	{Name: "corpus replay", Purpose: "Replay one verified corpus entry on a fresh network", SideEffectClass: "runtime-mutation", Controller: false, OutputKinds: []string{"json"}},
+	{Name: "reduce", Purpose: "Run bounded removal-only reduction for one confirmed corpus entry", SideEffectClass: "runtime-mutation", Controller: false, OutputKinds: []string{"json"}},
 }
 
 const maximumCLIInputBytes = 8 << 20
@@ -74,25 +88,26 @@ func kindNames() []string {
 
 // App contains CLI dependencies and I/O streams.
 type App struct {
-	Backend          Backend
-	BackendFactory   func() (Backend, error)
-	DefaultNamespace string
-	Stdin            io.Reader
-	Stdout           io.Writer
-	Stderr           io.Writer
-	Now              func() time.Time
-	PortForwards     PortForwardManager
-	CommandRunner    CommandRunner
-	IncidentReader   IncidentEvidenceReader
-	IncidentFactory  func() (IncidentEvidenceReader, error)
-	LogExporter      RetainedLogExporter
-	LogExportFactory func() (RetainedLogExporter, error)
-	backendOnce      sync.Once
-	backendErr       error
-	incidentOnce     sync.Once
-	incidentErr      error
-	logExportOnce    sync.Once
-	logExportErr     error
+	Backend            Backend
+	BackendFactory     func() (Backend, error)
+	DefaultNamespace   string
+	Stdin              io.Reader
+	Stdout             io.Writer
+	Stderr             io.Writer
+	Now                func() time.Time
+	PortForwards       PortForwardManager
+	CommandRunner      CommandRunner
+	IncidentReader     IncidentEvidenceReader
+	IncidentFactory    func() (IncidentEvidenceReader, error)
+	LogExporter        RetainedLogExporter
+	LogExportFactory   func() (RetainedLogExporter, error)
+	FuzzRuntimeFactory func(string, string) (fuzzsession.Runtime, error)
+	backendOnce        sync.Once
+	backendErr         error
+	incidentOnce       sync.Once
+	incidentErr        error
+	logExportOnce      sync.Once
+	logExportErr       error
 }
 
 // NewLazyApp constructs an application whose Kubernetes clients are created
@@ -151,6 +166,12 @@ func (app *App) Run(ctx context.Context, args []string) int {
 		err = app.runInstall(ctx, args[1:])
 	case "teardown":
 		err = app.runTeardown(ctx, args[1:])
+	case "fuzz":
+		err = app.runFuzz(ctx, args[1:])
+	case "corpus":
+		err = app.runCorpus(ctx, args[1:])
+	case "reduce":
+		err = app.runReduce(ctx, args[1:])
 	default:
 		err = usageError(fmt.Sprintf("unknown command %q", args[0]))
 	}

@@ -2,6 +2,7 @@ package orchestratormetrics
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -57,9 +58,14 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 		},
 	}
 	run := &attacknetv1beta1.AttacknetRun{
-		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "test"},
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "test", Labels: map[string]string{"testing.stacks.org/fuzz-session": "nightly-one"}},
 		Spec: attacknetv1beta1.AttacknetRunSpec{
 			NetworkRef: "network", Minimization: attacknetv1beta1.MinimizationSpec{Enabled: true},
+			FuzzProvenance: &attacknetv1beta1.FuzzProvenance{
+				SessionDigest: "sha256:" + strings.Repeat("a", 64), TrialOrdinal: 1,
+				PlanDigest: "sha256:" + strings.Repeat("b", 64), DecisionDigest: "sha256:" + strings.Repeat("c", 64),
+				AttemptID: "source", AttemptKind: "Source",
+			},
 		},
 		Status: attacknetv1beta1.AttacknetRunStatus{
 			Phase: "Passed", Reason: "SequenceCompleted", Attribution: "NotRequired",
@@ -67,7 +73,7 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 			ScheduleSummary: &attacknetv1beta1.ScheduleSummary{Replay: true},
 			BudgetUsage:     &attacknetv1beta1.BudgetUsage{CampaignsStarted: 1, CumulativeFaultMillis: 30_000},
 			TerminalClassification: &attacknetv1beta1.TerminalClassification{
-				AttemptID: "attempt-1", CandidateScheduleDigest: "sha256:candidate",
+				AttemptID: "attempt-1", CandidateDigest: "sha256:candidate",
 				ExpectedAssertion: "ChainProgress", ExpectedStatus: "failed",
 				Outcome: "reproduced", Reason: "ExpectedFailureObserved", EvidenceDigest: "sha256:evidence",
 			},
@@ -112,6 +118,7 @@ func TestCollectorPreservesOrchestratorMetricContract(t *testing.T) {
 		"attacknet_fault_campaign_target_info":                               1,
 		"attacknet_fault_campaign_assertion_outcome":                         1,
 		"attacknet_run_info":                                                 1,
+		"attacknet_fuzz_run_info":                                            1,
 		"attacknet_run_budget_usage":                                         11,
 		"attacknet_run_minimization_outcome":                                 1,
 		"attacknet_run_protocol_assertion":                                   2,

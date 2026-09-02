@@ -1,0 +1,78 @@
+schemaVersion: stacks-attacknet-fuzz-plan/v1
+sessionId: local-kind-example
+seed: local-kind-example-seed-v1
+maxTrials: 4
+maxDuration: 2h
+network:
+  templateFile: ../../../helm/hacknet/examples/minimal.yaml
+templates:
+  - id: follower-network-delay
+    kind: FaultCampaign
+    name: fuzz-follower-network-delay
+    weight: 3
+    maxUses: 4
+    conflictGroups: [follower-disruption]
+  - id: follower-pod-failure
+    kind: FaultCampaign
+    name: fuzz-follower-pod-failure
+    weight: 1
+    maxUses: 2
+    conflictGroups: [follower-disruption]
+generation:
+  minExecutions: 1
+  maxExecutions: 1
+  triggers:
+    - afterRunStart: 5s
+    - afterRunStart: 15s
+run:
+  budgets:
+    maxCampaigns: 1
+    maxWallTimeSeconds: 300
+    maxCumulativeFaultSeconds: 120
+    maxActiveFaults: 1
+    maxSignerImpactPercent: 0
+    maxBurnchainFaults: 0
+    maxInconclusiveCampaigns: 1
+  stopPolicy:
+    onCampaignFailure: Stop
+    onInconclusive: Stop
+    onBudgetExhausted: Stop
+    onSuccess: Continue
+  attributionPolicy:
+    requiredOnFailure: true
+    requireIncidentBundle: true
+    allowedTerminalStates: [Triaged, Remediated, Inconclusive]
+  baselineAssertions:
+    timeout: 90s
+    assertions:
+      - id: baseline-telemetry
+        telemetryCompleteness:
+          actors: [follower-1]
+  recoveryAssertions:
+    timeout: 180s
+    assertions:
+      - id: follower-progress
+        chainProgress:
+          chain: stacks
+          actors: [follower-1]
+          window: 90s
+          minimumDelta: 1
+confirmation:
+  requiredMatches: 1
+  maxAttempts: 2
+reduction:
+  enabled: true
+  maxAttempts: 16
+  maxDuration: 1h
+  maxEvidenceBytes: 67108864
+capacity:
+  minimumNodeBytes: 2147483648
+  minimumImageBytes: 2147483648
+  minimumCorpusBytes: 2147483648
+  storageEscrowBytes: 16777216
+  evidenceEscrowBytes: 67108864
+  requirePhysicalEscrow: true
+corpus:
+  root: /tmp/stacks-attacknet-corpus
+  maximumBytes: 4294967296
+  retainCleanEvidence: false

@@ -202,6 +202,20 @@ admitted-inventory checks and records an identity-bound source receipt.
 Missing, stale, ambiguous, or replaced sources remain Pending and expire
 `Inconclusive`; they never satisfy a trigger or assertion.
 
+## Run finite seeded sessions
+
+The typed client can select only admitted inert fault and upgrade templates,
+record every deterministic choice, execute a finite trial budget, confirm an
+adverse result on fresh networks, and retain a content-addressed corpus. It may
+then attempt deterministic removal-only reduction without claiming causal
+minimality.
+
+Start with the [seeded fuzz-session operator guide](docs/operations/fuzzing.md)
+and [`examples/fuzzing/`](examples/fuzzing/). Use `--dry-run` to inspect the
+unconditional source resources and contingent attempt bounds before creating a
+network. Missing evidence, capacity loss, identity drift, or harness failure
+cannot become a clean or confirmed network outcome.
+
 ## Observe and retain evidence
 
 Grafana is for human triage. Agents should query Prometheus, Loki, Kubernetes,
@@ -282,6 +296,7 @@ helm uninstall chaos-mesh -n chaos-mesh
 | Actor image cannot be pulled | Re-run `attacknet image build` and `attacknet image load`; Docker and each `kind` node have separate image stores. |
 | Network remains Pending | Inspect its referenced `BurnchainPolicy`, actor Pods, and current `status.conditions`. |
 | Campaign waits for a lease | Inspect active campaigns; do not steal or manually edit the controller-owned lease. |
+| Fuzz session reports an owned lock or Lease | Use `fuzz lock status` or `fuzz lease status`; break only the exact externally confirmed stale identity with a recorded reason. |
 | Campaign is Inconclusive | Preserve the network and evidence. Inspect identity divergence, partial rollback, effect, and recovery status before retrying. |
 | Pod remains Pending after node disruption | Inspect PVC node affinity. Release 1 does not prove portable cross-node reattachment. |
 | Fault is unsupported on arm64 | Use `io-pressure` or `clock-skew`; do not bypass the capability gate. |
@@ -304,6 +319,8 @@ helm uninstall chaos-mesh -n chaos-mesh
 ## Further reading
 
 - [`docs/operations/`](docs/operations/README.md): runtime operations and recovery.
+- [`docs/operations/fuzzing.md`](docs/operations/fuzzing.md): finite seeded
+  sessions, corpus replay, capacity admission, and reduction.
 - [`docs/reference/go-cli.md`](docs/reference/go-cli.md): typed client contract.
 - [`docs/reference/faults/`](docs/reference/faults/): supported fault types,
   parameters, safety invariants, and examples.

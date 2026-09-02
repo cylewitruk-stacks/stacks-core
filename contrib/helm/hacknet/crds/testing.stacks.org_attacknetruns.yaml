@@ -740,13 +740,53 @@ spec:
                 x-kubernetes-list-map-keys:
                 - id
                 x-kubernetes-list-type: map
+              fuzzProvenance:
+                description: |-
+                  FuzzProvenance binds a generated run to one immutable local session
+                  decision. It records provenance only and grants no mutation authority.
+                properties:
+                  attemptId:
+                    pattern: ^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$
+                    type: string
+                  attemptKind:
+                    enum:
+                    - Source
+                    - Confirmation
+                    - Reduction
+                    type: string
+                  decisionDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  planDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  sessionDigest:
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  trialOrdinal:
+                    format: int32
+                    maximum: 256
+                    minimum: 1
+                    type: integer
+                required:
+                - attemptId
+                - attemptKind
+                - decisionDigest
+                - planDigest
+                - sessionDigest
+                - trialOrdinal
+                type: object
               minimization:
                 description: MinimizationSpec describes one bounded, fresh-network
                   delta-debug attempt.
                 properties:
                   attemptId:
                     type: string
-                  candidateScheduleDigest:
+                  candidateDigest:
+                    description: |-
+                      CandidateDigest identifies the canonical retained removal instructions.
+                      The admitted fresh-network schedule is reported separately by scheduleRef.
+                    pattern: ^sha256:[0-9a-f]{64}$
                     type: string
                   enabled:
                     type: boolean
@@ -805,12 +845,13 @@ spec:
                 - message: disabled minimization requires maxAttempts=0
                   rule: self.enabled || self.maxAttempts == 0
                 - message: enabled minimization requires one bounded fresh-network
-                    DeltaDebug attempt and immutable source and expectation fields
+                    DeltaDebug attempt and immutable source, candidate, and expectation
+                    fields
                   rule: '!self.enabled || (self.strategy == ''DeltaDebug'' && self.maxAttempts
                     == 1 && self.requireFreshNetwork && has(self.sourceRunRef) &&
-                    has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.expectedAssertion)
-                    && has(self.expectedStatus) && has(self.retained) && self.retained.size()
-                    > 0)'
+                    has(self.sourceScheduleDigest) && has(self.attemptId) && has(self.candidateDigest)
+                    && has(self.expectedAssertion) && has(self.expectedStatus) &&
+                    has(self.retained) && self.retained.size() > 0)'
               networkRef:
                 type: string
               recoveryAssertions:
@@ -1831,7 +1872,7 @@ spec:
                 properties:
                   attemptId:
                     type: string
-                  candidateScheduleDigest:
+                  candidateDigest:
                     type: string
                   causalMinimalityClaimed:
                     type: boolean

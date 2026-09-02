@@ -65,11 +65,17 @@ func (r *V1Beta1Reconciler) deriveBetaSchedule(
 		if run.Spec.Minimization.SourceScheduleDigest != source.Integrity.Digest {
 			return betaSchedule{}, errors.New("minimization sourceScheduleDigest does not match source schedule")
 		}
+		if err := validateReductionCandidateDigest(
+			run.Spec.Minimization.Retained, run.Spec.Minimization.CandidateDigest,
+		); err != nil {
+			return betaSchedule{}, err
+		}
 		result.Executions, err = minimizedBetaExecutions(source.Executions, run.Spec.Minimization.Retained)
 		if err != nil {
 			return betaSchedule{}, err
 		}
 		result.Replay.Strategy = "delta-debug-removal/v2"
+		result.Replay.CandidateDigest = run.Spec.Minimization.CandidateDigest
 	}
 	if err := rebindBetaExecutionNetwork(result.Executions, candidate.Network.Name); err != nil {
 		return betaSchedule{}, err
@@ -86,9 +92,6 @@ func (r *V1Beta1Reconciler) deriveBetaSchedule(
 	sealed, err := sealBetaSchedule(result)
 	if err != nil {
 		return betaSchedule{}, err
-	}
-	if run.Spec.Minimization.Enabled && run.Spec.Minimization.CandidateScheduleDigest != "" && run.Spec.Minimization.CandidateScheduleDigest != sealed.Integrity.Digest {
-		return betaSchedule{}, errors.New("minimization candidateScheduleDigest does not match the removal-only schedule")
 	}
 	return sealed, nil
 }
@@ -139,17 +142,33 @@ func recomputeBetaExecutionBudgets(executions []betaExecution, manifest fault.Ma
 }
 
 func validateBetaSourceTemplates(source, candidate []betaExecution) error {
-	current := make(map[string]sourceIdentity, len(candidate))
+	// Fresh-network replay deliberately materializes new Kubernetes template
+	// identities. Compare the sealed logical kind, alias, and template-spec
+	// digest here; buildBetaSchedule has already bound each fresh clone's exact
+	// UID and generation through its own catalog admission constraints.
+	type templateIdentity struct {
+		Kind       string
+		Alias      string
+		SpecDigest string
+	}
+	key := func(execution betaExecution) string {
+		return execution.Kind + "\x00" + execution.CampaignAlias
+	}
+	current := make(map[string]templateIdentity, len(candidate))
 	for _, execution := range candidate {
-		if prior, duplicate := current[execution.Source.Name]; duplicate && prior != execution.Source {
-			return fmt.Errorf("candidate campaign source %q has conflicting identities", execution.Source.Name)
+		identity := templateIdentity{
+			Kind: execution.Kind, Alias: execution.CampaignAlias,
+			SpecDigest: execution.Source.SpecDigest,
 		}
-		current[execution.Source.Name] = execution.Source
+		if prior, duplicate := current[key(execution)]; duplicate && prior != identity {
+			return fmt.Errorf("candidate template %q has conflicting immutable specifications", execution.CampaignAlias)
+		}
+		current[key(execution)] = identity
 	}
 	for _, execution := range source {
-		identity, found := current[execution.Source.Name]
-		if !found || identity != execution.Source {
-			return fmt.Errorf("source campaign template %q differs from current immutable identity", execution.Source.Name)
+		identity, found := current[key(execution)]
+		if !found || identity.SpecDigest != execution.Source.SpecDigest {
+			return fmt.Errorf("source template %q differs from the fresh immutable specification", execution.CampaignAlias)
 		}
 	}
 	return nil
