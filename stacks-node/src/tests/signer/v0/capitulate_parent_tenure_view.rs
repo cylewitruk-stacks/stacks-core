@@ -716,9 +716,7 @@ fn minority_signers_capitulate_to_supermajority_consensus() {
     .expect("Approving signers did not sign block N+1");
 
     info!("------------------------- Start Next Tenure -------------------------");
-    TEST_REJECT_ALL_BLOCK_PROPOSAL.set(Vec::new());
-    TEST_SIGNERS_IGNORE_PRE_COMMITS.set(vec![]);
-    TEST_SIGNERS_IGNORE_BLOCK_RESPONSES.set(vec![]);
+    // Keep the minority isolated from late N+1 responses until the split view is observed.
     test_observer::clear();
     signer_test.mine_bitcoin_block();
     let now = std::time::Instant::now();
@@ -795,6 +793,9 @@ fn minority_signers_capitulate_to_supermajority_consensus() {
     })
     .expect("Signers did not update state machine with split view of parent tenure last block");
 
+    TEST_REJECT_ALL_BLOCK_PROPOSAL.set(Vec::new());
+    TEST_SIGNERS_IGNORE_PRE_COMMITS.set(vec![]);
+    TEST_SIGNERS_IGNORE_BLOCK_RESPONSES.set(vec![]);
     TEST_SIGNERS_IGNORE_BLOCK_ANNOUNCEMENT.set(vec![]);
     TEST_SKIP_BLOCK_BROADCAST.set(false);
     TEST_BLOCK_ANNOUNCE_STALL.set(false);
