@@ -1,0 +1,25 @@
+name: Download Test Reports
+description: List every REST artifact page before downloading matching, unexpired test reports.
+
+inputs:
+  kind:
+    description: "Report artifact prefix: codecov or junit"
+    required: true
+  path:
+    description: "Empty destination directory for the reports"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Collect test reports
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      env:
+        REPORT_KIND: ${{ inputs.kind }}
+        REPORT_PATH: ${{ inputs.path }}
+        REPORT_ACTION_PATH: ${{ github.action_path }}
+      with:
+        retries: 3
+        script: |
+          const reports = require(`${process.env.REPORT_ACTION_PATH}/reports.js`);
+          await reports.collect({ github, core, context }, process.env.REPORT_KIND, process.env.REPORT_PATH);
