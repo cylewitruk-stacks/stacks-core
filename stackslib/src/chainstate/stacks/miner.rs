@@ -16,6 +16,7 @@
 
 use std::cmp;
 use std::collections::HashSet;
+use std::fmt;
 #[cfg(any(test, feature = "testing"))]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
@@ -29,11 +30,11 @@ use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, StacksBlockId, StacksWorkScore, TrieHash,
 };
-use stacks_common::util::get_epoch_time_ms;
 use stacks_common::util::hash::{MerkleTree, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::Secp256k1PrivateKey;
 #[cfg(any(test, feature = "testing"))]
 use stacks_common::util::tests::TestFlag;
+use stacks_common::util::{get_epoch_time_ms, log};
 
 use crate::burnchains::{Burnchain, Txid};
 use crate::chainstate::burn::db::sortdb::{SortitionDB, SortitionHandleConn};
@@ -47,6 +48,7 @@ use crate::chainstate::stacks::db::transactions::{
 use crate::chainstate::stacks::db::unconfirmed::UnconfirmedState;
 use crate::chainstate::stacks::db::{ChainstateTx, ClarityTx, StacksChainState};
 use crate::chainstate::stacks::events::{BoundedErrorString, StacksTransactionReceipt};
+use crate::chainstate::stacks::transaction_context::TransactionContext;
 use crate::chainstate::stacks::{Error, StacksBlockHeader, StacksMicroblockHeader, *};
 use crate::clarity_vm::clarity::{ClarityError, ClarityInstance};
 use crate::config::DEFAULT_MAX_TENURE_BYTES;
@@ -434,9 +436,31 @@ impl TransactionEvent {
     }
 }
 
+/// Whether transaction dumps may include the payload's full contract data.
+pub fn transaction_payload_logging_enabled(payload: &TransactionPayload) -> bool {
+    payload_logging_enabled(
+        payload,
+        log::clarity_values_enabled(),
+        log::contract_source_enabled(),
+    )
+}
+
+/// Resolve the two independent contract-detail settings for a payload.
+fn payload_logging_enabled(payload: &TransactionPayload, values: bool, source: bool) -> bool {
+    match payload {
+        TransactionPayload::ContractCall(_) => values,
+        TransactionPayload::SmartContract(..) => source,
+        TransactionPayload::TokenTransfer(..)
+        | TransactionPayload::PoisonMicroblock(..)
+        | TransactionPayload::Coinbase(..)
+        | TransactionPayload::TenureChange(..) => true,
+    }
+}
+
 impl TransactionResult {
     /// Logs a queryable message for the case where `txid` has succeeded.
-    pub fn log_transaction_success(tx: &StacksTransaction) {
+    pub fn log_transaction_success<'a>(tx: impl Into<TransactionContext<'a>>) {
+        let tx = &tx.into();
         info!("Tx successfully processed";
             "event_name" => %"transaction_result",
             "tx_id" => %tx.txid(),
@@ -447,7 +471,8 @@ impl TransactionResult {
 
     /// Logs a queryable message for the case where `txid` has failed
     /// with error `err`.
-    pub fn log_transaction_error(tx: &StacksTransaction, err: &Error) {
+    pub fn log_transaction_error<'a>(tx: impl Into<TransactionContext<'a>>, err: &Error) {
+        let tx = &tx.into();
         info!("Tx processing failed with error";
             "event_name" => "transaction_result",
             "reason" => %err,
@@ -458,7 +483,8 @@ impl TransactionResult {
 
     /// Logs a queryable message for the case where `tx` has been skipped
     /// for error `err`.
-    pub fn log_transaction_skipped(tx: &StacksTransaction, err: &Error) {
+    pub fn log_transaction_skipped<'a>(tx: impl Into<TransactionContext<'a>>, err: &Error) {
+        let tx = &tx.into();
         info!(
             "Tx processing skipped";
             "event_name" => "transaction_result",
@@ -470,7 +496,8 @@ impl TransactionResult {
     }
 
     /// Logs a queryable message for the case where `tx` is problematic and needs to be dropped.
-    pub fn log_transaction_problematic(tx: &StacksTransaction, err: &Error) {
+    pub fn log_transaction_problematic<'a>(tx: impl Into<TransactionContext<'a>>, err: &Error) {
+        let tx = &tx.into();
         info!(
             "Tx processing problematic";
             "event_name" => "transaction_result",
@@ -482,13 +509,14 @@ impl TransactionResult {
 
     /// Creates a `TransactionResult` backed by `TransactionSuccess`.
     /// This method logs "transaction success" as a side effect.
-    pub fn success(
-        transaction: &StacksTransaction,
+    pub fn success<'a>(
+        transaction: impl Into<TransactionContext<'a>>,
         receipt: StacksTransactionReceipt,
     ) -> TransactionResult {
+        let transaction = &transaction.into();
         Self::log_transaction_success(transaction);
         Self::Success(TransactionSuccess {
-            tx: transaction.clone(),
+            tx: transaction.transaction().clone(),
             fee: transaction.get_tx_fee(),
             receipt,
             soft_limit_reached: false,
@@ -497,14 +525,15 @@ impl TransactionResult {
 
     /// Creates a `TransactionResult` backed by `TransactionSuccess` with a soft limit reached.
     /// This method logs "transaction success" as a side effect.
-    pub fn success_with_soft_limit(
-        transaction: &StacksTransaction,
+    pub fn success_with_soft_limit<'a>(
+        transaction: impl Into<TransactionContext<'a>>,
         receipt: StacksTransactionReceipt,
         soft_limit_reached: bool,
     ) -> TransactionResult {
+        let transaction = &transaction.into();
         Self::log_transaction_success(transaction);
         Self::Success(TransactionSuccess {
-            tx: transaction.clone(),
+            tx: transaction.transaction().clone(),
             fee: transaction.get_tx_fee(),
             receipt,
             soft_limit_reached,
@@ -513,10 +542,14 @@ impl TransactionResult {
 
     /// Creates a `TransactionResult` backed by `TransactionError`.
     /// This method logs "transaction error" as a side effect.
-    pub fn error(transaction: &StacksTransaction, error: Error) -> TransactionResult {
+    pub fn error<'a>(
+        transaction: impl Into<TransactionContext<'a>>,
+        error: Error,
+    ) -> TransactionResult {
+        let transaction = &transaction.into();
         Self::log_transaction_error(transaction, &error);
         TransactionResult::ProcessingError(TransactionError {
-            tx: transaction.clone(),
+            tx: transaction.transaction().clone(),
             error,
         })
     }
@@ -525,34 +558,43 @@ impl TransactionResult {
     /// This method logs "transaction skipped" as a side effect.
     /// Takes in a reason (String) and uses the default error type for
     /// skipped transactions, `StacksTransactionSkipped` for the associated error.
-    pub fn skipped(transaction: &StacksTransaction, reason: String) -> TransactionResult {
+    pub fn skipped<'a>(
+        transaction: impl Into<TransactionContext<'a>>,
+        reason: String,
+    ) -> TransactionResult {
+        let transaction = &transaction.into();
         let error = Error::StacksTransactionSkipped(reason);
         Self::log_transaction_skipped(transaction, &error);
         TransactionResult::Skipped(TransactionSkipped {
-            tx: transaction.clone(),
+            tx: transaction.transaction().clone(),
             error,
         })
     }
 
     /// Creates a `TransactionResult` backed by `TransactionSkipped`.
     /// This method logs "transaction skipped" as a side effect.
-    pub fn skipped_due_to_error(
-        transaction: &StacksTransaction,
+    pub fn skipped_due_to_error<'a>(
+        transaction: impl Into<TransactionContext<'a>>,
         error: Error,
     ) -> TransactionResult {
+        let transaction = &transaction.into();
         Self::log_transaction_skipped(transaction, &error);
         TransactionResult::Skipped(TransactionSkipped {
-            tx: transaction.clone(),
+            tx: transaction.transaction().clone(),
             error,
         })
     }
 
     /// Creates a `TransactionResult` backed by `TransactionProblematic`.
     /// This method logs "transaction problematic" as a side effect.
-    pub fn problematic(transaction: &StacksTransaction, error: Error) -> TransactionResult {
+    pub fn problematic<'a>(
+        transaction: impl Into<TransactionContext<'a>>,
+        error: Error,
+    ) -> TransactionResult {
+        let transaction = &transaction.into();
         Self::log_transaction_problematic(transaction, &error);
         TransactionResult::Problematic(TransactionProblematic {
-            tx: transaction.clone(),
+            tx: transaction.transaction().clone(),
             error,
         })
     }
@@ -624,11 +666,38 @@ impl TransactionResult {
     /// We can't clone() the error, nor use a reference, so we have to return it.
     /// Returns (true, error) if so
     /// Returns (false, error) if none
-    pub fn is_problematic(
-        tx: &StacksTransaction,
+    pub fn is_problematic<'a>(
+        tx: impl Into<TransactionContext<'a>>,
         error: Error,
         epoch_id: StacksEpochId,
     ) -> (bool, Error) {
+        let tx = &tx.into();
+        let payload_display = format_args!("{:?}", tx.payload);
+        let full_payload_fields = slog::b!("payload" => payload_display);
+        let call = match &tx.payload {
+            TransactionPayload::ContractCall(call) => Some(call),
+            _ => None,
+        };
+        let contract = fmt::from_fn(|f| match &tx.payload {
+            TransactionPayload::ContractCall(call) => {
+                write!(f, "{}.{}", call.address, call.contract_name)
+            }
+            TransactionPayload::SmartContract(contract, _) => {
+                write!(f, "{}.{}", tx.origin_address(), contract.name)
+            }
+            _ => Ok(()),
+        });
+        let contract_display = format_args!("{contract}");
+        let function = call.map(|call| call.function_name.as_str()).unwrap_or("");
+        let summary_fields = slog::b!(
+            "contract_name" => contract_display,
+            if call.is_some() { slog::b!("function_name" => function) } else { slog::b!() },
+        );
+        let payload_fields = if transaction_payload_logging_enabled(&tx.payload) {
+            full_payload_fields
+        } else {
+            summary_fields
+        };
         let error = match error {
             Error::ClarityError(e) => match handle_clarity_runtime_error(e, epoch_id) {
                 ClarityRuntimeTxError::Rejected(RejectedRuntimeTxError::Clarity {
@@ -653,8 +722,8 @@ impl TransactionResult {
                     info!("Problematic transaction caused ExecutionResourceBudgetExceeded";
                           "error" => s.clone(),
                           "txid" => %tx.txid(),
-                          "origin" => %tx.get_origin().get_address(false),
-                          "payload" => ?tx.payload,
+                          "origin" => %tx.origin_address(),
+                          payload_fields,
                     );
                     return (true, Error::ExecutionResourceBudgetExceeded(s));
                 }
@@ -667,8 +736,8 @@ impl TransactionResult {
                 // this will no longer be an issue.
                 info!("Problematic transaction caused InvalidFee";
                       "txid" => %tx.txid(),
-                      "origin" => %tx.get_origin().get_address(false),
-                      "payload" => ?tx.payload,
+                      "origin" => %tx.origin_address(),
+                      payload_fields,
                 );
                 return (true, Error::InvalidFee);
             }
@@ -677,8 +746,8 @@ impl TransactionResult {
                 info!("Problematic transaction caused ExecutionResourceBudgetExceeded";
                       "error" => s.clone(),
                       "txid" => %tx.txid(),
-                      "origin" => %tx.get_origin().get_address(false),
-                      "payload" => ?tx.payload,
+                      "origin" => %tx.origin_address(),
+                      payload_fields,
                 );
                 return (true, Error::ExecutionResourceBudgetExceeded(s));
             }
@@ -688,8 +757,8 @@ impl TransactionResult {
                 info!("Problematic transaction caused AnalysisResourceBudgetExceeded";
                       "error" => s.clone(),
                       "txid" => %tx.txid(),
-                      "origin" => %tx.get_origin().get_address(false),
-                      "payload" => ?tx.payload,
+                      "origin" => %tx.origin_address(),
+                      payload_fields,
                 );
                 return (true, Error::AnalysisResourceBudgetExceeded(s));
             }
@@ -1070,11 +1139,12 @@ impl<'a> StacksMicroblockBuilder<'a> {
         bytes_so_far: u64,
         limit_behavior: &BlockLimitFunction,
     ) -> TransactionResult {
+        let tx = &TransactionContext::from(&tx);
         if tx.anchor_mode != TransactionAnchorMode::OffChainOnly
             && tx.anchor_mode != TransactionAnchorMode::Any
         {
             return TransactionResult::skipped_due_to_error(
-                &tx,
+                tx,
                 Error::InvalidStacksTransaction(
                     "Invalid transaction anchor mode for streamed data".to_string(),
                     false,
@@ -1087,7 +1157,7 @@ impl<'a> StacksMicroblockBuilder<'a> {
                 "Adding microblock tx {} would exceed epoch data size",
                 &tx.txid()
             );
-            return TransactionResult::skipped_due_to_error(&tx, Error::BlockTooBigError);
+            return TransactionResult::skipped_due_to_error(tx, Error::BlockTooBigError);
         }
         match limit_behavior {
             BlockLimitFunction::CONTRACT_LIMIT_HIT => {
@@ -1097,14 +1167,14 @@ impl<'a> StacksMicroblockBuilder<'a> {
                         //   other contract calls
                         if !cc.address.is_boot_code_addr() {
                             return TransactionResult::skipped(
-                                &tx,
+                                tx,
                                 "BlockLimitFunction::CONTRACT_LIMIT_HIT".to_string(),
                             );
                         }
                     }
                     TransactionPayload::SmartContract(..) => {
                         return TransactionResult::skipped(
-                            &tx,
+                            tx,
                             "BlockLimitFunction::CONTRACT_LIMIT_HIT".to_string(),
                         );
                     }
@@ -1113,7 +1183,7 @@ impl<'a> StacksMicroblockBuilder<'a> {
             }
             BlockLimitFunction::LIMIT_REACHED => {
                 return TransactionResult::skipped(
-                    &tx,
+                    tx,
                     "BlockLimitFunction::LIMIT_REACHED".to_string(),
                 )
             }
@@ -1124,20 +1194,20 @@ impl<'a> StacksMicroblockBuilder<'a> {
         if let Err(e) = Relayer::static_check_problematic_relayed_tx(
             clarity_tx.config.mainnet,
             clarity_tx.get_epoch(),
-            &tx,
+            tx,
         ) {
             info!(
                 "Detected problematic tx {} while mining; dropping from mempool",
                 tx.txid()
             );
-            return TransactionResult::problematic(&tx, Error::NetError(e));
+            return TransactionResult::problematic(tx, Error::NetError(e));
         }
 
         let quiet = !cfg!(test);
         let cost_before = clarity_tx.cost_so_far();
-        match StacksChainState::process_transaction(clarity_tx, &tx, quiet, None) {
-            Ok((_fee, receipt)) => TransactionResult::success(&tx, receipt),
-            Err(e) => finalize_failed_transaction(clarity_tx, &tx, &cost_before, e),
+        match StacksChainState::process_transaction(clarity_tx, tx, quiet, None) {
+            Ok((_fee, receipt)) => TransactionResult::success(tx, receipt),
+            Err(e) => finalize_failed_transaction(clarity_tx, tx, &cost_before, e),
         }
     }
 
@@ -2460,6 +2530,7 @@ impl BlockBuilder for StacksBlockBuilder {
         _resource_budgets: &TransactionResourceBudgets,
         _total_receipt_size: &mut u64,
     ) -> TransactionResult {
+        let tx = &TransactionContext::from(tx);
         if self.bytes_so_far + tx_len >= u64::from(MAX_EPOCH_SIZE) {
             return TransactionResult::skipped_due_to_error(tx, Error::BlockTooBigError);
         }
@@ -2536,7 +2607,7 @@ impl BlockBuilder for StacksBlockBuilder {
                   "origin" => %tx.origin_address());
 
             // save
-            self.txs.push(tx.clone());
+            self.txs.push(tx.transaction().clone());
             self.total_anchored_fees += fee;
 
             TransactionResult::success(tx, receipt)
@@ -2581,7 +2652,7 @@ impl BlockBuilder for StacksBlockBuilder {
             );
 
             // save
-            self.micro_txs.push(tx.clone());
+            self.micro_txs.push(tx.transaction().clone());
             self.total_streamed_fees += fee;
 
             TransactionResult::success(tx, receipt)
@@ -2673,9 +2744,12 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                 // skip transactions that signers have rejected
                 if settings
                     .temporarily_excluded_txids
-                    .contains(&txinfo.tx.txid())
+                    .contains(&txinfo.metadata.txid)
                 {
-                    info!("Skipping signer-rejected transaction {}", txinfo.tx.txid());
+                    info!(
+                        "Skipping signer-rejected transaction {}",
+                        txinfo.metadata.txid
+                    );
                     return Ok(Some(
                         TransactionResult::skipped(
                             &txinfo.tx,
@@ -2688,7 +2762,7 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                 if let Some(time_estimate) = txinfo.metadata.time_estimate_ms {
                     if time_now.saturating_add(time_estimate.into()) > deadline {
                         info!("Mining tx would cause us to exceed our deadline, skipping";
-                                   "txid" => %txinfo.tx.txid(),
+                                   "txid" => %txinfo.metadata.txid,
                                    "deadline" => deadline,
                                    "now" => time_now,
                                    "estimate" => time_estimate);
@@ -2703,8 +2777,8 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                 }
 
                 // skip transactions early if we can
-                if considered.contains(&txinfo.tx.txid()) {
-                    debug!("Skipping {}", txinfo.tx.txid());
+                if considered.contains(&txinfo.metadata.txid) {
+                    debug!("Skipping {}", txinfo.metadata.txid);
                     return Ok(Some(
                         TransactionResult::skipped(
                             &txinfo.tx,
@@ -2714,7 +2788,7 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                     ));
                 }
 
-                considered.insert(txinfo.tx.txid());
+                considered.insert(txinfo.metadata.txid.clone());
                 num_considered += 1;
 
                 let tx_start = Instant::now();
@@ -2750,7 +2824,7 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                                 .try_into()
                                 // should be unreachable
                                 .unwrap_or(0);
-                            update_timings.push((txinfo.tx.txid(), time_estimate_ms));
+                            update_timings.push((txinfo.metadata.txid.clone(), time_estimate_ms));
                         }
 
                         num_txs += 1;
@@ -2770,7 +2844,7 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                         if soft_limit_reached {
                             // done mining -- our soft limit execution budget is exceeded.
                             // Make the block from the transactions we did manage to get
-                            debug!("Soft block budget exceeded on tx {}", &txinfo.tx.txid());
+                            debug!("Soft block budget exceeded on tx {}", &txinfo.metadata.txid);
                             if block_limit_hit != BlockLimitFunction::CONTRACT_LIMIT_HIT {
                                 debug!("Switch to mining stx-transfers only");
                                 block_limit_hit = BlockLimitFunction::CONTRACT_LIMIT_HIT;
@@ -2784,7 +2858,7 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                             Error::BlockTooBigError => {
                                 // done mining -- our execution budget is exceeded.
                                 // Make the block from the transactions we did manage to get
-                                debug!("Block budget exceeded on tx {}", &txinfo.tx.txid());
+                                debug!("Block budget exceeded on tx {}", &txinfo.metadata.txid);
                                 if block_limit_hit == BlockLimitFunction::NO_LIMIT_HIT {
                                     debug!("Switch to mining stx-transfers only");
                                     block_limit_hit = BlockLimitFunction::CONTRACT_LIMIT_HIT;
@@ -2818,7 +2892,7 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
                                 // if we have an invalid transaction that was quietly ignored, don't warn here either
                             }
                             e => {
-                                info!("Failed to apply tx {}: {:?}", &txinfo.tx.txid(), &e);
+                                info!("Failed to apply tx {}: {:?}", &txinfo.metadata.txid, &e);
                                 return Ok(Some(result_event));
                             }
                         }
@@ -2872,4 +2946,40 @@ fn select_and_apply_transactions_from_mempool<B: BlockBuilder>(
     }
     loop_result?;
     Ok((tx_events, blocked))
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use clarity::vm::Value;
+    use stacks_common::util::secp256k1::Secp256k1PrivateKey;
+
+    use super::*;
+
+    /// Each contract payload follows only its own detail switch.
+    #[test]
+    fn transaction_payload_logging_settings_are_independent() {
+        let key = Secp256k1PrivateKey::from_seed(b"payload-policy-test");
+        let address = TransactionAuth::from_p2pkh(&key)
+            .unwrap()
+            .origin()
+            .address_testnet();
+        let call = TransactionPayload::new_contract_call(
+            address,
+            "test",
+            "run",
+            vec![Value::buff_from(vec![0xab; 65536]).unwrap()],
+        )
+        .unwrap();
+        let publish =
+            TransactionPayload::new_smart_contract("test", "(define-public (run) (ok true))", None)
+                .unwrap();
+        let coinbase = TransactionPayload::Coinbase(CoinbasePayload([0; 32]), None, None);
+        for values in [false, true] {
+            for source in [false, true] {
+                assert_eq!(payload_logging_enabled(&call, values, source), values);
+                assert_eq!(payload_logging_enabled(&publish, values, source), source);
+                assert!(payload_logging_enabled(&coinbase, values, source));
+            }
+        }
+    }
 }

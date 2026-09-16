@@ -841,10 +841,11 @@ impl<NC: NeighborComms> StackerDBSync<NC> {
                 }
                 x => {
                     info!(
-                        "{:?}: {}: Received unexpected message {:?}",
+                        "{:?}: {}: Received unexpected message {}",
                         &network.get_local_peer(),
                         &self.smart_contract_id,
-                        &x
+                        x.get_message_name();
+                        "remote_peer" => ?naddr
                     );
                     continue;
                 }
@@ -977,10 +978,11 @@ impl<NC: NeighborComms> StackerDBSync<NC> {
                 }
                 x => {
                     info!(
-                        "{:?}: {}: Received unexpected message {:?}",
+                        "{:?}: {}: Received unexpected message {}",
                         network.get_local_peer(),
                         &self.smart_contract_id,
-                        &x
+                        x.get_message_name();
+                        "remote_peer" => ?naddr
                     );
                     self.unpin_connected_replica(network, &naddr);
                     continue;
@@ -1150,10 +1152,11 @@ impl<NC: NeighborComms> StackerDBSync<NC> {
                 }
                 x => {
                     info!(
-                        "{:?}: {}: Received unexpected message {:?}",
+                        "{:?}: {}: Received unexpected message {}",
                         network.get_local_peer(),
                         &self.smart_contract_id,
-                        &x
+                        x.get_message_name();
+                        "remote_peer" => ?naddr
                     );
                     self.unpin_connected_replica(network, &naddr);
                     continue;
@@ -1322,10 +1325,11 @@ impl<NC: NeighborComms> StackerDBSync<NC> {
                 }
                 x => {
                     info!(
-                        "{:?}: {}: Received unexpected message {:?}",
+                        "{:?}: {}: Received unexpected message {}",
                         network.get_local_peer(),
                         &self.smart_contract_id,
-                        &x
+                        x.get_message_name();
+                        "remote_peer" => ?naddr
                     );
                     continue;
                 }

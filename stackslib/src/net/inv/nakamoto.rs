@@ -680,10 +680,10 @@ impl NakamotoTenureInv {
             }
             _ => {
                 info!(
-                    "{:?}: got unexpected message from {:?}: {:?}",
+                    "{:?}: got unexpected message from {:?}: {}",
                     network.get_local_peer(),
                     &self.neighbor_address,
-                    &reply
+                    reply.payload.get_message_name()
                 );
                 self.set_online(false);
                 return Err(NetError::ConnectionBroken);

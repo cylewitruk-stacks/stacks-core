@@ -65,6 +65,7 @@ pub mod index;
 pub mod miner;
 pub mod sbtc;
 pub mod transaction;
+pub mod transaction_context;
 
 #[cfg(test)]
 pub mod tests;

@@ -92,6 +92,15 @@ These environment variables affect node behavior and cannot be set via TOML:
 | `STACKS_LOG_JSON` | Enable JSON-formatted logging |
 | `STACKS_LOG_DEBUG` | Enable debug-level logging |
 | `STACKS_LOG_TRACE` | Enable trace-level logging |
+| `STACKS_LOG_CLARITY_VALUES` | Include full contract-call arguments, return values, and payload/transaction dumps: `1` enables, `0` disables, unset follows debug/trace verbosity (omitted at info). Read once per process; restart to change. |
+| `STACKS_LOG_CONTRACT_SOURCE` | Include full contract-publish payloads/transactions and analysis-error expressions: `1` enables, `0` disables, unset follows debug/trace verbosity (omitted at info). Independent of `STACKS_LOG_CLARITY_VALUES`; restart to change. |
+
+For problematic-transaction logs, suppressing `payload` adds `contract_name`
+(`address.contract-name`) and, for contract calls, `function_name` instead.
+For proposal-rejection logs, suppressing `tx` adds `txid` instead. Setting the
+corresponding detail variable to `1` restores the original full-detail field set,
+without these replacement fields. Contract-call execution logs simply omit
+`function_args` and `return_value` when value logging is disabled.
 
 ## Configuration Files
 

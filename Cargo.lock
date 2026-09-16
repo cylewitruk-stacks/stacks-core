@@ -4655,6 +4655,7 @@ dependencies = [
  "assert-json-diff 1.1.0",
  "chrono",
  "clarity 0.0.1",
+ "criterion",
  "ed25519-dalek",
  "insta",
  "lazy_static",

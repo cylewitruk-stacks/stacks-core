@@ -53,6 +53,8 @@ use crate::net::relay::Relayer;
 use crate::net::test::{TestEventObserver, TestPeer};
 use crate::net::ProtocolFamily;
 
+mod logging;
+
 #[test]
 fn test_try_parse_request() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
@@ -879,8 +881,13 @@ fn test_block_proposal_validation_execution_time_expired_blames_tx() {
 /// the next proposal.
 #[test]
 fn test_block_proposal_validation_analysis_time_expired_blames_tx() {
+    assert_analysis_budget_rejects_proposal(function_name!());
+}
+
+/// Validate a real proposal and return the rejected transaction and observer reason.
+fn assert_analysis_budget_rejects_proposal(test_name: &str) -> (StacksTransaction, String) {
     let test_observer = TestEventObserver::new();
-    let mut rpc_test = TestRPC::setup_nakamoto(function_name!(), &test_observer);
+    let mut rpc_test = TestRPC::setup_nakamoto(test_name, &test_observer);
 
     // Force every contract-analysis to exceed its budget: a 0s deadline is
     // already elapsed at the first per-node check. The overall validation
@@ -1026,7 +1033,7 @@ fn test_block_proposal_validation_analysis_time_expired_blames_tx() {
     drop(results);
     drop(observer_guard);
 
-    match result {
+    let reason = match result {
         Ok(_) => panic!("expected analysis-time-expired tx to reject block"),
         Err(postblock_proposal::BlockValidateReject {
             reason_code,
@@ -1044,6 +1051,8 @@ fn test_block_proposal_validation_analysis_time_expired_blames_tx() {
                 reason.contains("Analysis took too much time"),
                 "Expected rejection reason to mention analysis time, got: {reason}"
             );
+            reason.to_string()
         }
-    }
+    };
+    (deploy_tx, reason)
 }

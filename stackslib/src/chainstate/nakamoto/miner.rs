@@ -37,6 +37,7 @@ use crate::chainstate::stacks::miner::{
     BlockBuilder, BlockBuilderSettings, BlockLimitFunction, TransactionEvent,
     TransactionResourceBudgets, TransactionResult,
 };
+use crate::chainstate::stacks::transaction_context::TransactionContext;
 use crate::chainstate::stacks::{Error, StacksBlockHeader, *};
 use crate::clarity_vm::clarity::ClarityInstance;
 use crate::config::{DEFAULT_CONTRACT_COST_LIMIT_PERCENTAGE, DEFAULT_MAX_TENURE_BYTES};
@@ -816,6 +817,7 @@ impl BlockBuilder for NakamotoBlockBuilder {
         resource_budgets: &TransactionResourceBudgets,
         total_receipts_size: &mut u64,
     ) -> TransactionResult {
+        let tx = &TransactionContext::from(tx);
         if self.bytes_so_far + tx_len >= u64::from(MAX_EPOCH_SIZE) {
             debug!("Transaction {} would be too big to include", tx.txid());
             return TransactionResult::skipped_due_to_error(tx, Error::TxWouldNotFitError);
@@ -936,7 +938,7 @@ impl BlockBuilder for NakamotoBlockBuilder {
             );
 
             // save
-            self.txs.push(tx.clone());
+            self.txs.push(tx.transaction().clone());
             TransactionResult::success_with_soft_limit(tx, receipt, soft_limit_reached)
         };
 
@@ -947,7 +949,7 @@ impl BlockBuilder for NakamotoBlockBuilder {
 
 fn parse_process_transaction_error(
     clarity_tx: &mut ClarityTx,
-    tx: &StacksTransaction,
+    tx: &TransactionContext,
     e: Error,
     contract_limit_percentage: u8,
 ) -> TransactionResult {

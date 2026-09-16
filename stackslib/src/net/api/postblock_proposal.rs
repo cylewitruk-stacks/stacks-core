@@ -44,7 +44,7 @@ use crate::chainstate::stacks::boot::PoxVersions;
 use crate::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState};
 use crate::chainstate::stacks::events::BoundedErrorString;
 use crate::chainstate::stacks::miner::{
-    BlockBuilder, BlockLimitFunction, TransactionResourceBudgets, TransactionResult,
+    self, BlockBuilder, BlockLimitFunction, TransactionResourceBudgets, TransactionResult,
 };
 use crate::chainstate::stacks::{Error as ChainError, TransactionPayload};
 use crate::config::DEFAULT_MAX_TENURE_BYTES;
@@ -772,15 +772,25 @@ impl NakamotoBlockProposal {
                 )),
             };
             if let Some((reason, reject_code)) = reason {
+                let txid = tx.txid();
+                let txid_display = format_args!("{txid}");
+                let summary_fields = slog::b!("txid" => txid_display);
+                let tx_display = format_args!("{tx:?}");
+                let full_tx_fields = slog::b!("tx" => tx_display);
                 warn!(
                     "Rejected block proposal";
                     "reason" => %reason,
-                    "tx" => ?tx,
+                    if miner::transaction_payload_logging_enabled(&tx.payload)
+                    {
+                        full_tx_fields
+                    } else {
+                        summary_fields
+                    },
                 );
                 return Err(BlockValidateRejectReason {
                     reason,
                     reason_code: reject_code,
-                    failed_txid: Some(tx.txid()),
+                    failed_txid: Some(txid),
                 });
             }
         }

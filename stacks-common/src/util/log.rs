@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::io::Write;
+use std::sync::LazyLock;
 use std::{env, io, thread};
 
 use chrono::prelude::*;
@@ -263,11 +264,48 @@ fn inner_get_loglevel() -> slog::Level {
     }
 }
 
-lazy_static! {
-    static ref LOGLEVEL: slog::Level = inner_get_loglevel();
+/// Whether contract-call records include full arguments and return values.
+///
+/// `STACKS_LOG_CLARITY_VALUES=1` enables these fields and `=0` disables them.
+/// Other values, including an unset variable, follow debug/trace verbosity.
+/// The setting is read once per process.
+pub fn clarity_values_enabled() -> bool {
+    static CLARITY_VALUES_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        verbose_fields_enabled_for(
+            env::var("STACKS_LOG_CLARITY_VALUES").ok().as_deref(),
+            get_loglevel(),
+        )
+    });
+    *CLARITY_VALUES_ENABLED
 }
 
+/// Whether diagnostic records include contract-source-bearing payloads and transactions.
+///
+/// `STACKS_LOG_CONTRACT_SOURCE=1` includes them and `=0` suppresses them.
+/// Other values, including an unset variable, follow debug/trace verbosity.
+/// The setting is read once per process, independently of Clarity value logging.
+pub fn contract_source_enabled() -> bool {
+    static CONTRACT_SOURCE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        verbose_fields_enabled_for(
+            env::var("STACKS_LOG_CONTRACT_SOURCE").ok().as_deref(),
+            get_loglevel(),
+        )
+    });
+    *CONTRACT_SOURCE_ENABLED
+}
+
+/// Resolves the field override against the node's logging verbosity.
+fn verbose_fields_enabled_for(setting: Option<&str>, level: Level) -> bool {
+    match setting {
+        Some("1") => true,
+        Some("0") => false,
+        _ => Level::Debug.is_at_least(level),
+    }
+}
+
+/// Returns the node's logging verbosity, reading the environment once.
 pub fn get_loglevel() -> slog::Level {
+    static LOGLEVEL: LazyLock<Level> = LazyLock::new(inner_get_loglevel);
     *LOGLEVEL
 }
 
@@ -341,7 +379,138 @@ fn color_if_tty(color: &str, isatty: bool) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    /// Captures complete records written by a real logging drain.
+    #[derive(Clone, Default)]
+    struct CaptureWriter {
+        /// Captured output shared with the test.
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Counts calls to either value formatter.
+    struct RenderProbe<'a> {
+        /// Number of formatting invocations.
+        calls: &'a Cell<usize>,
+    }
+
+    impl fmt::Display for RenderProbe<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.calls.set(self.calls.get() + 1);
+            formatter.write_str("full value")
+        }
+    }
+
+    impl fmt::Debug for RenderProbe<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(self, formatter)
+        }
+    }
+
+    /// Emits one summary with conditional Display and Debug fields.
+    fn emit_conditional_fields(logger: &Logger, enabled: bool) {
+        let calls = Cell::new(0);
+        let value = RenderProbe { calls: &calls };
+        let args = format_args!("{value}");
+        let result = format_args!("{value:?}");
+        let argument_fields = slog::b!("function_args" => args);
+        let argument_fields = if enabled { argument_fields } else { slog::b!() };
+        let result_fields = slog::b!("return_value" => result);
+        slog::info!(logger, "Contract-call successfully processed";
+            "txid" => "test-tx",
+            argument_fields,
+            if enabled { result_fields } else { slog::b!() });
+        if enabled {
+            assert!(calls.get() >= 2);
+        } else {
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    /// Overrides apply at every level; absent or invalid values follow verbosity.
+    #[test]
+    fn test_verbose_fields_setting() {
+        for level in [
+            Level::Critical,
+            Level::Error,
+            Level::Warning,
+            Level::Info,
+            Level::Debug,
+            Level::Trace,
+        ] {
+            assert!(verbose_fields_enabled_for(Some("1"), level));
+            assert!(!verbose_fields_enabled_for(Some("0"), level));
+            let verbose = level == Level::Debug || level == Level::Trace;
+            for setting in [None, Some(""), Some("invalid")] {
+                assert_eq!(verbose_fields_enabled_for(setting, level), verbose);
+            }
+        }
+    }
+
+    /// Both text formats omit disabled fields without invoking their formatters.
+    #[test]
+    fn test_conditional_fields_text() {
+        for pretty in [false, true] {
+            for enabled in [false, true] {
+                let writer = CaptureWriter::default();
+                let decorator = slog_term::PlainSyncDecorator::new(writer.clone());
+                let logger = Logger::root(
+                    TermFormat::new(decorator, pretty, false, false).fuse(),
+                    o!(),
+                );
+                emit_conditional_fields(&logger, enabled);
+                let output = String::from_utf8(writer.bytes.lock().unwrap().clone()).unwrap();
+                assert_eq!(output.lines().count(), 1);
+                assert!(output.contains("Contract-call successfully processed"));
+                assert!(output.contains("txid: test-tx"));
+                assert_eq!(output.contains("function_args: full value"), enabled);
+                assert_eq!(output.contains("return_value: full value"), enabled);
+                assert_eq!(output.contains("function_args"), enabled);
+                assert_eq!(output.contains("return_value"), enabled);
+            }
+        }
+    }
+
+    /// JSON fields retain their names and string values, with no null placeholders.
+    #[cfg(feature = "slog_json")]
+    #[test]
+    fn test_conditional_fields_json() {
+        for enabled in [false, true] {
+            let writer = CaptureWriter::default();
+            let logger = Logger::root(
+                Mutex::new(slog_json::Json::default(writer.clone())).fuse(),
+                o!(),
+            );
+            emit_conditional_fields(&logger, enabled);
+            let output = String::from_utf8(writer.bytes.lock().unwrap().clone()).unwrap();
+            assert_eq!(output.lines().count(), 1);
+            let record: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(record["msg"], "Contract-call successfully processed");
+            assert_eq!(record["txid"], "test-tx");
+            for key in ["function_args", "return_value"] {
+                if enabled {
+                    assert_eq!(record[key], "full value");
+                } else {
+                    assert!(record.get(key).is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     #[ignore = "manual test"]

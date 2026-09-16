@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::fmt;
+
 use clarity::vm::analysis::types::ContractAnalysis;
 use clarity::vm::clarity::TransactionConnection;
 // Re-exported to keep the old import paths working.
@@ -33,14 +35,30 @@ use clarity::vm::types::{
     StacksAddressExtensions as ClarityStacksAddressExt, TupleData, TypeSignature, Value,
 };
 use stacks_common::bounded_format;
+use stacks_common::util::log;
 
 use crate::chainstate::nakamoto::miner::MinerTenureInfoCause;
 use crate::chainstate::stacks::db::*;
 use crate::chainstate::stacks::miner::{TransactionResourceBudgets, TransactionResult};
+use crate::chainstate::stacks::transaction_context::TransactionContext;
 use crate::chainstate::stacks::{CostOverflowContext, Error, StacksMicroblockHeader};
 use crate::clarity_vm::clarity::{ClarityConnection, ClarityError, ClarityTransactionConnection};
 use crate::monitoring::increment_unreachable_errors_counter;
 use crate::util_lib::strings::VecDisplay;
+
+/// Preserve full diagnostics on request without traversing expressions for summaries.
+fn analysis_error_display(error: &ClarityError, full_source: bool) -> impl fmt::Display + '_ {
+    fmt::from_fn(move |f| {
+        if full_source {
+            write!(f, "{error:?}")
+        } else {
+            fmt::Display::fmt(
+                &StacksTransactionReceipt::analysis_failure_message(error),
+                f,
+            )
+        }
+    })
+}
 
 impl StacksTransactionReceipt {
     pub fn from_stx_transfer(
@@ -171,12 +189,9 @@ impl StacksTransactionReceipt {
         }
     }
 
-    pub fn from_analysis_failure(
-        tx: StacksTransaction,
-        analysis_cost: ExecutionCost,
-        error: ClarityError,
-    ) -> StacksTransactionReceipt {
-        let vm_error = match error {
+    /// Bounded analysis diagnostic with its source location, without the AST.
+    fn analysis_failure_message(error: &ClarityError) -> BoundedErrorString {
+        match error {
             ClarityError::StaticCheck(ref static_check_error) => {
                 if let Some(span) = static_check_error.diagnostic.spans.first() {
                     bounded_format!(
@@ -202,7 +217,15 @@ impl StacksTransactionReceipt {
                 }
             }
             _ => BoundedErrorString::from_display(&error),
-        };
+        }
+    }
+
+    pub fn from_analysis_failure(
+        tx: StacksTransaction,
+        analysis_cost: ExecutionCost,
+        error: ClarityError,
+    ) -> StacksTransactionReceipt {
+        let vm_error = Self::analysis_failure_message(&error);
         StacksTransactionReceipt {
             transaction: tx.into(),
             events: vec![],
@@ -418,12 +441,13 @@ fn log_unreachable_error(error: &ClarityError, txid: &Txid) {
 /// charged execution cost before bailing (problematic txs and cost overflows),
 /// roll back the cost so the failure does not shrink the remaining block
 /// budget for subsequent honest txs.
-pub fn finalize_failed_transaction(
+pub fn finalize_failed_transaction<'a>(
     clarity_tx: &mut ClarityTx,
-    tx: &StacksTransaction,
+    tx: impl Into<TransactionContext<'a>>,
     cost_before: &ExecutionCost,
     error: Error,
 ) -> TransactionResult {
+    let tx = &tx.into();
     let (is_problematic, error) =
         TransactionResult::is_problematic(tx, error, clarity_tx.get_epoch());
     if is_problematic {
@@ -490,11 +514,12 @@ impl StacksChainState {
 
     /// Check the account nonces for the supplied stacks transaction,
     ///   returning the origin and payer accounts if valid.
-    pub fn check_transaction_nonces<T: ClarityConnection>(
+    pub fn check_transaction_nonces<'a, T: ClarityConnection>(
         clarity_tx: &mut T,
-        tx: &StacksTransaction,
+        tx: impl Into<TransactionContext<'a>>,
         quiet: bool,
     ) -> Result<(StacksAccount, StacksAccount), Box<NonceCheckFailure>> {
+        let tx = &tx.into();
         // who's sending it?
         let origin = tx.get_origin();
         let origin_account = StacksChainState::get_account(clarity_tx, &tx.origin_address().into());
@@ -595,11 +620,12 @@ impl StacksChainState {
     /// transaction signatures should be verified to be the low-S variant, or if
     /// high-S is allowed. If it's `None`, this decision is made based on consensus
     /// rules for the specified epoch.
-    pub fn process_transaction_precheck(
+    pub fn process_transaction_precheck<'a>(
         config: &DBConfig,
-        tx: &StacksTransaction,
+        tx: impl Into<TransactionContext<'a>>,
         epoch_id: StacksEpochId,
     ) -> Result<(), Error> {
+        let tx = &tx.into();
         // valid auth?
         if !tx.auth.is_supported_in_epoch(epoch_id) {
             let msg = format!(
@@ -910,12 +936,13 @@ impl StacksChainState {
     /// StacksBlock::validate_transactions_static().
     ///
     /// Returns the stacks transaction receipt
-    pub fn process_transaction_payload(
+    pub fn process_transaction_payload<'a>(
         clarity_tx: &mut ClarityTransactionConnection,
-        tx: &StacksTransaction,
+        tx: impl Into<TransactionContext<'a>>,
         origin_account: &StacksAccount,
         resource_budgets: &TransactionResourceBudgets,
     ) -> Result<StacksTransactionReceipt, Error> {
+        let tx = &tx.into();
         match tx.payload {
             TransactionPayload::TokenTransfer(ref addr, ref amount, ref memo) => {
                 // post-conditions are not allowed for this variant, since they're non-sensical.
@@ -951,7 +978,7 @@ impl StacksChainState {
                     .expect("BUG: total block cost decreased");
 
                 let receipt = StacksTransactionReceipt::from_stx_transfer(
-                    tx.clone(),
+                    tx.transaction().clone(),
                     events,
                     value,
                     total_cost,
@@ -994,16 +1021,38 @@ impl StacksChainState {
                     .sub(&cost_before)
                     .expect("BUG: total block cost decreased");
 
+                let log_values = log::clarity_values_enabled();
+                let function_args_display = VecDisplay(&contract_call.function_args);
+                let function_args_format = format_args!("{function_args_display}");
+                let full_argument_fields = slog::b!("function_args" => function_args_format);
+                let argument_fields = if log_values {
+                    full_argument_fields
+                } else {
+                    slog::b!()
+                };
+
+                let txid = tx.txid();
+                let txid_format = format_args!("{txid}");
+                let origin_format = format_args!("{}", origin_account.principal);
+                let nonce_format = format_args!("{}", origin_account.nonce);
+                let contract_format = format_args!("{contract_id}");
+                let function_format = format_args!("{}", contract_call.function_name);
+                let context_fields = slog::b!(
+                    "txid" => txid_format,
+                    "origin" => origin_format,
+                    "origin_nonce" => nonce_format,
+                    "contract_name" => contract_format,
+                    "function_name" => function_format,
+                    argument_fields,
+                );
+
                 let (result, asset_map, events, vm_error) = match contract_call_resp {
                     Ok((return_value, asset_map, events)) => {
+                        let result_display = format_args!("{return_value}");
+                        let result_fields = slog::b!("return_value" => result_display);
                         info!("Contract-call successfully processed";
-                              "txid" => %tx.txid(),
-                              "origin" => %origin_account.principal,
-                              "origin_nonce" => %origin_account.nonce,
-                              "contract_name" => %contract_id,
-                              "function_name" => %contract_call.function_name,
-                              "function_args" => %VecDisplay(&contract_call.function_args),
-                              "return_value" => %return_value,
+                              context_fields,
+                              if log_values { result_fields } else { slog::b!() },
                               "cost" => ?total_cost);
                         (return_value, asset_map, events, None)
                     }
@@ -1018,12 +1067,7 @@ impl StacksChainState {
                             }) => {
                                 let vm_error = BoundedErrorString::from_display(&error);
                                 info!("Contract-call processed with {}", err_type;
-                                          "txid" => %tx.txid(),
-                                          "origin" => %origin_account.principal,
-                                          "origin_nonce" => %origin_account.nonce,
-                                          "contract_name" => %contract_id,
-                                          "function_name" => %contract_call.function_name,
-                                          "function_args" => %VecDisplay(&contract_call.function_args),
+                                          context_fields,
                                           "error" => %vm_error);
                                 (Value::err_none(), AssetMap::new(), vec![], Some(vm_error))
                             }
@@ -1037,14 +1081,9 @@ impl StacksChainState {
                                 },
                             ) => {
                                 info!("Contract-call aborted by post-condition";
-                                          "txid" => %tx.txid(),
-                                          "origin" => %origin_account.principal,
-                                          "origin_nonce" => %origin_account.nonce,
-                                          "contract_name" => %contract_id,
-                                          "function_name" => %contract_call.function_name,
-                                          "function_args" => %VecDisplay(&contract_call.function_args));
+                                          context_fields);
                                 let receipt = StacksTransactionReceipt::from_condition_aborted_contract_call(
-                                        tx.clone(),
+                                        tx.transaction().clone(),
                                         tx_events,
                                         output.expect("BUG: Post condition contract call must provide would-have-been-returned value"),
                                         assets_modified
@@ -1075,17 +1114,12 @@ impl StacksChainState {
                                 ..
                             }) => {
                                 info!("Contract-call encountered an analysis error at runtime";
-                                          "txid" => %tx.txid(),
-                                          "origin" => %origin_account.principal,
-                                          "origin_nonce" => %origin_account.nonce,
-                                          "contract_name" => %contract_id,
-                                          "function_name" => %contract_call.function_name,
-                                          "function_args" => %VecDisplay(&contract_call.function_args),
+                                          context_fields,
                                           "error" => %BoundedErrorString::from_display(&runtime_check_err));
 
                                 let receipt =
                                     StacksTransactionReceipt::from_runtime_failure_contract_call(
-                                        tx.clone(),
+                                        tx.transaction().clone(),
                                         total_cost,
                                         runtime_check_err,
                                     );
@@ -1099,12 +1133,7 @@ impl StacksChainState {
                             ) => {
                                 warn!("Transaction exceeded miner execution resource limit; will be dropped from mempool";
                                               "error" => s.clone(),
-                                              "txid" => %tx.txid(),
-                                              "origin" => %origin_account.principal,
-                                              "origin_nonce" => %origin_account.nonce,
-                                               "contract_name" => %contract_id,
-                                               "function_name" => %contract_call.function_name,
-                                               "function_args" => %VecDisplay(&contract_call.function_args));
+                                              context_fields);
                                 return Err(Error::ExecutionResourceBudgetExceeded(s));
                             }
                             ClarityRuntimeTxError::Rejected(RejectedRuntimeTxError::Clarity {
@@ -1112,12 +1141,7 @@ impl StacksChainState {
                                 ..
                             }) => {
                                 error!("Unexpected error in validating transaction: if included, this will invalidate a block";
-                                           "txid" => %tx.txid(),
-                                           "origin" => %origin_account.principal,
-                                           "origin_nonce" => %origin_account.nonce,
-                                           "contract_name" => %contract_id,
-                                           "function_name" => %contract_call.function_name,
-                                           "function_args" => %VecDisplay(&contract_call.function_args),
+                                           context_fields,
                                            "error" => ?e);
                                 return Err(Error::ClarityError(e));
                             }
@@ -1126,7 +1150,7 @@ impl StacksChainState {
                 };
 
                 let receipt = StacksTransactionReceipt::from_contract_call(
-                    tx.clone(),
+                    tx.transaction().clone(),
                     events,
                     result,
                     asset_map
@@ -1229,11 +1253,12 @@ impl StacksChainState {
                                     .expect("BUG: total block cost decreased");
 
                                 info!(
-                                    "Runtime error in contract analysis for {contract_id}: {other_error:?}";
+                                    "Runtime error in contract analysis for {contract_id}: {}",
+                                    analysis_error_display(&other_error, log::contract_source_enabled());
                                     "txid" => %tx.txid(),
                                 );
                                 let receipt = StacksTransactionReceipt::from_analysis_failure(
-                                    tx.clone(),
+                                    tx.transaction().clone(),
                                     analysis_cost,
                                     other_error,
                                 );
@@ -1305,7 +1330,7 @@ impl StacksChainState {
                                 //   Return a tx receipt with an `err_none()` result to indicate
                                 //   that the transaction failed during execution.
                                 let receipt = StacksTransactionReceipt {
-                                    transaction: tx.clone().into(),
+                                    transaction: tx.transaction().clone().into(),
                                     events: vec![],
                                     post_condition_aborted: false,
                                     result: Value::err_none(),
@@ -1329,7 +1354,7 @@ impl StacksChainState {
                             ) => {
                                 let receipt =
                                     StacksTransactionReceipt::from_condition_aborted_smart_contract(
-                                        tx.clone(),
+                                        tx.transaction().clone(),
                                         tx_events,
                                         assets_modified
                                             .get_stx_burned_total()
@@ -1369,7 +1394,7 @@ impl StacksChainState {
 
                                 let receipt =
                                     StacksTransactionReceipt::from_runtime_failure_smart_contract(
-                                        tx.clone(),
+                                        tx.transaction().clone(),
                                         total_cost,
                                         contract_analysis,
                                         runtime_check_err,
@@ -1403,7 +1428,7 @@ impl StacksChainState {
                 };
 
                 let receipt = StacksTransactionReceipt::from_smart_contract(
-                    tx.clone(),
+                    tx.transaction().clone(),
                     events,
                     asset_map
                         .get_stx_burned_total()
@@ -1433,15 +1458,18 @@ impl StacksChainState {
                 cost.sub(&cost_before)
                     .expect("BUG: running poison microblock tx has negative cost");
 
-                let receipt =
-                    StacksTransactionReceipt::from_poison_microblock(tx.clone(), res, cost);
+                let receipt = StacksTransactionReceipt::from_poison_microblock(
+                    tx.transaction().clone(),
+                    res,
+                    cost,
+                );
 
                 Ok(receipt)
             }
             TransactionPayload::Coinbase(..) => {
                 // NOTE: technically, post-conditions are allowed (even if they're non-sensical).
 
-                let receipt = StacksTransactionReceipt::from_coinbase(tx.clone());
+                let receipt = StacksTransactionReceipt::from_coinbase(tx.transaction().clone());
                 Ok(receipt)
             }
             TransactionPayload::TenureChange(ref payload) => {
@@ -1476,7 +1504,8 @@ impl StacksChainState {
                     return Err(Error::InvalidStacksTransaction(msg, false));
                 }
 
-                let receipt = StacksTransactionReceipt::from_tenure_change(tx.clone());
+                let receipt =
+                    StacksTransactionReceipt::from_tenure_change(tx.transaction().clone());
                 Ok(receipt)
             }
         }
@@ -1501,12 +1530,13 @@ impl StacksChainState {
     }
 
     /// Process a transaction.  Return the fee and the transaction receipt
-    pub fn process_transaction(
+    pub fn process_transaction<'a>(
         clarity_block: &mut ClarityTx,
-        tx: &StacksTransaction,
+        tx: impl Into<TransactionContext<'a>>,
         quiet: bool,
         max_execution_time: Option<std::time::Duration>,
     ) -> Result<(u64, StacksTransactionReceipt), Error> {
+        let tx = &tx.into();
         // The generic/replay entry point imposes no analysis deadline: only the
         // miner assembly and block-proposal validation paths (which call
         // `process_transaction_with_check` directly) bound the analysis phase.
@@ -1594,14 +1624,16 @@ impl StacksChainState {
     }
 
     pub fn process_transaction_with_check<
+        'a,
         F: FnMut(&StacksTransactionReceipt) -> Result<(), Error>,
     >(
         clarity_block: &mut ClarityTx,
-        tx: &StacksTransaction,
+        tx: impl Into<TransactionContext<'a>>,
         quiet: bool,
         resource_budgets: &TransactionResourceBudgets,
         mut check: F,
     ) -> Result<(u64, StacksTransactionReceipt), Error> {
+        let tx = &tx.into();
         debug!("Process transaction {} ({})", tx.txid(), tx.payload.name());
         let epoch = clarity_block.get_epoch();
 
@@ -1691,10 +1723,12 @@ impl StacksChainState {
 #[cfg(test)]
 pub mod test {
     use clarity::util::secp256k1::Secp256k1PrivateKey;
+    use clarity::vm::analysis::errors::{StaticCheckError, StaticCheckErrorKind};
     use clarity::vm::representations::{ClarityName, ContractName};
     use clarity::vm::test_util::{UnitTestBurnStateDB, TEST_BURN_STATE_DB};
     use clarity::vm::tests::TEST_HEADER_DB;
     use clarity::vm::types::{ResponseData, StandardPrincipalData};
+    use clarity::vm::SymbolicExpression;
     use rand::Rng;
     use rstest::rstest;
     use stacks_common::types::chainstate::SortitionId;
@@ -1703,6 +1737,27 @@ pub mod test {
     use super::*;
     use crate::chainstate::stacks::db::testing::*;
     use crate::chainstate::stacks::{Error, *};
+
+    /// Summary logging never traverses the large expression attached to an analysis error.
+    #[test]
+    fn analysis_error_logging_omits_expressions() {
+        let expression =
+            SymbolicExpression::atom_value(Value::buff_from(vec![0xab; 65536]).unwrap());
+        let error = ClarityError::StaticCheck(Box::new(StaticCheckError::with_expression(
+            StaticCheckErrorKind::ExpectedOptionalType(Box::new(TypeSignature::UIntType)),
+            &expression,
+        )));
+        let summary = analysis_error_display(&error, false).to_string();
+        assert_eq!(
+            summary,
+            StacksTransactionReceipt::analysis_failure_message(&error).to_string()
+        );
+        assert!(summary.len() < 4096);
+        assert!(!summary.contains("abababab"));
+        let full = analysis_error_display(&error, true).to_string();
+        assert_eq!(full, format!("{error:?}"));
+        assert!(full.len() > 131072);
+    }
 
     fn expect_runtime_check_error(error: Error) -> RuntimeCheckErrorKind {
         let Error::ClarityError(ClarityError::Interpreter(error)) = error else {

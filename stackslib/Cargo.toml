@@ -60,11 +60,13 @@ features = ["arbitrary_precision", "unbounded_depth"]
 workspace = true
 
 [dev-dependencies]
+criterion = { workspace = true }
 assert-json-diff = "1.0.0"
 stdext = "0.3.1"
 stx-genesis = { path = "../stx-genesis"}
 clarity = { features = ["default", "testing"], path = "../clarity" }
-stacks-common = { features = ["default", "testing"], path = "../stacks-common" }
+# The subprocess logging regression test requires the production JSON backend.
+stacks-common = { features = ["default", "testing", "slog_json"], path = "../stacks-common" }
 stacks-codec = { features = ["default", "testing"], path = "../stacks-codec" }
 rstest = "0.17.0"
 rstest_reuse = "0.5.0"
@@ -98,3 +100,8 @@ sha2 = { version = "0.10" }
 
 [package.metadata.pinny]
 allowed = ["t_prop"]
+
+[[bench]]
+name = "mining_logging"
+harness = false
+required-features = ["testing"]
