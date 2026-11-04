@@ -32,7 +32,7 @@ use crate::net::httpcore::{
     HttpPreambleExtensions as _, RPCRequestHandler, StacksHttpRequest, StacksHttpResponse,
 };
 use crate::net::p2p::PeerNetwork;
-use crate::net::{Error as NetError, StacksNodeState};
+use crate::net::{rpc_services, Error as NetError, StacksNodeState};
 use crate::version_string;
 
 /// The request to GET /v2/info
@@ -195,14 +195,11 @@ impl RPCRequestHandler for RPCPeerInfoRequestHandler {
 
         let rpc_peer_info: Result<RPCPeerInfoData, StacksHttpResponse> =
             node.with_node_state(|network, _sortdb, chainstate, _mempool, rpc_args| {
-                let coinbase_height = network.stacks_tip.coinbase_height;
-
-                Ok(RPCPeerInfoData::from_network(
+                Ok(rpc_services::get_peer_info(
                     network,
                     chainstate,
                     rpc_args.exit_at_block_height,
                     &rpc_args.genesis_chainstate_hash,
-                    coinbase_height,
                     ibd,
                 ))
             });

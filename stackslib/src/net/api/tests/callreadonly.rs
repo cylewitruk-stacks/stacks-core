@@ -15,6 +15,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use clarity::types::chainstate::StacksBlockId;
 use clarity::vm::costs::ExecutionCost;
@@ -34,6 +35,7 @@ use crate::net::http::HttpRequestContents;
 use crate::net::httpcore::{
     HttpRequestContentsExtensions as _, RPCRequestHandler, StacksHttp, StacksHttpRequest,
 };
+use crate::net::rpc_services::{self, ReadOnlyCallView};
 use crate::net::{ProtocolFamily, TipRequest};
 
 /// Unconfirmed contract whose public functions call into the confirmed `hello-world`.
@@ -485,4 +487,52 @@ fn test_try_make_response_over_budget() {
     assert!(!resp.okay);
     assert!(resp.result.is_none());
     assert!(resp.cause.unwrap().contains("CostBalanceExceeded"));
+}
+
+/// The shared service passes values directly and enforces upstream execution limits.
+#[test]
+fn read_only_calls_preserve_values_write_limits_and_execution_budgets() {
+    let mut fixture = TestRPC::setup(function_name!());
+    let sortdb = fixture.peer_2.chain.sortdb.as_ref().unwrap();
+    let chainstate = &mut fixture
+        .peer_2
+        .chain
+        .stacks_node
+        .as_mut()
+        .unwrap()
+        .chainstate;
+    let contract =
+        QualifiedContractIdentifier::parse("ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R.hello-world")
+            .unwrap();
+    let sender = PrincipalData::Standard(contract.issuer.clone());
+    let tip = TipRequest::SpecificTip(fixture.canonical_tip);
+    let mut call = |function: &str, arguments: Vec<Value>, duration| {
+        rpc_services::call_read_only(
+            sortdb,
+            chainstate,
+            &contract,
+            &ClarityName::try_from(function.to_string()).unwrap(),
+            sender.clone(),
+            None,
+            arguments,
+            &tip,
+            ExecutionCost::max_value(),
+            duration,
+            0,
+        )
+        .unwrap()
+    };
+    let duration = Duration::from_secs(30);
+    assert_eq!(
+        call("ro-confirmed?", vec![Value::UInt(3)], duration),
+        ReadOnlyCallView::Success(format!("0x{}", Value::UInt(3).serialize_to_hex().unwrap()))
+    );
+    assert_eq!(
+        call("add-unit", vec![], duration),
+        ReadOnlyCallView::NotReadOnly
+    );
+    assert_eq!(
+        call("ro-confirmed", vec![], Duration::ZERO),
+        ReadOnlyCallView::ExecutionBudgetExceeded
+    );
 }
