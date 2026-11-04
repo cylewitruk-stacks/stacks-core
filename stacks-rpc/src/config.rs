@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use clarity::vm::costs::ExecutionCost;
 use stacks::burnchains::Burnchain;
-use stacks::chainstate::stacks::index::marf::MARFOpenOpts;
 use stacks::cost_estimates::metrics::CostMetric;
 use stacks::cost_estimates::{CostEstimator, FeeEstimator};
+use stacks_marf::MARFOpenOpts;
 
 pub struct AxumRpcConfig {
     pub bind_addr: SocketAddr,

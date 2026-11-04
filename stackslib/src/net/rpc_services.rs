@@ -19,8 +19,11 @@ use clarity::vm::database::clarity_store::{make_contract_hash_key, ContractCommi
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
 use clarity::vm::errors::ClarityEvalError;
 use clarity::vm::errors::VmExecutionError::{self, RuntimeCheck};
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, TraitIdentifier};
-use clarity::vm::{ClarityName, SymbolicExpression, Value};
+use clarity::vm::resource_limiter::ResourceBudget;
+use clarity::vm::types::{
+    BoundedErrorString, PrincipalData, QualifiedContractIdentifier, TraitIdentifier,
+};
+use clarity::vm::{ClarityName, Value};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{StacksAddress, StacksBlockId};
 use stacks_common::util::get_epoch_time_secs;
@@ -30,8 +33,7 @@ use crate::burnchains::{Burnchain, Txid};
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::burn::BlockSnapshot;
 use crate::chainstate::coordinator::Error as CoordinatorError;
-use crate::chainstate::nakamoto::miner::make_mem_abort_callback;
-use crate::chainstate::nakamoto::{NakamotoChainState, NakamotoStagingBlocksConn, StacksDBIndexed};
+use crate::chainstate::nakamoto::{NakamotoChainState, NakamotoStagingBlocksConn};
 use crate::chainstate::stacks::boot::RewardSet;
 use crate::chainstate::stacks::db::{
     ExtendedStacksHeader, StacksBlockHeaderTypes, StacksChainState,
@@ -148,7 +150,8 @@ pub enum SortitionQuery {
 pub enum ReadOnlyCallView {
     Success(String),
     NotReadOnly,
-    ExecutionTimedOut,
+    /// Execution exceeded its configured time or memory budget.
+    ExecutionBudgetExceeded,
     Failed(String),
 }
 
@@ -1207,10 +1210,8 @@ fn map_stacker_set_error(error: GetStackersErrors) -> RpcServiceError {
 
 pub fn get_sortitions(
     sortdb: &SortitionDB,
-    chainstate: &mut StacksChainState,
     query: &SortitionQuery,
 ) -> RpcServiceResult<Vec<SortitionInfo>> {
-    let tip = load_canonical_chain_tip(sortdb, chainstate)?;
     let burn_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn())
         .map_err(|e| RpcServiceError::internal("Failed to load canonical burn tip", e))?;
     let snapshot = match query {
@@ -1244,7 +1245,7 @@ pub fn get_sortitions(
     }
     .ok_or_else(|| RpcServiceError::NotFound(format!("Sortition not found: {query:?}")))?;
 
-    let first = GetSortitionHandler::get_sortition_info(snapshot, sortdb, chainstate, &tip)
+    let first = GetSortitionHandler::get_sortition_info(snapshot, sortdb)
         .map_err(|e| RpcServiceError::internal("Failed to load sortition details", e))?;
     let last_sortition = first.last_sortition_ch.clone();
     let mut result = vec![first];
@@ -1259,10 +1260,9 @@ pub fn get_sortitions(
                         ))
                     })?;
             result.push(
-                GetSortitionHandler::get_sortition_info(snapshot, sortdb, chainstate, &tip)
-                    .map_err(|e| {
-                        RpcServiceError::internal("Failed to load last sortition details", e)
-                    })?,
+                GetSortitionHandler::get_sortition_info(snapshot, sortdb).map_err(|e| {
+                    RpcServiceError::internal("Failed to load last sortition details", e)
+                })?,
             );
         }
     }
@@ -1284,10 +1284,10 @@ pub fn call_read_only(
     max_memory_bytes: u64,
 ) -> RpcServiceResult<ReadOnlyCallView> {
     let tip = load_stacks_chain_tip(sortdb, chainstate, tip_req)?;
-    let args: Vec<_> = arguments
-        .into_iter()
-        .map(SymbolicExpression::atom_value)
-        .collect();
+    let resource_limiter = ResourceBudget::unlimited()
+        .with_max_duration(Some(max_execution_time))
+        .with_max_memory_use((max_memory_bytes > 0).then_some(max_memory_bytes))
+        .start_tracking();
     let mainnet = chainstate.mainnet;
     let chain_id = chainstate.chain_id;
     cost_limit.write_length = 0;
@@ -1314,15 +1314,12 @@ pub fn call_read_only(
                 |exec_state, invoke_ctx| {
                     exec_state
                         .global_context
-                        .set_abort_callback(make_mem_abort_callback(max_memory_bytes));
-                    exec_state
-                        .global_context
-                        .set_max_execution_time(max_execution_time);
+                        .set_execution_resource_limiter(resource_limiter);
                     // Deliberately allow any public function, not only `define-read-only`
                     // functions. The zero write budget still rejects state changes, while this
                     // permits read-only execution paths that use `contract-call?`.
                     exec_state
-                        .execute_contract(invoke_ctx, contract, function.as_str(), &args, false)
+                        .execute_contract(invoke_ctx, contract, function.as_str(), arguments, false)
                         .map_err(ClarityEvalError::from)
                 },
             )
@@ -1342,9 +1339,11 @@ pub fn call_read_only(
             Ok(ReadOnlyCallView::NotReadOnly)
         }
         Ok(Some(Err(ClarityEvalError::Vm(RuntimeCheck(
-            RuntimeCheckErrorKind::ExecutionTimeExpired,
-        ))))) => Ok(ReadOnlyCallView::ExecutionTimedOut),
-        Ok(Some(Err(e))) => Ok(ReadOnlyCallView::Failed(e.to_string())),
+            RuntimeCheckErrorKind::ExecutionResourceBudgetExceeded(_),
+        ))))) => Ok(ReadOnlyCallView::ExecutionBudgetExceeded),
+        Ok(Some(Err(e))) => Ok(ReadOnlyCallView::Failed(
+            BoundedErrorString::from_display(&e).to_string(),
+        )),
         Ok(None) => Err(RpcServiceError::NotFound(format!(
             "Chain tip '{tip}' not found"
         ))),
@@ -1391,9 +1390,8 @@ pub fn get_tenure_blocks_page(
     cursor: Option<StacksBlockId>,
     limit: usize,
 ) -> RpcServiceResult<TenureBlocksPage> {
-    let tip = load_canonical_chain_tip(sortdb, chainstate)?;
     let snapshot = get_tenure_snapshot(sortdb, selector)?;
-    let last_sortition_consensus_hash = get_prior_sortition(sortdb, chainstate, &snapshot, &tip)?;
+    let last_sortition_consensus_hash = get_prior_sortition(sortdb, &snapshot)?;
     let highest = match selector {
         TenureSelector::ConsensusHash(consensus_hash) => {
             NakamotoChainState::find_highest_known_block_header_in_tenure(
@@ -1494,12 +1492,7 @@ pub fn get_tenure_fork_info(
     let mut result = vec![];
     let mut depth = 0;
     loop {
-        if cursor.sortition
-            || chainstate
-                .nakamoto_blocks_db()
-                .is_shadow_tenure(&cursor.consensus_hash)
-                .map_err(|e| RpcServiceError::internal("Failed to query shadow tenure", e))?
-        {
+        if cursor.sortition {
             result.push(
                 TenureForkingInfo::from_snapshot(&cursor, sortdb, chainstate, &tip)
                     .map_err(|e| RpcServiceError::internal("Failed to load tenure fork info", e))?,
@@ -1551,21 +1544,8 @@ fn get_tenure_snapshot(
 
 fn get_prior_sortition(
     sortdb: &SortitionDB,
-    chainstate: &mut StacksChainState,
     snapshot: &BlockSnapshot,
-    tip: &StacksBlockId,
 ) -> RpcServiceResult<stacks_common::types::chainstate::ConsensusHash> {
-    let is_shadow = chainstate
-        .nakamoto_blocks_db()
-        .is_shadow_tenure(&snapshot.consensus_hash)
-        .map_err(|e| RpcServiceError::internal("Failed to query shadow tenure", e))?;
-    if is_shadow {
-        return chainstate
-            .index_conn()
-            .get_parent_tenure_consensus_hash(tip, &snapshot.consensus_hash)
-            .map_err(|e| RpcServiceError::internal("Failed to query parent tenure", e))?
-            .ok_or_else(|| RpcServiceError::NotFound("Parent tenure not found".into()));
-    }
     sortdb
         .index_handle_at_ch(&snapshot.consensus_hash)
         .map_err(|e| RpcServiceError::internal("Failed to open tenure sortition", e))?

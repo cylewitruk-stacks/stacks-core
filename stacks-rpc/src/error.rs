@@ -46,7 +46,6 @@ pub enum ApiErrorCode {
     BodyReadFailed,
     EmptyBody,
     InvalidJson,
-    ShadowBlock,
     InvalidPrincipal,
     InvalidContract,
     InvalidClarityName,
@@ -54,6 +53,8 @@ pub enum ApiErrorCode {
     InvalidMetadataKey,
     CallArgumentsTooLarge,
     ContractCallNotReadOnly,
+    /// Contract execution exceeded its configured time or memory budget.
+    ContractCallBudgetExceeded,
     ContractCallFailed,
     InvalidBlockId,
     InvalidBlockHeight,

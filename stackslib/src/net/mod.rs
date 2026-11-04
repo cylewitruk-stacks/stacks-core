@@ -34,6 +34,7 @@ use stacks_common::types::StacksPublicKeyBuffer;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{Hash160, Sha256Sum};
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PublicKey};
+use stacks_marf::Error as marf_error;
 use url;
 
 use self::dns::*;
@@ -43,7 +44,6 @@ use crate::chainstate::burn::ConsensusHash;
 use crate::chainstate::coordinator::comm::CoordinatorChannels;
 use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoChainState};
 use crate::chainstate::stacks::db::StacksChainState;
-use crate::chainstate::stacks::index::Error as marf_error;
 use crate::chainstate::stacks::{
     Error as chainstate_error, Error as chain_error, StacksBlock, StacksMicroblock,
     StacksPublicKey, StacksTransaction,
@@ -750,15 +750,15 @@ impl<'a> StacksNodeState<'a> {
     ///
     /// # Warn
     /// - There is a potential race condition. If this function is loading the latest unconfirmed
-    /// tip, that tip may get invalidated by the time it is used in `maybe_read_only_clarity_tx`,
-    /// which is used to load clarity state at a particular tip (which would lead to a 404 error).
-    /// If this race condition occurs frequently, we can modify `maybe_read_only_clarity_tx` to
-    /// re-load the unconfirmed chain tip. Refer to issue #2997.
+    ///   tip, that tip may get invalidated by the time it is used in `maybe_read_only_clarity_tx`,
+    ///   which is used to load clarity state at a particular tip (which would lead to a 404 error).
+    ///   If this race condition occurs frequently, we can modify `maybe_read_only_clarity_tx` to
+    ///   re-load the unconfirmed chain tip. Refer to issue #2997.
     ///
     /// # Inputs
     /// - `tip_req` is given by the HTTP request as the optional query parameter for the chain tip
-    /// hash.  It will be UseLatestAnchoredTip if there was no parameter given. If it is set to
-    /// `latest`, the parameter will be set to UseLatestUnconfirmedTip.
+    ///   hash.  It will be UseLatestAnchoredTip if there was no parameter given. If it is set to
+    ///   `latest`, the parameter will be set to UseLatestUnconfirmedTip.
     ///
     /// Returns the requested chain tip on success.
     /// If the chain tip could not be found, then it returns Err(HttpNotFound)
@@ -798,21 +798,17 @@ impl<'a> StacksNodeState<'a> {
                                 &tip.consensus_hash,
                                 &tip.anchored_header.block_hash(),
                             )),
-                            Ok(None) => {
-                                return Err(StacksHttpResponse::new_error(
-                                    preamble,
-                                    &HttpNotFound::new("No such confirmed tip".to_string()),
-                                ));
-                            }
-                            Err(e) => {
-                                return Err(StacksHttpResponse::new_error(
-                                    preamble,
-                                    &HttpServerError::new(format!(
-                                        "Failed to load chain tip: {:?}",
-                                        &e
-                                    )),
-                                ));
-                            }
+                            Ok(None) => Err(StacksHttpResponse::new_error(
+                                preamble,
+                                &HttpNotFound::new("No such confirmed tip".to_string()),
+                            )),
+                            Err(e) => Err(StacksHttpResponse::new_error(
+                                preamble,
+                                &HttpServerError::new(format!(
+                                    "Failed to load chain tip: {:?}",
+                                    &e
+                                )),
+                            )),
                         }
                     }
                 }
@@ -823,23 +819,16 @@ impl<'a> StacksNodeState<'a> {
                             &tip.consensus_hash,
                             &tip.anchored_header.block_hash(),
                         )),
-                        Ok(None) => {
-                            return Err(StacksHttpResponse::new_error(
-                                preamble,
-                                &HttpNotFound::new(
-                                    "No stacks chain tip exists at this point in time.".to_string(),
-                                ),
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(StacksHttpResponse::new_error(
-                                preamble,
-                                &HttpServerError::new(format!(
-                                    "Failed to load chain tip: {:?}",
-                                    &e
-                                )),
-                            ));
-                        }
+                        Ok(None) => Err(StacksHttpResponse::new_error(
+                            preamble,
+                            &HttpNotFound::new(
+                                "No stacks chain tip exists at this point in time.".to_string(),
+                            ),
+                        )),
+                        Err(e) => Err(StacksHttpResponse::new_error(
+                            preamble,
+                            &HttpServerError::new(format!("Failed to load chain tip: {:?}", &e)),
+                        )),
                     }
                 }
             }
@@ -951,7 +940,7 @@ pub struct PoxInvData {
 pub struct BlocksDatum(pub ConsensusHash, pub StacksBlock);
 
 /// Stacks epoch 2.x blocks pushed
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BlocksData {
     pub blocks: Vec<BlocksDatum>,
 }
@@ -972,7 +961,7 @@ pub struct MicroblocksData {
 }
 
 /// Block available hint
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BlocksAvailableData {
     pub available: Vec<(ConsensusHash, BurnchainHeaderHash)>,
 }
@@ -1176,6 +1165,12 @@ pub struct RelayData {
     pub seq: u32,
 }
 
+/// A microblock message paired with its prior relay hints.
+pub type RelayedMicroblocks = (Vec<RelayData>, MicroblocksData);
+
+/// A Nakamoto blocks message paired with its prior relay hints.
+pub type RelayedNakamotoBlocks = (Vec<RelayData>, NakamotoBlocksData);
+
 /// All P2P message types
 #[derive(Debug, Clone, PartialEq)]
 pub enum StacksMessageType {
@@ -1262,6 +1257,24 @@ pub trait MessageSequence {
     fn get_message_name(&self) -> &'static str;
 }
 
+/// A completed streamed payload and its encoded size.
+#[derive(Debug)]
+pub struct CompletedPayload<T> {
+    /// Decoded payload assembled across one or more reads.
+    pub payload: T,
+    /// Total encoded bytes consumed to assemble this payload.
+    pub total_encoded_bytes: usize,
+}
+
+/// Progress made while consuming a streamed payload.
+#[derive(Debug)]
+pub struct StreamRead<T> {
+    /// Completed payload, or none if more input is required.
+    pub completed: Option<CompletedPayload<T>>,
+    /// Encoded bytes consumed during this call only.
+    pub consumed: usize,
+}
+
 pub trait ProtocolFamily {
     type Preamble: StacksMessageCodec + Send + Sync + Clone + PartialEq + std::fmt::Debug;
     type Message: MessageSequence + Send + Sync + Clone + PartialEq + std::fmt::Debug;
@@ -1295,7 +1308,7 @@ pub trait ProtocolFamily {
         &mut self,
         preamble: &Self::Preamble,
         fd: &mut R,
-    ) -> Result<(Option<(Self::Message, usize)>, usize), Error>;
+    ) -> Result<StreamRead<Self::Message>, Error>;
 
     /// Given a public key, a preamble, and the yet-to-be-parsed message bytes, verify the message
     /// authenticity.  Not all protocols need to do this.
@@ -1313,7 +1326,7 @@ pub trait ProtocolFamily {
 }
 
 // these implement the ProtocolFamily trait
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StacksP2P {}
 
 // an array in our protocol can't exceed this many items
@@ -1523,6 +1536,18 @@ pub const DENY_BAN_DURATION: u64 = 86400; // seconds (1 day)
 
 pub const DENY_MIN_BAN_DURATION: u64 = 2;
 
+/// Stacks 2.x data fetched by the block downloader.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Downloaded<T> {
+    /// Consensus hash of the anchored block the data belongs to. For a microblock stream,
+    /// this is the anchored block that produced the stream.
+    pub consensus_hash: ConsensusHash,
+    /// Downloaded block or microblock stream.
+    pub data: T,
+    /// Time taken to download the data, in seconds.
+    pub download_time_secs: u64,
+}
+
 /// Result of doing network work
 #[derive(Clone, PartialEq, Debug)]
 pub struct NetworkResult {
@@ -1533,9 +1558,9 @@ pub struct NetworkResult {
     /// Network messages we received but did not handle
     pub unhandled_messages: HashMap<NeighborKey, Vec<StacksMessage>>,
     /// Stacks 2.x blocks we downloaded, and time taken
-    pub blocks: Vec<(ConsensusHash, StacksBlock, u64)>,
+    pub blocks: Vec<Downloaded<StacksBlock>>,
     /// Stacks 2.x confiremd microblocks we downloaded, and time taken
-    pub confirmed_microblocks: Vec<(ConsensusHash, Vec<StacksMicroblock>, u64)>,
+    pub confirmed_microblocks: Vec<Downloaded<Vec<StacksMicroblock>>>,
     /// Nakamoto blocks we downloaded
     pub nakamoto_blocks: HashMap<StacksBlockId, NakamotoBlock>,
     /// all transactions pushed to us and their message relay hints
@@ -1543,9 +1568,9 @@ pub struct NetworkResult {
     /// all Stacks 2.x blocks pushed to us
     pub pushed_blocks: HashMap<NeighborKey, Vec<BlocksData>>,
     /// all Stacks 2.x microblocks pushed to us, and the relay hints from the message
-    pub pushed_microblocks: HashMap<NeighborKey, Vec<(Vec<RelayData>, MicroblocksData)>>,
+    pub pushed_microblocks: HashMap<NeighborKey, Vec<RelayedMicroblocks>>,
     /// all Stacks 3.x blocks pushed to us
-    pub pushed_nakamoto_blocks: HashMap<NeighborKey, Vec<(Vec<RelayData>, NakamotoBlocksData)>>,
+    pub pushed_nakamoto_blocks: HashMap<NeighborKey, Vec<RelayedNakamotoBlocks>>,
     /// transactions sent to us by the http server
     pub uploaded_transactions: Vec<StacksTransaction>,
     /// blocks sent to us via the http server
@@ -1634,7 +1659,7 @@ impl NetworkResult {
         let mut blocks: HashSet<_> = self
             .blocks
             .iter()
-            .map(|(ch, blk, _)| StacksBlockId::new(ch, &blk.block_hash()))
+            .map(|blk| StacksBlockId::new(&blk.consensus_hash, &blk.data.block_hash()))
             .collect();
 
         let pushed_blocks: HashSet<_> = self
@@ -1674,7 +1699,7 @@ impl NetworkResult {
         let mut mblocks: HashSet<_> = self
             .confirmed_microblocks
             .iter()
-            .flat_map(|(_, mblocks, _)| mblocks.iter().map(|mblk| mblk.block_hash()))
+            .flat_map(|mblocks| mblocks.data.iter().map(|mblk| mblk.block_hash()))
             .collect();
 
         let pushed_microblocks: HashSet<_> = self
@@ -1823,8 +1848,8 @@ impl NetworkResult {
         let newer_txids = newer.all_txids();
 
         // only retain blocks not found in `newer`
-        self.blocks.retain(|(ch, blk, _)| {
-            let block_id = StacksBlockId::new(ch, &blk.block_hash());
+        self.blocks.retain(|blk| {
+            let block_id = StacksBlockId::new(&blk.consensus_hash, &blk.data.block_hash());
             let retain = !newer_blocks.contains(&block_id);
             if !retain {
                 debug!("Drop duplicate downloaded block {}", &block_id);
@@ -1835,7 +1860,7 @@ impl NetworkResult {
 
         // merge microblocks, but deduplicate
         self.confirmed_microblocks
-            .retain_mut(|(_, ref mut mblocks, _)| {
+            .retain_mut(|Downloaded { data: mblocks, .. }| {
                 mblocks.retain(|mblk| {
                     let retain = !newer_microblocks.contains(&mblk.block_hash());
                     if !retain {
@@ -2008,53 +2033,82 @@ impl NetworkResult {
             .uploaded_nakamoto_blocks
             .append(&mut self.uploaded_nakamoto_blocks);
 
-        // merge uploaded/pushed stackerdb, but drop stale versions
-        let newer_stackerdb_chunk_versions: HashMap<_, _> = newer
-            .uploaded_stackerdb_chunks
-            .iter()
-            .map(|chunk| {
-                (
-                    (
-                        chunk.contract_id.clone(),
-                        chunk.rc_consensus_hash.clone(),
-                        chunk.chunk_data.slot_id,
-                    ),
-                    chunk.chunk_data.slot_version,
-                )
-            })
-            .chain(newer.pushed_stackerdb_chunks.iter().map(|pushed| {
-                (
-                    (
-                        pushed.chunk.contract_id.clone(),
-                        pushed.chunk.rc_consensus_hash.clone(),
-                        pushed.chunk.chunk_data.slot_id,
-                    ),
-                    pushed.chunk.chunk_data.slot_version,
-                )
-            }))
-            .collect();
-
-        self.uploaded_stackerdb_chunks.retain(|push_chunk| {
-            if push_chunk.rc_consensus_hash != newer.rc_consensus_hash {
-                debug!(
-                    "Drop pushed StackerDB chunk for {} due to stale view ({} != {}): {:?}",
-                    &push_chunk.contract_id,
-                    &push_chunk.rc_consensus_hash,
-                    &newer.rc_consensus_hash,
-                    &push_chunk.chunk_data
+        // Merge uploaded/pushed stackerdb chunks, dropping ones the newer result supersedes.
+        //
+        // Uploaded chunks must only be deduped against other uploaded chunks. An uploaded
+        // chunk is already stored in our replica, and this record is the only thing that
+        // will ever emit an event for it. If a peer echoes the same chunk back to us and
+        // the echo wins here, the relayer later rejects the echo as a stale chunk (we
+        // already have the data) and no event is ever emitted. The chunk ends up stored
+        // and acknowledged but invisible to local signers, e.g. a lost block pre-commit
+        // that stalls consensus which was identified as a source of integration test
+        // flakiness that triggered this investigation.
+        fn max_versions<'a>(
+            chunks: impl Iterator<
+                Item = (
+                    &'a QualifiedContractIdentifier,
+                    &'a ConsensusHash,
+                    &'a StackerDBChunkData,
+                ),
+            >,
+        ) -> HashMap<(QualifiedContractIdentifier, ConsensusHash, u32), u32> {
+            let mut versions = HashMap::new();
+            for (contract_id, rc_consensus_hash, chunk_data) in chunks {
+                let key = (
+                    contract_id.clone(),
+                    rc_consensus_hash.clone(),
+                    chunk_data.slot_id,
                 );
-                return false;
+                let version = versions.entry(key).or_insert(chunk_data.slot_version);
+                *version = (*version).max(chunk_data.slot_version);
             }
-            if let Some(version) = newer_stackerdb_chunk_versions.get(&(
-                push_chunk.contract_id.clone(),
-                push_chunk.rc_consensus_hash.clone(),
-                push_chunk.chunk_data.slot_id,
+            versions
+        }
+
+        let newer_uploaded_versions =
+            max_versions(newer.uploaded_stackerdb_chunks.iter().map(|chunk| {
+                (
+                    &chunk.contract_id,
+                    &chunk.rc_consensus_hash,
+                    &chunk.chunk_data,
+                )
+            }));
+        let newer_any_versions = max_versions(
+            newer
+                .uploaded_stackerdb_chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        &chunk.contract_id,
+                        &chunk.rc_consensus_hash,
+                        &chunk.chunk_data,
+                    )
+                })
+                .chain(newer.pushed_stackerdb_chunks.iter().map(|pushed| {
+                    (
+                        &pushed.chunk.contract_id,
+                        &pushed.chunk.rc_consensus_hash,
+                        &pushed.chunk.chunk_data,
+                    )
+                })),
+        );
+
+        // NB: no stale-view check for uploaded chunks. Their `rc_consensus_hash` was stamped by
+        // *this* node when it accepted and stored the upload, so a mismatch only means our own
+        // view moved on afterwards and says nothing about the chunk's validity, and the data is
+        // already in our replica. `process_uploaded_stackerdb_chunks` still declines to
+        // *rebroadcast* a stale-view chunk; it just no longer withholds the event as well.
+        self.uploaded_stackerdb_chunks.retain(|uploaded_chunk| {
+            if let Some(version) = newer_uploaded_versions.get(&(
+                uploaded_chunk.contract_id.clone(),
+                uploaded_chunk.rc_consensus_hash.clone(),
+                uploaded_chunk.chunk_data.slot_id,
             )) {
-                let retain = push_chunk.chunk_data.slot_version > *version;
+                let retain = uploaded_chunk.chunk_data.slot_version > *version;
                 if !retain {
                     debug!(
-                        "Drop pushed StackerDB chunk for {} due to stale version: {:?}",
-                        &push_chunk.contract_id, &push_chunk.chunk_data
+                        "Drop uploaded StackerDB chunk for {} due to stale version: {:?}",
+                        &uploaded_chunk.contract_id, &uploaded_chunk.chunk_data
                     );
                 }
                 retain
@@ -2067,7 +2121,7 @@ impl NetworkResult {
             let push_chunk = &pushed.chunk;
             if push_chunk.rc_consensus_hash != newer.rc_consensus_hash {
                 debug!(
-                    "Drop uploaded StackerDB chunk for {} due to stale view ({} != {}): {:?}",
+                    "Drop pushed StackerDB chunk for {} due to stale view ({} != {}): {:?}",
                     &push_chunk.contract_id,
                     &push_chunk.rc_consensus_hash,
                     &newer.rc_consensus_hash,
@@ -2075,7 +2129,7 @@ impl NetworkResult {
                 );
                 return false;
             }
-            if let Some(version) = newer_stackerdb_chunk_versions.get(&(
+            if let Some(version) = newer_any_versions.get(&(
                 push_chunk.contract_id.clone(),
                 push_chunk.rc_consensus_hash.clone(),
                 push_chunk.chunk_data.slot_id,
@@ -2083,7 +2137,7 @@ impl NetworkResult {
                 let retain = push_chunk.chunk_data.slot_version > *version;
                 if !retain {
                     debug!(
-                        "Drop uploaded StackerDB chunk for {} due to stale version: {:?}",
+                        "Drop pushed StackerDB chunk for {} due to stale version: {:?}",
                         &push_chunk.contract_id, &push_chunk.chunk_data
                     );
                 }
@@ -2154,15 +2208,6 @@ impl NetworkResult {
             .any(|x| !x.chunks_to_store.is_empty())
             || !self.uploaded_stackerdb_chunks.is_empty()
             || !self.pushed_stackerdb_chunks.is_empty()
-    }
-
-    pub fn transactions(&self) -> Vec<StacksTransaction> {
-        self.pushed_transactions
-            .values()
-            .flat_map(|pushed_txs| pushed_txs.iter().map(|(_, tx)| tx.clone()))
-            .chain(self.uploaded_transactions.iter().cloned())
-            .chain(self.synced_transactions.iter().cloned())
-            .collect()
     }
 
     pub fn has_data_to_store(&self) -> bool {
@@ -2299,13 +2344,11 @@ pub mod test {
 
     use clarity::types::sqlite::NO_PARAMS;
     use clarity::vm::costs::ExecutionCost;
-    use clarity::vm::types::*;
     use mio;
     use rand::{self, RngCore};
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
     use stacks_common::types::StacksEpochId;
-    use stacks_common::util::hash::*;
     use stacks_common::util::secp256k1::*;
     use stacks_common::util::vrf::*;
 
@@ -2329,9 +2372,9 @@ pub mod test {
     use crate::chainstate::stacks::{StacksMicroblockHeader, *};
     use crate::chainstate::tests::{TestChainstate, TestChainstateConfig};
     use crate::core::{StacksEpoch, StacksEpochExtension};
-    use crate::cost_estimates::metrics::UnitMetric;
+    use crate::cost_estimates::metrics::{ProportionalDotProduct, UnitMetric};
     use crate::cost_estimates::tests::fee_rate_fuzzer::ConstantFeeEstimator;
-    use crate::cost_estimates::UnitEstimator;
+    use crate::cost_estimates::{CostEstimator, EstimatorError, UnitEstimator};
     use crate::net::asn::*;
     use crate::net::atlas::*;
     use crate::net::chat::*;
@@ -2436,9 +2479,9 @@ pub mod test {
                 // when reading from a non-blocking socket, a return value of 0 indicates the
                 // remote end was closed.  For this reason, when we're out of bytes to read on our
                 // inner cursor, but still have bytes, we need to re-interpret this as EWOULDBLOCK.
-                return Err(io::Error::from(ErrorKind::WouldBlock));
+                Err(io::Error::from(ErrorKind::WouldBlock))
             } else {
-                return Ok(sz);
+                Ok(sz)
             }
         }
     }
@@ -2493,7 +2536,7 @@ pub mod test {
                 next_port = 1024 + (rng.next_u32() % (65535 - 1024));
                 let hostport = format!("127.0.0.1:{}", next_port);
                 std_listener = match std::net::TcpListener::bind(
-                    &hostport.parse::<std::net::SocketAddr>().unwrap(),
+                    hostport.parse::<std::net::SocketAddr>().unwrap(),
                 ) {
                     Ok(sock) => sock,
                     Err(e) => {
@@ -2509,7 +2552,7 @@ pub mod test {
         };
 
         let std_sock_1 = std::net::TcpStream::connect(
-            &format!("127.0.0.1:{port}")
+            format!("127.0.0.1:{port}")
                 .parse::<std::net::SocketAddr>()
                 .unwrap(),
         )
@@ -2638,11 +2681,60 @@ pub mod test {
         coord_comms: None,
     };
 
+    /// What `FeeResponseEstimator` reports for any contract call.
+    pub const FEE_RESPONSE_CONTRACT_CALL_COST: ExecutionCost = ExecutionCost {
+        write_length: 1,
+        write_count: 1,
+        read_length: 1,
+        read_count: 1,
+        runtime: 1,
+    };
+
+    struct FeeResponseEstimator;
+
+    impl CostEstimator for FeeResponseEstimator {
+        fn notify_event(
+            &mut self,
+            _tx: &TransactionPayload,
+            _actual_cost: &ExecutionCost,
+            _block_limit: &ExecutionCost,
+            _evaluated_epoch: &StacksEpochId,
+        ) -> Result<(), EstimatorError> {
+            Ok(())
+        }
+
+        fn estimate_cost(
+            &self,
+            tx: &TransactionPayload,
+            _evaluated_epoch: &StacksEpochId,
+        ) -> Result<ExecutionCost, EstimatorError> {
+            match tx {
+                TransactionPayload::TokenTransfer(..) => Ok(ExecutionCost::ZERO),
+                TransactionPayload::ContractCall(..) => Ok(FEE_RESPONSE_CONTRACT_CALL_COST),
+                _ => Err(EstimatorError::NoEstimateAvailable),
+            }
+        }
+    }
+
+    const FEE_RESPONSE_COST_ESTIMATOR: FeeResponseEstimator = FeeResponseEstimator {};
+    const FEE_RESPONSE_COST_METRIC: ProportionalDotProduct =
+        ProportionalDotProduct::new(MAX_BLOCK_LEN as u64);
+    const FEE_RESPONSE_RPC_HANDLER_ARGS: RPCHandlerArgs<'static> = RPCHandlerArgs {
+        exit_at_block_height: None,
+        genesis_chainstate_hash: Sha256Sum([0x00; 32]),
+        event_observer: None,
+        cost_estimator: Some(&FEE_RESPONSE_COST_ESTIMATOR),
+        fee_estimator: Some(&CONSTANT_FEE_ESTIMATOR),
+        cost_metric: Some(&FEE_RESPONSE_COST_METRIC),
+        coord_comms: None,
+    };
+
     /// Templates for RPC Handler Args (which must be owned by the TestPeer, and cannot be a bare
     /// RPCHandlerArgs since references to the inner members cannot be made thread-safe).
     #[derive(Clone, Debug, PartialEq)]
     pub enum RPCHandlerArgsType {
         Default,
+        FeeResponse,
         Null,
         Unit,
     }
@@ -2653,6 +2745,10 @@ pub mod test {
                 Self::Default => {
                     debug!("Default RPC Handler Args");
                     DEFAULT_RPC_HANDLER_ARGS.clone()
+                }
+                Self::FeeResponse => {
+                    debug!("Fee Response RPC Handler Args");
+                    FEE_RESPONSE_RPC_HANDLER_ARGS.clone()
                 }
                 Self::Null => {
                     debug!("Null RPC Handler Args");
@@ -3262,6 +3358,16 @@ pub mod test {
             dns_client: Option<&mut DNSClient>,
         ) -> Result<(NetworkResult, ProcessedNetReceipts), net_error> {
             let net_result = self.step_with_ibd_and_dns(ibd, dns_client)?;
+            let receipts = self.relay_network_result(net_result.clone(), ibd)?;
+            Ok((net_result, receipts))
+        }
+
+        /// Store and process the data in `net_result`, as the node's relayer would.
+        pub fn relay_network_result(
+            &mut self,
+            mut net_result: NetworkResult,
+            ibd: bool,
+        ) -> Result<ProcessedNetReceipts, net_error> {
             let mut sortdb = self.chain.sortdb.take().unwrap();
             let mut stacks_node = self.chain.stacks_node.take().unwrap();
             let mut mempool = self.mempool.take().unwrap();
@@ -3269,7 +3375,7 @@ pub mod test {
 
             let receipts_res = self.relayer.process_network_result(
                 self.network.get_local_peer(),
-                &mut net_result.clone(),
+                &mut net_result,
                 &self.network.burnchain,
                 &mut sortdb,
                 &mut stacks_node.chainstate,
@@ -3288,7 +3394,7 @@ pub mod test {
             self.chain.coord.handle_new_stacks_block().unwrap();
             self.chain.coord.handle_new_nakamoto_stacks_block().unwrap();
 
-            receipts_res.map(|receipts| (net_result, receipts))
+            receipts_res
         }
 
         pub fn step_dns(&mut self, dns_client: &mut DNSClient) -> Result<NetworkResult, net_error> {
@@ -3454,9 +3560,7 @@ pub mod test {
             let sortdb = self.chain.sortdb.as_ref().unwrap();
             let tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn()).unwrap();
             let sort_handle = sortdb.index_handle(&tip.sortition_id);
-            let Some(sn) = sort_handle.get_block_snapshot_by_height(height).unwrap() else {
-                return None;
-            };
+            let sn = sort_handle.get_block_snapshot_by_height(height).unwrap()?;
             Some(self.get_burnchain_block_ops(&sn.burn_header_hash))
         }
 
@@ -3517,7 +3621,7 @@ pub mod test {
         }
 
         pub fn set_ops_consensus_hash(
-            blockstack_ops: &mut Vec<BlockstackOperationType>,
+            blockstack_ops: &mut [BlockstackOperationType],
             ch: &ConsensusHash,
         ) {
             for op in blockstack_ops.iter_mut() {
@@ -3528,7 +3632,7 @@ pub mod test {
         }
 
         pub fn set_ops_burn_header_hash(
-            blockstack_ops: &mut Vec<BlockstackOperationType>,
+            blockstack_ops: &mut [BlockstackOperationType],
             bhh: &BurnchainHeaderHash,
         ) {
             for op in blockstack_ops.iter_mut() {
@@ -3577,15 +3681,13 @@ pub mod test {
                 &block_header_hash
             );
 
-            let block_header = BurnchainBlockHeader {
+            BurnchainBlockHeader {
                 block_height: tip_block_height + 1,
                 block_hash: block_header_hash.clone(),
                 parent_block_hash: parent_hdr.block_hash.clone(),
                 num_txs: num_ops,
                 timestamp: now,
-            };
-
-            block_header
+            }
         }
 
         pub fn add_burnchain_block(
@@ -3617,9 +3719,9 @@ pub mod test {
 
         /// Generate and commit the next burnchain block with the given block operations.
         /// * if `set_consensus_hash` is true, then each op's consensus_hash field will be set to
-        /// that of the resulting block snapshot.
+        ///   that of the resulting block snapshot.
         /// * if `set_burn_hash` is true, then each op's burnchain header hash field will be set to
-        /// that of the resulting block snapshot.
+        ///   that of the resulting block snapshot.
         ///
         /// Returns (
         ///     burnchain tip block height,

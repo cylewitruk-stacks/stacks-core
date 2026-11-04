@@ -148,7 +148,7 @@ The section below has example json encodings for each of the burnchain operation
   "parent_microblock_sequence": 0,
   "transactions": [
     {
-      "contract_abi": null,
+      "contract_interface": null,
       "burnchain_op": null,
       "raw_result": "0x03",
       "raw_tx": "0x808000000004008bc5147525b8f477f0bc4522a88c8339b2494db50000000000000002000000000000000001015814daf929d8700af344987681f44e913890a12e38550abe8e40f149ef5269f40f4008083a0f2e0ddf65dcd05ecfc151c7ff8a5308ad04c77c0e87b5aeadad31010200000000040000000000000000000000000000000000000000000000000000000000000000",
@@ -160,7 +160,7 @@ The section below has example json encodings for each of the burnchain operation
       "microblock_parent_hash": "None"
     },
     {
-      "contract_abi": null,
+      "contract_interface": null,
       "burnchain_op": null,
       "raw_result": "0x03",
       "raw_tx": "0x80800000000400f942874ce525e87f21bbe8c121b12fac831d02f4000000000000000000000000000003e800006ae29867aec4b0e4f776bebdcea7f6d9a24eeff370c8c739defadfcbb52659b30736ad4af021e8fb741520a6c65da419fdec01989fdf0032fc1838f427a9a36102010000000000051ac2d519faccba2e435f3272ff042b89435fd160ff00000000000003e800000000000000000000000000000000000000000000000000000000000000000000",
@@ -192,7 +192,7 @@ The section below has example json encodings for each of the burnchain operation
           "vtxindex": 10
         }
       },
-      "contract_abi": null,
+      "contract_interface": null,
       "execution_cost": {
         "read_count": 0,
         "read_length": 0,
@@ -368,7 +368,7 @@ More details on burnchain operations can be found in [SIP-007](https://github.co
 
 Delivers information about burnchain blocks as their sortitions are processed.
 *   **Triggered by keys**: `*`, `"burn_blocks"`.
-*   **Payload Summary**: Contains burn block hash, height, consensus hash, parent hash, reward recipients, slot holders, and total burn amount.
+*   **Payload Summary**: Contains burn block hash, height, consensus hash, parent hash, reward recipients, individual PoX transactions, slot holders, and total burn amount.
 *   **Note**: In the event of PoX forks, a `new_burn_block` event may be triggered for a burn block previously processed.
 
 *Example Payload:*
@@ -385,6 +385,19 @@ Delivers information about burnchain blocks as their sortitions are processed.
       "amt": 5000
     }
   ],
+  "pox_transactions": [
+    {
+      "txid": "0x738e4d44636023efa08374033428e44eca490582bd39a6e61f3b6cf749b4214c",
+      "apparent_sender": "1Nf8i9YJZmeomYqKkV7UEhDPr6S7pABG4B",
+      "reward_recipients": [
+        {
+          "recipient": "1C56LYirKa3PFXFsvhSESgDy2acEHVAEt6",
+          "amt": 5000,
+          "utxo_idx": 0
+        }
+      ]
+    }
+  ],
   "reward_slot_holders": [
     "1C56LYirKa3PFXFsvhSESgDy2acEHVAEt6",
     "1C56LYirKa3PFXFsvhSESgDy2acEHVAEt6"
@@ -397,6 +410,9 @@ Delivers information about burnchain blocks as their sortitions are processed.
   include recipients who did _not_ have reward slots during the block. This could happen if
   a miner's commitment was included a block or two later than intended. Such commitments would
   not be valid, but the reward recipient would still receive the burn `amt`.
+* `pox_transactions` attributes each PoX reward to its burnchain transaction and apparent sender.
+  The apparent sender is derived from the transaction's change output and is not authenticated. It
+  is `null` when the transaction has no change output or the output cannot be decoded.
 * `reward_slot_holders` is an array of the Bitcoin addresses that would validly receive
   PoX commitments during this block. These addresses may not actually receive rewards during
   this block if the block is faster than miners have an opportunity to commit.
@@ -427,7 +443,7 @@ Delivers data for one or more microblocks, either self-emitted or received from 
   ],
   "transactions": [
     {
-      "contract_abi": null,
+      "contract_interface": null,
       "burnchain_op": null,
       "raw_result": "0x03",
       "raw_tx": "0x808000000004008bc5147525b8f477f0bc4522a88c8339b2494db50000000000000002000000000000000001015814daf929d8700af344987681f44e913890a12e38550abe8e40f149ef5269f40f4008083a0f2e0ddf65dcd05ecfc151c7ff8a5308ad04c77c0e87b5aeadad31010200000000040000000000000000000000000000000000000000000000000000000000000000",
@@ -439,7 +455,7 @@ Delivers data for one or more microblocks, either self-emitted or received from 
       "microblock_parent_hash": "0x4893ab44636023efa08374033428e44eca490582bd39a6e61f3b6cf749b474bd"
     },
     {
-      "contract_abi": null,
+      "contract_interface": null,
       "burnchain_op": null,
       "raw_result": "0x03",
       "raw_tx": "0x80800000000400f942874ce525e87f21bbe8c121b12fac831d02f4000000000000000000000000000003e800006ae29867aec4b0e4f776bebdcea7f6d9a24eeff370c8c739defadfcbb52659b30736ad4af021e8fb741520a6c65da419fdec01989fdf0032fc1838f427a9a36102010000000000051ac2d519faccba2e435f3272ff042b89435fd160ff00000000000003e800000000000000000000000000000000000000000000000000000000000000000000",

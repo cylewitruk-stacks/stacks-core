@@ -192,9 +192,9 @@ pub async fn call_read_only(
             ApiErrorCode::ContractCallNotReadOnly,
             "Contract call attempted to write state",
         )),
-        ReadOnlyCallView::ExecutionTimedOut => Err(ApiError::unavailable(
-            ApiErrorCode::RequestTimeout,
-            "Contract call exceeded the execution deadline",
+        ReadOnlyCallView::ExecutionBudgetExceeded => Err(ApiError::bad_request(
+            ApiErrorCode::ContractCallBudgetExceeded,
+            "Execution budget exceeded",
         )),
         ReadOnlyCallView::Failed(message) => Err(ApiError::status(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -333,6 +333,35 @@ mod tests {
         assert_eq!(call.status().as_u16(), StatusCode::OK.as_u16());
         let call: serde_json::Value = call.json().unwrap();
         assert_eq!(call["result"], "0x0703");
+    }
+
+    /// Resource-budget failures retain HTTP 400 and the Axum error envelope.
+    #[test]
+    fn read_only_execution_budget_exceeded_is_bad_request() {
+        let (node, endpoints) = rpc_bridge();
+        spawn_test_node(&node, endpoints);
+        let addr = free_addr();
+        let _server =
+            spawn_axum_rpc_server(addr, node, mock_chainstate_reads(), Some("password".into()))
+                .unwrap();
+        let client = reqwest::blocking::Client::new();
+        wait_get(&client, &format!("{}/source", contract_url(addr)));
+
+        let response = client
+            .post(format!(
+                "{}/functions/exceed-budget/call-read",
+                contract_url(addr)
+            ))
+            .json(&serde_json::json!({
+                "sender": "ST2DS4MSWSGJ3W9FBC6BVT0Y92S345HY8N3T6AV7R",
+                "arguments": []
+            }))
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), StatusCode::BAD_REQUEST.as_u16());
+        let body: serde_json::Value = response.json().unwrap();
+        assert_eq!(body["error"]["code"], "contract_call_budget_exceeded");
+        assert_eq!(body["error"]["message"], "Execution budget exceeded");
     }
 
     #[test]

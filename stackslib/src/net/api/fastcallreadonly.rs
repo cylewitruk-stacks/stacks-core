@@ -22,8 +22,8 @@ use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::errors::ClarityEvalError;
 use clarity::vm::errors::VmExecutionError::RuntimeCheck;
 use clarity::vm::representations::{CONTRACT_NAME_REGEX_STRING, STANDARD_PRINCIPAL_REGEX_STRING};
-use clarity::vm::types::PrincipalData;
-use clarity::vm::{ClarityName, ContractName, SymbolicExpression, Value};
+use clarity::vm::types::{BoundedErrorString, PrincipalData};
+use clarity::vm::{ClarityName, ContractName, Value};
 use regex::{Captures, Regex};
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::net::PeerHost;
@@ -160,7 +160,7 @@ impl RPCRequestHandler for RPCFastCallReadOnlyRequestHandler {
         let tip = match node.load_stacks_chain_tip(&preamble, &contents) {
             Ok(tip) => tip,
             Err(error_resp) => {
-                return error_resp.try_into_contents().map_err(NetError::from);
+                return error_resp.try_into_contents();
             }
         };
 
@@ -186,17 +186,11 @@ impl RPCRequestHandler for RPCFastCallReadOnlyRequestHandler {
             .take()
             .ok_or(NetError::SendError("Missing `arguments`".into()))?;
 
-        // Started before the argument conversion so it counts against execution.
         let resource_limiter = self.call_read_only_handler.execution_resource_limiter();
 
         // run the read-only call
         let data_resp =
             node.with_node_state(|_network, sortdb, chainstate, _mempool, _rpc_args| {
-                let args: Vec<_> = arguments
-                    .into_iter()
-                    .map(SymbolicExpression::atom_value)
-                    .collect();
-
                 let mainnet = chainstate.mainnet;
                 let chain_id = chainstate.chain_id;
 
@@ -229,7 +223,7 @@ impl RPCRequestHandler for RPCFastCallReadOnlyRequestHandler {
                                         invoke_ctx,
                                         &contract_identifier,
                                         function.as_str(),
-                                        &args,
+                                        arguments,
                                         false,
                                     )
                                     .map_err(ClarityEvalError::from)
@@ -259,7 +253,7 @@ impl RPCRequestHandler for RPCFastCallReadOnlyRequestHandler {
                 ))) if actual_cost.write_count > 0 => CallReadOnlyResponse {
                     okay: false,
                     result: None,
-                    cause: Some("NotReadOnly".to_string()),
+                    cause: Some("NotReadOnly".into()),
                 },
                 ClarityEvalError::Vm(RuntimeCheck(
                     RuntimeCheckErrorKind::ExecutionResourceBudgetExceeded(_),
@@ -269,12 +263,11 @@ impl RPCRequestHandler for RPCFastCallReadOnlyRequestHandler {
                         &HttpBadRequest::new("Execution resource budget exceeded".to_string()),
                     )
                     .try_into_contents()
-                    .map_err(NetError::from)
                 }
                 _ => CallReadOnlyResponse {
                     okay: false,
                     result: None,
-                    cause: Some(e.to_string()),
+                    cause: Some(BoundedErrorString::from_display(&e)),
                 },
             },
             Ok(None) | Err(_) => {
@@ -282,8 +275,7 @@ impl RPCRequestHandler for RPCFastCallReadOnlyRequestHandler {
                     &preamble,
                     &HttpNotFound::new("Chain tip not found".to_string()),
                 )
-                .try_into_contents()
-                .map_err(NetError::from);
+                .try_into_contents();
             }
         };
 
@@ -301,7 +293,7 @@ impl HttpResponse for RPCFastCallReadOnlyRequestHandler {
         body: &[u8],
     ) -> Result<HttpResponsePayload, Error> {
         let map_entry: CallReadOnlyResponse = parse_json(preamble, body)?;
-        Ok(HttpResponsePayload::try_from_json(map_entry)?)
+        HttpResponsePayload::try_from_json(map_entry)
     }
 }
 

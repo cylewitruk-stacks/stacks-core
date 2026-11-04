@@ -584,9 +584,8 @@ impl ChainstateReadExecutor for PooledChainstateReads {
     }
 
     fn get_sortitions(&self, query: SortitionQuery) -> Result<Vec<SortitionInfo>, ApiError> {
-        let mut handles = self.checkout()?;
-        let ChainstateReadHandles { chainstate, sortdb } = &mut *handles;
-        rpc_services::get_sortitions(sortdb, chainstate, &query).map_err(ApiError::from)
+        let handles = self.checkout()?;
+        rpc_services::get_sortitions(&handles.sortdb, &query).map_err(ApiError::from)
     }
 
     fn call_read_only(

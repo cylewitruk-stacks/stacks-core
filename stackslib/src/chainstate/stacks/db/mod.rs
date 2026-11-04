@@ -27,12 +27,11 @@ use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::{
     BurnStateDB, ClarityDatabase, HeadersDB, STXBalance, NULL_BURN_STATE_DB,
 };
-use clarity::vm::errors::ClarityEvalError;
 use clarity::vm::events::*;
 use clarity::vm::representations::ContractName;
 use clarity::vm::resource_limiter::ResourceBudget;
 use clarity::vm::types::TupleData;
-use clarity::vm::{SymbolicExpression, Value};
+use clarity::vm::Value;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::de::Error as de_Error;
 use serde::Deserialize;
@@ -40,6 +39,8 @@ use stacks_common::codec::{read_next, write_next, StacksMessageCodec};
 use stacks_common::types::chainstate::{StacksAddress, StacksBlockId, TrieHash};
 use stacks_common::types::sqlite::NO_PARAMS;
 use stacks_common::util::hash::{hex_bytes, to_hex};
+use stacks_marf::marf::{test_override_marf_compression, MARFOpenOpts, MarfConnection, MARF};
+use stacks_marf::ClarityMarfTrieId;
 
 use crate::burnchains::bitcoin::address::LegacyBitcoinAddress;
 use crate::burnchains::{Address, Burnchain, BurnchainParameters, PoxConstants};
@@ -58,13 +59,9 @@ use crate::chainstate::stacks::address::StacksAddressExtensions;
 use crate::chainstate::stacks::boot::*;
 use crate::chainstate::stacks::db::accounts::*;
 use crate::chainstate::stacks::db::blocks::*;
+use crate::chainstate::stacks::db::transactions::TransactionProcessor;
 use crate::chainstate::stacks::db::unconfirmed::UnconfirmedState;
 use crate::chainstate::stacks::events::*;
-use crate::chainstate::stacks::index::marf::{
-    test_override_marf_compression, MARFOpenOpts, MarfConnection, MARF,
-};
-use crate::chainstate::stacks::index::ClarityMarfTrieId;
-use crate::chainstate::stacks::miner::TransactionResourceBudgets;
 use crate::chainstate::stacks::{
     Error, StacksBlockHeader, StacksMicroblockHeader, C32_ADDRESS_VERSION_MAINNET_MULTISIG,
     C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_MULTISIG,
@@ -75,7 +72,7 @@ use crate::clarity_vm::clarity::{
     ClarityReadOnlyConnection, PreCommitClarityBlock,
 };
 use crate::clarity_vm::database::marf::MarfedKV;
-use crate::clarity_vm::database::HeadersDBConn;
+use crate::clarity_vm::database::{HeadersDBConn, MarfHeadersDB};
 use crate::core::*;
 use crate::monitoring;
 use crate::net::atlas::BNS_CHARS_REGEX;
@@ -112,7 +109,7 @@ pub struct StacksChainState {
     pub chain_id: u32,
     pub clarity_state: ClarityInstance,
     pub nakamoto_staging_blocks_conn: NakamotoStagingBlocksConn,
-    pub state_index: MARF<StacksBlockId>,
+    pub state_index: MarfHeadersDB,
     pub blocks_path: String,
     pub clarity_state_index_path: String, // path to clarity MARF
     pub clarity_state_index_root: String, // path to dir containing clarity MARF and side-store
@@ -578,11 +575,9 @@ impl<'a, 'b> ClarityTx<'a, 'b> {
         self.block.commit_block();
     }
 
-    pub fn commit_mined_block(
-        self,
-        block_hash: &StacksBlockId,
-    ) -> Result<ExecutionCost, ClarityError> {
-        Ok(self.block.commit_mined_block(block_hash)?.get_total())
+    /// Complete proposal execution and return its cost, discarding speculative state.
+    pub fn finish_block_proposal(self) -> Result<ExecutionCost, ClarityError> {
+        Ok(self.block.finish_block_proposal()?.get_total())
     }
 
     pub fn commit_to_block(self, consensus_hash: &ConsensusHash, block_hash: &BlockHeaderHash) {
@@ -980,28 +975,43 @@ impl ChainstateAccountLockup {
     }
 }
 
+/// Unprocessed Stacks operations from the burnchain, ordered within each operation kind.
+#[derive(Default)]
+pub struct StacksOnBurnchainOperations {
+    /// STX stacking operations enabled for the current epoch.
+    pub stack: Vec<StackStxOp>,
+    /// STX transfer operations.
+    pub transfer: Vec<TransferStxOp>,
+    /// Delegation operations enabled for the current epoch.
+    pub delegate: Vec<DelegateStxOp>,
+    /// Aggregate-key votes enabled for the current epoch.
+    pub vote_for_aggregate_key: Vec<VoteForAggregateKeyOp>,
+}
+
+/// One-shot callback invoked after chainstate boot initialization.
+pub type PostFlightCallback = Box<dyn FnOnce(&mut ClarityTx)>;
+
+/// One-shot factory for lazily streamed genesis records.
+pub type BulkInitialData<T> = Box<dyn FnOnce() -> Box<dyn Iterator<Item = T>>>;
+
 pub struct ChainStateBootData {
     pub first_burnchain_block_hash: BurnchainHeaderHash,
     pub first_burnchain_block_height: u32,
     pub first_burnchain_block_timestamp: u32,
     pub initial_balances: Vec<(PrincipalData, u64)>,
     pub pox_constants: PoxConstants,
-    pub post_flight_callback: Option<Box<dyn FnOnce(&mut ClarityTx)>>,
-    pub get_bulk_initial_lockups:
-        Option<Box<dyn FnOnce() -> Box<dyn Iterator<Item = ChainstateAccountLockup>>>>,
-    pub get_bulk_initial_balances:
-        Option<Box<dyn FnOnce() -> Box<dyn Iterator<Item = ChainstateAccountBalance>>>>,
-    pub get_bulk_initial_namespaces:
-        Option<Box<dyn FnOnce() -> Box<dyn Iterator<Item = ChainstateBNSNamespace>>>>,
-    pub get_bulk_initial_names:
-        Option<Box<dyn FnOnce() -> Box<dyn Iterator<Item = ChainstateBNSName>>>>,
+    pub post_flight_callback: Option<PostFlightCallback>,
+    pub get_bulk_initial_lockups: Option<BulkInitialData<ChainstateAccountLockup>>,
+    pub get_bulk_initial_balances: Option<BulkInitialData<ChainstateAccountBalance>>,
+    pub get_bulk_initial_namespaces: Option<BulkInitialData<ChainstateBNSNamespace>>,
+    pub get_bulk_initial_names: Option<BulkInitialData<ChainstateBNSName>>,
 }
 
 impl ChainStateBootData {
     pub fn new(
         burnchain: &Burnchain,
         initial_balances: Vec<(PrincipalData, u64)>,
-        post_flight_callback: Option<Box<dyn FnOnce(&mut ClarityTx)>>,
+        post_flight_callback: Option<PostFlightCallback>,
     ) -> ChainStateBootData {
         ChainStateBootData {
             first_burnchain_block_hash: burnchain.first_block_hash.clone(),
@@ -1246,7 +1256,7 @@ impl StacksChainState {
             }
 
             // need a migration
-            let tx = marf.storage_tx()?;
+            let tx = marf.storage_tx().map_err(db_error::from)?;
             StacksChainState::apply_schema_migrations(&tx, mainnet, chain_id)?;
             StacksChainState::add_indexes(&tx)?;
             tx.commit()?;
@@ -1290,7 +1300,7 @@ impl StacksChainState {
             let db_config = StacksChainState::load_db_config(marf.sqlite_conn())
                 .expect("CORRUPTION: no db_config found");
 
-            let tx = marf.storage_tx()?;
+            let tx = marf.storage_tx().map_err(db_error::from)?;
             StacksChainState::add_indexes(&tx)?;
             tx.commit()?;
             Ok(marf)
@@ -1387,7 +1397,7 @@ impl StacksChainState {
             .expect("FATAL: infallible constant version byte is not valid")
             .into();
 
-        return principal;
+        principal
     }
 
     /// Instantiate the boot code and genesis state into a given [`ClarityTx`].
@@ -1448,12 +1458,10 @@ impl StacksChainState {
                 StacksTransaction::new(tx_version, boot_code_auth.clone(), smart_contract);
 
             let tx_receipt = clarity_tx.connection().as_transaction(|clarity| {
-                StacksChainState::process_transaction_payload(
-                    clarity,
-                    &boot_code_smart_contract,
-                    &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
+                TransactionProcessor::from(&boot_code_smart_contract)
+                    .using_clarity_transaction(clarity, &boot_code_account)
+                    .with_unlimited_resource_policy()
+                    .process_payload()
             })?;
             receipts.push(tx_receipt);
 
@@ -1678,7 +1686,7 @@ impl StacksChainState {
                             };
 
                             let name = {
-                                let name_str = components.get(0).unwrap().to_string();
+                                let name_str = components.first().unwrap().to_string();
                                 if !BNS_CHARS_REGEX.is_match(&name_str) {
                                     panic!("Invalid name characters");
                                 }
@@ -1788,11 +1796,11 @@ impl StacksChainState {
         ];
         clarity_tx.connection().as_transaction(|conn| {
             conn.run_contract_call(
-                &sender,
+                sender,
                 None,
-                &contract,
+                contract,
                 "set-burnchain-parameters",
-                &params,
+                params,
                 |_, _| None,
                 &ResourceBudget::unlimited(),
             )
@@ -2047,7 +2055,7 @@ impl StacksChainState {
             !readonly,
         )?;
 
-        let state_index = if readonly {
+        let state_db = if readonly {
             StacksChainState::open_db_readonly(
                 mainnet,
                 chain_id,
@@ -2084,7 +2092,7 @@ impl StacksChainState {
             chain_id,
             clarity_state,
             nakamoto_staging_blocks_conn,
-            state_index,
+            state_index: MarfHeadersDB::new(state_db),
             blocks_path: blocks_path_root,
             clarity_state_index_path: clarity_state_index_marf,
             clarity_state_index_root,
@@ -2132,7 +2140,9 @@ impl StacksChainState {
     /// Begin a transaction against the underlying DB
     /// Does not create a Clarity instance, and does not affect the MARF.
     pub fn db_tx_begin(&mut self) -> Result<DBTx<'_>, Error> {
-        self.state_index.storage_tx().map_err(Error::DBError)
+        self.state_index
+            .storage_tx()
+            .map_err(|e| Error::DBError(e.into()))
     }
 
     /// Simultaneously begin a transaction against both the headers and blocks.
@@ -2183,50 +2193,6 @@ impl StacksChainState {
             contract,
             code,
         )
-    }
-
-    /// Execute a public function in `contract` from a read-only DB context
-    ///  Any mutations that occur will be rolled-back before returning, regardless of
-    ///  an okay or error result.
-    pub fn eval_fn_read_only(
-        &mut self,
-        burn_dbconn: &dyn BurnStateDB,
-        parent_id_bhh: &StacksBlockId,
-        contract: &QualifiedContractIdentifier,
-        function: &str,
-        args: &[Value],
-    ) -> Result<Value, ClarityError> {
-        let headers_db = HeadersDBConn(StacksDBConn::new(&self.state_index, ()));
-        let mut conn = self.clarity_state.read_only_connection_checked(
-            parent_id_bhh,
-            &headers_db,
-            burn_dbconn,
-        )?;
-
-        let args: Vec<_> = args
-            .iter()
-            .map(|x| SymbolicExpression::atom_value(x.clone()))
-            .collect();
-
-        let result = conn.with_readonly_clarity_env(
-            self.mainnet,
-            self.chain_id,
-            contract.clone().into(),
-            None,
-            LimitedCostTracker::Free,
-            |exec_state, invoke_ctx| {
-                exec_state
-                    .execute_contract(
-                        invoke_ctx, contract, function, &args,
-                        // read-only is set to `false` so that non-read-only functions
-                        //  can be executed. any transformation is rolled back.
-                        false,
-                    )
-                    .map_err(ClarityEvalError::from)
-            },
-        )?;
-
-        Ok(result)
     }
 
     pub fn db(&self) -> &DBConn {
@@ -2915,7 +2881,7 @@ impl StacksChainState {
         new_burnchain_timestamp: u64,
         microblock_tail_opt: Option<StacksMicroblockHeader>,
         block_reward: &MinerPaymentSchedule,
-        mature_miner_payouts: Option<(MinerReward, Vec<MinerReward>, MinerReward, MinerRewardInfo)>, // (miner, [users], parent, matured rewards)
+        mature_miner_payouts: Option<MaturedMinerPayouts>,
         anchor_block_cost: &ExecutionCost,
         anchor_block_size: u64,
         applied_epoch_transition: bool,
@@ -2990,7 +2956,12 @@ impl StacksChainState {
             burn_vote_for_aggregate_key_ops,
         )?;
 
-        if let Some((miner_payout, user_payouts, parent_payout, reward_info)) = mature_miner_payouts
+        if let Some(MaturedMinerPayouts {
+            miner: miner_payout,
+            users: user_payouts,
+            parent: parent_payout,
+            info: reward_info,
+        }) = mature_miner_payouts
         {
             let rewarded_miner_block_id = StacksBlockHeader::make_index_block_hash(
                 &reward_info.from_block_consensus_hash,
@@ -3150,7 +3121,7 @@ pub mod test {
 
     #[test]
     fn test_open_readonly_chainstate() {
-        let mut chainstate = instantiate_chainstate(false, 0x80000000, function_name!());
+        let mut chainstate = TestChainstateBuilder::new_testnet(function_name!()).build();
         let mut readonly_chainstate = StacksChainState::open_readonly(
             false,
             0x80000000,

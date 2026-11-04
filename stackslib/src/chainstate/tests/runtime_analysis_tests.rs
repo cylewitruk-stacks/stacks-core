@@ -73,7 +73,7 @@ fn variant_coverage_report(variant: RuntimeCheckErrorKind) {
         ]),
         ExecutionResourceBudgetExceeded(_) => Unreachable_Functionally(
             "All consensus-critical code paths (block validation and transaction processing)
-             pass `ResourceBudget::unlimited()` to StacksChainState::process_transaction,
+             select unlimited resource budgets on `TransactionProcessor`,
              causing GlobalContext::execution_resource_limiter to remain unlimited (i.e. no-op).
              The check_interpreter_resource_usage function always returns Ok(()) when there are
              no limits. Execution time limits are only enforced in RPC API calls and miner-local
@@ -94,6 +94,10 @@ fn variant_coverage_report(variant: RuntimeCheckErrorKind) {
         TraitMethodUnknown(_, _) => Tested(vec![trait_method_unknown_transitive_use_trait_ccall]),
         Unreachable(_) => Unreachable_ExpectLike, // This error is used in places where we expect the code to be unreachable, so if we hit it, it indicates a bug.
         ListTypesMustMatch => Tested(vec![runtime_check_error_kind_list_types_must_match_cdeploy]),
+        SequenceElementArityMismatch { .. } => Tested(vec![
+            runtime_check_error_kind_sequence_element_arity_mismatch_cdeploy,
+            runtime_check_error_kind_sequence_element_arity_mismatch_ccall,
+        ]),
         TypeError(_, _) => Tested(vec![
             runtime_check_error_kind_type_error_cdeploy,
             runtime_check_error_kind_type_error_ccall,
@@ -101,6 +105,7 @@ fn variant_coverage_report(variant: RuntimeCheckErrorKind) {
         TypeValueError(_, _) => Tested(vec![
             runtime_check_error_kind_type_value_error_cdeploy,
             runtime_check_error_kind_type_value_error_ccall,
+            runtime_check_error_kind_type_value_error_list_too_long_ccall,
         ]),
         UnionTypeValueError(_, _) => Tested(vec![
             runtime_check_error_kind_union_type_value_error_cdeploy,
@@ -131,6 +136,9 @@ fn variant_coverage_report(variant: RuntimeCheckErrorKind) {
         ]),
         UndefinedFunction(_) => Tested(vec![runtime_check_error_kind_undefined_function_ccall]),
         AtBlockUnavailable => Tested(vec![runtime_check_error_kind_at_block_unavailable_ccall]),
+        WithAllAllowanceNotAllowed => Tested(vec![
+            runtime_check_error_kind_with_all_allowance_not_allowed_ccall,
+        ]),
         IncorrectArgumentCount(_, _) => Tested(vec![
             runtime_check_error_kind_incorrect_argument_count_ccall,
         ]),
@@ -644,6 +652,65 @@ fn runtime_check_error_kind_type_value_error_ccall() {
     );
 }
 
+/// RuntimeCheckErrorKind: [`RuntimeCheckErrorKind::TypeValueError`]
+/// Caused by: passing a list longer than the parameter allows. Unlike a wrong
+/// non-list value, the argument is rebuilt by the implicit cast before it is rejected.
+/// Outcome: block accepted.
+#[test]
+fn runtime_check_error_kind_type_value_error_list_too_long_ccall() {
+    contract_call_consensus_snap_test!(
+        contract_name: "check-error-kind",
+        contract_code: "(define-public (trigger-error (x (list 2 uint))) (ok true))",
+        function_name: "trigger-error",
+        function_args: &[ClarityValue::cons_list_unsanitized(vec![
+            ClarityValue::UInt(1),
+            ClarityValue::UInt(2),
+            ClarityValue::UInt(3),
+        ])
+        .unwrap()],
+    );
+}
+
+/// RuntimeCheckErrorKind: [`RuntimeCheckErrorKind::SequenceElementArityMismatch`]
+/// Caused by: a `replace-at?` buff/string element whose length is not exactly 1.
+/// Outcome: block rejected before epoch 4.1; block accepted (failure receipt) from 4.1.
+#[test]
+fn runtime_check_error_kind_sequence_element_arity_mismatch_cdeploy() {
+    contract_deploy_consensus_snap_test!(
+        contract_name: "check-error-kind",
+        // `as-max-len?` widens `0x` to type `(buff 1)` while it still holds 0 bytes,
+        // so analysis passes in every epoch and the runtime arity check fires.
+        contract_code: "(replace-at? 0x0102 u0 (unwrap-panic (as-max-len? 0x u1)))",
+        deploy_epochs: &[
+            StacksEpochId::Epoch34,
+            StacksEpochId::Epoch40,
+            StacksEpochId::Epoch41,
+        ],
+        clarity_versions: ClarityVersion::since(ClarityVersion::Clarity2),
+    );
+}
+
+/// RuntimeCheckErrorKind: [`RuntimeCheckErrorKind::SequenceElementArityMismatch`]
+/// Caused by: a `replace-at?` buff/string element whose length is not exactly 1.
+/// Outcome: block rejected before epoch 4.1; block accepted (failure receipt) from 4.1.
+#[test]
+fn runtime_check_error_kind_sequence_element_arity_mismatch_ccall() {
+    contract_call_consensus_snap_test!(
+        contract_name: "check-error-kind",
+        contract_code: "(define-public (trigger-error)
+            (ok (replace-at? 0x0102 u0 (unwrap-panic (as-max-len? 0x u1)))))",
+        function_name: "trigger-error",
+        function_args: &[],
+        deploy_epochs: EPOCHS_TO_TEST,
+        call_epochs: &[
+            StacksEpochId::Epoch34,
+            StacksEpochId::Epoch40,
+            StacksEpochId::Epoch41,
+        ],
+        clarity_versions: ClarityVersion::since(ClarityVersion::Clarity2),
+    );
+}
+
 /// RuntimeCheckErrorKind: [`RuntimeCheckErrorKind::ContractCallExpectName`]
 /// Caused by: the trait reference is stored as a constant, so the runtime never
 ///     binds it in `LocalContext::callable_contracts` and `special_contract_call`
@@ -957,18 +1024,41 @@ fn runtime_check_error_kind_at_block_unavailable_ccall() {
     );
 }
 
+/// RuntimeCheckErrorKind: [`RuntimeCheckErrorKind::WithAllAllowanceNotAllowed`]
+/// Caused by: `with-all-assets-unsafe` inside `restrict-assets?`, in a contract
+///     deployed before epoch 4.1.
+/// Outcome: block accepted. From epoch 4.1 the call fails on this error.
+#[test]
+fn runtime_check_error_kind_with_all_allowance_not_allowed_ccall() {
+    contract_call_consensus_snap_test!(
+        contract_name: "check-error-kind",
+        contract_code: "(define-private (ignore) true)
+            (define-public (trigger-error)
+              (begin
+                (ignore (restrict-assets? tx-sender ((with-all-assets-unsafe)) true))
+                (ok true)))",
+        function_name: "trigger-error",
+        function_args: &[],
+        deploy_epochs: EPOCHS_TO_TEST,
+        call_epochs: &[
+            StacksEpochId::Epoch34,
+            StacksEpochId::Epoch40,
+            StacksEpochId::Epoch41,
+        ],
+        clarity_versions: ClarityVersion::since(ClarityVersion::Clarity4),
+    );
+}
+
 /// RuntimeCheckErrorKind: [`RuntimeCheckErrorKind::NoSuchContract`]
 /// Caused by: calling a contract that does not exist.
 /// Outcome: block accepted.
 #[test]
 fn runtime_check_error_kind_no_such_contract_ccall() {
-    let mut nonce = 0;
-
     let mut epochs_blocks = HashMap::new();
 
-    for epoch in EPOCHS_TO_TEST {
+    for (nonce, epoch) in EPOCHS_TO_TEST.iter().enumerate() {
         let call_tx = ConsensusUtils::new_call_tx(
-            nonce,
+            nonce as u64,
             "non-existent-contract",
             "this-function-does-not-exist",
         );
@@ -978,8 +1068,6 @@ fn runtime_check_error_kind_no_such_contract_ccall() {
             .push(TestBlock {
                 transactions: vec![call_tx],
             });
-
-        nonce += 1;
     }
 
     let result = ConsensusTest::new(function_name!(), vec![], epochs_blocks).run();
@@ -1296,15 +1384,15 @@ fn trait_reference_unknown_transitive_use_trait_ccall() {
 /// Scenario:
 ///   - `foo`        — `(define-trait foo ((do-it () (response bool uint))))`
 ///   - `transitive` — `(define-trait foo ((other-method () ...)))` comes first, then
-///                    `(use-trait alias .foo.foo)` (remote name also "foo").
-///                    Analysis: use-trait overwrites `defined_traits["foo"]` → `{do-it}`.
-///                    Runtime:  `defined_traits["foo"]` = `{other-method}` (define-trait only).
+///     `(use-trait alias .foo.foo)` (remote name also "foo").
+///     Analysis: use-trait overwrites `defined_traits["foo"]` → `{do-it}`.
+///     Runtime:  `defined_traits["foo"]` = `{other-method}` (define-trait only).
 ///   - `foo-impl`   — `(impl-trait .foo.foo)` + `(define-public (do-it) ...)`.
-///                    Does NOT impl-trait `.transitive.foo`, so the short-circuit is bypassed.
+///     Does NOT impl-trait `.transitive.foo`, so the short-circuit is bypassed.
 ///   - `call-foo`   — `(use-trait foo .transitive.foo)`.
-///                    Analysis sees `do-it` in `.transitive.foo` and accepts the call.
-///                    Runtime: `lookup_trait_definition("foo")` finds `{other-method}`;
-///                    `get("do-it")` returns `None` → `TraitMethodUnknown`.
+///     Analysis sees `do-it` in `.transitive.foo` and accepts the call.
+///     Runtime: `lookup_trait_definition("foo")` finds `{other-method}`;
+///     `get("do-it")` returns `None` → `TraitMethodUnknown`.
 ///
 /// Outcome: block accepted.
 #[test]

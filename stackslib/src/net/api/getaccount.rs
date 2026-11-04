@@ -70,7 +70,7 @@ fn legacy_proof(proof: ProofBytes) -> Option<String> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RPCGetAccountRequestHandler {
     pub account: Option<PrincipalData>,
 }
@@ -157,18 +157,15 @@ impl RPCRequestHandler for RPCGetAccountRequestHandler {
             Ok(account) => AccountEntryResponse::from(account),
             Err(RpcServiceError::BadRequest(msg)) => {
                 return StacksHttpResponse::new_error(&preamble, &HttpBadRequest::new(msg))
-                    .try_into_contents()
-                    .map_err(NetError::from);
+                    .try_into_contents();
             }
             Err(RpcServiceError::NotFound(msg)) => {
                 return StacksHttpResponse::new_error(&preamble, &HttpNotFound::new(msg))
-                    .try_into_contents()
-                    .map_err(NetError::from);
+                    .try_into_contents();
             }
             Err(RpcServiceError::Internal(msg)) => {
                 return StacksHttpResponse::new_error(&preamble, &HttpServerError::new(msg))
-                    .try_into_contents()
-                    .map_err(NetError::from);
+                    .try_into_contents();
             }
         };
 
@@ -186,7 +183,7 @@ impl HttpResponse for RPCGetAccountRequestHandler {
         body: &[u8],
     ) -> Result<HttpResponsePayload, Error> {
         let account: AccountEntryResponse = parse_json(preamble, body)?;
-        Ok(HttpResponsePayload::try_from_json(account)?)
+        HttpResponsePayload::try_from_json(account)
     }
 }
 

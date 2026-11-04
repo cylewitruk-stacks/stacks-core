@@ -23,6 +23,7 @@ pub mod neighbors;
 pub mod relay;
 
 use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use clarity::types::{EpochList, StacksEpochId};
@@ -69,9 +70,9 @@ use crate::core::{StacksEpoch, StacksEpochExtension};
 use crate::net::relay::Relayer;
 use crate::net::test::{RPCHandlerArgsType, TestEventObserver, TestPeer, TestPeerConfig};
 use crate::net::{
-    BlocksData, BlocksDatum, MicroblocksData, NakamotoBlocksData, NeighborAddress, NeighborKey,
-    NetworkResult, PingData, PushedStackerDBChunk, StackerDBPushChunkData, StacksMessage,
-    StacksMessageType, StacksNodeState,
+    BlocksData, BlocksDatum, Downloaded, MicroblocksData, NakamotoBlocksData, NeighborAddress,
+    NeighborKey, NetworkResult, PingData, PushedStackerDBChunk, StackerDBPushChunkData,
+    StacksMessage, StacksMessageType, StacksNodeState,
 };
 use crate::util_lib::boot::{boot_code_addr, boot_code_id, boot_code_tx_auth};
 
@@ -343,14 +344,9 @@ impl NakamotoBootPlan {
                         function_name,
                         ..
                     }) => {
-                        if contract_name.as_str() == SIGNERS_VOTING_NAME
+                        !(contract_name.as_str() == SIGNERS_VOTING_NAME
                             && address.is_burn()
-                            && function_name.as_str() == SIGNERS_VOTING_FUNCTION_NAME
-                        {
-                            false
-                        } else {
-                            true
-                        }
+                            && function_name.as_str() == SIGNERS_VOTING_FUNCTION_NAME)
                     }
                     _ => true,
                 })
@@ -698,8 +694,7 @@ impl NakamotoBootPlan {
                         .map(|(block, _, _)| block)
                         .collect();
 
-                    let malleablized_blocks =
-                        std::mem::replace(&mut peer.chain.malleablized_blocks, vec![]);
+                    let malleablized_blocks = mem::take(&mut peer.chain.malleablized_blocks);
                     for mblk in malleablized_blocks.iter() {
                         malleablized_block_ids.insert(mblk.block_id());
                     }
@@ -816,8 +811,7 @@ impl NakamotoBootPlan {
                         .map(|(block, _, _)| block)
                         .collect();
 
-                    let malleablized_blocks =
-                        std::mem::replace(&mut peer.chain.malleablized_blocks, vec![]);
+                    let malleablized_blocks = mem::take(&mut peer.chain.malleablized_blocks);
                     for mblk in malleablized_blocks.iter() {
                         malleablized_block_ids.insert(mblk.block_id());
                     }
@@ -1094,9 +1088,8 @@ fn test_boot_nakamoto_peer() {
 
         let mut tx_signer = StacksTransactionSigner::new(&stx_transfer);
         tx_signer.sign_origin(&private_key).unwrap();
-        let stx_transfer_signed = tx_signer.get_tx().unwrap();
 
-        stx_transfer_signed
+        tx_signer.get_tx().unwrap()
     };
 
     let boot_tenures = vec![
@@ -1460,12 +1453,16 @@ fn test_network_result_update() {
     network_result_1
         .unhandled_messages
         .insert(nk1.clone(), vec![msg1]);
-    network_result_1
-        .blocks
-        .push((ConsensusHash([0x11; 20]), blk1, 1));
-    network_result_1
-        .confirmed_microblocks
-        .push((ConsensusHash([0x11; 20]), vec![mblk1], 1));
+    network_result_1.blocks.push(Downloaded {
+        consensus_hash: ConsensusHash([0x11; 20]),
+        data: blk1,
+        download_time_secs: 1,
+    });
+    network_result_1.confirmed_microblocks.push(Downloaded {
+        consensus_hash: ConsensusHash([0x11; 20]),
+        data: vec![mblk1],
+        download_time_secs: 1,
+    });
     network_result_1
         .nakamoto_blocks
         .insert(nblk1.block_id(), nblk1.clone());
@@ -1522,12 +1519,16 @@ fn test_network_result_update() {
     network_result_2
         .unhandled_messages
         .insert(nk2.clone(), vec![msg2.clone()]);
-    network_result_2
-        .blocks
-        .push((ConsensusHash([0x22; 20]), blk2, 2));
-    network_result_2
-        .confirmed_microblocks
-        .push((ConsensusHash([0x22; 20]), vec![mblk2], 2));
+    network_result_2.blocks.push(Downloaded {
+        consensus_hash: ConsensusHash([0x22; 20]),
+        data: blk2,
+        download_time_secs: 2,
+    });
+    network_result_2.confirmed_microblocks.push(Downloaded {
+        consensus_hash: ConsensusHash([0x22; 20]),
+        data: vec![mblk2],
+        download_time_secs: 2,
+    });
     network_result_2
         .nakamoto_blocks
         .insert(nblk2.block_id(), nblk2);
@@ -1615,7 +1616,13 @@ fn test_network_result_update() {
     network_result_union
         .uploaded_nakamoto_blocks
         .append(&mut n1.uploaded_nakamoto_blocks);
-    // stackerdb chunks from n1 get dropped since their rc_consensus_hash no longer matches
+    // n1's *pushed* stackerdb chunk gets dropped since its rc_consensus_hash no longer matches:
+    // a peer sent it to us under a view we have moved past, and we never stored it.
+    //
+    // n1's *uploaded* stackerdb chunk is kept.
+    network_result_union
+        .uploaded_stackerdb_chunks
+        .append(&mut n1.uploaded_stackerdb_chunks);
     network_result_union
         .synced_transactions
         .append(&mut n1.synced_transactions);
@@ -1625,7 +1632,7 @@ fn test_network_result_update() {
     let new = network_result_1.clone();
     assert_eq!(old.update(new), network_result_1);
 
-    // disjoint results get unioned, except for stackerdb chunks
+    // disjoint results get unioned, except for stackerdb chunks pushed to us under a stale view
     let old = network_result_1.clone();
     let new = network_result_2.clone();
     assert_eq!(old.update(new), network_result_union);
@@ -1774,11 +1781,122 @@ fn test_network_result_update() {
                 chunk: new_chunk_1,
             },
             PushedStackerDBChunk {
-                peer: na1,
+                peer: na1.clone(),
                 chunk: new_chunk_2,
             },
         ]
     );
+
+    // An uploaded chunk survives coalescing even when the newer result carries a copy of it.
+    let mut old = NetworkResult::new(
+        StacksBlockId([0xaa; 32]),
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        ConsensusHash([0xaa; 20]),
+        HashMap::new(),
+    );
+    let mut new = old.clone();
+
+    let uploaded = StackerDBPushChunkData {
+        contract_id: QualifiedContractIdentifier::transient(),
+        rc_consensus_hash: ConsensusHash([0xaa; 20]),
+        chunk_data: StackerDBChunkData {
+            slot_id: 1,
+            slot_version: 1,
+            sig: MessageSignature::empty(),
+            data: vec![3],
+        },
+    };
+    // the same chunk, echoed back to us by a peer we relayed it to
+    let echoed = PushedStackerDBChunk {
+        peer: na1.clone(),
+        chunk: uploaded.clone(),
+    };
+
+    old.uploaded_stackerdb_chunks.push(uploaded.clone());
+    new.pushed_stackerdb_chunks.push(echoed);
+
+    let updated = old.update(new);
+    assert_eq!(
+        updated.uploaded_stackerdb_chunks,
+        vec![uploaded.clone()],
+        "uploaded chunk must not be dropped in favor of a peer's echo of it"
+    );
+    // The echo itself stays since `update` only filters the older result, but it is harmless:
+    // the relayer will reject it as a stale chunk when it tries to store it, because the upload
+    // already wrote that data. The event comes from the uploaded record above.
+    assert_eq!(updated.pushed_stackerdb_chunks.len(), 1);
+
+    // An uploaded chunk also survives our own view moving on. Its rc_consensus_hash was stamped
+    // by this node when it accepted the upload, so a mismatch says nothing about the chunk;
+    // only the rebroadcast is view-sensitive, and that is decided later in the relayer.
+    let mut old = NetworkResult::new(
+        StacksBlockId([0xaa; 32]),
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        ConsensusHash([0xaa; 20]),
+        HashMap::new(),
+    );
+    let new = NetworkResult::new(
+        StacksBlockId([0xaa; 32]),
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        10,
+        ConsensusHash([0xbb; 20]),
+        HashMap::new(),
+    );
+
+    let stale_view_upload = StackerDBPushChunkData {
+        contract_id: QualifiedContractIdentifier::transient(),
+        rc_consensus_hash: ConsensusHash([0xaa; 20]),
+        chunk_data: StackerDBChunkData {
+            slot_id: 1,
+            slot_version: 1,
+            sig: MessageSignature::empty(),
+            data: vec![3],
+        },
+    };
+    let stale_view_push = PushedStackerDBChunk {
+        peer: na1.clone(),
+        chunk: StackerDBPushChunkData {
+            contract_id: QualifiedContractIdentifier::transient(),
+            rc_consensus_hash: ConsensusHash([0xaa; 20]),
+            chunk_data: StackerDBChunkData {
+                slot_id: 2,
+                slot_version: 1,
+                sig: MessageSignature::empty(),
+                data: vec![3],
+            },
+        },
+    };
+
+    old.uploaded_stackerdb_chunks
+        .push(stale_view_upload.clone());
+    old.pushed_stackerdb_chunks.push(stale_view_push);
+
+    let updated = old.update(new);
+    assert_eq!(
+        updated.uploaded_stackerdb_chunks,
+        vec![stale_view_upload],
+        "uploaded chunk must survive our own view advancing"
+    );
+    // a *pushed* chunk from a stale view is still dropped -- it reflects a peer's disagreement
+    // with us, and we have not stored it, so nothing is owed
+    assert!(updated.pushed_stackerdb_chunks.is_empty());
 
     // nakamoto blocks obtained via download, upload, or pushed get consoldated
     let mut old = NetworkResult::new(

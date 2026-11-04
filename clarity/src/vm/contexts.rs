@@ -15,11 +15,11 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::mem::replace;
 
 pub use clarity_types::effects::{AssetMap, AssetMapEntry};
 use clarity_types::representations::ClarityName;
 use serde::Serialize;
+use stacks_common::bounded_format;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
@@ -28,7 +28,7 @@ use super::hooks::{
 };
 use crate::vm::ast::ContractAST;
 use crate::vm::ast::errors::{ParseError, ParseErrorKind};
-use crate::vm::callables::{DefinedFunction, FunctionIdentifier};
+use crate::vm::callables::{DefinedFunction, FunctionIdentifier, sanitize_argument};
 use crate::vm::contracts::Contract;
 use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::execution_cost::ExecutionCost;
@@ -278,7 +278,10 @@ impl EventBatch {
 
 impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
     #[cfg(any(test, feature = "testing"))]
-    pub fn new(database: ClarityDatabase<'a>, epoch: StacksEpochId) -> OwnedEnvironment<'a, 'a> {
+    pub fn new(
+        database: ClarityDatabase<'a>,
+        epoch: StacksEpochId,
+    ) -> OwnedEnvironment<'a, 'hooks> {
         OwnedEnvironment {
             context: GlobalContext::new(
                 false,
@@ -292,7 +295,7 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
     }
 
     #[cfg(any(test, feature = "testing"))]
-    pub fn new_toplevel(mut database: ClarityDatabase<'a>) -> OwnedEnvironment<'a, 'a> {
+    pub fn new_toplevel(mut database: ClarityDatabase<'a>) -> OwnedEnvironment<'a, 'hooks> {
         database.begin();
         let epoch = database.get_clarity_epoch_version().unwrap();
         let version = ClarityVersion::default_for_epoch(epoch);
@@ -316,7 +319,7 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
         mut database: ClarityDatabase<'a>,
         epoch: StacksEpochId,
         use_mainnet: bool,
-    ) -> OwnedEnvironment<'a, 'a> {
+    ) -> OwnedEnvironment<'a, 'hooks> {
         use crate::vm::tests::test_only_mainnet_to_chain_id;
         let cost_track = LimitedCostTracker::new_max_limit(&mut database, epoch, use_mainnet)
             .expect("FAIL: problem instantiating cost tracking");
@@ -333,7 +336,7 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
         chain_id: u32,
         database: ClarityDatabase<'a>,
         epoch_id: StacksEpochId,
-    ) -> OwnedEnvironment<'a, 'a> {
+    ) -> OwnedEnvironment<'a, 'hooks> {
         OwnedEnvironment {
             context: GlobalContext::new(
                 mainnet,
@@ -352,7 +355,7 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
         database: ClarityDatabase<'a>,
         cost_tracker: LimitedCostTracker,
         epoch_id: StacksEpochId,
-    ) -> OwnedEnvironment<'a, 'a> {
+    ) -> OwnedEnvironment<'a, 'hooks> {
         OwnedEnvironment {
             context: GlobalContext::new(mainnet, chain_id, database, cost_tracker, epoch_id),
             call_stack: CallStack::new(),
@@ -361,12 +364,7 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
 
     /// Registers an evaluation hook for this environment.
     pub fn add_eval_hook(&mut self, hook: &'hooks mut dyn EvalHook) {
-        if let Some(mut hooks) = self.context.eval_hooks.take() {
-            hooks.push(hook);
-            self.context.eval_hooks = Some(hooks);
-        } else {
-            self.context.eval_hooks = Some(vec![hook]);
-        }
+        self.context.eval_hooks.get_or_insert_default().push(hook);
     }
 
     pub fn set_execution_resource_limiter(&mut self, resource_limiter: ResourceLimiter) {
@@ -374,12 +372,14 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
             .set_execution_resource_limiter(resource_limiter);
     }
 
-    pub fn get_exec_environment<'b>(
-        &'b mut self,
+    /// The invocation borrows only `context`, so a callable resolved through it outlives
+    /// the execution state.
+    pub fn get_exec_environment<'c>(
+        &mut self,
         sender: Option<PrincipalData>,
         sponsor: Option<PrincipalData>,
-        context: &'b ContractContext,
-    ) -> (ExecutionState<'b, 'a, 'hooks>, InvocationContext<'b>) {
+        context: &'c ContractContext,
+    ) -> (ExecutionState<'_, 'a, 'hooks>, InvocationContext<'c>) {
         (
             ExecutionState {
                 global_context: &mut self.context,
@@ -512,7 +512,7 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
         sponsor: Option<PrincipalData>,
         contract_identifier: QualifiedContractIdentifier,
         tx_name: &str,
-        args: &[SymbolicExpression],
+        args: Vec<Value>,
     ) -> Result<(Value, AssetMap, Vec<StacksTransactionEvent>), VmExecutionError> {
         self.execute_in_env(sender, sponsor, None, |exec_state, invoke_ctx| {
             exec_state.execute_contract(invoke_ctx, &contract_identifier, tx_name, args, false)
@@ -641,16 +641,6 @@ impl CostTracker for ExecutionState<'_, '_, '_> {
     fn reset_memory(&mut self) {
         self.global_context.cost_track.reset_memory()
     }
-    fn short_circuit_contract_call(
-        &mut self,
-        contract: &QualifiedContractIdentifier,
-        function: &ClarityName,
-        input: &[u64],
-    ) -> std::result::Result<bool, CostErrors> {
-        self.global_context
-            .cost_track
-            .short_circuit_contract_call(contract, function, input)
-    }
 }
 
 impl CostTracker for GlobalContext<'_, '_> {
@@ -674,35 +664,9 @@ impl CostTracker for GlobalContext<'_, '_> {
     fn reset_memory(&mut self) {
         self.cost_track.reset_memory()
     }
-    fn short_circuit_contract_call(
-        &mut self,
-        contract: &QualifiedContractIdentifier,
-        function: &ClarityName,
-        input: &[u64],
-    ) -> std::result::Result<bool, CostErrors> {
-        self.cost_track
-            .short_circuit_contract_call(contract, function, input)
-    }
 }
 
 impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
-    /// Used only for contract-call! cost short-circuiting. Once the short-circuited cost
-    ///  has been evaluated and assessed, the contract-call! itself is executed "for free".
-    pub fn run_free<F, A>(&mut self, invoke_ctx: &InvocationContext, to_run: F) -> A
-    where
-        F: FnOnce(&mut ExecutionState, &InvocationContext) -> A,
-    {
-        let original_tracker = replace(
-            &mut self.global_context.cost_track,
-            LimitedCostTracker::new_free(),
-        );
-        // note: it is important that this method not return until original_tracker has been
-        //  restored. DO NOT use the try syntax (?).
-        let result = to_run(self, invoke_ctx);
-        self.global_context.cost_track = original_tracker;
-        result
-    }
-
     pub fn eval_read_only(
         &mut self,
         invoke_ctx: &InvocationContext,
@@ -800,12 +764,14 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
         &self.global_context.epoch_id
     }
 
+    /// Calls `tx_name` on `contract`. The arguments are taken by value so the caller
+    /// does not hold them for the duration of the call.
     pub fn execute_contract(
         &mut self,
         invoke_ctx: &InvocationContext,
         contract: &QualifiedContractIdentifier,
         tx_name: &str,
-        args: &[SymbolicExpression],
+        args: Vec<Value>,
         read_only: bool,
     ) -> Result<Value, VmExecutionError> {
         self.inner_execute_contract(invoke_ctx, contract, tx_name, args, read_only, false)
@@ -819,7 +785,7 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
         invoke_ctx: &InvocationContext,
         contract: &QualifiedContractIdentifier,
         tx_name: &str,
-        args: &[SymbolicExpression],
+        args: Vec<Value>,
         read_only: bool,
     ) -> Result<Value, VmExecutionError> {
         self.inner_execute_contract(invoke_ctx, contract, tx_name, args, read_only, true)
@@ -836,7 +802,7 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
         invoke_ctx: &InvocationContext,
         contract_identifier: &QualifiedContractIdentifier,
         tx_name: &str,
-        args: &[SymbolicExpression],
+        args: Vec<Value>,
         read_only: bool,
         allow_private: bool,
     ) -> Result<Value, VmExecutionError> {
@@ -859,31 +825,17 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
             if !allow_private && !func.is_public() {
                 return Err(RuntimeCheckErrorKind::NoSuchPublicFunction(contract_identifier.to_string(), tx_name.to_string()).into());
             } else if read_only && !func.is_read_only() {
-                return Err(RuntimeCheckErrorKind::Unreachable(format!("Public function not read-only: {contract_identifier} {tx_name}")).into());
+                return Err(RuntimeCheckErrorKind::Unreachable(bounded_format!("Public function not read-only: {contract_identifier} {tx_name}")).into());
             }
 
-            let args: Result<Vec<Value>, VmExecutionError> = args.iter()
-                .map(|arg| {
-                    let value = arg.match_atom_value()
-                        .ok_or_else(|| VmInternalError::InvariantViolation(format!("Passed non-value expression to exec_tx on {tx_name}!")))?;
-                    // sanitize contract-call inputs in epochs >= 2.4
-                    // testing todo: ensure sanitize_value() preserves trait callability!
-                    let expected_type = TypeSignature::type_of(value)?;
-                    let (sanitized_value, _) = Value::sanitize_value(
-                        self.epoch(),
-                        &expected_type,
-                        value.clone(),
-                    ).ok_or_else(|| RuntimeCheckErrorKind::TypeValueError(
-                            Box::new(expected_type),
-                            value.to_error_string(),
-                        )
-                    )?;
-
-                    Ok(sanitized_value)
+            // sanitize contract-call inputs in epochs >= 2.4
+            // testing todo: ensure sanitize_value() preserves trait callability!
+            let args = args.into_iter()
+                .map(|value| {
+                    let expected_type = TypeSignature::type_of(&value)?;
+                    sanitize_argument(self.epoch(), &expected_type, value)
                 })
-                .collect();
-
-            let args = args?;
+                .collect::<Result<Vec<_>, _>>()?;
 
             let func_identifier = func.get_identifier();
             if self.call_stack.contains(&func_identifier) {
@@ -899,19 +851,25 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
             let callee_view = invoke_ctx.with_contract_context(&contract);
             let call = CallTraceFrame::when(self.has_eval_hooks(), || CallHook::UserDefined {
                 contract_identifier: &callee_view.contract_context.contract_identifier,
-                function: &func,
+                function: func,
             });
             call.begin(self, &callee_view, CallArguments::Values(&args));
             call.did_evaluate_arguments(self, &callee_view, &args);
 
-            let res = self.execute_function_as_transaction(invoke_ctx, &func, &args, options);
+            // The arguments are kept only if the store has a special-case handler for this
+            // contract; otherwise they move into the call.
+            let special_case = self.global_context.database
+                .get_cc_special_cases_handler(contract_identifier)
+                .map(|handler| (handler, args.clone()));
+
+            let res = self.execute_function_as_transaction(invoke_ctx, func, args, options);
 
             call.finish(self, &callee_view, &res);
             self.call_stack.remove(&func_identifier, true)?;
 
             match res {
                 Ok(value) => {
-                    if let Some(handler) = self.global_context.database.get_cc_special_cases_handler() {
+                    if let Some((handler, args)) = special_case {
                         handler(
                             self.global_context,
                             invoke_ctx.sender.as_ref(),
@@ -939,7 +897,7 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
         &mut self,
         invoke_ctx: &InvocationContext,
         function: &DefinedFunction,
-        args: &[Value],
+        args: Vec<Value>,
         options: FunctionExecutionOptions<'_>,
     ) -> Result<Value, VmExecutionError> {
         let make_read_only = function.is_read_only();
@@ -1047,7 +1005,7 @@ impl<'a, 'b, 'hooks> ExecutionState<'a, 'b, 'hooks> {
                 .database
                 .has_contract(&contract_identifier)
             {
-                return Err(RuntimeCheckErrorKind::Unreachable(format!(
+                return Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
                     "Contract already exists: {contract_identifier}"
                 ))
                 .into());
@@ -1700,7 +1658,7 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
                 Ok(result)
             } else {
                 self.roll_back()?;
-                Err(RuntimeCheckErrorKind::Unreachable(format!(
+                Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
                     "Public function must return response: {}",
                     TypeSignature::type_of(&result)?
                 ))
@@ -1751,27 +1709,31 @@ impl ContractContext {
         self.variables.get(name)
     }
 
-    pub fn lookup_function(&self, name: &str) -> Option<DefinedFunction> {
-        self.functions.get(name).cloned()
+    pub fn lookup_function(&self, name: &str) -> Option<&DefinedFunction> {
+        self.functions.get(name)
     }
 
     pub fn lookup_trait_definition(
         &self,
         name: &str,
-    ) -> Option<BTreeMap<ClarityName, FunctionSignature>> {
-        self.defined_traits.get(name).cloned()
+    ) -> Option<&BTreeMap<ClarityName, FunctionSignature>> {
+        self.defined_traits.get(name)
     }
 
     pub fn is_explicitly_implementing_trait(&self, trait_identifier: &TraitIdentifier) -> bool {
         self.implemented_traits.contains(trait_identifier)
     }
 
-    pub fn is_name_used(&self, name: &str) -> bool {
-        is_reserved(name, self.get_clarity_version())
-            || self.variables.contains_key(name)
+    /// Whether the contract itself defines `name`, ignoring reserved natives.
+    pub fn is_name_defined_by_contract(&self, name: &str) -> bool {
+        self.variables.contains_key(name)
             || self.functions.contains_key(name)
             || self.persisted_names.contains(name)
             || self.defined_traits.contains_key(name)
+    }
+
+    pub fn is_name_used(&self, name: &str) -> bool {
+        is_reserved(name, self.get_clarity_version()) || self.is_name_defined_by_contract(name)
     }
 
     pub fn get_clarity_version(&self) -> &ClarityVersion {
@@ -1782,12 +1744,12 @@ impl ContractContext {
     /// defined traits are exposed externally, so other types are not
     /// canonicalized.
     pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) -> Result<(), VmExecutionError> {
-        for (_, function) in self.functions.iter_mut() {
+        for function in self.functions.values_mut() {
             function.canonicalize_types(epoch);
         }
 
         for trait_def in self.defined_traits.values_mut() {
-            for (_, function) in trait_def.iter_mut() {
+            for function in trait_def.values_mut() {
                 *function = function.canonicalize(epoch);
             }
         }
@@ -1795,11 +1757,11 @@ impl ContractContext {
         // In pre-sanitized-variable epochs, sanitize all contract
         // variables at load time so lookups can borrow directly.
         if epoch.uses_pre_sanitized_variables() {
-            for (_, value) in self.variables.iter_mut() {
+            for value in self.variables.values_mut() {
                 let owned = std::mem::replace(value, Value::none());
                 let (sanitized, _) =
                     Value::sanitize_value(epoch, &TypeSignature::type_of(&owned)?, owned)
-                        .ok_or_else(|| RuntimeCheckErrorKind::CouldNotDetermineType)?;
+                        .ok_or(RuntimeCheckErrorKind::CouldNotDetermineType)?;
                 *value = sanitized;
             }
         }
@@ -2173,7 +2135,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Contract already exists: S1G2081040G2081040G2081040G208105NK8PE5.dup".to_string()
+                "Contract already exists: S1G2081040G2081040G2081040G208105NK8PE5.dup".into()
             ))
         );
     }

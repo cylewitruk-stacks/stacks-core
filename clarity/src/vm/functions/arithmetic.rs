@@ -17,6 +17,7 @@
 use std::cmp;
 
 use integer_sqrt::IntegerSquareRoot;
+use stacks_common::bounded_format;
 
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::costs::cost_functions::ClarityCostFunction;
@@ -46,26 +47,6 @@ impl U128Ops {
 impl I128Ops {
     fn make_value(x: i128) -> Result<Value, VmExecutionError> {
         Ok(Value::Int(x))
-    }
-}
-impl ASCIIOps {
-    fn make_value(x: Vec<u8>) -> Result<Value, VmExecutionError> {
-        Ok(Value::Sequence(SequenceData::String(CharType::ASCII(
-            ASCIIData { data: x },
-        ))))
-    }
-}
-impl UTF8Ops {
-    fn make_value(x: Vec<Vec<u8>>) -> Result<Value, VmExecutionError> {
-        Ok(Value::Sequence(SequenceData::String(CharType::UTF8(
-            UTF8Data { data: x },
-        ))))
-    }
-}
-
-impl BuffOps {
-    fn make_value(x: Vec<u8>) -> Result<Value, VmExecutionError> {
-        Ok(Value::Sequence(SequenceData::Buffer(BuffData { data: x })))
     }
 }
 
@@ -411,10 +392,14 @@ fn special_geq_v2(
     check_argument_count(2, args)?;
     let a = eval(&args[0], exec_state, invoke_ctx, context)?;
     let b = eval(&args[1], exec_state, invoke_ctx, context)?;
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::Geq,
         exec_state,
-        cmp::min(a.as_ref().size()?, b.as_ref().size()?),
+        cmp::min(
+            a.as_ref().charged_size(&epoch)?,
+            b.as_ref().charged_size(&epoch)?,
+        ),
     )?;
     type_force_binary_comparison_v2!(geq, a, b, exec_state)
 }
@@ -461,10 +446,14 @@ fn special_leq_v2(
     check_argument_count(2, args)?;
     let a = eval(&args[0], exec_state, invoke_ctx, context)?;
     let b = eval(&args[1], exec_state, invoke_ctx, context)?;
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::Leq,
         exec_state,
-        cmp::min(a.as_ref().size()?, b.as_ref().size()?),
+        cmp::min(
+            a.as_ref().charged_size(&epoch)?,
+            b.as_ref().charged_size(&epoch)?,
+        ),
     )?;
     type_force_binary_comparison_v2!(leq, a, b, exec_state)
 }
@@ -510,10 +499,14 @@ fn special_greater_v2(
     check_argument_count(2, args)?;
     let a = eval(&args[0], exec_state, invoke_ctx, context)?;
     let b = eval(&args[1], exec_state, invoke_ctx, context)?;
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::Ge,
         exec_state,
-        cmp::min(a.as_ref().size()?, b.as_ref().size()?),
+        cmp::min(
+            a.as_ref().charged_size(&epoch)?,
+            b.as_ref().charged_size(&epoch)?,
+        ),
     )?;
     type_force_binary_comparison_v2!(greater, a, b, exec_state)
 }
@@ -559,10 +552,14 @@ fn special_less_v2(
     check_argument_count(2, args)?;
     let a = eval(&args[0], exec_state, invoke_ctx, context)?;
     let b = eval(&args[1], exec_state, invoke_ctx, context)?;
+    let epoch = *exec_state.epoch();
     runtime_cost(
         ClarityCostFunction::Le,
         exec_state,
-        cmp::min(a.as_ref().size()?, b.as_ref().size()?),
+        cmp::min(
+            a.as_ref().charged_size(&epoch)?,
+            b.as_ref().charged_size(&epoch)?,
+        ),
     )?;
     type_force_binary_comparison_v2!(less, a, b, exec_state)
 }
@@ -622,7 +619,7 @@ pub fn native_bitwise_left_shift(input: Value, pos: Value) -> Result<Value, VmEx
                 let result = input.wrapping_shl(shamt);
                 Ok(Value::UInt(result))
             }
-            _ => Err(RuntimeCheckErrorKind::Unreachable(format!(
+            _ => Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
                 "Union type error {}",
                 TypeSignature::type_of(&input)?
             ))
@@ -652,7 +649,7 @@ pub fn native_bitwise_right_shift(input: Value, pos: Value) -> Result<Value, VmE
                 let result = input.wrapping_shr(shamt);
                 Ok(Value::UInt(result))
             }
-            _ => Err(RuntimeCheckErrorKind::Unreachable(format!(
+            _ => Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
                 "Union type error {}",
                 TypeSignature::type_of(&input)?
             ))

@@ -112,7 +112,6 @@ pub fn sample_block_proposal() -> NakamotoBlockProposal {
             txs: vec![],
         },
         chain_id: 0x80000000,
-        replay_txs: None,
     }
 }
 
@@ -553,13 +552,16 @@ impl ChainstateReadExecutor for MockChainstateReads {
     fn call_read_only(
         &self,
         _contract: QualifiedContractIdentifier,
-        _function: ClarityName,
+        function: ClarityName,
         _sender: PrincipalData,
         _sponsor: Option<PrincipalData>,
         _arguments: Vec<Value>,
         tip: TipRequest,
     ) -> Result<ReadOnlyCallView, ApiError> {
         self.check_tip(&tip);
+        if function.as_str() == "exceed-budget" {
+            return Ok(ReadOnlyCallView::ExecutionBudgetExceeded);
+        }
         Ok(ReadOnlyCallView::Success("0x0703".into()))
     }
 

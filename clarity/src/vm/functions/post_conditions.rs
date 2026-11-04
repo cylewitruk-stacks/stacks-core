@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use clarity_types::ClarityName;
 use clarity_types::types::{AssetIdentifier, PrincipalData, StandardPrincipalData};
+use stacks_common::bounded_format;
 use stacks_common::types::StacksEpochId;
 
 use crate::vm::analysis::type_checker::v2_1::natives::post_conditions::MAX_ALLOWANCES;
@@ -83,7 +84,7 @@ impl Allowance {
     /// Returns the size in bytes of the allowance when stored in memory.
     /// This is used to account for memory usage when evaluating `as-contract?`
     /// and `restrict-assets?` expressions.
-    pub fn size_in_bytes(&self) -> Result<usize, VmInternalError> {
+    pub fn size_in_bytes(&self, epoch: &StacksEpochId) -> Result<usize, VmInternalError> {
         match self {
             Allowance::Stx(_) => Ok(std::mem::size_of::<StxAllowance>()),
             Allowance::Ft(ft) => Ok(std::mem::size_of::<FtAllowance>()
@@ -97,7 +98,7 @@ impl Allowance {
                     + nft.asset.asset_name.len() as usize;
 
                 for id in &nft.asset_ids {
-                    let memory_use = id.get_memory_use().map_err(|e| {
+                    let memory_use = id.get_memory_use(epoch).map_err(|e| {
                         VmInternalError::Expect(format!("Failed to calculate memory use: {e}"))
                     })?;
                     total_size += memory_use as usize;
@@ -121,25 +122,26 @@ fn eval_allowance(
     let list = allowance_expr
         .match_list()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Non functional application".to_string(),
+            "Non functional application".into(),
         ))?;
     let (name_expr, rest) = list
         .split_first()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Non functional application".to_string(),
+            "Non functional application".into(),
         ))?;
     let name = name_expr
         .match_atom()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Bad function name".to_string(),
+            "Bad function name".into(),
         ))?;
     let Some(ref native_function) = NativeFunctions::lookup_by_name_at_version(
         name,
         invoke_ctx.contract_context.get_clarity_version(),
     ) else {
-        return Err(
-            RuntimeCheckErrorKind::Unreachable(format!("Expected allowance expr: {name}")).into(),
-        );
+        return Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
+            "Expected allowance expr: {name}"
+        ))
+        .into());
     };
 
     match native_function {
@@ -274,9 +276,10 @@ fn eval_allowance(
             }
             Ok(Allowance::All)
         }
-        _ => Err(
-            RuntimeCheckErrorKind::Unreachable(format!("Expected allowance expr: {name}")).into(),
-        ),
+        _ => Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
+            "Expected allowance expr: {name}"
+        ))
+        .into()),
     }
 }
 
@@ -297,7 +300,7 @@ pub fn special_restrict_assets(
     let allowance_list = args[1]
         .match_list()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected list of allowances: for restrict-assets? as argument 2".to_string(),
+            "Expected list of allowances: for restrict-assets? as argument 2".into(),
         ))?;
     let body_exprs = &args[2..];
 
@@ -315,7 +318,7 @@ pub fn special_restrict_assets(
     )?;
 
     if allowance_len > MAX_ALLOWANCES {
-        return Err(RuntimeCheckErrorKind::Unreachable(format!(
+        return Err(RuntimeCheckErrorKind::Unreachable(bounded_format!(
             "Too many allowances: got {allowance_len}, allowed {MAX_ALLOWANCES}"
         ))
         .into());
@@ -323,12 +326,18 @@ pub fn special_restrict_assets(
 
     let starting_memory = exec_state.global_context.cost_track.get_memory();
     let mut memory_use: u64 = 0;
+    let checks_with_all = exec_state
+        .epoch()
+        .checks_with_all_assets_in_restrict_assets();
 
     finally_drop_memory!( exec_state, memory_use; {
         let mut allowances = Vec::with_capacity(allowance_len);
         for allowance in allowance_list {
             let allowance = eval_allowance(allowance, exec_state, invoke_ctx, context)?;
-            let allowance_memory = u64::try_from(allowance.size_in_bytes()?)
+            if checks_with_all && matches!(allowance, Allowance::All) {
+                return Err(RuntimeCheckErrorKind::WithAllAllowanceNotAllowed.into());
+            }
+            let allowance_memory = u64::try_from(allowance.size_in_bytes(exec_state.epoch())?)
                 .map_err(|_| VmInternalError::Expect("Allowance size too large".into()))?;
 
             match exec_state.add_memory(allowance_memory) {
@@ -397,7 +406,7 @@ fn evaluate_body_with_allowance_check(
         })();
 
     // A block-rejecting error raised inside the body must abort the transaction.
-    if matches!(&eval_result, Err(err) if err.rejectable()) {
+    if matches!(&eval_result, Err(err) if err.rejectable_in_epoch(epoch)) {
         exec_state.global_context.roll_back()?;
         return Err(eval_result.unwrap_err());
     }
@@ -453,7 +462,7 @@ pub fn special_as_contract(
     let allowance_list = args[0]
         .match_list()
         .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Expected list of allowances: for as-contract? as argument 1".to_string(),
+            "Expected list of allowances: for as-contract? as argument 1".into(),
         ))?;
     let body_exprs = &args[1..];
 
@@ -469,7 +478,7 @@ pub fn special_as_contract(
         let mut allowances = Vec::with_capacity(allowance_list.len());
         for allowance_expr in allowance_list {
             let allowance = eval_allowance(allowance_expr, exec_state, invoke_ctx, context)?;
-            let allowance_memory = u64::try_from(allowance.size_in_bytes()?)
+            let allowance_memory = u64::try_from(allowance.size_in_bytes(exec_state.epoch())?)
                 .map_err(|_| VmInternalError::Expect("Allowance size too large".into()))?;
             exec_state.add_memory(allowance_memory)?;
             memory_use += allowance_memory;
@@ -712,7 +721,7 @@ pub fn special_allowance(
     _invoke_ctx: &InvocationContext,
     _context: &LocalContext,
 ) -> Result<Value, VmExecutionError> {
-    Err(RuntimeCheckErrorKind::Unreachable("Allowance expr not allowed".to_string()).into())
+    Err(RuntimeCheckErrorKind::Unreachable("Allowance expr not allowed".into()).into())
 }
 
 #[cfg(test)]
@@ -741,13 +750,11 @@ mod test {
             CHAIN_ID_TESTNET,
             marf.as_clarity_db(),
             LimitedCostTracker::new_free(),
-            StacksEpochId::latest(),
+            epoch,
         );
 
-        let contract_context = ContractContext::new(
-            QualifiedContractIdentifier::transient(),
-            ClarityVersion::Clarity3,
-        );
+        let contract_context =
+            ContractContext::new(QualifiedContractIdentifier::transient(), version);
 
         let context = LocalContext::new();
         let mut call_stack = CallStack::new();
@@ -767,7 +774,7 @@ mod test {
 
         assert_eq!(
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Non functional application".to_string()
+                "Non functional application".into()
             )),
             err
         );

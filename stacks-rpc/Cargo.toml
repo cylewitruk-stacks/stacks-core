@@ -24,6 +24,7 @@ serde_json = { workspace = true }
 slog = { workspace = true }
 stacks = { package = "stackslib", path = "../stackslib" }
 stacks-common = { path = "../stacks-common" }
+stacks-marf = { path = "../stacks-marf" }
 subtle = "2.6.1"
 tokio = { version = "1.15", features = ["net", "rt-multi-thread", "sync"] }
 tower = { version = "0.5.2", features = ["limit", "timeout", "util"] }

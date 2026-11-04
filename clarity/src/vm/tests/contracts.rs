@@ -20,6 +20,8 @@ use stacks_common::types::{StacksEpochId, chainstate::BlockHeaderHash};
 #[cfg(test)]
 use stacks_common::util::hash::Sha512Trunc256Sum;
 
+#[cfg(test)]
+use crate::vm::contexts::OwnedEnvironment;
 use crate::vm::contexts::{ExecutionState, InvocationContext};
 use crate::vm::tests::{test_clarity_versions, test_epochs};
 use crate::vm::types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, Value};
@@ -29,7 +31,7 @@ use crate::vm::{
     errors::{ClarityEvalError, RuntimeCheckErrorKind, RuntimeError, VmExecutionError},
     tests::{
         MemoryEnvironmentGenerator, TopLevelMemoryEnvironmentGenerator, env_factory, execute,
-        is_committed, is_err_code_i128 as is_err_code, symbols_from_values, tl_env_factory,
+        is_committed, is_err_code_i128 as is_err_code, tl_env_factory,
     },
     types::{OptionalData, ResponseData, TypeSignature},
     {ClarityVersion, ContractContext, execute as vm_execute, max_call_stack_depth_for_epoch},
@@ -221,7 +223,7 @@ fn test_contract_caller(epoch: StacksEpochId, mut env_factory: MemoryEnvironment
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-a").unwrap(),
                     "get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -233,7 +235,7 @@ fn test_contract_caller(epoch: StacksEpochId, mut env_factory: MemoryEnvironment
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-b").unwrap(),
                     "as-contract-get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -245,7 +247,7 @@ fn test_contract_caller(epoch: StacksEpochId, mut env_factory: MemoryEnvironment
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-b").unwrap(),
                     "cc-get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -257,7 +259,7 @@ fn test_contract_caller(epoch: StacksEpochId, mut env_factory: MemoryEnvironment
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-b").unwrap(),
                     "as-contract-cc-get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -281,7 +283,7 @@ fn tx_sponsor_contract_asserts(
                 invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-a").unwrap(),
                 "get-sponsor",
-                &[],
+                vec![],
                 false
             )
             .unwrap(),
@@ -293,7 +295,7 @@ fn tx_sponsor_contract_asserts(
                 invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-b").unwrap(),
                 "as-contract-get-sponsor",
-                &[],
+                vec![],
                 false
             )
             .unwrap(),
@@ -305,7 +307,7 @@ fn tx_sponsor_contract_asserts(
                 invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-b").unwrap(),
                 "cc-get-sponsor",
-                &[],
+                vec![],
                 false
             )
             .unwrap(),
@@ -317,7 +319,7 @@ fn tx_sponsor_contract_asserts(
                 invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-b").unwrap(),
                 "as-contract-cc-get-sponsor",
-                &[],
+                vec![],
                 false
             )
             .unwrap(),
@@ -449,7 +451,7 @@ fn test_fully_qualified_contract_call(
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-a").unwrap(),
                     "get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -461,7 +463,7 @@ fn test_fully_qualified_contract_call(
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-b").unwrap(),
                     "as-contract-get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -473,7 +475,7 @@ fn test_fully_qualified_contract_call(
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-b").unwrap(),
                     "cc-get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -485,7 +487,7 @@ fn test_fully_qualified_contract_call(
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("contract-b").unwrap(),
                     "as-contract-cc-get-caller",
-                    &[],
+                    vec![],
                     false
                 )
                 .unwrap(),
@@ -593,7 +595,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "preorder",
-                    &symbols_from_values(vec![name_hash_expensive_0.clone(), Value::UInt(1000)]),
+                    vec![name_hash_expensive_0.clone(), Value::UInt(1000)],
                     false
                 )
                 .unwrap(),
@@ -613,7 +615,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "preorder",
-                    &symbols_from_values(vec![name_hash_expensive_0.clone(), Value::UInt(1000)]),
+                    vec![name_hash_expensive_0.clone(), Value::UInt(1000)],
                     false
                 )
                 .unwrap()
@@ -624,7 +626,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "preorder",
-                    &symbols_from_values(vec![name_hash_expensive_0, Value::UInt(1000)]),
+                    vec![name_hash_expensive_0, Value::UInt(1000)],
                     false
                 )
                 .unwrap(),
@@ -645,7 +647,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "register",
-                    &symbols_from_values(vec![p2.clone(), Value::Int(1), Value::Int(0)]),
+                    vec![p2.clone(), Value::Int(1), Value::Int(0)],
                     false
                 )
                 .unwrap(),
@@ -666,7 +668,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "register",
-                    &symbols_from_values(vec![p2.clone(), Value::Int(1), Value::Int(0)]),
+                    vec![p2.clone(), Value::Int(1), Value::Int(0)],
                     false
                 )
                 .unwrap()
@@ -686,7 +688,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "preorder",
-                    &symbols_from_values(vec![name_hash_expensive_1, Value::UInt(100)]),
+                    vec![name_hash_expensive_1, Value::UInt(100)],
                     false
                 )
                 .unwrap()
@@ -697,7 +699,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "register",
-                    &symbols_from_values(vec![p2.clone(), Value::Int(2), Value::Int(0)]),
+                    vec![p2.clone(), Value::Int(2), Value::Int(0)],
                     false
                 )
                 .unwrap(),
@@ -711,7 +713,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "preorder",
-                    &symbols_from_values(vec![name_hash_cheap_0, Value::UInt(100)]),
+                    vec![name_hash_cheap_0, Value::UInt(100)],
                     false
                 )
                 .unwrap()
@@ -722,7 +724,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "register",
-                    &symbols_from_values(vec![p2.clone(), Value::Int(100001), Value::Int(0)]),
+                    vec![p2.clone(), Value::Int(100001), Value::Int(0)],
                     false
                 )
                 .unwrap()
@@ -735,7 +737,7 @@ fn test_simple_naming_system(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                     &invoke_ctx,
                     &QualifiedContractIdentifier::local("names").unwrap(),
                     "register",
-                    &symbols_from_values(vec![p2, Value::Int(100001), Value::Int(0)]),
+                    vec![p2, Value::Int(100001), Value::Int(0)],
                     false
                 )
                 .unwrap(),
@@ -774,7 +776,7 @@ fn test_simple_contract_call(epoch: StacksEpochId, mut env_factory: MemoryEnviro
         .initialize_contract(&invoke_ctx, contract_identifier, contract_2)
         .unwrap();
 
-    let args = symbols_from_values(vec![]);
+    let args: Vec<Value> = vec![];
 
     let expected = [
         Value::Int(5),
@@ -790,7 +792,7 @@ fn test_simple_contract_call(epoch: StacksEpochId, mut env_factory: MemoryEnviro
                 &invoke_ctx,
                 &QualifiedContractIdentifier::local("proxy-compute").unwrap(),
                 "proxy-compute",
-                &args,
+                args.clone(),
                 false,
             )
             .unwrap();
@@ -871,7 +873,7 @@ fn test_aborts(epoch: StacksEpochId, mut env_factory: MemoryEnvironmentGenerator
                 &invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-1").unwrap(),
                 "modify-data",
-                &symbols_from_values(vec![Value::Int(10), Value::Int(10)]),
+                vec![Value::Int(10), Value::Int(10)],
                 false
             )
             .unwrap(),
@@ -887,7 +889,7 @@ fn test_aborts(epoch: StacksEpochId, mut env_factory: MemoryEnvironmentGenerator
                 &invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-1").unwrap(),
                 "modify-data",
-                &symbols_from_values(vec![Value::Int(20), Value::Int(10)]),
+                vec![Value::Int(20), Value::Int(10)],
                 false
             )
             .unwrap(),
@@ -925,7 +927,7 @@ fn test_aborts(epoch: StacksEpochId, mut env_factory: MemoryEnvironmentGenerator
                 &invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-2").unwrap(),
                 "fail-in-other",
-                &symbols_from_values(vec![]),
+                vec![],
                 false
             )
             .unwrap(),
@@ -941,7 +943,7 @@ fn test_aborts(epoch: StacksEpochId, mut env_factory: MemoryEnvironmentGenerator
                 &invoke_ctx,
                 &QualifiedContractIdentifier::local("contract-2").unwrap(),
                 "fail-in-self",
-                &symbols_from_values(vec![]),
+                vec![],
                 false
             )
             .unwrap(),
@@ -993,17 +995,17 @@ fn test_factorial_contract(epoch: StacksEpochId, mut env_factory: MemoryEnvironm
 
     let tx_name = "compute";
     let arguments_to_test = [
-        symbols_from_values(vec![Value::Int(1337)]),
-        symbols_from_values(vec![Value::Int(1337)]),
-        symbols_from_values(vec![Value::Int(1337)]),
-        symbols_from_values(vec![Value::Int(1337)]),
-        symbols_from_values(vec![Value::Int(1337)]),
-        symbols_from_values(vec![Value::Int(8008)]),
-        symbols_from_values(vec![Value::Int(8008)]),
-        symbols_from_values(vec![Value::Int(8008)]),
-        symbols_from_values(vec![Value::Int(8008)]),
-        symbols_from_values(vec![Value::Int(8008)]),
-        symbols_from_values(vec![Value::Int(8008)]),
+        vec![Value::Int(1337)],
+        vec![Value::Int(1337)],
+        vec![Value::Int(1337)],
+        vec![Value::Int(1337)],
+        vec![Value::Int(1337)],
+        vec![Value::Int(8008)],
+        vec![Value::Int(8008)],
+        vec![Value::Int(8008)],
+        vec![Value::Int(8008)],
+        vec![Value::Int(8008)],
+        vec![Value::Int(8008)],
     ];
 
     let expected = vec![
@@ -1028,7 +1030,7 @@ fn test_factorial_contract(epoch: StacksEpochId, mut env_factory: MemoryEnvironm
                 &invoke_ctx,
                 &QualifiedContractIdentifier::local("factorial").unwrap(),
                 tx_name,
-                arguments,
+                arguments.clone(),
                 false,
             )
             .unwrap();
@@ -1053,7 +1055,7 @@ fn test_factorial_contract(epoch: StacksEpochId, mut env_factory: MemoryEnvironm
             &invoke_ctx,
             &QualifiedContractIdentifier::local("factorial").unwrap(),
             "init-factorial",
-            &symbols_from_values(vec![Value::Int(9000), Value::Int(15)]),
+            vec![Value::Int(9000), Value::Int(15)],
             false,
         )
         .unwrap_err();
@@ -1067,7 +1069,7 @@ fn test_factorial_contract(epoch: StacksEpochId, mut env_factory: MemoryEnvironm
             &invoke_ctx,
             &QualifiedContractIdentifier::local("factorial").unwrap(),
             "compute",
-            &symbols_from_values(vec![Value::Bool(true)]),
+            vec![Value::Bool(true)],
             false,
         )
         .unwrap_err();
@@ -1336,15 +1338,14 @@ fn test_contract_hash_success(
 
     // Attempt to get the hash of the other contract and expect it to be
     // successful and for the returned hash to match the expected hash.
-    let standard_principal = QualifiedContractIdentifier::local("standard-principal").unwrap();
     let result = exec_state
         .execute_contract(
             &invoke_ctx,
             &test_contract,
             "get-hash",
-            &symbols_from_values(vec![Value::Principal(PrincipalData::Contract(
+            vec![Value::Principal(PrincipalData::Contract(
                 other_contract.clone(),
-            ))]),
+            ))],
             true,
         )
         .unwrap();
@@ -1377,7 +1378,6 @@ fn test_contract_hash_nonexistent_contract(
     // Deploy a contract to hash
     let other_contract = QualifiedContractIdentifier::local("other-contract").unwrap();
     let contract_content = "(define-constant test-var 1)";
-    let expected_hash = Sha512Trunc256Sum::from_data(contract_content.as_bytes());
 
     exec_state
         .initialize_contract(&invoke_ctx, other_contract.clone(), contract_content)
@@ -1399,9 +1399,9 @@ fn test_contract_hash_nonexistent_contract(
             &invoke_ctx,
             &test_contract,
             "get-hash",
-            &symbols_from_values(vec![Value::Principal(PrincipalData::Contract(
+            vec![Value::Principal(PrincipalData::Contract(
                 non_existent_contract.clone(),
-            ))]),
+            ))],
             true,
         )
         .unwrap();
@@ -1429,7 +1429,6 @@ fn test_contract_hash_standard_principal(
     // Deploy a contract to hash
     let other_contract = QualifiedContractIdentifier::local("other-contract").unwrap();
     let contract_content = "(define-constant test-var 1)";
-    let expected_hash = Sha512Trunc256Sum::from_data(contract_content.as_bytes());
 
     exec_state
         .initialize_contract(&invoke_ctx, other_contract.clone(), contract_content)
@@ -1450,9 +1449,9 @@ fn test_contract_hash_standard_principal(
             &invoke_ctx,
             &test_contract,
             "get-hash",
-            &symbols_from_values(vec![Value::Principal(PrincipalData::Standard(
+            vec![Value::Principal(PrincipalData::Standard(
                 StandardPrincipalData::transient(),
-            ))]),
+            ))],
             true,
         )
         .unwrap();
@@ -1488,7 +1487,7 @@ fn test_contract_hash_type_check(
 
     // Attempt to execute the contract, expecting a type-check error
     let err = exec_state
-        .execute_contract(&invoke_ctx, &test_contract, "get-hash", &[], true)
+        .execute_contract(&invoke_ctx, &test_contract, "get-hash", vec![], true)
         .unwrap_err();
     assert_eq!(
         err,
@@ -1518,7 +1517,6 @@ fn test_contract_hash_pre_clarity4(
     // Deploy a contract to hash
     let other_contract = QualifiedContractIdentifier::local("other-contract").unwrap();
     let contract_content = "(define-constant test-var 1)";
-    let expected_hash = Sha512Trunc256Sum::from_data(contract_content.as_bytes());
 
     exec_state
         .initialize_contract(&invoke_ctx, other_contract.clone(), contract_content)
@@ -1535,15 +1533,14 @@ fn test_contract_hash_pre_clarity4(
 
     // Attempt to get the hash of the other contract and expect it to be
     // successful and for the returned hash to match the expected hash.
-    let standard_principal = QualifiedContractIdentifier::local("standard-principal").unwrap();
     let err = exec_state
         .execute_contract(
             &invoke_ctx,
             &test_contract,
             "get-hash",
-            &symbols_from_values(vec![Value::Principal(PrincipalData::Contract(
+            vec![Value::Principal(PrincipalData::Contract(
                 other_contract.clone(),
-            ))]),
+            ))],
             true,
         )
         .unwrap_err();
@@ -1603,7 +1600,7 @@ fn test_contract_call_with_constant(
         &invoke_ctx,
         &QualifiedContractIdentifier::local("contract-b").unwrap(),
         "call-foo",
-        &[],
+        vec![],
         false,
     );
 
@@ -1614,6 +1611,63 @@ fn test_contract_call_with_constant(
             call_result.unwrap_err(),
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::ContractCallExpectName)
         );
+    }
+}
+
+#[apply(test_clarity_versions)]
+fn test_runtime_name_resolution_order(
+    version: ClarityVersion,
+    epoch: StacksEpochId,
+    mut env_factory: MemoryEnvironmentGenerator,
+) {
+    let mut owned_env = env_factory.get_env(epoch);
+
+    let contract = "
+        (define-constant duplicate 42)
+        (define-public (some-function)
+            (let ((duplicate 7)) (ok duplicate))
+        )
+        ";
+
+    let principal = execute("'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR");
+    let placeholder_context =
+        ContractContext::new(QualifiedContractIdentifier::transient(), version);
+
+    {
+        let (mut exec_env, invoke_ctx) =
+            owned_env.get_exec_environment(None, None, &placeholder_context);
+        let init_result = exec_env.initialize_contract(
+            &invoke_ctx,
+            QualifiedContractIdentifier::local("contract").unwrap(),
+            contract,
+        );
+        if version.definition_sorter_probes_binding_names() {
+            let err =
+                init_result.expect_err("shadowing should be fully prevented from Clarity 7 on");
+            assert!(err.to_string().contains("NameAlreadyUsed(\"duplicate\")"));
+            return;
+        } else {
+            init_result.expect("before Clarity 7 this should have passed analysis");
+        }
+    }
+
+    let (mut exec_env, invoke_ctx) = owned_env.get_exec_environment(
+        Some(principal.clone().expect_principal().unwrap()),
+        None,
+        &placeholder_context,
+    );
+    let call_result = exec_env.execute_contract(
+        &invoke_ctx,
+        &QualifiedContractIdentifier::local("contract").unwrap(),
+        "some-function",
+        vec![],
+        false,
+    );
+
+    if epoch.clarity_runtime_checks_global_constants_before_local_vars() {
+        assert_eq!(call_result.unwrap(), Value::okay(Value::Int(42)).unwrap());
+    } else {
+        assert_eq!(call_result.unwrap(), Value::okay(Value::Int(7)).unwrap());
     }
 }
 
@@ -1771,7 +1825,7 @@ fn test_constant_to_trait(
         &invoke_ctx,
         &QualifiedContractIdentifier::local("contract-b").unwrap(),
         "call-foo",
-        &[],
+        vec![],
         false,
     );
 
@@ -1855,7 +1909,7 @@ fn test_constant_contract_principal_in_principal_functions(
     // is-standard returns false because the local test principal uses a
     // non-standard version byte (0x01).
     let result = exec_env
-        .execute_contract(&invoke_ctx, &contract_b_id, "check-standard", &[], false)
+        .execute_contract(&invoke_ctx, &contract_b_id, "check-standard", vec![], false)
         .unwrap();
     assert_eq!(result, Value::Bool(false));
 
@@ -1863,7 +1917,7 @@ fn test_constant_contract_principal_in_principal_functions(
     // a recognized network version. The tuple still contains the decomposed
     // principal fields.
     let result = exec_env
-        .execute_contract(&invoke_ctx, &contract_b_id, "check-destruct", &[], false)
+        .execute_contract(&invoke_ctx, &contract_b_id, "check-destruct", vec![], false)
         .unwrap();
     assert_eq!(
         result,
@@ -1875,7 +1929,7 @@ fn test_constant_contract_principal_in_principal_functions(
     // to-ascii? returns (ok <string>) with the full principal representation.
     if has_to_ascii {
         let result = exec_env
-            .execute_contract(&invoke_ctx, &contract_b_id, "check-to-ascii", &[], false)
+            .execute_contract(&invoke_ctx, &contract_b_id, "check-to-ascii", vec![], false)
             .unwrap();
         assert_eq!(
             result,
@@ -1949,7 +2003,8 @@ fn test_constant_contract_principal_dual_use(
     let contract_b_id = QualifiedContractIdentifier::local("contract-b").unwrap();
 
     // contract-call? via constant requires epoch + version support
-    let call_result = exec_env.execute_contract(&invoke_ctx, &contract_b_id, "call-it", &[], false);
+    let call_result =
+        exec_env.execute_contract(&invoke_ctx, &contract_b_id, "call-it", vec![], false);
     if epoch.supports_call_with_constant() && version.supports_callables() {
         assert_eq!(call_result.unwrap(), Value::okay_true());
     } else {
@@ -1962,14 +2017,602 @@ fn test_constant_contract_principal_dual_use(
     // stx-get-balance and is-standard work in all epochs because the
     // constant is always `Value::Principal`.
     let result = exec_env
-        .execute_contract(&invoke_ctx, &contract_b_id, "get-bal", &[], false)
+        .execute_contract(&invoke_ctx, &contract_b_id, "get-bal", vec![], false)
         .unwrap();
     assert_eq!(result, Value::UInt(0));
 
     // is-standard returns false because the local test principal uses a
     // non-standard version byte (0x01).
     let result = exec_env
-        .execute_contract(&invoke_ctx, &contract_b_id, "check-standard", &[], false)
+        .execute_contract(&invoke_ctx, &contract_b_id, "check-standard", vec![], false)
         .unwrap();
     assert_eq!(result, Value::Bool(false));
+}
+
+/// Deploys `contracts` (name, version, source) into a fresh Epoch 4.1
+/// environment and opens the transaction `execute_contract` needs.
+#[cfg(test)]
+fn make_epoch41_env<'a>(
+    tl_env_factory: &'a mut TopLevelMemoryEnvironmentGenerator,
+    contracts: &[(&str, ClarityVersion, &str)],
+) -> OwnedEnvironment<'a, 'a> {
+    let mut owned_env = tl_env_factory.get_env(StacksEpochId::Epoch41);
+    for &(name, version, source) in contracts {
+        owned_env
+            .initialize_versioned_contract(
+                QualifiedContractIdentifier::local(name).unwrap(),
+                version,
+                source,
+                None,
+            )
+            .unwrap();
+    }
+    owned_env.begin();
+    owned_env
+}
+
+// Epoch 4.1 reserved-name defines: the rule these tests pin is documented on
+// `is_shadowable_reserved`.
+
+/// A transient Clarity 7 contract context for `get_exec_environment`.
+#[cfg(test)]
+fn make_c7_placeholder() -> ContractContext {
+    ContractContext::new(
+        QualifiedContractIdentifier::transient(),
+        ClarityVersion::Clarity7,
+    )
+}
+
+/// Pins `is_shadowable_reserved` to an explicit list, so adding or removing a
+/// native forces a conscious update here.
+#[test]
+fn shadowable_reserved_names_at_clarity7() {
+    use crate::vm::functions::NativeFunctions;
+    use crate::vm::is_shadowable_reserved;
+    use crate::vm::variables::NativeVariables;
+
+    let mut shadowable: Vec<&str> = NativeFunctions::ALL_NAMES
+        .iter()
+        .chain(NativeVariables::ALL_NAMES.iter())
+        .copied()
+        .filter(|name| is_shadowable_reserved(name, &ClarityVersion::Clarity7))
+        .collect();
+    shadowable.sort_unstable();
+
+    let expected = [
+        "as-contract?",
+        "bit-and",
+        "bit-not",
+        "bit-or",
+        "bit-shift-left",
+        "bit-shift-right",
+        "bit-xor",
+        "buff-to-int-be",
+        "buff-to-int-le",
+        "buff-to-uint-be",
+        "buff-to-uint-le",
+        "chain-id",
+        "contract-hash?",
+        "current-contract",
+        "ed25519-verify",
+        "element-at?",
+        "from-consensus-buff?",
+        "get-bitcoin-tx-output?",
+        "get-burn-block-info?",
+        "get-stacks-block-info?",
+        "get-tenure-info?",
+        "index-of?",
+        "int-to-ascii",
+        "int-to-utf8",
+        "is-in-mainnet",
+        "is-standard",
+        "principal-construct?",
+        "principal-destruct?",
+        "replace-at?",
+        "restrict-assets?",
+        "secp256k1-decompress?",
+        "secp256r1-verify",
+        "slice?",
+        "stacks-block-height",
+        "stacks-block-time",
+        "string-to-int?",
+        "string-to-uint?",
+        "stx-account",
+        "stx-transfer-memo?",
+        "tenure-height",
+        "to-ascii?",
+        "to-consensus-buff?",
+        "tx-sponsor?",
+        "verify-merkle-proof",
+        "with-all-assets-unsafe",
+        "with-ft",
+        "with-nft",
+        "with-pox",
+        "with-staking",
+        "with-stx",
+    ];
+    assert_eq!(expected.as_slice(), shadowable.as_slice());
+
+    // Reserved since Clarity 1: never shadowable.
+    for name in ["map", "+", "tx-sender", "let", "true"] {
+        assert!(!is_shadowable_reserved(name, &ClarityVersion::Clarity7));
+    }
+    // Removed natives are plain free names, not shadowable.
+    for name in [
+        "block-height",
+        "get-block-info?",
+        "as-contract",
+        "at-block",
+        "with-stacking",
+    ] {
+        assert!(!is_shadowable_reserved(name, &ClarityVersion::Clarity7));
+    }
+}
+
+/// The implementing function is reachable from outside by its literal name,
+/// while a bare reference inside the contract still resolves to the native.
+#[test]
+fn epoch41_external_call_reaches_shadowed_function_and_native_is_kept() {
+    let mut tl_env_factory = tl_env_factory();
+    let mut owned_env = make_epoch41_env(
+        &mut tl_env_factory,
+        &[
+            // A Clarity 1 trait whose method name later became a native.
+            (
+                "ops-def",
+                ClarityVersion::Clarity1,
+                "(define-trait ops ((slice? (int int) (response int int))))",
+            ),
+            // Implements `slice?` and also uses the native `slice?`.
+            (
+                "c7-shadow",
+                ClarityVersion::Clarity7,
+                "(impl-trait .ops-def.ops)
+                 (define-public (slice? (a int) (b int)) (ok (+ a b)))
+                 (define-read-only (use-native) (slice? (list 10 20 30) u0 u2))",
+            ),
+        ],
+    );
+    let contract_id = QualifiedContractIdentifier::local("c7-shadow").unwrap();
+    let placeholder_context = make_c7_placeholder();
+    let (mut exec_state, invoke_ctx) =
+        owned_env.get_exec_environment(None, None, &placeholder_context);
+
+    // An external call by literal name reaches the user-defined `slice?`.
+    assert_eq!(
+        exec_state
+            .execute_contract(
+                &invoke_ctx,
+                &contract_id,
+                "slice?",
+                vec![Value::Int(4), Value::Int(5)],
+                false
+            )
+            .unwrap(),
+        Value::okay(Value::Int(9)).unwrap()
+    );
+
+    // A bare `slice?` inside the contract still means the NATIVE.
+    assert_eq!(
+        Ok(Value::some(Value::list_from(vec![Value::Int(10), Value::Int(20)]).unwrap()).unwrap()),
+        exec_state.eval_read_only(&invoke_ctx, &contract_id, "(use-native)")
+    );
+}
+
+/// Read-only functions qualify too.
+#[test]
+fn epoch41_read_only_implementation_of_legacy_trait_method() {
+    let mut tl_env_factory = tl_env_factory();
+    let mut owned_env = make_epoch41_env(
+        &mut tl_env_factory,
+        &[
+            (
+                "ops-def",
+                ClarityVersion::Clarity1,
+                "(define-trait ops ((slice? (int int) (response int int))))",
+            ),
+            (
+                "c7-ro-impl",
+                ClarityVersion::Clarity7,
+                "(impl-trait .ops-def.ops)
+                 (define-read-only (slice? (a int) (b int)) (ok (+ a b)))",
+            ),
+        ],
+    );
+    let contract_id = QualifiedContractIdentifier::local("c7-ro-impl").unwrap();
+    let placeholder_context = make_c7_placeholder();
+    let (mut exec_state, invoke_ctx) =
+        owned_env.get_exec_environment(None, None, &placeholder_context);
+    assert_eq!(
+        exec_state
+            .execute_contract(
+                &invoke_ctx,
+                &contract_id,
+                "slice?",
+                vec![Value::Int(4), Value::Int(5)],
+                false
+            )
+            .unwrap(),
+        Value::okay(Value::Int(9)).unwrap()
+    );
+}
+
+/// The gate is the epoch, not the version: tooling may run a pinned Clarity 6
+/// contract at Epoch 4.1 (on chain such pins are rejected).
+#[test]
+fn clarity6_at_epoch41_implements_legacy_trait_method() {
+    let mut tl_env_factory = tl_env_factory();
+    let mut owned_env = make_epoch41_env(
+        &mut tl_env_factory,
+        &[
+            (
+                "ops-def",
+                ClarityVersion::Clarity1,
+                "(define-trait ops ((slice? (int int) (response int int))))",
+            ),
+            (
+                "c6-impl",
+                ClarityVersion::Clarity6,
+                "(impl-trait .ops-def.ops)
+                 (define-public (slice? (a int) (b int)) (ok (+ a b)))",
+            ),
+        ],
+    );
+    let contract_id = QualifiedContractIdentifier::local("c6-impl").unwrap();
+    let placeholder_context = make_c7_placeholder();
+    let (mut exec_state, invoke_ctx) =
+        owned_env.get_exec_environment(None, None, &placeholder_context);
+    assert_eq!(
+        exec_state
+            .execute_contract(
+                &invoke_ctx,
+                &contract_id,
+                "slice?",
+                vec![Value::Int(4), Value::Int(5)],
+                false
+            )
+            .unwrap(),
+        Value::okay(Value::Int(9)).unwrap()
+    );
+}
+
+/// A keyword-named implementation splits by use: applying it calls the
+/// function (no native function has that name); the bare atom reads the keyword.
+#[test]
+fn epoch41_keyword_name_implementation_splits_by_position() {
+    let mut tl_env_factory = tl_env_factory();
+    let mut owned_env = make_epoch41_env(
+        &mut tl_env_factory,
+        &[
+            // The method name became a native keyword in Clarity 3.
+            (
+                "ops-def",
+                ClarityVersion::Clarity1,
+                "(define-trait ops ((stacks-block-height () (response uint uint))))",
+            ),
+            (
+                "c7-keyword",
+                ClarityVersion::Clarity7,
+                "(impl-trait .ops-def.ops)
+                 (define-read-only (stacks-block-height) (ok u12345))
+                 (define-read-only (call-mine) (stacks-block-height))
+                 (define-read-only (read-keyword) stacks-block-height)",
+            ),
+        ],
+    );
+    let contract_id = QualifiedContractIdentifier::local("c7-keyword").unwrap();
+    let placeholder_context = make_c7_placeholder();
+    let (mut exec_state, invoke_ctx) =
+        owned_env.get_exec_environment(None, None, &placeholder_context);
+
+    // Head position: the implementing function.
+    assert_eq!(
+        Ok(Value::okay(Value::UInt(12345)).unwrap()),
+        exec_state.eval_read_only(&invoke_ctx, &contract_id, "(call-mine)")
+    );
+    // Bare atom: the keyword (the env's height, u1).
+    assert_eq!(
+        Ok(Value::UInt(1)),
+        exec_state.eval_read_only(&invoke_ctx, &contract_id, "(read-keyword)")
+    );
+    // Literal-name lookup from outside.
+    assert_eq!(
+        exec_state
+            .execute_contract(
+                &invoke_ctx,
+                &contract_id,
+                "stacks-block-height",
+                vec![],
+                false
+            )
+            .unwrap(),
+        Value::okay(Value::UInt(12345)).unwrap()
+    );
+}
+
+/// Defining a shadowable name twice is an ordinary collision, trait or not.
+#[test]
+fn epoch41_duplicate_shadowable_define_rejected() {
+    let mut tl_env_factory = tl_env_factory();
+    let trait_def = "(define-trait ops ((slice? (int int) (response int int))))";
+    // A second definition is a plain collision, trait or not.
+    let contract = "(impl-trait .ops-def.ops)
+                    (define-public (slice? (a int) (b int)) (ok (+ a b)))
+                    (define-public (slice? (a int) (b int)) (ok (- a b)))";
+    let trait_id = QualifiedContractIdentifier::local("ops-def").unwrap();
+    let contract_id = QualifiedContractIdentifier::local("c7-dup").unwrap();
+    let mut owned_env = tl_env_factory.get_env(StacksEpochId::Epoch41);
+    owned_env
+        .initialize_versioned_contract(trait_id, ClarityVersion::Clarity1, trait_def, None)
+        .unwrap();
+    let err = owned_env
+        .initialize_versioned_contract(contract_id, ClarityVersion::Clarity7, contract, None)
+        .unwrap_err();
+    assert_eq!(
+        ClarityEvalError::Vm(VmExecutionError::RuntimeCheck(
+            RuntimeCheckErrorKind::NameAlreadyUsed("slice?".to_string())
+        )),
+        err
+    );
+}
+
+/// VM side of the `define-trait` rule: reserved method names are rejected
+/// from Epoch 4.1 and unchecked before.
+#[test]
+fn epoch41_trait_cannot_declare_reserved_method_name() {
+    let trait_def = "(define-trait t ((slice? (int int) (response int int))))";
+
+    // Unchecked before Epoch 4.1.
+    {
+        let mut tl_env_factory = tl_env_factory();
+        let trait_id = QualifiedContractIdentifier::local("t-c5").unwrap();
+        let mut owned_env = tl_env_factory.get_env(StacksEpochId::Epoch34);
+        owned_env
+            .initialize_versioned_contract(trait_id, ClarityVersion::Clarity5, trait_def, None)
+            .unwrap();
+    }
+
+    // From Epoch 4.1, a trait may not declare a currently-reserved method name.
+    {
+        let mut tl_env_factory = tl_env_factory();
+        let trait_id = QualifiedContractIdentifier::local("t-c7").unwrap();
+        let mut owned_env = tl_env_factory.get_env(StacksEpochId::Epoch41);
+        let err = owned_env
+            .initialize_versioned_contract(trait_id, ClarityVersion::Clarity7, trait_def, None)
+            .unwrap_err();
+        assert_eq!(
+            ClarityEvalError::Vm(VmExecutionError::RuntimeCheck(
+                RuntimeCheckErrorKind::NameAlreadyUsed("slice?".to_string())
+            )),
+            err
+        );
+    }
+}
+
+/// Defines that stay illegal: reserved names before Epoch 4.1; private
+/// functions (never trait methods); and names reserved since Clarity 1, for
+/// every define form.
+#[rstest]
+#[case::later_native_at_c5(
+    StacksEpochId::Epoch34,
+    ClarityVersion::Clarity5,
+    "(define-read-only (slice? (a int) (b int)) (+ a b))",
+    "slice?"
+)]
+#[case::later_native_at_c6(
+    StacksEpochId::Epoch40,
+    ClarityVersion::Clarity6,
+    "(define-read-only (slice? (a int) (b int)) (+ a b))",
+    "slice?"
+)]
+#[case::private_at_c7(
+    StacksEpochId::Epoch41,
+    ClarityVersion::Clarity7,
+    "(define-private (slice? (a int) (b int)) (+ a b))",
+    "slice?"
+)]
+#[case::hard_reserved_public_at_c7(
+    StacksEpochId::Epoch41,
+    ClarityVersion::Clarity7,
+    "(define-public (map (x int)) (ok x))",
+    "map"
+)]
+#[case::hard_reserved_read_only_at_c7(
+    StacksEpochId::Epoch41,
+    ClarityVersion::Clarity7,
+    "(define-read-only (map (x int)) x)",
+    "map"
+)]
+#[case::hard_reserved_private_at_c7(
+    StacksEpochId::Epoch41,
+    ClarityVersion::Clarity7,
+    "(define-private (map (x int)) x)",
+    "map"
+)]
+fn reserved_define_rejected(
+    #[case] epoch: StacksEpochId,
+    #[case] version: ClarityVersion,
+    #[case] contract: &str,
+    #[case] name: &str,
+) {
+    let mut tl_env_factory = tl_env_factory();
+    let contract_id = QualifiedContractIdentifier::local("subject").unwrap();
+    let mut owned_env = tl_env_factory.get_env(epoch);
+    let err = owned_env
+        .initialize_versioned_contract(contract_id, version, contract, None)
+        .unwrap_err();
+    assert_eq!(
+        ClarityEvalError::Vm(VmExecutionError::RuntimeCheck(
+            RuntimeCheckErrorKind::NameAlreadyUsed(name.to_string())
+        )),
+        err
+    );
+}
+
+/// A legacy dispatcher dynamically dispatches its trait into a Clarity 7
+/// implementation whose method name is now reserved.
+#[test]
+fn epoch41_implements_legacy_trait_with_reserved_method_name() {
+    let mut tl_env_factory = tl_env_factory();
+    let mut owned_env = make_epoch41_env(
+        &mut tl_env_factory,
+        &[
+            // A Clarity 1 trait with a method named `slice?` (free then), and a
+            // dispatcher over it.
+            (
+                "legacy",
+                ClarityVersion::Clarity1,
+                "(define-trait ops ((slice? (int int) (response int int))))
+                 (define-public (call-slice (impl-c <ops>))
+                     (contract-call? impl-c slice? 4 5))",
+            ),
+            // A Clarity 7 contract can still implement that trait.
+            (
+                "impl-c7",
+                ClarityVersion::Clarity7,
+                "(impl-trait .legacy.ops)
+                 (define-public (slice? (a int) (b int)) (ok (+ a b)))",
+            ),
+        ],
+    );
+    let legacy_id = QualifiedContractIdentifier::local("legacy").unwrap();
+    let impl_id = QualifiedContractIdentifier::local("impl-c7").unwrap();
+    let placeholder_context = make_c7_placeholder();
+    let (mut exec_state, invoke_ctx) =
+        owned_env.get_exec_environment(None, None, &placeholder_context);
+
+    assert_eq!(
+        exec_state
+            .execute_contract(
+                &invoke_ctx,
+                &legacy_id,
+                "call-slice",
+                vec![Value::from(PrincipalData::Contract(impl_id))],
+                false
+            )
+            .unwrap(),
+        Value::okay(Value::Int(9)).unwrap()
+    );
+}
+
+/// A static `contract-call?` from another contract reaches the shadowed
+/// function by its literal name.
+#[test]
+fn epoch41_cross_contract_call_resolves_shadowed_function() {
+    let mut tl_env_factory = tl_env_factory();
+    let mut owned_env = make_epoch41_env(
+        &mut tl_env_factory,
+        &[
+            (
+                "ops-def",
+                ClarityVersion::Clarity1,
+                "(define-trait ops ((slice? (int int) (response int int))))",
+            ),
+            (
+                "contract-a",
+                ClarityVersion::Clarity7,
+                "(impl-trait .ops-def.ops)
+                 (define-public (slice? (a int) (b int)) (ok (+ a b)))",
+            ),
+            (
+                "contract-b",
+                ClarityVersion::Clarity7,
+                "(define-public (call-a) (contract-call? .contract-a slice? 4 5))",
+            ),
+        ],
+    );
+    let id_b = QualifiedContractIdentifier::local("contract-b").unwrap();
+    let placeholder_context = make_c7_placeholder();
+    let (mut exec_state, invoke_ctx) =
+        owned_env.get_exec_environment(None, None, &placeholder_context);
+    assert_eq!(
+        exec_state
+            .execute_contract(&invoke_ctx, &id_b, "call-a", vec![], false)
+            .unwrap(),
+        Value::okay(Value::Int(9)).unwrap()
+    );
+}
+
+/// Runtime `is-eq` and list construction keep the un-gated least supertype
+/// after 4.1: contracts deployed before the transition return the same values,
+/// errors, events and state effects.
+#[rstest]
+#[case::equals("(is-eq hidden {a: u1})", "false")]
+#[case::mixed_list("(list {a: u1} hidden)", "(list {a: u1} {a: u1})")]
+#[case::identical_list("(list hidden hidden)", "(list {a: u1, b: true} {a: u1, b: true})")]
+#[case::append("(append (list {a: u1}) hidden)", "(list {a: u1} {a: u1})")]
+#[case::concat("(concat (list {a: u1}) (list hidden))", "(list {a: u1} {a: u1})")]
+#[case::map("(map map-item (list u0 u1))", "(list {a: u1} {a: u1})")]
+fn test_legacy_tuple_supertype_execution_after_epoch41(
+    #[case] expression: &str,
+    #[case] expected: &str,
+) {
+    use crate::vm::analysis::mem_type_check;
+    use crate::vm::database::MemoryBackingStore;
+    use crate::vm::execute_with_parameters;
+
+    let source = format!(
+        "(define-data-var counter uint u0)
+         (define-private (map-item (x uint))
+           (if (is-eq x u0) {{a: u1}} {{a: u1, b: true}}))
+         (define-public (probe)
+           (let ((hidden (if false
+                            (begin (var-set counter (+ (var-get counter) u1)) {{a: u1}})
+                            {{a: u1, b: true}})))
+             (ok (print {expression}))))
+         (define-public (bad-equality)
+           (let ((hidden (if false {{a: u1}} {{a: u1, b: true}})))
+             (begin (var-set counter u1) (ok (is-eq {{a: u1}} hidden)))))
+         (define-read-only (count) (ok (var-get counter)))"
+    );
+    let version = ClarityVersion::Clarity2;
+    mem_type_check(&source, version, StacksEpochId::Epoch40).unwrap();
+    let id = QualifiedContractIdentifier::local("legacy-tuples").unwrap();
+    let mut store = MemoryBackingStore::new();
+    OwnedEnvironment::new_free(
+        false,
+        0x80000000,
+        store.as_clarity_db(),
+        StacksEpochId::Epoch40,
+    )
+    .initialize_versioned_contract(id.clone(), version, &source, None)
+    .unwrap();
+    let expected = execute_with_parameters(expected, version, StacksEpochId::Epoch40, false)
+        .unwrap()
+        .unwrap();
+    let mut previous = None;
+    for epoch in [StacksEpochId::Epoch40, StacksEpochId::Epoch41] {
+        let mut env = OwnedEnvironment::new_free(false, 0x80000000, store.as_clarity_db(), epoch);
+        let (result, _, events) = env
+            .execute_transaction(id.issuer.clone().into(), None, id.clone(), "probe", vec![])
+            .unwrap();
+        assert_eq!(result, Value::okay(expected.clone()).unwrap());
+        assert_eq!(events.len(), 1);
+        let error = env
+            .execute_transaction(
+                id.issuer.clone().into(),
+                None,
+                id.clone(),
+                "bad-equality",
+                vec![],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::TypeError(..))
+            ),
+            "{error:?}"
+        );
+        let (counter, _, _) = env
+            .execute_transaction(id.issuer.clone().into(), None, id.clone(), "count", vec![])
+            .unwrap();
+        // The unselected branch never ran, and the failing call's write rolled back.
+        assert_eq!(counter, Value::okay(Value::UInt(0)).unwrap());
+        let observed = (result, events, error, counter);
+        if let Some(previous) = previous.as_ref() {
+            assert_eq!(previous, &observed);
+        }
+        previous = Some(observed);
+    }
 }

@@ -24,8 +24,8 @@ use clarity::vm::errors::ClarityEvalError;
 use clarity::vm::errors::VmExecutionError::{self, RuntimeCheck};
 use clarity::vm::representations::{CONTRACT_NAME_REGEX_STRING, STANDARD_PRINCIPAL_REGEX_STRING};
 use clarity::vm::resource_limiter::{ResourceBudget, ResourceLimiter};
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
-use clarity::vm::{ClarityName, ContractName, SymbolicExpression, Value};
+use clarity::vm::types::{BoundedErrorString, PrincipalData, QualifiedContractIdentifier};
+use clarity::vm::{ClarityName, ContractName, Value};
 use regex::{Captures, Regex};
 use stacks_common::types::chainstate::StacksAddress;
 use stacks_common::types::net::PeerHost;
@@ -53,7 +53,7 @@ pub struct CallReadOnlyResponse {
     pub result: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cause: Option<String>,
+    pub cause: Option<BoundedErrorString>,
 }
 
 #[derive(Clone)]
@@ -98,7 +98,7 @@ impl RPCCallReadOnlyRequestHandler {
     /// Starts tracking at call time: build it before any execution-side
     /// allocation, e.g. converting the arguments.
     pub fn execution_resource_limiter(&self) -> ResourceLimiter {
-        ResourceBudget::new()
+        ResourceBudget::unlimited()
             .with_max_duration(Some(self.read_only_max_execution_time))
             .with_max_memory_use(remaining_execution_mem_budget(
                 self.read_only_call_max_mem_bytes,
@@ -185,7 +185,7 @@ impl RPCRequestHandler for RPCCallReadOnlyRequestHandler {
         let tip = match node.load_stacks_chain_tip(&preamble, &contents) {
             Ok(tip) => tip,
             Err(error_resp) => {
-                return error_resp.try_into_contents().map_err(NetError::from);
+                return error_resp.try_into_contents();
             }
         };
 
@@ -207,17 +207,11 @@ impl RPCRequestHandler for RPCCallReadOnlyRequestHandler {
             .take()
             .ok_or(NetError::SendError("Missing `arguments`".into()))?;
 
-        // Started before the argument conversion so it counts against execution.
         let resource_limiter = self.execution_resource_limiter();
 
         // run the read-only call
         let data_resp =
             node.with_node_state(|_network, sortdb, chainstate, _mempool, _rpc_args| {
-                let args: Vec<_> = arguments
-                    .into_iter()
-                    .map(SymbolicExpression::atom_value)
-                    .collect();
-
                 let mainnet = chainstate.mainnet;
                 let chain_id = chainstate.chain_id;
                 let mut cost_limit = self.read_only_call_limit.clone();
@@ -259,7 +253,7 @@ impl RPCRequestHandler for RPCCallReadOnlyRequestHandler {
                                         invoke_ctx,
                                         &contract_identifier,
                                         function.as_str(),
-                                        &args,
+                                        arguments,
                                         false,
                                     )
                                     .map_err(ClarityEvalError::from)
@@ -289,7 +283,7 @@ impl RPCRequestHandler for RPCCallReadOnlyRequestHandler {
                 ))) if actual_cost.write_count > 0 => CallReadOnlyResponse {
                     okay: false,
                     result: None,
-                    cause: Some("NotReadOnly".to_string()),
+                    cause: Some("NotReadOnly".into()),
                 },
                 ClarityEvalError::Vm(RuntimeCheck(
                     RuntimeCheckErrorKind::ExecutionResourceBudgetExceeded(_),
@@ -299,12 +293,11 @@ impl RPCRequestHandler for RPCCallReadOnlyRequestHandler {
                         &HttpBadRequest::new("Execution budget exceeded".to_string()),
                     )
                     .try_into_contents()
-                    .map_err(NetError::from)
                 }
                 _ => CallReadOnlyResponse {
                     okay: false,
                     result: None,
-                    cause: Some(e.to_string()),
+                    cause: Some(BoundedErrorString::from_display(&e)),
                 },
             },
             Ok(None) | Err(_) => {
@@ -312,8 +305,7 @@ impl RPCRequestHandler for RPCCallReadOnlyRequestHandler {
                     &preamble,
                     &HttpNotFound::new("Chain tip not found".to_string()),
                 )
-                .try_into_contents()
-                .map_err(NetError::from);
+                .try_into_contents();
             }
         };
 
@@ -331,7 +323,7 @@ impl HttpResponse for RPCCallReadOnlyRequestHandler {
         body: &[u8],
     ) -> Result<HttpResponsePayload, Error> {
         let map_entry: CallReadOnlyResponse = parse_json(preamble, body)?;
-        Ok(HttpResponsePayload::try_from_json(map_entry)?)
+        HttpResponsePayload::try_from_json(map_entry)
     }
 }
 

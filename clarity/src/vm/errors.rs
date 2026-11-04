@@ -22,6 +22,7 @@ use clarity_types::representations::SymbolicExpression;
 use clarity_types::types::FunctionIdentifier;
 #[cfg(feature = "rusqlite")]
 use rusqlite::Error as SqliteError;
+use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::BlockHeaderHash;
 
 pub use crate::vm::analysis::errors::{
@@ -248,12 +249,12 @@ impl From<ClarityTypeError> for VmExecutionError {
 
 impl VmExecutionError {
     /// Returns `true` if this error, were it to propagate out of transaction processing, makes the
-    /// transaction non-includable (a block that contains it is invalid), as opposed to producing an
-    /// includable failure receipt.
-    pub fn rejectable(&self) -> bool {
+    /// transaction non-includable in the given epoch (a block that contains it is invalid), as
+    /// opposed to producing an includable failure receipt.
+    pub fn rejectable_in_epoch(&self, epoch: StacksEpochId) -> bool {
         match self {
             VmExecutionError::RuntimeCheck(check) => {
-                check.rejectable()
+                check.rejectable_in_epoch(epoch)
                     || matches!(
                         check,
                         RuntimeCheckErrorKind::CostOverflow
@@ -414,10 +415,7 @@ mod test {
     #[cfg(feature = "developer-mode")]
     fn error_formats() {
         let t = "(/ 10 0)";
-        let expected = "DivisionByZero
- Stack Trace:
-_native_:native_div
-";
+        let expected = "DivisionByZero\n Stack Trace: \n_native_:native_div\n";
 
         assert_eq!(format!("{}", crate::vm::execute(t).unwrap_err()), expected);
     }

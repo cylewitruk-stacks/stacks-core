@@ -33,6 +33,9 @@ specific 32-byte index block hash may also be supplied. Proofs are opt-in with `
 Confirmed transaction lookup requires the node's `txindex` setting; nodes without it return a
 typed `501 transaction_index_disabled` response.
 
+Read-only contract calls enforce the configured execution time and memory budgets. Exceeding
+either returns `400 contract_call_budget_exceeded`.
+
 Mempool collection reads are cursor-paginated and return newest transactions first. Post-Nakamoto
 nodes do not expose legacy unconfirmed-microblock state through this API.
 

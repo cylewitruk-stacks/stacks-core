@@ -19,8 +19,8 @@ use std::thread;
 #[cfg(test)]
 use clarity::consts::CHAIN_ID_TESTNET;
 use clarity::vm::analysis::AnalysisDatabase;
-use clarity::vm::clarity::TransactionConnection;
 pub use clarity::vm::clarity::{ClarityConnection, ClarityError};
+use clarity::vm::clarity::{TransactionConfig, TransactionConnection, TransactionOutput};
 use clarity::vm::contexts::{AssetMap, OwnedEnvironment};
 use clarity::vm::costs::{CostTracker, ExecutionCost, LimitedCostTracker};
 use clarity::vm::database::{
@@ -29,12 +29,13 @@ use clarity::vm::database::{
 };
 use clarity::vm::errors::VmExecutionError;
 use clarity::vm::events::{STXEventType, STXMintEventData};
-use clarity::vm::representations::SymbolicExpression;
+use clarity::vm::hooks::EvalHook;
 use clarity::vm::resource_limiter::ResourceBudget;
-use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, Value};
+use clarity::vm::types::{BoundedErrorString, PrincipalData, QualifiedContractIdentifier, Value};
 use clarity::vm::{ClarityVersion, ContractName};
 use stacks_common::consts::SIGNER_SLOTS_PER_USER;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
+use stacks_marf::marf::MARF;
 
 use crate::burnchains::PoxConstants;
 use crate::chainstate::nakamoto::signer_set::NakamotoSigners;
@@ -47,10 +48,9 @@ use crate::chainstate::stacks::boot::{
     SIGNERS_BODY, SIGNERS_DB_0_BODY, SIGNERS_DB_1_BODY, SIGNERS_NAME, SIGNERS_VOTING_BODY,
     SIGNERS_VOTING_NAME, SIP_031_NAME,
 };
+use crate::chainstate::stacks::db::transactions::{self, TransactionProcessor};
 use crate::chainstate::stacks::db::{StacksAccount, StacksChainState};
 use crate::chainstate::stacks::events::{StacksTransactionEvent, StacksTransactionReceipt};
-use crate::chainstate::stacks::index::marf::MARF;
-use crate::chainstate::stacks::miner::TransactionResourceBudgets;
 use crate::chainstate::stacks::{
     Error as ChainstateError, StacksMicroblockHeader, StacksTransaction, TransactionPayload,
     TransactionSmartContract, TransactionVersion,
@@ -62,6 +62,17 @@ use crate::core::{StacksEpoch, StacksEpochId, FIRST_STACKS_BLOCK_ID, GENESIS_EPO
 use crate::util_lib::boot::{boot_code_acc, boot_code_addr, boot_code_id, boot_code_tx_auth};
 use crate::util_lib::db::Error as DatabaseError;
 use crate::util_lib::strings::StacksString;
+
+fn process_boot_transaction_payload(
+    clarity_tx: &mut ClarityTransactionConnection,
+    tx: &StacksTransaction,
+    origin_account: &StacksAccount,
+) -> Result<StacksTransactionReceipt, ChainstateError> {
+    TransactionProcessor::from(tx)
+        .using_clarity_transaction(clarity_tx, origin_account)
+        .with_unlimited_resource_policy()
+        .process_payload()
+}
 
 pub const SIP_031_INITIAL_MINT: u128 = 200_000_000_000_000;
 
@@ -139,6 +150,8 @@ pub struct ClarityTransactionConnection<'a, 'b> {
     /// Per-tx cache container which is attached to [`ClarityDatabase`] instances handed out by this
     /// connection.
     cache: ClarityExecutionCache,
+    /// Optional evaluation hook scoped to this transaction.
+    eval_hook: Option<&'b mut dyn EvalHook>,
 }
 
 /// Unified API common to all MARF stores
@@ -188,11 +201,10 @@ pub trait WritableMarfStore:
 ///
 /// The Stacks node commits tries for one of three purposes:
 /// * It processed a block, and needs to persist its trie in the chainstate proper.
-/// * It mined a block, and needs to persist its trie outside of the chainstate proper. The miner
-/// may build on it later.
+/// * It constructed or validated a proposal and needs to discard its speculative trie.
 /// * It processed an unconfirmed microblock (Stacks 2.x only), and needs to persist the
-/// unconfirmed chainstate outside of the chainstate proper so that the microblock miner can
-/// continue to build on it and the network can service RPC requests on its state.
+///   unconfirmed chainstate outside of the chainstate proper so that the microblock miner can
+///   continue to build on it and the network can service RPC requests on its state.
 ///
 /// These needs are each captured in distinct methods for committing this transaction.
 pub trait ClarityMarfStoreTransaction {
@@ -236,14 +248,9 @@ pub trait ClarityMarfStoreTransaction {
     /// Returns Err(..) if there was an error in trying to persist this block trie.
     fn commit_to_processed_block(self, target: &StacksBlockId) -> Result<(), VmExecutionError>;
 
-    /// Store a mined block's trie that this transaction was creating.
-    /// This function is distinct from `commit_to_processed_block()` in that the stored block will
-    /// not be added to the chainstate. However, it must be persisted so that the node can later
-    /// build on it.
-    ///
-    /// Returns Ok(()) if the block trie was successfully persisted.
-    /// Returns Err(..) if there was an error trying to persist this MARF trie.
-    fn commit_to_mined_block(self, target: &StacksBlockId) -> Result<(), VmExecutionError>;
+    /// Finish a proposal by discarding its speculative trie and metadata.
+    /// Commits side-store values without publishing accepted chainstate.
+    fn finish_block_proposal(self) -> Result<(), VmExecutionError>;
 
     /// Persist the unconfirmed state trie so that other parts of the Stacks node can read from it
     /// (such as to handle pending transactions or process RPC requests on it).
@@ -277,7 +284,13 @@ impl<'a, 'b> ClarityTransactionConnection<'a, 'b> {
             chain_id,
             epoch,
             cache: ClarityExecutionCache::default(),
+            eval_hook: None,
         }
+    }
+
+    /// Attaches a Clarity evaluation hook to this transaction connection.
+    pub fn set_eval_hook(&mut self, eval_hook: &'b mut dyn EvalHook) {
+        self.eval_hook = Some(eval_hook);
     }
 }
 
@@ -292,8 +305,8 @@ impl From<ChainstateError> for ClarityError {
     fn from(e: ChainstateError) -> Self {
         match e {
             ChainstateError::InvalidStacksTransaction(msg, _) => ClarityError::BadTransaction(msg),
-            ChainstateError::CostOverflowError(_, after, budget) => {
-                ClarityError::CostError(after, budget)
+            ChainstateError::CostOverflowError(context) => {
+                ClarityError::CostError(context.after, context.budget)
             }
             ChainstateError::ClarityError(x) => x,
             x => ClarityError::BadTransaction(x.to_string()),
@@ -451,10 +464,7 @@ impl ClarityBlockConnection<'_, '_> {
 
     /// Returns the block limit for the block being created.
     pub fn block_limit(&self) -> Option<ExecutionCost> {
-        match self.cost_track {
-            Some(ref track) => Some(track.get_limit()),
-            None => None,
-        }
+        self.cost_track.as_ref().map(|track| track.get_limit())
     }
 
     /// Load the epoch ID from the clarity DB.
@@ -606,7 +616,7 @@ impl ClarityInstance {
                 .analyze_smart_contract(
                     &boot_code_id("cost-voting", use_mainnet),
                     ClarityVersion::Clarity1,
-                    &*BOOT_CODE_COST_VOTING,
+                    &BOOT_CODE_COST_VOTING,
                     &ResourceBudget::unlimited(),
                 )
                 .unwrap();
@@ -615,7 +625,7 @@ impl ClarityInstance {
                     &boot_code_id("cost-voting", use_mainnet),
                     ClarityVersion::Clarity1,
                     &ast,
-                    &*BOOT_CODE_COST_VOTING,
+                    &BOOT_CODE_COST_VOTING,
                     None,
                     |_, _| None,
                     &ResourceBudget::unlimited(),
@@ -632,7 +642,7 @@ impl ClarityInstance {
                 .analyze_smart_contract(
                     &boot_code_id("pox", use_mainnet),
                     ClarityVersion::Clarity1,
-                    &*BOOT_CODE_POX_TESTNET,
+                    &BOOT_CODE_POX_TESTNET,
                     &ResourceBudget::unlimited(),
                 )
                 .unwrap();
@@ -641,7 +651,7 @@ impl ClarityInstance {
                     &boot_code_id("pox", use_mainnet),
                     ClarityVersion::Clarity1,
                     &ast,
-                    &*BOOT_CODE_POX_TESTNET,
+                    &BOOT_CODE_POX_TESTNET,
                     None,
                     |_, _| None,
                     &ResourceBudget::unlimited(),
@@ -728,7 +738,7 @@ impl ClarityInstance {
                 .analyze_smart_contract(
                     &boot_code_id("pox-2", use_mainnet),
                     ClarityVersion::Clarity2,
-                    &*POX_2_TESTNET_CODE,
+                    &POX_2_TESTNET_CODE,
                     &ResourceBudget::unlimited(),
                 )
                 .unwrap();
@@ -737,7 +747,7 @@ impl ClarityInstance {
                     &boot_code_id("pox-2", use_mainnet),
                     ClarityVersion::Clarity2,
                     &ast,
-                    &*POX_2_TESTNET_CODE,
+                    &POX_2_TESTNET_CODE,
                     None,
                     |_, _| None,
                     &ResourceBudget::unlimited(),
@@ -1068,19 +1078,10 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
         self.cost_track.unwrap()
     }
 
-    /// Commits all changes in the current block by
-    /// (1) committing the current MARF tip to storage,
-    /// (2) committing side-storage.
-    ///    before this saves, it updates the metadata headers in
-    ///    the sidestore so that they don't get stepped on after
-    ///    a miner re-executes a constructed block.
-    pub fn commit_mined_block(
-        self,
-        bhh: &StacksBlockId,
-    ) -> Result<LimitedCostTracker, ClarityError> {
-        debug!("Commit mined Clarity datastore to {}", bhh);
-        self.datastore.commit_to_mined_block(bhh)?;
-
+    /// Complete speculative block processing by discarding its trie and metadata.
+    /// Side-store values commit, but the block does not become readable accepted chainstate.
+    pub fn finish_block_proposal(self) -> Result<LimitedCostTracker, ClarityError> {
+        self.datastore.finish_block_proposal()?;
         Ok(self.cost_track.unwrap())
     }
 
@@ -1142,42 +1143,6 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
         ))
     }
 
-    /// Instantiates a boot contract by:
-    ///
-    /// 1. Preparing a [`StacksTransaction`] with the appropriate version, payload and auth,
-    /// 2. Executing it using the boot account within a cost-free transaction, and
-    /// 3. Asserting the receipt for success.
-    ///
-    /// Panics if any of the above steps fail.
-    fn instantiate_boot_contract(
-        &mut self,
-        contract_name: &str,
-        code_body: &str,
-        clarity_version: Option<ClarityVersion>,
-    ) -> Result<StacksTransactionReceipt, ClarityError> {
-        let contract_id = boot_code_id(contract_name, self.mainnet);
-
-        let (boot_code_account, contract_tx) =
-            self.make_boot_code_smart_contract_tx(contract_name, code_body, clarity_version)?;
-
-        let receipt = self.as_free_transaction(|tx_conn| {
-            info!("Instantiate {} contract", &contract_id);
-            StacksChainState::process_transaction_payload(
-                tx_conn,
-                &contract_tx,
-                &boot_code_account,
-                &TransactionResourceBudgets::unlimited(),
-            )
-            .expect("FATAL: Failed to process boot contract initialization")
-        });
-
-        if receipt.result != Value::okay_true() || receipt.post_condition_aborted {
-            panic!("FATAL: Failure processing {contract_id} contract initialization: {receipt:#?}");
-        }
-
-        Ok(receipt)
-    }
-
     pub fn initialize_epoch_2_05(&mut self) -> Result<StacksTransactionReceipt, ClarityError> {
         // use the `using!` statement to ensure that the old cost_tracker is placed
         //  back in all branches after initialization
@@ -1236,13 +1201,8 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 // initialize with a synthetic transaction
                 debug!("Instantiate .costs-2 contract");
-                StacksChainState::process_transaction_payload(
-                    tx_conn,
-                    &costs_2_contract_tx,
-                    &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .expect("FATAL: Failed to process PoX 2 contract initialization")
+                process_boot_transaction_payload(tx_conn, &costs_2_contract_tx, &boot_code_account)
+                    .expect("FATAL: Failed to process PoX 2 contract initialization")
             });
 
             if initialization_receipt.result != Value::okay_true()
@@ -1346,11 +1306,10 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 // initialize with a synthetic transaction
                 debug!("Instantiate {} contract", &pox_2_contract_id);
-                let receipt = StacksChainState::process_transaction_payload(
+                let receipt = process_boot_transaction_payload(
                     tx_conn,
                     &pox_2_contract_tx,
                     &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
                 )
                 .expect("FATAL: Failed to process PoX 2 contract initialization");
 
@@ -1366,11 +1325,11 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 let (_, _, _burnchain_params_events) = tx_conn
                     .run_contract_call(
-                        &consts_setter,
+                        consts_setter,
                         None,
-                        &pox_2_contract_id,
+                        pox_2_contract_id,
                         "set-burnchain-parameters",
-                        &params,
+                        params,
                         |_, _| None,
                         &ResourceBudget::unlimited(),
                     )
@@ -1417,15 +1376,9 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 // initialize with a synthetic transaction
                 debug!("Instantiate .costs-3 contract");
-                let receipt = StacksChainState::process_transaction_payload(
-                    tx_conn,
-                    &costs_3_contract_tx,
-                    &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .expect("FATAL: Failed to process costs-3 contract initialization");
 
-                receipt
+                process_boot_transaction_payload(tx_conn, &costs_3_contract_tx, &boot_code_account)
+                    .expect("FATAL: Failed to process costs-3 contract initialization")
             });
 
             if costs_3_initialization_receipt.result != Value::okay_true()
@@ -1585,11 +1538,10 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
             let pox_3_initialization_receipt = self.as_transaction(|tx_conn| {
                 // initialize with a synthetic transaction
                 debug!("Instantiate {} contract", &pox_3_contract_id);
-                let receipt = StacksChainState::process_transaction_payload(
+                let receipt = process_boot_transaction_payload(
                     tx_conn,
                     &pox_3_contract_tx,
                     &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
                 )
                 .expect("FATAL: Failed to process PoX 3 contract initialization");
 
@@ -1605,11 +1557,11 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 let (_, _, _burnchain_params_events) = tx_conn
                     .run_contract_call(
-                        &consts_setter,
+                        consts_setter,
                         None,
-                        &pox_3_contract_id,
+                        pox_3_contract_id,
                         "set-burnchain-parameters",
-                        &params,
+                        params,
                         |_, _| None,
                         &ResourceBudget::unlimited(),
                     )
@@ -1703,11 +1655,10 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
             let pox_4_initialization_receipt = self.as_transaction(|tx_conn| {
                 // initialize with a synthetic transaction
                 debug!("Instantiate {} contract", &pox_4_contract_id);
-                let receipt = StacksChainState::process_transaction_payload(
+                let receipt = process_boot_transaction_payload(
                     tx_conn,
                     &pox_4_contract_tx,
                     &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
                 )
                 .expect("FATAL: Failed to process PoX 4 contract initialization");
 
@@ -1722,11 +1673,11 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 let (_, _, _burnchain_params_events) = tx_conn
                     .run_contract_call(
-                        &consts_setter,
+                        consts_setter,
                         None,
-                        &pox_4_contract_id,
+                        pox_4_contract_id,
                         "set-burnchain-parameters",
-                        &params,
+                        params,
                         |_, _| None,
                         &ResourceBudget::unlimited(),
                     )
@@ -1762,14 +1713,9 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
             let signers_initialization_receipt = self.as_transaction(|tx_conn| {
                 // initialize with a synthetic transaction
                 debug!("Instantiate {} contract", &signers_contract_id);
-                let receipt = StacksChainState::process_transaction_payload(
-                    tx_conn,
-                    &signers_contract_tx,
-                    &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .expect("FATAL: Failed to process .signers contract initialization");
-                receipt
+
+                process_boot_transaction_payload(tx_conn, &signers_contract_tx, &boot_code_account)
+                    .expect("FATAL: Failed to process .signers contract initialization")
             });
 
             if signers_initialization_receipt.result != Value::okay_true()
@@ -1808,14 +1754,13 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
                     let signers_db_receipt = self.as_transaction(|tx_conn| {
                         // initialize with a synthetic transaction
                         debug!("Instantiate .{} contract", &signers_name);
-                        let receipt = StacksChainState::process_transaction_payload(
+
+                        process_boot_transaction_payload(
                             tx_conn,
                             &signers_contract_tx,
                             &boot_code_account,
-                            &TransactionResourceBudgets::unlimited(),
                         )
-                        .expect("FATAL: Failed to process .signers DB contract initialization");
-                        receipt
+                        .expect("FATAL: Failed to process .signers DB contract initialization")
                     });
 
                     if signers_db_receipt.result != Value::okay_true()
@@ -1847,14 +1792,9 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
             let signers_voting_initialization_receipt = self.as_transaction(|tx_conn| {
                 // initialize with a synthetic transaction
                 debug!("Instantiate {} contract", &signers_voting_contract_id);
-                let receipt = StacksChainState::process_transaction_payload(
-                    tx_conn,
-                    &signers_contract_tx,
-                    &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .expect("FATAL: Failed to process .signers-voting contract initialization");
-                receipt
+
+                process_boot_transaction_payload(tx_conn, &signers_contract_tx, &boot_code_account)
+                    .expect("FATAL: Failed to process .signers-voting contract initialization")
             });
 
             if signers_voting_initialization_receipt.result != Value::okay_true()
@@ -1978,14 +1918,9 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
             let mut sip_031_initialization_receipt = self.as_transaction(|tx_conn| {
                 // initialize with a synthetic transaction
                 info!("Instantiate {} contract", &sip_031_contract_id);
-                let receipt = StacksChainState::process_transaction_payload(
-                    tx_conn,
-                    &sip_031_contract_tx,
-                    &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .expect("FATAL: Failed to process .sip-031 contract initialization");
-                receipt
+
+                process_boot_transaction_payload(tx_conn, &sip_031_contract_tx, &boot_code_account)
+                    .expect("FATAL: Failed to process .sip-031 contract initialization")
             });
 
             if sip_031_initialization_receipt.result != Value::okay_true()
@@ -2092,15 +2027,9 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 // initialize with a synthetic transaction
                 info!("Instantiate .costs-4 contract");
-                let receipt = StacksChainState::process_transaction_payload(
-                    tx_conn,
-                    &costs_4_contract_tx,
-                    &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .expect("FATAL: Failed to process costs-4 contract initialization");
 
-                receipt
+                process_boot_transaction_payload(tx_conn, &costs_4_contract_tx, &boot_code_account)
+                    .expect("FATAL: Failed to process costs-4 contract initialization")
             });
 
             if costs_4_initialization_receipt.result != Value::okay_true()
@@ -2190,11 +2119,10 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
             let pox_5_initialization_receipt = self.as_transaction(|tx_conn| {
                 debug!("Instantiate {} contract", &pox_5_contract_id);
-                let receipt = StacksChainState::process_transaction_payload(
+                let receipt = process_boot_transaction_payload(
                     tx_conn,
                     &pox_5_contract_tx,
                     &boot_code_account,
-                    &TransactionResourceBudgets::unlimited(),
                 )
                 .expect("FATAL: Failed to process .pox-5 contract initialization");
 
@@ -2209,11 +2137,11 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
                 let (_, _, _burnchain_params_events) = tx_conn
                     .run_contract_call(
-                        &consts_setter,
+                        consts_setter,
                         None,
-                        &pox_5_contract_id,
+                        pox_5_contract_id,
                         "set-burnchain-parameters",
-                        &params,
+                        params,
                         |_, _| None,
                         &ResourceBudget::unlimited(),
                     )
@@ -2391,9 +2319,9 @@ impl TransactionConnection for ClarityTransactionConnection<'_, '_> {
         &'hooks mut self,
         to_do: F,
         abort_call_back: A,
-    ) -> Result<(R, AssetMap, Vec<StacksTransactionEvent>, Option<String>), E>
+    ) -> Result<TransactionOutput<R>, E>
     where
-        A: FnOnce(&AssetMap, &mut ClarityDatabase) -> Option<String>,
+        A: FnOnce(&AssetMap, &mut ClarityDatabase) -> Option<BoundedErrorString>,
         F: FnOnce(
             &mut OwnedEnvironment<'_, 'hooks>,
         ) -> Result<(R, AssetMap, Vec<StacksTransactionEvent>), E>,
@@ -2402,51 +2330,32 @@ impl TransactionConnection for ClarityTransactionConnection<'_, '_> {
         using!(self.log, "log", |log| {
             using!(self.cost_track, "cost tracker", |cost_track| {
                 let rollback_wrapper = RollbackWrapper::from_persisted_log(self.store, log);
-                let mut db = ClarityDatabase::new_with_rollback_wrapper(
+                let db = ClarityDatabase::new_with_rollback_wrapper(
                     rollback_wrapper,
                     self.header_db,
                     self.burn_state_db,
                 )
                 .with_cache(&mut self.cache);
+                let eval_hook = self.eval_hook.as_deref_mut();
 
-                // wrap the whole contract-call in a claritydb transaction,
-                //   so we can abort on call_back's boolean retun
-                db.begin();
-                let mut vm_env = OwnedEnvironment::new_cost_limited(
-                    self.mainnet,
-                    self.chain_id,
+                // The returned cost tracker keeps its memory usage: it is reset only when the
+                // surrounding transaction commits.
+                let (db, cost_track, result) = clarity::vm::clarity::execute_with_abort_callback(
                     db,
                     cost_track,
-                    self.epoch,
+                    TransactionConfig {
+                        mainnet: self.mainnet,
+                        chain_id: self.chain_id,
+                        epoch: self.epoch,
+                    },
+                    |vm_env| {
+                        if let Some(eval_hook) = eval_hook {
+                            vm_env.add_eval_hook(eval_hook);
+                        }
+                        to_do(vm_env)
+                    },
+                    abort_call_back,
                 );
-
-                let result = to_do(&mut vm_env);
-                let (mut db, cost_track) = vm_env
-                    .destruct()
-                    .expect("Failed to recover database reference after executing transaction");
-                // DO NOT reset memory usage yet -- that should happen only when the TX commits.
-
-                let result = match result {
-                    Ok((value, asset_map, events)) => {
-                        let aborted = abort_call_back(&asset_map, &mut db);
-                        let db_result = if aborted.is_some() {
-                            db.roll_back()
-                        } else {
-                            db.commit()
-                        };
-                        match db_result {
-                            Ok(_) => Ok((value, asset_map, events, aborted)),
-                            Err(e) => Err(e.into()),
-                        }
-                    }
-                    Err(e) => {
-                        let db_result = db.roll_back();
-                        match db_result {
-                            Ok(_) => Err(e),
-                            Err(db_err) => Err(db_err.into()),
-                        }
-                    }
-                };
 
                 (cost_track, (db.destroy().into(), result))
             })
@@ -2520,7 +2429,7 @@ impl ClarityTransactionConnection<'_, '_> {
                 vm_env
                     .execute_in_env(sender.clone(), None, None, |exec_state, invoke_ctx| {
                         exec_state.run_as_transaction(invoke_ctx, |exec_state, invoke_ctx| {
-                            StacksChainState::handle_poison_microblock(
+                            transactions::processing::poison_microblock::handle(
                                 exec_state,
                                 invoke_ctx,
                                 mblock_header_1,
@@ -2536,7 +2445,7 @@ impl ClarityTransactionConnection<'_, '_> {
     }
 
     pub fn is_mainnet(&self) -> bool {
-        return self.mainnet;
+        self.mainnet
     }
 
     /// Commit the changes from the edit log.
@@ -2576,7 +2485,7 @@ impl ClarityTransactionConnection<'_, '_> {
         &mut self,
         contract: &QualifiedContractIdentifier,
         method: &str,
-        args: &[SymbolicExpression],
+        args: Vec<Value>,
     ) -> Result<Value, ClarityError> {
         let (result, _, _, _) = self.with_abort_callback(
             |vm_env| {
@@ -2590,7 +2499,7 @@ impl ClarityTransactionConnection<'_, '_> {
                     )
                     .map_err(ClarityError::from)
             },
-            |_, _| Some("read-only".to_string()),
+            |_, _| Some("read-only".into()),
         )?;
         Ok(result)
     }
@@ -2631,16 +2540,17 @@ mod tests {
     use clarity::types::chainstate::{BurnchainHeaderHash, SortitionId, StacksAddress};
     use clarity::vm::analysis::errors::RuntimeCheckErrorKind;
     use clarity::vm::database::{ClarityBackingStore, STXBalance, SqliteConnection};
+    use clarity::vm::hooks::trace::CallTraceHook;
     use clarity::vm::test_util::{TEST_BURN_STATE_DB, TEST_HEADER_DB};
     use clarity::vm::types::{StandardPrincipalData, TupleData, Value};
     use clarity::vm::ClarityName;
     use stacks_common::consts::CHAIN_ID_TESTNET;
     use stacks_common::types::chainstate::ConsensusHash;
     use stacks_common::types::sqlite::NO_PARAMS;
+    use stacks_marf::marf::{MARFOpenOpts, MarfConnection as _};
+    use stacks_marf::ClarityMarfTrieId;
 
     use super::*;
-    use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MarfConnection as _};
-    use crate::chainstate::stacks::index::ClarityMarfTrieId;
     use crate::clarity_vm::database::marf::MarfedKV;
     use crate::core::PEER_VERSION_EPOCH_2_0;
 
@@ -2971,11 +2881,11 @@ mod tests {
 
             assert_eq!(
                 conn.as_transaction(|tx| tx.run_contract_call(
-                    &StandardPrincipalData::transient().into(),
+                    StandardPrincipalData::transient().into(),
                     None,
-                    &contract_identifier,
+                    contract_identifier.clone(),
                     "foo",
-                    &[Value::Int(1)],
+                    vec![Value::Int(1)],
                     |_, _| None,
                     &ResourceBudget::unlimited()
                 ))
@@ -3208,7 +3118,7 @@ mod tests {
         let marf = MarfedKV::temporary();
         let mut clarity_instance = ClarityInstance::new(false, CHAIN_ID_TESTNET, marf);
         let contract_identifier = QualifiedContractIdentifier::local("foo").unwrap();
-        let sender = StandardPrincipalData::transient().into();
+        let sender: PrincipalData = StandardPrincipalData::transient().into();
 
         clarity_instance
             .begin_test_genesis_block(
@@ -3258,11 +3168,11 @@ mod tests {
 
             assert_eq!(
                 conn.as_transaction(|tx| tx.run_contract_call(
-                    &sender,
+                    sender.clone(),
                     None,
-                    &contract_identifier,
+                    contract_identifier.clone(),
                     "get-bar",
-                    &[],
+                    vec![],
                     |_, _| None,
                     &ResourceBudget::unlimited()
                 ))
@@ -3273,11 +3183,11 @@ mod tests {
 
             assert_eq!(
                 conn.as_transaction(|tx| tx.run_contract_call(
-                    &sender,
+                    sender.clone(),
                     None,
-                    &contract_identifier,
+                    contract_identifier.clone(),
                     "set-bar",
-                    &[Value::Int(1), Value::Int(1)],
+                    vec![Value::Int(1), Value::Int(1)],
                     |_, _| None,
                     &ResourceBudget::unlimited()
                 ))
@@ -3289,12 +3199,12 @@ mod tests {
             let e = conn
                 .as_transaction(|tx| {
                     tx.run_contract_call(
-                        &sender,
+                        sender.clone(),
                         None,
-                        &contract_identifier,
+                        contract_identifier.clone(),
                         "set-bar",
-                        &[Value::Int(10), Value::Int(1)],
-                        |_, _| Some("testing rollback".to_string()),
+                        vec![Value::Int(10), Value::Int(1)],
+                        |_, _| Some("testing rollback".into()),
                         &ResourceBudget::unlimited(),
                     )
                 })
@@ -3310,11 +3220,11 @@ mod tests {
             // prior transaction should have rolled back due to abort call back!
             assert_eq!(
                 conn.as_transaction(|tx| tx.run_contract_call(
-                    &sender,
+                    sender.clone(),
                     None,
-                    &contract_identifier,
+                    contract_identifier.clone(),
                     "get-bar",
-                    &[],
+                    vec![],
                     |_, _| None,
                     &ResourceBudget::unlimited()
                 ))
@@ -3326,12 +3236,12 @@ mod tests {
             assert!(format!(
                 "{:?}",
                 conn.as_transaction(|tx| tx.run_contract_call(
-                    &sender,
+                    sender,
                     None,
-                    &contract_identifier,
+                    contract_identifier.clone(),
                     "set-bar",
-                    &[Value::Int(10), Value::Int(0)],
-                    |_, _| Some("testing rollback".to_string()),
+                    vec![Value::Int(10), Value::Int(0)],
+                    |_, _| Some("testing rollback".into()),
                     &ResourceBudget::unlimited()
                 ))
                 .unwrap_err()
@@ -3341,11 +3251,11 @@ mod tests {
             // prior transaction should have rolled back due to runtime error
             assert_eq!(
                 conn.as_transaction(|tx| tx.run_contract_call(
-                    &StandardPrincipalData::transient().into(),
+                    StandardPrincipalData::transient().into(),
                     None,
-                    &contract_identifier,
+                    contract_identifier,
                     "get-bar",
-                    &[],
+                    vec![],
                     |_, _| None,
                     &ResourceBudget::unlimited()
                 ))
@@ -3453,33 +3363,15 @@ mod tests {
             );
 
             conn.as_transaction(|clarity_tx| {
-                let receipt = StacksChainState::process_transaction_payload(
-                    clarity_tx,
-                    &tx1,
-                    &account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .unwrap();
+                let receipt = process_boot_transaction_payload(clarity_tx, &tx1, &account).unwrap();
                 assert!(receipt.post_condition_aborted);
             });
             conn.as_transaction(|clarity_tx| {
-                StacksChainState::process_transaction_payload(
-                    clarity_tx,
-                    &tx2,
-                    &account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .unwrap();
+                process_boot_transaction_payload(clarity_tx, &tx2, &account).unwrap();
             });
 
             conn.as_transaction(|clarity_tx| {
-                let receipt = StacksChainState::process_transaction_payload(
-                    clarity_tx,
-                    &tx3,
-                    &account,
-                    &TransactionResourceBudgets::unlimited(),
-                )
-                .unwrap();
+                let receipt = process_boot_transaction_payload(clarity_tx, &tx3, &account).unwrap();
 
                 assert!(receipt.post_condition_aborted);
             });
@@ -3592,7 +3484,7 @@ mod tests {
                 _height: u32,
                 _sortition_id: &SortitionId,
             ) -> Option<(Vec<TupleData>, u128)> {
-                return None;
+                None
             }
         }
 
@@ -3658,11 +3550,11 @@ mod tests {
             );
             assert!(match conn
                 .as_transaction(|tx| tx.run_contract_call(
-                    &sender,
+                    sender,
                     None,
-                    &contract_identifier,
+                    contract_identifier,
                     "do-expand",
-                    &[],
+                    vec![],
                     |_, _| None,
                     &ResourceBudget::unlimited()
                 ))
@@ -3735,17 +3627,21 @@ mod tests {
                 .unwrap();
         });
 
-        // tx2: first call misses, second call hits.
-        conn.as_transaction(|tx| {
+        // tx2: first call misses, second call hits. The same eval hook must be
+        // reborrowed into both environments created by these calls.
+        let mut call_trace = CallTraceHook::new();
+        {
+            let mut tx = conn.start_transaction_processing();
+            tx.set_eval_hook(&mut call_trace);
             assert_eq!(tx.cache.contracts.hits(), 0);
             assert_eq!(tx.cache.contracts.misses(), 0);
 
             tx.run_contract_call(
-                &sender,
+                sender.clone(),
                 None,
-                &contract_identifier,
+                contract_identifier.clone(),
                 "noop",
-                &[],
+                vec![],
                 |_, _| None,
                 &ResourceBudget::unlimited(),
             )
@@ -3756,11 +3652,11 @@ mod tests {
             assert!(misses_after_first >= 1, "first call should miss");
 
             tx.run_contract_call(
-                &sender,
+                sender.clone(),
                 None,
-                &contract_identifier,
+                contract_identifier.clone(),
                 "noop",
-                &[],
+                vec![],
                 |_, _| None,
                 &ResourceBudget::unlimited(),
             )
@@ -3769,7 +3665,13 @@ mod tests {
                 tx.cache.contracts.hits() > hits_after_first,
                 "second call should hit the cache",
             );
-        });
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            call_trace.calls().len(),
+            2,
+            "both sequential environments should use the attached eval hook",
+        );
 
         // tx3: fresh tx must see counters reset and still work.
         conn.as_transaction(|tx| {
@@ -3781,11 +3683,11 @@ mod tests {
             );
 
             tx.run_contract_call(
-                &sender,
+                sender,
                 None,
-                &contract_identifier,
+                contract_identifier,
                 "noop",
-                &[],
+                vec![],
                 |_, _| None,
                 &ResourceBudget::unlimited(),
             )

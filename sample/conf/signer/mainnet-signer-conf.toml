@@ -39,7 +39,7 @@ node_host = "127.0.0.1:20443"
 endpoint = "0.0.0.0:30000"
 
 # REQUIRED: Network selection.
-# Valid values: "mainnet", "testnet", "mocknet"
+# Valid values: "mainnet", "testnet", "signet"
 network = "mainnet"
 
 # REQUIRED: Authorization password for the node's block proposal endpoint.
@@ -212,18 +212,14 @@ db_path = "/var/lib/stacks-signer/signerdb.sqlite"
 # Default: false
 # dry_run = false
 
-# Enforce transaction replay during stacks block validation following a
-# bitcoin block reorg (experimental). Ensures that a miner includes the
-# expected transactions from reorged stacks blocks that can be replayed.
-# Default: false
-# validate_with_replay_tx = false
-
-# Number of bitcoin blocks after a bitcoin fork to reset the replay set.
-# Acts as a failsafe to ensure that signers do not permanently prevent
-# valid stacks block production based solely on transaction replay.
-# Default: 2
-# Units: bitcoin blocks
-# reset_replay_set_after_fork_blocks = 2
+# Prune the signer database online. Every 10 seconds, a small batch of
+# records older than the last 100 burn blocks of tenures is removed, so
+# the database no longer grows without bound. Freed space is reused but
+# not returned to the OS: an existing large file keeps its size until it
+# is compacted offline.
+#
+# Default: true
+# db_pruning = true
 
 # HTTP timeout for StackerDB read/write operations.
 # Default: 10

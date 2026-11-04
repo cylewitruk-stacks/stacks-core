@@ -202,7 +202,10 @@ define_versioned_named_enum_with_max!(NativeFunctions(ClarityVersion) {
 /// Returns a callable for the given native function if it exists in the provided
 ///   ClarityVersion
 ///
-pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option<CallableType> {
+pub fn lookup_reserved_functions(
+    name: &str,
+    version: &ClarityVersion,
+) -> Option<CallableType<'static>> {
     use crate::vm::callables::BuiltinKind::{Native, Native205, Special};
     use crate::vm::functions::NativeFunctions::*;
     if let Some(native_function) = NativeFunctions::lookup_by_name_at_version(name, version) {
@@ -368,7 +371,7 @@ pub fn lookup_reserved_functions(name: &str, version: &ClarityVersion) -> Option
             TupleGet => Special("special_get-tuple", &tuples::tuple_get),
             TupleMerge => Native205(
                 "native_merge-tuple",
-                NativeHandle::MoreArgEnv(&tuples::tuple_merge),
+                NativeHandle::DoubleArg(&tuples::tuple_merge),
                 ClarityCostFunction::TupleMerge,
                 &cost_input_sized_vararg,
             ),
@@ -637,10 +640,9 @@ fn native_eq(
 fn native_begin(mut args: Vec<Value>) -> Result<Value, VmExecutionError> {
     match args.pop() {
         Some(v) => Ok(v),
-        None => Err(RuntimeCheckErrorKind::Unreachable(
-            "Requires at least args: 1 got 0".to_string(),
-        )
-        .into()),
+        None => {
+            Err(RuntimeCheckErrorKind::Unreachable("Requires at least args: 1 got 0".into()).into())
+        }
     }
 }
 
@@ -655,11 +657,8 @@ fn special_print(
     })?;
     let input = eval(arg, exec_state, invoke_ctx, context)?;
 
-    runtime_cost(
-        ClarityCostFunction::Print,
-        exec_state,
-        input.as_ref().size()?,
-    )?;
+    let input_size = input.as_ref().charged_size(exec_state.epoch())?;
+    runtime_cost(ClarityCostFunction::Print, exec_state, input_size)?;
 
     if cfg!(feature = "developer-mode") {
         debug!("{}", input.as_ref());
@@ -800,9 +799,7 @@ fn special_let(
     // parse and eval the bindings.
     let bindings = args[0]
         .match_list()
-        .ok_or(RuntimeCheckErrorKind::Unreachable(
-            "Bad let syntax".to_string(),
-        ))?;
+        .ok_or(RuntimeCheckErrorKind::Unreachable("Bad let syntax".into()))?;
 
     runtime_cost(ClarityCostFunction::Let, exec_state, bindings.len())?;
 
@@ -821,7 +818,7 @@ fn special_let(
 
             let binding_value = eval(var_sexp, exec_state, invoke_ctx, &inner_context)?;
 
-            let bind_mem_use = binding_value.as_ref().get_memory_use()?;
+            let bind_mem_use = binding_value.as_ref().get_memory_use(exec_state.epoch())?;
             exec_state.add_memory(bind_mem_use)?;
             memory_use += bind_mem_use; // no check needed, b/c it's done in add_memory.
             let binding_value = binding_value.clone_with_cost(exec_state)?;
@@ -890,10 +887,9 @@ fn special_contract_of(
     let contract_ref = match &args[0].expr {
         SymbolicExpressionType::Atom(contract_ref) => contract_ref,
         _ => {
-            return Err(RuntimeCheckErrorKind::Unreachable(
-                "Contract of expects trait".to_string(),
-            )
-            .into());
+            return Err(
+                RuntimeCheckErrorKind::Unreachable("Contract of expects trait".into()).into(),
+            );
         }
     };
 
@@ -913,10 +909,9 @@ fn special_contract_of(
             &trait_data.contract_identifier
         }
         _ => {
-            return Err(RuntimeCheckErrorKind::Unreachable(
-                "Contract of expects trait".to_string(),
-            )
-            .into());
+            return Err(
+                RuntimeCheckErrorKind::Unreachable("Contract of expects trait".into()).into(),
+            );
         }
     };
 
@@ -1009,7 +1004,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Contract of expects trait".to_string()
+                "Contract of expects trait".into()
             ))
         );
     }
@@ -1056,7 +1051,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Contract of expects trait".to_string()
+                "Contract of expects trait".into()
             ))
         );
     }
@@ -1101,7 +1096,7 @@ mod test {
 
         assert_eq!(
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Bad let syntax".to_string()
+                "Bad let syntax".into()
             )),
             err
         );
@@ -1152,7 +1147,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Get tenure info expect property name".to_string()
+                "Get tenure info expect property name".into()
             ))
         );
     }
@@ -1204,7 +1199,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Get block info expect property name".to_string()
+                "Get block info expect property name".into()
             ))
         );
     }
@@ -1254,7 +1249,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "Get stacks block info expect property name".to_string()
+                "Get stacks block info expect property name".into()
             ))
         );
     }
@@ -1306,7 +1301,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "No such stacks block info property: not-a-valid-stacks-prop".to_string()
+                "No such stacks block info property: not-a-valid-stacks-prop".into()
             ))
         );
     }
@@ -1359,7 +1354,7 @@ mod test {
         assert_eq!(
             err,
             VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::Unreachable(
-                "No such burn block info property: not-a-valid-burn-prop".to_string()
+                "No such burn block info property: not-a-valid-burn-prop".into()
             ))
         );
     }

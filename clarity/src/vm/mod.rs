@@ -54,6 +54,7 @@ pub mod clarity;
 use std::collections::BTreeMap;
 
 pub use clarity_types::max_call_stack_depth_for_epoch;
+use stacks_common::bounded_format;
 use stacks_common::types::StacksEpochId;
 
 use self::analysis::ContractAnalysis;
@@ -103,13 +104,14 @@ impl AsRef<Value> for ValueRef<'_> {
     }
 }
 impl<'a> ValueRef<'a> {
-    pub fn clone_with_cost<T: CostTracker>(
+    pub fn clone_with_cost(
         self,
-        tracker: &mut T,
+        exec_state: &mut ExecutionState,
     ) -> Result<Value, VmExecutionError> {
         match self {
             ValueRef::Borrowed(r) => {
-                runtime_cost(ClarityCostFunction::LookupVariableSize, tracker, r.size()?)?;
+                let size = r.charged_size(exec_state.epoch())?;
+                runtime_cost(ClarityCostFunction::LookupVariableSize, exec_state, size)?;
                 Ok(r.clone())
             }
             ValueRef::Owned(o) => Ok(o),
@@ -191,30 +193,55 @@ fn lookup_variable<'a>(
         exec_state,
         context.depth(),
     )?;
-    if let Some(value) = context.lookup_variable(name) {
-        let value = ValueRef::Borrowed(value);
-        if exec_state.epoch().uses_pre_sanitized_variables() {
-            // If the epoch supports value refs, we can return a borrowed reference to the variable without cloning.
-            return Ok(value);
-        } else {
-            // Epochs that don't support borrowed refs must clone and pay the cost every time.
-            return Ok(ValueRef::Owned(value.clone_with_cost(exec_state)?));
+    let lookup_from_local_variable =
+        |exec_state: &mut ExecutionState| -> Result<_, VmExecutionError> {
+            if let Some(value) = context.lookup_variable(name) {
+                let value = ValueRef::Borrowed(value);
+                if exec_state.epoch().uses_pre_sanitized_variables() {
+                    // If the epoch supports value refs, we can return a borrowed reference to the variable without cloning.
+                    return Ok(Some(value));
+                } else {
+                    // Epochs that don't support borrowed refs must clone and pay the cost every time.
+                    return Ok(Some(ValueRef::Owned(value.clone_with_cost(exec_state)?)));
+                }
+            }
+            Ok(None)
+        };
+    let lookup_from_constant = |exec_state: &mut ExecutionState| -> Result<_, VmExecutionError> {
+        if let Some(value) = invoke_ctx.contract_context.lookup_variable(name) {
+            let value = ValueRef::Borrowed(value);
+            if exec_state.epoch().uses_pre_sanitized_variables() {
+                // Variables were sanitized at load time by canonicalize_types.
+                // Borrow directly.
+                return Ok(Some(value));
+            }
+            // Variables were not sanitized at load time, so we need to sanitize them
+            // now before returning and pay for the clone.
+            let value = value.clone_with_cost(exec_state)?;
+            let (value, _) =
+                Value::sanitize_value(exec_state.epoch(), &TypeSignature::type_of(&value)?, value)
+                    .ok_or(RuntimeCheckErrorKind::CouldNotDetermineType)?;
+            return Ok(Some(ValueRef::Owned(value)));
         }
-    }
-    if let Some(value) = invoke_ctx.contract_context.lookup_variable(name) {
-        let value = ValueRef::Borrowed(value);
-        if exec_state.epoch().uses_pre_sanitized_variables() {
-            // Variables were sanitized at load time by canonicalize_types.
-            // Borrow directly.
-            return Ok(value);
+        Ok(None)
+    };
+    // TODO: Once we've reached Epoch 4.1, this conditional can probably be removed.
+    // See doc comment of [`StacksEpochId::clarity_runtime_checks_global_constants_before_local_vars`].
+    if exec_state
+        .epoch()
+        .clarity_runtime_checks_global_constants_before_local_vars()
+    {
+        if let Some(v) = lookup_from_constant(exec_state)? {
+            return Ok(v);
+        } else if let Some(v) = lookup_from_local_variable(exec_state)? {
+            return Ok(v);
         }
-        // Variables were not sanitized at load time, so we need to sanitize them
-        // now before returning and pay for the clone.
-        let value = value.clone_with_cost(exec_state)?;
-        let (value, _) =
-            Value::sanitize_value(exec_state.epoch(), &TypeSignature::type_of(&value)?, value)
-                .ok_or_else(|| RuntimeCheckErrorKind::CouldNotDetermineType)?;
-        return Ok(ValueRef::Owned(value));
+    } else {
+        if let Some(v) = lookup_from_local_variable(exec_state)? {
+            return Ok(v);
+        } else if let Some(v) = lookup_from_constant(exec_state)? {
+            return Ok(v);
+        }
     }
     if let Some(callable_data) = context.lookup_callable_contract(name) {
         let value = if invoke_ctx.contract_context.get_clarity_version() < &ClarityVersion::Clarity2
@@ -225,14 +252,17 @@ fn lookup_variable<'a>(
         };
         return Ok(ValueRef::Owned(value));
     }
-    Err(RuntimeCheckErrorKind::Unreachable(format!("Undefined variable: {name}")).into())
+    Err(RuntimeCheckErrorKind::Unreachable(bounded_format!("Undefined variable: {name}")).into())
 }
 
-pub fn lookup_function(
+/// Resolves `name` to a builtin, or to a user function borrowed from the contract context.
+/// Charges the `LookupFunction` cost, unlike `ContractContext::lookup_function`, and fails
+/// with `UndefinedFunction` when neither matches.
+pub fn lookup_function<'a>(
     name: &str,
     exec_state: &mut ExecutionState,
-    invoke_ctx: &InvocationContext,
-) -> Result<CallableType, VmExecutionError> {
+    invoke_ctx: &InvocationContext<'a>,
+) -> Result<CallableType<'a>, VmExecutionError> {
     runtime_cost(ClarityCostFunction::LookupFunction, exec_state, 0)?;
 
     if let Some(result) = functions::lookup_reserved_functions(
@@ -244,7 +274,7 @@ pub fn lookup_function(
         let user_function = invoke_ctx
             .contract_context
             .lookup_function(name)
-            .ok_or(RuntimeCheckErrorKind::UndefinedFunction(name.to_string()))?;
+            .ok_or_else(|| RuntimeCheckErrorKind::UndefinedFunction(name.to_string()))?;
         Ok(CallableType::UserFunction(user_function))
     }
 }
@@ -261,7 +291,7 @@ fn add_stack_trace(result: &mut Result<Value, VmExecutionError>, exec_state: &mu
 /// [`apply_evaluated`], returning the function's identifier and whether recursion is tracked.
 #[inline]
 fn check_call_preconditions(
-    function: &CallableType,
+    function: &CallableType<'_>,
     exec_state: &ExecutionState,
 ) -> Result<(FunctionIdentifier, bool), VmExecutionError> {
     // Aaron: in non-debug executions, we shouldn't track a full call-stack.
@@ -284,7 +314,7 @@ fn check_call_preconditions(
 /// `used_memory` is the total already charged via [`ExecutionState::add_memory`] for the
 /// argument values; it is released before returning.
 fn dispatch_args(
-    function: &CallableType,
+    function: &CallableType<'_>,
     identifier: FunctionIdentifier,
     track_recursion: bool,
     args: Vec<Value>,
@@ -324,7 +354,7 @@ fn dispatch_args(
             }
 
             // User-defined functions (Clarity)
-            CallableType::UserFunction(function) => function.apply(&args, exec_state, invoke_ctx),
+            CallableType::UserFunction(function) => function.apply(args, exec_state, invoke_ctx),
 
             // Special functions evaluate their own arguments and are dispatched directly in
             // `apply`/`apply_evaluated`, so they never reach `dispatch_args`.
@@ -353,7 +383,7 @@ fn dispatch_args(
 ///
 /// Enforces recursion detection and max stack-depth limits before dispatch.
 pub fn apply(
-    function: &CallableType,
+    function: &CallableType<'_>,
     args: &[SymbolicExpression],
     exec_state: &mut ExecutionState,
     invoke_ctx: &InvocationContext,
@@ -405,7 +435,7 @@ pub fn apply(
                 return_call_error!(err);
             }
         };
-        let arg_use = match arg_value.get_memory_use() {
+        let arg_use = match arg_value.get_memory_use(exec_state.epoch()) {
             Ok(x) => x,
             Err(e) => {
                 let err = match exec_state.drop_memory(used_memory) {
@@ -459,7 +489,7 @@ pub fn apply(
 /// `SymbolicExpression::atom_value` so the special function can evaluate them normally
 /// with `eval`.
 pub fn apply_evaluated(
-    function: &CallableType,
+    function: &CallableType<'_>,
     args: Vec<Value>,
     exec_state: &mut ExecutionState,
     invoke_ctx: &InvocationContext,
@@ -508,7 +538,7 @@ pub fn apply_evaluated(
     let mut used_memory = 0;
     exec_state.call_stack.incr_apply_depth();
     for arg in args.iter() {
-        let arg_use = match arg.get_memory_use() {
+        let arg_use = match arg.get_memory_use(exec_state.epoch()) {
             Ok(x) => x,
             Err(e) => {
                 let err = match exec_state.drop_memory(used_memory) {
@@ -593,14 +623,14 @@ pub fn eval<'a>(
                 children
                     .split_first()
                     .ok_or(RuntimeCheckErrorKind::Unreachable(
-                        "Non functional application".to_string(),
+                        "Non functional application".into(),
                     ))?;
 
             let function_name =
                 function_variable
                     .match_atom()
                     .ok_or(RuntimeCheckErrorKind::Unreachable(
-                        "Bad function name".to_string(),
+                        "Bad function name".into(),
                     ))?;
             let f = lookup_function(function_name, exec_state, invoke_ctx)?;
             apply(&f, rest, exec_state, invoke_ctx, context).map(ValueRef::Owned)
@@ -621,6 +651,19 @@ pub fn eval<'a>(
 pub fn is_reserved(name: &str, version: &ClarityVersion) -> bool {
     functions::lookup_reserved_functions(name, version).is_some()
         || variables::is_reserved_name(name, version)
+}
+
+/// Reserved at `version` but free in an earlier one, so a legacy trait may
+/// carry it as a method name. From Epoch 4.1 a public/read-only function may
+/// take such a name to implement that method, else old traits would be
+/// unimplementable at the only deployable version; the native still wins every
+/// reference where one exists. Enforced by `TraitChecker` at analysis.
+pub fn is_shadowable_reserved(name: &str, version: &ClarityVersion) -> bool {
+    is_reserved(name, version)
+        && ClarityVersion::ALL
+            .iter()
+            .filter(|v| *v < version)
+            .any(|v| !is_reserved(name, v))
 }
 
 /// This function evaluates a list of expressions, sharing a global context.
@@ -657,7 +700,7 @@ pub fn eval_all(
             match try_define {
                 DefineResult::Variable(name, value) => {
                     runtime_cost(ClarityCostFunction::BindName, global_context, 0)?;
-                    let value_memory_use = value.get_memory_use()?;
+                    let value_memory_use = value.get_memory_use(&global_context.epoch_id)?;
                     global_context.add_memory(value_memory_use)?;
                     total_memory_use += value_memory_use;
 
@@ -669,13 +712,14 @@ pub fn eval_all(
                     contract_context.functions.insert(name, value);
                 },
                 DefineResult::PersistedVariable(name, value_type, value) => {
-                    runtime_cost(ClarityCostFunction::CreateVar, global_context, value_type.size()?)?;
+                    let value_size = value_type.charged_size(&global_context.epoch_id)?;
+                    runtime_cost(ClarityCostFunction::CreateVar, global_context, value_size)?;
                     contract_context.persisted_names.insert(name.clone());
 
-                    global_context.add_memory(value_type.type_size()
+                    global_context.add_memory(value_type.charged_type_size(&global_context.epoch_id)
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
 
-                    global_context.add_memory(value.size()?.into())?;
+                    global_context.add_memory(value.charged_size(&global_context.epoch_id)?.into())?;
 
                     let data_type = global_context.database.create_variable(&contract_context.contract_identifier, &name, value_type)?;
                     global_context.database.set_variable(&contract_context.contract_identifier, &name, value, &data_type, &global_context.epoch_id)?;
@@ -683,14 +727,15 @@ pub fn eval_all(
                     contract_context.meta_data_var.insert(name, data_type);
                 },
                 DefineResult::Map(name, key_type, value_type) => {
+                    let epoch = global_context.epoch_id;
                     runtime_cost(ClarityCostFunction::CreateMap, global_context,
-                                  u64::from(key_type.size()?).cost_overflow_add(
-                                      u64::from(value_type.size()?))?)?;
+                                  u64::from(key_type.charged_size(&epoch)?).cost_overflow_add(
+                                      u64::from(value_type.charged_size(&epoch)?))?)?;
                     contract_context.persisted_names.insert(name.clone());
 
-                    global_context.add_memory(key_type.type_size()
+                    global_context.add_memory(key_type.charged_type_size(&epoch)
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
-                    global_context.add_memory(value_type.type_size()
+                    global_context.add_memory(value_type.charged_type_size(&epoch)
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
 
                     let data_type = global_context.database.create_map(&contract_context.contract_identifier, &name, key_type, value_type)?;
@@ -701,7 +746,7 @@ pub fn eval_all(
                     runtime_cost(ClarityCostFunction::CreateFt, global_context, 0)?;
                     contract_context.persisted_names.insert(name.clone());
 
-                    global_context.add_memory(TypeSignature::UIntType.type_size()
+                    global_context.add_memory(TypeSignature::UIntType.charged_type_size(&global_context.epoch_id)
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
 
                     let data_type = global_context.database.create_fungible_token(&contract_context.contract_identifier, &name, &total_supply)?;
@@ -709,10 +754,11 @@ pub fn eval_all(
                     contract_context.meta_ft.insert(name, data_type);
                 },
                 DefineResult::NonFungibleAsset(name, asset_type) => {
-                    runtime_cost(ClarityCostFunction::CreateNft, global_context, asset_type.size()?)?;
+                    let asset_size = asset_type.charged_size(&global_context.epoch_id)?;
+                    runtime_cost(ClarityCostFunction::CreateNft, global_context, asset_size)?;
                     contract_context.persisted_names.insert(name.clone());
 
-                    global_context.add_memory(asset_type.type_size()
+                    global_context.add_memory(asset_type.charged_type_size(&global_context.epoch_id)
                                               .map_err(|_| VmInternalError::Expect("Type size should be realizable".into()))?.into())?;
 
                     let data_type = global_context.database.create_non_fungible_token(&contract_context.contract_identifier, &name, &asset_type)?;
@@ -886,7 +932,7 @@ pub fn execute_with_limited_execution_time(
         false,
         clarity_types::types::StandardPrincipalData::transient(),
         |g| {
-            let budget = ResourceBudget::new().with_max_duration(Some(max_execution_time));
+            let budget = ResourceBudget::unlimited().with_max_duration(Some(max_execution_time));
             g.set_execution_resource_limiter(budget.start_tracking());
             Ok(())
         },

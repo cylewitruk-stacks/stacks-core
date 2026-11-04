@@ -30,7 +30,6 @@ use clarity::vm::representations::ContractName;
 use clarity::vm::types::{
     PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TupleData, Value,
 };
-use clarity::vm::SymbolicExpression;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use stacks_common::codec::StacksMessageCodec;
@@ -65,11 +64,7 @@ pub const BOOT_CODE_COSTS_2_TESTNET: &str = std::include_str!("costs-2-testnet.c
 pub const BOOT_CODE_COST_VOTING_MAINNET: &str = std::include_str!("cost-voting.clar");
 pub const BOOT_CODE_BNS: &str = std::include_str!("bns.clar");
 pub const BOOT_CODE_GENESIS: &str = std::include_str!("genesis.clar");
-pub const POX_1_NAME: &str = "pox";
-pub const POX_2_NAME: &str = "pox-2";
-pub const POX_3_NAME: &str = "pox-3";
-pub const POX_4_NAME: &str = "pox-4";
-pub const POX_5_NAME: &str = "pox-5";
+pub use pox_locking::{POX_1_NAME, POX_2_NAME, POX_3_NAME, POX_4_NAME, POX_5_NAME};
 /// pox-5's flat minimum to participate as a stacker, mirroring
 /// `SIGNER_SET_MIN_USTX` in `pox-5.clar` (`u50000000000` = 50,000 STX).
 pub const POX_5_SIGNER_SET_MIN_USTX: u64 = 50_000_000_000;
@@ -314,23 +309,7 @@ pub struct RawRewardSetEntry {
     pub signer: Option<[u8; SIGNERS_PK_LEN]>,
 }
 
-define_named_enum!(
-    /// This enum captures the names of the PoX contracts by version.
-    // This should deprecate the const values `POX_version_NAME`, but
-    // that is the kind of refactor that should be in its own PR.
-    // Having an enum here is useful for a bunch of reasons, but chiefly:
-    //   * we'll be able to add an Ord implementation, so that we can
-    //     do much easier version checks
-    //   * static enforcement of matches
-    #[derive(PartialOrd, Ord)]
-    PoxVersions {
-        Pox1("pox"),
-        Pox2("pox-2"),
-        Pox3("pox-3"),
-        Pox4("pox-4"),
-        Pox5("pox-5"),
-    }
-);
+pub use pox_locking::PoxVersions;
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct PoxStartCycleInfo {
@@ -557,8 +536,8 @@ impl RewardSet {
     ///
     /// * V0: one bit per reward-slot recipient.
     /// * Waterfall: always 1 => there is a single sBTC output. This treatment vec
-    ///    is no longer used in consensus, but the miner includes it for deserialization
-    ///    compatibility
+    ///   is no longer used in consensus, but the miner includes it for deserialization
+    ///   compatibility
     pub fn pox_treatment_bitvec_len(&self) -> u16 {
         match self {
             RewardSet::V0(v0) => v0.rewarded_addresses.len().try_into().unwrap_or(u16::MAX),
@@ -845,12 +824,10 @@ impl StacksChainState {
                                     invoke_ctx,
                                     &pox_contract,
                                     "handle-unlock",
-                                    &[
-                                        SymbolicExpression::atom_value(principal.clone().into()),
-                                        SymbolicExpression::atom_value(Value::UInt(*amount_locked)),
-                                        SymbolicExpression::atom_value(Value::UInt(
-                                            cycle_number.into(),
-                                        )),
+                                    vec![
+                                        principal.clone().into(),
+                                        Value::UInt(*amount_locked),
+                                        Value::UInt(cycle_number.into()),
                                     ],
                                     false,
                                 )
@@ -874,7 +851,7 @@ impl StacksChainState {
             let tx_event =
                 ExecutionState::construct_print_transaction_event(pox_contract.clone(), event_info);
             events.push(tx_event);
-            total_events.extend(events.into_iter());
+            total_events.extend(events);
         }
 
         Ok(total_events)
@@ -960,7 +937,7 @@ impl StacksChainState {
                                     invoke_ctx,
                                     &contract_identifier,
                                     function,
-                                    &[SymbolicExpression::atom_value(Value::UInt(reward_cycle))],
+                                    vec![Value::UInt(reward_cycle)],
                                     true,
                                 )
                                 .map_err(ClarityEvalError::from)
@@ -1204,8 +1181,8 @@ impl StacksChainState {
             0 => 0,
             remainder => POX_THRESHOLD_STEPS_USTX - remainder,
         };
-        let threshold = threshold_precise + ceil_amount;
-        return threshold;
+
+        threshold_precise + ceil_amount
     }
 
     pub fn get_reward_threshold_and_participation(
@@ -1627,7 +1604,7 @@ impl StacksChainState {
                 VmExecutionError::RuntimeCheck(RuntimeCheckErrorKind::NoSuchContract(_)),
             ))) => {
                 warn!("Reward cycle attempted to calculate rewards before the PoX contract was instantiated");
-                return Ok(vec![]);
+                Ok(vec![])
             }
             x => x,
         }
@@ -1823,6 +1800,7 @@ pub mod test {
     use std::collections::HashSet;
 
     use clarity::vm::contracts::Contract;
+    use clarity::vm::events::STXEventType;
     use clarity::vm::types::*;
     use stacks_common::util::secp256k1::Secp256k1PublicKey;
 
@@ -2132,7 +2110,7 @@ pub mod test {
         )
     }
 
-    fn eval_contract_at_tip(
+    pub fn eval_contract_at_tip(
         peer: &mut TestPeer,
         addr: &StacksAddress,
         name: &str,
@@ -2156,7 +2134,7 @@ pub mod test {
     pub fn get_liquid_ustx(peer: &mut TestPeer) -> u128 {
         let value = eval_at_tip(peer, "pox", "stx-liquid-supply");
         if let Value::UInt(inner_uint) = value {
-            return inner_uint;
+            inner_uint
         } else {
             panic!("stx-liquid-supply isn't a uint");
         }
@@ -2165,7 +2143,7 @@ pub mod test {
     pub fn get_balance(peer: &mut TestPeer, addr: &PrincipalData) -> u128 {
         let value = eval_at_tip(peer, "pox", &format!("(stx-get-balance '{addr})"));
         if let Value::UInt(balance) = value {
-            return balance;
+            balance
         } else {
             panic!("stx-get-balance isn't a uint");
         }
@@ -2984,72 +2962,6 @@ pub mod test {
         make_tx(key, nonce, 0, payload)
     }
 
-    // make a stream of invalid pox-lockup transactions
-    fn make_invalid_pox_lockups(key: &StacksPrivateKey, mut nonce: u64) -> Vec<StacksTransaction> {
-        let mut ret = vec![];
-
-        let amount = 1;
-        let lock_period = 1;
-        let addr_bytes = Hash160([0u8; 20]);
-
-        let bad_pox_addr_version = Value::Tuple(
-            TupleData::from_data(vec![
-                (
-                    ClarityName::try_from("version".to_owned()).unwrap(),
-                    Value::UInt(100),
-                ),
-                (
-                    ClarityName::try_from("hashbytes".to_owned()).unwrap(),
-                    Value::Sequence(SequenceData::Buffer(BuffData {
-                        data: addr_bytes.as_bytes().to_vec(),
-                    })),
-                ),
-            ])
-            .unwrap(),
-        );
-
-        let generator = |amount, pox_addr, lock_period, nonce| {
-            make_pox_contract_call(
-                key,
-                nonce,
-                "stack-stx",
-                vec![Value::UInt(amount), pox_addr, Value::UInt(lock_period)],
-            )
-        };
-
-        let bad_pox_addr_tx = generator(amount, bad_pox_addr_version, lock_period, nonce);
-        ret.push(bad_pox_addr_tx);
-        nonce += 1;
-
-        let bad_lock_period_short = generator(
-            amount,
-            make_pox_addr(AddressHashMode::SerializeP2PKH, &addr_bytes),
-            0,
-            nonce,
-        );
-        ret.push(bad_lock_period_short);
-        nonce += 1;
-
-        let bad_lock_period_long = generator(
-            amount,
-            make_pox_addr(AddressHashMode::SerializeP2PKH, &addr_bytes),
-            13,
-            nonce,
-        );
-        ret.push(bad_lock_period_long);
-        nonce += 1;
-
-        let bad_amount = generator(
-            0,
-            make_pox_addr(AddressHashMode::SerializeP2PKH, &addr_bytes),
-            1,
-            nonce,
-        );
-        ret.push(bad_amount);
-
-        ret
-    }
-
     fn make_bare_contract(
         key: &StacksPrivateKey,
         nonce: u64,
@@ -3106,8 +3018,8 @@ pub mod test {
             ))
         )
         ", boot_code_test_addr());
-        let contract_tx = make_bare_contract(key, nonce, 0, name, &contract);
-        contract_tx
+
+        make_bare_contract(key, nonce, 0, name, &contract)
     }
 
     // call after make_pox_lockup_contract gets mined
@@ -3316,7 +3228,7 @@ pub mod test {
         let mut peer_config = TestPeerConfig::new(function_name!(), 2000, 2001);
         let alice = StacksAddress::from_string("STVK1K405H6SK9NKJAP32GHYHDJ98MMNP8Y6Z9N0").unwrap();
         let bob = StacksAddress::from_string("ST76D2FMXZ7D2719PNE4N71KPSX84XCCNCMYC940").unwrap();
-        peer_config.chain_config.initial_lockups = vec![
+        let lockups = vec![
             ChainstateAccountLockup::new(alice.clone(), 1000, 1),
             ChainstateAccountLockup::new(bob.clone(), 1000, 1),
             ChainstateAccountLockup::new(alice.clone(), 1000, 2),
@@ -3327,7 +3239,9 @@ pub mod test {
             ChainstateAccountLockup::new(alice.clone(), 1000, 6),
             ChainstateAccountLockup::new(alice.clone(), 1000, 7),
         ];
-        let mut peer = TestPeer::new(peer_config);
+        peer_config.chain_config.initial_lockups = lockups.clone();
+        let observer = TestEventObserver::new();
+        let mut peer = TestPeer::new_with_observer(peer_config, Some(&observer));
 
         let num_blocks = 8;
         let mut missed_initial_blocks = 0;
@@ -3421,6 +3335,32 @@ pub mod test {
 
             let (burn_ht, _, _) = peer.next_burnchain_block(burn_ops.clone());
             peer.process_stacks_epoch_at_tip(&stacks_block, &microblocks);
+
+            // Each unlock is minted in the block at its scheduled height and
+            // reported on that block's coinbase receipt.
+            let block = observer.get_blocks().pop().unwrap();
+            let block_height = block.metadata.stacks_block_height;
+            assert_eq!(block_height, tenure_id as u64 + 1);
+            let coinbase_receipt = &block.receipts[0];
+            assert!(coinbase_receipt.is_coinbase_tx());
+            let mut minted = coinbase_receipt
+                .events
+                .iter()
+                .map(|event| match event {
+                    StacksTransactionEvent::STXEvent(STXEventType::STXMintEvent(mint)) => {
+                        (mint.recipient.to_string(), mint.amount)
+                    }
+                    other => panic!("unexpected coinbase event {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            minted.sort();
+            let mut expected = lockups
+                .iter()
+                .filter(|lockup| lockup.block_height == block_height)
+                .map(|lockup| (lockup.address.clone(), u128::from(lockup.amount)))
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(minted, expected);
         }
     }
 
@@ -5697,7 +5637,7 @@ pub mod test {
                             1,
                         );
                         block_txs.push(alice_stack);
-                    } else if tenure_id >= 2 && tenure_id <= 8 {
+                    } else if (2..=8).contains(&tenure_id) {
                         // try to spend tokens -- they should all fail with short-return
                         let alice_spend = make_bare_contract(
                             &alice,
@@ -5911,7 +5851,7 @@ pub mod test {
 
                 assert!(reward_cycle > cur_reward_cycle);
                 test_before_first_reward_cycle = true;
-            } else if tenure_id >= 2 && tenure_id <= 8 {
+            } else if (2..=8).contains(&tenure_id) {
                 // alice did _NOT_ spend
                 assert!(get_contract(
                     &mut peer,

@@ -14,9 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use clarity::vm::analysis::contract_interface_builder::{
-    build_contract_interface, ContractInterface,
-};
+use clarity::vm::analysis::contract_interface_builder::ContractInterface;
 use clarity::vm::costs::ExecutionCost;
 use clarity::vm::types::Value;
 use serde_json::json;
@@ -33,8 +31,8 @@ use stacks::chainstate::stacks::boot::{
 };
 use stacks::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksHeaderInfo};
 use stacks::chainstate::stacks::events::{
-    BurnBlockEvent, BurnBlockEventRewardRecipient, StacksBlockEventData, StacksTransactionEvent,
-    StacksTransactionReceipt, TransactionOrigin,
+    BoundedErrorString, BurnBlockEvent, BurnBlockEventRewardRecipient, StacksBlockEventData,
+    StacksTransactionEvent, StacksTransactionReceipt, TransactionOrigin,
 };
 use stacks::chainstate::stacks::miner::TransactionEvent;
 use stacks::chainstate::stacks::{StacksTransaction, TransactionPayload};
@@ -208,7 +206,7 @@ pub struct TransactionEventPayload<'a> {
     /// The microblock parent hash
     pub microblock_parent_hash: Option<BlockHeaderHash>,
     /// Error information if one occurred in the Clarity VM
-    pub vm_error: Option<String>,
+    pub vm_error: Option<BoundedErrorString>,
     /// Set when the transaction was marked problematic by the block's
     /// `problematic_txs` list (Epoch 4.0+). When `Some(category)`, the
     /// transaction's payload was NOT executed but the fee was still debited
@@ -312,10 +310,7 @@ pub fn make_new_block_txs_payload(
         raw_result: receipt.result.clone(),
         raw_tx,
         contract_interface: if include_contract_interface {
-            receipt.contract_analysis.as_ref().map(|analysis| {
-                build_contract_interface(analysis)
-                    .expect("FATAL: failed to serialize contract publish receipt")
-            })
+            receipt.contract_interface.clone()
         } else {
             None
         },

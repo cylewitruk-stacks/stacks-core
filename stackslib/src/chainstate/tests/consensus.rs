@@ -12,7 +12,7 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use clarity::boot_util::boot_code_addr;
@@ -22,7 +22,9 @@ use clarity::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKe
 use clarity::types::{EpochList, StacksEpoch, StacksEpochId, StacksEpochRangeTestExt as _};
 use clarity::util::hash::Hash160;
 use clarity::vm::costs::ExecutionCost;
-use clarity::vm::types::{PrincipalData, ResponseData};
+use clarity::vm::types::{
+    PrincipalData, QualifiedContractIdentifier, ResponseData, StandardPrincipalData,
+};
 use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value as ClarityValue};
 use serde::{Deserialize, Serialize, Serializer};
 use stacks_common::types::chainstate::StacksBlockId;
@@ -38,8 +40,8 @@ use crate::chainstate::nakamoto::coordinator::load_nakamoto_reward_set;
 use crate::chainstate::nakamoto::test_signers::TestSigners;
 use crate::chainstate::nakamoto::tests::node::TestStacker;
 use crate::chainstate::nakamoto::NakamotoChainState;
-use crate::chainstate::stacks::db::{StacksChainState, StacksEpochReceipt};
-use crate::chainstate::stacks::events::TransactionOrigin;
+use crate::chainstate::stacks::db::{StacksChainState, StacksEpochReceipt, StacksHeaderInfo};
+use crate::chainstate::stacks::events::{BoundedErrorString, TransactionOrigin};
 use crate::chainstate::stacks::miner::{BlockBuilder, TransactionResourceBudgets};
 use crate::chainstate::stacks::tests::{make_coinbase, TestStacksNode};
 use crate::chainstate::stacks::{
@@ -102,8 +104,22 @@ pub static FAUCET_PRIV_KEY: LazyLock<StacksPrivateKey> = LazyLock::new(|| {
 // The address for the faucet account
 pub static FAUCET_ADDRESS: LazyLock<StacksAddress> = LazyLock::new(|| to_addr(&FAUCET_PRIV_KEY));
 
+/// Principal of a setup contract deployed by the faucet, for dynamic dispatch.
+pub fn setup_contract_principal(name: &'static str) -> ClarityValue {
+    ClarityValue::Principal(PrincipalData::Contract(QualifiedContractIdentifier::new(
+        StandardPrincipalData::from(FAUCET_ADDRESS.clone()),
+        ContractName::from_literal(name),
+    )))
+}
+
 const FOO_CONTRACT: &str = "(define-public (foo) (ok 1))
                                     (define-public (bar (x uint)) (ok x))";
+
+/// Whether a deploy in `epoch` may pin a Clarity version: the payload exists
+/// from Epoch 2.1 and is rejected from Epoch 4.1.
+pub fn deploys_can_pin_version(epoch: StacksEpochId) -> bool {
+    epoch >= StacksEpochId::Epoch21 && !epoch.rejects_versioned_smart_contracts()
+}
 
 /// Returns the list of Clarity versions that can be used to deploy contracts in the given epoch.
 pub const fn clarity_versions_for_epoch(epoch: StacksEpochId) -> &'static [ClarityVersion] {
@@ -133,7 +149,7 @@ pub const fn clarity_versions_for_epoch(epoch: StacksEpochId) -> &'static [Clari
             ClarityVersion::Clarity4,
             ClarityVersion::Clarity5,
         ],
-        StacksEpochId::Epoch40 | StacksEpochId::Epoch41 => &[
+        StacksEpochId::Epoch40 => &[
             ClarityVersion::Clarity1,
             ClarityVersion::Clarity2,
             ClarityVersion::Clarity3,
@@ -141,6 +157,8 @@ pub const fn clarity_versions_for_epoch(epoch: StacksEpochId) -> &'static [Clari
             ClarityVersion::Clarity5,
             ClarityVersion::Clarity6,
         ],
+        // From Epoch 4.1 deploys cannot pin a version; they run as the epoch default.
+        StacksEpochId::Epoch41 => &[ClarityVersion::Clarity7],
     }
 }
 
@@ -190,7 +208,10 @@ where
 }
 
 /// Serialize an optional string field appending a non-consensus breaking info message.
-fn serialize_opt_string_ncb<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_opt_string_ncb<S>(
+    value: &Option<BoundedErrorString>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -211,7 +232,7 @@ pub struct ExpectedTransactionOutput {
     pub tx: Option<TransactionPayload>,
     /// The possible Clarity VM error message associated to the transaction (non-consensus breaking)
     #[serde(serialize_with = "serialize_opt_string_ncb")]
-    pub vm_error: Option<String>,
+    pub vm_error: Option<BoundedErrorString>,
     /// The expected return value of the transaction.
     pub return_type: ClarityValue,
     /// The expected execution cost of the transaction.
@@ -340,6 +361,15 @@ impl ConsensusChain<'_> {
     ) -> Self {
         let boot_plan = Self::new_boot_plan(test_name, initial_balances);
         Self::from_boot_plan(boot_plan, num_blocks_per_epoch)
+    }
+
+    /// Creates a [`ConsensusChain`] and advances it into `epoch`. As its last epoch,
+    /// `epoch` has room for any number of tenures.
+    pub fn new_in_epoch(test_name: &str, epoch: StacksEpochId) -> Self {
+        let mut chain = Self::new(test_name, vec![], HashMap::from([(epoch, 1)]));
+        let miner_key = chain.test_chainstate.miner.nakamoto_miner_key();
+        chain.test_chainstate.advance_into_epoch(&miner_key, epoch);
+        chain
     }
 
     fn new_with_signing_set(
@@ -610,19 +640,75 @@ impl ConsensusChain<'_> {
             .test_chainstate
             .append_nakamoto_block_with_txs(&test_block.transactions);
 
-        let burn_block_height = self.test_chainstate.get_burn_block_height();
-        let current_epoch =
-            SortitionDB::get_stacks_epoch(self.test_chainstate.sortdb().conn(), burn_block_height)
-                .unwrap()
-                .unwrap()
-                .epoch_id;
-
         ExpectedResult::create_from(
             outcome.execution,
             outcome.block.header.state_index_root,
-            current_epoch,
+            self.current_epoch(),
             &test_block,
         )
+    }
+
+    /// Starts a new tenure with a block of the [`TestBlock`]'s transactions and
+    /// returns the result for those transactions only.
+    pub fn append_tenure_start_block(&mut self, test_block: TestBlock) -> ExpectedResult {
+        debug!("--------- Running tenure-start block {test_block:?} ---------");
+        let outcome = self
+            .test_chainstate
+            .append_nakamoto_tenure_start_block_with_txs(&test_block.transactions);
+        let txids: HashSet<_> = test_block.transactions.iter().map(|tx| tx.txid()).collect();
+        let execution = outcome.execution.map(|mut receipt| {
+            receipt.tx_receipts.retain(|tx_receipt| {
+                matches!(
+                    &tx_receipt.transaction,
+                    TransactionOrigin::Stacks(tx) if txids.contains(&tx.txid())
+                )
+            });
+            receipt
+        });
+
+        ExpectedResult::create_from(
+            execution,
+            outcome.block.header.state_index_root,
+            self.current_epoch(),
+            &test_block,
+        )
+    }
+
+    fn current_epoch(&self) -> StacksEpochId {
+        let burn_block_height = self.test_chainstate.get_burn_block_height();
+        SortitionDB::get_stacks_epoch(self.test_chainstate.sortdb_ref().conn(), burn_block_height)
+            .unwrap()
+            .unwrap()
+            .epoch_id
+    }
+
+    /// The canonical Stacks tip.
+    pub fn tip(&self) -> StacksHeaderInfo {
+        NakamotoChainState::get_canonical_block_header(
+            self.test_chainstate.chainstate_ref().db(),
+            self.test_chainstate.sortdb_ref(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Evaluates `code` in `contract` as a read-only call at the canonical tip.
+    pub fn eval_read_only_at_tip(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        code: &str,
+    ) -> ClarityValue {
+        let tip = self.tip().index_block_hash();
+        let sortdb = self.test_chainstate.sortdb.as_ref().unwrap();
+        let chainstate = &mut self
+            .test_chainstate
+            .stacks_node
+            .as_mut()
+            .unwrap()
+            .chainstate;
+        chainstate
+            .eval_read_only(&sortdb.index_handle_at_tip(), &tip, contract, code)
+            .unwrap()
     }
 
     /// Appends a single block to the chain as a Pre-Nakamoto block and returns the result.
@@ -666,12 +752,7 @@ impl ConsensusChain<'_> {
         self.test_chainstate.sortdb = Some(sortdb);
         self.test_chainstate.stacks_node = Some(stacks_node);
 
-        let burn_block_height = self.test_chainstate.get_burn_block_height();
-        let current_epoch =
-            SortitionDB::get_stacks_epoch(self.test_chainstate.sortdb().conn(), burn_block_height)
-                .unwrap()
-                .unwrap()
-                .epoch_id;
+        let current_epoch = self.current_epoch();
 
         let remapped_result = res.map(|receipt| {
             let mut receipt = receipt.unwrap();
@@ -1008,7 +1089,8 @@ impl ContractConsensusTest<'_> {
     /// * `function_name` - Contract function to test
     /// * `function_args` - Arguments passed to `function_name` on every call
     /// * `clarity_versions` - List of Clarity versions to include in testing. For each epoch to test, at least one clarity version must be available.
-    /// * `setup_contracts` - Contracts that must be deployed before epoch-specific logic runs
+    /// * `setup_contracts` - Deployed before the deploy/call blocks: in the first epoch, or in the
+    ///   epoch pinned with `with_epoch` (which may predate the deploy epochs).
     ///
     /// # Panics
     ///
@@ -1054,12 +1136,6 @@ impl ContractConsensusTest<'_> {
             call_epochs.iter().all(|e| e >= min_deploy_epoch),
             "All call epochs must be >= the minimum deploy epoch"
         );
-        assert!(
-            setup_contracts
-                .iter()
-                .all(|c| c.deploy_epoch.is_none() || c.deploy_epoch.unwrap() >= *min_deploy_epoch),
-            "All setup contracts must have a deploy epoch >= the minimum deploy epoch"
-        );
 
         // Build epoch_blocks map based on deploy and call epochs
         let mut num_blocks_per_epoch: HashMap<StacksEpochId, u64> = HashMap::new();
@@ -1080,13 +1156,19 @@ impl ContractConsensusTest<'_> {
         for contract in setup_contracts {
             // Deploy the setup contracts in the first epoch if not specified.
             let deploy_epoch = contract.deploy_epoch.unwrap_or(default_setup_epoch);
+            if let Some(version) = contract.clarity_version {
+                // A pin where versioned deploys are rejected would fail the whole
+                // block at precheck; fail fast with the reason instead.
+                assert!(
+                    !deploy_epoch.rejects_versioned_smart_contracts(),
+                    "Setup contract {} pins {version} at {deploy_epoch}, which rejects versioned deploys",
+                    contract.name
+                );
+            }
             // Get the default Clarity version for the epoch of the contract if not specified.
             let clarity_version = contract.clarity_version.or_else(|| {
-                if deploy_epoch < StacksEpochId::Epoch21 {
-                    None
-                } else {
-                    Some(ClarityVersion::default_for_epoch(deploy_epoch))
-                }
+                deploys_can_pin_version(deploy_epoch)
+                    .then(|| ClarityVersion::default_for_epoch(deploy_epoch))
             });
             let mut contract = contract.clone();
             contract.deploy_epoch = Some(deploy_epoch);
@@ -1265,13 +1347,9 @@ impl ContractConsensusTest<'_> {
             .clone()
             .iter()
             .map(|(name, version)| {
-                let clarity_version = if epoch < StacksEpochId::Epoch21 {
-                    // Old epochs have no concept of clarity version. It defaults to
-                    // clarity version 1 behaviour.
-                    None
-                } else {
-                    Some(*version)
-                };
+                // Epochs that reject versioned deploys (before 2.1, from 4.1)
+                // deploy unversioned and run as the epoch default.
+                let clarity_version = deploys_can_pin_version(epoch).then_some(*version);
                 self.chain.consume_pre_naka_prepare_phase();
                 self.append_tx_block(
                     &TestTxSpec::ContractDeploy {
@@ -1616,6 +1694,17 @@ impl ContractTxReport {
             TxOutcome::BlockAccepted(t) => &t.return_type,
             TxOutcome::BlockRejected(err) => {
                 panic!("block rejected tx has no result: {err}")
+            }
+        }
+    }
+
+    /// Return the tx execution cost if included in an accepted block,
+    /// panics otherwise.
+    pub fn cost(&self) -> &ExecutionCost {
+        match &self.outcome {
+            TxOutcome::BlockAccepted(t) => &t.cost,
+            TxOutcome::BlockRejected(err) => {
+                panic!("block rejected tx has no cost: {err}")
             }
         }
     }
@@ -2059,6 +2148,19 @@ impl ConsensusUtils {
         StacksTransaction::consensus_deserialize(&mut deploy_tx.as_slice()).unwrap()
     }
 
+    /// A 1 uSTX transfer from the faucet, for blocks that need any transaction.
+    pub fn new_transfer_tx(nonce: u64) -> StacksTransaction {
+        let recipient = StacksAddress::burn_address(false).into();
+        make_stacks_transfer_tx(
+            &FAUCET_PRIV_KEY,
+            nonce,
+            200,
+            CHAIN_ID_TESTNET,
+            &recipient,
+            1,
+        )
+    }
+
     pub fn new_call_tx(nonce: u64, contract_name: &str, funct_name: &str) -> StacksTransaction {
         let call_tx = make_contract_call(
             &FAUCET_PRIV_KEY,
@@ -2141,6 +2243,83 @@ fn test_append_empty_blocks() {
 
     let result = ConsensusTest::new(function_name!(), vec![], epoch_blocks).run();
     insta::assert_ron_snapshot!(result);
+}
+
+/// A block with one STX transfer from the faucet.
+fn transfer_block(nonce: u64) -> TestBlock {
+    TestBlock {
+        transactions: vec![ConsensusUtils::new_transfer_tx(nonce)],
+    }
+}
+
+/// Tenure-start blocks report only their own transactions, and extension blocks
+/// and later tenures build on them, also across a reward cycle.
+#[test]
+fn test_append_tenure_start_blocks() {
+    let mut chain = ConsensusChain::new_in_epoch(function_name!(), max_tested_epoch());
+    let contract = QualifiedContractIdentifier::new(
+        FAUCET_ADDRESS.clone().into(),
+        ContractName::try_from("tenure".to_string()).unwrap(),
+    );
+    let deploy = ConsensusUtils::new_deploy_tx(
+        0,
+        &contract.name,
+        "(define-read-only (height) tenure-height)",
+        None,
+    );
+    let ExpectedResult::Success(start) = chain.append_tenure_start_block(TestBlock {
+        transactions: vec![deploy],
+    }) else {
+        panic!("the first tenure-start block was rejected");
+    };
+    assert_eq!(start.transactions.len(), 1);
+    let first_tenure = chain.eval_read_only_at_tip(&contract, "(height)");
+
+    let reward_cycle_length = u64::from(
+        chain
+            .test_chainstate
+            .config
+            .burnchain
+            .pox_constants
+            .reward_cycle_length,
+    );
+    for tenure in 1..=reward_cycle_length {
+        let start = chain.append_tenure_start_block(transfer_block(2 * tenure - 1));
+        assert!(matches!(start, ExpectedResult::Success(_)), "{start:?}");
+        let extension = chain.append_block(transfer_block(2 * tenure), true);
+        assert!(
+            matches!(extension, ExpectedResult::Success(_)),
+            "{extension:?}"
+        );
+    }
+    let last_tenure = chain.eval_read_only_at_tip(&contract, "(height)");
+    assert_eq!(
+        last_tenure.expect_u128().unwrap(),
+        first_tenure.expect_u128().unwrap() + u128::from(reward_cycle_length)
+    );
+}
+
+/// After a rejected tenure-start block, the next tenure builds on the last
+/// accepted block.
+#[test]
+fn test_append_tenure_start_block_after_rejected_one() {
+    let mut chain = ConsensusChain::new_in_epoch(function_name!(), max_tested_epoch());
+    let height = chain.tip().stacks_block_height;
+
+    // The faucet's next nonce is 0.
+    let rejected = chain.append_tenure_start_block(transfer_block(1));
+    assert!(
+        matches!(rejected, ExpectedResult::Failure(_)),
+        "{rejected:?}"
+    );
+    let start = chain.append_tenure_start_block(transfer_block(0));
+    assert!(matches!(start, ExpectedResult::Success(_)), "{start:?}");
+    assert_eq!(chain.tip().stacks_block_height, height + 1);
+    let extension = chain.append_block(transfer_block(1), true);
+    assert!(
+        matches!(extension, ExpectedResult::Success(_)),
+        "{extension:?}"
+    );
 }
 
 #[test]

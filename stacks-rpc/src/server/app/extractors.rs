@@ -66,13 +66,6 @@ impl FromRequest<AppState> for BlockProposalBody {
                 format!("Failed to parse body: {e}"),
             )
         })?;
-        if proposal.block.is_shadow_block() {
-            return Err(ApiError::bad_request(
-                ApiErrorCode::ShadowBlock,
-                "Shadow blocks cannot be submitted for validation",
-            ));
-        }
-
         Ok(Self(proposal))
     }
 }
