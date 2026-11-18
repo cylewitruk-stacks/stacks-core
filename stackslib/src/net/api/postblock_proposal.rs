@@ -325,7 +325,10 @@ pub fn is_event_pox_addr_valid(is_mainnet: bool, event: &StacksTransactionEvent)
 }
 
 impl NakamotoBlockProposal {
-    fn spawn_validation_thread(
+    /// Spawn the shared bounded proposal validator with a transport-neutral
+    /// callback receiver. HTTP and authenticated libp2p ingress both use this
+    /// implementation so validation policy cannot drift between carriers.
+    pub fn spawn_validation_thread(
         self,
         sortdb: SortitionDB,
         mut chainstate: StacksChainState,
@@ -340,6 +343,7 @@ impl NakamotoBlockProposal {
         thread::Builder::new()
             .name("block-proposal".into())
             .spawn(move || {
+                let execution_started = Instant::now();
                 let result = self
                     .validate(
                         &sortdb,
@@ -356,6 +360,14 @@ impl NakamotoBlockProposal {
                         reason: reason.reason,
                         failed_txid: reason.failed_txid,
                     });
+                crate::monitoring::record_block_proposal_validation_execution(
+                    if result.is_ok() {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    execution_started.elapsed(),
+                );
                 receiver.notify_proposal_result(result);
             })
     }

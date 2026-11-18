@@ -1,0 +1,123 @@
+Derive PoC signer public keys from their configured private scalars so observer
+enrollment cannot drift from the signer processes.
+
+Wire every generated signer companion's durable event observer to its paired
+signer and break the companion-health/signer-start dependency cycle. Continuously
+verify signer state-machine burn height against its live companion, and surface
+persistent drift as a critical authenticated-federation incident.
+
+Synchronize native miner authorization with the companion sortition made
+queryable by each burn-block callback. A short callback/RPC ordering window can
+no longer leave signers perpetually authorizing the prior tenure or refusing
+the newly canonical miner at data-plane admission.
+
+Coalesce signer replay to one bounded provider per reward cycle, rotate after
+provider failure, derive current/next-cycle repair pages from the live
+signer-event capacity, pause pagination on downstream backpressure, and make
+equivocation evidence idempotent. Periodic recovery can no longer multiply the
+same replay burst by the signer-set size or hot-loop a refused page.
+
+Stop a rejected old-tenure extension before its next assembly attempt once the
+node's canonical Stacks tip shows that the new winner's tenure is active. The
+legitimate initial extension window remains unchanged.
+
+Verify libp2p-only operation from each node's live diagnostics instead of a
+bounded startup-log tail, and use the canonical exported Prometheus counter
+name when checking signer validation observations.
+
+Bound companion validation POSTs by the configured validation deadline, avoid
+duplicate synchronous POST retries, and emit `CompanionTimeout` abstention when
+the companion stalls. Give monitoring its own short RPC deadline so `/metrics`
+continues serving the last snapshot during companion chaos, and bound every
+chaos-side RPC probe so cleanup cannot be held indefinitely.
+
+Bound all synchronous signer-runloop companion RPCs by the proposal-validation
+horizon. If the canonical sortition view cannot be refreshed for an arriving
+proposal, publish `ChainView` unavailability immediately instead of continuing
+with cached state and accidentally admitting the proposal after recovery.
+
+Preserve native sync-provider ranking when selecting initial-download status
+hedges. Configured bootstrap peers are now preferred as validated recovery
+anchors, while an independently rotating secondary provider preserves
+failover; pinned peers still obey capability checks, availability backoff, and
+invalid-data quarantine.
+
+Classify authenticated sync `Busy` replies as bounded overload rather than
+transport unavailability, and jitter retry scheduling by local identity and
+request correlation. A simultaneous initial-download fan-in can no longer
+exponentially exile a healthy bootstrap or repeatedly elect the same clients
+into a small downstream queue.
+
+Add a bounded, per-peer-coalesced FIFO for validated metadata-only sync-control
+requests when the shared node handoff is full. Objects, signer replay,
+proposals, and arbitrary sync payloads cannot enter this queue;
+deferred controls expire to `Busy`, preserving fair multi-page progress and a
+strict memory/latency bound.
+
+Serve native sync status from the durable canonical sortition index instead of
+the transient per-pass `NetworkResult`. A populated source no longer advertises
+height zero between block-processing passes, so simultaneous fresh nodes can
+reliably identify and download from the canonical provider.
+
+Bind every paginated inventory/object sync plan to the provider whose status
+snapshot established it. Status discovery remains hedged, but a valid empty
+inventory from a behind hedge can no longer be spliced into a current source's
+plan and falsely complete initial block download.
+
+Track the canonical tip ID as well as its height in the multi-miner Stacks
+progress observer. A signer-approved same-height tip replacement now counts as
+canonical progress. An unchanged tip is reported as an overlay stall and fails
+independent verification while regtest Bitcoin continues producing blocks.
+
+Require every chaos disruption to recover through a fresh canonical Stacks
+transition. Bitcoin burn-height progress alone can no longer produce a false
+positive recovery result.
+
+Preserve all independently correlated status hedges when a behind peer replies
+first in both initial download and steady state, avoiding avoidable sync delay.
+
+Replace the zero-delay compact-epoch cadence with fixed five- and twenty-second
+intervals, leaving room for one bounded ten-signer validation retry, and deploy
+the historical sBTC interface fixtures at Epoch 3 activation so reward-cycle
+anchors and contracts settle before Epoch 4.
+
+Add bounded flash- and slow-Bitcoin cadence events to the chaos runner. A
+cadence event succeeds only after a later Bitcoin block and canonical Stacks
+transition, so timing variance cannot be mistaken for network recovery.
+
+Apply seeded, replayable Bitcoin timing entropy after Epoch 4: most intervals
+remain near 20 seconds, with bounded flash and one-minute tails. Explicit chaos
+signals remain available for deterministic cadence scenarios.
+
+Install a detached bounded unpause failsafe around verifier convergence pauses,
+so external termination of the controlling shell cannot strand the Bitcoin
+cadence container while leaving the PoC apparently stopped.
+
+Treat source-bound miner proposals for a not-yet-observed sortition as bounded
+canonical-view-pending work instead of invalid GossipSub traffic. They now
+produce an immediate local abstention observation without binding, relaying,
+object fetch, journal admission, signer-attributable wire disclosure, or a
+false rejection, and are released only after the companion-derived snapshot
+confirms the tuple. A clean 28-actor preflight exposed three such background
+participation losses per signer in roughly 20 minutes, correlated across the
+whole signer set; a companion pause extended the affected signer to thirteen.
+Availability-only handoff is itself retried under signer-event backpressure, so
+a full bounded queue cannot silently discard the abstention before later
+canonical release.
+
+Serve signer Prometheus snapshots independently from synchronous companion
+collection. A bounded background refresher retains the last good companion
+gauges while `/metrics` continues exposing live process counters throughout a
+companion outage. Companion chaos now retries bounded metric probes and requests
+periodic flash sortitions until a real unavailable proposal is observed.
+
+Recover chaos targets by resolved container ID instead of `docker compose
+start`, preventing Compose from restarting or gating on unrelated dependency
+containers outside the selected failure domain.
+
+Drain authenticated native signer events through one process-lifetime miner
+router instead of only while an elected miner is waiting for a proposal. A
+generation-safe bounded handoff attaches the current coordinator accumulator;
+non-winning miners no longer fill the service queue and repeatedly re-observe
+uncommitted GossipSub envelopes between tenures. Router saturation remains
+visible through the existing event-queue diagnostic.

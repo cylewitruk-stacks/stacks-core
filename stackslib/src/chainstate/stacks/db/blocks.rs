@@ -188,6 +188,16 @@ pub struct DummyEventDispatcher;
 
 pub const MAX_RECEIPT_SIZES: u64 = 50 * 1024 * 1024;
 
+/// Epoch 2 inventory cycles begin at the modulo-1 reward block. This differs
+/// intentionally from `Burnchain::block_height_to_reward_cycle`, which treats
+/// the preceding modulo-0 signer-transition block as part of the new cycle.
+fn epoch2_inventory_reward_cycle(burnchain: &Burnchain, burn_height: u64) -> Option<u64> {
+    let effective_height = burn_height
+        .checked_sub(burnchain.first_block_height)?
+        .checked_sub(1)?;
+    Some(effective_height / u64::from(burnchain.pox_constants.reward_cycle_length))
+}
+
 impl BlockEventDispatcher for DummyEventDispatcher {
     fn announce_block(
         &self,
@@ -2035,6 +2045,57 @@ impl StacksChainState {
             })
             .optional()?
             .ok_or_else(|| Error::DBError(db_error::NotFoundError))
+    }
+
+    /// Generate a blocks inventory message for a range of Stacks block heights.
+    /// This is the shared semantic entry point for transport inventory
+    /// responses. It preserves the reward-cycle query optimization while also
+    /// handling pages that cross a cycle boundary (or predate cycle zero).
+    pub fn get_blocks_inventory_for_burnchain_range(
+        &self,
+        burnchain: &Burnchain,
+        start_burn_height: u64,
+        header_hashes: &[(ConsensusHash, Option<BlockHeaderHash>)],
+    ) -> Result<BlocksInvData, Error> {
+        let mut block_bits = Vec::with_capacity(header_hashes.len());
+        let mut microblock_bits = Vec::with_capacity(header_hashes.len());
+        let mut offset = 0usize;
+
+        while offset < header_hashes.len() {
+            let height = start_burn_height.saturating_add(offset as u64);
+            let reward_cycle = epoch2_inventory_reward_cycle(burnchain, height);
+            let mut group_end = offset + 1;
+            while group_end < header_hashes.len()
+                && epoch2_inventory_reward_cycle(
+                    burnchain,
+                    start_burn_height.saturating_add(group_end as u64),
+                ) == reward_cycle
+            {
+                group_end += 1;
+            }
+
+            let group = &header_hashes[offset..group_end];
+            let inventory = match reward_cycle {
+                Some(reward_cycle) => {
+                    self.get_blocks_inventory_for_reward_cycle(burnchain, reward_cycle, group)?
+                }
+                None => self.get_blocks_inventory(group)?,
+            };
+            for group_offset in 0..group.len() {
+                let group_offset =
+                    u16::try_from(group_offset).expect("FATAL: inventory group exceeds u16 policy");
+                block_bits.push(inventory.has_ith_block(group_offset));
+                microblock_bits.push(inventory.has_ith_microblock_stream(group_offset));
+            }
+            offset = group_end;
+        }
+
+        Ok(BlocksInvData {
+            bitlen: u16::try_from(header_hashes.len())
+                .expect("FATAL: inventory page exceeds u16 policy"),
+            block_bitvec: BlocksInvData::compress_bools(&block_bits),
+            microblocks_bitvec: BlocksInvData::compress_bools(&microblock_bits),
+        })
     }
 
     /// Generate a blocks inventory message for a range of Stacks block heights.
@@ -10093,7 +10154,9 @@ pub mod test {
 
     #[test]
     fn stacks_db_get_blocks_inventory_for_reward_cycle() {
-        let mut peer_config = TestPeerConfig::new(function_name!(), 21313, 21314);
+        // Ephemeral listeners keep this chainstate-only equivalence test from
+        // colliding with a running node or another test process.
+        let mut peer_config = TestPeerConfig::new(function_name!(), 0, 0);
 
         let privk = StacksPrivateKey::random();
         let addr = StacksAddress::from_public_keys(
@@ -10284,6 +10347,21 @@ pub mod test {
             total_reward_cycles
         );
 
+        // Transport equivalence gate: the shared range service used by both
+        // legacy and libp2p must exactly match the reference evaluator across
+        // multiple reward-cycle boundaries.
+        let shared_inventory = chainstate
+            .get_blocks_inventory_for_burnchain_range(
+                &peer_config.chain_config.burnchain,
+                0,
+                &header_hashes,
+            )
+            .unwrap();
+        assert_eq!(
+            chainstate.get_blocks_inventory(&header_hashes).unwrap(),
+            shared_inventory
+        );
+
         // everything is stored, so check each reward cycle
         for i in 0..total_reward_cycles {
             let start_range = peer_config
@@ -10371,6 +10449,18 @@ pub mod test {
                 }
             }
         }
+
+        let shared_orphan_inventory = chainstate
+            .get_blocks_inventory_for_burnchain_range(
+                &peer_config.chain_config.burnchain,
+                0,
+                &header_hashes,
+            )
+            .unwrap();
+        assert_eq!(
+            chainstate.get_blocks_inventory(&header_hashes).unwrap(),
+            shared_orphan_inventory
+        );
 
         for i in 0..total_reward_cycles {
             let start_range = peer_config

@@ -47,8 +47,6 @@ use stacks_signer::monitor_signers::SignerMonitor;
 use stacks_signer::signerdb::SignerDb;
 use stacks_signer::utils::stackerdb_session;
 use stacks_signer::v0::SpawnedSigner;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter};
 
 /// Write the chunk to stdout
 fn write_chunk_to_stdout(chunk_opt: Option<Vec<u8>>) {
@@ -227,10 +225,10 @@ fn main() {
 
     let cli = Cli::parse();
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
+    let _observability_guard =
+        stacks_network::install_tracing("stacks-signer", "info,stacks_network=info")
+            .inspect_err(|error| eprintln!("optional tracing initialization failed: {error}"))
+            .ok();
 
     match cli.command {
         Command::GetChunk(args) => {

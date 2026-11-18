@@ -17,8 +17,8 @@
 use lazy_static::lazy_static;
 use prometheus::{
     histogram_opts, labels, opts, register_gauge, register_histogram, register_histogram_vec,
-    register_int_counter, register_int_counter_vec, register_int_gauge, Gauge, Histogram,
-    HistogramTimer, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    Gauge, GaugeVec, Histogram, HistogramTimer, HistogramVec, IntCounter, IntCounterVec, IntGauge,
 };
 
 lazy_static! {
@@ -33,6 +33,19 @@ lazy_static! {
         "Time (seconds) measuring RPC calls latency"
         // Will use DEFAULT_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0] by default
     ), &["path"]).unwrap();
+
+    pub static ref BLOCK_PROPOSAL_VALIDATION_EXECUTIONS: IntCounterVec = register_int_counter_vec!(
+        "stacks_node_block_proposal_validation_executions_total",
+        "Independent block-proposal validation executions performed by this node, by outcome",
+        &["outcome"]
+    )
+    .unwrap();
+
+    pub static ref BLOCK_PROPOSAL_VALIDATION_EXECUTION_SECONDS: HistogramVec = register_histogram_vec!(histogram_opts!(
+        "stacks_node_block_proposal_validation_execution_seconds",
+        "Wall-clock duration of independent block-proposal validation executions",
+        vec![0.005, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0]
+    ), &["outcome"]).unwrap();
 
     pub static ref STX_BLOCKS_RECEIVED_COUNTER: IntCounter = register_int_counter!(opts!(
         "stacks_node_stx_blocks_received_total",
@@ -165,9 +178,19 @@ lazy_static! {
         "Stacks chain tip height"
     )).unwrap();
 
+    pub static ref STACKS_TIP_LAST_CHANGED_TIMESTAMP_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_node_stacks_tip_last_changed_timestamp_seconds",
+        "Unix timestamp when the observed Stacks chain tip height last changed"
+    )).unwrap();
+
     pub static ref BURNCHAIN_HEIGHT_GAUGE: IntGauge = register_int_gauge!(opts!(
         "stacks_node_burn_block_height",
         "Burnchain tip height"
+    )).unwrap();
+
+    pub static ref BURNCHAIN_LAST_CHANGED_TIMESTAMP_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_node_burn_block_last_changed_timestamp_seconds",
+        "Unix timestamp when the observed burnchain tip height last changed"
     )).unwrap();
 
     pub static ref INBOUND_NEIGHBORS_GAUGE: IntGauge = register_int_gauge!(opts!(
@@ -178,6 +201,140 @@ lazy_static! {
     pub static ref OUTBOUND_NEIGHBORS_GAUGE: IntGauge = register_int_gauge!(opts!(
         "stacks_node_neighbors_outbound",
         "Total count of current known outbound neighbors"
+    )).unwrap();
+
+    pub static ref LIBP2P_CONNECTIONS_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_connections",
+        "Current number of native libp2p connections"
+    )).unwrap();
+
+    pub static ref LIBP2P_AUTHENTICATED_SIGNER_LINK_GAUGE: prometheus::IntGaugeVec = register_int_gauge_vec!(opts!(
+        "stacks_p2p_authenticated_signer_link",
+        "Current endpoint-free link evidence to a chain-authorized signer public key"
+    ), &["signer_public_key"]).unwrap();
+
+    pub static ref LIBP2P_CONNECTED_PEER_GAUGE: prometheus::IntGaugeVec = register_int_gauge_vec!(opts!(
+        "stacks_p2p_connected_peer",
+        "Current native connection to a transport PeerId; the authenticated observer joins only enrolled identities"
+    ), &["peer_id"]).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_STATUS_GAUGE: prometheus::IntGaugeVec = register_int_gauge_vec!(opts!(
+        "stacks_miner_signer_round_status",
+        "One-hot status of the miner's single bounded latest signer round"
+    ), &["status"]).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_BLOCK_HEIGHT_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_miner_signer_round_block_height",
+        "Proposed Stacks block height for the miner's single bounded latest signer round"
+    )).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_STARTED_TIMESTAMP_GAUGE: Gauge = register_gauge!(opts!(
+        "stacks_miner_signer_round_started_timestamp_seconds",
+        "Unix timestamp when the miner's single bounded latest signer round started"
+    )).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_THRESHOLD_WEIGHT_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_miner_signer_round_threshold_weight",
+        "Approval weight required by the miner's single bounded latest signer round"
+    )).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_TOTAL_WEIGHT_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_miner_signer_round_total_weight",
+        "Total signer weight for the miner's single bounded latest signer round"
+    )).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_APPROVED_WEIGHT_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_miner_signer_round_approved_weight",
+        "Approval weight received by the miner's single bounded latest signer round"
+    )).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_REJECTED_WEIGHT_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_miner_signer_round_rejected_weight",
+        "Rejection weight received by the miner's single bounded latest signer round"
+    )).unwrap();
+
+    pub static ref MINER_SIGNER_ROUND_UNAVAILABLE_WEIGHT_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_miner_signer_round_unavailable_weight",
+        "Temporary unavailable weight in the miner's single bounded latest signer round"
+    )).unwrap();
+
+    pub static ref MINER_SIGNER_VOTE_WEIGHT_GAUGE: prometheus::IntGaugeVec = register_int_gauge_vec!(opts!(
+        "stacks_miner_signer_vote_weight",
+        "Weight of an authenticated response in the miner's bounded latest signer round"
+    ), &["signer_public_key", "decision"]).unwrap();
+
+    pub static ref MINER_SIGNER_VOTE_LATENCY_SECONDS_GAUGE: GaugeVec = {
+        let gauge = GaugeVec::new(opts!(
+            "stacks_miner_signer_vote_latency_seconds",
+            "Response latency for an authenticated vote in the miner's bounded latest signer round"
+        ), &["signer_public_key", "decision"]).unwrap();
+        prometheus::register(Box::new(gauge.clone())).unwrap();
+        gauge
+    };
+
+    pub static ref LIBP2P_SYNC_CAPABLE_PEERS_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_sync_capable_peers",
+        "Current number of Hello-authenticated native sync peers"
+    )).unwrap();
+
+    pub static ref LIBP2P_SWARM_LAG_SECONDS_GAUGE: Gauge = register_gauge!(opts!(
+        "stacks_p2p_swarm_lag_seconds",
+        "Most recently observed native swarm scheduler lag in seconds"
+    )).unwrap();
+
+    pub static ref LIBP2P_COMMAND_QUEUE_RESIDENCE_SECONDS_GAUGE: Gauge = register_gauge!(opts!(
+        "stacks_p2p_command_queue_residence_seconds",
+        "Most recently observed native command queue residence in seconds"
+    )).unwrap();
+
+    pub static ref LIBP2P_OLDEST_ITEM_WAITING_SECONDS_GAUGE: Gauge = register_gauge!(opts!(
+        "stacks_p2p_oldest_item_waiting_seconds",
+        "Age of the oldest item waiting in the bounded native command queue"
+    )).unwrap();
+
+    pub static ref OBSERVABILITY_BLOCKED_ON_GAUGE: prometheus::IntGaugeVec = register_int_gauge_vec!(opts!(
+        "stacks_observability_blocked_on",
+        "One-hot bounded current blocking reason for a local subsystem"
+    ), &["subsystem", "reason"]).unwrap();
+
+    pub static ref LIBP2P_STALL_REASON_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_stall_reason_code",
+        "Bounded native stall reason: 0 healthy, 1 no peers, 2 no sync peers, 3 swarm lag, 4 command queue, 5 sync failures, 6 orphaned validation result"
+    )).unwrap();
+
+    pub static ref LIBP2P_EVENTS_COUNTER: IntCounterVec = register_int_counter_vec!(opts!(
+        "stacks_p2p_events_total",
+        "Cumulative native libp2p outcomes by a fixed low-cardinality event class"
+    ), &["event"]).unwrap();
+
+    pub static ref OBSERVABILITY_SPANS_DROPPED_COUNTER: IntCounterVec = register_int_counter_vec!(opts!(
+        "stacks_observability_spans_dropped_total",
+        "Spans discarded by the bounded optional OpenTelemetry path"
+    ), &["reason"]).unwrap();
+
+    pub static ref LIBP2P_OBJECT_CACHE_ITEMS_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_object_cache_items",
+        "Current number of contextually accepted objects in the bounded native cache"
+    )).unwrap();
+
+    pub static ref LIBP2P_OBJECT_CACHE_BYTES_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_object_cache_bytes",
+        "Current bytes retained in the bounded native object cache"
+    )).unwrap();
+
+    pub static ref LIBP2P_PEER_STORE_PEERS_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_peer_store_peers",
+        "Current PeerIds retained in the bounded native restart-discovery cache"
+    )).unwrap();
+
+    pub static ref LIBP2P_PEER_STORE_ADDRESSES_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_peer_store_addresses",
+        "Current verified dial endpoints retained in the bounded native restart-discovery cache"
+    )).unwrap();
+
+    pub static ref LIBP2P_PEER_RTT_SECONDS_GAUGE: Gauge = register_gauge!(opts!(
+        "stacks_p2p_peer_rtt_seconds",
+        "Mean RTT across currently connected native peers"
     )).unwrap();
 
     pub static ref INBOUND_BANDWIDTH_GAUGE: IntGauge = register_int_gauge!(opts!(

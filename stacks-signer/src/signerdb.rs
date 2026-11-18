@@ -25,7 +25,9 @@ use blockstack_lib::util_lib::db::{
     query_row, query_rows, sqlite_open, table_exists, tx_begin_immediate, u64_to_sql, DBTx,
     Error as DBError, FromColumn, FromRow,
 };
-use clarity::types::chainstate::{BurnchainHeaderHash, StacksAddress, StacksPublicKey};
+#[cfg(any(test, feature = "testing"))]
+use clarity::types::chainstate::StacksPublicKey;
+use clarity::types::chainstate::{BurnchainHeaderHash, StacksAddress};
 use clarity::types::Address;
 use libsigner::v0::messages::{RejectReason, RejectReasonPrefix, StateMachineUpdate};
 use libsigner::v0::signer_state::GlobalStateEvaluator;
@@ -874,6 +876,43 @@ pub struct SignerDb {
     db: Connection,
 }
 
+/// A durable, transport-neutral signer envelope retained for replay and
+/// restart-safe sequence admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerNetworkJournalRecord {
+    /// Domain-separated ID of the encoded author envelope.
+    pub envelope_id: Vec<u8>,
+    /// Reward cycle that scopes authorization and replay.
+    pub reward_cycle: u64,
+    /// Protobuf signer-lane discriminant.
+    pub lane: i32,
+    /// Author-monotonic sequence within the cycle and lane.
+    pub sequence: u64,
+    /// Original prost-encoded, author-signed envelope.
+    pub envelope: Vec<u8>,
+    /// Stable local ingress-origin discriminant.
+    pub origin: u8,
+    /// Whether this envelope conflicts with the retained first-seen value.
+    pub is_equivocation: bool,
+    /// Local observation time in Unix seconds.
+    pub observed_at: u64,
+}
+
+/// Durable state for one locally-authored reward-cycle lane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignerNetworkSequenceState {
+    /// Reward cycle that scopes this cursor.
+    pub reward_cycle: u64,
+    /// Protobuf signer-lane discriminant.
+    pub lane: i32,
+    /// Sequence reserved for the next authored envelope.
+    pub next_sequence: u64,
+    /// Most recently persisted authored envelope, if any.
+    pub previous_envelope_id: Option<Vec<u8>>,
+}
+
+const SIGNER_NETWORK_JOURNAL_LIMIT: usize = 4096;
+const SIGNER_NETWORK_PROPOSAL_LIMIT: usize = 16;
 /// Outcome of recording a signer's rejection of a block.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlockRejectionUpdate {
@@ -1405,6 +1444,43 @@ BEGIN
 END;
 "#;
 
+static CREATE_SIGNER_NETWORK_JOURNAL: &str = r#"
+CREATE TABLE IF NOT EXISTS signer_network_journal (
+    envelope_id BLOB PRIMARY KEY NOT NULL,
+    reward_cycle INTEGER NOT NULL,
+    lane INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope BLOB NOT NULL,
+    origin INTEGER NOT NULL,
+    is_equivocation INTEGER NOT NULL,
+    observed_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS signer_network_journal_cycle_lane_sequence
+ON signer_network_journal (reward_cycle, lane, sequence, observed_at);
+
+CREATE TABLE IF NOT EXISTS signer_network_sequences (
+    author_public_key BLOB NOT NULL,
+    reward_cycle INTEGER NOT NULL,
+    lane INTEGER NOT NULL,
+    next_sequence INTEGER NOT NULL,
+    previous_envelope_id BLOB,
+    PRIMARY KEY (author_public_key, reward_cycle, lane)
+) STRICT;
+"#;
+
+static CREATE_SIGNER_NETWORK_PROPOSALS: &str = r#"
+CREATE TABLE IF NOT EXISTS signer_network_proposals (
+    content_id BLOB PRIMARY KEY NOT NULL,
+    reward_cycle INTEGER NOT NULL,
+    proposal BLOB NOT NULL,
+    observed_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS signer_network_proposals_cycle_observed
+ON signer_network_proposals (reward_cycle, observed_at);
+"#;
+
 /// Migration logic to add approved_time and remove signed_over from the blocks table.
 ///
 /// Uses the recreate-table approach instead of `ALTER TABLE DROP COLUMN` because
@@ -1686,6 +1762,18 @@ struct Migration {
     statements: &'static [&'static str],
 }
 
+/// Converge upstream and prototype databases whose versions 20–22 had different schemas.
+static SCHEMA_24: &[&str] = &[
+    CREATE_SUPERSEDED_TENURES_TABLE,
+    "CREATE INDEX IF NOT EXISTS blocks_stacks_height ON blocks (stacks_height DESC);",
+    "CREATE INDEX IF NOT EXISTS burn_blocks_height ON burn_blocks (block_height);",
+    "CREATE INDEX IF NOT EXISTS blocks_consensus_hash_height ON blocks (consensus_hash, stacks_height);",
+    CREATE_SIGNER_NETWORK_JOURNAL,
+    CREATE_SIGNER_NETWORK_PROPOSALS,
+    "DROP TABLE IF EXISTS stackerdb_tracking;",
+    "INSERT INTO db_config (version) VALUES (24);",
+];
+
 /// Enum representing each schema version. Adding a new schema version requires
 /// adding a variant here, a corresponding entry in `MIGRATIONS`, and a test
 /// case in `test_all_schema_migrations_have_tests` (which uses an exhaustive
@@ -1716,6 +1804,7 @@ enum SchemaVersion {
     V21 = 21,
     V22 = 22,
     V23 = 23,
+    V24 = 24,
 }
 
 impl SchemaVersion {
@@ -1817,11 +1906,63 @@ static MIGRATIONS: &[Migration] = &[
         version: SchemaVersion::V23,
         statements: SCHEMA_23,
     },
+    Migration {
+        version: SchemaVersion::V24,
+        statements: SCHEMA_24,
+    },
 ];
 
 impl SignerDb {
+    #[cfg(any(test, feature = "testing"))]
+    fn ensure_legacy_test_adapter_versions(&self) -> Result<(), DBError> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS legacy_signer_test_adapter_versions(
+                public_key TEXT NOT NULL,
+                slot_id INTEGER NOT NULL,
+                slot_version INTEGER NOT NULL,
+                PRIMARY KEY (public_key, slot_id)
+            ) STRICT;",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    /// Read the cursor used solely by the incumbent compatibility test adapter.
+    pub fn get_legacy_test_adapter_version(
+        &self,
+        pk: &StacksPublicKey,
+        slot_id: u32,
+    ) -> Result<Option<u32>, DBError> {
+        self.ensure_legacy_test_adapter_versions()?;
+        self.db
+            .query_row(
+                "SELECT slot_version FROM legacy_signer_test_adapter_versions WHERE public_key = ? AND slot_id = ?",
+                params![pk.to_hex(), slot_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DBError::from)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    /// Advance the cursor used solely by the incumbent compatibility test adapter.
+    pub fn set_legacy_test_adapter_version(
+        &self,
+        pk: &StacksPublicKey,
+        slot_id: u32,
+        slot_version: u32,
+    ) -> Result<(), DBError> {
+        self.ensure_legacy_test_adapter_versions()?;
+        self.db.execute(
+            "INSERT OR REPLACE INTO legacy_signer_test_adapter_versions
+             (public_key, slot_id, slot_version) VALUES (?1, ?2, ?3)",
+            params![pk.to_hex(), slot_id, slot_version],
+        )?;
+        Ok(())
+    }
+
     /// The current schema version used in this build of the signer binary.
-    pub const SCHEMA_VERSION: u32 = SchemaVersion::V23.as_u32();
+    pub const SCHEMA_VERSION: u32 = SchemaVersion::V24.as_u32();
 
     /// Create a new `SignerState` instance.
     /// This will create a new SQLite database at the given path
@@ -1983,33 +2124,211 @@ impl SignerDb {
         Ok(burn_block_hex.to_string())
     }
 
-    /// Get the latest known version from the db for the given slot_id/pk pair
-    pub fn get_latest_chunk_version(
+    /// Atomically retain a locally-authored envelope and advance its durable
+    /// lane sequence. Persisting before enqueue means a crash cannot reuse a
+    /// sequence or lose an envelope that may already have reached a peer.
+    pub fn persist_outgoing_signer_network_envelope(
+        &mut self,
+        author_public_key: &[u8],
+        record: &SignerNetworkJournalRecord,
+        next_sequence: u64,
+    ) -> Result<(), DBError> {
+        let tx = tx_begin_immediate(&mut self.db)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO signer_network_journal
+             (envelope_id, reward_cycle, lane, sequence, envelope, origin, is_equivocation, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                &record.envelope_id,
+                u64_to_sql(record.reward_cycle)?,
+                record.lane,
+                u64_to_sql(record.sequence)?,
+                &record.envelope,
+                i64::from(record.origin),
+                record.is_equivocation,
+                u64_to_sql(record.observed_at)?,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO signer_network_sequences
+             (author_public_key, reward_cycle, lane, next_sequence, previous_envelope_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(author_public_key, reward_cycle, lane) DO UPDATE SET
+                 next_sequence = excluded.next_sequence,
+                 previous_envelope_id = excluded.previous_envelope_id
+             WHERE excluded.next_sequence > signer_network_sequences.next_sequence",
+            params![
+                author_public_key,
+                u64_to_sql(record.reward_cycle)?,
+                record.lane,
+                u64_to_sql(next_sequence)?,
+                &record.envelope_id,
+            ],
+        )?;
+        Self::evict_signer_network_journal(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retain a verified remote envelope before exposing it to signer policy.
+    pub fn persist_signer_network_envelope(
         &self,
-        pk: &StacksPublicKey,
-        slot_id: u32,
-    ) -> Result<Option<u32>, DBError> {
+        record: &SignerNetworkJournalRecord,
+    ) -> Result<(), DBError> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO signer_network_journal
+             (envelope_id, reward_cycle, lane, sequence, envelope, origin, is_equivocation, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                &record.envelope_id,
+                u64_to_sql(record.reward_cycle)?,
+                record.lane,
+                u64_to_sql(record.sequence)?,
+                &record.envelope,
+                i64::from(record.origin),
+                record.is_equivocation,
+                u64_to_sql(record.observed_at)?,
+            ],
+        )?;
+        Self::evict_signer_network_journal(&self.db)?;
+        Ok(())
+    }
+
+    fn evict_signer_network_journal(connection: &Connection) -> Result<(), DBError> {
+        connection.execute(
+            "DELETE FROM signer_network_journal WHERE envelope_id IN (
+                 SELECT envelope_id FROM signer_network_journal
+                 ORDER BY observed_at DESC, rowid DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            [i64::try_from(SIGNER_NETWORK_JOURNAL_LIMIT)
+                .expect("signer journal limit fits SQLite INTEGER")],
+        )?;
+        Ok(())
+    }
+
+    /// Retain canonical proposal bytes for bounded restart recovery and
+    /// content serving. The object is written before its manifest is exposed.
+    pub fn persist_signer_network_proposal(
+        &self,
+        content_id: &[u8],
+        reward_cycle: u64,
+        proposal: &[u8],
+        observed_at: u64,
+    ) -> Result<(), DBError> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO signer_network_proposals
+             (content_id, reward_cycle, proposal, observed_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                content_id,
+                u64_to_sql(reward_cycle)?,
+                proposal,
+                u64_to_sql(observed_at)?,
+            ],
+        )?;
+        self.db.execute(
+            "DELETE FROM signer_network_proposals WHERE content_id IN (
+                 SELECT content_id FROM signer_network_proposals
+                 ORDER BY observed_at DESC, rowid DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            [i64::try_from(SIGNER_NETWORK_PROPOSAL_LIMIT)
+                .expect("proposal journal limit fits SQLite INTEGER")],
+        )?;
+        Ok(())
+    }
+
+    /// Load retained canonical proposal bytes by their domain-separated ID.
+    pub fn get_signer_network_proposal(
+        &self,
+        content_id: &[u8],
+    ) -> Result<Option<Vec<u8>>, DBError> {
         self.db
             .query_row(
-                "SELECT slot_version FROM stackerdb_tracking WHERE public_key = ? AND slot_id = ?",
-                params![pk.to_hex(), slot_id],
+                "SELECT proposal FROM signer_network_proposals WHERE content_id = ?1",
+                [content_id],
                 |row| row.get(0),
             )
             .optional()
             .map_err(DBError::from)
     }
 
-    /// Set the latest known version for the given slot_id/pk pair
-    pub fn set_latest_chunk_version(
-        &self,
-        pk: &StacksPublicKey,
-        slot_id: u32,
-        slot_version: u32,
-    ) -> Result<(), DBError> {
-        self.db.execute(
-            "INSERT OR REPLACE INTO stackerdb_tracking (public_key, slot_id, slot_version) VALUES (?, ?, ?)",
-            params![pk.to_hex(), slot_id, slot_version],
+    /// Load the bounded journal in deterministic observation order.
+    pub fn get_signer_network_journal(&self) -> Result<Vec<SignerNetworkJournalRecord>, DBError> {
+        let mut statement = self.db.prepare(
+            "SELECT envelope_id, reward_cycle, lane, sequence, envelope, origin,
+                    is_equivocation, observed_at
+             FROM signer_network_journal
+             ORDER BY observed_at ASC, rowid ASC",
         )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SignerNetworkJournalRecord {
+                envelope_id: row.get(0)?,
+                reward_cycle: row.get(1)?,
+                lane: row.get(2)?,
+                sequence: row.get(3)?,
+                envelope: row.get(4)?,
+                origin: row.get(5)?,
+                is_equivocation: row.get(6)?,
+                observed_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DBError::from)
+    }
+
+    /// Load all durable outgoing lane cursors for this signer key.
+    pub fn get_signer_network_sequences(
+        &self,
+        author_public_key: &[u8],
+    ) -> Result<Vec<SignerNetworkSequenceState>, DBError> {
+        let mut statement = self.db.prepare(
+            "SELECT reward_cycle, lane, next_sequence, previous_envelope_id
+             FROM signer_network_sequences
+             WHERE author_public_key = ?1
+             ORDER BY reward_cycle, lane",
+        )?;
+        let rows = statement.query_map([author_public_key], |row| {
+            Ok(SignerNetworkSequenceState {
+                reward_cycle: row.get(0)?,
+                lane: row.get(1)?,
+                next_sequence: row.get(2)?,
+                previous_envelope_id: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DBError::from)
+    }
+
+    /// Keep only the current/next reward-cycle network state.
+    pub fn prune_signer_network_cycles(
+        &self,
+        current: u64,
+        next: Option<u64>,
+    ) -> Result<(), DBError> {
+        let current = u64_to_sql(current)?;
+        match next {
+            Some(next) => {
+                let next = u64_to_sql(next)?;
+                self.db.execute(
+                    "DELETE FROM signer_network_journal WHERE reward_cycle NOT IN (?1, ?2)",
+                    params![current, next],
+                )?;
+                self.db.execute(
+                    "DELETE FROM signer_network_sequences WHERE reward_cycle NOT IN (?1, ?2)",
+                    params![current, next],
+                )?;
+            }
+            None => {
+                self.db.execute(
+                    "DELETE FROM signer_network_journal WHERE reward_cycle != ?1",
+                    [current],
+                )?;
+                self.db.execute(
+                    "DELETE FROM signer_network_sequences WHERE reward_cycle != ?1",
+                    [current],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -4387,6 +4706,109 @@ pub mod tests {
         ))
     }
 
+    #[test]
+    fn signer_network_journal_survives_restart_and_never_regresses_sequence() {
+        let db_path = tmp_db_path();
+        let author = [3_u8; 33];
+        let first = SignerNetworkJournalRecord {
+            envelope_id: vec![1; 32],
+            reward_cycle: 12,
+            lane: 4,
+            sequence: 0,
+            envelope: vec![9, 8, 7],
+            origin: 0,
+            is_equivocation: false,
+            observed_at: 100,
+        };
+        {
+            let mut db = SignerDb::new(&db_path).unwrap();
+            db.persist_outgoing_signer_network_envelope(&author, &first, 1)
+                .unwrap();
+        }
+
+        let mut db = SignerDb::new(&db_path).unwrap();
+        assert_eq!(
+            db.get_signer_network_journal().unwrap(),
+            vec![first.clone()]
+        );
+        assert_eq!(
+            db.get_signer_network_sequences(&author).unwrap(),
+            vec![SignerNetworkSequenceState {
+                reward_cycle: 12,
+                lane: 4,
+                next_sequence: 1,
+                previous_envelope_id: Some(vec![1; 32]),
+            }]
+        );
+
+        let second = SignerNetworkJournalRecord {
+            envelope_id: vec![2; 32],
+            sequence: 1,
+            observed_at: 101,
+            ..first.clone()
+        };
+        db.persist_outgoing_signer_network_envelope(&author, &second, 2)
+            .unwrap();
+        // A stale retry may retain evidence but cannot move the durable cursor back.
+        db.persist_outgoing_signer_network_envelope(&author, &first, 1)
+            .unwrap();
+        assert_eq!(
+            db.get_signer_network_sequences(&author).unwrap()[0].next_sequence,
+            2
+        );
+
+        let remote = SignerNetworkJournalRecord {
+            envelope_id: vec![3; 32],
+            reward_cycle: 13,
+            lane: 5,
+            sequence: 7,
+            envelope: vec![6, 5, 4],
+            origin: 1,
+            is_equivocation: true,
+            observed_at: 102,
+        };
+        db.persist_signer_network_envelope(&remote).unwrap();
+        assert_eq!(db.get_signer_network_journal().unwrap().len(), 3);
+        db.prune_signer_network_cycles(13, None).unwrap();
+        assert_eq!(db.get_signer_network_journal().unwrap(), vec![remote]);
+        assert!(db.get_signer_network_sequences(&author).unwrap().is_empty());
+    }
+
+    #[test]
+    fn proposal_object_survives_restart_and_is_bounded() {
+        let db_path = tmp_db_path();
+        let retained_id = vec![0x42; 32];
+        {
+            let db = SignerDb::new(&db_path).unwrap();
+            db.persist_signer_network_proposal(&retained_id, 12, b"retained-proposal", 1)
+                .unwrap();
+        }
+        {
+            let db = SignerDb::new(&db_path).unwrap();
+            assert_eq!(
+                db.get_signer_network_proposal(&retained_id).unwrap(),
+                Some(b"retained-proposal".to_vec())
+            );
+            for index in 0..=SIGNER_NETWORK_PROPOSAL_LIMIT {
+                db.persist_signer_network_proposal(
+                    &[index as u8; 32],
+                    13,
+                    &[index as u8],
+                    2 + index as u64,
+                )
+                .unwrap();
+            }
+            let count: i64 = db
+                .db
+                .query_row("SELECT count(*) FROM signer_network_proposals", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count as usize, SIGNER_NETWORK_PROPOSAL_LIMIT);
+        }
+        _wipe_db(&db_path);
+    }
+
     fn test_basic_signer_db_with_path(db_path: impl AsRef<Path>) {
         let mut db = SignerDb::new(db_path).expect("Failed to create signer db");
         let (block_info_1, block_proposal_1) = create_block_override(|b| {
@@ -6740,6 +7162,85 @@ pub mod tests {
     /// 2. Add the `Migration` entry in `MIGRATIONS`
     /// 3. Add the variant to the match below with version-specific checks
     #[test]
+    /// Prototype versions 20–22 upgrade without losing authored envelope cursors.
+    fn prototype_schema_versions_converge_without_losing_native_state() {
+        for version in 20..=22 {
+            let path = tmp_db_path();
+            let mut db = SignerDb {
+                db: SignerDb::connect(&path).unwrap(),
+            };
+            db.register_scalar_functions().unwrap();
+            for migration in MIGRATIONS.iter().filter(|m| m.version.as_u32() <= 19) {
+                for statement in migration.statements {
+                    db.db.execute_batch(statement).unwrap();
+                }
+            }
+            db.db.execute_batch(CREATE_SIGNER_NETWORK_JOURNAL).unwrap();
+            if version >= 21 {
+                db.db
+                    .execute_batch("DROP TABLE IF EXISTS stackerdb_tracking")
+                    .unwrap();
+            }
+            if version >= 22 {
+                db.db
+                    .execute_batch(CREATE_SIGNER_NETWORK_PROPOSALS)
+                    .unwrap();
+                db.persist_signer_network_proposal(&[7; 32], 12, b"proposal", 1)
+                    .unwrap();
+            }
+            db.db
+                .execute("INSERT INTO db_config (version) VALUES (?1)", [version])
+                .unwrap();
+            let record = SignerNetworkJournalRecord {
+                envelope_id: vec![1; 32],
+                reward_cycle: 12,
+                lane: 4,
+                sequence: 8,
+                envelope: vec![9],
+                origin: 0,
+                is_equivocation: false,
+                observed_at: 1,
+            };
+            let author = [3; 33];
+            db.persist_outgoing_signer_network_envelope(&author, &record, 9)
+                .unwrap();
+            drop(db);
+            let db = SignerDb::new(&path).unwrap();
+            assert_eq!(
+                SignerDb::get_schema_version(&db.db).unwrap(),
+                SignerDb::SCHEMA_VERSION
+            );
+            assert_eq!(db.get_signer_network_journal().unwrap(), vec![record]);
+            assert_eq!(
+                db.get_signer_network_sequences(&author).unwrap()[0].next_sequence,
+                9
+            );
+            assert_eq!(
+                db.get_signer_network_proposal(&[7; 32]).unwrap(),
+                (version >= 22).then(|| b"proposal".to_vec())
+            );
+            assert!(table_exists(&db.db, "superseded_tenures").unwrap());
+            assert!(!table_exists(&db.db, "stackerdb_tracking").unwrap());
+            for index in [
+                "blocks_stacks_height",
+                "burn_blocks_height",
+                "blocks_consensus_hash_height",
+                "blocks_message_info",
+            ] {
+                let count: u32 = db
+                    .db
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                        [index],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "missing {index} after prototype schema {version}");
+            }
+        }
+    }
+
+    #[test]
     fn test_all_schema_migrations() {
         let db_path = tmp_db_path();
         let mut signer_db = SignerDb {
@@ -6924,6 +7425,12 @@ pub mod tests {
                         plan.iter().any(|step| step.contains("blocks_consensus_hash_height")),
                         "get_sibling_commitments should use blocks_consensus_hash_height, got: {plan:?}"
                     );
+                }
+                SchemaVersion::V24 => {
+                    assert!(table_exists(&signer_db.db, "signer_network_journal").unwrap());
+                    assert!(table_exists(&signer_db.db, "signer_network_sequences").unwrap());
+                    assert!(table_exists(&signer_db.db, "signer_network_proposals").unwrap());
+                    assert!(!table_exists(&signer_db.db, "stackerdb_tracking").unwrap());
                 }
                 SchemaVersion::V23 => {
                     // The covering index used by `block_message_info` exists

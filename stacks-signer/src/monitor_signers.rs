@@ -1,65 +1,50 @@
-// Copyright (C) 2020-2024 Stacks Open Internet Foundation
+// Copyright (C) 2020-2026 Stacks Open Internet Foundation
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+//! Native signer liveness monitoring. This deliberately consumes the node's
+//! protected authenticated-network observation view instead of signer
+//! StackerDB slots.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use clarity::codec::read_next;
 use clarity::types::chainstate::{StacksAddress, StacksPrivateKey, StacksPublicKey};
-use clarity::types::StacksEpochId;
 use clarity::util::sleep_ms;
-use libsigner::v0::messages::{MessageSlotID, SignerMessage};
-use libsigner::SignerSession;
 use stacks_common::{info, warn};
 
 use crate::cli::MonitorSignersArgs;
-use crate::client::{ClientError, SignerSlotID, StacksClient};
-use crate::utils::stackerdb_session;
+use crate::client::{ClientError, NativeSignerObservation, StacksClient};
 
-/// The `SignerMonitor` struct is used to monitor the signers stackerdb slots for expected new messages
+/// Polls authenticated native signer observations and reports liveness gaps.
 pub struct SignerMonitor {
-    /// The client being used to monitor stackerdb messages
     stacks_client: StacksClient,
-    /// The current view of the reward cycle
     cycle_state: RewardCycleState,
-    /// The arguments used to configure the monitor
     args: MonitorSignersArgs,
 }
 
+/// Cached reward-set material used to attribute authenticated observations.
 #[derive(Debug, Default, Clone)]
-/// The `RewardCycleState` struct is used to store the current reward cycle view
 pub struct RewardCycleState {
-    signers_slots: HashMap<StacksAddress, SignerSlotID>,
     signers_keys: HashMap<StacksAddress, StacksPublicKey>,
-    signers_addresses: HashMap<SignerSlotID, StacksAddress>,
+    signer_by_key: HashMap<Vec<u8>, StacksAddress>,
     signers_weights: HashMap<StacksAddress, u32>,
-    slot_ids: Vec<u32>,
-    /// Reward cycle is not known until the first successful call to the node
     reward_cycle: Option<u64>,
 }
 
 impl SignerMonitor {
-    /// Create a new `SignerMonitor` instance
+    /// Connect to the configured node and construct a native signer monitor.
     pub fn new(args: MonitorSignersArgs) -> Self {
         url::Url::parse(&format!("http://{}", args.host)).expect("Failed to parse node host");
         let stacks_client = StacksClient::try_from_host(
-            &StacksPrivateKey::random(), // We don't need a private key to read
+            &StacksPrivateKey::random(),
             args.host.clone(),
-            "FOO".to_string(), // We don't care about authorized paths. Just accessing public info
+            args.auth_token.clone(),
         )
-        .expect("Failed to connect to provided host.");
+        .expect("Failed to connect to provided host");
         Self {
             stacks_client,
             cycle_state: RewardCycleState::default(),
@@ -73,261 +58,165 @@ impl SignerMonitor {
             .get_current_reward_cycle_info()?
             .reward_cycle;
         if Some(reward_cycle) == self.cycle_state.reward_cycle {
-            // The reward cycle has not changed. Nothing to refresh.
             return Ok(false);
         }
-        self.cycle_state.reward_cycle = Some(reward_cycle);
-
-        self.cycle_state.signers_keys.clear();
-        self.cycle_state.signers_addresses.clear();
-
-        self.cycle_state.signers_slots =
-            self.stacks_client.get_parsed_signer_slots(reward_cycle)?;
 
         let entries = self
             .stacks_client
             .get_reward_set_signers(reward_cycle)?
-            .unwrap_or_else(|| {
-                panic!("No signers found for the current reward cycle {reward_cycle}")
-            });
+            .unwrap_or_else(|| panic!("No signers found for reward cycle {reward_cycle}"));
+        self.cycle_state = RewardCycleState {
+            reward_cycle: Some(reward_cycle),
+            ..RewardCycleState::default()
+        };
         for entry in entries {
-            let public_key = StacksPublicKey::from_slice(entry.signing_key.as_slice())
-                .expect("Failed to convert signing key to StacksPublicKey");
-            let stacks_address = StacksAddress::p2pkh(self.stacks_client.mainnet, &public_key);
+            let public_key = StacksPublicKey::from_slice(&entry.signing_key)
+                .expect("node returned an invalid reward-set signer key");
+            let address = StacksAddress::p2pkh(self.stacks_client.mainnet, &public_key);
             self.cycle_state
-                .signers_keys
-                .insert(stacks_address.clone(), public_key);
+                .signer_by_key
+                .insert(entry.signing_key.to_vec(), address.clone());
             self.cycle_state
                 .signers_weights
-                .insert(stacks_address, entry.weight);
-        }
-        for (signer_address, slot_id) in self.cycle_state.signers_slots.iter() {
-            self.cycle_state
-                .signers_addresses
-                .insert(*slot_id, signer_address.clone());
-        }
-
-        for (signer_address, slot_id) in self.cycle_state.signers_slots.iter() {
-            self.cycle_state
-                .signers_addresses
-                .insert(*slot_id, signer_address.clone());
-            self.cycle_state.slot_ids.push(slot_id.0);
+                .insert(address.clone(), entry.weight);
+            self.cycle_state.signers_keys.insert(address, public_key);
         }
         Ok(true)
     }
 
-    fn print_missing_signers(&self, missing_signers: &[StacksAddress]) {
-        if missing_signers.is_empty() {
+    fn print_missing_signers(&self, missing: &[StacksAddress]) {
+        if missing.is_empty() {
             return;
         }
-        let formatted_signers = missing_signers
+        let missing_weight = missing
             .iter()
-            .map(|addr| format!("{addr}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let formatted_keys = self
-            .cycle_state
-            .signers_keys
-            .iter()
-            .filter_map(|(addr, key)| {
-                if missing_signers.contains(addr) {
-                    Some(format!("0x{}", key.to_hex()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let missing_weight = missing_signers
-            .iter()
-            .map(|addr| self.cycle_state.signers_weights.get(addr).unwrap())
+            .filter_map(|address| self.cycle_state.signers_weights.get(address))
             .sum::<u32>();
         let total_weight = self.cycle_state.signers_weights.values().sum::<u32>();
-        let percentage_missing = missing_weight as f64 / total_weight as f64 * 100.00;
+        let percentage = if total_weight == 0 {
+            0.0
+        } else {
+            f64::from(missing_weight) / f64::from(total_weight) * 100.0
+        };
         warn!(
-            "Missing messages for {} of {} signer(s). Missing {percentage_missing:.2}% of signing weight  ({missing_weight}/{total_weight})", missing_signers.len(), self.cycle_state.signers_addresses.len();
-            "signer_addresses" => formatted_signers,
-            "signer_keys" => formatted_keys
+            "Missing native BlockResponse observations for {} of {} signers ({percentage:.2}% weight, {missing_weight}/{total_weight})",
+            missing.len(),
+            self.cycle_state.signers_keys.len();
+            "signer_addresses" => missing.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         );
     }
 
-    fn print_stale_signers(&self, stale_signers: &[StacksAddress]) {
-        if stale_signers.is_empty() {
+    fn print_stale_signers(&self, stale: &[StacksAddress]) {
+        if stale.is_empty() {
             return;
         }
-        let formatted_signers = stale_signers
-            .iter()
-            .map(|addr| format!("{addr}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let formatted_keys = self
-            .cycle_state
-            .signers_keys
-            .iter()
-            .filter_map(|(addr, key)| {
-                if stale_signers.contains(addr) {
-                    Some(format!("0x{}", key.to_hex()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
         warn!(
-            "No new updates from {} of {} signer(s) in over {} seconds",
-            stale_signers.len(),
-            self.cycle_state.signers_addresses.len(),
+            "No authenticated native BlockResponse from {} of {} signers in over {} seconds",
+            stale.len(),
+            self.cycle_state.signers_keys.len(),
             self.args.max_age;
-            "signer_addresses" => formatted_signers,
-            "signer_keys" => formatted_keys
+            "signer_addresses" => stale.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         );
     }
 
     fn print_unexpected_messages(
         &self,
-        unexpected_messages: &HashMap<StacksAddress, (SignerMessage, SignerSlotID)>,
+        unexpected: &HashMap<StacksAddress, NativeSignerObservation>,
     ) {
-        if unexpected_messages.is_empty() {
+        if unexpected.is_empty() {
             return;
         }
-        let formatted_signers = unexpected_messages
-            .iter()
-            .map(|(addr, (msg, slot))| {
-                format!("(address: {addr}, slot_id: {slot}, message: {msg:?})")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let formatted_keys = self
-            .cycle_state
-            .signers_keys
-            .iter()
-            .filter_map(|(addr, key)| {
-                if unexpected_messages.contains_key(addr) {
-                    Some(format!("0x{}", key.to_hex()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
         warn!(
-            "Unexpected messages from {} of {} signer(s).",
-            unexpected_messages.len(),
-            self.cycle_state.signers_addresses.len();
-            "signer_addresses" => formatted_signers,
-            "signer_keys" => formatted_keys
+            "Observed authenticated same-sequence equivocation from {} signer(s)",
+            unexpected.len();
+            "observations" => unexpected.iter().map(|(address, observation)| format!(
+                "address={address},peer_id={},sequence={}",
+                observation.peer_id, observation.sequence
+            )).collect::<Vec<_>>().join(";"),
         );
     }
 
-    /// Start monitoring the signers stackerdb slots for expected new messages
+    /// Poll forever, preserving missing, stale, and equivocation reporting.
     pub fn start(&mut self) -> Result<(), ClientError> {
         self.refresh_state()?;
-        let nmb_signers = self.cycle_state.signers_keys.len();
-        let interval_ms = self.args.interval * 1000;
-        let reward_cycle = self
-            .cycle_state
-            .reward_cycle
-            .expect("BUG: reward cycle not set");
-        let contract = MessageSlotID::BlockResponse
-            .stacker_db_contract(self.stacks_client.mainnet, reward_cycle);
         info!(
-            "Monitoring signers stackerdb. Polling interval: {} secs, Max message age: {} secs, Reward cycle: {reward_cycle}, StackerDB contract: {contract}",
-            self.args.interval, self.args.max_age
+            "Monitoring authenticated native signer observations";
+            "interval_secs" => self.args.interval,
+            "max_age_secs" => self.args.max_age,
+            "reward_cycle" => self.cycle_state.reward_cycle.unwrap_or_default(),
+            "signer_count" => self.cycle_state.signers_keys.len(),
         );
-        let stackerdb_timeout = Duration::from_secs(self.args.stackerdb_timeout_secs);
-        let mut session = stackerdb_session(&self.args.host, contract, stackerdb_timeout);
-        info!("Confirming messages for {nmb_signers} registered signers";
-            "signer_addresses" => self.cycle_state.signers_addresses.values().map(|addr| format!("{addr}")).collect::<Vec<_>>().join(", ")
-        );
-        let mut last_messages = HashMap::with_capacity(nmb_signers);
-        let mut last_updates = HashMap::with_capacity(nmb_signers);
+
         loop {
-            info!("Polling signers stackerdb for new messages...");
-            let mut missing_signers = Vec::with_capacity(nmb_signers);
-            let mut stale_signers = Vec::with_capacity(nmb_signers);
-            let mut unexpected_messages = HashMap::new();
-
             if self.refresh_state()? {
-                let reward_cycle = self
-                    .cycle_state
-                    .reward_cycle
-                    .expect("BUG: reward cycle not set");
-                let contract = MessageSlotID::BlockResponse
-                    .stacker_db_contract(self.stacks_client.mainnet, reward_cycle);
                 info!(
-                    "Reward cycle has changed to {reward_cycle}. Updating stacker db session to StackerDB contract {contract}.",
+                    "Updated native signer monitoring reward set";
+                    "reward_cycle" => self.cycle_state.reward_cycle.unwrap_or_default(),
+                    "signer_count" => self.cycle_state.signers_keys.len(),
                 );
-                session = stackerdb_session(&self.args.host, contract, stackerdb_timeout);
-                // Clear the last messages and signer last update times.
-                last_messages.clear();
-                last_updates.clear();
             }
-            let new_messages: Vec<_> = session
-                .get_latest_chunks(&self.cycle_state.slot_ids)?
-                .into_iter()
-                .map(|chunk_opt| {
-                    chunk_opt.and_then(|data| read_next::<SignerMessage, _>(&mut &data[..]).ok())
-                })
-                .collect();
 
-            for (signer_message_opt, slot_id) in
-                new_messages.into_iter().zip(&self.cycle_state.slot_ids)
+            let diagnostics = self.stacks_client.get_native_network_diagnostics()?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let max_age_ms = u128::from(self.args.max_age).saturating_mul(1000);
+            if diagnostics
+                .snapshot_generated_unix_ms
+                .is_none_or(|generated| now_ms.saturating_sub(generated) > max_age_ms)
             {
-                let signer_slot_id = SignerSlotID(*slot_id);
-                let signer_address = self
+                warn!("Native signer companion observation is stale or missing");
+            }
+
+            let reward_cycle = self.cycle_state.reward_cycle.expect("reward cycle is set");
+            let mut responses = HashMap::new();
+            let mut unexpected = HashMap::new();
+            for observation in diagnostics.signer_observations {
+                // v1 lane 2 is BlockResponse. Other lanes have independent
+                // liveness semantics and must not hide a missing response.
+                if observation.reward_cycle != reward_cycle || observation.lane != 2 {
+                    continue;
+                }
+                let Some(address) = self
                     .cycle_state
-                    .signers_addresses
-                    .get(&signer_slot_id)
-                    .expect("BUG: missing signer address for given slot id")
-                    .clone();
-                let Some(signer_message) = signer_message_opt else {
-                    missing_signers.push(signer_address);
+                    .signer_by_key
+                    .get(&observation.signer_public_key)
+                    .cloned()
+                else {
                     continue;
                 };
-                if let Some(last_message) = last_messages.get(&signer_slot_id) {
-                    if last_message == &signer_message {
-                        continue;
+                if observation.equivocation {
+                    unexpected.insert(address, observation.clone());
+                }
+                responses.insert(observation.signer_public_key.clone(), observation);
+            }
+
+            let mut missing = Vec::new();
+            let mut stale = Vec::new();
+            for (key, address) in &self.cycle_state.signer_by_key {
+                match responses.get(key) {
+                    None => missing.push(address.clone()),
+                    Some(observation)
+                        if now_ms.saturating_sub(observation.last_seen_unix_ms) > max_age_ms =>
+                    {
+                        stale.push(address.clone());
                     }
-                }
-                let epoch = self.stacks_client.get_node_epoch()?;
-                if epoch < StacksEpochId::Epoch25 {
-                    return Err(ClientError::UnsupportedStacksFeature(format!("Monitoring signers is only supported for Epoch 2.5 and later. Current epoch: {epoch:?}")));
-                }
-                if (epoch == StacksEpochId::Epoch25
-                    && !matches!(signer_message, SignerMessage::MockSignature(_)))
-                    || (epoch > StacksEpochId::Epoch25
-                        && !matches!(signer_message, SignerMessage::BlockResponse(_)))
-                {
-                    unexpected_messages.insert(signer_address, (signer_message, signer_slot_id));
-                    continue;
-                }
-                last_messages.insert(signer_slot_id, signer_message);
-                last_updates.insert(signer_slot_id, std::time::Instant::now());
-            }
-            for (slot_id, last_update_time) in last_updates.iter() {
-                if last_update_time.elapsed().as_secs() > self.args.max_age {
-                    let address = self
-                        .cycle_state
-                        .signers_addresses
-                        .get(slot_id)
-                        .expect("BUG: missing signer address for given slot id");
-                    stale_signers.push(address.clone());
+                    Some(_) => {}
                 }
             }
-            if missing_signers.is_empty()
-                && stale_signers.is_empty()
-                && unexpected_messages.is_empty()
-            {
+
+            if missing.is_empty() && stale.is_empty() && unexpected.is_empty() {
                 info!(
-                    "All {} signers are sending messages as expected.",
-                    nmb_signers
+                    "All {} signers have fresh authenticated native BlockResponse observations",
+                    self.cycle_state.signers_keys.len()
                 );
             } else {
-                self.print_missing_signers(&missing_signers);
-                self.print_stale_signers(&stale_signers);
-                self.print_unexpected_messages(&unexpected_messages);
+                self.print_missing_signers(&missing);
+                self.print_stale_signers(&stale);
+                self.print_unexpected_messages(&unexpected);
             }
-            sleep_ms(interval_ms);
+            sleep_ms(self.args.interval.saturating_mul(1000));
         }
     }
 }

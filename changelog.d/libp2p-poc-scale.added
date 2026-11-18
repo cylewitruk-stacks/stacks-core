@@ -1,0 +1,17 @@
+Scale the libp2p regtest PoC to configurable topologies of up to three miners,
+ten signer/companion-node pairs, and five outsider followers. Add per-actor
+authenticated telemetry, bounded host-driven chaos testing, restart-safe
+Bitcoin mining, retryable Epoch 4 fixture deployment, and full-topology
+canonical-convergence verification.
+
+Require chaos recovery to start stopped services as well as unpause paused
+services, then prove each recovered target is running and healthy before the
+next disruption.
+
+Allow the collector-outage chaos gate to require an authenticated
+`telemetry-blind-spot` incident before recovery, proving that chain progress is
+independent of telemetry and that the observer labels stale coverage honestly.
+
+Publish each signer's reconstructed state-machine update when its native
+network handle is installed, preventing a simultaneous signer-set restart from
+waiting circularly for a state transition before protocol-version agreement.

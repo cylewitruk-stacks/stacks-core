@@ -1,0 +1,25 @@
+stacks_private_key = "3ec0ca5770a356d6cd1a9bfcbf6cd151eb1bd85c388cc00648ec4ef5853fdb7401"
+node_host = "stacks-node:20443"
+endpoint = "0.0.0.0:30000"
+network = "testnet"
+auth_password = "12345"
+db_path = "/data/signer.sqlite"
+metrics_endpoint = "0.0.0.0:31000"
+# Native events are in-memory queue reads, so a short PoC poll interval keeps
+# signer state synchronized before the miner's first proposal in each tenure.
+event_timeout_ms = 250
+block_proposal_validation_timeout_ms = 15000
+
+[libp2p]
+rollout_mode = "libp2p-only"
+bind = ["/ip4/0.0.0.0/tcp/30445"]
+advertise = ["/dns4/signer-3/tcp/30445"]
+bootstrap_peers = [
+  "/dns4/stacks-node/tcp/20445/p2p/16Uiu2HAmU1MbqEPd87m36aZWn6qKUtPumc2SthnzhF4h2RXz4wTS",
+  "/dns4/signer-1/tcp/30445/p2p/16Uiu2HAm7K2fEAn5W93hqHt3qhjMKTdDCDDPfyykqEcrgNNBAoqn",
+]
+rendezvous_peers = ["/dns4/stacks-node/tcp/20445/p2p/16Uiu2HAmU1MbqEPd87m36aZWn6qKUtPumc2SthnzhF4h2RXz4wTS"]
+
+
+[libp2p.signer_bridge]
+mode = "off"

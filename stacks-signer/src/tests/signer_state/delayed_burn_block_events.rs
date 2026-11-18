@@ -91,6 +91,7 @@ fn node_responses(height: u64, id: u8) -> Vec<(String, String)> {
         committed_block_hash: None,
         vrf_seed: None,
         stacks_parent_ch: Some(ConsensusHash([id - 1; 20])),
+        num_sortitions: 0,
     };
     let sortitions = [sortition(height, id), sortition(height - 1, id - 1)];
     let header = parent_header(id);

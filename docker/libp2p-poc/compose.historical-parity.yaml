@@ -1,0 +1,76 @@
+# Optional Milestone 4 override. The mining node keeps both transports online,
+# while two independent followers synchronize the same current-genesis chain:
+# one exclusively through libp2p and one through the incumbent legacy stack.
+# No host ports are published; verify.sh queries all three nodes from inside the
+# Compose network.
+services:
+  miner-1:
+    ports: !reset []
+    networks:
+      default:
+        # The incumbent downloader resolves advertised data URLs itself and
+        # does not use Docker's embedded DNS. Keep the parity oracle on a
+        # deterministic, private address instead of coupling it to a
+        # host-published port.
+        ipv4_address: 172.29.77.10
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        sed \
+          -e 's#data_url = "http://127.0.0.1:20443"#data_url = "http://172.29.77.10:20443"#' \
+          -e 's/rollout_mode = "libp2p-only"/rollout_mode = "dual"/' \
+          -e 's/disable_inbound_handshakes = true/disable_inbound_handshakes = false/' \
+          -e 's/disable_block_download = true/private_neighbors = true\ndisable_block_download = true/' \
+          /config.toml > /tmp/config.toml
+        exec stacks-node start --config /tmp/config.toml
+
+  follower-1:
+    ports: !reset []
+
+  stacks-legacy-follower:
+    build:
+      context: ../..
+      dockerfile: docker/libp2p-poc/Dockerfile
+    image: stacks-core-libp2p-poc:local
+    restart: unless-stopped
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+      miner-1:
+        condition: service_healthy
+    ports: !reset []
+    environment:
+      RUST_LOG: "info,stacks_network=info"
+    volumes:
+      - ./generated/configs/follower-1.toml:/config.base.toml:ro
+      - stacks-legacy-follower-data-v1:/data
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        sed \
+          -e 's/name = "libp2p-regtest-follower-1"/name = "legacy-regtest-follower"\nbootstrap_node = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa@miner-1:20444"/' \
+          -e 's/20443/22443/g' \
+          -e 's/20444/22444/g' \
+          -e 's/20445/22445/g' \
+          -e 's/20446/22446/g' \
+          -e 's/rollout_mode = "libp2p-only"/rollout_mode = "off"/' \
+          -e 's/disable_block_download = true/private_neighbors = true\ndisable_block_download = false/' \
+          /config.base.toml > /tmp/config.toml
+        exec stacks-node start --config /tmp/config.toml
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:22443/v2/info >/dev/null"]
+      start_period: 15s
+      interval: 5s
+      timeout: 2s
+      retries: 60
+
+volumes:
+  stacks-legacy-follower-data-v1:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.77.0/24

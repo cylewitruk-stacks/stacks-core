@@ -45,6 +45,7 @@ pub mod getmicroblocks_confirmed;
 pub mod getmicroblocks_indexed;
 pub mod getmicroblocks_unconfirmed;
 pub mod getneighbors;
+pub mod getnetworkdiagnostics;
 pub mod getpoxinfo;
 pub mod getsigner;
 pub mod getsortition;
@@ -131,6 +132,11 @@ impl StacksHttp {
             getmicroblocks_unconfirmed::RPCMicroblocksUnconfirmedRequestHandler::new(),
         );
         self.register_rpc_endpoint(getneighbors::RPCNeighborsRequestHandler::new());
+        self.register_rpc_endpoint(
+            getnetworkdiagnostics::RPCNetworkDiagnosticsRequestHandler::new(
+                self.auth_token.clone(),
+            ),
+        );
         self.register_rpc_endpoint(getstxtransfercost::RPCGetStxTransferCostRequestHandler::new());
         self.register_rpc_endpoint(getstackerdbchunk::RPCGetStackerDBChunkRequestHandler::new());
         self.register_rpc_endpoint(getpoxinfo::RPCPoxInfoRequestHandler::new());

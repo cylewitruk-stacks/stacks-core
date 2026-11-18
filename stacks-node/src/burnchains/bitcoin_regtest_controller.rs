@@ -165,6 +165,7 @@ pub fn make_bitcoin_indexer(
             first_block: burnchain_params.first_block_height,
             magic_bytes: burnchain_config.magic_bytes,
             epochs: burnchain_config.epochs,
+            allow_stale_bitcoin_tip: burnchain_config.allow_stale_bitcoin_tip,
             signet_challenge: burnchain_config.signet_challenge,
         }
     };
@@ -392,6 +393,7 @@ impl BitcoinRegtestController {
                 first_block: burnchain_params.first_block_height,
                 magic_bytes: burnchain_config.magic_bytes,
                 epochs: burnchain_config.epochs,
+                allow_stale_bitcoin_tip: burnchain_config.allow_stale_bitcoin_tip,
                 signet_challenge: burnchain_config.signet_challenge,
             }
         };
@@ -441,6 +443,7 @@ impl BitcoinRegtestController {
                 first_block: burnchain_params.first_block_height,
                 magic_bytes: burnchain_config.magic_bytes,
                 epochs: burnchain_config.epochs,
+                allow_stale_bitcoin_tip: burnchain_config.allow_stale_bitcoin_tip,
                 signet_challenge: burnchain_config.signet_challenge,
             }
         };

@@ -1087,6 +1087,7 @@ fn check_miner_inactivity_timeout() {
         canonical: Some(true),
         burn_block_hash: cur_sortition.burn_block_hash.clone(),
         burn_block_height: burn_height,
+        num_sortitions: 2,
         burn_header_timestamp: cur_sortition.burn_header_timestamp,
         sortition_id: SortitionId([1u8; 32]),
         parent_sortition_id: SortitionId([3u8; 32]),
@@ -1102,6 +1103,7 @@ fn check_miner_inactivity_timeout() {
         canonical: Some(true),
         burn_block_hash: last_sortition.burn_block_hash.clone(),
         burn_block_height: 0,
+        num_sortitions: 1,
         burn_header_timestamp: last_sortition.burn_header_timestamp,
         sortition_id: SortitionId([0u8; 32]),
         parent_sortition_id: SortitionId([4u8; 32]),
@@ -1509,6 +1511,7 @@ fn bitcoin_block_arrival_error_parks_pending_and_retries() {
         committed_block_hash: None,
         vrf_seed: None,
         stacks_parent_ch: Some(cur_sortition.parent_tenure_id.clone()),
+        num_sortitions: 0,
     };
     let last = SortitionInfo {
         canonical: Some(true),
@@ -1524,6 +1527,7 @@ fn bitcoin_block_arrival_error_parks_pending_and_retries() {
         committed_block_hash: None,
         vrf_seed: None,
         stacks_parent_ch: Some(genesis_block.consensus_hash.clone()),
+        num_sortitions: 0,
     };
     let sortitions_json = serde_json::to_string(&vec![cur, last]).unwrap();
     let sortitions_ok = format!("HTTP/1.1 200 OK\n\n{sortitions_json}");
@@ -1839,6 +1843,7 @@ fn pending_burn_block_not_replaced_by_lower_event() {
         committed_block_hash: None,
         vrf_seed: None,
         stacks_parent_ch: Some(event_6b.consensus_hash.clone()),
+        num_sortitions: 0,
     };
     let last = SortitionInfo {
         canonical: Some(true),
@@ -1854,6 +1859,7 @@ fn pending_burn_block_not_replaced_by_lower_event() {
         committed_block_hash: None,
         vrf_seed: None,
         stacks_parent_ch: Some(genesis_block.consensus_hash.clone()),
+        num_sortitions: 0,
     };
     let (peer_info_7b, _) = build_get_peer_info_response(
         Some(event_7b.burn_block_height),

@@ -511,7 +511,7 @@ fn test_new_event_observer() {
     let endpoint = "http://example.com".to_string();
     let timeout = Duration::from_secs(5);
 
-    let observer = EventObserver::new(endpoint.clone(), timeout, false, false);
+    let observer = EventObserver::new(endpoint.clone(), timeout, false, None, false);
 
     // Verify fields
     assert_eq!(observer.endpoint, endpoint);
@@ -543,7 +543,7 @@ fn test_send_payload_with_db() {
     let endpoint = server.url().strip_prefix("http://").unwrap().to_string();
     let timeout = Duration::from_secs(5);
 
-    let observer = EventObserver::new(endpoint, timeout, false, false);
+    let observer = EventObserver::new(endpoint, timeout, false, None, false);
 
     TEST_EVENT_OBSERVER_SKIP_RETRY.set(false);
 
@@ -592,6 +592,7 @@ fn test_send_payload_success() {
         format!("127.0.0.1:{port}"),
         Duration::from_secs(3),
         false,
+        None,
         false,
     );
 
@@ -649,6 +650,7 @@ fn test_send_payload_retry() {
         format!("127.0.0.1:{port}"),
         Duration::from_secs(3),
         false,
+        None,
         false,
     );
 
@@ -703,7 +705,7 @@ fn test_send_payload_timeout() {
         }
     });
 
-    let observer = EventObserver::new(format!("127.0.0.1:{port}"), timeout, false, false);
+    let observer = EventObserver::new(format!("127.0.0.1:{port}"), timeout, false, None, false);
 
     let payload = json!({"key": "value"});
 
@@ -807,13 +809,16 @@ fn test_send_payload_with_db_force_restart() {
 
     let mut dispatcher = EventDispatcher::new(working_dir.clone());
 
-    let observer = dispatcher.register_observer_private(&EventObserverConfig {
-        endpoint: format!("127.0.0.1:{port}"),
-        timeout_ms: timeout.as_millis() as u64,
-        events_keys: vec![EventKeyType::AnyEvent],
-        disable_retries: false,
-        disable_contract_interface: false,
-    });
+    let observer = dispatcher.register_observer_private(
+        &EventObserverConfig {
+            endpoint: format!("127.0.0.1:{port}"),
+            timeout_ms: timeout.as_millis() as u64,
+            events_keys: vec![EventKeyType::AnyEvent],
+            disable_retries: false,
+            disable_contract_interface: false,
+        },
+        None,
+    );
 
     EventDispatcherDbConnection::new(&dispatcher.clone().db_path).unwrap();
 
@@ -860,7 +865,7 @@ fn test_event_dispatcher_disable_retries() {
 
     let endpoint = server.url().strip_prefix("http://").unwrap().to_string();
 
-    let observer = EventObserver::new(endpoint, timeout, true, false);
+    let observer = EventObserver::new(endpoint, timeout, true, None, false);
 
     let dir = tempdir().unwrap();
     let working_dir = dir.path().to_path_buf();
@@ -883,7 +888,7 @@ fn test_event_dispatcher_disable_retries_invalid_url() {
 
     let endpoint = String::from("255.255.255.255");
 
-    let observer = EventObserver::new(endpoint, timeout, true, false);
+    let observer = EventObserver::new(endpoint, timeout, true, None, false);
 
     let dir = tempdir().unwrap();
     let working_dir = dir.path().to_path_buf();
@@ -1257,19 +1262,25 @@ fn backwards_compatibility_transaction_event_payload() {
 #[test]
 fn test_block_proposal_validation_event() {
     let mut server = mockito::Server::new();
-    let mock = server.mock("POST", "/proposal_response").create();
+    let mock = server
+        .mock("POST", "/proposal_response")
+        .match_header("authorization", "companion-secret")
+        .create();
 
     let endpoint = server.url().strip_prefix("http://").unwrap().to_string();
     let dir = tempdir().unwrap();
     let mut dispatcher = EventDispatcher::new(dir.path().to_path_buf());
 
-    dispatcher.register_observer(&EventObserverConfig {
-        endpoint: endpoint.clone(),
-        events_keys: vec![EventKeyType::BlockProposal],
-        timeout_ms: 3_000,
-        disable_retries: false,
-        disable_contract_interface: false,
-    });
+    dispatcher.register_observer_with_proposal_auth(
+        &EventObserverConfig {
+            endpoint: endpoint.clone(),
+            events_keys: vec![EventKeyType::BlockProposal],
+            timeout_ms: 3_000,
+            disable_retries: false,
+            disable_contract_interface: false,
+        },
+        Some("companion-secret".to_owned()),
+    );
 
     // The below matches what the `RPCBlockProposalRequestHandler` does via
     // `NakamotoBlockProposal::spawn_validation_thread`: It calls

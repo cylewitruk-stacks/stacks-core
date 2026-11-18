@@ -21,13 +21,16 @@ use blockstack_lib::chainstate::stacks::boot::RewardSet;
 use blockstack_lib::net::api::getsortition::SortitionInfo;
 use clarity::codec::StacksMessageCodec;
 use hashbrown::HashMap;
-use libsigner::{SignerEntries, SignerEvent, SignerRunLoop};
+use libsigner::v0::messages::SignerMessageTypePrefix;
+use libsigner::{AuthenticatedSignerEvent, SignerEntries, SignerEvent, SignerRunLoop};
 use reqwest::StatusCode;
-use stacks_common::types::chainstate::ConsensusHash;
+use stacks_common::types::chainstate::{ConsensusHash, StacksPublicKey};
 use stacks_common::{debug, error, info, warn};
+use stacks_network_types::wire::v1::SignerLane;
+use stacks_network_types::BridgeMode;
 
 use crate::chainstate::v1::SortitionsView;
-use crate::client::{retry_with_exponential_backoff, ClientError, StacksClient};
+use crate::client::{retry_with_exponential_backoff, ClientError, SignerSlotID, StacksClient};
 use crate::config::{GlobalConfig, SignerConfig, SignerConfigMode};
 use crate::signerdb::BlockInfo;
 use crate::signerdb_pruner::SignerDbPruner;
@@ -36,6 +39,113 @@ use crate::v0::signer_state::LocalStateMachine;
 #[cfg(any(test, feature = "testing"))]
 use crate::v0::tests::TEST_SKIP_SIGNER_CLEANUP;
 use crate::Signer as SignerTrait;
+
+/// A libp2p-only signer can start before PoX-4 reward-set queries are
+/// available.  It cannot wait for the legacy burn-block callback to retry,
+/// because that callback is deliberately disabled.  Keep this retry slow and
+/// bounded so bootstrap cannot turn an unavailable node into a tight RPC loop.
+const COMPANION_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Resume the bounded RPC safety-net if the authenticated companion stream goes
+/// quiet.  This is deliberately longer than the PoC's steady-state Bitcoin
+/// cadence, so a healthy companion remains the authoritative event source while
+/// a dropped role record or connection can still heal without a restart.
+const COMPANION_STATE_STALE_AFTER: Duration = Duration::from_secs(45);
+
+/// Chain-view refresh is a control-plane liveness probe, not a block-validation
+/// obligation. Keep it independently short so a stalled companion cannot hold
+/// the synchronous signer runloop for the much longer validation horizon and
+/// delay already-authenticated availability observations.
+const COMPANION_STATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A companion emits its durable burn-block callback just before the same
+/// block becomes queryable from its RPC thread. Do not install a perpetually
+/// one-sortition-behind miner snapshot from that short ordering window.
+const MINER_AUTHORIZATION_CATCHUP_TIMEOUT: Duration = Duration::from_secs(2);
+const MINER_AUTHORIZATION_CATCHUP_POLL: Duration = Duration::from_millis(50);
+
+/// Translate one authenticated native transport event into the existing signer
+/// event boundary. Keeping this conversion independent of queue draining lets
+/// production-path tests prove that the exact released envelope, rather than a
+/// separately reconstructed proposal, reaches signer policy.
+pub(crate) fn authenticated_native_event<T>(
+    authenticated: AuthenticatedSignerEvent,
+) -> Option<SignerEvent<T>>
+where
+    T: StacksMessageCodec + Clone + Send + Debug,
+{
+    if authenticated.is_equivocation {
+        warn!(
+            "Retained native signer equivocation without applying conflicting payload";
+            "event_id" => ?authenticated.event_id(),
+        );
+        return None;
+    }
+    let lane = authenticated.message.lane;
+    if matches!(lane, SignerLane::Control | SignerLane::ProposalUnavailable) {
+        return None;
+    }
+    let Some(prefix) = authenticated
+        .message
+        .payload
+        .first()
+        .and_then(|prefix| SignerMessageTypePrefix::from_u8(*prefix))
+    else {
+        warn!("Authenticated signer event has no recognized payload prefix");
+        return None;
+    };
+    let expected_lane = match prefix {
+        SignerMessageTypePrefix::BlockProposal => SignerLane::BlockProposal,
+        SignerMessageTypePrefix::BlockResponse | SignerMessageTypePrefix::MockSignature => {
+            SignerLane::BlockResponse
+        }
+        SignerMessageTypePrefix::BlockPushed => SignerLane::BlockPushed,
+        SignerMessageTypePrefix::StateMachineUpdate => SignerLane::StateMachineUpdate,
+        SignerMessageTypePrefix::BlockPreCommit => SignerLane::BlockPreCommit,
+        SignerMessageTypePrefix::MockProposal | SignerMessageTypePrefix::MockBlock => {
+            warn!("Epoch-2.5 miner-only payload is not valid on native signer transport");
+            return None;
+        }
+    };
+    if lane != expected_lane {
+        warn!(
+            "Rejected native signer event with mismatched lane and payload";
+            "lane" => ?lane,
+            "payload_type" => ?prefix,
+        );
+        return None;
+    }
+    let Some(author_public_key) = authenticated.author_public_key() else {
+        warn!("Authenticated signer event has no author public key evidence");
+        return None;
+    };
+    let Ok(public_key) = StacksPublicKey::from_slice(author_public_key) else {
+        warn!("Authenticated signer event has an invalid author public key");
+        return None;
+    };
+    let mut payload = authenticated.message.payload.as_slice();
+    let Ok(message) = T::consensus_deserialize(&mut payload) else {
+        warn!("Failed to deserialize authenticated native signer payload");
+        return None;
+    };
+    if !payload.is_empty() {
+        warn!("Rejected authenticated native signer payload with trailing bytes");
+        return None;
+    }
+    match lane {
+        SignerLane::BlockProposal | SignerLane::BlockPushed => {
+            Some(SignerEvent::MinerMessages(vec![message]))
+        }
+        SignerLane::BlockResponse | SignerLane::BlockPreCommit | SignerLane::StateMachineUpdate => {
+            Some(SignerEvent::SignerMessages {
+                signer_set: (authenticated.message.reward_cycle % 2) as u32,
+                messages: vec![(0, public_key, message)],
+                received_time: std::time::SystemTime::now(),
+            })
+        }
+        SignerLane::Unspecified | SignerLane::Control | SignerLane::ProposalUnavailable => None,
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -375,6 +485,7 @@ where
     pub config: GlobalConfig,
     /// The stacks node client
     pub stacks_client: StacksClient,
+    companion_state_client: StacksClient,
     /// The internal signer for an odd or even reward cycle
     /// Keyed by reward cycle % 2
     pub stacks_signers: HashMap<u64, ConfiguredSigner<Signer, T>>,
@@ -384,6 +495,15 @@ where
     pub burnchain_view: Option<SignerBurnView>,
     /// Cache sortitin data from `stacks-node`
     pub sortition_state: Option<SortitionsView>,
+    /// Process-wide native signer network shared by current/next cycle signers.
+    signer_network: Option<crate::network::SignerNetworkHandle>,
+    /// Locally authorized signer ID for each configured reward cycle.
+    local_signer_ids: HashMap<u64, u32>,
+    /// Earliest time a signer may retry companion state refresh after its
+    /// authenticated observer stream goes stale.
+    next_companion_state_refresh: Instant,
+    /// Last authenticated burn-block callback from this signer's companion.
+    last_companion_burn_event: Option<Instant>,
     /// Prunes the signer db shared by all signers of this process. None if pruning is disabled
     /// in the config.
     pruner: Option<SignerDbPruner>,
@@ -392,7 +512,16 @@ where
 impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLoop<Signer, T> {
     /// Create a new signer runloop from the provided configuration
     pub fn new(config: GlobalConfig) -> Self {
-        let stacks_client = StacksClient::from(&config);
+        // Proposal validation and chain-view liveness have different timeout
+        // budgets. Sharing the validation horizon with control-plane probes
+        // lets a paused companion block the signer runloop long after a local
+        // availability observation is ready.
+        let stacks_client = StacksClient::from(&config)
+            .with_request_timeout(config.block_proposal_validation_timeout)
+            .expect("failed to construct bounded Stacks node HTTP client");
+        let companion_state_client = StacksClient::from(&config)
+            .with_request_timeout(COMPANION_STATE_REQUEST_TIMEOUT)
+            .expect("failed to construct bounded companion state HTTP client");
         // Before the pruner below opens the first connection of this process
         if config.db_shrink {
             maybe_shrink(&config.db_path);
@@ -409,12 +538,26 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         Self {
             config,
             stacks_client,
+            companion_state_client,
             stacks_signers: HashMap::with_capacity(2),
             state: State::Uninitialized,
             burnchain_view: None,
             sortition_state: None,
+            signer_network: None,
+            local_signer_ids: HashMap::with_capacity(2),
+            next_companion_state_refresh: Instant::now(),
+            last_companion_burn_event: None,
             pruner,
         }
+    }
+
+    /// Attach the native network after startup database maintenance has finished.
+    pub fn with_signer_network(
+        mut self,
+        signer_network: Option<crate::network::SignerNetworkHandle>,
+    ) -> Self {
+        self.signer_network = signer_network;
+        self
     }
 
     /// Run a signer db pruning pass if pruning is enabled and one is due
@@ -459,30 +602,62 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
             }
         };
 
-        // Ensure that the stackerdb has been updated for the reward cycle before proceeding
-        let last_calculated_reward_cycle =
-            self.stacks_client.get_last_set_cycle().map_err(|e| {
+        if let Some(network) = self.signer_network.as_ref() {
+            let public_keys = signer_entries
+                .signer_pks
+                .iter()
+                .map(|public_key| {
+                    public_key
+                        .to_bytes_compressed()
+                        .try_into()
+                        .expect("compressed Stacks public keys are exactly 33 bytes")
+                })
+                .collect();
+            if let Err(error) = network.update_authorized_signers(reward_cycle, public_keys) {
                 warn!(
-                    "Failed to fetch last calculated stackerdb cycle from stacks-node";
+                    "Failed to update native signer-network reward-set authorization";
                     "reward_cycle" => reward_cycle,
-                    "err" => ?e
+                    "error" => %error,
                 );
-                ConfigurationError::StackerDBNotUpdated
-            })?;
-        if last_calculated_reward_cycle < reward_cycle as u128 {
-            warn!(
-                "Stackerdb has not been updated for reward cycle {reward_cycle}. Last calculated reward cycle is {last_calculated_reward_cycle}."
-            );
-            return Err(ConfigurationError::StackerDBNotUpdated);
+            }
         }
 
-        let signer_slot_ids = self
-            .stacks_client
-            .get_parsed_signer_slots(reward_cycle)
-            .map_err(|e| {
-                warn!("Error while fetching stackerdb slots {reward_cycle}: {e:?}");
-                e
-            })?;
+        let requires_legacy_slots =
+            !self.config.libp2p.enabled || self.config.libp2p.signer_bridge.mode != BridgeMode::Off;
+        let signer_slot_ids = if requires_legacy_slots {
+            // The quarantined compatibility boundary still needs the legacy
+            // contract's exact slot assignment while mixed-version signers
+            // exist. Native-only operation never reads this state.
+            let last_calculated_reward_cycle =
+                self.stacks_client.get_last_set_cycle().map_err(|e| {
+                    warn!(
+                        "Failed to fetch last calculated StackerDB cycle for compatibility mode";
+                        "reward_cycle" => reward_cycle,
+                        "err" => ?e
+                    );
+                    ConfigurationError::StackerDBNotUpdated
+                })?;
+            if last_calculated_reward_cycle < reward_cycle as u128 {
+                warn!(
+                    "Compatibility StackerDB has not been updated for reward cycle {reward_cycle}. Last calculated reward cycle is {last_calculated_reward_cycle}."
+                );
+                return Err(ConfigurationError::StackerDBNotUpdated);
+            }
+            self.stacks_client
+                .get_parsed_signer_slots(reward_cycle)
+                .map_err(|e| {
+                    warn!(
+                        "Error while fetching compatibility StackerDB slots {reward_cycle}: {e:?}"
+                    );
+                    e
+                })?
+        } else {
+            signer_entries
+                .signer_addr_to_id
+                .iter()
+                .map(|(address, signer_id)| (address.clone(), SignerSlotID(*signer_id)))
+                .collect()
+        };
 
         let dry_run = self.config.dry_run;
         let current_addr = self.stacks_client.get_signer_address();
@@ -490,13 +665,13 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         let signer_config_mode = if !dry_run {
             let Some(signer_slot_id) = signer_slot_ids.get(current_addr) else {
                 warn!(
-                    "Signer {current_addr} was not found in stacker db. Must not be registered for this reward cycle {reward_cycle}."
+                    "Signer {current_addr} was not found in the active signer membership. Must not be registered for reward cycle {reward_cycle}."
                 );
                 return Ok(None);
             };
             let Some(signer_id) = signer_entries.signer_addr_to_id.get(current_addr) else {
                 warn!(
-                    "Signer {current_addr} was found in stacker db but not the reward set for reward cycle {reward_cycle}."
+                    "Signer {current_addr} has a transport slot but is not in the reward set for reward cycle {reward_cycle}."
                 );
                 return Ok(None);
             };
@@ -510,13 +685,13 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         } else {
             if signer_slot_ids.contains_key(current_addr) {
                 error!(
-                    "Signer is configured for dry-run, but the signer address {current_addr} was found in stacker db."
+                    "Signer is configured for dry-run, but {current_addr} is in the active signer membership."
                 );
                 return Err(ConfigurationError::DryRunStackerIsRegistered);
             };
             if signer_entries.signer_addr_to_id.contains_key(current_addr) {
                 warn!(
-                    "Signer {current_addr} was found in stacker db but not the reward set for reward cycle {reward_cycle}."
+                    "Signer {current_addr} has a transport slot but is not in the reward set for reward cycle {reward_cycle}."
                 );
                 return Ok(None);
             };
@@ -550,7 +725,8 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
             reorg_attempts_activity_timeout: self.config.reorg_attempts_activity_timeout,
             proposal_wait_for_parent_time: self.config.proposal_wait_for_parent_time,
             capitulate_miner_view_timeout: self.config.capitulate_miner_view_timeout,
-            stackerdb_timeout: self.config.stackerdb_timeout,
+            #[cfg(any(test, feature = "testing"))]
+            legacy_test_adapter_timeout: self.config.stackerdb_timeout,
             #[cfg(any(test, feature = "testing"))]
             supported_signer_protocol_version: self.config.supported_signer_protocol_version,
         }))
@@ -562,11 +738,41 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         let new_signer_config = match self.get_signer_config(reward_cycle) {
             Ok(Some(new_signer_config)) => {
                 let signer_mode = new_signer_config.signer_mode.clone();
-                let new_signer = Signer::new(&self.stacks_client, new_signer_config);
-                info!("{new_signer} Signer is registered for reward cycle {reward_cycle} as {signer_mode}. Initialized signer state.");
+                match &signer_mode {
+                    SignerConfigMode::Normal { signer_id, .. } => {
+                        self.local_signer_ids.insert(reward_cycle, *signer_id);
+                    }
+                    SignerConfigMode::DryRun => {
+                        self.local_signer_ids.remove(&reward_cycle);
+                    }
+                }
+                if self.config.libp2p.signer_bridge.mode != BridgeMode::Off {
+                    if let (Some(network), SignerConfigMode::Normal { signer_slot_id, .. }) =
+                        (self.signer_network.as_ref(), &signer_mode)
+                    {
+                        if let Err(error) = network.configure_legacy_cycle(
+                            reward_cycle,
+                            signer_slot_id.0,
+                            new_signer_config.mainnet,
+                        ) {
+                            warn!(
+                                "Failed to configure temporary signer compatibility bridge";
+                                "reward_cycle" => reward_cycle,
+                                "signer_slot_id" => signer_slot_id.0,
+                                "error" => %error,
+                            );
+                        }
+                    }
+                }
+                let mut new_signer = Signer::new(&self.stacks_client, new_signer_config);
+                new_signer.set_signer_network(self.signer_network.clone());
+                info!(
+                    "{new_signer} Signer is registered for reward cycle {reward_cycle} as {signer_mode}. Initialized signer state."
+                );
                 ConfiguredSigner::RegisteredSigner(new_signer)
             }
             Ok(None) => {
+                self.local_signer_ids.remove(&reward_cycle);
                 warn!("Signer is not registered for reward cycle {reward_cycle}");
                 ConfiguredSigner::not_registered(reward_cycle)
             }
@@ -609,6 +815,11 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
             self.refresh_signer_config(current_reward_cycle.saturating_add(1));
         }
         self.refresh_signer_retention();
+        self.update_network_cycles(current_reward_cycle);
+        self.refresh_miner_authorizations(
+            current_reward_cycle,
+            self.burnchain_view.as_ref().unwrap().tip.height,
+        );
         Ok(())
     }
 
@@ -664,7 +875,7 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
     /// a failure: every caller treats a missing answer as "unknown".
     fn query_sortition(&self, consensus_hash: &ConsensusHash) -> Option<SortitionInfo> {
         match self
-            .stacks_client
+            .companion_state_client
             .get_sortition_by_consensus_hash(consensus_hash)
         {
             Ok(sortition) => Some(sortition),
@@ -745,8 +956,8 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         };
     }
 
-    fn refresh_runloop(&mut self, event_block: BurnBlock) -> Result<(), ClientError> {
-        let peer_info = self.stacks_client.get_peer_info()?;
+    fn refresh_runloop(&mut self, event_block: Option<BurnBlock>) -> Result<(), ClientError> {
+        let peer_info = self.companion_state_client.get_peer_info()?;
         let burnchain_view = self
             .burnchain_view
             .as_mut()
@@ -759,11 +970,10 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
             height: peer_info.burn_block_height,
             consensus_hash: peer_info.pox_consensus,
         };
-        let event_height = event_block.height;
-        let tip = if node_tip.height > event_block.height {
-            node_tip
-        } else {
-            event_block
+        let event_height = event_block.as_ref().map(|block| block.height);
+        let tip = match event_block {
+            Some(event_tip) if event_tip.height >= node_tip.height => event_tip,
+            _ => node_tip,
         };
         burnchain_view.set_tip(tip);
 
@@ -774,7 +984,7 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         info!(
             "Refreshing runloop with new burn block event";
             "latest_node_burn_ht" => burnchain_view.tip.height,
-            "event_ht" => event_height,
+            "event_ht" => ?event_height,
             "reward_cycle_before_refresh" => reward_cycle_before_refresh,
             "current_reward_cycle" => current_reward_cycle,
             "configured_for_current" => Self::is_configured_for_cycle(&self.stacks_signers, current_reward_cycle),
@@ -798,7 +1008,183 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug> RunLo
         }
 
         self.refresh_signer_retention();
+        self.update_network_cycles(current_reward_cycle);
+        self.refresh_miner_authorizations(
+            current_reward_cycle,
+            self.burnchain_view.as_ref().unwrap().tip.height,
+        );
         Ok(())
+    }
+
+    fn update_network_cycles(&self, current_reward_cycle: u64) {
+        let mut active_cycles = self
+            .stacks_signers
+            .values()
+            .map(ConfiguredSigner::reward_cycle)
+            .filter(|cycle| {
+                *cycle >= current_reward_cycle.saturating_sub(1)
+                    && *cycle <= current_reward_cycle.saturating_add(1)
+            })
+            .collect::<Vec<_>>();
+        active_cycles.sort_unstable();
+        active_cycles.dedup();
+        let retained_current = active_cycles
+            .first()
+            .copied()
+            .unwrap_or(current_reward_cycle);
+        let retained_next = active_cycles.get(1).copied();
+        if let Some(network) = self.signer_network.as_ref() {
+            if let Err(error) = network.update_cycles(retained_current, retained_next) {
+                warn!(
+                    "Failed to update native signer-network reward cycles";
+                    "current_reward_cycle" => current_reward_cycle,
+                    "retained_current" => retained_current,
+                    "retained_next" => ?retained_next,
+                    "error" => %error,
+                );
+                return;
+            }
+            if let Some(info) = self
+                .burnchain_view
+                .as_ref()
+                .map(SignerBurnView::reward_cycle_info)
+            {
+                for cycle in active_cycles {
+                    let Some(signer_id) = self.local_signer_ids.get(&cycle).copied() else {
+                        continue;
+                    };
+                    let cycle_start = info
+                        .first_burnchain_block_height
+                        .saturating_add(cycle.saturating_mul(info.reward_cycle_length));
+                    let valid_from = cycle_start.saturating_sub(info.prepare_phase_block_length);
+                    let valid_until = cycle_start
+                        .saturating_add(info.reward_cycle_length)
+                        .saturating_sub(1)
+                        .max(info.last_burnchain_block_height);
+                    if let Err(error) = network.install_role_record(
+                        cycle,
+                        signer_id,
+                        info.last_burnchain_block_height,
+                        valid_from,
+                        valid_until,
+                    ) {
+                        warn!(
+                            "Failed to install private signer role-directory record";
+                            "reward_cycle" => cycle,
+                            "signer_id" => signer_id,
+                            "error" => %error,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn refresh_miner_authorizations(&self, reward_cycle: u64, minimum_burn_height: u64) {
+        let Some(network) = self.signer_network.as_ref() else {
+            return;
+        };
+        let deadline = Instant::now() + MINER_AUTHORIZATION_CATCHUP_TIMEOUT;
+        let sortitions = loop {
+            match self.companion_state_client.get_current_and_last_sortition() {
+                Ok(sortitions)
+                    if sortitions.current_sortition.burn_block_height >= minimum_burn_height =>
+                {
+                    break sortitions;
+                }
+                Ok(sortitions) => {
+                    if Instant::now() >= deadline {
+                        warn!(
+                            "Companion sortition RPC did not catch up to its burn-block event";
+                            "event_burn_height" => minimum_burn_height,
+                            "rpc_burn_height" => sortitions.current_sortition.burn_block_height,
+                        );
+                        return;
+                    }
+                }
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        warn!(
+                            "Failed to refresh canonical miner authorization: {error}";
+                            "event_burn_height" => minimum_burn_height,
+                        );
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(MINER_AUTHORIZATION_CATCHUP_POLL);
+        };
+        let mut native_by_cycle =
+            std::collections::BTreeMap::<u64, Vec<(Vec<u8>, [u8; 20])>>::new();
+        for sortition in
+            std::iter::once(&sortitions.current_sortition).chain(sortitions.last_sortition.as_ref())
+        {
+            let Some(hash) = sortition.miner_pk_hash160.as_ref() else {
+                continue;
+            };
+            let cycle = self
+                .burnchain_view
+                .as_ref()
+                .map(|view| view.geometry.reward_cycle_of(sortition.burn_block_height))
+                .unwrap_or(reward_cycle);
+            native_by_cycle
+                .entry(cycle)
+                .or_default()
+                .push((sortition.consensus_hash.as_bytes().to_vec(), hash.0));
+        }
+        for (cycle, miners) in native_by_cycle {
+            if let Err(error) = network.update_authorized_miners(cycle, miners) {
+                warn!(
+                    "Failed to install canonical native miner authorization";
+                    "reward_cycle" => cycle,
+                    "error" => %error,
+                );
+            }
+        }
+        if !self.config.libp2p.signer_bridge.mode.accepts_ingress() {
+            return;
+        }
+        // Zero is the serde-compatible value returned by an old node that does
+        // not expose the count. Fail closed and retain the incumbent parser.
+        if sortitions.current_sortition.num_sortitions == 0 {
+            warn!("Node does not expose sortition count; exact .miners bridge remains disabled");
+            return;
+        }
+        let authorizations = legacy_miner_authorizations(
+            sortitions.current_sortition.num_sortitions,
+            sortitions
+                .current_sortition
+                .miner_pk_hash160
+                .map(|hash| hash.0),
+            sortitions
+                .last_sortition
+                .and_then(|sortition| sortition.miner_pk_hash160.map(|hash| hash.0)),
+        );
+        if let Err(error) = network.update_authorized_legacy_miners(reward_cycle, authorizations) {
+            warn!("Failed to install exact legacy miner authorization: {error}");
+        }
+    }
+
+    fn drain_native_signer_events(&self) -> Vec<SignerEvent<T>> {
+        const MAX_EVENTS_PER_PASS: usize = 256;
+        let Some(network) = self.signer_network.as_ref() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        for _ in 0..MAX_EVENTS_PER_PASS {
+            let authenticated = match network.try_next_event() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!("Failed to poll native signer network: {error}");
+                    break;
+                }
+            };
+            if let Some(event) = authenticated_native_event(authenticated) {
+                events.push(event);
+            }
+        }
+        events
     }
 
     fn is_configured_for_cycle(
@@ -949,17 +1335,33 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug>
             ..
         }) = event
         {
+            self.last_companion_burn_event = Some(Instant::now());
             let event_block = BurnBlock {
                 height: burn_height,
                 consensus_hash: consensus_hash.clone(),
             };
-            if let Err(e) = self.refresh_runloop(event_block) {
+            if let Err(e) = self.refresh_runloop(Some(event_block)) {
                 error!("Failed to refresh signer runloop: {e}.");
                 warn!("Signer may have an outdated view of the network.");
             }
         }
+        // Authenticated companion callbacks are the authoritative chain-view
+        // trigger. A bounded RPC refresh is only a liveness safety net when
+        // that observer stream is stale.
+        let now = Instant::now();
+        let companion_stale = self
+            .last_companion_burn_event
+            .is_none_or(|last_event| now.duration_since(last_event) >= COMPANION_STATE_STALE_AFTER);
+        if companion_stale && now >= self.next_companion_state_refresh {
+            self.next_companion_state_refresh = now + COMPANION_REFRESH_RETRY_INTERVAL;
+            if let Err(error) = self.refresh_runloop(None) {
+                warn!("Failed to refresh companion signer state: {error}");
+            }
+        }
         if self.resolve_latest_sortition() {
             self.refresh_signer_retention();
+            let cycle = self.burnchain_view.as_ref().unwrap().current_reward_cycle();
+            self.update_network_cycles(cycle);
         }
 
         let burnchain_view = self
@@ -968,6 +1370,18 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug>
             .expect("FATAL: cannot be an initialized signer with no burnchain view.");
         let current_reward_cycle = burnchain_view.current_reward_cycle();
         let latest_sortition_reward_cycle = burnchain_view.latest_sortition_reward_cycle();
+        let native_events = self.drain_native_signer_events();
+        let miner_bridge_ready = self
+            .signer_network
+            .as_ref()
+            .is_some_and(|network| network.bridges_legacy_miner_ingress());
+        let compatibility_event = event.as_ref().filter(|event| match event {
+            SignerEvent::SignerMessages { .. } => {
+                !self.config.libp2p.signer_bridge.mode.emits_events()
+            }
+            SignerEvent::MinerMessages(_) => !miner_bridge_ready,
+            _ => true,
+        });
         for configured_signer in self.stacks_signers.values_mut() {
             let ConfiguredSigner::RegisteredSigner(ref mut signer) = configured_signer else {
                 debug!("{configured_signer}: Not configured for cycle, ignoring events for cycle");
@@ -977,16 +1391,37 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug>
             signer.process_event(
                 &self.stacks_client,
                 &mut self.sortition_state,
-                event.as_ref(),
+                compatibility_event,
                 res,
                 current_reward_cycle,
                 latest_sortition_reward_cycle,
             );
         }
+        for native_event in &native_events {
+            for configured_signer in self.stacks_signers.values_mut() {
+                let ConfiguredSigner::RegisteredSigner(ref mut signer) = configured_signer else {
+                    continue;
+                };
+                signer.process_event(
+                    &self.stacks_client,
+                    &mut self.sortition_state,
+                    Some(native_event),
+                    res,
+                    current_reward_cycle,
+                    latest_sortition_reward_cycle,
+                );
+            }
+        }
+
+        if let Some(network) = self.signer_network.as_ref() {
+            network.record_observability_metrics();
+        }
 
         if self.state == State::NoRegisteredSigners && event.is_some() {
             let next_reward_cycle = current_reward_cycle.saturating_add(1);
-            info!("Signer is not registered for the current reward cycle ({current_reward_cycle}). Reward set is not yet determined or signer is not registered for the upcoming reward cycle ({next_reward_cycle}).");
+            info!(
+                "Signer is not registered for the current reward cycle ({current_reward_cycle}). Reward set is not yet determined or signer is not registered for the upcoming reward cycle ({next_reward_cycle})."
+            );
         }
         // Prune only once the runloop is initialized and the event is processed, although
         // pruning itself does not depend on either.
@@ -995,12 +1430,32 @@ impl<Signer: SignerTrait<T>, T: StacksMessageCodec + Clone + Send + Debug>
     }
 }
 
+fn legacy_miner_authorizations(
+    num_sortitions: u64,
+    current_hash: Option<[u8; 20]>,
+    previous_hash: Option<[u8; 20]>,
+) -> Vec<(u32, SignerLane, [u8; 20])> {
+    let current_index = u32::from(!num_sortitions.is_multiple_of(2));
+    let mut authorizations = Vec::with_capacity(4);
+    for (index, hash) in [
+        (current_index, current_hash),
+        (current_index ^ 1, previous_hash),
+    ] {
+        let Some(hash) = hash else { continue };
+        let slot_base = index * 2;
+        authorizations.push((slot_base, SignerLane::BlockProposal, hash));
+        authorizations.push((slot_base + 1, SignerLane::BlockPushed, hash));
+    }
+    authorizations
+}
+
 #[cfg(test)]
 mod tests {
     use blockstack_lib::chainstate::stacks::boot::NakamotoSignerEntry;
     use libsigner::SignerEntries;
     use rand::{thread_rng, Rng, RngCore};
     use stacks_common::types::chainstate::{ConsensusHash, StacksPublicKey};
+    use stacks_network_types::wire::v1::SignerLane;
 
     use super::{
         oldest_active_reward_cycle, BurnBlock, PoxGeometry, RewardCycleInfo, SignerBurnView,
@@ -1178,6 +1633,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_miner_slots_follow_incumbent_sortition_parity() {
+        let current = [1; 20];
+        let previous = [2; 20];
+        assert_eq!(
+            super::legacy_miner_authorizations(7, Some(current), Some(previous)),
+            vec![
+                (2, SignerLane::BlockProposal, current),
+                (3, SignerLane::BlockPushed, current),
+                (0, SignerLane::BlockProposal, previous),
+                (1, SignerLane::BlockPushed, previous),
+            ]
+        );
+        assert_eq!(
+            super::legacy_miner_authorizations(8, Some(current), None),
+            vec![
+                (0, SignerLane::BlockProposal, current),
+                (1, SignerLane::BlockPushed, current),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_nakamoto_signer_entries_test() {
         let nmb_signers = 10;
         let weight = 10;
@@ -1218,7 +1695,7 @@ mod tests {
         .wrapping_add(prepare_phase_block_length);
         let reward_cycle_phase_block_length =
             reward_cycle_length.wrapping_sub(prepare_phase_block_length);
-        let first_burnchain_block_height = std::cmp::max(1u8, thread_rng().gen()) as u64;
+        let first_burnchain_block_height = std::cmp::max(1u8, thread_rng().r#gen()) as u64;
         let last_burnchain_block_height = thread_rng().gen_range(
             first_burnchain_block_height
                 ..first_burnchain_block_height
@@ -1282,7 +1759,7 @@ mod tests {
         assert!(!geometry.is_in_next_prepare_phase(60));
         assert!(!geometry.is_in_next_prepare_phase(61));
 
-        let rand_byte: u8 = std::cmp::max(1, thread_rng().gen());
+        let rand_byte: u8 = std::cmp::max(1, thread_rng().r#gen());
         let prepare_phase_block_length = rand_byte as u64;
         // Ensure the reward cycle is not close to u64 Max to prevent overflow when adding prepare phase len
         let reward_cycle_length = (std::cmp::max(

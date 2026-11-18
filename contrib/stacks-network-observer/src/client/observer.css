@@ -1,0 +1,158 @@
+:root {
+  background: var(--color-background-body);
+}
+
+body {
+  margin: var(--spacing-0);
+  min-width: calc(var(--spacing-12) * 6);
+  background:
+    radial-gradient(circle at 12% 8%, var(--color-background-blue), transparent 30%),
+    radial-gradient(circle at 88% 18%, var(--color-background-purple), transparent 28%),
+    var(--color-background-body);
+}
+
+.observer-page {
+  min-height: 100dvh;
+}
+
+.observer-mark {
+  width: var(--size-element-md);
+  height: var(--size-element-md);
+  fill: var(--color-background-blue);
+  stroke: var(--color-icon-accent);
+  stroke-width: 1.5;
+}
+
+.topology {
+  width: 100%;
+  min-height: calc(var(--spacing-12) * 7);
+  overflow: visible;
+}
+
+.topology--compact {
+  min-height: calc(var(--spacing-12) * 5);
+}
+
+.topology__link {
+  stroke: var(--color-border-blue);
+  stroke-width: 2;
+  opacity: 0.08;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.topology__link--reported {
+  stroke-dasharray: 8 6;
+  opacity: 0.16;
+}
+
+.topology__link--corroborated {
+  stroke-width: 2;
+  opacity: 0.14;
+}
+
+.topology__link--focused {
+  stroke-width: 4;
+  opacity: 0.95;
+}
+
+.topology__link--muted,
+.topology__binding--muted {
+  opacity: 0.03;
+}
+
+.topology__link--both {
+  stroke: var(--color-border-emphasized);
+  stroke-dasharray: 8 6;
+}
+
+.topology__binding {
+  stroke: var(--color-border-emphasized);
+  stroke-width: 2;
+  stroke-dasharray: 2 4;
+  opacity: 0.5;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.topology__binding--focused {
+  stroke-width: 3;
+  opacity: 1;
+}
+
+.topology__halo {
+  fill: var(--color-background-muted);
+  stroke: var(--color-border);
+}
+
+.topology__node--degraded .topology__halo,
+.topology__node--critical .topology__halo {
+  stroke: var(--color-warning);
+  stroke-width: 3;
+}
+
+.topology__node {
+  cursor: crosshair;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.topology__node:focus {
+  outline: none;
+}
+
+.topology__node:focus .topology__halo {
+  stroke: var(--color-border-blue);
+  stroke-width: 3;
+}
+
+.topology__node--muted {
+  opacity: 0.35;
+}
+
+.topology__node--critical .topology__halo {
+  stroke: var(--color-error);
+}
+
+.topology__dot {
+  fill: var(--color-icon-secondary);
+  stroke: var(--color-background-surface);
+  stroke-width: 4;
+}
+
+.topology__dot--miner { fill: var(--color-icon-blue); }
+.topology__dot--signer { fill: var(--color-icon-purple); }
+.topology__dot--companion { fill: var(--color-icon-cyan); }
+.topology__dot--bootstrap { fill: var(--color-icon-orange); }
+
+.topology__node-code {
+  fill: var(--color-on-dark);
+  font-family: var(--font-family-body);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  pointer-events: none;
+}
+
+.topology-legend-dot {
+  width: var(--spacing-3);
+  height: var(--spacing-3);
+  flex: 0 0 auto;
+}
+
+.topology-legend-line {
+  width: var(--spacing-5);
+  height: var(--spacing-3);
+  flex: 0 0 auto;
+}
+
+.waterfall-row { width: 100%; }
+.waterfall-label { width: calc(var(--spacing-12) * 2.5); }
+.waterfall-track { width: 100%; height: var(--spacing-4); flex: 1 1 auto; }
+.waterfall-time { width: var(--spacing-12); text-align: end; }
+.waterfall-base { stroke: var(--color-track); stroke-width: 3; }
+.waterfall-value { stroke: var(--color-border-blue); stroke-width: 5; stroke-linecap: round; }
+.waterfall-value--direct-push { stroke: var(--color-border-purple); }
+.waterfall-value--fetch { stroke: var(--color-border-cyan); }
+.waterfall-marker { fill: var(--color-background-surface); stroke: var(--color-icon-accent); stroke-width: 3; }
+
+@media (max-width: 47.5rem) {
+  .topology { min-height: calc(var(--spacing-12) * 5); }
+  .waterfall-label { width: calc(var(--spacing-12) * 1.5); }
+}

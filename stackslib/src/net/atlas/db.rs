@@ -162,6 +162,18 @@ impl FromRow<(u32, u32)> for (u32, u32) {
     }
 }
 
+#[derive(Debug)]
+struct AttachmentHashRow(Hash160);
+
+impl FromRow<AttachmentHashRow> for AttachmentHashRow {
+    fn from_row(row: &Row) -> Result<Self, db_error> {
+        let value: String = row.get_unwrap("hash");
+        Hash160::from_hex(&value)
+            .map(Self)
+            .map_err(|_| db_error::TypeError)
+    }
+}
+
 impl ToSql for AttachmentInstanceStatus {
     fn to_sql(&self) -> Result<ToSqlOutput<'_>, rusqlite::Error> {
         let integer_rep: i64 = match self {
@@ -603,6 +615,74 @@ impl AtlasDB {
         let args = params![hex_content_hash];
         let row = query_row::<Attachment, _>(&self.conn, &qry, args)?;
         Ok(row)
+    }
+
+    /// Return a stable, lexicographically ordered page of instantiated Atlas
+    /// content hashes. `cursor` is exclusive. Querying one extra row makes the
+    /// completion bit exact without loading attachment content.
+    pub fn get_instantiated_attachment_hash_page(
+        &self,
+        cursor: Option<&Hash160>,
+        max_items: usize,
+    ) -> Result<(Vec<Hash160>, bool), db_error> {
+        let query_limit =
+            i64::try_from(max_items.saturating_add(1)).map_err(|_| db_error::Overflow)?;
+        let mut rows = match cursor {
+            Some(cursor) => query_rows::<AttachmentHashRow, _>(
+                &self.conn,
+                "SELECT hash FROM attachments \
+                 WHERE was_instantiated = 1 AND hash > ?1 \
+                 ORDER BY hash ASC LIMIT ?2",
+                params![to_hex(&cursor.0), query_limit],
+            )?,
+            None => query_rows::<AttachmentHashRow, _>(
+                &self.conn,
+                "SELECT hash FROM attachments \
+                 WHERE was_instantiated = 1 \
+                 ORDER BY hash ASC LIMIT ?1",
+                params![query_limit],
+            )?,
+        };
+        let complete = rows.len() <= max_items;
+        rows.truncate(max_items);
+        Ok((rows.into_iter().map(|row| row.0).collect(), complete))
+    }
+
+    /// Return hash and content from one ordered SQLite statement. This is the
+    /// semantic inventory snapshot used by all native transports: a
+    /// concurrent status change cannot leave a hash selected in one database
+    /// view and its content materialized from another.
+    pub fn get_instantiated_attachment_page(
+        &self,
+        cursor: Option<&Hash160>,
+        max_items: usize,
+    ) -> Result<(Vec<(Hash160, Attachment)>, bool), db_error> {
+        let query_limit =
+            i64::try_from(max_items.saturating_add(1)).map_err(|_| db_error::Overflow)?;
+        let mut rows = match cursor {
+            Some(cursor) => query_rows::<Attachment, _>(
+                &self.conn,
+                "SELECT content, hash FROM attachments \
+                 WHERE was_instantiated = 1 AND hash > ?1 \
+                 ORDER BY hash ASC LIMIT ?2",
+                params![to_hex(&cursor.0), query_limit],
+            )?,
+            None => query_rows::<Attachment, _>(
+                &self.conn,
+                "SELECT content, hash FROM attachments \
+                 WHERE was_instantiated = 1 \
+                 ORDER BY hash ASC LIMIT ?1",
+                params![query_limit],
+            )?,
+        };
+        let complete = rows.len() <= max_items;
+        rows.truncate(max_items);
+        Ok((
+            rows.into_iter()
+                .map(|attachment| (attachment.hash(), attachment))
+                .collect(),
+            complete,
+        ))
     }
 
     /// Queue a new attachment instance, status will be set to "queued",

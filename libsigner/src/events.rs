@@ -312,6 +312,8 @@ pub trait EventReceiver<T: SignerEventTrait> {
     }
 }
 
+type StackerDbEventObserver = Arc<dyn Fn(&StackerDBChunksEvent) + Send + Sync>;
+
 /// Event receiver for Signer events
 pub struct SignerEventReceiver<T: SignerEventTrait> {
     /// Address we bind to
@@ -324,6 +326,11 @@ pub struct SignerEventReceiver<T: SignerEventTrait> {
     stop_signal: Arc<AtomicBool>,
     /// Whether the receiver is running on mainnet
     is_mainnet: bool,
+    /// Shared credential required on companion-node proposal callbacks.
+    proposal_response_auth_token: Option<Arc<str>>,
+    /// Optional compatibility observer invoked with the original signed chunks
+    /// before the legacy event is converted to signer-policy messages.
+    stackerdb_event_observer: Option<StackerDbEventObserver>,
 }
 
 impl<T: SignerEventTrait> SignerEventReceiver<T> {
@@ -336,7 +343,28 @@ impl<T: SignerEventTrait> SignerEventReceiver<T> {
             out_channels: vec![],
             stop_signal: Arc::new(AtomicBool::new(false)),
             is_mainnet,
+            proposal_response_auth_token: None,
+            stackerdb_event_observer: None,
         }
+    }
+
+    /// Require the configured node/signer credential on `/proposal_response` callbacks.
+    ///
+    /// Other observer endpoints retain their existing behavior. This scopes the
+    /// trust boundary to the asynchronous response that can change signer policy.
+    pub fn with_proposal_response_auth_token(mut self, token: impl Into<Arc<str>>) -> Self {
+        self.proposal_response_auth_token = Some(token.into());
+        self
+    }
+
+    /// Install an observer for raw StackerDB chunk events.
+    ///
+    /// The observer cannot alter event delivery and is intended for the
+    /// quarantined signer compatibility bridge, which must verify original
+    /// chunk signatures before translating them to semantic signer events.
+    pub fn with_stackerdb_event_observer(mut self, observer: StackerDbEventObserver) -> Self {
+        self.stackerdb_event_observer = Some(observer);
+        self
     }
 
     /// Do something with the socket
@@ -435,8 +463,27 @@ impl<T: SignerEventTrait> EventReceiver<T> for SignerEventReceiver<T> {
             }
             debug!("Processing {} event", request.url());
             if request.url() == "/stackerdb_chunks" {
-                process_event::<T, StackerDBChunksEvent>(request)
+                process_stackerdb_event::<T>(
+                    request,
+                    event_receiver.stackerdb_event_observer.as_deref(),
+                )
             } else if request.url() == "/proposal_response" {
+                if !proposal_response_is_authorized(
+                    &request,
+                    event_receiver.proposal_response_auth_token.as_deref(),
+                ) {
+                    let remote_addr = request.remote_addr().copied();
+                    request
+                        .respond(HttpResponse::empty(401u16))
+                        .expect("response failed");
+                    warn!(
+                        "Rejected unauthenticated block proposal response";
+                        "remote_addr" => ?remote_addr,
+                    );
+                    return Err(EventError::MalformedRequest(
+                        "unauthenticated block proposal response".into(),
+                    ));
+                }
                 process_event::<T, BlockValidateResponse>(request)
             } else if request.url() == "/new_burn_block" {
                 process_event::<T, BurnBlockEvent>(request)
@@ -508,6 +555,16 @@ impl<T: SignerEventTrait> EventReceiver<T> for SignerEventReceiver<T> {
     }
 }
 
+fn proposal_response_is_authorized(request: &HttpRequest, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    request
+        .headers()
+        .iter()
+        .any(|header| header.field.equiv("Authorization") && header.value.as_str() == expected)
+}
+
 fn ack_dispatcher(request: HttpRequest) {
     if let Err(e) = request.respond(HttpResponse::empty(200u16)) {
         error!("Failed to respond to request: {:?}", &e);
@@ -539,6 +596,27 @@ where
     let signer_event: SignerEvent<T> = json_event.try_into()?;
 
     Ok(signer_event)
+}
+
+fn process_stackerdb_event<T: SignerEventTrait>(
+    mut request: HttpRequest,
+    observer: Option<&(dyn Fn(&StackerDBChunksEvent) + Send + Sync)>,
+) -> Result<SignerEvent<T>, EventError> {
+    let mut body = String::new();
+    if let Err(error) = request.as_reader().read_to_string(&mut body) {
+        ack_dispatcher(request);
+        return Err(EventError::MalformedRequest(format!(
+            "Failed to read body: {error:?}"
+        )));
+    }
+    ack_dispatcher(request);
+    let event: StackerDBChunksEvent = serde_json::from_slice(body.as_bytes()).map_err(|error| {
+        EventError::Deserialize(format!("Could not decode body to JSON: {error:?}"))
+    })?;
+    if let Some(observer) = observer {
+        observer(&event);
+    }
+    event.try_into()
 }
 
 impl<T: SignerEventTrait> TryFrom<StackerDBChunksEvent> for SignerEvent<T> {

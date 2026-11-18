@@ -1,0 +1,120 @@
+[node]
+name = "libp2p-regtest-miner"
+rpc_bind = "0.0.0.0:20443"
+p2p_bind = "0.0.0.0:20444"
+data_url = "http://127.0.0.1:20443"
+p2p_address = "127.0.0.1:20444"
+prometheus_bind = "0.0.0.0:20446"
+working_dir = "/data/node"
+seed = "9e446f6b0c6a96cf2190e54bcd5a8569c3e386f091605499464389b8d4e0bfc201"
+local_peer_seed = "1111111111111111111111111111111111111111111111111111111111111111"
+miner = true
+stacker = true
+use_test_genesis_chainstate = true
+pox_5_sbtc_contract = "ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-token"
+pox_5_sbtc_registry_contract = "ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H.sbtc-registry"
+pox_sync_sample_secs = 0
+wait_time_for_blocks = 0
+wait_time_for_microblocks = 0
+mine_microblocks = false
+
+[node.libp2p]
+rollout_mode = "libp2p-only"
+kademlia_server = true
+bind = ["/ip4/0.0.0.0/tcp/20445"]
+advertise = ["/dns4/stacks-node/tcp/20445/p2p/16Uiu2HAmU1MbqEPd87m36aZWn6qKUtPumc2SthnzhF4h2RXz4wTS"]
+direct_block_push = true
+direct_push_fanout = 3
+
+[node.libp2p.signer_bridge]
+mode = "off"
+
+[miner]
+first_attempt_time_ms = 1000
+subsequent_attempt_time_ms = 2000
+mining_key = "19ec1c3e31d139c989a23a27eac60d1abfad5277d3ae9604242514c738258efa01"
+block_reward_recipient = "STQM73RQC4EX0A07KWG1J5ECZJYBZS4SJ4ERC6WN"
+activated_vrf_key_path = "/data/node/activated-vrf-key.json"
+
+[connection_options]
+disable_block_download = true
+disable_inbound_handshakes = true
+disable_inbound_walks = true
+public_ip_address = "127.0.0.1:20444"
+auth_token = "12345"
+
+[burnchain]
+chain = "bitcoin"
+mode = "nakamoto-neon"
+poll_time_secs = 1
+magic_bytes = "T3"
+pox_prepare_length = 5
+pox_reward_length = 20
+burn_fee_cap = 20000
+peer_host = "bitcoin"
+peer_port = 18444
+rpc_port = 18443
+rpc_ssl = false
+username = "devnet"
+password = "devnet"
+timeout = 30
+wallet_name = "libp2p-poc"
+# This controlled regtest intentionally supports resuming named volumes after
+# the production indexer's two-hour wall-clock freshness window.
+allow_stale_bitcoin_tip = true
+
+[[burnchain.epochs]]
+epoch_name = "1.0"
+start_height = 0
+[[burnchain.epochs]]
+epoch_name = "2.0"
+start_height = 0
+[[burnchain.epochs]]
+epoch_name = "2.05"
+start_height = 203
+[[burnchain.epochs]]
+epoch_name = "2.1"
+start_height = 204
+[[burnchain.epochs]]
+epoch_name = "2.2"
+start_height = 206
+[[burnchain.epochs]]
+epoch_name = "2.3"
+start_height = 207
+[[burnchain.epochs]]
+epoch_name = "2.4"
+start_height = 208
+[[burnchain.epochs]]
+epoch_name = "2.5"
+start_height = 209
+[[burnchain.epochs]]
+epoch_name = "3.0"
+start_height = 223
+[[burnchain.epochs]]
+epoch_name = "3.1"
+start_height = 224
+[[burnchain.epochs]]
+epoch_name = "3.2"
+start_height = 225
+[[burnchain.epochs]]
+epoch_name = "3.3"
+start_height = 226
+[[burnchain.epochs]]
+epoch_name = "3.4"
+start_height = 227
+[[burnchain.epochs]]
+# Epoch 4.0 is placed at offset 5 of the next reward cycle. The stacker
+# bootstrap publishes the configured sBTC interface fixtures before height
+# 245, then the node installs the real .pox-5 boot contract at this boundary.
+epoch_name = "4.0"
+start_height = 245
+
+[[ustx_balance]]
+address = "ST24VB7FBXCBV6P0SRDSPSW0Y2J9XHDXNHW9Q8S7H"
+amount = 10000000000000000
+[[ustx_balance]]
+address = "ST2XAK68AR2TKBQBFNYSK9KN2AY9CVA91A7CSK63Z"
+amount = 10000000000000000
+[[ustx_balance]]
+address = "ST1J9R0VMA5GQTW65QVHW1KVSKD7MCGT27X37A551"
+amount = 10000000000000000

@@ -41,12 +41,13 @@ use crate::run_loop::boot_nakamoto::Neon2NakaData;
 use crate::run_loop::nakamoto::{Globals, RunLoop};
 use crate::run_loop::RegisteredKey;
 
+pub mod libp2p;
 pub mod miner;
 pub mod miner_db;
 pub mod peer;
 pub mod relayer;
 pub mod signer_coordinator;
-pub mod stackerdb_listener;
+pub mod signer_message_processor;
 
 #[cfg(test)]
 mod tests;
@@ -75,6 +76,10 @@ pub struct StacksNode {
     pub p2p_thread_handle: JoinHandle<()>,
     /// handle to the relayer thread
     pub relayer_thread_handle: JoinHandle<()>,
+    /// Parallel libp2p network service, when enabled.
+    pub libp2p_service: Option<stacks_network::NetworkService>,
+    /// Sole process-lifetime consumer for authenticated native signer events.
+    libp2p_signer_thread: Option<JoinHandle<()>>,
 }
 
 /// Types of errors that can arise during Nakamoto StacksNode operation
@@ -200,14 +205,17 @@ impl StacksNode {
 
         let data_from_neon = data_from_neon.unwrap_or_default();
 
-        let mut p2p_net = data_from_neon
-            .peer_network
-            .unwrap_or_else(|| NeonNode::setup_peer_network(&config, &atlas_config, burnchain));
+        let mut p2p_net = data_from_neon.peer_network.unwrap_or_else(|| {
+            NeonNode::setup_peer_network(&config, &atlas_config, burnchain.clone())
+        });
 
         let stackerdbs = StackerDBs::connect(&config.get_stacker_db_file_path(), true)
             .expect("FATAL: failed to connect to stacker DB");
 
-        let relayer = Relayer::from_p2p(&mut p2p_net, stackerdbs);
+        let mut relayer = Relayer::from_p2p(&mut p2p_net, stackerdbs);
+        relayer.set_legacy_data_relay_enabled(
+            config.node.libp2p.rollout_mode.legacy_fallback_enabled(),
+        );
 
         let local_peer = p2p_net.local_peer.clone();
 
@@ -274,14 +282,64 @@ impl StacksNode {
             .expect("FATAL: failed to start p2p thread");
 
         info!("Start HTTP server on: {}", &config.node.rpc_bind);
-        info!("Start P2P server on: {}", &config.node.p2p_bind);
-
+        if config.node.libp2p.rollout_mode.legacy_listener_enabled() {
+            info!("Start legacy P2P server on: {}", &config.node.p2p_bind);
+        } else {
+            info!("Legacy P2P server is disabled in libp2p-only mode");
+        }
+        let libp2p_service = if config.node.libp2p.enabled {
+            Some(
+                self::libp2p::spawn(&config, &burnchain)
+                    .expect("FATAL: failed to start parallel libp2p network"),
+            )
+        } else {
+            None
+        };
+        globals.set_libp2p_handle(libp2p_service.as_ref().map(|service| service.handle()));
+        let libp2p_signer_thread = if is_miner {
+            libp2p_service.as_ref().map(|service| {
+                let network = service.handle();
+                let router = globals.libp2p_signer_events();
+                let keep_running = globals.should_keep_running.clone();
+                thread::Builder::new()
+                    .name("libp2p-signer-router".to_owned())
+                    .spawn(move || {
+                        let mut saturated = false;
+                        while keep_running.load(std::sync::atomic::Ordering::Relaxed) {
+                            match network
+                                .recv_signer_event_timeout(std::time::Duration::from_millis(500))
+                            {
+                                Ok(Some(event)) => {
+                                    let delivered = router.route(event);
+                                    if !delivered && !saturated {
+                                        warn!("Native signer coordinator inbox is saturated");
+                                    }
+                                    if !delivered {
+                                        network.record_signer_event_queue_full();
+                                    }
+                                    saturated = !delivered;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    debug!("Native signer event router stopped: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .expect("FATAL: failed to start libp2p signer event router")
+            })
+        } else {
+            None
+        };
         StacksNode {
             atlas_config,
             globals,
             is_miner,
             p2p_thread_handle,
             relayer_thread_handle,
+            libp2p_service,
+            libp2p_signer_thread,
         }
     }
 
@@ -392,7 +450,17 @@ impl StacksNode {
     }
 
     /// Join all inner threads
-    pub fn join(self) {
+    pub fn join(mut self) {
+        if let Some(libp2p_service) = self.libp2p_service.take() {
+            libp2p_service
+                .shutdown()
+                .expect("libp2p network thread panicked");
+        }
+        if let Some(libp2p_signer_thread) = self.libp2p_signer_thread.take() {
+            libp2p_signer_thread
+                .join()
+                .expect("libp2p signer event router thread panicked");
+        }
         self.relayer_thread_handle.join().unwrap();
         self.p2p_thread_handle.join().unwrap();
     }

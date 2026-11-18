@@ -20,6 +20,8 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use blockstack_lib::chainstate::nakamoto::{NakamotoBlock, NakamotoBlockHeader};
+#[cfg(test)]
+use blockstack_lib::chainstate::stacks::boot::NakamotoSignerEntry;
 use blockstack_lib::chainstate::stacks::boot::RewardSet;
 use blockstack_lib::chainstate::stacks::Error as ChainstateError;
 use blockstack_lib::net::api::postblock_proposal::{
@@ -27,8 +29,9 @@ use blockstack_lib::net::api::postblock_proposal::{
     TOO_MANY_REQUESTS_STATUS,
 };
 use blockstack_lib::util_lib::db::Error as DBError;
+use clarity::codec::StacksMessageCodec;
 use clarity::types::chainstate::{StacksBlockId, StacksPrivateKey};
-use clarity::types::{PrivateKey, StacksEpochId};
+use clarity::types::PrivateKey;
 use clarity::util::hash::{MerkleHashFunc, Sha512Trunc256Sum};
 use clarity::util::secp256k1::Secp256k1PublicKey;
 #[cfg(any(test, feature = "testing"))]
@@ -36,23 +39,28 @@ use clarity::util::sleep_ms;
 #[cfg(any(test, feature = "testing"))]
 use clarity::util::tests::TestFlag;
 use libsigner::v0::messages::{
-    BlockAccepted, BlockRejection, BlockResponse, MessageSlotID, MockProposal, MockSignature,
-    RejectReason, RejectReasonPrefix, SignerMessage, StateMachineUpdate,
+    BlockAccepted, BlockRejection, BlockResponse, RejectReason, RejectReasonPrefix, SignerMessage,
+    StateMachineUpdate,
 };
 use libsigner::v0::signer_state::{GlobalStateEvaluator, MinerState};
-use libsigner::{BlockProposal, RPCError, SignerEvent, SignerSession};
+use libsigner::{BlockProposal, SignerEvent, SignerNetworkMessage};
+use prost::Message as ProstMessage;
 use stacks_common::types::chainstate::{ConsensusHash, StacksAddress, StacksPublicKey};
+use stacks_common::types::StacksEpochId;
 use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::secp256k1::MessageSignature;
 use stacks_common::{debug, error, info, warn};
+use stacks_network_types::wire::v1::{ProposalUnavailable, ProposalUnavailableReason, SignerLane};
+use stacks_network_types::PROPOSAL_UNAVAILABLE_VERSION;
 
 use super::pre_commit::PreCommitThrottle;
 use super::signer_state::LocalStateMachine;
 use crate::chainstate::v1::{SortitionMinerStatus, SortitionsView};
 use crate::chainstate::v2::GlobalStateView;
 use crate::chainstate::{ProposalEvalConfig, SelfAsTip, SortitionData, SortitionStateVersion};
-use crate::client::{ClientError, SignerSlotID, StackerDB, StacksClient};
+use crate::client::{ClientError, SignerSlotID, StacksClient};
 use crate::config::{SignerConfig, SignerConfigMode};
+use crate::network::SignerNetworkHandle;
 use crate::runloop::{PoxGeometry, SignerResult};
 use crate::signerdb::{
     BlockInfo, BlockRejectionUpdate, BlockState, PendingBlockResponses, ReorgPermit,
@@ -78,6 +86,27 @@ const MAX_DEFERRED_PROPOSALS: usize = 16;
 #[cfg(any(test, feature = "testing"))]
 pub static TEST_REPEAT_PROPOSAL_RESPONSE: LazyLock<TestFlag<Vec<StacksPublicKey>>> =
     LazyLock::new(TestFlag::default);
+
+const STATE_UPDATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Bounds repeated publication attempts while making reconstructed signer
+/// state independent of one-shot startup and GossipSub mesh timing.
+#[derive(Debug, Default)]
+struct StateUpdateHeartbeat {
+    last_attempt: Option<Instant>,
+}
+
+impl StateUpdateHeartbeat {
+    fn due(&self, now: Instant) -> bool {
+        self.last_attempt.is_none_or(|last_attempt| {
+            now.saturating_duration_since(last_attempt) >= STATE_UPDATE_HEARTBEAT_INTERVAL
+        })
+    }
+
+    fn record_attempt(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+    }
+}
 
 /// Signer running mode (whether dry-run or real)
 #[derive(Debug)]
@@ -110,8 +139,9 @@ pub struct Signer {
     private_key: StacksPrivateKey,
     /// The signer address
     pub stacks_address: StacksAddress,
-    /// The stackerdb client
-    pub stackerdb: StackerDB<MessageSlotID>,
+    /// Native signer transport. Legacy translation, when explicitly enabled,
+    /// is owned exclusively by the quarantined process-wide bridge.
+    signer_network: Option<SignerNetworkHandle>,
     /// Whether the signer is a mainnet signer or not
     pub mainnet: bool,
     /// The running mode of the signer (whether dry-run or normal)
@@ -147,6 +177,7 @@ pub struct Signer {
     recently_processed: RecentlyProcessedBlocks<100>,
     /// The signer's global state evaluator
     pub global_state_evaluator: GlobalStateEvaluator,
+    state_update_heartbeat: StateUpdateHeartbeat,
     /// Block proposals held back because the global signer state had not formed when they
     /// arrived, each with the time it was first seen. Evaluated as soon as the state forms, or
     /// regardless once `global_state_defer_timeout` has passed.
@@ -239,56 +270,9 @@ impl<const N: usize> RecentlyProcessedBlocks<N> {
     }
 }
 
-/// Read the latest state machine update each signer in the set has written to StackerDB and
-/// store it in `signer_db`, returning the updates read.
-///
-/// An update is recorded as received now. That may be later than it would have arrived as an
-/// event, never earlier, so it can only delay a timeout measured from it.
-///
-/// `signer_addresses` is in signer id order, and a signer's id is also its StackerDB slot (see
-/// `SignerEntries::parse`).
-fn load_state_machine_updates(
-    stackerdb: &mut StackerDB<MessageSlotID>,
-    signer_db: &mut SignerDb,
-    signer_addresses: &[StacksAddress],
-    reward_cycle: u64,
-) -> Result<Vec<(StacksAddress, StateMachineUpdate)>, RPCError> {
-    let session = stackerdb
-        .get_session_mut(&MessageSlotID::StateMachineUpdate)
-        .expect("Invalid stackerdb session");
-    let signer_slot_ids: Vec<u32> = (0..signer_addresses.len())
-        .map(|slot_id| u32::try_from(slot_id).expect("FATAL: signer count exceeds u32::MAX"))
-        .collect();
-    let chunks = session.get_latest_chunks(&signer_slot_ids)?;
-    let mut updates = Vec::new();
-    for (chunk_opt, signer_addr) in chunks.into_iter().zip(signer_addresses.iter()) {
-        let Some(chunk) = chunk_opt else {
-            continue;
-        };
-
-        let Some(update) = StateMachineUpdate::from_signer_message_chunk(&chunk) else {
-            continue;
-        };
-
-        // This might update the received time/cause a discrepency between when we receive it at our event queue, but it
-        // allows signers to potentially evaluate blocks immediately regardless of its nodes event queue state
-        if let Err(e) = signer_db.insert_state_machine_update(
-            reward_cycle,
-            signer_addr,
-            &update,
-            &SystemTime::now(),
-        ) {
-            warn!("Error submitting state machine update to signer DB: {e}");
-        };
-        updates.push((signer_addr.clone(), update));
-    }
-    Ok(updates)
-}
-
 impl SignerTrait<SignerMessage> for Signer {
     /// Create a new signer from the given configuration
     fn new(stacks_client: &StacksClient, signer_config: SignerConfig) -> Self {
-        let mut stackerdb = StackerDB::from(&signer_config);
         let mode = match signer_config.signer_mode {
             SignerConfigMode::DryRun => SignerMode::DryRun,
             SignerConfigMode::Normal { signer_id, .. } => SignerMode::Normal { signer_id },
@@ -304,15 +288,6 @@ impl SignerTrait<SignerMessage> for Signer {
             signer_config.mainnet,
             &StacksPublicKey::from_private(&signer_config.stacks_private_key),
         );
-
-        if let Err(e) = load_state_machine_updates(
-            &mut stackerdb,
-            &mut signer_db,
-            &signer_config.signer_entries.signer_addresses,
-            signer_config.reward_cycle,
-        ) {
-            warn!("Error retrieving state machine updates from stacker DB: {e}");
-        }
 
         let updates = signer_db
             .get_signer_state_machine_updates(signer_config.reward_cycle)
@@ -336,10 +311,11 @@ impl SignerTrait<SignerMessage> for Signer {
             &global_state_evaluator,
             version,
         );
+        crate::monitoring::actions::record_local_state(signer_state.clone());
         Self {
             private_key: signer_config.stacks_private_key,
             stacks_address,
-            stackerdb,
+            signer_network: None,
             mainnet: signer_config.mainnet,
             mode,
             signer_addresses: signer_config.signer_entries.signer_addresses.clone(),
@@ -357,6 +333,7 @@ impl SignerTrait<SignerMessage> for Signer {
             pending_retry_backoff: PendingRetryBackoff::default(),
             recently_processed: RecentlyProcessedBlocks::new(),
             global_state_evaluator,
+            state_update_heartbeat: StateUpdateHeartbeat::default(),
             deferred_proposals: Vec::new(),
             pre_commit_throttle: PreCommitThrottle::default(),
             global_state_defer_timeout: DEFAULT_GLOBAL_STATE_DEFER_TIMEOUT,
@@ -375,6 +352,20 @@ impl SignerTrait<SignerMessage> for Signer {
     /// Return the reward cycle of the signer
     fn reward_cycle(&self) -> u64 {
         self.reward_cycle
+    }
+
+    fn set_signer_network(&mut self, network: Option<SignerNetworkHandle>) {
+        self.signer_network = network;
+        // A signer can reconstruct its local state from its node and database
+        // without observing a state transition. Publish that reconstructed
+        // state as soon as the native network becomes available so a
+        // simultaneous signer-set restart cannot deadlock waiting for the
+        // first post-restart transition. The native journal persists the
+        // envelope before dissemination, so peers joining after this call can
+        // recover it through signer replay even when no gossip mesh exists yet.
+        if self.signer_network.is_some() {
+            self.send_signer_update_message(self.get_signer_protocol_version());
+        }
     }
 
     /// Process the event
@@ -426,10 +417,13 @@ impl SignerTrait<SignerMessage> for Signer {
 
         if prior_state != self.local_state_machine {
             let version = self.get_signer_protocol_version();
-            self.local_state_machine
-                .send_signer_update_message(&mut self.stackerdb, version);
+            self.send_signer_update_message(version);
             prior_state = self.local_state_machine.clone();
         }
+        if self.state_update_heartbeat.due(Instant::now()) {
+            self.send_signer_update_message(self.get_signer_protocol_version());
+        }
+        crate::monitoring::actions::record_local_state(self.local_state_machine.clone());
 
         let event_parity = match event {
             // Block proposal events do have reward cycles, but each proposal has its own cycle,
@@ -460,13 +454,37 @@ impl SignerTrait<SignerMessage> for Signer {
                 SignerEvent::StatusCheck | SignerEvent::NewBurnBlock { .. }
             )
         {
-            // The reward cycle has not yet started for this signer instance
-            // Do not process any events other than status checks or new burn blocks
+            // Retain authenticated state updates before activation so cycle-start
+            // recovery does not depend on peers sending the same update again.
+            if let SignerEvent::SignerMessages {
+                messages,
+                received_time,
+                ..
+            } = event
+            {
+                for (_, public_key, message) in messages {
+                    if let SignerMessage::StateMachineUpdate(update) = message {
+                        let address = StacksAddress::p2pkh(self.mainnet, public_key);
+                        if !self.is_valid_signer(&address) {
+                            continue;
+                        }
+                        if let Err(error) = self.signer_db.insert_state_machine_update(
+                            self.reward_cycle,
+                            &address,
+                            update,
+                            received_time,
+                        ) {
+                            warn!("{self}: Failed to retain future-cycle state update: {error}");
+                        }
+                    }
+                }
+            }
+            // Proposal and response policy starts when the reward cycle does.
             debug!("{self}: Signer reward cycle has not yet started. Ignoring event.");
             return;
         }
 
-        self.handle_event_match(stacks_client, sortition_state, event, current_reward_cycle);
+        self.handle_event_match(stacks_client, sortition_state, event);
 
         // A state update in this event may have completed the global signer state; judge any
         // proposal that was waiting for it now rather than on the next pass.
@@ -476,9 +494,9 @@ impl SignerTrait<SignerMessage> for Signer {
 
         if prior_state != self.local_state_machine {
             let version = self.get_signer_protocol_version();
-            self.local_state_machine
-                .send_signer_update_message(&mut self.stackerdb, version);
+            self.send_signer_update_message(version);
         }
+        crate::monitoring::actions::record_local_state(self.local_state_machine.clone());
     }
 
     fn has_unprocessed_blocks(&self) -> bool {
@@ -518,6 +536,110 @@ impl SignerTrait<SignerMessage> for Signer {
 }
 
 impl Signer {
+    fn burn_view_consensus_hash(&self) -> Vec<u8> {
+        let state = match &self.local_state_machine {
+            LocalStateMachine::Initialized(state) => Some(state),
+            LocalStateMachine::Pending { prior, .. } => Some(prior),
+            LocalStateMachine::Uninitialized => None,
+        };
+        state
+            .map(|state| state.burn_block.as_bytes().to_vec())
+            .unwrap_or_default()
+    }
+
+    fn publish_semantic_message(&self, message: &SignerMessage) {
+        let Some(network) = self.signer_network.as_ref() else {
+            return;
+        };
+        if !network.accepts_local_publication() {
+            return;
+        }
+        if matches!(self.mode, SignerMode::DryRun) {
+            return;
+        }
+        let lane = match message {
+            SignerMessage::BlockResponse(_) => SignerLane::BlockResponse,
+            SignerMessage::BlockPreCommit(_) => SignerLane::BlockPreCommit,
+            SignerMessage::StateMachineUpdate(_) => SignerLane::StateMachineUpdate,
+            SignerMessage::BlockProposal(_) => SignerLane::BlockProposal,
+            SignerMessage::BlockPushed(_) => SignerLane::BlockPushed,
+            SignerMessage::MockSignature(_)
+            | SignerMessage::MockProposal(_)
+            | SignerMessage::MockBlock(_) => {
+                debug!("Skipping historical epoch-2.5 message on semantic signer transport");
+                return;
+            }
+        };
+        let result = network.publish(SignerNetworkMessage {
+            reward_cycle: self.reward_cycle,
+            lane,
+            burn_view_consensus_hash: self.burn_view_consensus_hash(),
+            payload: message.serialize_to_vec(),
+        });
+        match result {
+            Ok(receipt) => info!(
+                "Queued semantic signer message";
+                "reward_cycle" => self.reward_cycle,
+                "lane" => ?lane,
+                "envelope_id" => ?receipt.envelope_id,
+            ),
+            Err(error) => warn!(
+                "Failed to queue semantic signer message";
+                "reward_cycle" => self.reward_cycle,
+                "lane" => ?lane,
+                "error" => %error,
+            ),
+        }
+    }
+
+    fn publish_proposal_unavailable(
+        &self,
+        signer_signature_hash: &Sha512Trunc256Sum,
+        reason: ProposalUnavailableReason,
+    ) {
+        crate::monitoring::actions::increment_block_validation_abstentions();
+        let Some(network) = self.signer_network.as_ref() else {
+            return;
+        };
+        if !network.accepts_local_publication() || matches!(self.mode, SignerMode::DryRun) {
+            return;
+        }
+        let unavailable = ProposalUnavailable {
+            version: PROPOSAL_UNAVAILABLE_VERSION,
+            signer_signature_hash: signer_signature_hash.0.to_vec(),
+            reward_cycle: self.reward_cycle,
+            reason: reason as i32,
+        };
+        if let Err(error) = network.publish(SignerNetworkMessage {
+            reward_cycle: self.reward_cycle,
+            lane: SignerLane::ProposalUnavailable,
+            burn_view_consensus_hash: self.burn_view_consensus_hash(),
+            payload: unavailable.encode_to_vec(),
+        }) {
+            warn!("Failed to publish proposal-unavailable outcome";
+                "signer_signature_hash" => %signer_signature_hash,
+                "reason" => ?reason,
+                "error" => %error,
+            );
+        }
+    }
+
+    fn send_signer_update_message(&mut self, version: u64) {
+        self.state_update_heartbeat.record_attempt(Instant::now());
+        let update = match self
+            .local_state_machine
+            .try_into_update_message_with_version(version)
+        {
+            Ok(update) => update,
+            Err(error) => {
+                warn!("Failed to convert local signer state to a signer message: {error:?}");
+                return;
+            }
+        };
+        let message = SignerMessage::StateMachineUpdate(update);
+        self.publish_semantic_message(&message);
+    }
+
     /// Determine this signers response to a proposed block
     /// Returns a BlockResponse if we have already validated the block
     /// Returns None otherwise
@@ -584,7 +706,6 @@ impl Signer {
         stacks_client: &StacksClient,
         sortition_state: &mut Option<SortitionsView>,
         event: &SignerEvent<SignerMessage>,
-        current_reward_cycle: u64,
     ) {
         match event {
             SignerEvent::BlockValidationResponse(block_validate_response) => {
@@ -671,24 +792,12 @@ impl Signer {
                             );
                         }
                         SignerMessage::BlockPushed(b) => self.handle_block_pushed(stacks_client, b),
-                        SignerMessage::MockProposal(mock_proposal) => {
-                            let epoch = match stacks_client.get_node_epoch() {
-                                Ok(epoch) => epoch,
-                                Err(e) => {
-                                    warn!("{self}: Failed to determine node epoch. Cannot mock sign: {e}");
-                                    continue;
-                                }
-                            };
-                            info!("{self}: received a mock block proposal.";
-                                "current_reward_cycle" => current_reward_cycle,
-                                "epoch" => ?epoch
-                            );
-                            if epoch == StacksEpochId::Epoch25
-                                && self.reward_cycle == current_reward_cycle
-                            {
-                                // We are in epoch 2.5, so we should mock sign to prove we are still alive.
-                                self.mock_sign(mock_proposal.clone());
-                            }
+                        SignerMessage::MockProposal(_) => {
+                            // Epoch 2.5 mock-signing is historical wire
+                            // compatibility, not an active signer protocol.
+                            // The test-only incumbent adapter retains codec
+                            // coverage; current signers never publish it.
+                            debug!("Ignoring historical epoch-2.5 mock proposal");
                         }
                         _ => {}
                     }
@@ -764,7 +873,9 @@ impl Signer {
                 }
 
                 let Some(signer_sighash) = signer_sighash else {
-                    debug!("{self}: received a new block event for a pre-nakamoto block, no processing necessary");
+                    debug!(
+                        "{self}: received a new block event for a pre-nakamoto block, no processing necessary"
+                    );
                     return;
                 };
                 self.recently_processed.add_block(block_id.clone());
@@ -1010,7 +1121,7 @@ impl Signer {
                         "signer_signature_hash" => %signer_signature_hash,
                         "block_id" => %block_id,
                     );
-                    Some(self.create_block_rejection(RejectReason::ConnectivityIssues(e), block))
+                    None
                 }
                 // Block proposal is bad
                 Err(reject_code) => {
@@ -1032,7 +1143,7 @@ impl Signer {
                 "signer_signature_hash" => %signer_signature_hash,
                 "block_id" => %block_id,
             );
-            Some(self.create_block_rejection(RejectReason::NoSortitionView, block))
+            None
         }
     }
 
@@ -1078,7 +1189,7 @@ impl Signer {
                     "signer_signature_hash" => %signer_signature_hash,
                     "block_id" => %block_id,
                 );
-                Some(self.create_block_rejection(RejectReason::ConnectivityIssues(e), block))
+                None
             }
             // Block proposal is bad
             Err(reject_code) => {
@@ -1103,24 +1214,10 @@ impl Signer {
             "{self}: Broadcasting block response to stacks node: {block_response:?}";
         );
         let accepted = matches!(block_response, BlockResponse::Accepted(..));
-        match self
-            .stackerdb
-            .send_message_with_retry::<SignerMessage>(block_response.into())
-        {
-            Ok(ack) => {
-                if !ack.accepted {
-                    warn!(
-                        "{self}: Block response not accepted by stacker-db: {:?}",
-                        ack.reason
-                    );
-                }
-                crate::monitoring::actions::increment_block_responses_sent(accepted);
-                crate::monitoring::actions::record_block_response_latency(block);
-            }
-            Err(e) => {
-                warn!("{self}: Failed to send block response to stacker-db: {e:?}",);
-            }
-        }
+        let message = SignerMessage::from(block_response);
+        self.publish_semantic_message(&message);
+        crate::monitoring::actions::increment_block_responses_sent(accepted);
+        crate::monitoring::actions::record_block_response_latency(block);
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -1165,55 +1262,24 @@ impl Signer {
         info!(
             "{self}: Broadcasting block pre-commit to stacks node for {signer_signature_hash}";
         );
-        match self
-            .stackerdb
-            .send_message_with_retry(SignerMessage::BlockPreCommit(signer_signature_hash))
-        {
-            Ok(ack) => {
-                if !ack.accepted {
-                    warn!(
-                        "{self}: Block pre-commit not accepted by stacker-db: {:?}",
-                        ack.reason
-                    );
-                }
-                crate::monitoring::actions::increment_block_pre_commits_sent();
-            }
-            Err(e) => {
-                warn!("{self}: Failed to send block pre-commit to stacker-db: {e:?}",);
-            }
-        }
+        let message = SignerMessage::BlockPreCommit(signer_signature_hash);
+        self.publish_semantic_message(&message);
+        crate::monitoring::actions::increment_block_pre_commits_sent();
     }
 
-    /// Reload the signer set's state machine updates from StackerDB on the pass in which our
-    /// reward cycle starts.
-    ///
-    /// Until it starts, `process_event` drops every signer message, state machine updates
-    /// included. A peer whose node processes the cycle's first burn block before ours sends its
-    /// update in that window, and does not send it again until its view changes. Without this
-    /// reload we would lack that update until the next burn block, and with enough of them
-    /// missing, reject every proposal in between with `NoSignerConsensus`.
-    ///
-    /// Runs each time the cycle starts, so again if a burnchain reorg takes the tip back into
-    /// the previous cycle and forward again. If StackerDB cannot be read, the signer carries on
-    /// as before and recovers on the next burn block, when its peers send new updates.
+    /// Restore authenticated updates retained before this reward cycle became active.
     fn reload_state_machine_updates_at_cycle_start(&mut self) {
-        match load_state_machine_updates(
-            &mut self.stackerdb,
-            &mut self.signer_db,
-            &self.signer_addresses,
-            self.reward_cycle,
-        ) {
+        match self
+            .signer_db
+            .get_signer_state_machine_updates(self.reward_cycle)
+        {
             Ok(updates) => {
-                info!(
-                    "{self}: Reward cycle started, reloaded the signer set's state machine updates";
-                    "updates" => updates.len(),
-                );
                 for (address, update) in updates {
                     self.global_state_evaluator.insert_update(address, update);
                 }
             }
-            Err(e) => {
-                warn!("{self}: Failed to reload state machine updates for the start of the reward cycle: {e}");
+            Err(error) => {
+                warn!("{self}: Failed to reload signer state at reward-cycle start: {error}")
             }
         }
     }
@@ -2451,16 +2517,25 @@ impl Signer {
 
         // Get sortition view if we don't have it
         if sortition_state.is_none() {
-            *sortition_state =
-                SortitionsView::fetch_view(self.proposal_config.clone(), stacks_client)
-                    .inspect_err(|e| {
-                        warn!(
-                            "{self}: Failed to update sortition view: {e:?}";
-                            "signer_signature_hash" => %signer_signature_hash,
-                            "block_id" => %block_proposal.block.block_id(),
-                        )
-                    })
-                    .ok();
+            match SortitionsView::fetch_view(self.proposal_config.clone(), stacks_client) {
+                Ok(view) => *sortition_state = Some(view),
+                Err(error) => {
+                    // A cached signer state cannot prove that this proposal's
+                    // sortition is canonical. Treat absent companion evidence
+                    // as unavailability, never as acceptance or invalidity.
+                    warn!(
+                        "{self}: Canonical sortition view is unavailable; abstaining from proposal";
+                        "signer_signature_hash" => %signer_signature_hash,
+                        "block_id" => %block_proposal.block.block_id(),
+                        "error" => ?error,
+                    );
+                    self.publish_proposal_unavailable(
+                        &signer_signature_hash,
+                        ProposalUnavailableReason::ChainView,
+                    );
+                    return;
+                }
+            }
         }
 
         // Check if proposal can be rejected now if not valid against sortition view
@@ -2473,12 +2548,30 @@ impl Signer {
 
         if let Some(block_rejection) = block_rejection {
             // We know proposal is invalid. Send rejection message, do not do further validation and do not store it.
+            let policy_reason =
+                RejectReasonPrefix::from(&block_rejection.response_data.reject_reason)
+                    .to_u8()
+                    .to_string();
+            crate::monitoring::actions::increment_block_policy_rejection(&policy_reason);
             self.send_block_response(&block_info.block, block_rejection.into());
         } else {
+            // Durably track the proposal before submitting validation. A fast
+            // local callback must never observe a submission whose proposal is
+            // still absent from signer state.
+            self.signer_db
+                .insert_block(&block_info)
+                .unwrap_or_else(|e| self.handle_insert_block_error(e));
+            self.process_pending_responses_for_block(
+                stacks_client,
+                sortition_state,
+                &mut block_info,
+                pending_responses,
+            );
+
             // Just in case check if the last block validation submission timed out.
             self.check_submitted_block_proposal();
             if self.submitted_block_proposal.is_none() {
-                // We don't know if proposal is valid, submit to stacks-node for further checks and store it locally.
+                // We don't know if proposal is valid, submit to stacks-node for further checks.
                 info!(
                     "{self}: submitting block proposal for validation";
                     "signer_signature_hash" => %signer_signature_hash,
@@ -2508,17 +2601,6 @@ impl Signer {
                         warn!("{self}: Failed to insert pending block validation: {e:?}")
                     });
             }
-
-            // Do not store KNOWN invalid blocks as this could DOS the signer. We only store blocks that are valid or unknown.
-            self.signer_db
-                .insert_block(&block_info)
-                .unwrap_or_else(|e| self.handle_insert_block_error(e));
-            self.process_pending_responses_for_block(
-                stacks_client,
-                sortition_state,
-                &mut block_info,
-                pending_responses,
-            );
         }
     }
 
@@ -2825,6 +2907,10 @@ impl Signer {
     ) {
         crate::monitoring::actions::increment_block_validation_responses(true);
         let signer_signature_hash = &block_validate_ok.signer_signature_hash;
+        info!("{self}: Companion validation accepted block proposal";
+            "signer_signature_hash" => %signer_signature_hash,
+            "validation_time_ms" => block_validate_ok.validation_time_ms,
+        );
         if self
             .submitted_block_proposal
             .as_ref()
@@ -2836,7 +2922,9 @@ impl Signer {
         // For mutability reasons, we need to take the block_info out of the map and add it back after processing
         let Some(mut block_info) = self.block_lookup_by_reward_cycle(signer_signature_hash) else {
             // We have not seen this block before. Why are we getting a response for it?
-            debug!("{self}: Received a block validate response for a block we have are not tracking. Ignoring...");
+            debug!(
+                "{self}: Received a block validate response for a block we have are not tracking. Ignoring..."
+            );
             return;
         };
 
@@ -2925,7 +3013,6 @@ impl Signer {
                     return;
                 }
             }
-
             self.signer_db
                 .insert_block(&block_info)
                 .unwrap_or_else(|e| self.handle_insert_block_error(e));
@@ -2949,6 +3036,10 @@ impl Signer {
     ) {
         crate::monitoring::actions::increment_block_validation_responses(false);
         let signer_signature_hash = &block_validate_reject.signer_signature_hash;
+        info!("{self}: Companion validation rejected block proposal";
+            "signer_signature_hash" => %signer_signature_hash,
+            "reject_code" => ?block_validate_reject.reason_code,
+        );
         if self
             .submitted_block_proposal
             .as_ref()
@@ -2959,7 +3050,9 @@ impl Signer {
         }
         let Some(mut block_info) = self.block_lookup_by_reward_cycle(signer_signature_hash) else {
             // We have not seen this block before. Why are we getting a response for it?
-            debug!("{self}: Received a block validate response for a block we are not tracking. Ignoring...");
+            debug!(
+                "{self}: Received a block validate response for a block we are not tracking. Ignoring..."
+            );
             return;
         };
         if block_info.valid.is_some() {
@@ -3015,6 +3108,18 @@ impl Signer {
         block_validate_response: &BlockValidateResponse,
         sortition_state: &mut Option<SortitionsView>,
     ) {
+        let signer_signature_hash = block_validate_response.signer_signature_hash();
+        let is_current_submission = self
+            .submitted_block_proposal
+            .as_ref()
+            .is_some_and(|(expected, _)| expected == signer_signature_hash);
+        if !is_current_submission {
+            warn!(
+                "{self}: Ignoring unsolicited or stale block validation response";
+                "signer_signature_hash" => %signer_signature_hash,
+            );
+            return;
+        }
         info!("{self}: Received a block validate response: {block_validate_response:?}");
         match block_validate_response {
             BlockValidateResponse::Ok(block_validate_ok) => {
@@ -3028,9 +3133,8 @@ impl Signer {
             }
         };
         // Remove this block validation from the pending table
-        let signer_sig_hash = block_validate_response.signer_signature_hash();
         self.signer_db
-            .remove_pending_block_validation(signer_sig_hash)
+            .remove_pending_block_validation(signer_signature_hash)
             .unwrap_or_else(|e| warn!("{self}: Failed to remove pending block validation: {e:?}"));
 
         // Check if there is a pending block validation that we need to submit to the node
@@ -3044,33 +3148,49 @@ impl Signer {
             return;
         }
 
-        let (signer_sig_hash, insert_ts) =
-            match self.signer_db.get_and_remove_pending_block_validation() {
-                Ok(Some(x)) => x,
-                Ok(None) => {
+        // A missing companion response must not turn already-finalized proposals
+        // into a multi-minute FIFO backlog. Consume a bounded number per pass;
+        // later events continue draining if an old database contains more.
+        const MAX_FINALIZED_VALIDATIONS_PER_PASS: usize = 64;
+        for _ in 0..MAX_FINALIZED_VALIDATIONS_PER_PASS {
+            let (signer_sig_hash, insert_ts) =
+                match self.signer_db.get_and_remove_pending_block_validation() {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => return,
+                    Err(e) => {
+                        warn!("{self}: Failed to get pending block validation: {e:?}");
+                        return;
+                    }
+                };
+
+            info!("{self}: Found a pending block validation: {signer_sig_hash:?}");
+            match self.signer_db.block_lookup(&signer_sig_hash) {
+                Ok(Some(block_info)) if block_info.has_reached_consensus() => {
+                    debug!(
+                        "{self}: Discarding pending validation for a finalized block";
+                        "signer_signature_hash" => %signer_sig_hash,
+                    );
+                }
+                Ok(Some(block_info)) => {
+                    self.submit_block_for_validation(stacks_client, &block_info.block, insert_ts);
                     return;
+                }
+                Ok(None) => {
+                    // This should never happen, but one corrupt queue entry
+                    // must not prevent later valid proposals from progressing.
+                    error!("{self}: Pending block validation not found in DB: {signer_sig_hash:?}");
                 }
                 Err(e) => {
-                    warn!("{self}: Failed to get pending block validation: {e:?}");
+                    error!("{self}: Failed to get block info: {e:?}");
                     return;
                 }
-            };
-
-        info!("{self}: Found a pending block validation: {signer_sig_hash:?}");
-        match self.signer_db.block_lookup(&signer_sig_hash) {
-            Ok(Some(block_info)) => {
-                self.submit_block_for_validation(stacks_client, &block_info.block, insert_ts);
             }
-            Ok(None) => {
-                // This should never happen
-                error!("{self}: Pending block validation not found in DB: {signer_sig_hash:?}");
-            }
-            Err(e) => error!("{self}: Failed to get block info: {e:?}"),
         }
+        debug!("{self}: Yielding after bounded finalized validation cleanup");
     }
 
     /// Check the current tracked submitted block proposal to see if it has timed out.
-    /// Broadcasts a rejection and marks the block locally rejected if it has.
+    /// Abstains if the companion has not answered before the bounded timeout.
     fn check_submitted_block_proposal(&mut self) {
         let Some((proposal_signer_sighash, block_submission)) =
             self.submitted_block_proposal.take()
@@ -3078,23 +3198,17 @@ impl Signer {
             // Nothing to check.
             return;
         };
-        if block_submission.elapsed() < self.block_proposal_validation_timeout {
-            // Not expired yet. Put it back!
-            self.submitted_block_proposal = Some((proposal_signer_sighash, block_submission));
-            return;
-        }
-        // For mutability reasons, we need to take the block_info out of the map and add it back after processing
-        let mut block_info = match self.signer_db.block_lookup(&proposal_signer_sighash) {
+        // Consensus is stronger completion evidence than this signer's local
+        // companion response. Retire the obligation immediately when the block
+        // has finalized; waiting for the timeout would serialize every later
+        // proposal behind work that can no longer affect the decision.
+        match self.signer_db.block_lookup(&proposal_signer_sighash) {
             Ok(Some(block_info)) => {
                 if block_info.has_reached_consensus() {
-                    // The block has already reached consensus.
                     return;
                 }
-                block_info
             }
             Ok(None) => {
-                // This is weird. If this is reached, its probably an error in code logic or the db was flushed.
-                // Why are we tracking a block submission for a block we have never seen / stored before.
                 error!("{self}: tracking an unknown block validation submission.";
                     "signer_signature_hash" => %proposal_signer_sighash,
                 );
@@ -3104,30 +3218,23 @@ impl Signer {
                 error!("{self}: Failed to lookup block in signer db: {e:?}",);
                 return;
             }
-        };
-        // We cannot determine the validity of the block, but we have not reached consensus on it yet.
-        // Reject it so we aren't holding up the network because of our inaction.
+        }
+        if block_submission.elapsed() < self.block_proposal_validation_timeout {
+            self.submitted_block_proposal = Some((proposal_signer_sighash, block_submission));
+            return;
+        }
         warn!(
-            "{self}: Failed to receive block validation response within {} ms. Rejecting block.", self.block_proposal_validation_timeout.as_millis();
+            "{self}: Companion validation timed out; abstaining from this proposal";
             "signer_signature_hash" => %proposal_signer_sighash,
+            "timeout_ms" => self.block_proposal_validation_timeout.as_millis(),
         );
-        let rejection = self.create_block_rejection(
-            RejectReason::ConnectivityIssues(
-                "failed to receive block validation response in time".into(),
-            ),
-            &block_info.block,
+        self.publish_proposal_unavailable(
+            &proposal_signer_sighash,
+            ProposalUnavailableReason::CompanionTimeout,
         );
-        block_info.reject_reason = Some(rejection.response_data.reject_reason.clone());
-        if let Err(e) = block_info.mark_locally_rejected() {
-            if !block_info.has_reached_consensus() {
-                warn!("{self}: Failed to mark block as locally rejected: {e:?}");
-            }
-        };
-        self.send_block_response(&block_info.block, rejection.into());
-
         self.signer_db
-            .insert_block(&block_info)
-            .unwrap_or_else(|e| self.handle_insert_block_error(e));
+            .remove_pending_block_validation(&proposal_signer_sighash)
+            .unwrap_or_else(|e| warn!("{self}: Failed to retire timed-out validation: {e:?}"));
     }
 
     /// Compute the signing weight, given a list of signatures
@@ -3739,10 +3846,14 @@ impl Signer {
                     });
                 return;
             } else {
-                debug!("{self}: Cannot confirm that we have processed parent, but we've waited proposal_wait_for_parent_time, will submit proposal");
+                debug!(
+                    "{self}: Cannot confirm that we have processed parent, but we've waited proposal_wait_for_parent_time, will submit proposal"
+                );
             }
         }
-        match stacks_client.submit_block_for_validation(block.clone()) {
+        match stacks_client
+            .submit_block_for_validation(block.clone(), self.block_proposal_validation_timeout)
+        {
             Ok(_) => {
                 self.submitted_block_proposal = Some((signer_signature_hash, Instant::now()));
             }
@@ -3758,24 +3869,29 @@ impl Signer {
                         });
                 } else {
                     warn!("{self}: Received non-429 status from stacks node: {status}");
+                    self.publish_proposal_unavailable(
+                        &signer_signature_hash,
+                        ProposalUnavailableReason::CompanionRequest,
+                    );
                 }
+            }
+            Err(ClientError::ReqwestError(e)) if e.is_timeout() => {
+                warn!("{self}: Companion block-validation request timed out; abstaining";
+                    "signer_signature_hash" => %signer_signature_hash,
+                    "timeout_ms" => self.block_proposal_validation_timeout.as_millis(),
+                );
+                self.publish_proposal_unavailable(
+                    &signer_signature_hash,
+                    ProposalUnavailableReason::CompanionTimeout,
+                );
             }
             Err(e) => {
                 warn!("{self}: Failed to submit block for validation: {e:?}");
+                self.publish_proposal_unavailable(
+                    &signer_signature_hash,
+                    ProposalUnavailableReason::CompanionRequest,
+                );
             }
-        }
-    }
-
-    /// Send a mock signature to stackerdb to prove we are still alive
-    fn mock_sign(&mut self, mock_proposal: MockProposal) {
-        info!("{self}: Mock signing mock proposal: {mock_proposal:?}");
-        let mock_signature = MockSignature::new(mock_proposal, &self.private_key);
-        let message = SignerMessage::MockSignature(mock_signature);
-        if let Err(e) = self
-            .stackerdb
-            .send_message_with_retry::<SignerMessage>(message)
-        {
-            warn!("{self}: Failed to send mock signature to stacker-db: {e:?}",);
         }
     }
 
@@ -4003,8 +4119,6 @@ mod reject_reason_tests {
 
 #[cfg(test)]
 mod pushed_block_signatures_tests {
-    use blockstack_lib::chainstate::stacks::boot::NakamotoSignerEntry;
-
     use super::*;
 
     /// Build a reward set with the given signer weights, in signer index order, returning
@@ -4132,5 +4246,239 @@ mod pushed_block_signatures_tests {
         header.chain_length += 1;
 
         assert!(verify_pushed_block_signatures(&header, &reward_set).is_err());
+    }
+}
+
+/// Complete the signer half of the native deferral integration test. The
+/// caller supplies the exact authenticated event released by the production
+/// libp2p service; this helper drives that event through the production
+/// runloop translation, proposal policy, companion submission/response,
+/// precommit, and accepted-vote paths.
+#[cfg(test)]
+pub(crate) fn assert_released_native_proposal_reaches_vote(
+    released: libsigner::AuthenticatedSignerEvent,
+    network: SignerNetworkHandle,
+    proposal: &BlockProposal,
+    miner_key: &StacksPrivateKey,
+    signer_key: &StacksPrivateKey,
+) {
+    use std::io::{Read, Write};
+    use std::thread;
+
+    use blockstack_lib::net::api::postblock::StacksBlockAcceptedData;
+    use clarity::vm::costs::ExecutionCost;
+    use stacks_common::types::chainstate::{BurnchainHeaderHash, ConsensusHash};
+    use stacks_common::util::hash::Hash160;
+    use tempfile::TempDir;
+
+    use crate::chainstate::v1::{SortitionMinerStatus, SortitionState};
+    use crate::client::tests::MockServerClient;
+
+    let MockServerClient { server, client, .. } = MockServerClient::new();
+    let accepted_body = serde_json::to_string(&StacksBlockAcceptedData {
+        stacks_block_id: proposal.block.block_id(),
+        accepted: true,
+    })
+    .expect("signed-block response JSON");
+    let accepted_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        accepted_body.len(),
+        accepted_body
+    );
+    let rpc_thread = thread::spawn(move || {
+        let responses = [
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            accepted_response.into_bytes(),
+        ];
+        for response in responses {
+            let (mut stream, _) = server.accept().expect("mock companion request");
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .expect("mock companion request body");
+            assert!(read > 0, "mock companion received an empty request");
+            stream
+                .write_all(&response)
+                .expect("mock companion response");
+        }
+    });
+
+    let signer_address = StacksAddress::p2pkh(false, &StacksPublicKey::from_private(signer_key));
+    let signer_weights = HashMap::from([(signer_address.clone(), 1)]);
+    let proposal_config = ProposalEvalConfig {
+        first_proposal_burn_block_timing: Duration::from_secs(30),
+        block_proposal_timeout: Duration::from_secs(30),
+        tenure_last_block_proposal_timeout: Duration::from_secs(30),
+        tenure_idle_timeout: Duration::from_secs(300),
+        read_count_idle_timeout: Duration::from_secs(12_000),
+        tenure_idle_timeout_buffer: Duration::from_secs(2),
+        reorg_attempts_activity_timeout: Duration::from_secs(3),
+        proposal_wait_for_parent_time: Duration::ZERO,
+        pre_commit_exclusivity_timeout: Duration::ZERO,
+    };
+    let db_dir = TempDir::new().expect("signer test database directory");
+    let signer_db =
+        SignerDb::new(db_dir.path().join("signer.sqlite")).expect("signer test database");
+    let mut reward_set = RewardSet::empty();
+    reward_set.as_v0_mut().unwrap().signers = Some(vec![NakamotoSignerEntry {
+        signing_key: StacksPublicKey::from_private(signer_key)
+            .to_bytes_compressed()
+            .try_into()
+            .unwrap(),
+        stacked_amt: 1,
+        weight: 1,
+    }]);
+    let mut signer = Signer {
+        private_key: signer_key.clone(),
+        stacks_address: signer_address.clone(),
+        signer_network: Some(network.clone()),
+        mainnet: false,
+        mode: SignerMode::Normal { signer_id: 0 },
+        signer_slot_ids: vec![SignerSlotID(0)],
+        signer_addresses: vec![signer_address.clone()],
+        reward_cycle: proposal.reward_cycle,
+        current_reward_cycle: proposal.reward_cycle,
+        latest_sortition_reward_cycle: Some(proposal.reward_cycle),
+        reward_cycle_reached: true,
+        pox_geometry: PoxGeometry {
+            reward_cycle_length: 1,
+            prepare_phase_block_length: 0,
+            first_burnchain_block_height: proposal.burn_height - proposal.reward_cycle,
+        },
+        reward_set,
+        deferred_proposals: Vec::new(),
+        pre_commit_throttle: PreCommitThrottle::default(),
+        global_state_defer_timeout: DEFAULT_GLOBAL_STATE_DEFER_TIMEOUT,
+        pending_retry_backoff: PendingRetryBackoff::default(),
+        test_block_messages: None,
+        signer_weights: signer_weights.clone(),
+        signer_db,
+        proposal_config: proposal_config.clone(),
+        block_proposal_validation_timeout: Duration::from_secs(1),
+        submitted_block_proposal: None,
+        block_proposal_max_age_secs: 300,
+        local_state_machine: LocalStateMachine::Uninitialized,
+        recently_processed: RecentlyProcessedBlocks::new(),
+        global_state_evaluator: GlobalStateEvaluator::new(HashMap::new(), signer_weights),
+        state_update_heartbeat: StateUpdateHeartbeat::default(),
+        capitulate_miner_view_timeout: Duration::from_secs(30),
+        last_capitulate_miner_view: SystemTime::now(),
+        supported_signer_protocol_version: 1,
+    };
+    signer
+        .signer_db
+        .insert_burn_block(
+            &BurnchainHeaderHash([3; 32]),
+            &proposal.block.header.consensus_hash,
+            proposal.burn_height,
+            &SystemTime::now(),
+            &BurnchainHeaderHash([2; 32]),
+        )
+        .unwrap();
+    signer
+        .recently_processed
+        .add_block(proposal.block.header.parent_block_id.clone());
+
+    let consensus_hash = proposal.block.header.consensus_hash.clone();
+    let miner_public_key = StacksPublicKey::from_private(miner_key);
+    let mut sortition_state = Some(SortitionsView {
+        cur_sortition: SortitionState {
+            data: SortitionData {
+                miner_pkh: Hash160::from_data(&miner_public_key.to_bytes_compressed()),
+                miner_pubkey: Some(miner_public_key),
+                prior_sortition: ConsensusHash([2; 20]),
+                parent_tenure_id: ConsensusHash([2; 20]),
+                consensus_hash,
+                burn_header_timestamp: get_epoch_time_secs(),
+                burn_block_hash: BurnchainHeaderHash([3; 32]),
+            },
+            miner_status: SortitionMinerStatus::Valid,
+        },
+        last_sortition: None,
+        config: proposal_config,
+    });
+
+    let event = crate::runloop::authenticated_native_event::<SignerMessage>(released)
+        .expect("released native proposal must cross the production runloop boundary");
+    let SignerEvent::MinerMessages(messages) = &event else {
+        panic!("released proposal did not translate to a miner event");
+    };
+    assert_eq!(
+        messages,
+        &vec![SignerMessage::BlockProposal(proposal.clone())]
+    );
+
+    signer.handle_event_match(&client, &mut sortition_state, &event);
+    let signer_signature_hash = proposal.block.header.signer_signature_hash();
+    assert_eq!(
+        signer
+            .submitted_block_proposal
+            .as_ref()
+            .map(|(hash, _)| hash),
+        Some(&signer_signature_hash),
+        "the exact released proposal must be submitted to the companion"
+    );
+
+    signer.handle_event_match(
+        &client,
+        &mut sortition_state,
+        &SignerEvent::BlockValidationResponse(BlockValidateResponse::Ok(BlockValidateOk {
+            signer_signature_hash: signer_signature_hash.clone(),
+            cost: ExecutionCost::ZERO,
+            size: proposal.block.serialize_to_vec().len() as u64,
+            validation_time_ms: 1,
+            replay_tx_hash: None,
+            replay_tx_exhausted: false,
+        })),
+    );
+    rpc_thread.join().expect("mock companion thread");
+
+    let block_info = signer
+        .block_lookup_by_reward_cycle(&signer_signature_hash)
+        .expect("released proposal remains tracked after voting");
+    assert_eq!(block_info.valid, Some(true));
+    assert!(
+        block_info.signed_self.is_some(),
+        "normal signer voting must record this signer's accepted vote"
+    );
+
+    let local_messages = network
+        .local_test_messages()
+        .into_iter()
+        .filter_map(|message| {
+            let mut payload = message.payload.as_slice();
+            SignerMessage::consensus_deserialize(&mut payload)
+                .ok()
+                .filter(|_| payload.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert!(local_messages.iter().any(|message| {
+        matches!(message, SignerMessage::BlockPreCommit(hash) if hash == &signer_signature_hash)
+    }));
+    assert!(local_messages.iter().any(|message| {
+        matches!(
+            message,
+            SignerMessage::BlockResponse(BlockResponse::Accepted(accepted))
+                if accepted.signer_signature_hash == signer_signature_hash
+        )
+    }));
+}
+
+#[cfg(test)]
+mod state_update_heartbeat_tests {
+    use super::*;
+
+    #[test]
+    fn state_update_heartbeat_is_immediate_then_bounded() {
+        let now = Instant::now();
+        let mut heartbeat = StateUpdateHeartbeat::default();
+        assert!(heartbeat.due(now));
+
+        heartbeat.record_attempt(now);
+        assert!(!heartbeat.due(now));
+        assert!(!heartbeat.due(now + STATE_UPDATE_HEARTBEAT_INTERVAL - Duration::from_millis(1)));
+        assert!(heartbeat.due(now + STATE_UPDATE_HEARTBEAT_INTERVAL));
     }
 }

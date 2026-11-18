@@ -1,0 +1,1 @@
+Added a bounded, network-scoped SQLite peer store for libp2p nodes. It restores only endpoints authenticated by Noise and the Stacks Hello protocol, and reauthenticates every restored connection after restart.

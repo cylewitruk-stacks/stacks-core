@@ -26,7 +26,7 @@ use stacks_signer::v0::tests::TEST_IGNORE_ALL_BLOCK_PROPOSALS;
 use stacks_signer::v0::SpawnedSigner;
 
 use crate::nakamoto_node::miner::TEST_BROADCAST_PROPOSAL_STALL;
-use crate::nakamoto_node::stackerdb_listener::TEST_IGNORE_SIGNERS;
+use crate::nakamoto_node::signer_message_processor::TEST_IGNORE_SIGNERS;
 use crate::tests::nakamoto_integrations::{enable_epoch_4_0, wait_for};
 use crate::tests::neon_integrations::{get_chain_info, test_observer};
 use crate::tests::signer::v0::{wait_for_block_proposal, wait_for_block_rejections_from_signers};

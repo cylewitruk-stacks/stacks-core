@@ -1,0 +1,1 @@
+Bound libp2p inbound content fetch and push work with one combined per-peer allowance, and use independently proven live cross-transport identities to suppress redundant legacy block and transaction broadcasts while preserving native gossip/fetch repair and generic StackerDB delivery.

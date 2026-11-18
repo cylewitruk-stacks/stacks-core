@@ -1,0 +1,181 @@
+extensions:
+  bearertokenauth/miner:
+    scheme: Bearer
+    token: poc-miner-token-7d3f4f0b9a3d4ab18893
+  bearertokenauth/follower:
+    scheme: Bearer
+    token: poc-follower-token-6e81b95a437c456ab183
+  bearertokenauth/signer1:
+    scheme: Bearer
+    token: poc-signer1-token-895c98336e544681aa20
+  bearertokenauth/signer2:
+    scheme: Bearer
+    token: poc-signer2-token-3e0fb0b2a1ef4381992c
+  bearertokenauth/signer3:
+    scheme: Bearer
+    token: poc-signer3-token-5ce111ba3ef643b0a8c2
+
+receivers:
+  otlp/miner:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        auth:
+          authenticator: bearertokenauth/miner
+  otlp/follower:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4319
+        auth:
+          authenticator: bearertokenauth/follower
+  otlp/signer1:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4320
+        auth:
+          authenticator: bearertokenauth/signer1
+  otlp/signer2:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4321
+        auth:
+          authenticator: bearertokenauth/signer2
+  otlp/signer3:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4322
+        auth:
+          authenticator: bearertokenauth/signer3
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  filter/schema:
+    error_mode: propagate
+    metrics:
+      metric:
+        - 'not IsMatch(name, "^(process_cpu_seconds_total|process_resident_memory_bytes|stacks_miner_signer_round_approved_weight|stacks_miner_signer_round_block_height|stacks_miner_signer_round_rejected_weight|stacks_miner_signer_round_unavailable_weight|stacks_miner_signer_round_started_timestamp_seconds|stacks_miner_signer_round_status|stacks_miner_signer_round_threshold_weight|stacks_miner_signer_round_total_weight|stacks_miner_signer_vote_latency_seconds|stacks_miner_signer_vote_weight|stacks_node_block_proposal_validation_execution_seconds|stacks_node_block_proposal_validation_executions_total|stacks_node_burn_block_height|stacks_node_burn_block_last_changed_timestamp_seconds|stacks_node_stacks_tip_height|stacks_node_stacks_tip_last_changed_timestamp_seconds|stacks_observability_blocked_on|stacks_observability_spans_dropped_total|stacks_p2p_authenticated_signer_link|stacks_p2p_command_queue_residence_seconds|stacks_p2p_connected_peer|stacks_p2p_connections|stacks_p2p_events_total|stacks_p2p_object_cache_bytes|stacks_p2p_object_cache_items|stacks_p2p_oldest_item_waiting_seconds|stacks_p2p_peer_rtt_seconds|stacks_p2p_peer_store_addresses|stacks_p2p_peer_store_peers|stacks_p2p_rendezvous_connections|stacks_p2p_stall_reason_code|stacks_p2p_swarm_lag_seconds|stacks_p2p_sync_capable_peers|stacks_signer_active_protocol_version|stacks_signer_block_policy_rejections|stacks_signer_deferred_miner_authorization_observations|stacks_signer_deferred_miner_authorizations_admitted|stacks_signer_deferred_miner_authorizations_pending|stacks_signer_deferred_miner_authorizations_resolved|stacks_signer_native_network_generation_start_timestamp_seconds|stacks_signer_agreement_state_change_reasons|stacks_signer_agreement_state_conflicts|stacks_signer_block_proposals_received|stacks_signer_block_response_latencies_histogram|stacks_signer_block_responses_sent|stacks_signer_block_validation_latencies_histogram|stacks_signer_block_validation_responses|stacks_signer_current_reward_cycle|stacks_signer_local_state|stacks_signer_miner_state|stacks_signer_stacks_node_height|stacks_signer_stacks_node_height_last_changed_timestamp_seconds|stacks_signer_stacks_node_height_last_observed_timestamp_seconds|stacks_signer_state_burn_block_height|stacks_signer_state_last_changed_timestamp_seconds)$")'
+      datapoint:
+        - 'attributes["signer_public_key"] != nil and not IsMatch(attributes["signer_public_key"], "^(02|03)[0-9a-f]{64}$")'
+        - 'attributes["peer_id"] != nil and not IsMatch(attributes["peer_id"], "^[1-9A-HJ-NP-Za-km-z]{32,128}$")'
+        - 'attributes["decision"] != nil and not IsMatch(attributes["decision"], "^(approved|rejected|unavailable)$")'
+        - 'attributes["status"] != nil and not IsMatch(attributes["status"], "^(collecting|approved|rejected|timed-out)$")'
+        - 'attributes["state"] != nil and not IsMatch(attributes["state"], "^(uninitialized|pending|initialized|unknown|no_valid_miner|active_miner)$")'
+        - 'attributes["response_type"] != nil and not IsMatch(attributes["response_type"], "^(accepted|rejected|abstained)$")'
+        - 'attributes["outcome"] != nil and not IsMatch(attributes["outcome"], "^(accepted|rejected)$")'
+        - 'attributes["observation"] != nil and not IsMatch(attributes["observation"], "^(delivered|retry)$")'
+        - 'attributes["resolution"] != nil and not IsMatch(attributes["resolution"], "^(released|expired|unauthorized|redundant|binding_failed|malformed)$")'
+        - 'attributes["reject_code"] != nil and not IsMatch(attributes["reject_code"], "^(0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|254|255)$")'
+        - 'attributes["conflict"] != nil and not IsMatch(attributes["conflict"], "^(burn_block_delay|stacks_block_delay|miner_view)$")'
+        - 'attributes["subsystem"] != nil and not IsMatch(attributes["subsystem"], "^(network_service|signer_state)$")'
+        - 'attributes["reason"] != nil and not IsMatch(attributes["reason"], "^(none|canonical_view|local_node_rpc|other|peer_capability|inventory|queue_capacity|validation|retry_backoff|burn_block_arrival|stacks_block_arrival|inactive_miner|protocol_upgrade|miner_view_update|miner_parent_tenure_update|queue_full|export_failed)$")'
+        - 'attributes["event"] != nil and not IsMatch(attributes["event"], "^(hello_accepted|hello_rejected|outbound_failure|resource_rejected|announcement_published|announcement_received|object_published|object_received|fetch_started|fetch_failed|durable_lookup|durable_hit|durable_miss|direct_push_sent|direct_push_received|direct_push_busy|direct_push_rejected|direct_push_failed|signer_received|signer_rejected|signer_equivocation|sync_request_sent|sync_request_received|sync_response_received|sync_failed|command_queue_full|event_queue_full|event_loop_stall|peer_store_write|peer_store_write_failed|peer_store_queue_full|peer_store_corruption_recovered)$")'
+  transform/privacy:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, [])
+      - context: datapoint
+        statements:
+          - keep_keys(datapoint.attributes, ["conflict", "decision", "event", "outcome", "observation", "peer_id", "reason", "reject_code", "response_type", "resolution", "signer_public_key", "state", "status", "subsystem"])
+  resource/miner:
+    attributes:
+      - {key: service.name, action: upsert, value: stacks-node}
+      - {key: stacks.federation.actor_id, action: upsert, value: poc-miner}
+      - {key: stacks.actor.type, action: upsert, value: node}
+      - {key: stacks.actor.role, action: upsert, value: miner}
+      - {key: stacks.chain.id, action: upsert, value: "2147483648"}
+      - {key: stacks.network.id, action: upsert, value: regtest}
+      - {key: stacks.region, action: upsert, value: local}
+      - {key: stacks.telemetry.schema.version, action: upsert, value: "1"}
+  resource/follower:
+    attributes:
+      - {key: service.name, action: upsert, value: stacks-node}
+      - {key: stacks.federation.actor_id, action: upsert, value: poc-follower}
+      - {key: stacks.actor.type, action: upsert, value: node}
+      - {key: stacks.actor.role, action: upsert, value: follower}
+      - {key: stacks.chain.id, action: upsert, value: "2147483648"}
+      - {key: stacks.network.id, action: upsert, value: regtest}
+      - {key: stacks.region, action: upsert, value: local}
+      - {key: stacks.telemetry.schema.version, action: upsert, value: "1"}
+  resource/signer1:
+    attributes:
+      - {key: service.name, action: upsert, value: stacks-signer}
+      - {key: stacks.federation.actor_id, action: upsert, value: poc-signer-1}
+      - {key: stacks.actor.type, action: upsert, value: signer}
+      - {key: stacks.actor.role, action: upsert, value: signer}
+      - {key: stacks.chain.id, action: upsert, value: "2147483648"}
+      - {key: stacks.network.id, action: upsert, value: regtest}
+      - {key: stacks.region, action: upsert, value: local}
+      - {key: stacks.telemetry.schema.version, action: upsert, value: "1"}
+  resource/signer2:
+    attributes:
+      - {key: service.name, action: upsert, value: stacks-signer}
+      - {key: stacks.federation.actor_id, action: upsert, value: poc-signer-2}
+      - {key: stacks.actor.type, action: upsert, value: signer}
+      - {key: stacks.actor.role, action: upsert, value: signer}
+      - {key: stacks.chain.id, action: upsert, value: "2147483648"}
+      - {key: stacks.network.id, action: upsert, value: regtest}
+      - {key: stacks.region, action: upsert, value: local}
+      - {key: stacks.telemetry.schema.version, action: upsert, value: "1"}
+  resource/signer3:
+    attributes:
+      - {key: service.name, action: upsert, value: stacks-signer}
+      - {key: stacks.federation.actor_id, action: upsert, value: poc-signer-3}
+      - {key: stacks.actor.type, action: upsert, value: signer}
+      - {key: stacks.actor.role, action: upsert, value: signer}
+      - {key: stacks.chain.id, action: upsert, value: "2147483648"}
+      - {key: stacks.network.id, action: upsert, value: regtest}
+      - {key: stacks.region, action: upsert, value: local}
+      - {key: stacks.telemetry.schema.version, action: upsert, value: "1"}
+  batch:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 2s
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  extensions:
+    - bearertokenauth/miner
+    - bearertokenauth/follower
+    - bearertokenauth/signer1
+    - bearertokenauth/signer2
+    - bearertokenauth/signer3
+  telemetry:
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    metrics/miner:
+      receivers: [otlp/miner]
+      processors: [memory_limiter, filter/schema, transform/privacy, resource/miner, batch]
+      exporters: [prometheus]
+    metrics/follower:
+      receivers: [otlp/follower]
+      processors: [memory_limiter, filter/schema, transform/privacy, resource/follower, batch]
+      exporters: [prometheus]
+    metrics/signer1:
+      receivers: [otlp/signer1]
+      processors: [memory_limiter, filter/schema, transform/privacy, resource/signer1, batch]
+      exporters: [prometheus]
+    metrics/signer2:
+      receivers: [otlp/signer2]
+      processors: [memory_limiter, filter/schema, transform/privacy, resource/signer2, batch]
+      exporters: [prometheus]
+    metrics/signer3:
+      receivers: [otlp/signer3]
+      processors: [memory_limiter, filter/schema, transform/privacy, resource/signer3, batch]
+      exporters: [prometheus]

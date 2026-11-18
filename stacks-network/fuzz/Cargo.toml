@@ -1,0 +1,27 @@
+[package]
+name = "stacks-network-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.14"
+stacks-network = { path = ".." }
+stacks-network-types = { path = "../../stacks-network-types" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "public_decoders"
+path = "fuzz_targets/public_decoders.rs"
+test = false
+doc = false
+bench = false

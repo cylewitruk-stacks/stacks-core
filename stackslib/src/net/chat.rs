@@ -1664,12 +1664,10 @@ impl ConversationP2P {
             let original_blocks_inv_data: BlocksInvData =
                 chainstate.get_blocks_inventory(&block_hashes)?;
 
-            if original_blocks_inv_data != blocks_inv_data {
-                warn!(
-                    "For reward cycle {}: {:?} != {:?}",
-                    reward_cycle, &original_blocks_inv_data, &blocks_inv_data
-                );
-            }
+            assert_eq!(
+                original_blocks_inv_data, blocks_inv_data,
+                "shared and reference inventory semantics differ for reward cycle {reward_cycle}"
+            );
         }
 
         Ok(StacksMessageType::BlocksInv(blocks_inv_data))

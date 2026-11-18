@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use blockstack_lib::chainstate::nakamoto::NakamotoBlock;
 use blockstack_lib::chainstate::stacks::boot::{NakamotoSignerEntry, SIGNERS_NAME};
@@ -76,6 +77,73 @@ struct GetStackersErrorResp {
     err_msg: String,
 }
 
+/// Protected high-cardinality observation produced by the node's authenticated
+/// native signer network. It intentionally mirrors only the stable monitoring
+/// subset of the node diagnostic schema.
+#[derive(Clone, Debug, Deserialize)]
+pub struct NativeSignerObservation {
+    /// Reward cycle in which the signer was authorized.
+    pub reward_cycle: u64,
+    /// Compressed on-chain signer public key.
+    pub signer_public_key: Vec<u8>,
+    /// Noise-authenticated transport peer ID.
+    pub peer_id: String,
+    /// Native signer protocol lane number.
+    pub lane: i32,
+    /// Author-controlled monotonic lane sequence.
+    pub sequence: u64,
+    #[serde(deserialize_with = "deserialize_u128_from_number_or_string")]
+    /// Companion callback receive timestamp in Unix milliseconds.
+    pub last_seen_unix_ms: u128,
+    /// Whether a conflicting payload was retained at this sequence.
+    pub equivocation: bool,
+}
+
+/// Monitoring subset of the protected node network diagnostic snapshot.
+#[derive(Clone, Debug, Deserialize)]
+pub struct NativeNetworkDiagnostics {
+    /// Bounded authenticated observations, keyed semantically by signer/lane.
+    #[serde(default)]
+    pub signer_observations: Vec<NativeSignerObservation>,
+    /// Time at which the node copied this snapshot out of the swarm.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_u128_from_number_or_string"
+    )]
+    pub snapshot_generated_unix_ms: Option<u128>,
+}
+
+fn deserialize_u128_from_number_or_string<'de, D>(deserializer: D) -> Result<u128, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(value) => value.parse().map_err(serde::de::Error::custom),
+        serde_json::Value::Number(value) => value
+            .as_u128()
+            .ok_or_else(|| serde::de::Error::custom("expected non-negative u128")),
+        _ => Err(serde::de::Error::custom("expected u128 number or string")),
+    }
+}
+
+fn deserialize_optional_u128_from_number_or_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<u128>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(deserializer)?
+        .map(|value| match value {
+            serde_json::Value::String(value) => value.parse().map_err(serde::de::Error::custom),
+            serde_json::Value::Number(value) => value
+                .as_u128()
+                .ok_or_else(|| serde::de::Error::custom("expected non-negative u128")),
+            _ => Err(serde::de::Error::custom("expected u128 number or string")),
+        })
+        .transpose()
+}
+
 /// Result from fetching current and last sortition:
 ///  two sortition infos
 pub struct CurrentAndLastSortition {
@@ -100,6 +168,17 @@ impl From<&GlobalConfig> for StacksClient {
 }
 
 impl StacksClient {
+    /// Replace the underlying HTTP client with one whose individual requests
+    /// are bounded. Callers choose the scope-appropriate horizon: monitoring
+    /// uses a short responsiveness budget, while the signer runloop uses its
+    /// configured proposal-validation obligation timeout.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Result<Self, ClientError> {
+        self.stacks_node_client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()?;
+        Ok(self)
+    }
+
     /// Create a new signer StacksClient with the provided private key, stacks node host endpoint, version, and auth password
     pub fn new(
         stacks_private_key: &StacksPrivateKey,
@@ -157,6 +236,26 @@ impl StacksClient {
     /// Get our signer address
     pub const fn get_signer_address(&self) -> &StacksAddress {
         &self.stacks_address
+    }
+
+    /// Return the configured Stacks chain identifier.
+    pub const fn chain_id(&self) -> u32 {
+        self.chain_id
+    }
+
+    /// Fetch the protected native-network diagnostic snapshot. Unlike the
+    /// legacy monitor this does not read signer StackerDB slots.
+    pub fn get_native_network_diagnostics(&self) -> Result<NativeNetworkDiagnostics, ClientError> {
+        let path = format!("{}/v3/network/diagnostics", self.http_origin);
+        let response = self
+            .stacks_node_client
+            .get(path)
+            .header(AUTHORIZATION, self.auth_password.clone())
+            .send()?;
+        if !response.status().is_success() {
+            return Err(ClientError::RequestFailure(response.status()));
+        }
+        Ok(response.json()?)
     }
 
     /// Get the burnchain views `block_id` hangs from, and whether a burnchain fork has since
@@ -304,7 +403,11 @@ impl StacksClient {
     }
 
     /// Submit the block proposal to the stacks node. The block will be validated and returned via the HTTP endpoint for Block events.
-    pub fn submit_block_for_validation(&self, block: NakamotoBlock) -> Result<(), ClientError> {
+    pub fn submit_block_for_validation(
+        &self,
+        block: NakamotoBlock,
+        request_timeout: Duration,
+    ) -> Result<(), ClientError> {
         debug!("StacksClient: Submitting block for validation";
             "signer_signature_hash" => %block.header.signer_signature_hash(),
             "block_id" => %block.header.block_id(),
@@ -318,17 +421,18 @@ impl StacksClient {
             &self.block_proposal_path(),
             &self.http_origin,
         );
-        let send_request = || {
-            self.stacks_node_client
-                .post(self.block_proposal_path())
-                .header("Content-Type", "application/json")
-                .header(AUTHORIZATION, self.auth_password.clone())
-                .json(&block_proposal)
-                .send()
-                .map_err(backoff::Error::transient)
-        };
-
-        let response = retry_with_exponential_backoff(send_request)?;
+        // This POST starts independent validation work at the signer's sole
+        // authority. Do not retry it inside a synchronous signer turn: a
+        // duplicate can execute validation twice, while an unbounded request
+        // prevents the signer from reaching its ProposalUnavailable path.
+        let response = self
+            .stacks_node_client
+            .post(self.block_proposal_path())
+            .header("Content-Type", "application/json")
+            .header(AUTHORIZATION, self.auth_password.clone())
+            .json(&block_proposal)
+            .timeout(request_timeout)
+            .send()?;
         timer.stop_and_record();
         if !response.status().is_success() {
             return Err(ClientError::RequestFailure(response.status()));
@@ -1086,7 +1190,10 @@ mod tests {
         let mock = MockServerClient::new();
         let header = NakamotoBlockHeader::empty();
         let block = NakamotoBlock::new(header, vec![]);
-        let h = spawn(move || mock.client.submit_block_for_validation(block));
+        let h = spawn(move || {
+            mock.client
+                .submit_block_for_validation(block, Duration::from_secs(1))
+        });
         write_response(mock.server, b"HTTP/1.1 200 OK\n\n");
         assert!(h.join().unwrap().is_ok());
     }
@@ -1096,9 +1203,44 @@ mod tests {
         let mock = MockServerClient::new();
         let header = NakamotoBlockHeader::empty();
         let block = NakamotoBlock::new(header, vec![]);
-        let h = spawn(move || mock.client.submit_block_for_validation(block));
+        let h = spawn(move || {
+            mock.client
+                .submit_block_for_validation(block, Duration::from_secs(1))
+        });
         write_response(mock.server, b"HTTP/1.1 404 Not Found\n\n");
         assert!(h.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn submit_block_for_validation_is_bounded_when_companion_stalls() {
+        let mock = MockServerClient::new();
+        let header = NakamotoBlockHeader::empty();
+        let block = NakamotoBlock::new(header, vec![]);
+        let started = std::time::Instant::now();
+        let result = mock
+            .client
+            .submit_block_for_validation(block, Duration::from_millis(50));
+        assert!(matches!(
+            result,
+            Err(ClientError::ReqwestError(ref error)) if error.is_timeout()
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn auxiliary_client_request_timeout_bounds_a_stalled_companion() {
+        let mock = MockServerClient::new();
+        let client = mock
+            .client
+            .with_request_timeout(Duration::from_millis(50))
+            .expect("failed to build bounded client");
+        let started = std::time::Instant::now();
+        let result = client.get_sortition_by_consensus_hash(&ConsensusHash([1; 20]));
+        assert!(matches!(
+            result,
+            Err(ClientError::ReqwestError(ref error)) if error.is_timeout()
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

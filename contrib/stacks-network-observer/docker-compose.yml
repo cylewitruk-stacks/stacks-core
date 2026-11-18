@@ -1,0 +1,41 @@
+name: stacks-network-observer
+
+services:
+  telemetry-collector:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.158.0
+    volumes:
+      - ./federation/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    read_only: true
+    tmpfs: [/tmp:size=16m,noexec,nosuid]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    depends_on: [telemetry-collector]
+    volumes:
+      - ./federation/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --storage.tsdb.retention.size=256MB
+
+  observer:
+    build: .
+    depends_on: [prometheus]
+    environment:
+      STACKS_OBSERVER_PROMETHEUS_URL: http://prometheus:9090
+      STACKS_OBSERVER_ENROLLMENTS_FILE: /app/federation/poc-enrollments.json
+      STACKS_OBSERVER_PUBLIC_NETWORK_LABEL: Stacks development
+      STACKS_OBSERVER_AUTH_MODE: development-password
+      STACKS_OBSERVER_ALLOW_INSECURE_DEVELOPMENT_AUTH: "true"
+      STACKS_OBSERVER_DEV_EMAIL: user@host.com
+      STACKS_OBSERVER_DEV_PASSWORD_HASH: "scrypt$$v1$$16384$$8$$1$$00112233445566778899aabbccddeeff$$36399bbc41eef2d142e319a445abe043a9a177fa4da34f2d1a0946ec6a01db0c"
+      STACKS_OBSERVER_SESSION_SECURE: "false"
+    ports: ["4319:4319"]
+    read_only: true
+    tmpfs: [/tmp:size=16m,noexec,nosuid]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped

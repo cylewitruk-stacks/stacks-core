@@ -21,6 +21,7 @@ libstackerdb = { path = "../libstackerdb" }
 serde = "1"
 slog = { workspace = true }
 stacks-common = { path = "../stacks-common" }
+stacks-network-types = { workspace = true }
 stackslib = { path = "../stackslib"}
 thiserror = { workspace = true }
 tiny_http = "0.12"

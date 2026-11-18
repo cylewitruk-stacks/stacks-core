@@ -14,18 +14,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use lazy_static::lazy_static;
 use libsigner::VERSION_STRING;
 use prometheus::{
     gather, histogram_opts, opts, register_histogram_vec, register_int_counter,
-    register_int_counter_vec, register_int_gauge, Encoder, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, TextEncoder,
+    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, Encoder, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 use stacks_common::monitoring::build_info_labels;
 
 use crate::v0::signer_state::LocalStateMachine;
+use stacks_network::DeferredMinerAuthorizationSnapshot;
 
 lazy_static! {
     pub static ref BUILD_INFO: IntGauge = register_int_gauge!(opts!(
@@ -40,9 +42,17 @@ lazy_static! {
         "The current height of the Stacks node"
     ))
     .unwrap();
+    pub static ref STACKS_TIP_LAST_CHANGED_TIMESTAMP_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_stacks_node_height_last_changed_timestamp_seconds",
+        "Unix timestamp when the signer's observed Stacks node height last changed"
+    )).unwrap();
+    pub static ref STACKS_TIP_LAST_OBSERVED_TIMESTAMP_GAUGE: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_stacks_node_height_last_observed_timestamp_seconds",
+        "Unix timestamp when the signer last successfully read its configured Stacks node height"
+    )).unwrap();
     pub static ref BLOCK_VALIDATION_RESPONSES: IntCounterVec = register_int_counter_vec!(
         "stacks_signer_block_validation_responses",
-        "The number of block validation responses. `response_type` is either 'accepted' or 'rejected'",
+        "Signer-side companion validation observations by outcome: accepted, rejected, or abstained",
         &["response_type"]
     )
     .unwrap();
@@ -62,10 +72,94 @@ lazy_static! {
         "The number of block pre-commits sent by the signer"
     ))
     .unwrap();
+    pub static ref POLICY_REJECTIONS: IntCounterVec = register_int_counter_vec!(
+        "stacks_signer_block_policy_rejections",
+        "Block proposals rejected before companion validation, by bounded wire reason",
+        &["reject_code"]
+    )
+    .unwrap();
+    pub static ref DEFERRED_MINER_AUTHORIZATIONS_ADMITTED: IntCounter = register_int_counter!(opts!(
+        "stacks_signer_deferred_miner_authorizations_admitted",
+        "Canonically-pending miner envelopes admitted to bounded signer-owned deferral"
+    ))
+    .unwrap();
+    pub static ref DEFERRED_MINER_AUTHORIZATIONS_PENDING: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_deferred_miner_authorizations_pending",
+        "Current canonically-pending miner envelopes owned by the signer transport"
+    ))
+    .unwrap();
+    pub static ref DEFERRED_MINER_AUTHORIZATION_OBSERVATIONS: IntCounterVec = register_int_counter_vec!(
+        "stacks_signer_deferred_miner_authorization_observations",
+        "Availability-observation delivery and retry lifecycle for deferred miner envelopes",
+        &["observation"]
+    )
+    .unwrap();
+    pub static ref DEFERRED_MINER_AUTHORIZATIONS_RESOLVED: IntCounterVec = register_int_counter_vec!(
+        "stacks_signer_deferred_miner_authorizations_resolved",
+        "Terminal outcomes for signer-owned canonically-pending miner envelopes",
+        &["resolution"]
+    )
+    .unwrap();
+    pub static ref NATIVE_NETWORK_GENERATION_START_TIMESTAMP: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_native_network_generation_start_timestamp_seconds",
+        "Unix timestamp identifying the process-owned native signer-network counter generation"
+    ))
+    .unwrap();
+    pub static ref PREVIOUS_DEFERRED_MINER_AUTHORIZATIONS: Mutex<DeferredMinerAuthorizationSnapshot> =
+        Mutex::new(DeferredMinerAuthorizationSnapshot::default());
     pub static ref CURRENT_REWARD_CYCLE: IntGauge = register_int_gauge!(opts!(
         "stacks_signer_current_reward_cycle",
         "The current reward cycle"
     )).unwrap();
+    pub static ref LOCAL_STATE: IntGaugeVec = register_int_gauge_vec!(
+        "stacks_signer_local_state",
+        "One-hot bounded lifecycle state of the local signer state machine",
+        &["state"]
+    ).unwrap();
+    pub static ref MINER_STATE: IntGaugeVec = register_int_gauge_vec!(
+        "stacks_signer_miner_state",
+        "One-hot bounded current-miner view held by the local signer state machine",
+        &["state"]
+    ).unwrap();
+    pub static ref STATE_BURN_BLOCK_HEIGHT: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_state_burn_block_height",
+        "Burn block height represented by the local signer state machine"
+    )).unwrap();
+    pub static ref ACTIVE_PROTOCOL_VERSION: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_active_protocol_version",
+        "Active signer agreement protocol version in the local state machine"
+    )).unwrap();
+    pub static ref STATE_LAST_CHANGED_TIMESTAMP: IntGauge = register_int_gauge!(opts!(
+        "stacks_signer_state_last_changed_timestamp_seconds",
+        "Unix timestamp when the local signer state machine last changed"
+    )).unwrap();
+    pub static ref NATIVE_CONNECTIONS: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_connections",
+        "Current number of native libp2p connections"
+    )).unwrap();
+    pub static ref NATIVE_RENDEZVOUS_CONNECTIONS: IntGauge = register_int_gauge!(opts!(
+        "stacks_p2p_rendezvous_connections",
+        "Current number of connected private native signer rendezvous peers"
+    )).unwrap();
+    pub static ref AUTHENTICATED_SIGNER_LINKS: IntGaugeVec = register_int_gauge_vec!(
+        "stacks_p2p_authenticated_signer_link",
+        "Current endpoint-free link evidence to a chain-authorized signer public key",
+        &["signer_public_key"]
+    ).unwrap();
+    pub static ref CONNECTED_PEERS: IntGaugeVec = register_int_gauge_vec!(
+        "stacks_p2p_connected_peer",
+        "Current native connection to a transport PeerId; the authenticated observer joins only enrolled identities",
+        &["peer_id"]
+    ).unwrap();
+    pub static ref PREVIOUS_AUTHENTICATED_SIGNER_LINKS: Mutex<BTreeSet<String>> =
+        Mutex::new(BTreeSet::new());
+    pub static ref PREVIOUS_CONNECTED_PEERS: Mutex<BTreeSet<String>> =
+        Mutex::new(BTreeSet::new());
+    pub static ref SIGNER_BLOCKED_ON: IntGaugeVec = register_int_gauge_vec!(
+        "stacks_observability_blocked_on",
+        "One-hot bounded current blocking reason for a local subsystem",
+        &["subsystem", "reason"]
+    ).unwrap();
     pub static ref SIGNER_STX_BALANCE: IntGauge = register_int_gauge!(opts!(
         "stacks_signer_stx_balance",
         "The current STX balance of the signer"
@@ -83,7 +177,7 @@ lazy_static! {
 
     pub static ref SIGNER_BLOCK_VALIDATION_LATENCIES_HISTOGRAM: HistogramVec = register_histogram_vec!(histogram_opts!(
         "stacks_signer_block_validation_latencies_histogram",
-        "Time (seconds) measuring block validation time reported by the Stacks node",
+        "One signer observation per independent companion validation execution, using companion-reported seconds",
         vec![0.005, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0]
     ), &[]).unwrap();
 

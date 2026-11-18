@@ -49,6 +49,7 @@ use stacks_common::util::hash::hex_bytes;
 use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 use stacks_marf::marf::MARFOpenOpts;
 use stacks_marf::storage::TrieHashCalculationMode;
+use stacks_network_types::{BridgeMode, Libp2pLimits, SignerBridgeConfig};
 
 use crate::burnchains::bitcoin::{signet, BitcoinNetworkType};
 use crate::burnchains::{Burnchain, MagicBytes, BLOCKSTACK_MAGIC_MAINNET};
@@ -927,7 +928,18 @@ impl Config {
 
         Self::validate_wallet_name(&node, &burnchain)?;
 
-        if node.stacker || node.miner {
+        // Validate explicit generic consumers before bridge-added system
+        // contracts are merged into the runtime replication list. This is the
+        // last side-effect-free configuration phase, before databases,
+        // listeners, workers, or either peer transport are started.
+        node.validate_stackerdb_rollout()?;
+
+        // Signer-specific StackerDB replication is a compatibility adapter,
+        // not an intrinsic Nakamoto-node dependency. Explicit generic
+        // `stacker_dbs` remain untouched.
+        if (node.stacker || node.miner)
+            && (!node.libp2p.enabled || node.libp2p.signer_bridge.mode != BridgeMode::Off)
+        {
             node.add_miner_stackerdb(is_mainnet);
             node.add_signers_stackerdbs(is_mainnet);
         }
@@ -1113,6 +1125,14 @@ impl Config {
     pub fn get_peer_db_file_path(&self) -> String {
         let mut path = self.get_chainstate_path();
         path.set_file_name("peer.sqlite");
+        path.to_str().expect("Unable to produce path").to_string()
+    }
+
+    /// Native libp2p restart-discovery cache. This is intentionally separate
+    /// from the incumbent transport's `peer.sqlite` schema and trust model.
+    pub fn get_libp2p_peer_db_file_path(&self) -> String {
+        let mut path = self.get_chainstate_path();
+        path.set_file_name("libp2p-peers.sqlite");
         path.to_str().expect("Unable to produce path").to_string()
     }
 
@@ -1390,6 +1410,12 @@ pub struct BurnchainConfig {
     /// @default: `30`
     /// @units: seconds
     pub socket_timeout: u64,
+    /// Allow the indexed Bitcoin tip to fall outside the normal two-hour
+    /// wall-clock freshness window. This exception is rejected on public
+    /// networks and is intended only for controlled, persisted regtests.
+    /// ---
+    /// @default: `false`
+    pub allow_stale_bitcoin_tip: bool,
     /// The network "magic bytes" used to identify packets for the specific bitcoin
     /// network instance (e.g., mainnet, testnet, regtest). Must match the magic
     /// bytes of the connected bitcoin node.
@@ -1674,6 +1700,7 @@ impl BurnchainConfig {
             password: None,
             timeout: 300,
             socket_timeout: 30,
+            allow_stale_bitcoin_tip: false,
             magic_bytes: BLOCKSTACK_MAGIC_MAINNET,
             signet_challenge: None,
             local_mining_public_key: None,
@@ -1754,6 +1781,9 @@ pub struct BurnchainConfigFile {
     pub timeout: Option<u64>,
     /// Socket timeout, in seconds, for socket operations with bitcoind
     pub socket_timeout: Option<u64>,
+    /// Allow the indexed Bitcoin tip outside the two-hour wall-clock window.
+    /// `true` is accepted only for a regtest mode.
+    pub allow_stale_bitcoin_tip: Option<bool>,
     pub magic_bytes: Option<String>,
     /// Hex-encoded BIP 325 challenge; omitted for public signet.
     pub signet_challenge: Option<String>,
@@ -1885,6 +1915,9 @@ impl BurnchainConfigFile {
             socket_timeout: self
                 .socket_timeout
                 .unwrap_or(default_burnchain_config.socket_timeout),
+            allow_stale_bitcoin_tip: self
+                .allow_stale_bitcoin_tip
+                .unwrap_or(default_burnchain_config.allow_stale_bitcoin_tip),
             magic_bytes: match self.magic_bytes {
                 Some(magic_ascii) => {
                     assert_eq!(magic_ascii.len(), 2, "Magic bytes must be length-2");
@@ -1972,6 +2005,12 @@ impl BurnchainConfigFile {
             }
         }
 
+        if config.allow_stale_bitcoin_tip
+            && config.get_bitcoin_network().1 != BitcoinNetworkType::Regtest
+        {
+            return Err("burnchain.allow_stale_bitcoin_tip may be enabled only on regtest".into());
+        }
+
         if config.mode == "signet" && self.epochs.is_none() {
             config.epochs = Some(signet::default_epochs());
         }
@@ -1984,6 +2023,185 @@ impl BurnchainConfigFile {
         }
 
         Ok(config)
+    }
+}
+
+pub use stacks_network_types::RolloutMode as Libp2pRolloutMode;
+
+const STACKERDB_DIAGNOSTIC_CONTRACT_LIMIT: usize = 8;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Libp2pConfig {
+    /// Enables the parallel libp2p network. The incumbent network remains available.
+    pub enabled: bool,
+    /// Staged application ingress/egress policy.
+    pub rollout_mode: Libp2pRolloutMode,
+    /// Multiaddresses on which the libp2p swarm listens.
+    pub bind: Vec<String>,
+    /// Explicit public dial hints. Empty uses the bound addresses and
+    /// Identify/AutoNAT observations.
+    pub advertise: Vec<String>,
+    /// Bootstrap multiaddresses, each ending in `/p2p/<PeerId>`.
+    pub bootstrap_peers: Vec<String>,
+    /// Private rendezvous multiaddresses kept connected for bounded reconnect
+    /// and role-directory exchange. These addresses do not grant miner authority.
+    pub rendezvous_peers: Vec<String>,
+    /// Explicit bootstrap/infrastructure profile. Ordinary nodes remain Kad
+    /// clients until independently confirmed reachable by AutoNAT.
+    pub kademlia_server: bool,
+    /// Enable bounded full-block push in addition to announcement/fetch.
+    pub direct_block_push: bool,
+    pub direct_push_fanout: u32,
+    /// Shared connection, stream, byte, validation, and cache bounds.
+    pub limits: Libp2pLimits,
+    /// Keep origin-side `.miners` writes during the mixed-version signer window.
+    /// Native signer delivery remains independent of this compatibility egress.
+    pub signer_bridge: SignerBridgeConfig,
+}
+
+impl Default for Libp2pConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rollout_mode: Libp2pRolloutMode::Off,
+            bind: vec!["/ip4/0.0.0.0/tcp/20445".to_owned()],
+            advertise: Vec::new(),
+            bootstrap_peers: Vec::new(),
+            rendezvous_peers: Vec::new(),
+            kademlia_server: false,
+            direct_block_push: false,
+            direct_push_fanout: 3,
+            limits: Libp2pLimits::default(),
+            signer_bridge: SignerBridgeConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Libp2pConfigFile {
+    pub enabled: Option<bool>,
+    pub rollout_mode: Option<Libp2pRolloutMode>,
+    pub bind: Option<Vec<String>>,
+    pub advertise: Option<Vec<String>>,
+    pub bootstrap_peers: Option<Vec<String>>,
+    pub rendezvous_peers: Option<Vec<String>>,
+    pub kademlia_server: Option<bool>,
+    pub direct_block_push: Option<bool>,
+    pub direct_push_fanout: Option<u32>,
+    pub limits: Option<Libp2pLimits>,
+    pub compatibility_stackerdb: Option<bool>,
+    pub signer_bridge: Option<SignerBridgeConfig>,
+}
+
+impl Libp2pConfigFile {
+    fn into_config_default(self, default: Libp2pConfig) -> Result<Libp2pConfig, String> {
+        let rollout_mode = match (self.rollout_mode, self.enabled) {
+            (Some(mode), Some(enabled)) if enabled != mode.enabled() => {
+                return Err("node.libp2p.enabled conflicts with rollout_mode".into());
+            }
+            (Some(mode), _) => mode,
+            (None, Some(true)) => Libp2pRolloutMode::Dual,
+            (None, Some(false)) => Libp2pRolloutMode::Off,
+            (None, None) => default.rollout_mode,
+        };
+        let enabled = rollout_mode.enabled();
+        let bind = self.bind.unwrap_or(default.bind);
+        let advertise = self.advertise.unwrap_or(default.advertise);
+        if enabled && bind.is_empty() {
+            return Err(
+                "node.libp2p.bind must contain at least one multiaddress when enabled".into(),
+            );
+        }
+        if bind
+            .iter()
+            .chain(advertise.iter())
+            .any(|address| address.len() > 512)
+            || self
+                .bootstrap_peers
+                .as_ref()
+                .is_some_and(|peers| peers.iter().any(|address| address.len() > 512))
+            || self
+                .rendezvous_peers
+                .as_ref()
+                .is_some_and(|peers| peers.iter().any(|address| address.len() > 512))
+        {
+            return Err("node.libp2p multiaddresses must not exceed 512 bytes".into());
+        }
+        let mut signer_bridge = self.signer_bridge.unwrap_or(default.signer_bridge);
+        if let Some(enabled) = self.compatibility_stackerdb {
+            signer_bridge.mode = if enabled {
+                BridgeMode::Bidirectional
+            } else {
+                BridgeMode::Off
+            };
+        }
+        signer_bridge
+            .validate()
+            .map_err(|error| format!("invalid node.libp2p.signer_bridge: {error}"))?;
+        let limits = self.limits.unwrap_or(default.limits);
+        limits
+            .validate()
+            .map_err(|error| format!("invalid node.libp2p.limits: {error}"))?;
+        let direct_block_push = self.direct_block_push.unwrap_or(default.direct_block_push);
+        let direct_push_fanout = self
+            .direct_push_fanout
+            .unwrap_or(default.direct_push_fanout);
+        if direct_block_push
+            && (direct_push_fanout == 0 || direct_push_fanout > limits.max_inflight_block_pushes)
+        {
+            return Err(
+                "node.libp2p.direct_push_fanout must be within 1..=max_inflight_block_pushes"
+                    .into(),
+            );
+        }
+        Ok(Libp2pConfig {
+            enabled,
+            rollout_mode,
+            bind,
+            advertise,
+            bootstrap_peers: self.bootstrap_peers.unwrap_or(default.bootstrap_peers),
+            rendezvous_peers: self.rendezvous_peers.unwrap_or(default.rendezvous_peers),
+            kademlia_server: self.kademlia_server.unwrap_or(default.kademlia_server),
+            direct_block_push,
+            direct_push_fanout,
+            limits,
+            signer_bridge,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct StackerDbConfigOrigins {
+    compatibility: Vec<QualifiedContractIdentifier>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenericStackerDbReplicationState {
+    NotConfigured,
+    LegacyTransportEnabled,
+    Incompatible,
+}
+
+impl GenericStackerDbReplicationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not-configured",
+            Self::LegacyTransportEnabled => "legacy-transport-enabled",
+            Self::Incompatible => "incompatible",
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "no explicitly configured generic StackerDB contracts",
+            Self::LegacyTransportEnabled => {
+                "generic StackerDB replication uses the incumbent P2P transport"
+            }
+            Self::Incompatible => {
+                "generic StackerDB replication is incompatible with the selected peer transport"
+            }
+        }
     }
 }
 
@@ -2042,6 +2260,8 @@ pub struct NodeConfig {
     /// ---
     /// @default: Randomly generated 32 bytes
     pub local_peer_seed: Vec<u8>,
+    /// Configuration for the parallel libp2p network.
+    pub libp2p: Libp2pConfig,
     /// A list of initial peer nodes used to bootstrap connections into the Stacks P2P
     /// network. Peers are specified in a configuration file as comma-separated
     /// strings in the format `"PUBKEY@IP:PORT"` or `"PUBKEY@HOSTNAME:PORT"`. DNS
@@ -2250,12 +2470,24 @@ pub struct NodeConfig {
     ///   - else: defaults to an empty list `[]`.
     /// @notes:
     ///   - Values are strings representing qualified contract identifiers.
+    ///   - Explicit entries require the incumbent Stacks P2P transport for
+    ///     replication and therefore cannot be combined with
+    ///     `node.libp2p.rollout_mode = "libp2p-only"`.
+    ///   - `libp2p-only` describes peer transport. A signer still uses its
+    ///     configured local node's HTTP/RPC API for chainstate and control-plane
+    ///     queries.
     /// @toml_example: |
     ///   stacker_dbs = [
     ///     "SP000000000000000000002Q6VF78.pox-3",
     ///     "SP2C2YFP12AJZB4M4KUPSTMZQR0SNHNPH204SCQJM.stx-oracle-v1"
     ///   ]
     pub stacker_dbs: Vec<QualifiedContractIdentifier>,
+    /// Source metadata for `stacker_dbs`. Compatibility entries are recorded
+    /// only when the quarantined signer bridge itself adds them; every other
+    /// final entry is conservatively treated as generic replication. This
+    /// prevents public/programmatic mutation or a system-looking contract name
+    /// from bypassing rollout validation.
+    stacker_db_origins: StackerDbConfigOrigins,
     /// Enables INFO logging for each newly stored StackerDB chunk, including
     /// whether it arrived via polling, P2P push, or HTTP.
     /// ---
@@ -2533,6 +2765,7 @@ impl Default for NodeConfig {
             bootstrap_node: vec![],
             deny_nodes: vec![],
             local_peer_seed: local_peer_seed.to_vec(),
+            libp2p: Libp2pConfig::default(),
             miner: false,
             stacker: false,
             mock_mining: false,
@@ -2553,6 +2786,7 @@ impl Default for NodeConfig {
             event_dispatcher_blocking: true,
             event_dispatcher_queue_size: 1000,
             stacker_dbs: vec![],
+            stacker_db_origins: StackerDbConfigOrigins::default(),
             #[cfg(any(test, feature = "testing"))]
             log_stackerdb_chunk_sources: true,
             #[cfg(not(any(test, feature = "testing")))]
@@ -2567,6 +2801,52 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
+    fn generic_stacker_dbs(&self) -> impl Iterator<Item = &QualifiedContractIdentifier> {
+        self.stacker_dbs
+            .iter()
+            .filter(|contract| !self.stacker_db_origins.compatibility.contains(contract))
+    }
+
+    pub fn generic_stackerdb_contract_count(&self) -> usize {
+        self.generic_stacker_dbs().count()
+    }
+
+    pub fn compatibility_stackerdb_contract_count(&self) -> usize {
+        self.stacker_db_origins.compatibility.len()
+    }
+
+    pub fn generic_stackerdb_replication_state(&self) -> GenericStackerDbReplicationState {
+        if self.generic_stackerdb_contract_count() == 0 {
+            GenericStackerDbReplicationState::NotConfigured
+        } else if self.libp2p.rollout_mode.legacy_listener_enabled() {
+            GenericStackerDbReplicationState::LegacyTransportEnabled
+        } else {
+            GenericStackerDbReplicationState::Incompatible
+        }
+    }
+
+    fn validate_stackerdb_rollout(&self) -> Result<(), String> {
+        let explicit = self.generic_stacker_dbs().collect::<Vec<_>>();
+        if self.libp2p.rollout_mode != Libp2pRolloutMode::Libp2pOnly || explicit.is_empty() {
+            return Ok(());
+        }
+        let affected = explicit
+            .iter()
+            .take(STACKERDB_DIAGNOSTIC_CONTRACT_LIMIT)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let omitted = explicit.len().saturating_sub(affected.len());
+        let suffix = if omitted == 0 {
+            String::new()
+        } else {
+            format!(" (and {omitted} more)")
+        };
+        Err(format!(
+            "node.libp2p.rollout_mode=\"libp2p-only\" cannot replicate explicitly configured generic StackerDB contracts over the disabled incumbent P2P transport: {}{suffix}. Remove these node.stacker_dbs entries or use a rollout mode that retains legacy peer networking, such as \"dual\" or \"libp2p-preferred\"",
+            affected.join(", ")
+        ))
+    }
+
     /// Get a SocketAddr for this node's RPC endpoint which uses the loopback address
     pub fn get_rpc_loopback(&self) -> Option<SocketAddr> {
         let rpc_port = self.rpc_bind_addr()?.port();
@@ -2595,7 +2875,8 @@ impl NodeConfig {
                 let contract_name = NakamotoSigners::make_signers_db_name(signer_set, message_id);
                 let contract_id = boot_code_id(contract_name.as_str(), is_mainnet);
                 if !self.stacker_dbs.contains(&contract_id) {
-                    self.stacker_dbs.push(contract_id);
+                    self.stacker_dbs.push(contract_id.clone());
+                    self.stacker_db_origins.compatibility.push(contract_id);
                 }
             }
         }
@@ -2604,7 +2885,10 @@ impl NodeConfig {
     pub fn add_miner_stackerdb(&mut self, is_mainnet: bool) {
         let miners_contract_id = boot_code_id(MINERS_NAME, is_mainnet);
         if !self.stacker_dbs.contains(&miners_contract_id) {
-            self.stacker_dbs.push(miners_contract_id);
+            self.stacker_dbs.push(miners_contract_id.clone());
+            self.stacker_db_origins
+                .compatibility
+                .push(miners_contract_id);
         }
     }
 
@@ -4096,6 +4380,7 @@ pub struct NodeConfigFile {
     pub data_url: Option<String>,
     pub bootstrap_node: Option<String>,
     pub local_peer_seed: Option<String>,
+    pub libp2p: Option<Libp2pConfigFile>,
     pub miner: Option<bool>,
     pub stacker: Option<bool>,
     pub mock_mining: Option<bool>,
@@ -4149,9 +4434,25 @@ impl NodeConfigFile {
             );
         }
 
+        let libp2p = self
+            .libp2p
+            .clone()
+            .unwrap_or_default()
+            .into_config_default(default_node_config.libp2p.clone())?;
         let rpc_bind = self.rpc_bind.unwrap_or(default_node_config.rpc_bind);
         let miner = self.miner.unwrap_or(default_node_config.miner);
         let stacker = self.stacker.unwrap_or(default_node_config.stacker);
+        let explicitly_configured_stacker_dbs = self
+            .stacker_dbs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|contract_id| {
+                QualifiedContractIdentifier::parse(contract_id).map_err(|error| {
+                    format!("Invalid node.stacker_dbs contract {contract_id:?}: {error}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let node_config = NodeConfig {
             seed: match self.seed {
                 Some(seed) => hex_bytes(&seed)
@@ -4174,6 +4475,7 @@ impl NodeConfigFile {
                 })?,
                 None => default_node_config.local_peer_seed,
             },
+            libp2p,
             miner,
             stacker,
             mock_mining: self.mock_mining.unwrap_or(default_node_config.mock_mining),
@@ -4227,12 +4529,10 @@ impl NodeConfigFile {
             event_dispatcher_queue_size: self
                 .event_dispatcher_queue_size
                 .unwrap_or(default_node_config.event_dispatcher_queue_size),
-            stacker_dbs: self
-                .stacker_dbs
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|contract_id| QualifiedContractIdentifier::parse(contract_id).ok())
-                .collect(),
+            stacker_dbs: explicitly_configured_stacker_dbs.clone(),
+            stacker_db_origins: StackerDbConfigOrigins {
+                compatibility: Vec::new(),
+            },
             log_stackerdb_chunk_sources: self
                 .log_stackerdb_chunk_sources
                 .unwrap_or(default_node_config.log_stackerdb_chunk_sources),
@@ -5174,6 +5474,298 @@ mod tests {
     }
 
     #[test]
+    fn libp2p_rollout_modes_are_fail_closed_and_backwards_compatible() {
+        let cases = [
+            ("off", Libp2pRolloutMode::Off, false, false),
+            ("observe", Libp2pRolloutMode::Observe, false, false),
+            ("receive", Libp2pRolloutMode::Receive, true, false),
+            ("dual", Libp2pRolloutMode::Dual, true, true),
+            (
+                "libp2p-preferred",
+                Libp2pRolloutMode::Libp2pPreferred,
+                true,
+                true,
+            ),
+            ("libp2p-only", Libp2pRolloutMode::Libp2pOnly, true, true),
+        ];
+
+        for (serialized, expected, ingress, egress) in cases {
+            let file = ConfigFile::from_str(&format!(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node.libp2p]
+                    rollout_mode = "{serialized}"
+                "#
+            ))
+            .unwrap();
+            let config = Config::from_config_file(file, false).unwrap();
+            assert_eq!(config.node.libp2p.rollout_mode, expected);
+            assert_eq!(config.node.libp2p.enabled, expected.enabled());
+            assert_eq!(expected.accepts_application_ingress(), ingress);
+            assert_eq!(expected.publishes_application_data(), egress);
+            assert_eq!(
+                expected.legacy_fallback_enabled(),
+                expected != Libp2pRolloutMode::Libp2pOnly
+            );
+            assert_eq!(
+                expected.legacy_listener_enabled(),
+                expected != Libp2pRolloutMode::Libp2pOnly
+            );
+        }
+
+        let legacy_enabled = Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node.libp2p]
+                    enabled = true
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_enabled.node.libp2p.rollout_mode,
+            Libp2pRolloutMode::Dual
+        );
+
+        let conflict = Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node.libp2p]
+                    enabled = false
+                    rollout_mode = "receive"
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .unwrap_err();
+        assert!(conflict.contains("enabled conflicts with rollout_mode"));
+    }
+
+    #[test]
+    fn native_signer_mode_does_not_auto_configure_signer_stackerdbs() {
+        let native = Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node]
+                    stacker = true
+
+                    [node.libp2p]
+                    rollout_mode = "libp2p-only"
+                    compatibility_stackerdb = false
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        assert!(native.node.stacker_dbs.is_empty());
+
+        let compatibility = Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node]
+                    stacker = true
+
+                    [node.libp2p]
+                    rollout_mode = "libp2p-only"
+                    compatibility_stackerdb = true
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        assert!(!compatibility.node.stacker_dbs.is_empty());
+        assert_eq!(compatibility.node.generic_stackerdb_contract_count(), 0);
+        assert!(compatibility.node.compatibility_stackerdb_contract_count() > 0);
+    }
+
+    #[test]
+    fn libp2p_only_rejects_explicit_generic_stackerdbs_before_runtime() {
+        let generic = "SP000000000000000000002Q6VF78.pox-3";
+        let error = Config::from_config_file(
+            ConfigFile::from_str(&format!(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node]
+                    stacker_dbs = ["{generic}"]
+
+                    [node.libp2p]
+                    rollout_mode = "libp2p-only"
+                    compatibility_stackerdb = false
+                "#
+            ))
+            .unwrap(),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot replicate explicitly configured generic StackerDB"));
+        assert!(error.contains(generic));
+        assert!(error.contains("dual"));
+        assert!(error.contains("libp2p-preferred"));
+    }
+
+    #[test]
+    fn generic_stackerdb_replication_state_is_explicit_for_diagnostics() {
+        let contract =
+            QualifiedContractIdentifier::parse("SP000000000000000000002Q6VF78.pox-3").unwrap();
+        let mut node = NodeConfig::default();
+        assert_eq!(
+            node.generic_stackerdb_replication_state(),
+            GenericStackerDbReplicationState::NotConfigured
+        );
+
+        node.stacker_dbs.push(contract);
+        node.libp2p.rollout_mode = Libp2pRolloutMode::Dual;
+        assert_eq!(
+            node.generic_stackerdb_replication_state(),
+            GenericStackerDbReplicationState::LegacyTransportEnabled
+        );
+
+        node.libp2p.rollout_mode = Libp2pRolloutMode::Libp2pOnly;
+        let state = node.generic_stackerdb_replication_state();
+        assert_eq!(state, GenericStackerDbReplicationState::Incompatible);
+        assert_eq!(state.as_str(), "incompatible");
+        assert!(state.reason().contains("incompatible"));
+        assert!(node.validate_stackerdb_rollout().is_err());
+    }
+
+    #[test]
+    fn stackerdb_rollout_error_bounds_contract_diagnostics() {
+        let contracts = (0..10)
+            .map(|index| format!("SP000000000000000000002Q6VF78.contract-{index}"))
+            .collect::<Vec<_>>();
+        let entries = contracts
+            .iter()
+            .map(|contract| format!("\"{contract}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let error = Config::from_config_file(
+            ConfigFile::from_str(&format!(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node]
+                    stacker_dbs = [{entries}]
+
+                    [node.libp2p]
+                    rollout_mode = "libp2p-only"
+                "#
+            ))
+            .unwrap(),
+            false,
+        )
+        .unwrap_err();
+
+        for contract in contracts.iter().take(STACKERDB_DIAGNOSTIC_CONTRACT_LIMIT) {
+            assert!(error.contains(contract));
+        }
+        assert!(error.contains("and 2 more"));
+        assert!(!error.contains(&contracts[STACKERDB_DIAGNOSTIC_CONTRACT_LIMIT]));
+    }
+
+    #[test]
+    fn legacy_retaining_modes_preserve_explicit_generic_stackerdbs() {
+        let generic = "SP000000000000000000002Q6VF78.pox-3";
+        for rollout_mode in ["dual", "libp2p-preferred"] {
+            let config = Config::from_config_file(
+                ConfigFile::from_str(&format!(
+                    r#"
+                        [burnchain]
+                        mode = "xenon"
+
+                        [node]
+                        stacker_dbs = ["{generic}"]
+
+                        [node.libp2p]
+                        rollout_mode = "{rollout_mode}"
+                        compatibility_stackerdb = false
+                    "#
+                ))
+                .unwrap(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(config.node.generic_stackerdb_contract_count(), 1);
+            assert_eq!(
+                config.node.generic_stackerdb_replication_state(),
+                GenericStackerDbReplicationState::LegacyTransportEnabled
+            );
+        }
+
+        let legacy_alias = Config::from_config_file(
+            ConfigFile::from_str(&format!(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node]
+                    stacker_dbs = ["{generic}"]
+
+                    [node.libp2p]
+                    enabled = true
+                "#
+            ))
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_alias.node.libp2p.rollout_mode,
+            Libp2pRolloutMode::Dual
+        );
+        assert_eq!(
+            legacy_alias.node.generic_stackerdb_replication_state(),
+            GenericStackerDbReplicationState::LegacyTransportEnabled
+        );
+    }
+
+    #[test]
+    fn explicit_system_named_stackerdb_cannot_claim_bridge_provenance() {
+        let system_contract = boot_code_id(MINERS_NAME, false).to_string();
+        let error = Config::from_config_file(
+            ConfigFile::from_str(&format!(
+                r#"
+                    [burnchain]
+                    mode = "xenon"
+
+                    [node]
+                    stacker = true
+                    stacker_dbs = ["{system_contract}"]
+
+                    [node.libp2p]
+                    rollout_mode = "libp2p-only"
+                    compatibility_stackerdb = true
+                "#
+            ))
+            .unwrap(),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains(&system_contract));
+    }
+
+    #[test]
     fn test_config() {
         assert_eq!(
             "node.seed should be a hex encoded string".to_string(),
@@ -5463,6 +6055,35 @@ mod tests {
         .into_config_default(default_burnchain_config)
         .unwrap();
         assert_eq!(merged.wallet_name.as_deref(), expected);
+    }
+
+    #[test]
+    fn stale_bitcoin_tip_policy_is_explicit_and_regtest_only() {
+        let default_config = BurnchainConfig::default();
+        assert!(!default_config.allow_stale_bitcoin_tip);
+
+        let regtest = BurnchainConfigFile {
+            mode: Some("nakamoto-neon".into()),
+            allow_stale_bitcoin_tip: Some(true),
+            ..BurnchainConfigFile::default()
+        }
+        .into_config_default(default_config.clone())
+        .expect("controlled regtests may opt out of the wall-clock freshness window");
+        assert!(regtest.allow_stale_bitcoin_tip);
+
+        for public_mode in ["mainnet", "xenon"] {
+            let error = BurnchainConfigFile {
+                mode: Some(public_mode.into()),
+                allow_stale_bitcoin_tip: Some(true),
+                ..BurnchainConfigFile::default()
+            }
+            .into_config_default(default_config.clone())
+            .expect_err("public networks must retain Bitcoin tip freshness checks");
+            assert!(
+                error.contains("may be enabled only on regtest"),
+                "unexpected error for {public_mode}: {error}"
+            );
+        }
     }
 
     #[test]

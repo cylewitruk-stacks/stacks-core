@@ -1,0 +1,8 @@
+# Optional override for parallel/CI verification. All assertions execute from
+# inside the Compose network, so host port publication is unnecessary and
+# would prevent two clean-room projects from running concurrently.
+services:
+  miner-1:
+    ports: !reset []
+  observer:
+    ports: !reset []

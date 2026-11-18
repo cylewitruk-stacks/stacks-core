@@ -1,0 +1,16 @@
+[package]
+name = "stacks-network-types"
+version = "0.1.0"
+edition = "2021"
+license = "GPLv3"
+description = "Transport-neutral types for the Stacks peer network"
+
+[dependencies]
+prost = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.14.3"
+protoc-bin-vendored = "3.2.0"

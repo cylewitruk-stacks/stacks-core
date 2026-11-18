@@ -39,6 +39,8 @@ struct PayloadInfo {
     disable_retries: bool,
     /// A value for the HTTP timeout is stored in the DB, but can optionally be overridden.
     timeout_override: Option<Duration>,
+    /// Credential reattached from live observer configuration, never persisted.
+    authorization: Option<Arc<str>>,
 }
 
 enum WorkerTask {
@@ -173,11 +175,22 @@ impl EventDispatcherWorker {
     ///
     /// The worker has a limited queue size (1000 by default). If the queue is already full, the
     /// call to `initiate_send()` will block until space has become available.
+    #[cfg(test)]
     pub fn initiate_send(
         &self,
         id: i64,
         disable_retries: bool,
         timeout_override: Option<Duration>,
+    ) -> Result<EventDispatcherResult, EventDispatcherError> {
+        self.initiate_send_with_authorization(id, disable_retries, timeout_override, None)
+    }
+
+    pub fn initiate_send_with_authorization(
+        &self,
+        id: i64,
+        disable_retries: bool,
+        timeout_override: Option<Duration>,
+        authorization: Option<Arc<str>>,
     ) -> Result<EventDispatcherResult, EventDispatcherError> {
         let (sender, receiver) = channel();
         debug!("Event Dispatcher Worker: sending payload {id}");
@@ -187,6 +200,7 @@ impl EventDispatcherWorker {
                 id,
                 disable_retries,
                 timeout_override,
+                authorization,
             }),
             completion: sender,
         })?;
@@ -236,6 +250,7 @@ impl EventDispatcherWorker {
                 id,
                 disable_retries,
                 timeout_override,
+                authorization,
             } = match task {
                 WorkerTask::Payload(p) => p,
 
@@ -280,6 +295,7 @@ impl EventDispatcherWorker {
                 disable_retries,
                 id,
                 &conn,
+                authorization.as_deref(),
             );
 
             // We're ignoring the result of this call -- if the requester has dropped the receiver
@@ -293,8 +309,9 @@ impl EventDispatcherWorker {
         disable_retries: bool,
         id: i64,
         conn: &EventDispatcherDbConnection,
+        authorization: Option<&str>,
     ) {
-        let http_result = Self::make_http_request(data, disable_retries);
+        let http_result = Self::make_http_request(data, disable_retries, authorization);
 
         if let Err(err) = http_result {
             // log but continue
@@ -325,6 +342,7 @@ impl EventDispatcherWorker {
     fn make_http_request(
         data: &EventRequestData,
         disable_retries: bool,
+        authorization: Option<&str>,
     ) -> Result<(), EventDispatcherError> {
         debug!(
             "Event dispatcher: Sending payload"; "url" => &data.url, "bytes" => data.payload_bytes.len()
@@ -353,6 +371,9 @@ impl EventDispatcherWorker {
             )
             .unwrap_or_else(|_| panic!("FATAL: failed to encode infallible data as HTTP request"));
             request.add_header("Connection".into(), "close".into());
+            if let Some(authorization) = authorization {
+                request.add_header("Authorization".into(), authorization.into());
+            }
             match send_http_request(host, port, request, data.timeout) {
                 Ok(response) => {
                     if response.preamble().status_code == 200 {

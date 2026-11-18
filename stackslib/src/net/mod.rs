@@ -35,6 +35,7 @@ use stacks_common::util::get_epoch_time_secs;
 use stacks_common::util::hash::{Hash160, Sha256Sum};
 use stacks_common::util::secp256k1::{MessageSignature, Secp256k1PublicKey};
 use stacks_marf::Error as marf_error;
+use stacks_network_types::{ContentId, ObjectKind};
 use url;
 
 use self::dns::*;
@@ -102,8 +103,10 @@ pub mod poll;
 pub mod prune;
 pub mod relay;
 pub mod rpc;
+pub mod semantic;
 pub mod server;
 pub mod stackerdb;
+pub mod sync_plan;
 pub mod unsolicited;
 
 pub use crate::net::neighbors::{NeighborComms, PeerNetworkComms};
@@ -1561,6 +1564,10 @@ pub struct NetworkResult {
     pub confirmed_microblocks: Vec<Downloaded<Vec<StacksMicroblock>>>,
     /// Nakamoto blocks we downloaded
     pub nakamoto_blocks: HashMap<StacksBlockId, NakamotoBlock>,
+    /// Native libp2p objects awaiting contextual chainstate/mempool validation.
+    /// The transport keeps their bytes quarantined until the relayer resolves
+    /// these IDs as accepted or rejected.
+    pub libp2p_object_ids: Vec<(ObjectKind, ContentId)>,
     /// all transactions pushed to us and their message relay hints
     pub pushed_transactions: HashMap<NeighborKey, Vec<(Vec<RelayData>, StacksTransaction)>>,
     /// all Stacks 2.x blocks pushed to us
@@ -1608,6 +1615,23 @@ pub struct NetworkResult {
 }
 
 impl NetworkResult {
+    /// Remove application data learned from the incumbent peer transport while
+    /// retaining RPC uploads, generic StackerDB traffic, and progress counters.
+    /// The libp2p adapter calls this before injecting its own semantic objects in
+    /// `libp2p-only` mode, so the relayer remains the single validation boundary.
+    fn clear_legacy_application_data(&mut self) {
+        self.unhandled_messages.clear();
+        self.blocks.clear();
+        self.confirmed_microblocks.clear();
+        self.nakamoto_blocks.clear();
+        self.pushed_transactions.clear();
+        self.pushed_blocks.clear();
+        self.pushed_microblocks.clear();
+        self.pushed_nakamoto_blocks.clear();
+        self.attachments.clear();
+        self.synced_transactions.clear();
+    }
+
     pub fn new(
         stacks_tip: StacksBlockId,
         num_state_machine_passes: u64,
@@ -1627,6 +1651,7 @@ impl NetworkResult {
             blocks: vec![],
             confirmed_microblocks: vec![],
             nakamoto_blocks: HashMap::new(),
+            libp2p_object_ids: vec![],
             pushed_transactions: HashMap::new(),
             pushed_blocks: HashMap::new(),
             pushed_microblocks: HashMap::new(),
@@ -1887,6 +1912,13 @@ impl NetworkResult {
             retain
         });
         newer.nakamoto_blocks.extend(self.nakamoto_blocks.drain());
+
+        let mut newer_libp2p_ids: HashSet<_> = newer.libp2p_object_ids.iter().copied().collect();
+        for object_ref in self.libp2p_object_ids.drain(..) {
+            if newer_libp2p_ids.insert(object_ref) {
+                newer.libp2p_object_ids.push(object_ref);
+            }
+        }
 
         // merge pushed transactions, but deduplicate
         for (nk, mut tx_data) in self.pushed_transactions.drain() {

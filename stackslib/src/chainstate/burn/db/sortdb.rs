@@ -3928,6 +3928,21 @@ impl SortitionDBConn<'_> {
         let prepare_phase_start =
             pox_constants.prepare_phase_start(first_block_height, reward_cycle_of_prepare_phase);
 
+        let tip_snapshot = SortitionDB::get_block_snapshot(self, tip)?.ok_or_else(|| {
+            error!(
+                "Could not find snapshot for sortition while fetching reward set";
+                "tip_sortition_id" => %tip,
+            );
+            db_error::NotFoundError
+        })?;
+        if prepare_phase_is_future(tip_snapshot.block_height, prepare_phase_start) {
+            // A caller may speculatively ask for current+1 on every `/v2/pox`
+            // poll. Absence before the prepare phase is ordinary `not ready`,
+            // so keep this path silent and reserve the error below for an
+            // ancestor that should already exist.
+            return Err(db_error::NotFoundError);
+        }
+
         let first_sortition =
             get_ancestor_sort_id(self, prepare_phase_start, tip)?.ok_or_else(|| {
                 error!(
@@ -6699,6 +6714,10 @@ impl SortitionHandleTx<'_> {
     }
 }
 
+fn prepare_phase_is_future(tip_block_height: u64, prepare_phase_start: u64) -> bool {
+    prepare_phase_start > tip_block_height
+}
+
 impl ChainstateDB for SortitionDB {
     fn backup(_backup_path: &str) -> Result<(), db_error> {
         Err(db_error::NotImplemented)
@@ -6736,6 +6755,13 @@ pub mod tests {
     use crate::chainstate::stacks::StacksPublicKey;
     use crate::core::{StacksEpochExtension, *};
     use crate::util_lib::db::Error as db_error;
+
+    #[test]
+    fn future_prepare_phase_boundary_is_not_ready_only_before_start() {
+        assert!(prepare_phase_is_future(275, 276));
+        assert!(!prepare_phase_is_future(276, 276));
+        assert!(!prepare_phase_is_future(277, 276));
+    }
 
     /// Stable views clamp to the first burn block until enough local history exists, on every network.
     #[test]

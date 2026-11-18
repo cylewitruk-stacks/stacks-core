@@ -22,13 +22,14 @@ use url::form_urlencoded;
 
 use crate::burnchains::Txid;
 use crate::chainstate::stacks::StacksTransaction;
-use crate::core::mempool::{decode_tx_stream, MemPoolDB, MemPoolSyncData};
+use crate::core::mempool::{decode_tx_stream, MemPoolSyncData};
 use crate::net::http::{
     parse_bytes, Error, HttpChunkGenerator, HttpContentType, HttpRequest, HttpRequestContents,
     HttpRequestPreamble, HttpResponse, HttpResponseContents, HttpResponsePayload,
     HttpResponsePreamble, HttpServerError,
 };
 use crate::net::httpcore::{RPCRequestHandler, StacksHttpRequest, StacksHttpResponse};
+use crate::net::semantic::MempoolSyncService;
 use crate::net::{Error as NetError, StacksNodeState};
 use crate::util_lib::db::DBConn;
 
@@ -144,7 +145,7 @@ impl HttpChunkGenerator for StacksMemPoolStream {
 
         let remaining = self.max_txs.saturating_sub(self.num_txs);
         let (next_txs, next_last_randomized_txid_opt, num_rows_visited) =
-            MemPoolDB::static_find_next_missing_transactions(
+            MempoolSyncService::next_missing_transactions(
                 &self.mempool_db,
                 &self.tx_query,
                 self.coinbase_height,

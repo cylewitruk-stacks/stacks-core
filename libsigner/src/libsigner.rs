@@ -30,6 +30,7 @@ mod tests;
 mod error;
 mod events;
 mod http;
+mod network;
 mod runloop;
 mod session;
 mod signer_set;
@@ -50,6 +51,11 @@ pub use crate::error::{EventError, RPCError};
 pub use crate::events::{
     BlockProposal, BlockProposalData, EventReceiver, EventStopSignaler, SignerEvent,
     SignerEventReceiver, SignerEventTrait, SignerStopSignaler, StacksBlockEvent,
+};
+pub use crate::network::{
+    AuthenticatedSignerEvent, PublishReceipt, ReplayCursor, ReplayRequest,
+    SignerEventAuthentication, SignerIngressOrigin, SignerNetwork, SignerNetworkError,
+    SignerNetworkMessage,
 };
 pub use crate::runloop::{RunningSigner, Signer, SignerRunLoop};
 pub use crate::session::{SignerSession, StackerDBSession};

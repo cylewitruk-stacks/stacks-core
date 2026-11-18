@@ -36,6 +36,7 @@ clarity = { path = "../clarity" }
 stacks-common = { path = "../stacks-common" }
 stacks-marf = { path = "../stacks-marf" }
 stacks-codec = { path = "../stacks-codec" }
+stacks-network-types = { workspace = true }
 stacks-transactions = { path = "../crates/stacks-transactions" }
 pox-locking = { path = "../pox-locking" }
 libstackerdb = { path = "../libstackerdb" }
@@ -85,6 +86,7 @@ profile-sqlite = ["stacks-common/profile-sqlite", "stacks-marf/profile-sqlite"]
 disable-costs = []
 developer-mode = ["clarity/developer-mode"]
 monitoring_prom = ["prometheus"]
+network_observer = []
 slog_json = ["stacks-common/slog_json", "clarity/slog_json", "pox-locking/slog_json"]
 testing = ["chrono", "stacks-common/testing", "stacks-marf/testing", "clarity/testing"]
 profiler = ["perf-event2"]

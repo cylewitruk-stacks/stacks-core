@@ -67,7 +67,7 @@ use super::miner_db::MinerDB;
 use super::relayer::{MinerStopHandle, RelayerThread};
 use super::{Config, Error as NakamotoNodeError, EventDispatcher, Keychain};
 use crate::nakamoto_node::signer_coordinator::SignerCoordinator;
-use crate::nakamoto_node::stackerdb_listener::InitialChunksLoader;
+use crate::nakamoto_node::signer_message_processor::InitialChunksLoader;
 use crate::nakamoto_node::VRF_MOCK_MINER_KEY;
 use crate::neon_node;
 use crate::run_loop::nakamoto::Globals;
@@ -236,6 +236,17 @@ impl MinerReason {
             Self::ReadCountExtend { .. } => false,
         }
     }
+}
+
+fn rejected_extension_retry_is_superseded(
+    reason: &MinerReason,
+    last_block_rejected: bool,
+    extension_tenure: &ConsensusHash,
+    canonical_stacks_tenure: &ConsensusHash,
+) -> bool {
+    last_block_rejected
+        && matches!(reason, MinerReason::Extended { .. })
+        && canonical_stacks_tenure != extension_tenure
 }
 
 impl std::fmt::Display for MinerReason {
@@ -605,6 +616,8 @@ impl BlockMinerThread {
             miner_privkey,
             &self.config,
             &self.burn_tip_at_start,
+            self.globals.libp2p_handle(),
+            self.globals.libp2p_signer_events(),
         )
         .map_err(|e| {
             NakamotoNodeError::SigningCoordinatorFailure(format!(
@@ -676,6 +689,24 @@ impl BlockMinerThread {
             self.globals
                 .raise_initiative("MiningFailure: aborted by node".to_string());
             return Err(ChainstateError::MinerAborted.into());
+        }
+
+        if *last_block_rejected && matches!(self.reason, MinerReason::Extended { .. }) {
+            let (canonical_stacks_tenure, _) =
+                SortitionDB::get_canonical_stacks_chain_tip_hash(sortdb.conn())?;
+            if rejected_extension_retry_is_superseded(
+                &self.reason,
+                *last_block_rejected,
+                &self.burn_election_block.consensus_hash,
+                &canonical_stacks_tenure,
+            ) {
+                info!(
+                    "Miner: stop rejected tenure-extension retry; a new Stacks tenure is active";
+                    "extension_tenure" => %self.burn_election_block.consensus_hash,
+                    "canonical_stacks_tenure" => %canonical_stacks_tenure,
+                );
+                return Err(NakamotoNodeError::StacksTipChanged);
+            }
         }
         let mut chain_state =
             neon_node::open_chainstate_with_faults(&self.config).map_err(|e| {
@@ -1013,7 +1044,7 @@ impl BlockMinerThread {
         *last_block_rejected = false;
 
         new_block.header.signer_signature = signer_signature;
-        if let Err(e) = self.broadcast(new_block.clone(), reward_set, stackerdbs) {
+        if let Err(e) = self.broadcast(new_block.clone(), reward_set, stackerdbs, coordinator) {
             warn!("Error accepting own block: {e:?}. Will try mining again.");
             return Ok(false);
         } else {
@@ -1307,13 +1338,39 @@ impl BlockMinerThread {
 
         let block_id = block.block_id();
         debug!("Broadcasting block {block_id}");
-        if let Err(e) = self.p2p_handle.broadcast_message(
-            vec![],
-            StacksMessageType::NakamotoBlocks(NakamotoBlocksData {
-                blocks: vec![block.clone()],
-            }),
-        ) {
-            warn!("Failed to broadcast block {block_id}: {e:?}");
+        if self
+            .config
+            .node
+            .libp2p
+            .rollout_mode
+            .legacy_fallback_enabled()
+        {
+            if let Err(e) = self.p2p_handle.broadcast_message(
+                vec![],
+                StacksMessageType::NakamotoBlocks(NakamotoBlocksData {
+                    blocks: vec![block.clone()],
+                }),
+            ) {
+                warn!("Failed to broadcast block {block_id}: {e:?}");
+            }
+        }
+        if self
+            .config
+            .node
+            .libp2p
+            .rollout_mode
+            .publishes_application_data()
+        {
+            let Some(network) = self.globals.libp2p_handle() else {
+                return Ok(());
+            };
+            if let Err(error) = super::libp2p::publish_nakamoto_block(&network, block) {
+                warn!(
+                    "Failed to queue mined Nakamoto block on libp2p";
+                    "block_id" => block_id.to_string(),
+                    "error" => error.to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -1323,6 +1380,7 @@ impl BlockMinerThread {
         block: NakamotoBlock,
         reward_set: &RewardSet,
         stackerdbs: &StackerDBs,
+        coordinator: &mut SignerCoordinator,
     ) -> Result<(), NakamotoNodeError> {
         if self.config.get_node_config(false).mock_mining {
             // If we're mock mining, we don't actually broadcast the block.
@@ -1376,18 +1434,51 @@ impl BlockMinerThread {
             return Ok(());
         }
 
-        SignerCoordinator::send_miners_message(
-            miner_privkey,
-            &sort_db,
-            &self.burn_block,
-            stackerdbs,
-            SignerMessage::BlockPushed(block),
-            MinerSlotID::BlockPushed,
-            chain_state.mainnet,
-            &mut miners_session,
-            &self.burn_election_block.consensus_hash,
-            &self.miner_db,
-        )
+        let reward_cycle = self
+            .burnchain
+            .block_height_to_reward_cycle(self.burn_election_block.block_height)
+            .expect("Nakamoto mining only begins after the first reward cycle");
+        let pushed_message = SignerMessage::BlockPushed(block.clone());
+        let native_envelope_id = coordinator.publish_native_message(
+            &pushed_message,
+            reward_cycle,
+            &self.burn_block.consensus_hash,
+            stacks_network_types::wire::v1::SignerLane::BlockPushed,
+        )?;
+
+        if coordinator.miner_bridge_enabled() {
+            coordinator.enqueue_miner_bridge_message(
+                &pushed_message,
+                native_envelope_id,
+                reward_cycle,
+                stacks_network_types::wire::v1::SignerLane::BlockPushed,
+                MinerSlotID::BlockPushed,
+                &sort_db,
+                &self.burn_block,
+                &self.burn_election_block.consensus_hash,
+                &self.burn_block.consensus_hash,
+            )?;
+            Ok(())
+        } else if self.config.node.libp2p.signer_bridge.mode.writes_legacy() {
+            SignerCoordinator::send_miners_message(
+                miner_privkey,
+                &sort_db,
+                &self.burn_block,
+                stackerdbs,
+                pushed_message,
+                MinerSlotID::BlockPushed,
+                chain_state.mainnet,
+                &mut miners_session,
+                &self.burn_election_block.consensus_hash,
+                &self.miner_db,
+            )
+        } else if native_envelope_id.is_some() {
+            Ok(())
+        } else {
+            Err(NakamotoNodeError::SigningCoordinatorFailure(
+                "native signer transport is required when StackerDB compatibility is off".into(),
+            ))
+        }
     }
 
     /// Get the coinbase recipient address, if set in the config and if allowed in this epoch
@@ -1817,7 +1908,9 @@ impl BlockMinerThread {
 
         if self.last_block_mined.is_none() && parent_block_info.parent_tenure.is_none() {
             if self.config.node.mock_mining {
-                info!("Mock miner will follow canonical tip within an ongoing tenure; no parent tenure info loaded yet");
+                info!(
+                    "Mock miner will follow canonical tip within an ongoing tenure; no parent tenure info loaded yet"
+                );
             } else {
                 warn!(
                     "Miner should be starting a new tenure, but failed to load parent tenure info"
@@ -2218,7 +2311,7 @@ impl BlockMinerThread {
         self.mined_blocks = 0;
     }
 
-    /// Collect whatever we need to inject into the [`StackerDBListener`] (via the
+    /// Collect whatever we need to inject into the [`SignerMessageProcessor`] (via the
     /// [`SignerCoordinator`]) so that it can load its initial state upon which to apply
     /// any updates it receives.
     fn build_initial_chunks_loader<'a>(
@@ -2388,6 +2481,40 @@ impl ReadCountCheck for () {
         // always allow the read count extend
         0
     }
+}
+
+#[test]
+fn rejected_extension_retry_stops_only_after_a_new_stacks_tenure_is_active() {
+    let extension_tenure = ConsensusHash([1; 20]);
+    let active_tenure = ConsensusHash([2; 20]);
+    let extension = MinerReason::Extended {
+        burn_view_consensus_hash: active_tenure.clone(),
+    };
+
+    assert!(!rejected_extension_retry_is_superseded(
+        &extension,
+        false,
+        &extension_tenure,
+        &active_tenure,
+    ));
+    assert!(!rejected_extension_retry_is_superseded(
+        &extension,
+        true,
+        &extension_tenure,
+        &extension_tenure,
+    ));
+    assert!(rejected_extension_retry_is_superseded(
+        &extension,
+        true,
+        &extension_tenure,
+        &active_tenure,
+    ));
+    assert!(!rejected_extension_retry_is_superseded(
+        &MinerReason::BlockFound { late: false },
+        true,
+        &extension_tenure,
+        &active_tenure,
+    ));
 }
 
 #[test]

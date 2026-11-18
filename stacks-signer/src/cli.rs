@@ -254,9 +254,9 @@ pub struct MonitorSignersArgs {
     /// Max age in seconds before a signer message is considered stale.
     #[arg(long, short, default_value = "1200")]
     pub max_age: u64,
-    /// The HTTP timeout (in seconds) for read/write operations with StackerDB.
-    #[arg(long, short, default_value = "60")]
-    pub stackerdb_timeout_secs: u64,
+    /// Privileged RPC authorization token configured on the Stacks node.
+    #[arg(long)]
+    pub auth_token: String,
 }
 
 #[derive(Parser, Debug, Clone, PartialEq)]

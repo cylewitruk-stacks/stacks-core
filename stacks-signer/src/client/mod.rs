@@ -14,8 +14,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-/// The stacker db module for communicating with the stackerdb contract
-pub(crate) mod stackerdb;
+/// Test-only incumbent signer adapter retained for compatibility integration
+/// coverage. Production signer policy cannot import this module.
+#[cfg(any(test, feature = "testing"))]
+mod stackerdb;
 /// The stacks node client module for communicating with the stacks node
 pub(crate) mod stacks_client;
 
@@ -24,11 +26,25 @@ use std::time::Duration;
 use clarity::vm::errors::ClarityTypeError;
 use clarity::vm::types::serialization::SerializationError;
 use libsigner::RPCError;
+#[cfg(any(test, feature = "testing"))]
 use libstackerdb::Error as StackerDBError;
-pub use stackerdb::*;
+#[cfg(any(test, feature = "testing"))]
+pub use stackerdb::StackerDB;
 pub use stacks_client::*;
+#[cfg(any(test, feature = "testing"))]
 use stacks_common::codec::Error as CodecError;
 use stacks_common::{debug, warn};
+
+/// Signer membership index. The wrapper prevents accidental conflation with
+/// other numeric role identifiers retained by compatibility code.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord)]
+pub struct SignerSlotID(pub u32);
+
+impl std::fmt::Display for SignerSlotID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Backoff timer initial interval in milliseconds
 const BACKOFF_INITIAL_INTERVAL: u64 = 128;
@@ -40,20 +56,23 @@ const BACKOFF_MAX_ELAPSED: u64 = 5;
 #[derive(thiserror::Error, Debug)]
 /// Client error type
 pub enum ClientError {
+    #[cfg(any(test, feature = "testing"))]
+    /// Test-adapter signer message serialization failed.
+    #[error("Unable to serialize legacy signer test-adapter message: {0}")]
+    StackerDBSerializationError(#[from] CodecError),
+    #[cfg(any(test, feature = "testing"))]
+    /// Test-adapter chunk signing failed.
+    #[error("Failed to sign legacy signer test-adapter chunk: {0}")]
+    FailToSign(#[from] StackerDBError),
     /// Error for when a response's format does not match the expected structure
     #[error("Unexpected response format: {0}")]
     UnexpectedResponseFormat(String),
-    /// An error occurred serializing the message
-    #[error("Unable to serialize stacker-db message: {0}")]
-    StackerDBSerializationError(#[from] CodecError),
-    /// Failed to sign stacker-db chunk
-    #[error("Failed to sign stacker-db chunk: {0}")]
-    FailToSign(#[from] StackerDBError),
     /// Failed on a DBError
     #[error("SignerDB database error: {0}")]
     SignerDBError(#[from] blockstack_lib::util_lib::db::Error),
-    /// Stacker-db instance rejected the chunk
-    #[error("Stacker-db rejected the chunk. Reason: {0}")]
+    #[cfg(any(test, feature = "testing"))]
+    /// The test-only legacy endpoint rejected a chunk.
+    #[error("Legacy signer test adapter rejected the chunk: {0}")]
     PutChunkRejected(String),
     /// Failed to call a read only function
     #[error("Failed to call read only function. {0}")]
@@ -171,9 +190,7 @@ pub(crate) mod tests {
     use stacks_common::util::hash::{Hash160, Sha256Sum};
 
     use super::*;
-    use crate::config::{
-        GlobalConfig, SignerConfig, SignerConfigMode, DEFAULT_STACKERDB_TIMEOUT_SECS,
-    };
+    use crate::config::{GlobalConfig, SignerConfig, SignerConfigMode};
     use crate::runloop::PoxGeometry;
     #[cfg(any(test, feature = "testing"))]
     use crate::v0::signer_state::SUPPORTED_SIGNER_PROTOCOL_VERSION;
@@ -426,19 +443,12 @@ pub(crate) mod tests {
         format!("HTTP/1.1 200 OK\n\n{{\"okay\":true,\"result\":\"{hex}\"}}")
     }
 
-    /// Generate a signer config with the given number of signers and keys where the first signer is
-    /// obtained from the provided global config
+    /// Build incumbent adapter material for compatibility-only tests. Native
+    /// signer construction derives membership indices directly from the reward set.
     pub fn generate_signer_config(config: &GlobalConfig, num_signers: u32) -> SignerConfig {
-        assert!(
-            num_signers > 0,
-            "Cannot generate 0 signers...Specify at least 1 signer."
-        );
-
+        assert!(num_signers > 0);
         let weight_per_signer = 100 / num_signers;
         let mut remaining_weight = 100 % num_signers;
-
-        let reward_cycle = thread_rng().next_u64();
-
         let mut signer_pk_to_id = HashMap::new();
         let mut signer_id_to_pk = HashMap::new();
         let mut signer_addr_to_id = HashMap::new();
@@ -456,7 +466,6 @@ pub(crate) mod tests {
                 StacksPrivateKey::random()
             };
             let public_key = StacksPublicKey::from_private(&private_key);
-
             signer_id_to_pk.insert(signer_id, public_key.clone());
             signer_pk_to_id.insert(public_key.clone(), signer_id);
             let address = StacksAddress::p2pkh(false, &public_key);
@@ -481,7 +490,7 @@ pub(crate) mod tests {
             .expect("empty reward set is V0")
             .signers = Some(reward_set_signers);
         SignerConfig {
-            reward_cycle,
+            reward_cycle: thread_rng().next_u64(),
             pox_geometry: PoxGeometry {
                 reward_cycle_length: 20,
                 prepare_phase_block_length: 5,
@@ -490,7 +499,7 @@ pub(crate) mod tests {
             reward_set,
             signer_mode: SignerConfigMode::Normal {
                 signer_id: 0,
-                signer_slot_id: SignerSlotID(rand::thread_rng().gen_range(0..num_signers)), // Give a random signer slot id between 0 and num_signers
+                signer_slot_id: SignerSlotID(thread_rng().gen_range(0..num_signers)),
             },
             signer_entries: SignerEntries {
                 signer_addr_to_id,
@@ -503,7 +512,7 @@ pub(crate) mod tests {
             },
             signer_slot_ids,
             stacks_private_key: config.stacks_private_key.clone(),
-            node_host: config.node_host.to_string(),
+            node_host: config.node_host.clone(),
             mainnet: config.network.is_mainnet(),
             db_path: config.db_path.clone(),
             first_proposal_burn_block_timing: config.first_proposal_burn_block_timing,
@@ -517,9 +526,8 @@ pub(crate) mod tests {
             reorg_attempts_activity_timeout: config.reorg_attempts_activity_timeout,
             proposal_wait_for_parent_time: config.proposal_wait_for_parent_time,
             capitulate_miner_view_timeout: config.capitulate_miner_view_timeout,
-            #[cfg(any(test, feature = "testing"))]
+            legacy_test_adapter_timeout: config.stackerdb_timeout,
             supported_signer_protocol_version: SUPPORTED_SIGNER_PROTOCOL_VERSION,
-            stackerdb_timeout: Duration::from_secs(DEFAULT_STACKERDB_TIMEOUT_SECS),
             read_count_idle_timeout: config.read_count_idle_timeout,
         }
     }

@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 use core::fmt;
+use std::collections::HashSet;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -59,6 +60,7 @@ use stacks_common::util::hash::Hash160;
 #[cfg(test)]
 use stacks_common::util::tests::TestFlag;
 use stacks_common::util::vrf::VRFPublicKey;
+use stacks_network_types::{ContentId, ObjectKind};
 
 use super::miner::MinerReason;
 use super::{
@@ -600,6 +602,8 @@ impl RelayerThread {
             self.last_network_block_height_ts = get_epoch_time_ms();
         }
 
+        let pending_libp2p_objects = std::mem::take(&mut net_result.libp2p_object_ids);
+        let pending_libp2p_set: HashSet<_> = pending_libp2p_objects.iter().copied().collect();
         let net_receipts = self
             .relayer
             .process_network_result(
@@ -614,6 +618,103 @@ impl RelayerThread {
                 Some(&self.event_dispatcher),
             )
             .expect("BUG: failure processing network results");
+
+        if let Some(network) = self.globals.libp2p_handle() {
+            let publishes_native = self
+                .config
+                .node
+                .libp2p
+                .rollout_mode
+                .publishes_application_data();
+            let mut accepted_libp2p_objects = HashSet::new();
+            for (consensus_hash, block) in &net_receipts.accepted_epoch2_blocks {
+                let object = super::libp2p::anchored_block_object(consensus_hash, block);
+                let object_key = (ObjectKind::AnchoredBlock, object.content_id);
+                accepted_libp2p_objects.insert(object_key);
+                if publishes_native || pending_libp2p_set.contains(&object_key) {
+                    if let Err(error) = network.commit_object(object) {
+                        warn!(
+                            "Failed to commit accepted Epoch 2.x block to libp2p hub";
+                            "error" => error.to_string(),
+                        );
+                    }
+                }
+            }
+            for (parent_consensus_hash, stream) in &net_receipts.accepted_confirmed_microblocks {
+                match super::libp2p::microblock_stream_object(parent_consensus_hash, stream) {
+                    Ok(object) => {
+                        let object_key = (ObjectKind::Microblock, object.content_id);
+                        accepted_libp2p_objects.insert(object_key);
+                        if publishes_native || pending_libp2p_set.contains(&object_key) {
+                            if let Err(error) = network.commit_object(object) {
+                                warn!(
+                                    "Failed to commit accepted microblock stream to libp2p hub";
+                                    "error" => error.to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => warn!(
+                        "Failed to encode accepted microblock stream for libp2p hub";
+                        "error" => error,
+                    ),
+                }
+            }
+            for block in &net_receipts.accepted_nakamoto_blocks {
+                let object_key = (
+                    ObjectKind::NakamotoBlock,
+                    ContentId::from_bytes(block.header.block_id().0),
+                );
+                accepted_libp2p_objects.insert(object_key);
+                let result = if publishes_native {
+                    super::libp2p::publish_nakamoto_block(&network, block)
+                } else if pending_libp2p_set.contains(&object_key) {
+                    network.commit_object(super::libp2p::nakamoto_block_object(block))
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "Failed to commit accepted Nakamoto block to libp2p hub";
+                        "block_id" => block.header.block_id().to_string(),
+                        "error" => error.to_string(),
+                    );
+                }
+            }
+            for transaction in &net_receipts.mempool_txs_added {
+                let object_key = (
+                    ObjectKind::Transaction,
+                    ContentId::from_bytes(transaction.txid().0),
+                );
+                accepted_libp2p_objects.insert(object_key);
+                let result = if publishes_native {
+                    super::libp2p::publish_transaction(&network, transaction)
+                } else if pending_libp2p_set.contains(&object_key) {
+                    network.commit_object(super::libp2p::transaction_object(transaction))
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    warn!(
+                        "Failed to commit accepted transaction to libp2p hub";
+                        "txid" => transaction.txid().to_string(),
+                        "error" => error.to_string(),
+                    );
+                }
+            }
+            for (kind, content_id) in pending_libp2p_objects {
+                if !accepted_libp2p_objects.contains(&(kind, content_id)) {
+                    if let Err(error) = network.reject_object(content_id) {
+                        warn!(
+                            "Failed to release rejected libp2p object reservation";
+                            "kind" => format!("{kind:?}"),
+                            "content_id" => format!("{content_id:?}"),
+                            "error" => error.to_string(),
+                        );
+                    }
+                }
+            }
+        }
 
         if net_receipts.num_new_blocks > 0 {
             // if we received any new block data that could invalidate our view of the chain tip,
@@ -755,7 +856,16 @@ impl RelayerThread {
                         self.config.miner.tenure_extend_wait_timeout,
                     ));
                 } else {
-                    info!("Relayer: no valid sortition since our last winning sortition. Will extend tenure.");
+                    info!(
+                        "Relayer: no valid sortition since our last winning sortition. Will extend tenure.";
+                        "sortition_tip" => %sn.consensus_hash,
+                        "ongoing_tenure" => %canonical_stacks_snapshot.consensus_hash,
+                        "canonical_stacks_tip" => %StacksBlockId::new(
+                            &canonical_stacks_tip_ch,
+                            &canonical_stacks_tip_bh,
+                        ),
+                        "winning_commit_target" => %committed_index_hash,
+                    );
                     self.tenure_extend_time = Some(TenureExtendTime::immediate(
                         TenureExtendReason::BadSortitionWinner,
                     ));

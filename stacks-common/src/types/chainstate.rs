@@ -259,20 +259,25 @@ impl PoxId {
         self.len() == 0
     }
 
+    /// Return a bounded view of the anchor-presence inventory.  This is the
+    /// semantic source used by both legacy and native transports; an offset
+    /// beyond the known inventory is an empty page, not an arithmetic error.
+    pub fn inventory_slice(&self, start: usize, len: usize) -> &[bool] {
+        let start = start.min(self.0.len());
+        let end = start.saturating_add(len).min(self.0.len());
+        &self.0[start..end]
+    }
+
     pub fn bit_slice(&self, start: usize, len: usize) -> (Vec<u8>, u64) {
         let mut ret = vec![0x00];
         let mut count = 0;
-        for bit in start..(start + len) {
-            if bit >= self.len() {
-                break;
-            }
-            let i = bit - start;
+        for (i, present) in self.inventory_slice(start, len).iter().enumerate() {
             if i > 0 && i.is_multiple_of(8) {
                 ret.push(0x00);
             }
 
             let sz = ret.len() - 1;
-            if self.0[bit] {
+            if *present {
                 ret[sz] |= 1 << (i % 8);
             }
             count += 1;
@@ -300,6 +305,20 @@ impl PoxId {
 
     pub fn into_inner(self) -> Vec<bool> {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod pox_id_tests {
+    use super::PoxId;
+
+    #[test]
+    fn inventory_slices_are_bounded_for_untrusted_offsets() {
+        let pox_id = PoxId::from_bools(vec![true, false, true]);
+        assert_eq!(pox_id.inventory_slice(1, usize::MAX), &[false, true]);
+        assert!(pox_id.inventory_slice(4, 1).is_empty());
+        assert!(pox_id.inventory_slice(usize::MAX, usize::MAX).is_empty());
+        assert_eq!(pox_id.bit_slice(usize::MAX, usize::MAX), (vec![0], 0));
     }
 }
 

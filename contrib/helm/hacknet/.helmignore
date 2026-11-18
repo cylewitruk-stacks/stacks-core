@@ -1,0 +1,8 @@
+.DS_Store
+.git/
+.github/
+operator/__pycache__/
+operator/.pytest_cache/
+operator/test_*.py
+scripts/
+

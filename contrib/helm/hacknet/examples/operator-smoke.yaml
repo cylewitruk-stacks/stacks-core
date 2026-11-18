@@ -1,0 +1,67 @@
+apiVersion: testing.stacks.org/v1alpha1
+kind: StacksNetwork
+metadata:
+  name: operator-smoke
+spec:
+  defaults:
+    imagePullPolicy: IfNotPresent
+    dependencyImage: busybox:1.36.1
+    storage:
+      enabled: true
+      size: 64Mi
+  telemetry:
+    enabled: false
+  actors:
+    # These deliberately use public, architecture-neutral images so the
+    # operator lifecycle can be tested before a branch Stacks image is loaded
+    # into a local kind cluster's separate containerd image store.
+    - name: origin
+      role: infrastructure
+      image: busybox:1.36.1
+      command: [sh, -ec]
+      args:
+        - |
+          if [ ! -f /data/identity ]; then
+            printf 'created-by=%s\n' "${ACTOR}" > /data/identity
+          fi
+          mkdir -p /tmp/www
+          cp /data/identity /tmp/www/identity
+          exec httpd -f -p 8080 -h /tmp/www
+      env:
+        - name: ACTOR
+          value: origin
+      ports:
+        - name: http
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /identity
+          port: http
+        periodSeconds: 2
+
+    - name: dependent
+      role: infrastructure
+      image: busybox:1.36.1
+      command: [sh, -ec]
+      args:
+        - |
+          if [ ! -f /data/identity ]; then
+            printf 'created-by=%s\n' "${ACTOR}" > /data/identity
+          fi
+          mkdir -p /tmp/www
+          cp /data/identity /tmp/www/identity
+          exec httpd -f -p 8080 -h /tmp/www
+      env:
+        - name: ACTOR
+          value: dependent
+      ports:
+        - name: http
+          containerPort: 8080
+      dependencies:
+        - actor: origin
+          port: 8080
+      readinessProbe:
+        httpGet:
+          path: /identity
+          port: http
+        periodSeconds: 2

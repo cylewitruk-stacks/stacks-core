@@ -1,0 +1,368 @@
+syntax = "proto3";
+
+package stacks.network.v1;
+
+// Field numbers are wire commitments. Never reuse a removed field number.
+message Envelope {
+  uint32 version = 1;
+  uint32 chain_id = 2;
+  EnvelopeKind kind = 3;
+  uint32 flags = 4;
+  bytes content_id = 5;
+  uint64 encoded_len = 6;
+  bytes payload = 7;
+}
+
+enum EnvelopeKind {
+  ENVELOPE_KIND_UNSPECIFIED = 0;
+  ENVELOPE_KIND_HELLO_REQUEST = 1;
+  ENVELOPE_KIND_HELLO_RESPONSE = 2;
+  ENVELOPE_KIND_ANNOUNCEMENT = 3;
+  ENVELOPE_KIND_CONTENT_REQUEST = 4;
+  ENVELOPE_KIND_CONTENT_RESPONSE = 5;
+  ENVELOPE_KIND_SIGNER = 6;
+  ENVELOPE_KIND_SYNC_REQUEST = 7;
+  ENVELOPE_KIND_SYNC_RESPONSE = 8;
+  ENVELOPE_KIND_ROLE_DIRECTORY_QUERY = 9;
+  ENVELOPE_KIND_ROLE_DIRECTORY_RESPONSE = 10;
+  ENVELOPE_KIND_CONTENT_PUSH = 11;
+  ENVELOPE_KIND_CONTENT_PUSH_ACK = 12;
+}
+
+message Hello {
+  uint32 envelope_version = 1;
+  uint32 chain_id = 2;
+  uint32 network_id = 3;
+  repeated uint32 supported_protocol_versions = 4;
+  uint32 peer_version = 5;
+  uint64 capabilities = 6;
+  uint64 burn_tip_height = 7;
+  bytes burn_tip_hash = 8;
+  uint64 stable_burn_tip_height = 9;
+  bytes stable_burn_tip_hash = 10;
+  uint64 stacks_tip_height = 11;
+  bytes stacks_tip_id = 12;
+  uint64 current_reward_cycle = 13;
+  repeated bytes advertised_multiaddrs = 14;
+  bytes challenge = 15;
+  // Optional proof that the Noise-authenticated PeerId and the incumbent
+  // rotating legacy conversation key belong to the same node. Endpoints are
+  // deliberately absent: addresses are dial hints, never identity evidence.
+  LegacyIdentityBinding legacy_identity_binding = 16;
+}
+
+message LegacyIdentityBinding {
+  uint32 version = 1;
+  uint32 chain_id = 2;
+  bytes peer_id = 3;
+  bytes legacy_node_public_key = 4;
+  uint64 legacy_key_expire_burn_height = 5;
+  bytes signature = 6;
+}
+
+message HelloResponse {
+  Status status = 1;
+  Hello hello = 2;
+  bytes challenge_response = 3;
+}
+
+// The existing SignerMessage consensus codec remains the v1 payload.  These
+// fields authenticate its author and transport binding without making libp2p
+// types part of the signer state machine.
+message SignerEnvelopeBody {
+  uint32 version = 1;
+  uint32 chain_id = 2;
+  uint32 network_id = 3;
+  uint64 reward_cycle = 4;
+  SignerLane lane = 5;
+  uint64 sequence = 6;
+  bytes previous_envelope_id = 7;
+  bytes signer_public_key = 8;
+  bytes transport_peer_id = 9;
+  bytes payload = 10;
+  bytes burn_view_consensus_hash = 11;
+  // Block proposals carry only this bounded manifest on signer transports.
+  // The canonical SignerMessage bytes are fetched as a content-addressed object.
+  ProposalManifest proposal_manifest = 12;
+}
+
+message ProposalManifest {
+  uint32 version = 1;
+  bytes content_id = 2;
+  uint64 encoded_len = 3;
+  bytes signer_signature_hash = 4;
+  uint64 burn_height = 5;
+  uint64 reward_cycle = 6;
+}
+
+message SignerEnvelope {
+  SignerEnvelopeBody body = 1;
+  // Recoverable compact Stacks secp256k1 signature (V || R || S).
+  bytes signature = 2;
+}
+
+enum SignerLane {
+  SIGNER_LANE_UNSPECIFIED = 0;
+  SIGNER_LANE_BLOCK_PROPOSAL = 1;
+  SIGNER_LANE_BLOCK_RESPONSE = 2;
+  SIGNER_LANE_BLOCK_PRE_COMMIT = 3;
+  SIGNER_LANE_STATE_MACHINE_UPDATE = 4;
+  SIGNER_LANE_BLOCK_PUSHED = 5;
+  // A signed liveness/control message. It carries no consensus weight.
+  SIGNER_LANE_CONTROL = 6;
+  // A versioned liveness outcome with no consensus rejection weight.
+  SIGNER_LANE_PROPOSAL_UNAVAILABLE = 7;
+}
+
+message ProposalUnavailable {
+  uint32 version = 1;
+  bytes signer_signature_hash = 2;
+  uint64 reward_cycle = 3;
+  ProposalUnavailableReason reason = 4;
+}
+
+enum ProposalUnavailableReason {
+  PROPOSAL_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  PROPOSAL_UNAVAILABLE_REASON_COMPANION_TIMEOUT = 1;
+  PROPOSAL_UNAVAILABLE_REASON_COMPANION_REQUEST = 2;
+  PROPOSAL_UNAVAILABLE_REASON_CHAIN_VIEW = 3;
+}
+
+message RoleProofBody {
+  uint32 version = 1;
+  uint32 chain_id = 2;
+  uint32 network_id = 3;
+  bytes transport_peer_id = 4;
+  Role role = 5;
+  uint64 reward_cycle = 6;
+  // Signer ID (u32be) or election consensus hash, interpreted by `role`.
+  bytes role_id = 7;
+  uint64 valid_from_burn_height = 8;
+  uint64 valid_until_burn_height = 9;
+}
+
+message RoleProof {
+  RoleProofBody body = 1;
+  bytes stacks_public_key = 2;
+  bytes stacks_signature = 3;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_SIGNER = 1;
+  ROLE_MINER = 2;
+  reserved 3;
+  reserved "ROLE_GATEWAY";
+}
+
+// A relayable, chainstate-authorized role binding. Addresses are merely dial
+// hints: Noise must still authenticate the PeerId committed by `proof`.
+message RoleDirectoryRecord {
+  RoleProof proof = 1;
+  repeated bytes addresses = 2;
+  // Recoverable Stacks signature over the proof ID and canonical address list.
+  bytes record_signature = 3;
+}
+
+message RoleDirectoryQuery {
+  RoleProof requester = 1;
+  repeated uint64 reward_cycles = 2;
+  repeated Role roles = 3;
+  uint32 max_records = 4;
+  // Rendezvous peers may install this only after verifying it; it must carry the same
+  // proof as `requester`. Omitting it performs a read-only query.
+  RoleDirectoryRecord requester_record = 5;
+}
+
+message RoleDirectoryResponse {
+  Status status = 1;
+  repeated RoleDirectoryRecord records = 2;
+}
+
+enum ObjectType {
+  OBJECT_TYPE_UNSPECIFIED = 0;
+  OBJECT_TYPE_TRANSACTION = 1;
+  OBJECT_TYPE_NAKAMOTO_BLOCK = 2;
+  OBJECT_TYPE_ANCHORED_BLOCK = 3;
+  OBJECT_TYPE_MICROBLOCK = 4;
+  OBJECT_TYPE_ATTACHMENT = 5;
+  OBJECT_TYPE_BLOCK_PROPOSAL = 6;
+}
+
+message ObjectAnnouncement {
+  ObjectType kind = 1;
+  bytes content_id = 2;
+  // For Nakamoto blocks this is the canonical consensus-encoded header with
+  // signer_signature empty; it includes miner_signature and version-gated
+  // problematic_txs. It carries no uncommitted size hint.
+  bytes canonical_metadata = 3;
+}
+
+message ContentRequest {
+  ObjectType kind = 1;
+  bytes content_id = 2;
+}
+
+message ContentResponse {
+  Status status = 1;
+  ObjectType kind = 2;
+  bytes content_id = 3;
+  bytes payload = 4;
+}
+
+message ContentPush {
+  ObjectType kind = 1;
+  bytes content_id = 2;
+  bytes payload = 3;
+}
+
+message ContentPushAck {
+  Status status = 1;
+  bytes content_id = 2;
+}
+
+message SyncRequest {
+  reserved 7, 8;
+  reserved "gateway_event", "submit_block_proposal";
+  oneof request {
+    GetStatus get_status = 1;
+    GetPoxInventory get_pox_inventory = 2;
+    GetTenureInventory get_tenure_inventory = 3;
+    GetEpoch2Inventory get_epoch2_inventory = 4;
+    GetMempoolPage get_mempool_page = 5;
+    GetAttachmentInventory get_attachment_inventory = 6;
+    GetSignerReplay get_signer_replay = 9;
+    GetUnconfirmedMicroblocks get_unconfirmed_microblocks = 10;
+  }
+}
+
+message GetStatus {}
+
+message GetPoxInventory {
+  uint64 start_cycle = 1;
+  uint32 count = 2;
+}
+
+message GetTenureInventory {
+  uint64 reward_cycle = 1;
+  uint64 cursor = 2;
+  uint32 max_items = 3;
+}
+
+message GetEpoch2Inventory {
+  uint64 start_height = 1;
+  uint32 count = 2;
+}
+
+message GetMempoolPage {
+  bytes cursor = 1;
+  uint32 max_items = 2;
+  uint32 max_bytes = 3;
+}
+
+// Atlas attachment content is paged by its incumbent 20-byte Hash160. The
+// cursor is exclusive and empty for the first page.
+message GetAttachmentInventory {
+  bytes cursor = 1;
+  uint32 max_items = 2;
+}
+
+// Resume an Epoch 2.x tip microblock stream. `start_sequence` is inclusive.
+message GetUnconfirmedMicroblocks {
+  bytes parent_block_id = 1;
+  uint32 start_sequence = 2;
+  uint32 max_items = 3;
+}
+
+// Bounded repair request for original author-signed signer state. Cursors are
+// per author and lane because sequence numbers are replica-local.
+message GetSignerReplay {
+  uint64 reward_cycle = 1;
+  repeated SignerReplayCursor cursors = 2;
+  uint32 max_items = 3;
+  uint32 max_bytes = 4;
+}
+
+message SignerReplayCursor {
+  bytes signer_public_key = 1;
+  SignerLane lane = 2;
+  uint64 sequence = 3;
+}
+
+message SyncResponse {
+  Status status = 1;
+  oneof response {
+    SyncStatus status_view = 2;
+    InventoryPage inventory = 3;
+    MempoolPage mempool = 4;
+    AttachmentInventoryPage attachments = 5;
+    SyncAck ack = 6;
+    SignerReplayPage signer_replay = 7;
+    MicroblockPage unconfirmed_microblocks = 8;
+  }
+}
+
+message SignerReplayPage {
+  // Complete original envelopes; replay servers cannot forge their authors.
+  repeated SignerEnvelope envelopes = 1;
+  bool complete = 2;
+}
+
+message SyncAck {}
+
+message SyncStatus {
+  uint64 burn_tip_height = 1;
+  bytes burn_tip_hash = 2;
+  uint64 stable_burn_tip_height = 3;
+  bytes stable_burn_tip_hash = 4;
+  uint64 stacks_tip_height = 5;
+  bytes stacks_tip_id = 6;
+  uint64 current_reward_cycle = 7;
+}
+
+message InventoryItem {
+  uint64 index = 1;
+  bytes object_id = 2;
+  bool available = 3;
+  // Unspecified for PoX-fork entries; concrete for fetchable object entries.
+  ObjectType kind = 4;
+}
+
+message InventoryPage {
+  repeated InventoryItem items = 1;
+  uint64 next_cursor = 2;
+  bool complete = 3;
+}
+
+message MempoolPage {
+  repeated bytes transaction_ids = 1;
+  bytes next_cursor = 2;
+  bool complete = 3;
+}
+
+message AttachmentInventoryPage {
+  repeated InventoryItem items = 1;
+  bytes next_cursor = 2;
+  bool complete = 3;
+}
+
+message MicroblockPage {
+  bytes parent_block_id = 1;
+  repeated bytes microblocks = 2;
+  uint32 next_sequence = 3;
+  bool complete = 4;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OK = 1;
+  STATUS_NOT_FOUND = 2;
+  STATUS_STALE_VIEW = 3;
+  STATUS_INVALID_REQUEST = 4;
+  STATUS_BUSY = 5;
+  STATUS_UNAUTHORIZED = 6;
+  STATUS_RATE_LIMITED = 7;
+  STATUS_UNSUPPORTED = 8;
+  STATUS_QUEUED = 9;
+  STATUS_ALREADY_HAVE = 10;
+}

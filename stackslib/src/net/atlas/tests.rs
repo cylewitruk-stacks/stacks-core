@@ -34,6 +34,7 @@ use crate::burnchains::Txid;
 use crate::net::connection::ConnectionOptions;
 use crate::net::http::{HttpResponsePayload, HttpResponsePreamble, HttpVersion};
 use crate::net::httpcore::StacksHttpResponse;
+use crate::net::semantic::AttachmentSyncService;
 use crate::net::Requestable;
 use crate::util_lib::boot::boot_code_id;
 use crate::util_lib::db::u64_to_sql;
@@ -1316,4 +1317,56 @@ fn test_attachments_inventory_requests_hashing() {
     requests.insert(attachments_inventory_4_request.key(), 4);
 
     println!("{:?}", requests);
+}
+
+#[test]
+fn instantiated_attachment_hash_pages_are_stable_and_exclusive() {
+    let mut atlas_db = AtlasDB::connect_memory(AtlasConfig::new(false)).unwrap();
+    let mut expected = (0..5)
+        .map(|index| new_attachment_from(&format!("libp2p-atlas-{index}")))
+        .collect::<Vec<_>>();
+    for attachment in &expected {
+        atlas_db.insert_instantiated_attachment(attachment).unwrap();
+    }
+    expected.sort_by_key(|attachment| attachment.hash().0);
+
+    let (first, complete) = atlas_db
+        .get_instantiated_attachment_hash_page(None, 2)
+        .unwrap();
+    assert!(!complete);
+    assert_eq!(
+        first,
+        expected[..2]
+            .iter()
+            .map(Attachment::hash)
+            .collect::<Vec<_>>()
+    );
+
+    let (second, complete) = atlas_db
+        .get_instantiated_attachment_hash_page(first.last(), 8)
+        .unwrap();
+    assert!(complete);
+    assert_eq!(
+        second,
+        expected[2..]
+            .iter()
+            .map(Attachment::hash)
+            .collect::<Vec<_>>()
+    );
+
+    let semantic = AttachmentSyncService::inventory_page(&atlas_db, None, 2).unwrap();
+    assert_eq!(
+        semantic
+            .attachments
+            .iter()
+            .map(|(hash, _)| hash.clone())
+            .collect::<Vec<_>>(),
+        first
+    );
+    assert_eq!(semantic.next_cursor, first.last().cloned());
+    assert!(!semantic.complete);
+    assert!(semantic
+        .attachments
+        .iter()
+        .all(|(hash, attachment)| *hash == attachment.hash()));
 }

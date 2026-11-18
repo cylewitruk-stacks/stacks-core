@@ -16,6 +16,9 @@ members = [
     "stacks-node",
     "stacks-profiler",
     "stacks-profiler-macros",
+    "stacks-network-types",
+    "stacks-network",
+    "stacks-signer-bridge",
     "contrib/stacks-inspect",
     "contrib/clarity-cli",
     "contrib/stacks-cli",
@@ -33,6 +36,7 @@ version = "4.0.7"
 # Local dependencies
 stacks-profiler = { path = "stacks-profiler" }
 stacks-profiler-macros = { path = "stacks-profiler-macros" }
+stacks-network-types = { path = "stacks-network-types" }
 
 # Dependencies we want to keep the same between workspace members
 ed25519-dalek = { version = "2.1.1", default-features = false }
@@ -53,6 +57,40 @@ thiserror = "1.0.65"
 tikv-jemallocator = "0.5.4"
 toml = "0.5.6"
 variant_count = "1.1"
+async-trait = "0.1.91"
+bytes = "1.12.1"
+futures = "0.3.31"
+hkdf = "0.13.0"
+libp2p = { version = "=0.56.0", default-features = false, features = [
+    "autonat",
+    "dns",
+    "gossipsub",
+    "identify",
+    "kad",
+    "macros",
+    "memory-connection-limits",
+    "metrics",
+    "noise",
+    "ping",
+    "request-response",
+    "secp256k1",
+    "serde",
+    "tcp",
+    "tokio",
+    "yamux",
+] }
+prost = "0.14.4"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing = "0.1.40"
+zeroize = "1.7.0"
 
 # Other dependencies
 assert-json-diff = "2.0.2"
@@ -61,7 +99,9 @@ rapidhash = { version = "4.3.0", default-features = false, features = ["std"] }
 trybuild = { version = "1.0.116", default-features = false }
 
 # Benchmarking dependencies
-criterion = { version = "0.8.2", default-features = false, features = ["html_reports"] }
+criterion = { version = "0.8.2", default-features = false, features = [
+    "html_reports",
+] }
 
 # Procedural macro dependencies
 syn = { version = "3.0.9", default-features = false, features = ["full", "extra-traits", "parsing", "printing", "proc-macro"] }
@@ -90,6 +130,15 @@ lto = "fat"
 [profile.release-lite]
 inherits = "release"
 lto = "thin"
+
+# Fast iteration profile for the local libp2p proof of concept. Keep dependency
+# optimization from `dev` so chain execution remains representative, while
+# retaining incremental, multi-codegen-unit builds for the frequently changed
+# node and signer crates. This is intentionally not a production profile.
+[profile.libp2p-poc]
+inherits = "dev"
+debug = "line-tables-only"
+incremental = true
 
 # faster tests for `insta` https://docs.rs/insta/1.43.2/insta/#optional-faster-runs
 [profile.dev.package]
